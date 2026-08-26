@@ -454,9 +454,10 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         .to_owned();
     assert!(init_cookie.starts_with("brocade_session=broc_session_"));
     assert!(init_cookie.contains("HttpOnly"));
-    // `Secure` 只在 release 构建里出现——调试时控制面常绑到 0.0.0.0，而局域网 IP 上的明文 HTTP
-    // 不是安全上下文，带 `Secure` 的 Cookie 会被浏览器丢弃。取值与构建类型的对应关系由
-    // http.rs 的 `session_cookies_carry_the_same_attributes_in_both_profiles` 单独锁住。
+    // `Secure` only appears in release builds — in debug the console is often bound to 0.0.0.0, and
+    // plaintext HTTP over a LAN IP is not a secure context, so a `Secure` cookie would be dropped by
+    // the browser. The mapping between this value and the build type is pinned separately by
+    // `session_cookies_carry_the_same_attributes_in_both_profiles` in http.rs.
     assert_eq!(init_cookie.contains("Secure"), !cfg!(debug_assertions));
     assert!(init_cookie.contains("SameSite=Lax"));
     let init_cookie_pair = init_cookie.split(';').next().unwrap().to_owned();

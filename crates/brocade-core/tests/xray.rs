@@ -219,7 +219,11 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
         &sys,
         &mut diagnostics,
     );
-    let hk = parse_xray(&xray::build(&project_node(&sys, &[app_ir.clone()], "hk")));
+    let hk = parse_xray(&xray::build(&project_node(
+        &sys,
+        std::slice::from_ref(&app_ir),
+        "hk",
+    )));
     let external = outbound(&hk, "out:app/external/vendor-edge");
     assert_eq!(external["protocol"], "vless");
     assert_eq!(external["settings"]["address"], "edge.vendor.example");

@@ -428,6 +428,12 @@ pub struct XrayClient {
     pub reverse_tag: Option<String>,
 }
 
+// The variants differ widely in size (Vless/External carry a full outbound config, Blackhole
+// just a bool), but this is a one-shot artifact built at compile time — never cloned on a hot
+// path or packed into a large Vec, so its layout footprint is immaterial. Splitting the
+// named-field variants into their own boxed structs to close the gap would only make this
+// intermediate representation harder to read.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XrayOutbound {
     Vless {

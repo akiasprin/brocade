@@ -680,6 +680,10 @@ pub enum ExternalOutboundProtocol {
 /// This belongs to the VLESS protocol variant rather than to [`ExternalOutbound`]: the other
 /// supported proxy protocols keep their own fixed transport shape, and making this a global axis
 /// would allow combinations Xray cannot use (for example WireGuard over XHTTP).
+// Raw carries no data while Xhttp carries a full XHTTP transport config, so the two variants
+// differ widely in size. This is per-external-outbound configuration, off any hot path, so the
+// layout footprint is immaterial and Xhttp is not worth boxing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum ExternalVlessTransport {

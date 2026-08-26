@@ -494,7 +494,7 @@ pub(crate) async fn upsert_external_outbound_tx(
         let credential = if request.protocol.allows_empty_credential() && credential.is_empty() {
             String::new()
         } else {
-            required_text(credential.to_owned(), "external outbound credential")?
+            required_text(credential, "external outbound credential")?
         };
         crate::secrets::seal(
             &crate::secrets::external_outbound_context(&app_id, &id),

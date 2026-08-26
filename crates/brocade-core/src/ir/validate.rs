@@ -327,9 +327,11 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     validate_external_xhttp_fields(
                         diagnostics,
                         &at,
-                        "external-outbound.xhttp-path",
-                        "external-outbound.xhttp-host",
-                        "external-outbound.xhttp-mux-range",
+                        XhttpFieldCodes {
+                            path: "external-outbound.xhttp-path",
+                            host: "external-outbound.xhttp-host",
+                            mux: "external-outbound.xhttp-mux-range",
+                        },
                         &xhttp.path,
                         xhttp.host.as_deref(),
                         xhttp.mux,
@@ -352,21 +354,22 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Some(32),
                     _ => None,
                 };
-                if key_len.is_none() {
-                    diagnostics.push(Diagnostic::error(
+                match key_len {
+                    None => diagnostics.push(Diagnostic::error(
                         "external-outbound.shadowsocks2022-method",
                         &at,
                         "外部 Shadowsocks 只支持 SS2022 的三种 2022-blake3-* 加密方式",
-                    ));
-                } else if !ss2022_credential_is_valid(credential, key_len.unwrap()) {
-                    diagnostics.push(Diagnostic::error(
-                        "external-outbound.shadowsocks2022-key",
-                        &at,
-                        format!(
-                            "SS2022 密钥必须是 Base64 编码的 {} 字节 PSK；多用户服务端使用 server-key:user-key",
-                            key_len.unwrap()
-                        ),
-                    ));
+                    )),
+                    Some(key_len) if !ss2022_credential_is_valid(credential, key_len) => {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.shadowsocks2022-key",
+                            &at,
+                            format!(
+                                "SS2022 密钥必须是 Base64 编码的 {key_len} 字节 PSK；多用户服务端使用 server-key:user-key"
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
                 }
             }
             ExternalOutboundProtocol::Socks5 {
@@ -524,6 +527,10 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     ));
                 }
             }
+            // Every field is required; kept as an if inside the arm, matching the shape of the Tls
+            // arm above. clippy would rather lift the condition into a match guard, but that buries
+            // this long check in the guard — inconsistent with its neighbour and harder to read.
+            #[allow(clippy::collapsible_match)]
             ExternalOutboundSecurity::Reality {
                 server_name,
                 public_key,
@@ -586,12 +593,18 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
+/// The diagnostic codes for XHTTP's three fields. The same checks run for both an external
+/// outbound and its own download, each with its own code prefix, so the codes travel with them.
+struct XhttpFieldCodes {
+    path: &'static str,
+    host: &'static str,
+    mux: &'static str,
+}
+
 fn validate_external_xhttp_fields(
     diagnostics: &mut Vec<Diagnostic>,
     at: &str,
-    path_code: &'static str,
-    host_code: &'static str,
-    mux_code: &'static str,
+    codes: XhttpFieldCodes,
     path: &str,
     host: Option<&str>,
     mux: Option<u16>,
@@ -602,21 +615,21 @@ fn validate_external_xhttp_fields(
             .any(|character| character.is_whitespace() || matches!(character, '?' | '#'))
     {
         diagnostics.push(Diagnostic::error(
-            path_code,
+            codes.path,
             at,
             "XHTTP 路径必须以 / 开头，且不能包含空白、? 或 #",
         ));
     }
     if host.is_some_and(|host| host.trim().is_empty()) {
         diagnostics.push(Diagnostic::error(
-            host_code,
+            codes.host,
             at,
             "XHTTP Host 不能是空白字符；不需要设置时请留空",
         ));
     }
     if mux.is_some_and(|mux| !(Xhttp::MUX_MIN..=Xhttp::MUX_MAX).contains(&mux)) {
         diagnostics.push(Diagnostic::error(
-            mux_code,
+            codes.mux,
             at,
             format!(
                 "XHTTP 并发数必须在 {}–{} 之间；留空使用客户端默认",
@@ -645,9 +658,11 @@ fn validate_external_xhttp_download(
     validate_external_xhttp_fields(
         diagnostics,
         at,
-        "external-outbound.xhttp-download-path",
-        "external-outbound.xhttp-download-host",
-        "external-outbound.xhttp-download-mux-range",
+        XhttpFieldCodes {
+            path: "external-outbound.xhttp-download-path",
+            host: "external-outbound.xhttp-download-host",
+            mux: "external-outbound.xhttp-download-mux-range",
+        },
         &download.path,
         download.host.as_deref(),
         download.mux,

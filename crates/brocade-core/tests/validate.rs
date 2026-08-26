@@ -858,7 +858,7 @@ fn validate_rejects_force_brutal_without_a_rate_and_out_of_range_quic_knobs() {
     );
     assert_has(&no_rate, Level::Error, "ingress.hy2-force-brutal-needs-up");
 
-    // The same档 with a rate is fine, so the diagnostic is about the missing value and not about
+    // The same case with a rate is fine, so the diagnostic is about the missing value and not about
     // force-brutal itself.
     let with_rate = case(
         HysteriaCongestion::ForceBrutal,
