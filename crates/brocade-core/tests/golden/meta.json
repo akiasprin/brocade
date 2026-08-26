@@ -1,0 +1,89 @@
+{
+  "nodes": [
+    {
+      "id": "hk-01",
+      "tenant": "platform.acme",
+      "name": "香港入口",
+      "host": "hk1.example.net",
+      "overlay": "10.66.0.1",
+      "wg_port": 51820,
+      "api_port": 10085,
+      "on_overlay": true,
+      "egress": true,
+      "dns": "system"
+    },
+    {
+      "id": "sg-01",
+      "tenant": "platform.acme",
+      "name": "新加坡中转",
+      "host": "sg1.example.net",
+      "overlay": "10.66.0.2",
+      "wg_port": 51820,
+      "api_port": 10085,
+      "on_overlay": true,
+      "egress": true,
+      "dns": "system"
+    },
+    {
+      "id": "au-01",
+      "tenant": "platform.acme",
+      "name": "澳洲落地",
+      "host": "au1.example.net",
+      "overlay": "10.66.0.3",
+      "wg_port": 51820,
+      "api_port": 10085,
+      "on_overlay": true,
+      "egress": true,
+      "dns": "1.1.1.1"
+    },
+    {
+      "id": "us-01",
+      "tenant": "platform.acme",
+      "name": "美国落地",
+      "host": "us1.example.net",
+      "overlay": "10.66.0.4",
+      "wg_port": 51820,
+      "api_port": 10085,
+      "on_overlay": true,
+      "egress": true,
+      "dns": "1.1.1.1"
+    },
+    {
+      "id": "jp-01",
+      "tenant": "platform.acme",
+      "name": "日本入口",
+      "host": "jp1.example.net",
+      "overlay": "10.66.0.5",
+      "wg_port": 51820,
+      "api_port": 10085,
+      "on_overlay": true,
+      "egress": false,
+      "dns": "system"
+    }
+  ],
+  "users": [
+    {
+      "id": "alice",
+      "tenant": "platform.acme"
+    },
+    {
+      "id": "bob",
+      "tenant": "platform.acme"
+    }
+  ],
+  "apps": [
+    {
+      "id": "lin",
+      "label": "线性主干"
+    },
+    {
+      "id": "brc",
+      "label": "分叉主干"
+    },
+    {
+      "id": "frt",
+      "label": "客户端前置"
+    }
+  ],
+  "diag": []
+}

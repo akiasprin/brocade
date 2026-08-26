@@ -1,0 +1,416 @@
+{
+  "api": {
+    "services": [
+      "HandlerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "burstObservatory": {
+    "pingConfig": {
+      "destination": "http://www.gstatic.com/generate_204",
+      "interval": "10s",
+      "samplingCount": 2,
+      "timeout": "5s"
+    },
+    "subjectSelector": [
+      "out:brc/c-brc-jp>au-01",
+      "out:brc/c-brc-jp>us-01",
+      "out:brc/c-brc-smart>au-01",
+      "out:brc/c-brc-smart>us-01",
+      "out:lin/c-lin-au>au-01",
+      "out:lin/c-lin-us>us-01"
+    ]
+  },
+  "dns": {
+    "servers": [
+      "localhost"
+    ]
+  },
+  "geodata": {
+    "assets": [
+      {
+        "file": "geoip.dat",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat"
+      },
+      {
+        "file": "geosite.dat",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat"
+      }
+    ],
+    "cron": "CRON_TZ=Asia/Shanghai 30 6 * * *",
+    "outbound": "out:internal"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      },
+      "tag": "api"
+    },
+    {
+      "listen": "10.66.0.2",
+      "port": 20003,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "email": "c-brc-jp@sg-01",
+            "id": "32761913-59d6-4020-b79a-91fc28289f66",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:hop:brc/c-brc-jp"
+    },
+    {
+      "listen": "10.66.0.2",
+      "port": 20002,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "email": "c-brc-smart@sg-01",
+            "id": "03a64703-2213-4beb-8e30-cbb84b1da52b",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:hop:brc/c-brc-smart"
+    },
+    {
+      "listen": "10.66.0.2",
+      "port": 20001,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "email": "c-lin-au@sg-01",
+            "id": "0a082e1e-80ce-4df9-8e6d-c3758ce96f73",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:hop:lin/c-lin-au"
+    },
+    {
+      "listen": "10.66.0.2",
+      "port": 20000,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "email": "c-lin-us@sg-01",
+            "id": "b136544a-f92b-4c7a-a2de-dc3639eb40c0",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:hop:lin/c-lin-us"
+    }
+  ],
+  "log": {
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "be28706f-a93f-4be2-b66e-5cfc726024dd"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:brc/c-brc-jp>au-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20003,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "3083b3f5-d4c8-44d2-9e54-7634dac4f621"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:brc/c-brc-jp>us-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "741ba094-e89d-4ac4-9f43-26823594ede9"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:brc/c-brc-smart>au-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "8233e9d2-0751-4b08-ac2f-999f7708c790"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:brc/c-brc-smart>us-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "a0621a1d-d3f0-4a8b-a9cd-95efbe50d542"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:lin/c-lin-au>au-01"
+    },
+    {
+      "mux": {
+        "concurrency": 8,
+        "enabled": true
+      },
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "336e37ff-0582-4d02-b572-fd18755776c8"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:lin/c-lin-us>us-01"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      },
+      "tag": "out:internal"
+    }
+  ],
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 300,
+        "downlinkOnly": 5,
+        "handshake": 60,
+        "statsUserDownlink": true,
+        "statsUserUplink": true,
+        "uplinkOnly": 2
+      }
+    },
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "balancers": [
+      {
+        "selector": [
+          "out:brc/c-brc-jp>au-01",
+          "out:brc/c-brc-jp>us-01",
+          "out:brc/c-brc-smart>au-01",
+          "out:brc/c-brc-smart>us-01",
+          "out:lin/c-lin-au>au-01",
+          "out:lin/c-lin-us>us-01"
+        ],
+        "strategy": {
+          "type": "leastPing"
+        },
+        "tag": "hop-health"
+      }
+    ],
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api",
+        "ruleTag": "r:ef805560:000",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
+        "outboundTag": "out:brc/c-brc-jp>au-01",
+        "ruleTag": "r:ef805560:001",
+        "type": "field",
+        "user": [
+          "c-brc-jp@sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "out:brc/c-brc-jp>us-01",
+        "ruleTag": "r:ef805560:002",
+        "type": "field",
+        "user": [
+          "c-brc-jp@sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-jp>us-01",
+        "ruleTag": "r:ef805560:003",
+        "type": "field",
+        "user": [
+          "c-brc-jp@sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
+        "outboundTag": "out:brc/c-brc-smart>au-01",
+        "ruleTag": "r:ef805560:004",
+        "type": "field",
+        "user": [
+          "c-brc-smart@sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "out:brc/c-brc-smart>us-01",
+        "ruleTag": "r:ef805560:005",
+        "type": "field",
+        "user": [
+          "c-brc-smart@sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-smart>us-01",
+        "ruleTag": "r:ef805560:006",
+        "type": "field",
+        "user": [
+          "c-brc-smart@sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:lin/c-lin-au>au-01",
+        "ruleTag": "r:ef805560:007",
+        "type": "field",
+        "user": [
+          "c-lin-au@sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:lin/c-lin-us>us-01",
+        "ruleTag": "r:ef805560:008",
+        "type": "field",
+        "user": [
+          "c-lin-us@sg-01"
+        ]
+      },
+      {
+        "balancerTag": "hop-health",
+        "domain": [
+          "full:invalid.brocade.never-match"
+        ],
+        "ruleTag": "r:ef805560:009",
+        "type": "field"
+      }
+    ]
+  },
+  "stats": {}
+}

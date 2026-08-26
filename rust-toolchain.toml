@@ -1,0 +1,11 @@
+# Pin the toolchain version. Unpinned, everyone who clones builds something slightly different:
+# clippy's rule set changes version to version, and a repository cleared to zero warnings today can
+# produce several more under another version.
+#
+# The two musl targets are required rather than optional: `crates/brocade-console/build.rs` compiles
+# statically linked agent binaries into the control plane (one each for x86_64 and aarch64). Missing
+# either fails the build.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/brocade-console",
+    "crates/brocade-core",
+    "crates/brocade-deployment",
+    "crates/brocade-agent",
+    "crates/brocade-preview",
+    "crates/brocade-store",
+]
+resolver = "2"
+
+[workspace.package]
+# The one place a version number is maintained. Every crate inherits it with
+# `version.workspace = true`, so bumping it here bumps the whole set — the console reports it as
+# its own version and stamps it onto the agent release it distributes
+# (`brocade-console/build.rs`, `describe_build`).
+#
+# Six copies of the same string lived in the six manifests before this. Nothing forced them to
+# agree, and the failure mode is quiet: the console would report one number while the agent it
+# distributes carried another, in a page whose whole purpose is telling an operator what is
+# deployed where.
+#
+# Note what this number is not: it does not identify a build. Self-update compares the sha256 of
+# the actual bytes, because nobody remembers to bump a version on the way to a node and every build
+# since the last bump would otherwise claim to be the same thing (`brocade-agent/src/identity.rs`).
+# This is here to be read by people, and the sha is there to be compared by machines.
+version = "0.2.0"
+edition = "2021"
+# Matches the version pinned in rust-toolchain.toml. clippy decides which lints apply from it (a
+# construct requiring 1.9x, say, should not be suggested below the MSRV).
+rust-version = "1.96"
+license = "Apache-2.0"

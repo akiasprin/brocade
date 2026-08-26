@@ -1,0 +1,1097 @@
+{
+  "revision": 1,
+  "tenants": ["platform.acme"],
+  "nodes": [
+    {
+      "id": "au-01",
+      "tenant": "platform.acme",
+      "name": "澳洲落地",
+      "host": "au1.example.net",
+      "egress_allowed": true,
+      "api_port": 10085,
+      "dns": {
+        "t": "servers",
+        "v": ["1.1.1.1"]
+      },
+      "dns_route": "out:egress"
+    },
+    {
+      "id": "hk-01",
+      "tenant": "platform.acme",
+      "name": "香港入口",
+      "host": "hk1.example.net",
+      "egress_allowed": true,
+      "api_port": 10085,
+      "dns": {
+        "t": "system"
+      },
+      "dns_route": null
+    },
+    {
+      "id": "jp-01",
+      "tenant": "platform.acme",
+      "name": "日本入口",
+      "host": "jp1.example.net",
+      "egress_allowed": false,
+      "api_port": 10085,
+      "dns": {
+        "t": "system"
+      },
+      "dns_route": null
+    },
+    {
+      "id": "sg-01",
+      "tenant": "platform.acme",
+      "name": "新加坡中转",
+      "host": "sg1.example.net",
+      "egress_allowed": true,
+      "api_port": 10085,
+      "dns": {
+        "t": "system"
+      },
+      "dns_route": null
+    },
+    {
+      "id": "us-01",
+      "tenant": "platform.acme",
+      "name": "美国落地",
+      "host": "us1.example.net",
+      "egress_allowed": true,
+      "api_port": 10085,
+      "dns": {
+        "t": "servers",
+        "v": ["1.1.1.1"]
+      },
+      "dns_route": "out:egress"
+    }
+  ],
+  "users": [
+    {
+      "id": "alice",
+      "tenant": "platform.acme",
+      "uuid": "2d2304da-f114-4574-8d44-625afdb1db5c"
+    },
+    {
+      "id": "bob",
+      "tenant": "platform.acme",
+      "uuid": "68b09204-6d75-4b3d-9327-12125021f8c0"
+    }
+  ],
+  "chains": [
+    {
+      "id": "c-brc-jp",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "name": "日本入口·智能出口"
+    },
+    {
+      "id": "c-brc-smart",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "name": "智能出口"
+    },
+    {
+      "id": "c-frt-au",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "name": "澳洲前置"
+    },
+    {
+      "id": "c-frt-hk",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "name": "香港入口"
+    },
+    {
+      "id": "c-frt-us",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "name": "美国前置"
+    },
+    {
+      "id": "c-lin-au",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "name": "澳洲出口"
+    },
+    {
+      "id": "c-lin-jp",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "name": "日本入口·美国出口"
+    },
+    {
+      "id": "c-lin-us",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "name": "美国出口"
+    }
+  ],
+  "ingresses": [
+    {
+      "sniff": true,
+      "id": "i-brc-hk",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "chain": "c-brc-smart",
+      "node": "hk-01",
+      "bind": "0.0.0.0",
+      "port": 2443,
+      "front": null,
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "MGiM0qQbW7jEhaRfoWS7TsHRL9_sS4QaCKCVRjmGDlw",
+        "public_key": "Pkz5sxRTCjw92NWFc4ST_3iniZkTjGufHp9EXEIrLgM",
+        "short_ids": ["8337a0bf"],
+        "dest": "www.bing.com:443",
+        "server_names": ["www.bing.com"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    {
+      "sniff": true,
+      "id": "i-brc-jp",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "chain": "c-brc-jp",
+      "node": "jp-01",
+      "bind": "0.0.0.0",
+      "port": 8443,
+      "front": null,
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "GO2aX16FduNLFAZM67iGNE38xq8ow1_UrC_eSf7Lh2M",
+        "public_key": "I9tZ66Z-ccTkwE1Kb5vUtJZ5MYMJm9INM9hGVumvQB0",
+        "short_ids": ["fba1c1c2"],
+        "dest": "www.yahoo.co.jp:443",
+        "server_names": ["www.yahoo.co.jp"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    {
+      "sniff": true,
+      "id": "i-frt-au",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "chain": "c-frt-au",
+      "node": "au-01",
+      "bind": "0.0.0.0",
+      "port": 443,
+      "front": "f-frt-in",
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "qH3hPcclttw0RxHRmq_0KFAFPBPC25XSHVTXnmpT4n4",
+        "public_key": "wBFt8xRRsPDB0QKTTTshGydTQ9nOK4pzhvqLYvRHRzc",
+        "short_ids": ["9ee77f9e"],
+        "dest": "www.icloud.com:443",
+        "server_names": ["www.icloud.com"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    {
+      "sniff": false,
+      "id": "i-frt-hk",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "chain": "c-frt-hk",
+      "node": "hk-01",
+      "bind": "0.0.0.0",
+      "port": 3443,
+      "front": null,
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "mJFx5v_FKhbBvCjkDqSUhxB57MMd305VRl6NVXd9VXg",
+        "public_key": "gyRZKBh6EcvSnCOXjVjufFmpzFVzTu5SMMrRhTn7yHw",
+        "short_ids": ["c71c181a"],
+        "dest": "apps.apple.com:443",
+        "server_names": ["apps.apple.com"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    {
+      "sniff": true,
+      "id": "i-frt-us",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "chain": "c-frt-us",
+      "node": "us-01",
+      "bind": "0.0.0.0",
+      "port": 443,
+      "front": "f-frt-in",
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "OAaRQm2kzxths_bax11X6Zm1IzdtIrA2Al-giid5zmA",
+        "public_key": "uxBtkE4kok30kk6idID_11SvP2DEoxgxjOR1jfddlkc",
+        "short_ids": ["cd033ce1"],
+        "dest": "www.apple.com:443",
+        "server_names": ["www.apple.com"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    {
+      "sniff": true,
+      "id": "i-lin-au",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "chain": "c-lin-au",
+      "node": "hk-01",
+      "bind": "0.0.0.0",
+      "port": 8443,
+      "front": null,
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "KGDiUfNxGufpe26UW1MDbNvjJMZPumNhDsK323JSJGQ",
+        "public_key": "BGGAFj9kbrtURk_nmOYFTey0HUJyov02Bgq0wLbeRRY",
+        "short_ids": ["78373993"],
+        "dest": "www.apple.com:443",
+        "server_names": ["www.apple.com"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    {
+      "sniff": true,
+      "id": "i-lin-jp",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "chain": "c-lin-jp",
+      "node": "jp-01",
+      "bind": "0.0.0.0",
+      "port": 443,
+      "front": null,
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "EJevjqloc1k1p9jtto5UCyzEeQ8h_6EgsbI7Z7RnbWk",
+        "public_key": "1xHNKXcGzhoClocrz7kpJxQYE-g-2NlXNGiWas_7NTw",
+        "short_ids": ["d19361a0"],
+        "dest": "www.amazon.co.jp:443",
+        "server_names": ["www.amazon.co.jp"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    {
+      "sniff": true,
+      "id": "i-lin-us",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "chain": "c-lin-us",
+      "node": "hk-01",
+      "bind": "0.0.0.0",
+      "port": 443,
+      "front": null,
+      "transport": {
+        "kind": "vless-reality",
+        "private_key": "6Cj9EDHBAcc8ANzGl8WotzAYn3WBlMfv_XbQxzLoc2A",
+        "public_key": "iG4pUtdiYMYAztx9c6t8A-0QF-Qknbu551RTC5cBo30",
+        "short_ids": ["7d07b06e"],
+        "dest": "www.bing.com:443",
+        "server_names": ["www.bing.com"],
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision"
+      }
+    }
+  ],
+  "fronts": [
+    {
+      "id": "f-frt-in",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "name": "入口组",
+      "via": ["i-frt-hk"],
+      "strategy": "url-test"
+    }
+  ],
+  "steps": [
+    {
+      "id": "s-c-brc-jp-au-01",
+      "app": "brc",
+      "chain": "c-brc-jp",
+      "node": "au-01",
+      "accept": {
+        "uuid": "be28706f-a93f-4be2-b66e-5cfc726024dd",
+        "label": "c-brc-jp@au-01"
+      },
+      "hop_in": {
+        "port": 20002,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-brc-jp-jp-01",
+      "app": "brc",
+      "chain": "c-brc-jp",
+      "node": "jp-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "geosite",
+            "v": "category-ads"
+          },
+          "a": {
+            "t": "block"
+          }
+        },
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "sg-01"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-brc-jp-sg-01",
+      "app": "brc",
+      "chain": "c-brc-jp",
+      "node": "sg-01",
+      "accept": {
+        "uuid": "32761913-59d6-4020-b79a-91fc28289f66",
+        "label": "c-brc-jp@sg-01"
+      },
+      "hop_in": {
+        "port": 20003,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "geosite",
+            "v": "netflix"
+          },
+          "a": {
+            "t": "forward",
+            "to": "au-01"
+          }
+        },
+        {
+          "m": {
+            "t": "geosite",
+            "v": "openai"
+          },
+          "a": {
+            "t": "forward",
+            "to": "us-01"
+          }
+        },
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "us-01"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-brc-jp-us-01",
+      "app": "brc",
+      "chain": "c-brc-jp",
+      "node": "us-01",
+      "accept": {
+        "uuid": "3083b3f5-d4c8-44d2-9e54-7634dac4f621",
+        "label": "c-brc-jp@us-01"
+      },
+      "hop_in": {
+        "port": 20003,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-brc-smart-au-01",
+      "app": "brc",
+      "chain": "c-brc-smart",
+      "node": "au-01",
+      "accept": {
+        "uuid": "741ba094-e89d-4ac4-9f43-26823594ede9",
+        "label": "c-brc-smart@au-01"
+      },
+      "hop_in": {
+        "port": 20001,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-brc-smart-hk-01",
+      "app": "brc",
+      "chain": "c-brc-smart",
+      "node": "hk-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "geosite",
+            "v": "category-ads"
+          },
+          "a": {
+            "t": "block"
+          }
+        },
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "sg-01"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-brc-smart-sg-01",
+      "app": "brc",
+      "chain": "c-brc-smart",
+      "node": "sg-01",
+      "accept": {
+        "uuid": "03a64703-2213-4beb-8e30-cbb84b1da52b",
+        "label": "c-brc-smart@sg-01"
+      },
+      "hop_in": {
+        "port": 20002,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "geosite",
+            "v": "netflix"
+          },
+          "a": {
+            "t": "forward",
+            "to": "au-01"
+          }
+        },
+        {
+          "m": {
+            "t": "geosite",
+            "v": "openai"
+          },
+          "a": {
+            "t": "forward",
+            "to": "us-01"
+          }
+        },
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "us-01"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-brc-smart-us-01",
+      "app": "brc",
+      "chain": "c-brc-smart",
+      "node": "us-01",
+      "accept": {
+        "uuid": "8233e9d2-0751-4b08-ac2f-999f7708c790",
+        "label": "c-brc-smart@us-01"
+      },
+      "hop_in": {
+        "port": 20002,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-frt-au-au-01",
+      "app": "frt",
+      "chain": "c-frt-au",
+      "node": "au-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-frt-hk-hk-01",
+      "app": "frt",
+      "chain": "c-frt-hk",
+      "node": "hk-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "domain_suffix",
+            "v": "au1.example.net,us1.example.net"
+          },
+          "a": {
+            "t": "egress"
+          }
+        },
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "block"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-frt-us-us-01",
+      "app": "frt",
+      "chain": "c-frt-us",
+      "node": "us-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-au-au-01",
+      "app": "lin",
+      "chain": "c-lin-au",
+      "node": "au-01",
+      "accept": {
+        "uuid": "a0621a1d-d3f0-4a8b-a9cd-95efbe50d542",
+        "label": "c-lin-au@au-01"
+      },
+      "hop_in": {
+        "port": 20000,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-au-hk-01",
+      "app": "lin",
+      "chain": "c-lin-au",
+      "node": "hk-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "sg-01",
+            "pool": "pool"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-au-sg-01",
+      "app": "lin",
+      "chain": "c-lin-au",
+      "node": "sg-01",
+      "accept": {
+        "uuid": "0a082e1e-80ce-4df9-8e6d-c3758ce96f73",
+        "label": "c-lin-au@sg-01"
+      },
+      "hop_in": {
+        "port": 20001,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "au-01"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-jp-jp-01",
+      "app": "lin",
+      "chain": "c-lin-jp",
+      "node": "jp-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "geosite",
+            "v": "category-ads"
+          },
+          "a": {
+            "t": "block"
+          }
+        },
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "us-01"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-jp-us-01",
+      "app": "lin",
+      "chain": "c-lin-jp",
+      "node": "us-01",
+      "accept": {
+        "uuid": "a5f4d148-c88b-48b6-bbeb-1d4abb9b26f5",
+        "label": "c-lin-jp@us-01"
+      },
+      "hop_in": {
+        "port": 20001,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-us-hk-01",
+      "app": "lin",
+      "chain": "c-lin-us",
+      "node": "hk-01",
+      "accept": null,
+      "hop_in": null,
+      "rules": [
+        {
+          "m": {
+            "t": "geosite",
+            "v": "category-ads"
+          },
+          "a": {
+            "t": "block"
+          }
+        },
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "sg-01"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-us-sg-01",
+      "app": "lin",
+      "chain": "c-lin-us",
+      "node": "sg-01",
+      "accept": {
+        "uuid": "b136544a-f92b-4c7a-a2de-dc3639eb40c0",
+        "label": "c-lin-us@sg-01"
+      },
+      "hop_in": {
+        "port": 20000,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "forward",
+            "to": "us-01",
+            "pool": "merge:8"
+          }
+        }
+      ]
+    },
+    {
+      "id": "s-c-lin-us-us-01",
+      "app": "lin",
+      "chain": "c-lin-us",
+      "node": "us-01",
+      "accept": {
+        "uuid": "336e37ff-0582-4d02-b572-fd18755776c8",
+        "label": "c-lin-us@us-01"
+      },
+      "hop_in": {
+        "port": 20000,
+        "security": {
+          "t": "none"
+        }
+      },
+      "rules": [
+        {
+          "m": {
+            "t": "any"
+          },
+          "a": {
+            "t": "egress"
+          }
+        }
+      ]
+    }
+  ],
+  "grants": [
+    {
+      "id": "g-alice@platform.acme-i-brc-hk",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-brc-hk",
+      "label": "alice@platform.acme#i-brc-hk"
+    },
+    {
+      "id": "g-alice@platform.acme-i-brc-jp",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-brc-jp",
+      "label": "alice@platform.acme#i-brc-jp"
+    },
+    {
+      "id": "g-alice@platform.acme-i-frt-au",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-frt-au",
+      "label": "alice@platform.acme#i-frt-au"
+    },
+    {
+      "id": "g-alice@platform.acme-i-frt-hk",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-frt-hk",
+      "label": "alice@platform.acme#i-frt-hk"
+    },
+    {
+      "id": "g-alice@platform.acme-i-frt-us",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-frt-us",
+      "label": "alice@platform.acme#i-frt-us"
+    },
+    {
+      "id": "g-alice@platform.acme-i-lin-au",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-lin-au",
+      "label": "alice@platform.acme#i-lin-au"
+    },
+    {
+      "id": "g-alice@platform.acme-i-lin-jp",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-lin-jp",
+      "label": "alice@platform.acme#i-lin-jp"
+    },
+    {
+      "id": "g-alice@platform.acme-i-lin-us",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "user": "alice",
+      "ingress": "i-lin-us",
+      "label": "alice@platform.acme#i-lin-us"
+    },
+    {
+      "id": "g-bob@platform.acme-i-brc-hk",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "user": "bob",
+      "ingress": "i-brc-hk",
+      "label": "bob@platform.acme#i-brc-hk"
+    },
+    {
+      "id": "g-bob@platform.acme-i-brc-jp",
+      "app": "brc",
+      "tenant": "platform.acme",
+      "user": "bob",
+      "ingress": "i-brc-jp",
+      "label": "bob@platform.acme#i-brc-jp"
+    },
+    {
+      "id": "g-bob@platform.acme-i-frt-hk",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "user": "bob",
+      "ingress": "i-frt-hk",
+      "label": "bob@platform.acme#i-frt-hk"
+    },
+    {
+      "id": "g-bob@platform.acme-i-frt-us",
+      "app": "frt",
+      "tenant": "platform.acme",
+      "user": "bob",
+      "ingress": "i-frt-us",
+      "label": "bob@platform.acme#i-frt-us"
+    },
+    {
+      "id": "g-bob@platform.acme-i-lin-jp",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "user": "bob",
+      "ingress": "i-lin-jp",
+      "label": "bob@platform.acme#i-lin-jp"
+    },
+    {
+      "id": "g-bob@platform.acme-i-lin-us",
+      "app": "lin",
+      "tenant": "platform.acme",
+      "user": "bob",
+      "ingress": "i-lin-us",
+      "label": "bob@platform.acme#i-lin-us"
+    }
+  ],
+  "hops": [
+    {
+      "chain": "c-brc-jp",
+      "app": "brc",
+      "from": "jp-01",
+      "to": "sg-01",
+      "link": "jp-01|sg-01",
+      "address": "10.66.0.2",
+      "port": 20003,
+      "credential": {
+        "uuid": "32761913-59d6-4020-b79a-91fc28289f66",
+        "label": "c-brc-jp@sg-01"
+      }
+    },
+    {
+      "chain": "c-brc-jp",
+      "app": "brc",
+      "from": "sg-01",
+      "to": "au-01",
+      "link": "au-01|sg-01",
+      "address": "10.66.0.3",
+      "port": 20002,
+      "credential": {
+        "uuid": "be28706f-a93f-4be2-b66e-5cfc726024dd",
+        "label": "c-brc-jp@au-01"
+      }
+    },
+    {
+      "chain": "c-brc-jp",
+      "app": "brc",
+      "from": "sg-01",
+      "to": "us-01",
+      "link": "sg-01|us-01",
+      "address": "10.66.0.4",
+      "port": 20003,
+      "credential": {
+        "uuid": "3083b3f5-d4c8-44d2-9e54-7634dac4f621",
+        "label": "c-brc-jp@us-01"
+      }
+    },
+    {
+      "chain": "c-brc-smart",
+      "app": "brc",
+      "from": "hk-01",
+      "to": "sg-01",
+      "link": "hk-01|sg-01",
+      "address": "10.66.0.2",
+      "port": 20002,
+      "credential": {
+        "uuid": "03a64703-2213-4beb-8e30-cbb84b1da52b",
+        "label": "c-brc-smart@sg-01"
+      }
+    },
+    {
+      "chain": "c-brc-smart",
+      "app": "brc",
+      "from": "sg-01",
+      "to": "au-01",
+      "link": "au-01|sg-01",
+      "address": "10.66.0.3",
+      "port": 20001,
+      "credential": {
+        "uuid": "741ba094-e89d-4ac4-9f43-26823594ede9",
+        "label": "c-brc-smart@au-01"
+      }
+    },
+    {
+      "chain": "c-brc-smart",
+      "app": "brc",
+      "from": "sg-01",
+      "to": "us-01",
+      "link": "sg-01|us-01",
+      "address": "10.66.0.4",
+      "port": 20002,
+      "credential": {
+        "uuid": "8233e9d2-0751-4b08-ac2f-999f7708c790",
+        "label": "c-brc-smart@us-01"
+      }
+    },
+    {
+      "chain": "c-lin-au",
+      "app": "lin",
+      "from": "hk-01",
+      "to": "sg-01",
+      "link": "hk-01|sg-01",
+      "address": "10.66.0.2",
+      "port": 20001,
+      "credential": {
+        "uuid": "0a082e1e-80ce-4df9-8e6d-c3758ce96f73",
+        "label": "c-lin-au@sg-01"
+      }
+    },
+    {
+      "chain": "c-lin-au",
+      "app": "lin",
+      "from": "sg-01",
+      "to": "au-01",
+      "link": "au-01|sg-01",
+      "address": "10.66.0.3",
+      "port": 20000,
+      "credential": {
+        "uuid": "a0621a1d-d3f0-4a8b-a9cd-95efbe50d542",
+        "label": "c-lin-au@au-01"
+      }
+    },
+    {
+      "chain": "c-lin-jp",
+      "app": "lin",
+      "from": "jp-01",
+      "to": "us-01",
+      "link": "jp-01|us-01",
+      "address": "10.66.0.4",
+      "port": 20001,
+      "credential": {
+        "uuid": "a5f4d148-c88b-48b6-bbeb-1d4abb9b26f5",
+        "label": "c-lin-jp@us-01"
+      }
+    },
+    {
+      "chain": "c-lin-us",
+      "app": "lin",
+      "from": "hk-01",
+      "to": "sg-01",
+      "link": "hk-01|sg-01",
+      "address": "10.66.0.2",
+      "port": 20000,
+      "credential": {
+        "uuid": "b136544a-f92b-4c7a-a2de-dc3639eb40c0",
+        "label": "c-lin-us@sg-01"
+      }
+    },
+    {
+      "chain": "c-lin-us",
+      "app": "lin",
+      "from": "sg-01",
+      "to": "us-01",
+      "link": "sg-01|us-01",
+      "address": "10.66.0.4",
+      "port": 20000,
+      "credential": {
+        "uuid": "336e37ff-0582-4d02-b572-fd18755776c8",
+        "label": "c-lin-us@us-01"
+      }
+    }
+  ]
+}

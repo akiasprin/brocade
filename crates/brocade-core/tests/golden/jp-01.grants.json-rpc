@@ -1,0 +1,38 @@
+{
+  "inbounds": [
+    {
+      "clients": [
+        {
+          "email": "alice@platform.acme#i-brc-jp",
+          "flow": "xtls-rprx-vision",
+          "id": "2d2304da-f114-4574-8d44-625afdb1db5c",
+          "level": 0
+        },
+        {
+          "email": "bob@platform.acme#i-brc-jp",
+          "flow": "xtls-rprx-vision",
+          "id": "68b09204-6d75-4b3d-9327-12125021f8c0",
+          "level": 0
+        }
+      ],
+      "tag": "in:brc/i-brc-jp"
+    },
+    {
+      "clients": [
+        {
+          "email": "alice@platform.acme#i-lin-jp",
+          "flow": "xtls-rprx-vision",
+          "id": "2d2304da-f114-4574-8d44-625afdb1db5c",
+          "level": 0
+        },
+        {
+          "email": "bob@platform.acme#i-lin-jp",
+          "flow": "xtls-rprx-vision",
+          "id": "68b09204-6d75-4b3d-9327-12125021f8c0",
+          "level": 0
+        }
+      ],
+      "tag": "in:lin/i-lin-jp"
+    }
+  ]
+}

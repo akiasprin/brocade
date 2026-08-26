@@ -1,0 +1,697 @@
+//! Telemetry: host load and per-hop link quality.
+//!
+//! Reads and writes two time series plus two latest-only tables. The shape of what arrives, and
+//! why it arrives already differenced, is argued at length on `LoadReportRequest` in protocol.rs;
+//! what matters here is the consequence: **the control plane stores what it is told**. It cannot
+//! re-derive a rate from counters the way usage does, so the only defences available are the ones
+//! below — a clock check, a window-overlap check, and an ownership check on each hop.
+//!
+//! That is a weaker guarantee than usage gets, and deliberately so. Usage is money; this is
+//! diagnostics. A node that lies about its CPU wastes an operator's afternoon, while a node that
+//! lies about its counters takes revenue.
+
+use brocade_deployment::protocol::{
+    HopLinkList, HopLinkSample, HopLinkView, HostFacts, LoadReportRequest, LoadReportResult,
+    LoadSample, NodeLoadList, NodeLoadView, ProcessSample,
+};
+use sqlx::{PgPool, Postgres, Row, Transaction};
+
+use crate::{admin::tenant_filter, AdminContext, Result, StoreError};
+
+// Scoping matters here even though telemetry is an operator's view: a tenant-admin is an operator
+// of *their* branch, and without `tenant_filter` they would read the CPU, memory and link quality
+// of every other tenant's machines. Node-side scoping alone is enough — a load reading belongs to
+// the machine that produced it, the way link_health does and unlike path MTU, which two ends
+// decide together.
+
+/// Same threshold, and the same reasoning, as usage's: far above any normal jitter (a 30-second
+/// round plus network) and small enough not to cross an accounting boundary.
+///
+/// The stakes are lower here — no month boundary divides a CPU reading — but a machine whose clock
+/// has run away would write windows into next week, where they sit above every real reading in
+/// every "latest N" query, permanently. That is worse than dropping the round.
+const MAX_CLOCK_SKEW_SECS: i64 = 600;
+
+/// How many windows one report may carry. A round produces one; more means the agent is catching
+/// up after failing to send. Beyond this it is not catching up, it is confused.
+const MAX_SAMPLES_PER_REPORT: usize = 60;
+
+/// Guard against a single report claiming the whole fleet's hops.
+const MAX_HOPS_PER_REPORT: usize = 512;
+
+pub async fn record_load_report(
+    pool: &PgPool,
+    node_id: &str,
+    request: LoadReportRequest,
+) -> Result<LoadReportResult> {
+    if request.read_at_unix_secs <= 0 {
+        return Err(StoreError::InvalidData(
+            "load report read_at must be positive unix seconds".to_owned(),
+        ));
+    }
+    if request.samples.len() > MAX_SAMPLES_PER_REPORT {
+        return Err(StoreError::InvalidData(format!(
+            "load report carries {} windows, over the {MAX_SAMPLES_PER_REPORT} limit",
+            request.samples.len()
+        )));
+    }
+    if request.hops.len() > MAX_HOPS_PER_REPORT {
+        return Err(StoreError::InvalidData(format!(
+            "load report carries {} hops, over the {MAX_HOPS_PER_REPORT} limit",
+            request.hops.len()
+        )));
+    }
+
+    // Signed rather than abs(): the sign says which side runs ahead, and the value is stored
+    // (see `upsert_host_facts`) so the UI can show the drift without re-measuring.
+    let (skew_secs,): (i64,) =
+        sqlx::query_as("SELECT $1::bigint - extract(epoch FROM now())::bigint")
+            .bind(request.read_at_unix_secs)
+            .fetch_one(pool)
+            .await?;
+    if skew_secs.abs() > MAX_CLOCK_SKEW_SECS {
+        return Err(StoreError::InvalidData(format!(
+            "load report clock skew {}s exceeds {MAX_CLOCK_SKEW_SECS}s; check the node's clock",
+            skew_secs.abs()
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut accepted_samples = 0_u64;
+    let mut skipped_samples = 0_u64;
+    let mut accepted_hops = 0_u64;
+    let mut rejected_hops = 0_u64;
+
+    for sample in &request.samples {
+        if sample.window_end_unix_secs <= sample.window_start_unix_secs {
+            skipped_samples += 1;
+            continue;
+        }
+        if insert_load_sample(&mut tx, node_id, request.btime_unix_secs, sample).await? {
+            accepted_samples += 1;
+        } else {
+            // ON CONFLICT DO NOTHING rather than an upsert: a window already stored is a window
+            // already stored, and a retry re-sending it must not overwrite. Not an error either —
+            // a resend is exactly what a flaky link produces.
+            skipped_samples += 1;
+        }
+    }
+
+    for hop in &request.hops {
+        if hop.window_end_unix_secs <= hop.window_start_unix_secs {
+            rejected_hops += 1;
+            continue;
+        }
+        if !node_carries_chain(&mut tx, node_id, &hop.chain_id).await? {
+            // The machine is reporting a leg on a chain it does not sit on. Not noise — an
+            // anomaly, counted apart so that "this agent is confused" is visible as a number
+            // rather than inferred from missing rows.
+            rejected_hops += 1;
+            continue;
+        }
+        if insert_hop_sample(&mut tx, node_id, hop).await? {
+            accepted_hops += 1;
+        } else {
+            rejected_hops += 1;
+        }
+    }
+
+    upsert_host_facts(
+        &mut tx,
+        node_id,
+        &request.host,
+        request.read_at_unix_secs,
+        skew_secs,
+    )
+    .await?;
+    replace_process_state(
+        &mut tx,
+        node_id,
+        &request.processes,
+        request.read_at_unix_secs,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(LoadReportResult {
+        node_id: node_id.to_owned(),
+        accepted_samples,
+        accepted_hops,
+        skipped_samples,
+        rejected_hops,
+    })
+}
+
+/// Whether this machine has any step on the named chain.
+///
+/// A looser test than usage's `counter_by_label`, on purpose. Usage has to pin a counter to one
+/// grant because a bill hangs off it; here the question is only "could this machine plausibly have
+/// an outbound on this chain", and being strict about which leg would reject the legitimate
+/// variants (reverse dial in particular) for no gain.
+async fn node_carries_chain(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    chain_id: &str,
+) -> Result<bool> {
+    // The agent's tag is `out:{app}/{chain}>{to}`, so chain_id arrives as `{app}/{chain}` while
+    // the model stores the bare chain id — the same last-segment match link_health does.
+    let bare = chain_id.rsplit('/').next().unwrap_or(chain_id);
+    let (found,): (bool,) =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM steps WHERE node_id = $1 AND chain_id = $2)")
+            .bind(node_id)
+            .bind(bare)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(found)
+}
+
+async fn insert_load_sample(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    btime: i64,
+    s: &LoadSample,
+) -> Result<bool> {
+    let cpu = cpu_split(s)?;
+    let result = sqlx::query(
+        "INSERT INTO node_load_samples (
+             node_id, window_start, window_end, btime, has_gap,
+             cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1,
+             mem_available_bytes, swap_used_bytes, oom_kills,
+             disk_free_bytes, disk_inode_free_pct,
+             nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
+             conntrack_count, uptime_secs
+         ) VALUES (
+             $1, to_timestamp($2), to_timestamp($3), $4, $5,
+             $6, $7, $8, $9, $10, $11,
+             $12, $13, $14,
+             $15, $16,
+             $17, $18, $19, $20, $21,
+             $22, $23
+         )
+         ON CONFLICT (node_id, window_start) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(s.window_start_unix_secs)
+    .bind(s.window_end_unix_secs)
+    .bind(btime)
+    .bind(s.has_gap)
+    .bind(cpu.0)
+    .bind(cpu.1)
+    .bind(cpu.2)
+    .bind(pct("cpu_peak_pct", s.cpu_peak_pct)?)
+    // Clamped on its own, never summed with the three shares: steal is not work this machine
+    // does, and the table's sum CHECK covers only work.
+    .bind(pct("cpu_steal_pct", s.cpu_steal_pct)?)
+    .bind(finite("load1", s.load1)?)
+    .bind(u64_to_i64("mem_available_bytes", s.mem_available_bytes)?)
+    .bind(u64_to_i64("swap_used_bytes", s.swap_used_bytes)?)
+    .bind(u64_to_i64("oom_kills", s.oom_kills)?)
+    .bind(u64_to_i64("disk_free_bytes", s.disk_free_bytes)?)
+    .bind(pct("disk_inode_free_pct", s.disk_inode_free_pct)?)
+    .bind(u64_to_i64("nic_rx_bps", s.nic_rx_bps)?)
+    .bind(u64_to_i64("nic_tx_bps", s.nic_tx_bps)?)
+    .bind(u64_to_i64("nic_rx_drop", s.nic_rx_drop)?)
+    .bind(u64_to_i64("nic_tx_drop", s.nic_tx_drop)?)
+    .bind(u64_to_i64("nic_err", s.nic_err)?)
+    .bind(
+        s.conntrack_count
+            .map(|v| u64_to_i64("conntrack_count", v))
+            .transpose()?,
+    )
+    .bind(u64_to_i64("uptime_secs", s.uptime_secs)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn insert_hop_sample(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    h: &HopLinkSample,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO node_hop_link_samples (
+             node_id, chain_id, peer_node_id, window_start, window_end,
+             conns, conns_measured, btlbw_p50_bps, btlbw_p90_bps,
+             min_rtt_us, rtt_p50_us, rtt_p90_us, retrans_pct,
+             busy_pct, rwnd_limited_pct, sndbuf_limited_pct
+         ) VALUES (
+             $1, $2, $3, to_timestamp($4), to_timestamp($5),
+             $6, $7, $8, $9,
+             $10, $11, $12, $13,
+             $14, $15, $16
+         )
+         ON CONFLICT (node_id, chain_id, peer_node_id, window_start) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(&h.chain_id)
+    .bind(&h.peer_node_id)
+    .bind(h.window_start_unix_secs)
+    .bind(h.window_end_unix_secs)
+    .bind(i32::try_from(h.conns).unwrap_or(i32::MAX))
+    .bind(i32::try_from(h.conns_measured).unwrap_or(i32::MAX))
+    .bind(
+        h.btlbw_p50_bps
+            .map(|v| u64_to_i64("btlbw_p50_bps", v))
+            .transpose()?,
+    )
+    .bind(
+        h.btlbw_p90_bps
+            .map(|v| u64_to_i64("btlbw_p90_bps", v))
+            .transpose()?,
+    )
+    .bind(i32::try_from(h.min_rtt_us).unwrap_or(i32::MAX))
+    .bind(i32::try_from(h.rtt_p50_us).unwrap_or(i32::MAX))
+    .bind(i32::try_from(h.rtt_p90_us).unwrap_or(i32::MAX))
+    .bind(pct("retrans_pct", h.retrans_pct)?)
+    .bind(pct("busy_pct", h.busy_pct)?)
+    .bind(pct("rwnd_limited_pct", h.rwnd_limited_pct)?)
+    .bind(pct("sndbuf_limited_pct", h.sndbuf_limited_pct)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn upsert_host_facts(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    host: &HostFacts,
+    read_at: i64,
+    clock_skew_secs: i64,
+) -> Result<()> {
+    let json = serde_json::to_value(host).map_err(|error| {
+        StoreError::InvalidData(format!("host facts not serializable: {error}"))
+    })?;
+    // The row is created by enrollment, but an UPSERT rather than an UPDATE anyway: a machine
+    // provisioned by an older path may have no node_agent_state row, and losing every load report
+    // until somebody notices is a silent failure.
+    sqlx::query(
+        "INSERT INTO node_agent_state (node_id, load_host_facts, load_reported_at, load_clock_skew_secs)
+         VALUES ($1, $2, to_timestamp($3), $4)
+         ON CONFLICT (node_id) DO UPDATE
+            SET load_host_facts = EXCLUDED.load_host_facts,
+                load_reported_at = EXCLUDED.load_reported_at,
+                load_clock_skew_secs = EXCLUDED.load_clock_skew_secs",
+    )
+    .bind(node_id)
+    .bind(json)
+    .bind(read_at)
+    .bind(clock_skew_secs)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Replace this machine's process rows wholesale.
+///
+/// Delete-then-insert rather than per-row upsert, because disappearance is information: xray
+/// removed from a machine that becomes a pure relay must stop being listed, and an upsert leaves
+/// the stale row there forever, showing a process that no longer exists.
+async fn replace_process_state(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    processes: &[ProcessSample],
+    read_at: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM node_process_state WHERE node_id = $1")
+        .bind(node_id)
+        .execute(&mut **tx)
+        .await?;
+    for p in processes {
+        // An unknown process name would fail the CHECK and take the whole transaction — every
+        // sample in this round included. Skipping is right: a newer agent reporting a process
+        // this control plane has not heard of must not cost the readings that came with it.
+        if !matches!(p.proc.as_str(), "xray" | "wg" | "phantun" | "agent") {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO node_process_state
+                 (node_id, proc, rss_bytes, cpu_pct, started_at, fds, fd_limit, observed_at)
+             VALUES ($1, $2, $3, $4, CASE WHEN $5::bigint IS NULL THEN NULL ELSE to_timestamp($5) END, $6, $7, to_timestamp($8))",
+        )
+        .bind(node_id)
+        .bind(&p.proc)
+        .bind(p.rss_bytes.map(|v| u64_to_i64("rss_bytes", v)).transpose()?)
+        .bind(p.cpu_pct.map(|v| finite("cpu_pct", v)).transpose()?)
+        .bind(p.started_at_unix_secs)
+        .bind(p.fds.map(|v| u64_to_i64("fds", v)).transpose()?)
+        .bind(p.fd_limit.map(|v| u64_to_i64("fd_limit", v)).transpose()?)
+        .bind(read_at)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// One machine's recent windows, oldest first.
+pub async fn node_load_view(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    windows: u32,
+) -> Result<NodeLoadView> {
+    // Scope check first, and as an early return rather than a filter woven through the three
+    // queries below: out of scope means this machine does not exist as far as this operator is
+    // concerned, and an empty view says exactly that without leaking whether the id is real.
+    if !node_in_scope(pool, actor, node_id).await? {
+        return Ok(NodeLoadView {
+            node_id: node_id.to_owned(),
+            reported_at_unix_secs: None,
+            clock_skew_secs: None,
+            host: None,
+            series: Vec::new(),
+            processes: Vec::new(),
+        });
+    }
+    let facts = sqlx::query(
+        "SELECT load_host_facts, extract(epoch FROM load_reported_at)::bigint AS reported_at,
+                load_clock_skew_secs
+         FROM node_agent_state WHERE node_id = $1",
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let (host, reported_at, clock_skew) = match facts {
+        Some(row) => {
+            let raw: Option<serde_json::Value> = row.try_get("load_host_facts")?;
+            // A blob that will not parse means an agent newer or older than this control plane.
+            // Treated as "no facts" rather than an error: the series alongside it is still good,
+            // and failing the whole read would blank a page over one field.
+            let host = raw.and_then(|v| serde_json::from_value::<HostFacts>(v).ok());
+            (
+                host,
+                row.try_get::<Option<i64>, _>("reported_at")?,
+                row.try_get::<Option<i64>, _>("load_clock_skew_secs")?,
+            )
+        }
+        None => (None, None, None),
+    };
+
+    // ORDER BY DESC + LIMIT to take the newest N, then reversed in Rust so the caller gets oldest
+    // first. Sorting ascending and limiting would return the oldest N, which on a machine
+    // reporting for a week is a chart of last Tuesday.
+    // Epochs extracted in SQL rather than read as timestamps and converted here: the alternative
+    // is a chrono dependency on this crate for one field, and the neighbouring queries
+    // (`load_reported_at`, `started_at`) already do it this way.
+    let rows = sqlx::query(
+        "SELECT extract(epoch FROM window_start)::bigint AS window_start_secs,
+                extract(epoch FROM window_end)::bigint AS window_end_secs,
+                has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1,
+                mem_available_bytes, swap_used_bytes, oom_kills,
+                disk_free_bytes, disk_inode_free_pct,
+                nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
+                conntrack_count, uptime_secs
+         FROM node_load_samples
+         WHERE node_id = $1
+         ORDER BY window_start DESC
+         LIMIT $2",
+    )
+    .bind(node_id)
+    .bind(i64::from(windows))
+    .fetch_all(pool)
+    .await?;
+    let mut series = rows
+        .iter()
+        .map(load_sample_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    series.reverse();
+
+    let processes = sqlx::query(
+        "SELECT proc, rss_bytes, cpu_pct,
+                extract(epoch FROM started_at)::bigint AS started_at, fds, fd_limit
+         FROM node_process_state WHERE node_id = $1
+         ORDER BY proc",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(process_from_row)
+    .collect::<Result<Vec<_>>>()?;
+
+    Ok(NodeLoadView {
+        node_id: node_id.to_owned(),
+        reported_at_unix_secs: reported_at,
+        clock_skew_secs: clock_skew,
+        host,
+        series,
+        processes,
+    })
+}
+
+/// Every live machine's latest window, for the list page.
+///
+/// `windows` per machine rather than one, because the list draws a sparkline: one reading makes a
+/// single bar, and a single bar cannot show a trend, which is the whole reason the column exists.
+pub async fn list_node_load(
+    pool: &PgPool,
+    actor: &AdminContext,
+    windows: u32,
+) -> Result<NodeLoadList> {
+    let filter = tenant_filter(actor);
+    let (scope, pattern) = split_filter(&filter);
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM nodes
+         WHERE retired_at IS NULL
+           AND ($1::text IS NULL OR tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\')
+         ORDER BY id",
+    )
+    .bind(scope)
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?;
+    let mut nodes = Vec::with_capacity(ids.len());
+    for id in ids {
+        nodes.push(node_load_view(pool, actor, &id, windows).await?);
+    }
+    Ok(NodeLoadList { nodes })
+}
+
+async fn node_in_scope(pool: &PgPool, actor: &AdminContext, node_id: &str) -> Result<bool> {
+    let filter = tenant_filter(actor);
+    let (scope, pattern) = split_filter(&filter);
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM nodes
+                        WHERE id = $3
+                          AND ($1::text IS NULL OR tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\'))",
+    )
+    .bind(scope)
+    .bind(pattern)
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
+fn split_filter(filter: &Option<(String, String)>) -> (Option<&str>, Option<&str>) {
+    match filter {
+        Some((scope, pattern)) => (Some(scope.as_str()), Some(pattern.as_str())),
+        None => (None, None),
+    }
+}
+
+/// The latest window of every hop, optionally narrowed to one chain.
+pub async fn hop_link_list(
+    pool: &PgPool,
+    actor: &AdminContext,
+    chain_id: Option<&str>,
+) -> Result<HopLinkList> {
+    let filter = tenant_filter(actor);
+    let (scope, pattern) = split_filter(&filter);
+    // DISTINCT ON gives the newest row per (node, chain, peer) in one pass. The alternative —
+    // fetching a window's worth and grouping in Rust — has to define "a window" first, and hops
+    // do not share window boundaries across machines whose clocks differ by a second.
+    let rows = sqlx::query(
+        "SELECT DISTINCT ON (h.node_id, h.chain_id, h.peer_node_id)
+                h.node_id, h.chain_id, h.peer_node_id,
+                extract(epoch FROM h.window_start)::bigint AS window_start_secs,
+                extract(epoch FROM h.window_end)::bigint AS window_end_secs,
+                h.conns, h.conns_measured, h.btlbw_p50_bps, h.btlbw_p90_bps,
+                h.min_rtt_us, h.rtt_p50_us, h.rtt_p90_us, h.retrans_pct,
+                h.busy_pct, h.rwnd_limited_pct, h.sndbuf_limited_pct,
+                s.load_host_facts ->> 'cc_algo' AS cc_algo
+         FROM node_hop_link_samples h
+         LEFT JOIN node_agent_state s ON s.node_id = h.node_id
+         WHERE ($3::text IS NULL OR h.chain_id = $3)
+           AND ($1::text IS NULL OR h.node_id IN (SELECT id FROM nodes
+                                                  WHERE tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\'))
+         ORDER BY h.node_id, h.chain_id, h.peer_node_id, h.window_start DESC",
+    )
+    .bind(scope)
+    .bind(pattern)
+    .bind(chain_id)
+    .fetch_all(pool)
+    .await?;
+
+    let hops = rows
+        .iter()
+        .map(|row| {
+            Ok(HopLinkView {
+                node_id: row.try_get("node_id")?,
+                // Absent facts mean the agent reported hops before any host facts landed, which
+                // one interrupted round can produce. Empty string, not "cubic": the UI's rule is
+                // that an unmeasured hop names the algorithm that cannot measure, and naming the
+                // wrong one sends somebody to change a setting that is already correct.
+                cc_algo: row
+                    .try_get::<Option<String>, _>("cc_algo")?
+                    .unwrap_or_default(),
+                sample: hop_sample_from_row(row)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(HopLinkList { hops })
+}
+
+/// Drop telemetry past its retention.
+///
+/// Both series in one call because they are pruned on the same schedule and for the same reason.
+/// Unlike `prune_usage_readings`, nothing here is derived from these rows before they go — they
+/// are the finished article, and once old, worthless.
+pub async fn prune_load_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
+    let cutoff = format!("{retain_days} days");
+    let load = sqlx::query("DELETE FROM node_load_samples WHERE window_end < now() - $1::interval")
+        .bind(&cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let hops =
+        sqlx::query("DELETE FROM node_hop_link_samples WHERE window_end < now() - $1::interval")
+            .bind(&cutoff)
+            .execute(pool)
+            .await?
+            .rows_affected();
+    Ok(load + hops)
+}
+
+fn load_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadSample> {
+    Ok(LoadSample {
+        window_start_unix_secs: row.try_get("window_start_secs")?,
+        window_end_unix_secs: row.try_get("window_end_secs")?,
+        has_gap: row.try_get("has_gap")?,
+        cpu_user_pct: row.try_get("cpu_user_pct")?,
+        cpu_sys_pct: row.try_get("cpu_sys_pct")?,
+        cpu_softirq_pct: row.try_get("cpu_softirq_pct")?,
+        cpu_peak_pct: row.try_get("cpu_peak_pct")?,
+        cpu_steal_pct: row.try_get("cpu_steal_pct")?,
+        load1: row.try_get("load1")?,
+        mem_available_bytes: i64_to_u64(
+            "mem_available_bytes",
+            row.try_get("mem_available_bytes")?,
+        )?,
+        swap_used_bytes: i64_to_u64("swap_used_bytes", row.try_get("swap_used_bytes")?)?,
+        oom_kills: i64_to_u64("oom_kills", row.try_get("oom_kills")?)?,
+        disk_free_bytes: i64_to_u64("disk_free_bytes", row.try_get("disk_free_bytes")?)?,
+        disk_inode_free_pct: row.try_get("disk_inode_free_pct")?,
+        nic_rx_bps: i64_to_u64("nic_rx_bps", row.try_get("nic_rx_bps")?)?,
+        nic_tx_bps: i64_to_u64("nic_tx_bps", row.try_get("nic_tx_bps")?)?,
+        nic_rx_drop: i64_to_u64("nic_rx_drop", row.try_get("nic_rx_drop")?)?,
+        nic_tx_drop: i64_to_u64("nic_tx_drop", row.try_get("nic_tx_drop")?)?,
+        nic_err: i64_to_u64("nic_err", row.try_get("nic_err")?)?,
+        conntrack_count: row
+            .try_get::<Option<i64>, _>("conntrack_count")?
+            .map(|v| i64_to_u64("conntrack_count", v))
+            .transpose()?,
+        uptime_secs: i64_to_u64("uptime_secs", row.try_get("uptime_secs")?)?,
+    })
+}
+
+fn hop_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<HopLinkSample> {
+    Ok(HopLinkSample {
+        chain_id: row.try_get("chain_id")?,
+        peer_node_id: row.try_get("peer_node_id")?,
+        window_start_unix_secs: row.try_get("window_start_secs")?,
+        window_end_unix_secs: row.try_get("window_end_secs")?,
+        conns: row.try_get::<i32, _>("conns")?.max(0) as u32,
+        conns_measured: row.try_get::<i32, _>("conns_measured")?.max(0) as u32,
+        btlbw_p50_bps: row
+            .try_get::<Option<i64>, _>("btlbw_p50_bps")?
+            .map(|v| i64_to_u64("btlbw_p50_bps", v))
+            .transpose()?,
+        btlbw_p90_bps: row
+            .try_get::<Option<i64>, _>("btlbw_p90_bps")?
+            .map(|v| i64_to_u64("btlbw_p90_bps", v))
+            .transpose()?,
+        min_rtt_us: row.try_get::<i32, _>("min_rtt_us")?.max(0) as u32,
+        rtt_p50_us: row.try_get::<i32, _>("rtt_p50_us")?.max(0) as u32,
+        rtt_p90_us: row.try_get::<i32, _>("rtt_p90_us")?.max(0) as u32,
+        retrans_pct: row.try_get("retrans_pct")?,
+        busy_pct: row.try_get("busy_pct")?,
+        rwnd_limited_pct: row.try_get("rwnd_limited_pct")?,
+        sndbuf_limited_pct: row.try_get("sndbuf_limited_pct")?,
+    })
+}
+
+fn process_from_row(row: &sqlx::postgres::PgRow) -> Result<ProcessSample> {
+    Ok(ProcessSample {
+        proc: row.try_get("proc")?,
+        rss_bytes: row
+            .try_get::<Option<i64>, _>("rss_bytes")?
+            .map(|v| i64_to_u64("rss_bytes", v))
+            .transpose()?,
+        cpu_pct: row.try_get("cpu_pct")?,
+        started_at_unix_secs: row.try_get("started_at")?,
+        fds: row
+            .try_get::<Option<i64>, _>("fds")?
+            .map(|v| i64_to_u64("fds", v))
+            .transpose()?,
+        fd_limit: row
+            .try_get::<Option<i64>, _>("fd_limit")?
+            .map(|v| i64_to_u64("fd_limit", v))
+            .transpose()?,
+    })
+}
+
+/// Percentages carry two hazards the CHECK constraints would otherwise turn into a failed
+/// transaction — taking every good sample in the round with them.
+///
+/// NaN is the first: serde_json renders it as `null`, so it does not survive the wire as NaN, but
+/// an agent-side division that produced one still arrives as something. The second is a value over
+/// 100, which a mis-scaled aggregation produces easily. Both are clamped rather than rejected: one
+/// bad percentage should cost that field, not the round.
+/// The three CPU shares, clamped individually **and** as a sum.
+///
+/// Clamping each one alone is not enough: three 99s add to 297, the table's CHECK refuses the row,
+/// and because the whole report is one transaction that refusal takes every good sample in the
+/// round with it. The same failure would also reach the console as a full-width bar — the three
+/// are drawn stacked and normalised to 100.
+///
+/// Scaled proportionally rather than truncated, so the *ratio* between user, system and softirq
+/// survives. That ratio is the entire reason the three are kept apart (see the column comments):
+/// truncating softirq to fit would erase exactly the signal this split exists to carry.
+fn cpu_split(s: &LoadSample) -> Result<(f32, f32, f32)> {
+    let user = pct("cpu_user_pct", s.cpu_user_pct)?;
+    let sys = pct("cpu_sys_pct", s.cpu_sys_pct)?;
+    let softirq = pct("cpu_softirq_pct", s.cpu_softirq_pct)?;
+    let sum = user + sys + softirq;
+    if sum <= 100.0 {
+        return Ok((user, sys, softirq));
+    }
+    let k = 100.0 / sum;
+    Ok((user * k, sys * k, softirq * k))
+}
+
+fn pct(field: &str, value: f32) -> Result<f32> {
+    if !value.is_finite() {
+        return Err(StoreError::InvalidData(format!("{field} is not a number")));
+    }
+    Ok(value.clamp(0.0, 100.0))
+}
+
+fn finite(field: &str, value: f32) -> Result<f32> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(StoreError::InvalidData(format!(
+            "{field} must be a non-negative number"
+        )));
+    }
+    Ok(value)
+}
+
+fn u64_to_i64(field: &str, value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| StoreError::InvalidData(format!("{field} is out of range")))
+}
+
+fn i64_to_u64(field: &str, value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_| StoreError::InvalidData(format!("{field} is out of range")))
+}

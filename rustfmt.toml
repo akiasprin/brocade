@@ -1,0 +1,9 @@
+# Entirely default, with not one deviation.
+#
+# Deviating from the defaults is itself a kind of non-conformance — outside readers hold stable
+# expectations of rustfmt's default output, and a custom style costs everyone reading this repository
+# for the first time the effort of working out why it differs from everywhere else.
+#
+# Only the edition is pinned here, so that anyone running `rustfmt <file>` directly rather than
+# through cargo gets the same result.
+edition = "2021"

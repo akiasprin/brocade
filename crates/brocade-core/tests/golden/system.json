@@ -1,0 +1,144 @@
+{
+  "revision": 1,
+  "overlay_cidr": "10.66.0.0/16",
+  "node_count": 5,
+  "nodes": [
+    {
+      "id": "au-01",
+      "tenant": "platform.acme",
+      "overlay_addr": "10.66.0.3",
+      "wg": {
+        "private_key": "aCz+IpJwzctrhBjQvLM7hhbtCensRoJZy1qTlFdYoHM=",
+        "public_key": "XcA2jjV1Ejv+t3ZJHMe1MNQO9nVxHNmq+TIiIy8s+CA=",
+        "listen_port": 51820,
+        "endpoint": "au1.example.net:51820"
+      }
+    },
+    {
+      "id": "hk-01",
+      "tenant": "platform.acme",
+      "overlay_addr": "10.66.0.1",
+      "wg": {
+        "private_key": "SJVYYrmamSxDoOrhSOCxekrLhoWg/T1QWMwbLQ2rfUw=",
+        "public_key": "9BndsjVAx9Sxe7MQjXjfPpN2PVPJ7XMArdAmm22IllU=",
+        "listen_port": 51820,
+        "endpoint": "hk1.example.net:51820"
+      }
+    },
+    {
+      "id": "jp-01",
+      "tenant": "platform.acme",
+      "overlay_addr": "10.66.0.5",
+      "wg": {
+        "private_key": "oEZCfr/1VJ/bfAnPMK9L5iyYXYvuikhP8xRGeCkKT3k=",
+        "public_key": "5BjGoVGyrceZCIr+8xgHM43qEe0b1HXg4bVHb1k0wDs=",
+        "listen_port": 51820,
+        "endpoint": "jp1.example.net:51820"
+      }
+    },
+    {
+      "id": "sg-01",
+      "tenant": "platform.acme",
+      "overlay_addr": "10.66.0.2",
+      "wg": {
+        "private_key": "UKpESgAG43MQALWuGdsxgSB0oO9P0dUbYYQJlNjCDls=",
+        "public_key": "2ENL02z/KACc1/Dv34Tybej891F/K3CZxWJTL7XmxXY=",
+        "listen_port": 51820,
+        "endpoint": "sg1.example.net:51820"
+      }
+    },
+    {
+      "id": "us-01",
+      "tenant": "platform.acme",
+      "overlay_addr": "10.66.0.4",
+      "wg": {
+        "private_key": "KM1PtZGQyIScl4xwKfqBTwbkB2hON56Jporv7o5g6VE=",
+        "public_key": "qv2Q4rtkuU3QnynNJdpR0C/ceC/816Ed7YEJyHWBADw=",
+        "listen_port": 51820,
+        "endpoint": "us1.example.net:51820"
+      }
+    }
+  ],
+  "links": [
+    {
+      "id": "l-au-01-hk-01",
+      "a": "au-01",
+      "b": "hk-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-au-01-jp-01",
+      "a": "au-01",
+      "b": "jp-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-au-01-sg-01",
+      "a": "au-01",
+      "b": "sg-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-au-01-us-01",
+      "a": "au-01",
+      "b": "us-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-hk-01-jp-01",
+      "a": "hk-01",
+      "b": "jp-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-hk-01-sg-01",
+      "a": "hk-01",
+      "b": "sg-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-hk-01-us-01",
+      "a": "hk-01",
+      "b": "us-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-jp-01-sg-01",
+      "a": "jp-01",
+      "b": "sg-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-jp-01-us-01",
+      "a": "jp-01",
+      "b": "us-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    },
+    {
+      "id": "l-sg-01-us-01",
+      "a": "sg-01",
+      "b": "us-01",
+      "dial": "Both",
+      "keepalive_secs": 25,
+      "mtu": 1420
+    }
+  ]
+}

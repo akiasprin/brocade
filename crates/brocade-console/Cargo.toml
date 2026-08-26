@@ -1,0 +1,53 @@
+[package]
+name = "brocade-console"
+version.workspace = true
+description = "brocade 控制面的 HTTP 服务：控制台 API 与节点 API 两个监听面"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = "0.8.9"
+brocade-deployment = { path = "../brocade-deployment" }
+brocade-core = { path = "../brocade-core" }
+brocade-store = { path = "../brocade-store" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["fs"] }
+# ── 证书签发 ─────────────────────────────────────────────────────────────────────
+# 控制面第一次需要主动往外发请求（ACME 和 DNS 提供商），所以第一次有 HTTP 客户端。
+# 不像 agent 那样手写：agent 手写是因为它是要塞进另一个二进制的静态 musl 产物，体积
+# 是硬约束；控制面没有这个约束，而 ACME 要处理重定向、Retry-After、以及每个响应里的
+# Replay-Nonce 头，手写这些只会把 bug 挪到自己这边。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "charset", "http2"] }
+# geoip.dat is the same protobuf database already configured under Settings → Geodata. The
+# control plane reads only its country CIDRs, so node flags do not depend on a third-party lookup
+# API and do not leak the fleet's addresses one request at a time.
+prost = "0.14"
+# JWS 的 ES256 签名。跟工作区其他地方一样用 ring，不引第二套密码学栈。
+ring = "0.17"
+# 生成证书密钥和 CSR。默认特性就是 crypto+pem+ring，不带 aws-lc-rs——已在两个 musl
+# 目标上验过能编。
+rcgen = "0.14"
+# 只为读回证书里的 notAfter。有效期必须取证书自己说的，不能拿签发时间加 90 天去猜。
+x509-parser = "0.17"
+# x509-parser 的时间类型来自 time；只用它把 notAfter 格式化成 RFC3339。
+time = { version = "0.3", default-features = false, features = ["formatting", "std"] }
+base64 = "0.22"
+
+[dev-dependencies]
+ipnet = "2.11.0"
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+# The agent binaries and the console front end are compiled into the control plane (argued at the
+# top of build.rs): sha2 for the agents' digests, flate2 to gzip the front end's files once at build
+# time instead of once per visitor.
+[build-dependencies]
+flate2 = "1.1"
+sha2 = "0.10"

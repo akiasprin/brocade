@@ -1,0 +1,354 @@
+# Brocade · SubBoost 标准版（请求时动态生成）
+mixed-port: 7897
+allow-lan: true
+mode: rule
+log-level: info
+ipv6: true
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
+
+dns:
+  enable: true
+  listen: 127.0.0.1:5335
+  ipv6: true
+  use-system-hosts: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver: [223.5.5.5, 119.29.29.29, 8.8.8.8]
+  nameserver: [223.5.5.5, 119.29.29.29, "https://dns.alidns.com/dns-query", "https://cloudflare-dns.com/dns-query"]
+  fallback: ["https://dns.quad9.net/dns-query", "https://dns.google/dns-query"]
+  fallback-filter:
+    geoip: true
+    ipcidr: [240.0.0.0/4, 0.0.0.0/32, 127.0.0.1/32]
+  fake-ip-filter: ["*.lan", "*.local", "stun.*.*", time.windows.com, time.apple.com, pool.ntp.org, localhost]
+
+profile:
+  store-selected: true
+  store-fake-ip: false
+
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  sniff:
+    TLS: {ports: [443, 8443]}
+    HTTP: {ports: [80, "8080-8880"], override-destination: true}
+    QUIC: {ports: [443, 8443]}
+
+proxies:
+  - name: "智能出口"
+    type: vless
+    server: hk1.example.net
+    port: 2443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.bing.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: Pkz5sxRTCjw92NWFc4ST_3iniZkTjGufHp9EXEIrLgM
+      short-id: "8337a0bf"
+  - name: "日本入口·智能出口"
+    type: vless
+    server: jp1.example.net
+    port: 8443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.yahoo.co.jp
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: I9tZ66Z-ccTkwE1Kb5vUtJZ5MYMJm9INM9hGVumvQB0
+      short-id: "fba1c1c2"
+  - name: "香港入口"
+    type: vless
+    server: hk1.example.net
+    port: 3443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: apps.apple.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: gyRZKBh6EcvSnCOXjVjufFmpzFVzTu5SMMrRhTn7yHw
+      short-id: "c71c181a"
+  - name: "美国前置"
+    type: vless
+    server: us1.example.net
+    port: 443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.apple.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: uxBtkE4kok30kk6idID_11SvP2DEoxgxjOR1jfddlkc
+      short-id: "cd033ce1"
+    dialer-proxy: "入口组"
+  - name: "日本入口·美国出口"
+    type: vless
+    server: jp1.example.net
+    port: 443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.amazon.co.jp
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: 1xHNKXcGzhoClocrz7kpJxQYE-g-2NlXNGiWas_7NTw
+      short-id: "d19361a0"
+  - name: "美国出口"
+    type: vless
+    server: hk1.example.net
+    port: 443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.bing.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: iG4pUtdiYMYAztx9c6t8A-0QF-Qknbu551RTC5cBo30
+      short-id: "7d07b06e"
+
+proxy-groups:
+  - name: "入口组"
+    type: url-test
+    proxies: ["香港入口"]
+  - name: "🚀 节点选择"
+    type: select
+    proxies: ["⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "⚡ 自动选择"
+    type: url-test
+    proxies: ["智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    url: "https://www.gstatic.com/generate_204"
+    interval: 300
+    lazy: false
+  - name: "🛑 广告拦截"
+    type: select
+    proxies: ["REJECT", "DIRECT", "🚀 节点选择"]
+  - name: "🤖 AI 服务"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "📹 油管视频"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "🔍 谷歌服务"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "Ⓜ️ 微软服务"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "🍏 苹果服务"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "📲 电报消息"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "🐱 代码托管"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "🏠 私有网络"
+    type: select
+    proxies: ["DIRECT", "REJECT", "🚀 节点选择", "⚡ 自动选择", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "🔒 国内服务"
+    type: select
+    proxies: ["DIRECT", "REJECT", "🚀 节点选择", "⚡ 自动选择", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "🌍 非中国"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+  - name: "🐟 漏网之鱼"
+    type: select
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+
+rule-providers:
+  "category-ads-all":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/category-ads-all.mrs"
+    path: "./ruleset/category-ads-all.mrs"
+    interval: 86400
+  "openai":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/openai.mrs"
+    path: "./ruleset/openai.mrs"
+    interval: 86400
+  "anthropic":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/anthropic.mrs"
+    path: "./ruleset/anthropic.mrs"
+    interval: 86400
+  "category-ai-chat-!cn":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/category-ai-chat-!cn.mrs"
+    path: "./ruleset/category-ai-chat-!cn.mrs"
+    interval: 86400
+  "youtube":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/youtube.mrs"
+    path: "./ruleset/youtube.mrs"
+    interval: 86400
+  "google":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/google.mrs"
+    path: "./ruleset/google.mrs"
+    interval: 86400
+  "google-ip":
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geoip/google.mrs"
+    path: "./ruleset/google-ip.mrs"
+    interval: 86400
+  "microsoft":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/microsoft.mrs"
+    path: "./ruleset/microsoft.mrs"
+    interval: 86400
+  "onedrive":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/onedrive.mrs"
+    path: "./ruleset/onedrive.mrs"
+    interval: 86400
+  "apple":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/apple.mrs"
+    path: "./ruleset/apple.mrs"
+    interval: 86400
+  "icloud":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/icloud.mrs"
+    path: "./ruleset/icloud.mrs"
+    interval: 86400
+  "telegram":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/telegram.mrs"
+    path: "./ruleset/telegram.mrs"
+    interval: 86400
+  "telegram-ip":
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geoip/telegram.mrs"
+    path: "./ruleset/telegram-ip.mrs"
+    interval: 86400
+  "github":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/github.mrs"
+    path: "./ruleset/github.mrs"
+    interval: 86400
+  "gitlab":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/gitlab.mrs"
+    path: "./ruleset/gitlab.mrs"
+    interval: 86400
+  "atlassian":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/atlassian.mrs"
+    path: "./ruleset/atlassian.mrs"
+    interval: 86400
+  "private":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/private.mrs"
+    path: "./ruleset/private.mrs"
+    interval: 86400
+  "private-ip":
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geoip/private.mrs"
+    path: "./ruleset/private-ip.mrs"
+    interval: 86400
+  "geolocation-cn":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/geolocation-cn.mrs"
+    path: "./ruleset/geolocation-cn.mrs"
+    interval: 86400
+  "cn-ip":
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geoip/cn.mrs"
+    path: "./ruleset/cn-ip.mrs"
+    interval: 86400
+  "geolocation-!cn":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/geolocation-!cn.mrs"
+    path: "./ruleset/geolocation-!cn.mrs"
+    interval: 86400
+  "cn":
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/7a26c86cf0e7497a423ab86c37274b34e3ce4153/geo/geosite/cn.mrs"
+    path: "./ruleset/cn.mrs"
+    interval: 86400
+
+rules:
+  - RULE-SET,category-ads-all,🛑 广告拦截
+  - RULE-SET,private,🏠 私有网络
+  - RULE-SET,private-ip,🏠 私有网络,no-resolve
+  - RULE-SET,openai,🤖 AI 服务
+  - RULE-SET,anthropic,🤖 AI 服务
+  - RULE-SET,category-ai-chat-!cn,🤖 AI 服务
+  - RULE-SET,geolocation-cn,🔒 国内服务
+  - RULE-SET,cn-ip,🔒 国内服务,no-resolve
+  - RULE-SET,youtube,📹 油管视频
+  - RULE-SET,google,🔍 谷歌服务
+  - RULE-SET,google-ip,🔍 谷歌服务,no-resolve
+  - RULE-SET,telegram,📲 电报消息
+  - RULE-SET,telegram-ip,📲 电报消息,no-resolve
+  - RULE-SET,github,🐱 代码托管
+  - RULE-SET,gitlab,🐱 代码托管
+  - RULE-SET,atlassian,🐱 代码托管
+  - RULE-SET,microsoft,Ⓜ️ 微软服务
+  - RULE-SET,onedrive,Ⓜ️ 微软服务
+  - RULE-SET,apple,🍏 苹果服务
+  - RULE-SET,icloud,🍏 苹果服务
+  - RULE-SET,geolocation-!cn,🌍 非中国
+  - RULE-SET,cn,🔒 国内服务
+  - MATCH,🐟 漏网之鱼

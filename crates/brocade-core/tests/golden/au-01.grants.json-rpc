@@ -1,0 +1,15 @@
+{
+  "inbounds": [
+    {
+      "clients": [
+        {
+          "email": "alice@platform.acme#i-frt-au",
+          "flow": "xtls-rprx-vision",
+          "id": "2d2304da-f114-4574-8d44-625afdb1db5c",
+          "level": 0
+        }
+      ],
+      "tag": "in:frt/i-frt-au"
+    }
+  ]
+}

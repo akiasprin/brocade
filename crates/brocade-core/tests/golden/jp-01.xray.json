@@ -1,0 +1,345 @@
+{
+  "api": {
+    "services": [
+      "HandlerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "burstObservatory": {
+    "pingConfig": {
+      "destination": "http://www.gstatic.com/generate_204",
+      "interval": "10s",
+      "samplingCount": 2,
+      "timeout": "5s"
+    },
+    "subjectSelector": [
+      "out:brc/c-brc-jp>sg-01",
+      "out:lin/c-lin-jp>us-01"
+    ]
+  },
+  "dns": {
+    "servers": [
+      "localhost"
+    ]
+  },
+  "geodata": {
+    "assets": [
+      {
+        "file": "geoip.dat",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat"
+      },
+      {
+        "file": "geosite.dat",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat"
+      }
+    ],
+    "cron": "CRON_TZ=Asia/Shanghai 30 6 * * *",
+    "outbound": "out:internal"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      },
+      "tag": "api"
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "dest": "127.0.0.1:61101",
+          "privateKey": "GO2aX16FduNLFAZM67iGNE38xq8ow1_UrC_eSf7Lh2M",
+          "serverNames": [
+            "www.yahoo.co.jp"
+          ],
+          "shortIds": [
+            "fba1c1c2"
+          ]
+        },
+        "security": "reality"
+      },
+      "tag": "in:brc/i-brc-jp"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 61101,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "www.yahoo.co.jp",
+        "network": "tcp",
+        "port": 443
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls"
+        ],
+        "enabled": true,
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:brc/i-brc-jp:guard"
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "dest": "127.0.0.1:61102",
+          "privateKey": "EJevjqloc1k1p9jtto5UCyzEeQ8h_6EgsbI7Z7RnbWk",
+          "serverNames": [
+            "www.amazon.co.jp"
+          ],
+          "shortIds": [
+            "d19361a0"
+          ]
+        },
+        "security": "reality"
+      },
+      "tag": "in:lin/i-lin-jp"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 61102,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "www.amazon.co.jp",
+        "network": "tcp",
+        "port": 443
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls"
+        ],
+        "enabled": true,
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:lin/i-lin-jp:guard"
+    }
+  ],
+  "log": {
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20003,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "32761913-59d6-4020-b79a-91fc28289f66"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:brc/c-brc-jp>sg-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "a5f4d148-c88b-48b6-bbeb-1d4abb9b26f5"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:lin/c-lin-jp>us-01"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:block"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:reality-guard"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      },
+      "tag": "out:internal"
+    }
+  ],
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 300,
+        "downlinkOnly": 5,
+        "handshake": 60,
+        "statsUserDownlink": true,
+        "statsUserUplink": true,
+        "uplinkOnly": 2
+      }
+    },
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "balancers": [
+      {
+        "selector": [
+          "out:brc/c-brc-jp>sg-01",
+          "out:lin/c-lin-jp>us-01"
+        ],
+        "strategy": {
+          "type": "leastPing"
+        },
+        "tag": "hop-health"
+      }
+    ],
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api",
+        "ruleTag": "r:bd6dcf0e:000",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "full:www.yahoo.co.jp"
+        ],
+        "inboundTag": [
+          "in:brc/i-brc-jp:guard"
+        ],
+        "outboundTag": "out:internal",
+        "ruleTag": "r:bd6dcf0e:001",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "full:www.amazon.co.jp"
+        ],
+        "inboundTag": [
+          "in:lin/i-lin-jp:guard"
+        ],
+        "outboundTag": "out:internal",
+        "ruleTag": "r:bd6dcf0e:002",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:brc/i-brc-jp:guard",
+          "in:lin/i-lin-jp:guard"
+        ],
+        "outboundTag": "out:reality-guard",
+        "ruleTag": "r:bd6dcf0e:003",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "inboundTag": [
+          "in:brc/i-brc-jp"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:bd6dcf0e:004",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:brc/i-brc-jp"
+        ],
+        "outboundTag": "out:brc/c-brc-jp>sg-01",
+        "ruleTag": "r:bd6dcf0e:005",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "inboundTag": [
+          "in:lin/i-lin-jp"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:bd6dcf0e:006",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:lin/i-lin-jp"
+        ],
+        "outboundTag": "out:lin/c-lin-jp>us-01",
+        "ruleTag": "r:bd6dcf0e:007",
+        "type": "field"
+      },
+      {
+        "balancerTag": "hop-health",
+        "domain": [
+          "full:invalid.brocade.never-match"
+        ],
+        "ruleTag": "r:bd6dcf0e:008",
+        "type": "field"
+      }
+    ]
+  },
+  "stats": {}
+}

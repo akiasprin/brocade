@@ -1,0 +1,32 @@
+[package]
+name = "brocade-agent"
+version.workspace = true
+description = "brocade 跑在节点上的收敛程序：拉期望状态、落配置、上报观测与用量"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+brocade-core = { path = "../brocade-core" }
+brocade-deployment = { path = "../brocade-deployment" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+# Probing path MTU needs our own ICMP socket: shelling out to ping depends on which
+# implementation is installed (BusyBox's does not understand -M) and can only treat an
+# exit code as a measurement. See the argument at the top of src/icmp.rs.
+libc = "0.2"
+# For the https leg to the control plane. We write the HTTP ourselves (see the top of
+# src/http.rs), but TLS is not something to write oneself.
+# default-features is fully off: the default set drags in aws-lc-rs (needing cmake and
+# bindgen, and cross-compiling that to musl is a separate battle) and logging (needing the
+# log crate, and the agent has no logging facade).
+# The provider is ring rather than either pure-Rust one; the reasoning and the measurements
+# are at the top of brocade-console/build.rs.
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+# Trust anchors are compiled into the binary rather than read from the target machine's
+# /etc/ssl/certs. The agent installs on other people's machines, and how old that root store
+# is — or whether it exists at all, which slim Alpine images often do not — should not decide
+# whether the agent can reach the control plane. The cost is 53KB and a store that ages with
+# the agent version — but the latter is in our hands and a new agent release fixes it, while
+# the former is not.
+webpki-roots = "1.0.9"

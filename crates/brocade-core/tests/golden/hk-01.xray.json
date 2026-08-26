@@ -1,0 +1,535 @@
+{
+  "api": {
+    "services": [
+      "HandlerService",
+      "StatsService",
+      "RoutingService"
+    ],
+    "tag": "api"
+  },
+  "burstObservatory": {
+    "pingConfig": {
+      "destination": "http://www.gstatic.com/generate_204",
+      "interval": "10s",
+      "samplingCount": 2,
+      "timeout": "5s"
+    },
+    "subjectSelector": [
+      "out:brc/c-brc-smart>sg-01",
+      "out:lin/c-lin-au>sg-01",
+      "out:lin/c-lin-us>sg-01"
+    ]
+  },
+  "dns": {
+    "servers": [
+      "localhost"
+    ]
+  },
+  "geodata": {
+    "assets": [
+      {
+        "file": "geoip.dat",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat"
+      },
+      {
+        "file": "geosite.dat",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat"
+      }
+    ],
+    "cron": "CRON_TZ=Asia/Shanghai 30 6 * * *",
+    "outbound": "out:internal"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      },
+      "tag": "api"
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": 2443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "dest": "127.0.0.1:61101",
+          "privateKey": "MGiM0qQbW7jEhaRfoWS7TsHRL9_sS4QaCKCVRjmGDlw",
+          "serverNames": [
+            "www.bing.com"
+          ],
+          "shortIds": [
+            "8337a0bf"
+          ]
+        },
+        "security": "reality"
+      },
+      "tag": "in:brc/i-brc-hk"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 61101,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "www.bing.com",
+        "network": "tcp",
+        "port": 443
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls"
+        ],
+        "enabled": true,
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:brc/i-brc-hk:guard"
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": 3443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": false
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "dest": "127.0.0.1:61102",
+          "privateKey": "mJFx5v_FKhbBvCjkDqSUhxB57MMd305VRl6NVXd9VXg",
+          "serverNames": [
+            "apps.apple.com"
+          ],
+          "shortIds": [
+            "c71c181a"
+          ]
+        },
+        "security": "reality"
+      },
+      "tag": "in:frt/i-frt-hk"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 61102,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "apps.apple.com",
+        "network": "tcp",
+        "port": 443
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls"
+        ],
+        "enabled": true,
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:frt/i-frt-hk:guard"
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "dest": "127.0.0.1:61103",
+          "privateKey": "KGDiUfNxGufpe26UW1MDbNvjJMZPumNhDsK323JSJGQ",
+          "serverNames": [
+            "www.apple.com"
+          ],
+          "shortIds": [
+            "78373993"
+          ]
+        },
+        "security": "reality"
+      },
+      "tag": "in:lin/i-lin-au"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 61103,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "www.apple.com",
+        "network": "tcp",
+        "port": 443
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls"
+        ],
+        "enabled": true,
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:lin/i-lin-au:guard"
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "enabled": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "dest": "127.0.0.1:61104",
+          "privateKey": "6Cj9EDHBAcc8ANzGl8WotzAYn3WBlMfv_XbQxzLoc2A",
+          "serverNames": [
+            "www.bing.com"
+          ],
+          "shortIds": [
+            "7d07b06e"
+          ]
+        },
+        "security": "reality"
+      },
+      "tag": "in:lin/i-lin-us"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 61104,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "www.bing.com",
+        "network": "tcp",
+        "port": 443
+      },
+      "sniffing": {
+        "destOverride": [
+          "tls"
+        ],
+        "enabled": true,
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "in:lin/i-lin-us:guard"
+    }
+  ],
+  "log": {
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "03a64703-2213-4beb-8e30-cbb84b1da52b"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:brc/c-brc-smart>sg-01"
+    },
+    {
+      "mux": {
+        "concurrency": 1,
+        "enabled": true
+      },
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "0a082e1e-80ce-4df9-8e6d-c3758ce96f73"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:lin/c-lin-au>sg-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "b136544a-f92b-4c7a-a2de-dc3639eb40c0"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "out:lin/c-lin-us>sg-01"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      },
+      "tag": "out:egress"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:block"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:reality-guard"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      },
+      "tag": "out:internal"
+    }
+  ],
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 300,
+        "downlinkOnly": 5,
+        "handshake": 60,
+        "statsUserDownlink": true,
+        "statsUserUplink": true,
+        "uplinkOnly": 2
+      }
+    },
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "balancers": [
+      {
+        "selector": [
+          "out:brc/c-brc-smart>sg-01",
+          "out:lin/c-lin-au>sg-01",
+          "out:lin/c-lin-us>sg-01"
+        ],
+        "strategy": {
+          "type": "leastPing"
+        },
+        "tag": "hop-health"
+      }
+    ],
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api",
+        "ruleTag": "r:0210603f:000",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "full:www.bing.com"
+        ],
+        "inboundTag": [
+          "in:brc/i-brc-hk:guard"
+        ],
+        "outboundTag": "out:internal",
+        "ruleTag": "r:0210603f:001",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "full:apps.apple.com"
+        ],
+        "inboundTag": [
+          "in:frt/i-frt-hk:guard"
+        ],
+        "outboundTag": "out:internal",
+        "ruleTag": "r:0210603f:002",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "full:www.apple.com"
+        ],
+        "inboundTag": [
+          "in:lin/i-lin-au:guard"
+        ],
+        "outboundTag": "out:internal",
+        "ruleTag": "r:0210603f:003",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "full:www.bing.com"
+        ],
+        "inboundTag": [
+          "in:lin/i-lin-us:guard"
+        ],
+        "outboundTag": "out:internal",
+        "ruleTag": "r:0210603f:004",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:brc/i-brc-hk:guard",
+          "in:frt/i-frt-hk:guard",
+          "in:lin/i-lin-au:guard",
+          "in:lin/i-lin-us:guard"
+        ],
+        "outboundTag": "out:reality-guard",
+        "ruleTag": "r:0210603f:005",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "inboundTag": [
+          "in:brc/i-brc-hk"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0210603f:006",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:brc/i-brc-hk"
+        ],
+        "outboundTag": "out:brc/c-brc-smart>sg-01",
+        "ruleTag": "r:0210603f:007",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "domain:au1.example.net",
+          "domain:us1.example.net"
+        ],
+        "inboundTag": [
+          "in:frt/i-frt-hk"
+        ],
+        "outboundTag": "out:egress",
+        "ruleTag": "r:0210603f:008",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:frt/i-frt-hk"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0210603f:009",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:lin/i-lin-au"
+        ],
+        "outboundTag": "out:lin/c-lin-au>sg-01",
+        "ruleTag": "r:0210603f:010",
+        "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "inboundTag": [
+          "in:lin/i-lin-us"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0210603f:011",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in:lin/i-lin-us"
+        ],
+        "outboundTag": "out:lin/c-lin-us>sg-01",
+        "ruleTag": "r:0210603f:012",
+        "type": "field"
+      },
+      {
+        "balancerTag": "hop-health",
+        "domain": [
+          "full:invalid.brocade.never-match"
+        ],
+        "ruleTag": "r:0210603f:013",
+        "type": "field"
+      }
+    ]
+  },
+  "stats": {}
+}

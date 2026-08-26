@@ -1,0 +1,167 @@
+# Build and test.
+#
+# This repository needs a few prerequisites an ordinary Rust project does not, each argued where it
+# is imposed — `crates/brocade-console/build.rs` and `rust-toolchain.toml`:
+#
+#   - Two musl targets, because the control plane compiles both the x86_64 and the aarch64 agent
+#     into itself. `rust-toolchain.toml` already declares them under `targets`, so rustup installs
+#     them on its own and there is no step for it here.
+#   - zig, because the agent's ring dependency has C and assembly while rustup's musl target ships
+#     no headers.
+#   - npm, because the console front end is compiled into the control plane too.
+#
+# Only actions from the `actions/` organization are used. A third-party action in CI holds the
+# permission to change what this repository produces, and what this repository produces runs as root
+# on other people's machines — `install.sh` refuses the same class of thing at its top. The cost is
+# writing the caching out by hand; see the two `actions/cache` steps.
+
+name: ci
+
+# Every branch, not only main. Narrowed to main, changing CI itself could not be verified before
+# merging it: `workflow_dispatch` does not appear in the UI for a non-default branch (GitHub reads
+# the manual-trigger list from the default branch only), which would leave pushing straight to main
+# as the sole way to find out.
+on:
+  push:
+  workflow_dispatch:
+
+# A new push on a branch cancels the run still going for the previous one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Read-only is enough. This workflow writes nothing back to the repository, publishes no release and
+# touches no packages.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # With no argument, this reads `rust-toolchain.toml` — the version, rustfmt, clippy and the
+      # two musl targets. Naming a version here instead would let the two drift apart.
+      - name: Install the toolchain rust-toolchain.toml declares
+        run: rustup toolchain install
+
+      - uses: ./.github/actions/install-zig
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          # Only what was downloaded, not `target/`. actions/cache does not write back to a key it
+          # already hit, so a cached `target/` would stay whatever the first run produced and grow
+          # steadily staler — while checkout stamps every file with the current time anyway, so the
+          # compilation that should re-run still does. It saves little, and correctness comes first.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - run: cargo fmt --all -- --check
+
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # BROCADE_RUN_PG_TESTS is not optional here. Without it the integration tests skip silently
+      # and CI is green all the same — and what green means quietly becomes "nobody has exercised
+      # the database layer". The runner ships docker, so testcontainers starts.
+      - name: cargo test (with the PostgreSQL integration tests)
+        env:
+          BROCADE_RUN_PG_TESTS: "1"
+        run: |
+          cargo test --workspace --locked
+          cargo test -p brocade-store --test pg_integration --locked -- --ignored
+          cargo test -p brocade-console --test http_integration --locked -- --ignored
+
+      - name: Front-end lint and self-checks
+        working-directory: frontend
+        run: |
+          npm run lint
+          node scripts/route-check.mjs
+
+  build:
+    name: brocade-console (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One architecture failing lets the other finish. Seeing both is what distinguishes a problem
+      # in the code from a problem in the cross-compilation.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            triple: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            triple: aarch64-unknown-linux-gnu
+            # The control plane cross-compiling itself to aarch64 needs a linker. (The two agents
+            # are built by build.rs with zig and rust-lld, and are unrelated to this.)
+            apt: gcc-aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install the toolchain rust-toolchain.toml declares
+        run: rustup toolchain install
+
+      - name: Install ${{ matrix.triple }}
+        run: rustup target add ${{ matrix.triple }}
+
+      - name: Install the cross linker
+        if: matrix.apt
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - uses: ./.github/actions/install-zig
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo build --release
+        env:
+          # Set for both architectures, because it applies only to the aarch64 target and the
+          # x86_64 leg simply never reads it. Interpolating it out of the matrix instead would give
+          # the x86_64 leg an empty string — which tells cargo "the linker is empty", not "unset".
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target ${{ matrix.triple }} -p brocade-console
+
+      # Say what was actually produced. This binary carries both agents and the whole front end, so
+      # the checksum belongs here to be compared against on the machine before anything is replaced.
+      # The glibc line answers "will this run there": if the target's `ldd --version` is below the
+      # floor printed here, do not deploy it.
+      - name: Report the artifact
+        run: |
+          bin=target/${{ matrix.triple }}/release/brocade-console
+          ls -l "$bin"
+          sha256sum "$bin"
+          file -b "$bin"
+          echo "highest glibc symbol required: $(readelf -V "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brocade-console-${{ matrix.arch }}
+          path: target/${{ matrix.triple }}/release/brocade-console
+          if-no-files-found: error

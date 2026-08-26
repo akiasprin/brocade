@@ -1,0 +1,29 @@
+[package]
+name = "brocade-store"
+version.workspace = true
+description = "brocade 的持久化层：修订、草稿、发布编排、凭据、配额、用量（PostgreSQL）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2 = { version = "0.5", features = ["std"] }
+base64 = "0.22"
+brocade-core = { path = "../brocade-core" }
+brocade-deployment = { path = "../brocade-deployment" }
+getrandom = "0.3"
+ipnet = "2.11.0"
+# AES-256-GCM for the two secrets that must come back out in the clear (see src/secrets.rs).
+# ring rather than a RustCrypto AEAD for the reason argued at the top of brocade-console/build.rs:
+# it is already what this workspace links through rustls, so it adds no second crypto stack.
+ring = "0.17"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "json"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

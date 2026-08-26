@@ -1,0 +1,68 @@
+name: install-zig
+description: >
+  Install the zig that build.rs needs. The agent's ring dependency has C and assembly while rustup's
+  musl target ships no headers; the full argument is at the top of crates/brocade-console/build.rs.
+
+runs:
+  using: composite
+  steps:
+    # The version and the sha256 are read out of build.rs rather than written down a second time.
+    # The cost of a second copy is not the duplication, it is that the two drift apart silently:
+    # ZIG_PINNED_VERSION changes over there and not here, the build still passes (a version mismatch
+    # only warns), and CI goes on for months compiling what ships to the whole fleet with a compiler
+    # nobody believes is in use.
+    - name: Read the pinned version out of build.rs
+      id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        src=crates/brocade-console/build.rs
+        version=$(sed -n 's/^const ZIG_PINNED_VERSION: &str = "\(.*\)";$/\1/p' "$src")
+        sha256=$(sed -n 's/^const ZIG_PINNED_SHA256: &str = "\(.*\)";$/\1/p' "$src")
+        # Stop if either came back empty. Carrying on builds a URL around an empty version, and the
+        # error then surfaces two steps away from what actually needs fixing.
+        [ -n "$version" ] && [ -n "$sha256" ] || {
+          echo "Could not read ZIG_PINNED_VERSION / ZIG_PINNED_SHA256 out of $src." >&2
+          echo "Most likely those two lines were reworded; fix the sed here." >&2
+          exit 1
+        }
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+        echo "zig $version ($sha256)"
+
+    # The runner is clean and loses this on every run, so what gets cached is the unpacked directory.
+    - name: Cache zig
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/zig-x86_64-linux-${{ steps.pin.outputs.version }}
+        key: zig-${{ steps.pin.outputs.version }}-${{ runner.os }}
+
+    - name: Download and verify
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ steps.pin.outputs.version }}
+        SHA256: ${{ steps.pin.outputs.sha256 }}
+      run: |
+        set -euo pipefail
+        file="zig-x86_64-linux-${VERSION}.tar.xz"
+        curl -fsSLO "https://ziglang.org/download/${VERSION}/${file}"
+        # Verified before it is unpacked. Skipping this makes the step "download something off the
+        # internet and compile the root program for the whole fleet with it" — the installation
+        # note in build.rs refuses exactly that, and being in CI is no reason to relax it.
+        echo "${SHA256}  ${file}" | sha256sum -c -
+        mkdir -p ~/.local
+        tar xf "$file" -C ~/.local/
+        rm "$file"
+
+    # build.rs looks for zig in $BROCADE_ZIG, then PATH, then a few fixed locations. Putting it on
+    # PATH means CI and a developer's machine go down the same branch of that search rather than CI
+    # having one of its own.
+    - name: Put it on PATH
+      shell: bash
+      run: echo "$HOME/.local/zig-x86_64-linux-${{ steps.pin.outputs.version }}" >> "$GITHUB_PATH"
+
+    - name: Check that it runs
+      shell: bash
+      run: zig version

@@ -1,0 +1,11 @@
+/target/
+crates/*/target/
+frontend/dist/
+frontend/node_modules/
+__pycache__/
+.env
+*.local
+.DS_Store
+/.tools/
+/.claude/worktrees/
+/mockups/
