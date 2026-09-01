@@ -955,6 +955,32 @@ if [ "$SERVICE_MODE" = "foreground" ]; then
 fi
 
 if have systemctl; then
+    # Give Brocade its own journal namespace so the bootstrap 100 MiB ceiling applies to this
+    # agent, not to unrelated host services. The first authenticated poll replaces it with the
+    # global/per-machine value from Settings. Namespaces landed in systemd 245; on an older host
+    # retaining the global journal is safer than shrinking every service's logs to our limit.
+    SYSTEMD_VERSION=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')
+    LOG_NAMESPACE_LINE=
+    if [ -n "$SYSTEMD_VERSION" ] && [ "$SYSTEMD_VERSION" -ge 245 ] 2>/dev/null; then
+        LOG_NAMESPACE_LINE=enabled
+        install -d -m 0755 /etc/systemd/system/brocade-agent.service.d
+        cat > /etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf <<'EOF'
+[Service]
+LogNamespace=brocade-agent
+EOF
+        install -d -m 0755 /etc/systemd/journald@brocade-agent.conf.d
+        cat > /etc/systemd/journald@brocade-agent.conf.d/limits.conf <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=100M
+RuntimeMaxUse=100M
+SystemMaxFileSize=25M
+RuntimeMaxFileSize=25M
+EOF
+    else
+        rm -f /etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf
+        echo "systemd 低于 245，不能创建独立日志命名空间；Agent 暂沿用系统 journal 上限" >&2
+    fi
     cat > /etc/systemd/system/brocade-agent.service <<EOF
 [Unit]
 Description=Brocade agent
@@ -988,6 +1014,9 @@ EOF
         echo "已移除旧的 brocade-agent-usage.service（采集已并进主进程）" >&2
     fi
     systemctl daemon-reload
+    if [ -n "$LOG_NAMESPACE_LINE" ]; then
+        systemctl try-restart systemd-journald@brocade-agent.service >/dev/null 2>&1 || true
+    fi
     systemctl enable brocade-agent.service
     # A resident process does not pick up a replaced binary on its own and must restart; re-running
     # the install script is the upgrade path.
@@ -1036,7 +1065,11 @@ done
     # another.
     echo "自检没通过。最近的 agent 日志：" >&2
     if have journalctl; then
-        journalctl -u brocade-agent -n 50 --no-pager >&2 || true
+        if [ -n "$LOG_NAMESPACE_LINE" ]; then
+            journalctl --namespace=brocade-agent -u brocade-agent -n 50 --no-pager >&2 || true
+        else
+            journalctl -u brocade-agent -n 50 --no-pager >&2 || true
+        fi
     fi
     exit 1
 }

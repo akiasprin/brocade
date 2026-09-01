@@ -1,10 +1,18 @@
 import { useEffect, useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { ApiError, createTenantNow, fetchAuthState, fetchSessionWhoami, initAdmin, loginAdmin } from '../api';
+import {
+  ApiError,
+  createTenantNow,
+  fetchAuthState,
+  fetchSessionWhoami,
+  initAdmin,
+  loginAdmin,
+  type BrandingSettings,
+} from '../api';
 import type { Session } from '../app';
 import { enterPublic } from '../session';
 
-export function Login({ onLogin }: { onLogin: (session: Session) => void }) {
+export function Login({ branding, onLogin }: { branding: BrandingSettings; onLogin: (session: Session) => void }) {
   const auth = useQuery({ queryKey: ['auth-state'], queryFn: fetchAuthState });
   const whoami = useQuery({
     queryKey: ['session-whoami'],
@@ -21,7 +29,7 @@ export function Login({ onLogin }: { onLogin: (session: Session) => void }) {
     <div className="fw active login-fw">
       <div className="fw-head">
         <span className="fw-kind">{initialized ? '登录' : '初始化'}</span>
-        <span className="fw-title">brocade console</span>
+        <span className="fw-title">{branding.site_name} console</span>
       </div>
       <div className="fw-body">
         {auth.isPending ? (

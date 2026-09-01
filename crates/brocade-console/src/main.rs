@@ -65,7 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let store = PgStore::connect(&database_url).await?;
-    store.migrate().await?;
+    let default_warps = store.migrate().await?;
+    if default_warps > 0 {
+        eprintln!(
+            "brocade-console created {default_warps} missing tenant default WARP resource(s)"
+        );
+    }
 
     // The console front end normally rides inside this binary (argued at the top of build.rs).
     // Set to a directory, this serves that directory instead — for iterating on the front end

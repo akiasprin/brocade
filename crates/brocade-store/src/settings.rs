@@ -5,7 +5,10 @@ use brocade_core::{
         ConnectionSettings, GeodataSettings, ModelSettings, NodeConnection, OverlaySettings,
         PortSettings, ProbeSettings, RealityClientPolicy, RealitySite,
     },
-    text::{normalize_host_port, parse_semver3},
+    text::{
+        is_nonzero_host_port, is_reality_fingerprint, is_reality_server_name, normalize_host_port,
+        parse_semver3,
+    },
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -417,10 +420,7 @@ fn validate_settings(settings: &ModelSettings) -> Result<()> {
     // dest must be host:port — REALITY forwards the handshake to that real site, and getting it
     // wrong presents as the handshake failing outright.
     if let Some(dest) = settings.reality_site.dest.as_deref() {
-        let ok = dest.rsplit_once(':').is_some_and(|(host, port)| {
-            !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
-        });
-        if !ok {
+        if !is_nonzero_host_port(dest) {
             return Err(StoreError::InvalidData(
                 "settings.reality_site.dest must look like example.com:443".to_owned(),
             ));
@@ -430,6 +430,32 @@ fn validate_settings(settings: &ModelSettings) -> Result<()> {
     if settings.reality_site.dest.is_some() && settings.reality_site.server_names.is_empty() {
         return Err(StoreError::InvalidData(
             "settings.reality_site.server_names must not be empty when dest is set".to_owned(),
+        ));
+    }
+    if settings.reality_site.dest.is_none() && !settings.reality_site.server_names.is_empty() {
+        return Err(StoreError::InvalidData(
+            "settings.reality_site.server_names requires a configured dest".to_owned(),
+        ));
+    }
+    if let Some(server_name) = settings
+        .reality_site
+        .server_names
+        .iter()
+        .find(|server_name| !is_reality_server_name(server_name))
+    {
+        return Err(StoreError::InvalidData(format!(
+            "settings.reality_site.server_names contains invalid name {server_name:?}"
+        )));
+    }
+    if settings
+        .reality_site
+        .fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| !is_reality_fingerprint(fingerprint))
+    {
+        return Err(StoreError::InvalidData(
+            "settings.reality_site.fingerprint is unsupported by the pinned Xray REALITY client"
+                .to_owned(),
         ));
     }
 
@@ -566,9 +592,17 @@ fn validate_version(value: Option<&str>, location: &str) -> Result<Option<(u64, 
     let Some(value) = value else {
         return Ok(None);
     };
-    parse_semver3(value)
-        .map(Some)
-        .ok_or_else(|| StoreError::InvalidData(format!("{location} must use x.y.z format")))
+    let version = parse_semver3(value)
+        .ok_or_else(|| StoreError::InvalidData(format!("{location} must use x.y.z format")))?;
+    if [version.0, version.1, version.2]
+        .into_iter()
+        .any(|part| part > 255)
+    {
+        return Err(StoreError::InvalidData(format!(
+            "{location} components must be between 0 and 255"
+        )));
+    }
+    Ok(Some(version))
 }
 
 fn optional_u64(location: &str, value: Option<i64>) -> Result<Option<u64>> {

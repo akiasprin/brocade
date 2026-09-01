@@ -1,5 +1,7 @@
 use crate::{
-    model::{FrontStrategy, Hysteria2},
+    model::{
+        ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2, XhttpXmux,
+    },
     physical::user::{UserPlan, UserRealityPlan, UserSecurityPlan},
 };
 
@@ -8,7 +10,17 @@ pub struct Subscription {
     pub tenant: String,
     pub user: String,
     pub entries: Vec<SubscriptionEntry>,
+    pub external_proxies: Vec<SubscriptionExternalProxy>,
     pub front_groups: Vec<SubscriptionFrontGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionExternalProxy {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    pub protocol: ExternalOutboundProtocol,
+    pub security: ExternalOutboundSecurity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,8 +49,8 @@ pub enum SubscriptionStream {
         /// Carried into the client's configuration because multiplexing has to be agreed on both
         /// ends; a server that multiplexes and a client that does not simply opens one connection
         /// per stream, which is the cost this exists to avoid.
-        mux: Option<u16>,
-        /// Carried for a blunter reason than `mux`: a server given an explicit mode refuses every
+        xmux: Option<XhttpXmux>,
+        /// Carried for a blunter reason than `xmux`: a server given an explicit mode refuses every
         /// client that disagrees, so a subscription that omits it hands out a configuration the
         /// server will turn away. `None` is the operator having chosen nothing, and then the two
         /// sides agree by both leaving it alone.
@@ -125,11 +137,22 @@ pub fn build(plan: &UserPlan) -> Subscription {
                                 http_host: download.http_host.clone(),
                                 mux: download.mux,
                             }),
-                        mux: xhttp.mux,
+                        xmux: xhttp.xmux.clone(),
                         mode: xhttp.mode.as_str(),
                     },
                 },
                 front_name: entry.front_name.clone(),
+            })
+            .collect(),
+        external_proxies: plan
+            .external_proxies
+            .iter()
+            .map(|proxy| SubscriptionExternalProxy {
+                name: proxy.name.clone(),
+                server: proxy.address.clone(),
+                port: proxy.port,
+                protocol: proxy.protocol.clone(),
+                security: proxy.security.clone(),
             })
             .collect(),
         front_groups: plan

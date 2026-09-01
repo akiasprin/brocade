@@ -25,7 +25,7 @@ CREATE OR REPLACE FUNCTION brocade_valid_reality_short_ids(value JSONB) RETURNS 
             SELECT 1
             FROM jsonb_array_elements(value) AS item(element)
             WHERE jsonb_typeof(item.element) <> 'string'
-                OR item.element #>> '{}' !~ '^[0-9A-Fa-f]{1,16}$'
+                OR item.element #>> '{}' !~ '^(?:[0-9A-Fa-f]{2}){1,8}$'
         )
 $_$;
 
@@ -88,19 +88,41 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
 CREATE TABLE IF NOT EXISTS apps (
     id TEXT NOT NULL,
     label TEXT NOT NULL,
+    position INTEGER NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     created_revision BIGINT,
     CONSTRAINT apps_pkey PRIMARY KEY (id),
+    CONSTRAINT apps_position_check CHECK (position >= 0),
+    CONSTRAINT apps_position_key UNIQUE (position) DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT apps_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id)
 );
 
--- Reusable project-level proxy targets. Credentials are sealed independently from the JSON
+-- Chain and ingress prefixes describe the resource kind; the six-letter body is the human-sized
+-- identity. Reserve that body once across both tables so `c-lumira` and `i-lumira` can never coexist
+-- and be confused in logs, URLs or support conversations. Triggers below maintain this registry.
+CREATE TABLE IF NOT EXISTS friendly_model_id_bodies (
+    body TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT friendly_model_id_bodies_pkey PRIMARY KEY (body),
+    CONSTRAINT friendly_model_id_bodies_kind_check CHECK (kind IN ('chain', 'ingress')),
+    CONSTRAINT friendly_model_id_bodies_body_check CHECK (
+        body ~ '^[bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou]$'
+    ),
+    CONSTRAINT friendly_model_id_bodies_model_id_key UNIQUE (model_id),
+    CONSTRAINT friendly_model_id_bodies_shape_check CHECK (
+        model_id = CASE kind WHEN 'chain' THEN 'c-' ELSE 'i-' END || body
+    )
+);
+
+-- Reusable tenant-level proxy targets. Credentials are sealed independently from the JSON
 -- protocol options: this keeps a query or dump of the ordinary configuration columns from
 -- exposing them, while still allowing protocol-specific settings to evolve without a column per
--- knob. The same resource can be selected by several rules, but is only compiled onto nodes that
--- reference it.
+-- knob. Projects consume these resources through rule/front references but do not own them. A
+-- globally unique id keeps those references unambiguous across tenant ancestry, while the same
+-- resource is only compiled onto nodes that actually reference it.
 CREATE TABLE IF NOT EXISTS external_outbounds (
-    app_id TEXT NOT NULL,
     id TEXT NOT NULL,
     tenant_id TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -112,13 +134,30 @@ CREATE TABLE IF NOT EXISTS external_outbounds (
     security JSONB NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     created_revision BIGINT,
-    CONSTRAINT external_outbounds_pkey PRIMARY KEY (app_id, id),
+    CONSTRAINT external_outbounds_pkey PRIMARY KEY (id),
     CONSTRAINT external_outbounds_port_check CHECK ((port >= 1) AND (port <= 65535)),
-    CONSTRAINT external_outbounds_protocol_check CHECK ((protocol IN ('vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard'))),
-    CONSTRAINT external_outbounds_app_id_fkey FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE,
+    CONSTRAINT external_outbounds_protocol_check CHECK ((protocol IN ('vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard', 'warp'))),
     CONSTRAINT external_outbounds_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT,
     CONSTRAINT external_outbounds_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id)
 );
+
+-- Reconcile the parent key before any new child table tries to reference it. Development
+-- databases can still have the earlier project-owned `(app_id, id)` primary key; waiting until
+-- the final reconciliation block would make CREATE TABLE front_external_vias fail because `id`
+-- is not unique yet. Existing children may themselves hold the old composite foreign key, so
+-- release those dependencies first. The full child keys are rebuilt in the final block after all
+-- CREATE TABLE IF NOT EXISTS statements have run.
+ALTER TABLE IF EXISTS front_external_vias
+    DROP CONSTRAINT IF EXISTS front_external_vias_outbound_fkey;
+ALTER TABLE IF EXISTS external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_outbound_fkey;
+ALTER TABLE external_outbounds
+    DROP CONSTRAINT IF EXISTS external_outbounds_app_id_fkey;
+ALTER TABLE external_outbounds
+    DROP CONSTRAINT IF EXISTS external_outbounds_pkey;
+ALTER TABLE external_outbounds DROP COLUMN IF EXISTS app_id;
+ALTER TABLE external_outbounds
+    ADD CONSTRAINT external_outbounds_pkey PRIMARY KEY (id);
 
 CREATE TABLE IF NOT EXISTS artifact_blobs (
     sha256 TEXT NOT NULL,
@@ -243,9 +282,17 @@ CREATE TABLE IF NOT EXISTS chains (
     app_id TEXT NOT NULL,
     tenant_id TEXT NOT NULL,
     name TEXT NOT NULL,
+    -- Optional ISO 3166-1 alpha-2 flag override used only by subscription presentation.
+    subscription_country TEXT,
+    position INTEGER NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     created_revision BIGINT,
     CONSTRAINT chains_app_id_id_key UNIQUE (app_id, id),
+    CONSTRAINT chains_subscription_country_check CHECK (
+        subscription_country IS NULL OR subscription_country ~ '^[A-Z]{2}$'
+    ),
+    CONSTRAINT chains_position_check CHECK (position >= 0),
+    CONSTRAINT chains_position_key UNIQUE (app_id, position) DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT chains_pkey PRIMARY KEY (id),
     CONSTRAINT chains_app_id_fkey FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE,
     CONSTRAINT chains_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id),
@@ -329,17 +376,11 @@ CREATE TABLE IF NOT EXISTS control_state (
     reality_min_client_ver TEXT DEFAULT '1.0.0',
     reality_max_client_ver TEXT,
     reality_max_time_diff_ms BIGINT,
-    -- Factory values for the REALITY camouflage site. A fresh database must compile out of the
-    -- box: with these three blank, the first chain built reports `reality.dest` (an empty string is
-    -- not host:port form) and the error hangs off the ingress — following which one finds that the
-    -- ingress is meant to be blank and inherit from the global setting.
-    --
-    -- apps.apple.com matches the placeholder the UI has always shown (settings.tsx's placeholder and
-    -- the chain wizard's fallback are both it). A factory value should be that value itself rather
-    -- than each call site falling back with `|| 'apps.apple.com:443'` — which would mean remembering
-    -- several places when the site changes.
-    reality_dest TEXT DEFAULT 'apps.apple.com:443',
-    reality_server_names JSONB DEFAULT '["apps.apple.com"]'::jsonb NOT NULL,
+    -- No external site is a safe universal REALITY target. A fresh control plane starts
+    -- unconfigured and the creation flow requires an explicit choice: the node certificate, this
+    -- global site after an operator configures it, or a per-ingress custom site.
+    reality_dest TEXT DEFAULT NULL,
+    reality_server_names JSONB DEFAULT '[]'::jsonb NOT NULL,
     -- The same value as materialize.rs's fallback on read, so as not to have two sources of truth
     -- where the database holds NULL and the read yields chrome.
     reality_fingerprint TEXT DEFAULT 'chrome',
@@ -374,6 +415,15 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- running on env vars keep behaving identically.
     agent_public_url TEXT,
     xray_version TEXT,
+    -- Runtime log retention is operational policy, not compiled model state. The fleet default
+    -- applies wherever nodes.agent_log_max_mib is NULL; changing either value is picked up by the
+    -- agent poll and does not create a revision or require a topology release.
+    agent_log_max_mib INTEGER DEFAULT 100 NOT NULL,
+    -- Console identity. It compiles into nothing and takes effect on the next browser fetch, so it
+    -- shares control_state with distribution but not the revisioned model settings above.
+    site_name TEXT DEFAULT 'Brocade' NOT NULL,
+    -- A validated PNG/JPEG/WebP data URL. NULL keeps the built-in woven vector mark.
+    site_icon_data_url TEXT,
     -- Connection policy defaults. Merely the defaults: what reaches a machine is its own
     -- `nodes.conn_*` falling back to these, the same arrangement as overlay_mtu / nodes.mtu.
     --
@@ -437,6 +487,7 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- A scope that is not `off` while no build is named would be a clearance to install nothing.
     -- Refused here so that no code downstream has to decide what it means.
     CONSTRAINT control_state_agent_release_armed CHECK (((agent_release_scope = 'off') OR (agent_release_id IS NOT NULL))),
+    CONSTRAINT control_state_agent_log_max_mib_range CHECK (((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096))),
     CONSTRAINT control_state_geodata_cron_shape CHECK ((geodata_cron ~ '^((CRON_)?TZ=\S+\s+)?\S+(\s+\S+){4}$')),
     CONSTRAINT control_state_geodata_geoip_url_shape CHECK ((geodata_geoip_url ~ '^https?://')),
     CONSTRAINT control_state_geodata_geosite_url_shape CHECK ((geodata_geosite_url ~ '^https?://')),
@@ -456,9 +507,35 @@ CREATE TABLE IF NOT EXISTS control_state (
     CONSTRAINT control_state_reality_max_time_diff_ms_range CHECK (((reality_max_time_diff_ms IS NULL) OR ((reality_max_time_diff_ms >= 0) AND (reality_max_time_diff_ms <= 86400000)))),
     CONSTRAINT control_state_reality_min_client_ver_shape CHECK (((reality_min_client_ver IS NULL) OR (reality_min_client_ver ~ '^[0-9]+\.[0-9]+\.[0-9]+$'))),
     CONSTRAINT control_state_reality_server_names_shape CHECK ((jsonb_typeof(reality_server_names) = 'array')),
+    CONSTRAINT control_state_site_name_shape CHECK ((length(btrim(site_name)) BETWEEN 1 AND 64)),
+    CONSTRAINT control_state_site_icon_size CHECK ((site_icon_data_url IS NULL) OR (octet_length(site_icon_data_url) <= 350000)),
     CONSTRAINT control_state_pkey PRIMARY KEY (id),
     CONSTRAINT control_state_current_revision_fkey FOREIGN KEY (current_revision) REFERENCES revisions(id)
 );
+
+-- Development deployments replay 0001 after clearing its checksum. Reconcile databases created
+-- before console branding existed instead of requiring them to be rebuilt for two additive fields.
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'Brocade' NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS site_icon_data_url TEXT;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS agent_log_max_mib INTEGER DEFAULT 100 NOT NULL;
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_agent_log_max_mib_range;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_agent_log_max_mib_range
+        CHECK (((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096)));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_site_name_shape;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_site_name_shape
+        CHECK ((length(btrim(site_name)) BETWEEN 1 AND 64));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_site_icon_size;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_site_icon_size
+        CHECK ((site_icon_data_url IS NULL) OR (octet_length(site_icon_data_url) <= 350000));
 
 -- One release.
 --
@@ -526,6 +603,33 @@ CREATE TABLE IF NOT EXISTS deployments (
     CONSTRAINT deployments_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES revisions(id),
     CONSTRAINT deployments_rollback_of_deployment_id_fkey FOREIGN KEY (rollback_of_deployment_id) REFERENCES deployments(id),
     CONSTRAINT deployments_sync_of_deployment_id_fkey FOREIGN KEY (sync_of_deployment_id) REFERENCES deployments(id)
+);
+
+-- User subscriptions are rendered on demand, but their input is a durable serving checkpoint —
+-- never the mutable head revision. Configuration and grants converge independently, so one row
+-- records both released dimensions. The row advances in the same transaction that makes a
+-- deployment succeeded; planned, partial, halted and canceled revisions therefore cannot leak
+-- into a URI or Clash subscription.
+--
+-- `generation` is a monotonic serving epoch. It changes even when the numeric model revision of
+-- only one dimension advances, and gives callers/diagnostics an unambiguous identity for the
+-- composed view. The singleton is deliberately absent before the first successful configuration
+-- release: without a known deployed topology there is nothing truthful to serve.
+CREATE TABLE IF NOT EXISTS subscription_serving_state (
+    id BOOLEAN DEFAULT true NOT NULL,
+    topology_revision_id BIGINT NOT NULL,
+    permissions_revision_id BIGINT NOT NULL,
+    topology_deployment_id BIGINT,
+    permissions_deployment_id BIGINT,
+    generation BIGINT DEFAULT 1 NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT subscription_serving_state_singleton CHECK (id),
+    CONSTRAINT subscription_serving_state_generation_check CHECK (generation > 0),
+    CONSTRAINT subscription_serving_state_pkey PRIMARY KEY (id),
+    CONSTRAINT subscription_serving_state_topology_revision_fkey FOREIGN KEY (topology_revision_id) REFERENCES revisions(id),
+    CONSTRAINT subscription_serving_state_permissions_revision_fkey FOREIGN KEY (permissions_revision_id) REFERENCES revisions(id),
+    CONSTRAINT subscription_serving_state_topology_deployment_fkey FOREIGN KEY (topology_deployment_id) REFERENCES deployments(id),
+    CONSTRAINT subscription_serving_state_permissions_deployment_fkey FOREIGN KEY (permissions_deployment_id) REFERENCES deployments(id)
 );
 
 -- One machine. overlay is whether it joins the wg overlay; a relay port's shape is not here but on
@@ -607,7 +711,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     conn_uplink_only_secs INTEGER,
     conn_downlink_only_secs INTEGER,
     conn_buffer_size_kb INTEGER,
+    -- NULL inherits control_state.agent_log_max_mib. This column is intentionally outside the
+    -- revisioned Node model: log retention is reconciled live and rollback must not rewrite it.
+    agent_log_max_mib INTEGER,
     CONSTRAINT nodes_api_port_check CHECK (((api_port >= 1) AND (api_port <= 65535))),
+    CONSTRAINT nodes_agent_log_max_mib_range CHECK (((agent_log_max_mib IS NULL) OR ((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096)))),
     CONSTRAINT nodes_check CHECK ((((dns_kind = 'system') AND (dns_servers = '[]'::jsonb)) OR (dns_kind = 'servers'))),
     CONSTRAINT nodes_dns_kind_check CHECK ((dns_kind IN ('system', 'servers'))),
     CONSTRAINT nodes_dns_servers_check CHECK ((jsonb_typeof(dns_servers) = 'array')),
@@ -621,6 +729,25 @@ CREATE TABLE IF NOT EXISTS nodes (
     CONSTRAINT nodes_wg_public_key_key UNIQUE (wg_public_key),
     CONSTRAINT nodes_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id),
     CONSTRAINT nodes_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT
+);
+
+-- Custom DNS is owned by the machine's Xray instance, not by any one chain. An Egress rule may
+-- activate the policy with the same domain selector (`a.dns = true`), but no resolver value or DNS
+-- order is copied into route JSON. Once activated, Xray applies the policy machine-wide.
+CREATE TABLE IF NOT EXISTS node_egress_dns (
+    node_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    selector JSONB NOT NULL,
+    resolution JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    created_revision BIGINT,
+    CONSTRAINT node_egress_dns_selector_check CHECK ((jsonb_typeof(selector) = 'object')),
+    CONSTRAINT node_egress_dns_resolution_check CHECK ((jsonb_typeof(resolution) = 'object')),
+    CONSTRAINT node_egress_dns_position_check CHECK ((position >= 0)),
+    CONSTRAINT node_egress_dns_pkey PRIMARY KEY (node_id, selector),
+    CONSTRAINT node_egress_dns_position_key UNIQUE (node_id, position) DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT node_egress_dns_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT node_egress_dns_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id)
 );
 
 CREATE TABLE IF NOT EXISTS deployment_targets (
@@ -644,6 +771,10 @@ CREATE TABLE IF NOT EXISTS deployment_target_state (
     observed_after JSONB,
     verdict JSONB,
     dispatched_at TIMESTAMPTZ,
+    -- Fences a target to the machine lifecycle in which it was created. Retirement and
+    -- reactivation advance the epoch; a target or report from an older epoch can then remain in
+    -- immutable history without ever becoming eligible again.
+    lifecycle_epoch BIGINT DEFAULT 0 NOT NULL,
     -- A release is an immutable work order, and its grants are part of that order. Fetching the
     -- current grants when an agent claims the target would let a permission edit made while the
     -- release waits change what the old release delivers, so the snapshot is frozen here beside the
@@ -651,12 +782,94 @@ CREATE TABLE IF NOT EXISTS deployment_target_state (
     -- reconstructs the grants from the release's own revision rather than from the current model.
     desired_grants JSONB,
     dispatched_grants JSONB,
+    -- Set only for work which changes Xray's counter namespace. The immutable generation is
+    -- activated after a successful convergence report; queued readings taken before that point
+    -- therefore retain the previous ownership map.
+    usage_generation_id BIGINT,
     CONSTRAINT deployment_target_state_desired_grants_check CHECK (((desired_grants IS NULL) OR (jsonb_typeof(desired_grants) = 'object'))),
     CONSTRAINT deployment_target_state_dispatched_grants_check CHECK (((dispatched_grants IS NULL) OR (jsonb_typeof(dispatched_grants) = 'object'))),
+    CONSTRAINT deployment_target_state_lifecycle_epoch_check CHECK ((lifecycle_epoch >= 0)),
     CONSTRAINT deployment_target_state_wave_check CHECK ((wave >= 0)),
     CONSTRAINT deployment_target_state_pkey PRIMARY KEY (deployment_id, node_id),
     CONSTRAINT deployment_target_state_deployment_id_node_id_fkey FOREIGN KEY (deployment_id, node_id) REFERENCES deployment_targets(deployment_id, node_id) ON DELETE CASCADE
 );
+
+-- Operational progress is deliberately separate from nodes.retired_at. The latter is revisioned
+-- model intent; this row says how far the agent has converged that intent and never enters a model
+-- snapshot. Every node has a row: the insert trigger covers new nodes and the replay backfill at
+-- the end of this migration covers databases created before lifecycle fencing existed.
+CREATE TABLE IF NOT EXISTS node_lifecycle_state (
+    node_id TEXT NOT NULL,
+    lifecycle_epoch BIGINT DEFAULT 0 NOT NULL,
+    phase TEXT DEFAULT 'active' NOT NULL,
+    intent_revision BIGINT,
+    deployment_id BIGINT,
+    requested_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    completed_by TEXT,
+    reason TEXT,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT node_lifecycle_state_epoch_check CHECK ((lifecycle_epoch >= 0)),
+    CONSTRAINT node_lifecycle_state_phase_check CHECK ((phase IN ('active', 'retiring', 'retired', 'abandoned'))),
+    CONSTRAINT node_lifecycle_state_pkey PRIMARY KEY (node_id),
+    CONSTRAINT node_lifecycle_state_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT node_lifecycle_state_intent_revision_fkey FOREIGN KEY (intent_revision) REFERENCES revisions(id),
+    CONSTRAINT node_lifecycle_state_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id)
+);
+
+-- Current lifecycle state is overwritten as the machine advances. Events are append-only so a
+-- later reactivation does not erase why an earlier retirement was forced or which release
+-- completed it.
+CREATE TABLE IF NOT EXISTS node_lifecycle_events (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+    node_id TEXT NOT NULL,
+    lifecycle_epoch BIGINT NOT NULL,
+    event TEXT NOT NULL,
+    revision_id BIGINT,
+    deployment_id BIGINT,
+    actor TEXT,
+    reason TEXT,
+    details JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT node_lifecycle_events_epoch_check CHECK ((lifecycle_epoch >= 0)),
+    CONSTRAINT node_lifecycle_events_event_check CHECK ((event IN ('retirement-requested', 'retirement-converged', 'retirement-abandoned', 'node-reactivated'))),
+    CONSTRAINT node_lifecycle_events_details_check CHECK ((jsonb_typeof(details) = 'object')),
+    CONSTRAINT node_lifecycle_events_pkey PRIMARY KEY (id),
+    CONSTRAINT node_lifecycle_events_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT node_lifecycle_events_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES revisions(id),
+    CONSTRAINT node_lifecycle_events_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id),
+    CONSTRAINT node_lifecycle_events_once UNIQUE (node_id, lifecycle_epoch, event)
+);
+
+CREATE OR REPLACE FUNCTION brocade_initialize_node_lifecycle() RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    INSERT INTO node_lifecycle_state (node_id, lifecycle_epoch, phase)
+    VALUES (NEW.id, 0, 'active')
+    ON CONFLICT (node_id) DO NOTHING;
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS nodes_initialize_lifecycle ON nodes;
+CREATE TRIGGER nodes_initialize_lifecycle
+    AFTER INSERT ON nodes
+    FOR EACH ROW EXECUTE FUNCTION brocade_initialize_node_lifecycle();
+
+-- Reconcile development databases created before lifecycle fencing existed. Keeping this beside
+-- the canonical definitions makes replaying 0001 sufficient; production deployment still runs
+-- the same statements manually under backup before the checksum is reconciled.
+ALTER TABLE deployment_target_state
+    ADD COLUMN IF NOT EXISTS lifecycle_epoch BIGINT;
+UPDATE deployment_target_state SET lifecycle_epoch = 0 WHERE lifecycle_epoch IS NULL;
+ALTER TABLE deployment_target_state
+    ALTER COLUMN lifecycle_epoch SET DEFAULT 0,
+    ALTER COLUMN lifecycle_epoch SET NOT NULL;
+ALTER TABLE deployment_target_state
+    DROP CONSTRAINT IF EXISTS deployment_target_state_lifecycle_epoch_check;
+ALTER TABLE deployment_target_state
+    ADD CONSTRAINT deployment_target_state_lifecycle_epoch_check CHECK (lifecycle_epoch >= 0);
 
 CREATE TABLE IF NOT EXISTS deployment_wave_confirmations (
     deployment_id BIGINT NOT NULL,
@@ -685,7 +898,7 @@ CREATE TABLE IF NOT EXISTS e2e_probe_samples (
     ttfb_ms INTEGER,
     CONSTRAINT e2e_probe_samples_status CHECK ((status IN ('ok', 'handshake-failed', 'chain-broken', 'timeout', 'unsupported'))),
     CONSTRAINT e2e_probe_samples_pkey PRIMARY KEY (chain_id, probed_at),
-    CONSTRAINT e2e_probe_samples_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON DELETE CASCADE
+    CONSTRAINT e2e_probe_samples_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE
 );
 
 -- End-to-end probing: whether a chain's entire data plane works right now.
@@ -724,7 +937,7 @@ CREATE TABLE IF NOT EXISTS e2e_probes (
     CONSTRAINT e2e_probes_verdict_needs_success CHECK (((status = 'ok') OR (exit_verdict = 'unknown'))),
     CONSTRAINT e2e_probes_pkey PRIMARY KEY (chain_id),
     CONSTRAINT e2e_probes_app_id_fkey FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE,
-    CONSTRAINT e2e_probes_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON DELETE CASCADE,
+    CONSTRAINT e2e_probes_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE,
     CONSTRAINT e2e_probes_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
@@ -750,6 +963,22 @@ CREATE TABLE IF NOT EXISTS users (
     CONSTRAINT users_uuid_key UNIQUE (uuid),
     CONSTRAINT users_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id),
     CONSTRAINT users_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT
+);
+
+-- A Haitun speed-test URL is intentionally not the user's UUID-backed everyday subscription.
+-- Operators can revoke this bearer without changing the user's normal Clash URL; the YAML is
+-- still compiled from the current model on every request, so no subscription content is stored.
+-- One row per user is enough: issuing an active link is idempotent, while reissuing a revoked row
+-- replaces the token and leaves the old URL unresolvable.
+CREATE TABLE IF NOT EXISTS clash_haitun_links (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    token UUID NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    CONSTRAINT clash_haitun_links_pkey PRIMARY KEY (tenant_id, user_id),
+    CONSTRAINT clash_haitun_links_token_key UNIQUE (token),
+    CONSTRAINT clash_haitun_links_user_fkey FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -833,10 +1062,11 @@ CREATE TABLE IF NOT EXISTS ingresses (
     -- configuration, so deriving it would make renaming an ingress silently disconnect everyone.
     xhttp_path TEXT,
     xhttp_host TEXT,
-    -- How many streams share one connection. NULL means share none. Only this one of XMUX's five
-    -- knobs is settable; the rest are rotation ranges xray draws from at random, and pinning them
-    -- would turn camouflage into a fingerprint.
-    xhttp_mux INTEGER,
+    -- The client-side XMUX policy. NULL means the whole object is absent, so Xray injects its
+    -- versioned defaults. A present object is deliberately complete: Xray only injects
+    -- hMaxRequestTimes=600-900 and hMaxReusableSecs=1800-3000 when every XMUX field is zero, so
+    -- storing maxConcurrency alone silently turns both rotation limits into unlimited.
+    xhttp_xmux JSONB,
     -- How the client sends its upload half. NULL is "nobody chose", and then both ends resolve it
     -- the same way on their own. A stored value is written into the server config too, where it
     -- stops being a choice and becomes a filter: a server told to expect one shape refuses every
@@ -908,7 +1138,27 @@ CREATE TABLE IF NOT EXISTS ingresses (
     -- a request against, and a mismatch is refused outright (`failed to validate path`).
     CONSTRAINT ingresses_xhttp_path CHECK (((transport_kind IS NULL OR transport_kind NOT IN ('vless-reality-xhttp', 'vless-tls-xhttp')) OR (xhttp_path ~ '^/'))),
     CONSTRAINT ingresses_xhttp_host_check CHECK ((xhttp_host IS NULL) OR (btrim(xhttp_host) <> '')),
-    CONSTRAINT ingresses_xhttp_mux_range CHECK (((xhttp_mux IS NULL) OR ((xhttp_mux >= 2) AND (xhttp_mux <= 128)))),
+    CONSTRAINT ingresses_xhttp_xmux_shape CHECK (
+        xhttp_xmux IS NULL OR ((
+            jsonb_typeof(xhttp_xmux) = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'max_concurrency') = 'number'
+            AND (xhttp_xmux ->> 'max_concurrency')::INTEGER BETWEEN 1 AND 128
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times') = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'from') = 'number'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'to') = 'number'
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'from')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'from')::BIGINT
+                <= (xhttp_xmux -> 'h_max_request_times' ->> 'to')::BIGINT
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs') = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs' -> 'from') = 'number'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs' -> 'to') = 'number'
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT
+                <= (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT
+        ) IS TRUE)
+    ),
     CONSTRAINT ingresses_xhttp_mode_known CHECK (((xhttp_mode IS NULL) OR (xhttp_mode IN ('packet-up', 'stream-up', 'stream-one')))),
     CONSTRAINT ingresses_hy2_port_present CHECK ((hy2_port IS NOT NULL) = hy2_enabled),
     CONSTRAINT ingresses_hy2_port_range CHECK ((hy2_port IS NULL) OR (hy2_port BETWEEN 1 AND 65535)),
@@ -1031,7 +1281,7 @@ CREATE TABLE IF NOT EXISTS ingresses (
 
     CONSTRAINT ingresses_pkey PRIMARY KEY (id),
     CONSTRAINT ingresses_app_id_fkey FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE,
-    CONSTRAINT ingresses_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON DELETE CASCADE,
+    CONSTRAINT ingresses_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE,
     CONSTRAINT ingresses_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id),
     CONSTRAINT ingresses_front_id_fkey FOREIGN KEY (front_id) REFERENCES fronts(id) ON DELETE SET NULL,
     CONSTRAINT ingresses_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
@@ -1045,8 +1295,138 @@ CREATE TABLE IF NOT EXISTS front_vias (
     CONSTRAINT front_vias_front_id_ordinal_key UNIQUE (front_id, ordinal),
     CONSTRAINT front_vias_pkey PRIMARY KEY (front_id, ingress_id),
     CONSTRAINT front_vias_front_id_fkey FOREIGN KEY (front_id) REFERENCES fronts(id) ON DELETE CASCADE,
-    CONSTRAINT front_vias_ingress_id_fkey FOREIGN KEY (ingress_id) REFERENCES ingresses(id) ON DELETE RESTRICT
+    CONSTRAINT front_vias_ingress_id_fkey FOREIGN KEY (ingress_id) REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE RESTRICT
 );
+
+CREATE TABLE IF NOT EXISTS front_external_vias (
+    front_id TEXT NOT NULL,
+    outbound_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    CONSTRAINT front_external_vias_ordinal_check CHECK ((ordinal >= 0)),
+    CONSTRAINT front_external_vias_front_id_ordinal_key UNIQUE (front_id, ordinal),
+    CONSTRAINT front_external_vias_pkey PRIMARY KEY (front_id, outbound_id),
+    CONSTRAINT front_external_vias_front_id_fkey FOREIGN KEY (front_id)
+        REFERENCES fronts(id) ON DELETE CASCADE,
+    CONSTRAINT front_external_vias_outbound_fkey FOREIGN KEY (outbound_id)
+        REFERENCES external_outbounds(id) ON DELETE RESTRICT
+);
+
+-- A managed WARP tunnel is one logical route with one Cloudflare registration per machine.
+-- Reusing one WireGuard private key on several machines makes those machines the same peer and
+-- produces unstable cryptokey routing, so the identity is keyed by both tunnel and node. Provider
+-- tokens and private keys remain independently sealed; neither is included in ordinary JSON
+-- columns or returned by the console snapshot.
+CREATE TABLE IF NOT EXISTS external_outbound_bindings (
+    outbound_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    access_token_sealed TEXT NOT NULL,
+    private_key_sealed TEXT NOT NULL,
+    peer_public_key TEXT NOT NULL,
+    local_addresses JSONB NOT NULL,
+    reserved JSONB DEFAULT '[]'::jsonb NOT NULL,
+    -- NULL means inherit the logical tunnel default. These are operational route choices, not
+    -- part of the Cloudflare identity, so changing one must not rotate the device or private key.
+    endpoint_address TEXT,
+    endpoint_port INTEGER,
+    mtu INTEGER,
+    keep_alive INTEGER,
+    allowed_ips JSONB,
+    no_kernel_tun BOOLEAN,
+    domain_strategy TEXT,
+    workers INTEGER,
+    registered_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    created_revision BIGINT,
+    CONSTRAINT external_outbound_bindings_pkey PRIMARY KEY (outbound_id, node_id),
+    CONSTRAINT external_outbound_bindings_device_id_key UNIQUE (device_id),
+    CONSTRAINT external_outbound_bindings_endpoint_address_check
+        CHECK ((endpoint_address IS NULL) OR (length(btrim(endpoint_address)) > 0)),
+    CONSTRAINT external_outbound_bindings_endpoint_port_check
+        CHECK ((endpoint_port IS NULL) OR ((endpoint_port >= 1) AND (endpoint_port <= 65535))),
+    CONSTRAINT external_outbound_bindings_mtu_check
+        CHECK ((mtu IS NULL) OR ((mtu >= 576) AND (mtu <= 9000))),
+    CONSTRAINT external_outbound_bindings_keep_alive_check
+        CHECK ((keep_alive IS NULL) OR ((keep_alive >= 0) AND (keep_alive <= 65535))),
+    CONSTRAINT external_outbound_bindings_allowed_ips_check
+        CHECK ((allowed_ips IS NULL) OR
+               ((jsonb_typeof(allowed_ips) = 'array') AND (jsonb_array_length(allowed_ips) > 0))),
+    CONSTRAINT external_outbound_bindings_domain_strategy_check
+        CHECK ((domain_strategy IS NULL) OR
+               (domain_strategy IN ('ForceIP', 'ForceIPv4', 'ForceIPv6', 'ForceIPv4v6', 'ForceIPv6v4'))),
+    CONSTRAINT external_outbound_bindings_address_policy_pair_check
+        CHECK ((allowed_ips IS NULL) = (domain_strategy IS NULL)),
+    CONSTRAINT external_outbound_bindings_workers_check
+        CHECK ((workers IS NULL) OR ((workers >= 0) AND (workers <= 256))),
+    CONSTRAINT external_outbound_bindings_outbound_fkey FOREIGN KEY (outbound_id)
+        REFERENCES external_outbounds(id) ON DELETE CASCADE,
+    CONSTRAINT external_outbound_bindings_node_fkey FOREIGN KEY (node_id)
+        REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT external_outbound_bindings_created_revision_fkey FOREIGN KEY (created_revision)
+        REFERENCES revisions(id)
+);
+
+-- CREATE TABLE IF NOT EXISTS does not reconcile an existing development database. Keep all
+-- additions and their checks replay-safe inside 0001; deployments clear this migration's sqlx
+-- checksum and run it again rather than carrying a compatibility 0002.
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS endpoint_address TEXT;
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS endpoint_port INTEGER;
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS mtu INTEGER;
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS keep_alive INTEGER;
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS allowed_ips JSONB;
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS no_kernel_tun BOOLEAN;
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS domain_strategy TEXT;
+ALTER TABLE external_outbound_bindings
+    ADD COLUMN IF NOT EXISTS workers INTEGER;
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_endpoint_address_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_endpoint_address_check
+        CHECK ((endpoint_address IS NULL) OR (length(btrim(endpoint_address)) > 0));
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_endpoint_port_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_endpoint_port_check
+        CHECK ((endpoint_port IS NULL) OR ((endpoint_port >= 1) AND (endpoint_port <= 65535)));
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_mtu_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_mtu_check
+        CHECK ((mtu IS NULL) OR ((mtu >= 576) AND (mtu <= 9000)));
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_keep_alive_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_keep_alive_check
+        CHECK ((keep_alive IS NULL) OR ((keep_alive >= 0) AND (keep_alive <= 65535)));
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_allowed_ips_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_allowed_ips_check
+        CHECK ((allowed_ips IS NULL) OR
+               ((jsonb_typeof(allowed_ips) = 'array') AND (jsonb_array_length(allowed_ips) > 0)));
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_domain_strategy_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_domain_strategy_check
+        CHECK ((domain_strategy IS NULL) OR
+               (domain_strategy IN ('ForceIP', 'ForceIPv4', 'ForceIPv6', 'ForceIPv4v6', 'ForceIPv6v4')));
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_address_policy_pair_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_address_policy_pair_check
+        CHECK ((allowed_ips IS NULL) = (domain_strategy IS NULL));
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_workers_check;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_workers_check
+        CHECK ((workers IS NULL) OR ((workers >= 0) AND (workers <= 256)));
 
 CREATE TABLE IF NOT EXISTS grants (
     app_id TEXT NOT NULL,
@@ -1058,7 +1438,7 @@ CREATE TABLE IF NOT EXISTS grants (
     CONSTRAINT grants_pkey PRIMARY KEY (app_id, tenant_id, user_id, ingress_id),
     CONSTRAINT grants_app_id_fkey FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE,
     CONSTRAINT grants_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id),
-    CONSTRAINT grants_ingress_id_fkey FOREIGN KEY (ingress_id) REFERENCES ingresses(id) ON DELETE CASCADE,
+    CONSTRAINT grants_ingress_id_fkey FOREIGN KEY (ingress_id) REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE CASCADE,
     CONSTRAINT grants_tenant_id_user_id_fkey FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE RESTRICT
 );
 
@@ -1252,13 +1632,114 @@ CREATE TABLE IF NOT EXISTS node_agent_state (
     load_reported_at TIMESTAMPTZ,
     -- The reporting agent's clock minus the control plane's, in seconds, signed. It can only be
     -- measured when a report arrives (read_at reads the agent's clock, which is gone afterwards),
-    -- so it is stored here rather than recomputed. Rounds past ±600s are rejected outright, so a
-    -- stored value is always inside that range.
+    -- so it is stored here rather than recomputed. Load is ephemeral and still rejects ±600s;
+    -- durable usage replay has its own sequence/epoch protocol and allows past readings.
     load_clock_skew_secs BIGINT,
+    -- The generation last acknowledged as converged on this machine, plus the exact outcome of
+    -- the latest usage ingestion round. Both are operational state, never model state.
+    usage_generation_id BIGINT,
+    usage_last_result JSONB DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT node_agent_state_pkey PRIMARY KEY (node_id),
     CONSTRAINT node_agent_state_token_hash_key UNIQUE (token_hash),
     CONSTRAINT node_agent_state_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
 );
+
+-- A usage generation is the immutable interpretation of every Xray counter label for one machine.
+-- It is deliberately frozen beside a deployment rather than reconstructed from today's grants:
+-- an offline agent may replay a reading after an ingress, user or chain has been changed or removed.
+CREATE TABLE IF NOT EXISTS usage_generations (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+    node_id TEXT NOT NULL,
+    deployment_id BIGINT,
+    revision_id BIGINT,
+    bindings JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT usage_generations_bindings_check CHECK ((jsonb_typeof(bindings) = 'object')),
+    CONSTRAINT usage_generations_pkey PRIMARY KEY (id),
+    CONSTRAINT usage_generations_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT usage_generations_deployment_target_key UNIQUE (deployment_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS usage_generation_activations (
+    node_id TEXT NOT NULL,
+    generation_id BIGINT NOT NULL,
+    deployment_id BIGINT,
+    activated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT usage_generation_activations_pkey PRIMARY KEY (node_id, generation_id),
+    CONSTRAINT usage_generation_activations_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT usage_generation_activations_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT
+);
+
+-- One lockable cursor per agent installation and a durable response per sequence make delivery
+-- exactly-once even when the HTTP response is lost after COMMIT. A repeated key with different
+-- bytes is rejected instead of silently returning somebody else's result.
+CREATE TABLE IF NOT EXISTS usage_agent_cursors (
+    node_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    last_sequence BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT usage_agent_cursors_sequence_check CHECK ((last_sequence >= 0)),
+    CONSTRAINT usage_agent_cursors_pkey PRIMARY KEY (node_id, agent_instance_id),
+    CONSTRAINT usage_agent_cursors_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS usage_report_receipts (
+    node_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    sequence BIGINT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    generation_id BIGINT NOT NULL,
+    read_at TIMESTAMPTZ NOT NULL,
+    result JSONB NOT NULL,
+    received_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT usage_report_receipts_sequence_check CHECK ((sequence >= 0)),
+    CONSTRAINT usage_report_receipts_sha_check CHECK ((length(payload_sha256) = 64)),
+    CONSTRAINT usage_report_receipts_result_check CHECK ((jsonb_typeof(result) = 'object')),
+    CONSTRAINT usage_report_receipts_pkey PRIMARY KEY (node_id, agent_instance_id, sequence),
+    CONSTRAINT usage_report_receipts_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT usage_report_receipts_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT
+);
+
+-- Current cumulative baselines are not retention data. Keeping them separate lets raw readings be
+-- pruned without making the next report forget every byte since the cutoff.
+CREATE TABLE IF NOT EXISTS usage_counter_heads (
+    node_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    xray_epoch TEXT NOT NULL,
+    read_at TIMESTAMPTZ NOT NULL,
+    xray_started_at TIMESTAMPTZ NOT NULL,
+    uplink_bytes BIGINT NOT NULL,
+    downlink_bytes BIGINT NOT NULL,
+    generation_id BIGINT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    sequence BIGINT NOT NULL,
+    CONSTRAINT usage_counter_heads_bytes_check CHECK ((uplink_bytes >= 0) AND (downlink_bytes >= 0)),
+    CONSTRAINT usage_counter_heads_sequence_check CHECK ((sequence >= 0)),
+    CONSTRAINT usage_counter_heads_pkey PRIMARY KEY (node_id, label),
+    CONSTRAINT usage_counter_heads_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT usage_counter_heads_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT
+);
+
+ALTER TABLE deployment_target_state
+    ADD COLUMN IF NOT EXISTS usage_generation_id BIGINT;
+ALTER TABLE node_agent_state
+    ADD COLUMN IF NOT EXISTS usage_generation_id BIGINT;
+ALTER TABLE node_agent_state
+    ADD COLUMN IF NOT EXISTS usage_last_result JSONB DEFAULT '{}'::jsonb;
+UPDATE node_agent_state SET usage_last_result = '{}'::jsonb WHERE usage_last_result IS NULL;
+ALTER TABLE node_agent_state
+    ALTER COLUMN usage_last_result SET DEFAULT '{}'::jsonb,
+    ALTER COLUMN usage_last_result SET NOT NULL;
+ALTER TABLE deployment_target_state
+    DROP CONSTRAINT IF EXISTS deployment_target_state_usage_generation_id_fkey;
+ALTER TABLE deployment_target_state
+    ADD CONSTRAINT deployment_target_state_usage_generation_id_fkey
+    FOREIGN KEY (usage_generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT;
+ALTER TABLE node_agent_state
+    DROP CONSTRAINT IF EXISTS node_agent_state_usage_generation_id_fkey;
+ALTER TABLE node_agent_state
+    ADD CONSTRAINT node_agent_state_usage_generation_id_fkey
+    FOREIGN KEY (usage_generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT;
 
 -- A release's observations: what state the four node artifacts are in on the machine.
 --
@@ -1584,11 +2065,19 @@ CREATE TABLE IF NOT EXISTS node_load_samples (
     -- does; a sustained non-zero value means an oversold host.
     cpu_steal_pct REAL NOT NULL,
     load1 REAL NOT NULL,
+    -- Optional deep diagnostics from newer agents. JSONB keeps one atomic observation together
+    -- (including a variable-length per-core list) without turning this hot time-series table into
+    -- dozens of sparse columns. NULL is an older agent, never a zero reading.
+    cpu_detail JSONB,
     mem_available_bytes BIGINT NOT NULL,
     swap_used_bytes BIGINT NOT NULL,
+    memory_detail JSONB,
     oom_kills BIGINT NOT NULL,
     disk_free_bytes BIGINT NOT NULL,
     disk_inode_free_pct REAL NOT NULL,
+    -- Optional rates/latency for the block device backing the agent state filesystem. NULL is an
+    -- overlay/network filesystem or an older Agent, never an idle disk.
+    disk_detail JSONB,
     nic_rx_bps BIGINT NOT NULL,
     nic_tx_bps BIGINT NOT NULL,
     nic_rx_drop BIGINT NOT NULL,
@@ -1598,6 +2087,10 @@ CREATE TABLE IF NOT EXISTS node_load_samples (
     -- such table. Storing 0 instead would read as "the table is empty", and an empty table on a
     -- busy NAT node is a real and different alarm.
     conntrack_count BIGINT,
+    -- Optional socket inventory and differenced TCP/UDP MIB counters from newer agents. As with
+    -- CPU and memory detail, one atomic JSONB object keeps the hot series narrow and NULL means
+    -- "old agent / unavailable kernel view", never an all-zero network.
+    network_detail JSONB,
     uptime_secs BIGINT NOT NULL,
     CONSTRAINT node_load_samples_window CHECK ((window_end > window_start)),
     -- CPU shares are normalised across all cores, so each part is within a window and the three
@@ -1712,7 +2205,7 @@ CREATE TABLE IF NOT EXISTS steps (
     CONSTRAINT steps_hop_in_check CHECK ((((hop_in_port IS NULL) AND (hop_in_wire IS NULL)) OR ((hop_in_wire IS NOT NULL) AND ((hop_in_port IS NULL) OR ((hop_in_port >= 1) AND (hop_in_port <= 65535)))))),
     CONSTRAINT steps_rules_check CHECK ((jsonb_typeof(rules) = 'array')),
     CONSTRAINT steps_pkey PRIMARY KEY (chain_id, node_id),
-    CONSTRAINT steps_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON DELETE CASCADE,
+    CONSTRAINT steps_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE,
     CONSTRAINT steps_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id),
     CONSTRAINT steps_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
 );
@@ -1747,6 +2240,7 @@ CREATE TABLE IF NOT EXISTS usage_chain_samples (
     has_gap BOOLEAN DEFAULT false NOT NULL,
     revision_id BIGINT,
     deployment_id BIGINT,
+    generation_id BIGINT,
     CONSTRAINT usage_chain_samples_check CHECK ((window_end > window_start)),
     CONSTRAINT usage_chain_samples_downlink_bytes_check CHECK ((downlink_bytes >= 0)),
     CONSTRAINT usage_chain_samples_uplink_bytes_check CHECK ((uplink_bytes >= 0)),
@@ -1755,20 +2249,28 @@ CREATE TABLE IF NOT EXISTS usage_chain_samples (
     CONSTRAINT usage_chain_samples_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id),
     CONSTRAINT usage_chain_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
     CONSTRAINT usage_chain_samples_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES revisions(id),
+    CONSTRAINT usage_chain_samples_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT,
     CONSTRAINT usage_chain_samples_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS usage_readings (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY,
     node_id TEXT NOT NULL,
     label TEXT NOT NULL,
     read_at TIMESTAMPTZ NOT NULL,
     xray_started_at TIMESTAMPTZ NOT NULL,
     uplink_bytes BIGINT NOT NULL,
     downlink_bytes BIGINT NOT NULL,
+    agent_instance_id TEXT,
+    sequence BIGINT,
+    generation_id BIGINT,
+    xray_epoch TEXT,
     CONSTRAINT usage_readings_downlink_bytes_check CHECK ((downlink_bytes >= 0)),
     CONSTRAINT usage_readings_uplink_bytes_check CHECK ((uplink_bytes >= 0)),
-    CONSTRAINT usage_readings_pkey PRIMARY KEY (node_id, label, read_at),
-    CONSTRAINT usage_readings_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
+    CONSTRAINT usage_readings_pkey PRIMARY KEY (id),
+    CONSTRAINT usage_readings_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT usage_readings_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT,
+    CONSTRAINT usage_readings_report_label_key UNIQUE (node_id, agent_instance_id, sequence, label)
 );
 
 CREATE TABLE IF NOT EXISTS usage_rollups (
@@ -1818,6 +2320,7 @@ CREATE TABLE IF NOT EXISTS usage_samples (
     revision_id BIGINT,
     deployment_id BIGINT,
     app_id TEXT,
+    generation_id BIGINT,
     CONSTRAINT usage_samples_check CHECK ((window_end > window_start)),
     CONSTRAINT usage_samples_downlink_bytes_check CHECK ((downlink_bytes >= 0)),
     CONSTRAINT usage_samples_uplink_bytes_check CHECK ((uplink_bytes >= 0)),
@@ -1826,8 +2329,33 @@ CREATE TABLE IF NOT EXISTS usage_samples (
     CONSTRAINT usage_samples_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id),
     CONSTRAINT usage_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
     CONSTRAINT usage_samples_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES revisions(id),
+    CONSTRAINT usage_samples_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT,
     CONSTRAINT usage_samples_tenant_id_user_id_fkey FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE RESTRICT
 );
+
+-- Reconcile development databases created before the durable usage protocol. Raw rows remain
+-- audit history; the first new report establishes an independent counter head.
+ALTER TABLE usage_readings ADD COLUMN IF NOT EXISTS id BIGINT GENERATED BY DEFAULT AS IDENTITY;
+ALTER TABLE usage_readings ADD COLUMN IF NOT EXISTS agent_instance_id TEXT;
+ALTER TABLE usage_readings ADD COLUMN IF NOT EXISTS sequence BIGINT;
+ALTER TABLE usage_readings ADD COLUMN IF NOT EXISTS generation_id BIGINT;
+ALTER TABLE usage_readings ADD COLUMN IF NOT EXISTS xray_epoch TEXT;
+ALTER TABLE usage_readings DROP CONSTRAINT IF EXISTS usage_readings_pkey;
+ALTER TABLE usage_readings ADD CONSTRAINT usage_readings_pkey PRIMARY KEY (id);
+ALTER TABLE usage_readings DROP CONSTRAINT IF EXISTS usage_readings_report_label_key;
+ALTER TABLE usage_readings ADD CONSTRAINT usage_readings_report_label_key
+    UNIQUE (node_id, agent_instance_id, sequence, label);
+ALTER TABLE usage_readings DROP CONSTRAINT IF EXISTS usage_readings_generation_id_fkey;
+ALTER TABLE usage_readings ADD CONSTRAINT usage_readings_generation_id_fkey
+    FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT;
+ALTER TABLE usage_samples ADD COLUMN IF NOT EXISTS generation_id BIGINT;
+ALTER TABLE usage_samples DROP CONSTRAINT IF EXISTS usage_samples_generation_id_fkey;
+ALTER TABLE usage_samples ADD CONSTRAINT usage_samples_generation_id_fkey
+    FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT;
+ALTER TABLE usage_chain_samples ADD COLUMN IF NOT EXISTS generation_id BIGINT;
+ALTER TABLE usage_chain_samples DROP CONSTRAINT IF EXISTS usage_chain_samples_generation_id_fkey;
+ALTER TABLE usage_chain_samples ADD CONSTRAINT usage_chain_samples_generation_id_fkey
+    FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT;
 
 -- Per user × view traffic quotas.
 --
@@ -1940,6 +2468,12 @@ CREATE INDEX IF NOT EXISTS usage_chain_samples_by_window_end ON usage_chain_samp
 
 CREATE INDEX IF NOT EXISTS usage_readings_by_read_at ON usage_readings USING btree (read_at);
 
+CREATE INDEX IF NOT EXISTS usage_generation_activations_by_time
+    ON usage_generation_activations USING btree (node_id, activated_at DESC, generation_id DESC);
+
+CREATE INDEX IF NOT EXISTS usage_report_receipts_by_received_at
+    ON usage_report_receipts USING btree (received_at);
+
 CREATE INDEX IF NOT EXISTS usage_samples_by_user_app_window ON usage_samples USING btree (tenant_id, user_id, app_id, window_start);
 
 CREATE INDEX IF NOT EXISTS usage_samples_by_user_window ON usage_samples USING btree (tenant_id, user_id, window_start, window_end);
@@ -1965,10 +2499,209 @@ FROM revisions
 WHERE note = 'initial schema revision'
 ON CONFLICT (id) DO NOTHING;
 
+-- Replaying 0001 changes only the factory default. The active row is operator data and must never
+-- be rewritten here: a configured REALITY site can already be in use by every inherited ingress.
+ALTER TABLE control_state
+    ALTER COLUMN reality_dest SET DEFAULT NULL;
+ALTER TABLE control_state
+    ALTER COLUMN reality_server_names SET DEFAULT '[]'::jsonb;
+
 -- Development uses this one migration as both bootstrap and schema reconciliation. Every change
 -- whose CREATE TABLE branch cannot affect an already existing table therefore has a matching
 -- ALTER here. This block is deliberately safe to execute repeatedly: it is also used when a
 -- development database clears `_sqlx_migrations` and replays 0001 without discarding its data.
+ALTER TABLE apps
+    ADD COLUMN IF NOT EXISTS position INTEGER;
+WITH ordered_apps AS (
+    SELECT id,
+           COALESCE((SELECT MAX(position) + 1 FROM apps), 0)
+             + (row_number() OVER (ORDER BY id) - 1)::integer AS position
+    FROM apps
+    WHERE position IS NULL
+)
+UPDATE apps AS app
+SET position = ordered.position
+FROM ordered_apps AS ordered
+WHERE app.id = ordered.id
+  AND app.position IS NULL;
+ALTER TABLE apps
+    ALTER COLUMN position SET NOT NULL;
+ALTER TABLE apps
+    DROP CONSTRAINT IF EXISTS apps_position_check;
+ALTER TABLE apps
+    ADD CONSTRAINT apps_position_check CHECK (position >= 0);
+ALTER TABLE apps
+    DROP CONSTRAINT IF EXISTS apps_position_key;
+ALTER TABLE apps
+    ADD CONSTRAINT apps_position_key UNIQUE (position)
+        DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE nodes
+    ADD COLUMN IF NOT EXISTS agent_log_max_mib INTEGER;
+ALTER TABLE nodes
+    DROP CONSTRAINT IF EXISTS nodes_agent_log_max_mib_range;
+ALTER TABLE nodes
+    ADD CONSTRAINT nodes_agent_log_max_mib_range
+        CHECK (((agent_log_max_mib IS NULL) OR ((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096))));
+
+ALTER TABLE chains
+    ADD COLUMN IF NOT EXISTS subscription_country TEXT;
+ALTER TABLE chains
+    DROP CONSTRAINT IF EXISTS chains_subscription_country_check;
+ALTER TABLE chains
+    ADD CONSTRAINT chains_subscription_country_check CHECK (
+        subscription_country IS NULL OR subscription_country ~ '^[A-Z]{2}$'
+    );
+ALTER TABLE chains
+    ADD COLUMN IF NOT EXISTS position INTEGER;
+WITH ordered_chains AS (
+    SELECT chain.app_id,
+           chain.id,
+           COALESCE((
+               SELECT MAX(existing.position) + 1
+               FROM chains AS existing
+               WHERE existing.app_id = chain.app_id
+           ), 0) +
+           (row_number() OVER (PARTITION BY chain.app_id ORDER BY chain.id) - 1)::integer
+               AS position
+    FROM chains AS chain
+    WHERE chain.position IS NULL
+)
+UPDATE chains AS chain
+SET position = ordered.position
+FROM ordered_chains AS ordered
+WHERE chain.app_id = ordered.app_id
+  AND chain.id = ordered.id
+  AND chain.position IS NULL;
+ALTER TABLE chains
+    ALTER COLUMN position SET NOT NULL;
+ALTER TABLE chains
+    DROP CONSTRAINT IF EXISTS chains_position_check;
+ALTER TABLE chains
+    ADD CONSTRAINT chains_position_check CHECK (position >= 0);
+ALTER TABLE chains
+    DROP CONSTRAINT IF EXISTS chains_position_key;
+ALTER TABLE chains
+    ADD CONSTRAINT chains_position_key UNIQUE (app_id, position)
+        DEFERRABLE INITIALLY DEFERRED;
+
+-- Earlier development schemas stored only maxConcurrency. Once any XMUX field is present Xray no
+-- longer injects its lifecycle defaults, so replaying 0001 expands the scalar into one complete,
+-- explicit policy before dropping the legacy column.
+ALTER TABLE ingresses
+    ADD COLUMN IF NOT EXISTS xhttp_xmux JSONB;
+DO $xhttp_xmux_compat$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'ingresses'
+           AND column_name = 'xhttp_mux'
+    ) THEN
+        EXECUTE $sql$
+            UPDATE ingresses
+               SET xhttp_xmux = jsonb_build_object(
+                       'max_concurrency', xhttp_mux,
+                       'h_max_request_times', jsonb_build_object('from', 600, 'to', 900),
+                       'h_max_reusable_secs', jsonb_build_object('from', 1800, 'to', 3000)
+                   )
+             WHERE xhttp_xmux IS NULL
+               AND xhttp_mux IS NOT NULL
+        $sql$;
+    END IF;
+END
+$xhttp_xmux_compat$;
+ALTER TABLE ingresses
+    DROP CONSTRAINT IF EXISTS ingresses_xhttp_mux_range;
+ALTER TABLE ingresses
+    DROP COLUMN IF EXISTS xhttp_mux;
+ALTER TABLE ingresses
+    DROP CONSTRAINT IF EXISTS ingresses_xhttp_xmux_shape;
+ALTER TABLE ingresses
+    ADD CONSTRAINT ingresses_xhttp_xmux_shape CHECK (
+        xhttp_xmux IS NULL OR ((
+            jsonb_typeof(xhttp_xmux) = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'max_concurrency') = 'number'
+            AND (xhttp_xmux ->> 'max_concurrency')::INTEGER BETWEEN 1 AND 128
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times') = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'from') = 'number'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'to') = 'number'
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'from')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'from')::BIGINT
+                <= (xhttp_xmux -> 'h_max_request_times' ->> 'to')::BIGINT
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs') = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs' -> 'from') = 'number'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs' -> 'to') = 'number'
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT
+                <= (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT
+        ) IS TRUE)
+    );
+
+ALTER TABLE node_egress_dns
+    ADD COLUMN IF NOT EXISTS position INTEGER;
+WITH ordered_node_egress_dns AS (
+    SELECT node_id, selector,
+           (row_number() OVER (PARTITION BY node_id ORDER BY created_at, selector) - 1)::integer AS position
+    FROM node_egress_dns
+)
+UPDATE node_egress_dns AS policy
+SET position = ordered.position
+FROM ordered_node_egress_dns AS ordered
+WHERE policy.node_id = ordered.node_id
+  AND policy.selector = ordered.selector
+  AND policy.position IS NULL;
+ALTER TABLE node_egress_dns
+    ALTER COLUMN position SET NOT NULL;
+ALTER TABLE node_egress_dns
+    DROP CONSTRAINT IF EXISTS node_egress_dns_position_check;
+ALTER TABLE node_egress_dns
+    ADD CONSTRAINT node_egress_dns_position_check CHECK (position >= 0);
+ALTER TABLE node_egress_dns
+    DROP CONSTRAINT IF EXISTS node_egress_dns_position_key;
+ALTER TABLE node_egress_dns
+    ADD CONSTRAINT node_egress_dns_position_key UNIQUE (node_id, position)
+        DEFERRABLE INITIALLY DEFERRED;
+
+-- Snapshots written during the short development window before `position` existed still feed
+-- grant-delta calculation, rollback and historical compilation. Their array was emitted in the
+-- table's canonical machine order, so number each machine within that array. Normalize the whole
+-- array when any entry is missing: a partially repaired snapshot must not retain colliding slots.
+UPDATE model_snapshots
+SET snapshot = jsonb_set(snapshot, '{node_egress_dns}', '[]'::jsonb, true)
+WHERE NOT (snapshot ? 'node_egress_dns');
+
+UPDATE model_snapshots AS stored
+SET snapshot = jsonb_set(
+    stored.snapshot,
+    '{node_egress_dns}',
+    (
+        SELECT jsonb_agg(
+            ranked.policy || jsonb_build_object('position', ranked.position)
+            ORDER BY ranked.ordinality
+        )
+        FROM (
+            SELECT item.policy,
+                   item.ordinality,
+                   row_number() OVER (
+                       PARTITION BY item.policy->>'node'
+                       ORDER BY item.ordinality
+                   ) - 1 AS position
+            FROM jsonb_array_elements(stored.snapshot->'node_egress_dns')
+                 WITH ORDINALITY AS item(policy, ordinality)
+        ) AS ranked
+    ),
+    false
+)
+WHERE EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(stored.snapshot->'node_egress_dns') AS item(policy)
+    WHERE NOT (item.policy ? 'position')
+);
+
 ALTER TABLE node_agent_state
     ADD COLUMN IF NOT EXISTS load_clock_skew_secs BIGINT;
 
@@ -1990,13 +2723,624 @@ ALTER TABLE node_load_samples
         AND cpu_steal_pct >= 0
         AND cpu_steal_pct <= 100
     );
+ALTER TABLE node_load_samples
+    ADD COLUMN IF NOT EXISTS cpu_detail JSONB;
+ALTER TABLE node_load_samples
+    ADD COLUMN IF NOT EXISTS memory_detail JSONB;
+ALTER TABLE node_load_samples
+    ADD COLUMN IF NOT EXISTS disk_detail JSONB;
+ALTER TABLE node_load_samples
+    ADD COLUMN IF NOT EXISTS network_detail JSONB;
 
--- CREATE TABLE handles a fresh database; replacing the check handles a development database that
--- saw an earlier external-outbound protocol set. Existing unsupported rows intentionally make the
--- constraint fail instead of being silently deleted.
+-- CREATE TABLE handles a fresh database. These ALTERs also reconcile development databases from
+-- the earlier project-owned tunnel shape. Child foreign keys are removed first so the parent key
+-- can change from (app_id, id) to the globally unique id. Conflicting legacy ids intentionally
+-- make the new primary key fail instead of silently merging credentials from different tunnels.
+ALTER TABLE front_external_vias
+    DROP CONSTRAINT IF EXISTS front_external_vias_outbound_fkey;
+ALTER TABLE front_external_vias
+    DROP CONSTRAINT IF EXISTS front_external_vias_pkey;
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_outbound_fkey;
+ALTER TABLE external_outbound_bindings
+    DROP CONSTRAINT IF EXISTS external_outbound_bindings_pkey;
+ALTER TABLE external_outbounds
+    DROP CONSTRAINT IF EXISTS external_outbounds_app_id_fkey;
+ALTER TABLE external_outbounds
+    DROP CONSTRAINT IF EXISTS external_outbounds_pkey;
+
+ALTER TABLE front_external_vias DROP COLUMN IF EXISTS app_id;
+ALTER TABLE external_outbound_bindings DROP COLUMN IF EXISTS app_id;
+ALTER TABLE external_outbounds DROP COLUMN IF EXISTS app_id;
+
+ALTER TABLE external_outbounds
+    ADD CONSTRAINT external_outbounds_pkey PRIMARY KEY (id);
+ALTER TABLE front_external_vias
+    ADD CONSTRAINT front_external_vias_pkey PRIMARY KEY (front_id, outbound_id);
+ALTER TABLE front_external_vias
+    ADD CONSTRAINT front_external_vias_outbound_fkey FOREIGN KEY (outbound_id)
+        REFERENCES external_outbounds(id) ON DELETE RESTRICT;
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_pkey PRIMARY KEY (outbound_id, node_id);
+ALTER TABLE external_outbound_bindings
+    ADD CONSTRAINT external_outbound_bindings_outbound_fkey FOREIGN KEY (outbound_id)
+        REFERENCES external_outbounds(id) ON DELETE CASCADE;
+
+-- Replacing the check handles a development database that saw an earlier external-outbound
+-- protocol set. Existing unsupported rows intentionally make the constraint fail instead of being
+-- silently deleted.
 ALTER TABLE external_outbounds
     DROP CONSTRAINT IF EXISTS external_outbounds_protocol_check;
 ALTER TABLE external_outbounds
     ADD CONSTRAINT external_outbounds_protocol_check CHECK (
-        protocol IN ('vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard')
+        protocol IN ('vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard', 'warp')
     );
+
+-- Chain and ingress ids are renamed as a unit. App ids are operator-owned slugs and deliberately
+-- stay unchanged. ON UPDATE CASCADE is intentional for the two migrated kinds even after the
+-- one-time conversion: a repair must not leave half the live model behind.
+ALTER TABLE chains DROP CONSTRAINT IF EXISTS chains_app_id_fkey;
+ALTER TABLE chains ADD CONSTRAINT chains_app_id_fkey FOREIGN KEY (app_id)
+    REFERENCES apps(id) ON DELETE CASCADE;
+ALTER TABLE e2e_probe_samples DROP CONSTRAINT IF EXISTS e2e_probe_samples_chain_id_fkey;
+ALTER TABLE e2e_probe_samples ADD CONSTRAINT e2e_probe_samples_chain_id_fkey FOREIGN KEY (chain_id)
+    REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
+ALTER TABLE e2e_probes DROP CONSTRAINT IF EXISTS e2e_probes_app_id_fkey;
+ALTER TABLE e2e_probes ADD CONSTRAINT e2e_probes_app_id_fkey FOREIGN KEY (app_id)
+    REFERENCES apps(id) ON DELETE CASCADE;
+ALTER TABLE e2e_probes DROP CONSTRAINT IF EXISTS e2e_probes_chain_id_fkey;
+ALTER TABLE e2e_probes ADD CONSTRAINT e2e_probes_chain_id_fkey FOREIGN KEY (chain_id)
+    REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
+ALTER TABLE fronts DROP CONSTRAINT IF EXISTS fronts_app_id_fkey;
+ALTER TABLE fronts ADD CONSTRAINT fronts_app_id_fkey FOREIGN KEY (app_id)
+    REFERENCES apps(id) ON DELETE CASCADE;
+ALTER TABLE ingresses DROP CONSTRAINT IF EXISTS ingresses_app_id_fkey;
+ALTER TABLE ingresses ADD CONSTRAINT ingresses_app_id_fkey FOREIGN KEY (app_id)
+    REFERENCES apps(id) ON DELETE CASCADE;
+ALTER TABLE ingresses DROP CONSTRAINT IF EXISTS ingresses_chain_id_fkey;
+ALTER TABLE ingresses ADD CONSTRAINT ingresses_chain_id_fkey FOREIGN KEY (chain_id)
+    REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
+ALTER TABLE front_vias DROP CONSTRAINT IF EXISTS front_vias_ingress_id_fkey;
+ALTER TABLE front_vias ADD CONSTRAINT front_vias_ingress_id_fkey FOREIGN KEY (ingress_id)
+    REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE RESTRICT;
+ALTER TABLE grants DROP CONSTRAINT IF EXISTS grants_app_id_fkey;
+ALTER TABLE grants ADD CONSTRAINT grants_app_id_fkey FOREIGN KEY (app_id)
+    REFERENCES apps(id) ON DELETE CASCADE;
+ALTER TABLE grants DROP CONSTRAINT IF EXISTS grants_ingress_id_fkey;
+ALTER TABLE grants ADD CONSTRAINT grants_ingress_id_fkey FOREIGN KEY (ingress_id)
+    REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE CASCADE;
+ALTER TABLE steps DROP CONSTRAINT IF EXISTS steps_chain_id_fkey;
+ALTER TABLE steps ADD CONSTRAINT steps_chain_id_fkey FOREIGN KEY (chain_id)
+    REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+CREATE OR REPLACE FUNCTION brocade_is_friendly_model_id(kind TEXT, value TEXT) RETURNS BOOLEAN
+    LANGUAGE sql IMMUTABLE STRICT
+    AS $_$
+    SELECT CASE kind
+        WHEN 'chain' THEN value ~ '^c-[bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou]$'
+        WHEN 'ingress' THEN value ~ '^i-[bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou]$'
+        ELSE FALSE
+    END
+$_$;
+
+CREATE OR REPLACE FUNCTION brocade_random_friendly_model_id(kind TEXT) RETURNS TEXT
+    LANGUAGE plpgsql VOLATILE STRICT
+    AS $_$
+DECLARE
+    prefix TEXT;
+    consonants CONSTANT TEXT := 'bcdfghjklmnprstvwz';
+    vowels CONSTANT TEXT := 'aeiou';
+    alphabet TEXT;
+    body TEXT := '';
+    letter_index INTEGER;
+BEGIN
+    prefix := CASE kind WHEN 'chain' THEN 'c-' WHEN 'ingress' THEN 'i-' END;
+    IF prefix IS NULL THEN
+        RAISE EXCEPTION 'unknown friendly model id kind: %', kind;
+    END IF;
+    FOR letter_index IN 0..5 LOOP
+        alphabet := CASE WHEN letter_index % 2 = 0 THEN consonants ELSE vowels END;
+        body := body || substr(alphabet, 1 + floor(random() * length(alphabet))::integer, 1);
+    END LOOP;
+    RETURN prefix || body;
+END
+$_$;
+
+-- Convert every active and historical association together. It is callable because production
+-- development databases replay 0001 manually after clearing its sqlx checksum; the function gives
+-- that procedure one atomic statement and gives PostgreSQL integration tests the exact same path.
+CREATE OR REPLACE FUNCTION brocade_migrate_friendly_model_ids() RETURNS INTEGER
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    source RECORD;
+    stored RECORD;
+    app_doc JSONB;
+    chain_doc JSONB;
+    ingress_doc JSONB;
+    front_doc JSONB;
+    step_doc JSONB;
+    grant_doc JSONB;
+    apps_doc JSONB;
+    chains_doc JSONB;
+    ingresses_doc JSONB;
+    fronts_doc JSONB;
+    steps_doc JSONB;
+    grants_doc JSONB;
+    old_chain TEXT;
+    new_chain TEXT;
+    old_ingress TEXT;
+    new_ingress TEXT;
+    candidate TEXT;
+    previous_revision BIGINT;
+    migration_revision BIGINT;
+    previous_snapshot JSONB;
+    changed INTEGER;
+BEGIN
+    CREATE TEMP TABLE _brocade_chain_id_map (
+        old_id TEXT PRIMARY KEY,
+        new_id TEXT NOT NULL UNIQUE
+    ) ON COMMIT DROP;
+    CREATE TEMP TABLE _brocade_ingress_id_map (
+        old_id TEXT PRIMARY KEY,
+        new_id TEXT NOT NULL UNIQUE
+    ) ON COMMIT DROP;
+    CREATE TEMP TABLE _brocade_hop_id_map (
+        old_id TEXT PRIMARY KEY,
+        new_id TEXT NOT NULL UNIQUE
+    ) ON COMMIT DROP;
+
+    FOR source IN SELECT id FROM chains WHERE NOT brocade_is_friendly_model_id('chain', id) ORDER BY id LOOP
+        LOOP
+            candidate := brocade_random_friendly_model_id('chain');
+            EXIT WHEN NOT EXISTS (SELECT 1 FROM chains WHERE id = candidate)
+                      AND NOT EXISTS (SELECT 1 FROM _brocade_chain_id_map WHERE new_id = candidate)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ingresses WHERE id = 'i-' || substr(candidate, 3)
+                      );
+        END LOOP;
+        INSERT INTO _brocade_chain_id_map VALUES (source.id, candidate);
+    END LOOP;
+    FOR source IN
+        SELECT ingress.id
+          FROM ingresses AS ingress
+         WHERE NOT brocade_is_friendly_model_id('ingress', ingress.id)
+            OR EXISTS (
+                SELECT 1
+                  FROM chains AS chain
+                 WHERE chain.id = 'c-' || substr(ingress.id, 3)
+                   AND brocade_is_friendly_model_id('ingress', ingress.id)
+            )
+         ORDER BY ingress.id
+    LOOP
+        LOOP
+            candidate := brocade_random_friendly_model_id('ingress');
+            EXIT WHEN NOT EXISTS (SELECT 1 FROM ingresses WHERE id = candidate)
+                      AND NOT EXISTS (SELECT 1 FROM _brocade_ingress_id_map WHERE new_id = candidate)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM chains WHERE id = 'c-' || substr(candidate, 3)
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM _brocade_chain_id_map
+                           WHERE substr(new_id, 3) = substr(candidate, 3)
+                      );
+        END LOOP;
+        INSERT INTO _brocade_ingress_id_map VALUES (source.id, candidate);
+    END LOOP;
+
+    INSERT INTO _brocade_hop_id_map (old_id, new_id)
+    SELECT chain.app_id || '/' || chain.id,
+           chain.app_id || '/' || COALESCE(chain_map.new_id, chain.id)
+      FROM chains AS chain
+      LEFT JOIN _brocade_chain_id_map AS chain_map ON chain_map.old_id = chain.id
+     WHERE chain_map.new_id IS NOT NULL;
+
+    SELECT (SELECT count(*) FROM _brocade_chain_id_map)
+         + (SELECT count(*) FROM _brocade_ingress_id_map)
+      INTO changed;
+    IF changed = 0 THEN
+        RETURN 0;
+    END IF;
+
+    -- Historical snapshots are rollback sources, not display caches. Rewrite their structured
+    -- references before changing the live tables so either side of a rollback uses one id family.
+    FOR stored IN SELECT revision_id, snapshot FROM model_snapshots ORDER BY revision_id LOOP
+        apps_doc := '[]'::jsonb;
+        FOR app_doc IN SELECT value FROM jsonb_array_elements(COALESCE(stored.snapshot->'apps', '[]'::jsonb)) LOOP
+            chains_doc := '[]'::jsonb;
+            FOR chain_doc IN SELECT value FROM jsonb_array_elements(COALESCE(app_doc->'chains', '[]'::jsonb)) LOOP
+                old_chain := chain_doc->>'id';
+                SELECT new_id INTO new_chain FROM _brocade_chain_id_map WHERE old_id = old_chain;
+                new_chain := COALESCE(new_chain, old_chain);
+                chain_doc := jsonb_set(chain_doc, '{id}', to_jsonb(new_chain), false);
+                IF chain_doc->>'name' = old_chain THEN
+                    chain_doc := jsonb_set(chain_doc, '{name}', to_jsonb(new_chain), false);
+                END IF;
+                chains_doc := chains_doc || jsonb_build_array(chain_doc);
+            END LOOP;
+            app_doc := jsonb_set(app_doc, '{chains}', chains_doc, false);
+
+            ingresses_doc := '[]'::jsonb;
+            FOR ingress_doc IN SELECT value FROM jsonb_array_elements(COALESCE(app_doc->'ingresses', '[]'::jsonb)) LOOP
+                old_ingress := ingress_doc->>'id';
+                SELECT new_id INTO new_ingress FROM _brocade_ingress_id_map WHERE old_id = old_ingress;
+                new_ingress := COALESCE(new_ingress, old_ingress);
+                old_chain := ingress_doc->>'chain';
+                SELECT new_id INTO new_chain FROM _brocade_chain_id_map WHERE old_id = old_chain;
+                new_chain := COALESCE(new_chain, old_chain);
+                ingress_doc := jsonb_set(ingress_doc, '{id}', to_jsonb(new_ingress), false);
+                ingress_doc := jsonb_set(ingress_doc, '{chain}', to_jsonb(new_chain), false);
+                ingresses_doc := ingresses_doc || jsonb_build_array(ingress_doc);
+            END LOOP;
+            app_doc := jsonb_set(app_doc, '{ingresses}', ingresses_doc, false);
+
+            fronts_doc := '[]'::jsonb;
+            FOR front_doc IN SELECT value FROM jsonb_array_elements(COALESCE(app_doc->'fronts', '[]'::jsonb)) LOOP
+                SELECT COALESCE(jsonb_agg(to_jsonb(COALESCE(mapped.new_id, item.value)) ORDER BY item.ordinality), '[]'::jsonb)
+                  INTO ingresses_doc
+                  FROM jsonb_array_elements_text(COALESCE(front_doc->'via', '[]'::jsonb)) WITH ORDINALITY AS item(value, ordinality)
+                  LEFT JOIN _brocade_ingress_id_map AS mapped ON mapped.old_id = item.value;
+                front_doc := jsonb_set(front_doc, '{via}', ingresses_doc, false);
+                fronts_doc := fronts_doc || jsonb_build_array(front_doc);
+            END LOOP;
+            app_doc := jsonb_set(app_doc, '{fronts}', fronts_doc, false);
+
+            steps_doc := '[]'::jsonb;
+            FOR step_doc IN SELECT value FROM jsonb_array_elements(COALESCE(app_doc->'steps', '[]'::jsonb)) LOOP
+                old_chain := step_doc->>'chain';
+                SELECT new_id INTO new_chain FROM _brocade_chain_id_map WHERE old_id = old_chain;
+                new_chain := COALESCE(new_chain, old_chain);
+                step_doc := jsonb_set(step_doc, '{chain}', to_jsonb(new_chain), false);
+                IF step_doc#>>'{accept,label}' = old_chain || '@' || (step_doc->>'node') THEN
+                    step_doc := jsonb_set(step_doc, '{accept,label}', to_jsonb(new_chain || '@' || (step_doc->>'node')), false);
+                END IF;
+                steps_doc := steps_doc || jsonb_build_array(step_doc);
+            END LOOP;
+            app_doc := jsonb_set(app_doc, '{steps}', steps_doc, false);
+
+            grants_doc := '[]'::jsonb;
+            FOR grant_doc IN SELECT value FROM jsonb_array_elements(COALESCE(app_doc->'grants', '[]'::jsonb)) LOOP
+                old_ingress := grant_doc->>'ingress';
+                SELECT new_id INTO new_ingress FROM _brocade_ingress_id_map WHERE old_id = old_ingress;
+                new_ingress := COALESCE(new_ingress, old_ingress);
+                grant_doc := jsonb_set(grant_doc, '{ingress}', to_jsonb(new_ingress), false);
+                grants_doc := grants_doc || jsonb_build_array(grant_doc);
+            END LOOP;
+            app_doc := jsonb_set(app_doc, '{grants}', grants_doc, false);
+            apps_doc := apps_doc || jsonb_build_array(app_doc);
+        END LOOP;
+        UPDATE model_snapshots
+           SET snapshot = jsonb_set(stored.snapshot, '{apps}', apps_doc, false)
+         WHERE revision_id = stored.revision_id;
+    END LOOP;
+
+    UPDATE chains AS live SET id = mapped.new_id,
+        name = CASE WHEN live.name = mapped.old_id THEN mapped.new_id ELSE live.name END
+      FROM _brocade_chain_id_map AS mapped WHERE live.id = mapped.old_id;
+    UPDATE ingresses AS live SET id = mapped.new_id
+      FROM _brocade_ingress_id_map AS mapped WHERE live.id = mapped.old_id;
+
+    UPDATE steps AS live SET accept_label = mapped.new_id || substr(live.accept_label, length(mapped.old_id) + 1)
+      FROM _brocade_chain_id_map AS mapped
+     WHERE live.chain_id = mapped.new_id AND live.accept_label LIKE mapped.old_id || '@%';
+    UPDATE link_health AS live SET chain_id = mapped.new_id
+      FROM _brocade_hop_id_map AS mapped WHERE live.chain_id = mapped.old_id;
+    UPDATE link_health AS live SET chain_id = mapped.new_id
+      FROM _brocade_chain_id_map AS mapped WHERE live.chain_id = mapped.old_id;
+    UPDATE node_hop_link_samples AS live SET chain_id = mapped.new_id
+      FROM _brocade_hop_id_map AS mapped WHERE live.chain_id = mapped.old_id;
+    UPDATE node_hop_link_samples AS live SET chain_id = mapped.new_id
+      FROM _brocade_chain_id_map AS mapped WHERE live.chain_id = mapped.old_id;
+    UPDATE usage_chain_samples AS live
+       SET chain_id = mapped.new_id,
+           hop_label = CASE WHEN live.hop_label LIKE mapped.old_id || '@%'
+                            THEN mapped.new_id || substr(live.hop_label, length(mapped.old_id) + 1)
+                            ELSE live.hop_label END
+      FROM _brocade_chain_id_map AS mapped WHERE live.chain_id = mapped.old_id;
+    UPDATE usage_samples AS live
+       SET ingress_id = mapped.new_id,
+           grant_label = CASE WHEN live.grant_label LIKE '%#' || mapped.old_id
+                              THEN left(live.grant_label, length(live.grant_label) - length(mapped.old_id)) || mapped.new_id
+                              ELSE live.grant_label END
+      FROM _brocade_ingress_id_map AS mapped WHERE live.ingress_id = mapped.old_id;
+    UPDATE usage_readings AS live
+       SET label = mapped.new_id || substr(live.label, length(mapped.old_id) + 1)
+      FROM _brocade_chain_id_map AS mapped
+     WHERE live.label NOT LIKE '%#%' AND live.label LIKE mapped.old_id || '@%';
+    UPDATE usage_readings AS live
+       SET label = left(live.label, length(live.label) - length(mapped.old_id)) || mapped.new_id
+      FROM _brocade_ingress_id_map AS mapped WHERE live.label LIKE '%#' || mapped.old_id;
+    UPDATE quota_suspensions AS live SET ingress_id = mapped.new_id
+      FROM _brocade_ingress_id_map AS mapped WHERE live.ingress_id = mapped.old_id;
+
+    SELECT current_revision INTO previous_revision FROM control_state WHERE id = TRUE FOR UPDATE;
+    SELECT snapshot INTO previous_snapshot FROM model_snapshots WHERE revision_id = previous_revision;
+    IF previous_snapshot IS NULL THEN
+        RAISE EXCEPTION 'cannot migrate model ids: current revision % has no snapshot', previous_revision;
+    END IF;
+    INSERT INTO revisions (author, note) VALUES ('system:id-migration', 'convert chain and ingress ids to friendly random ids')
+        RETURNING id INTO migration_revision;
+    previous_snapshot := jsonb_set(previous_snapshot, '{revision}', to_jsonb(migration_revision), false);
+    INSERT INTO model_snapshots (revision_id, snapshot) VALUES (migration_revision, previous_snapshot);
+    UPDATE control_state SET current_revision = migration_revision WHERE id = TRUE;
+    RETURN changed;
+END
+$_$;
+
+-- Rebuild the global body registry from canonical model rows on every 0001 replay. Existing
+-- triggers are removed first so an earlier development replay cannot repopulate it halfway through
+-- the atomic ID migration.
+DROP TRIGGER IF EXISTS chains_friendly_id_body ON chains;
+DROP TRIGGER IF EXISTS ingresses_friendly_id_body ON ingresses;
+TRUNCATE friendly_model_id_bodies;
+SELECT brocade_migrate_friendly_model_ids();
+
+INSERT INTO friendly_model_id_bodies (body, kind, model_id)
+SELECT substr(id, 3), 'chain', id
+  FROM chains
+ WHERE brocade_is_friendly_model_id('chain', id)
+UNION ALL
+SELECT substr(id, 3), 'ingress', id
+  FROM ingresses
+ WHERE brocade_is_friendly_model_id('ingress', id);
+
+CREATE OR REPLACE FUNCTION brocade_reserve_friendly_model_id_body() RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    resource_kind TEXT := TG_ARGV[0];
+    old_body TEXT;
+    new_body TEXT;
+    owner_kind TEXT;
+    owner_id TEXT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF brocade_is_friendly_model_id(resource_kind, OLD.id) THEN
+            DELETE FROM friendly_model_id_bodies
+             WHERE body = substr(OLD.id, 3)
+               AND friendly_model_id_bodies.kind = resource_kind
+               AND model_id = OLD.id;
+        END IF;
+        RETURN OLD;
+    END IF;
+
+    IF brocade_is_friendly_model_id(resource_kind, NEW.id) THEN
+        new_body := substr(NEW.id, 3);
+        INSERT INTO friendly_model_id_bodies (body, kind, model_id)
+        VALUES (new_body, resource_kind, NEW.id)
+        ON CONFLICT (body) DO NOTHING;
+        SELECT reserved.kind, reserved.model_id
+          INTO owner_kind, owner_id
+          FROM friendly_model_id_bodies AS reserved
+         WHERE reserved.body = new_body;
+        IF owner_kind IS DISTINCT FROM resource_kind OR owner_id IS DISTINCT FROM NEW.id THEN
+            RAISE EXCEPTION 'friendly id body % is already used by % %', new_body, owner_kind, owner_id
+                USING ERRCODE = '23505', CONSTRAINT = 'friendly_model_id_bodies_pkey';
+        END IF;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND brocade_is_friendly_model_id(resource_kind, OLD.id) THEN
+        old_body := substr(OLD.id, 3);
+        IF new_body IS DISTINCT FROM old_body THEN
+            DELETE FROM friendly_model_id_bodies
+             WHERE body = old_body
+               AND friendly_model_id_bodies.kind = resource_kind
+               AND model_id = OLD.id;
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$_$;
+
+CREATE TRIGGER chains_friendly_id_body
+    BEFORE INSERT OR UPDATE OF id OR DELETE ON chains
+    FOR EACH ROW EXECUTE FUNCTION brocade_reserve_friendly_model_id_body('chain');
+CREATE TRIGGER ingresses_friendly_id_body
+    BEFORE INSERT OR UPDATE OF id OR DELETE ON ingresses
+    FOR EACH ROW EXECUTE FUNCTION brocade_reserve_friendly_model_id_body('ingress');
+
+-- A development database may already contain rows marked retired by the former one-bit flow.
+-- Only an explicit all-disabled observation is proof of completed teardown; absent, dirty,
+-- unmanaged or present state remains retiring and keeps its agent token long enough to receive the
+-- cleanup release.
+INSERT INTO node_lifecycle_state (
+    node_id, lifecycle_epoch, phase, intent_revision, requested_at, completed_at,
+    completed_by, reason, updated_at
+)
+SELECT n.id,
+       CASE WHEN n.retired_at IS NULL THEN 0 ELSE 1 END,
+       CASE WHEN n.retired_at IS NULL THEN 'active'
+            WHEN a.phantun_state = 'disabled'
+                  AND a.hy2_port_hop_state = 'disabled'
+                  AND a.wireguard_state = 'disabled'
+                  AND a.xray_state = 'disabled'
+            THEN 'retired' ELSE 'retiring' END,
+       CASE WHEN n.retired_at IS NULL THEN NULL ELSE c.current_revision END,
+       n.retired_at,
+       CASE WHEN n.retired_at IS NOT NULL
+                  AND a.phantun_state = 'disabled'
+                  AND a.hy2_port_hop_state = 'disabled'
+                  AND a.wireguard_state = 'disabled'
+                  AND a.xray_state = 'disabled'
+            THEN a.observed_at ELSE NULL END,
+       CASE WHEN n.retired_at IS NOT NULL
+                  AND a.phantun_state = 'disabled'
+                  AND a.hy2_port_hop_state = 'disabled'
+                  AND a.wireguard_state = 'disabled'
+                  AND a.xray_state = 'disabled'
+            THEN 'system:migration' ELSE NULL END,
+       CASE WHEN n.retired_at IS NULL THEN NULL ELSE 'backfilled from nodes.retired_at' END,
+       now()
+  FROM nodes AS n
+  CROSS JOIN control_state AS c
+  LEFT JOIN node_applied_state AS a ON a.node_id = n.id
+ON CONFLICT (node_id) DO NOTHING;
+
+INSERT INTO node_lifecycle_events (
+    node_id, lifecycle_epoch, event, revision_id, actor, reason, details
+)
+SELECT node_id, lifecycle_epoch, 'retirement-requested', intent_revision,
+       'system:migration', reason, '{"backfilled":true}'::jsonb
+  FROM node_lifecycle_state
+ WHERE phase IN ('retiring', 'retired', 'abandoned')
+ON CONFLICT (node_id, lifecycle_epoch, event) DO NOTHING;
+
+INSERT INTO node_lifecycle_events (
+    node_id, lifecycle_epoch, event, revision_id, deployment_id, actor, reason, details
+)
+SELECT node_id, lifecycle_epoch, 'retirement-converged', intent_revision, deployment_id,
+       COALESCE(completed_by, 'system:migration'), reason, '{"backfilled":true}'::jsonb
+  FROM node_lifecycle_state
+ WHERE phase = 'retired'
+ON CONFLICT (node_id, lifecycle_epoch, event) DO NOTHING;
+
+UPDATE node_agent_state AS agent
+   SET token_revoked_at = COALESCE(agent.token_revoked_at, now())
+  FROM node_lifecycle_state AS lifecycle
+ WHERE lifecycle.node_id = agent.node_id
+   AND lifecycle.phase IN ('retired', 'abandoned')
+   AND agent.token_hash IS NOT NULL;
+
+-- The rolling-release compatibility table existed only while agents could still report labels
+-- from the pre-friendly-id configuration. Once the fleet has converged, retaining it would make
+-- old IDs a permanent second namespace. Replaying 0001 removes both the table and its data.
+DROP TABLE IF EXISTS model_id_aliases;
+
+-- Development databases predate the explicit subscription checkpoint. Reconstruct it once from
+-- release history, without treating the current head revision as deployed. Only releases whose
+-- target set covers every currently active/retiring machine can establish a global checkpoint; a
+-- successful tenant-scoped release is not proof that the rest of the fleet runs that revision.
+-- A configuration release is always the topology authority. Permissions come from the newest
+-- globally settled automatic grant release or from a fully covering configuration target that
+-- actually replaced/disabled Xray. A grants order contains only machines whose running client
+-- list differed; the succeeded automation job pointing at it is the proof that whole-fleet
+-- planning found no deferred machine. A pending configuration target may have been rebased to a
+-- newer grants revision, which is frozen in desired_structure and therefore wins over
+-- deployments.revision_id.
+WITH topology AS (
+    SELECT d.id AS deployment_id, d.revision_id
+      FROM deployments AS d
+     WHERE d.kind = 'config' AND d.status = 'succeeded'
+       AND NOT EXISTS (
+           SELECT 1
+             FROM node_lifecycle_state AS lifecycle
+            WHERE lifecycle.phase IN ('active', 'retiring')
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM deployment_targets AS covered
+                   WHERE covered.deployment_id = d.id
+                     AND covered.node_id = lifecycle.node_id
+                     AND covered.status IN ('succeeded', 'skipped')
+              )
+       )
+     ORDER BY d.id DESC
+     LIMIT 1
+), permission_candidates AS (
+    SELECT d.id AS deployment_id,
+           CASE
+             WHEN d.kind = 'config' THEN COALESCE(
+                 max(
+                     CASE
+                       WHEN dt.status = 'succeeded'
+                            AND dts.desired_structure->'actions'
+                                ?| array['apply-xray', 'disable-xray']
+                       THEN CASE
+                              WHEN dts.desired_structure->>'grants_revision' ~ '^[0-9]+$'
+                              THEN (dts.desired_structure->>'grants_revision')::bigint
+                              ELSE d.revision_id
+                            END
+                     END
+                 ),
+                 d.revision_id
+             )
+             ELSE d.revision_id
+           END AS revision_id
+      FROM deployments AS d
+      LEFT JOIN deployment_targets AS dt ON dt.deployment_id = d.id
+     LEFT JOIN deployment_target_state AS dts
+        ON dts.deployment_id = dt.deployment_id AND dts.node_id = dt.node_id
+     WHERE d.status = 'succeeded'
+       AND (
+           (
+               d.kind = 'grants'
+               AND EXISTS (
+                   SELECT 1
+                     FROM jobs AS settled_job
+                    WHERE settled_job.kind = 'grants-deployment'
+                      AND settled_job.status = 'succeeded'
+                      AND settled_job.payload->>'deployment_id' ~ '^[0-9]+$'
+                      AND (settled_job.payload->>'deployment_id')::bigint = d.id
+               )
+           )
+           OR (
+               d.kind = 'config'
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM node_lifecycle_state AS lifecycle
+                    WHERE lifecycle.phase IN ('active', 'retiring')
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM deployment_targets AS covered
+                           WHERE covered.deployment_id = d.id
+                             AND covered.node_id = lifecycle.node_id
+                             AND covered.status IN ('succeeded', 'skipped')
+                      )
+               )
+               AND EXISTS (
+                   SELECT 1
+                     FROM deployment_targets AS managed_dt
+                     JOIN deployment_target_state AS managed_dts
+                       ON managed_dts.deployment_id = managed_dt.deployment_id
+                      AND managed_dts.node_id = managed_dt.node_id
+                    WHERE managed_dt.deployment_id = d.id
+                      AND managed_dt.status = 'succeeded'
+                      AND managed_dts.desired_structure->'actions'
+                          ?| array['apply-xray', 'disable-xray']
+               )
+           )
+       )
+     GROUP BY d.id, d.kind, d.revision_id
+), permissions AS (
+    SELECT deployment_id, revision_id
+      FROM permission_candidates
+     ORDER BY deployment_id DESC
+     LIMIT 1
+)
+INSERT INTO subscription_serving_state AS serving (
+    id, topology_revision_id, permissions_revision_id,
+    topology_deployment_id, permissions_deployment_id, generation
+)
+SELECT TRUE,
+       topology.revision_id,
+       COALESCE(permissions.revision_id, topology.revision_id),
+       topology.deployment_id,
+       permissions.deployment_id,
+       1
+  FROM topology
+  LEFT JOIN permissions ON TRUE
+ON CONFLICT (id) DO UPDATE SET
+    topology_revision_id = CASE
+        WHEN EXCLUDED.topology_deployment_id > COALESCE(serving.topology_deployment_id, 0)
+        THEN EXCLUDED.topology_revision_id
+        ELSE serving.topology_revision_id
+    END,
+    topology_deployment_id = CASE
+        WHEN EXCLUDED.topology_deployment_id > COALESCE(serving.topology_deployment_id, 0)
+        THEN EXCLUDED.topology_deployment_id
+        ELSE serving.topology_deployment_id
+    END,
+    permissions_revision_id = CASE
+        WHEN EXCLUDED.permissions_deployment_id > COALESCE(serving.permissions_deployment_id, 0)
+        THEN EXCLUDED.permissions_revision_id
+        ELSE serving.permissions_revision_id
+    END,
+    permissions_deployment_id = CASE
+        WHEN EXCLUDED.permissions_deployment_id > COALESCE(serving.permissions_deployment_id, 0)
+        THEN EXCLUDED.permissions_deployment_id
+        ELSE serving.permissions_deployment_id
+    END,
+    generation = serving.generation + 1,
+    updated_at = now()
+WHERE EXCLUDED.topology_deployment_id > COALESCE(serving.topology_deployment_id, 0)
+   OR EXCLUDED.permissions_deployment_id > COALESCE(serving.permissions_deployment_id, 0);

@@ -9,12 +9,14 @@ license.workspace = true
 [dependencies]
 axum = "0.8.9"
 brocade-deployment = { path = "../brocade-deployment" }
+brocade-probe = { path = "../brocade-probe" }
 brocade-core = { path = "../brocade-core" }
 brocade-store = { path = "../brocade-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["fs"] }
 # ── 证书签发 ─────────────────────────────────────────────────────────────────────
 # 控制面第一次需要主动往外发请求（ACME 和 DNS 提供商），所以第一次有 HTTP 客户端。

@@ -30,7 +30,7 @@
 //! transaction per preview — no problem at the console's concurrency, and not worth trading
 //! correctness for.
 
-use brocade_core::model::ModelSettings;
+use brocade_core::model::{DestMatch, EgressDnsResolution, ModelSettings};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -40,7 +40,7 @@ use crate::console::{
     CreateTenantRequest, CreateUserRequest, PutStepRequest, UpdateNodeRequest,
     UpdateNodeStatusRequest, UpdateUserStatusRequest, UpsertExternalOutboundRequest,
 };
-use crate::{AdminContext, Result};
+use crate::{AdminContext, Result, StoreError};
 
 /// One edit within a draft. Each corresponds to an existing write interface — adding no
 /// semantics, merely turning "which interface with which arguments" into data that can be
@@ -53,11 +53,29 @@ use crate::{AdminContext, Result};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ModelOp {
+    CreateApp {
+        app: CreateAppRequest,
+    },
     UpsertApp {
         app: CreateAppRequest,
     },
+    /// Replace the complete top-level line order. The UI emits one final ordering document after
+    /// a drag, so a draft never has to replay every intermediate pointer crossing.
+    ReorderApps {
+        ids: Vec<String>,
+    },
+    /// Replace the complete chain order within one app. IDs and every usage/probe reference stay
+    /// stable; only app-local positions are rewritten.
+    ReorderChains {
+        app_id: String,
+        ids: Vec<String>,
+    },
     UpsertExternalOutbound {
         outbound: UpsertExternalOutboundRequest,
+    },
+    CreateChain {
+        app_id: String,
+        chain: CreateChainRequest,
     },
     UpsertChain {
         app_id: String,
@@ -66,6 +84,10 @@ pub enum ModelOp {
     UpsertFront {
         app_id: String,
         front: CreateFrontRequest,
+    },
+    CreateIngress {
+        app_id: String,
+        ingress: CreateIngressRequest,
     },
     UpsertIngress {
         app_id: String,
@@ -76,6 +98,19 @@ pub enum ModelOp {
         chain_id: String,
         node_id: String,
         step: PutStepRequest,
+    },
+    /// Set or remove one machine-owned DNS policy. `None` removes the policy; route tables only
+    /// activate its selector and never own this operation.
+    SetNodeEgressDns {
+        node_id: String,
+        selector: DestMatch,
+        resolution: Option<EgressDnsResolution>,
+    },
+    /// Replace the complete machine-wide resolver priority. This changes Xray DNS server order,
+    /// not the top-to-bottom route order of any chain.
+    ReorderNodeEgressDns {
+        node_id: String,
+        selectors: Vec<DestMatch>,
     },
     DeleteStep {
         app_id: String,
@@ -130,18 +165,31 @@ impl ModelOp {
     /// drafts in the UI.
     pub fn describe(&self) -> String {
         match self {
-            ModelOp::UpsertApp { app } => format!("视图 {}", app.id),
-            ModelOp::UpsertExternalOutbound { outbound } => {
-                format!("外部出站 {}/{}", outbound.app_id, outbound.id)
+            ModelOp::CreateApp { app } | ModelOp::UpsertApp { app } => {
+                format!("视图 {}", app.id)
             }
-            ModelOp::UpsertChain { app_id, chain } => format!("链 {app_id}/{}", chain.id),
+            ModelOp::ReorderApps { .. } => "调整线路顺序".to_owned(),
+            ModelOp::ReorderChains { app_id, .. } => format!("调整链顺序 {app_id}"),
+            ModelOp::UpsertExternalOutbound { outbound } => {
+                format!("隧道 {}/{}", outbound.tenant_id, outbound.id)
+            }
+            ModelOp::CreateChain { app_id, chain } | ModelOp::UpsertChain { app_id, chain } => {
+                format!("链 {app_id}/{}", chain.id)
+            }
             ModelOp::UpsertFront { app_id, front } => format!("前置组 {app_id}/{}", front.id),
-            ModelOp::UpsertIngress { app_id, ingress } => {
+            ModelOp::CreateIngress { app_id, ingress }
+            | ModelOp::UpsertIngress { app_id, ingress } => {
                 format!("接入面 {app_id}/{}", ingress.id)
             }
             ModelOp::PutStep {
                 chain_id, node_id, ..
             } => format!("规则 {chain_id}/{node_id}"),
+            ModelOp::SetNodeEgressDns {
+                node_id, selector, ..
+            } => format!("机器 DNS 策略 {node_id}/{}", selector_summary(selector)),
+            ModelOp::ReorderNodeEgressDns { node_id, .. } => {
+                format!("机器 DNS 策略顺序 {node_id}")
+            }
             ModelOp::DeleteStep {
                 chain_id, node_id, ..
             } => {
@@ -217,9 +265,19 @@ async fn apply_op(
 ) -> Result<bool> {
     use crate::console as c;
     Ok(match op {
+        ModelOp::CreateApp { app } => c::create_app_tx(tx, actor, revision_id, app).await?,
         ModelOp::UpsertApp { app } => c::upsert_app_tx(tx, actor, revision_id, app).await?,
+        ModelOp::ReorderApps { ids } => c::reorder_apps_tx(tx, actor, ids).await?,
+        ModelOp::ReorderChains { app_id, ids } => {
+            c::reorder_chains_tx(tx, actor, app_id, ids).await?
+        }
         ModelOp::UpsertExternalOutbound { outbound } => {
             c::upsert_external_outbound_tx(tx, actor, revision_id, outbound).await?
+        }
+        ModelOp::CreateChain { app_id, chain } => {
+            c::create_chain_tx(tx, actor, revision_id, &app_id, chain)
+                .await?
+                .1
         }
         ModelOp::UpsertChain { app_id, chain } => {
             c::upsert_chain_tx(tx, actor, revision_id, &app_id, chain)
@@ -228,6 +286,11 @@ async fn apply_op(
         }
         ModelOp::UpsertFront { app_id, front } => {
             c::upsert_front_tx(tx, actor, revision_id, &app_id, front)
+                .await?
+                .1
+        }
+        ModelOp::CreateIngress { app_id, ingress } => {
+            c::create_ingress_tx(tx, actor, revision_id, &app_id, ingress)
                 .await?
                 .1
         }
@@ -241,10 +304,17 @@ async fn apply_op(
             chain_id,
             node_id,
             step,
+        } => c::put_step_tx(tx, actor, revision_id, &app_id, &chain_id, &node_id, step).await?,
+        ModelOp::SetNodeEgressDns {
+            node_id,
+            selector,
+            resolution,
         } => {
-            c::put_step_tx(tx, actor, revision_id, &app_id, &chain_id, &node_id, step)
+            crate::egress_dns::set_policy_tx(tx, actor, revision_id, &node_id, selector, resolution)
                 .await?
-                .1
+        }
+        ModelOp::ReorderNodeEgressDns { node_id, selectors } => {
+            crate::egress_dns::reorder_policies_tx(tx, actor, &node_id, selectors).await?
         }
         ModelOp::DeleteStep {
             app_id,
@@ -286,7 +356,11 @@ async fn apply_op(
             c::update_node_tx(tx, actor, revision_id, &node_id, node).await?
         }
         ModelOp::UpdateNodeStatus { node_id, status } => {
-            c::update_node_status_tx(tx, actor, &node_id, status).await?
+            let _ = (node_id, status);
+            return Err(StoreError::Unsupported(
+                "node retirement and reactivation are operational actions and cannot be stored in a draft"
+                    .to_owned(),
+            ));
         }
         ModelOp::UpdateSettings { settings } => {
             crate::settings::update_settings_tx(tx, actor, settings)
@@ -294,6 +368,16 @@ async fn apply_op(
                 .1
         }
     })
+}
+
+fn selector_summary(selector: &DestMatch) -> String {
+    match selector {
+        DestMatch::DomainSuffix(values) => format!("domain:{}", values.join(",")),
+        DestMatch::DomainKeyword(values) => format!("keyword:{}", values.join(",")),
+        DestMatch::DomainRegex(value) => format!("regex:{value}"),
+        DestMatch::Geosite(values) => format!("geosite:{}", values.join(",")),
+        _ => "不支持的匹配条件".to_owned(),
+    }
 }
 
 /// Commit a draft: a run of operations completing in one transaction, stamping one revision.
@@ -394,7 +478,7 @@ pub async fn preview_artifact(
         target_id,
         artifact_kind,
         !actor.is_system_admin(),
-        None,
+        Default::default(),
     )
 }
 

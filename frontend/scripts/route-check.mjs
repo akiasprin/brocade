@@ -70,6 +70,11 @@ trip('机器详情', { nav: 'nodes', drill: { p: 'node', id: 'hk-01' } }, '#/nod
 trip('没下钻的面', { nav: 'settings' }, '#/settings');
 trip('不走 wm 的面', { nav: 'topo' }, '#/topo');
 trip('链路详情两段', { nav: 'chains', drill: { p: 'chain', app: 'app-1', chain: 'c-a' } }, '#/chains/chain/app-1/c-a');
+trip(
+  '用户详情由租户和用户名共同定位',
+  { nav: 'users', drill: { p: 'user', tenant: 'acme/apac', id: 'alice' } },
+  '#/users/user/acme%2Fapac/alice',
+);
 
 console.log('\n— 类型要还原 —');
 trip('发布详情的 id 是数字', { nav: 'deploy', drill: { p: 'detail', id: 12 } }, '#/deploy/detail/12');
@@ -98,14 +103,15 @@ trip(
   { nav: 'chains', drill: { p: 'chain', app: 'acme/sub', chain: 'c-a' } },
   '#/chains/chain/acme%2Fsub/c-a',
 );
-
 console.log('\n— 坏地址不许炸出坏状态 —');
 reads('不认识的面', '#/nonsense', null);
+reads('已隐藏的隧道页', '#/tunnels', null);
 reads('空地址', '#/', null);
 reads('什么都没有', '', null);
 reads('不认识的下钻', '#/nodes/bogus', { nav: 'nodes' });
 reads('详情少了 id', '#/deploy/detail', { nav: 'deploy' });
 reads('机器详情少了 id', '#/nodes/node', { nav: 'nodes' });
+reads('用户详情少了用户名', '#/users/user/acme', { nav: 'users' });
 reads('多余的段忽略', '#/nodes/node/hk-01/extra', { nav: 'nodes', drill: { p: 'node', id: 'hk-01' } });
 
 console.log('\n— 缺字段的 loc 退回面的根 —');

@@ -1,6 +1,7 @@
 use crate::artifacts::subscription::{
     Subscription, SubscriptionEntry, SubscriptionSecurity, SubscriptionStream,
 };
+use crate::model::{XhttpXmux, XhttpXmuxRange};
 
 pub fn subscription(subscription: &Subscription) -> String {
     let mut lines = Vec::new();
@@ -34,20 +35,20 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
     // `type` names the network layer, and it is the field a client uses to decide how to dial.
     // XHTTP additionally needs the path: the server matches it and refuses anything else, so a
     // URI missing it imports cleanly and never connects.
-    let (kind, path, host, download, mux, mode) = match &entry.stream {
+    let (kind, path, host, download, xmux, mode) = match &entry.stream {
         SubscriptionStream::Tcp => ("tcp", None, None, None, None, None),
         SubscriptionStream::Xhttp {
             path,
             host,
             download,
-            mux,
+            xmux,
             mode,
         } => (
             "xhttp",
             Some(path.as_str()),
             host.as_deref(),
             download.as_ref(),
-            *mux,
+            xmux.as_ref(),
             *mode,
         ),
     };
@@ -95,11 +96,8 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
     // (`parseXHTTPExtra`, `common/convert/v.go`).
     if let Some(path) = path {
         let mut extra = serde_json::Map::new();
-        if let Some(concurrency) = mux {
-            extra.insert(
-                "xmux".to_owned(),
-                serde_json::json!({ "maxConcurrency": concurrency }),
-            );
+        if let Some(xmux) = xmux {
+            extra.insert("xmux".to_owned(), xmux_json(xmux));
         }
         if let Some(download) = download {
             let mut down_xhttp = serde_json::json!({
@@ -107,7 +105,7 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
                 "path": path,
             });
             if let Some(concurrency) = download.mux {
-                down_xhttp["xmux"] = serde_json::json!({ "maxConcurrency": concurrency });
+                down_xhttp["xmux"] = xmux_json(&XhttpXmux::with_concurrency(concurrency));
             }
             let tls_settings = serde_json::json!({
                 "serverName": download.server_name,
@@ -150,6 +148,22 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
         query,
         pct_encode(&entry.name)
     )
+}
+
+fn xmux_json(xmux: &XhttpXmux) -> serde_json::Value {
+    serde_json::json!({
+        "maxConcurrency": xmux.max_concurrency,
+        "hMaxRequestTimes": xray_range(&xmux.h_max_request_times),
+        "hMaxReusableSecs": xray_range(&xmux.h_max_reusable_secs),
+    })
+}
+
+fn xray_range(range: &XhttpXmuxRange) -> serde_json::Value {
+    if range.from == range.to {
+        serde_json::json!(range.from)
+    } else {
+        serde_json::json!(format!("{}-{}", range.from, range.to))
+    }
 }
 
 fn hysteria2_uri(

@@ -4,6 +4,7 @@ members = [
     "crates/brocade-core",
     "crates/brocade-deployment",
     "crates/brocade-agent",
+    "crates/brocade-probe",
     "crates/brocade-preview",
     "crates/brocade-store",
 ]

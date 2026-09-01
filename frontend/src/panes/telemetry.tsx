@@ -7,7 +7,7 @@
  * 时间统一使用 unix 秒（服务端两侧共用同一组结构体，见 api.ts 的说明），因此传给
  * `Ago` 之前需要转换为 ISO —— `iso()` 即用于该转换。
  */
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { memo, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import * as echarts from 'echarts/core';
 import { LineChart } from 'echarts/charts';
 import { GridComponent, TooltipComponent } from 'echarts/components';
@@ -17,7 +17,16 @@ import { Ago } from '../ui/bits';
 import { useNow } from '../ui/clock';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
-import type { HopLinkView, LoadSample, NodeLoadView, ProcessSample } from '../api';
+import type {
+  CpuDetailSample,
+  DiskDetailSample,
+  HopLinkView,
+  LoadSample,
+  MemoryDetailSample,
+  NetworkDetailSample,
+  NodeLoadView,
+  ProcessSample,
+} from '../api';
 
 // 与 nodes.tsx 的 FleetNetChart 共用同一套注册；echarts.use 对重复注册幂等，
 // 但本模块独立使用 echarts，需要自己声明所依赖的组件。
@@ -79,14 +88,17 @@ type Finding = {
   /** 只在详情页显示，不进入列表。部分条目是说明而非问题（如「该版本 agent 不上报」），
       进入列表会将正常机器显示为异常。 */
   detailOnly?: boolean;
+  /** 这条判定归属的可展开指标。KPI 与页签角标必须消费同一条 finding，不能各自再算一遍。 */
+  section?: 'cpu' | 'memory' | 'disk';
 };
 
 /* ── LOAD 趋势图 ─────────────────────────────────────────────
- * 24 个窗口直接来自现有 node-load 接口。横轴固定为最近 12 分钟；样本不足时右对齐，
+ * 60 个窗口直接来自现有 node-load 接口。横轴固定为最近 30 分钟；样本不足时右对齐，
  * `has_gap` 时切断路径，不把机器重启前后的两个值连成一条不存在的趋势。
  */
 
-const LOAD_SLOTS = 24;
+/** 节点详情保留 60 个 30 秒窗口：完整覆盖最近 30 分钟。 */
+const LOAD_SLOTS = 60;
 const PLOT_W = 100;
 const PLOT_H = 48;
 const PLOT_TOP = 4;
@@ -198,9 +210,13 @@ const CPU_PEAK_WARN = 85;
 /** 软中断单独设置阈值。达到该值表示网卡中断已占用约半个核，
     继续上升会出现丢包，而丢包在业务上表现为间歇性无法连接。 */
 const SOFTIRQ_WARN = 30;
+const CPU_PSI_WARN = 1;
+const CPU_STEAL_WARN = 5;
+const IO_PSI_WARN = 1;
 /** 可用内存低于该比例。使用 available 而非 free——free 在有 page cache 的机器上
     始终很小，按其判定会将所有正常机器报为内存不足。 */
 const MEM_AVAIL_WARN = 0.12;
+const MEM_PSI_WARN = 1;
 /** 磁盘。两档：warn 表示需要清理，bad 表示即将开始丢失用量记录。 */
 const DISK_FREE_WARN = 0.1;
 const DISK_FREE_BAD = 0.05;
@@ -228,6 +244,48 @@ const below = (v: [number, number], min: [number, number]) => v[0] < min[0] || (
     它们都维护瓶颈带宽估计，可通过 `tcp_bbr_info` 读取，因此不应报为未启用 BBR。 */
 const isBbr = (algo: string) => algo.startsWith('bbr');
 
+type SampleMaximum = { sample: LoadSample; value: number };
+
+/** 返回有效窗口中的最大值及其发生窗口。只返回数字会导致详情只能展示最新窗口，
+ * 页签角标却按历史最大值计数，最终出现“有 1 个问题但找不到是什么”的断裂。 */
+function sampleMaximum(series: LoadSample[], valueOf: (sample: LoadSample) => number): SampleMaximum | null {
+  let maximum: SampleMaximum | null = null;
+  for (const sample of series) {
+    if (sample.has_gap) continue;
+    const value = valueOf(sample);
+    if (!maximum || value > maximum.value) maximum = { sample, value };
+  }
+  return maximum;
+}
+
+/** 后端默认返回 24 个窗口，但刚纳管或存在保留边界时可能不足 24 个；显示真实跨度，
+ * 不把不足 12 分钟的数据硬写成“近 12 分钟”。 */
+function findingWindow(series: LoadSample[]): string {
+  const first = series[0];
+  const last = series[series.length - 1];
+  return `近 ${dur(Math.max(1, last.window_end_unix_secs - first.window_start_unix_secs))}`;
+}
+
+/** 历史窗口触发、最新窗口已经恢复时，字段本身已无法解释页签角标，必须留下可见说明。 */
+function rollingFinding(
+  finding: Omit<Finding, 'chipOnly' | 'text'>,
+  maximum: SampleMaximum,
+  latest: LoadSample,
+  window: string,
+): Finding {
+  const historical = maximum.sample.window_end_unix_secs < latest.window_end_unix_secs;
+  return {
+    ...finding,
+    chipOnly: !historical,
+    text: historical ? (
+      <>
+        {window}内 <b>{finding.chip}</b>，<Ago at={iso(maximum.sample.window_end_unix_secs)} />
+        达到阈值；{sampleWindow(latest)}已恢复。
+      </>
+    ) : null,
+  };
+}
+
 /** 该机器是否运行 xray。
  *
  * 判定中使用该条件排除一类误报：**BBR 只作用于本机终结重传的 TCP**，
@@ -246,25 +304,79 @@ export function loadFindings(r: NodeLoadView): Finding[] {
   if (r.series.length === 0) return out;
 
   const last = r.series[r.series.length - 1];
+  const window = findingWindow(r.series);
 
   // CPU。峰值和 softirq 分为两条，因为二者对应不同的处理方式。
-  const peak = Math.max(...r.series.map(s => s.cpu_peak_pct));
-  if (peak >= CPU_PEAK_WARN) {
-    out.push({
-      tone: 'warn',
-      chip: `CPU 峰值 ${pct(peak)}`,
-      chipOnly: true,
-      text: null,
-    });
+  const peak = sampleMaximum(r.series, sample => sample.cpu_peak_pct);
+  if (peak && peak.value >= CPU_PEAK_WARN) {
+    out.push(
+      rollingFinding(
+        {
+          tone: 'warn',
+          chip: `CPU 峰值 ${pct(peak.value)}`,
+          section: 'cpu',
+        },
+        peak,
+        last,
+        window,
+      ),
+    );
   }
-  const softirq = Math.max(...r.series.map(s => s.cpu_softirq_pct));
-  if (softirq >= SOFTIRQ_WARN) {
-    out.push({
-      tone: 'warn',
-      chip: `软中断 ${pct(softirq)}`,
-      chipOnly: true,
-      text: null,
-    });
+  const softirq = sampleMaximum(r.series, sample => sample.cpu_softirq_pct);
+  if (softirq && softirq.value >= SOFTIRQ_WARN) {
+    out.push(
+      rollingFinding(
+        {
+          tone: 'warn',
+          chip: `软中断 ${pct(softirq.value)}`,
+          section: 'cpu',
+        },
+        softirq,
+        last,
+        window,
+      ),
+    );
+  }
+  const steal = sampleMaximum(r.series, sample => sample.cpu_steal_pct);
+  if (steal && steal.value >= CPU_STEAL_WARN) {
+    out.push(
+      rollingFinding(
+        {
+          tone: steal.value >= 15 ? 'bad' : 'warn',
+          chip: `宿主争抢 ${pct(steal.value, 1)}`,
+          section: 'cpu',
+        },
+        steal,
+        last,
+        window,
+      ),
+    );
+  }
+  const cpuPsi = sampleMaximum(r.series, sample => sample.cpu_detail?.pressure_some_pct ?? 0);
+  if (cpuPsi && cpuPsi.value >= CPU_PSI_WARN) {
+    out.push(
+      rollingFinding(
+        {
+          tone: cpuPsi.value >= 10 ? 'bad' : 'warn',
+          chip: `CPU 等待 ${pct(cpuPsi.value, 1)}`,
+          section: 'cpu',
+        },
+        cpuPsi,
+        last,
+        window,
+      ),
+    );
+  }
+  const ioFull = sampleMaximum(r.series, sample => sample.cpu_detail?.io_pressure_full_pct ?? 0);
+  const ioSome = sampleMaximum(r.series, sample => sample.cpu_detail?.io_pressure_some_pct ?? 0);
+  if (ioFull && ioFull.value >= IO_PSI_WARN) {
+    out.push(
+      rollingFinding({ tone: 'bad', chip: `I/O 抖动 ${pct(ioFull.value, 1)}`, section: 'cpu' }, ioFull, last, window),
+    );
+  } else if (ioSome && ioSome.value >= IO_PSI_WARN) {
+    out.push(
+      rollingFinding({ tone: 'warn', chip: `I/O 等待 ${pct(ioSome.value, 1)}`, section: 'cpu' }, ioSome, last, window),
+    );
   }
 
   // 内存。OOM 是已发生的事实，单独一条且级别为 bad——它表示已有进程被终止。
@@ -292,7 +404,33 @@ export function loadFindings(r: NodeLoadView): Finding[] {
       chip: `内存剩 ${pct(availRatio * 100)}`,
       chipOnly: true,
       text: null,
+      section: 'memory',
     });
+  }
+  const memFull = sampleMaximum(r.series, sample => sample.memory_detail?.pressure_full_pct ?? 0);
+  const memSome = sampleMaximum(r.series, sample => sample.memory_detail?.pressure_some_pct ?? 0);
+  if (memFull && memFull.value >= MEM_PSI_WARN) {
+    out.push(
+      rollingFinding(
+        { tone: 'bad', chip: `内存抖动 ${pct(memFull.value, 1)}`, section: 'memory' },
+        memFull,
+        last,
+        window,
+      ),
+    );
+  } else if (memSome && memSome.value >= MEM_PSI_WARN) {
+    out.push(
+      rollingFinding(
+        { tone: 'warn', chip: `内存等待 ${pct(memSome.value, 1)}`, section: 'memory' },
+        memSome,
+        last,
+        window,
+      ),
+    );
+  }
+  const swapOut = r.series.reduce((sum, sample) => sum + (sample.memory_detail?.swap_out_bytes ?? 0), 0);
+  if (swapOut > 0) {
+    out.push({ tone: 'warn', chip: `换出 ${bytes(swapOut)}`, chipOnly: true, text: null });
   }
 
   // 磁盘。说明需要写到丢失用量记录这一步——只写「磁盘使用率 94%」不会促成处理。
@@ -306,6 +444,7 @@ export function loadFindings(r: NodeLoadView): Finding[] {
       // 保留该行，因为它不属于通用知识：查看数据的人无从知道 spool 位于 state_dir 所在分区，
       // 也无从将磁盘写满与该机器本月没有流量记录关联起来。
       text: <>spool 在这个分区上，写不下就丢账。</>,
+      section: 'disk',
     });
   }
 
@@ -440,7 +579,7 @@ export function ThroughputChart({
   txName,
   group,
 }: {
-  /** 24 个 30 秒窗口的速率（bps），下标 23 为最近；null 表示缺口，断开不连。 */
+  /** 60 个 30 秒窗口的速率（bps），下标 59 为最近；null 表示缺口，断开不连。 */
   rx: (number | null)[];
   tx: (number | null)[];
   rxName: string;
@@ -496,7 +635,16 @@ export function ThroughputChart({
       1,
     );
     const max = peak * 1.12;
-    const slot = (i: number) => (i === LOAD_SLOTS - 1 ? '现在' : `−${Math.round(((LOAD_SLOTS - 1 - i) * 30) / 60)}m`);
+    const slots = Math.max(rx.length, tx.length, 1);
+    const slot = (i: number) => {
+      if (i === slots - 1) return '现在';
+      const minutes = ((slots - 1 - i) * 30) / 60;
+      return minutes >= 60
+        ? `−${Number((minutes / 60).toFixed(minutes % 60 === 0 ? 0 : 1))}h`
+        : `−${Math.round(minutes)}m`;
+    };
+    const tick = (index: number) =>
+      index === 0 || index === slots - 1 || [1, 2, 3].some(part => index === Math.round(((slots - 1) * part) / 4));
 
     const mk = (name: string, data: (number | null)[], color: string, area: boolean) => ({
       name,
@@ -538,7 +686,7 @@ export function ThroughputChart({
         },
         xAxis: {
           type: 'category',
-          data: Array.from({ length: LOAD_SLOTS }, (_, i) => String(i)),
+          data: Array.from({ length: slots }, (_, i) => String(i)),
           boundaryGap: false,
           axisLine: { lineStyle: { color: line } },
           axisTick: { show: false },
@@ -546,7 +694,7 @@ export function ThroughputChart({
           axisLabel: {
             color: ink4,
             fontSize: 8,
-            interval: (i: number) => i === 0 || i === 8 || i === 16 || i === LOAD_SLOTS - 1,
+            interval: (i: number) => tick(i),
             formatter: (_v: string, i: number) => slot(i),
           },
         },
@@ -570,6 +718,829 @@ export function ThroughputChart({
 
   return <div ref={elRef} className="ndtp-ec" />;
 }
+
+type HistoryLine = {
+  name: string;
+  values: (number | null)[];
+};
+
+/** 原始时序曲线。这里不放阈值、状态词或自动结论，只负责把服务端保留的窗口逐点画出。
+ * null 与 has_gap 都断线，不用 0 填补；tooltip 显示窗口结束的绝对时间和原始数值。 */
+function HistoryChart({
+  title,
+  samples,
+  lines,
+  formatValue,
+  group,
+  legend = true,
+}: {
+  title: string;
+  samples: LoadSample[];
+  lines: HistoryLine[];
+  formatValue: (value: number) => string;
+  group: string;
+  legend?: boolean;
+}) {
+  const elRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
+  const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
+  const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
+  const lastSig = useRef<string | null>(null);
+
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const chart = echarts.init(el, null, { renderer: 'canvas' });
+    chart.group = group;
+    chartRef.current = chart;
+    const ro = new ResizeObserver(() => chart.resize());
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      chart.dispose();
+      chartRef.current = null;
+    };
+  }, [group]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const times = samples.map(sample => sample.window_end_unix_secs);
+    const sig = JSON.stringify([times, lines, title, themeName, paletteKey]);
+    if (sig === lastSig.current) return;
+    lastSig.current = sig;
+    const css = getComputedStyle(document.documentElement);
+    const cv = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
+    const colors = [
+      cv('--data', '#3976d8'),
+      cv('--data-secondary', '#62a4be'),
+      cv('--action', '#775ad8'),
+      cv('--gold', '#ae7a16'),
+      cv('--err', '#bd4b4b'),
+      cv('--ok', '#3c8b6b'),
+      cv('--ink-3', '#707780'),
+      '#a56a9a',
+    ];
+    const ink = cv('--ink', '#20242a');
+    const ink3 = cv('--ink-3', '#707780');
+    const ink4 = cv('--ink-4', '#9298a1');
+    const line = cv('--line', '#d9dde3');
+    const lineSoft = cv('--line-soft', '#edf0f3');
+    const glass = cv('--glass-strong', '#fff');
+    const labelAt = (index: number) => {
+      const at = times[index];
+      if (at === undefined) return '';
+      return new Date(at * 1000).toLocaleTimeString('zh-CN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      });
+    };
+    chart.setOption(
+      {
+        animation: false,
+        color: colors,
+        grid: { left: 58, right: 14, top: legend ? 36 : 14, bottom: 24 },
+        textStyle: { fontFamily: TP_MONO },
+        legend: legend
+          ? {
+              top: 5,
+              left: 8,
+              right: 8,
+              itemWidth: 10,
+              itemHeight: 3,
+              textStyle: { color: ink3, fontSize: 9, fontFamily: TP_MONO },
+            }
+          : { show: false },
+        tooltip: {
+          trigger: 'axis',
+          confine: true,
+          backgroundColor: glass,
+          borderColor: line,
+          borderWidth: 1,
+          padding: [7, 9],
+          textStyle: { color: ink3, fontSize: 11, fontFamily: TP_MONO },
+          axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' } },
+          formatter: (params: unknown) => {
+            const rows = params as { seriesName: string; color: string; value: number | null; dataIndex: number }[];
+            const body = rows
+              .map(row => {
+                const value = row.value === null ? '—' : formatValue(Number(row.value));
+                return (
+                  `<div style="display:flex;gap:8px;align-items:center;line-height:1.7">` +
+                  `<span style="width:8px;height:3px;background:${row.color}"></span>` +
+                  `<span>${row.seriesName}</span><b style="margin-left:auto;color:${ink}">${value}</b></div>`
+                );
+              })
+              .join('');
+            return `<div style="color:${ink4};font-size:9px;margin-bottom:3px">${labelAt(rows[0]?.dataIndex ?? 0)}</div>${body}`;
+          },
+        },
+        xAxis: {
+          type: 'category',
+          data: times.map(String),
+          boundaryGap: false,
+          axisLine: { lineStyle: { color: line } },
+          axisTick: { show: false },
+          axisLabel: {
+            color: ink4,
+            fontSize: 8,
+            interval: (index: number) =>
+              index === 0 ||
+              index === times.length - 1 ||
+              [1, 2, 3].some(part => index === Math.round(((times.length - 1) * part) / 4)),
+            formatter: (_value: string, index: number) => labelAt(index).slice(0, 5),
+          },
+        },
+        yAxis: {
+          type: 'value',
+          min: 0,
+          scale: true,
+          axisLine: { show: false },
+          axisTick: { show: false },
+          axisLabel: { color: ink4, fontSize: 8, formatter: (value: number) => formatValue(value) },
+          splitLine: { lineStyle: { color: lineSoft } },
+        },
+        series: lines.map((series, index) => ({
+          name: series.name,
+          type: 'line' as const,
+          showSymbol: false,
+          smooth: false,
+          connectNulls: false,
+          lineStyle: { color: colors[index % colors.length], width: index === 0 ? 1.8 : 1.25 },
+          emphasis: { focus: 'series' as const },
+          data: series.values,
+        })),
+      },
+      true,
+    );
+    echarts.connect(group);
+  }, [formatValue, group, legend, lines, paletteKey, samples, themeName, title]);
+
+  return (
+    <section className="history-chart-card">
+      <header>{title}</header>
+      <div ref={elRef} className="history-chart" />
+    </section>
+  );
+}
+
+const historyValues = (samples: LoadSample[], read: (sample: LoadSample) => number | null): (number | null)[] =>
+  samples.map(sample => (sample.has_gap ? null : read(sample)));
+
+const CpuHistory = memo(function CpuHistory({
+  report,
+  label,
+  windows,
+}: {
+  report: NodeLoadView;
+  label: string;
+  windows: number;
+}) {
+  const samples = report.series.slice(-windows);
+  const group = `nd-cpu-history-${report.node_id}`;
+  const detail = (sample: LoadSample, read: (value: CpuDetailSample) => number | null) =>
+    sample.cpu_detail ? read(sample.cpu_detail) : null;
+  const coreIds = Array.from(
+    new Set(samples.flatMap(sample => sample.cpu_detail?.cores.map(core => core.cpu) ?? [])),
+  ).sort((a, b) => a - b);
+  const coreLines = coreIds.map(cpu => ({
+    name: `CPU ${cpu}`,
+    values: historyValues(samples, sample => {
+      const core = sample.cpu_detail?.cores.find(value => value.cpu === cpu);
+      return core ? core.user_pct + core.system_pct + core.softirq_pct : null;
+    }),
+  }));
+  return (
+    <section className="observe-history" aria-label={`CPU ${label} 数值`}>
+      <header className="observe-history-head">
+        <span>
+          <b>CPU · {label}</b>
+          <small>
+            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个 30 秒窗口 · 缺口断线 ·
+            悬停查看绝对时间与原始值
+          </small>
+        </span>
+      </header>
+      <div className="history-grid">
+        <HistoryChart
+          title="CPU 时间占比"
+          samples={samples}
+          group={group}
+          formatValue={value => pct(value, 1)}
+          lines={[
+            { name: '用户态', values: historyValues(samples, sample => sample.cpu_user_pct) },
+            { name: '内核态', values: historyValues(samples, sample => sample.cpu_sys_pct) },
+            { name: 'SoftIRQ', values: historyValues(samples, sample => sample.cpu_softirq_pct) },
+            { name: 'IOwait', values: historyValues(samples, sample => detail(sample, value => value.iowait_pct)) },
+            { name: 'Steal', values: historyValues(samples, sample => sample.cpu_steal_pct) },
+            { name: '窗口峰值', values: historyValues(samples, sample => sample.cpu_peak_pct) },
+          ]}
+        />
+        <HistoryChart
+          title="CPU 与 I/O 压力"
+          samples={samples}
+          group={group}
+          formatValue={value => pct(value, 2)}
+          lines={[
+            {
+              name: 'CPU PSI some',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
+            },
+            {
+              name: 'I/O PSI some',
+              values: historyValues(samples, sample => detail(sample, value => value.io_pressure_some_pct)),
+            },
+            {
+              name: 'I/O PSI full',
+              values: historyValues(samples, sample => detail(sample, value => value.io_pressure_full_pct)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="负载与运行队列"
+          samples={samples}
+          group={group}
+          formatValue={value => value.toFixed(2)}
+          lines={[
+            { name: 'Load 1m', values: historyValues(samples, sample => sample.load1) },
+            { name: 'Load 5m', values: historyValues(samples, sample => detail(sample, value => value.load5)) },
+            { name: 'Load 15m', values: historyValues(samples, sample => detail(sample, value => value.load15)) },
+            {
+              name: '运行进程',
+              values: historyValues(samples, sample => detail(sample, value => value.procs_running)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="调度与网络事件速率"
+          samples={samples}
+          group={group}
+          formatValue={value => `${compact(value)} /s`}
+          lines={[
+            {
+              name: '上下文切换',
+              values: historyValues(samples, sample => detail(sample, value => value.context_switches_per_sec)),
+            },
+            {
+              name: 'NET_RX SoftIRQ',
+              values: historyValues(samples, sample => detail(sample, value => value.net_rx_softirqs_per_sec)),
+            },
+            {
+              name: 'NET_TX SoftIRQ',
+              values: historyValues(samples, sample => detail(sample, value => value.net_tx_softirqs_per_sec)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="Cgroup 限流时间"
+          samples={samples}
+          group={group}
+          formatValue={value => `${value.toFixed(2)} ms`}
+          lines={[
+            {
+              name: '每窗口 throttled',
+              values: historyValues(samples, sample =>
+                detail(sample, value => (value.throttled_usec === null ? null : value.throttled_usec / 1000)),
+              ),
+            },
+          ]}
+        />
+        {coreLines.length > 0 && (
+          <HistoryChart
+            title={`逐核繁忙度 · ${coreLines.length} 核`}
+            samples={samples}
+            group={group}
+            formatValue={value => pct(value, 1)}
+            lines={coreLines}
+            legend={coreLines.length <= 16}
+          />
+        )}
+      </div>
+    </section>
+  );
+});
+
+const MemoryHistory = memo(function MemoryHistory({
+  report,
+  label,
+  windows,
+}: {
+  report: NodeLoadView;
+  label: string;
+  windows: number;
+}) {
+  const samples = report.series.slice(-windows);
+  const group = `nd-memory-history-${report.node_id}`;
+  const detail = (sample: LoadSample, read: (value: MemoryDetailSample) => number | null) =>
+    sample.memory_detail ? read(sample.memory_detail) : null;
+  return (
+    <section className="observe-history" aria-label={`内存 ${label} 数值`}>
+      <header className="observe-history-head">
+        <span>
+          <b>MEMORY · {label}</b>
+          <small>
+            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个窗口 ·
+            容量均为字节；交换、回收与缺页均为每个 30 秒窗口的增量
+          </small>
+        </span>
+      </header>
+      <div className="history-grid">
+        <HistoryChart
+          title="容量构成"
+          samples={samples}
+          group={group}
+          formatValue={bytes}
+          lines={[
+            { name: '可用', values: historyValues(samples, sample => sample.mem_available_bytes) },
+            {
+              name: '窗口最低可用',
+              values: historyValues(samples, sample => detail(sample, value => value.available_min_bytes)),
+            },
+            { name: '匿名页', values: historyValues(samples, sample => detail(sample, value => value.anon_bytes)) },
+            {
+              name: '文件缓存',
+              values: historyValues(samples, sample => detail(sample, value => value.file_cache_bytes)),
+            },
+            {
+              name: '共享/tmpfs',
+              values: historyValues(samples, sample => detail(sample, value => value.shmem_bytes)),
+            },
+            {
+              name: '内核/其他',
+              values: historyValues(samples, sample => detail(sample, value => value.kernel_other_bytes)),
+            },
+            { name: '空闲', values: historyValues(samples, sample => detail(sample, value => value.free_bytes)) },
+          ]}
+        />
+        <HistoryChart
+          title="内核缓存与固定页"
+          samples={samples}
+          group={group}
+          formatValue={bytes}
+          lines={[
+            { name: 'Buffers', values: historyValues(samples, sample => detail(sample, value => value.buffers_bytes)) },
+            {
+              name: 'KReclaimable',
+              values: historyValues(samples, sample => detail(sample, value => value.kernel_reclaimable_bytes)),
+            },
+            {
+              name: 'SUnreclaim',
+              values: historyValues(samples, sample => detail(sample, value => value.slab_unreclaimable_bytes)),
+            },
+            {
+              name: 'Unevictable',
+              values: historyValues(samples, sample => detail(sample, value => value.unevictable_bytes)),
+            },
+            { name: 'Mlocked', values: historyValues(samples, sample => detail(sample, value => value.mlocked_bytes)) },
+            {
+              name: 'GUP pinned',
+              values: historyValues(samples, sample => detail(sample, value => value.gup_pinned_bytes)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="Swap、脏页与回写"
+          samples={samples}
+          group={group}
+          formatValue={bytes}
+          lines={[
+            { name: 'Swap 已用', values: historyValues(samples, sample => sample.swap_used_bytes) },
+            {
+              name: 'Swap cache',
+              values: historyValues(samples, sample => detail(sample, value => value.swap_cached_bytes)),
+            },
+            { name: 'Zswap', values: historyValues(samples, sample => detail(sample, value => value.zswap_bytes)) },
+            {
+              name: 'Zswapped',
+              values: historyValues(samples, sample => detail(sample, value => value.zswapped_bytes)),
+            },
+            { name: 'Dirty', values: historyValues(samples, sample => detail(sample, value => value.dirty_bytes)) },
+            {
+              name: 'Writeback',
+              values: historyValues(samples, sample => detail(sample, value => value.writeback_bytes)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="内存压力"
+          samples={samples}
+          group={group}
+          formatValue={value => pct(value, 2)}
+          lines={[
+            {
+              name: 'Memory PSI some',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
+            },
+            {
+              name: 'Memory PSI full',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_full_pct)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="Swap I/O"
+          samples={samples}
+          group={group}
+          formatValue={bytes}
+          lines={[
+            { name: '换入', values: historyValues(samples, sample => detail(sample, value => value.swap_in_bytes)) },
+            { name: '换出', values: historyValues(samples, sample => detail(sample, value => value.swap_out_bytes)) },
+          ]}
+        />
+        <HistoryChart
+          title="缺页与直接回收"
+          samples={samples}
+          group={group}
+          formatValue={value => compact(value)}
+          lines={[
+            {
+              name: 'Major faults',
+              values: historyValues(samples, sample => detail(sample, value => value.major_faults)),
+            },
+            {
+              name: 'Direct reclaim pages',
+              values: historyValues(samples, sample => detail(sample, value => value.direct_reclaim_pages)),
+            },
+          ]}
+        />
+      </div>
+    </section>
+  );
+});
+
+const DiskHistory = memo(function DiskHistory({
+  report,
+  label,
+  windows,
+}: {
+  report: NodeLoadView;
+  label: string;
+  windows: number;
+}) {
+  const samples = report.series.slice(-windows);
+  const host = report.host;
+  const group = `nd-disk-history-${report.node_id}`;
+  const detail = (sample: LoadSample, read: (value: DiskDetailSample) => number | null) =>
+    sample.disk_detail ? read(sample.disk_detail) : null;
+  const total = (sample: LoadSample) => sample.disk_detail?.total_bytes ?? host?.disk_total_bytes ?? 0;
+  const identity = [host?.disk_device, host?.disk_filesystem, host?.disk_mount].filter(Boolean).join(' · ');
+  return (
+    <section className="observe-history" aria-label={`磁盘 ${label} 数值`}>
+      <header className="observe-history-head">
+        <span>
+          <b>DISK · {label}</b>
+          <small>
+            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个窗口
+            {identity && ` · ${identity}`}
+            {host?.disk_read_only === true && ' · 只读'}
+          </small>
+        </span>
+      </header>
+      <div className="history-grid">
+        <HistoryChart
+          title="容量"
+          samples={samples}
+          group={group}
+          formatValue={bytes}
+          lines={[
+            {
+              name: '已用',
+              values: historyValues(samples, sample => {
+                const capacity = total(sample);
+                return capacity > 0 ? capacity - sample.disk_free_bytes : null;
+              }),
+            },
+            { name: '可用', values: historyValues(samples, sample => sample.disk_free_bytes) },
+          ]}
+        />
+        <HistoryChart
+          title="容量与 inode"
+          samples={samples}
+          group={group}
+          formatValue={value => pct(value, 2)}
+          lines={[
+            {
+              name: '容量占用',
+              values: historyValues(samples, sample => {
+                const capacity = total(sample);
+                return capacity > 0 ? (1 - sample.disk_free_bytes / capacity) * 100 : null;
+              }),
+            },
+            {
+              name: 'inode 占用',
+              values: historyValues(samples, sample => 100 - sample.disk_inode_free_pct),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="inode"
+          samples={samples}
+          group={group}
+          formatValue={value => Math.round(value).toLocaleString()}
+          lines={[
+            {
+              name: '已用',
+              values: historyValues(samples, sample => {
+                const total = sample.disk_detail?.inode_total;
+                const free = sample.disk_detail?.inode_free;
+                return total != null && free != null ? Math.max(0, total - free) : null;
+              }),
+            },
+            {
+              name: '可用',
+              values: historyValues(samples, sample => sample.disk_detail?.inode_free ?? null),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="块设备吞吐"
+          samples={samples}
+          group={group}
+          formatValue={value => `${bytes(value)}/s`}
+          lines={[
+            { name: '读取', values: historyValues(samples, sample => detail(sample, value => value.read_bps)) },
+            { name: '写入', values: historyValues(samples, sample => detail(sample, value => value.write_bps)) },
+          ]}
+        />
+        <HistoryChart
+          title="块设备 IOPS"
+          samples={samples}
+          group={group}
+          formatValue={value => `${value.toFixed(2)} /s`}
+          lines={[
+            { name: '读取', values: historyValues(samples, sample => detail(sample, value => value.read_iops)) },
+            { name: '写入', values: historyValues(samples, sample => detail(sample, value => value.write_iops)) },
+          ]}
+        />
+        <HistoryChart
+          title="完成延迟"
+          samples={samples}
+          group={group}
+          formatValue={value => `${value.toFixed(2)} ms`}
+          lines={[
+            {
+              name: '读取 await',
+              values: historyValues(samples, sample => detail(sample, value => value.read_await_ms)),
+            },
+            {
+              name: '写入 await',
+              values: historyValues(samples, sample => detail(sample, value => value.write_await_ms)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="设备繁忙与 I/O 压力"
+          samples={samples}
+          group={group}
+          formatValue={value => pct(value, 2)}
+          lines={[
+            { name: '设备繁忙', values: historyValues(samples, sample => detail(sample, value => value.busy_pct)) },
+            {
+              name: 'I/O PSI some',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
+            },
+            {
+              name: 'I/O PSI full',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_full_pct)),
+            },
+          ]}
+        />
+        <HistoryChart
+          title="队列"
+          samples={samples}
+          group={group}
+          formatValue={value => value.toFixed(2)}
+          lines={[
+            {
+              name: '平均队列深度',
+              values: historyValues(samples, sample => detail(sample, value => value.queue_depth)),
+            },
+            {
+              name: '窗口末 in-flight',
+              values: historyValues(samples, sample => detail(sample, value => value.in_flight)),
+            },
+          ]}
+        />
+      </div>
+    </section>
+  );
+});
+
+const NetworkHistory = memo(function NetworkHistory({
+  report,
+  label,
+  windows,
+}: {
+  report: NodeLoadView;
+  label: string;
+  windows: number;
+}) {
+  const samples = report.series.slice(-windows);
+  const group = `nd-network-history-${report.node_id}`;
+  const detail = (sample: LoadSample, read: (value: NetworkDetailSample) => number | null | undefined) =>
+    sample.network_detail ? (read(sample.network_detail) ?? null) : null;
+  const hasDeep = samples.some(sample => sample.network_detail);
+  const pressure = (sample: LoadSample, read: (value: NetworkDetailSample) => number | null | undefined) => {
+    const value = sample.network_detail;
+    const capacity = value?.ephemeral_port_capacity;
+    if (!value || typeof capacity !== 'number' || capacity <= 0) return null;
+    const occupied = read(value);
+    return typeof occupied === 'number' ? (occupied / capacity) * 100 : null;
+  };
+  const range =
+    report.host?.ephemeral_port_low != null && report.host.ephemeral_port_high != null
+      ? `${report.host.ephemeral_port_low}–${report.host.ephemeral_port_high}`
+      : null;
+  return (
+    <section className="observe-history" aria-label={`网络 ${label} 数值`}>
+      <header className="observe-history-head">
+        <span>
+          <b>NETWORK · {label}</b>
+          <small>
+            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个窗口 ·
+            连接数为窗口末快照；建立、重传、溢出与错误为每个 30 秒窗口的增量
+            {range && ` · 临时端口 ${range}`}
+            {report.host?.ephemeral_port_capacity != null &&
+              ` · 可用 ${report.host.ephemeral_port_capacity.toLocaleString()} · 最繁忙目标仅在节点内聚合，不上传地址`}
+          </small>
+        </span>
+      </header>
+      <div className="history-grid">
+        {samples.some(sample => sample.network_detail?.ephemeral_port_capacity != null) && (
+          <>
+            <HistoryChart
+              title="出站端口压力（估算）· 最繁忙目标"
+              samples={samples}
+              group={group}
+              formatValue={value => pct(value, 2)}
+              lines={[
+                {
+                  name: 'IPv4',
+                  values: historyValues(samples, sample =>
+                    pressure(sample, value => value.tcp_ephemeral_top_target_v4),
+                  ),
+                },
+                {
+                  name: 'IPv6',
+                  values: historyValues(samples, sample =>
+                    pressure(sample, value => value.tcp_ephemeral_top_target_v6),
+                  ),
+                },
+              ]}
+            />
+            <HistoryChart
+              title="出站临时端口套接字"
+              samples={samples}
+              group={group}
+              formatValue={value => compact(value)}
+              lines={[
+                {
+                  name: 'IPv4 范围内',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_inuse_v4)),
+                },
+                {
+                  name: 'IPv4 TIME_WAIT',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_time_wait_v4)),
+                },
+                {
+                  name: 'IPv6 范围内',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_inuse_v6)),
+                },
+                {
+                  name: 'IPv6 TIME_WAIT',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_time_wait_v6)),
+                },
+              ]}
+            />
+          </>
+        )}
+        <HistoryChart
+          title="连接与套接字"
+          samples={samples}
+          group={group}
+          formatValue={value => compact(value)}
+          lines={[
+            { name: 'Conntrack', values: historyValues(samples, sample => sample.conntrack_count) },
+            {
+              name: 'TCP 已建立',
+              values: historyValues(samples, sample => detail(sample, value => value.tcp_curr_estab)),
+            },
+            { name: 'TCP in-use', values: historyValues(samples, sample => detail(sample, value => value.tcp_inuse)) },
+            {
+              name: 'TIME_WAIT',
+              values: historyValues(samples, sample => detail(sample, value => value.tcp_time_wait)),
+            },
+            { name: 'TCP orphan', values: historyValues(samples, sample => detail(sample, value => value.tcp_orphan)) },
+            { name: 'UDP in-use', values: historyValues(samples, sample => detail(sample, value => value.udp_inuse)) },
+          ]}
+        />
+        {hasDeep && (
+          <>
+            <HistoryChart
+              title="TCP 连接生命周期"
+              samples={samples}
+              group={group}
+              formatValue={value => compact(value)}
+              lines={[
+                {
+                  name: '主动建立',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_active_opens)),
+                },
+                {
+                  name: '被动建立',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_passive_opens)),
+                },
+                {
+                  name: '建立失败',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_attempt_fails)),
+                },
+                {
+                  name: '连接复位',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_estab_resets)),
+                },
+              ]}
+            />
+            <HistoryChart
+              title="TCP 重传与异常"
+              samples={samples}
+              group={group}
+              formatValue={value => compact(value)}
+              lines={[
+                {
+                  name: '重传段',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_retrans_segs)),
+                },
+                {
+                  name: 'SYN 重传',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_syn_retrans)),
+                },
+                { name: '超时', values: historyValues(samples, sample => detail(sample, value => value.tcp_timeouts)) },
+                {
+                  name: '接收错误',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_in_errors)),
+                },
+                {
+                  name: '发出 RST',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_out_resets)),
+                },
+              ]}
+            />
+            <HistoryChart
+              title="监听队列与 UDP 丢弃"
+              samples={samples}
+              group={group}
+              formatValue={value => compact(value)}
+              lines={[
+                {
+                  name: '监听溢出',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_listen_overflows)),
+                },
+                {
+                  name: '监听丢弃',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_listen_drops)),
+                },
+                {
+                  name: 'UDP 接收错误',
+                  values: historyValues(samples, sample => detail(sample, value => value.udp_in_errors)),
+                },
+                {
+                  name: 'UDP 无端口',
+                  values: historyValues(samples, sample => detail(sample, value => value.udp_no_ports)),
+                },
+                {
+                  name: 'UDP 接收缓冲满',
+                  values: historyValues(samples, sample => detail(sample, value => value.udp_rcvbuf_errors)),
+                },
+                {
+                  name: 'UDP 发送缓冲满',
+                  values: historyValues(samples, sample => detail(sample, value => value.udp_sndbuf_errors)),
+                },
+              ]}
+            />
+            <HistoryChart
+              title="套接字资源"
+              samples={samples}
+              group={group}
+              formatValue={bytes}
+              lines={[
+                {
+                  name: 'TCP 内存',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_mem_bytes)),
+                },
+                {
+                  name: 'UDP 内存',
+                  values: historyValues(samples, sample => detail(sample, value => value.udp_mem_bytes)),
+                },
+              ]}
+            />
+          </>
+        )}
+      </div>
+    </section>
+  );
+});
 
 /** KPI 芯片右下角的迷你趋势线。复用 trendPaths + metricDomain，与既有的指标卡曲线同口径；
  * 面积铺到 viewBox 底部（小图无网格，收在 PLOT_BOTTOM 会留一条空缝）。 */
@@ -599,33 +1570,49 @@ function Spark({
   );
 }
 
-function LoadDashboard({
+function sampleWindow(sample: LoadSample): string {
+  const seconds = Math.max(1, sample.window_end_unix_secs - sample.window_start_unix_secs);
+  return seconds === 30 ? '最近 30 秒' : `实际窗口 ${dur(seconds)}`;
+}
+
+const compact = (value: number): string => {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
+  return Math.round(value).toLocaleString();
+};
+
+const LoadDashboard = memo(function LoadDashboard({
   report,
   reportedAt,
   stale,
+  historyLabel,
+  historyWindows,
 }: {
   report: NodeLoadView;
   reportedAt: number | null;
   stale: boolean;
+  historyLabel: string;
+  historyWindows: number;
 }) {
   const series = report.series;
   const last = series[series.length - 1];
   const host = report.host;
+  const [openDetail, setOpenDetail] = useState<'cpu' | 'memory' | 'disk' | 'network' | null>(null);
   const cpu = (sample: LoadSample) => sample.cpu_user_pct + sample.cpu_sys_pct + sample.cpu_softirq_pct;
   const mem = (sample: LoadSample) =>
     host && host.mem_total_bytes > 0 ? (1 - sample.mem_available_bytes / host.mem_total_bytes) * 100 : null;
-  const disk = (sample: LoadSample) =>
-    host && host.disk_total_bytes > 0 ? (1 - sample.disk_free_bytes / host.disk_total_bytes) * 100 : null;
+  const disk = (sample: LoadSample) => {
+    const total = sample.disk_detail?.total_bytes ?? host?.disk_total_bytes ?? 0;
+    return total > 0 ? (1 - sample.disk_free_bytes / total) * 100 : null;
+  };
   const cpuNow = cpu(last);
   const memNow = mem(last);
   const diskNow = disk(last);
-  const valid = series.filter(sample => !sample.has_gap);
-  const peak = Math.max(...valid.map(sample => sample.cpu_peak_pct), 0);
   const drops = last.nic_rx_drop + last.nic_tx_drop + last.nic_err;
-  // 与 usage 的 24 桶对齐的 24 个 30 秒窗口；最近在下标 23，缺口断开。不足 24 个左侧补 null。
+  // 与 usage 对齐的 30 秒窗口；缺口断开，历史不足选定范围时左侧补 null。
   const group = `nd-tp-${report.node_id}`;
-  const tail = series.slice(-LOAD_SLOTS);
-  const pad = LOAD_SLOTS - tail.length;
+  const tail = series.slice(-historyWindows);
+  const pad = historyWindows - tail.length;
   const rxData: (number | null)[] = [
     ...Array<number | null>(pad).fill(null),
     ...tail.map(s => (s.has_gap ? null : s.nic_rx_bps)),
@@ -634,25 +1621,25 @@ function LoadDashboard({
     ...Array<number | null>(pad).fill(null),
     ...tail.map(s => (s.has_gap ? null : s.nic_tx_bps)),
   ];
-  // 芯片的语气阈值与既有的判定/指标卡完全一致——同一处越线，卡片、芯片与下方说明三处一致。
-  const cpuTone = peak >= CPU_PEAK_WARN ? 'warn' : '';
-  const memTone = memNow !== null && 100 - memNow < MEM_AVAIL_WARN * 100 ? 'warn' : '';
-  const diskTone =
-    diskNow !== null && 100 - diskNow < DISK_FREE_BAD * 100
-      ? 'bad'
-      : diskNow !== null && 100 - diskNow < DISK_FREE_WARN * 100
-        ? 'warn'
-        : '';
   const [upNum, upUnit] = dur(last.uptime_secs).split(' ');
   const ctMax = host?.conntrack_max ?? null;
   const ctRatio = last.conntrack_count !== null && ctMax !== null && ctMax > 0 ? last.conntrack_count / ctMax : null;
+  const hasNetworkHistory = series.some(sample => sample.conntrack_count !== null || sample.network_detail);
+  const window = sampleWindow(last);
 
   return (
     <>
       {/* KPI 芯片带：CPU/内存/磁盘/负载 征收成标题下一条带（各带迷你趋势线）；已运行、连接表
           是标量，只给读数不给趋势线。金/红语气由阈值算出，spark 用 currentColor 随之变色。 */}
       <div className="kpi-band">
-        <div className={`kpi ${cpuTone}`}>
+        <button
+          type="button"
+          className={`kpi kpi-expand ${openDetail === 'cpu' ? 'open' : ''}`}
+          aria-expanded={openDetail === 'cpu'}
+          disabled={!last.cpu_detail}
+          title={last.cpu_detail ? `展开 ${historyLabel} CPU 曲线` : '当前 Agent 尚未上报 CPU 深度数据'}
+          onClick={() => setOpenDetail(value => (value === 'cpu' ? null : 'cpu'))}
+        >
           <span className="kpi-l">CPU</span>
           <span className="kpi-v">
             {pct(cpuNow).replace('%', '')}
@@ -669,43 +1656,78 @@ function LoadDashboard({
             )}
           </span>
           <Spark series={series} valueOf={cpu} percent />
-        </div>
-        <div className={`kpi ${memTone}`}>
+        </button>
+        <button
+          type="button"
+          className={`kpi kpi-expand ${openDetail === 'memory' ? 'open' : ''}`}
+          aria-expanded={openDetail === 'memory'}
+          disabled={!last.memory_detail}
+          title={last.memory_detail ? `展开 ${historyLabel} 内存曲线` : '当前 Agent 尚未上报内存深度数据'}
+          onClick={() => setOpenDetail(value => (value === 'memory' ? null : 'memory'))}
+        >
           <span className="kpi-l">内存</span>
           <span className="kpi-v">
             {memNow === null ? '—' : pct(memNow).replace('%', '')}
             {memNow !== null && <small>%</small>}
           </span>
           <Spark series={series} valueOf={mem} percent />
-        </div>
-        <div className={`kpi ${diskTone}`}>
+        </button>
+        <button
+          type="button"
+          className={`kpi kpi-expand ${openDetail === 'disk' ? 'open' : ''}`}
+          aria-expanded={openDetail === 'disk'}
+          disabled={!last.disk_detail}
+          title={last.disk_detail ? `展开 ${historyLabel} 磁盘曲线` : '当前 Agent 尚未上报磁盘深度数据'}
+          onClick={() => setOpenDetail(value => (value === 'disk' ? null : 'disk'))}
+        >
           <span className="kpi-l">磁盘</span>
           <span className="kpi-v">
             {diskNow === null ? '—' : pct(diskNow).replace('%', '')}
             {diskNow !== null && <small>%</small>}
           </span>
           <Spark series={series} valueOf={disk} percent />
-        </div>
+        </button>
         <div className="kpi">
           <span className="kpi-l">Load 1m</span>
           <span className="kpi-v">{last.load1.toFixed(2)}</span>
           <Spark series={series} valueOf={sample => sample.load1} />
         </div>
-        <div className={`kpi ${last.uptime_secs < JUST_REBOOTED_SECS ? 'warn' : ''}`}>
+        <div className="kpi">
           <span className="kpi-l">已运行</span>
           <span className="kpi-v">
             {upNum}
             <small>{upUnit}</small>
           </span>
         </div>
-        <div className={`kpi ${ctRatio !== null && ctRatio >= CONNTRACK_WARN ? 'warn' : ''}`}>
+        <button
+          type="button"
+          className={`kpi kpi-expand ${openDetail === 'network' ? 'open' : ''}`}
+          aria-expanded={openDetail === 'network'}
+          disabled={!hasNetworkHistory}
+          title={hasNetworkHistory ? `展开 ${historyLabel} 网络曲线` : '当前尚无连接表或网络深度数据'}
+          onClick={() => setOpenDetail(value => (value === 'network' ? null : 'network'))}
+        >
           <span className="kpi-l">连接表</span>
           <span className="kpi-v">
             {ctRatio === null ? '—' : pct(ctRatio * 100, 1).replace('%', '')}
             {ctRatio !== null && <small>%</small>}
           </span>
-        </div>
+          <Spark series={series} valueOf={sample => sample.conntrack_count} />
+        </button>
       </div>
+
+      {openDetail === 'cpu' && last.cpu_detail && (
+        <CpuHistory report={report} label={historyLabel} windows={historyWindows} />
+      )}
+      {openDetail === 'memory' && last.memory_detail && (
+        <MemoryHistory report={report} label={historyLabel} windows={historyWindows} />
+      )}
+      {openDetail === 'disk' && last.disk_detail && (
+        <DiskHistory report={report} label={historyLabel} windows={historyWindows} />
+      )}
+      {openDetail === 'network' && hasNetworkHistory && (
+        <NetworkHistory report={report} label={historyLabel} windows={historyWindows} />
+      )}
 
       {/* 卡框沿用 .chart-card（即原 .load-network 的卡框语言），图区交给 echarts。 */}
       <section className="chart-card">
@@ -713,7 +1735,7 @@ function LoadDashboard({
           <b>NETWORK THROUGHPUT</b>
           <span className={stale ? 'stale' : undefined}>
             <Ago at={reportedAt === null ? null : iso(reportedAt)} />
-            {stale ? ' · 数据不新了' : ' 上报'} · 30 秒 / 窗口
+            {stale ? ' · 数据不新了' : ' 上报'} · {window}
           </span>
         </div>
         <div className="load-network-legend">
@@ -729,7 +1751,7 @@ function LoadDashboard({
           {drops > 0 && (
             <span
               className="hot"
-              title={`最近 30 秒增量：接收丢弃 ${last.nic_rx_drop}，发送丢弃 ${last.nic_tx_drop}，网卡错误 ${last.nic_err}。接收丢弃可能包含 802.2/LLC 等二层控制帧，不等同于业务链路丢包；不是开机累计值`}
+              title={`${window}增量：接收丢弃 ${last.nic_rx_drop}，发送丢弃 ${last.nic_tx_drop}，网卡错误 ${last.nic_err}。接收丢弃可能包含 802.2/LLC 等二层控制帧，不等同于业务链路丢包；不是开机累计值`}
             >
               {[
                 last.nic_rx_drop > 0 ? `接收丢弃 ${last.nic_rx_drop.toLocaleString()}` : null,
@@ -751,14 +1773,23 @@ function LoadDashboard({
       </section>
     </>
   );
-}
+});
 
-export function LoadCard({ report, xrayChart }: { report: NodeLoadView; xrayChart?: ReactNode }) {
+export function LoadCard({
+  report,
+  xrayChart,
+  historyLabel = '30 MINUTES',
+  historyWindows = LOAD_SLOTS,
+}: {
+  report: NodeLoadView;
+  xrayChart?: ReactNode;
+  historyLabel?: string;
+  historyWindows?: number;
+}) {
   // 计时器需要在提前 return 之前获取（hook 不能有条件地跳过），也不能在渲染中直接调用
   // Date.now()：该调用不是纯函数，同一次渲染的两处会得到不同的值。
   const now = useNow();
   const [showProcs, setShowProcs] = useState(false);
-  const findings = loadFindings(report);
   const reportedAt = report.reported_at_unix_secs;
   const stale = reportedAt !== null && now / 1000 - reportedAt > STALE_SECS;
   const head = (
@@ -777,7 +1808,6 @@ export function LoadCard({ report, xrayChart }: { report: NodeLoadView; xrayChar
       <div className="panel">
         {head}
         <p className="note">还没有负载读数。</p>
-        <Findings list={findings} />
       </div>
     );
   }
@@ -790,15 +1820,18 @@ export function LoadCard({ report, xrayChart }: { report: NodeLoadView; xrayChar
   const ctMax = host?.conntrack_max ?? null;
   const ctRatio = last.conntrack_count !== null && ctMax !== null && ctMax > 0 ? last.conntrack_count / ctMax : null;
 
-  // 进程中是否存在需要关注的项。存在时默认展开，不存在时折叠为一行——正常机器上该表的
-  // 二十个单元格中有十一个是 0.0% 或 —，占用近半张卡而不提供有效信息。
-  const hotProc = report.processes.find(p => p.fds !== null && p.fd_limit !== null && p.fds / p.fd_limit >= FD_WARN);
   const xray = report.processes.find(p => p.proc === 'xray');
-  const open = showProcs || !!hotProc;
+  const open = showProcs;
 
   return (
     <div className="load-cluster">
-      <LoadDashboard report={report} reportedAt={reportedAt} stale={stale} />
+      <LoadDashboard
+        report={report}
+        reportedAt={reportedAt}
+        stale={stale}
+        historyLabel={historyLabel}
+        historyWindows={historyWindows}
+      />
       {/* XRAY 承载曲线紧跟 NETWORK 之后（两者时间轴一致、联动十字线）；数据来自 usage，
           由 nodes.tsx 组装后经 xrayChart 传入，本卡只负责把它放在正确的位置。 */}
       {xrayChart}
@@ -813,20 +1846,17 @@ export function LoadCard({ report, xrayChart }: { report: NodeLoadView; xrayChar
               <b className="dim">没开</b>
             ) : (
               <>
-                <b className={ctRatio >= CONNTRACK_WARN ? 'hot' : undefined}>{pct(ctRatio * 100, 1)}</b>
+                <b>{pct(ctRatio * 100, 1)}</b>
                 <span className="dim"> · {(last.conntrack_count as number).toLocaleString()} 条</span>
               </>
             )}
           </span>
           <span>
-            已运行 <b className={last.uptime_secs < JUST_REBOOTED_SECS ? 'hot' : undefined}>{dur(last.uptime_secs)}</b>
+            已运行 <b>{dur(last.uptime_secs)}</b>
           </span>
           {host?.cc_algo && (
             <span>
-              拥塞{' '}
-              {/* 是否标为金色的判定必须与 congestionFindings 完全一致——纯 wg 中继上使用 cubic 不影响，
-                  此处标为金色而下方不输出说明时，会导致查找不到对应的解释。 */}
-              <b className={isBbr(host.cc_algo) || !hasXray(report) ? undefined : 'hot'}>{host.cc_algo}</b>
+              拥塞 <b>{host.cc_algo}</b>
               <span className="dim"> · {host.nic_qdisc || '?'}</span>
             </span>
           )}
@@ -850,7 +1880,6 @@ export function LoadCard({ report, xrayChart }: { report: NodeLoadView; xrayChar
             <span className="dim">展开</span>
           </button>
         )}
-        <Findings list={findings} />
       </div>
 
       {open && (
@@ -879,7 +1908,7 @@ export function LoadCard({ report, xrayChart }: { report: NodeLoadView; xrayChar
                     ) : (
                       // 分母显示实际数值。`512k` 是由 524287 近似得到的整数，与 ulimit 中的值不符，
                       // 而调整该上限时需要的正是实际值。
-                      <span className={p.fd_limit && p.fds / p.fd_limit >= FD_WARN ? 'hot' : undefined}>
+                      <span>
                         {p.fds.toLocaleString()}
                         {p.fd_limit && <span className="dim"> / {p.fd_limit.toLocaleString()}</span>}
                       </span>
@@ -1162,21 +2191,6 @@ export function HopLinkTable({ hops, nodeName }: { hops: HopLinkView[]; nodeName
 }
 
 /* ── 共用 ───────────────────────────────────────────────────── */
-
-function Findings({ list }: { list: Finding[] }) {
-  // chipOnly 的条目只在列表中显示标记，详情页不显示——卡片中的字段已表达该信息。
-  const shown = list.filter(f => !f.chipOnly);
-  if (shown.length === 0) return null;
-  return (
-    <>
-      {shown.map((f, i) => (
-        <p key={i} className={`rt-dx${f.tone === 'bad' ? ' bad' : ''}`}>
-          {f.text}
-        </p>
-      ))}
-    </>
-  );
-}
 
 /** 列表中的标记。正常的行不显示额外内容——该规则在 nodes.tsx 中确立，
  *  常驻的「负载正常」标记会增加每行的宽度而不提供信息。 */

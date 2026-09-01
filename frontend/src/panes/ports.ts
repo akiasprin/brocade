@@ -1,8 +1,5 @@
 import type { NodeAgentStateItem, SnapshotApp } from '../api';
 
-// 建链时的两类冲突：id 冲突和端口冲突。两者都不会报错，都会覆盖已有配置，
-// 因此判定逻辑放在此处、与界面分离——纯函数，可脱离浏览器直接执行。
-//
 // 类型使用 `import type`，运行时不引入 api.ts，因此不会关联 draft.ts 的浏览器状态。
 
 // slug 的字符集和长度上限，与 model.rs 的 is_valid_slug / SLUG_MAX_LEN 一致。
@@ -10,45 +7,6 @@ import type { NodeAgentStateItem, SnapshotApp } from '../api';
 // 因此没有任何运行时表现能提前暴露该问题。
 export const SLUG_MAX = 32;
 export const isValidSlug = (value: string) => /^[a-z0-9._-]{1,32}$/.test(value);
-
-// id 冲突会覆盖已有配置且无提示：写入接口是 upsert，而 `chains.id` / `ingresses.id`
-// 都是 TEXT PRIMARY KEY，全局唯一。`ON CONFLICT (id) DO UPDATE SET app_id = ...`
-// 表示复用其他线路的 id 时不会被拒绝，而是将该链连同主干一并迁移。
-export function freeId(used: Set<string>, base: string): string {
-  const fit = (s: string) => (s.length <= SLUG_MAX ? s : s.slice(0, SLUG_MAX));
-  const head = fit(base);
-  if (!used.has(head)) return head;
-  for (let i = 2; i < 1000; i += 1) {
-    const tail = `-${i}`;
-    /* 序号也需计入 32 的长度上限，否则避让本身会生成无法通过 label.charset 的 id */
-    const candidate = `${head.slice(0, SLUG_MAX - tail.length)}${tail}`;
-    if (!used.has(candidate)) return candidate;
-  }
-  return head;
-}
-
-// 线路内编号的 id：`app-hk.c1`、`app-hk.c2`。
-// 链 id 是全局主键，而每个线路命名一条 c-hk 是常见做法，因此两个线路必然冲突，
-// 后者会迁移前者。前缀划分命名空间，线路内使用序号，将必然冲突降为仅在手动重名时冲突。
-//
-// 主体部分不重复节点名。`app-hk-01.c-hk-01` 中 `hk-01` 出现两次，前缀已包含该信息，
-// 主体重复不增加区分度；发生冲突需要添加避让序号时会变为 `app-hk-01.c-hk-01-2`，
-// 两串数字相邻，无法分辨哪个是机器编号。可读性由 `name` 字段承担——slug 与显示名是解耦的。
-//
-// 分隔符使用 `.`：租户路径已使用它表示层级，可读作 app-hk 下的第 1 条链。
-//
-// 拼接后超过 32 个字符时回退到不带前缀的形式，此时线路 id 本身已接近长度上限，
-// 前缀也不再具有区分度。
-export function scopedId(app: string, kind: string, used: Set<string>): string {
-  const pick = (prefix: string) => {
-    for (let i = 1; i < 1000; i += 1) {
-      const candidate = `${prefix}${kind}${i}`;
-      if (candidate.length <= SLUG_MAX && !used.has(candidate)) return candidate;
-    }
-    return null;
-  };
-  return (app && pick(`${app}.`)) || pick('') || `${kind}1`;
-}
 
 export type PortOwners = Map<number, string>;
 

@@ -13,8 +13,14 @@ use crate::plan::{
 /// response body as a `NodeDesiredDeployment`, and an enum-shaped body fails that outright —
 /// which is deliberate. An agent that silently ignored the `certificate` field would read as
 /// converged while never writing the file.
-pub const AGENT_PROTOCOL_VERSION: u32 = 2;
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 2;
+pub const AGENT_PROTOCOL_VERSION: u32 = 3;
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 3;
+
+/// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
+/// intentional: the values shown to operators map exactly to disk allocation in binary units.
+pub const DEFAULT_AGENT_LOG_MAX_MIB: u32 = 100;
+pub const MIN_AGENT_LOG_MAX_MIB: u32 = 16;
+pub const MAX_AGENT_LOG_MAX_MIB: u32 = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateDeploymentRequest {
@@ -51,6 +57,12 @@ pub struct NodeDesiredDeployment {
     pub node_id: String,
     pub wave: u32,
     pub actions: Vec<PlannedAction>,
+    /// Immutable ownership map for the Xray counters created by this work order.  It advances
+    /// only after the agent has converged the target, so a reading queued before a permission or
+    /// topology change is never interpreted through the model that happened to be current when
+    /// it was replayed.
+    #[serde(default)]
+    pub usage_generation_id: Option<i64>,
     pub desired: NodeDesiredState,
     /// Where to fetch the phantun binaries.
     ///
@@ -576,8 +588,22 @@ pub struct LinkHealthResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReportRequest {
+    /// Stable across process restarts and regenerated only when the agent state directory is
+    /// replaced. Together with `sequence` this is the idempotency key of a report.
+    #[serde(default)]
+    pub agent_instance_id: Option<String>,
+    /// Persisted before sampling. Gaps are allowed; reuse and reversal are not.
+    #[serde(default)]
+    pub sequence: Option<u64>,
+    /// The frozen ownership map active when the counters were read.
+    #[serde(default)]
+    pub usage_generation_id: Option<i64>,
     pub read_at_unix_secs: i64,
     pub xray_started_at_unix_secs: i64,
+    /// Boot time plus the serving process's exact start ticks. Unlike the rounded unix second,
+    /// this changes for two Xray processes started within the same second.
+    #[serde(default)]
+    pub xray_epoch: Option<String>,
     #[serde(default)]
     pub route: Option<RouteIpReport>,
     pub counters: Vec<UsageCounter>,
@@ -593,12 +619,21 @@ pub struct UsageCounter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReportResult {
     pub node_id: String,
+    #[serde(default)]
+    pub agent_instance_id: Option<String>,
+    #[serde(default)]
+    pub sequence: Option<u64>,
+    #[serde(default)]
+    pub usage_generation_id: Option<i64>,
+    /// True when the control plane returned the durable result of an already committed report.
+    #[serde(default)]
+    pub duplicate: bool,
     pub accepted_readings: u64,
     pub inserted_samples: u64,
-    /// The label has no unique corresponding grant in the model.
+    /// The label has no corresponding owner in the report's frozen usage generation.
     pub skipped_counters: u64,
-    /// The label's ingress is not on this node and the report was refused. Persistently non-zero
-    /// means the node is fabricating usage.
+    /// The label belongs to another reporter, is out of order, or regressed inside one exact Xray
+    /// epoch. Persistently non-zero requires investigation and is never billed.
     pub rejected_counters: u64,
     pub gap_samples: u64,
 }
@@ -826,6 +861,23 @@ pub struct E2eProbeHysteria2 {
     pub up: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down: Option<String>,
+    /// Absent is Xray's standard profile, matching artifact omission semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbr_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_stream_receive_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stream_receive_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_connection_receive_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connection_receive_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_idle_timeout_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_period_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_path_mtu_discovery: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub salamander_password: Option<String>,
 }
@@ -835,9 +887,23 @@ pub struct E2eProbeXhttp {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    pub mux: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xmux: Option<E2eProbeXhttpXmux>,
     /// The literal value xray expects, or `None` to let both ends resolve it themselves.
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eProbeXhttpXmux {
+    pub max_concurrency: u16,
+    pub h_max_request_times: E2eProbeXhttpRange,
+    pub h_max_reusable_secs: E2eProbeXhttpRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eProbeXhttpRange {
+    pub from: u32,
+    pub to: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1020,6 +1086,8 @@ pub struct NodeVersions {
     pub wg_tools: Option<String>,
     /// `kernel` or `userspace`.
     ///
+    /// `None` means WireGuard is disabled locally, or an older agent could not observe it.
+    ///
     /// Kernels 5.6 and above have WireGuard built in; without it `wg-quick` falls back to
     /// `wireguard-go` or `boringtun`. Their `wg show` output is identical while throughput
     /// differs by an order of magnitude, so the backend has to be queried explicitly.
@@ -1117,7 +1185,19 @@ pub struct HostFacts {
     /// report kernel versus userspace but not which kernel, so the measurement and the conclusion
     /// were separated.
     pub kernel: String,
+    /// Human-readable processor model. New agents read it from `/proc/cpuinfo`; an empty value is
+    /// valid for older agents and for architectures whose kernel exposes no model identity.
+    #[serde(default)]
+    pub cpu_model: String,
     pub cores: u32,
+    /// Maximum frequency exposed by cpufreq, in MHz. Virtual machines commonly expose no cpufreq
+    /// tree at all; `None` means unsupported, not a zero-frequency processor.
+    #[serde(default)]
+    pub cpu_freq_max_mhz: Option<u64>,
+    /// The common scaling governor across online CPUs. Empty/mixed governors are represented as
+    /// `None`; this is a capability detail rather than an alarm.
+    #[serde(default)]
+    pub cpu_governor: Option<String>,
     /// `/proc/sys/net/ipv4/tcp_congestion_control`. Do not assume this is cubic or bbr: low-cost
     /// VPS images often carry a patched kernel offering `bbrplus` or `bbr2`.
     pub cc_algo: String,
@@ -1142,10 +1222,29 @@ pub struct HostFacts {
     pub mem_total_bytes: u64,
     /// The filesystem holding the state directory, which is where the spool is written.
     pub disk_total_bytes: u64,
+    /// Identity of the filesystem whose capacity is reported above. Overlay/container filesystems
+    /// do not always have a block device, so every field remains optional independently.
+    #[serde(default)]
+    pub disk_mount: Option<String>,
+    #[serde(default)]
+    pub disk_filesystem: Option<String>,
+    #[serde(default)]
+    pub disk_device: Option<String>,
+    #[serde(default)]
+    pub disk_read_only: Option<bool>,
     /// `nf_conntrack_max`. `None` means the module is not loaded, which is not a fault: a machine
     /// doing no NAT simply has no such table.
     #[serde(default)]
     pub conntrack_max: Option<u64>,
+    /// Kernel-selected anonymous local-port range after subtracting
+    /// `ip_local_reserved_ports`. Stored with host facts for explanation; each network sample also
+    /// carries the contemporaneous capacity so a later sysctl change cannot rewrite history.
+    #[serde(default)]
+    pub ephemeral_port_low: Option<u16>,
+    #[serde(default)]
+    pub ephemeral_port_high: Option<u16>,
+    #[serde(default)]
+    pub ephemeral_port_capacity: Option<u64>,
     /// Whether the installer set the congestion control algorithm on this machine.
     ///
     /// This distinguishes a machine where the installer set bbr and something later changed it
@@ -1175,6 +1274,171 @@ pub struct HostFacts {
     pub somaxconn: u64,
 }
 
+/// One logical CPU's mutually-exclusive time shares inside a load window.
+///
+/// The aggregate CPU value cannot reveal a single saturated forwarding queue on a many-core
+/// machine. Keeping the three kinds of work separate also preserves the existing distinction
+/// between encryption/user work and packet-processing softirqs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CpuCoreSample {
+    pub cpu: u32,
+    pub user_pct: f32,
+    pub system_pct: f32,
+    pub softirq_pct: f32,
+    pub iowait_pct: f32,
+    pub steal_pct: f32,
+}
+
+/// Optional deep CPU diagnostics from agents that support them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CpuDetailSample {
+    /// `/proc/stat`'s iowait. Kept outside CPU busy time: waiting for storage is not CPU work.
+    pub iowait_pct: f32,
+    pub load5: f32,
+    pub load15: f32,
+    /// CPU PSI `some`, averaged over this exact window from the cumulative microsecond counter.
+    pub pressure_some_pct: Option<f32>,
+    /// I/O PSI over this exact window. Unlike `/proc/stat`'s iowait, PSI measures task stall time
+    /// directly and is therefore the signal used for the UI's I/O-pressure diagnosis.
+    #[serde(default)]
+    pub io_pressure_some_pct: Option<f32>,
+    #[serde(default)]
+    pub io_pressure_full_pct: Option<f32>,
+    pub procs_running: Option<u64>,
+    pub procs_total: Option<u64>,
+    pub context_switches_per_sec: Option<u64>,
+    pub net_rx_softirqs_per_sec: Option<u64>,
+    pub net_tx_softirqs_per_sec: Option<u64>,
+    /// Cgroup CPU time denied during this window. Root cgroups or kernels without the controller
+    /// expose no usable counter and report `None` rather than pretending no throttling occurred.
+    pub throttled_usec: Option<u64>,
+    /// Mean current frequency across CPUs with a readable cpufreq entry.
+    pub frequency_mhz: Option<u64>,
+    pub cores: Vec<CpuCoreSample>,
+}
+
+/// Optional deep memory diagnostics from agents that support them.
+///
+/// Raw `/proc/meminfo` counters overlap. The first five fields are deliberately an exclusive
+/// physical composition: file cache excludes shmem, and `kernel_other_bytes` is the residual that
+/// makes the five add back to MemTotal. The remaining counters are diagnostic lenses and must not
+/// be stacked on top of that composition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryDetailSample {
+    pub available_min_bytes: u64,
+    pub free_bytes: u64,
+    pub anon_bytes: u64,
+    pub file_cache_bytes: u64,
+    pub shmem_bytes: u64,
+    pub kernel_other_bytes: u64,
+    pub buffers_bytes: u64,
+    pub kernel_reclaimable_bytes: u64,
+    pub slab_unreclaimable_bytes: u64,
+    pub unevictable_bytes: u64,
+    pub mlocked_bytes: u64,
+    pub dirty_bytes: u64,
+    pub writeback_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub swap_cached_bytes: u64,
+    pub zswap_bytes: Option<u64>,
+    pub zswapped_bytes: Option<u64>,
+    /// Best-effort estimate from nr_foll_pin_acquired - nr_foll_pin_released.
+    pub gup_pinned_bytes: Option<u64>,
+    pub swap_in_bytes: u64,
+    pub swap_out_bytes: u64,
+    pub pressure_some_pct: Option<f32>,
+    pub pressure_full_pct: Option<f32>,
+    pub major_faults: u64,
+    pub direct_reclaim_pages: u64,
+}
+
+/// Optional block-I/O diagnostics for the filesystem containing the agent state directory.
+///
+/// `statvfs` describes capacity but cannot say whether the disk is busy or merely full. These
+/// values come from the exact backing device's `/proc/diskstats` row. A container overlay or
+/// network filesystem may have no block-device row; that absence is represented by `None` rather
+/// than a fabricated idle disk.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiskDetailSample {
+    /// Contemporaneous capacity. HostFacts keeps the latest copy for the summary, while this copy
+    /// prevents a later volume resize from rewriting historical utilization.
+    pub total_bytes: Option<u64>,
+    pub inode_total: Option<u64>,
+    pub inode_free: Option<u64>,
+    pub read_bps: Option<u64>,
+    pub write_bps: Option<u64>,
+    pub read_iops: Option<f32>,
+    pub write_iops: Option<f32>,
+    pub read_await_ms: Option<f32>,
+    pub write_await_ms: Option<f32>,
+    /// Wall-clock share for which this device had at least one I/O in flight.
+    pub busy_pct: Option<f32>,
+    /// Time-weighted queue length (`weighted_io_ms / elapsed_ms`).
+    pub queue_depth: Option<f32>,
+    /// Requests in flight at the end of the window.
+    pub in_flight: Option<u64>,
+    /// Host-wide I/O PSI. It is kept beside the device counters because it answers the missing
+    /// half: device utilization alone cannot tell whether applications were actually stalled.
+    pub pressure_some_pct: Option<f32>,
+    pub pressure_full_pct: Option<f32>,
+}
+
+/// Optional deep network diagnostics from agents that support them.
+///
+/// The socket inventory fields are end-of-window levels. The remaining fields are differences of
+/// kernel counters over this exact 30-second window. Keeping those two kinds explicit prevents a
+/// UI from accidentally presenting a lifetime `TcpRetransSegs` counter as a current rate, or from
+/// averaging a current socket count that only has meaning at one instant.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkDetailSample {
+    /// TCP sockets currently in ESTABLISHED or CLOSE-WAIT (`Tcp.CurrEstab`).
+    pub tcp_curr_estab: Option<u64>,
+    /// IPv4 and IPv6 socket inventory. `alloc`, `orphan`, `tw` and memory are global kernel
+    /// counters and are exposed only by `/proc/net/sockstat`; the in-use fields add sockstat6.
+    pub tcp_inuse: Option<u64>,
+    pub tcp_time_wait: Option<u64>,
+    pub tcp_orphan: Option<u64>,
+    pub tcp_alloc: Option<u64>,
+    pub tcp_mem_bytes: Option<u64>,
+    pub udp_inuse: Option<u64>,
+    pub udp_mem_bytes: Option<u64>,
+
+    /// Anonymous local-port pressure, estimated from an all-state inet_diag snapshot. A plain
+    /// TIME_WAIT/range ratio is not a capacity measure because Linux may reuse the same local port
+    /// for different destinations. `top_target` is therefore the largest number of distinct
+    /// local ports occupied by one (source address, destination address, destination port) tuple
+    /// space. No peer address leaves the machine.
+    pub ephemeral_port_capacity: Option<u64>,
+    pub tcp_ephemeral_inuse_v4: Option<u64>,
+    pub tcp_ephemeral_inuse_v6: Option<u64>,
+    pub tcp_ephemeral_time_wait_v4: Option<u64>,
+    pub tcp_ephemeral_time_wait_v6: Option<u64>,
+    pub tcp_ephemeral_top_target_v4: Option<u64>,
+    pub tcp_ephemeral_top_target_v6: Option<u64>,
+
+    /// TCP lifecycle and reliability events during the window (`/proc/net/snmp` and TcpExt).
+    pub tcp_active_opens: Option<u64>,
+    pub tcp_passive_opens: Option<u64>,
+    pub tcp_attempt_fails: Option<u64>,
+    pub tcp_estab_resets: Option<u64>,
+    pub tcp_retrans_segs: Option<u64>,
+    pub tcp_syn_retrans: Option<u64>,
+    pub tcp_in_errors: Option<u64>,
+    pub tcp_out_resets: Option<u64>,
+    pub tcp_timeouts: Option<u64>,
+    pub tcp_listen_overflows: Option<u64>,
+    pub tcp_listen_drops: Option<u64>,
+
+    /// UDP delivery failures during the window. IPv4 and IPv6 counters are added where both are
+    /// available; absence remains `None`, never a fabricated zero.
+    pub udp_in_errors: Option<u64>,
+    pub udp_no_ports: Option<u64>,
+    pub udp_rcvbuf_errors: Option<u64>,
+    pub udp_sndbuf_errors: Option<u64>,
+}
+
 /// One window of one machine's resource use. Rates, already differenced.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadSample {
@@ -1201,11 +1465,17 @@ pub struct LoadSample {
     /// this machine does, and folding it in would dress an oversold host up as a busy one.
     pub cpu_steal_pct: f32,
     pub load1: f32,
+    /// Absent on older agents. Missing and zero are intentionally distinct throughout the stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_detail: Option<CpuDetailSample>,
 
     /// `MemAvailable` rather than `free`. On any machine with a page cache `free` is always
     /// small, so using it reports every healthy machine as low on memory.
     pub mem_available_bytes: u64,
     pub swap_used_bytes: u64,
+    /// Absent on older agents. Contains composition, reclaimability and pressure diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_detail: Option<MemoryDetailSample>,
     /// `/proc/vmstat`'s `oom_kill`, differenced. A non-zero value means the kernel killed a
     /// process in this window. It is a direct measurement rather than an inference, and nothing
     /// else reports it; the only other symptom is a user reporting a brief outage.
@@ -1216,6 +1486,10 @@ pub struct LoadSample {
     /// The existing `dropped` counter only reports the loss after it happens.
     pub disk_free_bytes: u64,
     pub disk_inode_free_pct: f32,
+    /// Absent on older agents. Filesystems without a local block-device view still carry an
+    /// object whose device-specific fields are `None`, preserving capacity/inode drill-down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_detail: Option<DiskDetailSample>,
 
     pub nic_rx_bps: u64,
     pub nic_tx_bps: u64,
@@ -1227,6 +1501,9 @@ pub struct LoadSample {
 
     #[serde(default)]
     pub conntrack_count: Option<u64>,
+    /// Absent on older agents. Socket levels plus differenced TCP/UDP kernel counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_detail: Option<NetworkDetailSample>,
     pub uptime_secs: u64,
 }
 
@@ -1402,5 +1679,132 @@ mod tests {
         );
         let parsed: DesiredStateResponse = serde_json::from_str(&wire).unwrap();
         assert_eq!(parsed, DesiredStateResponse::Certificate(material));
+    }
+
+    #[test]
+    fn host_facts_from_an_older_agent_default_the_cpu_model() {
+        let host = HostFacts {
+            kernel: "6.8.0".to_owned(),
+            cpu_model: "Neoverse-N1".to_owned(),
+            cores: 2,
+            cpu_freq_max_mhz: Some(3000),
+            cpu_governor: Some("schedutil".to_owned()),
+            cc_algo: "bbr".to_owned(),
+            available_cc: vec!["cubic".to_owned(), "bbr".to_owned()],
+            default_qdisc: "fq".to_owned(),
+            nic_qdisc: "fq".to_owned(),
+            nic: "eth0".to_owned(),
+            nic_mtu: Some(1500),
+            mem_total_bytes: 1024,
+            disk_total_bytes: 2048,
+            disk_mount: None,
+            disk_filesystem: None,
+            disk_device: None,
+            disk_read_only: None,
+            conntrack_max: Some(262_144),
+            ephemeral_port_low: None,
+            ephemeral_port_high: None,
+            ephemeral_port_capacity: None,
+            sysctl_managed: true,
+            arch: "aarch64".to_owned(),
+            os_pretty: "Linux".to_owned(),
+            virt: "KVM".to_owned(),
+            rmem_max: 4096,
+            wmem_max: 4096,
+            somaxconn: 4096,
+        };
+        let mut wire = serde_json::to_value(host).unwrap();
+        wire.as_object_mut().unwrap().remove("cpu_model");
+        wire.as_object_mut().unwrap().remove("cpu_freq_max_mhz");
+        wire.as_object_mut().unwrap().remove("cpu_governor");
+        wire.as_object_mut().unwrap().remove("disk_mount");
+        wire.as_object_mut().unwrap().remove("disk_filesystem");
+        wire.as_object_mut().unwrap().remove("disk_device");
+        wire.as_object_mut().unwrap().remove("disk_read_only");
+        wire.as_object_mut().unwrap().remove("ephemeral_port_low");
+        wire.as_object_mut().unwrap().remove("ephemeral_port_high");
+        wire.as_object_mut()
+            .unwrap()
+            .remove("ephemeral_port_capacity");
+        let parsed: HostFacts = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.cpu_model, "");
+        assert_eq!(parsed.cpu_freq_max_mhz, None);
+        assert_eq!(parsed.cpu_governor, None);
+        assert_eq!(parsed.disk_mount, None);
+        assert_eq!(parsed.ephemeral_port_capacity, None);
+        assert_eq!(parsed.cores, 2);
+    }
+
+    #[test]
+    fn load_samples_from_older_agents_have_no_deep_diagnostics() {
+        let parsed: LoadSample = serde_json::from_value(serde_json::json!({
+            "window_start_unix_secs": 100,
+            "window_end_unix_secs": 130,
+            "has_gap": false,
+            "cpu_user_pct": 1.0,
+            "cpu_sys_pct": 2.0,
+            "cpu_softirq_pct": 3.0,
+            "cpu_peak_pct": 7.0,
+            "cpu_steal_pct": 0.0,
+            "load1": 0.2,
+            "mem_available_bytes": 1024,
+            "swap_used_bytes": 0,
+            "oom_kills": 0,
+            "disk_free_bytes": 2048,
+            "disk_inode_free_pct": 99.0,
+            "nic_rx_bps": 0,
+            "nic_tx_bps": 0,
+            "nic_rx_drop": 0,
+            "nic_tx_drop": 0,
+            "nic_err": 0,
+            "conntrack_count": null,
+            "uptime_secs": 10
+        }))
+        .unwrap();
+        assert_eq!(parsed.cpu_detail, None);
+        assert_eq!(parsed.memory_detail, None);
+        assert_eq!(parsed.disk_detail, None);
+        assert_eq!(parsed.network_detail, None);
+    }
+
+    #[test]
+    fn network_detail_is_forward_compatible_with_partial_kernel_views() {
+        let parsed: NetworkDetailSample = serde_json::from_value(serde_json::json!({
+            "tcp_curr_estab": 12,
+            "tcp_inuse": 18
+        }))
+        .unwrap();
+        assert_eq!(parsed.tcp_curr_estab, Some(12));
+        assert_eq!(parsed.tcp_inuse, Some(18));
+        assert_eq!(parsed.tcp_listen_drops, None);
+        assert_eq!(parsed.udp_rcvbuf_errors, None);
+        assert_eq!(parsed.ephemeral_port_capacity, None);
+        assert_eq!(parsed.tcp_ephemeral_top_target_v4, None);
+    }
+
+    #[test]
+    fn cpu_details_from_the_previous_agent_default_missing_io_pressure() {
+        let detail = CpuDetailSample {
+            iowait_pct: 1.0,
+            load5: 0.2,
+            load15: 0.1,
+            pressure_some_pct: Some(0.0),
+            io_pressure_some_pct: Some(2.0),
+            io_pressure_full_pct: Some(1.0),
+            procs_running: Some(1),
+            procs_total: Some(10),
+            context_switches_per_sec: Some(100),
+            net_rx_softirqs_per_sec: Some(20),
+            net_tx_softirqs_per_sec: Some(10),
+            throttled_usec: Some(0),
+            frequency_mhz: None,
+            cores: Vec::new(),
+        };
+        let mut wire = serde_json::to_value(detail).unwrap();
+        wire.as_object_mut().unwrap().remove("io_pressure_some_pct");
+        wire.as_object_mut().unwrap().remove("io_pressure_full_pct");
+        let parsed: CpuDetailSample = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.io_pressure_some_pct, None);
+        assert_eq!(parsed.io_pressure_full_pct, None);
     }
 }

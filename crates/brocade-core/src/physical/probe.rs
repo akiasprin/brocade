@@ -266,6 +266,7 @@ mod tests {
             api_port: None,
             dns: Dns::System,
             domain_strategy: DomainStrategy::default(),
+            egress_dns: Vec::new(),
             connection: NodeConnection::default(),
         }
     }

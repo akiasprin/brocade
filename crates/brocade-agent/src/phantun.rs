@@ -4,7 +4,7 @@
 //! It sits underneath wg — for a fake-TCP peer in `wg0.conf`, Endpoint points at
 //! the phantun client's local loopback port, so convergence runs phantun first
 //! and wg second (see `converge_linux` in main.rs).
-use std::{fs, path::Path, time::Duration};
+use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 
 use brocade_deployment::{
     plan::{AppliedArtifactState, DesiredArtifact},
@@ -15,6 +15,9 @@ use crate::{
     artifact_dirty, command_success, present_file_state, run_shell, run_shell_with_timeout,
     shell_quote, write_private,
 };
+
+pub(crate) const PHANTUN_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log-v2";
+const PHANTUN_OLD_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PhantunInstanceKind {
@@ -111,12 +114,15 @@ pub(crate) fn converge_linux_phantun(
             let path = state_dir.join("phantun.json");
             write_private(&path, content)?;
             let _ = fs::remove_file(state_dir.join("phantun.disabled"));
-            apply_phantun(content, binaries)?;
+            apply_phantun(state_dir, content, binaries)?;
             Ok(())
         }
         DesiredArtifact::Disabled { reason } => {
             stop_phantun();
+            let _ = fs::remove_file("/tmp/brocade-agent-phantun.log");
             let _ = fs::remove_file(state_dir.join("phantun.json"));
+            let _ = fs::remove_file(state_dir.join(PHANTUN_BOUNDED_LOG_MARKER));
+            let _ = fs::remove_file(state_dir.join(PHANTUN_OLD_BOUNDED_LOG_MARKER));
             fs::write(state_dir.join("phantun.disabled"), reason)
                 .map_err(|error| error.to_string())?;
             Ok(())
@@ -142,6 +148,7 @@ pub(crate) fn converge_linux_phantun(
 /// quietly edits the machine's global firewall, which is too large a blast
 /// radius.
 pub(crate) fn apply_phantun(
+    state_dir: &Path,
     content: &str,
     binaries: Option<&PhantunBinaries>,
 ) -> Result<(), String> {
@@ -150,10 +157,12 @@ pub(crate) fn apply_phantun(
     prepare_phantun_binaries_for_plan(&plan, binaries)?;
     stop_phantun();
 
+    let instances = phantun_instances_from_plan(&plan)?;
+    prune_phantun_logs(state_dir, &instances)?;
     let mut rules = Vec::new();
 
-    for instance in phantun_instances_from_plan(&plan)? {
-        spawn_phantun(instance.program(), &instance.args())?;
+    for instance in &instances {
+        spawn_phantun(state_dir, instance)?;
         match &instance.kind {
             PhantunInstanceKind::Server { tcp_port, .. } => {
                 // Inbound TCP lands on the physical NIC and must be steered to the TUN's
@@ -184,6 +193,11 @@ pub(crate) fn apply_phantun(
     if !rules.is_empty() {
         install_phantun_nat(&rules)?;
     }
+    fs::write(state_dir.join(PHANTUN_BOUNDED_LOG_MARKER), b"dynamic\n")
+        .map_err(|error| format!("failed to record bounded phantun logging: {error}"))?;
+    let _ = fs::remove_file(state_dir.join(PHANTUN_OLD_BOUNDED_LOG_MARKER));
+    // stop_phantun has closed every legacy descriptor, so this unlink releases the blocks now.
+    let _ = fs::remove_file("/tmp/brocade-agent-phantun.log");
     Ok(())
 }
 
@@ -274,17 +288,75 @@ fn ensure_phantun_binary(program: &str, source: Option<&BinarySource>) -> Result
     Ok(())
 }
 
-fn spawn_phantun(program: &str, args: &[String]) -> Result<(), String> {
+fn spawn_phantun(state_dir: &Path, instance: &PhantunInstance) -> Result<(), String> {
+    let program = instance.program();
+    let args = instance.args();
     let quoted = args
         .iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
+    let log_path = phantun_log_path(state_dir, instance);
+    let sink = crate::logcap::command(&log_path, state_dir)?;
+    let pipeline = shell_quote(&format!("{program} {quoted} 2>&1 | {sink}"));
     run_shell(&format!(
         "set -eu\n\
-         nohup {program} {quoted} >>/tmp/brocade-agent-phantun.log 2>&1 &\n\
+         nohup sh -c {pipeline} >/dev/null 2>&1 &\n\
          sleep 0.4"
     ))?;
+    Ok(())
+}
+
+fn phantun_log_path(state_dir: &Path, instance: &PhantunInstance) -> std::path::PathBuf {
+    let tun = instance
+        .tun
+        .name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    state_dir
+        .join("logs")
+        .join(format!("{}-{tun}.log", instance.program()))
+}
+
+fn prune_phantun_logs(state_dir: &Path, instances: &[PhantunInstance]) -> Result<(), String> {
+    let directory = state_dir.join("logs");
+    let mut wanted = BTreeSet::new();
+    for instance in instances {
+        let path = phantun_log_path(state_dir, instance);
+        if !wanted.insert(path.clone()) {
+            return Err(format!(
+                "phantun plan repeats TUN/log identity {}",
+                instance.tun.name
+            ));
+        }
+        let mut archive = path.as_os_str().to_os_string();
+        archive.push(".1");
+        wanted.insert(std::path::PathBuf::from(archive));
+    }
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read {}: {error}", directory.display())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read {}: {error}", directory.display()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = (name.starts_with("phantun-server-") || name.starts_with("phantun-client-"))
+            && (name.ends_with(".log") || name.ends_with(".log.1"));
+        if ours && !wanted.contains(&path) {
+            fs::remove_file(&path)
+                .map_err(|error| format!("remove {}: {error}", path.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -388,6 +460,9 @@ pub(crate) fn observe_linux_phantun(
             // already hit with xray.
             if phantun_wanted(&path) && !phantun_running() {
                 return artifact_dirty("phantun.json 里有实例，但一个 phantun 进程都没跑");
+            }
+            if !state_dir.join(PHANTUN_BOUNDED_LOG_MARKER).exists() {
+                return artifact_dirty("phantun 仍在使用旧的无限日志");
             }
             present_file_state(&path, "phantun.json")
         }
@@ -651,7 +726,8 @@ mod tests {
 
     use super::{
         command_line_matches, converge_linux_phantun, observe_linux_phantun, phantun_instances,
-        phantun_runtime_probes, phantun_servers, phantun_wanted, tun_fields, PhantunInstanceKind,
+        phantun_log_path, phantun_runtime_probes, phantun_servers, phantun_wanted,
+        prune_phantun_logs, tun_fields, PhantunInstance, PhantunInstanceKind, PhantunTun,
     };
 
     fn state_dir(name: &str) -> PathBuf {
@@ -970,6 +1046,35 @@ mod tests {
         assert!(!dir.join("phantun.json").exists());
         assert!(!dir.join("phantun.disabled").exists());
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retired_instance_logs_are_removed_without_touching_unrelated_files() {
+        let dir = state_dir("prune-logs");
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let instance = PhantunInstance {
+            kind: PhantunInstanceKind::Client {
+                peer: "peer".to_owned(),
+                listen_udp_port: 3000,
+                remote_tcp_endpoint: "192.0.2.1:443".to_owned(),
+            },
+            tun: PhantunTun {
+                name: "bt/0".to_owned(),
+                local: "10.0.0.1".to_owned(),
+                peer: "10.0.0.2".to_owned(),
+            },
+        };
+        let keep = phantun_log_path(&dir, &instance);
+        fs::write(&keep, "current").unwrap();
+        fs::write(logs.join("phantun-client-retired.log"), "old").unwrap();
+        fs::write(logs.join("notes.log"), "operator").unwrap();
+
+        prune_phantun_logs(&dir, &[instance]).unwrap();
+        assert!(keep.exists());
+        assert!(!logs.join("phantun-client-retired.log").exists());
+        assert!(logs.join("notes.log").exists());
         let _ = fs::remove_dir_all(dir);
     }
 }

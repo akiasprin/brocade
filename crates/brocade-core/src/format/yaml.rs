@@ -1,7 +1,12 @@
 use std::collections::BTreeSet;
 
 use crate::artifacts::subscription::{
-    Subscription, SubscriptionEntry, SubscriptionSecurity, SubscriptionStream,
+    Subscription, SubscriptionEntry, SubscriptionExternalProxy, SubscriptionSecurity,
+    SubscriptionStream,
+};
+use crate::model::{
+    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport, XhttpXmux,
+    XhttpXmuxRange,
 };
 
 const TEST_URL: &str = "https://www.gstatic.com/generate_204";
@@ -276,10 +281,13 @@ const EXPERIMENTAL_CN_RULE: StandardRule = StandardRule {
 
 pub fn clash_subscription(subscription: &Subscription) -> String {
     let mut lines = Vec::new();
-    push_standard_base(&mut lines);
+    push_standard_base(&mut lines, subscription);
     lines.push(String::new());
     lines.push("proxies:".to_owned());
 
+    for proxy in &subscription.external_proxies {
+        push_external_proxy(&mut lines, proxy);
+    }
     for entry in &subscription.entries {
         push_proxy(&mut lines, entry);
     }
@@ -299,7 +307,81 @@ pub fn clash_subscription(subscription: &Subscription) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-fn push_standard_base(lines: &mut Vec<String>) {
+/// A deliberately small, self-contained Mihomo document for koipy.
+///
+/// The bot measures concrete proxies itself, so SubBoost's DNS policy, remote rule providers and
+/// daily-use service groups only add parser and network dependencies. Front groups are retained:
+/// entries carrying `dialer-proxy` would otherwise look valid but test a different route from the
+/// one handed to the user. The final group contains only user-facing entries, never helper
+/// external proxies.
+pub fn clash_haitun_subscription(subscription: &Subscription) -> String {
+    let mut lines = vec![
+        "# Brocade · koipy 测速（请求时动态生成）".to_owned(),
+        "mixed-port: 7897".to_owned(),
+        "allow-lan: false".to_owned(),
+        "mode: rule".to_owned(),
+        "log-level: warning".to_owned(),
+        "ipv6: true".to_owned(),
+        String::new(),
+        "proxies:".to_owned(),
+    ];
+
+    for proxy in &subscription.external_proxies {
+        push_external_proxy(&mut lines, proxy);
+    }
+    for entry in &subscription.entries {
+        push_proxy(&mut lines, entry);
+    }
+
+    let reserved = subscription
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .chain(
+            subscription
+                .external_proxies
+                .iter()
+                .map(|proxy| proxy.name.as_str()),
+        )
+        .chain(
+            subscription
+                .front_groups
+                .iter()
+                .map(|group| group.name.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut test_group = "koipy 测速".to_owned();
+    let mut suffix = 1;
+    while reserved.contains(test_group.as_str()) {
+        suffix += 1;
+        test_group = format!("koipy 测速 · Brocade {suffix}");
+    }
+    lines.push(String::new());
+    lines.push("proxy-groups:".to_owned());
+    for group in &subscription.front_groups {
+        lines.push(format!("  - name: {}", yaml_quote(&group.name)));
+        lines.push(format!("    type: {}", group.strategy.as_str()));
+        lines.push(format!("    proxies: {}", inline_list(&group.members)));
+    }
+    let mut candidates = subscription
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates.push("DIRECT".to_owned());
+    }
+    lines.push(format!("  - name: {}", yaml_quote(&test_group)));
+    lines.push("    type: select".to_owned());
+    lines.push(format!("    proxies: {}", inline_list(&candidates)));
+    lines.push(String::new());
+    lines.push("rules:".to_owned());
+    lines.push(format!("  - MATCH,{}", test_group));
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn push_standard_base(lines: &mut Vec<String>, subscription: &Subscription) {
     lines.extend(
         [
             "# Brocade · SubBoost 标准版（请求时动态生成）",
@@ -342,6 +424,49 @@ fn push_standard_base(lines: &mut Vec<String>) {
         .into_iter()
         .map(str::to_owned),
     );
+
+    let server_names = subscription_server_names(subscription);
+    if !server_names.is_empty() {
+        lines.push("  skip-domain:".to_owned());
+        lines.extend(
+            server_names
+                .into_iter()
+                .map(|server_name| format!("    - {}", yaml_quote(server_name))),
+        );
+    }
+}
+
+/// Names used by the subscription's own encrypted transports must never become replacement
+/// destinations when the standard template sniffs TLS.  A REALITY entry dials its literal
+/// `server` address while borrowing `servername`; replacing the former with a fresh DNS lookup
+/// of the latter sends the handshake to the cover website and produces a genuine certificate
+/// instead of a REALITY session.
+///
+/// A set is intentional: one cover name is commonly shared by many entries, and lexical order
+/// keeps a dynamic subscription byte-stable when unrelated projection order changes.
+fn subscription_server_names(subscription: &Subscription) -> BTreeSet<&str> {
+    subscription
+        .entries
+        .iter()
+        .map(|entry| match &entry.security {
+            SubscriptionSecurity::Reality(reality) => reality.server_name.as_str(),
+            SubscriptionSecurity::Tls(tls) => tls.server_name.as_str(),
+            SubscriptionSecurity::Hysteria2(hysteria) => hysteria.server_name.as_str(),
+        })
+        .chain(
+            subscription
+                .external_proxies
+                .iter()
+                .filter_map(|proxy| match &proxy.security {
+                    ExternalOutboundSecurity::None => None,
+                    ExternalOutboundSecurity::Tls { server_name, .. }
+                    | ExternalOutboundSecurity::Reality { server_name, .. } => {
+                        Some(server_name.as_str())
+                    }
+                }),
+        )
+        .filter(|server_name| !server_name.trim().is_empty())
+        .collect()
 }
 
 fn standard_group_names(subscription: &Subscription) -> Vec<String> {
@@ -349,6 +474,12 @@ fn standard_group_names(subscription: &Subscription) -> Vec<String> {
         .entries
         .iter()
         .map(|entry| entry.name.clone())
+        .chain(
+            subscription
+                .external_proxies
+                .iter()
+                .map(|proxy| proxy.name.clone()),
+        )
         .chain(
             subscription
                 .front_groups
@@ -552,7 +683,7 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
         path,
         host,
         download,
-        mux,
+        xmux,
         mode,
     } = &entry.stream
     {
@@ -572,15 +703,11 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
         // arrives and never complains. The field it feeds is `XHTTPReuseSettings`, tagged
         // `// aka XMUX` in mihomo's own source.
         //
-        // The integer is fine against mihomo's `string` field: its decoder runs with
-        // `WeaklyTypedInput`, which formats an int into the string.
-        //
-        // Omitted when unset — but note that absent does not mean the same thing here as it does
-        // in the xray config: mihomo builds no reuse manager at all and reuses nothing, where
-        // xray puts every stream on one connection. See `Xhttp::mux`.
-        if let Some(concurrency) = mux {
-            lines.push("      reuse-settings:".to_owned());
-            lines.push(format!("        max-concurrency: {concurrency}"));
+        // Omitted as one complete object when the operator selects Xray defaults. A custom value
+        // includes the lifecycle ranges too: carrying only max-concurrency would make Xray's
+        // omitted request and time limits unlimited.
+        if let Some(xmux) = xmux {
+            push_xhttp_reuse_settings(lines, 6, xmux);
         }
         if let Some(download) = download {
             lines.push("      download-settings:".to_owned());
@@ -606,13 +733,202 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
             ));
             lines.push(format!("        path: {}", yaml_quote(path)));
             if let Some(concurrency) = download.mux {
-                lines.push("        reuse-settings:".to_owned());
-                lines.push(format!("          max-concurrency: {concurrency}"));
+                push_xhttp_reuse_settings(lines, 8, &XhttpXmux::with_concurrency(concurrency));
             }
         }
     }
     if let Some(front_name) = &entry.front_name {
         lines.push(format!("    dialer-proxy: {}", yaml_quote(front_name)));
+    }
+}
+
+fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProxy) {
+    lines.push(format!("  - name: {}", yaml_quote(&proxy.name)));
+    lines.push(format!("    server: {}", scalar(&proxy.server)));
+    lines.push(format!("    port: {}", proxy.port));
+    match &proxy.protocol {
+        ExternalOutboundProtocol::Vless {
+            credential,
+            encryption: _,
+            flow,
+            transport,
+        } => {
+            lines.push("    type: vless".to_owned());
+            lines.push(format!("    uuid: {}", scalar(credential)));
+            match transport {
+                ExternalVlessTransport::Raw => lines.push("    network: tcp".to_owned()),
+                ExternalVlessTransport::Xhttp(xhttp) => {
+                    lines.push("    network: xhttp".to_owned());
+                    lines.push("    xhttp-opts:".to_owned());
+                    lines.push(format!("      path: {}", yaml_quote(&xhttp.path)));
+                    if let Some(host) = &xhttp.host {
+                        lines.push(format!("      host: {}", scalar(host)));
+                    }
+                    if let Some(mode) = xhttp.mode.as_str() {
+                        lines.push(format!("      mode: {}", yaml_quote(mode)));
+                    }
+                    if let Some(concurrency) = xhttp.mux {
+                        push_xhttp_reuse_settings(
+                            lines,
+                            6,
+                            &XhttpXmux::with_concurrency(concurrency),
+                        );
+                    }
+                    if let Some(download) = &xhttp.download {
+                        lines.push("      download-settings:".to_owned());
+                        lines.push(format!("        server: {}", scalar(&download.address)));
+                        lines.push(format!("        port: {}", download.port));
+                        lines.push(format!("        path: {}", yaml_quote(&download.path)));
+                        if let Some(host) = &download.host {
+                            lines.push(format!("        host: {}", scalar(host)));
+                        }
+                        push_external_security(lines, &download.security, 8);
+                        if let Some(concurrency) = download.mux {
+                            push_xhttp_reuse_settings(
+                                lines,
+                                8,
+                                &XhttpXmux::with_concurrency(concurrency),
+                            );
+                        }
+                    }
+                }
+            }
+            lines.push("    udp: true".to_owned());
+            if let Some(flow) = flow.as_ref().filter(|flow| !flow.is_empty()) {
+                lines.push(format!("    flow: {}", scalar(flow)));
+            }
+            push_external_security(lines, &proxy.security, 4);
+        }
+        ExternalOutboundProtocol::Shadowsocks2022 { credential, method } => {
+            lines.push("    type: ss".to_owned());
+            lines.push(format!("    cipher: {}", scalar(method)));
+            lines.push(format!("    password: {}", scalar(credential)));
+            lines.push("    udp: true".to_owned());
+        }
+        ExternalOutboundProtocol::Socks5 {
+            username,
+            credential,
+        } => {
+            lines.push("    type: socks5".to_owned());
+            push_external_auth(lines, username.as_deref(), credential);
+            lines.push("    udp: true".to_owned());
+        }
+        ExternalOutboundProtocol::HttpConnect {
+            username,
+            credential,
+        } => {
+            lines.push("    type: http".to_owned());
+            push_external_auth(lines, username.as_deref(), credential);
+            push_external_security(lines, &proxy.security, 4);
+        }
+        ExternalOutboundProtocol::Wireguard {
+            credential,
+            peer_public_key,
+            local_addresses,
+            mtu,
+            reserved,
+            keep_alive,
+            allowed_ips,
+            ..
+        } => {
+            lines.push("    type: wireguard".to_owned());
+            if let Some(address) = local_addresses
+                .iter()
+                .find(|address| !address.contains(':'))
+            {
+                lines.push(format!(
+                    "    ip: {}",
+                    scalar(address.trim_end_matches("/32"))
+                ));
+            }
+            if let Some(address) = local_addresses.iter().find(|address| address.contains(':')) {
+                lines.push(format!(
+                    "    ipv6: {}",
+                    scalar(address.trim_end_matches("/128"))
+                ));
+            }
+            lines.push(format!("    private-key: {}", scalar(credential)));
+            lines.push(format!("    public-key: {}", scalar(peer_public_key)));
+            lines.push(format!("    allowed-ips: {}", inline_list(allowed_ips)));
+            if !reserved.is_empty() {
+                lines.push(format!(
+                    "    reserved: [{}]",
+                    reserved
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            lines.push(format!("    persistent-keepalive: {keep_alive}"));
+            lines.push(format!("    mtu: {mtu}"));
+            lines.push("    udp: true".to_owned());
+        }
+        ExternalOutboundProtocol::Warp { .. } => {
+            unreachable!("WARP has no user-scoped identity and is rejected from Clash fronts")
+        }
+    }
+}
+
+fn push_xhttp_reuse_settings(lines: &mut Vec<String>, indent: usize, xmux: &XhttpXmux) {
+    let base = " ".repeat(indent);
+    let field = " ".repeat(indent + 2);
+    lines.push(format!("{base}reuse-settings:"));
+    lines.push(format!("{field}max-concurrency: {}", xmux.max_concurrency));
+    lines.push(format!(
+        "{field}h-max-request-times: {}",
+        yaml_quote(&xhttp_range(&xmux.h_max_request_times))
+    ));
+    lines.push(format!(
+        "{field}h-max-reusable-secs: {}",
+        yaml_quote(&xhttp_range(&xmux.h_max_reusable_secs))
+    ));
+}
+
+fn xhttp_range(range: &XhttpXmuxRange) -> String {
+    if range.from == range.to {
+        range.from.to_string()
+    } else {
+        format!("{}-{}", range.from, range.to)
+    }
+}
+
+fn push_external_auth(lines: &mut Vec<String>, username: Option<&str>, credential: &str) {
+    if let Some(username) = username.filter(|username| !username.is_empty()) {
+        lines.push(format!("    username: {}", scalar(username)));
+        lines.push(format!("    password: {}", scalar(credential)));
+    }
+}
+
+fn push_external_security(
+    lines: &mut Vec<String>,
+    security: &ExternalOutboundSecurity,
+    indent: usize,
+) {
+    let pad = " ".repeat(indent);
+    match security {
+        ExternalOutboundSecurity::None => {}
+        ExternalOutboundSecurity::Tls {
+            server_name,
+            fingerprint,
+        } => {
+            lines.push(format!("{pad}tls: true"));
+            lines.push(format!("{pad}servername: {}", scalar(server_name)));
+            lines.push(format!("{pad}client-fingerprint: {}", scalar(fingerprint)));
+        }
+        ExternalOutboundSecurity::Reality {
+            server_name,
+            public_key,
+            short_id,
+            fingerprint,
+        } => {
+            lines.push(format!("{pad}tls: true"));
+            lines.push(format!("{pad}servername: {}", scalar(server_name)));
+            lines.push(format!("{pad}client-fingerprint: {}", scalar(fingerprint)));
+            lines.push(format!("{pad}reality-opts:"));
+            lines.push(format!("{pad}  public-key: {}", scalar(public_key)));
+            lines.push(format!("{pad}  short-id: {}", yaml_quote(short_id)));
+        }
     }
 }
 

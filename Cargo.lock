@@ -339,6 +339,8 @@ version = "0.2.0"
 dependencies = [
  "brocade-core",
  "brocade-deployment",
+ "brocade-probe",
+ "getrandom 0.3.4",
  "libc",
  "rustls",
  "serde",
@@ -354,6 +356,7 @@ dependencies = [
  "base64",
  "brocade-core",
  "brocade-deployment",
+ "brocade-probe",
  "brocade-store",
  "flate2",
  "ipnet",
@@ -369,6 +372,7 @@ dependencies = [
  "testcontainers-modules",
  "time",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "x509-parser 0.17.0",
@@ -406,6 +410,14 @@ dependencies = [
  "sha2",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "brocade-probe"
+version = "0.2.0"
+dependencies = [
+ "brocade-deployment",
+ "serde_json",
 ]
 
 [[package]]
@@ -3071,6 +3083,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

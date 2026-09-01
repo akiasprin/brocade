@@ -1,21 +1,27 @@
 mod admin;
 mod agent;
 mod agent_release;
+mod branding;
 mod cert;
 mod console;
 mod credentials;
 mod deployment;
 mod distribution;
 mod draft;
+mod egress_dns;
 mod grant_automation;
+mod grant_probe;
 mod input;
+mod lifecycle;
 mod load;
+mod log_policy;
 mod materialize;
 mod pg;
 mod probe;
 mod provision;
 mod quota;
 pub mod secrets;
+mod serving;
 mod settings;
 mod usage;
 
@@ -27,6 +33,7 @@ pub use admin::{
 };
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
 pub use agent_release::{AgentBuildInfo, AgentRelease, AgentReleaseScope};
+pub use branding::{BrandingSettings, DEFAULT_SITE_NAME};
 pub use brocade_deployment::protocol::{
     BinarySource, CreateDeploymentRequest, CreateDeploymentResult, CreateRollbackRequest,
     DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
@@ -47,18 +54,21 @@ pub use cert::{
     ACME_LETSENCRYPT_STAGING,
 };
 pub use console::{
-    ArtifactContent, ArtifactIndex, ArtifactIndexEntry, ClashSubscriptionUsage, CompileView,
-    ConsoleSnapshot, CreateAppRequest, CreateChainRequest, CreateFrontRequest, CreateGrantRequest,
-    CreateIngressRequest, CreateRealityIngressRequest, CreateTenantRequest, CreateUserRequest,
-    DeleteStepResult, DeploymentVerification, DynamicClashSubscription, HopInRequest,
-    HopWireRequest, ModelWriteResult, NodeAgentStateItem, NodeAgentStateList, PruneChainResult,
-    PutStepRequest, RedactedModelSnapshot, RedactedSecret, RevisionList, RevisionListItem,
-    RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult, StepAcceptRequest,
-    TenantList, TenantListItem, TransportRequest, UpdateNodeRequest, UpdateNodeResult,
-    UpdateNodeStatusRequest, UpdateUserStatusRequest, UpdateUserStatusResult, UpsertAppResult,
-    UpsertChainResult, UpsertExternalOutboundRequest, UpsertFrontResult, UpsertGrantResult,
-    UpsertIngressResult, UpsertStepResult, UpsertTenantResult, UpsertUserResult, UserAppQuota,
-    UserAppQuotaList, UserList, UserListItem, VerifyDeploymentRequest, WiresRequest,
+    ArtifactContent, ArtifactIndex, ArtifactIndexEntry, ClashHaitunLink, ClashSubscriptionUsage,
+    CompileView, ConsoleEgressDnsPolicy, ConsoleSnapshot, CreateAppRequest, CreateChainRequest,
+    CreateFrontRequest, CreateGrantRequest, CreateIngressRequest, CreateRealityIngressRequest,
+    CreateTenantRequest, CreateUserRequest, DeleteStepResult, DeploymentVerification,
+    DynamicClashSubscription, HopInRequest, HopWireRequest, ModelWriteResult, NodeAgentStateItem,
+    NodeAgentStateList, PruneChainResult, PutStepRequest, RedactedModelSnapshot, RedactedSecret,
+    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveWarpBindingRequest,
+    RemoveWarpBindingResult, RevisionList, RevisionListItem, RotateUserUuidResult,
+    SetUserAppQuotaRequest, SetUserAppQuotaResult, StepAcceptRequest, TenantList, TenantListItem,
+    TransportRequest, UpdateNodeRequest, UpdateNodeResult, UpdateNodeStatusRequest,
+    UpdateUserStatusRequest, UpdateUserStatusResult, UpdateWarpBindingRequest,
+    UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult, UpsertExternalOutboundRequest,
+    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
+    UpsertUserResult, UserAppQuota, UserAppQuotaList, UserList, UserListItem,
+    VerifyDeploymentRequest, WarpBindingRemoval, WiresRequest,
 };
 pub use credentials::{
     admin_session_token_hash, admin_token_display_prefix, admin_token_hash,
@@ -75,7 +85,18 @@ pub use credentials::{
 };
 pub use distribution::DistributionSettings;
 pub use draft::{ApplyDraftResult, DraftPreview, ModelOp};
-pub use grant_automation::{GrantAutomationOutcome, GRANTS_AUTOMATION_ACTOR};
+pub use grant_automation::{
+    GrantAutomationOutcome, GrantAutomationStatus, GRANTS_AUTOMATION_ACTOR,
+};
+pub use grant_probe::{UserGrantProbePlan, UserGrantProbeTarget};
+pub use lifecycle::{
+    AbandonNodeRequest, NodeLifecyclePhase, NodeLifecycleState, NodeLifecycleTransitionResult,
+};
+pub use log_policy::{
+    AgentLogPolicyView, NodeLogPolicyItem, UpdateAgentLogDefaultRequest,
+    UpdateNodeLogPolicyRequest, DEFAULT_AGENT_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
+    MIN_AGENT_LOG_MAX_MIB,
+};
 pub use pg::PgStore;
 pub use probe::{
     E2eProbeItem, E2eProbeSample, LinkHealthItem, LinkMtuItem, LinkMtuView, NodeMtuItem,
@@ -97,6 +118,8 @@ pub enum StoreError {
     NotFound(String),
     Unauthorized(String),
     Forbidden(String),
+    Conflict(String),
+    Unavailable(String),
     InvalidData(String),
     Unsupported(String),
     PublishBlocked(brocade_core::compile::PublishBlocked),
@@ -112,6 +135,8 @@ impl std::fmt::Display for StoreError {
             StoreError::NotFound(message) => write!(f, "not found: {message}"),
             StoreError::Unauthorized(message) => write!(f, "unauthorized: {message}"),
             StoreError::Forbidden(message) => write!(f, "forbidden: {message}"),
+            StoreError::Conflict(message) => write!(f, "conflict: {message}"),
+            StoreError::Unavailable(message) => write!(f, "unavailable: {message}"),
             StoreError::InvalidData(message) => write!(f, "invalid store data: {message}"),
             StoreError::Unsupported(message) => write!(f, "unsupported store operation: {message}"),
             StoreError::PublishBlocked(blocked) => write!(

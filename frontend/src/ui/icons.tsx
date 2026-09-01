@@ -19,11 +19,27 @@ const PATHS = {
       <path d="M4.8 11.3 C 7.5 8.6, 8.5 7.4, 11.2 4.7" />
     </>
   ),
+  /* 一段轴向管道：左侧椭圆是接入口，横向体积表示一项可复用的传输资源。
+     不使用箭头——隧道未来既能作为出口，也能作为入口；箭头还会让资源图标被读成
+     “退出”动作。侧视管道与「线路」的端点曲线、机器的终端框都有独立轮廓。 */
+  tunnels: (
+    <>
+      <ellipse cx="4.2" cy="8" rx="2.1" ry="4.3" />
+      <path d="M4.2 3.7 H11.5 C12.8 3.7 13.8 5.6 13.8 8 C13.8 10.4 12.8 12.3 11.5 12.3 H4.2" />
+    </>
+  ),
   /* 头与肩 */
   users: (
     <>
       <circle cx="8" cy="5.2" r="2.6" />
       <path d="M3.2 13.4 C 3.2 10.6, 5.3 8.9, 8 8.9 C 10.7 8.9, 12.8 10.6, 12.8 13.4" />
+    </>
+  ),
+  /* 放大镜：列表页的即时筛选。 */
+  search: (
+    <>
+      <circle cx="7" cy="7" r="4.2" />
+      <path d="M10.2 10.2 L13.8 13.8" />
     </>
   ),
   /* 出盘上箭头：发布 */
@@ -66,9 +82,7 @@ const PATHS = {
     </>
   ),
   /* 脉搏线：诊断 */
-  diag: (
-    <path d="M1.8 8 H4.6 L6.4 3.4 L9.6 12.6 L11.4 8 H14.2" />
-  ),
+  diag: <path d="M1.8 8 H4.6 L6.4 3.4 L9.6 12.6 L11.4 8 H14.2" />,
   /* 趋势线：观测（机器详情页签，指标上行 + 端点） */
   observe: (
     <>
@@ -89,15 +103,7 @@ const PATHS = {
 
 export type IconName = keyof typeof PATHS;
 
-export function Icon({
-  of,
-  size = 16,
-  className,
-}: {
-  of: IconName;
-  size?: number;
-  className?: string;
-}) {
+export function Icon({ of, size = 16, className }: { of: IconName; size?: number; className?: string }) {
   return (
     <span className={className} aria-hidden="true">
       <svg
@@ -117,6 +123,6 @@ export function Icon({
 }
 
 /* 列表页标题行的固定用法：16px，颜色由 .list-ico 定为 --ink-2，比 15px/600 的标题浅一档。 */
-export function ListIcon({ of }: { of: 'nodes' | 'chains' | 'users' }) {
+export function ListIcon({ of }: { of: 'nodes' | 'chains' | 'tunnels' | 'users' }) {
   return <Icon of={of} size={16} className="list-ico" />;
 }

@@ -1,18 +1,68 @@
 import { useEffect, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { fetchArtifactContent, fetchClashSubscription, fetchRevisions, type ArtifactFamily } from '../api';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  fetchArtifactContent,
+  fetchClashSubscription,
+  fetchRevisions,
+  issueClashHaitunSubscription,
+  revokeClashHaitunSubscription,
+  type ArtifactFamily,
+  type ArtifactProtocol,
+  type ClashSubscriptionInfo,
+} from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
 import { copyText } from '../ui/platform';
 
 export type SubscriptionKind = 'uri' | 'clash';
 
 type FamilyPick = 'both' | ArtifactFamily;
+type ProtocolPick = 'both' | ArtifactProtocol;
+type ClashTemplatePick = 'standard' | 'haitun';
 
 const FAMILY_PICKS: { key: FamilyPick; label: string }[] = [
   { key: 'both', label: 'IPv4 + IPv6' },
   { key: 'v4', label: '仅 IPv4' },
   { key: 'v6', label: '仅 IPv6' },
 ];
+
+const PROTOCOL_PICKS: { key: ProtocolPick; label: string }[] = [
+  { key: 'vless', label: 'VLESS' },
+  { key: 'hysteria2', label: 'Hysteria 2' },
+  { key: 'both', label: 'VLESS + Hysteria 2' },
+];
+
+function SubscriptionTabs<T extends string>({
+  label,
+  ariaLabel,
+  picks,
+  value,
+  onChange,
+}: {
+  label: string;
+  ariaLabel: string;
+  picks: { key: T; label: string }[];
+  value: T;
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="sub-filter-row">
+      <span className="sub-filter-label">{label}</span>
+      <div className="sub-tabs" role="tablist" aria-label={ariaLabel}>
+        {picks.map(pick => (
+          <button
+            key={pick.key}
+            type="button"
+            role="tab"
+            aria-selected={value === pick.key}
+            onClick={() => onChange(pick.key)}
+          >
+            {pick.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function SubscriptionViewer({
   tenant,
@@ -42,18 +92,27 @@ function useEscape(onClose: () => void) {
   }, [onClose]);
 }
 
-/* VLESS keeps the existing address-list interaction. Address-family narrowing is performed by
- * the server, so every tab remains an exact view of a current compiled artifact. */
+/* The VLESS entry keeps the existing address-list interaction, while the server narrows both
+ * protocol and address family so every tab remains an exact view of the current artifact. */
 function VlessAddresses({ tenant, user, onClose }: { tenant: string; user: string; onClose: () => void }) {
   const [family, setFamily] = useState<FamilyPick>('both');
+  const [protocol, setProtocol] = useState<ProtocolPick>('both');
   useEscape(onClose);
 
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), refetchInterval: 10_000 });
   const revision = revisions.data?.current_revision;
   const content = useQuery({
-    queryKey: ['artifact', revision, 'user', `${tenant}:${user}`, 'uri', family],
+    queryKey: ['artifact', revision, 'user', `${tenant}:${user}`, 'uri', family, protocol],
     queryFn: () =>
-      fetchArtifactContent('user', `${tenant}:${user}`, 'uri', undefined, family === 'both' ? undefined : family),
+      fetchArtifactContent(
+        'user',
+        `${tenant}:${user}`,
+        'uri',
+        undefined,
+        family === 'both' ? undefined : family,
+        protocol === 'both' ? undefined : protocol,
+        true,
+      ),
     enabled: !!revision,
   });
 
@@ -69,25 +128,28 @@ function VlessAddresses({ tenant, user, onClose }: { tenant: string; user: strin
       <div className="sub-card" onClick={event => event.stopPropagation()} role="dialog" aria-modal="true">
         <SubscriptionHead user={user} suffix="uri.txt" onClose={onClose} />
         <div className="cfg-main">
-          <div className="sub-tabbar">
-            <div className="sub-tabs" role="tablist" aria-label="地址族">
-              {FAMILY_PICKS.map(pick => (
-                <button
-                  key={pick.key}
-                  type="button"
-                  role="tab"
-                  aria-selected={family === pick.key}
-                  onClick={() => setFamily(pick.key)}
-                >
-                  {pick.label}
+          <div className="sub-filterbar">
+            <SubscriptionTabs
+              label="协议"
+              ariaLabel="订阅协议"
+              picks={PROTOCOL_PICKS}
+              value={protocol}
+              onChange={setProtocol}
+            />
+            <div className="sub-filter-with-action">
+              <SubscriptionTabs
+                label="网络"
+                ariaLabel="地址族"
+                picks={FAMILY_PICKS}
+                value={family}
+                onChange={setFamily}
+              />
+              {text && (
+                <button className="sub-copy" onClick={() => void copyText(text)}>
+                  复制
                 </button>
-              ))}
+              )}
             </div>
-            {text && (
-              <button className="sub-copy" onClick={() => void copyText(text)}>
-                复制
-              </button>
-            )}
           </div>
           {!revision || content.isPending ? (
             <Loading />
@@ -103,10 +165,10 @@ function VlessAddresses({ tenant, user, onClose }: { tenant: string; user: strin
                 <b>{lines.length} 行</b>
                 <span>·</span>
                 <span>修订 {content.data.revision}</span>
-                {family !== 'both' && empty && (
+                {empty && (
                   <>
                     <span className="cfg-sp" />
-                    <span className="st st-warn">这个人名下没有 {family === 'v4' ? 'IPv4' : 'IPv6'} 接入面</span>
+                    <span className="st st-warn">没有符合当前协议与网络条件的接入面</span>
                   </>
                 )}
               </div>
@@ -120,16 +182,37 @@ function VlessAddresses({ tenant, user, onClose }: { tenant: string; user: strin
 
 function ClashSubscription({ tenant, user, onClose }: { tenant: string; user: string; onClose: () => void }) {
   const [family, setFamily] = useState<FamilyPick>('both');
+  const [protocol, setProtocol] = useState<ProtocolPick>('both');
+  const [template, setTemplate] = useState<ClashTemplatePick>('standard');
   const [revealed, setRevealed] = useState(false);
+  const qc = useQueryClient();
   useEscape(onClose);
+  const queryKey = ['clash-subscription', tenant, user] as const;
   const subscription = useQuery({
-    queryKey: ['clash-subscription', tenant, user],
+    queryKey,
     queryFn: () => fetchClashSubscription(tenant, user),
     staleTime: 0,
   });
+  const updateHaitun = (haitun: ClashSubscriptionInfo['haitun']) => {
+    qc.setQueryData<ClashSubscriptionInfo>(queryKey, current => (current ? { ...current, haitun } : current));
+  };
+  const issueHaitun = useMutation({
+    mutationFn: () => issueClashHaitunSubscription(tenant, user),
+    onSuccess: updateHaitun,
+  });
+  const revokeHaitun = useMutation({
+    mutationFn: () => revokeClashHaitunSubscription(tenant, user),
+    onSuccess: data => {
+      setRevealed(false);
+      updateHaitun(data);
+    },
+  });
   const value = subscription.data;
-  const selectedUrl = value?.urls[family] ?? '';
+  const haitunActive = value?.haitun.status === 'active' && !!value.haitun.urls;
+  const selectedUrls = template === 'haitun' ? value?.haitun.urls : value?.urls;
+  const selectedUrl = withSubscriptionProtocol(selectedUrls?.[family] ?? '', protocol);
   const shownUrl = selectedUrl ? (revealed ? selectedUrl : maskSubscriptionUrl(selectedUrl)) : '';
+  const actionError = issueHaitun.error ?? revokeHaitun.error;
 
   return (
     <div className="confirm-mask" onClick={onClose}>
@@ -152,42 +235,102 @@ function ClashSubscription({ tenant, user, onClose }: { tenant: string; user: st
         ) : value ? (
           <div className="clash-body">
             <div className="clash-intro">
-              <span className="clash-mark">CLASH</span>
+              <span className="clash-mark">{template === 'haitun' ? 'KOI' : 'CLASH'}</span>
               <span>
-                <b>Clash 订阅地址</b>
-                <span>选择客户端可用的地址族，再复制到 Mihomo / Clash Meta</span>
+                <b>{template === 'haitun' ? 'koipy 测速订阅' : 'Clash 订阅地址'}</b>
+                <span>
+                  {template === 'haitun'
+                    ? '精简为 koipy 测速需要的具体节点与必要链路'
+                    : '选择客户端可用的地址族，再复制到 Mihomo / Clash Meta'}
+                </span>
               </span>
             </div>
-            <div className="clash-family">
-              <div className="sub-tabs" role="tablist" aria-label="订阅地址族">
-                {FAMILY_PICKS.map(pick => (
-                  <button
-                    key={pick.key}
-                    type="button"
-                    role="tab"
-                    aria-selected={family === pick.key}
-                    onClick={() => setFamily(pick.key)}
-                  >
-                    {pick.label}
+            <label className="clash-template">
+              <span>订阅模板</span>
+              <select
+                aria-label="订阅模板"
+                value={template}
+                onChange={event => {
+                  setTemplate(event.target.value as ClashTemplatePick);
+                  setRevealed(false);
+                }}
+              >
+                <option value="standard">{value.template}</option>
+                <option value="haitun">{value.haitun.template}</option>
+              </select>
+              <small>{template === 'haitun' ? '供 koipy 测速拉取' : '日常客户端配置'}</small>
+            </label>
+            <div className="clash-filters">
+              <SubscriptionTabs
+                label="协议"
+                ariaLabel="订阅协议"
+                picks={PROTOCOL_PICKS}
+                value={protocol}
+                onChange={next => {
+                  setProtocol(next);
+                  setRevealed(false);
+                }}
+              />
+              <SubscriptionTabs
+                label="网络"
+                ariaLabel="订阅地址族"
+                picks={FAMILY_PICKS}
+                value={family}
+                onChange={next => {
+                  setFamily(next);
+                  setRevealed(false);
+                }}
+              />
+            </div>
+            {template === 'haitun' && !haitunActive ? (
+              <div className="clash-haitun-empty">
+                <span className={value.haitun.status === 'revoked' ? 'st st-warn' : 'st'}>
+                  {value.haitun.status === 'revoked' ? '已撤销' : '尚未生成'}
+                </span>
+                <span>
+                  <b>{value.haitun.status === 'revoked' ? '旧 koipy 测速地址已经失效' : '生成独立的 koipy 测速地址'}</b>
+                  <small>不会修改或替换当前的标准 Clash 订阅。</small>
+                </span>
+                <button type="button" disabled={issueHaitun.isPending} onClick={() => issueHaitun.mutate()}>
+                  {issueHaitun.isPending
+                    ? '生成中…'
+                    : value.haitun.status === 'revoked'
+                      ? '重新生成'
+                      : '生成 koipy 测速地址'}
+                </button>
+              </div>
+            ) : (
+              <div>
+                <div className="clash-url-label">
+                  <b>{template === 'haitun' ? 'koipy 测速 URL' : '订阅 URL'}</b>
+                  <span>{template === 'haitun' ? '独立 Token，可单独撤销' : '地址中的 UUID 是访问凭据'}</span>
+                  {template === 'haitun' && (
+                    <>
+                      <span className="sp" />
+                      <span className="clash-live">● 可用</span>
+                      <button
+                        className="clash-revoke"
+                        type="button"
+                        disabled={revokeHaitun.isPending}
+                        onClick={() => revokeHaitun.mutate()}
+                      >
+                        {revokeHaitun.isPending ? '撤销中…' : '撤销 koipy 测速地址'}
+                      </button>
+                    </>
+                  )}
+                </div>
+                <div className="clash-url">
+                  <code title={revealed ? selectedUrl : undefined}>{shownUrl}</code>
+                  <button type="button" onClick={() => setRevealed(current => !current)}>
+                    {revealed ? '隐藏' : '显示'}
                   </button>
-                ))}
+                  <button type="button" onClick={() => void copyText(selectedUrl)}>
+                    复制
+                  </button>
+                </div>
               </div>
-            </div>
-            <div>
-              <div className="clash-url-label">
-                <b>订阅 URL</b>
-                <span>地址中的 UUID 是访问凭据</span>
-              </div>
-              <div className="clash-url">
-                <code title={revealed ? selectedUrl : undefined}>{shownUrl}</code>
-                <button type="button" onClick={() => setRevealed(current => !current)}>
-                  {revealed ? '隐藏' : '显示'}
-                </button>
-                <button type="button" onClick={() => void copyText(selectedUrl)}>
-                  复制
-                </button>
-              </div>
-            </div>
+            )}
+            {template === 'haitun' && actionError && <ErrorBox error={actionError} />}
             <div className="clash-meta">
               <span>
                 <small>剩余流量</small>
@@ -197,14 +340,19 @@ function ClashSubscription({ tenant, user, onClose }: { tenant: string; user: st
                 <small>重置时间</small>
                 <b>{formatResetAt(value.reset_at)}</b>
               </span>
-              {value.usage_has_gap && <span className="st st-warn">用量有缺口</span>}
             </div>
             <div className="clash-note">
-              <i>●</i>
-              <span>
-                每次获取都按当前授权与全局 {value.template} 实时生成；<b>不保存结果，不使用缓存。</b>换 UUID
-                后旧地址立即失效。
-              </span>
+              <i>{template === 'haitun' ? '!' : '●'}</i>
+              {template === 'haitun' ? (
+                <span>
+                  撤销后 koipy 测速无法再次获取；已经下载的节点凭据仍需通过<b>换 UUID</b>失效。
+                </span>
+              ) : (
+                <span>
+                  每次获取都按当前授权与全局 {value.template} 实时生成；<b>不保存结果，不使用缓存。</b>换 UUID
+                  后旧地址立即失效。
+                </span>
+              )}
             </div>
           </div>
         ) : null}
@@ -229,10 +377,20 @@ function SubscriptionHead({ user, suffix, onClose }: { user: string; suffix: str
 }
 
 function maskSubscriptionUrl(url: string): string {
-  return url.replace(/(\/sub\/v1\/)([^/]+)(\/clash\.yaml)/, (_match, prefix: string, token: string, suffix: string) => {
-    const tail = token.slice(-4);
-    return `${prefix}••••••••-••••-••••-••••-••••••••${tail}${suffix}`;
-  });
+  return url.replace(
+    /(\/sub\/v1\/(?:haitun\/)?)([^/]+)(\/clash\.yaml)/,
+    (_match, prefix: string, token: string, suffix: string) => {
+      const tail = token.slice(-4);
+      return `${prefix}••••••••-••••-••••-••••-••••••••${tail}${suffix}`;
+    },
+  );
+}
+
+function withSubscriptionProtocol(url: string, protocol: ProtocolPick): string {
+  if (!url || protocol === 'both') return url;
+  const selected = new URL(url);
+  selected.searchParams.set('protocol', protocol);
+  return selected.toString();
 }
 
 function formatBytes(bytes: number): string {

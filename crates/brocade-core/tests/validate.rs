@@ -8,18 +8,41 @@ use brocade_core::{
         validate::{validate_app, validate_app_set, validate_model_snapshot, validate_system},
     },
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, ExternalOutbound,
+        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
+        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutbound,
         ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
-        ExternalVlessXhttp, ExternalVlessXhttpDownload, Front, FrontStrategy, Grant, HopDial,
-        HopIn, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaMasquerade, HysteriaObfs,
-        HysteriaPortHop, Ingress, IngressWires, IpFamily, ModelSettings, ModelSnapshot, Node,
-        OverlaySettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
-        RealityClientPolicy, RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls,
-        Transport, User, WireGuardKeys, Xhttp, XhttpMode,
+        ExternalVlessXhttp, ExternalVlessXhttpDownload, ExternalWarpBinding, Front, FrontStrategy,
+        Grant, HopDial, HopIn, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaMasquerade,
+        HysteriaObfs, HysteriaPortHop, Ingress, IngressWires, IpFamily, ModelSettings,
+        ModelSnapshot, Node, NodeEgressDnsPolicy, OverlaySettings, Projection,
+        ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityClientPolicy,
+        RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User,
+        WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
     },
     Diagnostic, Level,
 };
 use ipnet::Ipv4Net;
+
+#[test]
+fn legacy_egress_resolution_is_ignored_and_cleaned_when_serialized() {
+    let action: Action = serde_json::from_value(serde_json::json!({
+        "t": "egress",
+        "send_through": null,
+        "resolution": { "address": "192.0.2.53", "port": 53 }
+    }))
+    .unwrap();
+    assert_eq!(
+        action,
+        Action::Egress {
+            send_through: None,
+            dns: false
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(action).unwrap(),
+        serde_json::json!({ "t": "egress", "send_through": null })
+    );
+}
 
 #[test]
 fn legacy_external_vless_without_transport_deserializes_as_raw() {
@@ -70,7 +93,6 @@ fn external_shadowsocks_is_explicitly_ss2022_raw_with_a_sized_psk() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        app: "app".to_owned(),
         id: "ss".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "SS".to_owned(),
@@ -84,6 +106,7 @@ fn external_shadowsocks_is_explicitly_ss2022_raw_with_a_sized_psk() {
             server_name: "ss.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
+        bindings: Vec::new(),
     }];
 
     let mut diagnostics = Vec::new();
@@ -119,6 +142,142 @@ fn external_shadowsocks_is_explicitly_ss2022_raw_with_a_sized_psk() {
 }
 
 #[test]
+fn managed_warp_runtime_overrides_are_validated() {
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Proxy {
+                    outbound: "warp".to_owned(),
+                },
+            }],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    doc.external_outbounds = vec![ExternalOutbound {
+        id: "warp".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "Cloudflare WARP".to_owned(),
+        address: "engage.cloudflareclient.com".to_owned(),
+        port: 2408,
+        protocol: ExternalOutboundProtocol::Warp {
+            mtu: 1280,
+            keep_alive: 25,
+            allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+            no_kernel_tun: false,
+            domain_strategy: "ForceIP".to_owned(),
+            workers: 257,
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: vec![ExternalWarpBinding {
+            node: "hk".to_owned(),
+            device_id: "device-hk".to_owned(),
+            account_id: "account-hk".to_owned(),
+            registered_at: "2026-08-28T00:00:00.000Z".to_owned(),
+            endpoint_address: None,
+            endpoint_port: None,
+            mtu: None,
+            keep_alive: None,
+            allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
+            no_kernel_tun: None,
+            domain_strategy: None,
+            workers: Some(257),
+            private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
+            peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+            local_addresses: vec!["172.16.0.2/32".to_owned()],
+            reserved: vec![0, 0, 0],
+        }],
+    }];
+    let mut invalid_warp = Vec::new();
+    let sys = compile_system(&doc, &mut invalid_warp);
+    let app_ir = compile_app(&doc, &app, &mut invalid_warp);
+    validate_app(&sys, &app_ir, &mut invalid_warp);
+    for code in [
+        "external-outbound.warp-workers",
+        "external-outbound.warp-binding-address-policy",
+        "external-outbound.warp-binding-workers",
+    ] {
+        assert_has(&invalid_warp, Level::Error, code);
+    }
+}
+
+#[test]
+fn external_tunnel_visibility_follows_tenant_ancestry() {
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Proxy {
+                    outbound: "shared".to_owned(),
+                },
+            }],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    doc.external_outbounds = vec![ExternalOutbound {
+        id: "shared".to_owned(),
+        tenant: "platform".to_owned(),
+        name: "共享出口".to_owned(),
+        address: "proxy.example.net".to_owned(),
+        port: 1080,
+        protocol: ExternalOutboundProtocol::Socks5 {
+            username: None,
+            credential: String::new(),
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: Vec::new(),
+    }];
+
+    let mut ancestor_diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut ancestor_diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut ancestor_diagnostics);
+    validate_app(&sys, &app_ir, &mut ancestor_diagnostics);
+    assert!(
+        ancestor_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "tenant.scope"),
+        "{ancestor_diagnostics:#?}"
+    );
+
+    doc.external_outbounds[0].tenant = "platform.beta".to_owned();
+    let mut sibling_diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut sibling_diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut sibling_diagnostics);
+    validate_app(&sys, &app_ir, &mut sibling_diagnostics);
+    assert_has(&sibling_diagnostics, Level::Error, "tenant.scope");
+}
+
+#[test]
 fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
     let mut doc = doc(vec![node(
         "hk",
@@ -147,7 +306,6 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        app: "app".to_owned(),
         id: "external".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External XHTTP".to_owned(),
@@ -177,6 +335,7 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
             server_name: "upload.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
+        bindings: Vec::new(),
     }];
 
     let mut invalid = Vec::new();
@@ -266,7 +425,6 @@ fn external_socks_auth_and_wireguard_shape_are_validated() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        app: "app".to_owned(),
         id: "external".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External".to_owned(),
@@ -280,6 +438,7 @@ fn external_socks_auth_and_wireguard_shape_are_validated() {
             server_name: "proxy.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
+        bindings: Vec::new(),
     }];
 
     let mut diagnostics = Vec::new();
@@ -594,7 +753,10 @@ fn reverse_hop_ir(
                 hop_in: None,
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress { send_through: None },
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: false,
+                    },
                 }],
             },
         ],
@@ -625,7 +787,7 @@ fn validate_refuses_xhttp_together_with_vision() {
         xhttp: Xhttp {
             path: "/probe".to_owned(),
             host: None,
-            mux: None,
+            xmux: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -646,7 +808,7 @@ fn validate_accepts_xhttp_with_flow_turned_off() {
         xhttp: Xhttp {
             path: "/probe".to_owned(),
             host: None,
-            mux: Some(16),
+            xmux: Some(XhttpXmux::with_concurrency(16)),
             mode: XhttpMode::Auto,
         },
     }));
@@ -679,7 +841,7 @@ fn validate_warns_about_an_upload_mode_that_locks_out_existing_clients() {
         xhttp: Xhttp {
             path: "/probe".to_owned(),
             host: None,
-            mux: None,
+            xmux: None,
             mode: XhttpMode::PacketUp,
         },
     }));
@@ -703,7 +865,7 @@ fn validate_says_nothing_about_the_other_upload_modes() {
             xhttp: Xhttp {
                 path: "/probe".to_owned(),
                 host: None,
-                mux: None,
+                xmux: None,
                 mode,
             },
         }));
@@ -1036,7 +1198,7 @@ fn validate_refuses_a_path_that_cannot_round_trip() {
                 xhttp: Xhttp {
                     path: path.to_owned(),
                     host: None,
-                    mux: None,
+                    xmux: None,
                     mode: XhttpMode::Auto,
                 },
             }));
@@ -1061,14 +1223,14 @@ fn validate_refuses_a_concurrency_outside_the_range() {
                 xhttp: Xhttp {
                     path: "/probe".to_owned(),
                     host: None,
-                    mux: Some(mux),
+                    xmux: Some(XhttpXmux::with_concurrency(mux)),
                     mode: XhttpMode::Auto,
                 },
             }));
 
         validate_app(&sys, &app_ir, &mut diagnostics);
 
-        assert_has(&diagnostics, Level::Error, "ingress.xhttp-mux-range");
+        assert_has(&diagnostics, Level::Error, "ingress.xhttp-xmux-concurrency");
     }
 }
 
@@ -1130,7 +1292,10 @@ fn two_hop_ir(
                 }),
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress { send_through: None },
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: false,
+                    },
                 }],
             },
         ],
@@ -1758,7 +1923,7 @@ fn validate_app_set_reports_a_split_download_port_used_by_another_view() {
         xhttp: Xhttp {
             path: "/split".to_owned(),
             host: None,
-            mux: None,
+            xmux: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -1811,7 +1976,7 @@ fn validate_rejects_stream_one_with_an_independent_download() {
         xhttp: Xhttp {
             path: "/split".to_owned(),
             host: None,
-            mux: None,
+            xmux: None,
             mode: XhttpMode::StreamOne,
         },
     }));
@@ -1920,7 +2085,10 @@ fn validate_app_reports_reverse_upstream_hop_in_clashing_with_its_own_ingress() 
                     "sg",
                     vec![Rule {
                         dest_match: DestMatch::Any,
-                        action: Action::Egress { send_through: None },
+                        action: Action::Egress {
+                            send_through: None,
+                            dns: false,
+                        },
                     }],
                     Some(Accept {
                         uuid: "uuid-sg".to_owned(),
@@ -2044,6 +2212,7 @@ fn validate_app_reports_front_open_default() {
             tenant: "platform.acme".to_owned(),
             name: "入口组".to_owned(),
             via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
             strategy: FrontStrategy::UrlTest,
         }],
         steps: vec![Step {
@@ -2110,6 +2279,216 @@ fn validate_app_reports_tenant_scope_and_bad_dns_form() {
 
     assert_has(&diagnostics, Level::Error, "tenant.scope");
     assert_has(&diagnostics, Level::Error, "node.dns-form");
+}
+
+#[test]
+fn validate_rejects_invalid_or_non_domain_machine_dns() {
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![Rule {
+                dest_match: DestMatch::IpCidr(vec!["203.0.113.0/24".to_owned()]),
+                action: Action::Egress {
+                    send_through: None,
+                    dns: false,
+                },
+            }],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    doc.node_egress_dns = vec![NodeEgressDnsPolicy {
+        node: "hk".to_owned(),
+        position: 0,
+        selector: DestMatch::IpCidr(vec!["203.0.113.0/24".to_owned()]),
+        resolution: EgressDnsResolution {
+            address: "resolver.example.com".to_owned(),
+            port: 0,
+            transport: EgressDnsTransport::Udp,
+            address_strategy: EgressDnsAddressStrategy::UseIpv4,
+            fallback: EgressDnsFallback::Stop,
+        },
+    }];
+    let mut diagnostics = Vec::new();
+    validate_model_snapshot(&doc, &mut diagnostics);
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert_has(&diagnostics, Level::Error, "dns.selector-unsupported");
+    assert_has(&diagnostics, Level::Error, "dns.address");
+    assert_has(&diagnostics, Level::Error, "dns.port");
+}
+
+#[test]
+fn validate_rejects_missing_or_non_domain_dns_references() {
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![
+                Rule {
+                    dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: true,
+                    },
+                },
+                Rule {
+                    dest_match: DestMatch::IpCidr(vec!["203.0.113.0/24".to_owned()]),
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: true,
+                    },
+                },
+            ],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    let doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+    validate_app_set(&[app_ir], &mut diagnostics);
+
+    assert_has(&diagnostics, Level::Error, "dns.reference-missing");
+    assert_has(&diagnostics, Level::Error, "dns.reference-selector");
+}
+
+#[test]
+fn validate_explains_which_chains_have_conflicting_dns_on_one_node() {
+    let mut direct = chain("c-direct");
+    direct.name = "线路 A".to_owned();
+    let mut transit = chain("c-transit");
+    transit.name = "线路 B".to_owned();
+    let mut transit_ingress = ingress("i-transit", "c-transit", "hk", None);
+    transit_ingress.port = 8443;
+    let mut app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![direct, transit],
+        ingresses: vec![ingress("i-direct", "c-direct", "hk", None), transit_ingress],
+        fronts: Vec::new(),
+        steps: vec![
+            step(
+                "c-direct",
+                "hk",
+                vec![Rule {
+                    dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: true,
+                    },
+                }],
+                None,
+            ),
+            step(
+                "c-transit",
+                "hk",
+                vec![Rule {
+                    dest_match: DestMatch::DomainSuffix(vec![
+                        "example.com".to_owned(),
+                        "other.example".to_owned(),
+                    ]),
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: true,
+                    },
+                }],
+                None,
+            ),
+        ],
+        grants: Vec::new(),
+    };
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    doc.nodes[0].name = "出口节点".to_owned();
+    doc.node_egress_dns = vec![
+        NodeEgressDnsPolicy {
+            node: "hk".to_owned(),
+            position: 0,
+            selector: app.steps[0].rules[0].dest_match.clone(),
+            resolution: EgressDnsResolution {
+                address: "192.0.2.53".to_owned(),
+                port: 53,
+                transport: EgressDnsTransport::Tcp,
+                address_strategy: EgressDnsAddressStrategy::UseIp,
+                fallback: EgressDnsFallback::Machine,
+            },
+        },
+        NodeEgressDnsPolicy {
+            node: "hk".to_owned(),
+            position: 1,
+            selector: app.steps[1].rules[0].dest_match.clone(),
+            resolution: EgressDnsResolution {
+                address: "198.51.100.53".to_owned(),
+                port: 53,
+                transport: EgressDnsTransport::Tcp,
+                address_strategy: EgressDnsAddressStrategy::UseIpv6,
+                fallback: EgressDnsFallback::Machine,
+            },
+        },
+    ];
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+    validate_app_set(&[app_ir], &mut diagnostics);
+
+    assert_has(&diagnostics, Level::Error, "dns.rule-conflict");
+    let conflict = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "dns.rule-conflict")
+        .unwrap();
+    assert_eq!(conflict.location, "hk/domain:example.com");
+    assert_eq!(
+        conflict.message,
+        "出口节点（hk）上的 domain:example.com DNS 配置冲突：线路「线路 A（c-direct）」使用 192.0.2.53:53 / TCP / UseIP / 回退机器 DNS；线路「线路 B（c-transit）」使用 198.51.100.53:53 / TCP / UseIPv6 / 回退机器 DNS。Xray 的 DNS 匹配在机器内全局生效，出站引用只决定策略是否下发，不能隔离同一域名的解析上下文；请统一这两条规则"
+    );
+
+    app.steps[1].rules[0].dest_match = app.steps[0].rules[0].dest_match.clone();
+    let mut duplicate_diagnostics = Vec::new();
+    let duplicate_ir = compile_app(&doc, &app, &mut duplicate_diagnostics);
+    validate_app(&sys, &duplicate_ir, &mut duplicate_diagnostics);
+    validate_app_set(&[duplicate_ir], &mut duplicate_diagnostics);
+    assert!(
+        duplicate_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "dns.rule-conflict"),
+        "完全相同的重复配置不应被当成冲突：{duplicate_diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -2234,7 +2613,10 @@ fn validate_app_reports_front_blocked_and_unproven_paths() {
                 vec![
                     Rule {
                         dest_match: DestMatch::Geosite(vec!["netflix".to_owned()]),
-                        action: Action::Egress { send_through: None },
+                        action: Action::Egress {
+                            send_through: None,
+                            dns: false,
+                        },
                     },
                     any_block(),
                 ],
@@ -2855,7 +3237,7 @@ fn validate_accepts_reality_xhttp_with_a_tls_download_front() {
         xhttp: Xhttp {
             path: "/split".to_owned(),
             host: Some("upload.route.example".to_owned()),
-            mux: None,
+            xmux: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -2909,7 +3291,7 @@ fn validate_rejects_invalid_xhttp_client_routing_fields() {
         xhttp: Xhttp {
             path: "/split".to_owned(),
             host: Some("  ".to_owned()),
-            mux: None,
+            xmux: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -2968,7 +3350,7 @@ fn validate_reality_split_requires_a_certificate_and_a_distinct_port() {
         xhttp: Xhttp {
             path: "/split".to_owned(),
             host: None,
-            mux: None,
+            xmux: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -3029,6 +3411,7 @@ fn doc(nodes: Vec<Node>) -> ModelSnapshot {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes,
+        node_egress_dns: Vec::new(),
         users: Vec::new(),
         external_outbounds: Vec::new(),
         apps: Vec::new(),
@@ -3091,6 +3474,7 @@ fn front_app(steps: Vec<Step>, grants: Vec<Grant>) -> AppView {
             tenant: "platform.acme".to_owned(),
             name: "入口组".to_owned(),
             via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
             strategy: FrontStrategy::UrlTest,
         }],
         steps,
@@ -3103,6 +3487,7 @@ fn chain(id: &str) -> Chain {
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),
         name: id.to_owned(),
+        subscription_country: None,
     }
 }
 
@@ -3167,7 +3552,10 @@ fn forward(to: &str) -> Rule {
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress { send_through: None },
+        action: Action::Egress {
+            send_through: None,
+            dns: false,
+        },
     }
 }
 
@@ -3340,7 +3728,10 @@ fn pool_ir_rules(
                 }),
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress { send_through: None },
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: false,
+                    },
                 }],
             },
         ],

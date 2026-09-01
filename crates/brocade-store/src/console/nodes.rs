@@ -15,42 +15,13 @@ pub struct UpdateNodeStatusRequest {
     pub note: Option<String>,
 }
 
-/// Decommissioning and restoring a node.
-///
-/// Decommissioning is not deleting the row: deleted, the plan cannot walk it, the agent
-/// receives 204 forever, and local reconcile keeps replaying it from the old artifacts in
-/// state_dir — wg0 up, xray running, allow-list intact: an unattended relay whose credentials
-/// still work. Keeping the row and marking it has the compiler produce "all three artifacts
-/// Disabled", which the agent follows to tear itself down cleanly and then confirms.
-///
-/// This does not check whether it still carries business: the compiler handles that itself —
-/// ingresses on a decommissioned node are not rendered, chains whose trunk includes it are
-/// disabled entirely, and the release succeeds as usual. Checking here would create a second
-/// source of truth, and only the compiler sees the complete model. Mark it freely.
-pub async fn update_node_status(
-    pool: &PgPool,
-    actor: &AdminContext,
-    node_id: &str,
-    request: UpdateNodeStatusRequest,
-) -> Result<UpdateNodeResult> {
-    let note = note_or(request.note.as_deref(), || {
-        format!("set node status {node_id} {}", request.status.trim())
-    });
-    let mut tx = pool.begin().await?;
-    let previous = lock_control_state(&mut tx).await?;
-    let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
-    let changed = update_node_status_tx(&mut tx, actor, node_id, request).await?;
-    let revision_id = commit_revision(&mut tx, revision_id, previous, changed).await?;
-    tx.commit().await?;
-
-    load_node_result(pool, node_id, revision_id).await
-}
-
 pub(crate) async fn update_node_status_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
+    revision_id: u64,
     node_id: &str,
     request: UpdateNodeStatusRequest,
+    reason: &str,
 ) -> Result<bool> {
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
@@ -84,6 +55,17 @@ pub(crate) async fn update_node_status_tx(
     .await?
     .rows_affected()
         > 0;
+    if changed {
+        crate::lifecycle::advance_intent_tx(
+            tx,
+            &node_id,
+            retired,
+            revision_id,
+            actor.operator_id(),
+            reason,
+        )
+        .await?;
+    }
     Ok(changed)
 }
 

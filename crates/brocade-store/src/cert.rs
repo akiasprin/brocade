@@ -1132,11 +1132,17 @@ pub async fn cert_delta_for_node(
     let Some((names, cert_pem, key_pem)) = node_key(pool, node_id).await? else {
         return Ok(None);
     };
-    let observed: Option<String> =
-        sqlx::query_scalar("SELECT observed_sha256 FROM node_cert_state WHERE node_id = $1")
-            .bind(node_id)
-            .fetch_optional(pool)
-            .await?;
+    // Two kinds of absence are equivalent here: the node has never reported (no row), or it
+    // explicitly reported that the certificate is absent (a row whose observed_sha256 is NULL).
+    // Decode the nullable column first and then flatten the optional row; asking sqlx for String
+    // makes the second, normal state fail as an unexpected NULL on every agent poll.
+    let observed: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT observed_sha256 FROM node_cert_state WHERE node_id = $1",
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
     if observed.as_deref() == Some(sha256_hex(cert_pem.as_bytes()).as_str()) {
         return Ok(None);
     }

@@ -44,7 +44,7 @@ const HOST_KEYS: &[&str] = &[
     // REALITY's borrowed site, as `host:port`. It needs naming here because the
     // key-independent pass cannot reach it: that one only treats `host:port` as an
     // endpoint when the host parses as an address, and this one is a domain
-    // (`apps.apple.com:443`). Left alone it is the one field on the settings page that
+    // (`borrowed.example.net:443`). Left alone it is the one field on the settings page that
     // still names a real host to a reviewer.
     "dest",
     "dial_host",
@@ -368,15 +368,15 @@ mod tests {
     fn the_borrowed_site_is_masked_wherever_it_appears() {
         let mut settings = json!({
             "reality_site": {
-                "dest": "apps.apple.com:443",
-                "server_names": ["apps.apple.com"],
+                "dest": "borrowed.example.net:443",
+                "server_names": ["borrowed.example.net"],
                 "fingerprint": "chrome",
                 "flow": "xtls-rprx-vision",
             }
         });
         mask_json(&mut settings);
-        assert_eq!(settings["reality_site"]["dest"], "***.com:***");
-        assert_eq!(settings["reality_site"]["server_names"][0], "***.com");
+        assert_eq!(settings["reality_site"]["dest"], "***.net:***");
+        assert_eq!(settings["reality_site"]["server_names"][0], "***.net");
         // Neither of these names a host, and blanking them would cost the reviewer the
         // very thing they are reviewing.
         assert_eq!(settings["reality_site"]["fingerprint"], "chrome");

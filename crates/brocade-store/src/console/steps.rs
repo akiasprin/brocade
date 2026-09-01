@@ -6,53 +6,20 @@
 //! and dangling rows remain in the database while the compiler sees a broken chain.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use brocade_core::model::{Action, HopIn, Rule, Step};
+use brocade_core::model::{Action, Rule};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::types::{
     DeleteStepOutcome, DeleteStepResult, HopInRequest, HopWireRequest, PruneChainResult,
-    PutStepRequest, UpsertStepResult,
+    PutStepRequest,
 };
 use super::{
     chain_tenant_tx, commit_revision, ensure_node_exists_tx, existing_step_accept_uuid,
-    insert_revision, lock_control_state, normalize_step_accept, note_or, redacted_value,
-    required_text, resolve_hop_security, u64_to_i64,
+    insert_revision, lock_control_state, normalize_step_accept, note_or, required_text,
+    resolve_hop_security, u64_to_i64,
 };
 use crate::{AdminContext, Result, StoreError};
-
-pub async fn put_step(
-    pool: &PgPool,
-    actor: &AdminContext,
-    app_id: &str,
-    chain_id: &str,
-    node_id: &str,
-    request: PutStepRequest,
-) -> Result<UpsertStepResult> {
-    let note = note_or(request.note.as_deref(), || {
-        format!("put step {app_id}/{chain_id}/{node_id}")
-    });
-    let mut tx = pool.begin().await?;
-    let previous = lock_control_state(&mut tx).await?;
-    let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
-    let (step, changed) = put_step_tx(
-        &mut tx,
-        actor,
-        revision_id,
-        app_id,
-        chain_id,
-        node_id,
-        request,
-    )
-    .await?;
-    let revision_id = commit_revision(&mut tx, revision_id, previous, changed).await?;
-    tx.commit().await?;
-
-    Ok(UpsertStepResult {
-        revision_id,
-        step: redacted_value(step)?,
-    })
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn put_step_tx(
@@ -63,21 +30,22 @@ pub(crate) async fn put_step_tx(
     chain_id: &str,
     node_id: &str,
     request: PutStepRequest,
-) -> Result<(Step, bool)> {
+) -> Result<bool> {
     let app_id = required_text(app_id, "app_id")?;
     let chain_id = required_text(chain_id, "chain_id")?;
     let node_id = required_text(node_id, "node_id")?;
-    let rules_json = serde_json::to_value(&request.rules)?;
     let chain_tenant = chain_tenant_tx(tx, &app_id, &chain_id).await?;
     actor.require_tenant_access(&chain_tenant, "step")?;
     ensure_node_exists_tx(tx, &node_id).await?;
+    let mut changed = false;
+    let rules_json = serde_json::to_value(&request.rules)?;
     let existing_accept_uuid = existing_step_accept_uuid(tx, &chain_id, &node_id).await?;
     let accept = normalize_step_accept(request.accept, existing_accept_uuid, &chain_id, &node_id)?;
     let hop_in = resolve_hop_in(tx, &chain_id, &node_id, request.hop_in.as_ref()).await?;
     // rules is jsonb and `IS DISTINCT FROM` compares parsed values rather than the source text,
     // so neither key order nor whitespace affects the verdict — storing the same rule table
     // again is no change.
-    let changed = sqlx::query(
+    changed |= sqlx::query(
         "INSERT INTO steps (
             chain_id, node_id, accept_uuid, accept_label, rules,
             hop_in_port, hop_in_wire, created_revision
@@ -108,31 +76,7 @@ pub(crate) async fn put_step_tx(
     .await?
     .rows_affected()
         > 0;
-
-    // The copy returned to the caller carries no private key: `hop_in_wire` holds a REALITY
-    // private key and this result goes out over HTTP (the `redacted_value` line). The port is
-    // given; of the material, only the kind.
-    let hop_in = hop_in
-        .map(|(port, security)| -> Result<HopIn> {
-            Ok(HopIn {
-                port,
-                security: serde_json::from_value(security).map_err(|error| {
-                    StoreError::InvalidData(format!("hop_in_wire 解不开：{error}"))
-                })?,
-            })
-        })
-        .transpose()?;
-
-    Ok((
-        Step {
-            chain: chain_id,
-            node: node_id,
-            accept,
-            hop_in,
-            rules: request.rules,
-        },
-        changed,
-    ))
+    Ok(changed)
 }
 
 /// Remove a machine from a chain — a cascading delete, not one row.

@@ -88,11 +88,11 @@ pub fn compile(snapshot: &ModelSnapshot) -> CompileOutput {
     let system = compile_system(snapshot, &mut diagnostics);
     validate_system(&system, &mut diagnostics);
 
-    let mut source_apps = snapshot.apps.iter().collect::<Vec<_>>();
-    source_apps.sort_by(|a, b| a.id.cmp(&b.id));
-
     let mut apps = Vec::new();
-    for app in source_apps {
+    // `ModelSnapshot.apps` is the operator-defined line order. The store materializes it from
+    // `apps.position`, and historical snapshots preserve it as array order. Keep that one semantic
+    // ordering fact in the IR; machine projections still canonicalize their own unordered sets.
+    for app in &snapshot.apps {
         let app_ir = compile_app(snapshot, app, &mut diagnostics);
         let app_ir = compile_hops(app_ir, &system, &mut diagnostics);
         validate_app(&system, &app_ir, &mut diagnostics);

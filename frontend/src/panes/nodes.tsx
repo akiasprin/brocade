@@ -5,6 +5,7 @@ import { GridComponent, TooltipComponent, MarkLineComponent } from 'echarts/comp
 import { CanvasRenderer } from 'echarts/renderers';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  abandonNode,
   fetchArtifactContentView,
   fetchCompileView,
   fetchDeployments,
@@ -39,7 +40,7 @@ import { fetchPreviewStatus } from '../preview/api';
 import type { LinkIr } from '../topo/model';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
 import { can, isPublic, useSession } from '../session';
-import { Ago, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
+import { Ago, Confirm, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { Icon, ListIcon } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
@@ -52,12 +53,12 @@ import { useCrumb } from '../wm/crumb';
 import { openTabByKey } from '../ui/topbar';
 import { RegionFlag } from '../ui/region-flag';
 import { navigate } from '../forge/route';
-import { LoadCard, loadFindings, bps, ThroughputChart, dur, iso } from './telemetry';
+import { LoadCard, bps, ThroughputChart, dur, iso } from './telemetry';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import { ChainWizard } from './chain-wizard';
 import { ChainRulesPanel, IngressPortEditor } from './chains';
-import { RuleDraftScope, isForwardTargetInChain } from './rules';
+import { MachineEgressDnsRules, RuleDraftScope, isForwardTargetInChain } from './rules';
 import { chainSpine, fetchSnapshot, type SnapshotChain, type SnapshotIngress, type SnapshotStep } from '../api';
 import type { AppIr } from '../topo/model';
 import { fmtBytes } from '../forge/diff';
@@ -401,6 +402,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   // 那样它们只在数据就绪的那次渲染中被调用，hook 数量前后不一致会导致 React 报错（#310）。
   const [selecting, setSelecting] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [retiredOpen, setRetiredOpen] = useState<boolean | null>(null);
   const togglePick = (id: string) =>
     setPicked(prev => {
       const next = new Set(prev);
@@ -473,21 +475,27 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
           </>
         )}
         {idle > 0 && ` · ${idle} 待纳管`}
-        {includeRetired && retiredCount > 0 && ` · ${retiredCount} 已退役`}
+        {includeRetired && retiredCount > 0 && ` · ${retiredCount} 退役/处理中`}
       </span>
       {selecting ? (
         <>
           <button className="btn" onClick={exitSelect}>
             取消
           </button>
-          {/* 退役不是删除：记录保留，期望状态变为三份产物全部关闭，agent 据此移除 wg0
-                和 xray。因此不加二次确认——该操作进入草稿，提交前可预览，恢复也只需
-                再次切换。 */}
+          {/* 退役是直接创建停用发布的操作，不进入浏览器草稿。确认框会明确说明它可能
+              取消并替换当前配置单。 */}
           <button
             className="btn danger"
             disabled={pickedLive.length === 0 || retireAll.isPending}
-            title={`退役选中的 ${pickedLive.length} 台：打标记不删行，agent 会把 wg0 和 xray 拆掉。进草稿，提交才生效`}
-            onClick={() => retireAll.mutate()}
+            title={`退役选中的 ${pickedLive.length} 台：保留记录，并为 Agent 创建完整停用发布`}
+            onClick={() => {
+              if (
+                window.confirm(
+                  `确认退役 ${pickedLive.length} 台机器？系统会提交退役修订、取消冲突中的发布，并立即创建完整停用发布。`,
+                )
+              )
+                retireAll.mutate();
+            }}
           >
             {retireAll.isPending ? '提交中…' : `退役下线${pickedLive.length > 0 ? ` ${pickedLive.length}` : ''}`}
           </button>
@@ -540,9 +548,13 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
           )}
         </section>
         {retired.length > 0 && (
-          <details className="panel titled node-retired-panel">
+          <details
+            className="panel titled node-retired-panel"
+            open={retiredOpen ?? retired.some(node => node.lifecycle_phase === 'retiring')}
+            onToggle={event => setRetiredOpen(event.currentTarget.open)}
+          >
             <summary>
-              <h4>已退役</h4>
+              <h4>退役机器</h4>
               <span className="hint">{retired.length} 台</span>
             </summary>
             {renderCards(retired)}
@@ -578,20 +590,39 @@ type NodeLampState = {
 
 /** 节点列表和详情书签共用的状态灯。在线状态优先，失联后不再用旧上报里的
  * finding 推断当前状态；detailOnly 只是详情说明，不改变灯色。 */
-function nodeLampState(node: NodeAgentStateItem, load?: NodeLoadView): NodeLampState {
-  if (node.retired_at) return { tone: 'idle', why: '已退役' };
+function nodeLampState(node: NodeAgentStateItem, wireguardEnabled?: boolean): NodeLampState {
+  if (node.lifecycle_phase === 'retiring') return { tone: 'warn', why: '退役中：等待停用收敛' };
+  if (node.lifecycle_phase === 'retired') {
+    return node.lifecycle_last_error
+      ? { tone: 'warn', why: `已停用，外部资源待清理：${node.lifecycle_last_error}` }
+      : { tone: 'idle', why: '已退役并确认停用' };
+  }
+  if (node.lifecycle_phase === 'abandoned') return { tone: 'bad', why: '强制退役：未确认远端停用' };
 
   const live = pollTone(node);
   if (live === 'idle') return { tone: 'idle', why: '从未上报' };
   if (live === 'bad') return { tone: 'bad', why: '失联' };
 
-  const findings = [...runtimeFindings(node), ...(load ? loadFindings(load) : [])].filter(f => !f.detailOnly);
+  const findings = runtimeFindings(node, wireguardEnabled).filter(f => !f.detailOnly);
   if (findings.length === 0) return { tone: 'ok', why: '没有要处理的' };
 
   return {
     tone: findings.some(f => f.tone === 'bad') ? 'bad' : 'warn',
     why: findings.map(f => f.chip).join(' · '),
   };
+}
+
+function nodeLifecycleLabel(node: NodeAgentStateItem): string | null {
+  switch (node.lifecycle_phase) {
+    case 'active':
+      return null;
+    case 'retiring':
+      return '退役中';
+    case 'retired':
+      return node.lifecycle_last_error ? '待清理' : '已退役';
+    case 'abandoned':
+      return '强制退役';
+  }
 }
 
 /** 卡片上的地址字段。
@@ -626,7 +657,7 @@ function NodeAddr({ node }: { node: NodeAgentStateItem }) {
  * 二十台机器时视线可沿本月用量列直接向下。卡片放弃该能力，换取每台可显示一条趋势线，
  * 而用量上升趋势比当前用量更早反映问题。
  *
- * 卡片上只有五项：状态点、名称、流量线、本月总量和 IP。移除的每一项原因相同——
+ * 卡片上只有五项：地区与状态的组合标识、名称、流量线、本月总量和 IP。移除的每一项原因相同——
  * **它们回答的是具体问题，而本页的职责是定位哪台机器有问题**：
  *   角色标签（入口/中转/末跳）  该机器在链中的位置，属于详情页
  *   异常文字                    压缩为状态点的颜色，具体项在 title 中
@@ -655,11 +686,11 @@ function NodeCard({
 }) {
   const { who } = useSession();
   const canCreate = can(who.role, 'edit');
-  const retired = !!node.retired_at;
+  const retired = node.lifecycle_phase !== 'active';
   const narrow = useNarrow();
   const live = pollTone(node);
   // 具体项写入 title，悬停即可在扫视列表时确认黄/红色对应的问题。
-  const lamp = nodeLampState(node, load);
+  const lamp = nodeLampState(node);
 
   const open = () => (selecting ? onPick() : go({ p: 'node', id: node.node_id }));
   return (
@@ -677,10 +708,10 @@ function NodeCard({
       }}
     >
       <div className="nc-head">
-        {/* 多选时勾选框替换状态点而非名称：勾选过程中需要识别的仍是机器标识，
-            而此时机器是否有异常不影响勾选决策。 */}
-        <span className="nc-status-slot">
-          {selecting ? (
+        {/* 多选框临时插在组合标识之前，不再替换状态灯：旗帜与右下角状态灯在列表和详情中
+            始终是同一个 identity 对象，进入多选也不会丢掉异常状态。 */}
+        {selecting && (
+          <span className="nc-pick-slot">
             <input
               type="checkbox"
               className="nc-pick"
@@ -690,20 +721,25 @@ function NodeCard({
               onChange={onPick}
               onClick={e => e.stopPropagation()}
             />
-          ) : (
+          </span>
+        )}
+        {node.public_ipv4_country ? (
+          <span className="nd-idplate nc-idplate">
+            <span className="nd-idplate-clip">
+              <RegionFlag code={node.public_ipv4_country} />
+            </span>
             <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
-          )}
-        </span>
-        {node.public_ipv4_country && (
-          <span className="nc-region">
-            <RegionFlag code={node.public_ipv4_country} />
+          </span>
+        ) : (
+          <span className="nc-status-slot">
+            <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
           </span>
         )}
         <b className={node.name ? undefined : 'mono'}>{node.name || node.node_id}</b>
         {/* 时间只在异常时着色。正常拉取的机器都显示为十几秒前，且每十秒各自变化，
             扫视列表时不携带信息——机器是否在线已由状态点表示。 */}
         <span className={`nc-ago${live === 'bad' && !retired ? ' bad' : ''}`}>
-          {retired ? '已退役' : <PollAgo at={node.last_poll_at} />}
+          {retired ? nodeLifecycleLabel(node) : <PollAgo at={node.last_poll_at} />}
         </span>
       </div>
 
@@ -728,8 +764,31 @@ function NodeCard({
   );
 }
 
-// 详情页 XRAY 吞吐曲线的格数：24 格 × 30s = 12 分钟。
-const SERIES_BUCKETS = 24;
+export const LOAD_RANGES = [
+  { seconds: 30 * 60, label: '30m', heading: '30 MINUTES' },
+  { seconds: 60 * 60, label: '1h', heading: '1 HOUR' },
+  { seconds: 6 * 60 * 60, label: '6h', heading: '6 HOURS' },
+  { seconds: 12 * 60 * 60, label: '12h', heading: '12 HOURS' },
+  { seconds: 24 * 60 * 60, label: '24h', heading: '24 HOURS' },
+] as const;
+export type LoadRange = (typeof LOAD_RANGES)[number];
+
+export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onChange: (value: LoadRange) => void }) {
+  return (
+    <span className="observe-range" role="group" aria-label="观测时间范围">
+      {LOAD_RANGES.map(option => (
+        <button
+          key={option.seconds}
+          type="button"
+          aria-pressed={value.seconds === option.seconds}
+          onClick={() => onChange(option)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </span>
+  );
+}
 
 // 列表的 NIC 曲线使用 24 个 30 秒窗口，即近 12 分钟。该值同时是 load 端点的请求数和绘图上限，
 // 不分成两个常量，避免「拉了 12 格却为 24 格留位」这类错位。
@@ -1002,14 +1061,14 @@ function useHopStats(nodeId: string) {
   return { list, loading, dead, expected, reported, alive, observatory, windowSecs };
 }
 
-/** 把 usage 桶按角色拆成速率序列（bps），右对齐：最近的完整窗口在下标 23——与网卡曲线
+/** 把 usage 桶按角色拆成速率序列（bps），右对齐：最近的完整窗口在下标 59——与网卡曲线
  * （LoadDashboard 的 `slice(-LOAD_SLOTS)`）同一对齐方式，两张图的右缘是同一个 30 秒窗口。
  * 字节/窗口 ×8 转比特、÷30 窗口秒，得到窗口平均速率——与网卡上报的速率同型，因此可对比。
  * 不用 since 推算绝对槽位：since 与桶的窗口边界存在相位差，最近一个完整桶会被算进 slot 22，
  * 把「现在」（slot 23）留空，表现为曲线右缘永远掉到 0。无桶的窗口计 0（无转发字节），不是缺失。 */
-function usageRoleSlots(series: UsageNodeSeries | undefined): { user: number[]; relay: number[] } {
-  const tail = (series?.buckets ?? []).slice(-SERIES_BUCKETS);
-  const pad = SERIES_BUCKETS - tail.length;
+function usageRoleSlots(series: UsageNodeSeries | undefined, slots: number): { user: number[]; relay: number[] } {
+  const tail = (series?.buckets ?? []).slice(-slots);
+  const pad = slots - tail.length;
   const padArr = new Array<number>(pad).fill(0);
   return {
     user: [...padArr, ...tail.map(b => ((b.user_uplink_bytes + b.user_downlink_bytes) * 8) / 30)],
@@ -1020,14 +1079,14 @@ function usageRoleSlots(series: UsageNodeSeries | undefined): { user: number[]; 
 /* 该机器的 xray 承载吞吐曲线。与网卡曲线（LoadCard 内）同窗口、同粒度、用 group 联动十字线，
  * 但口径不同：网卡按方向（接收/发送）统计全部流量，此处按角色（用户/中继）只统计 xray 转发
  * 的字节——两者不能合并进一张图，各自的 Y 轴与图例保持这个差异可见。 */
-function XrayThroughputCard({ nodeId }: { nodeId: string }) {
+function XrayThroughputCard({ nodeId, range }: { nodeId: string; range: LoadRange }) {
   const series = useQuery({
-    queryKey: ['usage-node-series'],
-    queryFn: () => fetchUsageNodeSeries(),
+    queryKey: ['usage-node-series', nodeId, range.seconds],
+    queryFn: () => fetchUsageNodeSeries(range.seconds, nodeId),
     refetchInterval: 30_000,
   });
   const mine = series.data?.nodes.find(n => n.node_id === nodeId);
-  const { user, relay } = usageRoleSlots(mine);
+  const { user, relay } = usageRoleSlots(mine, range.seconds / 30);
   const total = mine ? monthBytes(mine) : 0;
   return (
     <section className="chart-card">
@@ -1399,6 +1458,9 @@ function OverlayRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
       setStaged(null);
       /* 该行的当前值来自编译视图，不重新编译则不会反映刚写入的改动 */
       qc.invalidateQueries({ queryKey: ['compile'] });
+      // Runtime findings read the draft-aware snapshot so a stale userspace observation is
+      // hidden as soon as WG is turned off, without waiting for commit or the next agent report.
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
       onSaved();
     },
   });
@@ -1978,7 +2040,7 @@ function xrayVer(raw: string | null | undefined): [number, number] | null {
 /** `geodata` 自动更新合入主线的版本。低于该版本的 xray 会忽略该段配置且不报错。 */
 const XRAY_GEODATA_MIN: [number, number] = [26, 4];
 
-function runtimeFindings(node: NodeAgentStateItem): Finding[] {
+export function runtimeFindings(node: NodeAgentStateItem, wireguardEnabled?: boolean): Finding[] {
   const out: Finding[] = [];
   const v = node.runtime_versions;
 
@@ -2002,7 +2064,9 @@ function runtimeFindings(node: NodeAgentStateItem): Finding[] {
     });
   }
 
-  if (v?.wg_backend === 'userspace') {
+  const wgEnabled = wireguardEnabled ?? (node.overlay && !node.retired_at);
+  const wgAppliedState = appliedOf(node)?.wireguard?.state;
+  if (wgEnabled && wgAppliedState !== 'disabled' && v?.wg_backend === 'userspace') {
     out.push({
       tone: 'warn',
       chip: '用户态',
@@ -2028,6 +2092,24 @@ function runtimeFindings(node: NodeAgentStateItem): Finding[] {
       ),
     });
   }
+
+  const usage = node.usage_last_result;
+  if (usage && usage.rejected_counters > 0) {
+    out.push({
+      tone: 'bad',
+      chip: `拒收 ${usage.rejected_counters} 项用量`,
+      text: <>最近一轮出现乱序、同一 Xray 代次内计数倒退，或标签不属于这台机器；异常项没有入账。</>,
+    });
+  }
+  if ((usage?.growing_unknown_counters ?? 0) > 0) {
+    out.push({
+      tone: 'warn',
+      chip: `未归属流量 ${usage!.growing_unknown_counters} 项`,
+      text: <>未知计数与上一轮相比仍在增长，流量没有入账。检查 Xray 中正在运行的用户与当前权限是否一致。</>,
+    });
+  }
+  // gap_samples 表示 Xray 重启或用量代次切换：字节已经正常入账，只是该窗口不能计算
+  // 可比速率。曲线仍按 has_gap 断开，避免画出错误速率；它不是机器故障，不进入健康告警。
 
   const lr = node.last_local_reconcile;
   if (lr?.error) {
@@ -2369,7 +2451,7 @@ export function FleetNetPanel() {
   );
 }
 
-function LoadCardFor({ nodeId }: { nodeId: string }) {
+function LoadCardFor({ nodeId, range }: { nodeId: string; range: LoadRange }) {
   /* 10s 而不是与上报窗口相同的 30s。窗口每 30 秒关一次（agent 的
      `SUBS_PER_WINDOW × SUB_INTERVAL_SECS`），前端也每 30 秒拉一次时两者不同相：
      最坏情况拿到的是刚过期 30 秒的窗口，再等 30 秒才拉下一次，端到端能到 60 秒。
@@ -2377,14 +2459,32 @@ function LoadCardFor({ nodeId }: { nodeId: string }) {
      真正的分辨率仍是 30 秒，那要改 agent 的窗口，且用量窗口得一起动（两者故意对齐，
      遥测页把流量柱和 CPU 线叠在同一根时间轴上就靠这个）。 */
   const load = useQuery({
-    queryKey: ['node-load', nodeId],
-    queryFn: () => fetchNodeLoad(nodeId, 24),
-    refetchInterval: 10_000,
+    queryKey: ['node-load-history', nodeId, range.seconds],
+    queryFn: () => fetchNodeLoad(nodeId, range.seconds / 30),
+    // 长范围响应最大有 2,880 个深度窗口，而原数据本身每 30 秒才增加一点。
+    // 30m/1h 保留 10s 的低延迟；6h 以上按数据分辨率拉取，避免重复传输同一大段历史。
+    refetchInterval: range.seconds <= 60 * 60 ? 10_000 : 30_000,
     retry: false,
   });
-  if (!load.data) return null;
+  if (!load.data) {
+    return (
+      <div className="panel load-range-loading">
+        <header>
+          <h4>LOAD</h4>
+        </header>
+        <Loading />
+      </div>
+    );
+  }
   // XRAY 曲线用 group 与 LoadCard 内的网卡曲线联动十字线；usage 数据由该卡自行获取。
-  return <LoadCard report={load.data} xrayChart={<XrayThroughputCard nodeId={nodeId} />} />;
+  return (
+    <LoadCard
+      report={load.data}
+      historyLabel={range.heading}
+      historyWindows={range.seconds / 30}
+      xrayChart={<XrayThroughputCard nodeId={nodeId} range={range} />}
+    />
+  );
 }
 
 /** 该机器本身：内核与平台、容量分母（LOAD/KPI 百分比的基数）、内核参数上限。
@@ -2392,11 +2492,10 @@ function LoadCardFor({ nodeId }: { nodeId: string }) {
 function HostCard({ load }: { load: NodeLoadView | undefined }) {
   const host = load?.host ?? null;
   const skew = load?.clock_skew_secs ?? null;
-  /* 内核行并排三件事：版本、架构、核数。版本字符串不截断——`-28` 这类修订号正是判断
-     内核是否已更新所需的部分；超长由 .rt-v 按宽度截断、完整值写入 title。 */
-  const kernelParts = host
-    ? [host.kernel, host.arch, host.cores > 0 ? `${host.cores} 核` : ''].filter(p => p !== '')
-    : [];
+  /* CPU 与内核分别成行：型号可能很长，用 rt-v 截断但 title 保留完整值。旧 Agent 没有
+     cpu_model 时仍显示核数；内核行只承担版本和架构，不再混入硬件信息。 */
+  const cpuParts = host ? [host.cpu_model || '', host.cores > 0 ? `${host.cores} 核` : ''].filter(p => p !== '') : [];
+  const kernelParts = host ? [host.kernel, host.arch].filter(p => p !== '') : [];
   const osParts = host ? [host.os_pretty, host.virt].filter(p => p !== '') : [];
   return (
     <div className="panel">
@@ -2419,6 +2518,19 @@ function HostCard({ load }: { load: NodeLoadView | undefined }) {
         <Strip
           items={[
             [
+              'CPU',
+              cpuParts.length > 0 ? (
+                <span className="rt-v" title={host.cpu_model || cpuParts.join(' · ')}>
+                  {cpuParts.join(' · ')}
+                </span>
+              ) : (
+                <span className="dim">—</span>
+              ),
+            ],
+            ['内存', host.mem_total_bytes > 0 ? bytes(host.mem_total_bytes) : <span className="dim">—</span>],
+            ['磁盘', host.disk_total_bytes > 0 ? bytes(host.disk_total_bytes) : <span className="dim">—</span>],
+            ['发行版', osParts.length > 0 ? osParts.join(' · ') : <span className="dim">—</span>, 'newline'],
+            [
               '内核',
               kernelParts.length > 0 ? (
                 <span className="rt-v" title={host.kernel}>
@@ -2428,9 +2540,6 @@ function HostCard({ load }: { load: NodeLoadView | undefined }) {
                 <span className="dim">—</span>
               ),
             ],
-            ['内存', host.mem_total_bytes > 0 ? bytes(host.mem_total_bytes) : <span className="dim">—</span>],
-            ['磁盘', host.disk_total_bytes > 0 ? bytes(host.disk_total_bytes) : <span className="dim">—</span>],
-            ['发行版', osParts.length > 0 ? osParts.join(' · ') : <span className="dim">—</span>],
             [
               '时钟偏移',
               skew !== null ? (
@@ -2457,6 +2566,7 @@ function HostCard({ load }: { load: NodeLoadView | undefined }) {
               ) : (
                 <span className="dim">—</span>
               ),
+              'newline',
             ],
             ['监听队列', host.somaxconn > 0 ? host.somaxconn.toLocaleString() : <span className="dim">—</span>],
             [
@@ -2496,6 +2606,14 @@ function AgentCard({
         items={[
           ['上次来拉', <Ago at={node.last_poll_at} />],
           ['上次用量', <Ago at={node.last_usage_report_at} />],
+          [
+            '用量明目',
+            node.usage_last_result ? (
+              <span className="mono">{node.usage_last_result.accepted_readings} 项</span>
+            ) : (
+              <span className="dim">—</span>
+            ),
+          ],
           // agent 进程自身的运行时长：崩溃循环的机器上该值恒为几分钟，与「上次来拉 6 秒前」
           // 并排即可区分「连不上」与「一直在重启」。
           [
@@ -2560,7 +2678,13 @@ function AgentCard({
       />
       <Findings
         list={runtimeFindings(node).filter(
-          f => f.chip === '自修失败' || f.chip.startsWith('丢了') || f.chip.startsWith('agent '),
+          f =>
+            f.chip === '自修失败' ||
+            f.chip.startsWith('丢了') ||
+            f.chip.startsWith('agent ') ||
+            f.chip.startsWith('拒收 ') ||
+            f.chip.startsWith('未识别 ') ||
+            f.chip.startsWith('断点 '),
         )}
       />
     </div>
@@ -2570,10 +2694,12 @@ function AgentCard({
 function AppliedCard({
   node,
   revisionOf,
+  wireguardEnabled,
   children,
 }: {
   node: NodeAgentStateItem;
   revisionOf: (d: number) => number | undefined;
+  wireguardEnabled: boolean;
   children?: ReactNode;
 }) {
   const a = appliedOf(node);
@@ -2616,7 +2742,7 @@ function AppliedCard({
       )}
       {/* 版本相关的判定（xray 过旧、wg 回落用户态）挂在这张卡。版本详情已从卡片移除，
           但需要处理的结论不能随之隐藏。放在条件分支外：从未收敛过的机器同样需要这些提示。 */}
-      <Findings list={runtimeFindings(node).filter(f => f.chip !== '自修失败')} />
+      <Findings list={runtimeFindings(node, wireguardEnabled).filter(f => f.chip !== '自修失败')} />
       {children}
     </div>
   );
@@ -2738,20 +2864,6 @@ function NodeChainRuleTree({
 }) {
   return (
     <div className="node-chain-use">
-      <div className="toolbar" style={{ marginTop: 0 }}>
-        {/* 标题显示用户设置的名称（如「香港入口」），`app-1 / c-hk` 是内部 id，作为副标题。
-            id 用于检索日志和拼接 label，识别依据的是名称。未设置名称时才回退到 id。 */}
-        <b>{use.chain.name || use.chain.id}</b>
-        <span className="subid mono">
-          {use.appId} / {use.chain.id}
-        </span>
-        <span className="sp" />
-        {/* 只读状态下端口不使用输入框，改为一行只读数值——它是该链的链头，需要的是监听端口 */}
-        {use.ingress?.node === nodeId && (
-          <IngressPortEditor appId={use.appId} ingress={use.ingress} editable={!readOnly} />
-        )}
-        <span className="st">{use.role}</span>
-      </div>
       <ChainRulesPanel
         appId={use.appId}
         chain={use.chain}
@@ -2760,6 +2872,14 @@ function NodeChainRuleTree({
         nodes={nodes}
         selected={nodeId}
         showHeader={false}
+        defaultOpenSelected
+        rootLabel={use.chain.name || use.chain.id}
+        rootLabelTitle={`${use.appId} / ${use.chain.id}`}
+        rootSummary={
+          use.ingress?.node === nodeId ? (
+            <IngressPortEditor appId={use.appId} ingress={use.ingress} editable={!readOnly} compact />
+          ) : undefined
+        }
         readOnly={readOnly}
       />
     </div>
@@ -2781,23 +2901,20 @@ function NodeChainsSection({
   canCreate: boolean;
   go: (d: Drill) => void;
 }) {
-  // 没有任何链时整块不显示。此前会保留一个空的「XRAY 链路」标题加一句
-  // 「该机器没有接入面，没有 xray 配置」——该表述不准确（是否有 xray 配置由编译器
-  // 根据模型计算，与是否有接入面不等价），也无必要：机器未参与任何链是正常状态。
-  // 建链入口在列表行和详情页顶部都有。
-  if (inChains.length === 0) return null;
   return (
     <>
       <header>
-        <h4>XRAY 链路</h4>
-        <span className="hint">{inChains.length} 条相关链，嵌套展示完整链路</span>
+        <h4>链路规则</h4>
+        <span className="hint">{inChains.length} 条相关链，当前机器默认展开</span>
         <span className="sp" />
         <button className="btn" disabled={!canCreate} title="以当前节点作为入口" onClick={() => go({ p: 'chain', id })}>
           添加新链
         </button>
       </header>
 
-      {canEdit ? (
+      {inChains.length === 0 ? (
+        <p className="note node-rules-empty">这台机器尚未加入任何链路。</p>
+      ) : canEdit ? (
         // 一台机器可能属于多条链，每条链又递归展开多台——若每张规则表各带一个
         // 「保存到草稿」，本屏会出现七八个。统一收敛为整段末尾的一个。
         <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
@@ -2872,7 +2989,11 @@ function NodeDetailLayout({
           </span>
         )}
         <h1 className={node.name ? 'nd-id nd-name' : 'nd-id'}>{node.name || node.node_id}</h1>
-        {node.retired_at && <span className="st st-halted">已退役</span>}
+        {nodeLifecycleLabel(node) && (
+          <span className={`st ${node.lifecycle_phase === 'abandoned' ? 'st-failed-dirty' : 'st-halted'}`}>
+            {nodeLifecycleLabel(node)}
+          </span>
+        )}
       </div>
       {toolbar}
     </header>
@@ -2906,6 +3027,8 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   const n = nodes.data?.nodes.find(x => x.node_id === id);
   /* 签发的 node token 同样只显示一次 */
   const [issued, setIssued] = useState<{ token: string; install_command: string } | null>(null);
+  const [lifecycleAction, setLifecycleAction] = useState<'retire' | 'restore' | 'abandon' | null>(null);
+  const [forceReason, setForceReason] = useState('');
 
   // 身份表单始终可编辑，不再设置「改名称 / 公网 IP」开关。
   // 取消编辑模式不会导致误改：不保存则不生效，且「保存到草稿」只在有修改时出现。
@@ -2962,9 +3085,21 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   const retire = useMutation({
     mutationFn: (status: 'active' | 'retired') => setNodeStatus(id, status),
     onSuccess: () => {
+      setLifecycleAction(null);
       qc.invalidateQueries({ queryKey: ['nodes'] });
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['deployments'] });
+    },
+  });
+  const abandon = useMutation({
+    mutationFn: (reason: string) => abandonNode(id, reason, true),
+    onSuccess: () => {
+      setLifecycleAction(null);
+      setForceReason('');
+      qc.invalidateQueries({ queryKey: ['nodes'] });
+      qc.invalidateQueries({ queryKey: ['deployments'] });
       qc.invalidateQueries({ queryKey: ['snapshot'] });
     },
   });
@@ -2975,10 +3110,16 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   /* ── 页签角标的两个来源 ──
      分页之后另外两页不在屏幕上，「那边有事」只能由页签自己说出来，否则在配置页改地址时
      不会知道观测页刚出了 finding。两处都复用已有的查询键，不引入新的取数：
-     `['node-load', id]` 由 LoadCardFor 拉取并按 10 秒轮询，此处只是同一份缓存的第二个
-     观察者（因此不重复设置 refetchInterval——间隔由那一处决定，两处写两个值必然会分叉）；
+     `['node-load-history', id, 30m]` 与 LoadCardFor 的默认范围共用，为 HOST 和 Agent
+     进程提供始终较新的低频事实。用户切到更长范围后，长历史另走带范围的缓存键，
+     不会让 HOST 因为 24 小时查询而延迟刷新；
      跳的存活同理，与下面的 HopHealth 共用 useHopStats。 */
-  const load = useQuery({ queryKey: ['node-load', id], queryFn: () => fetchNodeLoad(id, 24), retry: false });
+  const load = useQuery({
+    queryKey: ['node-load-history', id, 30 * 60],
+    queryFn: () => fetchNodeLoad(id, 60),
+    refetchInterval: 10_000,
+    retry: false,
+  });
   const { dead } = useHopStats(id);
 
   /* 页签不进地址栏。`Drill` 的字段是地址中的路径段，而 route.ts 的 parse 要求段数不少于
@@ -2987,6 +3128,10 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
      换一台机器时回到观测：id 变了而状态还在，是上一台的阅读位置。 */
   const [tabState, setTabState] = useState<{ id: string; tab: NodeTab }>({ id, tab: 'observed' });
   const setTab = (tab: NodeTab) => setTabState({ id, tab });
+  const [loadRangeState, setLoadRangeState] = useState<{ id: string; range: LoadRange }>({
+    id,
+    range: LOAD_RANGES[0],
+  });
 
   /* 页头的稀有/危险操作（重签 token、退役下线）收进 ⋯ 菜单：它们的视觉权重原与
      使用频率成反比——最稀有的危险操作画着最抢眼的红框。菜单项可以带一行说明，
@@ -3020,6 +3165,25 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
   if (!n) return <Loading sheeted={sheeted} />;
 
+  const activeOrders = (deployments.data?.deployments ?? []).filter(
+    deployment => deployment.active && ['planned', 'running', 'halted'].includes(deployment.status),
+  );
+  const lifecycleOrder = n.lifecycle_deployment_id
+    ? deployments.data?.deployments.find(deployment => deployment.id === n.lifecycle_deployment_id)
+    : undefined;
+  const teardownNeedsRepair =
+    n.lifecycle_phase === 'retiring' &&
+    (!n.lifecycle_deployment_id ||
+      (deployments.isSuccess &&
+        (!lifecycleOrder ||
+          !lifecycleOrder.active ||
+          !['planned', 'running', 'halted'].includes(lifecycleOrder.status))));
+
+  // The snapshot is draft-aware while `/nodes/agent-state` is committed state. Use the former so
+  // turning WG off removes the backend warning immediately, before the draft is committed and
+  // before the agent's next half-hourly runtime report clears its old observation.
+  const wireguardEnabled = snapshot.data?.snapshot.nodes?.find(modelNode => modelNode.id === id)?.overlay ?? n.overlay;
+
   // 该机器所属的链。不能只列出 chain id：分叉节点、显式规则边、主干默认边都会影响
   // accept/hop_in 是否保留。此处将关系拆分计算，下方的整链规则树使用同一份数据。
   const inChains = (snapshot.data?.snapshot.apps ?? []).flatMap(a =>
@@ -3037,20 +3201,18 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
       )
       .filter((use): use is NodeChainUse => use !== null),
   );
-  // 没有任何链时整块内容不渲染——其中的小节现在使用同一判定条件（NodeChainsSection）。
-  // 此前多出的条件用于显示「该机器还没有接入面」的提示，该提示已移除。
-  const showChainSection = inChains.length > 0;
+  const machineEgressPolicies = (snapshot.data?.node_egress_dns ?? []).filter(policy => policy.node === id);
 
-  // 不在链上的机器没有第三页，此时停留在链路页的状态要落回观测——tabState 可能是
-  // 上一次这台机器还在链上时留下的。
-  const tab: NodeTab =
-    tabState.id !== id || (tabState.tab === 'chains' && !showChainSection) ? 'observed' : tabState.tab;
+  // 规则页同时承载机器 DNS 策略和链路规则，所以没有加入链路的机器也保留这一页；两块
+  // 各自显示空状态，不能再把“无链路”等同于“没有规则页面”。
+  const tab: NodeTab = tabState.id !== id ? 'observed' : tabState.tab;
+  const loadRange = loadRangeState.id === id ? loadRangeState.range : LOAD_RANGES[0];
 
   /* 观测页的角标数。此处不按 `detailOnly` 过滤：那个标记的含义是「列表里不占标记位，
      进详情页才读」，而这里就是详情页——角标指向的正是它下面那几张卡里会展开的说明。
      跳不通与 finding 合计成一个数：两者在这一页上是同一件事，「有几处要看」。 */
-  const findingCount = runtimeFindings(n).length + (load.data ? loadFindings(load.data).length : 0) + dead.length;
-  const lamp = nodeLampState(n, load.data);
+  const findingCount = runtimeFindings(n, wireguardEnabled).length + dead.length;
+  const lamp = nodeLampState(n, wireguardEnabled);
 
   /* A1 页头：身份、页签与操作共用 sheet 内的一条横梁，当前页由满宽底部刻度标记。 */
   const detailToolbar = (
@@ -3069,57 +3231,106 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
             {/* 圆点＝身份表单有未保存的改动，与身份面板的保存条使用同一个判定。 */}
             {dirty && <span className="nd-tab-badge dot" />}
           </button>
-          {showChainSection && (
-            <button role="tab" aria-selected={tab === 'chains'} onClick={() => setTab('chains')}>
-              <Icon of="chains" size={14} className="nd-tab-ic" />
-              规则
-              <span className="nd-tab-badge dim">{inChains.length}</span>
-            </button>
-          )}
+          <button role="tab" aria-selected={tab === 'chains'} onClick={() => setTab('chains')}>
+            <Icon of="chains" size={14} className="nd-tab-ic" />
+            规则
+            {(inChains.length > 0 || machineEgressPolicies.length > 0) && (
+              <span className="nd-tab-badge dim">{inChains.length + machineEgressPolicies.length}</span>
+            )}
+          </button>
         </div>
       </div>
-      {!pub && (
-        <div className="nd-acts">
-          <div className="fg-menuwrap">
-            {/* stopPropagation 是必须的：document 级关闭监听在 effect 里绑定，
+      {(tab === 'observed' || !pub) && (
+        <div className="nd-tools">
+          {tab === 'observed' && (
+            <ObserveRangeControl value={loadRange} onChange={range => setLoadRangeState({ id, range })} />
+          )}
+          {!pub && (
+            <div className="nd-acts">
+              <div className="fg-menuwrap">
+                {/* stopPropagation 是必须的：document 级关闭监听在 effect 里绑定，
                 而打开菜单的这次点击绑定发生后仍会冒泡到 document——不拦下，
                 菜单开同一瞬间又被自己关掉（shell.tsx 的两个菜单同样拦）。 */}
-            <button
-              className="btn fg-more"
-              aria-label="更多操作"
-              onClick={e => {
-                e.stopPropagation();
-                setActsOpen(v => !v);
-              }}
-            >
-              ⋯
-            </button>
-            {actsOpen && (
-              <div className="fg-menu" onClick={() => setActsOpen(false)}>
-                {tab === 'observed' && (
-                  <button disabled={!verifyAllowed || verify.isPending} onClick={() => verify.mutate()}>
-                    {verify.isPending ? '验证中…' : '验证接入'}
-                    <small>空跑一次收敛，确认这台与当前模型一致，不改任何配置</small>
-                  </button>
-                )}
-                <button disabled={!system || issue.isPending} onClick={() => issue.mutate()}>
-                  {n.token_prefix && !n.token_revoked_at ? '重签 token' : '签发 token'}
-                  <small>凭据只显示一次；重签后旧 token 立即失效</small>
-                </button>
-                <hr />
                 <button
-                  className={n.retired_at ? undefined : 'dg'}
-                  disabled={!system || retire.isPending}
-                  onClick={() => retire.mutate(n.retired_at ? 'active' : 'retired')}
+                  className="btn fg-more"
+                  aria-label="更多操作"
+                  onClick={e => {
+                    e.stopPropagation();
+                    setActsOpen(v => !v);
+                  }}
                 >
-                  {retire.isPending ? '提交中…' : n.retired_at ? '复出' : '退役下线'}
-                  <small>
-                    {n.retired_at ? '下次发布会让它恢复纳管。' : '打标记，不删行。先搬走接入面和链路再下线。'}
-                  </small>
+                  ⋯
                 </button>
+                {actsOpen && (
+                  <div className="fg-menu" onClick={() => setActsOpen(false)}>
+                    {tab === 'observed' && (
+                      <button disabled={!verifyAllowed || verify.isPending} onClick={() => verify.mutate()}>
+                        {verify.isPending ? '验证中…' : '验证接入'}
+                        <small>空跑一次收敛，确认这台与当前模型一致，不改任何配置</small>
+                      </button>
+                    )}
+                    <button
+                      disabled={!system || issue.isPending || n.lifecycle_phase !== 'active'}
+                      onClick={() => issue.mutate()}
+                    >
+                      {n.token_prefix && !n.token_revoked_at ? '重签 token' : '签发 token'}
+                      <small>凭据只显示一次；重签后旧 token 立即失效</small>
+                    </button>
+                    <hr />
+                    <button
+                      className={n.lifecycle_phase === 'active' ? 'dg' : undefined}
+                      disabled={!system || retire.isPending}
+                      onClick={() => {
+                        retire.reset();
+                        setLifecycleAction(n.lifecycle_phase === 'active' ? 'retire' : 'restore');
+                      }}
+                    >
+                      {retire.isPending ? '提交中…' : n.lifecycle_phase === 'active' ? '退役机器' : '恢复机器'}
+                      <small>
+                        {n.lifecycle_phase === 'active'
+                          ? '立即创建完整停用发布；不会删除机器记录'
+                          : '递增生命周期代次并创建恢复发布；需要重新签发 Token'}
+                      </small>
+                    </button>
+                    {n.lifecycle_phase === 'retiring' && (
+                      <>
+                        {teardownNeedsRepair && (
+                          <button
+                            disabled={!system || retire.isPending}
+                            onClick={() => {
+                              retire.reset();
+                              setLifecycleAction('retire');
+                            }}
+                          >
+                            重建停用发布
+                            <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
+                          </button>
+                        )}
+                        <button
+                          className="dg"
+                          disabled={!system || abandon.isPending}
+                          onClick={() => {
+                            abandon.reset();
+                            setForceReason('');
+                            setLifecycleAction('abandon');
+                          }}
+                        >
+                          {abandon.isPending ? '处理中…' : '强制退役'}
+                          <small>仅用于机器永久失联；结果会保留为警告状态</small>
+                        </button>
+                      </>
+                    )}
+                    {n.lifecycle_deployment_id && (
+                      <button onClick={() => openTabByKey('deploy')}>
+                        查看发布 #{n.lifecycle_deployment_id}
+                        <small>打开发布页查看停用动作与波次确认</small>
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       )}
     </>
@@ -3127,6 +3338,86 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
   return (
     <NodeDetailLayout sheeted={sheeted} node={n} lamp={lamp} toolbar={detailToolbar}>
+      {lifecycleAction === 'retire' && (
+        <Confirm
+          title={`退役 ${nodeLabel(n)}`}
+          confirmLabel={retire.isPending ? '正在创建…' : '创建停用发布'}
+          confirmDisabled={retire.isPending}
+          onCancel={() => setLifecycleAction(null)}
+          onConfirm={() => retire.mutate('retired')}
+          body={
+            <div className="node-lifecycle-confirm">
+              <p>这不是隐藏机器。系统会先提交退役修订，再让 Agent 确认以下四项都已停用：</p>
+              <div className="node-lifecycle-artifacts">
+                <span>Xray</span>
+                <span>WireGuard</span>
+                <span>Phantun</span>
+                <span>HY2 端口跳转</span>
+              </div>
+              {activeOrders.length > 0 ? (
+                <p className="callout warn">
+                  当前活动发布 {activeOrders.map(order => `#${order.id}`).join('、')}{' '}
+                  会被取消，并按最新修订创建替代发布。
+                </p>
+              ) : (
+                <p className="note">没有冲突中的活动发布；确认后直接创建停用发布。</p>
+              )}
+              <p className="note">Agent Token 会保留到停用回报成功，随后自动撤销；机器记录和发布历史不会删除。</p>
+              {retire.error && <ErrorBox error={retire.error} />}
+            </div>
+          }
+        />
+      )}
+      {lifecycleAction === 'restore' && (
+        <Confirm
+          title={`恢复 ${nodeLabel(n)}`}
+          confirmLabel={retire.isPending ? '正在恢复…' : '恢复并创建发布'}
+          danger={false}
+          confirmDisabled={retire.isPending}
+          onCancel={() => setLifecycleAction(null)}
+          onConfirm={() => retire.mutate('active')}
+          body={
+            <div className="node-lifecycle-confirm">
+              <p>恢复会递增生命周期代次，因此退役前遗留的发布仍然无效；系统将按当前模型创建新的收敛发布。</p>
+              <p className="callout warn">旧 Agent Token 不会复用。恢复后需要重新签发 Token，机器才能领取新发布。</p>
+              {retire.error && <ErrorBox error={retire.error} />}
+            </div>
+          }
+        />
+      )}
+      {lifecycleAction === 'abandon' && (
+        <Confirm
+          title={`强制退役 ${nodeLabel(n)}`}
+          confirmLabel={abandon.isPending ? '正在处理…' : '强制退役'}
+          requireWord="强制退役"
+          confirmDisabled={abandon.isPending || forceReason.trim().length === 0}
+          onCancel={() => {
+            setLifecycleAction(null);
+            setForceReason('');
+          }}
+          onConfirm={() => abandon.mutate(forceReason.trim())}
+          body={
+            <div className="node-lifecycle-confirm">
+              <p className="callout err">
+                控制面将不再等待这台机器，但无法证明远端 Xray、WireGuard 或监听端口已经停止。
+              </p>
+              <label className="field">
+                <span>原因</span>
+                <textarea
+                  className="f"
+                  rows={3}
+                  autoFocus
+                  placeholder="例如：机器已由供应商销毁，无法再连接"
+                  value={forceReason}
+                  onChange={event => setForceReason(event.target.value)}
+                />
+              </label>
+              <p className="note">确认后立即撤销 Agent Token、封住旧发布代次，并尝试注销该机器的托管 WARP 设备。</p>
+              {abandon.error && <ErrorBox error={abandon.error} />}
+            </div>
+          }
+        />
+      )}
       {issued && (
         <div className="callout warn">
           <b>{id}</b> 的 node token —— 只显示这一次：
@@ -3159,14 +3450,14 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
         </div>
       )}
 
-      {(issue.error || verify.error || retire.error) && (
-        <ErrorBox error={issue.error ?? verify.error ?? retire.error} />
+      {(issue.error || verify.error || retire.error || abandon.error) && (
+        <ErrorBox error={issue.error ?? verify.error ?? retire.error ?? abandon.error} />
       )}
 
       {tab === 'observed' && (
         /* LOAD 是监控页的第一视图；三张状态卡横排，让机器、运行时与配置收敛并行扫读。 */
         <section className="nd-tab-observed">
-          <LoadCardFor nodeId={id} />
+          <LoadCardFor nodeId={id} range={loadRange} />
           <div className="nd-observed-status">
             <AgentCard
               node={n}
@@ -3176,7 +3467,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
             <HostCard load={load.data} />
             {/* AGENT → HOST → CONFIGURATIONS 是一组状态事实。验证结果仍留在收敛卡内：
                   页头的「验证接入」调用同一接口，不再产生另一块重复结果。 */}
-            <AppliedCard node={n} revisionOf={revisionOf}>
+            <AppliedCard node={n} revisionOf={revisionOf} wireguardEnabled={wireguardEnabled}>
               {verify.data && (
                 <div className={verify.data.converged ? 'callout blue' : 'callout warn'} style={{ marginBottom: 0 }}>
                   {verify.data.converged
@@ -3290,20 +3581,26 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
         </section>
       )}
 
-      {/* 仍然是一张 panel。NodeChainsSection 的第一个元素是 `<header><h4>XRAY 链路</h4>`，
-            它的样式来自 `.panel > :is(header, summary)`——去掉外层就只剩一行裸标题。
-            sheeted 时此前用的是 fg-sheet，现在整页已经在一张 fg-sheet 里，不能再套一层。 */}
-      {tab === 'chains' && showChainSection && (
-        <div className="panel node-chain-sheet">
-          <NodeChainsSection
-            id={id}
-            inChains={inChains}
-            nodes={nodes.data?.nodes ?? []}
-            canEdit={can(who.role, 'edit')}
-            canCreate={can(who.role, 'edit')}
-            go={go}
-          />
-        </div>
+      {tab === 'chains' && (
+        <section className="nd-tab-rules">
+          <div className="panel node-egress-rule-sheet">
+            <header>
+              <h4>DNS 解析策略</h4>
+              <span className="hint">{machineEgressPolicies.length} 条，按 D1 起在这台机器的 Xray 内全局匹配</span>
+            </header>
+            <MachineEgressDnsRules key={id} nodeId={id} nodeName={n.name || id} readOnly={!can(who.role, 'edit')} />
+          </div>
+          <div className="panel node-chain-sheet">
+            <NodeChainsSection
+              id={id}
+              inChains={inChains}
+              nodes={nodes.data?.nodes ?? []}
+              canEdit={can(who.role, 'edit')}
+              canCreate={can(who.role, 'edit')}
+              go={go}
+            />
+          </div>
+        </section>
       )}
     </NodeDetailLayout>
   );

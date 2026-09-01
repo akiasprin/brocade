@@ -21,15 +21,19 @@ use brocade_core::{
     format::{ini, json as json_format, uri, yaml},
     hash::sha256_hex,
     model::{
-        AppView, Chain, Dns, DomainStrategy, ExternalOutboundProtocol, Front, Grant, HopEncryption,
-        HopWire, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressIdentity,
+        Action, AppView, Chain, Dns, DomainStrategy, ExternalOutboundProtocol,
+        ExternalOutboundSecurity, ExternalWarpBinding, Front, Grant, HopEncryption, HopWire,
+        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressIdentity,
         IngressWires, IngressWiresWire, ModelSnapshot, NodeConnection, Projection,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
         RealityFallbackMode, RealityFallbackRateLimit, RealitySettings, RealityXhttp, Tls,
-        TlsXhttp, Transport, User, WgTransport,
+        TlsXhttp, Transport, User, WgTransport, EXTERNAL_WIREGUARD_MAX_WORKERS,
     },
-    text::normalize_host_port,
+    text::{
+        is_nonzero_host_port, is_reality_fingerprint, is_reality_server_name, normalize_host_port,
+    },
 };
+use ipnet::IpNet;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -56,10 +60,22 @@ pub async fn redacted_snapshot(
 /// inside a transaction it is about to roll back (see `draft.rs`) and cannot take the pool-based
 /// path above.
 pub(crate) fn snapshot_view(snapshot: ModelSnapshot) -> Result<ConsoleSnapshot> {
+    let node_egress_dns = snapshot
+        .node_egress_dns
+        .iter()
+        .cloned()
+        .map(|policy| ConsoleEgressDnsPolicy {
+            node: policy.node,
+            position: policy.position,
+            selector: policy.selector,
+            resolution: policy.resolution,
+        })
+        .collect();
     let mut value = serde_json::to_value(snapshot)?;
     redact_private_keys(&mut value);
     Ok(ConsoleSnapshot {
         snapshot: value,
+        node_egress_dns,
         redacted: true,
     })
 }
@@ -128,7 +144,7 @@ pub(crate) async fn create_tenant_tx(
     // would be judged changed for the sake of backfilling metadata and consume a revision number
     // for nothing; and once updated here the row references that number and it can no longer be
     // returned.
-    let changed = sqlx::query(
+    let tenant_changed = sqlx::query(
         "INSERT INTO tenants (id, name, created_revision)
          VALUES ($1, $2, $3)
          ON CONFLICT (id) DO UPDATE SET
@@ -143,6 +159,142 @@ pub(crate) async fn create_tenant_tx(
     .await?
     .rows_affected()
         > 0;
+    // A tenant is immediately usable as an egress scope. Keeping this in the same model
+    // transaction is important: draft preview sees the resource, commit records one revision,
+    // and a caller can never observe the tenant without its managed WARP target in between.
+    let warp_changed = ensure_default_warp_for_tenant_tx(tx, actor, revision_id, &id).await?;
+    Ok(tenant_changed || warp_changed)
+}
+
+const DEFAULT_WARP_ADDRESS: &str = "engage.cloudflareclient.com";
+const DEFAULT_WARP_PORT: u16 = 2408;
+
+/// Add the one managed WARP target every tenant receives.
+///
+/// Existing WARP resources win, including ones created before this invariant existed. We do not
+/// rename or duplicate them: their references and operator-selected defaults remain authoritative.
+/// Callers hold the control-state write lock, which serializes allocation with every ordinary
+/// model write and makes the existence check + globally unique id allocation atomic.
+async fn ensure_default_warp_for_tenant_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    revision_id: u64,
+    tenant_id: &str,
+) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM external_outbounds
+              WHERE tenant_id = $1 AND protocol = 'warp'
+         )",
+    )
+    .bind(tenant_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if exists {
+        return Ok(false);
+    }
+
+    let id = allocate_default_warp_id_tx(tx, tenant_id).await?;
+    upsert_external_outbound_tx(
+        tx,
+        actor,
+        revision_id,
+        UpsertExternalOutboundRequest {
+            id,
+            tenant_id: tenant_id.to_owned(),
+            name: "Cloudflare WARP".to_owned(),
+            address: DEFAULT_WARP_ADDRESS.to_owned(),
+            port: DEFAULT_WARP_PORT,
+            protocol: ExternalOutboundProtocol::Warp {
+                mtu: 1280,
+                keep_alive: 25,
+                allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+                no_kernel_tun: false,
+                domain_strategy: "ForceIP".to_owned(),
+                workers: 0,
+            },
+            security: ExternalOutboundSecurity::None,
+            note: None,
+        },
+    )
+    .await
+}
+
+/// Prefer a semantic id in logs and raw snapshots. Very long tenant paths, or an id already used
+/// by an unrelated external target, fall back to a stable short digest. The database remains the
+/// final collision authority and every fallback is checked before it is returned.
+async fn allocate_default_warp_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: &str,
+) -> Result<String> {
+    let readable = format!("warp.{tenant_id}");
+    if readable.len() <= 32 && external_outbound_id_available_tx(tx, &readable).await? {
+        return Ok(readable);
+    }
+
+    for attempt in 0..64_u8 {
+        let digest = sha256_hex(format!("default-warp:{tenant_id}:{attempt}").as_bytes());
+        let candidate = format!("warp-{}", &digest[..12]);
+        if external_outbound_id_available_tx(tx, &candidate).await? {
+            return Ok(candidate);
+        }
+    }
+    Err(StoreError::Conflict(format!(
+        "cannot allocate a unique default WARP id for tenant {tenant_id}"
+    )))
+}
+
+async fn external_outbound_id_available_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: &str,
+) -> Result<bool> {
+    Ok(!sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM external_outbounds WHERE id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// Reconcile development/production databases created before default WARP resources existed.
+///
+/// This is deliberately a normal model revision rather than migration DML: the control-state
+/// number and stored snapshot move together, historical revisions stay truthful, and a second
+/// process or restart becomes a no-op.
+pub(crate) async fn ensure_default_warp_outbounds(pool: &PgPool) -> Result<usize> {
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+    let tenants = sqlx::query_scalar::<_, String>(
+        "SELECT tenant.id
+           FROM tenants AS tenant
+          WHERE NOT EXISTS (
+                    SELECT 1 FROM external_outbounds AS outbound
+                     WHERE outbound.tenant_id = tenant.id AND outbound.protocol = 'warp'
+                )
+          ORDER BY tenant.id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if tenants.is_empty() {
+        tx.commit().await?;
+        return Ok(0);
+    }
+
+    let revision_id = insert_revision(
+        &mut tx,
+        "brocade-system",
+        &format!("为 {} 个租户补齐默认 WARP", tenants.len()),
+    )
+    .await?;
+    let actor = AdminContext::system_admin("brocade-system");
+    let mut changed = 0_usize;
+    for tenant_id in &tenants {
+        if ensure_default_warp_for_tenant_tx(&mut tx, &actor, revision_id, tenant_id).await? {
+            changed += 1;
+        }
+    }
+    commit_revision(&mut tx, revision_id, previous, changed > 0).await?;
+    tx.commit().await?;
     Ok(changed)
 }
 
@@ -429,22 +581,145 @@ pub(crate) async fn upsert_app_tx(
     }
     let id = required_text(request.id, "app id")?;
     let label = required_text(request.label, "app label")?;
-    let changed = sqlx::query(
-        "INSERT INTO apps (id, label, created_revision)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (id) DO UPDATE SET
-            label = EXCLUDED.label,
-            created_revision = COALESCE(apps.created_revision, EXCLUDED.created_revision)
-         WHERE apps.label IS DISTINCT FROM EXCLUDED.label",
+    let revision_id = u64_to_i64(revision_id, "revision_id")?;
+
+    let existing_label: Option<String> =
+        sqlx::query_scalar("SELECT label FROM apps WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(existing_label) = existing_label {
+        if existing_label == label {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE apps
+             SET label = $2,
+                 created_revision = COALESCE(created_revision, $3)
+             WHERE id = $1",
+        )
+        .bind(&id)
+        .bind(&label)
+        .bind(revision_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(true);
+    }
+
+    // A fresh database has no operator-defined order yet: migration backfill establishes the
+    // legacy ID order. Keep that fallback exact as new lines arrive. Once the current sequence no
+    // longer equals ID order, it is operator-owned; a new line appends instead of silently moving
+    // any of those choices. The deferred uniqueness constraint makes the one-statement shift safe.
+    let rows = sqlx::query("SELECT id, position FROM apps ORDER BY position, id FOR UPDATE")
+        .fetch_all(&mut **tx)
+        .await?;
+    let positioned = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("id")?,
+                row.try_get::<i32, _>("position")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let follows_id = positioned.windows(2).all(|pair| pair[0].0 < pair[1].0);
+    let append_position = positioned
+        .iter()
+        .map(|(_, position)| *position)
+        .max()
+        .map(|position| {
+            position
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidData("app position exceeds i32 range".to_owned()))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let position = if follows_id {
+        positioned
+            .iter()
+            .find(|(existing_id, _)| existing_id > &id)
+            .map(|(_, position)| *position)
+            .unwrap_or(append_position)
+    } else {
+        append_position
+    };
+    if position != append_position {
+        sqlx::query("UPDATE apps SET position = position + 1 WHERE position >= $1")
+            .bind(position)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO apps (id, label, position, created_revision)
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(&id)
     .bind(&label)
-    .bind(u64_to_i64(revision_id, "revision_id")?)
+    .bind(position)
+    .bind(revision_id)
     .execute(&mut **tx)
-    .await?
-    .rows_affected()
-        > 0;
-    Ok(changed)
+    .await?;
+    Ok(true)
+}
+
+/// Insert a new app without inheriting upsert's rename semantics. Draft-created random IDs must
+/// fail closed on a collision: treating one as an update would rename an unrelated existing app.
+pub(crate) async fn create_app_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    revision_id: u64,
+    request: CreateAppRequest,
+) -> Result<bool> {
+    let id = required_text(request.id.clone(), "app id")?;
+    let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM apps WHERE id = $1)")
+        .bind(&id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if exists {
+        return Err(StoreError::Conflict(format!("app id {id} already exists")));
+    }
+    upsert_app_tx(tx, actor, revision_id, request).await
+}
+
+/// Persist the final order produced by one drag gesture.
+///
+/// The complete ID list is intentional: pointer movement is transient UI state, and a draft holds
+/// one final ordering document rather than a potentially long crossing log. Exact membership checking
+/// turns a stale page into a clear conflict instead of silently dropping a concurrently-added line.
+pub(crate) async fn reorder_apps_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    ids: Vec<String>,
+) -> Result<bool> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can reorder apps".to_owned(),
+        ));
+    }
+    let rows = sqlx::query("SELECT id FROM apps ORDER BY position, id FOR UPDATE")
+        .fetch_all(&mut **tx)
+        .await?;
+    let current = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let ids = complete_order(ids, &current, "app")?;
+    if ids == current {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE apps AS app
+         SET position = requested.position
+         FROM (
+             SELECT id, (ordinality - 1)::integer AS position
+             FROM unnest($1::text[]) WITH ORDINALITY AS ordered(id, ordinality)
+         ) AS requested
+         WHERE app.id = requested.id",
+    )
+    .bind(&ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
 }
 
 pub(crate) async fn upsert_external_outbound_tx(
@@ -453,11 +728,9 @@ pub(crate) async fn upsert_external_outbound_tx(
     revision_id: u64,
     request: UpsertExternalOutboundRequest,
 ) -> Result<bool> {
-    let app_id = required_text(request.app_id, "app_id")?;
     let id = required_slug(request.id, "external outbound id")?;
     let tenant_id = required_text(request.tenant_id, "tenant_id")?;
     actor.require_tenant_access(&tenant_id, "external outbound")?;
-    ensure_app_exists_tx(tx, &app_id).await?;
     ensure_tenant_exists_tx(tx, &tenant_id).await?;
     let name = required_text(request.name, "external outbound name")?;
     let address = required_text(request.address, "external outbound address")?;
@@ -468,17 +741,31 @@ pub(crate) async fn upsert_external_outbound_tx(
         ExternalOutboundProtocol::Socks5 { .. } => "socks5",
         ExternalOutboundProtocol::HttpConnect { .. } => "http_connect",
         ExternalOutboundProtocol::Wireguard { .. } => "wireguard",
+        ExternalOutboundProtocol::Warp { .. } => "warp",
     };
 
     let existing = sqlx::query(
-        "SELECT credential_sealed, protocol FROM external_outbounds WHERE app_id = $1 AND id = $2 FOR UPDATE",
+        "SELECT tenant_id, credential_sealed, protocol FROM external_outbounds WHERE id = $1 FOR UPDATE",
     )
-    .bind(&app_id)
     .bind(&id)
     .fetch_optional(&mut **tx)
     .await?;
+    if let Some(row) = existing.as_ref() {
+        if row.try_get::<String, _>("tenant_id")? != tenant_id {
+            return Err(StoreError::InvalidData(
+                "an existing tunnel cannot be moved to another tenant; create a new tunnel instead"
+                    .to_owned(),
+            ));
+        }
+    }
     let credential = request.protocol.credential();
-    let credential_sealed = if credential == "<redacted>" {
+    // WARP has no resource-level credential: its private key and provider token are generated per
+    // machine binding and sealed in external_outbound_bindings. Storing an encrypted empty string
+    // here made an otherwise harmless default target depend on BROCADE_SECRET_KEY and conveyed no
+    // security property, so the column carries an explicit empty sentinel for this protocol.
+    let credential_sealed = if requested_protocol == "warp" {
+        String::new()
+    } else if credential == "<redacted>" {
         let existing = existing.as_ref().ok_or_else(|| {
             StoreError::InvalidData(
                 "new external outbound cannot use <redacted> as its credential".to_owned(),
@@ -497,7 +784,7 @@ pub(crate) async fn upsert_external_outbound_tx(
             required_text(credential, "external outbound credential")?
         };
         crate::secrets::seal(
-            &crate::secrets::external_outbound_context(&app_id, &id),
+            &crate::secrets::external_outbound_context(&tenant_id, &id),
             &credential,
         )?
     };
@@ -538,14 +825,29 @@ pub(crate) async fn upsert_external_outbound_tx(
             "no_kernel_tun": no_kernel_tun,
             "domain_strategy": domain_strategy,
         }),
+        ExternalOutboundProtocol::Warp {
+            mtu,
+            keep_alive,
+            allowed_ips,
+            no_kernel_tun,
+            domain_strategy,
+            workers,
+        } => json!({
+            "mtu": mtu,
+            "keep_alive": keep_alive,
+            "allowed_ips": allowed_ips,
+            "no_kernel_tun": no_kernel_tun,
+            "domain_strategy": domain_strategy,
+            "workers": workers,
+        }),
     };
     let security = serde_json::to_value(request.security)?;
     let changed = sqlx::query(
         "INSERT INTO external_outbounds
-            (app_id, id, tenant_id, name, address, port, protocol, credential_sealed,
+            (id, tenant_id, name, address, port, protocol, credential_sealed,
              protocol_options, security, created_revision)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT (app_id, id) DO UPDATE SET
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (id) DO UPDATE SET
             tenant_id = EXCLUDED.tenant_id,
             name = EXCLUDED.name,
             address = EXCLUDED.address,
@@ -564,7 +866,6 @@ pub(crate) async fn upsert_external_outbound_tx(
                 EXCLUDED.protocol, EXCLUDED.credential_sealed, EXCLUDED.protocol_options,
                 EXCLUDED.security)",
     )
-    .bind(&app_id)
     .bind(&id)
     .bind(&tenant_id)
     .bind(&name)
@@ -580,6 +881,541 @@ pub(crate) async fn upsert_external_outbound_tx(
     .rows_affected()
         > 0;
     Ok(changed)
+}
+
+/// Commits one successfully registered WARP device to a tunnel.
+///
+/// Cloudflare has already been contacted by the HTTP layer when this begins. Keeping this outside
+/// `ModelOp` is a hard side-effect boundary: draft preview replays every model operation inside a
+/// rolled-back transaction, and a provider registration cannot be rolled back with PostgreSQL.
+pub async fn register_warp_binding(
+    pool: &PgPool,
+    actor: &AdminContext,
+    request: RegisterWarpBindingRequest,
+) -> Result<RegisterWarpBindingResult> {
+    let outbound_id = required_slug(request.outbound_id, "tunnel id")?;
+    let node_id = required_slug(request.node_id, "node id")?;
+    let device_id = required_text(request.device_id, "WARP device id")?;
+    let account_id = required_text(request.account_id, "WARP account id")?;
+    let access_token = required_text(request.access_token, "WARP access token")?;
+    let private_key = required_text(request.private_key, "WARP private key")?;
+    let peer_public_key = required_text(request.peer_public_key, "WARP peer public key")?;
+    if request.local_addresses.is_empty()
+        || request
+            .local_addresses
+            .iter()
+            .any(|address| address.trim().is_empty())
+    {
+        return Err(StoreError::InvalidData(
+            "WARP registration returned no tunnel addresses".to_owned(),
+        ));
+    }
+    if !request.reserved.is_empty() && request.reserved.len() != 3 {
+        return Err(StoreError::InvalidData(
+            "WARP client_id must decode to exactly three reserved bytes".to_owned(),
+        ));
+    }
+
+    let note = note_or(request.note.as_deref(), || {
+        format!("bind WARP tunnel {outbound_id} to {node_id}")
+    });
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+
+    let target = sqlx::query(
+        "SELECT external_outbounds.tenant_id, external_outbounds.protocol,
+                nodes.tenant_id AS node_tenant_id, nodes.retired_at::text AS retired_at
+         FROM external_outbounds
+         JOIN nodes ON nodes.id = $2
+         WHERE external_outbounds.id = $1
+         FOR UPDATE OF external_outbounds, nodes",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        StoreError::NotFound(format!(
+            "WARP tunnel {outbound_id} or node {node_id} not found"
+        ))
+    })?;
+    let tenant_id = target.try_get::<String, _>("tenant_id")?;
+    actor.require_tenant_access(&tenant_id, "WARP tunnel")?;
+    if target.try_get::<String, _>("protocol")? != "warp" {
+        return Err(StoreError::InvalidData(format!(
+            "tunnel {outbound_id} is not a managed WARP tunnel"
+        )));
+    }
+    if target.try_get::<String, _>("node_tenant_id")? != tenant_id {
+        return Err(StoreError::InvalidData(
+            "a WARP tunnel can only bind a machine in the same tenant".to_owned(),
+        ));
+    }
+    if target.try_get::<Option<String>, _>("retired_at")?.is_some() {
+        return Err(StoreError::InvalidData(
+            "a retired machine cannot receive a new WARP identity".to_owned(),
+        ));
+    }
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM external_outbound_bindings
+             WHERE outbound_id = $1 AND node_id = $2
+         )",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        return Err(StoreError::InvalidData(format!(
+            "WARP tunnel {outbound_id} is already bound to {node_id}"
+        )));
+    }
+
+    let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
+    let access_token_sealed = crate::secrets::seal(
+        &crate::secrets::external_outbound_binding_token_context(
+            &tenant_id,
+            &outbound_id,
+            &node_id,
+        ),
+        &access_token,
+    )?;
+    let private_key_sealed = crate::secrets::seal(
+        &crate::secrets::external_outbound_binding_key_context(&tenant_id, &outbound_id, &node_id),
+        &private_key,
+    )?;
+    let row = sqlx::query(
+        "INSERT INTO external_outbound_bindings
+            (outbound_id, node_id, device_id, account_id, access_token_sealed,
+             private_key_sealed, peer_public_key, local_addresses, reserved, created_revision)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING to_char(registered_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS registered_at",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .bind(&device_id)
+    .bind(&account_id)
+    .bind(access_token_sealed)
+    .bind(private_key_sealed)
+    .bind(&peer_public_key)
+    .bind(serde_json::to_value(&request.local_addresses)?)
+    .bind(serde_json::to_value(&request.reserved)?)
+    .bind(u64_to_i64(revision_id, "revision_id")?)
+    .fetch_one(&mut *tx)
+    .await?;
+    let revision_id = commit_revision(&mut tx, revision_id, previous, true).await?;
+    tx.commit().await?;
+
+    let binding = ExternalWarpBinding {
+        node: node_id,
+        device_id,
+        account_id,
+        registered_at: row.try_get("registered_at")?,
+        endpoint_address: None,
+        endpoint_port: None,
+        mtu: None,
+        keep_alive: None,
+        allowed_ips: None,
+        no_kernel_tun: None,
+        domain_strategy: None,
+        workers: None,
+        private_key,
+        peer_public_key,
+        local_addresses: request.local_addresses,
+        reserved: request.reserved,
+    };
+    Ok(RegisterWarpBindingResult {
+        revision_id,
+        binding: redacted_value(binding)?,
+    })
+}
+
+/// Changes how one registered WARP identity reaches Cloudflare without rotating that identity.
+///
+/// The nullable fields are override state, not effective values. Keeping them nullable is what
+/// lets a later edit of the logical tunnel default flow through to every machine which has not
+/// deliberately pinned that field.
+pub async fn update_warp_binding(
+    pool: &PgPool,
+    actor: &AdminContext,
+    request: UpdateWarpBindingRequest,
+) -> Result<UpdateWarpBindingResult> {
+    let requested_tenant_id = required_text(request.tenant_id, "tenant id")?;
+    let outbound_id = required_slug(request.outbound_id, "tunnel id")?;
+    let node_id = required_slug(request.node_id, "node id")?;
+    // Only JSON null means inheritance. Treating whitespace as null would make a malformed form
+    // submission silently erase an intentional machine override.
+    let endpoint_address = request
+        .endpoint_address
+        .map(|address| required_text(address, "WARP endpoint address"))
+        .transpose()?;
+    if endpoint_address
+        .as_deref()
+        .is_some_and(|address| address.chars().any(char::is_whitespace))
+    {
+        return Err(StoreError::InvalidData(
+            "WARP endpoint address must not contain whitespace".to_owned(),
+        ));
+    }
+    if let Some(port) = request.endpoint_port {
+        ensure_nonzero_port(port, "WARP endpoint port")?;
+    }
+    if request.mtu.is_some_and(|mtu| !(576..=9000).contains(&mtu)) {
+        return Err(StoreError::InvalidData(
+            "WARP MTU must be between 576 and 9000".to_owned(),
+        ));
+    }
+    if request.allowed_ips.is_some() != request.domain_strategy.is_some() {
+        return Err(StoreError::InvalidData(
+            "WARP address policy must override allowed IPs and domain strategy together".to_owned(),
+        ));
+    }
+    if request.allowed_ips.as_ref().is_some_and(|networks| {
+        networks.is_empty()
+            || networks
+                .iter()
+                .any(|network| network.parse::<IpNet>().is_err())
+    }) {
+        return Err(StoreError::InvalidData(
+            "WARP allowed IPs must contain valid CIDR networks".to_owned(),
+        ));
+    }
+    if request.domain_strategy.as_deref().is_some_and(|strategy| {
+        !matches!(
+            strategy,
+            "ForceIP" | "ForceIPv4" | "ForceIPv6" | "ForceIPv4v6" | "ForceIPv6v4"
+        )
+    }) {
+        return Err(StoreError::InvalidData(
+            "WARP domain strategy is not supported by Xray".to_owned(),
+        ));
+    }
+    if request
+        .workers
+        .is_some_and(|workers| workers > EXTERNAL_WIREGUARD_MAX_WORKERS)
+    {
+        return Err(StoreError::InvalidData(format!(
+            "WARP workers must be between 0 and {EXTERNAL_WIREGUARD_MAX_WORKERS}"
+        )));
+    }
+    let allowed_ips_json = request
+        .allowed_ips
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
+
+    let note = note_or(request.note.as_deref(), || {
+        format!("update WARP route {outbound_id} on {node_id}")
+    });
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+    let row = sqlx::query(
+        "SELECT external_outbounds.tenant_id, external_outbounds.protocol,
+                external_outbound_bindings.device_id,
+                external_outbound_bindings.account_id,
+                external_outbound_bindings.peer_public_key,
+                external_outbound_bindings.local_addresses,
+                external_outbound_bindings.reserved,
+                to_char(external_outbound_bindings.registered_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS registered_at
+         FROM external_outbound_bindings
+         JOIN external_outbounds ON external_outbounds.id = external_outbound_bindings.outbound_id
+         WHERE external_outbound_bindings.outbound_id = $1
+           AND external_outbound_bindings.node_id = $2
+         FOR UPDATE OF external_outbound_bindings, external_outbounds",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        StoreError::NotFound(format!(
+            "WARP tunnel {outbound_id} is not registered on {node_id}"
+        ))
+    })?;
+    let tenant_id: String = row.try_get("tenant_id")?;
+    if tenant_id != requested_tenant_id {
+        return Err(StoreError::NotFound(format!(
+            "WARP tunnel {requested_tenant_id}/{outbound_id} is not registered on {node_id}"
+        )));
+    }
+    actor.require_tenant_access(&tenant_id, "WARP tunnel")?;
+    if row.try_get::<String, _>("protocol")? != "warp" {
+        return Err(StoreError::InvalidData(format!(
+            "tunnel {outbound_id} is not a managed WARP tunnel"
+        )));
+    }
+
+    let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
+    let changed = sqlx::query(
+        "UPDATE external_outbound_bindings
+         SET endpoint_address = $3, endpoint_port = $4, mtu = $5,
+             keep_alive = $6, allowed_ips = $7, no_kernel_tun = $8,
+             domain_strategy = $9, workers = $10
+         WHERE outbound_id = $1 AND node_id = $2
+           AND (endpoint_address IS DISTINCT FROM $3
+             OR endpoint_port IS DISTINCT FROM $4
+             OR mtu IS DISTINCT FROM $5
+             OR keep_alive IS DISTINCT FROM $6
+             OR allowed_ips IS DISTINCT FROM $7
+             OR no_kernel_tun IS DISTINCT FROM $8
+             OR domain_strategy IS DISTINCT FROM $9
+             OR workers IS DISTINCT FROM $10)",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .bind(&endpoint_address)
+    .bind(request.endpoint_port.map(i32::from))
+    .bind(request.mtu.map(i32::from))
+    .bind(request.keep_alive.map(i32::from))
+    .bind(&allowed_ips_json)
+    .bind(request.no_kernel_tun)
+    .bind(&request.domain_strategy)
+    .bind(request.workers.map(i32::from))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    let revision_id = commit_revision(&mut tx, revision_id, previous, changed).await?;
+    tx.commit().await?;
+
+    Ok(UpdateWarpBindingResult {
+        revision_id,
+        binding: json!({
+            "node": node_id,
+            "device_id": row.try_get::<String, _>("device_id")?,
+            "account_id": row.try_get::<String, _>("account_id")?,
+            "registered_at": row.try_get::<String, _>("registered_at")?,
+            "endpoint_address": endpoint_address,
+            "endpoint_port": request.endpoint_port,
+            "mtu": request.mtu,
+            "keep_alive": request.keep_alive,
+            "allowed_ips": request.allowed_ips,
+            "no_kernel_tun": request.no_kernel_tun,
+            "domain_strategy": request.domain_strategy,
+            "workers": request.workers,
+            "peer_public_key": row.try_get::<String, _>("peer_public_key")?,
+            "local_addresses": row.try_get::<Value, _>("local_addresses")?,
+            "reserved": row.try_get::<Value, _>("reserved")?,
+        }),
+    })
+}
+
+/// Reads the provider credential only after proving that retiring it cannot cut a live route.
+///
+/// A WARP identity has two consumers to consider. The current model may still refer to it, and a
+/// just-edited model may no longer refer to it while the machine is still running the last
+/// successfully published revision. Both must be clear before the irreversible provider call.
+pub async fn prepare_warp_binding_removal(
+    pool: &PgPool,
+    actor: &AdminContext,
+    requested_tenant_id: &str,
+    requested_outbound_id: &str,
+    requested_node_id: &str,
+) -> Result<WarpBindingRemoval> {
+    let requested_tenant_id = required_text(requested_tenant_id, "tenant id")?;
+    let outbound_id = required_slug(requested_outbound_id.to_owned(), "tunnel id")?;
+    let node_id = required_slug(requested_node_id.to_owned(), "node id")?;
+    let row = sqlx::query(
+        "SELECT external_outbounds.tenant_id, external_outbounds.protocol,
+                external_outbound_bindings.device_id,
+                external_outbound_bindings.access_token_sealed,
+                nodes.name AS node_name,
+                lifecycle.phase AS lifecycle_phase
+         FROM external_outbound_bindings
+         JOIN external_outbounds
+           ON external_outbounds.id = external_outbound_bindings.outbound_id
+         JOIN nodes ON nodes.id = external_outbound_bindings.node_id
+         JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = nodes.id
+         WHERE external_outbound_bindings.outbound_id = $1
+           AND external_outbound_bindings.node_id = $2",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        StoreError::NotFound(format!(
+            "WARP tunnel {requested_tenant_id}/{outbound_id} is not registered on {node_id}"
+        ))
+    })?;
+    let tenant_id: String = row.try_get("tenant_id")?;
+    if tenant_id != requested_tenant_id {
+        return Err(StoreError::NotFound(format!(
+            "WARP tunnel {requested_tenant_id}/{outbound_id} is not registered on {node_id}"
+        )));
+    }
+    actor.require_tenant_access(&tenant_id, "WARP tunnel")?;
+    if row.try_get::<String, _>("protocol")? != "warp" {
+        return Err(StoreError::InvalidData(format!(
+            "tunnel {outbound_id} is not a managed WARP tunnel"
+        )));
+    }
+    let lifecycle_complete = matches!(
+        row.try_get::<String, _>("lifecycle_phase")?.as_str(),
+        "retired" | "abandoned"
+    );
+
+    let current_references = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)
+         FROM steps
+         CROSS JOIN LATERAL jsonb_array_elements(steps.rules) AS item(rule)
+         WHERE steps.node_id = $1
+           AND COALESCE(item.rule->'action', item.rule->'a')->>'t' = 'proxy'
+           AND COALESCE(item.rule->'action', item.rule->'a')->>'outbound' = $2",
+    )
+    .bind(&node_id)
+    .bind(&outbound_id)
+    .fetch_one(pool)
+    .await?;
+    let node_name: String = row.try_get("node_name")?;
+    if current_references > 0 && !lifecycle_complete {
+        return Err(StoreError::InvalidData(format!(
+            "{node_name} 的 WARP 身份仍被当前规则引用；请先解除这台机器上的引用并完成发布，再注销身份"
+        )));
+    }
+
+    // A successful deployment containing this target is the newest revision we know this
+    // particular machine runs. A global latest deployment can belong to another tenant and says
+    // nothing about this node, hence the target join. Deployment success is the aggregate
+    // invariant; repeating its allowed target statuses here would create a second definition.
+    let deployed_revision = sqlx::query_scalar::<_, i64>(
+        "SELECT deployments.revision_id
+         FROM deployments
+         JOIN deployment_targets
+           ON deployment_targets.deployment_id = deployments.id
+         WHERE deployments.kind = 'config'
+           AND deployments.status = 'succeeded'
+           AND deployment_targets.node_id = $1
+         ORDER BY deployments.finished_at DESC NULLS LAST, deployments.id DESC
+         LIMIT 1",
+    )
+    .bind(&node_id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(revision) = deployed_revision.filter(|_| !lifecycle_complete) {
+        let revision = u64::try_from(revision).map_err(|_| {
+            StoreError::InvalidData("published WARP revision is negative".to_owned())
+        })?;
+        let published = crate::materialize::load_snapshot(pool, Some(revision)).await?;
+        if warp_binding_is_referenced(&published, &outbound_id, &node_id) {
+            return Err(StoreError::InvalidData(format!(
+                "{node_name} 最后成功发布的版本仍在使用这个 WARP 身份；请先发布解除引用后的配置，再注销身份"
+            )));
+        }
+    }
+
+    let device_id: String = row.try_get("device_id")?;
+    let access_token = crate::secrets::open(
+        &crate::secrets::external_outbound_binding_token_context(
+            &tenant_id,
+            &outbound_id,
+            &node_id,
+        ),
+        &row.try_get::<String, _>("access_token_sealed")?,
+    )?;
+    Ok(WarpBindingRemoval {
+        device_id,
+        access_token,
+    })
+}
+
+fn warp_binding_is_referenced(snapshot: &ModelSnapshot, outbound_id: &str, node_id: &str) -> bool {
+    snapshot.apps.iter().any(|app| {
+        app.steps.iter().any(|step| {
+            step.node == node_id
+                && step.rules.iter().any(|rule| {
+                    matches!(
+                        &rule.action,
+                        Action::Proxy { outbound } if outbound == outbound_id
+                    )
+                })
+        })
+    })
+}
+
+/// Deletes only the exact local identity that the provider step prepared.
+///
+/// This deliberately does not repeat the reference preflight. Cloudflare has already retired the
+/// credential when this begins; refusing to remove the now-dead local row would make a retry less
+/// repairable, not safer. A changed device id is different: it means another registration won the
+/// race and must never be removed by a stale provider response.
+pub async fn remove_warp_binding(
+    pool: &PgPool,
+    actor: &AdminContext,
+    request: RemoveWarpBindingRequest,
+) -> Result<RemoveWarpBindingResult> {
+    let requested_tenant_id = required_text(request.tenant_id, "tenant id")?;
+    let outbound_id = required_slug(request.outbound_id, "tunnel id")?;
+    let node_id = required_slug(request.node_id, "node id")?;
+    let expected_device_id = required_text(request.expected_device_id, "WARP device id")?;
+    let note = note_or(request.note.as_deref(), || {
+        format!("unregister WARP tunnel {outbound_id} from {node_id}")
+    });
+
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+    let row = sqlx::query(
+        "SELECT external_outbounds.tenant_id, external_outbounds.protocol,
+                external_outbound_bindings.device_id
+         FROM external_outbound_bindings
+         JOIN external_outbounds
+           ON external_outbounds.id = external_outbound_bindings.outbound_id
+         WHERE external_outbound_bindings.outbound_id = $1
+           AND external_outbound_bindings.node_id = $2
+         FOR UPDATE OF external_outbound_bindings, external_outbounds",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        StoreError::NotFound(format!(
+            "WARP tunnel {requested_tenant_id}/{outbound_id} is not registered on {node_id}"
+        ))
+    })?;
+    let tenant_id: String = row.try_get("tenant_id")?;
+    if tenant_id != requested_tenant_id {
+        return Err(StoreError::NotFound(format!(
+            "WARP tunnel {requested_tenant_id}/{outbound_id} is not registered on {node_id}"
+        )));
+    }
+    actor.require_tenant_access(&tenant_id, "WARP tunnel")?;
+    if row.try_get::<String, _>("protocol")? != "warp" {
+        return Err(StoreError::InvalidData(format!(
+            "tunnel {outbound_id} is not a managed WARP tunnel"
+        )));
+    }
+    let device_id: String = row.try_get("device_id")?;
+    if device_id != expected_device_id {
+        return Err(StoreError::InvalidData(format!(
+            "WARP identity on {node_id} changed while it was being removed; refresh and try again"
+        )));
+    }
+
+    let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
+    let removed = sqlx::query(
+        "DELETE FROM external_outbound_bindings
+         WHERE outbound_id = $1 AND node_id = $2 AND device_id = $3",
+    )
+    .bind(&outbound_id)
+    .bind(&node_id)
+    .bind(&device_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    let revision_id = commit_revision(&mut tx, revision_id, previous, removed).await?;
+    tx.commit().await?;
+
+    Ok(RemoveWarpBindingResult {
+        revision_id,
+        node_id,
+        device_id,
+        removed,
+    })
 }
 
 pub async fn upsert_chain(
@@ -612,37 +1448,265 @@ pub(crate) async fn upsert_chain_tx(
     let id = required_slug(request.id, "chain id")?;
     let tenant_id = required_text(request.tenant_id, "tenant_id")?;
     let name = required_text(request.name, "chain name")?;
+    let subscription_country = normalize_subscription_country(request.subscription_country)?;
     actor.require_tenant_access(&tenant_id, "chain")?;
+    reject_non_friendly_new_model_id_tx(tx, "chain", &id).await?;
+    reject_friendly_body_conflict_tx(tx, "chain", &id).await?;
     ensure_app_exists_tx(tx, &app_id).await?;
     ensure_tenant_exists_tx(tx, &tenant_id).await?;
-    let head_changed = sqlx::query(
-        "INSERT INTO chains (id, app_id, tenant_id, name, created_revision)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (id) DO UPDATE SET
-            app_id = EXCLUDED.app_id,
-            tenant_id = EXCLUDED.tenant_id,
-            name = EXCLUDED.name,
-            created_revision = COALESCE(chains.created_revision, EXCLUDED.created_revision)
-         WHERE ROW(chains.app_id, chains.tenant_id, chains.name)
-            IS DISTINCT FROM ROW(EXCLUDED.app_id, EXCLUDED.tenant_id, EXCLUDED.name)",
+    let revision_id = u64_to_i64(revision_id, "revision_id")?;
+    let existing = sqlx::query(
+        "SELECT app_id, tenant_id, name, subscription_country, position
+         FROM chains
+         WHERE id = $1
+         FOR UPDATE",
     )
     .bind(&id)
-    .bind(&app_id)
-    .bind(&tenant_id)
-    .bind(&name)
-    .bind(u64_to_i64(revision_id, "revision_id")?)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected()
-        > 0;
+    .fetch_optional(&mut **tx)
+    .await?;
+    let existing_app = existing
+        .as_ref()
+        .map(|row| row.try_get::<String, _>("app_id"))
+        .transpose()?;
+    let position = match (&existing, existing_app.as_deref()) {
+        (Some(row), Some(current_app)) if current_app == app_id => row.try_get("position")?,
+        _ => new_chain_position_tx(tx, &app_id, &id).await?,
+    };
+    let head_changed = match existing {
+        Some(row) => {
+            let changed = row.try_get::<String, _>("app_id")? != app_id
+                || row.try_get::<String, _>("tenant_id")? != tenant_id
+                || row.try_get::<String, _>("name")? != name
+                || row.try_get::<Option<String>, _>("subscription_country")?
+                    != subscription_country;
+            if changed {
+                sqlx::query(
+                    "UPDATE chains
+                     SET app_id = $2,
+                         tenant_id = $3,
+                         name = $4,
+                         subscription_country = $5,
+                         position = $6,
+                         created_revision = COALESCE(created_revision, $7)
+                     WHERE id = $1",
+                )
+                .bind(&id)
+                .bind(&app_id)
+                .bind(&tenant_id)
+                .bind(&name)
+                .bind(&subscription_country)
+                .bind(position)
+                .bind(revision_id)
+                .execute(&mut **tx)
+                .await?;
+            }
+            changed
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO chains
+                    (id, app_id, tenant_id, name, subscription_country, position, created_revision)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&id)
+            .bind(&app_id)
+            .bind(&tenant_id)
+            .bind(&name)
+            .bind(&subscription_country)
+            .bind(position)
+            .bind(revision_id)
+            .execute(&mut **tx)
+            .await?;
+            true
+        }
+    };
     Ok((
         Chain {
             id,
             tenant: tenant_id,
             name,
+            subscription_country,
         },
         head_changed,
     ))
+}
+
+fn normalize_subscription_country(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value.map(|value| value.trim().to_ascii_uppercase()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() != 2 || !value.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return Err(StoreError::InvalidData(
+            "subscription country must be a two-letter ISO country code".to_owned(),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// The create-only counterpart used by the chain wizard. See [`create_app_tx`].
+pub(crate) async fn create_chain_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    revision_id: u64,
+    app_id: &str,
+    request: CreateChainRequest,
+) -> Result<(Chain, bool)> {
+    let id = required_slug(request.id.clone(), "chain id")?;
+    let exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM chains WHERE id = $1)")
+            .bind(&id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if exists {
+        return Err(StoreError::Conflict(format!(
+            "chain id {id} already exists"
+        )));
+    }
+    upsert_chain_tx(tx, actor, revision_id, app_id, request).await
+}
+
+/// Select the slot for a new chain inside one app.
+///
+/// As with apps, ID order is the fallback only while the operator has not established a custom
+/// sequence. A chain created after a custom reorder appends and cannot disturb that sequence.
+async fn new_chain_position_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: &str,
+    id: &str,
+) -> Result<i32> {
+    let rows = sqlx::query(
+        "SELECT id, position
+         FROM chains
+         WHERE app_id = $1
+         ORDER BY position, id
+         FOR UPDATE",
+    )
+    .bind(app_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let positioned = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("id")?,
+                row.try_get::<i32, _>("position")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let follows_id = positioned.windows(2).all(|pair| pair[0].0 < pair[1].0);
+    let append_position = positioned
+        .iter()
+        .map(|(_, position)| *position)
+        .max()
+        .map(|position| {
+            position.checked_add(1).ok_or_else(|| {
+                StoreError::InvalidData(format!("chain position exceeds i32 range in app {app_id}"))
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let position = if follows_id {
+        positioned
+            .iter()
+            .find(|(existing_id, _)| existing_id.as_str() > id)
+            .map(|(_, position)| *position)
+            .unwrap_or(append_position)
+    } else {
+        append_position
+    };
+    if position != append_position {
+        sqlx::query(
+            "UPDATE chains
+             SET position = position + 1
+             WHERE app_id = $1 AND position >= $2",
+        )
+        .bind(app_id)
+        .bind(position)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(position)
+}
+
+/// Persist one app's complete final chain order while keeping every stable chain ID intact.
+pub(crate) async fn reorder_chains_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    app_id: String,
+    ids: Vec<String>,
+) -> Result<bool> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can reorder chains".to_owned(),
+        ));
+    }
+    let app_id = required_text(app_id, "app_id")?;
+    ensure_app_exists_tx(tx, &app_id).await?;
+    let rows = sqlx::query(
+        "SELECT id
+         FROM chains
+         WHERE app_id = $1
+         ORDER BY position, id
+         FOR UPDATE",
+    )
+    .bind(&app_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let current = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let ids = complete_order(ids, &current, &format!("chain in app {app_id}"))?;
+    if ids == current {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE chains AS chain
+         SET position = requested.position
+         FROM (
+             SELECT id, (ordinality - 1)::integer AS position
+             FROM unnest($2::text[]) WITH ORDINALITY AS ordered(id, ordinality)
+         ) AS requested
+         WHERE chain.app_id = $1 AND chain.id = requested.id",
+    )
+    .bind(&app_id)
+    .bind(&ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
+/// Normalize and verify a complete ordering document against rows locked by the caller.
+fn complete_order(ids: Vec<String>, current: &[String], resource: &str) -> Result<Vec<String>> {
+    if ids.len() > i32::MAX as usize {
+        return Err(StoreError::InvalidData(format!(
+            "{resource} order exceeds i32 range"
+        )));
+    }
+    let ids = ids
+        .into_iter()
+        .map(|id| required_text(id, &format!("{resource} id")))
+        .collect::<Result<Vec<_>>>()?;
+    let requested = ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if requested.len() != ids.len() {
+        return Err(StoreError::InvalidData(format!(
+            "{resource} order contains duplicate ids"
+        )));
+    }
+    let existing = current.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if requested != existing {
+        let missing = existing.difference(&requested).copied().collect::<Vec<_>>();
+        let unknown = requested.difference(&existing).copied().collect::<Vec<_>>();
+        return Err(StoreError::InvalidData(format!(
+            "stale {resource} order: missing [{}], unknown [{}]",
+            missing.join(", "),
+            unknown.join(", ")
+        )));
+    }
+    Ok(ids)
 }
 
 pub async fn upsert_front(
@@ -677,10 +1741,12 @@ pub(crate) async fn upsert_front_tx(
     let name = required_text(request.name, "front name")?;
     actor.require_tenant_access(&tenant_id, "front")?;
     let via = normalize_id_list(request.via, "front via")?;
+    let external_via = normalize_id_list(request.external_via, "front external via")?;
     let strategy = request.strategy.as_str();
     ensure_app_exists_tx(tx, &app_id).await?;
     ensure_tenant_exists_tx(tx, &tenant_id).await?;
     ensure_ingresses_in_app_tx(tx, &app_id, &via).await?;
+    ensure_external_outbounds_for_tenant_tx(tx, &tenant_id, &external_via).await?;
     let head_changed = sqlx::query(
         "INSERT INTO fronts (id, app_id, tenant_id, name, strategy, created_revision)
          VALUES ($1, $2, $3, $4, $5, $6)
@@ -705,6 +1771,7 @@ pub(crate) async fn upsert_front_tx(
     .rows_affected()
         > 0;
     let via_changed = replace_front_via(tx, &id, &via).await?;
+    let external_via_changed = replace_front_external_via(tx, &id, &external_via).await?;
 
     Ok((
         Front {
@@ -712,9 +1779,10 @@ pub(crate) async fn upsert_front_tx(
             tenant: tenant_id,
             name,
             via,
+            external_via,
             strategy: request.strategy,
         },
-        head_changed || via_changed,
+        head_changed || via_changed || external_via_changed,
     ))
 }
 
@@ -798,6 +1866,8 @@ pub(crate) async fn upsert_ingress_tx(
     ensure_app_exists_tx(tx, &app_id).await?;
     let chain_tenant = chain_tenant_tx(tx, &app_id, &chain_id).await?;
     actor.require_tenant_access(&chain_tenant, "ingress")?;
+    reject_non_friendly_new_model_id_tx(tx, "ingress", &id).await?;
+    reject_friendly_body_conflict_tx(tx, "ingress", &id).await?;
     ensure_node_exists_tx(tx, &node_id).await?;
     if let Some(front_id) = &front_id {
         ensure_front_in_app_tx(tx, &app_id, front_id).await?;
@@ -809,6 +1879,10 @@ pub(crate) async fn upsert_ingress_tx(
     let fallback_limits_json = serde_json::to_value(&fallback_limits)?;
     let short_ids = serde_json::json!([short_id]);
     let xhttp = request.wires.xhttp();
+    let xhttp_xmux = xhttp
+        .and_then(|xhttp| xhttp.xmux.as_ref())
+        .map(serde_json::to_value)
+        .transpose()?;
     let hysteria2 = request.wires.hysteria2.as_ref();
     /* 四个接收窗口在模型里是 u64（跟上游 `uint64` 同宽），列是 BIGINT。超出 i64 的值只会
     来自手写请求，宁可在这里拒绝也不要截断——截断之后剩下的那个数很可能还满足 CHECK，
@@ -850,7 +1924,7 @@ pub(crate) async fn upsert_ingress_tx(
             reality_dest, reality_server_names, reality_fingerprint, reality_flow,
             reality_fallback_mode, reality_fallback_limits,
             reality_fallback_guard,
-            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_mux, xhttp_mode,
+            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_mode,
             hy2_port, hy2_hop_start, hy2_hop_end,
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password,
             hy2_masquerade_kind, hy2_masquerade_url,
@@ -905,7 +1979,7 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_enabled = EXCLUDED.hy2_enabled,
             xhttp_path = EXCLUDED.xhttp_path,
             xhttp_host = EXCLUDED.xhttp_host,
-            xhttp_mux = EXCLUDED.xhttp_mux,
+            xhttp_xmux = EXCLUDED.xhttp_xmux,
             xhttp_mode = EXCLUDED.xhttp_mode,
             hy2_port = EXCLUDED.hy2_port,
             hy2_hop_start = EXCLUDED.hy2_hop_start,
@@ -950,7 +2024,7 @@ pub(crate) async fn upsert_ingress_tx(
                    ingresses.reality_server_names, ingresses.reality_fingerprint,
                    ingresses.reality_flow, ingresses.reality_fallback_mode,
                    ingresses.reality_fallback_limits, ingresses.reality_fallback_guard,
-                   ingresses.transport_kind, ingresses.hy2_enabled, ingresses.xhttp_path, ingresses.xhttp_host, ingresses.xhttp_mux,
+                   ingresses.transport_kind, ingresses.hy2_enabled, ingresses.xhttp_path, ingresses.xhttp_host, ingresses.xhttp_xmux,
                    ingresses.hy2_port, ingresses.hy2_hop_start, ingresses.hy2_hop_end,
                    ingresses.xhttp_mode, ingresses.hy2_up, ingresses.hy2_down,
                    ingresses.hy2_congestion, ingresses.hy2_obfs_password,
@@ -978,7 +2052,7 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.reality_flow, EXCLUDED.reality_fallback_mode,
                 EXCLUDED.reality_fallback_limits, EXCLUDED.reality_fallback_guard,
                 EXCLUDED.transport_kind, EXCLUDED.hy2_enabled, EXCLUDED.xhttp_path,
-                EXCLUDED.xhttp_host, EXCLUDED.xhttp_mux,
+                EXCLUDED.xhttp_host, EXCLUDED.xhttp_xmux,
                 EXCLUDED.hy2_port, EXCLUDED.hy2_hop_start, EXCLUDED.hy2_hop_end,
                 EXCLUDED.xhttp_mode, EXCLUDED.hy2_up, EXCLUDED.hy2_down,
                 EXCLUDED.hy2_congestion, EXCLUDED.hy2_obfs_password,
@@ -1028,7 +2102,7 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(request.wires.hysteria2.is_some())
     .bind(xhttp.map(|xhttp| xhttp.path.clone()))
     .bind(xhttp.and_then(|xhttp| xhttp.host.clone()))
-    .bind(xhttp.and_then(|xhttp| xhttp.mux.map(i32::from)))
+    .bind(xhttp_xmux)
     .bind(xhttp.and_then(|xhttp| xhttp.mode.as_str()))
     .bind(hysteria2.map(|h| i32::from(h.port)))
     .bind(hysteria2.and_then(|h| h.hop.map(|hop| i32::from(hop.start))))
@@ -1203,6 +2277,29 @@ pub(crate) async fn upsert_ingress_tx(
     Ok((ingress, changed))
 }
 
+/// The create-only counterpart used by the chain wizard. An ingress ID is embedded in user
+/// counter labels, so colliding with one is data corruption rather than an ordinary edit.
+pub(crate) async fn create_ingress_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    revision_id: u64,
+    app_id: &str,
+    request: CreateIngressRequest,
+) -> Result<(Ingress, bool)> {
+    let id = required_slug(request.id.clone(), "ingress id")?;
+    let exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM ingresses WHERE id = $1)")
+            .bind(&id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if exists {
+        return Err(StoreError::Conflict(format!(
+            "ingress id {id} already exists"
+        )));
+    }
+    upsert_ingress_tx(tx, actor, revision_id, app_id, request).await
+}
+
 /// The certificate-holding shapes carry the two settings that were never REALITY's — which
 /// ClientHello to imitate and whether to run flow control.
 fn tls_echo(effective: &RealitySettings) -> Tls {
@@ -1210,6 +2307,93 @@ fn tls_echo(effective: &RealitySettings) -> Tls {
         flow: effective.flow.clone(),
         fingerprint: effective.fingerprint.clone(),
     }
+}
+
+/// Existing non-friendly IDs may still be updated while an old development fixture is being
+/// migrated, but no write path may create another one. Production has no such rows after the
+/// one-time conversion, so this closes the door previously held shut by persistent tombstones.
+async fn reject_non_friendly_new_model_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    kind: &str,
+    id: &str,
+) -> Result<()> {
+    if friendly_model_id_body(kind, id).is_some() {
+        return Ok(());
+    }
+    let exists = match kind {
+        "chain" => {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM chains WHERE id = $1)")
+        }
+        "ingress" => {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ingresses WHERE id = $1)")
+        }
+        _ => {
+            return Err(StoreError::InvalidData(format!(
+                "unknown friendly model id kind {kind}"
+            )))
+        }
+    }
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !exists {
+        let prefix = if kind == "chain" { "c-" } else { "i-" };
+        return Err(StoreError::InvalidData(format!(
+            "new {kind} id must use {prefix} plus six alternating consonant/vowel letters"
+        )));
+    }
+    Ok(())
+}
+
+fn friendly_model_id_body<'a>(kind: &str, id: &'a str) -> Option<&'a str> {
+    let prefix = match kind {
+        "chain" => "c-",
+        "ingress" => "i-",
+        _ => return None,
+    };
+    let body = id.strip_prefix(prefix)?;
+    let consonants = b"bcdfghjklmnprstvwz";
+    let vowels = b"aeiou";
+    (body.len() == 6
+        && body.bytes().enumerate().all(|(index, byte)| {
+            if index % 2 == 0 {
+                consonants.contains(&byte)
+            } else {
+                vowels.contains(&byte)
+            }
+        }))
+    .then_some(body)
+}
+
+/// Give a model write a clean 409 before the database trigger's final concurrency backstop. The
+/// six-letter body is one namespace shared by chains and ingresses, even though their full IDs have
+/// different prefixes.
+async fn reject_friendly_body_conflict_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    kind: &str,
+    id: &str,
+) -> Result<()> {
+    let Some(body) = friendly_model_id_body(kind, id) else {
+        return Ok(());
+    };
+    let owner = sqlx::query(
+        "SELECT kind, model_id
+           FROM friendly_model_id_bodies
+          WHERE body = $1",
+    )
+    .bind(body)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(owner) = owner {
+        let owner_kind: String = owner.try_get("kind")?;
+        let owner_id: String = owner.try_get("model_id")?;
+        if owner_kind != kind || owner_id != id {
+            return Err(StoreError::Conflict(format!(
+                "friendly id body {body} is already used"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn node_agent_state_sql(scoped: bool) -> &'static str {
@@ -1232,6 +2416,11 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.conn_downlink_only_secs,
                 n.conn_buffer_size_kb,
                 n.retired_at::text AS retired_at,
+                COALESCE(l.phase, CASE WHEN n.retired_at IS NULL THEN 'active' ELSE 'retiring' END) AS lifecycle_phase,
+                COALESCE(l.lifecycle_epoch, 0) AS lifecycle_epoch,
+                l.deployment_id AS lifecycle_deployment_id,
+                l.completed_at::text AS lifecycle_completed_at,
+                l.last_error AS lifecycle_last_error,
                 n.wg_transport,
                 s.route_ipv4,
                 s.route_ipv6,
@@ -1248,6 +2437,8 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 s.geodata_observed,
                 s.last_poll_at::text AS last_poll_at,
                 s.last_usage_report_at::text AS last_usage_report_at,
+                s.usage_last_result,
+                s.usage_generation_id,
                 s.xray_started_at::text AS xray_started_at,
                 a.phantun_state,
                 a.phantun_sha256,
@@ -1263,6 +2454,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          FROM nodes n
          LEFT JOIN node_agent_state s ON s.node_id = n.id
          LEFT JOIN node_applied_state a ON a.node_id = n.id
+         LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
          WHERE n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\'
          ORDER BY n.id"
     } else {
@@ -1284,6 +2476,11 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.conn_downlink_only_secs,
                 n.conn_buffer_size_kb,
                 n.retired_at::text AS retired_at,
+                COALESCE(l.phase, CASE WHEN n.retired_at IS NULL THEN 'active' ELSE 'retiring' END) AS lifecycle_phase,
+                COALESCE(l.lifecycle_epoch, 0) AS lifecycle_epoch,
+                l.deployment_id AS lifecycle_deployment_id,
+                l.completed_at::text AS lifecycle_completed_at,
+                l.last_error AS lifecycle_last_error,
                 n.wg_transport,
                 s.route_ipv4,
                 s.route_ipv6,
@@ -1300,6 +2497,8 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 s.geodata_observed,
                 s.last_poll_at::text AS last_poll_at,
                 s.last_usage_report_at::text AS last_usage_report_at,
+                s.usage_last_result,
+                s.usage_generation_id,
                 s.xray_started_at::text AS xray_started_at,
                 a.phantun_state,
                 a.phantun_sha256,
@@ -1315,6 +2514,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          FROM nodes n
          LEFT JOIN node_agent_state s ON s.node_id = n.id
          LEFT JOIN node_applied_state a ON a.node_id = n.id
+         LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
          ORDER BY n.id"
     }
 }
@@ -1387,6 +2587,8 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         geodata_observed: non_empty_json(row.try_get("geodata_observed").ok()),
         last_poll_at: row.try_get("last_poll_at")?,
         last_usage_report_at: row.try_get("last_usage_report_at")?,
+        usage_last_result: non_empty_json(row.try_get("usage_last_result").ok()),
+        usage_generation_id: row.try_get("usage_generation_id")?,
         xray_started_at: row.try_get("xray_started_at")?,
         overlay: row.try_get("overlay")?,
         egress_allowed: row.try_get("egress_allowed")?,
@@ -1414,6 +2616,12 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
             StoreError::InvalidData(format!("nodes.domain_strategy 解不开: {error}"))
         })?,
         retired_at: row.try_get("retired_at")?,
+        lifecycle_phase: row.try_get("lifecycle_phase")?,
+        lifecycle_epoch: u64::try_from(row.try_get::<i64, _>("lifecycle_epoch")?)
+            .map_err(|_| StoreError::InvalidData("node lifecycle epoch is negative".to_owned()))?,
+        lifecycle_deployment_id: row.try_get("lifecycle_deployment_id")?,
+        lifecycle_completed_at: row.try_get("lifecycle_completed_at")?,
+        lifecycle_last_error: row.try_get("lifecycle_last_error")?,
         wg_transport_kind: {
             let value = row.try_get::<Value, _>("wg_transport")?;
             value
@@ -1924,6 +3132,76 @@ async fn replace_front_via(
     Ok(true)
 }
 
+async fn ensure_external_outbounds_for_tenant_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: &str,
+    outbound_ids: &[String],
+) -> Result<()> {
+    for outbound_id in outbound_ids {
+        let row = sqlx::query(
+            "SELECT tenant_id, protocol
+             FROM external_outbounds
+             WHERE id = $1",
+        )
+        .bind(outbound_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "front references external tunnel {outbound_id}, which does not exist"
+            ))
+        })?;
+        if row.try_get::<String, _>("tenant_id")? != tenant_id {
+            return Err(StoreError::InvalidData(format!(
+                "front and external tunnel {outbound_id} must belong to the same tenant"
+            )));
+        }
+        if row.try_get::<String, _>("protocol")? == "warp" {
+            return Err(StoreError::InvalidData(format!(
+                "WARP tunnel {outbound_id} has machine-specific identities and cannot be exported to a user Clash subscription"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn replace_front_external_via(
+    tx: &mut Transaction<'_, Postgres>,
+    front_id: &str,
+    via: &[String],
+) -> Result<bool> {
+    let existing: Vec<String> = sqlx::query_scalar(
+        "SELECT outbound_id
+         FROM front_external_vias
+         WHERE front_id = $1
+         ORDER BY ordinal",
+    )
+    .bind(front_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if existing == via {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM front_external_vias WHERE front_id = $1")
+        .bind(front_id)
+        .execute(&mut **tx)
+        .await?;
+    for (ordinal, outbound_id) in via.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO front_external_vias (front_id, outbound_id, ordinal)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(front_id)
+        .bind(outbound_id)
+        .bind(i32::try_from(ordinal).map_err(|_| {
+            StoreError::InvalidData("front external via ordinal out of range".to_owned())
+        })?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(true)
+}
+
 fn ensure_tenant_management_allowed(actor: &AdminContext, tenant_id: &str) -> Result<()> {
     if actor.is_system_admin()
         || (actor.role() == AdminRole::TenantAdmin && actor.can_access_tenant(tenant_id))
@@ -1944,9 +3222,34 @@ fn normalize_reality_request(
     // half configuration whose handshake is certain to fail.
     let dest = optional_owned_text(request.dest).map(|dest| normalize_host_port(&dest));
     let server_names = normalize_id_list(request.server_names, "reality.server_names")?;
+    if dest
+        .as_deref()
+        .is_some_and(|dest| !is_nonzero_host_port(dest))
+    {
+        return Err(StoreError::InvalidData(
+            "reality.dest must use host:port with a port between 1 and 65535".to_owned(),
+        ));
+    }
     if dest.is_some() && server_names.is_empty() {
         return Err(StoreError::InvalidData(
             "reality.server_names must not be empty when reality.dest is set".to_owned(),
+        ));
+    }
+    if let Some(server_name) = server_names
+        .iter()
+        .find(|server_name| !is_reality_server_name(server_name))
+    {
+        return Err(StoreError::InvalidData(format!(
+            "reality.server_names contains invalid name {server_name:?}"
+        )));
+    }
+    let fingerprint = optional_owned_text(request.fingerprint);
+    if fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| !is_reality_fingerprint(fingerprint))
+    {
+        return Err(StoreError::InvalidData(
+            "reality.fingerprint is unsupported by the pinned Xray REALITY client".to_owned(),
         ));
     }
     // Not `optional_owned_text`: that turns an empty string into `None`, and for flow those two
@@ -1967,7 +3270,7 @@ fn normalize_reality_request(
         fallback_guard: request.fallback_guard,
         dest,
         server_names,
-        fingerprint: optional_owned_text(request.fingerprint),
+        fingerprint,
         flow,
     })
 }

@@ -385,6 +385,7 @@ fn compile_hops_reports_forward_when_the_target_is_unreachable() {
             id: "c".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "c".to_owned(),
+            subscription_country: None,
         }],
         ingresses: vec![ingress("i", "hk")],
         fronts: Vec::new(),
@@ -790,6 +791,7 @@ fn doc(nodes: Vec<Node>) -> ModelSnapshot {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes,
+        node_egress_dns: Vec::new(),
         users: vec![User {
             tenant: "platform.acme".to_owned(),
             id: "alice".to_owned(),
@@ -808,6 +810,7 @@ fn app(steps: Vec<Step>) -> AppView {
             id: "c".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "c".to_owned(),
+            subscription_country: None,
         }],
         ingresses: vec![ingress("i", "hk")],
         fronts: Vec::new(),
@@ -822,6 +825,7 @@ fn app_two_chains(steps: Vec<Step>) -> AppView {
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),
         name: id.to_owned(),
+        subscription_country: None,
     };
     AppView {
         id: "app".to_owned(),
@@ -972,7 +976,10 @@ fn encryption() -> HopWire {
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress { send_through: None },
+        action: Action::Egress {
+            send_through: None,
+            dns: false,
+        },
     }
 }
 

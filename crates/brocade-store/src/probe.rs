@@ -11,8 +11,8 @@ use brocade_core::{
 use brocade_deployment::protocol::{
     E2eExitVerdict, E2eProbe, E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest, E2eProbeResult,
     E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList, E2eProbeTls, E2eProbeXhttp,
-    LinkHealthRequest, LinkHealthResult, LinkProbeRequest, LinkProbeResult, LinkProbeStatus,
-    ProbeTarget, ProbeTargetList, ProbeTransport,
+    E2eProbeXhttpRange, E2eProbeXhttpXmux, LinkHealthRequest, LinkHealthResult, LinkProbeRequest,
+    LinkProbeResult, LinkProbeStatus, ProbeTarget, ProbeTargetList, ProbeTransport,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -338,6 +338,31 @@ pub async fn record_link_health(
             continue;
         }
 
+        // Chain IDs are model identities, not free-form telemetry dimensions. After the
+        // friendly-ID rollout there is deliberately no alias fallback: a stale tag is unknown and
+        // must not recreate the retired namespace in an operational table.
+        let known_chain = match hop.chain_id.split_once('/') {
+            Some((app_id, chain_id)) => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM chains WHERE app_id = $1 AND id = $2)",
+                )
+                .bind(app_id)
+                .bind(chain_id)
+                .fetch_one(pool)
+                .await?
+            }
+            None => {
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM chains WHERE id = $1)")
+                    .bind(&hop.chain_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        if !known_chain {
+            unknown += 1;
+            continue;
+        }
+
         sqlx::query(
             "INSERT INTO link_health
                  (node_id, chain_id, peer_node_id, alive, downlink_bytes, window_secs, checked_at)
@@ -497,6 +522,28 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                         congestion: hysteria.settings.congestion.as_str().to_owned(),
                         up: hysteria.settings.bandwidth.up.clone(),
                         down: hysteria.settings.bandwidth.down.clone(),
+                        bbr_profile: (hysteria.settings.bbr_profile
+                            != brocade_core::model::HysteriaBbrProfile::default())
+                        .then(|| hysteria.settings.bbr_profile.as_str().to_owned()),
+                        init_stream_receive_window: hysteria
+                            .settings
+                            .quic
+                            .init_stream_receive_window,
+                        max_stream_receive_window: hysteria.settings.quic.max_stream_receive_window,
+                        init_connection_receive_window: hysteria
+                            .settings
+                            .quic
+                            .init_connection_receive_window,
+                        max_connection_receive_window: hysteria
+                            .settings
+                            .quic
+                            .max_connection_receive_window,
+                        max_idle_timeout_secs: hysteria.settings.quic.max_idle_timeout_secs,
+                        keep_alive_period_secs: hysteria.settings.quic.keep_alive_period_secs,
+                        disable_path_mtu_discovery: hysteria
+                            .settings
+                            .quic
+                            .disable_path_mtu_discovery,
                         salamander_password: hysteria.settings.obfs.as_ref().map(
                             |obfs| match obfs {
                                 brocade_core::model::HysteriaObfs::Salamander { password } => {
@@ -518,7 +565,17 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                 xhttp: target.xhttp.as_ref().map(|xhttp| E2eProbeXhttp {
                     path: xhttp.path.clone(),
                     host: xhttp.host.clone(),
-                    mux: xhttp.mux,
+                    xmux: xhttp.xmux.as_ref().map(|xmux| E2eProbeXhttpXmux {
+                        max_concurrency: xmux.max_concurrency,
+                        h_max_request_times: E2eProbeXhttpRange {
+                            from: xmux.h_max_request_times.from,
+                            to: xmux.h_max_request_times.to,
+                        },
+                        h_max_reusable_secs: E2eProbeXhttpRange {
+                            from: xmux.h_max_reusable_secs.from,
+                            to: xmux.h_max_reusable_secs.to,
+                        },
+                    }),
                     mode: xhttp.mode.as_str().map(str::to_owned),
                 }),
                 expected_exit_ips: target.expected_exit_ips,
@@ -653,12 +710,13 @@ pub async fn e2e_probe_view(
                 p.exit_ip, p.exit_loc, p.exit_verdict, p.detail, p.probed_at::text AS probed_at
          FROM e2e_probes p
          JOIN chains c ON c.id = p.chain_id
+         JOIN apps a ON a.id = c.app_id
          WHERE (
                 $1::text IS NULL
                 OR c.tenant_id = $1
                 OR c.tenant_id LIKE $2 ESCAPE '\\'
          )
-         ORDER BY p.app_id, p.chain_id",
+         ORDER BY a.position, a.id, c.position, c.id",
     )
     .bind(tenant_scope)
     .bind(&tenant_pattern)
@@ -770,6 +828,7 @@ mod tests {
             overlay_cidr: "10.66.0.0/16".parse().unwrap(),
             settings: Default::default(),
             nodes: Vec::new(),
+            node_egress_dns: Vec::new(),
             users: vec![
                 User {
                     id: "alice".to_owned(),

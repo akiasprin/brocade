@@ -1,10 +1,13 @@
 import {
+  Fragment,
+  Suspense,
   createContext,
+  lazy,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
-  useReducer,
   useRef,
   useState,
   type ReactNode,
@@ -19,8 +22,11 @@ import {
   fetchSnapshot,
   pruneChain,
   putStep,
+  reorderNodeEgressDns,
+  setNodeEgressDns,
   upsertExternalOutbound,
   type DestMatch,
+  type EgressDnsResolution,
   type ExternalOutbound,
   type ExternalOutboundProtocol,
   type ExternalOutboundSecurity,
@@ -37,6 +43,18 @@ import {
 import { ErrorBox } from '../ui/bits';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
 import { externalImportCanSave, serverNameAfterAddressChange } from '../external-outbound';
+import {
+  REALITY_FINGERPRINT_OPTIONS,
+  realityFingerprintIsValid,
+  realityPublicKeyIsValid,
+  realityServerNameIsValid,
+  realityShortIdIsValid,
+} from '../reality';
+
+// The tunnel resource page is intentionally absent from primary navigation. Load its shared WARP
+// lifecycle editor only when an operator asks to manage a WARP target from a rule; a dynamic edge
+// also avoids turning `tunnels -> rules -> tunnels` into an eager module cycle.
+const WarpRuleManager = lazy(() => import('./tunnels').then(module => ({ default: module.WarpRuleManager })));
 
 // 未填写 dial 的规则读取后为 undefined，等同于 overlay。在此统一补全，
 // 避免每处各写一次 `?? {t:'overlay'}`，遗漏其中一处会导致下拉框为空。
@@ -71,9 +89,9 @@ export const MERGE_DEFAULT = 8;
 export const MERGE_MIN = 2;
 export const MERGE_MAX = 128;
 
-// 只在该链在该机器上尚未配置过 REALITY 时作为初始值。已配置的一律显示其自身的
-// 站点——用该值覆盖实际配置相当于在无提示的情况下更换伪装目标。
-const FALLBACK_SITE = { dest: 'apps.apple.com:443', names: 'apps.apple.com' };
+// 没有跨机器通用的 REALITY 站点。新建中转入口保持空白，要求操作者明确填写；已有配置
+// 始终显示其自身站点，不会被某个 UI 常量静默覆盖。
+const EMPTY_REALITY_SITE = { dest: '', names: '' };
 
 // 中转端口从该值开始向上查找空闲端口。选择高位段是为了与接入面和系统服务分开。
 // 该值来自全局设置（`settings.ports.hop_base`），下面的常量只是设置尚未加载时的回退值——
@@ -156,7 +174,10 @@ function hopInChanged(body: HopInRequest, prev: SnapshotStep['hop_in']): boolean
 //
 // 没有总线时——画布上拖动连线弹出的浮层只编辑一台机器——编辑器自带按钮。
 interface RuleDraftHandle {
+  id: string;
   dirty: boolean;
+  /* 机器 DNS 单独保存，不应因为它变更而追加任何链路清理操作。 */
+  structuralDirty: boolean;
   save: () => Promise<unknown>;
   // 该表对应的链和机器、草稿内容、链的当前状态和链头。
   // 判断哪些节点不再被引用需要整条链的规则表，单张表无法读取其他表的草稿
@@ -170,16 +191,19 @@ interface RuleDraftHandle {
 }
 
 interface RuleDraftBus {
-  attach: (handle: RuleDraftHandle) => () => void;
-  /* dirty 存储在 ref 中，修改后不会触发重渲染，需要主动触发一次以更新末尾的按钮状态 */
-  changed: () => void;
+  attach: (id: string) => () => void;
+  update: (handle: RuleDraftHandle) => void;
 }
 
 const RuleDraftCtx = createContext<RuleDraftBus | null>(null);
 
 export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?: string }) {
-  const handles = useRef<RuleDraftHandle[]>([]);
-  const [tick, bump] = useReducer((n: number) => n + 1, 0);
+  // Registration order is structural (entry first, downstream later), while each editor's draft
+  // changes on every keystroke. Keep the order and the current value together in React state:
+  // reading or mutating a ref during render made the footer one render late and React 19 rightly
+  // warns about it. A temporarily empty slot is possible only between the two mount effects and is
+  // deliberately omitted from the derived list.
+  const [slots, setSlots] = useState<Array<{ id: string; handle: RuleDraftHandle | null }>>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const qc = useQueryClient();
@@ -189,20 +213,23 @@ export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?:
 
   const bus = useMemo<RuleDraftBus>(
     () => ({
-      attach: handle => {
-        handles.current = [...handles.current, handle];
-        bump();
+      attach: id => {
+        setSlots(current => (current.some(slot => slot.id === id) ? current : [...current, { id, handle: null }]));
         return () => {
-          handles.current = handles.current.filter(h => h !== handle);
-          bump();
+          setSlots(current => current.filter(slot => slot.id !== id));
         };
       },
-      changed: bump,
+      update: handle => {
+        setSlots(current =>
+          current.map(slot => (slot.id === handle.id && slot.handle !== handle ? { ...slot, handle } : slot)),
+        );
+      },
     }),
     [],
   );
 
-  const pending = handles.current.filter(h => h.dirty);
+  const handles = slots.flatMap(slot => (slot.handle ? [slot.handle] : []));
+  const pending = handles.filter(h => h.dirty);
 
   // 按链收集完整的规则表后再计算不再被引用的节点。每条链计算两次：库中当前已无引用的
   // （即已存在的悬空记录，可立即清除），以及这些草稿写入后将无引用的（即本次改动的
@@ -218,7 +245,7 @@ export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?:
         drafts: Map<string, Rule[]>;
       }
     >();
-    for (const h of handles.current) {
+    for (const h of handles) {
       const key = `${h.appId}/${h.chainId}`;
       const entry = byChain.get(key) ?? {
         appId: h.appId,
@@ -243,11 +270,7 @@ export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?:
         willDrop: after.filter(n => !now.includes(n)),
       };
     });
-    // handles 存储在 ref 中，无法感知其变化，依靠 bump 的计数触发重新计算。不能用表数量或
-    // dirty 数量作为依赖：将转发目标从 A 改为 B 时两个数值都不变，
-    // 提示会停留在上一次的结果。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, nodeList.data]);
+  }, [handles]);
 
   const stranded = chains.filter(c => c.stranded.length > 0);
   const dropping = chains.filter(c => c.willDrop.length > 0);
@@ -271,7 +294,7 @@ export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?:
       // 分隔符使用转义写法而非直接输入 NUL 字符：源码中包含 NUL 会使
       // grep / ripgrep 将该文件判定为二进制并**整体跳过**，且不报错——全仓库搜索 dial
       // 或 reverse 都不会命中该文件，可能据此得出前端不存在该功能的结论。运行时等价。
-      for (const key of new Set(pending.map(h => `${h.appId}\u0000${h.chainId}`))) {
+      for (const key of new Set(pending.filter(h => h.structuralDirty).map(h => `${h.appId}\u0000${h.chainId}`))) {
         const [appId, chainId] = key.split('\u0000');
         await pruneChain(appId, chainId);
       }
@@ -324,7 +347,7 @@ export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?:
       <div className="toolbar">
         {hint && <span className="note">{hint}</span>}
         <span className="sp" />
-        <span className="note">{pending.length === 0 ? '没有待保存的改动' : `${pending.length} 张规则表有改动`}</span>
+        <span className="note">{pending.length === 0 ? '没有待保存的改动' : `${pending.length} 项配置有改动`}</span>
         <button className="btn primary" disabled={saving || pending.length === 0} onClick={() => void saveAll()}>
           {saving ? '保存中…' : '保存到草稿'}
         </button>
@@ -348,12 +371,338 @@ const MATCH_KINDS: { t: DestMatch['t']; label: string; hint: string; list: boole
   { t: 'geoip', label: 'geoip', hint: '如 cn、private', list: true },
   { t: 'domain_suffix', label: '域名后缀', hint: '如 example.com', list: true },
   { t: 'domain_keyword', label: '域名关键词', hint: '如 google', list: true },
+  { t: 'domain_regex', label: '域名正则', hint: '如 ^.+\\.example\\.com$', list: true },
   { t: 'ip_cidr', label: 'IP 段', hint: '如 10.0.0.0/8', list: true },
   { t: 'port', label: '端口', hint: '如 443 或 1000-2000', list: true },
   { t: 'network', label: '传输层', hint: 'tcp 或 udp', list: false },
 ];
 
+const supportsEgressDns = (match: DestMatch): boolean =>
+  match.t === 'domain_suffix' || match.t === 'domain_keyword' || match.t === 'domain_regex' || match.t === 'geosite';
+
+const ruleActionTone = (action: RuleAction['t']): 'forward' | 'egress' | 'block' =>
+  action === 'proxy' ? 'forward' : action;
+
+const egressDnsSelectorKey = (match: DestMatch): string => {
+  if (match.t === 'domain_suffix' || match.t === 'domain_keyword' || match.t === 'geosite') {
+    return JSON.stringify({ t: match.t, v: [...match.v].sort() });
+  }
+  return JSON.stringify(match);
+};
+
+const newEgressDns = (): EgressDnsResolution => ({
+  address: '',
+  port: 53,
+  transport: 'tcp',
+  address_strategy: 'use_ip',
+  fallback: 'stop',
+});
+
+function MachineEgressDnsControls({
+  resolution,
+  supported,
+  onChange,
+  readOnly,
+  nodeName,
+  accessibleSuffix = '',
+  showChoice = true,
+  removalBlockedReason,
+}: {
+  resolution: EgressDnsResolution | null;
+  supported: boolean;
+  onChange: (next: EgressDnsResolution | null) => void;
+  readOnly: boolean;
+  nodeName: string;
+  accessibleSuffix?: string;
+  showChoice?: boolean;
+  removalBlockedReason?: string;
+}) {
+  const previousCustom = useRef<EgressDnsResolution | null>(resolution);
+  useEffect(() => {
+    if (resolution) previousCustom.current = resolution;
+  }, [resolution]);
+  const label = (name: string) => `${name}${accessibleSuffix}`;
+  return (
+    <>
+      {showChoice && (
+        <select
+          className="f egress-dns-choice"
+          aria-label={label('DNS 解析方式')}
+          value={resolution ? 'custom' : 'machine'}
+          title={
+            removalBlockedReason ?? (supported ? `修改 ${nodeName} 的机器 DNS 策略` : '自定义 DNS 只支持域名类规则')
+          }
+          onChange={event =>
+            onChange(event.target.value === 'custom' ? (previousCustom.current ?? newEgressDns()) : null)
+          }
+        >
+          <option value="machine" disabled={!!removalBlockedReason}>
+            默认 DNS 解析
+          </option>
+          <option value="custom" disabled={!supported}>
+            自定义 DNS 解析
+          </option>
+        </select>
+      )}
+      {resolution && supported && (
+        <span className="egress-dns-editor">
+          <span className="egress-dns-endpoint">
+            <input
+              className="f mono"
+              aria-label={label('DNS 地址')}
+              title="DNS 地址"
+              value={resolution.address}
+              placeholder="66.66.66.66"
+              spellCheck={false}
+              onChange={event => onChange({ ...resolution, address: event.target.value })}
+            />
+            <i>:</i>
+            <input
+              className="f mono"
+              aria-label={label('端口')}
+              title="端口"
+              type={readOnly ? 'text' : 'number'}
+              min={readOnly ? undefined : 1}
+              max={readOnly ? undefined : 65535}
+              value={resolution.port || ''}
+              onChange={event => onChange({ ...resolution, port: Number(event.target.value) || 0 })}
+            />
+          </span>
+          <select
+            className="f words egress-dns-transport"
+            aria-label={label('传输')}
+            title="传输"
+            value={resolution.transport}
+            onChange={event =>
+              onChange({
+                ...resolution,
+                transport: event.target.value as EgressDnsResolution['transport'],
+              })
+            }
+          >
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+          </select>
+          <select
+            className="f words egress-dns-family"
+            aria-label={label('地址策略')}
+            title="地址策略"
+            value={resolution.address_strategy}
+            onChange={event =>
+              onChange({
+                ...resolution,
+                address_strategy: event.target.value as EgressDnsResolution['address_strategy'],
+              })
+            }
+          >
+            <option value="use_ip">UseIP</option>
+            <option value="use_ipv4v6">UseIPv4v6</option>
+            <option value="use_ipv6v4">UseIPv6v4</option>
+            <option value="use_ipv4">UseIPv4</option>
+            <option value="use_ipv6">UseIPv6</option>
+          </select>
+          <select
+            className="f words egress-dns-fallback"
+            aria-label={label('失败处理')}
+            title="失败处理"
+            value={resolution.fallback}
+            onChange={event =>
+              onChange({
+                ...resolution,
+                fallback: event.target.value as EgressDnsResolution['fallback'],
+              })
+            }
+          >
+            <option value="stop">停止连接</option>
+            <option value="machine">回退机器 DNS</option>
+          </select>
+          <span className="egress-dns-note">
+            <b>机器全局</b> · {nodeName}
+          </span>
+        </span>
+      )}
+    </>
+  );
+}
+
 const matchValues = (m: DestMatch): string => ('v' in m ? (Array.isArray(m.v) ? m.v.join(', ') : String(m.v)) : '');
+
+const isAnyRule = (rule: Rule): boolean => rule.m.t === 'any';
+
+/** 机器详情页中的机器级 DNS 策略。它不属于任何一条链，所以单独读取并写入
+ * `node_egress_dns`；把它塞进某张链表单会重新制造已经移除的链路所有权。 */
+export function MachineEgressDnsRules({
+  nodeId,
+  nodeName,
+  readOnly = false,
+}: {
+  nodeId: string;
+  nodeName: string;
+  readOnly?: boolean;
+}) {
+  const qc = useQueryClient();
+  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
+  const [overrides, setOverrides] = useState<EgressDnsDraft>({});
+  const [order, setOrder] = useState<EgressDnsOrderDraft>(null);
+
+  const policies = sortedDnsPolicies((snapshot.data?.node_egress_dns ?? []).filter(policy => policy.node === nodeId));
+  const referencesFor = (selector: DestMatch): string[] =>
+    (snapshot.data?.snapshot.apps ?? []).flatMap(app =>
+      app.steps.flatMap(step => {
+        if (step.node !== nodeId) return [];
+        const referenced = step.rules.some(
+          rule =>
+            rule.a.t === 'egress' &&
+            rule.a.dns === true &&
+            egressDnsSelectorKey(rule.m) === egressDnsSelectorKey(selector),
+        );
+        if (!referenced) return [];
+        const chain = app.chains.find(candidate => candidate.id === step.chain);
+        return [`${app.label || app.id} / ${chain?.name || step.chain}`];
+      }),
+    );
+  const displayedPolicies = orderedDnsPolicies(policies, order);
+  const storedFor = (selector: DestMatch): EgressDnsResolution | null =>
+    policies.find(policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector))?.resolution ??
+    null;
+  const effectiveFor = (selector: DestMatch): EgressDnsResolution | null => {
+    const override = overrides[egressDnsSelectorKey(selector)];
+    return override ? override.resolution : storedFor(selector);
+  };
+  const patch = (selector: DestMatch, resolution: EgressDnsResolution | null) => {
+    const key = egressDnsSelectorKey(selector);
+    setOverrides(current => {
+      const next = { ...current };
+      if (JSON.stringify(resolution) === JSON.stringify(storedFor(selector))) delete next[key];
+      else next[key] = { selector, resolution };
+      return next;
+    });
+  };
+  const changes = Object.values(overrides).filter(
+    change => JSON.stringify(change.resolution) !== JSON.stringify(storedFor(change.selector)),
+  );
+  const orderDirty =
+    displayedPolicies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0') !==
+    policies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0');
+  const movePolicy = (selector: DestMatch, delta: number) => {
+    const index = displayedPolicies.findIndex(
+      policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector),
+    );
+    const target = index + delta;
+    if (index < 0 || target < 0 || target >= displayedPolicies.length) return;
+    const next = displayedPolicies.map(policy => policy.selector);
+    [next[index], next[target]] = [next[target], next[index]];
+    setOrder(next);
+  };
+  const save = useMutation({
+    mutationFn: async () => {
+      for (const change of changes) await setNodeEgressDns(nodeId, change.selector, change.resolution);
+      if (orderDirty) {
+        const selectors = displayedPolicies
+          .filter(policy => effectiveFor(policy.selector) !== null)
+          .map(policy => policy.selector);
+        for (const change of changes) {
+          if (
+            change.resolution &&
+            !selectors.some(selector => egressDnsSelectorKey(selector) === egressDnsSelectorKey(change.selector))
+          ) {
+            selectors.push(change.selector);
+          }
+        }
+        await reorderNodeEgressDns(nodeId, selectors);
+      }
+    },
+    onSuccess: () => {
+      setOverrides({});
+      setOrder(null);
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['revisions'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+    },
+  });
+
+  if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  return (
+    <fieldset className="node-egress-rules rule-ro" disabled={readOnly}>
+      <p className="note node-egress-dns-limit">
+        Xray 在一台机器内共用一个 DNS 实例。链路出站的“引用”只决定策略是否下发；任一出站引用后，
+        所有匹配该域名条件的解析都会使用它，不能用 tag 隔离同一域名的不同 DNS。
+      </p>
+      {policies.length === 0 ? (
+        <p className="note node-rules-empty">这台机器没有自定义 DNS 策略。请在链路的落地规则中创建并引用。</p>
+      ) : (
+        <table className="tbl node-egress-rules-table">
+          <tbody>
+            {displayedPolicies.map((policy, index) => {
+              const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
+              const value = matchValues(policy.selector);
+              const suffix = `（${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`;
+              const references = referencesFor(policy.selector);
+              const removalBlockedReason =
+                references.length > 0
+                  ? `仍被 ${references.length} 条链路出站引用，请先在链路规则中取消引用`
+                  : undefined;
+              return (
+                <tr key={egressDnsSelectorKey(policy.selector)}>
+                  <td className="mono dim" style={{ width: 24 }}>
+                    D{index + 1}
+                  </td>
+                  <td className="rule-match-cell">
+                    <span className="f rule-readonly-select">{kind?.label ?? policy.selector.t}</span>
+                    {value && <span className="f rule-readonly-value">{value}</span>}
+                  </td>
+                  <td className="rule-action-cell">
+                    <MachineEgressDnsControls
+                      key={egressDnsSelectorKey(policy.selector)}
+                      resolution={effectiveFor(policy.selector)}
+                      supported
+                      onChange={next => patch(policy.selector, next)}
+                      readOnly={readOnly}
+                      nodeName={nodeName}
+                      accessibleSuffix={suffix}
+                      removalBlockedReason={removalBlockedReason}
+                    />
+                    <span className="egress-dns-usage" title={references.join('\n')}>
+                      {references.length > 0 ? `${references.length} 条出站引用` : '未引用 · 不下发'}
+                    </span>
+                  </td>
+                  <td className="dns-priority-cell">
+                    <DnsPriorityControl
+                      index={index}
+                      count={displayedPolicies.length}
+                      label={`${kind?.label ?? policy.selector.t} ${value}`.trim()}
+                      readOnly={readOnly}
+                      showLabel={false}
+                      onMove={delta => movePolicy(policy.selector, delta)}
+                    />
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {!readOnly && policies.length > 0 && (
+        <div className="toolbar node-egress-rules-foot">
+          <span className="note">
+            {changes.length === 0 && !orderDirty
+              ? '没有待保存的改动'
+              : `${changes.length} 条策略有改动${orderDirty ? '，DNS 优先级已调整' : ''}`}
+          </span>
+          <span className="sp" />
+          {save.error && <ErrorBox error={save.error} />}
+          <button
+            className="btn primary"
+            disabled={save.isPending || (changes.length === 0 && !orderDirty)}
+            onClick={() => save.mutate()}
+          >
+            {save.isPending ? '保存中…' : '保存到草稿'}
+          </button>
+        </div>
+      )}
+    </fieldset>
+  );
+}
 
 function buildMatch(t: DestMatch['t'], raw: string): DestMatch {
   const list = raw
@@ -695,6 +1044,83 @@ export type HopsDraft = Record<
   }
 >;
 
+/** Unsaved machine DNS policies, keyed by their canonical selector. Kept beside HopsDraft in the
+ * chain panel because one machine may occur more than once in the rendered rule tree. */
+export type EgressDnsDraft = Record<string, { selector: DestMatch; resolution: EgressDnsResolution | null }>;
+
+/** Unsaved machine-wide DNS priority. `null` means use the snapshot's position order. */
+export type EgressDnsOrderDraft = DestMatch[] | null;
+
+type EgressDnsPolicy = {
+  node: string;
+  position: number;
+  selector: DestMatch;
+  resolution: EgressDnsResolution;
+};
+
+const sortedDnsPolicies = (policies: EgressDnsPolicy[]): EgressDnsPolicy[] =>
+  [...policies].sort(
+    (a, b) =>
+      a.position - b.position || egressDnsSelectorKey(a.selector).localeCompare(egressDnsSelectorKey(b.selector)),
+  );
+
+function orderedDnsPolicies(policies: EgressDnsPolicy[], order: EgressDnsOrderDraft): EgressDnsPolicy[] {
+  const baseline = sortedDnsPolicies(policies);
+  if (!order) return baseline;
+  const bySelector = new Map(baseline.map(policy => [egressDnsSelectorKey(policy.selector), policy]));
+  const ordered = order.flatMap(selector => {
+    const policy = bySelector.get(egressDnsSelectorKey(selector));
+    if (!policy) return [];
+    bySelector.delete(egressDnsSelectorKey(selector));
+    return [policy];
+  });
+  return [...ordered, ...bySelector.values()];
+}
+
+function DnsPriorityControl({
+  index,
+  count,
+  label,
+  readOnly,
+  showLabel = true,
+  onMove,
+}: {
+  index: number;
+  count: number;
+  label: string;
+  readOnly: boolean;
+  showLabel?: boolean;
+  onMove: (delta: number) => void;
+}) {
+  return (
+    <span className="dns-priority" title="整台机器的 Xray DNS 匹配优先级">
+      {showLabel && <b>D{index + 1}</b>}
+      {!readOnly && count > 1 && (
+        <span className="dns-priority-buttons">
+          <button
+            type="button"
+            className="btn"
+            disabled={index === 0}
+            aria-label={`DNS 优先级上移（${label}）`}
+            onClick={() => onMove(-1)}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            className="btn"
+            disabled={index === count - 1}
+            aria-label={`DNS 优先级下移（${label}）`}
+            onClick={() => onMove(1)}
+          >
+            ↓
+          </button>
+        </span>
+      )}
+    </span>
+  );
+}
+
 /** 中转端口草稿的初始值：取自对端 step 上已有的配置，不存在时使用默认值。 */
 // 中转端口的默认值。
 // 对端已有中转端口时沿用；没有时选择该机器上空闲的端口，而非硬编码默认值。
@@ -709,8 +1135,8 @@ export function seedHops(peers: ForwardPeer[], taken?: Map<string, PortOwners>, 
     seed[p.id] = {
       port: String(h?.port ?? fallbackPort),
       kind: h?.security.t ?? 'none',
-      dest: h?.security.t === 'reality' ? h.security.v.dest : FALLBACK_SITE.dest,
-      names: h?.security.t === 'reality' ? h.security.v.server_names.join(', ') : FALLBACK_SITE.names,
+      dest: h?.security.t === 'reality' ? h.security.v.dest : EMPTY_REALITY_SITE.dest,
+      names: h?.security.t === 'reality' ? h.security.v.server_names.join(', ') : EMPTY_REALITY_SITE.names,
     };
   }
   return seed;
@@ -778,10 +1204,9 @@ export function RuleEditor({
   // 两者都提供时才执行该计算；缺少其一时只保存该表，不修改其他节点的 step。
   steps?: SnapshotStep[];
   root?: string;
-  // 规则表末尾的兜底行：编译器补全的那一条。
-  // 由外部传入，因为它属于编译产物而非该表的状态——在此计算相当于在浏览器中
-  // 复制一份补全规则的逻辑。
-  fallback?: ReactNode;
+  // 规则表末尾由编译器补全的规则。内容来自编译视图，不在浏览器里重新推算；
+  // RuleEditor 只负责把它按普通规则的列布局渲染成不可编辑行。
+  fallback?: { rules: Rule[]; pending: boolean };
   onClose?: () => void;
   /* 由上层持有的共享草稿。不传入时由本组件自行管理（机器详情页中一台机器只出现一次，不需要共享）。 */
   shared?: {
@@ -789,6 +1214,10 @@ export function RuleEditor({
     setRules: (next: Rule[]) => void;
     hops: HopsDraft;
     setHops: (next: HopsDraft) => void;
+    dns: EgressDnsDraft;
+    setDns: (next: EgressDnsDraft) => void;
+    dnsOrder: EgressDnsOrderDraft;
+    setDnsOrder: (next: EgressDnsOrderDraft) => void;
   };
   // 是否参与 RuleDraftScope 的批量保存。同一台机器在树中出现多次、共用一份草稿时，
   // 只由其中一处注册——两处都注册会将同一内容写入两次。
@@ -805,12 +1234,13 @@ export function RuleEditor({
   const app = snapshot.data?.snapshot.apps.find(candidate => candidate.id === appId);
   const chainTenant = app?.chains.find(chain => chain.id === chainId)?.tenant ?? '';
   const externalOutbounds = (snapshot.data?.snapshot.external_outbounds ?? []).filter(
-    outbound => outbound.app === appId,
+    outbound => chainTenant === outbound.tenant || chainTenant.startsWith(`${outbound.tenant}.`),
   );
   const [externalEditor, setExternalEditor] = useState<{
     existing: ExternalOutbound | null;
     ruleIndex: number;
   } | null>(null);
+  const [warpManagerId, setWarpManagerId] = useState<string | null>(null);
   const [targetPickerRule, setTargetPickerRule] = useState<number | null>(null);
   const [targetQuery, setTargetQuery] = useState('');
   const targetPickerRoot = useRef<HTMLSpanElement>(null);
@@ -874,6 +1304,53 @@ export function RuleEditor({
   // （steps 主键为 chain_id + node_id）。
   const ownRules = useState<Rule[]>(initial);
   const [rules, setRules] = shared ? [shared.rules, shared.setRules] : ownRules;
+  const warpReferencedOnCurrentNode = (outboundId: string) =>
+    rules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === outboundId) ||
+    (snapshot.data?.snapshot.apps ?? []).some(candidateApp =>
+      candidateApp.steps.some(
+        step =>
+          step.node === nodeId &&
+          !(candidateApp.id === appId && step.chain === chainId) &&
+          step.rules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === outboundId),
+      ),
+    );
+  // Only local overrides live in the editor. The query remains the canonical baseline and is
+  // replaced by the server-side draft preview after saving, so two chain pages never maintain
+  // copied policy state of their own.
+  const ownDnsOverrides = useState<EgressDnsDraft>({});
+  const [dnsOverrides, setDnsOverrides] = shared ? [shared.dns, shared.setDns] : ownDnsOverrides;
+  const ownDnsOrder = useState<EgressDnsOrderDraft>(null);
+  const [dnsOrder, setDnsOrder] = shared ? [shared.dnsOrder, shared.setDnsOrder] : ownDnsOrder;
+  const nodeDnsPolicies = sortedDnsPolicies(
+    (snapshot.data?.node_egress_dns ?? []).filter(policy => policy.node === nodeId),
+  );
+  const orderedNodeDnsPolicies = orderedDnsPolicies(nodeDnsPolicies, dnsOrder);
+  const storedDnsFor = (selector: DestMatch): EgressDnsResolution | null =>
+    nodeDnsPolicies.find(policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector))
+      ?.resolution ?? null;
+  const effectiveDnsFor = (selector: DestMatch): EgressDnsResolution | null => {
+    const override = dnsOverrides[egressDnsSelectorKey(selector)];
+    return override ? override.resolution : storedDnsFor(selector);
+  };
+  const patchMachineDns = (selector: DestMatch, resolution: EgressDnsResolution | null) => {
+    const key = egressDnsSelectorKey(selector);
+    const next = { ...dnsOverrides };
+    if (JSON.stringify(resolution) === JSON.stringify(storedDnsFor(selector))) delete next[key];
+    else next[key] = { selector, resolution };
+    setDnsOverrides(next);
+  };
+  const dnsPolicyIndex = (selector: DestMatch) =>
+    orderedNodeDnsPolicies.findIndex(
+      policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector),
+    );
+  const moveMachineDns = (selector: DestMatch, delta: number) => {
+    const index = dnsPolicyIndex(selector);
+    const target = index + delta;
+    if (index < 0 || target < 0 || target >= orderedNodeDnsPolicies.length) return;
+    const next = orderedNodeDnsPolicies.map(policy => policy.selector);
+    [next[index], next[target]] = [next[target], next[index]];
+    setDnsOrder(next);
+  };
   const peerOf = (id: string) => peers.find(p => p.id === id) ?? null;
 
   // 下拉框按关系对可选目标分组；不可选的同样保留在列表中并说明原因，直接隐藏时
@@ -892,6 +1369,9 @@ export function RuleEditor({
   const visibleExternalOutbounds = externalOutbounds.filter(outbound =>
     targetMatches(outbound.id, outbound.name, outbound.address, externalProtocolLabel(outbound.protocol.t)),
   );
+  const managedWarp = warpManagerId
+    ? (externalOutbounds.find(outbound => outbound.id === warpManagerId && outbound.protocol.t === 'warp') ?? null)
+    : null;
   /* 新增转发规则时的默认目标。优先使用主干下一跳：它是沿链继续的默认路径。 */
   const defaultTarget = selectable[0]?.id ?? '';
 
@@ -929,6 +1409,13 @@ export function RuleEditor({
     family === 'v6'
       ? (!selfNode?.public_ipv6_nat && selfNode?.public_ipv6) || ''
       : (!selfNode?.public_ipv4_nat && selfNode?.public_ipv4) || '';
+  // `fallback` comes from a compiled table. A locally written Any may still be present in the
+  // last fetched compilation; it is not a second row in this editor.
+  const visibleFallbackRules = (fallback?.rules ?? []).filter(rule => {
+    if (rules.some(written => JSON.stringify(written) === JSON.stringify(rule))) return false;
+    return true;
+  });
+  const displayedRuleCount = rules.length;
   const ownHops = useState<HopsDraft>(() => seedHops(peers, portPool, hopBase));
   const [hops, setHops] = shared ? [shared.hops, shared.setHops] : ownHops;
   // `seedHops` 只初始化转发目标，不包含本机——反向接入时端口开在本机，
@@ -940,15 +1427,17 @@ export function RuleEditor({
       ? {
           port: String(selfHopIn.port),
           kind: selfHopIn.security.t,
-          dest: selfHopIn.security.t === 'reality' ? selfHopIn.security.v.dest : FALLBACK_SITE.dest,
+          dest: selfHopIn.security.t === 'reality' ? selfHopIn.security.v.dest : EMPTY_REALITY_SITE.dest,
           names:
-            selfHopIn.security.t === 'reality' ? selfHopIn.security.v.server_names.join(', ') : FALLBACK_SITE.names,
+            selfHopIn.security.t === 'reality'
+              ? selfHopIn.security.v.server_names.join(', ')
+              : EMPTY_REALITY_SITE.names,
         }
       : {
           port: String(freePortAcross(portPool, [id], hopBase)),
           kind: 'none' as const,
-          dest: FALLBACK_SITE.dest,
-          names: FALLBACK_SITE.names,
+          dest: EMPTY_REALITY_SITE.dest,
+          names: EMPTY_REALITY_SITE.names,
         });
   const patchHop = (id: string, next: Partial<ReturnType<typeof hopOf>>) =>
     setHops({ ...hops, [id]: { ...hopOf(id), ...next } });
@@ -996,53 +1485,13 @@ export function RuleEditor({
     };
   };
 
-  const bus = useContext(RuleDraftCtx);
-  const save = useMutation({
-    mutationFn: async (_opts?: { keepOpen?: boolean }) => {
-      // 先写入对端的中转端口，再写入本机的规则。顺序不可颠倒：规则中已引用该端口，
-      // 先写入规则时，中间时段的编译结果为 relay.no-hop-in。
-      for (const to of forwardTargets) {
-        const peer = peerOf(to);
-        if (!peer) continue;
-        await putStep(appId, chainId, to, {
-          // 对端自身的规则原样回传，不清空其规则表。
-          // 分叉到链外时对端尚无 step，此处写入空表——不为其补全出网规则：
-          // 该机器的 egress_allowed 可能为假，补全会导致 step.egress-denied。空表交由
-          // 编译器按其规则补全，应补 Egress 时补 Egress，应补 Block 时补 Block。
-          rules: peer.step?.rules ?? [],
-          accept: peer.step?.accept ? { uuid: peer.step.accept.uuid, label: peer.step.accept.label } : {},
-          // 反向档下对端不监听，中转端口开在本机（由下面的 putStep 写入）。为其也写入一个
-          // 只会占用该机器上的一个无用端口，并进入端口冲突校验。
-          ...(reverseTargets.includes(to) ? {} : { hop_in: hopInBody(to) }),
-        });
-      }
-      const saved = await putStep(appId, chainId, nodeId, {
-        rules,
-        /* 已有则原样回传（label 是统计键，不能变更）；不存在但被转发指向时由 store 生成一份 */
-        ...(accept ? { accept: { uuid: accept.uuid, label: accept.label } } : isForwardTarget ? { accept: {} } : {}),
-        // 存在反向接入的下游时，该端口开在本机——下游连接的即是它。链头同样需要开启：
-        // 编译器为该档位放宽了链头不配置中转端口的限制（ir/routing.rs）。
-        ...(reverseTargets.length > 0 ? { hop_in: hopInBody(nodeId) } : {}),
-      });
-      // 无引用的机器由服务端统一清理一次。在树中时不在此处追加该操作：其他表尚未保存，
-      // 此时的链不完整，服务端按其计算会移除刚在另一张表中建立连接的机器。树中的清理
-      // 由 RuleDraftScope 在所有表写入完成后执行，此处只处理画布浮层的单表编辑场景。
-      if (!bus) await pruneChain(appId, chainId);
-      return saved;
-    },
-    onSuccess: (_data, opts) => {
-      qc.invalidateQueries({ queryKey: ['snapshot'] });
-      qc.invalidateQueries({ queryKey: ['revisions'] });
-      qc.invalidateQueries({ queryKey: ['compile'] });
-      /* 删除规则的路径自行保存，不应同时关闭编辑器——操作仍在该表内进行。 */
-      if (!opts?.keepOpen) onClose?.();
-    },
-  });
-
-  // 该表是否有待保存的内容。三种情况都计入：规则已修改、该跳对应的对端入口已修改，
-  // 以及被其他节点转发指向但尚无接受凭据——最后一种不是用户修改产生的，但不保存时
-  // 编译会报 relay.no-accept，因此同样需要启用末尾的保存按钮。
-  const dirty =
+  const dnsChanges = Object.values(dnsOverrides).filter(
+    change => JSON.stringify(change.resolution) !== JSON.stringify(storedDnsFor(change.selector)),
+  );
+  const dnsOrderDirty =
+    orderedNodeDnsPolicies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0') !==
+    nodeDnsPolicies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0');
+  const structuralDirty =
     JSON.stringify(rules) !== JSON.stringify(initial) ||
     (isForwardTarget && !accept) ||
     normalTargets.some(to => {
@@ -1051,39 +1500,134 @@ export function RuleEditor({
     }) ||
     /* 反向接入的端口开在本机，修改它同样需要启用保存按钮 */
     (reverseTargets.length > 0 && hopInChanged(hopInBody(nodeId), selfHopIn));
+  const dirty = structuralDirty || dnsChanges.length > 0 || dnsOrderDirty;
 
-  const handle = useRef<RuleDraftHandle>({
-    dirty: false,
-    save: () => Promise.resolve(),
-    appId,
-    chainId,
-    nodeId,
-    root,
-    steps: steps ?? [],
-    rules,
+  const bus = useContext(RuleDraftCtx);
+  const save = useMutation({
+    mutationFn: async (_opts?: { keepOpen?: boolean }) => {
+      let saved: unknown = { revision_id: 0 };
+      if (structuralDirty) {
+        // 先写入对端的中转端口，再写入本机的规则。顺序不可颠倒：规则中已引用该端口，
+        // 先写入规则时，中间时段的编译结果为 relay.no-hop-in。
+        for (const to of forwardTargets) {
+          const peer = peerOf(to);
+          if (!peer) continue;
+          await putStep(appId, chainId, to, {
+            // 对端自身的规则原样回传，不清空其规则表。
+            // 分叉到链外时对端尚无 step，此处写入空表——不为其补全出网规则：
+            // 该机器的 egress_allowed 可能为假，补全会导致 step.egress-denied。空表交由
+            // 编译器按其规则补全，应补 Egress 时补 Egress，应补 Block 时补 Block。
+            rules: peer.step?.rules ?? [],
+            accept: peer.step?.accept ? { uuid: peer.step.accept.uuid, label: peer.step.accept.label } : {},
+            // 反向档下对端不监听，中转端口开在本机（由下面的 putStep 写入）。为其也写入一个
+            // 只会占用该机器上的一个无用端口，并进入端口冲突校验。
+            ...(reverseTargets.includes(to) ? {} : { hop_in: hopInBody(to) }),
+          });
+        }
+        saved = await putStep(appId, chainId, nodeId, {
+          rules,
+          /* 已有则原样回传（label 是统计键，不能变更）；不存在但被转发指向时由 store 生成一份 */
+          ...(accept ? { accept: { uuid: accept.uuid, label: accept.label } } : isForwardTarget ? { accept: {} } : {}),
+          // 存在反向接入的下游时，该端口开在本机——下游连接的即是它。链头同样需要开启：
+          // 编译器为该档位放宽了链头不配置中转端口的限制（ir/routing.rs）。
+          ...(reverseTargets.length > 0 ? { hop_in: hopInBody(nodeId) } : {}),
+        });
+        // 无引用的机器由服务端统一清理一次。在树中时不在此处追加该操作：其他表尚未保存，
+        // 此时的链不完整，服务端按其计算会移除刚在另一张表中建立连接的机器。树中的清理
+        // 由 RuleDraftScope 在所有表写入完成后执行，此处只处理画布浮层的单表编辑场景。
+        if (!bus) await pruneChain(appId, chainId);
+      }
+      // This operation is independent from put_step. A DNS-only edit therefore adds only a
+      // machine policy to the draft and cannot claim the currently open chain as its owner.
+      for (const change of dnsChanges) {
+        await setNodeEgressDns(nodeId, change.selector, change.resolution);
+      }
+      if (dnsOrderDirty) {
+        const selectors = orderedNodeDnsPolicies
+          .filter(policy => effectiveDnsFor(policy.selector) !== null)
+          .map(policy => policy.selector);
+        for (const change of dnsChanges) {
+          if (
+            change.resolution &&
+            !selectors.some(selector => egressDnsSelectorKey(selector) === egressDnsSelectorKey(change.selector))
+          ) {
+            selectors.push(change.selector);
+          }
+        }
+        await reorderNodeEgressDns(nodeId, selectors);
+      }
+      return saved;
+    },
+    onSuccess: (_data, opts) => {
+      // Every DNS override in this editor has just been copied into the global browser draft.
+      // Keeping a second local copy makes "discard draft" reveal it again against the committed
+      // baseline, and lets an older chain page overwrite a newer machine-wide edit.
+      setDnsOverrides({});
+      setDnsOrder(null);
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['revisions'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+      /* 删除规则的路径自行保存，不应同时关闭编辑器——操作仍在该表内进行。 */
+      if (!opts?.keepOpen) onClose?.();
+    },
   });
-  handle.current.dirty = dirty;
-  handle.current.save = () => save.mutateAsync({});
+
+  const handleId = useId();
+  const rulesKey = JSON.stringify(rules);
+  const stepsKey = JSON.stringify(steps ?? []);
+  // The tree can construct a fresh empty array while a newly referenced step has not been saved
+  // yet. Register canonical copies keyed by content so a scope update does not turn that harmless
+  // new reference into an update/render loop.
+  const registeredRules = useMemo(() => JSON.parse(rulesKey) as Rule[], [rulesKey]);
+  const registeredSteps = useMemo(() => JSON.parse(stepsKey) as SnapshotStep[], [stepsKey]);
+  const saveAsync = save.mutateAsync;
+  const handle = useMemo<RuleDraftHandle>(
+    () => ({
+      id: handleId,
+      dirty,
+      structuralDirty,
+      save: () => saveAsync({}),
+      appId,
+      chainId,
+      nodeId,
+      root,
+      steps: registeredSteps,
+      rules: registeredRules,
+    }),
+    [handleId, dirty, structuralDirty, saveAsync, appId, chainId, nodeId, root, registeredSteps, registeredRules],
+  );
   // 计算无引用节点需要整条链的规则表，因此草稿和链的当前状态都交由总线管理
   // （见 RuleDraftScope）。各表自行计算时无法读取其他表的草稿——这是此前误删的原因。
-  handle.current.rules = rules;
-  handle.current.steps = steps ?? [];
-  handle.current.root = root;
   // 只读时不注册到总线：注册后末尾的按钮会显示为存在待保存的改动，
   // 而该状态下没有任何可修改的入口。
-  useEffect(() => (saves && !readOnly ? bus?.attach(handle.current) : undefined), [bus, saves, readOnly]);
-  // dirty 变化时需要触发更新（末尾按钮的可用性依赖它），规则本身变化时同样需要：
-  // 无引用提示按草稿计算，只依赖 dirty 时，将转发目标从 A 改为 B 这类 dirty 不变的改动
-  // 会使提示停留在上一次的结果。
-  // 依赖使用序列化后的字符串而非数组本身：`rules` 在没有 step 的节点上每次渲染都是
-  // 新的 `[]`，以引用作为依赖会导致每次渲染都触发更新并再次渲染，形成循环。
-  const rulesKey = JSON.stringify(rules);
-  useEffect(() => bus?.changed(), [bus, dirty, rulesKey]);
+  useEffect(() => (saves && !readOnly ? bus?.attach(handleId) : undefined), [bus, handleId, saves, readOnly]);
+  useEffect(() => {
+    if (saves && !readOnly) bus?.update(handle);
+  }, [bus, handle, saves, readOnly]);
 
-  const patch = (i: number, next: Rule) => setRules(rules.map((r, idx) => (idx === i ? next : r)));
+  const patch = (i: number, next: Rule) => {
+    const updated = rules.map((rule, index) => (index === i ? next : rule));
+    // Any 是整张表的兜底，不论动作是落地、转发还是拒绝，都不能让后续规则失效。
+    // 在下拉框中把某行改成 Any 时，立即把该行移到末尾。
+    if (isAnyRule(next) && i < updated.length - 1) {
+      updated.splice(i, 1);
+      updated.push(next);
+    }
+    setRules(updated);
+  };
+  const patchMatch = (i: number, rule: Rule, match: DestMatch) =>
+    patch(i, {
+      ...rule,
+      m: match,
+      // A DNS reference identifies the policy by this exact selector. Changing the selector must
+      // make the operator opt in again rather than silently activating another machine policy.
+      a: rule.a.t === 'egress' ? { ...rule.a, dns: false } : rule.a,
+    });
   const move = (i: number, delta: number) => {
     const j = i + delta;
     if (j < 0 || j >= rules.length) return;
+    // Any 可以向下归位，但不能向上；普通规则也不能越过已经位于末尾的 Any。
+    if ((isAnyRule(rules[i]) && delta < 0) || (delta > 0 && isAnyRule(rules[j]))) return;
     const next = [...rules];
     [next[i], next[j]] = [next[j], next[i]];
     setRules(next);
@@ -1146,8 +1690,6 @@ export function RuleEditor({
     setTargetPickerRule(null);
   };
 
-  const lastIsCatchAll = rules.length > 0 && rules[rules.length - 1].m.t === 'any';
-
   // 删除规则时立即写入草稿，不等待末尾的「保存到草稿」。修改常处于中间状态（已选匹配条件
   // 但未选动作），累积后统一保存是合理的；而删除是一次完成的操作，且会连带将无引用的机器
   // 移出链——该结果只有实际写入并重新渲染树之后才能看到。需要经过一轮 state 更新后再保存：
@@ -1156,10 +1698,28 @@ export function RuleEditor({
   const [flushing, setFlushing] = useState(false);
   useEffect(() => {
     if (!flushing) return;
-    setFlushing(false);
-    void save.mutateAsync({ keepOpen: true });
+    save.mutate(
+      { keepOpen: true },
+      {
+        onSettled: () => setFlushing(false),
+      },
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flushing]);
+
+  const addRule = () => {
+    const anyIndex = rules.findIndex(isAnyRule);
+    const next: Rule = {
+      // 已有兜底时，新行必须插在它之前；再创建一个 Any 会让原兜底之后的内容永远不可达。
+      m: anyIndex >= 0 ? { t: 'domain_suffix', v: [] } : { t: 'any' },
+      a: defaultTarget
+        ? forwardAction(defaultTarget, defaultDial(defaultTarget))
+        : { t: 'egress', send_through: null, dns: false },
+    };
+    const updated = [...rules];
+    updated.splice(anyIndex >= 0 ? anyIndex : updated.length, 0, next);
+    setRules(updated);
+  };
 
   return (
     // 使用 `fieldset` 仅为其 disabled 属性（它是 HTML 中唯一能一次禁用整棵子树
@@ -1169,7 +1729,7 @@ export function RuleEditor({
         <b className="mono">
           {chainId} / {nodeId}
         </b>
-        <span className="note">规则自上而下匹配，第一条命中的生效</span>
+        <span className="note">DNS 引用写在落地规则内；引用后按机器全局生效</span>
         <span className="sp" />
         {onClose && (
           <button className="btn" onClick={onClose}>
@@ -1178,12 +1738,11 @@ export function RuleEditor({
         )}
       </div>
 
-      {/* 没有任何规则时，将编译器补全的那一条接在该说明之后，同行显示：
-          「将使用兜底规则」和「兜底规则的内容」是同一条信息的两部分，分隔在空表两侧
-          需要记住前半部分再向下查找。表中有规则时它仍位于表尾——此时其位置本身
-          即是信息（它是产物中的最后一条）。 */}
-      {rules.length === 0 && (
-        <div className="note rules-empty">没有规则，编译器会使用「出网权限」的兜底规则：{fallback}</div>
+      {(nodeDnsPolicies.length > 0 || rules.some(rule => rule.a.t === 'egress' && supportsEgressDns(rule.m))) && (
+        <p className="note node-egress-dns-limit">
+          Xray 限制：DNS 在机器内全局匹配。这里的引用只决定策略是否下发；任一出站引用后，
+          这台机器上所有匹配域名的解析都会受影响，tag 不能提供出站级隔离。
+        </p>
       )}
 
       <table className="tbl">
@@ -1204,264 +1763,418 @@ export function RuleEditor({
             const targetLabel =
               external?.name || peer?.name || (r.a.t === 'proxy' ? '外部出站不可用' : to ? '内部节点不可用' : '');
             return (
-              <tr key={i}>
-                <td className="mono dim" style={{ width: 24 }}>
-                  {i + 1}
-                </td>
-                <td>
-                  <select
-                    className="f"
-                    value={r.m.t}
-                    onChange={e => patch(i, { ...r, m: buildMatch(e.target.value as DestMatch['t'], '') })}
-                  >
-                    {MATCH_KINDS.map(k => (
-                      <option key={k.t} value={k.t}>
-                        {k.label}
-                      </option>
-                    ))}
-                  </select>
-                  {kind?.list !== false && r.m.t !== 'any' && r.m.t !== 'front_downstream' && (
-                    <input
+              <Fragment key={i}>
+                <tr>
+                  <td className="mono dim" style={{ width: 24 }}>
+                    {i + 1}
+                  </td>
+                  <td className="rule-match-cell">
+                    <select
                       className="f"
-                      style={{ marginLeft: 6, width: 190 }}
-                      placeholder={kind?.hint}
-                      value={matchValues(r.m)}
-                      onChange={e => patch(i, { ...r, m: buildMatch(r.m.t, e.target.value) })}
-                    />
-                  )}
-                </td>
-                <td>
-                  <select
-                    className="f"
-                    value={r.a.t === 'proxy' ? 'forward' : r.a.t}
-                    onChange={e => {
-                      const t = e.target.value as Exclude<RuleAction['t'], 'proxy'>;
-                      const a: RuleAction =
-                        t === 'forward'
-                          ? // dial 要显式写：不写的语义就是 overlay（模型里 HopDial
-                            // 的 #[default]），会绕过 defaultDial 的选择逻辑。
-                            defaultTarget
-                            ? forwardAction(defaultTarget, defaultDial(defaultTarget))
-                            : externalOutbounds[0]
-                              ? { t: 'proxy', outbound: externalOutbounds[0].id }
-                              : { t: 'forward', to: '' }
-                          : t === 'egress'
-                            ? { t: 'egress', send_through: null }
-                            : { t: 'block' };
-                      patch(i, { ...r, a });
-                      setTargetPickerRule(t === 'forward' ? i : null);
-                    }}
-                  >
-                    <option value="forward">转发给</option>
-                    <option value="egress">从这台落地</option>
-                    <option value="block">拒绝</option>
-                  </select>
-                  {(r.a.t === 'forward' || r.a.t === 'proxy') && (
-                    <span
-                      className="external-target-picker"
-                      ref={targetPickerRule === i ? targetPickerRoot : undefined}
-                    >
-                      <button
-                        type="button"
-                        className="external-target-trigger"
-                        aria-expanded={targetPickerRule === i}
-                        onClick={() => {
-                          const opening = targetPickerRule !== i;
-                          setTargetPickerRule(opening ? i : null);
-                          if (opening) setTargetQuery('');
-                        }}
-                      >
-                        <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
-                        <span className="external-target-copy">
-                          <b>{targetLabel || '选择内部节点或外部出站'}</b>
-                        </span>
-                        <span className="external-target-chevron">⌄</span>
-                      </button>
-                      {targetPickerRule === i && (
-                        <span
-                          ref={targetMenu}
-                          className={`external-target-menu${targetMenuPlacement.below ? ' below' : ''}`}
-                          style={{ maxHeight: targetMenuPlacement.maxHeight }}
-                        >
-                          <input
-                            autoFocus
-                            className="f external-target-search"
-                            placeholder="搜索节点或外部出站"
-                            value={targetQuery}
-                            onChange={event => setTargetQuery(event.target.value)}
-                          />
-                          <span className="external-target-menu-label">Brocade 节点</span>
-                          {[...visibleNextPeers, ...visibleInsidePeers, ...visibleForkPeers].map(candidate => (
-                            <button
-                              type="button"
-                              className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
-                              key={candidate.id}
-                              onClick={() => selectForwardTarget(i, r, candidate.id)}
-                            >
-                              <span className="external-target-kind">NODE</span>
-                              <span className="external-target-copy">
-                                <b>{candidate.name || '未命名节点'}</b>
-                              </span>
-                              <span className="external-target-where">
-                                {candidate.where === 'next'
-                                  ? '当前下游'
-                                  : candidate.where === 'inside'
-                                    ? '链内其它节点'
-                                    : '主干之外'}
-                              </span>
-                            </button>
-                          ))}
-                          {visibleBlockedPeers.map(candidate => (
-                            <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
-                              <span className="external-target-kind">NODE</span>
-                              <span className="external-target-copy">
-                                <b>{candidate.name || '未命名节点'}</b>
-                              </span>
-                              <span className="external-target-where">不能选</span>
-                            </button>
-                          ))}
-                          <span className="external-target-menu-label">外部出站</span>
-                          {visibleExternalOutbounds.map(outbound => (
-                            <button
-                              type="button"
-                              className={r.a.t === 'proxy' && r.a.outbound === outbound.id ? 'on' : ''}
-                              key={outbound.id}
-                              onClick={() => selectExternalTarget(i, r, outbound.id)}
-                            >
-                              <span className="external-target-kind external">
-                                {externalProtocolBadge(outbound.protocol.t)}
-                              </span>
-                              <span className="external-target-copy">
-                                <b>{outbound.name}</b>
-                              </span>
-                              <span className="external-target-where">本项目</span>
-                            </button>
-                          ))}
-                          <button
-                            type="button"
-                            className="external-target-new"
-                            onClick={() => {
-                              setTargetPickerRule(null);
-                              setExternalEditor({ existing: null, ruleIndex: i });
-                            }}
-                          >
-                            <span>＋</span>
-                            <b>新建外部出站</b>
-                            <span>粘贴链接或手动填写</span>
-                          </button>
-                          {visibleNextPeers.length +
-                            visibleInsidePeers.length +
-                            visibleForkPeers.length +
-                            visibleBlockedPeers.length +
-                            visibleExternalOutbounds.length ===
-                            0 && <span className="external-target-empty">没有匹配项</span>}
-                        </span>
-                      )}
-                    </span>
-                  )}
-                  {r.a.t === 'forward' && (
-                    <>
-                      <select
-                        className="f"
-                        style={{ marginLeft: 6 }}
-                        value={dk}
-                        title="这一跳连接对端的哪个地址"
-                        onChange={e => setDial(i, to, e.target.value as DialKind)}
-                      >
-                        {/* 排列和可用性判定都在模块层（DIAL_ORDER / dialUnavailable），
-                            与默认档位的选择、建链向导的下拉框共用同一份。 */}
-                        {DIAL_ORDER.map(k => (
-                          <option key={k} value={k} disabled={dialUnavailable(k, peer, selfAddrs)}>
-                            {DIAL_LABEL[k]}
-                          </option>
-                        ))}
-                      </select>
-                      {/* 前三档的地址由推导得出，只读；仅自定义档需要手动填写 */}
-                      {dk === 'overlay' ? (
-                        // 与公网两档一样直接显示地址。显示为「XX 的 overlay 地址」会要求
-                        // 到其他位置查询该值——而它就在编译结果中，可直接获取。
-                        // 获取失败只有一种情况：该机器尚未加入 overlay，这正是需要说明的内容。
-                        <span className="mono dim" style={{ marginLeft: 6 }}>
-                          {overlayOf(to) || (
-                            <span style={{ color: 'var(--gold)' }}>{peer?.name || to} 不在 overlay 里</span>
-                          )}
-                        </span>
-                      ) : dk === 'public_ipv4' ? (
-                        <span className="mono dim" style={{ marginLeft: 6 }}>
-                          {publicIpv4Of(peer) || (
-                            <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv4</span>
-                          )}
-                        </span>
-                      ) : dk === 'public_ipv6' ? (
-                        <span className="mono dim" style={{ marginLeft: 6 }}>
-                          {publicIpv6Of(peer) || (
-                            <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv6</span>
-                          )}
-                        </span>
-                      ) : dk === 'reverse_v4' || dk === 'reverse_v6' ? (
-                        // 与前三档一样由推导得出，只读。显示的是本机的接入地址——
-                        // 对端从该地址接入。连接由哪一方发起、通道如何建立属于传输层的内容，
-                        // 界面不涉及。
-                        <span className="mono dim" style={{ marginLeft: 6 }}>
-                          {selfPublicHostOf(dk === 'reverse_v6' ? 'v6' : 'v4') || (
-                            <span style={{ color: 'var(--gold)' }}>
-                              这台机器没有可直连的{dk === 'reverse_v6' ? '公网 IPv6' : '公网 IPv4'}
-                            </span>
-                          )}
-                        </span>
-                      ) : (
-                        <>
-                          <input
-                            className="f mono"
-                            style={{ marginLeft: 6, width: 150 }}
-                            placeholder="10.0.0.9 / 2001:db8::9"
-                            value={hostOf(dial)}
-                            onChange={e =>
-                              setDialForTarget(
-                                to,
-                                {
-                                  t: 'addr',
-                                  v: formatHostPort(e.target.value, Number(hopOf(to).port) || hopBase),
-                                },
-                                i,
-                              )
-                            }
-                          />
-                          {natPublicHostOf(peer, hostOf(dial)) && (
-                            <span className="sub" style={{ color: 'var(--gold)' }}>
-                              该地址为 {natPublicHostOf(peer, hostOf(dial))} 且标记为经 NAT，编译会拒绝。
-                            </span>
-                          )}
-                        </>
-                      )}
-                    </>
-                  )}
-                </td>
-                {/* 只读时整列不渲染：保留一列禁用按钮表示此处有操作但不可执行，
-                    而规则顺序已由左侧的序号表示。 */}
-                {!readOnly && (
-                  <td style={{ width: 120, textAlign: 'right' }}>
-                    <button className="btn" disabled={i === 0} onClick={() => move(i, -1)} title="上移">
-                      ↑
-                    </button>
-                    <button className="btn" disabled={i === rules.length - 1} onClick={() => move(i, 1)} title="下移">
-                      ↓
-                    </button>
-                    <button
-                      className="btn danger"
-                      disabled={save.isPending}
-                      onClick={() => {
-                        setRules(rules.filter((_, x) => x !== i));
-                        setFlushing(true);
+                      value={r.m.t}
+                      onChange={e => {
+                        const m = buildMatch(e.target.value as DestMatch['t'], '');
+                        patchMatch(i, r, m);
                       }}
                     >
-                      删
-                    </button>
+                      {MATCH_KINDS.map(k => (
+                        <option
+                          key={k.t}
+                          value={k.t}
+                          disabled={k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)}
+                        >
+                          {k.label}
+                        </option>
+                      ))}
+                    </select>
+                    {kind?.list !== false && r.m.t !== 'any' && r.m.t !== 'front_downstream' && (
+                      <input
+                        className="f"
+                        style={{ marginLeft: 6, width: 190 }}
+                        placeholder={kind?.hint}
+                        value={matchValues(r.m)}
+                        onChange={e => patchMatch(i, r, buildMatch(r.m.t, e.target.value))}
+                      />
+                    )}
                   </td>
-                )}
-              </tr>
+                  <td className="rule-action-cell">
+                    <select
+                      className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)}`}
+                      value={r.a.t === 'proxy' ? 'forward' : r.a.t}
+                      onChange={e => {
+                        const t = e.target.value as Exclude<RuleAction['t'], 'proxy'>;
+                        const a: RuleAction =
+                          t === 'forward'
+                            ? // dial 要显式写：不写的语义就是 overlay（模型里 HopDial
+                              // 的 #[default]），会绕过 defaultDial 的选择逻辑。
+                              defaultTarget
+                              ? forwardAction(defaultTarget, defaultDial(defaultTarget))
+                              : externalOutbounds[0]
+                                ? { t: 'proxy', outbound: externalOutbounds[0].id }
+                                : { t: 'forward', to: '' }
+                            : t === 'egress'
+                              ? { t: 'egress', send_through: null, dns: false }
+                              : { t: 'block' };
+                        patch(i, { ...r, a });
+                        setTargetPickerRule(t === 'forward' ? i : null);
+                      }}
+                    >
+                      <option value="forward">转发给</option>
+                      <option value="egress">从这台落地</option>
+                      <option value="block">拒绝</option>
+                    </select>
+                    {(r.a.t === 'forward' || r.a.t === 'proxy') && (
+                      <span
+                        className="external-target-picker"
+                        ref={targetPickerRule === i ? targetPickerRoot : undefined}
+                      >
+                        <button
+                          type="button"
+                          className="external-target-trigger"
+                          aria-expanded={targetPickerRule === i}
+                          onClick={() => {
+                            const opening = targetPickerRule !== i;
+                            setTargetPickerRule(opening ? i : null);
+                            if (opening) setTargetQuery('');
+                          }}
+                        >
+                          <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
+                          <span className="external-target-copy">
+                            <b>{targetLabel || '选择内部节点或外部出站'}</b>
+                          </span>
+                          <span className="external-target-chevron">⌄</span>
+                        </button>
+                        {targetPickerRule === i && (
+                          <span
+                            ref={targetMenu}
+                            className={`external-target-menu${targetMenuPlacement.below ? ' below' : ''}`}
+                            style={{ maxHeight: targetMenuPlacement.maxHeight }}
+                          >
+                            <input
+                              autoFocus
+                              className="f external-target-search"
+                              placeholder="搜索节点或外部出站"
+                              value={targetQuery}
+                              onChange={event => setTargetQuery(event.target.value)}
+                            />
+                            <span className="external-target-menu-label">Brocade 节点</span>
+                            {[...visibleNextPeers, ...visibleInsidePeers, ...visibleForkPeers].map(candidate => (
+                              <button
+                                type="button"
+                                className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
+                                key={candidate.id}
+                                onClick={() => selectForwardTarget(i, r, candidate.id)}
+                              >
+                                <span className="external-target-kind">NODE</span>
+                                <span className="external-target-copy">
+                                  <b>{candidate.name || '未命名节点'}</b>
+                                </span>
+                                <span className="external-target-where">
+                                  {candidate.where === 'next'
+                                    ? '当前下游'
+                                    : candidate.where === 'inside'
+                                      ? '链内其它节点'
+                                      : '主干之外'}
+                                </span>
+                              </button>
+                            ))}
+                            {visibleBlockedPeers.map(candidate => (
+                              <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
+                                <span className="external-target-kind">NODE</span>
+                                <span className="external-target-copy">
+                                  <b>{candidate.name || '未命名节点'}</b>
+                                </span>
+                                <span className="external-target-where">不能选</span>
+                              </button>
+                            ))}
+                            <span className="external-target-menu-label">外部出站</span>
+                            {visibleExternalOutbounds.map(outbound => (
+                              <span className="external-target-option" key={outbound.id}>
+                                <button
+                                  type="button"
+                                  className={`external-target-option-select${
+                                    r.a.t === 'proxy' && r.a.outbound === outbound.id ? ' on' : ''
+                                  }`}
+                                  onClick={() => selectExternalTarget(i, r, outbound.id)}
+                                >
+                                  <span className="external-target-kind external">
+                                    {externalProtocolBadge(outbound.protocol.t)}
+                                  </span>
+                                  <span className="external-target-copy">
+                                    <b>{outbound.name}</b>
+                                  </span>
+                                  <span className="external-target-where">租户资源</span>
+                                </button>
+                                {outbound.protocol.t === 'warp' && (
+                                  <button
+                                    type="button"
+                                    className="external-target-manage"
+                                    aria-label={`管理 ${outbound.name}`}
+                                    title={`管理 ${selfNode?.name || nodeId} 的 WARP 注册与参数`}
+                                    onClick={() => {
+                                      setTargetPickerRule(null);
+                                      setWarpManagerId(outbound.id);
+                                    }}
+                                  >
+                                    管理
+                                  </button>
+                                )}
+                              </span>
+                            ))}
+                            <button
+                              type="button"
+                              className="external-target-new"
+                              onClick={() => {
+                                setTargetPickerRule(null);
+                                setExternalEditor({ existing: null, ruleIndex: i });
+                              }}
+                            >
+                              <span>＋</span>
+                              <b>创建外部出站</b>
+                              <span>粘贴链接或手动填写</span>
+                            </button>
+                            {visibleNextPeers.length +
+                              visibleInsidePeers.length +
+                              visibleForkPeers.length +
+                              visibleBlockedPeers.length +
+                              visibleExternalOutbounds.length ===
+                              0 && <span className="external-target-empty">没有匹配项</span>}
+                          </span>
+                        )}
+                      </span>
+                    )}
+                    {r.a.t === 'forward' && (
+                      <>
+                        <select
+                          className="f"
+                          style={{ marginLeft: 6 }}
+                          value={dk}
+                          title="这一跳连接对端的哪个地址"
+                          onChange={e => setDial(i, to, e.target.value as DialKind)}
+                        >
+                          {/* 排列和可用性判定都在模块层（DIAL_ORDER / dialUnavailable），
+                            与默认档位的选择、建链向导的下拉框共用同一份。 */}
+                          {DIAL_ORDER.map(k => (
+                            <option key={k} value={k} disabled={dialUnavailable(k, peer, selfAddrs)}>
+                              {DIAL_LABEL[k]}
+                            </option>
+                          ))}
+                        </select>
+                        {/* 前三档的地址由推导得出，只读；仅自定义档需要手动填写 */}
+                        {dk === 'overlay' ? (
+                          // 与公网两档一样直接显示地址。显示为「XX 的 overlay 地址」会要求
+                          // 到其他位置查询该值——而它就在编译结果中，可直接获取。
+                          // 获取失败只有一种情况：该机器尚未加入 overlay，这正是需要说明的内容。
+                          <span className="mono dim" style={{ marginLeft: 6 }}>
+                            {overlayOf(to) || (
+                              <span style={{ color: 'var(--gold)' }}>{peer?.name || to} 不在 overlay 里</span>
+                            )}
+                          </span>
+                        ) : dk === 'public_ipv4' ? (
+                          <span className="mono dim" style={{ marginLeft: 6 }}>
+                            {publicIpv4Of(peer) || (
+                              <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv4</span>
+                            )}
+                          </span>
+                        ) : dk === 'public_ipv6' ? (
+                          <span className="mono dim" style={{ marginLeft: 6 }}>
+                            {publicIpv6Of(peer) || (
+                              <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv6</span>
+                            )}
+                          </span>
+                        ) : dk === 'reverse_v4' || dk === 'reverse_v6' ? (
+                          // 与前三档一样由推导得出，只读。显示的是本机的接入地址——
+                          // 对端从该地址接入。连接由哪一方发起、通道如何建立属于传输层的内容，
+                          // 界面不涉及。
+                          <span className="mono dim" style={{ marginLeft: 6 }}>
+                            {selfPublicHostOf(dk === 'reverse_v6' ? 'v6' : 'v4') || (
+                              <span style={{ color: 'var(--gold)' }}>
+                                这台机器没有可直连的{dk === 'reverse_v6' ? '公网 IPv6' : '公网 IPv4'}
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          <>
+                            <input
+                              className="f mono"
+                              style={{ marginLeft: 6, width: 150 }}
+                              placeholder="10.0.0.9 / 2001:db8::9"
+                              value={hostOf(dial)}
+                              onChange={e =>
+                                setDialForTarget(
+                                  to,
+                                  {
+                                    t: 'addr',
+                                    v: formatHostPort(e.target.value, Number(hopOf(to).port) || hopBase),
+                                  },
+                                  i,
+                                )
+                              }
+                            />
+                            {natPublicHostOf(peer, hostOf(dial)) && (
+                              <span className="sub" style={{ color: 'var(--gold)' }}>
+                                该地址为 {natPublicHostOf(peer, hostOf(dial))} 且标记为经 NAT，编译会拒绝。
+                              </span>
+                            )}
+                          </>
+                        )}
+                      </>
+                    )}
+                    {r.a.t === 'egress' && (
+                      <span className="egress-dns-reference">
+                        <select
+                          className="f egress-dns-choice"
+                          aria-label={`DNS 策略（${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
+                          value={r.a.dns ? 'policy' : 'none'}
+                          title={
+                            supportsEgressDns(r.m)
+                              ? `引用 ${selfNode?.name || nodeId} 的机器 DNS 策略`
+                              : '机器 DNS 策略只支持域名类匹配条件'
+                          }
+                          onChange={event => {
+                            if (r.a.t !== 'egress') return;
+                            const referenced = event.target.value === 'policy';
+                            patch(i, { ...r, a: { ...r.a, dns: referenced } });
+                            if (referenced && !effectiveDnsFor(r.m)) patchMachineDns(r.m, newEgressDns());
+                          }}
+                        >
+                          <option value="none">不引用 DNS 策略</option>
+                          <option value="policy" disabled={!supportsEgressDns(r.m)}>
+                            引用机器 DNS 策略
+                          </option>
+                        </select>
+                        {r.a.dns && supportsEgressDns(r.m) && effectiveDnsFor(r.m) && (
+                          <>
+                            <MachineEgressDnsControls
+                              resolution={effectiveDnsFor(r.m)}
+                              supported
+                              onChange={next => patchMachineDns(r.m, next)}
+                              readOnly={readOnly}
+                              nodeName={selfNode?.name || nodeId}
+                              accessibleSuffix={`（${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
+                              showChoice={false}
+                            />
+                            {dnsPolicyIndex(r.m) >= 0 && (
+                              <DnsPriorityControl
+                                index={dnsPolicyIndex(r.m)}
+                                count={orderedNodeDnsPolicies.length}
+                                label={`${kind?.label ?? r.m.t} ${matchValues(r.m)}`.trim()}
+                                readOnly={readOnly}
+                                showLabel
+                                onMove={delta => moveMachineDns(r.m, delta)}
+                              />
+                            )}
+                          </>
+                        )}
+                      </span>
+                    )}
+                  </td>
+                  {/* 只读时整列不渲染：保留一列禁用按钮表示此处有操作但不可执行，
+                    而规则顺序已由左侧的序号表示。 */}
+                  {!readOnly && (
+                    <td style={{ width: 120, textAlign: 'right' }}>
+                      <button
+                        className="btn"
+                        disabled={i === 0 || isAnyRule(r)}
+                        onClick={() => move(i, -1)}
+                        title={isAnyRule(r) ? '任意是兜底规则，固定在末尾' : '上移'}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        className="btn"
+                        disabled={i === rules.length - 1 || rules[i + 1]?.m.t === 'any'}
+                        onClick={() => move(i, 1)}
+                        title={rules[i + 1]?.m.t === 'any' ? '不能移动到任意兜底之后' : '下移'}
+                      >
+                        ↓
+                      </button>
+                      <button
+                        className="btn danger"
+                        disabled={flushing || save.isPending}
+                        onClick={() => {
+                          setRules(rules.filter((_, x) => x !== i));
+                          setFlushing(true);
+                        }}
+                      >
+                        删
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              </Fragment>
             );
           })}
+          {fallback?.pending && (
+            <tr className="rule-fallback-row" aria-label="正在计算编译器兜底规则">
+              <td className="mono dim" style={{ width: 24 }}>
+                *
+              </td>
+              <td className="rule-match-cell">
+                <span className="f rule-readonly-select">正在计算…</span>
+              </td>
+              <td className="rule-action-cell">
+                <span className="dim">兜底规则尚未生成</span>
+                {readOnly && <span className="rule-fallback-sign inline">自动补齐 · 计算中</span>}
+              </td>
+              {!readOnly && (
+                <td className="rule-fallback-sign" style={{ width: 120 }}>
+                  自动补齐 · 计算中
+                </td>
+              )}
+            </tr>
+          )}
+          {!fallback?.pending &&
+            visibleFallbackRules.map((r, fallbackIndex) => {
+              const kind = MATCH_KINDS.find(candidate => candidate.t === r.m.t);
+              const value = matchValues(r.m);
+              const to = r.a.t === 'forward' ? r.a.to : '';
+              const externalId = r.a.t === 'proxy' ? r.a.outbound : '';
+              const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
+              const peer = peerOf(to);
+              const targetBadge = external ? externalProtocolBadge(external.protocol.t) : 'NODE';
+              const targetLabel =
+                external?.name || peer?.name || (r.a.t === 'proxy' ? '外部出站不可用' : to || '内部节点不可用');
+              const actionLabel =
+                r.a.t === 'forward' || r.a.t === 'proxy' ? '转发给' : r.a.t === 'egress' ? '从这台落地' : '拒绝';
+              return (
+                <tr
+                  className="rule-fallback-row"
+                  aria-label="编译器生成的不可编辑兜底规则"
+                  title="编译器根据当前配置自动生成，不能在这里修改"
+                  key={`fallback-${fallbackIndex}`}
+                >
+                  <td className="mono dim" style={{ width: 24 }}>
+                    {fallbackIndex === visibleFallbackRules.length - 1 ? '*' : displayedRuleCount + fallbackIndex + 1}
+                  </td>
+                  <td className="rule-match-cell">
+                    <span className="f rule-readonly-select">{kind?.label ?? r.m.t}</span>
+                    {value && <span className="f rule-readonly-value">{value}</span>}
+                  </td>
+                  <td className="rule-action-cell">
+                    <span className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)} rule-readonly-select`}>
+                      {actionLabel}
+                    </span>
+                    {(r.a.t === 'forward' || r.a.t === 'proxy') && (
+                      <span className="external-target-picker">
+                        <span className="external-target-trigger rule-readonly-target">
+                          <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
+                          <span className="external-target-copy">
+                            <b>{targetLabel}</b>
+                          </span>
+                        </span>
+                      </span>
+                    )}
+                    {readOnly && <span className="rule-fallback-sign inline">自动补齐 · 只读</span>}
+                  </td>
+                  {!readOnly && (
+                    <td className="rule-fallback-sign" style={{ width: 120 }}>
+                      自动补齐 · 只读
+                    </td>
+                  )}
+                </tr>
+              );
+            })}
         </tbody>
       </table>
 
@@ -1472,7 +2185,7 @@ export function RuleEditor({
         if (!outbound) {
           return (
             <div className="external-outbound-summary missing" key={`external-${ruleIndex}`}>
-              外部出站 <code>{outboundId || '未选择'}</code> 不存在，请重新选择或新建资源。
+              外部出站 <code>{outboundId || '未选择'}</code> 不存在，请重新选择或创建资源。
             </div>
           );
         }
@@ -1489,9 +2202,13 @@ export function RuleEditor({
                 <button
                   type="button"
                   className="btn"
-                  onClick={() => setExternalEditor({ existing: outbound, ruleIndex })}
+                  onClick={() =>
+                    outbound.protocol.t === 'warp'
+                      ? setWarpManagerId(outbound.id)
+                      : setExternalEditor({ existing: outbound, ruleIndex })
+                  }
                 >
-                  编辑
+                  {outbound.protocol.t === 'warp' ? '机器设置' : '编辑'}
                 </button>
               )}
             </header>
@@ -1524,16 +2241,6 @@ export function RuleEditor({
           </section>
         );
       })}
-
-      {/* 编译器补全的规则排在手写规则之后，其位置即它在产物中的位置。
-          空表的情况已在上面的说明中表述，此处不重复。 */}
-      {rules.length > 0 && fallback}
-
-      {rules.length > 0 && !lastIsCatchAll && (
-        <p className="note" style={{ color: 'var(--warn)' }}>
-          末条不是「任意」兜底规则，未命中的流量没有出路。
-        </p>
-      )}
 
       {/* 该跳在对端一侧的配置：使用哪个端口、如何加密。
           配置在此处而非对端页面，因为它属于该跳的组成部分。中转端口关联在
@@ -1585,7 +2292,7 @@ export function RuleEditor({
                         className="f mono"
                         style={{ width: 180 }}
                         value={hopOf(nodeId).dest}
-                        placeholder="apps.apple.com:443"
+                        placeholder="example.com:443"
                         onChange={e => patchHop(nodeId, { dest: e.target.value })}
                       />
                       <input
@@ -1675,7 +2382,7 @@ export function RuleEditor({
                             className="f mono"
                             style={{ width: 180 }}
                             value={h.dest}
-                            placeholder="apps.apple.com:443"
+                            placeholder="example.com:443"
                             onChange={e => patchHop(to, { dest: e.target.value })}
                           />
                           <input
@@ -1763,20 +2470,7 @@ export function RuleEditor({
       {/* 整块常驻，只读时由外层 `fieldset disabled` 一并禁用：按角色隐藏会使只读视角
           看不到这张表可以增行和保存，页面读起来像是一份静态清单。 */}
       <div className="toolbar">
-        <button
-          className="btn"
-          onClick={() =>
-            setRules([
-              ...rules,
-              {
-                m: { t: 'any' },
-                a: defaultTarget
-                  ? forwardAction(defaultTarget, defaultDial(defaultTarget))
-                  : { t: 'egress', send_through: null },
-              },
-            ])
-          }
-        >
+        <button className="btn" onClick={addRule}>
           ＋ 加一条
         </button>
         <span className="sp" />
@@ -1792,7 +2486,6 @@ export function RuleEditor({
 
       {externalEditor && (
         <ExternalOutboundEditor
-          appId={appId}
           tenantId={chainTenant}
           existing={externalEditor.existing}
           onClose={() => setExternalEditor(null)}
@@ -1802,6 +2495,28 @@ export function RuleEditor({
             setExternalEditor(null);
           }}
         />
+      )}
+      {managedWarp && (
+        <Suspense
+          fallback={
+            <div className="external-outbound-wrap">
+              <div className="loading">正在打开 WARP 设置…</div>
+            </div>
+          }
+        >
+          <WarpRuleManager
+            tunnel={managedWarp}
+            nodeId={nodeId}
+            nodeName={selfNode?.name || nodeId}
+            editable={!readOnly}
+            removalBlockedReason={
+              warpReferencedOnCurrentNode(managedWarp.id)
+                ? '这台机器仍在规则中使用 WARP。请先解除引用、保存草稿并完成发布，再注销身份。'
+                : undefined
+            }
+            onClose={() => setWarpManagerId(null)}
+          />
+        </Suspense>
       )}
     </fieldset>
   );
@@ -1814,6 +2529,7 @@ function externalProtocolLabel(protocol: ExternalOutboundProtocol['t']): string 
     socks5: 'SOCKS5',
     http_connect: 'HTTP CONNECT',
     wireguard: 'WireGuard',
+    warp: 'Cloudflare WARP',
   }[protocol];
 }
 
@@ -1824,6 +2540,7 @@ function externalProtocolBadge(protocol: ExternalOutboundProtocol['t']): string 
     socks5: 'SOCKS5',
     http_connect: 'HTTP',
     wireguard: 'WG',
+    warp: 'WARP',
   }[protocol];
 }
 
@@ -1854,6 +2571,13 @@ function externalOutboundFacts(outbound: ExternalOutbound): {
       transport: `UDP · MTU ${protocol.v.mtu}`,
       security: 'WireGuard',
       credential: '私钥 · 已密封',
+    };
+  }
+  if (protocol.t === 'warp') {
+    return {
+      transport: `WireGuard · MTU ${protocol.v.mtu}`,
+      security: 'Cloudflare WARP',
+      credential: `${outbound.bindings.length} 台机器已绑定`,
     };
   }
   const authenticated = !!protocol.v.username;
@@ -2171,21 +2895,24 @@ function externalOptionalMuxIsValid(value: string): boolean {
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= 128;
 }
 
-function ExternalOutboundEditor({
-  appId,
+type EditableExternalProtocol = Exclude<ExternalOutboundProtocol['t'], 'warp'>;
+
+export function ExternalOutboundEditor({
   tenantId,
   existing,
   onClose,
   onSaved,
+  purpose = 'rule',
 }: {
-  appId: string;
   tenantId: string;
   existing: ExternalOutbound | null;
   onClose: () => void;
   onSaved: (outbound: ExternalOutbound) => void;
+  purpose?: 'rule' | 'resource';
 }) {
   const qc = useQueryClient();
-  const initialProtocol = existing?.protocol.t ?? 'vless';
+  const initialProtocol: EditableExternalProtocol =
+    existing?.protocol.t && existing.protocol.t !== 'warp' ? existing.protocol.t : 'vless';
   const [entryMode, setEntryMode] = useState<'import' | 'manual'>(existing ? 'manual' : 'import');
   const [shareLink, setShareLink] = useState('');
   const parsedShare = useMemo(() => {
@@ -2197,11 +2924,13 @@ function ExternalOutboundEditor({
     }
   }, [shareLink]);
   const [id, setId] = useState(existing?.id ?? 'external-1');
-  const [name, setName] = useState(existing?.name ?? '外部出站');
+  const [name, setName] = useState(existing?.name ?? '新外部出站');
   const [address, setAddress] = useState(existing?.address ?? '');
   const [port, setPort] = useState(String(existing?.port ?? 443));
-  const [protocolKind, setProtocolKind] = useState<ExternalOutboundProtocol['t']>(initialProtocol);
-  const [credential, setCredential] = useState(existing?.protocol.v.credential ?? '');
+  const [protocolKind, setProtocolKind] = useState<EditableExternalProtocol>(initialProtocol);
+  const [credential, setCredential] = useState(
+    existing?.protocol.t && existing.protocol.t !== 'warp' ? existing.protocol.v.credential : '',
+  );
   const [encryption, setEncryption] = useState(
     existing?.protocol.t === 'vless' ? existing.protocol.v.encryption : 'none',
   );
@@ -2255,6 +2984,7 @@ function ExternalOutboundEditor({
   const [error, setError] = useState<unknown>(null);
 
   const applyParsedShare = (parsed: ParsedExternalShare) => {
+    if (parsed.protocol.t === 'warp') return;
     setAddress(parsed.address);
     setPort(String(parsed.port));
     if (parsed.name) setName(parsed.name);
@@ -2288,9 +3018,11 @@ function ExternalOutboundEditor({
     if (next === 'xhttp') setFlow('');
   };
 
-  const chooseProtocol = (next: ExternalOutboundProtocol['t']) => {
+  const chooseProtocol = (next: EditableExternalProtocol) => {
     if (next !== protocolKind) {
-      setCredential(next === initialProtocol ? (existing?.protocol.v.credential ?? '') : '');
+      setCredential(
+        next === initialProtocol && existing?.protocol.t !== 'warp' ? (existing?.protocol.v.credential ?? '') : '',
+      );
       setUsername(
         next === initialProtocol && (existing?.protocol.t === 'socks5' || existing?.protocol.t === 'http_connect')
           ? (existing.protocol.v.username ?? '')
@@ -2315,6 +3047,18 @@ function ExternalOutboundEditor({
   const reservedBytes = externalReserved(reserved);
   const rawOnly = protocolKind === 'shadowsocks2022' || protocolKind === 'socks5' || protocolKind === 'wireguard';
   const currentEntryCanSave = externalImportCanSave(entryMode, parsedShare.value !== null);
+  const primaryRealityValid =
+    securityKind !== 'reality' ||
+    (realityServerNameIsValid(serverName) &&
+      realityPublicKeyIsValid(publicKey) &&
+      realityShortIdIsValid(shortId) &&
+      realityFingerprintIsValid(fingerprint));
+  const downloadRealityValid =
+    xhttp.downloadSecurityKind !== 'reality' ||
+    (realityServerNameIsValid(xhttp.downloadServerName) &&
+      realityPublicKeyIsValid(xhttp.downloadPublicKey) &&
+      realityShortIdIsValid(xhttp.downloadShortId) &&
+      realityFingerprintIsValid(xhttp.downloadFingerprint));
   const xhttpValid =
     protocolKind !== 'vless' ||
     vlessTransport !== 'xhttp' ||
@@ -2330,8 +3074,7 @@ function ExternalOutboundEditor({
           externalXhttpPathIsValid(xhttp.downloadPath) &&
           externalOptionalMuxIsValid(xhttp.downloadMux) &&
           !!xhttp.downloadServerName.trim() &&
-          (xhttp.downloadSecurityKind !== 'reality' ||
-            (!!xhttp.downloadPublicKey.trim() && /^[0-9a-fA-F]{1,16}$/.test(xhttp.downloadShortId))))));
+          downloadRealityValid)));
   const valid =
     currentEntryCanSave &&
     /^[a-z0-9][a-z0-9_-]*$/.test(id) &&
@@ -2358,7 +3101,7 @@ function ExternalOutboundEditor({
     (protocolKind !== 'vless' || securityKind !== 'none') &&
     xhttpValid &&
     (securityKind === 'none' || !!serverName.trim()) &&
-    (securityKind !== 'reality' || (!!publicKey.trim() && /^[0-9a-fA-F]{1,16}$/.test(shortId)));
+    primaryRealityValid;
 
   const save = async () => {
     if (!valid) return;
@@ -2439,7 +3182,6 @@ function ExternalOutboundEditor({
                 v: { server_name: serverName, public_key: publicKey, short_id: shortId, fingerprint },
               };
       const outbound: ExternalOutbound = {
-        app: appId,
         id,
         tenant: tenantId,
         name: name.trim(),
@@ -2447,9 +3189,9 @@ function ExternalOutboundEditor({
         port: Number(port),
         protocol,
         security,
+        bindings: existing?.bindings ?? [],
       };
       await upsertExternalOutbound({
-        app_id: appId,
         id,
         tenant_id: tenantId,
         name: outbound.name,
@@ -2472,8 +3214,8 @@ function ExternalOutboundEditor({
       <button className="external-outbound-scrim" aria-label="关闭" onClick={onClose} />
       <section className="external-outbound-drawer">
         <header>
-          <b>{existing ? '配置外部出站' : '新建外部出站'}</b>
-          <small>项目 · {appId}</small>
+          <b>{existing ? '配置外部出站' : '创建外部出站'}</b>
+          <small>租户 · {tenantId}</small>
           <span className="sp" />
           <button className="btn" onClick={onClose}>
             关闭
@@ -2573,7 +3315,7 @@ function ExternalOutboundEditor({
                     value={id}
                     onChange={event => setId(event.target.value)}
                   />
-                  <small>项目内唯一。规则只保存这个 ID，不复制协议字段。</small>
+                  <small>全局唯一。规则只保存这个 ID，不复制协议字段。</small>
                 </span>
                 <span className="external-form-label">解析策略</span>
                 <span className="external-form-value">
@@ -2621,7 +3363,7 @@ function ExternalOutboundEditor({
                       value={id}
                       onChange={event => setId(event.target.value)}
                     />
-                    <span className="sub">项目内唯一；创建后不变。</span>
+                    <span className="sub">全局唯一；创建后不变。</span>
                   </span>
                 </label>
                 <label className="row">
@@ -2927,15 +3669,40 @@ function ExternalOutboundEditor({
                                   className="f mono"
                                   placeholder="download.example.com"
                                   value={xhttp.downloadServerName}
+                                  aria-invalid={
+                                    xhttp.downloadSecurityKind === 'reality' &&
+                                    !realityServerNameIsValid(xhttp.downloadServerName)
+                                  }
                                   onChange={event => patchXhttp({ downloadServerName: event.target.value })}
                                 />
-                                <input
-                                  className="f mono"
-                                  placeholder="chrome"
-                                  value={xhttp.downloadFingerprint}
-                                  onChange={event => patchXhttp({ downloadFingerprint: event.target.value })}
-                                />
+                                {xhttp.downloadSecurityKind === 'reality' ? (
+                                  <select
+                                    className="f mono"
+                                    value={xhttp.downloadFingerprint}
+                                    aria-label="下载 REALITY 指纹"
+                                    onChange={event => patchXhttp({ downloadFingerprint: event.target.value })}
+                                  >
+                                    {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                                      <option value={value} key={value}>
+                                        {label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                ) : (
+                                  <input
+                                    className="f mono"
+                                    placeholder="chrome"
+                                    value={xhttp.downloadFingerprint}
+                                    onChange={event => patchXhttp({ downloadFingerprint: event.target.value })}
+                                  />
+                                )}
                               </span>
+                              {xhttp.downloadSecurityKind === 'reality' &&
+                                !realityFingerprintIsValid(xhttp.downloadFingerprint) && (
+                                  <span className="sub bad">
+                                    当前 Xray 不支持该 REALITY 指纹；unsafe / hellogolang 不可用。
+                                  </span>
+                                )}
                             </label>
                             {xhttp.downloadSecurityKind === 'reality' && (
                               <>
@@ -2945,8 +3712,14 @@ function ExternalOutboundEditor({
                                     <input
                                       className="f mono"
                                       value={xhttp.downloadPublicKey}
+                                      aria-invalid={!realityPublicKeyIsValid(xhttp.downloadPublicKey)}
                                       onChange={event => patchXhttp({ downloadPublicKey: event.target.value })}
                                     />
+                                    {!realityPublicKeyIsValid(xhttp.downloadPublicKey) && (
+                                      <span className="sub bad">
+                                        需要 base64url（无 =）编码的 32 字节 X25519 公钥。
+                                      </span>
+                                    )}
                                   </span>
                                 </label>
                                 <label className="row">
@@ -2955,8 +3728,12 @@ function ExternalOutboundEditor({
                                     <input
                                       className="f mono"
                                       value={xhttp.downloadShortId}
+                                      aria-invalid={!realityShortIdIsValid(xhttp.downloadShortId)}
                                       onChange={event => patchXhttp({ downloadShortId: event.target.value })}
                                     />
+                                    {!realityShortIdIsValid(xhttp.downloadShortId) && (
+                                      <span className="sub bad">需要 2–16 位、偶数长度的十六进制字符串。</span>
+                                    )}
                                   </span>
                                 </label>
                               </>
@@ -3118,18 +3895,42 @@ function ExternalOutboundEditor({
                         <input
                           className="f mono"
                           value={serverName}
+                          aria-invalid={securityKind === 'reality' && !realityServerNameIsValid(serverName)}
                           onChange={event => setServerName(event.target.value)}
                         />
+                        {securityKind === 'reality' && !realityServerNameIsValid(serverName) && (
+                          <span className="sub bad">SNI 不能为空，且不能包含端口、空白或通配符。</span>
+                        )}
                       </span>
                     </label>
                     <label className="row">
                       <span className="k">指纹</span>
                       <span className="v">
-                        <input
-                          className="f mono"
-                          value={fingerprint}
-                          onChange={event => setFingerprint(event.target.value)}
-                        />
+                        {securityKind === 'reality' ? (
+                          <select
+                            className="f mono"
+                            value={fingerprint}
+                            aria-label="REALITY 指纹"
+                            onChange={event => setFingerprint(event.target.value)}
+                          >
+                            {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                              <option value={value} key={value}>
+                                {label}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            className="f mono"
+                            value={fingerprint}
+                            onChange={event => setFingerprint(event.target.value)}
+                          />
+                        )}
+                        {securityKind === 'reality' && !realityFingerprintIsValid(fingerprint) && (
+                          <span className="sub bad">
+                            当前 Xray 不支持该 REALITY 指纹；unsafe / hellogolang 不可用。
+                          </span>
+                        )}
                       </span>
                     </label>
                   </>
@@ -3142,14 +3943,26 @@ function ExternalOutboundEditor({
                         <input
                           className="f mono"
                           value={publicKey}
+                          aria-invalid={!realityPublicKeyIsValid(publicKey)}
                           onChange={event => setPublicKey(event.target.value)}
                         />
+                        {!realityPublicKeyIsValid(publicKey) && (
+                          <span className="sub bad">需要 base64url（无 =）编码的 32 字节 X25519 公钥。</span>
+                        )}
                       </span>
                     </label>
                     <label className="row">
                       <span className="k">Short ID</span>
                       <span className="v">
-                        <input className="f mono" value={shortId} onChange={event => setShortId(event.target.value)} />
+                        <input
+                          className="f mono"
+                          value={shortId}
+                          aria-invalid={!realityShortIdIsValid(shortId)}
+                          onChange={event => setShortId(event.target.value)}
+                        />
+                        {!realityShortIdIsValid(shortId) && (
+                          <span className="sub bad">需要 2–16 位、偶数长度的十六进制字符串。</span>
+                        )}
                       </span>
                     </label>
                   </>
@@ -3160,13 +3973,25 @@ function ExternalOutboundEditor({
           {error !== null && <ErrorBox error={error} />}
         </div>
         <footer>
-          <span className="note">保存后自动选到当前规则，仍需“保存到草稿”。</span>
+          <span className="note">
+            {purpose === 'rule'
+              ? '保存后自动选到当前规则，仍需“保存到草稿”。'
+              : '修改会先进入草稿，提交后才成为正式配置。'}
+          </span>
           <span className="sp" />
           <button className="btn" onClick={onClose}>
             取消
           </button>
           <button className="btn primary" disabled={!valid || saving} onClick={() => void save()}>
-            {saving ? '保存中…' : existing ? '保存并选中' : '创建并选中'}
+            {saving
+              ? '保存中…'
+              : purpose === 'rule'
+                ? existing
+                  ? '保存并选中'
+                  : '创建并选中'
+                : existing
+                  ? '保存到草稿'
+                  : '创建到草稿'}
           </button>
         </footer>
       </section>

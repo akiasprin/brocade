@@ -1,10 +1,11 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { fetchCompileView, fetchRevisions, type AdminRole, type Whoami } from '../api';
+import { fetchCompileView, fetchRevisions, type AdminRole, type BrandingSettings, type Whoami } from '../api';
 import { wm } from '../wm/store';
 import { artifactPanel } from './artifact-panel';
 import { useNarrow } from './viewport';
 import { useWm } from './windows';
+import { BrandIcon } from './branding';
 
 export interface Tab {
   key: string;
@@ -102,7 +103,7 @@ function openPassword() {
   wm.open('tab:password', '改密码', { w: 460, h: 300 });
 }
 
-export function Topbar({ who, onLogout }: { who: Whoami; onLogout: () => void }) {
+export function Topbar({ branding, who, onLogout }: { branding: BrandingSettings; who: Whoami; onLogout: () => void }) {
   const snap = useWm();
   const narrow = useNarrow();
   const [sheet, setSheet] = useState(false);
@@ -114,7 +115,8 @@ export function Topbar({ who, onLogout }: { who: Whoami; onLogout: () => void })
     <>
       <header id="bar">
         <div className="brand">
-          <b>brocade</b> <span>/ console</span>
+          <BrandIcon branding={branding} className="brand-logo" />
+          <b>{branding.site_name}</b> <span>/ console</span>
         </div>
         <div className="seg">
           <button aria-pressed={snap.floor === 'desk'} onClick={() => wm.setFloor('desk')}>

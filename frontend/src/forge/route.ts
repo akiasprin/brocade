@@ -59,8 +59,9 @@ const DRILL: Partial<Record<NavKey, DrillSpec[]>> = {
     { seg: 'install', fields: [{ name: 'node' }], rest: { step: 4 } },
   ],
   chains: [{ seg: 'chain', fields: [{ name: 'app' }, { name: 'chain' }] }],
-  /* 开户表单是一层下钻，需要进入地址，否则后退键会退出用户页而非返回列表 */
-  users: [{ seg: 'new' }],
+  /* 开户表单和用户详情都需要进入地址。用户 id 只在租户内唯一，详情必须同时携带完整
+     tenant 路径；否则同名用户会在刷新后定位到错误对象。 */
+  users: [{ seg: 'new' }, { seg: 'user', fields: [{ name: 'tenant' }, { name: 'id' }] }],
   deploy: [{ seg: 'plan' }, { seg: 'detail', fields: [{ name: 'id', num: true }] }],
 };
 

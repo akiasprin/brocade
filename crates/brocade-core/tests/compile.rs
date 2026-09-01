@@ -24,6 +24,8 @@ fn compile_output_projects_only_when_publishable() {
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
     assert_eq!(output.summary.warnings, 0, "{:#?}", output.diagnostics);
     assert!(output.can_publish());
+    // The snapshot is materialized in `apps.position` order. Compilation must preserve that
+    // semantic order instead of silently falling back to the stable IDs.
     assert_eq!(
         output
             .unpublishable_view()
@@ -31,7 +33,7 @@ fn compile_output_projects_only_when_publishable() {
             .iter()
             .map(|app| app.app_id.as_deref())
             .collect::<Vec<_>>(),
-        [Some("a"), Some("z")]
+        [Some("z"), Some("a")]
     );
 
     let node_plan = output.project_node("hk").unwrap();
@@ -153,6 +155,7 @@ fn compile_output_warns_when_as_is_bypasses_configured_dns() {
                 dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
                 action: Action::Egress {
                     send_through: Some("10.66.0.1".parse().unwrap()),
+                    dns: false,
                 },
             },
             any_egress(),
@@ -384,6 +387,7 @@ fn a_front_drops_via_entries_whose_ingress_was_retired_away() {
         tenant: "platform.acme".to_owned(),
         name: "前置组".to_owned(),
         via: vec!["i-a".to_owned()],
+        external_via: Vec::new(),
         strategy: FrontStrategy::UrlTest,
     }];
     snapshot.apps = vec![a];
@@ -416,6 +420,7 @@ fn snapshot(nodes: Vec<Node>) -> ModelSnapshot {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes,
+        node_egress_dns: Vec::new(),
         users: vec![User {
             tenant: "platform.acme".to_owned(),
             id: "alice".to_owned(),
@@ -462,6 +467,7 @@ fn app(id: &str, chain_id: &str, ingress_id: &str, port: u16, default_rule: Rule
             id: chain_id.to_owned(),
             tenant: "platform.acme".to_owned(),
             name: chain_id.to_owned(),
+            subscription_country: None,
         }],
         ingresses: vec![Ingress {
             id: ingress_id.to_owned(),
@@ -588,6 +594,7 @@ fn blocking_torrents_needs_an_entrance_that_sniffs() {
         tenant: "platform.acme".to_owned(),
         name: "f-a".to_owned(),
         via: vec!["i-a".to_owned()],
+        external_via: Vec::new(),
         strategy: FrontStrategy::UrlTest,
     }];
     snapshot.apps = vec![project];
@@ -607,7 +614,10 @@ fn blocking_torrents_needs_an_entrance_that_sniffs() {
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress { send_through: None },
+        action: Action::Egress {
+            send_through: None,
+            dns: false,
+        },
     }
 }
 

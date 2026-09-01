@@ -9,8 +9,10 @@ license.workspace = true
 [dependencies]
 brocade-core = { path = "../brocade-core" }
 brocade-deployment = { path = "../brocade-deployment" }
+brocade-probe = { path = "../brocade-probe" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.3"
 # Probing path MTU needs our own ICMP socket: shelling out to ping depends on which
 # implementation is installed (BusyBox's does not understand -M) and can only treat an
 # exit code as a measurement. See the argument at the top of src/icmp.rs.

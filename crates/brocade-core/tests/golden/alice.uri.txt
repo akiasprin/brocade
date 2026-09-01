@@ -1,9 +1,9 @@
-vless://2d2304da-f114-4574-8d44-625afdb1db5c@hk1.example.net:2443?encryption=none&type=tcp&security=reality&sni=www.bing.com&fp=chrome&pbk=Pkz5sxRTCjw92NWFc4ST_3iniZkTjGufHp9EXEIrLgM&sid=8337a0bf&flow=xtls-rprx-vision#%E6%99%BA%E8%83%BD%E5%87%BA%E5%8F%A3
-vless://2d2304da-f114-4574-8d44-625afdb1db5c@jp1.example.net:8443?encryption=none&type=tcp&security=reality&sni=www.yahoo.co.jp&fp=chrome&pbk=I9tZ66Z-ccTkwE1Kb5vUtJZ5MYMJm9INM9hGVumvQB0&sid=fba1c1c2&flow=xtls-rprx-vision#%E6%97%A5%E6%9C%AC%E5%85%A5%E5%8F%A3%C2%B7%E6%99%BA%E8%83%BD%E5%87%BA%E5%8F%A3
-vless://2d2304da-f114-4574-8d44-625afdb1db5c@hk1.example.net:3443?encryption=none&type=tcp&security=reality&sni=apps.apple.com&fp=chrome&pbk=gyRZKBh6EcvSnCOXjVjufFmpzFVzTu5SMMrRhTn7yHw&sid=c71c181a&flow=xtls-rprx-vision#%E9%A6%99%E6%B8%AF%E5%85%A5%E5%8F%A3
 vless://2d2304da-f114-4574-8d44-625afdb1db5c@hk1.example.net:8443?encryption=none&type=tcp&security=reality&sni=www.apple.com&fp=chrome&pbk=BGGAFj9kbrtURk_nmOYFTey0HUJyov02Bgq0wLbeRRY&sid=78373993&flow=xtls-rprx-vision#%E6%BE%B3%E6%B4%B2%E5%87%BA%E5%8F%A3
 vless://2d2304da-f114-4574-8d44-625afdb1db5c@jp1.example.net:443?encryption=none&type=tcp&security=reality&sni=www.amazon.co.jp&fp=chrome&pbk=1xHNKXcGzhoClocrz7kpJxQYE-g-2NlXNGiWas_7NTw&sid=d19361a0&flow=xtls-rprx-vision#%E6%97%A5%E6%9C%AC%E5%85%A5%E5%8F%A3%C2%B7%E7%BE%8E%E5%9B%BD%E5%87%BA%E5%8F%A3
 vless://2d2304da-f114-4574-8d44-625afdb1db5c@hk1.example.net:443?encryption=none&type=tcp&security=reality&sni=www.bing.com&fp=chrome&pbk=iG4pUtdiYMYAztx9c6t8A-0QF-Qknbu551RTC5cBo30&sid=7d07b06e&flow=xtls-rprx-vision#%E7%BE%8E%E5%9B%BD%E5%87%BA%E5%8F%A3
+vless://2d2304da-f114-4574-8d44-625afdb1db5c@jp1.example.net:8443?encryption=none&type=tcp&security=reality&sni=www.yahoo.co.jp&fp=chrome&pbk=I9tZ66Z-ccTkwE1Kb5vUtJZ5MYMJm9INM9hGVumvQB0&sid=fba1c1c2&flow=xtls-rprx-vision#%E6%97%A5%E6%9C%AC%E5%85%A5%E5%8F%A3%C2%B7%E6%99%BA%E8%83%BD%E5%87%BA%E5%8F%A3
+vless://2d2304da-f114-4574-8d44-625afdb1db5c@hk1.example.net:2443?encryption=none&type=tcp&security=reality&sni=www.bing.com&fp=chrome&pbk=Pkz5sxRTCjw92NWFc4ST_3iniZkTjGufHp9EXEIrLgM&sid=8337a0bf&flow=xtls-rprx-vision#%E6%99%BA%E8%83%BD%E5%87%BA%E5%8F%A3
+vless://2d2304da-f114-4574-8d44-625afdb1db5c@hk1.example.net:3443?encryption=none&type=tcp&security=reality&sni=apps.apple.com&fp=chrome&pbk=gyRZKBh6EcvSnCOXjVjufFmpzFVzTu5SMMrRhTn7yHw&sid=c71c181a&flow=xtls-rprx-vision#%E9%A6%99%E6%B8%AF%E5%85%A5%E5%8F%A3
 
 # 以下条目带前置代理，URI 列表表达不了，已跳过：
 # 澳洲前置、美国前置

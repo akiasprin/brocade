@@ -6,13 +6,14 @@ use crate::{
     hash::hex_lower,
     ir::{hops::HopDialWire, routing::DestMatch},
     model::{
-        Dns, DomainStrategy, ExternalOutboundProtocol, ExternalOutboundSecurity, GeodataSettings,
-        HopPool, HopWire, Hysteria2, Network, RealityClientPolicy,
+        Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsTransport,
+        ExternalOutboundProtocol, ExternalOutboundSecurity, GeodataSettings, HopPool, HopWire,
+        Hysteria2, Network, RealityClientPolicy,
     },
     physical::node::{
-        IngressProtocol, IngressSecurity, NodePlan, XrayClientPlan, XrayEgressOutboundPlan,
-        XrayExternalOutboundPlan, XrayFallbackLimitsPlan, XrayForwardOutboundPlan,
-        XrayHopInboundPlan, XrayIngressPlan, XrayRuleSelector,
+        IngressProtocol, IngressSecurity, NodePlan, XrayClientPlan, XrayEgressDnsPlan,
+        XrayEgressOutboundPlan, XrayExternalOutboundPlan, XrayFallbackLimitsPlan,
+        XrayForwardOutboundPlan, XrayHopInboundPlan, XrayIngressPlan, XrayRuleSelector,
     },
     text::normalize_host_port,
 };
@@ -190,7 +191,20 @@ pub struct XrayPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayDns {
     pub tag: Option<String>,
-    pub servers: Vec<String>,
+    pub servers: Vec<XrayDnsServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XrayDnsServer {
+    Address(String),
+    Scoped {
+        address: String,
+        port: u16,
+        domains: Vec<String>,
+        query_strategy: String,
+        tag: String,
+        final_query: bool,
+    },
 }
 
 /// Which certificate an ingress presents — xray's `streamSettings.security`.
@@ -475,6 +489,7 @@ pub enum XrayOutbound {
         port: u16,
         protocol: ExternalOutboundProtocol,
         security: ExternalOutboundSecurity,
+        wireguard_workers: u16,
     },
     Freedom {
         tag: String,
@@ -771,6 +786,16 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             balancer_tag: None,
         });
     }
+    for dns in &xray.egress_dns {
+        rules.push(XrayRoutingRule {
+            rule_tag: String::new(),
+            inbound_tags: vec![dns.tag.clone()],
+            users: Vec::new(),
+            condition: XrayMatchCondition::default(),
+            outbound_tag: dns.outbound_tag.clone(),
+            balancer_tag: None,
+        });
+    }
     if !cover_tags.is_empty() {
         rules.push(XrayRoutingRule {
             rule_tag: String::new(),
@@ -917,7 +942,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             buffer_size_kb: xray.connection.buffer_size_kb,
             stats_user_online: xray.connection.stats_user_online,
         },
-        dns: dns_config(&xray.dns, xray.dns_route.as_deref()),
+        dns: dns_config(&xray.dns, xray.dns_route.as_deref(), &xray.egress_dns),
         inbounds,
         outbounds,
         routing: XrayRouting {
@@ -1262,7 +1287,8 @@ fn egress_outbound(outbound: &XrayEgressOutboundPlan, strategy: DomainStrategy) 
     XrayOutbound::Freedom {
         tag: outbound.tag.clone(),
         send_through: outbound.send_through,
-        domain_strategy: domain_strategy_name(strategy).to_owned(),
+        domain_strategy: domain_strategy_name(outbound.domain_strategy.unwrap_or(strategy))
+            .to_owned(),
     }
 }
 
@@ -1273,6 +1299,7 @@ fn external_outbound(outbound: &XrayExternalOutboundPlan) -> XrayOutbound {
         port: outbound.port,
         protocol: outbound.protocol.clone(),
         security: outbound.security.clone(),
+        wireguard_workers: outbound.wireguard_workers,
     }
 }
 
@@ -1292,14 +1319,58 @@ fn domain_strategy_name(strategy: DomainStrategy) -> &'static str {
     }
 }
 
-fn dns_config(dns: &Dns, dns_route: Option<&str>) -> XrayDns {
-    let servers = match dns {
-        Dns::System => vec!["localhost".to_owned()],
-        Dns::Servers(servers) => servers.clone(),
-    };
+fn dns_config(dns: &Dns, dns_route: Option<&str>, scoped: &[XrayEgressDnsPlan]) -> XrayDns {
+    let mut servers = scoped
+        .iter()
+        .map(|server| XrayDnsServer::Scoped {
+            address: dns_server_address(server),
+            port: server.port,
+            domains: server.domains.clone(),
+            query_strategy: dns_query_strategy_name(server.address_strategy).to_owned(),
+            tag: server.tag.clone(),
+            final_query: matches!(server.fallback, crate::model::EgressDnsFallback::Stop),
+        })
+        .collect::<Vec<_>>();
+    servers.extend(match dns {
+        Dns::System => vec![XrayDnsServer::Address("localhost".to_owned())],
+        Dns::Servers(servers) => servers
+            .iter()
+            .cloned()
+            .map(XrayDnsServer::Address)
+            .collect(),
+    });
     XrayDns {
         tag: dns_route.map(|_| DNS_TAG.to_owned()),
         servers,
+    }
+}
+
+fn dns_server_address(server: &XrayEgressDnsPlan) -> String {
+    let address = server
+        .address
+        .trim()
+        .parse::<IpAddr>()
+        .map(|address| match address {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => address.to_string(),
+        })
+        .unwrap_or_else(|_| server.address.trim().to_owned());
+    match server.transport {
+        EgressDnsTransport::Udp => address,
+        EgressDnsTransport::Tcp => match address.parse::<IpAddr>() {
+            Ok(IpAddr::V6(address)) => format!("tcp://[{address}]"),
+            _ => format!("tcp://{address}"),
+        },
+    }
+}
+
+fn dns_query_strategy_name(strategy: EgressDnsAddressStrategy) -> &'static str {
+    match strategy {
+        EgressDnsAddressStrategy::UseIp
+        | EgressDnsAddressStrategy::UseIpv4v6
+        | EgressDnsAddressStrategy::UseIpv6v4 => "UseIP",
+        EgressDnsAddressStrategy::UseIpv4 => "UseIPv4",
+        EgressDnsAddressStrategy::UseIpv6 => "UseIPv6",
     }
 }
 

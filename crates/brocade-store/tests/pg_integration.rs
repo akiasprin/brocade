@@ -1,13 +1,14 @@
 use brocade_core::{
     compile::compile,
     model::{
-        Action, ConnectionSettings, DestMatch, Dns, DomainStrategy, ExternalOutboundProtocol,
+        Action, ConnectionSettings, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
+        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
         ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttp,
         ExternalVlessXhttpDownload, HopDial, HopPool, Hysteria2, HysteriaBandwidth,
         HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires, ModelSettings,
         NodeConnection, OverlaySettings, Projection, ProjectionDownloadEndpoint,
         ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
-        RealityFallbackRateLimit, RealitySite, Rule, Xhttp, XhttpMode,
+        RealityFallbackRateLimit, RealitySite, Rule, Xhttp, XhttpMode, XhttpXmux,
     },
 };
 use brocade_deployment::plan::{
@@ -16,20 +17,24 @@ use brocade_deployment::plan::{
     PlannedTargetStatus,
 };
 use brocade_deployment::protocol::{
-    GeodataFileState, GeodataObservation, LocalReconcileReport, NodeRuntimeReport, NodeVersions,
+    DiskDetailSample, GeodataFileState, GeodataObservation, HostFacts, LoadReportRequest,
+    LoadSample, LocalReconcileReport, NetworkDetailSample, NodeRuntimeReport, NodeVersions,
     SpoolBacklog,
 };
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
-    AdminContext, AdminLoginRequest, AdminRole, CertDomainInput, ChangeAdminPasswordRequest,
-    CreateAdminOperatorRequest, CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest,
-    CreateIngressRequest, CreateRealityIngressRequest, CreateRollbackRequest, CreateUserRequest,
+    AbandonNodeRequest, AdminContext, AdminLoginRequest, AdminRole, ApplyDraftResult,
+    CertDomainInput, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest,
+    CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest, CreateIngressRequest,
+    CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
     HopInRequest, HopWireRequest, LinkProbe, LinkProbeRequest, LinkProbeStatus, ModelOp,
     NodeDesiredDeployment, PgStore, ProbeTransport, ProvisionNodeRequest, PutStepRequest,
-    ReportedNodeState, SetUserAppQuotaRequest, StepAcceptRequest, StoreError, TargetApplyResult,
-    TargetConvergenceReport, TransportRequest, UpdateNodeRequest, UpdateUserStatusRequest,
-    UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest, VerifyDeploymentRequest,
-    WiresRequest, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
+    RegisterWarpBindingRequest, RemoveWarpBindingRequest, ReportedNodeState,
+    SetUserAppQuotaRequest, StepAcceptRequest, StoreError, TargetApplyResult,
+    TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
+    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateUserStatusRequest,
+    UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest,
+    VerifyDeploymentRequest, WiresRequest, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -90,6 +95,88 @@ impl TestPg {
 
 fn system_admin() -> AdminContext {
     AdminContext::system_admin("test-system")
+}
+
+/// Direct SQL fixtures do not pass through a revision commit, so freeze their current shape as
+/// the initial deployed model before exercising subscription semantics.
+async fn seed_subscription_serving(db: &TestPg) -> u64 {
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let revision = snapshot.revision;
+    sqlx::query(
+        "INSERT INTO model_snapshots (revision_id, snapshot)
+         VALUES ($1, $2)
+         ON CONFLICT (revision_id) DO UPDATE SET snapshot = EXCLUDED.snapshot",
+    )
+    .bind(i64::try_from(revision).unwrap())
+    .bind(serde_json::to_value(snapshot).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO subscription_serving_state (
+             id, topology_revision_id, permissions_revision_id, generation
+         ) VALUES (TRUE, $1, $1, 1)
+         ON CONFLICT (id) DO UPDATE SET
+             topology_revision_id = EXCLUDED.topology_revision_id,
+             permissions_revision_id = EXCLUDED.permissions_revision_id,
+             topology_deployment_id = NULL,
+             permissions_deployment_id = NULL,
+             generation = subscription_serving_state.generation + 1,
+             updated_at = now()",
+    )
+    .bind(i64::try_from(revision).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    revision
+}
+
+/// Commit direct fixture mutations as a real immutable revision. Production writes do this in
+/// `commit_revision`; keeping the helper local avoids exposing a test-only store API.
+async fn commit_direct_fixture_revision(db: &TestPg, note: &str) -> u64 {
+    let revision: i64 = sqlx::query_scalar(
+        "INSERT INTO revisions (author, note) VALUES ('test:fixture', $1) RETURNING id",
+    )
+    .bind(note)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE control_state SET current_revision = $1 WHERE id = TRUE")
+        .bind(revision)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(snapshot.revision, u64::try_from(revision).unwrap());
+    sqlx::query("INSERT INTO model_snapshots (revision_id, snapshot) VALUES ($1, $2)")
+        .bind(revision)
+        .bind(serde_json::to_value(snapshot).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    u64::try_from(revision).unwrap()
+}
+
+async fn put_step_draft(
+    db: &TestPg,
+    app_id: &str,
+    chain_id: &str,
+    node_id: &str,
+    step: PutStepRequest,
+) -> ApplyDraftResult {
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::PutStep {
+                app_id: app_id.to_owned(),
+                chain_id: chain_id.to_owned(),
+                node_id: node_id.to_owned(),
+                step,
+            }],
+            None,
+        )
+        .await
+        .unwrap()
 }
 
 fn tenant_admin(scope: &str) -> AdminContext {
@@ -246,6 +333,1375 @@ async fn migrations_bootstrap_empty_snapshot() {
     assert!(snapshot.nodes.is_empty());
     assert!(snapshot.users.is_empty());
     assert!(snapshot.apps.is_empty());
+
+    let serving_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'subscription_serving_state'
+          ORDER BY ordinal_position",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        serving_columns,
+        vec![
+            "id",
+            "topology_revision_id",
+            "permissions_revision_id",
+            "topology_deployment_id",
+            "permissions_deployment_id",
+            "generation",
+            "updated_at",
+        ]
+    );
+    let serving_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM subscription_serving_state")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(serving_rows, 0, "a fresh database has never been deployed");
+
+    let reality_defaults =
+        sqlx::query("SELECT reality_dest, reality_server_names FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        reality_defaults
+            .try_get::<Option<String>, _>("reality_dest")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        reality_defaults
+            .try_get::<serde_json::Value, _>("reality_server_names")
+            .unwrap(),
+        json!([])
+    );
+
+    let branding =
+        sqlx::query("SELECT site_name, site_icon_data_url FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        branding.try_get::<String, _>("site_name").unwrap(),
+        "Brocade"
+    );
+    assert_eq!(
+        branding
+            .try_get::<Option<String>, _>("site_icon_data_url")
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    sqlx::query(
+        "INSERT INTO apps (id, label, position)
+         VALUES ('app-secondary', 'Secondary App', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // Simulate the pre-position chain schema with more than one row in the same app. The replay
+    // must rank each app independently and use stable chain IDs as the legacy/default order.
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES
+            ('c-zulu', 'app-main', 'platform.acme', 'Zulu Chain', 1),
+            ('c-alpha', 'app-main', 'platform.acme', 'Alpha Chain', 2)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(
+        "INSERT INTO fronts (id, app_id, tenant_id, name, strategy)
+         VALUES ('f-main', 'app-main', 'platform.acme', 'Main Front', 'select');
+         UPDATE ingresses SET front_id = 'f-main' WHERE id = 'i-main';
+         INSERT INTO front_vias (front_id, ingress_id, ordinal) VALUES ('f-main', 'i-main', 0);
+         UPDATE steps
+            SET accept_uuid = '87a10c5e-c3a4-4f19-95a5-d56fef82cd8a',
+                accept_label = 'c-main@n1'
+          WHERE chain_id = 'c-main' AND node_id = 'n1';
+         INSERT INTO e2e_probes
+             (chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at)
+         VALUES ('c-main', 'app-main', 'n1', 'ok', 12, 'unknown', now());
+         INSERT INTO e2e_probe_samples (chain_id, probed_at, status, ttfb_ms)
+         VALUES ('c-main', now(), 'ok', 12);
+         INSERT INTO user_app_quotas (tenant_id, user_id, app_id, limit_bytes)
+         VALUES ('platform.acme', 'alice', 'app-main', 1000);
+         INSERT INTO quota_suspensions (tenant_id, user_id, app_id, ingress_id)
+         VALUES ('platform.acme', 'alice', 'app-main', 'i-main');
+         INSERT INTO usage_readings
+             (node_id, label, read_at, xray_started_at, uplink_bytes, downlink_bytes)
+         VALUES
+             ('n1', 'alice@platform.acme#i-main', now() - interval '2 minutes', now() - interval '1 hour', 10, 20),
+             ('n1', 'c-main@n1', now() - interval '2 minutes', now() - interval '1 hour', 30, 40);
+         INSERT INTO usage_samples
+             (window_start, window_end, node_id, tenant_id, user_id, ingress_id, grant_label,
+              uplink_bytes, downlink_bytes, app_id)
+         VALUES
+             (now() - interval '2 minutes', now() - interval '1 minute', 'n1', 'platform.acme',
+              'alice', 'i-main', 'alice@platform.acme#i-main', 10, 20, 'app-main');
+         INSERT INTO usage_chain_samples
+             (window_start, window_end, node_id, tenant_id, app_id, chain_id, hop_label,
+              uplink_bytes, downlink_bytes)
+         VALUES
+             (now() - interval '2 minutes', now() - interval '1 minute', 'n1', 'platform.acme',
+              'app-main', 'c-main', 'c-main@n1', 30, 40);
+         INSERT INTO link_health
+             (node_id, chain_id, peer_node_id, alive, downlink_bytes, window_secs, checked_at)
+         VALUES ('n1', 'app-main/c-main', 'n1', TRUE, 1, 30, now());
+         INSERT INTO node_hop_link_samples
+             (node_id, chain_id, peer_node_id, window_start, window_end, conns,
+              conns_measured, btlbw_p50_bps, btlbw_p90_bps, min_rtt_us, rtt_p50_us,
+              rtt_p90_us, retrans_pct, busy_pct, rwnd_limited_pct, sndbuf_limited_pct)
+         VALUES
+             ('n1', 'app-main/c-main', 'n1', now() - interval '2 minutes',
+              now() - interval '1 minute', 1, 1, 100, 200, 100, 200, 300, 0, 50, 0, 0)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    // Simulate the development schema which introduced machine DNS before its independent
+    // priority column. Replaying 0001 must retain both policies and assign deterministic slots.
+    for (position, host) in ["b.example", "a.example"].into_iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO node_egress_dns (node_id, position, selector, resolution)
+             VALUES ('n1', $1, $2, $3)",
+        )
+        .bind(i32::try_from(position).unwrap())
+        .bind(json!({ "t": "domain_suffix", "v": [host] }))
+        .bind(json!({
+            "address": "192.0.2.53",
+            "port": 53,
+            "transport": "tcp",
+            "address_strategy": "use_ip",
+            "fallback": "stop"
+        }))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "UPDATE model_snapshots
+         SET snapshot = jsonb_set(snapshot, '{node_egress_dns}', $1, true)",
+    )
+    .bind(json!([
+        {
+            "node": "n1",
+            "selector": { "t": "domain_suffix", "v": ["b.example"] },
+            "resolution": {
+                "address": "192.0.2.53",
+                "port": 53,
+                "transport": "tcp",
+                "address_strategy": "use_ip",
+                "fallback": "stop"
+            }
+        },
+        {
+            "node": "n1",
+            "selector": { "t": "domain_suffix", "v": ["a.example"] },
+            "resolution": {
+                "address": "192.0.2.53",
+                "port": 53,
+                "transport": "tcp",
+                "address_strategy": "use_ip",
+                "fallback": "stop"
+            }
+        }
+    ]))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE node_egress_dns DROP COLUMN position")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE apps DROP COLUMN position")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE chains DROP COLUMN position")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE ingresses ADD COLUMN xhttp_mux INTEGER;
+         UPDATE ingresses SET xhttp_mux = 16 WHERE id = 'i-main';
+         ALTER TABLE ingresses DROP CONSTRAINT ingresses_xhttp_xmux_shape;
+         ALTER TABLE ingresses DROP COLUMN xhttp_xmux",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // Development deployments deliberately keep schema evolution in 0001. Clearing its sqlx
+    // record makes the migrator execute the complete file again against an existing schema,
+    // which is the same compatibility path used by those deployments.
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 1")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.migrate().await.unwrap();
+
+    let app_main = "app-main".to_owned();
+    let app_secondary = "app-secondary".to_owned();
+    let chain_alpha: String =
+        sqlx::query_scalar("SELECT id FROM chains WHERE name = 'Alpha Chain'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let chain_main: String = sqlx::query_scalar("SELECT id FROM chains WHERE name = 'Main Chain'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let chain_zulu: String = sqlx::query_scalar("SELECT id FROM chains WHERE name = 'Zulu Chain'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let ingress_main: String =
+        sqlx::query_scalar("SELECT id FROM ingresses WHERE chain_id = $1 AND node_id = 'n1'")
+            .bind(&chain_main)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(chain_main.starts_with("c-") && chain_main.len() == 8);
+    assert!(ingress_main.starts_with("i-") && ingress_main.len() == 8);
+    assert_ne!(
+        &chain_main[2..],
+        &ingress_main[2..],
+        "Chain and Ingress must share one six-letter namespace"
+    );
+    let migrated_xmux: serde_json::Value =
+        sqlx::query_scalar("SELECT xhttp_xmux FROM ingresses WHERE id = $1")
+            .bind(&ingress_main)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        migrated_xmux,
+        json!({
+            "max_concurrency": 16,
+            "h_max_request_times": { "from": 600, "to": 900 },
+            "h_max_reusable_secs": { "from": 1800, "to": 3000 }
+        })
+    );
+    let legacy_xhttp_mux: Option<String> = sqlx::query_scalar(
+        "SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'ingresses'
+            AND column_name = 'xhttp_mux'",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(legacy_xhttp_mux, None);
+    let reserved_bodies: (i64, i64) =
+        sqlx::query_as("SELECT count(*), count(DISTINCT body) FROM friendly_model_id_bodies")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(reserved_bodies, (4, 4));
+    let alias_table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('model_id_aliases')::text")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        alias_table, None,
+        "rolling compatibility data must be removed"
+    );
+
+    let live_refs: (String, String, String, String, String) = sqlx::query_as(
+        "SELECT c.app_id, i.app_id, i.chain_id, g.app_id, g.ingress_id
+           FROM chains c
+           JOIN ingresses i ON i.chain_id = c.id
+           JOIN grants g ON g.ingress_id = i.id
+          WHERE c.id = $1",
+    )
+    .bind(&chain_main)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        live_refs,
+        (
+            app_main.clone(),
+            app_main.clone(),
+            chain_main.clone(),
+            app_main.clone(),
+            ingress_main.clone(),
+        )
+    );
+    let structural_refs: (String, String, String, String, String) = sqlx::query_as(
+        "SELECT f.app_id, fv.ingress_id, s.chain_id, p.app_id, p.chain_id
+           FROM fronts f
+           JOIN front_vias fv ON fv.front_id = f.id
+           JOIN steps s ON s.node_id = 'n1'
+           JOIN e2e_probes p ON p.node_id = 'n1'
+          WHERE f.id = 'f-main'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        structural_refs,
+        (
+            app_main.clone(),
+            ingress_main.clone(),
+            chain_main.clone(),
+            app_main.clone(),
+            chain_main.clone(),
+        )
+    );
+    let probe_sample_chain: String =
+        sqlx::query_scalar("SELECT chain_id FROM e2e_probe_samples LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(probe_sample_chain, chain_main);
+
+    let current_snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(current_snapshot.apps[0].id, app_main);
+    assert!(current_snapshot.apps[0]
+        .chains
+        .iter()
+        .any(|chain| chain.id == chain_main));
+    assert_eq!(current_snapshot.apps[0].ingresses[0].id, ingress_main);
+
+    let historical_old_ids: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM model_snapshots
+          WHERE snapshot::text LIKE '%\"c-main\"%'
+             OR snapshot::text LIKE '%\"i-main\"%'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        historical_old_ids, 0,
+        "rollback snapshots retain legacy ids"
+    );
+
+    let user_usage: (String, String, String) =
+        sqlx::query_as("SELECT app_id, ingress_id, grant_label FROM usage_samples LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        user_usage,
+        (
+            app_main.clone(),
+            ingress_main.clone(),
+            format!("alice@platform.acme#{ingress_main}"),
+        )
+    );
+    let chain_usage: (String, String, String) =
+        sqlx::query_as("SELECT app_id, chain_id, hop_label FROM usage_chain_samples LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        chain_usage,
+        (
+            app_main.clone(),
+            chain_main.clone(),
+            format!("{chain_main}@n1"),
+        )
+    );
+    let health_chain: String = sqlx::query_scalar("SELECT chain_id FROM link_health LIMIT 1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(health_chain, format!("{app_main}/{chain_main}"));
+    let hop_sample_chain: String =
+        sqlx::query_scalar("SELECT chain_id FROM node_hop_link_samples LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(hop_sample_chain, format!("{app_main}/{chain_main}"));
+    let quota_refs: (String, String, String) = sqlx::query_as(
+        "SELECT q.app_id, s.app_id, s.ingress_id
+           FROM user_app_quotas q
+           JOIN quota_suspensions s USING (tenant_id, user_id)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        quota_refs,
+        (app_main.clone(), app_main.clone(), ingress_main.clone())
+    );
+    let reading_labels: Vec<String> =
+        sqlx::query_scalar("SELECT label FROM usage_readings ORDER BY label")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        reading_labels,
+        [
+            format!("alice@platform.acme#{ingress_main}"),
+            format!("{chain_main}@n1"),
+        ]
+    );
+
+    // Once the fleet has converged there is no second identity namespace. A stale pre-migration
+    // counter is unknown rather than being silently attributed through a permanent alias.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let transition = db
+        .store
+        .record_usage_report(
+            "n1",
+            UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
+                read_at_unix_secs: now,
+                xray_started_at_unix_secs: now - 3600,
+                route: None,
+                counters: vec![
+                    UsageCounter {
+                        label: "alice@platform.acme#i-main".to_owned(),
+                        uplink_bytes: 50,
+                        downlink_bytes: 70,
+                    },
+                    UsageCounter {
+                        label: "c-main@n1".to_owned(),
+                        uplink_bytes: 80,
+                        downlink_bytes: 100,
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(transition.accepted_readings, 0);
+    assert_eq!(transition.skipped_counters, 2);
+    let legacy_readings: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_readings WHERE label IN ('c-main@n1', 'alice@platform.acme#i-main')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(legacy_readings, 0);
+
+    let collision = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::CreateApp {
+                app: CreateAppRequest {
+                    id: app_main.clone(),
+                    label: "must not rename".to_owned(),
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(collision, StoreError::Conflict(_)));
+
+    let resurrect = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertChain {
+                app_id: app_main.clone(),
+                chain: CreateChainRequest {
+                    id: "c-main".to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "legacy draft".to_owned(),
+                    subscription_country: None,
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(resurrect, StoreError::InvalidData(_)));
+    let legacy_chain_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chains WHERE id = 'c-main'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        legacy_chain_count, 0,
+        "a stale draft resurrected a migrated chain id"
+    );
+
+    let cross_kind_id = format!("c-{}", &ingress_main[2..]);
+    let cross_kind = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertChain {
+                app_id: app_main.clone(),
+                chain: CreateChainRequest {
+                    id: cross_kind_id,
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "must not share an ingress body".to_owned(),
+                    subscription_country: None,
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(cross_kind, StoreError::Conflict(_)));
+
+    // The trigger is the final backstop for maintenance SQL and concurrent writers which bypass
+    // the Store helper. A prefix change must not make the same six-letter body legal.
+    let duplicate_ingress_id = format!("i-{}", &chain_main[2..]);
+    let direct_collision = sqlx::query("UPDATE ingresses SET id = $1 WHERE id = $2")
+        .bind(&duplicate_ingress_id)
+        .bind(&ingress_main)
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        direct_collision
+            .as_database_error()
+            .and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("23505"))
+    );
+
+    let app_positions: Vec<(String, i32)> =
+        sqlx::query_as("SELECT id, position FROM apps ORDER BY position")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        app_positions,
+        [(app_main.clone(), 0), (app_secondary.clone(), 1)]
+    );
+
+    let dns_positions: Vec<i32> = sqlx::query_scalar(
+        "SELECT position FROM node_egress_dns WHERE node_id = 'n1' ORDER BY position",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(dns_positions, [0, 1]);
+
+    let chain_positions: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT id, position
+         FROM chains
+         WHERE app_id = $1
+         ORDER BY position, id",
+    )
+    .bind(&app_main)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        chain_positions,
+        [
+            (chain_alpha.clone(), 0),
+            (chain_main.clone(), 1),
+            (chain_zulu.clone(), 2),
+        ]
+    );
+
+    let snapshot_dns_positions: Vec<i32> = sqlx::query_scalar(
+        "SELECT (policy->>'position')::integer
+         FROM model_snapshots
+         JOIN control_state ON control_state.current_revision = model_snapshots.revision_id
+         CROSS JOIN LATERAL jsonb_array_elements(snapshot->'node_egress_dns')
+              WITH ORDINALITY AS item(policy, ordinality)
+         ORDER BY ordinality",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(snapshot_dns_positions, [0, 1]);
+
+    // A second replay is the normal development deployment path. Existing operator order is
+    // data, not a derived ID sort, and therefore must survive an already-compatible 0001 replay.
+    sqlx::query(
+        "UPDATE apps
+         SET position = CASE id WHEN $1 THEN 1 WHEN $2 THEN 0 END
+         WHERE id IN ($1, $2)",
+    )
+    .bind(&app_main)
+    .bind(&app_secondary)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE chains
+         SET position = CASE id WHEN $1 THEN 2 WHEN $2 THEN 0 WHEN $3 THEN 1 END
+         WHERE app_id = $4",
+    )
+    .bind(&chain_alpha)
+    .bind(&chain_main)
+    .bind(&chain_zulu)
+    .bind(&app_main)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 1")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.migrate().await.unwrap();
+    let replayed_app_order: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM apps ORDER BY position")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(replayed_app_order, [app_secondary, app_main.clone()]);
+    let replayed_chain_order: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM chains WHERE app_id = $1 ORDER BY position, id")
+            .bind(&app_main)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(replayed_chain_order, [chain_main, chain_zulu, chain_alpha]);
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'external_outbound_bindings'
+           AND column_name IN (
+               'endpoint_address', 'endpoint_port', 'mtu', 'keep_alive',
+               'allowed_ips', 'no_kernel_tun', 'domain_strategy', 'workers'
+           )
+         ORDER BY column_name",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "allowed_ips",
+            "domain_strategy",
+            "endpoint_address",
+            "endpoint_port",
+            "keep_alive",
+            "mtu",
+            "no_kernel_tun",
+            "workers",
+        ]
+    );
+
+    let migration_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(migration_count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO apps (id, label, position)
+         VALUES ('app-secondary', 'Secondary App', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    insert_usage_history_for_main_fixture(db.pool()).await;
+    sqlx::query("UPDATE usage_samples SET app_id = 'app-main'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_app_quotas (tenant_id, user_id, app_id, limit_bytes)
+         VALUES ('platform.acme', 'alice', 'app-main', 1048576)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO e2e_probes (
+            chain_id, app_id, node_id, status, ttfb_ms, exit_ip,
+            exit_loc, exit_verdict, probed_at
+         ) VALUES (
+            'c-main', 'app-main', 'n1', 'ok', 25, '192.0.2.10',
+            'test-region', 'match', now()
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let identity_references = || async {
+        sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
+            "SELECT
+                (SELECT app_id FROM chains WHERE id = 'c-main'),
+                (SELECT app_id FROM grants WHERE ingress_id = 'i-main'),
+                (SELECT app_id FROM e2e_probes WHERE chain_id = 'c-main'),
+                (SELECT app_id FROM usage_samples LIMIT 1),
+                (SELECT app_id FROM usage_chain_samples LIMIT 1),
+                (SELECT chain_id FROM usage_chain_samples LIMIT 1),
+                (SELECT app_id FROM user_app_quotas WHERE user_id = 'alice')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    };
+    let before = identity_references().await;
+
+    let result = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::ReorderApps {
+                ids: vec!["app-secondary".to_owned(), "app-main".to_owned()],
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.changed, 1);
+
+    let positions: Vec<(String, i32)> =
+        sqlx::query_as("SELECT id, position FROM apps ORDER BY position")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        positions,
+        [("app-secondary".to_owned(), 0), ("app-main".to_owned(), 1)]
+    );
+    assert_eq!(identity_references().await, before);
+    assert_eq!(
+        before,
+        (
+            "app-main".to_owned(),
+            "app-main".to_owned(),
+            "app-main".to_owned(),
+            "app-main".to_owned(),
+            "app-main".to_owned(),
+            "c-main".to_owned(),
+            "app-main".to_owned(),
+        )
+    );
+
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let app_ids: Vec<&str> = snapshot.apps.iter().map(|app| app.id.as_str()).collect();
+    assert_eq!(app_ids, ["app-secondary", "app-main"]);
+
+    db.store
+        .upsert_app(
+            &system_admin(),
+            CreateAppRequest {
+                id: "app-new".to_owned(),
+                label: "New App".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let order_after_create: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM apps ORDER BY position")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(order_after_create, ["app-secondary", "app-main", "app-new"]);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stable() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_usage_history_for_main_fixture(db.pool()).await;
+
+    // The untouched/default sequence follows stable IDs even when creation happens in another
+    // order. Both chains belong to app-main; positions are deliberately not global.
+    for (id, name) in [("c-zovuru", "Zulu Chain"), ("c-bacemu", "Alpha Chain")] {
+        db.store
+            .upsert_chain(
+                &system_admin(),
+                "app-main",
+                CreateChainRequest {
+                    id: id.to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: name.to_owned(),
+                    subscription_country: None,
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let default_order: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM chains WHERE app_id = 'app-main' ORDER BY position, id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(default_order, ["c-bacemu", "c-main", "c-zovuru"]);
+
+    // A complete ordering document is also the stale-page guard. Missing or duplicated IDs must
+    // abort the whole draft rather than assigning a partial set of positions.
+    for ids in [
+        vec!["c-main".to_owned(), "c-zovuru".to_owned()],
+        vec![
+            "c-bacemu".to_owned(),
+            "c-bacemu".to_owned(),
+            "c-zovuru".to_owned(),
+        ],
+    ] {
+        let error = db
+            .store
+            .apply_draft(
+                &system_admin(),
+                vec![ModelOp::ReorderChains {
+                    app_id: "app-main".to_owned(),
+                    ids,
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("order"),
+            "unexpected complete-order error: {error}"
+        );
+    }
+    let after_rejected_order: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM chains WHERE app_id = 'app-main' ORDER BY position, id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after_rejected_order, default_order);
+
+    // Give every chain an ingress so materialization's authorization-column projection is tested
+    // as well as the chain declarations themselves. These are fixture rows, not the write path
+    // under test, so cloning the known-good ingress keeps this test about ordering.
+    for (chain_id, ingress_id, port) in [
+        ("c-bacemu", "i-dafino", 444_i32),
+        ("c-zovuru", "i-gurelo", 445_i32),
+    ] {
+        sqlx::query(
+            "INSERT INTO ingresses (
+                id, app_id, chain_id, node_id, bind, port, front_id, transport_kind,
+                reality_private_key, reality_public_key, reality_short_ids,
+                reality_dest, reality_server_names, reality_fingerprint, reality_flow,
+                reality_fallback_mode
+             )
+             SELECT $1, app_id, $2, node_id, bind, $3, front_id, transport_kind,
+                    reality_private_key || '-' || $1,
+                    reality_public_key || '-' || $1,
+                    reality_short_ids,
+                    reality_dest, reality_server_names, reality_fingerprint, reality_flow,
+                    reality_fallback_mode
+             FROM ingresses
+             WHERE id = 'i-main'",
+        )
+        .bind(ingress_id)
+        .bind(chain_id)
+        .bind(port)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
+             VALUES ('app-main', 'platform.acme', 'alice', $1)",
+        )
+        .bind(ingress_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO e2e_probes (
+            chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at
+         ) VALUES
+            ('c-bacemu', 'app-main', 'n1', 'ok', 21, 'match', now()),
+            ('c-main', 'app-main', 'n1', 'ok', 22, 'match', now()),
+            ('c-zovuru', 'app-main', 'n1', 'ok', 23, 'match', now())",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let references_before: (i64, i64, i64, String, String) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM grants WHERE app_id = 'app-main'),
+            (SELECT count(*) FROM e2e_probes WHERE app_id = 'app-main'),
+            (SELECT count(*) FROM usage_chain_samples WHERE app_id = 'app-main'),
+            (SELECT chain_id FROM usage_chain_samples WHERE app_id = 'app-main' LIMIT 1),
+            (SELECT app_id FROM chains WHERE id = 'c-main')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    let changed = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::ReorderChains {
+                app_id: "app-main".to_owned(),
+                ids: vec![
+                    "c-zovuru".to_owned(),
+                    "c-main".to_owned(),
+                    "c-bacemu".to_owned(),
+                ],
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.changed, 1);
+
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let app = snapshot
+        .apps
+        .iter()
+        .find(|app| app.id == "app-main")
+        .unwrap();
+    assert_eq!(
+        app.chains
+            .iter()
+            .map(|chain| chain.id.as_str())
+            .collect::<Vec<_>>(),
+        ["c-zovuru", "c-main", "c-bacemu"]
+    );
+    assert_eq!(
+        app.ingresses
+            .iter()
+            .map(|ingress| ingress.chain.as_str())
+            .collect::<Vec<_>>(),
+        ["c-zovuru", "c-main", "c-bacemu"]
+    );
+    assert_eq!(
+        db.store
+            .e2e_probes(&system_admin())
+            .await
+            .unwrap()
+            .iter()
+            .map(|probe| probe.chain_id.as_str())
+            .collect::<Vec<_>>(),
+        ["c-zovuru", "c-main", "c-bacemu"]
+    );
+    let references_after: (i64, i64, i64, String, String) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM grants WHERE app_id = 'app-main'),
+            (SELECT count(*) FROM e2e_probes WHERE app_id = 'app-main'),
+            (SELECT count(*) FROM usage_chain_samples WHERE app_id = 'app-main'),
+            (SELECT chain_id FROM usage_chain_samples WHERE app_id = 'app-main' LIMIT 1),
+            (SELECT app_id FROM chains WHERE id = 'c-main')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(references_after, references_before);
+    assert_eq!(references_after.3, "c-main");
+    assert_eq!(references_after.4, "app-main");
+
+    // Once an operator has established a custom order, a new chain appends even if its ID would
+    // sort into the middle. This preserves the explicit sequence instead of partially resetting it.
+    db.store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: "c-betalo".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Beta Chain".to_owned(),
+                subscription_country: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let order_after_create: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM chains WHERE app_id = 'app-main' ORDER BY position, id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        order_after_create,
+        ["c-zovuru", "c-main", "c-bacemu", "c-betalo"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn chain_subscription_country_is_normalized_persisted_and_clearable() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    let updated = db
+        .store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: "c-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Main".to_owned(),
+                subscription_country: Some(" tw ".to_owned()),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.chain.subscription_country.as_deref(), Some("TW"));
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(
+        snapshot.apps[0].chains[0].subscription_country.as_deref(),
+        Some("TW")
+    );
+
+    let invalid = db
+        .store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: "c-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Main".to_owned(),
+                subscription_country: Some("TWN".to_owned()),
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid, StoreError::InvalidData(_)));
+
+    let cleared = db
+        .store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: "c-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Main".to_owned(),
+                subscription_country: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.chain.subscription_country, None);
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(snapshot.apps[0].chains[0].subscription_country, None);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn line_order_drives_every_operator_facing_projection_with_id_as_the_default() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    // With no custom ordering, a newly-created line keeps the legacy ID order rather than merely
+    // appending. This is the fallback contract for databases/operators that never reorder lines.
+    db.store
+        .upsert_app(
+            &system_admin(),
+            CreateAppRequest {
+                id: "app-alpha".to_owned(),
+                label: "Alpha App".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let default_order: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM apps ORDER BY position, id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(default_order, ["app-alpha", "app-main"]);
+
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('c-alpha', 'app-alpha', 'platform.acme', 'Alpha Chain', 0)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO e2e_probes (
+            chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at
+         ) VALUES
+            ('c-alpha', 'app-alpha', 'n1', 'ok', 20, 'match', now()),
+            ('c-main', 'app-main', 'n1', 'ok', 30, 'match', now())",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for app_id in ["app-alpha", "app-main"] {
+        db.store
+            .set_user_app_quota(
+                &system_admin(),
+                SetUserAppQuotaRequest {
+                    tenant_id: "platform.acme".to_owned(),
+                    user_id: "alice".to_owned(),
+                    app_id: app_id.to_owned(),
+                    limit_bytes: Some(1024),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO usage_samples (
+            window_start, window_end, node_id, tenant_id, user_id, ingress_id,
+            app_id, grant_label, uplink_bytes, downlink_bytes
+         ) VALUES
+            (now() - interval '60 seconds', now() - interval '30 seconds',
+             'n1', 'platform.acme', 'alice', 'i-main',
+             'app-alpha', 'test-user#alpha', 10, 20),
+            (now() - interval '60 seconds', now() - interval '30 seconds',
+             'n1', 'platform.acme', 'alice', 'i-main',
+             'app-main', 'test-user#main', 30, 40)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // Reverse the visible order without touching either stable ID. Every API whose rows are
+    // displayed as ordinary line groups must now follow position rather than re-sorting by ID.
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::ReorderApps {
+                ids: vec!["app-main".to_owned(), "app-alpha".to_owned()],
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(
+        snapshot
+            .apps
+            .iter()
+            .map(|app| app.id.as_str())
+            .collect::<Vec<_>>(),
+        ["app-main", "app-alpha"]
+    );
+    assert_eq!(
+        db.store
+            .e2e_probes(&system_admin())
+            .await
+            .unwrap()
+            .iter()
+            .map(|probe| probe.app_id.as_str())
+            .collect::<Vec<_>>(),
+        ["app-main", "app-alpha"]
+    );
+    assert_eq!(
+        db.store
+            .list_user_app_quotas(&system_admin(), None)
+            .await
+            .unwrap()
+            .quotas
+            .iter()
+            .map(|quota| quota.app_id.as_str())
+            .collect::<Vec<_>>(),
+        ["app-main", "app-alpha"]
+    );
+    assert_eq!(
+        db.store
+            .list_monthly_usage_summary(&system_admin())
+            .await
+            .unwrap()
+            .views
+            .iter()
+            .map(|view| view.app_id.as_str())
+            .collect::<Vec<_>>(),
+        ["app-main", "app-alpha"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn tenant_creation_adds_exactly_one_default_warp_in_the_same_revision() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+
+    let created = db
+        .store
+        .create_tenant(
+            &system_admin(),
+            CreateTenantRequest {
+                id: "platform.acme".to_owned(),
+                name: "Platform Acme".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(snapshot.revision, created.revision_id);
+    assert_eq!(snapshot.external_outbounds.len(), 1);
+    let warp = &snapshot.external_outbounds[0];
+    assert_eq!(warp.id, "warp.platform.acme");
+    assert_eq!(warp.tenant, "platform.acme");
+    assert_eq!(warp.name, "Cloudflare WARP");
+    assert_eq!(warp.address, "engage.cloudflareclient.com");
+    assert_eq!(warp.port, 2408);
+    assert!(matches!(
+        &warp.protocol,
+        ExternalOutboundProtocol::Warp {
+            mtu: 1280,
+            keep_alive: 25,
+            allowed_ips,
+            no_kernel_tun: false,
+            domain_strategy,
+            workers: 0,
+        } if allowed_ips == &["0.0.0.0/0", "::/0"] && domain_strategy == "ForceIP"
+    ));
+    let credential: String = sqlx::query_scalar(
+        "SELECT credential_sealed FROM external_outbounds WHERE id = 'warp.platform.acme'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        credential.is_empty(),
+        "WARP has no resource-level credential"
+    );
+
+    let repeated = db
+        .store
+        .create_tenant(
+            &system_admin(),
+            CreateTenantRequest {
+                id: "platform.acme".to_owned(),
+                name: "Platform Acme".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.revision_id, created.revision_id);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM external_outbounds WHERE tenant_id = 'platform.acme' AND protocol = 'warp'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn startup_backfills_missing_tenant_warp_idempotently_and_avoids_global_id_collision() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, name)
+         VALUES ('alpha', 'Alpha'), ('beta', 'Beta')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // Occupy alpha's readable id with beta's already-existing WARP. The reconciler must preserve
+    // this resource, count it as beta's default, and allocate alpha a checked fallback id.
+    sqlx::query(
+        "INSERT INTO external_outbounds
+            (id, tenant_id, name, address, port, protocol, credential_sealed,
+             protocol_options, security)
+         VALUES
+            ('warp.alpha', 'beta', 'Existing WARP', 'engage.cloudflareclient.com', 2408,
+             'warp', '', $1, $2)",
+    )
+    .bind(json!({
+        "mtu": 1280,
+        "keep_alive": 25,
+        "allowed_ips": ["0.0.0.0/0", "::/0"],
+        "no_kernel_tun": false,
+        "domain_strategy": "ForceIP",
+        "workers": 0,
+    }))
+    .bind(json!({ "t": "none" }))
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let before: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let added = db.store.migrate().await.unwrap();
+    assert_eq!(added, 1);
+    let after: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, before + 1);
+
+    let rows = sqlx::query(
+        "SELECT id, tenant_id FROM external_outbounds WHERE protocol = 'warp' ORDER BY tenant_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].try_get::<String, _>("tenant_id").unwrap(), "alpha");
+    let alpha_id = rows[0].try_get::<String, _>("id").unwrap();
+    assert!(alpha_id.starts_with("warp-"), "fallback id was {alpha_id}");
+    assert_eq!(alpha_id.len(), 17);
+    assert_eq!(rows[1].try_get::<String, _>("tenant_id").unwrap(), "beta");
+    assert_eq!(rows[1].try_get::<String, _>("id").unwrap(), "warp.alpha");
+
+    assert_eq!(db.store.migrate().await.unwrap(), 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        after
+    );
 }
 
 #[tokio::test]
@@ -258,7 +1714,6 @@ async fn external_outbound_round_trips_sealed_and_redacted() {
     insert_minimal_fixture(db.pool()).await;
 
     let request = UpsertExternalOutboundRequest {
-        app_id: "app-main".to_owned(),
         id: "vendor-edge".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "Vendor edge".to_owned(),
@@ -290,14 +1745,13 @@ async fn external_outbound_round_trips_sealed_and_redacted() {
         .await
         .unwrap();
 
-    let sealed: String = sqlx::query(
-        "SELECT credential_sealed FROM external_outbounds WHERE app_id = 'app-main' AND id = 'vendor-edge'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap()
-    .try_get("credential_sealed")
-    .unwrap();
+    let sealed: String =
+        sqlx::query("SELECT credential_sealed FROM external_outbounds WHERE id = 'vendor-edge'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+            .try_get("credential_sealed")
+            .unwrap();
     assert!(sealed.starts_with("v1."));
     assert!(!sealed.contains(request.protocol.credential()));
 
@@ -398,6 +1852,456 @@ async fn external_outbound_round_trips_sealed_and_redacted() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn managed_warp_binding_round_trips_sealed_and_redacted() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: UpsertExternalOutboundRequest {
+                    id: "warp".to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "Cloudflare WARP".to_owned(),
+                    address: "engage.cloudflareclient.com".to_owned(),
+                    port: 2408,
+                    protocol: ExternalOutboundProtocol::Warp {
+                        mtu: 1280,
+                        keep_alive: 25,
+                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+                        no_kernel_tun: true,
+                        domain_strategy: "ForceIP".to_owned(),
+                        workers: 0,
+                    },
+                    security: ExternalOutboundSecurity::None,
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let private_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    let access_token = "provider-control-token";
+    let committed = db
+        .store
+        .register_warp_binding(
+            &system_admin(),
+            RegisterWarpBindingRequest {
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                device_id: "device-1".to_owned(),
+                account_id: "account-1".to_owned(),
+                access_token: access_token.to_owned(),
+                private_key: private_key.to_owned(),
+                peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+                local_addresses: vec![
+                    "172.16.0.2/32".to_owned(),
+                    "2606:4700:110:8::2/128".to_owned(),
+                ],
+                reserved: vec![1, 2, 3],
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT access_token_sealed, private_key_sealed
+         FROM external_outbound_bindings
+         WHERE outbound_id = 'warp' AND node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let token_sealed = row.try_get::<String, _>("access_token_sealed").unwrap();
+    let key_sealed = row.try_get::<String, _>("private_key_sealed").unwrap();
+    assert!(token_sealed.starts_with("v1."));
+    assert!(key_sealed.starts_with("v1."));
+    assert!(!token_sealed.contains(access_token));
+    assert!(!key_sealed.contains(private_key));
+
+    let customized = db
+        .store
+        .update_warp_binding(
+            &system_admin(),
+            UpdateWarpBindingRequest {
+                tenant_id: "platform.acme".to_owned(),
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                endpoint_address: Some("162.159.193.10".to_owned()),
+                endpoint_port: Some(500),
+                mtu: Some(1420),
+                keep_alive: Some(40),
+                allowed_ips: Some(vec!["::/0".to_owned()]),
+                no_kernel_tun: Some(false),
+                domain_strategy: Some("ForceIPv6".to_owned()),
+                workers: Some(4),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(customized.revision_id > committed.revision_id);
+
+    let customized_snapshot = db
+        .store
+        .materialize_snapshot(Some(customized.revision_id))
+        .await
+        .unwrap();
+    let customized_binding = &customized_snapshot.external_outbounds[0].bindings[0];
+    assert_eq!(
+        customized_binding.endpoint_address.as_deref(),
+        Some("162.159.193.10")
+    );
+    assert_eq!(customized_binding.endpoint_port, Some(500));
+    assert_eq!(customized_binding.mtu, Some(1420));
+    assert_eq!(customized_binding.keep_alive, Some(40));
+    assert_eq!(
+        customized_binding.allowed_ips,
+        Some(vec!["::/0".to_owned()])
+    );
+    assert_eq!(customized_binding.no_kernel_tun, Some(false));
+    assert_eq!(
+        customized_binding.domain_strategy.as_deref(),
+        Some("ForceIPv6")
+    );
+    assert_eq!(customized_binding.workers, Some(4));
+
+    let customized_deployment = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(customized.revision_id, "warp-customized"),
+        )
+        .await
+        .unwrap();
+    mark_succeeded(db.pool(), customized_deployment.deployment_id).await;
+
+    let no_op = db
+        .store
+        .update_warp_binding(
+            &system_admin(),
+            UpdateWarpBindingRequest {
+                tenant_id: "platform.acme".to_owned(),
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                endpoint_address: Some("162.159.193.10".to_owned()),
+                endpoint_port: Some(500),
+                mtu: Some(1420),
+                keep_alive: Some(40),
+                allowed_ips: Some(vec!["::/0".to_owned()]),
+                no_kernel_tun: Some(false),
+                domain_strategy: Some("ForceIPv6".to_owned()),
+                workers: Some(4),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_op.revision_id, customized.revision_id);
+
+    let inherited = db
+        .store
+        .update_warp_binding(
+            &system_admin(),
+            UpdateWarpBindingRequest {
+                tenant_id: "platform.acme".to_owned(),
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                endpoint_address: None,
+                endpoint_port: None,
+                mtu: None,
+                keep_alive: None,
+                allowed_ips: None,
+                no_kernel_tun: None,
+                domain_strategy: None,
+                workers: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(inherited.revision_id > customized.revision_id);
+    let current_snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let current_binding = &current_snapshot.external_outbounds[0].bindings[0];
+    assert_eq!(current_binding.endpoint_address, None);
+    assert_eq!(current_binding.endpoint_port, None);
+    assert_eq!(current_binding.mtu, None);
+    assert_eq!(current_binding.keep_alive, None);
+    assert_eq!(current_binding.allowed_ips, None);
+    assert_eq!(current_binding.no_kernel_tun, None);
+    assert_eq!(current_binding.domain_strategy, None);
+    assert_eq!(current_binding.workers, None);
+
+    db.store
+        .create_rollback_deployment(
+            &system_admin(),
+            create_rollback_request(
+                customized_deployment.deployment_id,
+                "warp-restore-customized",
+            ),
+        )
+        .await
+        .unwrap();
+    let rolled_back = db.store.materialize_snapshot(None).await.unwrap();
+    let rolled_back_binding = &rolled_back.external_outbounds[0].bindings[0];
+    assert_eq!(
+        rolled_back_binding.endpoint_address.as_deref(),
+        Some("162.159.193.10")
+    );
+    assert_eq!(rolled_back_binding.endpoint_port, Some(500));
+    assert_eq!(rolled_back_binding.mtu, Some(1420));
+    assert_eq!(rolled_back_binding.keep_alive, Some(40));
+    assert_eq!(
+        rolled_back_binding.allowed_ips,
+        Some(vec!["::/0".to_owned()])
+    );
+    assert_eq!(rolled_back_binding.no_kernel_tun, Some(false));
+    assert_eq!(
+        rolled_back_binding.domain_strategy.as_deref(),
+        Some("ForceIPv6")
+    );
+    assert_eq!(rolled_back_binding.workers, Some(4));
+
+    for revision in [
+        None,
+        Some(committed.revision_id),
+        Some(customized.revision_id),
+    ] {
+        let snapshot = db.store.materialize_snapshot(revision).await.unwrap();
+        let tunnel = snapshot
+            .external_outbounds
+            .iter()
+            .find(|outbound| outbound.id == "warp")
+            .unwrap();
+        assert_eq!(tunnel.bindings.len(), 1);
+        assert_eq!(tunnel.bindings[0].node, "n1");
+        assert_eq!(tunnel.bindings[0].private_key, private_key);
+        assert_eq!(tunnel.bindings[0].reserved, vec![1, 2, 3]);
+    }
+
+    let redacted = db
+        .store
+        .redacted_snapshot(&system_admin(), Some(committed.revision_id))
+        .await
+        .unwrap();
+    let binding = &redacted.snapshot["external_outbounds"][0]["bindings"][0];
+    assert_eq!(binding["device_id"], "device-1");
+    assert!(binding.get("private_key").is_none());
+    assert!(!redacted.snapshot.to_string().contains(access_token));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: UpsertExternalOutboundRequest {
+                    id: "warp".to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "Cloudflare WARP".to_owned(),
+                    address: "engage.cloudflareclient.com".to_owned(),
+                    port: 2408,
+                    protocol: ExternalOutboundProtocol::Warp {
+                        mtu: 1280,
+                        keep_alive: 25,
+                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+                        no_kernel_tun: false,
+                        domain_strategy: "ForceIP".to_owned(),
+                        workers: 0,
+                    },
+                    security: ExternalOutboundSecurity::None,
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    db.store
+        .register_warp_binding(
+            &system_admin(),
+            RegisterWarpBindingRequest {
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                device_id: "device-remove".to_owned(),
+                account_id: "account-remove".to_owned(),
+                access_token: "provider-delete-token".to_owned(),
+                private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
+                peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+                local_addresses: vec![
+                    "172.16.0.2/32".to_owned(),
+                    "2606:4700:110:8::2/128".to_owned(),
+                ],
+                reserved: vec![1, 2, 3],
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let proxy = put_step_draft(
+        &db,
+        "app-main",
+        "c-main",
+        "n1",
+        PutStepRequest {
+            accept: None,
+            hop_in: None,
+            rules: vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Proxy {
+                    outbound: "warp".to_owned(),
+                },
+            }],
+            note: None,
+        },
+    )
+    .await;
+    let current_error = db
+        .store
+        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp", "n1")
+        .await
+        .unwrap_err();
+    assert!(
+        current_error.to_string().contains("仍被当前规则引用"),
+        "{current_error}"
+    );
+
+    let published_proxy = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(proxy.revision_id, "warp-remove-proxy"),
+        )
+        .await
+        .unwrap();
+    mark_succeeded(db.pool(), published_proxy.deployment_id).await;
+
+    let direct = put_step_draft(
+        &db,
+        "app-main",
+        "c-main",
+        "n1",
+        PutStepRequest {
+            accept: None,
+            hop_in: None,
+            rules: vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Egress {
+                    send_through: None,
+                    dns: false,
+                },
+            }],
+            note: None,
+        },
+    )
+    .await;
+    let published_error = db
+        .store
+        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp", "n1")
+        .await
+        .unwrap_err();
+    assert!(
+        published_error
+            .to_string()
+            .contains("最后成功发布的版本仍在使用"),
+        "{published_error}"
+    );
+
+    let published_direct = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(direct.revision_id, "warp-remove-direct"),
+        )
+        .await
+        .unwrap();
+    mark_succeeded(db.pool(), published_direct.deployment_id).await;
+
+    let prepared = db
+        .store
+        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp", "n1")
+        .await
+        .unwrap();
+    assert_eq!(prepared.device_id, "device-remove");
+    assert_eq!(prepared.access_token, "provider-delete-token");
+
+    let stale = db
+        .store
+        .remove_warp_binding(
+            &system_admin(),
+            RemoveWarpBindingRequest {
+                tenant_id: "platform.acme".to_owned(),
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                expected_device_id: "different-device".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        stale.to_string().contains("identity on n1 changed"),
+        "{stale}"
+    );
+
+    let removed = db
+        .store
+        .remove_warp_binding(
+            &system_admin(),
+            RemoveWarpBindingRequest {
+                tenant_id: "platform.acme".to_owned(),
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                expected_device_id: prepared.device_id,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(removed.removed);
+    assert_eq!(removed.node_id, "n1");
+    assert_eq!(removed.device_id, "device-remove");
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let warp = snapshot
+        .external_outbounds
+        .iter()
+        .find(|outbound| outbound.id == "warp")
+        .unwrap();
+    assert!(warp.bindings.is_empty());
+    let rows = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM external_outbound_bindings WHERE outbound_id = 'warp'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn external_vless_xhttp_round_trips_and_legacy_rows_default_to_raw() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -406,7 +2310,6 @@ async fn external_vless_xhttp_round_trips_and_legacy_rows_default_to_raw() {
     insert_minimal_fixture(db.pool()).await;
 
     let request = UpsertExternalOutboundRequest {
-        app_id: "app-main".to_owned(),
         id: "xhttp-edge".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "XHTTP edge".to_owned(),
@@ -454,14 +2357,13 @@ async fn external_vless_xhttp_round_trips_and_legacy_rows_default_to_raw() {
         .await
         .unwrap();
 
-    let options: serde_json::Value = sqlx::query(
-        "SELECT protocol_options FROM external_outbounds WHERE app_id = 'app-main' AND id = 'xhttp-edge'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap()
-    .try_get("protocol_options")
-    .unwrap();
+    let options: serde_json::Value =
+        sqlx::query("SELECT protocol_options FROM external_outbounds WHERE id = 'xhttp-edge'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+            .try_get("protocol_options")
+            .unwrap();
     assert_eq!(options["transport"]["t"], "xhttp");
     assert_eq!(options["transport"]["v"]["path"], "/upload");
     assert_eq!(
@@ -475,7 +2377,7 @@ async fn external_vless_xhttp_round_trips_and_legacy_rows_default_to_raw() {
     // Simulate an existing row written before transport was persisted. Runtime compatibility is
     // deliberately in the decoder; deployment also normalizes such rows to an explicit RAW value.
     sqlx::query(
-        "UPDATE external_outbounds SET protocol_options = protocol_options - 'transport' WHERE app_id = 'app-main' AND id = 'xhttp-edge'",
+        "UPDATE external_outbounds SET protocol_options = protocol_options - 'transport' WHERE id = 'xhttp-edge'",
     )
     .execute(db.pool())
     .await
@@ -576,6 +2478,93 @@ async fn global_settings_update_materializes_reality_client_policy() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn agent_log_policy_resolves_global_node_override_and_clear_without_a_revision() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.acme', 'Platform Acme')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for id in ["n1", "n2"] {
+        db.store
+            .provision_node(&system_admin(), provision_node_request(id))
+            .await
+            .unwrap();
+    }
+    let revision_before: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+    assert_eq!(
+        db.store.effective_node_log_max_mib("n1").await.unwrap(),
+        100
+    );
+    db.store
+        .update_agent_log_default(
+            &system_admin(),
+            UpdateAgentLogDefaultRequest { max_mib: 192 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store.effective_node_log_max_mib("n1").await.unwrap(),
+        192
+    );
+    assert_eq!(
+        db.store.effective_node_log_max_mib("n2").await.unwrap(),
+        192
+    );
+
+    db.store
+        .update_node_log_policy(
+            &system_admin(),
+            "n1",
+            UpdateNodeLogPolicyRequest { max_mib: Some(64) },
+        )
+        .await
+        .unwrap();
+    db.store
+        .update_agent_log_default(
+            &system_admin(),
+            UpdateAgentLogDefaultRequest { max_mib: 256 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(db.store.effective_node_log_max_mib("n1").await.unwrap(), 64);
+    assert_eq!(
+        db.store.effective_node_log_max_mib("n2").await.unwrap(),
+        256
+    );
+
+    db.store
+        .update_node_log_policy(
+            &system_admin(),
+            "n1",
+            UpdateNodeLogPolicyRequest { max_mib: None },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store.effective_node_log_max_mib("n1").await.unwrap(),
+        256
+    );
+    let revision_after: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        revision_after, revision_before,
+        "运行时策略不应创建模型修订"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn deployment_schema_matches_convergence_design() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -583,6 +2572,8 @@ async fn deployment_schema_matches_convergence_design() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
 
+    assert_column_exists(db.pool(), "control_state", "agent_log_max_mib").await;
+    assert_column_exists(db.pool(), "nodes", "agent_log_max_mib").await;
     assert_table_exists(db.pool(), "artifact_blobs").await;
     assert_column_exists(db.pool(), "artifact_snapshots", "content_byte_len").await;
     assert_column_missing(db.pool(), "artifact_snapshots", "content").await;
@@ -599,17 +2590,52 @@ async fn deployment_schema_matches_convergence_design() {
     assert_column_exists(db.pool(), "node_enrollments", "expires_at").await;
     assert_column_exists(db.pool(), "node_enrollments", "used_at").await;
     assert_table_exists(db.pool(), "admin_operators").await;
+    assert_table_exists(db.pool(), "clash_haitun_links").await;
+    assert_column_exists(db.pool(), "clash_haitun_links", "token").await;
+    assert_column_exists(db.pool(), "clash_haitun_links", "revoked_at").await;
     assert_column_exists(db.pool(), "deployment_target_state", "desired_grants").await;
     assert_column_exists(db.pool(), "deployment_target_state", "dispatched_grants").await;
+    assert_column_exists(db.pool(), "deployment_target_state", "lifecycle_epoch").await;
+    assert_column_exists(db.pool(), "deployment_target_state", "usage_generation_id").await;
+    assert_table_exists(db.pool(), "node_lifecycle_state").await;
+    assert_column_exists(db.pool(), "node_lifecycle_state", "lifecycle_epoch").await;
+    assert_column_exists(db.pool(), "node_lifecycle_state", "phase").await;
+    assert_table_exists(db.pool(), "node_lifecycle_events").await;
     assert_table_exists(db.pool(), "deployment_wave_confirmations").await;
+    assert_table_exists(db.pool(), "subscription_serving_state").await;
+    assert_column_exists(
+        db.pool(),
+        "subscription_serving_state",
+        "topology_revision_id",
+    )
+    .await;
+    assert_column_exists(
+        db.pool(),
+        "subscription_serving_state",
+        "permissions_revision_id",
+    )
+    .await;
+    assert_column_exists(db.pool(), "subscription_serving_state", "generation").await;
     assert_column_exists(db.pool(), "deployments", "sync_of_deployment_id").await;
     assert_column_exists(db.pool(), "usage_samples", "has_gap").await;
+    assert_column_exists(db.pool(), "usage_samples", "generation_id").await;
+    assert_column_exists(db.pool(), "usage_chain_samples", "generation_id").await;
+    assert_column_exists(db.pool(), "usage_readings", "agent_instance_id").await;
+    assert_column_exists(db.pool(), "usage_readings", "sequence").await;
+    assert_column_exists(db.pool(), "node_agent_state", "usage_last_result").await;
+    assert_table_exists(db.pool(), "usage_generations").await;
+    assert_table_exists(db.pool(), "usage_generation_activations").await;
+    assert_table_exists(db.pool(), "usage_agent_cursors").await;
+    assert_table_exists(db.pool(), "usage_report_receipts").await;
+    assert_table_exists(db.pool(), "usage_counter_heads").await;
     assert_constraint_missing(db.pool(), "usage_samples_ingress_id_fkey").await;
     assert_constraint_missing(db.pool(), "usage_chain_samples_app_id_fkey").await;
     assert_constraint_missing(db.pool(), "usage_chain_samples_chain_id_fkey").await;
     assert_column_exists(db.pool(), "control_state", "reality_min_client_ver").await;
     assert_column_exists(db.pool(), "control_state", "reality_max_client_ver").await;
     assert_column_exists(db.pool(), "control_state", "reality_max_time_diff_ms").await;
+    assert_column_exists(db.pool(), "control_state", "site_name").await;
+    assert_column_exists(db.pool(), "control_state", "site_icon_data_url").await;
 
     let revision_id: i64 =
         sqlx::query("SELECT current_revision FROM control_state WHERE id = TRUE")
@@ -681,7 +2707,7 @@ async fn deployment_schema_matches_convergence_design() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn clash_subscription_is_fresh_by_uuid_and_reports_combined_quota() {
+async fn clash_subscription_uses_only_the_stable_serving_projection() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -689,6 +2715,7 @@ async fn clash_subscription_is_fresh_by_uuid_and_reports_combined_quota() {
     insert_minimal_fixture(db.pool()).await;
     set_quota(&db, Some(10_000)).await;
     insert_month_sample(db.pool(), "i-main", "app-main", 1, 1_200, 800).await;
+    let initial_revision = seed_subscription_serving(&db).await;
 
     let uuid = "2d2304da-f114-4574-8d44-625afdb1db5c";
     let first = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
@@ -701,22 +2728,208 @@ async fn clash_subscription_is_fresh_by_uuid_and_reports_combined_quota() {
     assert!(first.content.contains("name: \"Main Chain\""));
     assert!(first.content.contains("# Brocade · SubBoost 标准版"));
 
-    // No artifact cache: changing the live model is visible on the next call to the same URL.
+    // Rendering is dynamic, but its model input is not the mutable head. A newly committed rename
+    // remains invisible until the matching configuration release succeeds.
     sqlx::query("UPDATE chains SET name = 'Renamed Chain' WHERE id = 'c-main'")
         .execute(db.pool())
         .await
         .unwrap();
+    let renamed_revision = commit_direct_fixture_revision(&db, "rename chain").await;
+    let unpublished = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(unpublished.content.contains("name: \"Main Chain\""));
+    assert!(!unpublished.content.contains("name: \"Renamed Chain\""));
+
+    let deployment_id: i64 = sqlx::query_scalar(
+        "INSERT INTO deployments (revision_id, status, active, kind, note)
+         VALUES ($1, 'planned', TRUE, 'config', 'test serving gate')
+         RETURNING id",
+    )
+    .bind(i64::try_from(renamed_revision).unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.store.clash_subscription_by_uuid(uuid).await,
+        Err(StoreError::Unavailable(_))
+    ));
+    sqlx::query("UPDATE deployments SET status = 'halted' WHERE id = $1")
+        .bind(deployment_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.store.clash_subscription_by_uuid(uuid).await,
+        Err(StoreError::Unavailable(_))
+    ));
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'canceled', active = NULL, finished_at = now()
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_applied_state (
+             node_id, wireguard_state, xray_state, grants_state, observed_at
+         ) VALUES ('n1', 'unknown', 'dirty', 'unknown', now())
+         ON CONFLICT (node_id) DO UPDATE SET
+             xray_state = 'dirty', xray_sha256 = NULL, observed_at = now()",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.store.clash_subscription_by_uuid(uuid).await,
+        Err(StoreError::Unavailable(_))
+    ));
+    sqlx::query("DELETE FROM node_applied_state WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let after_cancel = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(after_cancel.content.contains("name: \"Main Chain\""));
+
+    sqlx::query(
+        "UPDATE subscription_serving_state
+            SET topology_revision_id = $1,
+                topology_deployment_id = $2,
+                generation = generation + 1,
+                updated_at = now()
+          WHERE id = TRUE",
+    )
+    .bind(i64::try_from(renamed_revision).unwrap())
+    .bind(deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
     let renamed = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert_eq!(renamed.revision, renamed_revision);
     assert!(renamed.content.contains("name: \"Renamed Chain\""));
     assert!(!renamed.content.contains("name: \"Main Chain\""));
 
-    // Rotating the UUID invalidates the old bearer immediately and creates no compatibility
-    // window. The new UUID resolves the same current user.
+    let partial_id: i64 = sqlx::query_scalar(
+        "INSERT INTO deployments (revision_id, status, active, kind, note)
+         VALUES ($1, 'canceled', NULL, 'config', 'partially applied test release')
+         RETURNING id",
+    )
+    .bind(i64::try_from(renamed_revision).unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_targets (deployment_id, node_id, status)
+         VALUES ($1, 'n1', 'succeeded')",
+    )
+    .bind(partial_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.store.clash_subscription_by_uuid(uuid).await,
+        Err(StoreError::Unavailable(_))
+    ));
+    // This row is a synthetic fault fixture. A real partial cancellation is cleared only by a
+    // later fleet-wide success; remove the fixture so the remaining assertions can exercise
+    // independent credential transitions.
+    sqlx::query("DELETE FROM deployments WHERE id = $1")
+        .bind(partial_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let grant_job_id: i64 = sqlx::query_scalar(
+        "INSERT INTO jobs (kind, status, payload)
+         VALUES ('grants-deployment', 'queued', jsonb_build_object('revision_id', $1))
+         RETURNING id",
+    )
+    .bind(i64::try_from(renamed_revision).unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.store.clash_subscription_by_uuid(uuid).await,
+        Err(StoreError::Unavailable(_))
+    ));
+    sqlx::query("UPDATE jobs SET status = 'succeeded' WHERE id = $1")
+        .bind(grant_job_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let link = db
+        .store
+        .issue_clash_haitun_link(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    let same_link = db
+        .store
+        .issue_clash_haitun_link(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        same_link.token, link.token,
+        "active issue must be idempotent"
+    );
+    let haitun = db
+        .store
+        .clash_subscription_by_haitun_token_for_family(&link.token, None)
+        .await
+        .unwrap();
+    assert!(haitun.content.contains("# Brocade · koipy 测速"));
+    assert!(!haitun.content.contains("rule-providers:"));
+    let revoked = db
+        .store
+        .revoke_clash_haitun_link(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert!(revoked.revoked_at.is_some());
+    assert!(matches!(
+        db.store
+            .clash_subscription_by_haitun_token_for_family(&link.token, None)
+            .await,
+        Err(StoreError::NotFound(_))
+    ));
+    let replacement = db
+        .store
+        .issue_clash_haitun_link(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_ne!(replacement.token, link.token);
+
+    // Credential rotation follows the independently converged permission line. Before it switches,
+    // the old bearer remains the truthful deployed credential and the committed new one is absent.
     let next_uuid = "f98b74ba-58f1-41d0-aaad-8fa5724c6d2d";
     sqlx::query(
         "UPDATE users SET uuid = $1::uuid WHERE tenant_id = 'platform.acme' AND id = 'alice'",
     )
     .bind(next_uuid)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let rotated_revision = commit_direct_fixture_revision(&db, "rotate user UUID").await;
+    assert_eq!(
+        db.store
+            .clash_subscription_by_uuid(uuid)
+            .await
+            .unwrap()
+            .uuid,
+        uuid
+    );
+    assert!(matches!(
+        db.store.clash_subscription_by_uuid(next_uuid).await,
+        Err(StoreError::NotFound(_))
+    ));
+    sqlx::query(
+        "UPDATE subscription_serving_state
+            SET permissions_revision_id = $1,
+                permissions_deployment_id = NULL,
+                generation = generation + 1,
+                updated_at = now()
+          WHERE id = TRUE",
+    )
+    .bind(i64::try_from(rotated_revision).unwrap())
     .execute(db.pool())
     .await
     .unwrap();
@@ -739,10 +2952,32 @@ async fn clash_subscription_is_fresh_by_uuid_and_reports_combined_quota() {
     .execute(db.pool())
     .await
     .unwrap();
+    let disabled_revision = commit_direct_fixture_revision(&db, "disable user").await;
+    assert_eq!(
+        db.store
+            .clash_subscription_by_uuid(next_uuid)
+            .await
+            .unwrap()
+            .uuid,
+        next_uuid
+    );
+    sqlx::query(
+        "UPDATE subscription_serving_state
+            SET permissions_revision_id = $1,
+                permissions_deployment_id = NULL,
+                generation = generation + 1,
+                updated_at = now()
+          WHERE id = TRUE",
+    )
+    .bind(i64::try_from(disabled_revision).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
     assert!(matches!(
         db.store.clash_subscription_by_uuid(next_uuid).await,
         Err(StoreError::NotFound(_))
     ));
+    assert!(initial_revision < renamed_revision);
 }
 
 /// A runtime reconcile must land, and an empty report must not erase the previous local
@@ -1153,6 +3388,7 @@ async fn hop_security_keeps_its_keys_until_the_kind_changes() {
                 id: "c-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Main".to_owned(),
+                subscription_country: None,
                 note: None,
             },
         )
@@ -1160,30 +3396,31 @@ async fn hop_security_keeps_its_keys_until_the_kind_changes() {
         .unwrap();
 
     async fn set(db: &TestPg, security: HopWireRequest) {
-        db.store
-            .put_step(
-                &system_admin(),
-                "app-main",
-                "c-main",
-                "n1",
-                PutStepRequest {
-                    accept: Some(StepAcceptRequest {
-                        uuid: None,
-                        label: None,
-                    }),
-                    hop_in: Some(HopInRequest {
-                        port: 20000,
-                        security: Some(security),
-                    }),
-                    rules: vec![Rule {
-                        dest_match: DestMatch::Any,
-                        action: Action::Egress { send_through: None },
-                    }],
-                    note: None,
-                },
-            )
-            .await
-            .unwrap();
+        put_step_draft(
+            db,
+            "app-main",
+            "c-main",
+            "n1",
+            PutStepRequest {
+                accept: Some(StepAcceptRequest {
+                    uuid: None,
+                    label: None,
+                }),
+                hop_in: Some(HopInRequest {
+                    port: 20000,
+                    security: Some(security),
+                }),
+                rules: vec![Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: false,
+                    },
+                }],
+                note: None,
+            },
+        )
+        .await;
     }
 
     set(&db, HopWireRequest::Encryption).await;
@@ -2751,7 +4988,13 @@ async fn materialize_minimal_fixture_and_compile() {
     let step = &app.steps[0];
     assert_eq!(step.rules.len(), 1);
     assert_eq!(step.rules[0].dest_match, DestMatch::Any);
-    assert_eq!(step.rules[0].action, Action::Egress { send_through: None });
+    assert_eq!(
+        step.rules[0].action,
+        Action::Egress {
+            send_through: None,
+            dns: false
+        }
+    );
 
     let output = compile(&snapshot);
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
@@ -2774,6 +5017,255 @@ async fn materialize_minimal_fixture_and_compile() {
         1,
         "探测凭据不多不少一份：{clients:#?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('c-shared-dns', 'app-main', 'platform.acme', 'Shared DNS Chain', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let selector = DestMatch::DomainSuffix(vec!["media.example".to_owned()]);
+    let stored_rule = Rule {
+        dest_match: selector.clone(),
+        action: Action::Egress {
+            send_through: None,
+            dns: false,
+        },
+    };
+    sqlx::query(
+        "INSERT INTO steps (chain_id, node_id, rules)
+         VALUES ('c-shared-dns', 'n1', $1)",
+    )
+    .bind(serde_json::to_value(vec![stored_rule.clone()]).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let resolution = EgressDnsResolution {
+        address: "192.0.2.53".to_owned(),
+        port: 53,
+        transport: EgressDnsTransport::Tcp,
+        address_strategy: EgressDnsAddressStrategy::UseIpv4v6,
+        fallback: EgressDnsFallback::Stop,
+    };
+    put_step_draft(
+        &db,
+        "app-main",
+        "c-main",
+        "n1",
+        PutStepRequest {
+            accept: None,
+            hop_in: None,
+            rules: vec![Rule {
+                dest_match: selector.clone(),
+                action: Action::Egress {
+                    send_through: None,
+                    dns: false,
+                },
+            }],
+            note: None,
+        },
+    )
+    .await;
+
+    let policy_count_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM node_egress_dns WHERE node_id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        policy_count_before, 0,
+        "put_step cannot create or own a machine DNS policy"
+    );
+    let policy_revision = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::SetNodeEgressDns {
+                node_id: "n1".to_owned(),
+                selector: selector.clone(),
+                resolution: Some(resolution.clone()),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let raw_rules: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT rules FROM steps WHERE node_id = 'n1' ORDER BY chain_id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        raw_rules
+            .iter()
+            .all(|rules| !rules.to_string().contains("resolution")),
+        "steps 只保留规则引用，不应复制机器级 DNS 配置"
+    );
+    let policy_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM node_egress_dns WHERE node_id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(policy_count, 1);
+
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let references = snapshot.apps[0]
+        .steps
+        .iter()
+        .filter(|step| step.node == "n1")
+        .filter(|step| {
+            step.rules[0].dest_match == selector
+                && matches!(step.rules[0].action, Action::Egress { .. })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(references.len(), 2);
+    assert!(!serde_json::to_string(&snapshot.apps)
+        .unwrap()
+        .contains("resolution"));
+
+    let console = db
+        .store
+        .redacted_snapshot(&system_admin(), None)
+        .await
+        .unwrap();
+    assert_eq!(console.node_egress_dns.len(), 1);
+    assert_eq!(console.node_egress_dns[0].node, "n1");
+    assert_eq!(console.node_egress_dns[0].selector, selector);
+    assert_eq!(console.node_egress_dns[0].resolution, resolution);
+
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::DeleteChain {
+                app_id: "app-main".to_owned(),
+                chain_id: "c-shared-dns".to_owned(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let after_chain_delete = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(after_chain_delete.node_egress_dns.len(), 1);
+    assert_eq!(after_chain_delete.node_egress_dns[0].selector, selector);
+
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::SetNodeEgressDns {
+                node_id: "n1".to_owned(),
+                selector,
+                resolution: None,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM node_egress_dns WHERE node_id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    let historical = db
+        .store
+        .materialize_snapshot(Some(policy_revision.revision_id))
+        .await
+        .unwrap();
+    assert_eq!(historical.node_egress_dns.len(), 1);
+    assert_eq!(historical.node_egress_dns[0].resolution, resolution);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn egress_dns_priority_is_persisted_and_reordered_as_one_machine_list() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    let first = DestMatch::DomainSuffix(vec!["first.example".to_owned()]);
+    let second = DestMatch::Geosite(vec!["second".to_owned()]);
+    let resolution = EgressDnsResolution {
+        address: "192.0.2.53".to_owned(),
+        port: 53,
+        transport: EgressDnsTransport::Tcp,
+        address_strategy: EgressDnsAddressStrategy::UseIp,
+        fallback: EgressDnsFallback::Stop,
+    };
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![
+                ModelOp::SetNodeEgressDns {
+                    node_id: "n1".to_owned(),
+                    selector: first.clone(),
+                    resolution: Some(resolution.clone()),
+                },
+                ModelOp::SetNodeEgressDns {
+                    node_id: "n1".to_owned(),
+                    selector: second.clone(),
+                    resolution: Some(resolution),
+                },
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let appended = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(appended.node_egress_dns[0].selector, first);
+    assert_eq!(appended.node_egress_dns[0].position, 0);
+    assert_eq!(appended.node_egress_dns[1].selector, second);
+    assert_eq!(appended.node_egress_dns[1].position, 1);
+
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::ReorderNodeEgressDns {
+                node_id: "n1".to_owned(),
+                selectors: vec![second.clone(), first.clone()],
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let reordered = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(reordered.node_egress_dns[0].selector, second);
+    assert_eq!(reordered.node_egress_dns[0].position, 0);
+    assert_eq!(reordered.node_egress_dns[1].selector, first);
+    assert_eq!(reordered.node_egress_dns[1].position, 1);
+
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::SetNodeEgressDns {
+                node_id: "n1".to_owned(),
+                selector: second,
+                resolution: None,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let compacted = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(compacted.node_egress_dns.len(), 1);
+    assert_eq!(compacted.node_egress_dns[0].selector, first);
+    assert_eq!(compacted.node_egress_dns[0].position, 0);
 }
 
 #[tokio::test]
@@ -2839,7 +5331,8 @@ async fn create_deployment_writes_structure_blobs_and_a_separate_frozen_grants_s
     assert_eq!(target.try_get::<String, _>("status").unwrap(), "pending");
 
     let state = sqlx::query(
-        "SELECT wave, disruptive, desired_structure, desired_grants, dispatched_grants
+        "SELECT wave, disruptive, desired_structure, desired_grants, dispatched_grants,
+                usage_generation_id
          FROM deployment_target_state
          WHERE deployment_id = $1 AND node_id = 'n1'",
     )
@@ -2870,6 +5363,16 @@ async fn create_deployment_writes_structure_blobs_and_a_separate_frozen_grants_s
     );
     assert_eq!(desired["wireguard"]["state"], "present");
     assert_eq!(desired["xray"]["state"], "present");
+    let usage_generation_id: i64 = state.try_get("usage_generation_id").unwrap();
+    let bindings: serde_json::Value = sqlx::query_scalar(
+        "SELECT bindings FROM usage_generations WHERE id = $1 AND deployment_id = $2",
+    )
+    .bind(usage_generation_id)
+    .bind(result.deployment_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(bindings["alice@platform.acme#i-main"]["kind"], "user");
     assert!(desired.get("grants").is_none());
     assert!(desired["actions"]
         .as_array()
@@ -3150,6 +5653,27 @@ async fn tenant_scoped_deployment_filters_targets_and_visibility() {
         .deployment_detail(&other, created.deployment_id, false)
         .await;
     assert!(matches!(other_detail, Err(StoreError::NotFound(_))));
+
+    let desired = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    let result = db
+        .store
+        .report_target_result(applied_report(&desired))
+        .await
+        .unwrap();
+    assert_eq!(result.deployment_status, "succeeded");
+    let serving_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM subscription_serving_state")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        serving_rows, 0,
+        "a successful tenant-scoped release must not pretend the whole fleet converged"
+    );
 }
 
 #[tokio::test]
@@ -3195,6 +5719,432 @@ async fn tenant_scoped_plan_filters_outside_warnings() {
         .warnings
         .iter()
         .any(|warning| warning.location == "n-other"));
+}
+
+/// Retirement is a model transition and an operational handoff in one transaction. Historical
+/// work remains readable, but its target is canceled and fenced by epoch; only the replacement
+/// all-disabled target can be claimed. The token stays alive exactly long enough to report that
+/// teardown and is revoked in the same transaction which marks the lifecycle retired.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn retirement_fences_old_target_and_converges_through_teardown_deployment() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    let existing = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "retirement-overlap-existing"),
+        )
+        .await
+        .unwrap();
+    assert!(existing
+        .plan
+        .targets
+        .iter()
+        .any(|target| target.node_id == "n1"));
+    let token = db.store.issue_node_token("n1").await.unwrap();
+    let stale_claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("the pre-retirement target is dispatched to characterize a late report");
+    assert_eq!(stale_claim.deployment_id, existing.deployment_id);
+
+    let retired = db
+        .store
+        .update_node_status(
+            &system_admin(),
+            "n1",
+            brocade_store::UpdateNodeStatusRequest {
+                status: "retired".to_owned(),
+                note: Some("characterize retirement overlap".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let frozen = db
+        .store
+        .deployment_detail(&system_admin(), existing.deployment_id, false)
+        .await
+        .unwrap();
+    assert!(
+        frozen.targets.iter().any(|target| target.node_id == "n1"),
+        "immutable history must retain the original target"
+    );
+    assert_eq!(frozen.status, "canceled");
+    assert!(retired
+        .canceled_deployment_ids
+        .contains(&existing.deployment_id));
+    let stale_report = db
+        .store
+        .report_target_result(applied_report(&stale_claim))
+        .await;
+    assert!(
+        matches!(stale_report, Err(StoreError::Unsupported(_))),
+        "a report from the prior lifecycle must be fenced after retirement"
+    );
+    let teardown_id = retired
+        .deployment_id
+        .expect("retirement creates a replacement teardown deployment");
+
+    let current = db
+        .store
+        .plan_deployment(&system_admin(), retired.revision_id)
+        .await
+        .unwrap();
+    let teardown_wave = current
+        .targets
+        .iter()
+        .find(|target| target.node_id == "n1")
+        .map(|target| target.wave)
+        .expect("retirement target has a wave");
+    assert!(
+        current.targets.iter().any(|target| {
+            target.node_id == "n1"
+                && target.status == PlannedTargetStatus::Pending
+                && target.actions.contains(&PlannedAction::DisableXray)
+                && target.actions.contains(&PlannedAction::DisableWireGuard)
+        }),
+        "the current plan must carry the retired node until teardown is confirmed"
+    );
+
+    let fleet_verify = db
+        .store
+        .verify_deployment(
+            &system_admin(),
+            VerifyDeploymentRequest {
+                revision_id: Some(retired.revision_id),
+                node_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !fleet_verify.converged && fleet_verify.summary.changed_targets > 0,
+        "retirement debt must keep fleet verification unconverged"
+    );
+    let node_verify = db
+        .store
+        .verify_deployment(
+            &system_admin(),
+            VerifyDeploymentRequest {
+                revision_id: Some(retired.revision_id),
+                node_id: Some("n1".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!node_verify.converged);
+    assert_eq!(
+        node_verify.node_lifecycle.unwrap().phase,
+        brocade_store::NodeLifecyclePhase::Retiring
+    );
+
+    let artifacts = db
+        .store
+        .artifact_index(&system_admin(), Some(retired.revision_id))
+        .await
+        .unwrap();
+    assert!(
+        artifacts
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.target_id == "n1" && artifact.state == "disabled"),
+        "artifact preview must retain the pure disabled contract"
+    );
+
+    let replacement_token = db.store.issue_node_token("n1").await;
+    assert!(matches!(replacement_token, Err(StoreError::Forbidden(_))));
+    assert!(matches!(
+        db.store.revoke_node_token("n1").await,
+        Err(StoreError::Unsupported(_))
+    ));
+    let authenticated = db
+        .store
+        .authenticate_node_token(&token.token)
+        .await
+        .unwrap()
+        .expect("the existing token remains valid while teardown is owed");
+    assert_eq!(
+        authenticated.lifecycle_phase,
+        brocade_store::NodeLifecyclePhase::Retiring
+    );
+
+    db.store
+        .confirm_deployment_wave(&system_admin(), teardown_id, teardown_wave, None)
+        .await
+        .unwrap();
+
+    let claimed = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("the replacement teardown target must be claimable");
+    assert_eq!(claimed.deployment_id, teardown_id);
+    assert!(matches!(
+        claimed.desired.phantun,
+        DesiredArtifact::Disabled { .. }
+    ));
+    assert!(matches!(
+        claimed.desired.hy2_port_hop,
+        DesiredArtifact::Disabled { .. }
+    ));
+    assert!(matches!(
+        claimed.desired.wireguard,
+        DesiredArtifact::Disabled { .. }
+    ));
+    assert!(matches!(
+        claimed.desired.xray,
+        DesiredArtifact::Disabled { .. }
+    ));
+
+    db.store
+        .report_target_result(applied_report(&claimed))
+        .await
+        .unwrap();
+
+    let lifecycle = db.store.node_lifecycle("n1").await.unwrap();
+    assert_eq!(lifecycle.phase, brocade_store::NodeLifecyclePhase::Retired);
+    assert_eq!(lifecycle.deployment_id, Some(teardown_id));
+    assert!(db
+        .store
+        .authenticate_node_token(&token.token)
+        .await
+        .unwrap()
+        .is_none());
+
+    let converged = db
+        .store
+        .plan_deployment(&system_admin(), retired.revision_id)
+        .await
+        .unwrap();
+    assert!(converged
+        .targets
+        .iter()
+        .all(|target| target.node_id != "n1"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses_a_new_epoch() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let old_token = db.store.issue_node_token("n1").await.unwrap();
+
+    let retiring = db
+        .store
+        .update_node_status(
+            &system_admin(),
+            "n1",
+            brocade_store::UpdateNodeStatusRequest {
+                status: "retired".to_owned(),
+                note: Some("force retirement setup".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(retiring.lifecycle.lifecycle_epoch, 1);
+    assert_eq!(
+        retiring.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Retiring
+    );
+    let first_teardown = retiring.deployment_id.expect("retirement has a teardown");
+    db.store
+        .cancel_deployment(&system_admin(), first_teardown)
+        .await
+        .unwrap();
+    let repaired = db
+        .store
+        .update_node_status(
+            &system_admin(),
+            "n1",
+            brocade_store::UpdateNodeStatusRequest {
+                status: "retired".to_owned(),
+                note: Some("repair canceled teardown".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(repaired.revision_id, retiring.revision_id);
+    assert_eq!(repaired.lifecycle.lifecycle_epoch, 1);
+    assert_ne!(repaired.deployment_id, Some(first_teardown));
+
+    let abandoned = db
+        .store
+        .abandon_node(
+            &system_admin(),
+            "n1",
+            AbandonNodeRequest {
+                reason: "machine is permanently unreachable".to_owned(),
+                unregister_warp: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(abandoned.lifecycle.lifecycle_epoch, 2);
+    assert_eq!(
+        abandoned.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Abandoned
+    );
+    assert!(abandoned.lifecycle.completed_at.is_some());
+    assert!(db
+        .store
+        .authenticate_node_token(&old_token.token)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.store.issue_node_token("n1").await,
+        Err(StoreError::Forbidden(_))
+    ));
+    assert!(db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .is_none());
+    let terminal_plan = db
+        .store
+        .plan_deployment(&system_admin(), abandoned.revision_id)
+        .await
+        .unwrap();
+    assert!(
+        terminal_plan
+            .targets
+            .iter()
+            .all(|target| target.node_id != "n1"),
+        "a force-retired machine must not poison every future deployment"
+    );
+    let terminal_verify = db
+        .store
+        .verify_deployment(
+            &system_admin(),
+            VerifyDeploymentRequest {
+                revision_id: Some(abandoned.revision_id),
+                node_id: Some("n1".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!terminal_verify.converged);
+    assert_eq!(terminal_verify.summary.total_targets, 1);
+    assert_eq!(terminal_verify.summary.changed_targets, 1);
+
+    let events = sqlx::query_as::<_, (i64, String)>(
+        "SELECT lifecycle_epoch, event
+           FROM node_lifecycle_events
+          WHERE node_id = 'n1'
+          ORDER BY lifecycle_epoch, id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            (1, "retirement-requested".to_owned()),
+            (2, "retirement-abandoned".to_owned()),
+        ]
+    );
+
+    let restored = db
+        .store
+        .update_node_status(
+            &system_admin(),
+            "n1",
+            brocade_store::UpdateNodeStatusRequest {
+                status: "active".to_owned(),
+                note: Some("machine recovered".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.lifecycle.lifecycle_epoch, 3);
+    assert_eq!(
+        restored.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Active
+    );
+    assert!(db
+        .store
+        .authenticate_node_token(&old_token.token)
+        .await
+        .unwrap()
+        .is_none());
+    let new_token = db.store.issue_node_token("n1").await.unwrap();
+    assert!(db
+        .store
+        .authenticate_node_token(&new_token.token)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn retirement_and_an_inflight_agent_report_have_one_serializable_winner_without_deadlock() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let deployment = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "retirement-report-race"),
+        )
+        .await
+        .unwrap();
+    let claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("the active target is in flight before retirement races it");
+    assert_eq!(claim.deployment_id, deployment.deployment_id);
+
+    let admin = system_admin();
+    let (report, retirement) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            db.store.report_target_result(applied_report(&claim)),
+            db.store.update_node_status(
+                &admin,
+                "n1",
+                brocade_store::UpdateNodeStatusRequest {
+                    status: "retired".to_owned(),
+                    note: Some("race an in-flight report".to_owned()),
+                },
+            )
+        )
+    })
+    .await
+    .expect("retirement/report race must not wait on an inverted database lock order");
+    let retirement = retirement.expect("retirement is the durable winner of the lifecycle change");
+    assert_eq!(
+        retirement.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Retiring
+    );
+    if let Err(error) = report {
+        assert!(
+            matches!(error, StoreError::Unsupported(_) | StoreError::Conflict(_)),
+            "the losing report must be rejected as stale, not fail internally: {error}"
+        );
+    }
+    let lifecycle = db.store.node_lifecycle("n1").await.unwrap();
+    assert_eq!(lifecycle.lifecycle_epoch, 1);
+    assert_eq!(lifecycle.phase, brocade_store::NodeLifecyclePhase::Retiring);
+    assert!(lifecycle.deployment_id.is_some());
 }
 
 #[tokio::test]
@@ -3542,25 +6492,49 @@ async fn permission_change_is_automatically_released_from_the_durable_queue() {
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
     store_current_model_snapshot(db.pool(), &db.store).await;
 
-    db.store
+    let base_deployment = db
+        .store
         .create_deployment(
             &system_admin(),
             create_deployment_request(1, "grants-auto-base"),
         )
         .await
         .unwrap();
-    let base = db
-        .store
-        .claim_desired_for_node("n1")
-        .await
-        .unwrap()
-        .unwrap();
-    db.store
-        .report_target_result(applied_report(&base))
-        .await
-        .unwrap();
+    for wave in 1..=base_deployment.plan.summary.max_wave {
+        if wave > 1 {
+            db.store
+                .confirm_deployment_wave(
+                    &system_admin(),
+                    base_deployment.deployment_id,
+                    wave,
+                    Some("tester".to_owned()),
+                )
+                .await
+                .unwrap();
+        }
+        let nodes = base_deployment
+            .plan
+            .targets
+            .iter()
+            .filter(|target| target.wave == wave)
+            .map(|target| target.node_id.clone())
+            .collect::<Vec<_>>();
+        for node_id in nodes {
+            let desired = db
+                .store
+                .claim_desired_for_node(&node_id)
+                .await
+                .unwrap()
+                .expect("the current base wave should be claimable");
+            db.store
+                .report_target_result(applied_report(&desired))
+                .await
+                .unwrap();
+        }
+    }
 
     let changed = db
         .store
@@ -3606,6 +6580,19 @@ async fn permission_change_is_automatically_released_from_the_durable_queue() {
         .deployment_id
         .expect("worker should create a grants order");
 
+    let targets: Vec<String> = sqlx::query_scalar(
+        "SELECT node_id FROM deployment_targets WHERE deployment_id = $1 ORDER BY node_id",
+    )
+    .bind(deployment_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        targets,
+        vec!["n1"],
+        "the automatic order should contain only the machine whose grants changed"
+    );
+
     let row = sqlx::query("SELECT kind, actor, revision_id FROM deployments WHERE id = $1")
         .bind(deployment_id)
         .fetch_one(db.pool())
@@ -3625,7 +6612,7 @@ async fn permission_change_is_automatically_released_from_the_durable_queue() {
         .unwrap()
         .expect("automatic grants order should be claimable");
     assert_eq!(desired.deployment_id, deployment_id);
-    let DesiredGrants::Present { inbounds } = desired.desired.grants else {
+    let DesiredGrants::Present { ref inbounds } = desired.desired.grants else {
         panic!("grants should be present");
     };
     assert!(
@@ -3635,6 +6622,169 @@ async fn permission_change_is_automatically_released_from_the_durable_queue() {
             .all(|client| client.email != "alice@platform.acme#i-main"),
         "the automatic order must contain the revoked state (probe identities may remain)"
     );
+    assert!(
+        db.store
+            .claim_desired_for_node("n-other")
+            .await
+            .unwrap()
+            .is_none(),
+        "an already-matching machine must not receive a synthetic grants target"
+    );
+    let result = db
+        .store
+        .report_target_result(applied_report(&desired))
+        .await
+        .unwrap();
+    assert_eq!(result.deployment_status, "succeeded");
+
+    let serving_permissions: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT permissions_revision_id, permissions_deployment_id
+           FROM subscription_serving_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        serving_permissions,
+        (
+            i64::try_from(changed.revision_id).unwrap(),
+            Some(deployment_id),
+        ),
+        "a settled automatic grants order advances globally even though unchanged machines have no target rows"
+    );
+    db.store
+        .clash_subscription_by_uuid("f98b74ba-58f1-41d0-aaad-8fa5724c6d2d")
+        .await
+        .expect("the stable subscription must reopen after the changed target converges");
+}
+
+// A grants deployment is projected onto the exact configuration a machine is running. That may
+// be an old stored snapshot, not the current tables. Development snapshots written while XHTTP
+// called its client dialer field `mux` used to fail before a deployment row could be created, so
+// the durable job retried invisibly forever. This reproduces that production path rather than
+// merely deserializing an isolated JSON fixture.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn automatic_grants_fold_legacy_xhttp_mux_in_the_running_revision() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "UPDATE ingresses
+         SET transport_kind = 'vless-reality-xhttp',
+             reality_flow = '',
+             xhttp_path = '/legacy',
+             xhttp_host = NULL,
+             xhttp_xmux = NULL,
+             xhttp_mode = NULL
+         WHERE id = 'i-main'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "legacy-xhttp-running-base"),
+        )
+        .await
+        .unwrap();
+    let base = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base))
+        .await
+        .unwrap();
+
+    // Mutate only the historical serialized shape. The live table remains a valid current
+    // revision, exactly as in an upgraded control plane holding older model_snapshots rows.
+    let mut legacy: serde_json::Value =
+        sqlx::query_scalar("SELECT snapshot FROM model_snapshots WHERE revision_id = 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let legacy_xhttp = legacy["apps"][0]["ingresses"][0]["wires"]["vless"]["xhttp"]
+        .as_object_mut()
+        .expect("fixture has one XHTTP wire");
+    legacy_xhttp.insert("mux".to_owned(), serde_json::Value::Null);
+    sqlx::query("UPDATE model_snapshots SET snapshot = $2 WHERE revision_id = $1")
+        .bind(1_i64)
+        .bind(legacy)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let changed = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+                ingress_id: "i-main".to_owned(),
+                enabled: false,
+                note: Some("legacy XHTTP snapshot regression".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(changed.revision_id > 1);
+
+    // Once revision 1 is historical, reading it must remove the old key while preserving the
+    // XHTTP hierarchy. This is the same read performed by create_automatic_grants_deployment.
+    let running = db.store.materialize_snapshot(Some(1)).await.unwrap();
+    let xhttp = running.apps[0].ingresses[0]
+        .wires
+        .xhttp()
+        .expect("the legacy transport remains XHTTP");
+    assert_eq!(xhttp.path, "/legacy");
+    assert_eq!(xhttp.xmux, None);
+
+    // Model a worker that has already failed a few rounds. This checks the status endpoint's data
+    // source as well as recovery: there is still no deployment row at this point.
+    sqlx::query(
+        "UPDATE jobs
+         SET attempts = 3,
+             last_error = 'legacy snapshot could not be decoded',
+             updated_at = now()
+         WHERE kind = 'grants-deployment' AND status = 'queued'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let waiting = db.store.grant_automation_status().await.unwrap();
+    assert_eq!(waiting.pending_jobs, 1);
+    assert_eq!(waiting.retrying_jobs, 1);
+    assert_eq!(waiting.max_attempts, 3);
+    assert_eq!(waiting.latest_revision_id, Some(changed.revision_id));
+    assert!(waiting.oldest_pending_at.is_some());
+    assert!(waiting.last_attempt_at.is_some());
+    assert_eq!(
+        waiting.last_error.as_deref(),
+        Some("legacy snapshot could not be decoded")
+    );
+
+    let outcome = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(outcome.revision_id, Some(changed.revision_id));
+    assert!(outcome.waiting.is_none(), "{outcome:?}");
+    assert!(
+        outcome.deployment_id.is_some(),
+        "the old running topology must no longer block the permission order"
+    );
+
+    let recovered = db.store.grant_automation_status().await.unwrap();
+    assert_eq!(recovered.pending_jobs, 0);
+    assert_eq!(recovered.retrying_jobs, 0);
+    assert_eq!(recovered.last_error, None);
 }
 
 // Grants are a compiled artifact, not just rows in the grants table.  A global flow change alters
@@ -3656,6 +6806,17 @@ async fn an_indirect_grants_artifact_change_is_automatically_queued() {
              reality_flow = NULL,
              reality_fallback_mode = 'global-site'
          WHERE id = 'i-main'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE control_state
+            SET reality_dest = 'www.example.com:443',
+                reality_server_names = '[\"www.example.com\"]'::jsonb,
+                reality_fingerprint = 'chrome',
+                reality_flow = 'xtls-rprx-vision'
+          WHERE id = TRUE",
     )
     .execute(db.pool())
     .await
@@ -4725,6 +7886,7 @@ async fn report_target_success_updates_applied_state_and_completes_deployment() 
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
 
     let created = db
         .store
@@ -4740,6 +7902,9 @@ async fn report_target_success_updates_applied_state_and_completes_deployment() 
         .await
         .unwrap()
         .unwrap();
+    let usage_generation_id = desired
+        .usage_generation_id
+        .expect("xray-changing target carries a frozen usage generation");
 
     let result = db
         .store
@@ -4749,6 +7914,17 @@ async fn report_target_success_updates_applied_state_and_completes_deployment() 
 
     assert_eq!(result.target_status, "succeeded");
     assert_eq!(result.deployment_status, "succeeded");
+    let activated: (Option<i64>, i64) = sqlx::query_as(
+        "SELECT s.usage_generation_id,
+                (SELECT count(*) FROM usage_generation_activations
+                 WHERE node_id = 'n1' AND generation_id = $1)
+         FROM node_agent_state s WHERE s.node_id = 'n1'",
+    )
+    .bind(usage_generation_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(activated, (Some(usage_generation_id), 1));
 
     let deployment = sqlx::query(
         "SELECT status, active, finished_at IS NOT NULL AS finished
@@ -4768,6 +7944,32 @@ async fn report_target_success_updates_applied_state_and_completes_deployment() 
         None
     );
     assert!(deployment.try_get::<bool, _>("finished").unwrap());
+
+    let serving: (i64, i64, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+        "SELECT topology_revision_id, permissions_revision_id,
+                topology_deployment_id, permissions_deployment_id, generation
+           FROM subscription_serving_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        serving,
+        (
+            1,
+            1,
+            Some(created.deployment_id),
+            Some(created.deployment_id),
+            1,
+        ),
+        "the final successful report must atomically establish the first serving checkpoint"
+    );
+    let subscription = db
+        .store
+        .clash_subscription_by_uuid("2d2304da-f114-4574-8d44-625afdb1db5c")
+        .await
+        .unwrap();
+    assert!(subscription.content.contains("name: \"Main Chain\""));
 
     let cleared_grants: Option<serde_json::Value> = sqlx::query(
         "SELECT dispatched_grants
@@ -4957,18 +8159,366 @@ async fn list_deployments_returns_recent_status_and_target_counts() {
     assert_eq!(item.max_wave, 1);
 }
 
-// A reported reading's instant has to sit close to the control plane's present:
-// record_usage_report checks it against now() and refuses the whole round beyond 10 minutes
-// (MAX_CLOCK_SKEW_SECS in usage.rs, "better to take nothing than to take it into the wrong
-// month"). Hardcoding an absolute second leaves these cases green only within ten minutes of that
-// instant — 1_800_000_000 is 2027-01-15, and until then they were permanently red.
-// The base is two minutes ago, so that the most-offset round (+120) lands exactly on now.
+// Keep ordinary rounds close to now. The protocol deliberately accepts arbitrarily old spool
+// replay; only a clock more than ten minutes in the future is retryably refused.
 fn usage_report_base_unix() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_secs() as i64;
     now - 120
+}
+
+fn protocol_v3_usage(
+    sequence: u64,
+    read_at: i64,
+    epoch: &str,
+    uplink_bytes: u64,
+    downlink_bytes: u64,
+) -> UsageReportRequest {
+    UsageReportRequest {
+        agent_instance_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        sequence: Some(sequence),
+        usage_generation_id: None,
+        read_at_unix_secs: read_at,
+        xray_started_at_unix_secs: read_at - 60,
+        xray_epoch: Some(epoch.to_owned()),
+        route: None,
+        counters: vec![UsageCounter {
+            label: "alice@platform.acme#i-main".to_owned(),
+            uplink_bytes,
+            downlink_bytes,
+        }],
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn unknown_counter_growth_is_ephemeral_and_not_persisted() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+
+    let mut first = protocol_v3_usage(1, base, "boot-a:100", 10, 20);
+    first.counters[0].label = "removed-user".to_owned();
+    first.counters.push(UsageCounter {
+        label: "probe#i-main".to_owned(),
+        uplink_bytes: 100,
+        downlink_bytes: 200,
+    });
+    assert_eq!(
+        db.store
+            .record_usage_report("n1", first)
+            .await
+            .unwrap()
+            .skipped_counters,
+        1
+    );
+    let first_list = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    let first_result = first_list
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap()
+        .usage_last_result
+        .as_ref()
+        .unwrap();
+    assert_eq!(first_result["growing_unknown_counters"], 0);
+
+    let mut second = protocol_v3_usage(2, base + 30, "boot-a:100", 11, 20);
+    second.counters[0].label = "removed-user".to_owned();
+    second.counters.push(UsageCounter {
+        label: "probe#i-main".to_owned(),
+        uplink_bytes: 150,
+        downlink_bytes: 280,
+    });
+    db.store.record_usage_report("n1", second).await.unwrap();
+    let second_list = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    let second_result = second_list
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap()
+        .usage_last_result
+        .as_ref()
+        .unwrap();
+    assert_eq!(second_result["growing_unknown_counters"], 1);
+
+    // Probe traffic uses a real Xray account but is neither billable nor an attribution anomaly.
+    // It keeps moving while the genuine unknown stays flat; the latest growth finding must clear.
+    let mut probe_only_growth = protocol_v3_usage(3, base + 60, "boot-a:100", 11, 20);
+    probe_only_growth.counters[0].label = "removed-user".to_owned();
+    probe_only_growth.counters.push(UsageCounter {
+        label: "probe#i-main".to_owned(),
+        uplink_bytes: 200,
+        downlink_bytes: 360,
+    });
+    let probe_only_result = db
+        .store
+        .record_usage_report("n1", probe_only_growth)
+        .await
+        .unwrap();
+    assert_eq!(probe_only_result.skipped_counters, 1);
+    let latest_list = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    let latest_result = latest_list
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap()
+        .usage_last_result
+        .as_ref()
+        .unwrap();
+    assert_eq!(latest_result["growing_unknown_counters"], 0);
+
+    let persisted: serde_json::Value =
+        sqlx::query_scalar("SELECT usage_last_result FROM node_agent_state WHERE node_id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(persisted.get("growing_unknown_counters").is_none());
+
+    // A fresh store represents a restarted control plane and intentionally has no baseline.
+    let restarted = PgStore::from_pool(db.pool().clone());
+    let restarted_list = restarted
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    let restarted_result = restarted_list
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap()
+        .usage_last_result
+        .as_ref()
+        .unwrap();
+    assert!(restarted_result.get("growing_unknown_counters").is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn usage_report_receipt_is_exactly_once_under_retry_and_concurrency() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+
+    let first = protocol_v3_usage(1, base, "boot-a:100", 100, 200);
+    let (a, b) = tokio::join!(
+        db.store.record_usage_report("n1", first.clone()),
+        db.store.record_usage_report("n1", first.clone())
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_ne!(
+        a.duplicate, b.duplicate,
+        "one commit and one durable replay"
+    );
+    assert_eq!(a.usage_generation_id, b.usage_generation_id);
+
+    let mut reused = first;
+    reused.counters[0].uplink_bytes = 101;
+    assert!(matches!(
+        db.store.record_usage_report("n1", reused).await,
+        Err(StoreError::InvalidData(message)) if message.contains("reused")
+    ));
+
+    let second = protocol_v3_usage(2, base + 30, "boot-a:100", 150, 280);
+    let landed = db
+        .store
+        .record_usage_report("n1", second.clone())
+        .await
+        .unwrap();
+    assert_eq!(landed.inserted_samples, 1);
+    assert!(
+        db.store
+            .record_usage_report("n1", second)
+            .await
+            .unwrap()
+            .duplicate
+    );
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM usage_report_receipts),
+                (SELECT count(*) FROM usage_readings),
+                (SELECT count(*) FROM usage_samples)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (2, 2, 1));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn exact_xray_epoch_rejects_counter_regression_and_new_epoch_marks_a_gap() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    db.store
+        .record_usage_report("n1", protocol_v3_usage(1, base, "boot-a:100", 100, 200))
+        .await
+        .unwrap();
+
+    let regressed = db
+        .store
+        .record_usage_report("n1", protocol_v3_usage(2, base + 20, "boot-a:100", 50, 100))
+        .await
+        .unwrap();
+    assert_eq!(regressed.rejected_counters, 1);
+    assert_eq!(regressed.inserted_samples, 0);
+
+    let recovered = db
+        .store
+        .record_usage_report(
+            "n1",
+            protocol_v3_usage(3, base + 40, "boot-a:100", 150, 260),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.inserted_samples, 1);
+    let recovered_bytes: (i64, i64) = sqlx::query_as(
+        "SELECT uplink_bytes, downlink_bytes FROM usage_samples ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered_bytes,
+        (50, 60),
+        "bad reading did not replace the head"
+    );
+
+    let restarted = db
+        .store
+        .record_usage_report("n1", protocol_v3_usage(4, base + 60, "boot-a:900", 20, 30))
+        .await
+        .unwrap();
+    assert_eq!(restarted.inserted_samples, 1);
+    assert_eq!(restarted.gap_samples, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn legacy_report_after_an_exact_epoch_does_not_rebill_climbing_counters() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    db.store
+        .record_usage_report("n1", protocol_v3_usage(1, base, "boot-a:100", 100, 200))
+        .await
+        .unwrap();
+
+    // During a rolling downgrade (or while the final old-Agent spool entry drains), the report
+    // has no exact process epoch. Its counters are still authoritative: if they climbed, this is
+    // a delta rather than a restart whose entire absolute value should be billed again.
+    let legacy = db
+        .store
+        .record_usage_report(
+            "n1",
+            UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
+                read_at_unix_secs: base + 30,
+                xray_started_at_unix_secs: base + 20,
+                route: None,
+                counters: vec![UsageCounter {
+                    label: "alice@platform.acme#i-main".to_owned(),
+                    uplink_bytes: 140,
+                    downlink_bytes: 260,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy.inserted_samples, 1);
+    assert_eq!(legacy.gap_samples, 0);
+    let bytes: (i64, i64) = sqlx::query_as(
+        "SELECT uplink_bytes, downlink_bytes FROM usage_samples ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(bytes, (40, 60));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn frozen_usage_generation_survives_model_removal_and_raw_retention() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let now = usage_report_base_unix();
+    let old = now - 3 * 86_400;
+    let first = db
+        .store
+        .record_usage_report("n1", protocol_v3_usage(1, old, "boot-a:100", 100, 200))
+        .await
+        .unwrap();
+    let generation = first.usage_generation_id.unwrap();
+
+    // The model no longer owns this label, but a delayed report from the already-running
+    // generation still has an immutable, auditable owner.
+    sqlx::query("DELETE FROM grants WHERE user_id = 'alice' AND ingress_id = 'i-main'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut delayed = protocol_v3_usage(2, old + 30, "boot-a:100", 160, 290);
+    delayed.usage_generation_id = Some(generation);
+    let delayed = db.store.record_usage_report("n1", delayed).await.unwrap();
+    assert_eq!(delayed.inserted_samples, 1);
+    assert_eq!(delayed.skipped_counters, 0);
+
+    let deleted = db.store.prune_usage_readings(1).await.unwrap();
+    assert_eq!(deleted, 2);
+    let heads: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_counter_heads")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        heads, 1,
+        "retention must never delete the accounting baseline"
+    );
+
+    let mut current = protocol_v3_usage(3, now, "boot-a:100", 200, 350);
+    current.usage_generation_id = Some(generation);
+    let current = db.store.record_usage_report("n1", current).await.unwrap();
+    assert_eq!(
+        current.inserted_samples, 1,
+        "head survives raw history pruning"
+    );
+    let bytes: (i64, i64) = sqlx::query_as(
+        "SELECT uplink_bytes, downlink_bytes FROM usage_samples ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(bytes, (40, 60));
 }
 
 #[tokio::test]
@@ -4986,6 +8536,10 @@ async fn usage_report_records_delta_samples_and_restart_gaps() {
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
                 read_at_unix_secs: base,
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
@@ -5014,6 +8568,10 @@ async fn usage_report_records_delta_samples_and_restart_gaps() {
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
                 read_at_unix_secs: base + 60,
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
@@ -5035,6 +8593,10 @@ async fn usage_report_records_delta_samples_and_restart_gaps() {
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
                 read_at_unix_secs: base + 120,
                 xray_started_at_unix_secs: base + 90,
                 route: None,
@@ -5102,6 +8664,10 @@ async fn usage_report_takes_a_delta_when_the_start_time_jumps_but_counters_climb
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
                 read_at_unix_secs: base,
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
@@ -5120,6 +8686,10 @@ async fn usage_report_takes_a_delta_when_the_start_time_jumps_but_counters_climb
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
                 read_at_unix_secs: base + 60,
                 // Two seconds old: a probe child's start time, not the server's.
                 xray_started_at_unix_secs: base + 58,
@@ -5193,6 +8763,10 @@ async fn usage_report_rejects_labels_for_another_nodes_ingress() {
             .record_usage_report(
                 "n2",
                 UsageReportRequest {
+                    agent_instance_id: None,
+                    sequence: None,
+                    usage_generation_id: None,
+                    xray_epoch: None,
                     read_at_unix_secs: read_at,
                     xray_started_at_unix_secs: base - 1000,
                     route: None,
@@ -5233,6 +8807,10 @@ async fn usage_report_rejects_labels_for_another_nodes_ingress() {
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
                 read_at_unix_secs: base,
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
@@ -5315,6 +8893,10 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
             .record_usage_report(
                 "n1",
                 UsageReportRequest {
+                    agent_instance_id: None,
+                    sequence: None,
+                    usage_generation_id: None,
+                    xray_epoch: None,
                     read_at_unix_secs: read_at,
                     xray_started_at_unix_secs: base - 1000,
                     route: None,
@@ -5344,6 +8926,18 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
     assert_eq!(row.try_get::<i64, _>("uplink_bytes").unwrap(), 100);
     assert_eq!(row.try_get::<i64, _>("downlink_bytes").unwrap(), 200);
 
+    let frozen_binding: serde_json::Value = sqlx::query_scalar(
+        "SELECT g.bindings -> 'c-main@n2'
+           FROM node_agent_state s
+           JOIN usage_generations g ON g.id = s.usage_generation_id
+          WHERE s.node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(frozen_binding["kind"], "chain-hop");
+    assert_eq!(frozen_binding["node_id"], "n2");
+
     // The raw reading is still recorded against whoever read it — differences must be taken
     // against one source.
     let readings: i64 = sqlx::query(
@@ -5356,9 +8950,9 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
     .unwrap();
     assert_eq!(readings, 2);
 
-    // The converse: the same label and the same machine with only the dial method changed to
-    // overlay. There n1 dials n2's relay port, the bytes should be read by n2 itself, and n1
-    // reporting them is an anomaly, refused as usual.
+    // Editing the live model alone must not reinterpret a report from the generation already
+    // running on the machine. Until a deployment converges and activates a new frozen map, n1 is
+    // still the legitimate reporter for this label.
     let overlay_rules = json!([
         {
             "m": { "t": "any" },
@@ -5371,11 +8965,15 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
         .await
         .unwrap();
 
-    let rejected = db
+    let still_owned_by_frozen_generation = db
         .store
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                agent_instance_id: None,
+                sequence: None,
+                usage_generation_id: None,
+                xray_epoch: None,
                 read_at_unix_secs: base + 120,
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
@@ -5388,8 +8986,8 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
         )
         .await
         .unwrap();
-    assert_eq!(rejected.rejected_counters, 1);
-    assert_eq!(rejected.accepted_readings, 0);
+    assert_eq!(still_owned_by_frozen_generation.rejected_counters, 0);
+    assert_eq!(still_owned_by_frozen_generation.accepted_readings, 1);
 }
 
 #[tokio::test]
@@ -5861,10 +9459,43 @@ async fn a_grants_deployment_carries_no_config_for_the_agent_to_apply() {
             .unwrap();
     assert!(xray_before.is_some());
 
+    // Serving accepts a sparse grants target set only with the durable worker's proof that
+    // whole-fleet planning found no deferred machine. Production writes this before the target
+    // converges; this test creates the grants order directly, so reproduce that proof explicitly.
+    sqlx::query(
+        "INSERT INTO jobs (kind, status, payload)
+         VALUES (
+             'grants-deployment',
+             'succeeded',
+             jsonb_build_object('revision_id', $1::bigint, 'deployment_id', $2::bigint)
+         )",
+    )
+    .bind(i64::try_from(revoked.revision_id).unwrap())
+    .bind(grants.deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
     db.store
         .report_target_result(applied_report(&desired))
         .await
         .unwrap();
+
+    let serving_permissions: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT permissions_revision_id, permissions_deployment_id
+           FROM subscription_serving_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        serving_permissions,
+        (
+            i64::try_from(revoked.revision_id).unwrap(),
+            Some(grants.deployment_id),
+        ),
+        "a successful grants release advances only the serving permission line"
+    );
 
     let after = sqlx::query(
         "SELECT xray_state, xray_sha256, grants_state
@@ -7467,6 +11098,52 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO apps (id, label, position)
+         VALUES ('app-secondary', 'Secondary App', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('c-secondary', 'app-main', 'platform.acme', 'Secondary Chain', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingresses (
+            id, app_id, chain_id, node_id, bind, port, front_id, transport_kind,
+            reality_private_key, reality_public_key, reality_short_ids,
+            reality_dest, reality_server_names, reality_fingerprint, reality_flow,
+            reality_fallback_mode
+         )
+         SELECT 'i-secondary', app_id, 'c-secondary', node_id, bind, 444, front_id,
+                transport_kind, reality_private_key || '-secondary',
+                reality_public_key || '-secondary', reality_short_ids,
+                reality_dest, reality_server_names, reality_fingerprint, reality_flow,
+                reality_fallback_mode
+         FROM ingresses
+         WHERE id = 'i-main'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO steps (chain_id, node_id, rules)
+         SELECT 'c-secondary', node_id, rules FROM steps WHERE chain_id = 'c-main'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
+         VALUES ('app-main', 'platform.acme', 'alice', 'i-secondary')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     store_current_model_snapshot(db.pool(), &db.store).await;
     let target_snapshot = db.store.materialize_snapshot(None).await.unwrap();
 
@@ -7492,6 +11169,36 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
         deployment_status(db.pool(), published.deployment_id).await,
         "succeeded"
     );
+
+    let reordered = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![
+                ModelOp::ReorderApps {
+                    ids: vec!["app-secondary".to_owned(), "app-main".to_owned()],
+                },
+                ModelOp::ReorderChains {
+                    app_id: "app-main".to_owned(),
+                    ids: vec!["c-secondary".to_owned(), "c-main".to_owned()],
+                },
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(reordered.revision_id > 1);
+    let pending_order: Vec<String> = sqlx::query_scalar("SELECT id FROM apps ORDER BY position")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(pending_order, ["app-secondary", "app-main"]);
+    let pending_chain_order: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM chains WHERE app_id = 'app-main' ORDER BY position, id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(pending_chain_order, ["c-secondary", "c-main"]);
 
     let mut changed_settings = target_snapshot.settings.clone();
     changed_settings.geodata.cron = "CRON_TZ=UTC 15 3 * * *".to_owned();
@@ -7533,6 +11240,14 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
         restored, expected,
         "discard must restore the complete model"
     );
+    let restored_order: Vec<&str> = restored.apps.iter().map(|app| app.id.as_str()).collect();
+    assert_eq!(restored_order, ["app-main", "app-secondary"]);
+    let restored_chain_order: Vec<&str> = restored.apps[0]
+        .chains
+        .iter()
+        .map(|chain| chain.id.as_str())
+        .collect();
+    assert_eq!(restored_chain_order, ["c-main", "c-secondary"]);
 }
 
 #[tokio::test]
@@ -7673,6 +11388,7 @@ async fn migration_enforces_reality_short_id_shape() {
     assert_insert_ingress_short_ids_fails(db.pool(), "i-empty", 444, json!([])).await;
     assert_insert_ingress_short_ids_fails(db.pool(), "i-non-string", 445, json!([123])).await;
     assert_insert_ingress_short_ids_fails(db.pool(), "i-non-hex", 446, json!(["not-hex"])).await;
+    assert_insert_ingress_short_ids_fails(db.pool(), "i-odd-length", 449, json!(["abc"])).await;
     assert_insert_ingress_short_ids_fails(
         db.pool(),
         "i-too-long",
@@ -8262,6 +11978,145 @@ async fn insert_basic_node(
     .unwrap();
 }
 
+#[tokio::test]
+async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform', 'Platform')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    insert_basic_node(db.pool(), "net-observe", "platform", "10.66.0.90", 51990).await;
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let network = NetworkDetailSample {
+        tcp_curr_estab: Some(82),
+        tcp_inuse: Some(95),
+        tcp_time_wait: Some(31),
+        tcp_orphan: Some(0),
+        tcp_alloc: Some(142),
+        tcp_mem_bytes: Some(512 * 1024),
+        udp_inuse: Some(18),
+        udp_mem_bytes: Some(64 * 1024),
+        tcp_active_opens: Some(41),
+        tcp_passive_opens: Some(36),
+        tcp_attempt_fails: Some(2),
+        tcp_estab_resets: Some(1),
+        tcp_retrans_segs: Some(3),
+        tcp_syn_retrans: Some(1),
+        tcp_in_errors: Some(0),
+        tcp_out_resets: Some(2),
+        tcp_timeouts: Some(0),
+        tcp_listen_overflows: Some(0),
+        tcp_listen_drops: Some(0),
+        udp_in_errors: Some(0),
+        udp_no_ports: Some(1),
+        udp_rcvbuf_errors: Some(0),
+        udp_sndbuf_errors: Some(0),
+        ..Default::default()
+    };
+    let disk = DiskDetailSample {
+        total_bytes: Some(8 * 1024 * 1024),
+        inode_total: Some(100_000),
+        inode_free: Some(90_000),
+        read_bps: Some(2048),
+        write_bps: Some(4096),
+        read_iops: Some(1.5),
+        write_iops: Some(2.5),
+        read_await_ms: Some(0.8),
+        write_await_ms: Some(1.2),
+        busy_pct: Some(12.0),
+        queue_depth: Some(0.4),
+        in_flight: Some(1),
+        pressure_some_pct: Some(0.2),
+        pressure_full_pct: Some(0.0),
+    };
+    let sample = LoadSample {
+        window_start_unix_secs: now - 30,
+        window_end_unix_secs: now,
+        has_gap: false,
+        cpu_user_pct: 1.0,
+        cpu_sys_pct: 1.0,
+        cpu_softirq_pct: 1.0,
+        cpu_peak_pct: 4.0,
+        cpu_steal_pct: 0.0,
+        load1: 0.1,
+        cpu_detail: None,
+        mem_available_bytes: 1024,
+        swap_used_bytes: 0,
+        memory_detail: None,
+        oom_kills: 0,
+        disk_free_bytes: 2048,
+        disk_inode_free_pct: 99.0,
+        disk_detail: Some(disk.clone()),
+        nic_rx_bps: 100,
+        nic_tx_bps: 200,
+        nic_rx_drop: 0,
+        nic_tx_drop: 0,
+        nic_err: 0,
+        conntrack_count: Some(1200),
+        network_detail: Some(network.clone()),
+        uptime_secs: 3600,
+    };
+    let report = LoadReportRequest {
+        read_at_unix_secs: now,
+        btime_unix_secs: now - 3600,
+        host: HostFacts {
+            kernel: "6.8.0".to_owned(),
+            cpu_model: "test".to_owned(),
+            cores: 2,
+            cpu_freq_max_mhz: None,
+            cpu_governor: None,
+            cc_algo: "bbr".to_owned(),
+            available_cc: vec!["bbr".to_owned()],
+            default_qdisc: "fq".to_owned(),
+            nic_qdisc: "fq".to_owned(),
+            nic: "eth0".to_owned(),
+            nic_mtu: Some(1500),
+            mem_total_bytes: 4096,
+            disk_total_bytes: 8192,
+            disk_mount: None,
+            disk_filesystem: None,
+            disk_device: None,
+            disk_read_only: None,
+            conntrack_max: Some(262_144),
+            ephemeral_port_low: None,
+            ephemeral_port_high: None,
+            ephemeral_port_capacity: None,
+            sysctl_managed: true,
+            arch: "aarch64".to_owned(),
+            os_pretty: "Linux".to_owned(),
+            virt: "KVM".to_owned(),
+            rmem_max: 4096,
+            wmem_max: 4096,
+            somaxconn: 4096,
+        },
+        samples: vec![sample],
+        processes: vec![],
+        hops: vec![],
+    };
+
+    let accepted = db
+        .store
+        .record_load_report("net-observe", report)
+        .await
+        .unwrap();
+    assert_eq!(accepted.accepted_samples, 1);
+    let view = db
+        .store
+        .node_load_view(&system_admin(), "net-observe", 60)
+        .await
+        .unwrap();
+    assert_eq!(view.series.len(), 1);
+    assert_eq!(view.series[0].network_detail.as_ref(), Some(&network));
+    assert_eq!(view.series[0].disk_detail.as_ref(), Some(&disk));
+    assert_eq!(view.series[0].conntrack_count, Some(1200));
+}
+
 async fn insert_usage_history_for_main_fixture(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO usage_samples (
@@ -8389,7 +12244,7 @@ async fn an_entrance_is_guarded_by_default_and_changing_it_stamps_a_revision() {
 
     // Written the way a caller that predates the field writes it: the JSON simply has no `guard`.
     let request: CreateIngressRequest = serde_json::from_value(serde_json::json!({
-        "id": "i-guarded",
+        "id": "i-garude",
         "chain_id": "c-main",
         "node_id": "n1",
         "bind": "0.0.0.0",
@@ -8422,7 +12277,7 @@ async fn an_entrance_is_guarded_by_default_and_changing_it_stamps_a_revision() {
     let stored: (bool, bool, bool, bool, bool) = sqlx::query_as(
         "SELECT guard_no_private, guard_no_bittorrent, guard_no_mail,
                 guard_no_udp_amplification, guard_tcp_and_quic_only
-           FROM ingresses WHERE id = 'i-guarded'",
+           FROM ingresses WHERE id = 'i-garude'",
     )
     .fetch_one(db.pool())
     .await
@@ -8465,8 +12320,8 @@ async fn an_entrance_is_guarded_by_default_and_changing_it_stamps_a_revision() {
         .apps
         .iter()
         .flat_map(|app| app.ingresses.iter())
-        .find(|ingress| ingress.id == "i-guarded")
-        .expect("i-guarded 在快照里");
+        .find(|ingress| ingress.id == "i-garude")
+        .expect("i-garude 在快照里");
     assert!(!ingress.guard.no_bittorrent);
     assert!(ingress.guard.no_private, "没动的那几条要原样留着");
 }
@@ -8604,6 +12459,19 @@ async fn cert_delta_is_some_until_the_node_reports_the_serving_certificate() {
     // No group bound, nothing issued: nothing is expected of this dimension.
     assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_none());
 
+    db.store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "example.test".to_owned(),
+                dns_credential: Some("token".to_owned()),
+                acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
+                acme_contact: Some("ops@example.test".to_owned()),
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
     issue_certificate_for(&db, "n1", "Test CA").await;
 
     // Serving now exists and the node has never reported: owed.
@@ -8618,7 +12486,11 @@ async fn cert_delta_is_some_until_the_node_reports_the_serving_certificate() {
 
     // Reported with a wrong sha: still owed.
     db.store
-        .record_certificate_observation("n1", "present", Some("deadbeef"))
+        .record_certificate_observation(
+            "n1",
+            "present",
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+        )
         .await
         .unwrap();
     assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_some());
@@ -8770,7 +12642,7 @@ async fn an_ingress_can_turn_flow_off_without_the_fleet_losing_it() {
         .upsert_ingress(
             &system_admin(),
             "app-main",
-            face("i-off", Some(String::new())),
+            face("i-bacemu", Some(String::new())),
         )
         .await
         .unwrap();
@@ -8793,7 +12665,7 @@ async fn an_ingress_can_turn_flow_off_without_the_fleet_losing_it() {
     assert_eq!(flow_of("i-main").as_deref(), Some("xtls-rprx-vision"));
     // The other one is off, and being off is `None` at the model layer — that is what "ship no
     // flow" is, and it is what lets an XHTTP ingress compile.
-    assert_eq!(flow_of("i-off"), None);
+    assert_eq!(flow_of("i-bacemu"), None);
 }
 
 #[tokio::test]
@@ -9004,7 +12876,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
     let xhttp = Xhttp {
         path: "/a1b2c3d4".to_owned(),
         host: Some("upload.route.example".to_owned()),
-        mux: Some(16),
+        xmux: Some(XhttpXmux::with_concurrency(16)),
         mode: XhttpMode::PacketUp,
     };
     let shape = WiresRequest {
@@ -9031,7 +12903,14 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         written.ingress["wires"]["vless"]["xhttp"]["host"],
         "upload.route.example"
     );
-    assert_eq!(written.ingress["wires"]["vless"]["xhttp"]["mux"], 16);
+    assert_eq!(
+        written.ingress["wires"]["vless"]["xhttp"]["xmux"],
+        json!({
+            "max_concurrency": 16,
+            "h_max_request_times": { "from": 600, "to": 900 },
+            "h_max_reusable_secs": { "from": 1800, "to": 3000 }
+        })
+    );
     assert_eq!(
         written.ingress["wires"]["vless"]["xhttp"]["mode"],
         "packet-up"
@@ -9047,6 +12926,18 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         .find(|ingress| ingress.id == "i-main")
         .expect("接入面还在");
     assert_eq!(stored.wires.xhttp(), Some(&xhttp));
+
+    let incomplete_xmux = sqlx::query(
+        "UPDATE ingresses
+         SET xhttp_xmux = '{\"max_concurrency\": 16}'::jsonb
+         WHERE id = 'i-main'",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(
+        incomplete_xmux.is_err(),
+        "a present XMUX object must include both lifecycle ranges"
+    );
 
     // A second write carrying the stream along changes only the port.
     let moved = db
@@ -9177,7 +13068,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
         .upsert_ingress(
             &system_admin(),
             "app-main",
-            face("i-vless", 8443, WiresRequest::default()),
+            face("i-velesu", 8443, WiresRequest::default()),
         )
         .await
         .expect("TCP and UDP should be allowed to share one numeric port");
@@ -9203,7 +13094,7 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                 xhttp: Xhttp {
                     path: "/projection-test".to_owned(),
                     host: Some("upload.route.example".to_owned()),
-                    mux: None,
+                    xmux: None,
                     mode: XhttpMode::Auto,
                 },
             }),
@@ -9419,14 +13310,14 @@ async fn insert_minimal_fixture(pool: &PgPool) {
     .await
     .unwrap();
 
-    sqlx::query("INSERT INTO apps (id, label) VALUES ('app-main', 'Main App')")
+    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-main', 'Main App', 0)")
         .execute(pool)
         .await
         .unwrap();
 
     sqlx::query(
-        "INSERT INTO chains (id, app_id, tenant_id, name)
-         VALUES ('c-main', 'app-main', 'platform.acme', 'Main Chain')",
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('c-main', 'app-main', 'platform.acme', 'Main Chain', 0)",
     )
     .execute(pool)
     .await
@@ -9507,14 +13398,14 @@ async fn insert_other_tenant_fixture(pool: &PgPool) {
     .await
     .unwrap();
 
-    sqlx::query("INSERT INTO apps (id, label) VALUES ('app-other', 'Other App')")
+    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-other', 'Other App', 1)")
         .execute(pool)
         .await
         .unwrap();
 
     sqlx::query(
-        "INSERT INTO chains (id, app_id, tenant_id, name)
-         VALUES ('c-other', 'app-other', 'platform.other', 'Other Chain')",
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('c-other', 'app-other', 'platform.other', 'Other Chain', 0)",
     )
     .execute(pool)
     .await
@@ -9641,9 +13532,10 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             &system_admin(),
             "app-main",
             CreateChainRequest {
-                id: "c-sub".to_owned(),
+                id: "c-sobacu".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Sub".to_owned(),
+                subscription_country: None,
                 note: None,
             },
         )
@@ -9659,7 +13551,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             reality_dest, reality_server_names, reality_fingerprint, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            'i-sub', 'app-main', 'c-sub', 'n1', '0.0.0.0', 8444, NULL, 'vless-reality',
+            'i-toremi', 'app-main', 'c-sobacu', 'n1', '0.0.0.0', 8444, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'chrome', 'xtls-rprx-vision',
             'custom-site'
@@ -9684,30 +13576,31 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
         if to.is_empty() {
             rules.push(Rule {
                 dest_match: DestMatch::Any,
-                action: Action::Egress { send_through: None },
+                action: Action::Egress {
+                    send_through: None,
+                    dns: false,
+                },
             });
         }
-        db.store
-            .put_step(
-                &system_admin(),
-                "app-main",
-                chain,
-                node,
-                PutStepRequest {
-                    accept: Some(StepAcceptRequest {
-                        uuid: None,
-                        label: None,
-                    }),
-                    hop_in: Some(HopInRequest {
-                        port: 20000,
-                        security: Some(HopWireRequest::Encryption),
-                    }),
-                    rules,
-                    note: None,
-                },
-            )
-            .await
-            .unwrap();
+        put_step_draft(
+            db,
+            "app-main",
+            chain,
+            node,
+            PutStepRequest {
+                accept: Some(StepAcceptRequest {
+                    uuid: None,
+                    label: None,
+                }),
+                hop_in: Some(HopInRequest {
+                    port: 20000,
+                    security: Some(HopWireRequest::Encryption),
+                }),
+                rules,
+                note: None,
+            },
+        )
+        .await;
     }
     async fn steps_of(db: &TestPg, chain: &str) -> Vec<String> {
         sqlx::query("SELECT node_id FROM steps WHERE chain_id = $1 ORDER BY node_id")
@@ -9745,22 +13638,26 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     // ── (1) Deleting a middle hop: the whole subtree is removed and references cleared ──
     // n1 → n2 → n3, with n2 also forking to n4. Deleting n2 removes the n2/n3/n4 rows and clears
     // the Forward → n2 entry from n1's rule table.
-    put(&db, "c-sub", "n1", &["n2"]).await;
-    put(&db, "c-sub", "n2", &["n3", "n4"]).await;
-    put(&db, "c-sub", "n3", &[]).await;
-    put(&db, "c-sub", "n4", &[]).await;
+    put(&db, "c-sobacu", "n1", &["n2"]).await;
+    put(&db, "c-sobacu", "n2", &["n3", "n4"]).await;
+    put(&db, "c-sobacu", "n3", &[]).await;
+    put(&db, "c-sobacu", "n4", &[]).await;
 
     let removed = db
         .store
-        .delete_step(&system_admin(), "app-main", "c-sub", "n2")
+        .delete_step(&system_admin(), "app-main", "c-sobacu", "n2")
         .await
         .unwrap();
     assert!(removed.deleted, "删中间跳必须真删掉东西");
     assert!(!removed.chain_removed);
     assert_eq!(removed.removed_steps, vec!["n2", "n3", "n4"]);
-    assert_eq!(steps_of(&db, "c-sub").await, vec!["n1"], "子树之外只剩 n1");
+    assert_eq!(
+        steps_of(&db, "c-sobacu").await,
+        vec!["n1"],
+        "子树之外只剩 n1"
+    );
     assert!(
-        forward_targets(&db, "c-sub", "n1").await.is_empty(),
+        forward_targets(&db, "c-sobacu", "n1").await.is_empty(),
         "n1 规则表里指向 n2 的 Forward 必须被清掉"
     );
 
@@ -9773,7 +13670,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     // Idempotent: deleting again is a no-op and the revision number falls back.
     let again = db
         .store
-        .delete_step(&system_admin(), "app-main", "c-sub", "n2")
+        .delete_step(&system_admin(), "app-main", "c-sobacu", "n2")
         .await
         .unwrap();
     assert!(!again.deleted);
@@ -9838,15 +13735,15 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     );
 
     // ── (3) The draft-commit path: the same DeleteStep op, the same cascade ──
-    put(&db, "c-sub", "n1", &["n2"]).await;
-    put(&db, "c-sub", "n2", &[]).await;
+    put(&db, "c-sobacu", "n1", &["n2"]).await;
+    put(&db, "c-sobacu", "n2", &[]).await;
     let applied = db
         .store
         .apply_draft(
             &system_admin(),
             vec![brocade_store::ModelOp::DeleteStep {
                 app_id: "app-main".to_owned(),
-                chain_id: "c-sub".to_owned(),
+                chain_id: "c-sobacu".to_owned(),
                 node_id: "n2".to_owned(),
             }],
             None,
@@ -9854,7 +13751,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
         .await
         .unwrap();
     assert_eq!(applied.changed, 1);
-    assert_eq!(steps_of(&db, "c-sub").await, vec!["n1"]);
+    assert_eq!(steps_of(&db, "c-sobacu").await, vec!["n1"]);
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
     let output = compile(&snapshot);
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
@@ -9895,7 +13792,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     // its convenience entrance.
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
-         VALUES ('app-main', 'platform.acme', 'alice', 'i-sub')",
+         VALUES ('app-main', 'platform.acme', 'alice', 'i-toremi')",
     )
     .execute(db.pool())
     .await
@@ -9906,32 +13803,32 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             &system_admin(),
             vec![brocade_store::ModelOp::DeleteChain {
                 app_id: "app-main".to_owned(),
-                chain_id: "c-sub".to_owned(),
+                chain_id: "c-sobacu".to_owned(),
             }],
             None,
         )
         .await
         .unwrap();
     assert_eq!(applied.changed, 1);
-    let c: i64 = sqlx::query("SELECT count(*) FROM chains WHERE id = 'c-sub'")
+    let c: i64 = sqlx::query("SELECT count(*) FROM chains WHERE id = 'c-sobacu'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
-    let i: i64 = sqlx::query("SELECT count(*) FROM ingresses WHERE id = 'i-sub'")
+    let i: i64 = sqlx::query("SELECT count(*) FROM ingresses WHERE id = 'i-toremi'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
-    let g: i64 = sqlx::query("SELECT count(*) FROM grants WHERE ingress_id = 'i-sub'")
+    let g: i64 = sqlx::query("SELECT count(*) FROM grants WHERE ingress_id = 'i-toremi'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
-    let s: i64 = sqlx::query("SELECT count(*) FROM steps WHERE chain_id = 'c-sub'")
+    let s: i64 = sqlx::query("SELECT count(*) FROM steps WHERE chain_id = 'c-sobacu'")
         .fetch_one(db.pool())
         .await
         .unwrap()
@@ -10004,7 +13901,10 @@ async fn prune_chain_drops_stranded_steps_after_whole_tree_lands() {
         if to.is_empty() {
             rules.push(Rule {
                 dest_match: DestMatch::Any,
-                action: Action::Egress { send_through: None },
+                action: Action::Egress {
+                    send_through: None,
+                    dns: false,
+                },
             });
         }
         brocade_store::ModelOp::PutStep {
@@ -10344,7 +14244,7 @@ async fn hysteria2_quic_tuning_round_trips_field_by_field() {
                 masquerade: HysteriaMasquerade::NotFound,
             }),
         },
-        id: "i-quic".to_owned(),
+        id: "i-pucivo".to_owned(),
         chain_id: "c-main".to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
@@ -10381,7 +14281,7 @@ async fn hysteria2_quic_tuning_round_trips_field_by_field() {
             .apps
             .iter()
             .flat_map(|app| &app.ingresses)
-            .find(|ingress| ingress.id == "i-quic")
+            .find(|ingress| ingress.id == "i-pucivo")
             .and_then(|ingress| ingress.wires.hysteria2().cloned())
             .expect("接入面还在")
     };

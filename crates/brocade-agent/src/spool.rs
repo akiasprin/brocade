@@ -34,6 +34,9 @@ pub(crate) struct Spool {
     /// Log prefix, and the unit noun in the over-limit message
     pub(crate) what: &'static str,
     pub(crate) unit: &'static str,
+    /// Statuses which prove this exact body can never become valid. Authentication failures,
+    /// throttling, timeouts and conflicts are deliberately absent: all can recover unchanged.
+    pub(crate) terminal_statuses: &'static [u16],
 }
 
 /// Spool depth. One long outage must not fill the disk, and an old reading loses
@@ -46,6 +49,7 @@ pub(crate) const USAGE_SPOOL: Spool = Spool {
     max: 720,
     what: "usage",
     unit: "读数",
+    terminal_statuses: &[400, 410, 422],
 };
 
 /// The observation spool is far shorter than the usage one because it cannot
@@ -60,6 +64,7 @@ pub(crate) const OBSERVATION_SPOOL: Spool = Spool {
     max: 64,
     what: "observation",
     unit: "条收敛结果",
+    terminal_statuses: &[400, 404, 409, 410, 422],
 };
 
 /// Cumulative count of dropped reports. Kept across restarts — it answers "has
@@ -102,7 +107,25 @@ pub(crate) fn record_local_reconcile(
 /// Every field may be `None` — unreadable does not mean absent, it may just not
 /// be on PATH. Report `None` rather than guess: an invented version number is
 /// worse than none.
-fn observe_versions() -> NodeVersions {
+fn observe_wg_backend(state_dir: &Path) -> Option<String> {
+    // An absent config or the explicit disable marker means there is no WireGuard backend to
+    // classify. Looking only at `/sys/module/wireguard` used to call every WG-off machine
+    // "userspace", even though wg-quick had not selected or started any implementation.
+    if !state_dir.join("wireguard.conf").exists() || state_dir.join("wireguard.disabled").exists() {
+        return None;
+    }
+
+    Some(
+        if Path::new("/sys/module/wireguard").exists() {
+            "kernel"
+        } else {
+            "userspace"
+        }
+        .to_owned(),
+    )
+}
+
+fn observe_versions(state_dir: &Path) -> NodeVersions {
     NodeVersions {
         // The sha256 of the running binary rather than `CARGO_PKG_VERSION`: nobody bumps a
         // workspace version on the way to a node, so that number claimed every build since it was
@@ -115,14 +138,7 @@ fn observe_versions() -> NodeVersions {
         // path and a fallback to wireguard-go / boringtun. Their `wg show`
         // output is identical and throughput differs by an order of magnitude —
         // without asking explicitly this is never discovered.
-        wg_backend: Some(
-            if Path::new("/sys/module/wireguard").exists() {
-                "kernel"
-            } else {
-                "userspace"
-            }
-            .to_owned(),
-        ),
+        wg_backend: observe_wg_backend(state_dir),
     }
 }
 
@@ -134,7 +150,7 @@ fn first_line(output: Option<String>) -> Option<String> {
 
 fn observe_runtime(state_dir: &Path) -> NodeRuntimeReport {
     NodeRuntimeReport {
-        versions: observe_versions(),
+        versions: observe_versions(state_dir),
         certificate: crate::certfile::observe(state_dir),
         geodata: observe_geodata(),
         local_reconcile: fs::read_to_string(state_dir.join(LOCAL_RECONCILE_FILE))
@@ -244,8 +260,9 @@ pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<(), String>
             // cancelled deployment, or a vanished target row, all answer 4xx
             // (409/404), and that observation will never land — filing it as 5xx
             // and retrying blocks the head of the queue forever.
-            Ok(response) if (400..500).contains(&response.status) => {
+            Ok(response) if spool.terminal_statuses.contains(&response.status) => {
                 sent += 1;
+                bump_dropped(&options.state_dir, 1);
                 eprintln!(
                     "{}: 控制面拒绝了一条，丢弃：HTTP {} {}",
                     spool.what, response.status, response.body
@@ -285,7 +302,8 @@ mod tests {
     use crate::options::{ApplyMode, Options};
 
     use super::{
-        first_line, read_dropped, spool_drain, spool_push, spool_read, Spool, OBSERVATION_SPOOL,
+        first_line, observe_wg_backend, read_dropped, spool_drain, spool_push, spool_read, Spool,
+        OBSERVATION_SPOOL,
     };
 
     const TEST_SPOOL: Spool = Spool {
@@ -294,7 +312,24 @@ mod tests {
         max: 16,
         what: "test",
         unit: "条",
+        terminal_statuses: &[400, 404, 410, 422],
     };
+
+    #[test]
+    fn wg_backend_exists_only_while_wireguard_is_enabled() {
+        let dir = state_dir("wg-backend-state");
+        assert_eq!(observe_wg_backend(&dir), None);
+
+        fs::write(dir.join("wireguard.conf"), "[Interface]\n").unwrap();
+        assert!(matches!(
+            observe_wg_backend(&dir).as_deref(),
+            Some("kernel" | "userspace")
+        ));
+
+        fs::write(dir.join("wireguard.disabled"), "").unwrap();
+        assert_eq!(observe_wg_backend(&dir), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn state_dir(name: &str) -> PathBuf {
         let dir =
@@ -366,9 +401,9 @@ mod tests {
         }
     }
 
-    /// When the control plane says outright that an entry is wrong (4xx), drop it
+    /// When the control plane says outright that an entry is malformed, drop it
     /// and move on. Keeping it for retry blocks the head of the queue: a finished
-    /// or cancelled deployment, or a vanished target row, all answer 409/404, that
+    /// or cancelled deployment, or a vanished target row, can answer 400/404, that
     /// observation never lands, and everything useful behind it is stuck too.
     #[test]
     fn a_rejected_item_is_dropped_so_the_queue_keeps_moving() {
@@ -377,7 +412,7 @@ mod tests {
             spool_push(TEST_SPOOL, &dir, &serde_json::json!({ "n": n })).unwrap();
         }
 
-        let (server, handle) = fake_control_plane(vec![409, 200, 200]);
+        let (server, handle) = fake_control_plane(vec![400, 200, 200]);
         spool_drain(TEST_SPOOL, &options(&server, &dir)).unwrap();
 
         let received = handle.join().unwrap();
@@ -388,8 +423,37 @@ mod tests {
             spool_read(TEST_SPOOL, &dir).unwrap().is_empty(),
             "三条都处理完了，队列该空"
         );
+        assert_eq!(read_dropped(&dir), 1, "服务端永久拒绝也必须进入丢失计数");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_conflict_is_retryable_and_stays_at_the_head() {
+        let dir = state_dir("drain-conflict");
+        for n in 0..2 {
+            spool_push(TEST_SPOOL, &dir, &serde_json::json!({ "n": n })).unwrap();
+        }
+        let (server, handle) = fake_control_plane(vec![409]);
+        let error = spool_drain(TEST_SPOOL, &options(&server, &dir)).unwrap_err();
+        assert!(error.contains("409"));
+        assert_eq!(handle.join().unwrap().len(), 1);
+        assert_eq!(spool_read(TEST_SPOOL, &dir).unwrap().len(), 2);
+        assert_eq!(read_dropped(&dir), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn usage_never_discards_auth_throttle_timeout_or_conflict_responses() {
+        for status in [401, 403, 404, 408, 409, 425, 429] {
+            assert!(
+                !super::USAGE_SPOOL.terminal_statuses.contains(&status),
+                "HTTP {status} can recover with the same queued body"
+            );
+        }
+        for status in [400, 410, 422] {
+            assert!(super::USAGE_SPOOL.terminal_statuses.contains(&status));
+        }
     }
 
     /// A 5xx means "cannot deliver right now": stop where you are and leave the

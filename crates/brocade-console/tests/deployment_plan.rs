@@ -1,8 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use brocade_core::model::{
-    Action, AppView, Chain, DestMatch, Dns, DomainStrategy, Grant, Hysteria2, HysteriaPortHop,
-    Ingress, IngressWires, ModelSnapshot, Node, Rule, Step, Transport, User, WireGuardKeys,
+    Action, AppView, Chain, DestMatch, Dns, DomainStrategy, ExternalOutbound,
+    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding, Grant, Hysteria2,
+    HysteriaPortHop, Ingress, IngressWires, ModelSnapshot, Node, Rule, Step, Transport, User,
+    WireGuardKeys,
 };
 use brocade_deployment::plan::{
     narrow_to_kind, plan_deployment, AppliedArtifactState, AppliedGrantsState, DeploymentKind,
@@ -478,7 +480,7 @@ fn observation_payload_from_the_spec_deserializes() {
 }
 
 #[test]
-fn a_retired_node_is_not_a_deployment_target() {
+fn a_retired_node_remains_a_teardown_target_until_all_artifacts_are_disabled() {
     let before = snapshot(
         vec![
             node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System),
@@ -504,11 +506,25 @@ fn a_retired_node_is_not_a_deployment_target() {
         .retired = true;
     let plan = plan_deployment(&after, &applied).unwrap();
 
-    assert!(
-        plan.targets.iter().all(|t| t.node_id != "sg"),
-        "退役的机器不该再成为等待 agent 拉取的 target: {:?}",
-        plan.targets
-    );
+    let sg = plan
+        .targets
+        .iter()
+        .find(|target| target.node_id == "sg")
+        .expect("未确认清理的退役机器必须保留为 teardown target");
+    assert_eq!(sg.status, PlannedTargetStatus::Pending);
+    assert!(matches!(
+        &sg.desired.phantun,
+        DesiredArtifact::Disabled { .. }
+    ));
+    assert!(matches!(
+        &sg.desired.hy2_port_hop,
+        DesiredArtifact::Disabled { .. }
+    ));
+    assert!(matches!(
+        &sg.desired.wireguard,
+        DesiredArtifact::Disabled { .. }
+    ));
+    assert!(matches!(&sg.desired.xray, DesiredArtifact::Disabled { .. }));
 
     let hk = plan.targets.iter().find(|t| t.node_id == "hk").unwrap();
     assert_eq!(hk.status, PlannedTargetStatus::Pending);
@@ -520,6 +536,28 @@ fn a_retired_node_is_not_a_deployment_target() {
     } else {
         panic!("hk 该有 wg 配置");
     }
+
+    let converged = applied
+        .into_iter()
+        .map(|state| {
+            if state.node_id != "sg" {
+                return state;
+            }
+            NodeAppliedState {
+                phantun: AppliedArtifactState::Disabled,
+                hy2_port_hop: AppliedArtifactState::Disabled,
+                wireguard: AppliedArtifactState::Disabled,
+                xray: AppliedArtifactState::Disabled,
+                grants: AppliedGrantsState::Disabled,
+                ..state
+            }
+        })
+        .collect::<Vec<_>>();
+    let settled = plan_deployment(&after, &converged).unwrap();
+    assert!(
+        settled.targets.iter().all(|target| target.node_id != "sg"),
+        "全组件已确认停用后，后续发布才应排除退役机器"
+    );
 }
 
 fn applied_from_plan(plan: &DeploymentPlan) -> Vec<NodeAppliedState> {
@@ -592,6 +630,7 @@ fn snapshot(nodes: Vec<Node>, apps: Vec<AppView>) -> ModelSnapshot {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes,
+        node_egress_dns: Vec::new(),
         users: vec![User {
             tenant: "platform.acme".to_owned(),
             id: "alice".to_owned(),
@@ -664,6 +703,7 @@ fn direct_app(
             id: chain_id.clone(),
             tenant: "platform.acme".to_owned(),
             name: chain_id.clone(),
+            subscription_country: None,
         }],
         ingresses: vec![Ingress {
             id: ingress_id.to_owned(),
@@ -747,7 +787,10 @@ fn hopping_app(
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress { send_through: None },
+        action: Action::Egress {
+            send_through: None,
+            dns: false,
+        },
     }
 }
 
@@ -777,7 +820,10 @@ fn a_change_the_running_xray_can_absorb_is_not_disruptive() {
             true,
             Rule {
                 dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
-                action: Action::Egress { send_through: None },
+                action: Action::Egress {
+                    send_through: None,
+                    dns: false,
+                },
             },
         )],
     );
@@ -835,5 +881,73 @@ fn a_change_the_running_xray_can_absorb_is_not_disruptive() {
     assert!(
         plan_deployment(&after, &stale).unwrap().targets[0].disruptive,
         "摘要对不上就等于不知道"
+    );
+}
+
+#[test]
+fn adding_a_managed_warp_outbound_requires_an_xray_restart() {
+    let mut before = snapshot(
+        vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
+        vec![direct_app("direct", "hk", "i-hk", 8443, true, any_egress())],
+    );
+    before.external_outbounds = vec![ExternalOutbound {
+        id: "warp".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "WARP".to_owned(),
+        address: "engage.example".to_owned(),
+        port: 2408,
+        protocol: ExternalOutboundProtocol::Warp {
+            mtu: 1280,
+            keep_alive: 25,
+            allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+            no_kernel_tun: false,
+            domain_strategy: "ForceIP".to_owned(),
+            workers: 0,
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: vec![ExternalWarpBinding {
+            node: "hk".to_owned(),
+            device_id: "device-hk".to_owned(),
+            account_id: "account-hk".to_owned(),
+            registered_at: "2026-08-30T12:00:00Z".to_owned(),
+            endpoint_address: None,
+            endpoint_port: None,
+            mtu: None,
+            keep_alive: None,
+            allowed_ips: None,
+            no_kernel_tun: None,
+            domain_strategy: None,
+            workers: None,
+            private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
+            peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+            local_addresses: vec![
+                "172.16.0.2/32".to_owned(),
+                "2606:4700:110:8::2/128".to_owned(),
+            ],
+            reserved: vec![1, 2, 3],
+        }],
+    }];
+
+    let baseline = plan_deployment(&before, &[]).unwrap();
+    let DesiredArtifact::Present { content, .. } = &baseline.targets[0].desired.xray else {
+        panic!("基线应生成 xray 配置");
+    };
+    let mut applied = applied_from_plan(&baseline);
+    applied[0].running_xray = Some(content.clone());
+
+    let mut after = before.clone();
+    after.apps[0].steps[0].rules = vec![Rule {
+        dest_match: DestMatch::Any,
+        action: Action::Proxy {
+            outbound: "warp".to_owned(),
+        },
+    }];
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+    let hk = target(&plan, "hk");
+    assert_eq!(hk.actions, vec![PlannedAction::ApplyXray]);
+    assert!(
+        hk.disruptive,
+        "新增 WARP/WireGuard 出站不能通过 HandlerService 热切"
     );
 }

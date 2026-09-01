@@ -203,9 +203,7 @@ pub fn enrollment_token_display_prefix(token: &str) -> String {
 }
 
 pub fn is_reality_short_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= REALITY_SHORT_ID_HEX_LEN
-        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    brocade_core::text::is_reality_short_id(value)
 }
 
 fn clamp_wireguard_private_key(private: &mut [u8; WIREGUARD_KEY_BYTES]) {
@@ -438,12 +436,14 @@ mod tests {
 
     #[test]
     fn reality_short_id_validation_matches_core_shape() {
-        assert!(is_reality_short_id("0"));
+        assert!(is_reality_short_id("00"));
         assert!(is_reality_short_id("8337a0bf"));
         assert!(is_reality_short_id("0123456789abcdef"));
         assert!(is_reality_short_id("ABCDEF"));
 
         assert!(!is_reality_short_id(""));
+        assert!(!is_reality_short_id("0"));
+        assert!(!is_reality_short_id("abc"));
         assert!(!is_reality_short_id("0123456789abcdef00"));
         assert!(!is_reality_short_id("not-hex"));
     }

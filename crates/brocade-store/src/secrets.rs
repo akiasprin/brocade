@@ -50,11 +50,30 @@ pub const CTX_ACME_ACCOUNT: &str = "acme-account";
 /// Sealing context for a node certificate's private key.
 pub const CTX_CERT_KEY: &str = "cert-key";
 
-/// Binds one external proxy credential to its project and stable resource id. Unlike the fixed
+/// Binds one external proxy credential to its tenant and stable resource id. Unlike the fixed
 /// contexts above this deliberately prevents swapping two valid proxy credentials in the same
 /// column: the moved ciphertext will fail authentication when read under the destination id.
-pub fn external_outbound_context(app_id: &str, outbound_id: &str) -> String {
-    format!("external-outbound:{app_id}/{outbound_id}")
+pub fn external_outbound_context(tenant_id: &str, outbound_id: &str) -> String {
+    format!("external-outbound:{tenant_id}/{outbound_id}")
+}
+
+/// Binds one managed tunnel's machine private key to all three stable identifiers.
+pub fn external_outbound_binding_key_context(
+    tenant_id: &str,
+    outbound_id: &str,
+    node_id: &str,
+) -> String {
+    format!("external-outbound-binding-key:{tenant_id}/{outbound_id}/{node_id}")
+}
+
+/// The provider token can modify or retire the Cloudflare registration, so it is sealed under a
+/// context distinct from the data-plane private key even though both live on the same row.
+pub fn external_outbound_binding_token_context(
+    tenant_id: &str,
+    outbound_id: &str,
+    node_id: &str,
+) -> String {
+    format!("external-outbound-binding-token:{tenant_id}/{outbound_id}/{node_id}")
 }
 
 /// Reads and validates the key. Returns `None` when unset, which callers turn into their own

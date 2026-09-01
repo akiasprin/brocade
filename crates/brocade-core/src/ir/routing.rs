@@ -46,8 +46,9 @@ pub struct AppIr {
     pub tenants: Vec<String>,
     pub nodes: Vec<AppNode>,
     pub users: Vec<User>,
-    /// External proxy resources belonging to this project. They are terminal routing targets,
-    /// not nodes and therefore never participate in `hops` or chain membership.
+    /// Tenant-owned external proxy resources visible to the compiler. They are terminal routing
+    /// targets, not nodes, and therefore never participate in `hops` or chain membership. Tenant
+    /// scope validation decides which of them this project's chains may actually reference.
     pub external_outbounds: Vec<model::ExternalOutbound>,
     pub chains: Vec<Chain>,
     pub ingresses: Vec<Ingress>,
@@ -70,6 +71,10 @@ pub struct AppNode {
     pub api_port: Option<u16>,
     pub dns: Dns,
     pub domain_strategy: DomainStrategy,
+    /// Machine-owned DNS policies. Repeated in each project's node view because node
+    /// artifacts are projected from the application IR; the source snapshot remains canonical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_dns: Vec<model::NodeEgressDnsPolicy>,
     /// Verbatim from the model, still unmerged — the global defaults live on
     /// `SystemIr::settings` and the two are combined in `physical/node.rs`, where both
     /// halves are in scope.
@@ -89,6 +94,7 @@ pub struct Chain {
     pub app_id: Option<String>,
     pub tenant: String,
     pub name: String,
+    pub subscription_country: Option<String>,
     /// The node where this chain begins, derived once from its sole ingress.
     ///
     /// `None` keeps a malformed chain without an ingress representable long enough for
@@ -131,6 +137,7 @@ pub struct Front {
     pub tenant: String,
     pub name: String,
     pub via: Vec<String>,
+    pub external_via: Vec<String>,
     pub strategy: FrontStrategy,
 }
 
@@ -227,6 +234,12 @@ pub fn compile_app(
                 api_port: node.api_port,
                 dns: node.dns.clone(),
                 domain_strategy: node.domain_strategy,
+                egress_dns: doc
+                    .node_egress_dns
+                    .iter()
+                    .filter(|policy| policy.node == node.id)
+                    .cloned()
+                    .collect(),
                 connection: node.connection,
             })
             .collect(),
@@ -239,12 +252,7 @@ pub fn compile_app(
                 uuid: user.uuid.clone(),
             })
             .collect(),
-        external_outbounds: doc
-            .external_outbounds
-            .iter()
-            .filter(|outbound| outbound.app == app.id)
-            .cloned()
-            .collect(),
+        external_outbounds: doc.external_outbounds.to_vec(),
         chains: Vec::new(),
         ingresses: Vec::new(),
         fronts: Vec::new(),
@@ -290,6 +298,7 @@ pub fn compile_app(
                 .filter(|via| live_ingresses.contains(via.as_str()))
                 .cloned()
                 .collect(),
+            external_via: front.external_via.clone(),
             strategy: front.strategy,
         })
         .collect();
@@ -357,6 +366,7 @@ pub fn compile_app(
             app_id: Some(app.id.clone()),
             tenant: chain.tenant.clone(),
             name: chain.name.clone(),
+            subscription_country: chain.subscription_country.clone(),
             root: root.map(str::to_owned),
         });
 
@@ -881,7 +891,10 @@ fn terminal_default(
     }
 
     if node.egress_allowed {
-        Action::Egress { send_through: None }
+        Action::Egress {
+            send_through: None,
+            dns: false,
+        }
     } else {
         diagnostics.push(Diagnostic::warn(
             "step.no-egress",
@@ -1010,7 +1023,9 @@ fn collect_tenants(ir: &mut AppIr) {
 
 fn sort_ir(ir: &mut AppIr) {
     ir.nodes.sort_by(|a, b| a.id.cmp(&b.id));
-    ir.chains.sort_by(|a, b| a.id.cmp(&b.id));
+    // Chain order is semantic: the store materializes this vector from `chains.position`, and
+    // console/topology/subscription projections all consume it. The remaining collections are
+    // unordered model sets and stay canonicalized by stable ID for machine artifact stability.
     ir.ingresses.sort_by(|a, b| a.id.cmp(&b.id));
     ir.fronts.sort_by(|a, b| a.id.cmp(&b.id));
     ir.steps.sort_by(|a, b| a.id.cmp(&b.id));

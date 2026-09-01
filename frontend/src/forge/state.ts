@@ -9,7 +9,7 @@
 
 import { useSyncExternalStore } from 'react';
 
-/** 顶栏导航的键。前六项显示在顶栏上，其余收入「⋯」。 */
+/** 顶栏导航的键。主工作流显示在顶栏上，其余收入「⋯」。 */
 export type NavKey =
   | 'nodes'
   | 'chains'
@@ -59,8 +59,8 @@ class ForgeStore {
     // 记录上次所在的页面——刷新后回到机器列表会要求每次重新导航。
     // 只记录所在页面，不记录页面内的层级：后者是临时状态。
     try {
-      const saved = localStorage.getItem(KEY) as NavKey | null;
-      if (saved) this.state = { ...this.state, nav: saved };
+      const saved = localStorage.getItem(KEY);
+      if (saved && isNavKey(saved)) this.state = { ...this.state, nav: saved };
     } catch {
       /* 读取失败时使用默认值 */
     }

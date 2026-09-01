@@ -3,10 +3,14 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from 'react';
 import { hopWireLabel } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -25,6 +29,7 @@ import {
   type TransportKind,
   type Hysteria2Settings,
   type Xhttp,
+  DEFAULT_XHTTP_XMUX,
   transportIsXhttp,
   type XhttpMode,
   type HysteriaBbrProfile,
@@ -47,7 +52,10 @@ import {
   type RealityFallbackMode,
   type Wires,
   currentWires,
+  reorderApps,
+  reorderChains,
 } from '../api';
+import { draft } from '../draft';
 import {
   compatibleXhttpMode,
   projectionForTransport,
@@ -60,15 +68,26 @@ import {
   type FallbackLimitDraft,
   type FallbackRateDraft,
 } from '../reality-fallback';
+import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
+import { FLAG_SHEET } from '../ui/flags';
 import { RegionFlag } from '../ui/region-flag';
 import { ListIcon } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { ProbeBanner, byChain, toneOf, toneTitle } from '../ui/probe';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
-import { RuleDraftScope, RuleEditor, forwardPeers, isForwardTargetInChain, seedHops, type HopsDraft } from './rules';
+import {
+  RuleDraftScope,
+  RuleEditor,
+  forwardPeers,
+  isForwardTargetInChain,
+  seedHops,
+  type EgressDnsDraft,
+  type EgressDnsOrderDraft,
+  type HopsDraft,
+} from './rules';
 import { SLUG_MAX, freePortAcross, freeSpanAcross, isValidSlug, occupiedPorts, portClash, spanClash } from './ports';
 
 /* Hysteria 2 的端口从此值起分配，跳转区间的默认长度同此。与 model.rs 的
@@ -481,7 +500,7 @@ function usePanelEntry(id: string, dirty: boolean, entry: PanelEntry, watch: unk
   const blocked = entry.blocked;
   const apply = entry.apply;
   const reset = entry.reset;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!put) return;
     put(id, dirty ? { blocked, apply, reset } : null);
     return () => put(id, null);
@@ -491,7 +510,7 @@ function usePanelEntry(id: string, dirty: boolean, entry: PanelEntry, watch: unk
   return put !== null;
 }
 
-function IngressPanel({
+export function IngressPanel({
   appId,
   ingress,
   title,
@@ -539,23 +558,27 @@ function IngressPanel({
     <PanelSaveCtx.Provider value={put}>
       <ConfigPanel title={title}>
         <dl className="kv form2 chain-face fill">{children}</dl>
-        {/* 与机器配置一致：没有改动时不占一条禁用操作栏；发生修改后在内容底部显示操作。 */}
-        {pending.length > 0 && (
-          <div className="toolbar">
-            <button className="btn" disabled={save.isPending} onClick={() => pending.forEach(entry => entry.reset())}>
-              还原
-            </button>
-            <button
-              className={!blocked ? 'btn primary' : 'btn'}
-              disabled={!editable || blocked || save.isPending}
-              title={blocked ? '有一项填得不对，先改好' : ''}
-              onClick={() => save.mutate()}
-            >
-              {save.isPending ? '保存中…' : '保存'}
-            </button>
-          </div>
-        )}
         {save.error && <ErrorBox error={save.error} />}
+        <footer className="config-panel-savebar">
+          <span className="sp" />
+          <button
+            type="button"
+            className="btn"
+            disabled={pending.length === 0 || save.isPending}
+            onClick={() => pending.forEach(entry => entry.reset())}
+          >
+            还原
+          </button>
+          <button
+            type="button"
+            className={pending.length > 0 && !blocked ? 'btn primary' : 'btn'}
+            disabled={!editable || pending.length === 0 || blocked || save.isPending}
+            title={blocked ? '有一项填得不对，先改好' : pending.length === 0 ? '没有未保存的修改' : ''}
+            onClick={() => save.mutate()}
+          >
+            {save.isPending ? '保存中…' : '保存'}
+          </button>
+        </footer>
       </ConfigPanel>
     </PanelSaveCtx.Provider>
   );
@@ -825,7 +848,10 @@ function IngressRealityRow({
     .filter(Boolean);
   const valid =
     (form.source !== 'custom-site' ||
-      (form.dest.trim() !== '' && names.length > 0 && form.fingerprint.trim() !== '')) &&
+      (form.dest.trim() !== '' &&
+        names.length > 0 &&
+        names.every(realityServerNameIsValid) &&
+        realityFingerprintIsValid(form.fingerprint))) &&
     (form.source !== 'node-certificate' || !!certificateName);
   const dirty = JSON.stringify(form) !== JSON.stringify(initial);
   /* 贴到面板那份 body 上。取值的整理（拆逗号、custom 之外清空）与下面 save 里的一致。 */
@@ -857,8 +883,6 @@ function IngressRealityRow({
   );
   // 选项中直接显示当前指向的站点：下拉框收起后，该行即表示客户端将看到哪张证书。
   const globalSite = (global?.dest ?? '').replace(/:\d+$/, '');
-
-  if (!ingress.wires.vless?.kind.startsWith('vless-reality')) return null;
 
   return (
     <>
@@ -893,13 +917,18 @@ function IngressRealityRow({
                 disabled={!editable || save.isPending}
                 onChange={e => setDraft({ ...form, names: e.target.value })}
               />
-              <input
+              <select
                 className="f mono"
                 value={form.fingerprint}
-                placeholder="浏览器指纹"
                 disabled={!editable || save.isPending}
                 onChange={e => setDraft({ ...form, fingerprint: e.target.value })}
-              />
+              >
+                {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
             </div>
           </>
         )}
@@ -1116,11 +1145,9 @@ function IngressRealityGuardRow({
     },
   });
 
-  if (!ingress.wires.vless?.kind.startsWith('vless-reality')) return null;
-
   /* 使用本机证书时回落不会离开该机器（返回本地固定的 403），不存在需要保护的外部站点。
    * 开关仍然显示但不可修改：隐藏会使人认为该接入面缺少这项防护。 */
-  const local = ingress.wires.vless.fallback_mode === 'node-certificate';
+  const local = ingress.wires.vless?.fallback_mode === 'node-certificate';
 
   return (
     <>
@@ -1197,8 +1224,6 @@ function IngressRealityLimitsRow({
     },
   });
 
-  if (!ingress.wires.vless?.kind.startsWith('vless-reality')) return null;
-
   const note =
     form.mode === 'balanced'
       ? '上传超过 1 MiB 后限速至 256 KiB/s，下载超过 8 MiB 后限速至 1 MiB/s。'
@@ -1260,6 +1285,42 @@ function IngressRealityLimitsRow({
  *
  * 有一项必须在保存前说明，不能等服务端报错：XHTTP 与流控（Vision）互斥，而流控默认启用。
  * xray 自身不拦截该组合——其配置检查会通过，但运行时所有连接都会被拒绝。 */
+type XmuxDraft = {
+  maxConcurrency: string;
+  requestFrom: string;
+  requestTo: string;
+  reusableFrom: string;
+  reusableTo: string;
+};
+
+function xmuxDraftOf(value: Xhttp['xmux']): XmuxDraft {
+  const visible = (actual: number | undefined, fallback: number) =>
+    actual === undefined || actual === fallback ? '' : String(actual);
+  return {
+    maxConcurrency: visible(value?.max_concurrency, DEFAULT_XHTTP_XMUX.max_concurrency),
+    requestFrom: visible(value?.h_max_request_times.from, DEFAULT_XHTTP_XMUX.h_max_request_times.from),
+    requestTo: visible(value?.h_max_request_times.to, DEFAULT_XHTTP_XMUX.h_max_request_times.to),
+    reusableFrom: visible(value?.h_max_reusable_secs.from, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from),
+    reusableTo: visible(value?.h_max_reusable_secs.to, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to),
+  };
+}
+
+function xmuxOfDraft(value: XmuxDraft): Exclude<Xhttp['xmux'], undefined> {
+  if (Object.values(value).every(item => item.trim() === '')) return null;
+  const number = (actual: string, fallback: number) => (actual.trim() === '' ? fallback : Number(actual));
+  return {
+    max_concurrency: number(value.maxConcurrency, DEFAULT_XHTTP_XMUX.max_concurrency),
+    h_max_request_times: {
+      from: number(value.requestFrom, DEFAULT_XHTTP_XMUX.h_max_request_times.from),
+      to: number(value.requestTo, DEFAULT_XHTTP_XMUX.h_max_request_times.to),
+    },
+    h_max_reusable_secs: {
+      from: number(value.reusableFrom, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from),
+      to: number(value.reusableTo, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to),
+    },
+  };
+}
+
 /* Hysteria 2 一侧的端口及其跳转区间。
  *
  * 端口归属协议栈而非落点：落点表示由哪台机器接收，端口表示该线路使用其哪个端口接收。
@@ -1399,7 +1460,7 @@ function IngressHy2PortRow({
   );
 }
 
-function IngressStreamRow({
+export function IngressStreamRow({
   appId,
   ingress,
   certificateName,
@@ -1478,12 +1539,12 @@ function IngressStreamRow({
   const hy2Value = draftHy2 ?? activeHy2;
   const path = current?.path ?? '';
   const host = current?.host ?? '';
-  const mux = current?.mux ?? null;
+  const xmux = current?.xmux ?? null;
   const storedMode: XhttpMode = current?.mode ?? 'auto';
   const hasDownload = (['v4', 'v6'] as const).some(family => !!ingress.projection?.[family]?.download);
   const [draftPath, setDraftPath] = useState<string | null>(null);
   const [draftHost, setDraftHost] = useState<string | null>(null);
-  const [draftMux, setDraftMux] = useState<string | null>(null);
+  const [draftXmux, setDraftXmux] = useState<XmuxDraft | undefined>(undefined);
   const [draftMode, setDraftMode] = useState<XhttpMode | null>(null);
   const mode = draftMode ?? storedMode;
   /* 「跟随两端」在产物中不写入该字段，由两端各自解析。显示解析结果才是该字段的实际状态——
@@ -1510,7 +1571,7 @@ function IngressStreamRow({
     onSuccess: async () => {
       setDraftPath(null);
       setDraftHost(null);
-      setDraftMux(null);
+      setDraftXmux(undefined);
       setDraftHy2(null);
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       setDraftMode(null);
@@ -1546,7 +1607,7 @@ function IngressStreamRow({
           xhttp: {
             path: current?.path ?? `/${Math.random().toString(36).slice(2, 10)}`,
             host: current?.host ?? null,
-            mux: current?.mux ?? null,
+            xmux: current?.xmux ?? null,
             mode: current?.mode ?? 'auto',
           },
         }
@@ -1589,16 +1650,26 @@ function IngressStreamRow({
 
   const pathValue = draftPath ?? path;
   const hostValue = draftHost ?? host;
-  const muxValue = draftMux ?? (mux === null ? '' : String(mux));
-  const muxNum = muxValue.trim() === '' ? null : Number(muxValue);
-  /* 下限是 1 而非 2：1 不表示最小并发数，而是另一种模式——一条连接同时只承载一条流，
-     空闲后交给下一条，即连接池。 */
-  const muxBad = muxNum !== null && (!Number.isInteger(muxNum) || muxNum < 1 || muxNum > 128);
+  const xmuxDraft = draftXmux ?? xmuxDraftOf(xmux);
+  const xmuxValue = draftXmux === undefined ? xmux : xmuxOfDraft(draftXmux);
+  const badRange = (range: { from: number; to: number }) =>
+    !Number.isSafeInteger(range.from) ||
+    !Number.isSafeInteger(range.to) ||
+    range.from < 1 ||
+    range.from > range.to ||
+    range.to > 2_147_483_647;
+  const xmuxBad =
+    xmuxValue !== null &&
+    (!Number.isInteger(xmuxValue.max_concurrency) ||
+      xmuxValue.max_concurrency < 1 ||
+      xmuxValue.max_concurrency > 128 ||
+      badRange(xmuxValue.h_max_request_times) ||
+      badRange(xmuxValue.h_max_reusable_secs));
   const pathBad = pathValue.trim() === '' || !pathValue.startsWith('/') || /[\s?#]/.test(pathValue);
   const xhttpForSave = (nextMode = mode): Xhttp => ({
     path: pathValue.trim(),
     host: hostValue.trim() || null,
-    mux: muxNum,
+    xmux: xmuxValue,
     mode: nextMode,
   });
   const transportForXhttp = (nextMode = mode): Transport =>
@@ -1615,7 +1686,7 @@ function IngressStreamRow({
     (on &&
       ((draftPath !== null && pathValue !== path) ||
         (draftHost !== null && hostValue !== host) ||
-        (draftMux !== null && muxNum !== mux) ||
+        (draftXmux !== undefined && JSON.stringify(xmuxValue) !== JSON.stringify(xmux)) ||
         (draftMode !== null && mode !== (current?.mode ?? 'auto'))));
   /* 两段各自登记进所在面板的那一次提交。三个下拉（协议 / 安全层 / 网络层）不在其中：
      它们改完即存，是切换而不是编辑。 */
@@ -1623,17 +1694,17 @@ function IngressStreamRow({
     'vless-xhttp',
     dirty,
     {
-      blocked: pathBad || muxBad,
+      blocked: on && (pathBad || xmuxBad),
       apply: body => ({ ...body, wires: { ...body.wires!, vless: vlessForSave() } }),
       reset: () => {
         setPendingTransport(null);
         setDraftPath(null);
         setDraftHost(null);
-        setDraftMux(null);
+        setDraftXmux(undefined);
         setDraftMode(null);
       },
     },
-    JSON.stringify([kind, pathValue, hostValue, muxValue, mode]),
+    JSON.stringify([kind, pathValue, hostValue, xmuxValue, mode]),
   );
   const hy2Up = hy2Value.bandwidth.up ?? '';
   const hy2Down = hy2Value.bandwidth.down ?? '';
@@ -2016,22 +2087,93 @@ function IngressStreamRow({
               />
             </div>
             {pathBad && <div className="note bad">路径需以 / 开头，不能包含空白或 ? #</div>}
-            <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
-              <span className="dim">并发</span>
-              <input
-                className="f mono"
-                style={{ borderColor: muxBad ? 'var(--err)' : undefined }}
-                placeholder="留空使用两端默认"
-                value={muxValue}
-                disabled={!editable}
-                onChange={e => setDraftMux(e.target.value)}
-              />
-            </div>
-            {muxBad && <div className="note bad">并发取值 1–128。</div>}
-            {muxNum === 1 && <div className="note">一条连接同一时刻只承载一条流，释放后供下一条使用。</div>}
-            {muxNum !== null && muxNum > 1 && !muxBad && (
-              <div className="note">{muxNum} 条流复用一条连接。单次丢包会阻塞该连接上的全部流（队头阻塞）。</div>
-            )}
+            <details className="form-adv" style={{ width: '100%' }}>
+              <summary>XMUX 调优（留空 = 用 Xray 默认）</summary>
+              <div className="hy2-quic xhttp-xmux">
+                <label className="hy2-quic-fld">
+                  <span>
+                    最大并发流 <small>流</small>
+                  </span>
+                  <input
+                    className="f mono"
+                    type="number"
+                    min={1}
+                    max={128}
+                    inputMode="numeric"
+                    placeholder={String(DEFAULT_XHTTP_XMUX.max_concurrency)}
+                    value={xmuxDraft.maxConcurrency}
+                    disabled={!editable}
+                    aria-label="XMUX 最大并发流"
+                    onChange={e => setDraftXmux({ ...xmuxDraft, maxConcurrency: e.target.value })}
+                  />
+                </label>
+                {(
+                  [
+                    [
+                      '请求轮换',
+                      '次',
+                      'requestFrom',
+                      'requestTo',
+                      'XMUX 请求轮换下限',
+                      'XMUX 请求轮换上限',
+                      DEFAULT_XHTTP_XMUX.h_max_request_times,
+                    ],
+                    [
+                      '复用时长',
+                      '秒',
+                      'reusableFrom',
+                      'reusableTo',
+                      'XMUX 复用时长下限',
+                      'XMUX 复用时长上限',
+                      DEFAULT_XHTTP_XMUX.h_max_reusable_secs,
+                    ],
+                  ] as const
+                ).map(([label, unit, fromKey, toKey, fromLabel, toLabel, defaults]) => (
+                  <label className="hy2-quic-fld xhttp-xmux-range-fld" key={label}>
+                    <span>
+                      {label} <small>{unit}</small>
+                    </span>
+                    <span className="xhttp-xmux-range">
+                      <input
+                        className="f mono"
+                        type="number"
+                        min={1}
+                        max={2_147_483_647}
+                        inputMode="numeric"
+                        placeholder={String(defaults.from)}
+                        value={xmuxDraft[fromKey]}
+                        disabled={!editable}
+                        aria-label={fromLabel}
+                        onChange={e => setDraftXmux({ ...xmuxDraft, [fromKey]: e.target.value })}
+                      />
+                      <i>–</i>
+                      <input
+                        className="f mono"
+                        type="number"
+                        min={1}
+                        max={2_147_483_647}
+                        inputMode="numeric"
+                        placeholder={String(defaults.to)}
+                        value={xmuxDraft[toKey]}
+                        disabled={!editable}
+                        aria-label={toLabel}
+                        onChange={e => setDraftXmux({ ...xmuxDraft, [toKey]: e.target.value })}
+                      />
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <div className="note">
+                最大并发流为 1 时只复用空闲连接；2–128 会并发承载多条流。请求轮换和复用时长使用随机范围，
+                避免连接按固定节奏同时重建。修改后需要发布并重启 xray。
+              </div>
+              <div className="note">
+                空值分别采用 {DEFAULT_XHTTP_XMUX.max_concurrency}、{DEFAULT_XHTTP_XMUX.h_max_request_times.from}–
+                {DEFAULT_XHTTP_XMUX.h_max_request_times.to} 次和 {DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from}–
+                {DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to} 秒；全部留空时不写入 xmux。
+              </div>
+              {xmuxBad && <div className="note bad">并发需为 1–128；两个范围需为正整数，且下限不能大于上限。</div>}
+            </details>
             <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
               <span className="dim">HTTP Host</span>
               <input
@@ -2078,6 +2220,12 @@ function IngressStreamRow({
         </>
       )}
       {section === 'vless' && <IngressFlowRow appId={appId} ingress={ingress} editable={editable} xhttp={on} />}
+      {!tls && (
+        <>
+          <IngressRealityGuardRow appId={appId} ingress={ingress} editable={editable} />
+          <IngressRealityLimitsRow appId={appId} ingress={ingress} editable={editable} />
+        </>
+      )}
     </>
   );
 }
@@ -2429,6 +2577,83 @@ export function IngressProjectionRow({
   );
 }
 
+type OrderDrag =
+  | { kind: 'apps'; active: string; original: string[]; order: string[] }
+  | { kind: 'chains'; appId: string; active: string; original: string[]; order: string[] };
+
+const sameOrder = (left: readonly string[], right: readonly string[]) =>
+  left.length === right.length && left.every((id, index) => id === right[index]);
+
+function moveOrder(order: readonly string[], active: string, target: string): string[] {
+  const from = order.indexOf(active);
+  const to = order.indexOf(target);
+  if (from < 0 || to < 0 || from === to) return [...order];
+  const next = [...order];
+  next.splice(from, 1);
+  next.splice(to, 0, active);
+  return next;
+}
+
+function orderByIds<T>(items: readonly T[], ids: readonly string[] | undefined, idOf: (item: T) => string): T[] {
+  if (!ids || ids.length !== items.length) return [...items];
+  const byId = new Map(items.map(item => [idOf(item), item]));
+  const ordered = ids.map(id => byId.get(id)).filter((item): item is T => item !== undefined);
+  return ordered.length === items.length ? ordered : [...items];
+}
+
+export type OrderSlot = {
+  id: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
+/**
+ * Resolve a drag against the slots captured at pointer-down, not against cards that React has
+ * already moved. Reading the live layout makes a stationary pointer alternate between the dragged
+ * card and its neighbour: each swap changes which card is under that pointer, so the next event
+ * immediately swaps them back.
+ */
+export function orderForPointer(
+  baseline: readonly string[],
+  active: string,
+  slots: readonly OrderSlot[],
+  x: number,
+  y: number,
+  scrollDelta = 0,
+): string[] {
+  let target = active;
+  let distance = Infinity;
+  for (const slot of slots) {
+    const dx = slot.left + slot.width / 2 - x;
+    const dy = slot.top + slot.height / 2 - scrollDelta - y;
+    const nextDistance = dx * dx + dy * dy;
+    if (nextDistance < distance) {
+      distance = nextDistance;
+      target = slot.id;
+    }
+  }
+  return moveOrder(baseline, active, target);
+}
+
+// 拖到视口上下缘时要滚动的容器：从被拖元素向上找第一个真正能纵向滚动的祖先，
+// 找不到就用整个窗口（本站是固定顶栏 + 文档滚动）。
+function findScrollParent(el: HTMLElement | null): HTMLElement | Window {
+  for (let node = el?.parentElement ?? null; node; node = node.parentElement) {
+    const overflow = getComputedStyle(node).overflowY;
+    if ((overflow === 'auto' || overflow === 'scroll') && node.scrollHeight > node.clientHeight) return node;
+  }
+  return window;
+}
+
+function orderElements(root: HTMLElement, order: OrderDrag): HTMLElement[] {
+  const selector = order.kind === 'apps' ? '[data-order-kind="app"]' : '[data-order-kind="chain"]';
+  return [...root.querySelectorAll<HTMLElement>(selector)].filter(
+    el => order.kind === 'apps' || el.dataset.orderApp === order.appId,
+  );
+}
+
 function ChainList({ go }: { go: (d: Drill) => void }) {
   const { who } = useSession();
   const qc = useQueryClient();
@@ -2465,12 +2690,284 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const editable = can(who.role, 'edit');
   const [creating, setCreating] = useState<{ id: string; label: string } | null>(null);
   const [renaming, setRenaming] = useState<{ id: string; label: string } | null>(null);
+  const [orderDrag, setOrderDragState] = useState<OrderDrag | null>(null);
+  const orderDragRef = useRef<OrderDrag | null>(null);
+  // FLIP 用：`.chain-sections` 容器、上一帧各卡片的位置、以及「这一帧要不要播动画」的开关。
+  const sectionsRef = useRef<HTMLDivElement | null>(null);
+  const flipRects = useRef<Map<string, DOMRect>>(new Map());
+  const animateReorder = useRef(false);
+  // 整卡可拖后，一次真实拖动结束时紧跟的 click 不应再触发「打开这条链」。
+  const justDragged = useRef(false);
+
+  const setOrderDrag = (next: OrderDrag | null) => {
+    orderDragRef.current = next;
+    setOrderDragState(next);
+  };
+
+  useEffect(
+    () => () => {
+      document.body.classList.remove('chain-order-dragging');
+      sectionsRef.current?.classList.remove('app-order-dragging');
+      // 拖拽进行中卸载（如导航离开）时，幽灵是挂在 body 上的游离节点，一并清掉。
+      for (const stray of document.querySelectorAll('.order-ghost')) stray.remove();
+    },
+    [],
+  );
+
+  // 重排后让卡片从旧位平滑滑到新位（FLIP），取代瞬移——四列网格换行时尤其明显。
+  // 只在 animateReorder 置位的那一帧播放（拖动移动、方向键微调）；探测数据刷新等
+  // 不改变顺序的重渲染只更新记录、不触发动画。
+  useLayoutEffect(() => {
+    const root = sectionsRef.current;
+    const current = orderDragRef.current;
+    if (!root || !current) return;
+    const play = animateReorder.current;
+    animateReorder.current = false;
+    const seen = new Set<string>();
+    for (const el of orderElements(root, current)) {
+      const key = `${el.dataset.orderKind}:${el.dataset.orderApp ?? ''}:${el.dataset.orderId}`;
+      seen.add(key);
+      const last = el.getBoundingClientRect();
+      const first = flipRects.current.get(key);
+      flipRects.current.set(key, last);
+      if (!play || !first) continue;
+      const dx = first.left - last.left;
+      const dy = first.top - last.top;
+      if (!dx && !dy) continue;
+      for (const running of el.getAnimations()) {
+        if ((running as { _flip?: boolean })._flip) running.cancel();
+      }
+      const anim = el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'translate(0, 0)' }], {
+        duration: 180,
+        easing: 'cubic-bezier(0.2, 0.7, 0.25, 1)',
+      });
+      (anim as { _flip?: boolean })._flip = true;
+    }
+    for (const key of [...flipRects.current.keys()]) if (!seen.has(key)) flipRects.current.delete(key);
+  });
 
   const appsNow = () => snapshot.data?.snapshot.apps ?? [];
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ['snapshot'] });
     qc.invalidateQueries({ queryKey: ['revisions'] });
     qc.invalidateQueries({ queryKey: ['compile'] });
+  };
+
+  const persistOrder = (order: OrderDrag) => {
+    if (sameOrder(order.order, order.original)) return;
+    if (order.kind === 'apps') {
+      void reorderApps(order.order).then(invalidate);
+    } else {
+      void reorderChains(order.appId, order.order).then(invalidate);
+    }
+  };
+
+  const nudgeOrder = (event: ReactKeyboardEvent<HTMLButtonElement>, order: OrderDrag) => {
+    const offset =
+      event.key === 'ArrowUp' || event.key === 'ArrowLeft'
+        ? -1
+        : event.key === 'ArrowDown' || event.key === 'ArrowRight'
+          ? 1
+          : 0;
+    if (offset === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const from = order.order.indexOf(order.active);
+    const to = Math.max(0, Math.min(order.order.length - 1, from + offset));
+    if (from === to) return;
+    const target = order.order[to];
+    animateReorder.current = true;
+    persistOrder({ ...order, order: moveOrder(order.order, order.active, target) });
+  };
+
+  // 整卡拖拽 · 幽灵跟随 · 实时平滑重排。
+  // - chains 从卡面任意处发起（触摸除外——触摸留给页面滚动，仅抓手可拖）；apps 仍从抓手发起。
+  // - 越过 4px 阈值才真正开始，阈值之内的按下仍是一次点击（打开这条链）。
+  // - app 起拖后切为紧凑行列表并卸载链卡；链拖拽保持卡片网格。两者均保留清晰的原位内容。
+  // - 抬起一枚跟随光标的克隆体作幽灵；落点只按起拖时固定下来的槽位判定。
+  // - 拖到视口上下缘自动滚动。
+  const beginOrderDrag = (event: ReactPointerEvent<HTMLElement>, descriptor: OrderDrag) => {
+    justDragged.current = false;
+    if (!owner || selecting || event.button !== 0) return;
+    const onGrip = !!(event.target as HTMLElement).closest('.order-grip');
+    // 触摸时卡面留给页面滚动，只有抓手能发起拖动；鼠标与触控笔整卡可拖。
+    if (event.pointerType === 'touch' && !onGrip) return;
+    // 此处不 preventDefault：按下若未越过阈值仍是一次点击（打开这条链），而在部分实现里
+    // 取消 pointerdown 会连带吞掉紧随的 click。文本选区改由越阈后 start() 清除、并靠
+    // `.chain-order-dragging` 的 user-select:none 兜住。
+
+    const listener = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    // 幽灵克隆源：链取整张卡，线路取标题条（整段太大，取标题条作一枚轻量条）。
+    const ghostSrc =
+      descriptor.kind === 'chains'
+        ? (listener.closest<HTMLElement>('[data-order-kind="chain"]') ?? listener)
+        : (listener.closest<HTMLElement>('.chain-section-head') ??
+          listener.closest<HTMLElement>('[data-order-kind="app"]') ??
+          listener);
+    const scroller = findScrollParent(ghostSrc);
+    const dragRoot = sectionsRef.current;
+
+    let started = false;
+    let ended = false;
+    let ghost: HTMLElement | null = null;
+    let offX = 0;
+    let offY = 0;
+    let lastX = startX;
+    let lastY = startY;
+    let scrollV = 0;
+    let raf = 0;
+    let frameDirty = false;
+    let scrollOrigin = 0;
+    let slots: OrderSlot[] = [];
+
+    const scrollPosition = () => (scroller === window ? window.scrollY : (scroller as HTMLElement).scrollTop);
+
+    const placeGhost = () => {
+      if (!ghost) return;
+      ghost.style.transform = `translate(${lastX - offX}px, ${lastY - offY}px)`;
+    };
+
+    const evaluate = () => {
+      const current = orderDragRef.current;
+      if (!current) return;
+      const order = orderForPointer(
+        descriptor.order,
+        descriptor.active,
+        slots,
+        lastX,
+        lastY,
+        scrollPosition() - scrollOrigin,
+      );
+      if (sameOrder(order, current.order)) return;
+      animateReorder.current = true;
+      setOrderDrag({ ...current, order });
+    };
+
+    const start = () => {
+      started = true;
+      justDragged.current = true;
+      try {
+        listener.setPointerCapture(pointerId);
+      } catch {
+        /* 捕获失败不致命，事件仍由绑定在 listener 上的监听驱动 */
+      }
+      document.body.classList.add('chain-order-dragging');
+      // 越阈前若已起了一点文本选区，起拖时清掉；之后由 user-select:none 兜住。
+      window.getSelection()?.removeAllRanges();
+      // App 的卡片可能让一个分组高出数屏。直接拖整个分组不但昂贵，按“分组中心”判定时
+      // 还必须把指针拖过半屏才会换位，看起来就像中途卡住。先切成仅标题的紧凑列表；
+      // 记录起拖点在标题内的偏移，并平移列表，让切换形态时当前行仍留在指针下面。
+      const sourceBeforeCompact = ghostSrc.getBoundingClientRect();
+      offX = Math.max(0, Math.min(sourceBeforeCompact.width, lastX - sourceBeforeCompact.left));
+      offY = Math.max(0, Math.min(sourceBeforeCompact.height, lastY - sourceBeforeCompact.top));
+      if (descriptor.kind === 'apps' && dragRoot) {
+        dragRoot.classList.add('app-order-dragging');
+        const compactTop = ghostSrc.getBoundingClientRect().top;
+        // 紧凑列表必须留在正常文档流里，面板背景与高度才会自然包住它。列表收缩后通过
+        // 滚动补偿当前标题的视口位移，而不是 transform 整个列表（transform 不参与布局）。
+        const alignScroll = compactTop - sourceBeforeCompact.top;
+        if (scroller === window) window.scrollBy(0, alignScroll);
+        else (scroller as HTMLElement).scrollTop += alignScroll;
+      }
+      // 以起拖瞬间的位置重新作为 FLIP 基准：上一次渲染后若滚动过页面，视口坐标已变，
+      // 不重采会让第一次重排的补间带上滚动位移、卡片「飞入」。
+      const root = sectionsRef.current;
+      if (root) {
+        flipRects.current.clear();
+        slots = orderElements(root, descriptor).flatMap(el => {
+          const id = el.dataset.orderId;
+          if (!id) return [];
+          const rect = el.getBoundingClientRect();
+          const key = `${el.dataset.orderKind}:${el.dataset.orderApp ?? ''}:${el.dataset.orderId}`;
+          flipRects.current.set(key, rect);
+          return [{ id, left: rect.left, top: rect.top, width: rect.width, height: rect.height }];
+        });
+      }
+      scrollOrigin = scrollPosition();
+      setOrderDrag(descriptor);
+      const rect = ghostSrc.getBoundingClientRect();
+      const clone = ghostSrc.cloneNode(true) as HTMLElement;
+      clone.classList.add('order-ghost');
+      clone.classList.remove('order-drag-active');
+      clone.removeAttribute('data-order-id');
+      clone.style.width = `${rect.width}px`;
+      clone.style.height = `${rect.height}px`;
+      document.body.appendChild(clone);
+      ghost = clone;
+      placeGhost();
+      frameDirty = true;
+      const tick = () => {
+        raf = requestAnimationFrame(tick);
+        if (scrollV) {
+          if (scroller === window) window.scrollBy(0, scrollV);
+          else (scroller as HTMLElement).scrollTop += scrollV;
+          frameDirty = true;
+        }
+        if (!frameDirty) return;
+        frameDirty = false;
+        placeGhost();
+        evaluate();
+      };
+      raf = requestAnimationFrame(tick);
+    };
+
+    const move = (pointer: PointerEvent) => {
+      if (pointer.pointerId !== pointerId) return;
+      lastX = pointer.clientX;
+      lastY = pointer.clientY;
+      if (!started) {
+        if (Math.hypot(lastX - startX, lastY - startY) < 4) return;
+        start();
+      }
+      pointer.preventDefault();
+      frameDirty = true;
+      const edge = 76;
+      const top = lastY;
+      const bottom = window.innerHeight - lastY;
+      scrollV = top < edge ? -Math.ceil((edge - top) / 5) : bottom < edge ? Math.ceil((edge - bottom) / 5) : 0;
+    };
+
+    const finish = (commit: boolean) => {
+      if (ended) return;
+      ended = true;
+      cancelAnimationFrame(raf);
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', cancel);
+      document.body.classList.remove('chain-order-dragging');
+      if (ghost) {
+        ghost.remove();
+        ghost = null;
+      }
+      // pointerup may arrive before the next animation frame. Resolve its final coordinates once so
+      // a quick drag commits the slot visibly reached by the pointer rather than the preceding one.
+      if (started && commit && frameDirty) evaluate();
+      const current = orderDragRef.current;
+      if (descriptor.kind === 'apps' && dragRoot) {
+        dragRoot.classList.remove('app-order-dragging');
+      }
+      setOrderDrag(null);
+      if (!started) return;
+      if (commit && current && !sameOrder(current.order, current.original)) persistOrder(current);
+    };
+    const up = (pointer: PointerEvent) => {
+      if (pointer.pointerId !== pointerId) return;
+      lastX = pointer.clientX;
+      lastY = pointer.clientY;
+      frameDirty = true;
+      finish(true);
+    };
+    const cancel = (pointer: PointerEvent) => {
+      if (pointer.pointerId === pointerId) finish(false);
+    };
+    // 监听放在 window：App 换位会搬动包含抓手的 DOM 分组，部分浏览器会在此时中断
+    // 元素级 pointer 事件；window 与 pointer capture 配合可让整个手势持续到抬手。
+    window.addEventListener('pointermove', move, { passive: false });
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', cancel);
   };
 
   const create = useMutation({
@@ -2523,13 +3020,27 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     ...r,
     disabled: r.members.some(n => retired.has(n)),
   }));
-  // 一个项目一组。组内已停用的排到末尾，同档内保持 snapshot 给出的顺序（即模型顺序，
-  // 除该维度外不在展示层重排，sort 是稳定的）。没有链的项目同样列出：新建的项目没有链，
-  // 过滤掉会使「新建项目」看起来没有生效，从而再次点击创建出第二个空项目。
-  // 项目本身不排序——`app` 没有停用状态，整体排到末尾会被理解为已归档。
-  const groups = (snapshot.data.snapshot.apps ?? []).map(a => ({
+  // 两层都直接保持 snapshot 的 position 顺序。停用状态只改变外观，不再把链挪到末尾：
+  // 否则操作者刚排好的 chain 顺序会在这张主列表上失效，而其他页面又是另一种顺序。
+  // 没有链的项目同样列出：新建的项目没有链，过滤掉会使「新建项目」看起来没有生效。
+  const snapshotApps = snapshot.data.snapshot.apps ?? [];
+  // Draft writes synchronously before its preview request begins. Reading the final order from the
+  // draft itself keeps the dropped shape on screen during that round-trip and also makes “discard
+  // this draft item” immediately remove the optimistic order without a second local cache.
+  const pendingOps = draft.ops();
+  const pendingAppOrder = pendingOps.find(op => op.op === 'reorder_apps');
+  const pendingChainOrders = new Map(
+    pendingOps.filter(op => op.op === 'reorder_chains').map(op => [op.app_id, op.ids] as const),
+  );
+  const appOrder = orderDrag?.kind === 'apps' ? orderDrag.order : pendingAppOrder?.ids;
+  const orderedApps = orderByIds(snapshotApps, appOrder, app => app.id);
+  const groups = orderedApps.map(a => ({
     app: a,
-    chains: rows.filter(r => r.app.id === a.id).sort((x, y) => Number(x.disabled) - Number(y.disabled)),
+    chains: orderByIds(
+      rows.filter(r => r.app.id === a.id),
+      orderDrag?.kind === 'chains' && orderDrag.appId === a.id ? orderDrag.order : pendingChainOrders.get(a.id),
+      row => row.chain.id,
+    ),
   }));
 
   // 卡片颜色表示是否需要处理，而不是“有没有流量”。模型事实优先于探测结果：含退役成员或
@@ -2664,11 +3175,39 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
         {groups.length === 0 ? (
           <Empty>还没有线路。用右上角「＋ 新建线路」建一个。</Empty>
         ) : (
-          <div className="chain-sections">
+          <div className={`chain-sections${orderDrag?.kind === 'apps' ? ' app-order-dragging' : ''}`} ref={sectionsRef}>
             {groups.map((g, gi) => (
-              <section className="chain-section" key={g.app.id}>
+              <section
+                className={`chain-section${orderDrag?.kind === 'apps' && orderDrag.active === g.app.id ? ' order-drag-active' : ''}`}
+                key={g.app.id}
+                data-order-kind="app"
+                data-order-id={g.app.id}
+              >
                 <header className="chain-section-head">
                   <span className="no">{String(gi + 1).padStart(2, '0')}</span>
+                  <button
+                    type="button"
+                    className="order-grip app-order-grip"
+                    disabled={!owner || selecting}
+                    aria-label={`拖动调整线路 ${g.app.label} 的顺序`}
+                    title={owner ? '按住拖动排序；聚焦后也可使用方向键' : '只有系统管理员可以调整顺序'}
+                    onPointerDown={event =>
+                      beginOrderDrag(event, {
+                        kind: 'apps',
+                        active: g.app.id,
+                        original: groups.map(group => group.app.id),
+                        order: groups.map(group => group.app.id),
+                      })
+                    }
+                    onKeyDown={event =>
+                      nudgeOrder(event, {
+                        kind: 'apps',
+                        active: g.app.id,
+                        original: groups.map(group => group.app.id),
+                        order: groups.map(group => group.app.id),
+                      })
+                    }
+                  />
                   {renaming?.id === g.app.id ? (
                     <form
                       className="prj-ren"
@@ -2726,7 +3265,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                     </>
                   )}
                 </header>
-                {g.chains.length === 0 ? (
+                {orderDrag?.kind === 'apps' ? null : g.chains.length === 0 ? (
                   <p className="chain-section-empty">还没有链。用上面的「＋ 新建链」建一条。</p>
                 ) : (
                   <div className="chain-card-grid">
@@ -2735,14 +3274,35 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                       const probe = probeOf.get(r.chain.id);
                       const key = rowKey(r.app.id, r.chain.id);
                       const checked = picked.has(key);
-                      const open = () =>
-                        selecting ? togglePick(key) : go({ p: 'chain', app: r.app.id, chain: r.chain.id });
+                      const open = () => {
+                        // 刚结束一次拖动排序：抬手后紧跟的 click 不应再打开这条链。
+                        if (justDragged.current) {
+                          justDragged.current = false;
+                          return;
+                        }
+                        if (selecting) togglePick(key);
+                        else go({ p: 'chain', app: r.app.id, chain: r.chain.id });
+                      };
                       return (
                         <div
                           role="button"
                           tabIndex={0}
                           key={key}
-                          className={`chain-card tone-${tone}${r.disabled ? ' off' : ''}${checked ? ' picked' : ''}`}
+                          className={`chain-card tone-${tone}${r.disabled ? ' off' : ''}${checked ? ' picked' : ''}${orderDrag?.kind === 'chains' && orderDrag.active === r.chain.id ? ' order-drag-active' : ''}`}
+                          data-order-kind="chain"
+                          data-order-app={g.app.id}
+                          data-order-id={r.chain.id}
+                          // 整卡即拖动手柄（方案 A）。越过 4px 阈值才起拖，之内仍是一次点击；
+                          // 触摸时卡面留给滚动、仅抓手可拖（判定在 beginOrderDrag 内）。
+                          onPointerDown={event =>
+                            beginOrderDrag(event, {
+                              kind: 'chains',
+                              appId: g.app.id,
+                              active: r.chain.id,
+                              original: g.chains.map(row => row.chain.id),
+                              order: g.chains.map(row => row.chain.id),
+                            })
+                          }
                           onClick={open}
                           onKeyDown={e => {
                             if (e.target !== e.currentTarget) return;
@@ -2771,6 +3331,26 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                                 />
                               )}
                             </span>
+                            <button
+                              type="button"
+                              className="order-grip chain-order-grip"
+                              disabled={!owner || selecting}
+                              aria-label={`拖动调整链 ${r.chain.name || r.chain.id} 的顺序`}
+                              title={owner ? '按住拖动排序；聚焦后也可使用方向键' : '只有系统管理员可以调整顺序'}
+                              // 抓手仍是排序的可见提示与键盘入口，但拖动由整张卡统一发起
+                              // （卡片的 onPointerDown 冒泡即含抓手），这里不再单独起拖，
+                              // 否则按住抓手会同时触发两个拖动会话。
+                              onClick={event => event.stopPropagation()}
+                              onKeyDown={event =>
+                                nudgeOrder(event, {
+                                  kind: 'chains',
+                                  appId: g.app.id,
+                                  active: r.chain.id,
+                                  original: g.chains.map(row => row.chain.id),
+                                  order: g.chains.map(row => row.chain.id),
+                                })
+                              }
+                            />
                             <span className="chain-card-title">
                               <b>{r.chain.name || r.chain.id}</b>
                               {r.chain.name && r.chain.name !== r.chain.id && <span>{r.chain.id}</span>}
@@ -2977,6 +3557,97 @@ function ChainTitle({ appId, chain, editable }: { appId: string; chain: Snapshot
   );
 }
 
+const SUBSCRIPTION_COUNTRY_CODES = FLAG_SHEET.flatMap(line =>
+  Array.from({ length: line.length / 2 }, (_, index) => line.slice(index * 2, index * 2 + 2).toUpperCase()),
+);
+const SUBSCRIPTION_COUNTRY_CODE_SET = new Set(SUBSCRIPTION_COUNTRY_CODES);
+const SUBSCRIPTION_COUNTRY_NAMES = new Intl.DisplayNames(['zh-Hans'], { type: 'region' });
+
+/** The compact regional-indicator prefix used in generated subscription node names. */
+export function subscriptionFlag(code: string): string {
+  return SUBSCRIPTION_COUNTRY_CODE_SET.has(code)
+    ? Array.from(code, letter => String.fromCodePoint(127462 + letter.charCodeAt(0) - 65)).join('')
+    : '';
+}
+
+function subscriptionCountryLabel(code: string): string {
+  const name = SUBSCRIPTION_COUNTRY_NAMES.of(code);
+  const flag = subscriptionFlag(code);
+  return `${flag ? `${flag} ` : ''}${name && name !== code ? `${code} · ${name}` : code}`;
+}
+
+export function ChainSubscriptionCountryRow({
+  appId,
+  chain,
+  probe,
+  editable,
+}: {
+  appId: string;
+  chain: SnapshotChain;
+  probe?: E2eProbeItem;
+  editable: boolean;
+}) {
+  const qc = useQueryClient();
+  const configured = chain.subscription_country?.trim().toUpperCase() ?? '';
+  const observed = probe?.status === 'ok' ? (probe.exit_loc?.trim().toUpperCase() ?? '') : '';
+  const suggested = SUBSCRIPTION_COUNTRY_CODE_SET.has(observed) && observed !== configured ? observed : '';
+  const save = useMutation({
+    mutationFn: (country: string | null) =>
+      upsertChain(appId, {
+        id: chain.id,
+        tenant_id: chain.tenant,
+        name: chain.name,
+        subscription_country: country,
+      }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['revisions'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+    },
+  });
+  const update = (country: string) => {
+    if (country !== configured) save.mutate(country || null);
+  };
+  const preview = `${configured ? `${subscriptionFlag(configured)} ` : ''}${chain.name}`;
+
+  return (
+    <>
+      <dt>出口地区标识</dt>
+      <dd>
+        <div className="toolbar" style={{ gap: 7 }}>
+          {editable ? (
+            <select
+              className="f"
+              aria-label="出口地区标识"
+              value={configured}
+              disabled={save.isPending}
+              onChange={event => update(event.target.value)}
+            >
+              <option value="">不显示国旗</option>
+              {SUBSCRIPTION_COUNTRY_CODES.map(code => (
+                <option key={code} value={code}>
+                  {subscriptionCountryLabel(code)}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <span>{configured ? subscriptionCountryLabel(configured) : '不显示国旗'}</span>
+          )}
+          {editable && suggested && (
+            <button className="btn" type="button" disabled={save.isPending} onClick={() => update(suggested)}>
+              采用当前出口 {suggested}
+            </button>
+          )}
+        </div>
+        <span className="note">
+          订阅显示：<span className="mono">{preview}</span>
+        </span>
+        {save.error && <ErrorBox error={save.error} />}
+      </dd>
+    </>
+  );
+}
+
 function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const { who } = useSession();
   const qc = useQueryClient();
@@ -3039,6 +3710,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   // 成员，有各自的规则表和中转端口。只列出主干时，配置分流后该机器会从界面上消失，
   // 其规则无法再访问。
   const chainSteps = (a.steps ?? []).filter(s => s.chain === chain);
+  const probe = byChain(probes.data?.chains).get(chain);
 
   return (
     <>
@@ -3079,7 +3751,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
               </div>
             </div>
           ) : (
-            <ProbeBanner item={byChain(probes.data?.chains).get(chain)} />
+            <ProbeBanner item={probe} />
           )}
 
           {/* ── 落点 ──
@@ -3154,6 +3826,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
           {ingress && (
             <ConfigPanel title="客户端配置">
               <dl className="kv form2 chain-face">
+                <ChainSubscriptionCountryRow appId={app} chain={c} probe={probe} editable={editable} />
                 <IngressProjectionRow
                   appId={app}
                   ingress={ingress}
@@ -3242,8 +3915,6 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     editable={editable}
                     section="vless"
                   />
-                  <IngressRealityGuardRow appId={app} ingress={ingress} editable={editable} />
-                  <IngressRealityLimitsRow appId={app} ingress={ingress} editable={editable} />
                 </IngressPanel>
               )}
               {!!ingress.wires.hysteria2 && (
@@ -3347,32 +4018,10 @@ interface CompiledApp {
   steps?: { chain: string; node: string; rules?: CompiledRule[] }[];
 }
 
-// 编译器补全的末条规则：规则表为空或末条不是「任意」时，按 egress_allowed 补全为
-// `any → Egress` 或 `any → Block`。虚线加灰字表示该行由编译器生成。
-//
-// 此处只渲染规则行，不另加说明——说明位于规则表上方（rules.tsx 的空规则提示）。
-// 上下两处各说明一次会被理解为两件事；而先读到会使用兜底规则、再看到该兜底行，
-// 顺序本身是正确的。
-function FallbackRules({
-  rules,
-  pending,
-  nameOf,
-}: {
-  rules: CompiledRule[];
-  pending: boolean;
-  nameOf: (id: string) => string;
-}) {
-  if (pending) return <p className="note">正在编译，兜底规则尚未计算完成…</p>;
-  if (rules.length === 0) return null;
-  return (
-    <div className="rule-fallback">
-      {rules.map((r, i) => (
-        <span className="rule-fallback-row mono" key={i}>
-          {summarize({ m: r.dest_match, a: r.action }, nameOf)}
-        </span>
-      ))}
-    </div>
-  );
+export function compilerFallbackRules(written: Rule[], compiled: CompiledRule[]): Rule[] {
+  if (written.at(-1)?.m.t === 'any') return [];
+  const fallback = compiled.at(-1);
+  return fallback ? [{ m: fallback.dest_match, a: fallback.action }] : [];
 }
 
 type ChainRuleRow = {
@@ -3406,6 +4055,33 @@ function chainRuleRows(spine: string[], steps: SnapshotStep[]): ChainRuleRow[] {
   return rows;
 }
 
+export function defaultChainRuleOccurrence(
+  spine: string[],
+  steps: SnapshotStep[],
+  selected: string | undefined,
+): string | null {
+  if (!selected) return null;
+  const rows = chainRuleRows(spine, steps);
+  const graph = chainRuleGraph(steps, rows);
+  const roots = spine[0] ? [spine[0]] : rows.slice(0, 1).map(row => row.node);
+  const seen = new Set<string>();
+  let found: string | null = null;
+  const walk = (node: string, path: string[]) => {
+    if (found) return;
+    const occurrence = [...path, node].join('>');
+    if (node === selected) {
+      found = occurrence;
+      return;
+    }
+    if (seen.has(node) || path.includes(node)) return;
+    seen.add(node);
+    for (const edge of graph.get(node) ?? []) walk(edge.to, [...path, node]);
+  };
+  for (const root of roots) walk(root, []);
+  for (const row of rows) if (!seen.has(row.node)) walk(row.node, []);
+  return found;
+}
+
 export function ChainRulesPanel({
   appId,
   chain,
@@ -3416,6 +4092,10 @@ export function ChainRulesPanel({
   showHeader = true,
   onClose,
   onRemove,
+  defaultOpenSelected = false,
+  rootLabel,
+  rootLabelTitle,
+  rootSummary,
   readOnly = false,
 }: {
   appId: string;
@@ -3440,6 +4120,10 @@ export function ChainRulesPanel({
   // 只有链详情页传入该参数——机器详情页中的对应区块表示该机器参与的链，
   // 在该上下文中删除其他机器不合适。不传入时不渲染该组控件。
   onRemove?: (node: string) => void;
+  defaultOpenSelected?: boolean;
+  rootLabel?: string;
+  rootLabelTitle?: string;
+  rootSummary?: ReactNode;
   // readonly 角色看到的是同一棵树和同一张表，只是全部禁用（见 RuleEditor 的 readOnly）。
   // 此前整块被替换为「修改规则需要 editor 及以上」——该提示回答的是权限问题，
   // 而进入链详情页需要了解的是当前配置，两者不同。
@@ -3480,13 +4164,23 @@ export function ChainRulesPanel({
   // 两份 draft 相互覆盖——RuleDraftScope 逐个 handle 保存，后保存的生效。
   const [draftRules, setDraftRules] = useState<Record<string, Rule[]>>({});
   const [draftHops, setDraftHops] = useState<Record<string, HopsDraft>>({});
+  const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
+  const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
   const peersOf = (node: string) => forwardPeers({ nodeId: node, spine, tenant: chain.tenant, steps, nodes });
 
   // 展开状态按出现位置记录（从根到该节点的完整路径），不按机器记录：
   // 同一台机器在树中出现两次时，点击哪一处展开哪一处。另一处不同步展开——
   // 两份相同的表单同时显示时无法确定正在编辑哪一份，而它们本就是同一份数据。
   // 另一处改为高亮显示（见 .same-open），表示该机器在其他位置已展开。
-  const [open, setOpen] = useState<Set<string>>(() => new Set());
+  const defaultOccurrence = defaultOpenSelected ? defaultChainRuleOccurrence(spine, steps, selected) : null;
+  const defaultKey = defaultOccurrence ? `${selected ?? ''}:${defaultOccurrence}` : null;
+  const [open, setOpen] = useState<Set<string>>(() => new Set(defaultOccurrence ? [defaultOccurrence] : []));
+  const lastDefaultKey = useRef(defaultKey);
+  useEffect(() => {
+    if (!defaultOccurrence || !defaultKey || lastDefaultKey.current === defaultKey) return;
+    lastDefaultKey.current = defaultKey;
+    setOpen(previous => new Set(previous).add(defaultOccurrence));
+  }, [defaultOccurrence, defaultKey]);
   const toggle = (occ: string) =>
     setOpen(prev => {
       const next = new Set(prev);
@@ -3513,11 +4207,10 @@ export function ChainRulesPanel({
     return new Map((app?.steps ?? []).filter(s => s.chain === chain.id).map(s => [s.node, s.rules ?? []]));
   }, [compiled.data, appId, chain.id]);
 
-  /* 编译器只在末尾追加（末条已是「任意」时不修改），因此多出的部分即为补全的内容 */
   const fallbackOf = (node: string) => {
-    const written = stepOf(node)?.rules.length ?? 0;
+    const written = draftRules[node] ?? stepOf(node)?.rules ?? [];
     const full = compiledRules.get(node) ?? [];
-    return full.length > written ? full.slice(written) : [];
+    return compilerFallbackRules(written, full);
   };
 
   // 先统计每台机器在该树中出现的次数。
@@ -3557,6 +4250,7 @@ export function ChainRulesPanel({
     /* 该位置的唯一键：从根到此处的路径。同一台机器的两个位置路径不同。 */
     const occ = [...path, node].join('>');
     const expanded = open.has(occ);
+    const rootOccurrence = path.size === 0 && rootNodes.includes(node);
     /* 该机器在其他位置已展开（而非此处）：高亮提示，不同步展开 */
     const sameOpen = !expanded && openNodes.has(node);
     /* 摘要行的两项内容：规则条数、中转端口（含加密档位，PLAIN 即该处的明文提示）。 */
@@ -3564,6 +4258,11 @@ export function ChainRulesPanel({
 
     const badges = (
       <>
+        {rootOccurrence && rootLabel && (
+          <span className="st b-chain" title={rootLabelTitle}>
+            {rootLabel}
+          </span>
+        )}
         {/* 「共享配置」排在最前：它表示的是该机器的属性（在该链中出现多次、共用一张规则表），
             而其后的 geoip= / domain= 标签表示的是该边的属性（流量因何条件到达此处）。
             机器的属性应紧邻机器名。 */}
@@ -3627,12 +4326,12 @@ export function ChainRulesPanel({
               />
             )}
           </span>
-          <span className="meta">
+          <div className="meta">
             <span className="m-rules">{written === 0 ? '没写规则' : `${written} 条规则`}</span>
-            <span className="m-hop">
-              <span className="mono">{summarizeHopIn(step)}</span>
-            </span>
-          </span>
+            <div className="m-hop">
+              {rootOccurrence && rootSummary ? rootSummary : <span className="mono">{summarizeHopIn(step)}</span>}
+            </div>
+          </div>
         </div>
         {
           <>
@@ -3654,6 +4353,10 @@ export function ChainRulesPanel({
                   setRules: next => setDraftRules(prev => ({ ...prev, [node]: next })),
                   hops: draftHops[node] ?? seedHops(peersOf(node), portPool),
                   setHops: next => setDraftHops(prev => ({ ...prev, [node]: next })),
+                  dns: draftDns[node] ?? {},
+                  setDns: next => setDraftDns(prev => ({ ...prev, [node]: next })),
+                  dnsOrder: draftDnsOrder[node] ?? null,
+                  setDnsOrder: next => setDraftDnsOrder(prev => ({ ...prev, [node]: next })),
                 }}
                 peers={peersOf(node)}
                 isForwardTarget={isForwardTargetInChain({
@@ -3667,7 +4370,7 @@ export function ChainRulesPanel({
                 // 两处都注册时同一内容会被写入两次（结果幂等，但产生一次多余的请求）。
                 saves={!repeated}
                 readOnly={readOnly}
-                fallback={<FallbackRules rules={fallbackOf(node)} pending={compiled.isLoading} nameOf={nameOf} />}
+                fallback={{ rules: fallbackOf(node), pending: compiled.isLoading }}
               />
             </div>
             {children.length > 0 && (

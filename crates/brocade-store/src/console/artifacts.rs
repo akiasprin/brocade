@@ -1,7 +1,7 @@
 //! Artifact index and contents. Artifacts are a pure function of the snapshot — computed on
 //! demand rather than looked up, which is how a draft can have artifacts too.
 use brocade_core::artifacts::hy2_port_hop::Hy2PortHopArtifact;
-use brocade_core::model::{IpFamily, ModelSnapshot};
+use brocade_core::{model::ModelSnapshot, physical::user::SubscriptionFilter};
 use sqlx::PgPool;
 
 use super::*;
@@ -24,7 +24,10 @@ pub(crate) fn artifact_index_of(snapshot: &ModelSnapshot) -> Result<ArtifactInde
     let mut artifacts = Vec::new();
 
     if output.summary.can_publish {
-        for node in snapshot.nodes.iter().filter(|node| !node.retired) {
+        // Retired machines still have a meaningful desired artifact set: Disabled is the teardown
+        // contract sent to their agent. Runtime planning drops them only after that contract has
+        // converged; artifact preview remains a pure function of the revision.
+        for node in &snapshot.nodes {
             if let Ok(plan) = output.project_node(&node.id) {
                 let phantun = phantun::build(&plan);
                 match &phantun {
@@ -144,7 +147,7 @@ pub async fn artifact_content(
     target_kind: &str,
     target_id: &str,
     artifact_kind: &str,
-    family: Option<IpFamily>,
+    filter: SubscriptionFilter,
 ) -> Result<ArtifactContent> {
     let snapshot = load_scoped_snapshot(pool, actor, revision).await?;
     artifact_content_of(
@@ -153,7 +156,42 @@ pub async fn artifact_content(
         target_id,
         artifact_kind,
         !actor.is_system_admin(),
-        family,
+        filter,
+    )
+}
+
+/// Render a user subscription from the same converged projection as the public Clash endpoint.
+/// This is intentionally separate from `artifact_content`: the artifact inspector is a draft and
+/// historical-revision tool, while the address dialog promises to show what subscribers can use
+/// now. Keeping the call sites explicit prevents a future preview feature from weakening serving
+/// semantics globally.
+pub async fn serving_user_artifact_content(
+    pool: &PgPool,
+    actor: &AdminContext,
+    target_id: &str,
+    artifact_kind: &str,
+    filter: SubscriptionFilter,
+) -> Result<ArtifactContent> {
+    let target_id = required_text(target_id, "target_id")?;
+    let artifact_kind = required_text(artifact_kind, "artifact_kind")?;
+    if !matches!(artifact_kind.as_str(), "uri" | "clash") {
+        return Err(StoreError::NotFound(format!(
+            "serving user artifact {target_id}/{artifact_kind}"
+        )));
+    }
+    let (tenant_id, user_id) = split_user_target(&target_id)?;
+    actor.require_tenant_access(tenant_id, "serving user artifact")?;
+
+    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
+    ensure_user_visible(&serving.snapshot, tenant_id, user_id)?;
+    serving.ensure_available()?;
+    artifact_content_of(
+        &serving.snapshot,
+        "user",
+        &target_id,
+        &artifact_kind,
+        false,
+        filter,
     )
 }
 
@@ -162,16 +200,15 @@ pub async fn artifact_content(
 /// different things: a tenant administrator can see their own machine and still should not see
 /// its wg private key. There is one test: whether the caller is a system-admin.
 ///
-/// `family` narrows a user subscription to one address family, for handing to a client that can
-/// only reach one of them. `None` is every family, and it is what the fleet itself is served —
-/// nothing but this console's read path passes anything else.
+/// `filter` can narrow a user subscription by address family and client wire. Its empty value is
+/// what the fleet itself is served; machine artifacts ignore it.
 pub(crate) fn artifact_content_of(
     snapshot: &ModelSnapshot,
     target_kind: &str,
     target_id: &str,
     artifact_kind: &str,
     redact: bool,
-    family: Option<IpFamily>,
+    filter: SubscriptionFilter,
 ) -> Result<ArtifactContent> {
     let target_kind = required_text(target_kind, "target_kind")?;
     let target_id = required_text(target_id, "target_id")?;
@@ -318,9 +355,7 @@ pub(crate) fn artifact_content_of(
                     "cannot project user {tenant_id}/{user_id}: {blocked:?}"
                 ))
             })?;
-            if let Some(family) = family {
-                plan.retain_family(family);
-            }
+            plan.retain_filter(filter);
             let subscription = subscription::build(&plan);
             let content = if artifact_kind == "uri" {
                 uri::subscription(&subscription)
@@ -352,14 +387,26 @@ pub async fn verify_deployment(
         None => crate::materialize::current_revision(pool).await?,
     };
     let mut plan = crate::deployment::plan_deployment(pool, actor, revision_id).await?;
+    let mut node_lifecycle = None;
     if let Some(node_id) = request.node_id.as_deref().and_then(optional_text) {
+        let lifecycle = crate::lifecycle::load(pool, node_id).await?;
         plan.targets.retain(|target| target.node_id == node_id);
         if plan.targets.is_empty() {
-            return Err(StoreError::NotFound(format!(
-                "node {node_id} in revision {revision_id}"
-            )));
+            let lifecycle_debt = matches!(
+                lifecycle.phase,
+                crate::NodeLifecyclePhase::Retiring | crate::NodeLifecyclePhase::Abandoned
+            );
+            plan.summary = brocade_deployment::plan::PlanSummary {
+                total_targets: usize::from(lifecycle_debt),
+                changed_targets: usize::from(lifecycle_debt),
+                skipped_targets: 0,
+                disruptive_targets: 0,
+                max_wave: 0,
+            };
+        } else {
+            plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
         }
-        plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
+        node_lifecycle = Some(lifecycle);
     }
 
     Ok(DeploymentVerification {
@@ -367,5 +414,6 @@ pub async fn verify_deployment(
         converged: plan.summary.changed_targets == 0,
         summary: plan.summary,
         targets: plan.targets,
+        node_lifecycle,
     })
 }

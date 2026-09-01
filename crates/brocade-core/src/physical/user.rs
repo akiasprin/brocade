@@ -1,11 +1,32 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     ir::routing::{AppIr, AppNode, Ingress},
     model::{
-        FrontStrategy, Hysteria2, IpFamily, ProjectionDownloadEndpoint, ProjectionEndpoint, Xhttp,
+        ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2, IpFamily,
+        ProjectionDownloadEndpoint, ProjectionEndpoint, Xhttp,
     },
 };
+
+/// Which client protocol a subscription view retains. This is a projection filter rather than
+/// model state: one ingress can publish both wires, while a particular URL can expose either one
+/// or the complete pair without changing what is deployed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionProtocol {
+    Vless,
+    Hysteria2,
+}
+
+/// Optional dimensions applied to a generated subscription. Keeping these together makes every
+/// output path apply the same intersection when both a network family and protocol are selected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionFilter {
+    pub family: Option<IpFamily>,
+    pub protocol: Option<SubscriptionProtocol>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserPlan {
@@ -13,10 +34,20 @@ pub struct UserPlan {
     pub user: String,
     pub uuid: String,
     pub entries: Vec<UserSubscriptionEntryPlan>,
+    pub external_proxies: Vec<UserExternalProxyPlan>,
     pub front_groups: Vec<UserFrontGroupPlan>,
 }
 
 impl UserPlan {
+    pub fn retain_filter(&mut self, filter: SubscriptionFilter) {
+        if let Some(family) = filter.family {
+            self.retain_family(family);
+        }
+        if let Some(protocol) = filter.protocol {
+            self.retain_protocol(protocol);
+        }
+    }
+
     /// Drop the entries a client restricted to `family` cannot dial.
     ///
     /// The whole subscription is compiled first and narrowed here, rather than compiled per
@@ -37,11 +68,39 @@ impl UserPlan {
     pub fn retain_family(&mut self, family: IpFamily) {
         self.entries
             .retain(|entry| entry.family.is_none_or(|entry| entry == family));
+        self.prune_empty_fronts();
+    }
+
+    /// Keep one wire protocol while preserving every front-group invariant maintained by the
+    /// address-family filter. Reality and TLS are both VLESS security variants; Hysteria 2 has a
+    /// distinct account and URI/YAML shape.
+    pub fn retain_protocol(&mut self, protocol: SubscriptionProtocol) {
+        self.entries.retain(|entry| {
+            matches!(
+                (protocol, &entry.security),
+                (
+                    SubscriptionProtocol::Vless,
+                    UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_)
+                ) | (
+                    SubscriptionProtocol::Hysteria2,
+                    UserSecurityPlan::Hysteria2(_)
+                )
+            )
+        });
+        self.prune_empty_fronts();
+    }
+
+    fn prune_empty_fronts(&mut self) {
         loop {
             let kept = self
                 .entries
                 .iter()
                 .map(|entry| entry.name.as_str())
+                .chain(
+                    self.external_proxies
+                        .iter()
+                        .map(|proxy| proxy.name.as_str()),
+                )
                 .collect::<BTreeSet<_>>();
             for group in &mut self.front_groups {
                 group
@@ -145,6 +204,18 @@ pub struct UserFrontGroupPlan {
     pub members: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserExternalProxyPlan {
+    /// Stable tenant resource id. Tunnel ids are globally unique so one proxy can be shared by
+    /// fronts in several projects without duplicating it in a subscription.
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    pub protocol: ExternalOutboundProtocol,
+    pub security: ExternalOutboundSecurity,
+}
+
 /// The security halves this ingress hands a subscriber, in the order they appear.
 ///
 /// One entry per wire: a client cannot speak both at once, so an ingress serving TCP and QUIC
@@ -196,15 +267,35 @@ fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
 }
 
 pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
-    let uuid = sorted_apps(apps)
-        .into_iter()
+    let uuid = apps
+        .iter()
         .flat_map(|app| app.users.iter())
         .find(|candidate| candidate.tenant == tenant && candidate.id == user)
         .map(|user| user.uuid.clone())
         .unwrap_or_else(|| "?".to_owned());
 
     let mut entries = Vec::new();
-    for app in sorted_apps(apps) {
+    for app in apps {
+        let app_start = entries.len();
+        let chain_rank = app
+            .chains
+            .iter()
+            .enumerate()
+            .map(|(position, chain)| (chain.id.as_str(), position))
+            .collect::<BTreeMap<_, _>>();
+        let ingress_rank = app
+            .ingresses
+            .iter()
+            .map(|ingress| {
+                (
+                    ingress.id.as_str(),
+                    chain_rank
+                        .get(ingress.chain.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         for grant in app
             .grants
             .iter()
@@ -224,7 +315,9 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                 .chains
                 .iter()
                 .find(|chain| chain.id == ingress.chain)
-                .map(|chain| chain.name.clone())
+                .map(|chain| {
+                    subscription_chain_name(&chain.name, chain.subscription_country.as_deref())
+                })
                 .unwrap_or_else(|| ingress.id.clone());
             let front = ingress
                 .front
@@ -279,23 +372,57 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                 }
             }
         }
+        // Both levels are semantic: apps arrive in apps.position order and chains in
+        // chains.position order. Sort only within this app, using the entry's parent chain first
+        // and stable entry fields only as deterministic ties inside one chain.
+        entries[app_start..].sort_by(|a, b| {
+            ingress_rank
+                .get(a.ingress_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &ingress_rank
+                        .get(b.ingress_id.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+                .then_with(|| a.grant_id.cmp(&b.grant_id))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.server.cmp(&b.server))
+        });
     }
-    entries.sort_by(|a, b| {
-        a.grant_id
-            .cmp(&b.grant_id)
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.server.cmp(&b.server))
-    });
 
-    let front_groups = front_groups(apps, &entries);
+    let external_proxies = external_proxies(apps, &entries);
+    let front_groups = front_groups(apps, &entries, &external_proxies);
 
     UserPlan {
         tenant: tenant.to_owned(),
         user: user.to_owned(),
         uuid,
         entries,
+        external_proxies,
         front_groups,
     }
+}
+
+/// The only portable icon a URI or YAML subscription can carry is text. Regional-indicator
+/// Unicode characters become a country flag in clients with an emoji font, while the explicit
+/// model field keeps the generated name stable across probe failures and historical revisions.
+fn subscription_chain_name(name: &str, country: Option<&str>) -> String {
+    let Some(code) = country
+        .map(str::trim)
+        .filter(|code| code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase()))
+    else {
+        return name.to_owned();
+    };
+    let mut flag = String::new();
+    for byte in code.bytes() {
+        // The shape check above constrains this to the 26 regional-indicator symbols.
+        flag.push(
+            char::from_u32(0x1f1e6 + u32::from(byte - b'A')).expect("valid regional indicator"),
+        );
+    }
+    format!("{flag} {name}")
 }
 
 struct SubscriptionServer {
@@ -391,7 +518,72 @@ fn family_server(
         })
 }
 
-fn front_groups(apps: &[AppIr], entries: &[UserSubscriptionEntryPlan]) -> Vec<UserFrontGroupPlan> {
+fn external_proxies(
+    apps: &[AppIr],
+    entries: &[UserSubscriptionEntryPlan],
+) -> Vec<UserExternalProxyPlan> {
+    let used_fronts = entries
+        .iter()
+        .filter_map(|entry| entry.front_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    for app in apps {
+        for front in app
+            .fronts
+            .iter()
+            .filter(|front| used_fronts.contains(front.id.as_str()))
+        {
+            for outbound_id in &front.external_via {
+                let Some(outbound) = app
+                    .external_outbounds
+                    .iter()
+                    .find(|outbound| outbound.id == *outbound_id)
+                else {
+                    continue;
+                };
+                // Validation rejects this combination. Keeping it out of the subscription as
+                // well makes a bypassed validator fail closed instead of publishing a logical
+                // WARP resource with no user identity.
+                if matches!(outbound.protocol, ExternalOutboundProtocol::Warp { .. }) {
+                    continue;
+                }
+                let id = outbound.id.clone();
+                if candidates
+                    .iter()
+                    .any(|candidate: &UserExternalProxyPlan| candidate.id == id)
+                {
+                    continue;
+                }
+                candidates.push(UserExternalProxyPlan {
+                    id,
+                    name: outbound.name.clone(),
+                    address: outbound.address.clone(),
+                    port: outbound.port,
+                    protocol: outbound.protocol.clone(),
+                    security: outbound.security.clone(),
+                });
+            }
+        }
+    }
+    let counts = candidates
+        .iter()
+        .fold(BTreeMap::new(), |mut counts, proxy| {
+            *counts.entry(proxy.name.clone()).or_insert(0_usize) += 1;
+            counts
+        });
+    for proxy in &mut candidates {
+        if counts.get(&proxy.name).copied().unwrap_or_default() > 1 {
+            proxy.name = format!("{} · {}", proxy.name, proxy.id);
+        }
+    }
+    candidates
+}
+
+fn front_groups(
+    apps: &[AppIr],
+    entries: &[UserSubscriptionEntryPlan],
+    external_proxies: &[UserExternalProxyPlan],
+) -> Vec<UserFrontGroupPlan> {
     let entries_by_ingress = entries.iter().fold(
         BTreeMap::<&str, Vec<&UserSubscriptionEntryPlan>>::new(),
         |mut by_ingress, entry| {
@@ -408,18 +600,24 @@ fn front_groups(apps: &[AppIr], entries: &[UserSubscriptionEntryPlan]) -> Vec<Us
         .collect::<BTreeSet<_>>();
     let mut groups = Vec::new();
 
-    for app in sorted_apps(apps) {
+    for app in apps {
         for front in app
             .fronts
             .iter()
             .filter(|front| used_fronts.contains(front.id.as_str()))
         {
-            let members = front
+            let mut members = front
                 .via
                 .iter()
                 .filter_map(|ingress_id| entries_by_ingress.get(ingress_id.as_str()))
                 .flat_map(|entries| entries.iter().map(|entry| entry.name.clone()))
                 .collect::<Vec<_>>();
+            members.extend(front.external_via.iter().filter_map(|outbound_id| {
+                external_proxies
+                    .iter()
+                    .find(|proxy| proxy.id == *outbound_id)
+                    .map(|proxy| proxy.name.clone())
+            }));
             groups.push(UserFrontGroupPlan {
                 id: front.id.clone(),
                 name: front.name.clone(),
@@ -429,12 +627,5 @@ fn front_groups(apps: &[AppIr], entries: &[UserSubscriptionEntryPlan]) -> Vec<Us
         }
     }
 
-    groups.sort_by(|a, b| a.id.cmp(&b.id));
     groups
-}
-
-fn sorted_apps(apps: &[AppIr]) -> Vec<&AppIr> {
-    let mut apps = apps.iter().collect::<Vec<_>>();
-    apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
-    apps
 }

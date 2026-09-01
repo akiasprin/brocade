@@ -2,12 +2,17 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCerts,
+  fetchBranding,
   saveCertDomain,
+  saveBranding,
   scanCerts,
   fetchDistribution,
+  fetchAgentLogPolicy,
   fetchLinkMtu,
   fetchSettings,
   saveDistribution,
+  saveAgentLogDefault,
+  saveNodeLogPolicy,
   saveSettings,
   createCertGroup,
   deleteCertGroup,
@@ -15,7 +20,10 @@ import {
   serveCertificate,
   updateCertGroup,
   type CertsView,
+  type BrandingSettings,
   type DistributionView,
+  type AgentLogPolicyNode,
+  type AgentLogPolicyView,
   type GroupCertificate,
   type NodeCertificateState,
   type LinkMtuItem,
@@ -23,7 +31,9 @@ import {
 } from '../api';
 import { can, useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
+import { BrandIcon } from '../ui/branding';
 import { useNodeNames } from '../ui/node-name';
+import { REALITY_FINGERPRINT_OPTIONS } from '../reality';
 
 /* 空串表示不设置该项（服务端类型为 Option<T>），不应将空串作为 "" 提交 */
 const text = (v: string | null) => v ?? '';
@@ -145,7 +155,7 @@ const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
 
 /* 保存之后会发生什么，三档。段标题里只写结果，原因写在段自己的说明里。
  *
- * 这是八段之间最大的一处差别，此前它只出现在每段说明的末尾（「不盖修订，保存即生效」
+ * 这是九段之间最大的一处差别，此前它只出现在每段说明的末尾（「不盖修订，保存即生效」
  * 「修改本段需要发布一次」），与其余的说明同为一句灰色小字，需要读完整句才能得知。 */
 type Apply = 'now' | 'publish' | 'cycle';
 
@@ -157,29 +167,31 @@ const APPLY: Record<Apply, string> = {
 
 /* ── 段目录 ──
  *
- * 八段分两栏排列，目录平铺这八项，不按生效方式分组：那是段自身的属性，每段的标题栏里
- * 已经有一枚徽章写明，目录里再分一次只是把八行拆成三段间隔。
+ * 九段分两栏排列，目录平铺这九项，不按生效方式分组：那是段自身的属性，每段的标题栏里
+ * 已经有一枚徽章写明，目录里再分一次只是把九行拆成三段间隔。
  *
- * 编号不是装饰：内容区按该顺序排列（左栏 01–03、右栏 04–08，从上到下、从左到右），
+ * 编号不是装饰：内容区按该顺序排列（左栏 01–04、右栏 05–09，从上到下、从左到右），
  * 可以直接引用第 5 段这样的位置。
  */
 type NavItem = { id: string; no: string; label: string; apply: Apply; key?: SectionKey };
 
 const NAV: NavItem[] = [
-  { id: 'set-dist', no: '01', label: '分发', apply: 'now' },
-  { id: 'set-cert', no: '02', label: '证书', apply: 'now' },
-  { id: 'set-xray', no: '03', label: 'XRAY', apply: 'publish', key: 'xray' },
-  { id: 'set-conn', no: '04', label: '连接策略', apply: 'publish', key: 'connection' },
-  { id: 'set-wg', no: '05', label: 'WireGuard', apply: 'publish', key: 'wireguard' },
-  { id: 'set-ports', no: '06', label: '端口分配', apply: 'publish', key: 'ports' },
+  { id: 'set-branding', no: '01', label: '站点外观', apply: 'now' },
+  { id: 'set-dist', no: '02', label: '分发', apply: 'now' },
+  { id: 'set-agent-logs', no: '03', label: '日志保留', apply: 'cycle' },
+  { id: 'set-cert', no: '04', label: '证书', apply: 'now' },
+  { id: 'set-xray', no: '05', label: 'XRAY', apply: 'publish', key: 'xray' },
+  { id: 'set-conn', no: '06', label: '连接策略', apply: 'publish', key: 'connection' },
+  { id: 'set-wg', no: '07', label: 'WireGuard', apply: 'publish', key: 'wireguard' },
+  { id: 'set-ports', no: '08', label: '端口分配', apply: 'publish', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
-  { id: 'set-probe', no: '07', label: '端到端探测', apply: 'cycle', key: 'probe' },
-  { id: 'set-geodata', no: '08', label: '规则库更新', apply: 'publish', key: 'geodata' },
+  { id: 'set-probe', no: '09', label: '端到端探测', apply: 'cycle', key: 'probe' },
+  { id: 'set-geodata', no: '10', label: '规则库更新', apply: 'publish', key: 'geodata' },
 ];
 
 const APPLY_OF: Record<string, Apply> = Object.fromEntries(NAV.map(item => [item.id, item.apply]));
 
-/** 段标题里的生效方式。只有「需要发布」着主色：八段里这一档占五段，
+/** 段标题里的生效方式。只有「需要发布」着主色：九段里这一档占五段，
     且它是唯一一档「保存完还没完」，另外两档保存即到位。 */
 function ApplyBadge({ id }: { id: string }) {
   const kind = APPLY_OF[id];
@@ -654,7 +666,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
         </div>
 
         <div className="guard">
-          每台一张<b>独立</b>证书。Let&apos;s Encrypt <b>同一组名字每 7 天最多签发 5 张</b>，随机标签使每台名字唯一，不受此限制。
+          每台一张<b>独立</b>证书。Let&apos;s Encrypt <b>同一组名字每 7 天最多签发 5 张</b>
+          ，随机标签使每台名字唯一，不受此限制。
         </div>
 
         <div className="guard">
@@ -872,7 +885,9 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   const disk = diskState(row, serving);
                   return (
                     <div className="certrow member" key={row.node_id}>
-                      <span className="cname" title={row.node_id}>{nameOf(row.node_id)}</span>
+                      <span className="cname" title={row.node_id}>
+                        {nameOf(row.node_id)}
+                      </span>
                       {disk ? (
                         <span className={`cdisk cstate ${disk.tone}`}>{disk.text}</span>
                       ) : (
@@ -928,6 +943,119 @@ function GroupForm({
         </button>
       </div>
     </div>
+  );
+}
+
+const BRAND_ICON_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+const BRAND_ICON_MAX_BYTES = 256 * 1024;
+
+function BrandingSection({ editable, data }: { editable: boolean; data: BrandingSettings }) {
+  const qc = useQueryClient();
+  const [form, setForm] = useState<BrandingSettings | null>(null);
+  const [savedAt, setSavedAt] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [syncedFrom, setSyncedFrom] = useState<BrandingSettings | undefined>(undefined);
+  if (data !== syncedFrom) {
+    setSyncedFrom(data);
+    setForm(data);
+  }
+
+  const f = form ?? data;
+  const dirty = f.site_name !== data.site_name || f.icon_data_url !== data.icon_data_url;
+  const save = useMutation({
+    mutationFn: () => saveBranding(f),
+    onSuccess: saved => {
+      setSavedAt(true);
+      setFileError(null);
+      setForm(saved);
+      qc.setQueryData(['branding'], saved);
+    },
+  });
+
+  const chooseIcon = (file: File | undefined) => {
+    setFileError(null);
+    if (!file) return;
+    if (!BRAND_ICON_TYPES.includes(file.type)) {
+      setFileError('只支持 PNG、JPEG 或 WebP');
+      return;
+    }
+    if (file.size > BRAND_ICON_MAX_BYTES) {
+      setFileError('图片不能超过 256 KiB');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => setFileError('图片读取失败');
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        setFileError('图片读取失败');
+        return;
+      }
+      setForm(current => ({ ...(current ?? data), icon_data_url: reader.result as string }));
+    };
+    reader.readAsDataURL(file);
+  };
+
+  return (
+    <section className="panel titled" id="set-branding">
+      <header>
+        <span className="no">{NO_OF['set-branding']}</span>
+        <h4>站点外观</h4>
+        <ApplyBadge id="set-branding" />
+        <span className="sp" />
+        {dirty && <span className="dirty">有未保存的改动</span>}
+        {!dirty && savedAt && <span className="dirty done">已保存，立刻生效</span>}
+        <button
+          className={dirty ? 'btn primary save' : 'btn save idle'}
+          disabled={!editable || !dirty || save.isPending}
+          onClick={() => save.mutate()}
+        >
+          {save.isPending ? '保存中…' : '保存这一段'}
+        </button>
+      </header>
+      <p className="cardsub">控制台左上角使用这里的名称和图标；名称也同步到登录页和浏览器标题</p>
+      {save.error && <ErrorBox error={save.error} />}
+      {fileError && <div className="callout err">{fileError}</div>}
+      <Group>
+        <Fld label="站点名称">
+          <input
+            className={dirty && f.site_name !== data.site_name ? 'f chg' : 'f'}
+            style={{ width: 260 }}
+            maxLength={64}
+            placeholder="Brocade"
+            value={f.site_name}
+            onChange={event => setForm({ ...f, site_name: event.target.value })}
+          />
+        </Fld>
+        <Fld label="站点图标">
+          <span className="branding-preview" title="左上角预览">
+            <BrandIcon branding={f} className="branding-preview-icon" />
+          </span>
+          <label className="btn sm branding-file">
+            选择图片
+            <input
+              type="file"
+              accept={BRAND_ICON_TYPES.join(',')}
+              disabled={!editable}
+              onChange={event => {
+                chooseIcon(event.currentTarget.files?.[0]);
+                event.currentTarget.value = '';
+              }}
+            />
+          </label>
+          {f.icon_data_url && (
+            <button
+              className="btn sm"
+              type="button"
+              disabled={!editable}
+              onClick={() => setForm({ ...f, icon_data_url: null })}
+            >
+              恢复默认图标
+            </button>
+          )}
+          <span className="hint">PNG / JPEG / WebP，最大 256 KiB；建议使用正方形图片</span>
+        </Fld>
+      </Group>
+    </section>
   );
 }
 
@@ -1013,6 +1141,186 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
   );
 }
 
+const LOG_MIN_MIB = 16;
+const LOG_MAX_MIB = 4096;
+
+const validLogMib = (raw: string) => {
+  if (!/^\d+$/.test(raw.trim())) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= LOG_MIN_MIB && value <= LOG_MAX_MIB ? value : null;
+};
+
+export function NodeLogPolicyRow({ editable, node }: { editable: boolean; node: AgentLogPolicyNode }) {
+  const qc = useQueryClient();
+  const [form, setForm] = useState(String(node.override_max_mib ?? node.effective_max_mib));
+  const [customizing, setCustomizing] = useState(false);
+  const [syncedFrom, setSyncedFrom] = useState(node);
+  if (node !== syncedFrom) {
+    setSyncedFrom(node);
+    setForm(String(node.override_max_mib ?? node.effective_max_mib));
+    setCustomizing(false);
+  }
+  const mutation = useMutation({
+    mutationFn: (maxMib: number | null) => saveNodeLogPolicy(node.node_id, maxMib),
+    onSuccess: view => {
+      qc.setQueryData(['agent-log-policy'], view);
+    },
+  });
+  const inherited = node.override_max_mib == null && !customizing;
+  const value = validLogMib(form);
+  const dirty = !inherited && (customizing || (value !== null && value !== node.override_max_mib));
+
+  return (
+    <div className="agent-log-node">
+      <div className="agent-log-node-name">
+        <b>{node.name}</b>
+        <span>{node.tenant_id}</span>
+      </div>
+      <span className={inherited ? 'agent-log-source' : 'agent-log-source overridden'}>
+        {inherited ? '继承全局' : '机器覆盖'}
+      </span>
+      <label className="agent-log-value">
+        <input
+          className={dirty ? 'f chg' : 'f'}
+          type="number"
+          min={LOG_MIN_MIB}
+          max={LOG_MAX_MIB}
+          step={1}
+          aria-label={`${node.name} 日志上限`}
+          disabled={!editable || inherited || mutation.isPending}
+          value={inherited ? node.effective_max_mib : form}
+          onChange={event => setForm(event.target.value)}
+        />
+        <span>MiB</span>
+      </label>
+      {inherited ? (
+        <button
+          className="btn sm"
+          type="button"
+          disabled={!editable}
+          onClick={() => {
+            setForm(String(node.effective_max_mib));
+            setCustomizing(true);
+          }}
+        >
+          设置覆盖
+        </button>
+      ) : (
+        <>
+          <button
+            className={dirty ? 'btn sm primary' : 'btn sm'}
+            type="button"
+            disabled={!editable || value === null || !dirty || mutation.isPending}
+            onClick={() => value !== null && mutation.mutate(value)}
+          >
+            {mutation.isPending && mutation.variables !== null ? '保存中…' : '保存'}
+          </button>
+          <button
+            className="btn sm"
+            type="button"
+            disabled={!editable || mutation.isPending}
+            onClick={() => {
+              if (node.override_max_mib == null) {
+                setCustomizing(false);
+                setForm(String(node.effective_max_mib));
+              } else {
+                mutation.mutate(null);
+              }
+            }}
+          >
+            {mutation.isPending && mutation.variables === null
+              ? '取消中…'
+              : node.override_max_mib == null
+                ? '取消'
+                : '取消覆盖'}
+          </button>
+        </>
+      )}
+      {value === null && !inherited && (
+        <span className="agent-log-invalid">
+          {LOG_MIN_MIB}–{LOG_MAX_MIB}
+        </span>
+      )}
+      {mutation.error && <ErrorBox error={mutation.error} />}
+    </div>
+  );
+}
+
+export function AgentLogPolicySection({ editable, data }: { editable: boolean; data: AgentLogPolicyView }) {
+  const qc = useQueryClient();
+  const [form, setForm] = useState(String(data.global_max_mib));
+  const [syncedFrom, setSyncedFrom] = useState(data.global_max_mib);
+  if (data.global_max_mib !== syncedFrom) {
+    setSyncedFrom(data.global_max_mib);
+    setForm(String(data.global_max_mib));
+  }
+  const value = validLogMib(form);
+  const dirty = value !== null && value !== data.global_max_mib;
+  const save = useMutation({
+    mutationFn: () => saveAgentLogDefault(value!),
+    onSuccess: view => qc.setQueryData(['agent-log-policy'], view),
+  });
+
+  return (
+    <section className="panel titled agent-log-policy" id="set-agent-logs">
+      <header>
+        <span className="no">{NO_OF['set-agent-logs']}</span>
+        <h4>日志保留</h4>
+        <ApplyBadge id="set-agent-logs" />
+        <span className="sp" />
+        {dirty && <span className="dirty">有未保存的改动</span>}
+        <button
+          className={dirty ? 'btn primary save' : 'btn save idle'}
+          disabled={!editable || !dirty || save.isPending}
+          onClick={() => save.mutate()}
+        >
+          {save.isPending ? '保存中…' : '保存全局值'}
+        </button>
+      </header>
+      <p className="cardsub">Agent、XRAY 与每个 Phantun 日志项的磁盘上限；机器覆盖优先于全局</p>
+      {save.error && <ErrorBox error={save.error} />}
+      <Group label="全局默认">
+        <Fld label="每个日志项最多">
+          <label className="agent-log-value global">
+            <input
+              className={dirty ? 'f chg' : 'f'}
+              type="number"
+              min={LOG_MIN_MIB}
+              max={LOG_MAX_MIB}
+              step={1}
+              aria-label="全局日志上限"
+              disabled={!editable || save.isPending}
+              value={form}
+              onChange={event => setForm(event.target.value)}
+            />
+            <span>MiB</span>
+          </label>
+          <span className="hint">
+            范围 {LOG_MIN_MIB}–{LOG_MAX_MIB}。修改后，所有未覆盖的机器随下一轮 Agent 轮询更新
+          </span>
+          {value === null && (
+            <span className="agent-log-invalid">
+              请输入 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数
+            </span>
+          )}
+        </Fld>
+      </Group>
+      <Group label="机器覆盖">
+        <div className="agent-log-nodes">
+          {data.nodes.length === 0 ? (
+            <span className="hint">还没有机器</span>
+          ) : (
+            data.nodes.map(node => <NodeLogPolicyRow key={node.node_id} editable={editable} node={node} />)
+          )}
+        </div>
+        <div className="guard">
+          不产生修订、不需要发布线路。降低上限会立即截断已有日志；XRAY 与 Phantun 不会因此重启。
+        </div>
+      </Group>
+    </section>
+  );
+}
+
 const Group = ({ label, children }: { label?: string; children: React.ReactNode }) => (
   <div className="setgrp">
     {label && <p className="eyebrow">{label}</p>}
@@ -1065,9 +1373,10 @@ export function SettingsPane() {
   const { who } = useSession();
   const qc = useQueryClient();
   const settings = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings() });
-  // 证书与分发两段的查询原本在各段组件内：三个查询各自结束时，页面先亮一次整页骨架，
+  // 证书、分发与站点外观的查询统一放在页面层：各段各自结束时会先亮一次整页骨架，
   // 再在刚渲染出的段落里亮第二次——加载态被看到两次。查询提到页面层、一次等齐，
   // 加载期只呈现一个骨架。
+  const branding = useQuery({ queryKey: ['branding'], queryFn: () => fetchBranding() });
   const certs = useQuery({
     queryKey: ['certs'],
     queryFn: () => fetchCerts(),
@@ -1078,6 +1387,7 @@ export function SettingsPane() {
         : false,
   });
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
+  const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
   const [form, setForm] = useState<Form>(EMPTY);
   const [saved, setSaved] = useState<Partial<Record<SectionKey, number>>>({});
 
@@ -1155,7 +1465,8 @@ export function SettingsPane() {
     },
   });
 
-  if (settings.isPending || certs.isPending || dist.isPending) return <Loading />;
+  if (settings.isPending || branding.isPending || certs.isPending || dist.isPending || logPolicy.isPending)
+    return <Loading />;
   if (settings.error) return <ErrorBox error={settings.error} />;
 
   const editable = can(who.role, 'system');
@@ -1174,13 +1485,23 @@ export function SettingsPane() {
   return (
     <div className="cardpage">
       <div className="duo">
-        {/* 左栏三段、右栏五段：两栏各自成流，不对齐底部。分段位置按高度定——证书段带着
+        {/* 左栏四段、右栏五段：两栏各自成流，不对齐底部。分段位置按高度定——证书段带着
             机队列表，单它一段就抵得上右栏的两段，与它同栏的只能是最短的那两段。
             编号仍从上到下、从左到右连续。 */}
         <div className="col">
           {save.error && <ErrorBox error={save.error} />}
 
+          {branding.error ? (
+            <ErrorBox error={branding.error} />
+          ) : (
+            <BrandingSection editable={editable} data={branding.data!} />
+          )}
           {dist.error ? <ErrorBox error={dist.error} /> : <DistributionSection editable={editable} data={dist.data!} />}
+          {logPolicy.error ? (
+            <ErrorBox error={logPolicy.error} />
+          ) : (
+            <AgentLogPolicySection editable={editable} data={logPolicy.data!} />
+          )}
           {certs.error ? <ErrorBox error={certs.error} /> : <CertSection editable={editable} view={certs.data!} />}
 
           <Section id="set-xray" name="XRAY" sub="所有接入面共用的服务端参数" {...secProps('xray')}>
@@ -1189,7 +1510,7 @@ export function SettingsPane() {
                 <input
                   className={chg('dest')}
                   style={{ width: 230 }}
-                  placeholder="apps.apple.com:443"
+                  placeholder="example.com:443"
                   value={form.dest}
                   onChange={e => setForm({ ...form, dest: e.target.value })}
                 />
@@ -1199,20 +1520,26 @@ export function SettingsPane() {
                 <input
                   className={chg('names')}
                   style={{ width: 280 }}
-                  placeholder="apps.apple.com"
+                  placeholder="example.com"
                   value={form.names}
                   onChange={e => setForm({ ...form, names: e.target.value })}
                 />
                 <span className="hint">SNI，多个用逗号分隔</span>
               </Fld>
               <Fld label="fingerprint">
-                <input
+                <select
                   className={chg('fp')}
                   style={{ width: 130 }}
-                  placeholder="chrome"
                   value={form.fp}
                   onChange={e => setForm({ ...form, fp: e.target.value })}
-                />
+                >
+                  <option value="">未设置</option>
+                  {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                    <option value={value} key={value}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
               </Fld>
               <div className="guard">
                 SNI 与 dest 必须指向同一个真实站点，不一致会导致握手失败。接入面未填写站点时使用这里的值。

@@ -31,7 +31,12 @@
 use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -63,6 +68,65 @@ const ATTEMPTS: u32 = 2;
 /// a gap is no gap at all.
 const RETRY_GAP: Duration = Duration::from_millis(700);
 
+/// Cooperative cancellation shared by every item in one on-demand job.
+///
+/// The process handle remains owned by the worker which spawned it — cancellation never searches
+/// the machine by process name, because doing that on an Agent would also kill the serving Xray.
+/// A blocked socket wakes when its bounded timeout expires; every other boundary checks the flag
+/// immediately and the process guard then reaps exactly its own child.
+#[derive(Clone, Default)]
+pub struct ProbeCancellation(Arc<AtomicBool>);
+
+impl ProbeCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Runtime-only choices. The target remains a pure description of the user path; where Xray is
+/// installed and whether the caller cancelled are properties of the machine running the probe.
+#[derive(Clone)]
+pub struct ProbeOptions {
+    xray_binary: PathBuf,
+    runtime_dir: PathBuf,
+    cancellation: ProbeCancellation,
+}
+
+impl Default for ProbeOptions {
+    fn default() -> Self {
+        Self {
+            xray_binary: PathBuf::from("xray"),
+            runtime_dir: std::env::temp_dir(),
+            cancellation: ProbeCancellation::default(),
+        }
+    }
+}
+
+impl ProbeOptions {
+    pub fn new(xray_binary: impl Into<PathBuf>, cancellation: ProbeCancellation) -> Self {
+        Self {
+            xray_binary: xray_binary.into(),
+            runtime_dir: std::env::temp_dir(),
+            cancellation,
+        }
+    }
+
+    /// Put credential-bearing configs in a caller-owned private directory. Console uses a
+    /// systemd RuntimeDirectory; Agents retain the established system temporary directory.
+    pub fn with_runtime_dir(mut self, runtime_dir: impl Into<PathBuf>) -> Self {
+        self.runtime_dir = runtime_dir.into();
+        self
+    }
+
+    pub fn cancellation(&self) -> &ProbeCancellation {
+        &self.cancellation
+    }
+}
+
 /// Probe a whole batch. Chains run serially: starting N xrays in parallel adds N
 /// processes to this machine for the seconds the probe takes, and a machine with
 /// many chains is precisely a loaded one. Probing must not become its burden.
@@ -80,13 +144,30 @@ pub fn probe_all(list: &E2eProbeTargetList) -> Vec<E2eProbe> {
 /// attempt is the chain's real timing, and failure details should be the most
 /// recent — an intermediate attempt's error is already stale.
 pub fn probe_one(target: &E2eProbeTarget, endpoint_url: &str, timeout_secs: u64) -> E2eProbe {
-    let mut last = probe_once(target, endpoint_url, timeout_secs);
+    probe_one_with_options(target, endpoint_url, timeout_secs, &ProbeOptions::default())
+}
+
+/// The same real protocol probe with an explicit Xray executable and cancellation scope. Console
+/// uses this form; Agents keep the PATH-based wrapper above.
+pub fn probe_one_with_options(
+    target: &E2eProbeTarget,
+    endpoint_url: &str,
+    timeout_secs: u64,
+    options: &ProbeOptions,
+) -> E2eProbe {
+    let mut last = probe_once(target, endpoint_url, timeout_secs, options);
     for _ in 1..ATTEMPTS {
-        if !worth_retrying(&last) {
+        if !worth_retrying(&last) || options.cancellation.is_cancelled() {
             break;
         }
-        std::thread::sleep(RETRY_GAP);
-        last = probe_once(target, endpoint_url, timeout_secs);
+        let until = Instant::now() + RETRY_GAP;
+        while Instant::now() < until && !options.cancellation.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if options.cancellation.is_cancelled() {
+            break;
+        }
+        last = probe_once(target, endpoint_url, timeout_secs, options);
     }
     last
 }
@@ -103,7 +184,12 @@ fn worth_retrying(probe: &E2eProbe) -> bool {
     )
 }
 
-fn probe_once(target: &E2eProbeTarget, endpoint_url: &str, timeout_secs: u64) -> E2eProbe {
+fn probe_once(
+    target: &E2eProbeTarget,
+    endpoint_url: &str,
+    timeout_secs: u64,
+    options: &ProbeOptions,
+) -> E2eProbe {
     let timeout = Duration::from_secs(timeout_secs.clamp(1, 120));
     let base = |status: E2eProbeStatus, detail: Option<String>| E2eProbe {
         app_id: target.app_id.clone(),
@@ -115,6 +201,10 @@ fn probe_once(target: &E2eProbeTarget, endpoint_url: &str, timeout_secs: u64) ->
         exit_verdict: E2eExitVerdict::Unknown,
         detail,
     };
+
+    if options.cancellation.is_cancelled() {
+        return base(E2eProbeStatus::Unsupported, Some("拨测已取消".to_owned()));
+    }
 
     let Ok(endpoint) = HttpTarget::parse(endpoint_url) else {
         // A misconfigured endpoint is our own configuration problem, not a broken
@@ -135,13 +225,18 @@ fn probe_once(target: &E2eProbeTarget, endpoint_url: &str, timeout_secs: u64) ->
         );
     };
 
-    let mut process = match spawn_xray(target, socks_port) {
+    let mut process = match spawn_xray(
+        target,
+        socks_port,
+        &options.xray_binary,
+        &options.runtime_dir,
+    ) {
         Ok(process) => process,
         Err(error) => return base(E2eProbeStatus::Unsupported, Some(error)),
     };
 
     let outcome = (|| {
-        if !wait_for_listen(socks_port) {
+        if !wait_for_listen(socks_port, &options.cancellation) {
             // A started process that never listens usually means xray rejected
             // the config. Carry its output along — it is the only thing that can
             // say why it would not start.
@@ -157,8 +252,14 @@ fn probe_once(target: &E2eProbeTarget, endpoint_url: &str, timeout_secs: u64) ->
         // outbound connections by default, and a user waits for it on every new
         // connection too. A failed warm-up fails outright without a second
         // request: a broken chain breaks again and only costs another timeout.
-        run_probe(socks_port, &endpoint, timeout)?;
-        run_probe(socks_port, &endpoint, timeout)
+        if options.cancellation.is_cancelled() {
+            return Err((E2eProbeStatus::Unsupported, "拨测已取消".to_owned()));
+        }
+        run_probe(socks_port, &endpoint, timeout, &options.cancellation)?;
+        if options.cancellation.is_cancelled() {
+            return Err((E2eProbeStatus::Unsupported, "拨测已取消".to_owned()));
+        }
+        run_probe(socks_port, &endpoint, timeout, &options.cancellation)
     })();
 
     process.kill();
@@ -310,6 +411,42 @@ fn hysteria_client_config(
             quic.insert("brutalDown".to_owned(), serde_json::json!(down));
         }
     }
+    if let Some(profile) = &hysteria.bbr_profile {
+        quic.insert("bbrProfile".to_owned(), serde_json::json!(profile));
+    }
+    for (key, value) in [
+        (
+            "initStreamReceiveWindow",
+            hysteria.init_stream_receive_window,
+        ),
+        ("maxStreamReceiveWindow", hysteria.max_stream_receive_window),
+        (
+            "initConnectionReceiveWindow",
+            hysteria.init_connection_receive_window,
+        ),
+        (
+            "maxConnectionReceiveWindow",
+            hysteria.max_connection_receive_window,
+        ),
+    ] {
+        if let Some(value) = value {
+            quic.insert(key.to_owned(), serde_json::json!(value));
+        }
+    }
+    for (key, value) in [
+        ("maxIdleTimeout", hysteria.max_idle_timeout_secs),
+        ("keepAlivePeriod", hysteria.keep_alive_period_secs),
+    ] {
+        if let Some(value) = value {
+            quic.insert(key.to_owned(), serde_json::json!(value));
+        }
+    }
+    if hysteria.disable_path_mtu_discovery {
+        quic.insert(
+            "disablePathMTUDiscovery".to_owned(),
+            serde_json::json!(true),
+        );
+    }
     let mut finalmask = serde_json::Map::new();
     finalmask.insert("quicParams".to_owned(), serde_json::Value::Object(quic));
     if let Some(password) = &hysteria.salamander_password {
@@ -397,8 +534,12 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
             if let Some(host) = &xhttp.host {
                 options["host"] = serde_json::json!(host);
             }
-            if let Some(mux) = xhttp.mux {
-                options["xmux"] = serde_json::json!({ "maxConcurrency": mux });
+            if let Some(xmux) = &xhttp.xmux {
+                options["xmux"] = serde_json::json!({
+                    "maxConcurrency": xmux.max_concurrency,
+                    "hMaxRequestTimes": xhttp_range(&xmux.h_max_request_times),
+                    "hMaxReusableSecs": xhttp_range(&xmux.h_max_reusable_secs),
+                });
             }
             // Absent means both ends resolve it the same way by themselves. Named, it has to
             // match: a server told to expect one upload shape refuses every client naming another.
@@ -409,6 +550,14 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
         }
     }
     settings
+}
+
+fn xhttp_range(range: &brocade_deployment::protocol::E2eProbeXhttpRange) -> serde_json::Value {
+    if range.from == range.to {
+        serde_json::json!(range.from)
+    } else {
+        serde_json::json!(format!("{}-{}", range.from, range.to))
+    }
 }
 
 // ── Process ─────────────────────────────────────────────────────────────────
@@ -467,9 +616,18 @@ impl Drop for ProbeProcess {
     }
 }
 
-fn spawn_xray(target: &E2eProbeTarget, socks_port: u16) -> Result<ProbeProcess, String> {
-    let log = TempFile::write("", ".log")?;
-    let file = TempFile::write(&client_config(target, socks_port, &log.path), ".json")?;
+fn spawn_xray(
+    target: &E2eProbeTarget,
+    socks_port: u16,
+    xray_binary: &Path,
+    runtime_dir: &Path,
+) -> Result<ProbeProcess, String> {
+    let log = TempFile::write(runtime_dir, "", ".log")?;
+    let file = TempFile::write(
+        runtime_dir,
+        &client_config(target, socks_port, &log.path),
+        ".json",
+    )?;
     // Both streams go to the same file. A rejected config is reported on **stdout**,
     // and stderr stays empty: at that point xray's logging system is not initialized
     // and the `log.error` path has not taken effect. Discarding stdout is why every
@@ -486,13 +644,13 @@ fn spawn_xray(target: &E2eProbeTarget, socks_port: u16) -> Result<ProbeProcess, 
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("打不开探测日志：{error}"))?;
-    let child = Command::new("xray")
+    let child = Command::new(xray_binary)
         .args(["-config", &file.path])
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .map_err(|error| format!("起不了探测进程：{error}（这台机器上有 xray 吗）"))?;
+        .map_err(|error| format!("起不了探测进程 {}：{error}", xray_binary.display()))?;
     Ok(ProbeProcess {
         child,
         _config: file,
@@ -514,22 +672,33 @@ impl TempFile {
     /// the format by extension and exits with `Failed to get format` without one —
     /// a line emitted before the logging system initializes, so it leaves no trace
     /// even in the log file.
-    fn write(content: &str, suffix: &str) -> Result<Self, String> {
+    fn write(runtime_dir: &Path, content: &str, suffix: &str) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+
         // The name carries the PID and a global counter: probes are serial on one
         // machine, but a manual `e2e-once` can collide with the daemon, and a
         // single probe needs two files of its own.
-        let path = format!(
-            "/tmp/brocade-probe-{}-{}{suffix}",
-            std::process::id(),
-            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        std::fs::write(&path, content).map_err(|error| format!("写探测配置失败：{error}"))?;
-        // The config carries credentials that reach the ingress; anyone able to
-        // read it has been handed those credentials.
-        let _ = std::fs::set_permissions(
-            &path,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-        );
+        let path = runtime_dir
+            .join(format!(
+                "brocade-probe-{}-{}{suffix}",
+                std::process::id(),
+                TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .to_string_lossy()
+            .into_owned();
+        // `create_new` prevents a pre-created symlink from redirecting a credential-bearing
+        // config, and mode is applied at creation rather than tightened in a later race window.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("创建探测配置失败：{error}"))?;
+        if let Err(error) = file.write_all(content.as_bytes()) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("写探测配置失败：{error}"));
+        }
         Ok(Self { path })
     }
 }
@@ -551,9 +720,9 @@ fn free_local_port() -> Option<u16> {
     listener.local_addr().ok().map(|addr| addr.port())
 }
 
-fn wait_for_listen(port: u16) -> bool {
+fn wait_for_listen(port: u16, cancellation: &ProbeCancellation) -> bool {
     let deadline = Instant::now() + STARTUP_WAIT;
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !cancellation.is_cancelled() {
         if TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), STARTUP_POLL)
             .is_ok()
         {
@@ -597,8 +766,10 @@ fn run_probe(
     socks_port: u16,
     endpoint: &HttpTarget,
     timeout: Duration,
+    cancellation: &ProbeCancellation,
 ) -> Result<ProbeSuccess, (E2eProbeStatus, String)> {
     let started = Instant::now();
+    let deadline = started + timeout;
 
     let mut stream = TcpStream::connect_timeout(
         &SocketAddr::from((Ipv4Addr::LOCALHOST, socks_port)),
@@ -610,11 +781,20 @@ fn run_probe(
             format!("连不上本机的探测口：{error}"),
         )
     })?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    // Writes go only to a loopback Xray and are tiny. Keep them bounded separately; reads use a
+    // short polling timeout below so cancellation reaps the exact child promptly rather than
+    // leaving it alive until the entire network timeout expires.
+    let _ = stream.set_write_timeout(Some(timeout.min(Duration::from_secs(1))));
     let _ = stream.set_nodelay(true);
 
-    socks5_connect(&mut stream, &endpoint.host, endpoint.port).map_err(|error| {
+    socks5_connect(
+        &mut stream,
+        &endpoint.host,
+        endpoint.port,
+        deadline,
+        cancellation,
+    )
+    .map_err(|error| {
         // Failure in the socks stage means xray could not establish the
         // connection. From the probe's side, "the REALITY handshake was refused"
         // and "the ingress never answered" are one phenomenon, and genuinely have
@@ -640,7 +820,7 @@ fn run_probe(
     // forwarding hop, and the exit reaching the internet — exactly what a user
     // waits through, and the only latency with business meaning.
     let mut first = [0_u8; 4096];
-    let read = stream.read(&mut first).map_err(|error| {
+    let read = read_until(&mut stream, &mut first, deadline, cancellation).map_err(|error| {
         let status = if error.kind() == std::io::ErrorKind::WouldBlock
             || error.kind() == std::io::ErrorKind::TimedOut
         {
@@ -664,7 +844,7 @@ fn run_probe(
     let mut body = Vec::from(&first[..read]);
     let mut chunk = [0_u8; 4096];
     while body.len() < 8192 {
-        match stream.read(&mut chunk) {
+        match read_until(&mut stream, &mut chunk, deadline, cancellation) {
             Ok(0) | Err(_) => break,
             Ok(n) => body.extend_from_slice(&chunk[..n]),
         }
@@ -708,14 +888,19 @@ fn trace_field(response: &str, key: &str) -> Option<String> {
 
 // ── SOCKS5 (a small slice of RFC 1928) ──────────────────────────────────────
 
-fn socks5_connect(stream: &mut TcpStream, host: &str, port: u16) -> Result<(), String> {
+fn socks5_connect(
+    stream: &mut TcpStream,
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    cancellation: &ProbeCancellation,
+) -> Result<(), String> {
     // Handshake: offer no-auth only
     stream
         .write_all(&[0x05, 0x01, 0x00])
         .map_err(|error| error.to_string())?;
     let mut greeting = [0_u8; 2];
-    stream
-        .read_exact(&mut greeting)
+    read_exact_until(stream, &mut greeting, deadline, cancellation)
         .map_err(|error| error.to_string())?;
     if greeting != [0x05, 0x00] {
         return Err(format!("socks 握手被拒：{greeting:?}"));
@@ -736,8 +921,7 @@ fn socks5_connect(stream: &mut TcpStream, host: &str, port: u16) -> Result<(), S
         .map_err(|error| error.to_string())?;
 
     let mut head = [0_u8; 4];
-    stream
-        .read_exact(&mut head)
+    read_exact_until(stream, &mut head, deadline, cancellation)
         .map_err(|error| error.to_string())?;
     if head[1] != 0x00 {
         return Err(format!("socks 建不了连接：REP={}", head[1]));
@@ -748,17 +932,70 @@ fn socks5_connect(stream: &mut TcpStream, host: &str, port: u16) -> Result<(), S
         0x04 => 16,
         0x03 => {
             let mut len = [0_u8; 1];
-            stream
-                .read_exact(&mut len)
+            read_exact_until(stream, &mut len, deadline, cancellation)
                 .map_err(|error| error.to_string())?;
             usize::from(len[0])
         }
         other => return Err(format!("socks 回了个没见过的地址类型 {other}")),
     };
     let mut rest = vec![0_u8; skip + 2];
-    stream
-        .read_exact(&mut rest)
+    read_exact_until(stream, &mut rest, deadline, cancellation)
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+fn read_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    cancellation: &ProbeCancellation,
+) -> std::io::Result<usize> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "probe canceled",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "probe timeout",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining.min(CANCEL_POLL)))?;
+        match stream.read(buffer) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+fn read_exact_until(
+    stream: &mut TcpStream,
+    mut buffer: &mut [u8],
+    deadline: Instant,
+    cancellation: &ProbeCancellation,
+) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        match read_until(stream, buffer, deadline, cancellation)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early eof",
+                ))
+            }
+            read => buffer = &mut buffer[read..],
+        }
+    }
     Ok(())
 }
 
@@ -787,6 +1024,56 @@ mod tests {
             xhttp: None,
             expected_exit_ips: expected.iter().map(|value| (*value).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn credential_configs_are_private_and_removed_with_the_guard() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "brocade-probe-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = {
+            let file = TempFile::write(&dir, "credential", ".json").unwrap();
+            assert_eq!(
+                std::fs::metadata(&file.path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            file.path.clone()
+        };
+        assert!(!Path::new(&path).exists());
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_blocked_socket_without_waiting_for_the_full_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        let cancellation = ProbeCancellation::default();
+        let trigger = cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let error = read_until(
+            &mut client,
+            &mut [0_u8; 1],
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
     }
 
     /// "Cannot check" must be its own outcome. Counted as a pass, a misconfigured
@@ -829,7 +1116,17 @@ mod tests {
         t.xhttp = Some(brocade_deployment::protocol::E2eProbeXhttp {
             path: "/probe".to_owned(),
             host: Some("upload.route.example".to_owned()),
-            mux: Some(16),
+            xmux: Some(brocade_deployment::protocol::E2eProbeXhttpXmux {
+                max_concurrency: 16,
+                h_max_request_times: brocade_deployment::protocol::E2eProbeXhttpRange {
+                    from: 600,
+                    to: 900,
+                },
+                h_max_reusable_secs: brocade_deployment::protocol::E2eProbeXhttpRange {
+                    from: 1800,
+                    to: 3000,
+                },
+            }),
             mode: Some("stream-one".to_owned()),
         });
         let out: serde_json::Value =
@@ -839,6 +1136,14 @@ mod tests {
         assert_eq!(stream["xhttpSettings"]["path"], "/probe");
         assert_eq!(stream["xhttpSettings"]["host"], "upload.route.example");
         assert_eq!(stream["xhttpSettings"]["xmux"]["maxConcurrency"], 16);
+        assert_eq!(
+            stream["xhttpSettings"]["xmux"]["hMaxRequestTimes"],
+            "600-900"
+        );
+        assert_eq!(
+            stream["xhttpSettings"]["xmux"]["hMaxReusableSecs"],
+            "1800-3000"
+        );
         assert_eq!(stream["xhttpSettings"]["mode"], "stream-one");
     }
 
@@ -876,6 +1181,14 @@ mod tests {
             congestion: "force-brutal".to_owned(),
             up: Some("20 mbps".to_owned()),
             down: Some("100 mbps".to_owned()),
+            bbr_profile: Some("conservative".to_owned()),
+            init_stream_receive_window: Some(131_072),
+            max_stream_receive_window: Some(262_144),
+            init_connection_receive_window: Some(327_680),
+            max_connection_receive_window: Some(655_360),
+            max_idle_timeout_secs: Some(30),
+            keep_alive_period_secs: Some(10),
+            disable_path_mtu_discovery: true,
             salamander_password: Some("obfs-secret".to_owned()),
         });
         let out: serde_json::Value =
@@ -896,6 +1209,22 @@ mod tests {
         assert_eq!(
             outbound["streamSettings"]["finalmask"]["quicParams"]["brutalDown"],
             "100 mbps"
+        );
+        assert_eq!(
+            outbound["streamSettings"]["finalmask"]["quicParams"]["bbrProfile"],
+            "conservative"
+        );
+        assert_eq!(
+            outbound["streamSettings"]["finalmask"]["quicParams"]["maxConnectionReceiveWindow"],
+            655_360
+        );
+        assert_eq!(
+            outbound["streamSettings"]["finalmask"]["quicParams"]["keepAlivePeriod"],
+            10
+        );
+        assert_eq!(
+            outbound["streamSettings"]["finalmask"]["quicParams"]["disablePathMTUDiscovery"],
+            true
         );
         assert_eq!(
             outbound["streamSettings"]["finalmask"]["udp"][0]["settings"]["password"],
@@ -980,8 +1309,9 @@ mod tests {
     /// config while the report says the chain is down.
     #[test]
     fn temp_files_do_not_collide() {
-        let a = TempFile::write("a", ".json").unwrap();
-        let b = TempFile::write("b", ".log").unwrap();
+        let runtime_dir = std::env::temp_dir();
+        let a = TempFile::write(&runtime_dir, "a", ".json").unwrap();
+        let b = TempFile::write(&runtime_dir, "b", ".log").unwrap();
         assert_ne!(a.path, b.path);
         // The config must be .json: xray identifies the format by extension and
         // exits without even writing a log when there is none.

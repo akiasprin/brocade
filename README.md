@@ -32,7 +32,9 @@ ModelSnapshot → 中间表示（IR）→ 节点产物 → 期望状态 → Agen
 
 agent 接收期望状态，而非待执行的命令序列。它将期望状态与本机实际状态比较，仅在存在偏差时执行操作，并将收敛结果回报控制面。最近一次期望状态会保存在节点本地，因此控制面暂时不可达时，节点仍能发现并修正本机漂移。
 
-除配置收敛外，agent 还负责上报用量与运行指标、执行链路探测，并给出路径 MTU 建议。用量按固定窗口累计，配额状态的变化会触发相应的授权调整。
+除配置收敛外，agent 还负责上报用量与运行指标、执行链路探测，并给出路径 MTU 建议。用量按固定窗口累计，配额状态的变化会触发相应的授权调整。机器观测以 30 秒窗口保存：磁盘面板针对 agent 状态目录所在文件系统，区分容量、inode、块设备吞吐、IOPS、完成延迟、队列与 I/O PSI；网络面板除连接与内核错误外，还按真实匿名端口范围估算最繁忙目标的出站端口压力。目标地址只在节点内参与聚合，不会上报控制面。
+
+节点日志默认有界：设置页配置全局上限（默认 100 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。Agent 使用独立 journald namespace；Agent 拉起的 Xray 与每个 Phantun 实例分别写入 `$BROCADE_AGENT_STATE_DIR/logs`，每个日志项的当前段与前一段合计不超过生效上限。降低上限会在线截断已有分段，不重启 Xray/Phantun。查看 Agent 日志使用 `journalctl --namespace=brocade-agent -u brocade-agent`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动，旧版 `/tmp/brocade-agent-*.log` 会在对应进程完成一次受控重启后移除。
 
 ## 代码结构
 
@@ -43,6 +45,7 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 | `brocade-console`    | 控制台 API、节点 API，以及内嵌的 Web 控制台与 agent 发行物 |
 | `brocade-deployment` | 发布计划和控制面—节点协议类型                              |
 | `brocade-agent`      | 节点侧收敛、观测、探测与用量采集                           |
+| `brocade-probe`      | Agent 与控制面共用的临时 Xray 客户端和端到端拨测执行器     |
 | `brocade-preview`    | 基于 Docker 的本地集群预览环境                             |
 | `frontend`           | React + Vite 控制台                                        |
 
@@ -149,7 +152,31 @@ sudo -u postgres createdb --owner=brocade brocade
 
 数据库迁移会在控制面启动时自动执行。若数据库不存在且角色具有 `CREATEDB` 权限，控制面也可以自动创建数据库；生产环境通常更适合预先创建数据库，并遵循最小权限原则。
 
-### 3. 安装二进制与环境文件
+### 3. 安装控制面拨测所需的 Xray
+
+用户页的「授权验证」由控制面使用当前 Serving 中的真实用户授权发起，因此控制面主机也必须安装与机队版本一致的 Xray。它只作为短生命周期的客户端执行，不运行常驻 Xray 服务。固定版本和校验和应取自 [XTLS/Xray-core 对应版本的官方 release](https://github.com/XTLS/Xray-core/releases)。以下是 `aarch64` 上已验证的 `v26.4.25`：
+
+```sh
+BROCADE_INSTALL_XRAY_VERSION=v26.4.25
+BROCADE_INSTALL_XRAY_SHA256=020416fa7e1b1b04c4f97209b33f1bd4683e15272feda48c769ae2c9beb1c3de
+BROCADE_XRAY_TMP="$(mktemp -d)"
+trap 'rm -rf -- "$BROCADE_XRAY_TMP"' EXIT
+
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --output "$BROCADE_XRAY_TMP/xray.zip" \
+  "https://github.com/XTLS/Xray-core/releases/download/${BROCADE_INSTALL_XRAY_VERSION}/Xray-linux-arm64-v8a.zip"
+printf '%s  %s\n' "$BROCADE_INSTALL_XRAY_SHA256" "$BROCADE_XRAY_TMP/xray.zip" \
+  | sha256sum --check --strict
+unzip -j "$BROCADE_XRAY_TMP/xray.zip" xray -d "$BROCADE_XRAY_TMP/unpacked"
+sudo install -d -o root -g root -m 0755 /opt/brocade/libexec
+sudo install -o root -g root -m 0755 \
+  "$BROCADE_XRAY_TMP/unpacked/xray" /opt/brocade/libexec/xray
+/opt/brocade/libexec/xray version | head -n 1
+```
+
+`x86_64` 主机应改用同一 release 的 `Xray-linux-64.zip`，并使用该资产自己的 SHA-256；不能沿用上面的 ARM64 校验值。
+
+### 4. 安装二进制与环境文件
 
 先将构建产物上传至目标服务器的临时目录，再安装到 `/opt/brocade`：
 
@@ -168,6 +195,8 @@ DATABASE_URL=postgres://brocade:CHANGE_ME@127.0.0.1:5432/brocade
 BROCADE_ADMIN_BIND=127.0.0.1:8080
 BROCADE_AGENT_PUBLIC_URL=https://console.example.net
 BROCADE_XRAY_VERSION=v26.4.25
+BROCADE_PROBE_XRAY_BIN=/opt/brocade/libexec/xray
+BROCADE_PROBE_RUNTIME_DIR=/run/brocade/probes
 ```
 
 环境文件包含数据库密码及密封密钥，应在写入任何内容之前将权限限制为 root 可读。随后在目标服务器上直接生成并追加 `BROCADE_SECRET_KEY`，避免密钥经过构建主机、终端输出或复制过程：
@@ -186,7 +215,7 @@ sudo chmod 0600 /opt/brocade/console.env
 
 若需要分别限制控制台流量与节点流量，可以设置 `BROCADE_AGENT_BIND`，并为第二个监听地址配置独立的反向代理入口。其余环境变量及留空时的行为见 [`console.env.example`](console.env.example)。
 
-### 4. 配置 systemd
+### 5. 配置 systemd
 
 创建 `/etc/systemd/system/brocade-console.service`：
 
@@ -209,6 +238,8 @@ RestartSec=5s
 TimeoutStopSec=90s
 UMask=0077
 CacheDirectory=brocade
+RuntimeDirectory=brocade
+RuntimeDirectoryMode=0700
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
@@ -218,7 +249,7 @@ ProtectSystem=strict
 WantedBy=multi-user.target
 ```
 
-控制面会在 `BROCADE_CACHE_DIR` 中保存 GeoIP 数据库缓存。`CacheDirectory=brocade` 由 systemd 创建并授予服务账号写权限，因此无需放宽 `/opt/brocade` 的文件权限。
+控制面会在 `BROCADE_CACHE_DIR` 中保存 GeoIP 数据库缓存。`CacheDirectory=brocade` 由 systemd 创建并授予服务账号写权限，因此无需放宽 `/opt/brocade` 的文件权限。授权拨测的临时配置包含真实用户凭据，只会以 `0600` 写入 `RuntimeDirectory` 下的 `probes` 子目录，任务结束后删除；该目录本身由控制面收紧为 `0700`。
 
 加载并启动服务：
 
@@ -231,7 +262,7 @@ sudo journalctl -u brocade-console -n 100 --no-pager
 
 首次启动时应核对日志中实际连接或自动创建的数据库名称，避免因 `DATABASE_URL` 拼写错误而得到一个新的空数据库。
 
-### 5. 配置 Nginx 与 TLS
+### 6. 配置 Nginx 与 TLS
 
 控制面应只监听回环地址，由 Nginx 负责公网 TLS 终止。将以下配置写入 `/etc/nginx/sites-available/brocade`。示例假定证书已安装于 `/etc/letsencrypt/live/console.example.net/`：
 
@@ -270,7 +301,7 @@ sudo systemctl reload nginx
 
 若域名经过 Cloudflare 等代理，应使用可验证的源站证书，并启用严格的端到端 TLS 验证（Cloudflare 对应 `Full (strict)`），而不应依赖不校验证书的兼容模式。
 
-### 6. 更新与回滚准备
+### 7. 更新与回滚准备
 
 升级前应备份数据库，并记录当前二进制的 SHA-256：
 
@@ -279,6 +310,7 @@ sudo install -d -o postgres -g postgres -m 0700 /var/backups/brocade
 sudo -u postgres pg_dump --format=custom \
   --file=/var/backups/brocade/before-upgrade.dump brocade
 sha256sum /opt/brocade/brocade-console
+/opt/brocade/libexec/xray version | head -n 1
 ```
 
 新二进制应先上传到临时路径，再原子替换并重启服务。上传阶段不会中断现有进程：
@@ -298,6 +330,17 @@ ssh deploy@console.example.net '
 ```
 
 迁移只会在启动时向前执行。常规升级不应通过删除数据库来“重建”状态；若新版本涉及不可逆迁移，应在部署前验证备份可恢复性，并准备与数据库版本相匹配的旧二进制。
+
+升级后除服务状态外，还应确认本地拨测执行器可用：
+
+```sh
+sudo systemctl is-active brocade-console
+/opt/brocade/libexec/xray version | head -n 1
+sudo journalctl -u brocade-console -n 100 --no-pager
+curl --fail https://console.example.net/healthz
+```
+
+登录控制台后，用户页「授权验证」不应显示“Console 未安装或无法执行拨测 Xray”。拨测使用真实用户凭据和真实完整链路，产生的少量流量会正常计入该用户用量；浏览器只提交 Serving 条目的不透明 ID，不能指定目标地址或凭据。
 
 常用诊断命令如下：
 

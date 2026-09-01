@@ -3,11 +3,11 @@
 // CSS 定义位于 styles.css 的 `:root[data-palette='…']` 令牌块。
 // 属性必须设置在 <html> 上，才能覆盖 :root 的视觉令牌。
 
-export type Palette = 'jinzi' | 'yuanqing' | 'rongyan' | 'xuanmo';
+export type Palette = 'jinzi' | 'dailan' | 'songlv' | 'oufen' | 'xuanmo';
 
-// 新会话以纯灰阶的「玄墨」进入；用户主动选择后仍尊重本地偏好。
-// 旧版 nocturne / celadon / iris 值不在 PALETTES 中，read 会自动回退到玄墨。
-const DEFAULT_PALETTE: Palette = 'xuanmo';
+// 新会话以「黛蓝」进入；用户主动选择后仍尊重本地偏好。
+// 旧版 nocturne / celadon / iris / yuanqing / rongyan 值不在 PALETTES 中，read 会自动回退到黛蓝。
+const DEFAULT_PALETTE: Palette = 'dailan';
 
 type PaletteOption = {
   key: Palette;
@@ -25,16 +25,22 @@ export const PALETTES: PaletteOption[] = [
     action: '#a394e8',
   },
   {
-    key: 'yuanqing',
-    name: '渊青',
-    description: '清青操作 · 青瓷数据',
-    action: '#58c2d8',
+    key: 'dailan',
+    name: '黛蓝',
+    description: '黛蓝操作 · 雾青数据',
+    action: '#8ca6dc',
   },
   {
-    key: 'rongyan',
-    name: '熔橙',
-    description: '熔橙操作 · 陶橙数据',
-    action: '#ec7340',
+    key: 'songlv',
+    name: '松绿',
+    description: '松绿操作 · 雾蓝数据',
+    action: '#9cbc84',
+  },
+  {
+    key: 'oufen',
+    name: '藕粉',
+    description: '藕粉操作 · 灰蓝数据',
+    action: '#d49ab4',
   },
   {
     key: 'xuanmo',

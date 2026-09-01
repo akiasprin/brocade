@@ -1,0 +1,11 @@
+[package]
+name = "brocade-probe"
+version.workspace = true
+description = "Brocade 共享的临时 Xray 客户端与端到端拨测执行器"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+brocade-deployment = { path = "../brocade-deployment" }
+serde_json = "1"

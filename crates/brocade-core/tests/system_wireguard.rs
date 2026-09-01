@@ -228,6 +228,7 @@ fn doc(nodes: Vec<Node>) -> ModelSnapshot {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes,
+        node_egress_dns: Vec::new(),
         users: Vec::new(),
         external_outbounds: Vec::new(),
         apps: Vec::new(),

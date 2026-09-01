@@ -237,8 +237,8 @@ export interface NodeVersions {
   xray: string | null;
   phantun: string | null;
   wg_tools: string | null;
-  /** `kernel` 或 `userspace`。内核版本低于 5.6 时 wg-quick 回退到 wireguard-go，
-      `wg show` 的输出与内核态相同，但吞吐相差一个数量级。 */
+  /** WG 启用时为 `kernel` 或 `userspace`；WG 关闭时为 null。内核版本低于 5.6 时
+      wg-quick 回退到 wireguard-go，`wg show` 的输出与内核态相同，但吞吐相差一个数量级。 */
   wg_backend: string | null;
 }
 export interface SpoolBacklog {
@@ -291,6 +291,17 @@ export interface NodeAgentStateItem {
   geodata_observed: GeodataObservation | null;
   last_poll_at: string | null;
   last_usage_report_at: string | null;
+  usage_generation_id?: number | null;
+  usage_last_result?: {
+    accepted_readings: number;
+    inserted_samples: number;
+    skipped_counters: number;
+    /** 仅由控制面进程内的相邻轮次比较产生；重启后重新建立基线。 */
+    growing_unknown_counters?: number;
+    rejected_counters: number;
+    gap_samples: number;
+    duplicate?: boolean;
+  } | null;
   xray_started_at: string | null;
   /* 该机器单独设置的 wg0 MTU；null 表示使用全局默认值 */
   mtu: number | null;
@@ -310,20 +321,52 @@ export interface NodeAgentStateItem {
   // 在此返回是为了详情页能够显示和修改——此前它们只出现在建机器表单中。
   dns: Dns;
   domain_strategy: DomainStrategy;
-  // 非空表示已退役。该机器仍在发布计划中，期望状态为三份产物全部关闭——
+  // 非空表示已有退役意图。该机器在停用收敛前仍在发布计划中，期望四类产物全部关闭——
   // agent 据此移除 wg0 和 xray，而不是保持原状继续运行。
   retired_at: string | null;
+  lifecycle_phase: 'active' | 'retiring' | 'retired' | 'abandoned';
+  lifecycle_epoch: number;
+  lifecycle_deployment_id: number | null;
+  lifecycle_completed_at: string | null;
+  lifecycle_last_error: string | null;
   /* 外部连接该机器 wg 端口的方式。`fake_tcp` 表示入站 UDP 被封禁，使用 phantun 的 TCP 封装。 */
   wg_transport_kind: 'udp' | 'fake_tcp';
   wg_fake_tcp_port: number | null;
   applied: Record<string, unknown> | null;
 }
 
-// 退役与恢复。需要 system-admin 权限：机器是否在网属于系统边界，不属于租户管理范围。
-export const setNodeStatus = async (id: string, status: 'active' | 'retired') => {
-  draft.push({ op: 'update_node_status', node_id: id, status: { status } });
-  return { revision_id: 0, node: null as unknown };
-};
+export interface NodeLifecycleTransitionResult {
+  revision_id: number;
+  node_id: string;
+  lifecycle: {
+    node_id: string;
+    lifecycle_epoch: number;
+    phase: 'active' | 'retiring' | 'retired' | 'abandoned';
+    intent_revision: number | null;
+    deployment_id: number | null;
+    requested_at: string | null;
+    completed_at: string | null;
+    completed_by: string | null;
+    reason: string | null;
+    last_error: string | null;
+  };
+  deployment_id: number | null;
+  canceled_deployment_ids: number[];
+}
+
+// 退役与恢复是操作流程，不进入浏览器草稿。服务端在一个事务中提交模型意图、使旧发布
+// 失效，并创建替代配置单。
+export const setNodeStatus = (id: string, status: 'active' | 'retired') =>
+  api<NodeLifecycleTransitionResult>(`/nodes/${encodeURIComponent(id)}/status`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ status }),
+  });
+
+export const abandonNode = (id: string, reason: string, unregisterWarp = true) =>
+  post<NodeLifecycleTransitionResult>(`/nodes/${encodeURIComponent(id)}/lifecycle/abandon`, {
+    reason,
+    unregister_warp: unregisterWarp,
+  });
 
 export const fetchNodes = (token = '') => api<{ nodes: NodeAgentStateItem[] }>('/nodes/agent-state', token);
 
@@ -524,6 +567,23 @@ export const fetchDeployments = (kind?: 'config' | 'grants', token = '') =>
 
 export const fetchDeployment = (id: number, token = '') => api<DeploymentDetail>(`/deployments/${id}`, token);
 
+/**
+ * 权限变更先进入 durable outbox，之后才会生成自动化授权单。如果规划阶段持续失败，
+ * deployments 列表里没有任何记录，因此必须单独读取这层状态。
+ */
+export interface GrantAutomationStatus {
+  pending_jobs: number;
+  retrying_jobs: number;
+  failed_jobs: number;
+  max_attempts: number;
+  latest_revision_id: number | null;
+  oldest_pending_at: string | null;
+  last_attempt_at: string | null;
+  last_error: string | null;
+}
+
+export const fetchGrantAutomationStatus = (token = '') => api<GrantAutomationStatus>('/grants/automation', token);
+
 export const createDeployment = (
   body: { revision_id: number; idempotency_key: string; note?: string | null },
   token = '',
@@ -600,6 +660,62 @@ export const setUserStatus = (tenant: string, user: string, status: 'active' | '
 export const rotateUserUuid = (tenant: string, user: string) =>
   post<{ revision_id: number }>(`/users/${tenant}/${user}/rotate-uuid`, undefined);
 
+export interface GrantProbeCapability {
+  available: boolean;
+  version: string | null;
+  reason: string | null;
+  concurrency: number;
+}
+
+export interface GrantProbePlanItem {
+  id: string;
+  name: string;
+  app_id: string;
+  app_name: string;
+  chain_id: string;
+  ingress_id: string;
+  family: 'ipv4' | 'ipv6' | 'unknown';
+  protocol: 'vless' | 'hysteria2';
+}
+
+export interface GrantProbePlan {
+  serving_revision: number;
+  serving_generation: number;
+  items: GrantProbePlanItem[];
+}
+
+export type GrantProbeItemStatus = 'waiting' | 'running' | 'passed' | 'failed' | 'canceled';
+export interface GrantProbeJobItem extends GrantProbePlanItem {
+  status: GrantProbeItemStatus;
+  ttfb_ms: number | null;
+  detail: string | null;
+}
+
+export type GrantProbeJobStatus = 'running' | 'completed' | 'canceled' | 'superseded';
+export interface GrantProbeJob {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  serving_revision: number;
+  serving_generation: number;
+  status: GrantProbeJobStatus;
+  message: string | null;
+  created_at_unix_secs: number;
+  finished_at_unix_secs: number | null;
+  items: GrantProbeJobItem[];
+}
+
+export const fetchGrantProbeCapability = () => api<GrantProbeCapability>('/grant-probes/capability');
+export const fetchUserGrantProbePlan = (tenant: string, user: string) =>
+  api<GrantProbePlan>(`/users/${tenant}/${user}/grant-probes`);
+export const startUserGrantProbe = (tenant: string, user: string, itemIds: string[] = []) =>
+  post<{ job: GrantProbeJob; reused: boolean }>(`/users/${tenant}/${user}/grant-probes`, {
+    item_ids: itemIds,
+  });
+export const fetchGrantProbeJob = (id: string) => api<GrantProbeJob>(`/grant-probes/${id}`);
+export const cancelGrantProbe = (id: string) => api<GrantProbeJob>(`/grant-probes/${id}`, '', { method: 'DELETE' });
+export const grantProbeEventsUrl = (id: string) => `/grant-probes/${encodeURIComponent(id)}/events`;
+
 export interface ClashSubscriptionInfo {
   url: string;
   urls: {
@@ -608,15 +724,34 @@ export interface ClashSubscriptionInfo {
     v6: string;
   };
   template: string;
+  haitun: ClashHaitunSubscriptionInfo;
   remaining_bytes: number | null;
   reset_at: string;
   usage_has_gap: boolean;
+}
+
+export interface ClashHaitunSubscriptionInfo {
+  template: string;
+  status: 'not-created' | 'active' | 'revoked';
+  urls: ClashSubscriptionInfo['urls'] | null;
+  created_at: string | null;
+  revoked_at: string | null;
 }
 
 // The URL is a bearer credential, so it is fetched only when the operator opens the Clash
 // dialog. It must not ride along in the ordinary user-list response or initial page DOM.
 export const fetchClashSubscription = (tenant: string, user: string) =>
   api<ClashSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription`);
+
+export const issueClashHaitunSubscription = (tenant: string, user: string) =>
+  api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun`, '', {
+    method: 'POST',
+  });
+
+export const revokeClashHaitunSubscription = (tenant: string, user: string) =>
+  api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun`, '', {
+    method: 'DELETE',
+  });
 
 // ── 流量额度（用户 × 项目）──
 // 额度不修改任何产物——xray.json 中不写入用户——因此它是直接写入的运营参数；
@@ -659,15 +794,45 @@ export const upsertApp = async (body: { id: string; label: string; note?: string
   return { revision_id: 0 } as ModelWriteResult;
 };
 
+export const createApp = async (body: { id: string; label: string }) => {
+  draft.push({ op: 'create_app', app: body });
+  return { revision_id: 0 } as ModelWriteResult;
+};
+
+/** Persist the complete final line order produced by a drag gesture. */
+export const reorderApps = async (ids: string[]) => {
+  draft.push({ op: 'reorder_apps', ids });
+  return { revision_id: 0 } as ModelWriteResult;
+};
+
+/** Persist one line's complete final chain order without changing any stable chain ID. */
+export const reorderChains = async (appId: string, ids: string[]) => {
+  draft.push({ op: 'reorder_chains', app_id: appId, ids });
+  return { revision_id: 0 } as ModelWriteResult;
+};
+
 export const upsertChain = async (
   appId: string,
-  body: { id: string; tenant_id: string; name: string; note?: string },
+  body: { id: string; tenant_id: string; name: string; subscription_country?: string | null; note?: string },
 ) => {
   draft.push({
     op: 'upsert_chain',
     app_id: appId,
-    chain: { id: body.id, tenant_id: body.tenant_id, name: body.name },
+    chain: {
+      id: body.id,
+      tenant_id: body.tenant_id,
+      name: body.name,
+      subscription_country: body.subscription_country ?? null,
+    },
   });
+  return { revision_id: 0 } as ModelWriteResult;
+};
+
+export const createChain = async (
+  appId: string,
+  body: { id: string; tenant_id: string; name: string; subscription_country?: string | null },
+) => {
+  draft.push({ op: 'create_chain', app_id: appId, chain: body });
   return { revision_id: 0 } as ModelWriteResult;
 };
 
@@ -710,10 +875,27 @@ export type RealityFallbackLimits =
  * 写入会将一个默认值变为一项限制条件。 */
 export type XhttpMode = 'auto' | 'packet-up' | 'stream-up' | 'stream-one';
 
+export interface XhttpXmuxRange {
+  from: number;
+  to: number;
+}
+
+export interface XhttpXmux {
+  max_concurrency: number;
+  h_max_request_times: XhttpXmuxRange;
+  h_max_reusable_secs: XhttpXmuxRange;
+}
+
+export const DEFAULT_XHTTP_XMUX: XhttpXmux = {
+  max_concurrency: 1,
+  h_max_request_times: { from: 600, to: 900 },
+  h_max_reusable_secs: { from: 1800, to: 3000 },
+};
+
 export interface Xhttp {
   path: string;
   host?: string | null;
-  mux?: number | null;
+  xmux?: XhttpXmux | null;
   mode?: XhttpMode;
 }
 
@@ -864,6 +1046,12 @@ export const upsertIngress = async (appId: string, body: UpsertIngressBody) => {
   return { revision_id: 0 } as ModelWriteResult;
 };
 
+export const createIngress = async (appId: string, body: UpsertIngressBody) => {
+  const { note: _note, ...ingress } = body;
+  draft.push({ op: 'create_ingress', app_id: appId, ingress });
+  return { revision_id: 0 } as ModelWriteResult;
+};
+
 export type GrantWrite = {
   app_id: string;
   tenant_id: string;
@@ -932,9 +1120,23 @@ export type HopPool =
 
 export type RuleAction =
   | { t: 'forward'; to: string; dial?: HopDial; pool?: HopPool }
-  | { t: 'egress'; send_through?: string | null }
+  | {
+      t: 'egress';
+      send_through?: string | null;
+      /* Activates the matching machine DNS policy. This is not per-outbound isolation: once
+         activated, Xray applies the policy to every matching lookup on the machine. */
+      dns?: boolean;
+    }
   | { t: 'proxy'; outbound: string }
   | { t: 'block' };
+
+export interface EgressDnsResolution {
+  address: string;
+  port: number;
+  transport: 'udp' | 'tcp';
+  address_strategy: 'use_ip' | 'use_ipv4v6' | 'use_ipv6v4' | 'use_ipv4' | 'use_ipv6';
+  fallback: 'stop' | 'machine';
+}
 
 export type ExternalOutboundProtocol =
   | {
@@ -962,7 +1164,40 @@ export type ExternalOutboundProtocol =
         no_kernel_tun: boolean;
         domain_strategy: 'ForceIP' | 'ForceIPv4' | 'ForceIPv6' | 'ForceIPv4v6' | 'ForceIPv6v4';
       };
+    }
+  | {
+      t: 'warp';
+      v: {
+        mtu: number;
+        keep_alive: number;
+        allowed_ips: string[];
+        no_kernel_tun: boolean;
+        domain_strategy: 'ForceIP' | 'ForceIPv4' | 'ForceIPv6' | 'ForceIPv4v6' | 'ForceIPv6v4';
+        /** 0 表示交给 Xray/wireguard-go 自动决定。 */
+        workers: number;
+      };
     };
+
+export interface ExternalWarpBinding {
+  node: string;
+  device_id: string;
+  account_id: string;
+  registered_at: string;
+  /** null 表示跟随逻辑隧道默认值；地址策略的两个底层字段始终成对覆盖。 */
+  endpoint_address?: string | null;
+  endpoint_port?: number | null;
+  mtu?: number | null;
+  keep_alive?: number | null;
+  allowed_ips?: string[] | null;
+  no_kernel_tun?: boolean | null;
+  domain_strategy?: 'ForceIP' | 'ForceIPv4' | 'ForceIPv6' | 'ForceIPv4v6' | 'ForceIPv6v4' | null;
+  workers?: number | null;
+  /* 服务端会完全移除私钥；仅历史/未打码数据形状允许它存在。 */
+  private_key?: string;
+  peer_public_key: string;
+  local_addresses: string[];
+  reserved: number[];
+}
 
 export type ExternalVlessTransport =
   | { t: 'raw' }
@@ -995,7 +1230,6 @@ export type ExternalOutboundSecurity =
 
 /** A reusable proxy managed outside the Brocade fleet. Credentials arrive redacted. */
 export interface ExternalOutbound {
-  app: string;
   id: string;
   tenant: string;
   name: string;
@@ -1003,10 +1237,10 @@ export interface ExternalOutbound {
   port: number;
   protocol: ExternalOutboundProtocol;
   security: ExternalOutboundSecurity;
+  bindings: ExternalWarpBinding[];
 }
 
-export type ExternalOutboundWrite = Omit<ExternalOutbound, 'app' | 'tenant'> & {
-  app_id: string;
+export type ExternalOutboundWrite = Omit<ExternalOutbound, 'tenant' | 'bindings'> & {
   tenant_id: string;
 };
 
@@ -1014,6 +1248,59 @@ export const upsertExternalOutbound = async (outbound: ExternalOutboundWrite) =>
   draft.push({ op: 'upsert_external_outbound', outbound });
   return { revision_id: 0 } as ModelWriteResult;
 };
+
+export interface WarpBindingResult {
+  revision_id: number;
+  binding: ExternalWarpBinding;
+  suggested_endpoint?: string | null;
+}
+
+export interface RemoveWarpBindingResult {
+  revision_id: number;
+  node_id: string;
+  device_id: string;
+  removed: boolean;
+}
+
+export interface WarpBindingOverrides {
+  endpoint_address: string | null;
+  endpoint_port: number | null;
+  mtu: number | null;
+  keep_alive: number | null;
+  allowed_ips: string[] | null;
+  no_kernel_tun: boolean | null;
+  domain_strategy: 'ForceIP' | 'ForceIPv4' | 'ForceIPv6' | 'ForceIPv4v6' | 'ForceIPv6v4' | null;
+  workers: number | null;
+}
+
+export const registerWarpBinding = (tenantId: string, outboundId: string, nodeId: string): Promise<WarpBindingResult> =>
+  post<WarpBindingResult>(
+    `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings`,
+    { node_id: nodeId, accept_terms: true },
+  );
+
+export const updateWarpBinding = (
+  tenantId: string,
+  outboundId: string,
+  nodeId: string,
+  overrides: WarpBindingOverrides,
+): Promise<WarpBindingResult> =>
+  api<WarpBindingResult>(
+    `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings/${encodeURIComponent(nodeId)}`,
+    '',
+    { method: 'PUT', body: JSON.stringify(overrides) },
+  );
+
+export const removeWarpBinding = (
+  tenantId: string,
+  outboundId: string,
+  nodeId: string,
+): Promise<RemoveWarpBindingResult> =>
+  api<RemoveWarpBindingResult>(
+    `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings/${encodeURIComponent(nodeId)}`,
+    '',
+    { method: 'DELETE' },
+  );
 
 // 该链在该机器上的中转 inbound：监听端口和传输层。
 // 一条链对应一个 inbound，因此同一台中继服务两条链时使用两个端口和各自的密钥。
@@ -1051,6 +1338,18 @@ export const putStep = (
 ) => {
   const { note: _note, ...step } = body;
   draft.push({ op: 'put_step', app_id: appId, chain_id: chainId, node_id: nodeId, step });
+  return Promise.resolve({ revision_id: 0 });
+};
+
+// DNS 策略是机器级配置；链路 Egress 规则只用 `dns` 激活同 selector 的策略。这里使用
+// 独立草稿操作写入或移除 `(node, selector)`，避免保存、删除链路时取得策略所有权。
+export const setNodeEgressDns = (nodeId: string, selector: DestMatch, resolution: EgressDnsResolution | null) => {
+  draft.push({ op: 'set_node_egress_dns', node_id: nodeId, selector, resolution });
+  return Promise.resolve({ revision_id: 0 });
+};
+
+export const reorderNodeEgressDns = (nodeId: string, selectors: DestMatch[]) => {
+  draft.push({ op: 'reorder_node_egress_dns', node_id: nodeId, selectors });
   return Promise.resolve({ revision_id: 0 });
 };
 
@@ -1196,6 +1495,7 @@ export interface SnapshotChain {
   id: string;
   tenant: string;
   name: string;
+  subscription_country?: string | null;
 }
 
 // 主干是派生概念：链头是接入面所在的机器（`ingress.node`），主干是从链头沿
@@ -1288,8 +1588,33 @@ export interface SnapshotApp {
   chains: SnapshotChain[];
   steps: SnapshotStep[];
   ingresses: SnapshotIngress[];
+  fronts: SnapshotFront[];
   grants: { tenant: string; user: string; ingress: string }[];
 }
+
+export interface SnapshotFront {
+  id: string;
+  tenant: string;
+  name: string;
+  strategy: 'url-test' | 'select' | 'fallback';
+  via: string[];
+  external_via: string[];
+}
+
+export const upsertFront = async (
+  appId: string,
+  front: {
+    id: string;
+    tenant_id: string;
+    name: string;
+    strategy: SnapshotFront['strategy'];
+    via: string[];
+    external_via: string[];
+  },
+) => {
+  draft.push({ op: 'upsert_front', app_id: appId, front });
+  return { revision_id: 0 } as ModelWriteResult;
+};
 export interface ConsoleSnapshot {
   /* 服务端返回完整的 ModelSnapshot，此处只声明需要使用的部分——完整声明相当于在浏览器中
      维护第二份模型定义，最终会与 model.rs 产生差异。 */
@@ -1299,9 +1624,11 @@ export interface ConsoleSnapshot {
     external_outbounds?: ExternalOutbound[];
     /* 机器的模型字段。产物相关的字段（overlay / egress / dns 等）各页面有各自的数据来源，
        此处只声明连接策略：它没有其他支持草稿的读取方式。 */
-    nodes?: { id: string; certificate_name?: string | null; connection?: NodeConnection }[];
+    nodes?: { id: string; overlay?: boolean; certificate_name?: string | null; connection?: NodeConnection }[];
     settings?: { connection?: ConnectionSettings };
   };
+  /* DNS 策略由机器持有；链路 Egress 规则只保存是否激活匹配策略。 */
+  node_egress_dns: { node: string; position: number; selector: DestMatch; resolution: EgressDnsResolution }[];
   redacted: boolean;
 }
 
@@ -1465,10 +1792,23 @@ export interface UsageNodeSeriesList {
   nodes: UsageNodeSeries[];
 }
 
-export const fetchUsageNodeSeries = (windowSecs = 720) =>
-  api<UsageNodeSeriesList>(`/usage/node-series?window_secs=${windowSecs}`);
+export const fetchUsageNodeSeries = (windowSecs = 1800, nodeId?: string) => {
+  const node = nodeId ? `&node_id=${encodeURIComponent(nodeId)}` : '';
+  return api<UsageNodeSeriesList>(`/usage/node-series?window_secs=${windowSecs}${node}`);
+};
 
 /* ── 设置 ── */
+
+export interface BrandingSettings {
+  site_name: string;
+  /** PNG、JPEG 或 WebP 的 data URL；null 使用内置织格图标。 */
+  icon_data_url: string | null;
+}
+
+export const DEFAULT_BRANDING: BrandingSettings = { site_name: 'Brocade', icon_data_url: null };
+export const fetchBranding = () => api<BrandingSettings>('/branding');
+export const saveBranding = (body: BrandingSettings) =>
+  api<BrandingSettings>('/branding', '', { method: 'PUT', body: JSON.stringify(body) });
 
 export interface ModelSettings {
   reality_client: {
@@ -1576,6 +1916,33 @@ export interface DistributionView {
 export const fetchDistribution = () => api<DistributionView>('/distribution');
 export const saveDistribution = (body: DistributionSettings) =>
   api<DistributionView>('/distribution', '', { method: 'PUT', body: JSON.stringify(body) });
+
+/* ── Agent 日志上限：运行时策略，不进入修订，也不需要发布 ── */
+export interface AgentLogPolicyNode {
+  node_id: string;
+  tenant_id: string;
+  name: string;
+  /* null 持续继承全局值；不是把当时的全局数字复制到机器上。 */
+  override_max_mib: number | null;
+  effective_max_mib: number;
+}
+
+export interface AgentLogPolicyView {
+  global_max_mib: number;
+  nodes: AgentLogPolicyNode[];
+}
+
+export const fetchAgentLogPolicy = () => api<AgentLogPolicyView>('/agent-log-policy');
+export const saveAgentLogDefault = (maxMib: number) =>
+  api<AgentLogPolicyView>('/agent-log-policy', '', {
+    method: 'PUT',
+    body: JSON.stringify({ max_mib: maxMib }),
+  });
+export const saveNodeLogPolicy = (nodeId: string, maxMib: number | null) =>
+  api<AgentLogPolicyView>(`/agent-log-policy/nodes/${encodeURIComponent(nodeId)}`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ max_mib: maxMib }),
+  });
 
 /* ── agent 发布 ──
  *
@@ -1983,11 +2350,12 @@ export const fetchArtifactContentView = (
     ? fetchArtifactContent(targetKind, targetId, artifactKind, revision)
     : previewDraftArtifact(draft.ops(), targetKind, targetId, artifactKind);
 
-// `family` 只对用户订阅（uri / clash）有效：将订阅过滤为单一地址族，用于只有 IPv4 或
-// 只有 IPv6 的用户。不传表示两族全量，与机队实际下发的内容一致。过滤在服务端执行——
-// Clash 的 proxy-groups 按代理名引用成员，在浏览器端按行删除会产生引用不存在代理的组，
-// mihomo 会拒绝导入。
+// `family` 与 `protocol` 只对用户订阅（uri / clash）有效：可以按地址族、接入协议或二者
+// 交集收窄。不传表示全量，与机队实际提供的内容一致。过滤在服务端执行——Clash 的
+// proxy-groups 按代理名引用成员，在浏览器端按行删除会产生引用不存在代理的组，mihomo 会
+// 拒绝导入。
 export type ArtifactFamily = 'v4' | 'v6';
+export type ArtifactProtocol = 'vless' | 'hysteria2';
 
 export const fetchArtifactContent = (
   targetKind: string,
@@ -1995,10 +2363,15 @@ export const fetchArtifactContent = (
   artifactKind: string,
   revision?: number,
   family?: ArtifactFamily,
+  protocol?: ArtifactProtocol,
+  serving = false,
 ) => {
-  const query = [revision == null ? null : `revision=${revision}`, family == null ? null : `family=${family}`].filter(
-    Boolean,
-  );
+  const query = [
+    revision == null ? null : `revision=${revision}`,
+    family == null ? null : `family=${family}`,
+    protocol == null ? null : `protocol=${protocol}`,
+    serving ? 'serving=true' : null,
+  ].filter(Boolean);
   return api<ArtifactContent>(
     `/artifacts/content/${encodeURIComponent(targetKind)}/${encodeURIComponent(targetId)}/${encodeURIComponent(artifactKind)}` +
       (query.length === 0 ? '' : `?${query.join('&')}`),
@@ -2022,7 +2395,12 @@ export const fetchArtifactContent = (
 /** 变化频率低的部分：不进入时序数据，只存储最新值。 */
 export interface HostFacts {
   kernel: string;
+  /** /proc/cpuinfo 的可读处理器型号；旧 Agent 上报为空串 */
+  cpu_model?: string;
   cores: number;
+  /** 虚拟机经常不暴露 cpufreq；缺失表示不支持，不是频率为零。 */
+  cpu_freq_max_mhz?: number | null;
+  cpu_governor?: string | null;
   /** 不应假设只有 cubic / bbr——低价 VPS 上常见通过脚本安装的定制内核，其中包含 bbrplus、bbr2 */
   cc_algo: string;
   /** 可切换的拥塞算法列表。不含 bbr 表示模块未加载，或该内核不支持 */
@@ -2035,8 +2413,15 @@ export interface HostFacts {
   nic_mtu: number | null;
   mem_total_bytes: number;
   disk_total_bytes: number;
+  disk_mount?: string | null;
+  disk_filesystem?: string | null;
+  disk_device?: string | null;
+  disk_read_only?: boolean | null;
   /** null 表示未加载 nf_conntrack。该机器未配置 NAT，不属于故障 */
   conntrack_max: number | null;
+  ephemeral_port_low?: number | null;
+  ephemeral_port_high?: number | null;
+  ephemeral_port_capacity?: number | null;
   /** 安装时是否写入过 /etc/sysctl.d/99-brocade.conf。用于区分原本即为 bbr 和被改回默认值 */
   sysctl_managed: boolean;
   /** x86_64 / aarch64 */
@@ -2050,6 +2435,110 @@ export interface HostFacts {
   wmem_max: number;
   /** net.core.somaxconn */
   somaxconn: number;
+}
+
+export interface CpuCoreSample {
+  cpu: number;
+  user_pct: number;
+  system_pct: number;
+  softirq_pct: number;
+  iowait_pct: number;
+  steal_pct: number;
+}
+
+export interface CpuDetailSample {
+  iowait_pct: number;
+  load5: number;
+  load15: number;
+  pressure_some_pct: number | null;
+  io_pressure_some_pct: number | null;
+  io_pressure_full_pct: number | null;
+  procs_running: number | null;
+  procs_total: number | null;
+  context_switches_per_sec: number | null;
+  net_rx_softirqs_per_sec: number | null;
+  net_tx_softirqs_per_sec: number | null;
+  throttled_usec: number | null;
+  frequency_mhz: number | null;
+  cores: CpuCoreSample[];
+}
+
+export interface MemoryDetailSample {
+  available_min_bytes: number;
+  free_bytes: number;
+  anon_bytes: number;
+  file_cache_bytes: number;
+  shmem_bytes: number;
+  kernel_other_bytes: number;
+  buffers_bytes: number;
+  kernel_reclaimable_bytes: number;
+  slab_unreclaimable_bytes: number;
+  unevictable_bytes: number;
+  mlocked_bytes: number;
+  dirty_bytes: number;
+  writeback_bytes: number;
+  swap_total_bytes: number;
+  swap_cached_bytes: number;
+  zswap_bytes: number | null;
+  zswapped_bytes: number | null;
+  gup_pinned_bytes: number | null;
+  swap_in_bytes: number;
+  swap_out_bytes: number;
+  pressure_some_pct: number | null;
+  pressure_full_pct: number | null;
+  major_faults: number;
+  direct_reclaim_pages: number;
+}
+
+export interface DiskDetailSample {
+  total_bytes: number | null;
+  inode_total: number | null;
+  inode_free: number | null;
+  read_bps: number | null;
+  write_bps: number | null;
+  read_iops: number | null;
+  write_iops: number | null;
+  read_await_ms: number | null;
+  write_await_ms: number | null;
+  busy_pct: number | null;
+  queue_depth: number | null;
+  in_flight: number | null;
+  pressure_some_pct: number | null;
+  pressure_full_pct: number | null;
+}
+
+/** 新 Agent 上报的网络深度观测。连接/内存字段是窗口末快照，其余字段是该 30 秒窗口增量。 */
+export interface NetworkDetailSample {
+  tcp_curr_estab: number | null;
+  tcp_inuse: number | null;
+  tcp_time_wait: number | null;
+  tcp_orphan: number | null;
+  tcp_alloc: number | null;
+  tcp_mem_bytes: number | null;
+  udp_inuse: number | null;
+  udp_mem_bytes: number | null;
+  ephemeral_port_capacity?: number | null;
+  tcp_ephemeral_inuse_v4?: number | null;
+  tcp_ephemeral_inuse_v6?: number | null;
+  tcp_ephemeral_time_wait_v4?: number | null;
+  tcp_ephemeral_time_wait_v6?: number | null;
+  tcp_ephemeral_top_target_v4?: number | null;
+  tcp_ephemeral_top_target_v6?: number | null;
+  tcp_active_opens: number | null;
+  tcp_passive_opens: number | null;
+  tcp_attempt_fails: number | null;
+  tcp_estab_resets: number | null;
+  tcp_retrans_segs: number | null;
+  tcp_syn_retrans: number | null;
+  tcp_in_errors: number | null;
+  tcp_out_resets: number | null;
+  tcp_timeouts: number | null;
+  tcp_listen_overflows: number | null;
+  tcp_listen_drops: number | null;
+  udp_in_errors: number | null;
+  udp_no_ports: number | null;
+  udp_rcvbuf_errors: number | null;
+  udp_sndbuf_errors: number | null;
 }
 
 /** 一台机器一个窗口的资源读数。agent 本地计算差值后上报的速率，不是累计值。 */
@@ -2069,18 +2558,24 @@ export interface LoadSample {
       与三段分列不同，steal 不是这台机器在做功——持续非零说明宿主机超售 */
   cpu_steal_pct: number;
   load1: number;
+  /** 缺失表示该窗口来自旧 Agent。 */
+  cpu_detail?: CpuDetailSample | null;
   mem_available_bytes: number;
   swap_used_bytes: number;
+  memory_detail?: MemoryDetailSample | null;
   /** 该窗口内确实有进程被内核终止。是实测结果，不是推断 */
   oom_kills: number;
   disk_free_bytes: number;
   disk_inode_free_pct: number;
+  disk_detail?: DiskDetailSample | null;
   nic_rx_bps: number;
   nic_tx_bps: number;
   nic_rx_drop: number;
   nic_tx_drop: number;
   nic_err: number;
   conntrack_count: number | null;
+  /** 缺失表示来自旧 Agent；不能把缺失解释成全部为零。 */
+  network_detail?: NetworkDetailSample | null;
   uptime_secs: number;
 }
 

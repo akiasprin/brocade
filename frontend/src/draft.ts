@@ -19,8 +19,10 @@
 
 import type {
   CreateRealityIngress,
+  DestMatch,
   Dns,
   DomainStrategy,
+  EgressDnsResolution,
   ExternalOutboundWrite,
   HopInRequest,
   IngressProjection,
@@ -30,12 +32,46 @@ import type {
 } from './api';
 
 export type ModelOp =
+  | { op: 'create_app'; app: { id: string; label: string } }
   | { op: 'upsert_app'; app: { id: string; label: string } }
+  | { op: 'reorder_apps'; ids: string[] }
+  | { op: 'reorder_chains'; app_id: string; ids: string[] }
   | { op: 'upsert_external_outbound'; outbound: ExternalOutboundWrite }
+  | {
+      op: 'create_chain';
+      app_id: string;
+      chain: { id: string; tenant_id: string; name: string; subscription_country?: string | null };
+    }
   | {
       op: 'upsert_chain';
       app_id: string;
-      chain: { id: string; tenant_id: string; name: string };
+      chain: { id: string; tenant_id: string; name: string; subscription_country?: string | null };
+    }
+  | {
+      op: 'upsert_front';
+      app_id: string;
+      front: {
+        id: string;
+        tenant_id: string;
+        name: string;
+        strategy: 'url-test' | 'select' | 'fallback';
+        via: string[];
+        external_via: string[];
+      };
+    }
+  | {
+      op: 'create_ingress';
+      app_id: string;
+      ingress: {
+        id: string;
+        chain_id: string;
+        node_id: string;
+        bind: string;
+        port: number;
+        front_id?: string;
+        reality: CreateRealityIngress;
+        projection?: IngressProjection;
+      };
     }
   | {
       op: 'upsert_ingress';
@@ -58,6 +94,13 @@ export type ModelOp =
       node_id: string;
       step: { rules: Rule[]; accept?: { uuid?: string; label?: string }; hop_in?: HopInRequest };
     }
+  | {
+      op: 'set_node_egress_dns';
+      node_id: string;
+      selector: DestMatch;
+      resolution: EgressDnsResolution | null;
+    }
+  | { op: 'reorder_node_egress_dns'; node_id: string; selectors: DestMatch[] }
   | { op: 'delete_step'; app_id: string; chain_id: string; node_id: string }
   | { op: 'delete_chain'; app_id: string; chain_id: string }
   // 移除该链上从链头不可达的 step。保存整棵规则树时排在所有 put_step 之后——
@@ -111,16 +154,37 @@ export interface DraftEntry {
 /* 一条操作的作用对象。合并和界面上列出草稿都依据它。 */
 function entryOf(op: ModelOp): DraftEntry {
   switch (op.op) {
+    case 'create_app':
     case 'upsert_app':
       return { key: `app:${op.app.id}`, label: `线路 ${op.app.id}`, op };
-    case 'upsert_external_outbound':
+    case 'reorder_apps':
       return {
-        key: `external-outbound:${op.outbound.app_id}/${op.outbound.id}`,
-        label: `外部出站 ${op.outbound.name || op.outbound.id}`,
+        key: 'app-order',
+        label: '调整线路顺序',
         op,
       };
+    case 'reorder_chains':
+      return {
+        key: `chain-order:${op.app_id}`,
+        label: `调整链顺序 ${op.app_id}`,
+        op,
+      };
+    case 'upsert_external_outbound':
+      return {
+        key: `external-outbound:${op.outbound.tenant_id}/${op.outbound.id}`,
+        label: `隧道 ${op.outbound.name || op.outbound.id}`,
+        op,
+      };
+    case 'upsert_front':
+      return {
+        key: `front:${op.app_id}/${op.front.id}`,
+        label: `订阅前置 ${op.front.name || op.front.id}`,
+        op,
+      };
+    case 'create_chain':
     case 'upsert_chain':
       return { key: `chain:${op.app_id}/${op.chain.id}`, label: `链 ${op.chain.id}`, op };
+    case 'create_ingress':
     case 'upsert_ingress':
       return {
         key: `ingress:${op.app_id}/${op.ingress.id}`,
@@ -132,6 +196,20 @@ function entryOf(op: ModelOp): DraftEntry {
         key: `step:${op.app_id}/${op.chain_id}/${op.node_id}`,
         label: `规则 ${op.chain_id}/${op.node_id}`,
         op,
+      };
+    case 'set_node_egress_dns': {
+      const selector = canonicalDnsSelector(op.selector);
+      return {
+        key: `node-egress-dns:${op.node_id}/${JSON.stringify(selector)}`,
+        label: `机器 DNS 策略 ${op.node_id}`,
+        op: { ...op, selector },
+      };
+    }
+    case 'reorder_node_egress_dns':
+      return {
+        key: `node-egress-dns-order:${op.node_id}`,
+        label: `机器 DNS 策略顺序 ${op.node_id}`,
+        op: { ...op, selectors: op.selectors.map(canonicalDnsSelector) },
       };
     // 与 put_step 使用同一个 key：先修改后删除和先删除后修改都收敛为后写入的一条，
     // 不会在草稿中留下相互冲突的两条记录。
@@ -190,6 +268,13 @@ function entryOf(op: ModelOp): DraftEntry {
   }
 }
 
+function canonicalDnsSelector(selector: DestMatch): DestMatch {
+  if (selector.t === 'domain_suffix' || selector.t === 'domain_keyword' || selector.t === 'geosite') {
+    return { ...selector, v: [...new Set(selector.v)].sort() };
+  }
+  return selector;
+}
+
 class DraftStore {
   private entries: DraftEntry[] = [];
   private listeners = new Set<() => void>();
@@ -213,13 +298,25 @@ class DraftStore {
 
   /* 按操作者分键恢复。切换用户时重新开始——草稿表示该用户未提交的内容，随用户区分。 */
   init(operator: string) {
-    const key = `brocade-console:draft:v1:${operator}`;
+    // v2 is an intentional hard boundary: v1 drafts can contain chain/ingress IDs replaced by the
+    // friendly-ID migration. Replaying one after that migration could target a different object
+    // graph, so it is safer to start a clean draft than to guess an old-to-new mapping in the
+    // browser. App slugs stay unchanged; server-side tombstones protect the two migrated kinds.
+    const key = `brocade-console:draft:v2:${operator}`;
     if (this.storageKey === key) return;
     this.storageKey = key;
     this.entries = [];
     try {
       const raw = localStorage.getItem(key);
-      if (raw) this.entries = JSON.parse(raw) as DraftEntry[];
+      if (raw) {
+        // The former arrow-button UI stored one `swap_*` entry per click. A complete final order
+        // cannot be reconstructed from those pairs without the old base snapshot, so retain every
+        // unrelated edit and discard only these obsolete ordering operations during the upgrade.
+        const restored = JSON.parse(raw) as { op?: { op?: unknown } }[];
+        this.entries = restored.filter(
+          entry => entry.op?.op !== 'swap_apps' && entry.op?.op !== 'swap_chains',
+        ) as DraftEntry[];
+      }
     } catch {
       /* 存储的草稿数据损坏时重新开始，优于整个页面无法打开 */
     }
@@ -227,15 +324,33 @@ class DraftStore {
   }
 
   push(op: ModelOp) {
-    const entry = entryOf(op);
+    let entry = entryOf(op);
     const at = this.entries.findIndex(e => e.key === entry.key);
-    if (at >= 0 && op.op !== 'prune_chain') {
+    // Editing an object created earlier in the same draft must retain create-only collision
+    // semantics. Replacing it with an upsert would let a coincidentally occupied random ID update
+    // an unrelated object at commit time.
+    const previous = at >= 0 ? this.entries[at].op : null;
+    if (previous?.op === 'create_app' && op.op === 'upsert_app') {
+      entry = entryOf({ op: 'create_app', app: op.app });
+    } else if (previous?.op === 'create_chain' && op.op === 'upsert_chain') {
+      entry = entryOf({ op: 'create_chain', app_id: op.app_id, chain: op.chain });
+    } else if (previous?.op === 'create_ingress' && op.op === 'upsert_ingress') {
+      entry = entryOf({ op: 'create_ingress', app_id: op.app_id, ingress: op.ingress });
+    }
+    if (
+      at >= 0 &&
+      op.op !== 'prune_chain' &&
+      op.op !== 'reorder_node_egress_dns' &&
+      op.op !== 'reorder_apps' &&
+      op.op !== 'reorder_chains'
+    ) {
       // 重复编辑保持原有位置。顺序存在依赖关系——链需要先创建才能写入其规则表，
       // 将后写入的记录移到末尾会使前置条件排在其后。
       this.entries[at] = entry;
     } else {
-      // 清理无引用节点的处理相反：它计算的是该链上哪些节点无引用，需要整条链的规则表
-      // 全部写入后才能准确计算，因此每次都移到末尾，排在本轮所有 put_step 之后。
+      // 清理和完整顺序都依赖此前的写入结果，因此重复操作也移到末尾。排序必须排在本轮
+      // 新增/删除之后，否则它校验的“完整列表”仍是修改前的集合。拖动期间同一范围只留下
+      // 最终顺序，而不是记录每次穿过相邻项的中间状态。
       if (at >= 0) this.entries.splice(at, 1);
       this.entries.push(entry);
     }

@@ -10,9 +10,12 @@
 //! diagnostics. A node that lies about its CPU wastes an operator's afternoon, while a node that
 //! lies about its counters takes revenue.
 
+use std::collections::BTreeSet;
+
 use brocade_deployment::protocol::{
-    HopLinkList, HopLinkSample, HopLinkView, HostFacts, LoadReportRequest, LoadReportResult,
-    LoadSample, NodeLoadList, NodeLoadView, ProcessSample,
+    CpuDetailSample, DiskDetailSample, HopLinkList, HopLinkSample, HopLinkView, HostFacts,
+    LoadReportRequest, LoadReportResult, LoadSample, MemoryDetailSample, NetworkDetailSample,
+    NodeLoadList, NodeLoadView, ProcessSample,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -109,7 +112,7 @@ pub async fn record_load_report(
             rejected_hops += 1;
             continue;
         }
-        if insert_hop_sample(&mut tx, node_id, hop).await? {
+        if insert_hop_sample(&mut tx, node_id, &hop.chain_id, hop).await? {
             accepted_hops += 1;
         } else {
             rejected_hops += 1;
@@ -173,21 +176,28 @@ async fn insert_load_sample(
     s: &LoadSample,
 ) -> Result<bool> {
     let cpu = cpu_split(s)?;
+    // Deep diagnostics are deliberately fail-soft. They are optional enrichment, so a malformed
+    // per-core reading from a hotplug/iowait counter regression must not discard the stable scalar
+    // sample, host facts, processes and hop observations travelling in the same transaction.
+    let cpu_detail = cpu_detail_json(s.cpu_detail.as_ref())?;
+    let memory_detail = memory_detail_json(s.memory_detail.as_ref())?;
+    let disk_detail = disk_detail_json(s.disk_detail.as_ref())?;
+    let network_detail = network_detail_json(s.network_detail.as_ref())?;
     let result = sqlx::query(
         "INSERT INTO node_load_samples (
              node_id, window_start, window_end, btime, has_gap,
-             cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1,
-             mem_available_bytes, swap_used_bytes, oom_kills,
-             disk_free_bytes, disk_inode_free_pct,
+             cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1, cpu_detail,
+             mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
+             disk_free_bytes, disk_inode_free_pct, disk_detail,
              nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
-             conntrack_count, uptime_secs
+             conntrack_count, network_detail, uptime_secs
          ) VALUES (
              $1, to_timestamp($2), to_timestamp($3), $4, $5,
-             $6, $7, $8, $9, $10, $11,
-             $12, $13, $14,
-             $15, $16,
-             $17, $18, $19, $20, $21,
-             $22, $23
+             $6, $7, $8, $9, $10, $11, $12,
+             $13, $14, $15, $16,
+             $17, $18, $19,
+             $20, $21, $22, $23, $24,
+             $25, $26, $27
          )
          ON CONFLICT (node_id, window_start) DO NOTHING",
     )
@@ -204,11 +214,14 @@ async fn insert_load_sample(
     // does, and the table's sum CHECK covers only work.
     .bind(pct("cpu_steal_pct", s.cpu_steal_pct)?)
     .bind(finite("load1", s.load1)?)
+    .bind(cpu_detail)
     .bind(u64_to_i64("mem_available_bytes", s.mem_available_bytes)?)
     .bind(u64_to_i64("swap_used_bytes", s.swap_used_bytes)?)
+    .bind(memory_detail)
     .bind(u64_to_i64("oom_kills", s.oom_kills)?)
     .bind(u64_to_i64("disk_free_bytes", s.disk_free_bytes)?)
     .bind(pct("disk_inode_free_pct", s.disk_inode_free_pct)?)
+    .bind(disk_detail)
     .bind(u64_to_i64("nic_rx_bps", s.nic_rx_bps)?)
     .bind(u64_to_i64("nic_tx_bps", s.nic_tx_bps)?)
     .bind(u64_to_i64("nic_rx_drop", s.nic_rx_drop)?)
@@ -219,6 +232,7 @@ async fn insert_load_sample(
             .map(|v| u64_to_i64("conntrack_count", v))
             .transpose()?,
     )
+    .bind(network_detail)
     .bind(u64_to_i64("uptime_secs", s.uptime_secs)?)
     .execute(&mut **tx)
     .await?;
@@ -228,6 +242,7 @@ async fn insert_load_sample(
 async fn insert_hop_sample(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
+    chain_id: &str,
     h: &HopLinkSample,
 ) -> Result<bool> {
     let result = sqlx::query(
@@ -245,7 +260,7 @@ async fn insert_hop_sample(
          ON CONFLICT (node_id, chain_id, peer_node_id, window_start) DO NOTHING",
     )
     .bind(node_id)
-    .bind(&h.chain_id)
+    .bind(chain_id)
     .bind(&h.peer_node_id)
     .bind(h.window_start_unix_secs)
     .bind(h.window_end_unix_secs)
@@ -398,11 +413,11 @@ pub async fn node_load_view(
     let rows = sqlx::query(
         "SELECT extract(epoch FROM window_start)::bigint AS window_start_secs,
                 extract(epoch FROM window_end)::bigint AS window_end_secs,
-                has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1,
-                mem_available_bytes, swap_used_bytes, oom_kills,
-                disk_free_bytes, disk_inode_free_pct,
+                has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1, cpu_detail,
+                mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
+                disk_free_bytes, disk_inode_free_pct, disk_detail,
                 nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
-                conntrack_count, uptime_secs
+                conntrack_count, network_detail, uptime_secs
          FROM node_load_samples
          WHERE node_id = $1
          ORDER BY window_start DESC
@@ -576,14 +591,17 @@ fn load_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadSample> {
         cpu_peak_pct: row.try_get("cpu_peak_pct")?,
         cpu_steal_pct: row.try_get("cpu_steal_pct")?,
         load1: row.try_get("load1")?,
+        cpu_detail: optional_detail_from_row(row, "cpu_detail")?,
         mem_available_bytes: i64_to_u64(
             "mem_available_bytes",
             row.try_get("mem_available_bytes")?,
         )?,
         swap_used_bytes: i64_to_u64("swap_used_bytes", row.try_get("swap_used_bytes")?)?,
+        memory_detail: optional_detail_from_row(row, "memory_detail")?,
         oom_kills: i64_to_u64("oom_kills", row.try_get("oom_kills")?)?,
         disk_free_bytes: i64_to_u64("disk_free_bytes", row.try_get("disk_free_bytes")?)?,
         disk_inode_free_pct: row.try_get("disk_inode_free_pct")?,
+        disk_detail: optional_detail_from_row(row, "disk_detail")?,
         nic_rx_bps: i64_to_u64("nic_rx_bps", row.try_get("nic_rx_bps")?)?,
         nic_tx_bps: i64_to_u64("nic_tx_bps", row.try_get("nic_tx_bps")?)?,
         nic_rx_drop: i64_to_u64("nic_rx_drop", row.try_get("nic_rx_drop")?)?,
@@ -593,6 +611,7 @@ fn load_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadSample> {
             .try_get::<Option<i64>, _>("conntrack_count")?
             .map(|v| i64_to_u64("conntrack_count", v))
             .transpose()?,
+        network_detail: optional_detail_from_row(row, "network_detail")?,
         uptime_secs: i64_to_u64("uptime_secs", row.try_get("uptime_secs")?)?,
     })
 }
@@ -641,6 +660,168 @@ fn process_from_row(row: &sqlx::postgres::PgRow) -> Result<ProcessSample> {
             .map(|v| i64_to_u64("fd_limit", v))
             .transpose()?,
     })
+}
+
+fn optional_json<T: serde::Serialize>(
+    field: &str,
+    value: Option<&T>,
+) -> Result<Option<serde_json::Value>> {
+    value
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| StoreError::InvalidData(format!("{field} not serializable: {error}")))
+}
+
+fn cpu_detail_json(value: Option<&CpuDetailSample>) -> Result<Option<serde_json::Value>> {
+    match value {
+        Some(detail) if validate_cpu_detail(detail).is_ok() => {
+            optional_json("cpu_detail", Some(detail))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn memory_detail_json(value: Option<&MemoryDetailSample>) -> Result<Option<serde_json::Value>> {
+    match value {
+        Some(detail) if validate_memory_detail(detail).is_ok() => {
+            optional_json("memory_detail", Some(detail))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn disk_detail_json(value: Option<&DiskDetailSample>) -> Result<Option<serde_json::Value>> {
+    match value {
+        Some(detail) if validate_disk_detail(detail).is_ok() => {
+            optional_json("disk_detail", Some(detail))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn network_detail_json(value: Option<&NetworkDetailSample>) -> Result<Option<serde_json::Value>> {
+    optional_json("network_detail", value)
+}
+
+fn optional_detail_from_row<T: serde::de::DeserializeOwned>(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Option<T>> {
+    let raw: Option<serde_json::Value> = row.try_get(field)?;
+    // A malformed/newer detail must not blank the entire load card. The stable scalar sample is
+    // still useful, and absence already has an explicit "agent does not report this" UI state.
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+#[cfg(test)]
+fn validate_details(sample: &LoadSample) -> Result<()> {
+    if let Some(detail) = &sample.cpu_detail {
+        validate_cpu_detail(detail)?;
+    }
+    if let Some(detail) = &sample.memory_detail {
+        validate_memory_detail(detail)?;
+    }
+    if let Some(detail) = &sample.disk_detail {
+        validate_disk_detail(detail)?;
+    }
+    Ok(())
+}
+
+fn validate_cpu_detail(detail: &CpuDetailSample) -> Result<()> {
+    strict_pct("cpu_detail.iowait_pct", detail.iowait_pct)?;
+    finite("cpu_detail.load5", detail.load5)?;
+    finite("cpu_detail.load15", detail.load15)?;
+    for (field, value) in [
+        ("cpu_detail.pressure_some_pct", detail.pressure_some_pct),
+        (
+            "cpu_detail.io_pressure_some_pct",
+            detail.io_pressure_some_pct,
+        ),
+        (
+            "cpu_detail.io_pressure_full_pct",
+            detail.io_pressure_full_pct,
+        ),
+    ] {
+        if let Some(value) = value {
+            strict_pct(field, value)?;
+        }
+    }
+    if detail.cores.len() > 1024 {
+        return Err(StoreError::InvalidData(
+            "cpu_detail carries more than 1024 logical CPUs".to_owned(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for core in &detail.cores {
+        if !seen.insert(core.cpu) {
+            return Err(StoreError::InvalidData(format!(
+                "cpu_detail repeats logical CPU {}",
+                core.cpu
+            )));
+        }
+        let shares = [
+            ("user", core.user_pct),
+            ("system", core.system_pct),
+            ("softirq", core.softirq_pct),
+            ("iowait", core.iowait_pct),
+            ("steal", core.steal_pct),
+        ];
+        let mut sum = 0.0;
+        for (name, value) in shares {
+            strict_pct(&format!("cpu_detail.cores[{}].{name}", core.cpu), value)?;
+            sum += value;
+        }
+        if sum > 100.5 {
+            return Err(StoreError::InvalidData(format!(
+                "cpu_detail logical CPU {} shares add to {sum:.2}%",
+                core.cpu
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_memory_detail(detail: &MemoryDetailSample) -> Result<()> {
+    if let Some(value) = detail.pressure_some_pct {
+        strict_pct("memory_detail.pressure_some_pct", value)?;
+    }
+    if let Some(value) = detail.pressure_full_pct {
+        strict_pct("memory_detail.pressure_full_pct", value)?;
+    }
+    Ok(())
+}
+
+fn validate_disk_detail(detail: &DiskDetailSample) -> Result<()> {
+    for (field, value) in [
+        ("disk_detail.read_iops", detail.read_iops),
+        ("disk_detail.write_iops", detail.write_iops),
+        ("disk_detail.read_await_ms", detail.read_await_ms),
+        ("disk_detail.write_await_ms", detail.write_await_ms),
+        ("disk_detail.queue_depth", detail.queue_depth),
+    ] {
+        if let Some(value) = value {
+            finite(field, value)?;
+        }
+    }
+    for (field, value) in [
+        ("disk_detail.busy_pct", detail.busy_pct),
+        ("disk_detail.pressure_some_pct", detail.pressure_some_pct),
+        ("disk_detail.pressure_full_pct", detail.pressure_full_pct),
+    ] {
+        if let Some(value) = value {
+            strict_pct(field, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn strict_pct(field: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(StoreError::InvalidData(format!(
+            "{field} must be a percentage between 0 and 100"
+        )));
+    }
+    Ok(())
 }
 
 /// Percentages carry two hazards the CHECK constraints would otherwise turn into a failed
@@ -694,4 +875,109 @@ fn u64_to_i64(field: &str, value: u64) -> Result<i64> {
 
 fn i64_to_u64(field: &str, value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| StoreError::InvalidData(format!("{field} is out of range")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brocade_deployment::protocol::{CpuCoreSample, CpuDetailSample};
+
+    fn sample() -> LoadSample {
+        LoadSample {
+            window_start_unix_secs: 100,
+            window_end_unix_secs: 130,
+            has_gap: false,
+            cpu_user_pct: 10.0,
+            cpu_sys_pct: 5.0,
+            cpu_softirq_pct: 3.0,
+            cpu_peak_pct: 20.0,
+            cpu_steal_pct: 0.0,
+            load1: 0.2,
+            cpu_detail: Some(CpuDetailSample {
+                iowait_pct: 0.1,
+                load5: 0.1,
+                load15: 0.1,
+                pressure_some_pct: Some(0.0),
+                io_pressure_some_pct: Some(0.0),
+                io_pressure_full_pct: Some(0.0),
+                procs_running: Some(1),
+                procs_total: Some(100),
+                context_switches_per_sec: Some(1000),
+                net_rx_softirqs_per_sec: Some(2000),
+                net_tx_softirqs_per_sec: Some(100),
+                throttled_usec: Some(0),
+                frequency_mhz: None,
+                cores: vec![CpuCoreSample {
+                    cpu: 0,
+                    user_pct: 10.0,
+                    system_pct: 5.0,
+                    softirq_pct: 3.0,
+                    iowait_pct: 0.1,
+                    steal_pct: 0.0,
+                }],
+            }),
+            mem_available_bytes: 1024,
+            swap_used_bytes: 0,
+            memory_detail: None,
+            oom_kills: 0,
+            disk_free_bytes: 2048,
+            disk_inode_free_pct: 99.0,
+            disk_detail: None,
+            nic_rx_bps: 0,
+            nic_tx_bps: 0,
+            nic_rx_drop: 0,
+            nic_tx_drop: 0,
+            nic_err: 0,
+            conntrack_count: None,
+            network_detail: None,
+            uptime_secs: 10,
+        }
+    }
+
+    #[test]
+    fn deep_cpu_details_accept_unique_bounded_cores() {
+        assert!(validate_details(&sample()).is_ok());
+    }
+
+    #[test]
+    fn deep_cpu_details_reject_duplicate_core_ids() {
+        let mut sample = sample();
+        let detail = sample.cpu_detail.as_mut().unwrap();
+        detail.cores.push(detail.cores[0].clone());
+        let error = validate_details(&sample).unwrap_err().to_string();
+        assert!(error.contains("repeats logical CPU 0"), "{error}");
+    }
+
+    #[test]
+    fn deep_cpu_details_reject_impossible_core_shares() {
+        let mut sample = sample();
+        sample.cpu_detail.as_mut().unwrap().cores[0].softirq_pct = 90.0;
+        let error = validate_details(&sample).unwrap_err().to_string();
+        assert!(error.contains("shares add"), "{error}");
+    }
+
+    #[test]
+    fn impossible_optional_cpu_detail_is_dropped_without_rejecting_the_scalar_sample() {
+        let mut sample = sample();
+        sample.cpu_detail.as_mut().unwrap().cores[0].softirq_pct = 90.0;
+        let json = cpu_detail_json(sample.cpu_detail.as_ref()).unwrap();
+        assert!(json.is_none());
+        assert!(
+            cpu_split(&sample).is_ok(),
+            "the stable CPU split remains usable"
+        );
+    }
+
+    #[test]
+    fn impossible_optional_disk_detail_is_dropped_without_rejecting_capacity() {
+        let mut sample = sample();
+        sample.disk_detail = Some(DiskDetailSample {
+            busy_pct: Some(f32::NAN),
+            ..Default::default()
+        });
+        assert!(disk_detail_json(sample.disk_detail.as_ref())
+            .unwrap()
+            .is_none());
+        assert_eq!(sample.disk_free_bytes, 2048);
+    }
 }

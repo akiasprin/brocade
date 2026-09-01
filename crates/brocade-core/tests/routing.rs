@@ -80,7 +80,10 @@ fn front_downstream_expands_to_sorted_domain_and_ip_rules() {
         "hk",
         vec![Rule {
             dest_match: ModelMatch::FrontDownstream,
-            action: Action::Egress { send_through: None },
+            action: Action::Egress {
+                send_through: None,
+                dns: false,
+            },
         }],
         None,
     )]);
@@ -127,7 +130,10 @@ fn front_downstream_deliberately_ignores_subscription_projection() {
         "hk",
         vec![Rule {
             dest_match: ModelMatch::FrontDownstream,
-            action: Action::Egress { send_through: None },
+            action: Action::Egress {
+                send_through: None,
+                dns: false,
+            },
         }],
         None,
     )]);
@@ -210,7 +216,10 @@ fn nested_front_downstream_blocks_publish_instead_of_becoming_a_dead_rule() {
                 ModelMatch::FrontDownstream,
                 ModelMatch::Port(vec!["443".to_owned()]),
             ]),
-            action: Action::Egress { send_through: None },
+            action: Action::Egress {
+                send_through: None,
+                dns: false,
+            },
         }],
         None,
     )]);
@@ -290,7 +299,7 @@ fn grants_resolve_users_by_tenant_and_id() {
 }
 
 #[test]
-fn entity_order_does_not_change_compiled_app_ir() {
+fn unordered_entity_order_does_not_change_compiled_app_ir() {
     let app = AppView {
         id: "stable".to_owned(),
         label: "稳定".to_owned(),
@@ -316,7 +325,8 @@ fn entity_order_does_not_change_compiled_app_ir() {
     let mut shuffled_doc = doc;
     shuffled_doc.nodes.reverse();
     let mut shuffled_app = app;
-    shuffled_app.chains.reverse();
+    // Chain array order is the explicit app-local position and is therefore semantic. The other
+    // model collections remain unordered inputs and must compile canonically.
     shuffled_app.ingresses.reverse();
     shuffled_app.steps.reverse();
 
@@ -571,6 +581,7 @@ fn front_app(steps: Vec<Step>) -> AppView {
             tenant: "platform.acme".to_owned(),
             name: "入口组".to_owned(),
             via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
             strategy: FrontStrategy::UrlTest,
         }],
         steps,
@@ -583,6 +594,7 @@ fn chain(id: &str) -> Chain {
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),
         name: id.to_owned(),
+        subscription_country: None,
     }
 }
 
@@ -636,7 +648,10 @@ fn step(chain: &str, node: &str, rules: Vec<Rule>, accept: Option<Accept>) -> St
 fn any_egress() -> Rule {
     Rule {
         dest_match: ModelMatch::Any,
-        action: Action::Egress { send_through: None },
+        action: Action::Egress {
+            send_through: None,
+            dns: false,
+        },
     }
 }
 
@@ -657,6 +672,7 @@ fn doc(nodes: Vec<Node>) -> ModelSnapshot {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes,
+        node_egress_dns: Vec::new(),
         users: Vec::new(),
         external_outbounds: Vec::new(),
         apps: Vec::new(),

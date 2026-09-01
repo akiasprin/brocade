@@ -995,7 +995,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
             // Local reconcile does not contact the control plane and has no
             // distribution source; the binary was installed by the last release.
             Ok(content) => {
-                if let Err(error) = apply_phantun(&content, None) {
+                if let Err(error) = apply_phantun(state_dir, &content, None) {
                     warn(format!("wireguard: phantun 重放失败：{error}"));
                 }
             }

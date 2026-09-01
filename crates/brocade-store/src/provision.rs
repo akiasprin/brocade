@@ -351,6 +351,20 @@ async fn issue_node_token_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
 ) -> Result<IssuedNodeToken> {
+    let phase = sqlx::query_scalar::<_, String>(
+        "SELECT phase
+           FROM node_lifecycle_state
+          WHERE node_id = $1
+          FOR UPDATE",
+    )
+    .bind(node_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !matches!(phase.as_str(), "active" | "retiring") {
+        return Err(StoreError::Forbidden(format!(
+            "node {node_id} is {phase}; its enrollment can no longer issue an agent token"
+        )));
+    }
     let token = generate_node_token()?;
     let token_hash = node_token_hash(&token);
     let token_prefix = node_token_display_prefix(&token);

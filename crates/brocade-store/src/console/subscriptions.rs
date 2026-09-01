@@ -1,29 +1,43 @@
-//! Public Clash subscriptions. Nothing in this module writes: each call reads the current
-//! materialized model, projects the user, compiles YAML, and accounts the current calendar month.
+//! Serving Clash subscriptions. Nothing in this module writes: every request renders fresh YAML
+//! from the last fully converged serving projection and accounts the current calendar month.
+//! Committed-but-unpublished revisions are intentionally invisible, while an open/uncertain
+//! release makes pulls temporarily unavailable instead of returning a configuration which may not
+//! match the fleet.
 
 use std::collections::BTreeSet;
 
 use brocade_core::{
-    artifacts::subscription, compile::compile, format::yaml, model::IpFamily,
-    physical::user::project_user,
+    artifacts::subscription,
+    compile::compile,
+    format::yaml,
+    model::IpFamily,
+    physical::user::{project_user, SubscriptionFilter},
 };
 use sqlx::{PgPool, Row};
 
 use super::*;
-use crate::{AdminContext, Result, StoreError};
+use crate::{
+    credentials::generate_uuid_v4, input::required_text, AdminContext, Result, StoreError,
+};
 
 const PUBLIC_NOT_FOUND: &str = "subscription not found";
 
-/// Resolve an active user by bearer UUID and compile their current subscription. Inactive users
-/// are absent from the current snapshot, so absent and inactive credentials have one answer.
+#[derive(Clone, Copy)]
+enum DynamicClashTemplate {
+    Standard,
+    Haitun,
+}
+
+/// Resolve an active user by bearer UUID and compile their serving subscription. Inactive users
+/// are absent from the serving snapshot, so absent and inactive credentials have one answer.
 pub async fn clash_subscription_by_uuid(
     pool: &PgPool,
     uuid: &str,
 ) -> Result<DynamicClashSubscription> {
-    clash_subscription_by_uuid_for_family(pool, uuid, None).await
+    clash_subscription_by_uuid_filtered(pool, uuid, SubscriptionFilter::default()).await
 }
 
-/// The family-specific public URLs are alternate views of the same live projection. Keeping the
+/// The family-specific public URLs are alternate views of the same serving projection. Keeping the
 /// filter here ensures VLESS artifacts and Clash subscriptions both use `UserPlan::retain_family`
 /// rather than growing subtly different notions of an IPv4/IPv6-capable entry.
 pub async fn clash_subscription_by_uuid_for_family(
@@ -31,33 +45,252 @@ pub async fn clash_subscription_by_uuid_for_family(
     uuid: &str,
     family: Option<IpFamily>,
 ) -> Result<DynamicClashSubscription> {
-    let snapshot = crate::materialize::load_current_snapshot(pool).await?;
-    let user = snapshot
+    clash_subscription_by_uuid_filtered(
+        pool,
+        uuid,
+        SubscriptionFilter {
+            family,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Resolve the public bearer and narrow the serving projection by address family and/or client
+/// protocol. Both filters operate on the same compiled plan so a combined URL cannot drift from
+/// the individual views.
+pub async fn clash_subscription_by_uuid_filtered(
+    pool: &PgPool,
+    uuid: &str,
+    filter: SubscriptionFilter,
+) -> Result<DynamicClashSubscription> {
+    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
+    let user = serving
+        .snapshot
         .users
         .iter()
         .find(|user| user.uuid == uuid)
         .ok_or_else(public_not_found)?;
-    build_dynamic_clash(pool, &snapshot, &user.tenant, &user.id, family, true).await
+    let tenant_id = user.tenant.clone();
+    let user_id = user.id.clone();
+    serving.ensure_available()?;
+    build_dynamic_clash(
+        pool,
+        &serving.snapshot,
+        &tenant_id,
+        &user_id,
+        filter,
+        DynamicClashTemplate::Standard,
+        true,
+    )
+    .await
 }
 
-/// The administrator-side lookup uses the already scoped snapshot. A tenant administrator can
-/// therefore obtain URLs only for users they can see, and readonly reviewers are still refused
-/// by the HTTP artifact permission before this function is called.
+/// Resolve a separately revocable Haitun bearer. The lookup deliberately happens before model
+/// projection: revoked, unknown, disabled and currently unusable users all have the same public
+/// answer and disclose no account state.
+pub async fn clash_subscription_by_haitun_token_for_family(
+    pool: &PgPool,
+    token: &str,
+    family: Option<IpFamily>,
+) -> Result<DynamicClashSubscription> {
+    clash_subscription_by_haitun_token_filtered(
+        pool,
+        token,
+        SubscriptionFilter {
+            family,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub async fn clash_subscription_by_haitun_token_filtered(
+    pool: &PgPool,
+    token: &str,
+    filter: SubscriptionFilter,
+) -> Result<DynamicClashSubscription> {
+    let link = sqlx::query(
+        "SELECT tenant_id, user_id
+         FROM clash_haitun_links
+         WHERE token = $1::uuid
+           AND revoked_at IS NULL",
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(public_not_found)?;
+    let tenant_id: String = link.try_get("tenant_id")?;
+    let user_id: String = link.try_get("user_id")?;
+    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
+    if !serving
+        .snapshot
+        .users
+        .iter()
+        .any(|user| user.tenant == tenant_id && user.id == user_id)
+    {
+        return Err(public_not_found());
+    }
+    serving.ensure_available()?;
+
+    build_dynamic_clash(
+        pool,
+        &serving.snapshot,
+        &tenant_id,
+        &user_id,
+        filter,
+        DynamicClashTemplate::Haitun,
+        true,
+    )
+    .await
+}
+
+/// The administrator-side lookup uses the same serving projection as the public endpoint. A
+/// tenant administrator can obtain URLs only for users in their scope, and cannot accidentally
+/// validate a URL against a committed-but-unpublished user.
 pub async fn clash_subscription_for_user(
     pool: &PgPool,
     actor: &AdminContext,
     tenant_id: &str,
     user_id: &str,
 ) -> Result<DynamicClashSubscription> {
-    let snapshot = load_scoped_snapshot(pool, actor, None).await?;
-    if !snapshot
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
+    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
+    if !serving
+        .snapshot
         .users
         .iter()
         .any(|user| user.tenant == tenant_id && user.id == user_id)
     {
         return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
     }
-    build_dynamic_clash(pool, &snapshot, tenant_id, user_id, None, false).await
+    serving.ensure_available()?;
+    build_dynamic_clash(
+        pool,
+        &serving.snapshot,
+        &tenant_id,
+        &user_id,
+        SubscriptionFilter::default(),
+        DynamicClashTemplate::Standard,
+        false,
+    )
+    .await
+}
+
+/// Read the durable link separately from the generated subscription. A missing row means the
+/// operator has never generated a Haitun URL; a row with `revoked_at` preserves that useful UI
+/// distinction without leaving the old token live.
+pub async fn clash_haitun_link_for_user(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Option<ClashHaitunLink>> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
+    let row = sqlx::query(
+        "SELECT tenant_id, user_id, token::text AS token,
+                created_at::text AS created_at, revoked_at::text AS revoked_at
+         FROM clash_haitun_links
+         WHERE tenant_id = $1 AND user_id = $2",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(clash_haitun_link_from_row).transpose()
+}
+
+/// Generate the first link, return an existing active one idempotently, or replace a revoked
+/// token. This is operational sharing state: it neither creates a revision nor changes anything
+/// deployed to the agents.
+pub async fn issue_clash_haitun_link(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<ClashHaitunLink> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM users
+             WHERE tenant_id = $1 AND id = $2 AND status = 'active'
+         )",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Err(StoreError::NotFound(format!(
+            "active user {tenant_id}/{user_id}"
+        )));
+    }
+
+    let token = generate_uuid_v4()?;
+    let row = sqlx::query(
+        "INSERT INTO clash_haitun_links (tenant_id, user_id, token)
+         VALUES ($1, $2, $3::uuid)
+         ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+             token = CASE
+                 WHEN clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.token
+                 ELSE EXCLUDED.token
+             END,
+             created_at = CASE
+                 WHEN clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.created_at
+                 ELSE EXCLUDED.created_at
+             END,
+             revoked_at = NULL
+         RETURNING tenant_id, user_id, token::text AS token,
+                   created_at::text AS created_at, revoked_at::text AS revoked_at",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .bind(token)
+    .fetch_one(pool)
+    .await?;
+    clash_haitun_link_from_row(row)
+}
+
+/// Repeated revocation is harmless and preserves the first revocation timestamp. A link that was
+/// never issued is a missing resource rather than an invented revoked state.
+pub async fn revoke_clash_haitun_link(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<ClashHaitunLink> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
+    let row = sqlx::query(
+        "UPDATE clash_haitun_links
+         SET revoked_at = COALESCE(revoked_at, now())
+         WHERE tenant_id = $1 AND user_id = $2
+         RETURNING tenant_id, user_id, token::text AS token,
+                   created_at::text AS created_at, revoked_at::text AS revoked_at",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("Haitun link {tenant_id}/{user_id}")))?;
+    clash_haitun_link_from_row(row)
+}
+
+fn clash_haitun_link_from_row(row: sqlx::postgres::PgRow) -> Result<ClashHaitunLink> {
+    Ok(ClashHaitunLink {
+        tenant_id: row.try_get("tenant_id")?,
+        user_id: row.try_get("user_id")?,
+        token: row.try_get("token")?,
+        created_at: row.try_get("created_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+    })
 }
 
 async fn build_dynamic_clash(
@@ -65,7 +298,8 @@ async fn build_dynamic_clash(
     snapshot: &brocade_core::model::ModelSnapshot,
     tenant_id: &str,
     user_id: &str,
-    family: Option<IpFamily>,
+    filter: SubscriptionFilter,
+    template: DynamicClashTemplate,
     hide_reason: bool,
 ) -> Result<DynamicClashSubscription> {
     let output = compile(snapshot);
@@ -83,9 +317,7 @@ async fn build_dynamic_clash(
             ))
         });
     }
-    if let Some(family) = family {
-        plan.retain_family(family);
-    }
+    plan.retain_filter(filter);
 
     // Only apps that actually project at least one subscription entry participate in the
     // combined quota. A grant whose ingress has no usable public endpoint does not silently make
@@ -115,7 +347,11 @@ async fn build_dynamic_clash(
     }
 
     let uuid = plan.uuid.clone();
-    let content = yaml::clash_subscription(&subscription::build(&plan));
+    let artifact = subscription::build(&plan);
+    let content = match template {
+        DynamicClashTemplate::Standard => yaml::clash_subscription(&artifact),
+        DynamicClashTemplate::Haitun => yaml::clash_haitun_subscription(&artifact),
+    };
     let usage = subscription_usage(pool, tenant_id, user_id, &app_ids).await?;
     Ok(DynamicClashSubscription {
         tenant_id: tenant_id.to_owned(),

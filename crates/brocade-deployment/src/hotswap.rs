@@ -61,6 +61,10 @@ pub struct HotSwap {
 /// - **An outbound that changed while keeping its tag.** Expressing that means taking it
 ///   out and putting it back, and in between the rules pointing at it name nothing.
 ///   Additions and removals have no such window, which is why those two are allowed.
+/// - **A WireGuard outbound appearing or disappearing.** HandlerService can acknowledge the
+///   add/remove operation while the stateful WireGuard outbound is not yet carrying traffic.
+///   Starting or retiring one therefore goes through a full xray restart; unrelated rule edits
+///   may still be hot-swapped while an unchanged WireGuard outbound remains installed.
 pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
     let (before, after): (Value, Value) = (
         serde_json::from_str(previous).ok()?,
@@ -126,6 +130,18 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
         {
             return None;
         }
+    }
+
+    let is_wireguard =
+        |outbound: &Value| outbound.get("protocol").and_then(Value::as_str) == Some("wireguard");
+    let adds_wireguard = after_outbounds
+        .iter()
+        .any(|(tag, outbound)| !before_outbounds.contains_key(tag) && is_wireguard(outbound));
+    let removes_wireguard = before_outbounds
+        .iter()
+        .any(|(tag, outbound)| !after_outbounds.contains_key(tag) && is_wireguard(outbound));
+    if adds_wireguard || removes_wireguard {
+        return None;
     }
 
     let (before_inbounds, after_inbounds) =
@@ -294,6 +310,69 @@ mod tests {
         assert_eq!(swap.remove_outbounds, vec!["out:a".to_owned()]);
         assert_eq!(swap.add_outbounds.len(), 1);
         assert_eq!(swap.add_outbounds[0]["tag"], "out:b");
+    }
+
+    #[test]
+    fn adding_or_removing_a_wireguard_outbound_forces_a_restart() {
+        let mut with_wireguard: Value = serde_json::from_str(&base()).unwrap();
+        with_wireguard["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "tag": "out:external/warp",
+                "protocol": "wireguard",
+                "settings": {
+                    "secretKey": "private-key",
+                    "address": ["172.16.0.2/32"],
+                    "peers": [{
+                        "endpoint": "engage.example:2408",
+                        "publicKey": "peer-key",
+                        "allowedIPs": ["0.0.0.0/0"]
+                    }]
+                }
+            }));
+        with_wireguard["routing"]["rules"] = json!([
+            { "type": "field", "ruleTag": "r:g2:000", "outboundTag": "out:egress" },
+            {
+                "type": "field",
+                "ruleTag": "r:g2:001",
+                "outboundTag": "out:external/warp"
+            }
+        ]);
+        let with_wireguard = serde_json::to_string(&with_wireguard).unwrap();
+
+        assert!(
+            hot_swap(&base(), &with_wireguard).is_none(),
+            "新增 WireGuard 出站必须重启 xray"
+        );
+        assert!(
+            hot_swap(&with_wireguard, &base()).is_none(),
+            "移除 WireGuard 出站必须重启 xray"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_wireguard_outbound_does_not_block_a_rule_only_swap() {
+        let mut before: Value = serde_json::from_str(&base()).unwrap();
+        before["outbounds"].as_array_mut().unwrap().push(json!({
+            "tag": "out:external/warp",
+            "protocol": "wireguard",
+            "settings": { "secretKey": "private-key" }
+        }));
+        let mut after = before.clone();
+        after["routing"]["rules"] = json!([
+            { "type": "field", "ruleTag": "r:g2:000", "outboundTag": "out:a" },
+            { "type": "field", "ruleTag": "r:g2:001", "outboundTag": "out:egress" }
+        ]);
+
+        assert!(
+            hot_swap(
+                &serde_json::to_string(&before).unwrap(),
+                &serde_json::to_string(&after).unwrap()
+            )
+            .is_some(),
+            "WireGuard 出站没变时，纯规则调整仍应热切"
+        );
     }
 
     /// An outbound can appear or vanish without any rule moving. The rule table is then

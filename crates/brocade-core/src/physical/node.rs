@@ -6,15 +6,18 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::{
+    hash::hex_lower,
     ir::{
         hops::{HopDialWire, HopPath},
-        routing::{egress_tag as routing_egress_tag, AppIr, DestMatch, Ingress},
+        routing::{egress_tag as routing_egress_tag, AppIr, DestMatch, Ingress, Rule},
         system::{Dial, Link, LinkWrap, SystemIr, SystemNode},
     },
     model::{
-        Action, Dns, DomainStrategy, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        GeodataSettings, HopPool, HopWire, IngressGuard, Network, RealityClientPolicy,
-        RealityFallbackLimits, RealityFallbackRateLimit, RealitySettings, Transport, Xhttp,
+        Action, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback,
+        EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
+        ExternalOutboundSecurity, GeodataSettings, HopPool, HopWire, IngressGuard, Network,
+        RealityClientPolicy, RealityFallbackLimits, RealityFallbackRateLimit, RealitySettings,
+        Transport, Xhttp,
     },
 };
 
@@ -186,6 +189,10 @@ pub struct XrayPlan {
     /// the renderer, which then only writes values.
     pub connection: ResolvedConnection,
     pub dns_route: Option<String>,
+    /// Domain-scoped resolvers requested by terminal egress rules. They are independent of the
+    /// machine default above: each query is tagged and routed through the same source-bound
+    /// Freedom outbound as the connection it resolves.
+    pub egress_dns: Vec<XrayEgressDnsPlan>,
     pub inbounds: Vec<XrayIngressPlan>,
     /// The relay inbounds on this machine, one per chain. A relay serving two chains
     /// has two entries here, with independent ports and wire formats.
@@ -362,6 +369,21 @@ pub struct XrayForwardOutboundPlan {
 pub struct XrayEgressOutboundPlan {
     pub tag: String,
     pub send_through: Option<IpAddr>,
+    /// `None` inherits the machine strategy. A custom resolver needs an outbound which always
+    /// resolves, even when the machine default is `AsIs`, so it carries its own concrete value.
+    pub domain_strategy: Option<DomainStrategy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrayEgressDnsPlan {
+    pub tag: String,
+    pub outbound_tag: String,
+    pub address: String,
+    pub port: u16,
+    pub transport: EgressDnsTransport,
+    pub address_strategy: EgressDnsAddressStrategy,
+    pub fallback: EgressDnsFallback,
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +393,9 @@ pub struct XrayExternalOutboundPlan {
     pub port: u16,
     pub protocol: ExternalOutboundProtocol,
     pub security: ExternalOutboundSecurity,
+    /// Only meaningful for a WireGuard protocol after a managed WARP target is lowered. Zero
+    /// leaves wireguard-go's automatic worker selection in control.
+    pub wireguard_workers: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,6 +696,7 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
             }
         },
         dns_route: None,
+        egress_dns: xray_egress_dns(apps, node_id, &app_node.egress_dns),
         inbounds: xray_ingresses(apps, node_id, app_node.api_port),
         hop_inbounds: xray_hop_inbounds(system_node, apps, node_id),
         forward_outbounds: xray_forward_outbounds(apps, node_id),
@@ -1147,18 +1173,177 @@ fn xray_egress_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayEgressOutboun
     for app in sorted_apps(apps) {
         for step in app.steps.iter().filter(|step| step.node == node_id) {
             for rule in &step.rules {
-                let Action::Egress { send_through } = rule.action else {
+                let Action::Egress { send_through, dns } = &rule.action else {
                     continue;
                 };
-                let tag = egress_tag(send_through);
+                let resolution = dns
+                    .then(|| egress_dns_resolution(app, node_id, &rule.dest_match))
+                    .flatten();
+                let (tag, domain_strategy) = match resolution {
+                    Some(resolution) => (
+                        custom_egress_tag(*send_through, resolution),
+                        Some(custom_dns_domain_strategy(resolution.address_strategy)),
+                    ),
+                    None => (egress_tag(*send_through), None),
+                };
                 outbounds
                     .entry(tag.clone())
-                    .or_insert(XrayEgressOutboundPlan { tag, send_through });
+                    .or_insert(XrayEgressOutboundPlan {
+                        tag,
+                        send_through: *send_through,
+                        domain_strategy,
+                    });
             }
         }
     }
 
     outbounds.into_values().collect()
+}
+
+fn xray_egress_dns(
+    apps: &[AppIr],
+    node_id: &str,
+    policies: &[crate::model::NodeEgressDnsPolicy],
+) -> Vec<XrayEgressDnsPlan> {
+    // DNS priority is machine-owned and deliberately independent from app/chain/rule order.
+    // Walk that canonical list first, locating only a rule which actually references each policy
+    // so an unused machine policy does not create an unused outbound in the artifact.
+    let mut plans = Vec::<XrayEgressDnsPlan>::new();
+    let mut ordered = policies.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| {
+        a.position.cmp(&b.position).then_with(|| {
+            serde_json::to_string(&a.selector)
+                .unwrap_or_default()
+                .cmp(&serde_json::to_string(&b.selector).unwrap_or_default())
+        })
+    });
+
+    for policy in ordered {
+        let Some(mut domains) = custom_dns_domains(&policy.selector) else {
+            continue;
+        };
+        domains.sort();
+        domains.dedup();
+        let Some(canonical) = policy.selector.canonical_egress_dns_selector() else {
+            continue;
+        };
+        let usage = sorted_apps(apps).into_iter().find_map(|app| {
+            app.steps
+                .iter()
+                .filter(|step| step.node == node_id)
+                .flat_map(|step| step.rules.iter())
+                .find_map(|rule| {
+                    let Action::Egress {
+                        send_through,
+                        dns: true,
+                    } = &rule.action
+                    else {
+                        return None;
+                    };
+                    (rule.dest_match.canonical_egress_dns_selector().as_ref() == Some(&canonical))
+                        .then_some(*send_through)
+                })
+        });
+        let Some(send_through) = usage else {
+            continue;
+        };
+        let resolution = &policy.resolution;
+        plans.push(XrayEgressDnsPlan {
+            tag: custom_dns_policy_tag(send_through, resolution, policy.position, &domains),
+            outbound_tag: custom_egress_tag(send_through, resolution),
+            address: resolution.address.clone(),
+            port: resolution.port,
+            transport: resolution.transport,
+            address_strategy: resolution.address_strategy,
+            fallback: resolution.fallback,
+            domains,
+        });
+    }
+    plans
+}
+
+fn custom_dns_domains(dest_match: &DestMatch) -> Option<Vec<String>> {
+    match dest_match {
+        DestMatch::DomainSuffix(values) => Some(
+            values
+                .iter()
+                .map(|value| format!("domain:{value}"))
+                .collect(),
+        ),
+        DestMatch::DomainKeyword(values) => Some(values.clone()),
+        DestMatch::DomainRegex(value) => Some(vec![format!("regexp:{value}")]),
+        DestMatch::Geosite(values) => Some(
+            values
+                .iter()
+                .map(|value| format!("geosite:{value}"))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn egress_dns_resolution<'a>(
+    app: &'a AppIr,
+    node_id: &str,
+    dest_match: &DestMatch,
+) -> Option<&'a EgressDnsResolution> {
+    let selector = dest_match.canonical_egress_dns_selector()?;
+    app.nodes
+        .iter()
+        .find(|node| node.id == node_id)?
+        .egress_dns
+        .iter()
+        .find(|policy| policy.selector.canonical_egress_dns_selector().as_ref() == Some(&selector))
+        .map(|policy| &policy.resolution)
+}
+
+fn custom_dns_domain_strategy(strategy: EgressDnsAddressStrategy) -> DomainStrategy {
+    match strategy {
+        EgressDnsAddressStrategy::UseIp => DomainStrategy::UseIp,
+        EgressDnsAddressStrategy::UseIpv4 => DomainStrategy::UseIpv4,
+        EgressDnsAddressStrategy::UseIpv6 => DomainStrategy::UseIpv6,
+        EgressDnsAddressStrategy::UseIpv4v6 => DomainStrategy::UseIpv4v6,
+        EgressDnsAddressStrategy::UseIpv6v4 => DomainStrategy::UseIpv6v4,
+    }
+}
+
+fn custom_dns_identity(send_through: Option<IpAddr>, resolution: &EgressDnsResolution) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"brocade/egress-dns/v1");
+    hasher.update(send_through.map(|ip| ip.to_string()).unwrap_or_default());
+    hasher.update([0]);
+    hasher.update(resolution.address.trim().as_bytes());
+    hasher.update([0]);
+    hasher.update(resolution.port.to_le_bytes());
+    hasher.update([
+        resolution.transport as u8,
+        resolution.address_strategy as u8,
+        resolution.fallback as u8,
+    ]);
+    hex_lower(&hasher.finalize()[..6])
+}
+
+fn custom_egress_tag(send_through: Option<IpAddr>, resolution: &EgressDnsResolution) -> String {
+    format!(
+        "out:egress:dns:{}",
+        custom_dns_identity(send_through, resolution)
+    )
+}
+
+fn custom_dns_policy_tag(
+    send_through: Option<IpAddr>,
+    resolution: &EgressDnsResolution,
+    position: u32,
+    domains: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(custom_dns_identity(send_through, resolution));
+    hasher.update(position.to_le_bytes());
+    for domain in domains {
+        hasher.update([0]);
+        hasher.update(domain.as_bytes());
+    }
+    format!("dns:egress:{}", hex_lower(&hasher.finalize()[..6]))
 }
 
 fn xray_external_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayExternalOutboundPlan> {
@@ -1179,21 +1364,98 @@ fn xray_external_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayExternalOut
                     // caller return the full diagnostic set instead of failing while lowering it.
                     continue;
                 };
-                let tag = external_outbound_tag(app, outbound);
+                let tag = external_outbound_tag(outbound);
+                let (protocol, address, port, wireguard_workers) = match &target.protocol {
+                    ExternalOutboundProtocol::Warp {
+                        mtu,
+                        keep_alive,
+                        allowed_ips,
+                        no_kernel_tun,
+                        domain_strategy,
+                        workers,
+                    } => {
+                        let Some(binding) = target
+                            .bindings
+                            .iter()
+                            .find(|binding| binding.node == node_id)
+                        else {
+                            // Validation reports the missing per-machine identity. Do not emit a
+                            // half-configured WireGuard outbound which Xray would accept but could
+                            // never authenticate as this machine.
+                            continue;
+                        };
+                        let effective_domain_strategy =
+                            binding.domain_strategy.as_ref().unwrap_or(domain_strategy);
+                        (
+                            ExternalOutboundProtocol::Wireguard {
+                                credential: binding.private_key.clone(),
+                                peer_public_key: binding.peer_public_key.clone(),
+                                // A WARP registration normally returns one address from each
+                                // family. Keep the full identity in the model, but only put the
+                                // selected family on Xray's virtual interface for a single-stack
+                                // exit. `allowedIPs` and `domainStrategy` then enforce the same
+                                // decision for literal and domain targets respectively.
+                                local_addresses: warp_local_addresses(
+                                    &binding.local_addresses,
+                                    effective_domain_strategy,
+                                ),
+                                mtu: binding.mtu.unwrap_or(*mtu),
+                                reserved: binding.reserved.clone(),
+                                keep_alive: binding.keep_alive.unwrap_or(*keep_alive),
+                                allowed_ips: binding
+                                    .allowed_ips
+                                    .clone()
+                                    .unwrap_or_else(|| allowed_ips.clone()),
+                                no_kernel_tun: binding.no_kernel_tun.unwrap_or(*no_kernel_tun),
+                                domain_strategy: effective_domain_strategy.clone(),
+                            },
+                            binding
+                                .endpoint_address
+                                .clone()
+                                .unwrap_or_else(|| target.address.clone()),
+                            binding.endpoint_port.unwrap_or(target.port),
+                            binding.workers.unwrap_or(*workers),
+                        )
+                    }
+                    protocol => (protocol.clone(), target.address.clone(), target.port, 0),
+                };
                 outbounds
                     .entry(tag.clone())
                     .or_insert_with(|| XrayExternalOutboundPlan {
                         tag,
-                        address: target.address.clone(),
-                        port: target.port,
-                        protocol: target.protocol.clone(),
+                        address,
+                        port,
+                        protocol,
                         security: target.security.clone(),
+                        wireguard_workers,
                     });
             }
         }
     }
 
     outbounds.into_values().collect()
+}
+
+fn warp_local_addresses(addresses: &[String], domain_strategy: &str) -> Vec<String> {
+    let family = match domain_strategy {
+        "ForceIPv4" => Some(true),
+        "ForceIPv6" => Some(false),
+        _ => None,
+    };
+    let Some(ipv4) = family else {
+        return addresses.to_vec();
+    };
+    addresses
+        .iter()
+        .filter(|address| {
+            address
+                .split_once('/')
+                .map_or(address.as_str(), |(ip, _)| ip)
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_ipv4() == ipv4)
+        })
+        .cloned()
+        .collect()
 }
 
 fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<XrayRoutingRulePlan> {
@@ -1266,7 +1528,7 @@ fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<Xray
                     rules.push(XrayRoutingRulePlan {
                         selector: selector.clone(),
                         dest_match: rule.dest_match.clone(),
-                        outbound_tag: action_tag(app, &step.chain, &step.node, &rule.action),
+                        outbound_tag: action_tag(app, &step.chain, &step.node, rule),
                     });
                 }
             }
@@ -1362,6 +1624,7 @@ fn node_dns_route(plan: &XrayPlan) -> Option<String> {
     let routes = plan
         .egress_outbounds
         .iter()
+        .filter(|outbound| outbound.domain_strategy.is_none())
         .map(|outbound| outbound.tag.clone())
         .collect::<BTreeSet<_>>();
     if routes.len() == 1 {
@@ -1377,8 +1640,8 @@ fn sorted_apps(apps: &[AppIr]) -> Vec<&AppIr> {
     apps
 }
 
-fn action_tag(app: &AppIr, chain: &str, node: &str, action: &Action) -> String {
-    match action {
+fn action_tag(app: &AppIr, chain: &str, node: &str, rule: &Rule) -> String {
+    match &rule.action {
         Action::Forward { to, .. } => {
             // Reverse traffic goes to the portal rather than to an outbound. An outbound
             // dials, whereas this hop's connection was established by the peer, and the
@@ -1395,8 +1658,14 @@ fn action_tag(app: &AppIr, chain: &str, node: &str, action: &Action) -> String {
                 forward_tag(app, chain, to)
             }
         }
-        Action::Egress { send_through } => egress_tag(*send_through),
-        Action::Proxy { outbound } => external_outbound_tag(app, outbound),
+        Action::Egress { send_through, dns } => dns
+            .then(|| egress_dns_resolution(app, node, &rule.dest_match))
+            .flatten()
+            .map_or_else(
+                || egress_tag(*send_through),
+                |resolution| custom_egress_tag(*send_through, resolution),
+            ),
+        Action::Proxy { outbound } => external_outbound_tag(outbound),
         Action::Block => "out:block".to_owned(),
     }
 }
@@ -1502,11 +1771,8 @@ fn forward_tag(app: &AppIr, chain: &str, to: &str) -> String {
     }
 }
 
-fn external_outbound_tag(app: &AppIr, outbound: &str) -> String {
-    match app.app_id.as_deref() {
-        Some(app_id) => format!("out:{app_id}/external/{outbound}"),
-        None => format!("out:external/{outbound}"),
-    }
+fn external_outbound_tag(outbound: &str) -> String {
+    format!("out:external/{outbound}")
 }
 
 /// The upstream's portal: traffic arrives here and leaves through one of the connections
@@ -1540,4 +1806,27 @@ fn reverse_dial_tag(app: &AppIr, chain: &str, from: &str) -> String {
 // outbound list derive the tag from one definition.
 fn egress_tag(send_through: Option<IpAddr>) -> String {
     routing_egress_tag(send_through.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::warp_local_addresses;
+
+    #[test]
+    fn warp_address_family_follows_the_exit_strategy() {
+        let addresses = vec![
+            "172.16.0.2/32".to_owned(),
+            "2606:4700:110:8::2/128".to_owned(),
+        ];
+
+        assert_eq!(
+            warp_local_addresses(&addresses, "ForceIPv4"),
+            ["172.16.0.2/32"]
+        );
+        assert_eq!(
+            warp_local_addresses(&addresses, "ForceIPv6"),
+            ["2606:4700:110:8::2/128"]
+        );
+        assert_eq!(warp_local_addresses(&addresses, "ForceIP"), addresses);
+    }
 }

@@ -5,7 +5,7 @@ use brocade_deployment::protocol::RouteIpReport;
 
 use crate::{
     credentials::{generate_node_token, node_token_display_prefix, node_token_hash},
-    Result, StoreError,
+    NodeLifecyclePhase, Result, StoreError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,7 @@ pub struct IssuedNodeToken {
 pub struct AuthenticatedNode {
     pub node_id: String,
     pub token_prefix: Option<String>,
+    pub lifecycle_phase: NodeLifecyclePhase,
 }
 
 pub async fn issue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNodeToken> {
@@ -26,6 +27,23 @@ pub async fn issue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNode
         return Err(StoreError::InvalidData(
             "node_id must not be empty when issuing a node token".to_owned(),
         ));
+    }
+    let mut tx = pool.begin().await?;
+    let phase = sqlx::query_scalar::<_, String>(
+        "SELECT lifecycle.phase
+           FROM nodes
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = nodes.id
+          WHERE nodes.id = $1
+          FOR UPDATE OF lifecycle",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+    if phase != NodeLifecyclePhase::Active.as_str() {
+        return Err(StoreError::Forbidden(format!(
+            "node {node_id} is {phase}; it cannot issue an agent token"
+        )));
     }
 
     let token = generate_node_token()?;
@@ -48,8 +66,9 @@ pub async fn issue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNode
     .bind(node_id)
     .bind(token_hash)
     .bind(token_prefix)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(IssuedNodeToken {
         node_id: row.try_get("node_id")?,
@@ -69,11 +88,14 @@ pub async fn authenticate_node_token(
 
     let token_hash = node_token_hash(token);
     let row = sqlx::query(
-        "UPDATE node_agent_state
-         SET token_last_used_at = now()
-         WHERE token_hash = $1
-           AND token_revoked_at IS NULL
-         RETURNING node_id, token_prefix",
+        "UPDATE node_agent_state AS agent
+            SET token_last_used_at = now()
+           FROM node_lifecycle_state AS lifecycle
+          WHERE agent.token_hash = $1
+            AND agent.token_revoked_at IS NULL
+            AND lifecycle.node_id = agent.node_id
+            AND lifecycle.phase IN ('active', 'retiring')
+        RETURNING agent.node_id, agent.token_prefix, lifecycle.phase",
     )
     .bind(token_hash)
     .fetch_optional(pool)
@@ -83,12 +105,38 @@ pub async fn authenticate_node_token(
         Ok(AuthenticatedNode {
             node_id: row.try_get("node_id")?,
             token_prefix: row.try_get("token_prefix")?,
+            lifecycle_phase: match row.try_get::<String, _>("phase")?.as_str() {
+                "active" => NodeLifecyclePhase::Active,
+                "retiring" => NodeLifecyclePhase::Retiring,
+                other => {
+                    return Err(StoreError::InvalidData(format!(
+                        "authenticated node has invalid lifecycle phase {other}"
+                    )))
+                }
+            },
         })
     })
     .transpose()
 }
 
 pub async fn revoke_node_token(pool: &PgPool, node_id: &str) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let phase = sqlx::query_scalar::<_, String>(
+        "SELECT lifecycle.phase
+           FROM nodes
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = nodes.id
+          WHERE nodes.id = $1
+          FOR UPDATE OF lifecycle",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+    if phase == NodeLifecyclePhase::Retiring.as_str() {
+        return Err(StoreError::Unsupported(format!(
+            "node {node_id} is retiring; keep its token until teardown converges or force-retire it"
+        )));
+    }
     let result = sqlx::query(
         "UPDATE node_agent_state
          SET token_revoked_at = COALESCE(token_revoked_at, now())
@@ -96,8 +144,9 @@ pub async fn revoke_node_token(pool: &PgPool, node_id: &str) -> Result<bool> {
            AND token_hash IS NOT NULL",
     )
     .bind(node_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(result.rows_affected() > 0)
 }

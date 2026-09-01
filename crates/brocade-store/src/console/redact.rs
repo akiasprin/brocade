@@ -31,12 +31,20 @@ pub(crate) fn scope_snapshot(actor: &AdminContext, mut snapshot: ModelSnapshot) 
     snapshot
         .external_outbounds
         .retain(|outbound| actor.can_access_tenant(&outbound.tenant));
+    let visible_external_ids = snapshot
+        .external_outbounds
+        .iter()
+        .map(|outbound| outbound.id.clone())
+        .collect::<BTreeSet<_>>();
 
     let visible_node_ids = snapshot
         .nodes
         .iter()
         .map(|node| node.id.clone())
         .collect::<BTreeSet<_>>();
+    snapshot
+        .node_egress_dns
+        .retain(|policy| visible_node_ids.contains(&policy.node));
     let visible_user_keys = snapshot
         .users
         .iter()
@@ -64,6 +72,9 @@ pub(crate) fn scope_snapshot(actor: &AdminContext, mut snapshot: ModelSnapshot) 
             front
                 .via
                 .retain(|ingress_id| visible_ingress_ids.contains(ingress_id));
+            front
+                .external_via
+                .retain(|outbound_id| visible_external_ids.contains(outbound_id));
         }
         app.steps.retain(|step| {
             visible_chain_ids.contains(&step.chain) && visible_node_ids.contains(&step.node)
@@ -378,7 +389,7 @@ mod tests {
         let xhttp = || Xhttp {
             path: "/probe".to_owned(),
             host: None,
-            mux: None,
+            xmux: None,
             mode: XhttpMode::Auto,
         };
 

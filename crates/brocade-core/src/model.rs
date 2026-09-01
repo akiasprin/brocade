@@ -29,15 +29,31 @@ pub struct ModelSnapshot {
     #[serde(default)]
     pub settings: ModelSettings,
     pub nodes: Vec<Node>,
+    /// DNS policies belong to one machine's Xray instance. Chain egress rules may activate a
+    /// matching policy, but Xray applies every activated policy machine-wide rather than keeping
+    /// resolver context per outbound. Keeping definitions here gives drafts, historical revisions
+    /// and rollback one canonical copy even while no chain currently activates a policy.
+    pub node_egress_dns: Vec<NodeEgressDnsPolicy>,
     pub users: Vec<User>,
-    /// Project-scoped proxy servers which a rule may select as its terminal outbound.
+    /// Tenant-owned proxy servers which rules and subscription fronts may share across projects.
     ///
-    /// They live beside nodes and users rather than inside `AppView`: both are resources used by
-    /// a project, while the app view itself remains the routing document. `app` supplies the join
-    /// without copying the same credential into every rule which uses it.
+    /// They live beside nodes and users rather than inside `AppView`: a project consumes a tunnel
+    /// but does not own it. Tunnel ids are globally unique, so a rule can keep its compact id-only
+    /// reference without becoming ambiguous across tenant ancestry.
     #[serde(default)]
     pub external_outbounds: Vec<ExternalOutbound>,
     pub apps: Vec<AppView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeEgressDnsPolicy {
+    pub node: String,
+    /// Zero-based priority within this machine. Xray evaluates scoped DNS servers in this order,
+    /// independently from the route-table order of any chain which activates them.
+    pub position: u32,
+    pub selector: DestMatch,
+    pub resolution: EgressDnsResolution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -553,16 +569,71 @@ fn is_local_dns(server: &str) -> bool {
     value == "localhost" || value == "fakedns" || value.contains("+local://")
 }
 
-/// How this machine resolves a domain to an address on egress.
+/// The resolver half of one machine-owned DNS policy.
 ///
-/// The field sits on the node beside `dns`, not on the egress rule. Resolver selection and
-/// family selection are one axis, and xray applies this on the outbound rather than on a
-/// routing rule: a rule references an outbound by tag and carries no resolution setting of
-/// its own. Placing it per rule would force the egress outbound map (`physical/node.rs`) to
-/// key on `(send_through, strategy)`, and two disagreeing rules on a machine with external
-/// DNS servers would then trigger `dns.route-ambiguous`, because the internal DNS's own
-/// queries need exactly one egress and the compiler cannot select among several. Per node,
-/// every outbound on the machine takes the same value and that key is unchanged.
+/// This does not replace [`Node::dns`] and never reaches the operating system resolver. The
+/// A chain egress rule can activate the policy for its selector. The compiler then lowers it to an
+/// Xray DNS server and routes both the DNS query and resulting connection through that rule's
+/// source address. Xray does not preserve which outbound requested a lookup, so an activated
+/// policy affects every matching lookup in this machine's Xray instance.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressDnsResolution {
+    /// An IP literal. Hostnames are deliberately refused: resolving the resolver through itself
+    /// creates a bootstrap loop, while resolving it elsewhere makes this supposedly isolated
+    /// policy depend on the machine default.
+    pub address: String,
+    #[serde(default = "default_dns_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub transport: EgressDnsTransport,
+    #[serde(default)]
+    pub address_strategy: EgressDnsAddressStrategy,
+    #[serde(default)]
+    pub fallback: EgressDnsFallback,
+}
+
+fn default_dns_port() -> u16 {
+    53
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressDnsTransport {
+    Udp,
+    #[default]
+    Tcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressDnsAddressStrategy {
+    /// Query A and AAAA, then let Xray choose one address from the combined result.
+    #[default]
+    UseIp,
+    /// Query and connect to IPv4 only.
+    UseIpv4,
+    /// Query and connect to IPv6 only.
+    UseIpv6,
+    /// Query IPv4 first and query IPv6 only when no IPv4 address was returned.
+    UseIpv4v6,
+    /// Query IPv6 first and query IPv4 only when no IPv6 address was returned.
+    UseIpv6v4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressDnsFallback {
+    #[default]
+    Stop,
+    Machine,
+}
+
+/// How this machine resolves a domain to an address on its default egresses.
+///
+/// This node-level value remains the default when no matching [`NodeEgressDnsPolicy`] is active.
+/// An active policy is lowered to its own freedom outbound. Its domain match is global to the
+/// machine's Xray instance, even though a chain egress rule is what activates it.
 ///
 /// The variants are xray's, written in the model's naming convention; the artifact layer
 /// (`artifacts/xray.rs`) maps them to xray's casing, the same separation `HopEncryption`
@@ -611,7 +682,6 @@ pub struct User {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalOutbound {
-    pub app: String,
     pub id: String,
     pub tenant: String,
     pub name: String,
@@ -619,7 +689,60 @@ pub struct ExternalOutbound {
     pub port: u16,
     pub protocol: ExternalOutboundProtocol,
     pub security: ExternalOutboundSecurity,
+    /// Machine-specific identities owned by a managed provider. Ordinary imported tunnels leave
+    /// this empty; WARP deliberately gets one private key and one Cloudflare device per machine
+    /// instead of copying a single WireGuard identity across the fleet.
+    #[serde(default)]
+    pub bindings: Vec<ExternalWarpBinding>,
 }
+
+/// The private, per-machine half of a managed Cloudflare WARP tunnel.
+///
+/// `private_key` is materialized only for compilation and is stripped by the console redactor.
+/// The provider access token is not part of the model at all: it is operational control-plane
+/// state kept sealed in the binding table, so a stored model snapshot cannot be used to mutate a
+/// Cloudflare account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWarpBinding {
+    pub node: String,
+    pub device_id: String,
+    pub account_id: String,
+    pub registered_at: String,
+    /// Optional machine-level runtime overrides. Each field inherits the logical tunnel's
+    /// default independently when absent, so changing the fleet default still reaches machines
+    /// which did not deliberately pin that field. Provider identity material below remains
+    /// immutable through this path.
+    #[serde(default)]
+    pub endpoint_address: Option<String>,
+    #[serde(default)]
+    pub endpoint_port: Option<u16>,
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    #[serde(default)]
+    pub keep_alive: Option<u16>,
+    /// Kept together with `domain_strategy` by the console: one operator-facing address policy
+    /// controls both the peer routes and DNS selection.
+    #[serde(default)]
+    pub allowed_ips: Option<Vec<String>>,
+    #[serde(default)]
+    pub no_kernel_tun: Option<bool>,
+    #[serde(default)]
+    pub domain_strategy: Option<String>,
+    /// Zero asks xray/wireguard-go to choose its worker count automatically.
+    #[serde(default)]
+    pub workers: Option<u16>,
+    pub private_key: String,
+    pub peer_public_key: String,
+    pub local_addresses: Vec<String>,
+    #[serde(default)]
+    pub reserved: Vec<u8>,
+}
+
+/// A defensive control-plane ceiling rather than an xray wire-format limit. A machine has no
+/// practical reason to create more WireGuard workers than this, while an unbounded value could
+/// turn a configuration typo into substantial scheduler and memory pressure.
+pub const EXTERNAL_WIREGUARD_MAX_WORKERS: u16 = 256;
 
 /// The first externally managed protocol set.
 ///
@@ -672,6 +795,28 @@ pub enum ExternalOutboundProtocol {
         no_kernel_tun: bool,
         #[serde(default = "external_wireguard_domain_strategy")]
         domain_strategy: String,
+    },
+    /// Cloudflare WARP registered through its WireGuard-compatible client interface.
+    ///
+    /// Endpoint and port have fleet defaults on [`ExternalOutbound`]; MTU, Keepalive, address
+    /// policy, TUN implementation and worker count live on this variant. A machine can override
+    /// all of them through [`ExternalWarpBinding`] without rotating its Cloudflare device. During
+    /// node compilation this variant is lowered to the ordinary `Wireguard` variant above with
+    /// those effective values.
+    Warp {
+        #[serde(default = "external_warp_mtu")]
+        mtu: u16,
+        #[serde(default = "external_warp_keep_alive")]
+        keep_alive: u16,
+        #[serde(default = "external_wireguard_allowed_ips")]
+        allowed_ips: Vec<String>,
+        #[serde(default)]
+        no_kernel_tun: bool,
+        #[serde(default = "external_wireguard_domain_strategy")]
+        domain_strategy: String,
+        /// wireguard-go worker count; zero leaves its automatic fallback in control.
+        #[serde(default)]
+        workers: u16,
     },
 }
 
@@ -740,6 +885,14 @@ fn external_wireguard_domain_strategy() -> String {
     "ForceIP".to_owned()
 }
 
+fn external_warp_mtu() -> u16 {
+    1280
+}
+
+fn external_warp_keep_alive() -> u16 {
+    25
+}
+
 impl ExternalOutboundProtocol {
     pub fn credential(&self) -> &str {
         match self {
@@ -748,6 +901,7 @@ impl ExternalOutboundProtocol {
             | Self::Socks5 { credential, .. }
             | Self::HttpConnect { credential, .. }
             | Self::Wireguard { credential, .. } => credential,
+            Self::Warp { .. } => "",
         }
     }
 
@@ -758,11 +912,15 @@ impl ExternalOutboundProtocol {
             | Self::Socks5 { credential, .. }
             | Self::HttpConnect { credential, .. }
             | Self::Wireguard { credential, .. } => *credential = value,
+            Self::Warp { .. } => {}
         }
     }
 
     pub fn allows_empty_credential(&self) -> bool {
-        matches!(self, Self::Socks5 { .. } | Self::HttpConnect { .. })
+        matches!(
+            self,
+            Self::Socks5 { .. } | Self::HttpConnect { .. } | Self::Warp { .. }
+        )
     }
 }
 
@@ -816,6 +974,11 @@ pub struct Chain {
     pub id: String,
     pub tenant: String,
     pub name: String,
+    /// Optional ISO 3166-1 alpha-2 code rendered as a flag in user-facing subscription names.
+    /// It is explicit model state rather than a live GeoIP result so historical artifacts and
+    /// rollback remain deterministic. Old snapshots omit it and therefore retain their names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_country: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1625,6 +1788,52 @@ pub struct RealityXhttp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct XhttpXmuxRange {
+    pub from: u32,
+    pub to: u32,
+}
+
+impl XhttpXmuxRange {
+    pub const fn new(from: u32, to: u32) -> Self {
+        Self { from, to }
+    }
+}
+
+/// The complete subset of Xray's client-side XMUX policy managed by Brocade.
+///
+/// This is deliberately one optional object rather than three optional fields. Xray injects its
+/// rotation defaults only when the entire `xmux` object is zero-valued. Emitting only
+/// `maxConcurrency` therefore changes the omitted request and lifetime limits to unlimited. A
+/// custom policy must carry all three values together; `None` means omit `xmux` completely and let
+/// the pinned Xray version own its defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpXmux {
+    pub max_concurrency: u16,
+    pub h_max_request_times: XhttpXmuxRange,
+    pub h_max_reusable_secs: XhttpXmuxRange,
+}
+
+impl XhttpXmux {
+    pub const CONCURRENCY_MIN: u16 = 1;
+    pub const CONCURRENCY_MAX: u16 = 128;
+    pub const VALUE_MAX: u32 = i32::MAX as u32;
+    pub const DEFAULT_REQUEST_TIMES: XhttpXmuxRange = XhttpXmuxRange::new(600, 900);
+    pub const DEFAULT_REUSABLE_SECS: XhttpXmuxRange = XhttpXmuxRange::new(1800, 3000);
+
+    /// Preserve an existing concurrency choice while restoring the lifecycle limits Xray would
+    /// otherwise have supplied for an entirely absent XMUX object.
+    pub const fn with_concurrency(max_concurrency: u16) -> Self {
+        Self {
+            max_concurrency,
+            h_max_request_times: Self::DEFAULT_REQUEST_TIMES,
+            h_max_reusable_secs: Self::DEFAULT_REUSABLE_SECS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Xhttp {
     /// The URL path the tunnel's requests carry, `/` first.
     ///
@@ -1641,36 +1850,12 @@ pub struct Xhttp {
     /// routed upload and download requests can share the same core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    /// How many streams may share one underlying connection. Absent does **not** disable
-    /// sharing.
-    ///
-    /// The three settings, read from `XmuxManager::GetXmuxClient`
-    /// (`transport/internet/splithttp/mux.go`) rather than from the documentation:
-    ///
-    /// - `None`: xray builds a zero-value `XmuxConfig`, and a `maxConcurrency` of 0 skips the
-    ///   eligibility filter (`else { xmuxClients = m.xmuxClients }`), so every stream uses the
-    ///   connection already open. This is the most aggressive reuse, not the absence of reuse.
-    ///   mihomo interprets the same absence in the opposite way: `NewReuseManager` returns a nil
-    ///   manager for a nil config and nothing is reused. A subscription that leaves this unset
-    ///   therefore behaves differently on the two clients, and an operator who needs a specific
-    ///   behavior has to set a number.
-    /// - `1`: a connection carries one stream at a time and is reused by the next stream once it
-    ///   goes idle. This is a connection pool, and the only pooling available to a client:
-    ///   Mux.cool is xray's other pooling mechanism, and Vision rejects every non-XUDP Mux
-    ///   session (`isMuxAndNotXUDP`, `proxy/vless/inbound/inbound.go`), which is what an ingress
-    ///   runs.
-    /// - `2..=128`: that many streams share a connection, which saves handshakes and costs stream
-    ///   isolation, because one lost packet stalls every stream on that connection.
-    ///
-    /// One of XMUX's five settings is exposed. The other four control when a connection is
-    /// rotated, and their defaults are *ranges* xray samples at random, because a constant value
-    /// is a fingerprint. Exposing them as fields would lead to fixed numbers being entered, which
-    /// removes the property they provide. `maxConnections` is excluded for a second reason:
-    /// mihomo treats it as a hard ceiling and fails the dial once the pool is full (`manager: no
-    /// available connection`), while xray opens another connection, so one field would carry two
-    /// behaviors and neither is a ceiling an operator could reason about.
-    #[serde(default)]
-    pub mux: Option<u16>,
+    /// Client-side connection reuse. `None` omits the complete `xmux` object, which makes Xray
+    /// v26.4.25 inject maxConcurrency=1, hMaxRequestTimes=600–900 and
+    /// hMaxReusableSecs=1800–3000. A present value is always complete so changing concurrency
+    /// cannot silently make connection rotation unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xmux: Option<XhttpXmux>,
     /// How the client sends its upload half.
     #[serde(default)]
     pub mode: XhttpMode,
@@ -1894,6 +2079,11 @@ pub struct Front {
     pub tenant: String,
     pub name: String,
     pub via: Vec<String>,
+    /// External tunnel ids emitted as ordinary Clash proxies and placed before the subscribed
+    /// ingress. Kept separate from `via`: those ids name ingresses, while tunnels are tenant-owned
+    /// resources with an independent lifecycle and may be shared by fronts in several projects.
+    #[serde(default)]
+    pub external_via: Vec<String>,
     pub strategy: FrontStrategy,
 }
 
@@ -2005,6 +2195,30 @@ pub enum DestMatch {
     Protocol(Vec<String>),
     All(Vec<DestMatch>),
     FrontDownstream,
+}
+
+impl DestMatch {
+    /// Canonical identity for a machine-owned DNS policy selector.
+    ///
+    /// Routing lists are sets, so their input order cannot create a second DNS policy. Keeping
+    /// this normalization in the core model lets the store, validator and artifact compiler all
+    /// join a route to the same machine row without copying subtly different equality rules.
+    pub fn canonical_egress_dns_selector(&self) -> Option<Self> {
+        fn values(values: &[String]) -> Vec<String> {
+            let mut values = values.to_vec();
+            values.sort();
+            values.dedup();
+            values
+        }
+
+        match self {
+            Self::DomainSuffix(items) => Some(Self::DomainSuffix(values(items))),
+            Self::DomainKeyword(items) => Some(Self::DomainKeyword(values(items))),
+            Self::DomainRegex(value) => Some(Self::DomainRegex(value.clone())),
+            Self::Geosite(items) => Some(Self::Geosite(values(items))),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2174,13 +2388,24 @@ pub enum Action {
     Egress {
         #[serde(default)]
         send_through: Option<IpAddr>,
+        /// Activate this machine's DNS policy whose selector is the rule's domain match.
+        ///
+        /// This is an inclusion reference, not an isolated per-outbound resolver choice. Xray's
+        /// built-in DNS loses the originating outbound context, so once any rule activates the
+        /// policy it affects all matching lookups on this machine.
+        #[serde(default, skip_serializing_if = "is_false")]
+        dns: bool,
     },
-    /// Send through a project-scoped external proxy. This is terminal like `Egress`, not an edge
+    /// Send through a tenant-owned external proxy. This is terminal like `Egress`, not an edge
     /// in the Brocade node graph; the referenced id is resolved within the current project.
     Proxy {
         outbound: String,
     },
     Block,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2432,7 +2657,7 @@ mod slug_tests {
 
 #[cfg(test)]
 mod transport_tests {
-    use super::{RealitySettings, RealityXhttp, Transport, Xhttp, XhttpMode};
+    use super::{RealitySettings, RealityXhttp, Transport, Xhttp, XhttpMode, XhttpXmux};
 
     fn reality() -> RealitySettings {
         RealitySettings {
@@ -2460,7 +2685,7 @@ mod transport_tests {
             xhttp: Xhttp {
                 path: "/probe".to_owned(),
                 host: None,
-                mux: None,
+                xmux: None,
                 mode: XhttpMode::Auto,
             },
         }))
@@ -2491,7 +2716,7 @@ mod transport_tests {
                 xhttp: Xhttp {
                     path: "/probe".to_owned(),
                     host: None,
-                    mux: Some(16),
+                    xmux: Some(XhttpXmux::with_concurrency(16)),
                     mode: XhttpMode::StreamOne,
                 },
             }),

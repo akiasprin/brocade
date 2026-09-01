@@ -19,9 +19,7 @@ fn formatted_artifacts_are_stable_across_unordered_model_collections() {
 
     reordered.nodes.reverse();
     reordered.users.reverse();
-    reordered.apps.reverse();
     for app in &mut reordered.apps {
-        app.chains.reverse();
         app.ingresses.reverse();
         app.fronts.reverse();
         app.steps.reverse();
@@ -29,6 +27,131 @@ fn formatted_artifacts_are_stable_across_unordered_model_collections() {
     }
 
     assert_eq!(artifact_texts(reordered), stable);
+}
+
+#[test]
+fn subscriptions_follow_chain_order_inside_an_app_while_machine_artifacts_stay_stable() {
+    let ordered = snapshot_with_two_direct_chains();
+    let ordered_machine = machine_artifacts(&ordered);
+    let ordered_subscription = subscription_artifacts(&ordered);
+    assert_eq!(
+        ordered_subscription.names,
+        ["香港直出", "东京直出", "新加坡中转"]
+    );
+    assert!(
+        ordered_subscription
+            .raw
+            .lines()
+            .next()
+            .unwrap()
+            .contains(":8443?"),
+        "{}",
+        ordered_subscription.raw
+    );
+
+    let mut reordered = snapshot_with_two_direct_chains();
+    reordered.apps[0].chains.reverse();
+    let reordered_machine = machine_artifacts(&reordered);
+    let reordered_subscription = subscription_artifacts(&reordered);
+    assert_eq!(ordered_machine, reordered_machine);
+    assert_eq!(
+        reordered_subscription.names,
+        ["东京直出", "香港直出", "新加坡中转"]
+    );
+    assert!(
+        reordered_subscription
+            .raw
+            .lines()
+            .next()
+            .unwrap()
+            .contains(":9443?"),
+        "{}",
+        reordered_subscription.raw
+    );
+    for yaml in [&reordered_subscription.clash, &reordered_subscription.koipy] {
+        assert!(
+            yaml.find("  - name: \"东京直出\"").unwrap()
+                < yaml.find("  - name: \"香港直出\"").unwrap(),
+            "{yaml}"
+        );
+    }
+}
+
+#[test]
+fn subscriptions_follow_explicit_app_order_while_machine_artifacts_stay_stable() {
+    let ordered = snapshot();
+    let ordered_machine = machine_artifacts(&ordered);
+    let ordered_subscription = subscription_artifacts(&ordered);
+    assert_eq!(ordered_subscription.names, ["香港直出", "新加坡中转"]);
+    assert!(
+        ordered_subscription
+            .raw
+            .lines()
+            .next()
+            .unwrap()
+            .contains(":8443?"),
+        "{}",
+        ordered_subscription.raw
+    );
+
+    let mut reversed = snapshot();
+    reversed.apps.reverse();
+    let reversed_machine = machine_artifacts(&reversed);
+    let reversed_subscription = subscription_artifacts(&reversed);
+    assert_eq!(ordered_machine, reversed_machine);
+    assert_eq!(reversed_subscription.names, ["新加坡中转", "香港直出"]);
+    assert!(
+        reversed_subscription
+            .raw
+            .lines()
+            .next()
+            .unwrap()
+            .contains(":443?"),
+        "{}",
+        reversed_subscription.raw
+    );
+    for clash in [&reversed_subscription.clash, &reversed_subscription.koipy] {
+        assert!(
+            clash.find("  - name: \"新加坡中转\"").unwrap()
+                < clash.find("  - name: \"香港直出\"").unwrap(),
+            "{clash}"
+        );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SubscriptionArtifacts {
+    names: Vec<String>,
+    raw: String,
+    clash: String,
+    koipy: String,
+}
+
+fn machine_artifacts(snapshot: &ModelSnapshot) -> (String, String) {
+    let output = compile(snapshot);
+    assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
+    let node_plan = output.project_node("hk").unwrap();
+    (
+        json::xray(&xray::build(&node_plan)),
+        json::grant_sync_batch(&grants::build(&node_plan)),
+    )
+}
+
+fn subscription_artifacts(snapshot: &ModelSnapshot) -> SubscriptionArtifacts {
+    let output = compile(snapshot);
+    assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
+    let user_plan = output.project_user("platform.acme", "alice").unwrap();
+    let subscription = subscription::build(&user_plan);
+    SubscriptionArtifacts {
+        names: subscription
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect(),
+        raw: uri::subscription(&subscription),
+        clash: yaml::clash_subscription(&subscription),
+        koipy: yaml::clash_haitun_subscription(&subscription),
+    }
 }
 
 fn artifact_texts(snapshot: ModelSnapshot) -> (String, String, String, String) {
@@ -57,6 +180,7 @@ fn snapshot() -> ModelSnapshot {
             node("hk", "hk.example.net", [10, 66, 0, 1]),
             node("sg", "sg.example.net", [10, 66, 0, 2]),
         ],
+        node_egress_dns: Vec::new(),
         users: vec![
             User {
                 tenant: "platform.beta".to_owned(),
@@ -72,6 +196,23 @@ fn snapshot() -> ModelSnapshot {
         external_outbounds: Vec::new(),
         apps: vec![direct_app(), relay_app()],
     }
+}
+
+fn snapshot_with_two_direct_chains() -> ModelSnapshot {
+    let mut snapshot = snapshot();
+    let direct = &mut snapshot.apps[0];
+    direct.chains.push(chain("c-direct-tokyo", "东京直出"));
+    direct.ingresses.push(Ingress {
+        port: 9443,
+        ..ingress("i-direct-tokyo", "c-direct-tokyo", "hk", None)
+    });
+    direct
+        .steps
+        .push(step("c-direct-tokyo", "hk", vec![any_egress()], None));
+    direct
+        .grants
+        .push(grant("platform.acme", "alice", "i-direct-tokyo"));
+    snapshot
 }
 
 fn direct_app() -> AppView {
@@ -168,6 +309,7 @@ fn chain(id: &str, name: &str) -> Chain {
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),
         name: name.to_owned(),
+        subscription_country: None,
     }
 }
 
@@ -221,7 +363,10 @@ fn step(chain: &str, node: &str, rules: Vec<Rule>, accept: Option<Accept>) -> St
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress { send_through: None },
+        action: Action::Egress {
+            send_through: None,
+            dns: false,
+        },
     }
 }
 

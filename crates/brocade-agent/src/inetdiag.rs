@@ -21,13 +21,15 @@
 //! old kernel. Every read goes through `u32_at`/`u64_at`, which return `None` past the end.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io, mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
-use brocade_deployment::protocol::HopLinkSample;
+use brocade_deployment::protocol::{HopLinkSample, NetworkDetailSample};
+
+use crate::load::EphemeralPortRange;
 
 const NETLINK_INET_DIAG: libc::c_int = 4;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
@@ -36,9 +38,12 @@ const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_DUMP: u16 = 0x300;
 
-/// Established only. A connection still handshaking has no bandwidth estimate to give, and one in
-/// TIME_WAIT is describing a conversation that already ended.
-const TCP_ESTABLISHED_MASK: u32 = 1 << 1;
+const TCP_ESTABLISHED: u8 = 1;
+const TCP_TIME_WAIT: u8 = 6;
+const TCP_LISTEN: u8 = 10;
+/// All kernel TCP states except LISTEN. Link-quality aggregation below still selects only
+/// ESTABLISHED, while port pressure needs handshakes, closing sockets and TIME_WAIT as well.
+const TCP_NON_LISTEN_MASK: u32 = ((1_u32 << 13) - 1) & !(1 << TCP_LISTEN);
 
 /// `INET_DIAG_INFO` — yields `struct tcp_info`.
 const INET_DIAG_INFO: u16 = 2;
@@ -68,7 +73,11 @@ const TI_BYTES_RETRANS: usize = 208;
 /// One established TCP connection, reduced to what the aggregation needs.
 #[derive(Debug, Clone)]
 pub(crate) struct Conn {
+    state: u8,
+    local: IpAddr,
+    local_port: u16,
     pub(crate) peer: IpAddr,
+    peer_port: u16,
     pub(crate) rtt_us: u32,
     pub(crate) min_rtt_us: u32,
     /// BBR's bottleneck-bandwidth estimate in **bytes** per second, as the kernel gives it.
@@ -86,7 +95,7 @@ pub(crate) struct Conn {
     pub(crate) cc: String,
 }
 
-/// Dump every established TCP connection, IPv4 and IPv6.
+/// Dump every non-listening TCP connection, IPv4 and IPv6. Consumers choose the states they need.
 pub(crate) fn dump() -> Result<Vec<Conn>, String> {
     let mut out = Vec::new();
     for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
@@ -199,7 +208,7 @@ fn send_request(fd: &OwnedFd, family: u8) -> Result<(), String> {
         | (1 << (INET_DIAG_VEGASINFO - 1))
         | (1 << (INET_DIAG_CONG - 1));
     req[19] = 0; // pad
-    req[20..24].copy_from_slice(&TCP_ESTABLISHED_MASK.to_le_bytes());
+    req[20..24].copy_from_slice(&TCP_NON_LISTEN_MASK.to_le_bytes());
     // The rest is inet_diag_sockid, all zero: no filter, dump everything.
 
     let sent = unsafe { libc::send(fd.as_raw_fd(), req.as_ptr().cast(), req.len(), 0) };
@@ -217,25 +226,37 @@ fn parse_msg(body: &[u8]) -> Option<Conn> {
         return None;
     }
     let family = body[0];
+    let state = body[1];
     // inet_diag_sockid starts at 4: sport(2) dport(2) src[4](16) dst[4](16) if(4) cookie[2](8).
-    // The peer port is deliberately not kept: hops are keyed by address alone (see
-    // probe.rs::hop_targets), because a hop is one machine and two chains reaching it on different
-    // ports still share one physical line — which is the thing being measured.
+    // Hop attribution below uses the peer address alone because two ports still share one physical
+    // line. Port pressure additionally keeps both ports locally so it can group the real tuple
+    // space; peer identity never leaves the machine.
+    let src = &body[8..24];
     let dst = &body[24..40];
-    let peer = match family {
-        f if f == libc::AF_INET as u8 => {
-            IpAddr::V4(Ipv4Addr::from([dst[0], dst[1], dst[2], dst[3]]))
-        }
+    let (local, peer) = match family {
+        f if f == libc::AF_INET as u8 => (
+            IpAddr::V4(Ipv4Addr::from([src[0], src[1], src[2], src[3]])),
+            IpAddr::V4(Ipv4Addr::from([dst[0], dst[1], dst[2], dst[3]])),
+        ),
         f if f == libc::AF_INET6 as u8 => {
+            let mut local_octets = [0_u8; 16];
+            local_octets.copy_from_slice(&src[0..16]);
             let mut octets = [0_u8; 16];
             octets.copy_from_slice(&dst[0..16]);
-            IpAddr::V6(Ipv6Addr::from(octets))
+            (
+                IpAddr::V6(Ipv6Addr::from(local_octets)),
+                IpAddr::V6(Ipv6Addr::from(octets)),
+            )
         }
         _ => return None,
     };
 
     let mut conn = Conn {
+        state,
+        local,
+        local_port: u16::from_be_bytes([body[4], body[5]]),
         peer,
+        peer_port: u16::from_be_bytes([body[6], body[7]]),
         rtt_us: 0,
         min_rtt_us: 0,
         btlbw_bytes: None,
@@ -326,8 +347,10 @@ pub(crate) fn aggregate(
 ) -> Vec<HopLinkSample> {
     let mut grouped: BTreeMap<(String, String), Vec<&Conn>> = BTreeMap::new();
     for conn in conns {
-        if let Some(key) = hops.get(&conn.peer) {
-            grouped.entry(key.clone()).or_default().push(conn);
+        if conn.state == TCP_ESTABLISHED {
+            if let Some(key) = hops.get(&conn.peer) {
+                grouped.entry(key.clone()).or_default().push(conn);
+            }
         }
     }
 
@@ -394,6 +417,71 @@ pub(crate) fn aggregate(
             }
         })
         .collect()
+}
+
+/// Add privacy-preserving anonymous-port pressure to a network sample.
+///
+/// Linux can reuse one local port across different remote endpoints, so the machine-wide number
+/// of sockets in the ephemeral range is useful activity context but not a pool utilization ratio.
+/// The capacity boundary is per source+destination tuple space. We therefore report the largest
+/// set of distinct local ports occupied by any one target, separately for IPv4 and IPv6, and send
+/// only that count — never the target address.
+pub(crate) fn apply_port_pressure(
+    detail: &mut NetworkDetailSample,
+    conns: &[Conn],
+    range: EphemeralPortRange,
+) {
+    let mut top_v4 = BTreeMap::<(IpAddr, IpAddr, u16), BTreeSet<u16>>::new();
+    let mut top_v6 = BTreeMap::<(IpAddr, IpAddr, u16), BTreeSet<u16>>::new();
+    let mut inuse_v4 = 0_u64;
+    let mut inuse_v6 = 0_u64;
+    let mut time_wait_v4 = 0_u64;
+    let mut time_wait_v6 = 0_u64;
+
+    for conn in conns {
+        if conn.state == TCP_LISTEN
+            || !range.contains(conn.local_port)
+            || conn.peer_port == 0
+            || conn.peer.is_unspecified()
+        {
+            continue;
+        }
+        let groups = match conn.local {
+            IpAddr::V4(_) => {
+                inuse_v4 += 1;
+                if conn.state == TCP_TIME_WAIT {
+                    time_wait_v4 += 1;
+                }
+                &mut top_v4
+            }
+            IpAddr::V6(_) => {
+                inuse_v6 += 1;
+                if conn.state == TCP_TIME_WAIT {
+                    time_wait_v6 += 1;
+                }
+                &mut top_v6
+            }
+        };
+        groups
+            .entry((conn.local, conn.peer, conn.peer_port))
+            .or_default()
+            .insert(conn.local_port);
+    }
+
+    let top = |groups: &BTreeMap<_, BTreeSet<u16>>| {
+        groups
+            .values()
+            .map(|ports| ports.len() as u64)
+            .max()
+            .unwrap_or(0)
+    };
+    detail.ephemeral_port_capacity = Some(range.capacity);
+    detail.tcp_ephemeral_inuse_v4 = Some(inuse_v4);
+    detail.tcp_ephemeral_inuse_v6 = Some(inuse_v6);
+    detail.tcp_ephemeral_time_wait_v4 = Some(time_wait_v4);
+    detail.tcp_ephemeral_time_wait_v6 = Some(time_wait_v6);
+    detail.tcp_ephemeral_top_target_v4 = Some(top(&top_v4));
+    detail.tcp_ephemeral_top_target_v6 = Some(top(&top_v6));
 }
 
 /// Nearest-rank percentile over a sorted slice. `None` on an empty one — which is the honest
@@ -463,6 +551,22 @@ mod tests {
         assert!(u64_at(&short, TI_BYTES_SENT).is_none());
         assert!(u64_at(&short, TI_SNDBUF_LIMITED).is_none());
         assert!(u32_at(&short, TI_MIN_RTT).is_none());
+    }
+
+    #[test]
+    fn inet_diag_ports_and_addresses_use_kernel_network_byte_order() {
+        let mut body = [0_u8; 72];
+        body[0] = libc::AF_INET as u8;
+        body[1] = TCP_ESTABLISHED;
+        body[4..6].copy_from_slice(&40_001_u16.to_be_bytes());
+        body[6..8].copy_from_slice(&443_u16.to_be_bytes());
+        body[8..12].copy_from_slice(&[192, 0, 2, 10]);
+        body[24..28].copy_from_slice(&[198, 51, 100, 20]);
+        let conn = parse_msg(&body).unwrap();
+        assert_eq!(conn.local_port, 40_001);
+        assert_eq!(conn.peer_port, 443);
+        assert_eq!(conn.local, "192.0.2.10".parse::<IpAddr>().unwrap());
+        assert_eq!(conn.peer, "198.51.100.20".parse::<IpAddr>().unwrap());
     }
 
     /// app_limited is bit 0 of a byte it shares with tcpi_fastopen_client_fail. Reading the byte
@@ -544,9 +648,53 @@ mod tests {
         assert!(aggregate(&[stranger], &hops, 100, 130).is_empty());
     }
 
+    #[test]
+    fn port_pressure_uses_the_busiest_tuple_space_without_exporting_its_identity() {
+        let make = |local: IpAddr, local_port: u16, peer: IpAddr, state: u8| {
+            let mut conn = blank();
+            conn.state = state;
+            conn.local = local;
+            conn.local_port = local_port;
+            conn.peer = peer;
+            conn.peer_port = 443;
+            conn
+        };
+        let local = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let busy = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let other = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let conns = vec![
+            make(local, 100, busy, TCP_ESTABLISHED),
+            make(local, 101, busy, TCP_TIME_WAIT),
+            make(local, 102, other, TCP_ESTABLISHED),
+            // A port outside the anonymous range and an inbound listener do not belong here.
+            make(local, 80, busy, TCP_ESTABLISHED),
+            make(local, 103, busy, TCP_LISTEN),
+        ];
+        let mut detail = NetworkDetailSample::default();
+        apply_port_pressure(
+            &mut detail,
+            &conns,
+            EphemeralPortRange {
+                low: 100,
+                high: 105,
+                capacity: 6,
+                reserved: Vec::new(),
+            },
+        );
+        assert_eq!(detail.tcp_ephemeral_inuse_v4, Some(3));
+        assert_eq!(detail.tcp_ephemeral_time_wait_v4, Some(1));
+        assert_eq!(detail.tcp_ephemeral_top_target_v4, Some(2));
+        assert_eq!(detail.tcp_ephemeral_inuse_v6, Some(0));
+        assert_eq!(detail.ephemeral_port_capacity, Some(6));
+    }
+
     fn blank() -> Conn {
         Conn {
+            state: TCP_ESTABLISHED,
+            local: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            local_port: 0,
             peer: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            peer_port: 0,
             rtt_us: 0,
             min_rtt_us: 0,
             btlbw_bytes: None,

@@ -34,12 +34,32 @@ sniffer:
     TLS: {ports: [443, 8443]}
     HTTP: {ports: [80, "8080-8880"], override-destination: true}
     QUIC: {ports: [443, 8443]}
+  skip-domain:
+    - "apps.apple.com"
+    - "www.amazon.co.jp"
+    - "www.apple.com"
+    - "www.bing.com"
+    - "www.yahoo.co.jp"
 
 proxies:
-  - name: "智能出口"
+  - name: "日本入口·美国出口"
+    type: vless
+    server: jp1.example.net
+    port: 443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.amazon.co.jp
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: 1xHNKXcGzhoClocrz7kpJxQYE-g-2NlXNGiWas_7NTw
+      short-id: "d19361a0"
+  - name: "美国出口"
     type: vless
     server: hk1.example.net
-    port: 2443
+    port: 443
     uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
     network: tcp
     tls: true
@@ -48,8 +68,8 @@ proxies:
     servername: www.bing.com
     client-fingerprint: chrome
     reality-opts:
-      public-key: Pkz5sxRTCjw92NWFc4ST_3iniZkTjGufHp9EXEIrLgM
-      short-id: "8337a0bf"
+      public-key: iG4pUtdiYMYAztx9c6t8A-0QF-Qknbu551RTC5cBo30
+      short-id: "7d07b06e"
   - name: "日本入口·智能出口"
     type: vless
     server: jp1.example.net
@@ -64,6 +84,20 @@ proxies:
     reality-opts:
       public-key: I9tZ66Z-ccTkwE1Kb5vUtJZ5MYMJm9INM9hGVumvQB0
       short-id: "fba1c1c2"
+  - name: "智能出口"
+    type: vless
+    server: hk1.example.net
+    port: 2443
+    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.bing.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: Pkz5sxRTCjw92NWFc4ST_3iniZkTjGufHp9EXEIrLgM
+      short-id: "8337a0bf"
   - name: "香港入口"
     type: vless
     server: hk1.example.net
@@ -93,34 +127,6 @@ proxies:
       public-key: uxBtkE4kok30kk6idID_11SvP2DEoxgxjOR1jfddlkc
       short-id: "cd033ce1"
     dialer-proxy: "入口组"
-  - name: "日本入口·美国出口"
-    type: vless
-    server: jp1.example.net
-    port: 443
-    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
-    network: tcp
-    tls: true
-    udp: true
-    flow: xtls-rprx-vision
-    servername: www.amazon.co.jp
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: 1xHNKXcGzhoClocrz7kpJxQYE-g-2NlXNGiWas_7NTw
-      short-id: "d19361a0"
-  - name: "美国出口"
-    type: vless
-    server: hk1.example.net
-    port: 443
-    uuid: 68b09204-6d75-4b3d-9327-12125021f8c0
-    network: tcp
-    tls: true
-    udp: true
-    flow: xtls-rprx-vision
-    servername: www.bing.com
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: iG4pUtdiYMYAztx9c6t8A-0QF-Qknbu551RTC5cBo30
-      short-id: "7d07b06e"
 
 proxy-groups:
   - name: "入口组"
@@ -128,10 +134,10 @@ proxy-groups:
     proxies: ["香港入口"]
   - name: "🚀 节点选择"
     type: select
-    proxies: ["⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "⚡ 自动选择"
     type: url-test
-    proxies: ["智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
     url: "https://www.gstatic.com/generate_204"
     interval: 300
     lazy: false
@@ -140,37 +146,37 @@ proxy-groups:
     proxies: ["REJECT", "DIRECT", "🚀 节点选择"]
   - name: "🤖 AI 服务"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "📹 油管视频"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "🔍 谷歌服务"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "Ⓜ️ 微软服务"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "🍏 苹果服务"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "📲 电报消息"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "🐱 代码托管"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "🏠 私有网络"
     type: select
-    proxies: ["DIRECT", "REJECT", "🚀 节点选择", "⚡ 自动选择", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["DIRECT", "REJECT", "🚀 节点选择", "⚡ 自动选择", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "🔒 国内服务"
     type: select
-    proxies: ["DIRECT", "REJECT", "🚀 节点选择", "⚡ 自动选择", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["DIRECT", "REJECT", "🚀 节点选择", "⚡ 自动选择", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "🌍 非中国"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
   - name: "🐟 漏网之鱼"
     type: select
-    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "智能出口", "日本入口·智能出口", "香港入口", "美国前置", "日本入口·美国出口", "美国出口"]
+    proxies: ["🚀 节点选择", "⚡ 自动选择", "DIRECT", "REJECT", "日本入口·美国出口", "美国出口", "日本入口·智能出口", "智能出口", "香港入口", "美国前置"]
 
 rule-providers:
   "category-ads-all":

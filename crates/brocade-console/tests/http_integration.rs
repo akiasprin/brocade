@@ -6,8 +6,10 @@ use axum::{
 use brocade_console::http::{
     admin_router, agent_router, agent_router_with_origin, merged_router, with_console_static,
 };
+use brocade_core::model::{ExternalOutboundProtocol, ExternalOutboundSecurity};
 use brocade_store::{
-    AdminInitRequest, IssuedAdminToken, IssuedNodeToken, PgStore, ENROLLMENT_TOKEN_PREFIX,
+    AdminContext, AdminInitRequest, IssuedAdminToken, IssuedNodeToken, ModelOp, PgStore,
+    RegisterWarpBindingRequest, UpsertExternalOutboundRequest, ENROLLMENT_TOKEN_PREFIX,
 };
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -53,6 +55,61 @@ impl TestPg {
     }
 }
 
+async fn seed_subscription_serving(db: &TestPg) -> u64 {
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let revision = snapshot.revision;
+    sqlx::query(
+        "INSERT INTO model_snapshots (revision_id, snapshot)
+         VALUES ($1, $2)
+         ON CONFLICT (revision_id) DO UPDATE SET snapshot = EXCLUDED.snapshot",
+    )
+    .bind(i64::try_from(revision).unwrap())
+    .bind(serde_json::to_value(snapshot).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO subscription_serving_state (
+             id, topology_revision_id, permissions_revision_id, generation
+         ) VALUES (TRUE, $1, $1, 1)
+         ON CONFLICT (id) DO UPDATE SET
+             topology_revision_id = EXCLUDED.topology_revision_id,
+             permissions_revision_id = EXCLUDED.permissions_revision_id,
+             topology_deployment_id = NULL,
+             permissions_deployment_id = NULL,
+             generation = subscription_serving_state.generation + 1,
+             updated_at = now()",
+    )
+    .bind(i64::try_from(revision).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    revision
+}
+
+async fn commit_direct_fixture_revision(db: &TestPg, note: &str) -> u64 {
+    let revision: i64 = sqlx::query_scalar(
+        "INSERT INTO revisions (author, note) VALUES ('test:fixture', $1) RETURNING id",
+    )
+    .bind(note)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE control_state SET current_revision = $1 WHERE id = TRUE")
+        .bind(revision)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    sqlx::query("INSERT INTO model_snapshots (revision_id, snapshot) VALUES ($1, $2)")
+        .bind(revision)
+        .bind(serde_json::to_value(snapshot).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    u64::try_from(revision).unwrap()
+}
+
 async fn admin_app(db: &TestPg) -> (Router, String) {
     let initialized = db.store.admin_auth_state().await.unwrap().initialized;
     let token = if initialized {
@@ -85,6 +142,190 @@ async fn admin_app(db: &TestPg) -> (Router, String) {
             .token
     };
     (admin_router(db.store.clone()), token)
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_warp_binding_route_updates_every_machine_runtime_override() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    db.store
+        .apply_draft(
+            &AdminContext::system_admin("fixture"),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: UpsertExternalOutboundRequest {
+                    id: "warp".to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "Cloudflare WARP".to_owned(),
+                    address: "engage.cloudflareclient.com".to_owned(),
+                    port: 2408,
+                    protocol: ExternalOutboundProtocol::Warp {
+                        mtu: 1280,
+                        keep_alive: 25,
+                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+                        no_kernel_tun: true,
+                        domain_strategy: "ForceIP".to_owned(),
+                        workers: 0,
+                    },
+                    security: ExternalOutboundSecurity::None,
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    db.store
+        .register_warp_binding(
+            &AdminContext::system_admin("fixture"),
+            RegisterWarpBindingRequest {
+                outbound_id: "warp".to_owned(),
+                node_id: "n1".to_owned(),
+                device_id: "device-n1".to_owned(),
+                account_id: "account-n1".to_owned(),
+                access_token: "provider-token".to_owned(),
+                private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
+                peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+                local_addresses: vec!["172.16.0.2/32".to_owned()],
+                reserved: vec![1, 2, 3],
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (app, token) = admin_app(&db).await;
+    let uri = "/tenants/platform.acme/tunnels/warp/warp-bindings/n1";
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::put(uri)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let unauthorized_delete = app
+        .clone()
+        .oneshot(Request::delete(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_delete.status(), StatusCode::UNAUTHORIZED);
+
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::put(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "endpoint_address": "162.159.193.10",
+                        "endpoint_port": 500,
+                        "mtu": 1420,
+                        "keep_alive": 40,
+                        "allowed_ips": ["::/0"],
+                        "no_kernel_tun": false,
+                        "domain_strategy": "ForceIPv6",
+                        "workers": 4
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = response_json(updated).await;
+    assert_eq!(updated["binding"]["endpoint_address"], "162.159.193.10");
+    assert_eq!(updated["binding"]["endpoint_port"], 500);
+    assert_eq!(updated["binding"]["mtu"], 1420);
+    assert_eq!(updated["binding"]["keep_alive"], 40);
+    assert_eq!(updated["binding"]["allowed_ips"], json!(["::/0"]));
+    assert_eq!(updated["binding"]["no_kernel_tun"], false);
+    assert_eq!(updated["binding"]["domain_strategy"], "ForceIPv6");
+    assert_eq!(updated["binding"]["workers"], 4);
+
+    let incomplete_policy = app
+        .clone()
+        .oneshot(
+            Request::put(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "allowed_ips": ["0.0.0.0/0"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(incomplete_policy.status(), StatusCode::BAD_REQUEST);
+
+    let blank_address = app
+        .clone()
+        .oneshot(
+            Request::put(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "endpoint_address": "   ",
+                        "endpoint_port": 500,
+                        "mtu": 1420
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank_address.status(), StatusCode::BAD_REQUEST);
+
+    let cleared = app
+        .oneshot(
+            Request::put(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "endpoint_address": null,
+                        "endpoint_port": null,
+                        "mtu": null,
+                        "keep_alive": null,
+                        "allowed_ips": null,
+                        "no_kernel_tun": null,
+                        "domain_strategy": null,
+                        "workers": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let cleared = response_json(cleared).await;
+    assert!(cleared["binding"]["endpoint_address"].is_null());
+    assert!(cleared["binding"]["endpoint_port"].is_null());
+    assert!(cleared["binding"]["mtu"].is_null());
+    assert!(cleared["binding"]["keep_alive"].is_null());
+    assert!(cleared["binding"]["allowed_ips"].is_null());
+    assert!(cleared["binding"]["no_kernel_tun"].is_null());
+    assert!(cleared["binding"]["domain_strategy"].is_null());
+    assert!(cleared["binding"]["workers"].is_null());
 }
 
 /// Asking for the split still gets two separate route tables, and the agent face still learns its
@@ -247,12 +488,22 @@ async fn merged_router_serves_both_faces_on_one_listener() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn clash_subscription_route_is_dynamic_no_store_and_exposed_by_the_admin_url() {
+async fn clash_subscription_route_serves_only_stable_releases_without_http_caching() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
+    // A fresh database intentionally has no borrowed site. Seed one here because this test is
+    // about readonly masking, not the factory configuration.
+    sqlx::query(
+        "UPDATE control_state
+         SET reality_dest = 'borrowed.example.net:443',
+             reality_server_names = '[\"borrowed.example.net\"]'::jsonb",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     sqlx::query("UPDATE nodes SET public_ipv6 = '2001:db8::10' WHERE id = 'n1'")
         .execute(db.pool())
         .await
@@ -260,6 +511,22 @@ async fn clash_subscription_route_is_dynamic_no_store_and_exposed_by_the_admin_u
 
     let uuid = "2d2304da-f114-4574-8d44-625afdb1db5c";
     let agent = agent_router(db.store.clone());
+    let before_first_release = agent
+        .clone()
+        .oneshot(
+            Request::get(format!("/sub/v1/{uuid}/clash.yaml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before_first_release.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(before_first_release.headers()["retry-after"], "15");
+
+    seed_subscription_serving(&db).await;
     let response = agent
         .clone()
         .oneshot(
@@ -299,6 +566,62 @@ async fn clash_subscription_route_is_dynamic_no_store_and_exposed_by_the_admin_u
     assert!(body.contains("name: \"Main Chain\""));
     assert!(body.contains("server: n1.example.net"));
     assert!(body.contains("server: 2001:db8::10"));
+    assert!(
+        body.contains("  skip-domain:\n    - \"www.example.com\""),
+        "标准 Clash 订阅必须保护它自己使用的 servername：{body}"
+    );
+
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::get(format!("/sub/v1/{uuid}/clash.yaml?protocol=vless"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("type: vless"), "{body}");
+    assert!(!body.contains("type: hysteria2"), "{body}");
+
+    // This fixture publishes VLESS only. A valid Hysteria-only view is therefore an empty
+    // subscription rather than an accidental fallback to all protocols.
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::get(format!("/sub/v1/{uuid}/clash.yaml?protocol=hysteria2"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!body.contains("type: vless"), "{body}");
+
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::get(format!("/sub/v1/{uuid}/clash.yaml?protocol=hy2"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let response = agent
         .clone()
@@ -348,12 +671,86 @@ async fn clash_subscription_route_is_dynamic_no_store_and_exposed_by_the_admin_u
     assert!(!body.contains("server: n1.example.net"));
     assert!(body.contains("server: 2001:db8::10"));
 
-    // Every GET recompiles the current model; there is no artifact, process, or HTTP cache to
-    // invalidate. An If-None-Match request still gets 200 and the renamed current node list.
-    sqlx::query("UPDATE chains SET name = 'Live Rename' WHERE id = 'c-main'")
+    // Every GET renders afresh, but committed head data is not serving data. Until a release
+    // succeeds, the old immutable snapshot remains authoritative.
+    sqlx::query("UPDATE chains SET name = 'Live Rename' WHERE id = 'c-bacemu'")
         .execute(db.pool())
         .await
         .unwrap();
+    let renamed_revision = commit_direct_fixture_revision(&db, "rename live chain").await;
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::get(format!("/sub/v1/{uuid}/clash.yaml"))
+                .header("if-none-match", "anything")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("name: \"Main Chain\""));
+    assert!(!body.contains("name: \"Live Rename\""));
+
+    let deployment_id: i64 = sqlx::query_scalar(
+        "INSERT INTO deployments (revision_id, status, active, kind, note)
+         VALUES ($1, 'planned', TRUE, 'config', 'HTTP serving gate')
+         RETURNING id",
+    )
+    .bind(i64::try_from(renamed_revision).unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let blocked = agent
+        .clone()
+        .oneshot(
+            Request::get(format!("/sub/v1/{uuid}/clash.yaml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(blocked.headers()["retry-after"], "15");
+    assert_eq!(
+        blocked.headers()["cache-control"],
+        "no-store, no-cache, max-age=0, must-revalidate"
+    );
+    let blocked_body = response_json(blocked).await;
+    assert_eq!(
+        blocked_body["error"],
+        "subscription temporarily unavailable"
+    );
+
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'canceled', active = NULL, finished_at = now()
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE subscription_serving_state
+            SET topology_revision_id = $1,
+                topology_deployment_id = $2,
+                generation = generation + 1,
+                updated_at = now()
+          WHERE id = TRUE",
+    )
+    .bind(i64::try_from(renamed_revision).unwrap())
+    .bind(deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
     let response = agent
         .oneshot(
             Request::get(format!("/sub/v1/{uuid}/clash.yaml"))
@@ -375,6 +772,7 @@ async fn clash_subscription_route_is_dynamic_no_store_and_exposed_by_the_admin_u
 
     let (admin, token) = admin_app(&db).await;
     let response = admin
+        .clone()
         .oneshot(
             Request::get("/users/platform.acme/alice/clash-subscription")
                 .header("authorization", format!("Bearer {token}"))
@@ -386,6 +784,9 @@ async fn clash_subscription_route_is_dynamic_no_store_and_exposed_by_the_admin_u
     assert_eq!(response.status(), StatusCode::OK);
     let info = response_json(response).await;
     assert_eq!(info["template"], "SubBoost 标准版");
+    assert_eq!(info["haitun"]["template"], "koipy 测速");
+    assert_eq!(info["haitun"]["status"], "not-created");
+    assert!(info["haitun"]["urls"].is_null());
     assert!(info["url"]
         .as_str()
         .unwrap()
@@ -399,6 +800,153 @@ async fn clash_subscription_route_is_dynamic_no_store_and_exposed_by_the_admin_u
         .as_str()
         .unwrap()
         .ends_with(&format!("/sub/v1/{uuid}/clash.yaml?family=v6")));
+
+    let unauthorized = admin
+        .clone()
+        .oneshot(
+            Request::post("/users/platform.acme/alice/clash-subscription/haitun")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let issued = admin
+        .clone()
+        .oneshot(
+            Request::post("/users/platform.acme/alice/clash-subscription/haitun")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::OK);
+    let issued = response_json(issued).await;
+    assert_eq!(issued["status"], "active");
+    let haitun_url = issued["urls"]["both"].as_str().unwrap();
+    let haitun_path = haitun_url
+        .split_once("/sub/")
+        .map(|(_, tail)| format!("/sub/{tail}"))
+        .unwrap();
+    assert!(issued["urls"]["v4"]
+        .as_str()
+        .unwrap()
+        .ends_with("?family=v4"));
+    assert!(issued["urls"]["v6"]
+        .as_str()
+        .unwrap()
+        .ends_with("?family=v6"));
+
+    let agent = agent_router(db.store.clone());
+    let response = agent
+        .clone()
+        .oneshot(Request::get(&haitun_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["cache-control"],
+        "no-store, no-cache, max-age=0, must-revalidate"
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("# Brocade · koipy 测速"), "{body}");
+    assert!(body.contains("name: \"Live Rename\""), "{body}");
+    assert!(body.contains("name: \"koipy 测速\""), "{body}");
+    assert!(!body.contains("rule-providers:"), "{body}");
+    assert!(!body.contains("SubBoost"), "{body}");
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::get(format!("{haitun_path}?family=v4"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("server: n1.example.net"), "{body}");
+    assert!(!body.contains("server: 2001:db8::10"), "{body}");
+
+    // Issuing an already active link is idempotent and must not invalidate a URL a bot may be
+    // fetching at the same moment.
+    let issued_again = admin
+        .clone()
+        .oneshot(
+            Request::post("/users/platform.acme/alice/clash-subscription/haitun")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let issued_again = response_json(issued_again).await;
+    assert_eq!(issued_again["urls"]["both"], issued["urls"]["both"]);
+
+    let revoked = admin
+        .clone()
+        .oneshot(
+            Request::delete("/users/platform.acme/alice/clash-subscription/haitun")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let revoked = response_json(revoked).await;
+    assert_eq!(revoked["status"], "revoked");
+    assert!(revoked["urls"].is_null());
+    let old = agent
+        .clone()
+        .oneshot(Request::get(&haitun_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(old.status(), StatusCode::NOT_FOUND);
+
+    let reissued = admin
+        .oneshot(
+            Request::post("/users/platform.acme/alice/clash-subscription/haitun")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reissued.status(), StatusCode::OK);
+    let reissued = response_json(reissued).await;
+    assert_eq!(reissued["status"], "active");
+    assert_ne!(reissued["urls"]["both"], issued["urls"]["both"]);
+    let replacement_path = reissued["urls"]["both"]
+        .as_str()
+        .unwrap()
+        .split_once("/sub/")
+        .map(|(_, tail)| format!("/sub/{tail}"))
+        .unwrap();
+    let replacement = agent
+        .clone()
+        .oneshot(Request::get(replacement_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let old = agent
+        .oneshot(Request::get(&haitun_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(old.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -719,6 +1267,10 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
         .unwrap();
     assert_eq!(legacy.status(), StatusCode::NO_CONTENT);
     assert_eq!(
+        legacy.headers().get("x-brocade-log-max-mib").unwrap(),
+        "100"
+    );
+    assert_eq!(
         legacy
             .headers()
             .get("x-brocade-agent-upgrade-required")
@@ -755,6 +1307,10 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
         .await
         .unwrap();
     assert_eq!(desired.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        desired.headers().get("x-brocade-log-max-mib").unwrap(),
+        "100"
+    );
     let protocol: Option<i32> = sqlx::query_scalar(
         "SELECT agent_protocol_version FROM node_agent_state WHERE node_id = 'n1'",
     )
@@ -1272,7 +1828,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
             .unwrap();
 
     let target = &list["targets"][0];
-    assert_eq!(target["chain_id"], "c-main");
+    assert_eq!(target["chain_id"], "c-bacemu");
     assert_eq!(target["port"], 443);
     // It dials the local machine rather than a public IP: going over the public internet also
     // measures inbound routing, which is not a property of the chain.
@@ -1286,11 +1842,11 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     // id alone — it is something that reaches the ingress.
     assert_eq!(
         target["uuid"],
-        brocade_core::model::probe_uuid("reality-private", "i-main").as_str()
+        brocade_core::model::probe_uuid("reality-private", "i-dafino").as_str()
     );
     assert_ne!(
         target["uuid"],
-        brocade_core::model::probe_uuid("", "i-main").as_str()
+        brocade_core::model::probe_uuid("", "i-dafino").as_str()
     );
     assert!(list["endpoint_url"]
         .as_str()
@@ -1304,7 +1860,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         "probed_at_unix_secs": 1_800_000_000_i64,
         "chains": [{
             "app_id": "app-main",
-            "chain_id": "c-main",
+            "chain_id": "c-bacemu",
             "status": "ok",
             "ttfb_ms": 86,
             "exit_ip": "203.0.113.9",
@@ -1365,7 +1921,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
     let chain = &view["chains"][0];
-    assert_eq!(chain["chain_id"], "c-main");
+    assert_eq!(chain["chain_id"], "c-bacemu");
     assert_eq!(chain["chain_name"], "Main Chain");
     assert_eq!(chain["node_id"], "n1");
     assert_eq!(chain["status"], "ok");
@@ -1380,7 +1936,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         "probed_at_unix_secs": 1_800_000_060_i64,
         "chains": [{
             "app_id": "app-main",
-            "chain_id": "c-main",
+            "chain_id": "c-bacemu",
             "status": "timeout",
             "ttfb_ms": 10000,
             "exit_ip": null,
@@ -1486,11 +2042,13 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let issued: IssuedNodeToken = serde_json::from_slice(&bytes).unwrap();
 
-    // A reading's instant has to sit close to the control plane's present: `record_usage_report`
-    // checks it against now() and refuses the whole round beyond 10 minutes (MAX_CLOCK_SKEW_SECS in
-    // usage.rs). Hardcoding an absolute second leaves this case green only within ten minutes of
-    // that instant — the old 1_800_000_000 was 2027-01-15.
-    // (The link probing in this same file is unaffected; that path has no clock check.)
+    // Retirement keeps usage open until teardown converges: disabling Xray takes one final sample
+    // and losing it would permanently understate the machine. Other business observations remain
+    // active-only.
+    sqlx::query("UPDATE node_lifecycle_state SET phase = 'retiring' WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
     let base = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
@@ -1501,7 +2059,7 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
             "read_at_unix_secs": read_at,
             "xray_started_at_unix_secs": base - 1000,
             "counters": [{
-                "label": "alice@platform.acme#i-main",
+                "label": "alice@platform.acme#i-dafino",
                 "uplink_bytes": up,
                 "downlink_bytes": down
             }]
@@ -1521,6 +2079,29 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+    let future = json!({
+        "read_at_unix_secs": base + 3600,
+        "xray_started_at_unix_secs": base,
+        "counters": []
+    });
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/v1/usage")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("content-type", "application/json")
+                .body(Body::from(future.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "future clocks are retryable"
+    );
 
     let response = admin
         .oneshot(
@@ -1540,7 +2121,7 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
     assert_eq!(body["samples"].as_array().unwrap().len(), 1);
     assert_eq!(
         body["samples"][0]["grant_label"],
-        "alice@platform.acme#i-main"
+        "alice@platform.acme#i-dafino"
     );
     assert_eq!(body["samples"][0]["uplink_bytes"], 25);
     assert_eq!(body["samples"][0]["downlink_bytes"], 60);
@@ -1626,7 +2207,7 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         &app,
         &admin_token,
         "/apps/app-main/chains",
-        json!({ "id": "c-main", "tenant_id": "platform.acme", "name": "Main Chain" }),
+        json!({ "id": "c-bacemu", "tenant_id": "platform.acme", "name": "Main Chain" }),
     )
     .await;
 
@@ -1636,8 +2217,8 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         &admin_token,
         "/apps/app-main/ingresses",
         json!({
-            "id": "i-inherit",
-            "chain_id": "c-main",
+            "id": "i-hemori",
+            "chain_id": "c-bacemu",
             "node_id": "n-api",
             "bind": "0.0.0.0",
             "port": 443,
@@ -1658,8 +2239,8 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         .unwrap();
     let inherited = ingresses
         .iter()
-        .find(|v| v["id"] == "i-inherit")
-        .expect("i-inherit 在快照里");
+        .find(|v| v["id"] == "i-hemori")
+        .expect("i-hemori 在快照里");
     assert_eq!(inherited["wires"]["vless"]["flow"], "xtls-rprx-vision");
 
     // Turning it off must really turn it off: on by default is not welded on. An ingress left blank
@@ -1692,8 +2273,8 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         .unwrap();
     let inherited = ingresses
         .iter()
-        .find(|v| v["id"] == "i-inherit")
-        .expect("i-inherit 在快照里");
+        .find(|v| v["id"] == "i-hemori")
+        .expect("i-hemori 在快照里");
     assert!(
         inherited["wires"]["vless"]["flow"].is_null(),
         "全局关掉之后，跟随全局的接入面也不下发 flow"
@@ -1871,6 +2452,14 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     };
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
+    sqlx::query(
+        "UPDATE control_state
+         SET reality_dest = 'borrowed.example.net:443',
+             reality_server_names = '[\"borrowed.example.net\"]'::jsonb",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
 
     let (app, admin_token) = admin_app(&db).await;
     let created = post_json(
@@ -1948,21 +2537,19 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     let settings = get_json_with_token(&app, "/settings", &reviewer_token).await;
     assert_eq!(settings.0, StatusCode::OK);
     let site = &settings.1["reality_site"];
-    // Read out rather than matched over. Both fields ship with a factory value
-    // (`apps.apple.com:443`), so a null or an empty list here does not mean "nothing to
-    // hide" — it means the fixture moved and these assertions stopped running, which is
-    // the way a masking test rots without ever going red.
+    // Read out rather than matched over. The fixture explicitly seeded this site, so null or an
+    // empty list means these assertions stopped exercising the masking path.
     let dest = site["dest"]
         .as_str()
-        .expect("出厂就带借用站点；为空说明夹具变了，下面几条会静默失效");
+        .expect("夹具写入了借用站点；为空说明下面几条会静默失效");
     assert!(
-        !dest.contains("apple") && dest.contains("***"),
+        !dest.contains("borrowed") && dest.contains("***"),
         "借用站点漏了：{dest}"
     );
     let names = site["server_names"]
         .as_array()
         .filter(|names| !names.is_empty())
-        .expect("出厂就带一条 SNI；空列表同上");
+        .expect("夹具写入了一条 SNI；空列表同上");
     for name in names {
         let name = name.as_str().unwrap_or_default();
         assert!(name.contains("***"), "借用站点的 SNI 漏了：{name}");
@@ -2220,7 +2807,7 @@ async fn http_console_read_surface_returns_redacted_snapshot_compile_state_and_a
         serde_json::from_slice(&to_bytes(grants.into_body(), 1024 * 1024).await.unwrap()).unwrap();
     assert_eq!(body["state"], "present");
     let grants: Value = serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-    assert_eq!(grants["inbounds"][0]["tag"], "in:app-main/i-main");
+    assert_eq!(grants["inbounds"][0]["tag"], "in:app-main/i-dafino");
     assert_eq!(
         grants["inbounds"][0]["clients"][0]["id"],
         "2d2304da-f114-4574-8d44-625afdb1db5c"
@@ -2299,7 +2886,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         &admin_token,
         "/apps/app-main/chains",
         json!({
-            "id": "c-main",
+            "id": "c-bacemu",
             "tenant_id": "platform.acme",
             "name": "Main Chain"
         }),
@@ -2313,8 +2900,8 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         &admin_token,
         "/apps/app-main/ingresses",
         json!({
-            "id": "i-main",
-            "chain_id": "c-main",
+            "id": "i-dafino",
+            "chain_id": "c-bacemu",
             "node_id": "n-api",
             "bind": "0.0.0.0",
             "port": 443,
@@ -2347,10 +2934,21 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         16
     );
 
-    let step = put_json(
+    let legacy_step = put_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-main/steps/n-api",
+        "/apps/app-main/chains/c-bacemu/steps/n-api",
+        json!({ "rules": [] }),
+    )
+    .await;
+    assert_eq!(legacy_step.0, StatusCode::METHOD_NOT_ALLOWED);
+
+    let step = apply_step_json(
+        &app,
+        &admin_token,
+        "app-main",
+        "c-bacemu",
+        "n-api",
         json!({
             "rules": [{
                 "m": { "t": "any" },
@@ -2370,7 +2968,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
             "app_id": "app-main",
             "tenant_id": "platform.acme",
             "user_id": "alice",
-            "ingress_id": "i-main",
+            "ingress_id": "i-dafino",
             "enabled": true
         }),
     )
@@ -2488,6 +3086,15 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
     )
     .await;
     assert_eq!(refused_artifact.0, StatusCode::FORBIDDEN);
+    let refused_probe = get_json_with_token(&app, "/grant-probes/capability", readonly_token).await;
+    assert_eq!(
+        refused_probe.0,
+        StatusCode::FORBIDDEN,
+        "a role that cannot read credentials must not be allowed to execute them"
+    );
+    let admin_probe = get_json(&app, &admin_token, "/grant-probes/capability").await;
+    assert_eq!(admin_probe.0, StatusCode::OK);
+    assert_eq!(admin_probe.1["concurrency"], 30);
 
     let verify = post_json(
         &app,
@@ -2825,6 +3432,62 @@ async fn http_admin_rbac_requires_tokens_and_separates_system_admin() {
     assert_eq!(secret_content.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_grant_automation_status_exposes_pre_deployment_retries() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (kind, status, payload, attempts, last_error)
+         VALUES (
+             'grants-deployment',
+             'queued',
+             '{\"revision_id\":42}'::jsonb,
+             7,
+             'historical snapshot could not be decoded'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let (app, admin_token) = admin_app(&db).await;
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::get("/grants/automation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::get("/grants/automation")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["pending_jobs"], 1);
+    assert_eq!(body["retrying_jobs"], 1);
+    assert_eq!(body["max_attempts"], 7);
+    assert_eq!(body["latest_revision_id"], 42);
+    assert_eq!(
+        body["last_error"],
+        "historical snapshot could not be decoded"
+    );
+}
+
 /// Submitting the same thing again must produce no new revision.
 ///
 /// The rule is that a changed field produces a revision — a *changed* field. The console's pages are
@@ -2911,7 +3574,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     assert_eq!(user.1["revision_id"], 6);
 
     let chain_body = json!({
-        "id": "c-main",
+        "id": "c-bacemu",
         "tenant_id": "platform.acme",
         "name": "Main Chain"
     });
@@ -2927,8 +3590,8 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     assert_eq!(chain_again.1["revision_id"], 7, "链和主干都原样");
 
     let ingress_body = json!({
-        "id": "i-main",
-        "chain_id": "c-main",
+        "id": "i-dafino",
+        "chain_id": "c-bacemu",
         "node_id": "n-api",
         "bind": "0.0.0.0",
         "port": 443,
@@ -2966,18 +3629,22 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     let step_body = json!({
         "rules": [{ "m": { "t": "any" }, "a": { "t": "egress", "send_through": null } }]
     });
-    let step = put_json(
+    let step = apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-main/steps/n-api",
+        "app-main",
+        "c-bacemu",
+        "n-api",
         step_body.clone(),
     )
     .await;
     assert_eq!(step.1["revision_id"], 9);
-    let step_again = put_json(
+    let step_again = apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-main/steps/n-api",
+        "app-main",
+        "c-bacemu",
+        "n-api",
         step_body,
     )
     .await;
@@ -2987,7 +3654,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         "app_id": "app-main",
         "tenant_id": "platform.acme",
         "user_id": "alice",
-        "ingress_id": "i-main",
+        "ingress_id": "i-dafino",
         "enabled": true
     });
     let grant = post_json(&app, &admin_token, "/grants", grant_body.clone()).await;
@@ -3004,7 +3671,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
             "app_id": "app-main",
             "tenant_id": "platform.acme",
             "user_id": "alice",
-            "ingress_id": "i-main",
+            "ingress_id": "i-dafino",
             "enabled": true
         }),
     )
@@ -3036,6 +3703,10 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     )
     .await;
     assert_eq!(retired.1["revision_id"], 12);
+    assert_eq!(retired.1["lifecycle"]["phase"], "retiring");
+    assert_eq!(retired.1["lifecycle"]["lifecycle_epoch"], 1);
+    assert!(retired.1["deployment_id"].is_number());
+    let retirement_deployment_id = retired.1["deployment_id"].clone();
     let retired_again = put_json(
         &app,
         &admin_token,
@@ -3044,6 +3715,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     )
     .await;
     assert_eq!(retired_again.1["revision_id"], 12, "已经退役了再退一次");
+    assert_eq!(retired_again.1["deployment_id"], retirement_deployment_id);
 
     // Global settings: read them and write them straight back, which is exactly "opened the settings
     // page and pressed save".
@@ -3112,7 +3784,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
         &admin_token,
         "/apps/app-main/chains",
         json!({
-            "id": "c-main",
+            "id": "c-bacemu",
             "tenant_id": "platform.acme",
             "name": "主链路"
         }),
@@ -3130,10 +3802,12 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
     };
 
     // The unencrypted variant: stored and read back.
-    let step = put_json(
+    let step = apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-main/steps/n-hop",
+        "app-main",
+        "c-bacemu",
+        "n-hop",
         json!({
             "accept": {},
             "hop_in": { "port": 20000, "security": { "t": "none" } },
@@ -3149,10 +3823,12 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
 
     // Switching to REALITY: the material is generated server-side and the private key does not leave
     // over HTTP.
-    let step = put_json(
+    let step = apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-main/steps/n-hop",
+        "app-main",
+        "c-bacemu",
+        "n-hop",
         json!({
             "accept": {},
             "hop_in": {
@@ -3181,10 +3857,12 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
     assert_eq!(hop_in(&snapshot.1)["port"], 443);
 
     // port: 0 turns it off. It must be a different thing from not mentioning the field.
-    let step = put_json(
+    let step = apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-main/steps/n-hop",
+        "app-main",
+        "c-bacemu",
+        "n-hop",
         json!({
             "accept": {},
             "hop_in": { "port": 0 },
@@ -3198,10 +3876,12 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
 
     // Not mentioning the field leaves it alone, so that the turning-off above is not undone by every
     // rule edit.
-    put_json(
+    apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-main/steps/n-hop",
+        "app-main",
+        "c-bacemu",
+        "n-hop",
         json!({
             "accept": {},
             "rules": [{ "m": { "t": "any" }, "a": { "t": "block" } }]
@@ -3247,7 +3927,10 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         assert_eq!(created.0, StatusCode::CREATED);
     }
 
-    for (chain, head) in [("c-lan", "n-lan"), ("c-wan", "n-wan")] {
+    for (chain, head, ingress) in [
+        ("c-lanavi", "n-lan", "i-mopelu"),
+        ("c-waneso", "n-wan", "i-rudesa"),
+    ] {
         post_json(
             &app,
             &admin_token,
@@ -3266,7 +3949,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
             &admin_token,
             "/apps/app-main/ingresses",
             json!({
-                "id": format!("i-{chain}"),
+                "id": ingress,
                 "chain_id": chain,
                 "node_id": head,
                 "bind": "0.0.0.0",
@@ -3283,10 +3966,12 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
     }
 
     // The in-datacenter one: dials the internal address and enters the unencrypted port
-    put_json(
+    apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-lan/steps/n-lan",
+        "app-main",
+        "c-lanavi",
+        "n-lan",
         json!({
             "rules": [{
                 "m": { "t": "any" },
@@ -3295,10 +3980,12 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         }),
     )
     .await;
-    let lan = put_json(
+    let lan = apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-lan/steps/n-relay",
+        "app-main",
+        "c-lanavi",
+        "n-relay",
         json!({
             "accept": {},
             "hop_in": { "port": 20000, "security": { "t": "none" } },
@@ -3310,10 +3997,12 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
 
     // The cross-border one: dials the public address, enters the REALITY port, and takes a port
     // distinct from the one above
-    put_json(
+    apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-wan/steps/n-wan",
+        "app-main",
+        "c-waneso",
+        "n-wan",
         json!({
             "rules": [{
                 "m": { "t": "any" },
@@ -3326,10 +4015,12 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         }),
     )
     .await;
-    let wan = put_json(
+    let wan = apply_step_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-wan/steps/n-relay",
+        "app-main",
+        "c-waneso",
+        "n-relay",
         json!({
             "accept": {},
             "hop_in": {
@@ -3366,10 +4057,10 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         .iter()
         .flat_map(|a| a["hops"].as_array().unwrap())
         .collect();
-    let lan_hop = hops.iter().find(|h| h["chain"] == "c-lan").unwrap();
+    let lan_hop = hops.iter().find(|h| h["chain"] == "c-lanavi").unwrap();
     assert_eq!(lan_hop["address"], "10.0.0.9");
     assert_eq!(lan_hop["security"]["t"], "none");
-    let wan_hop = hops.iter().find(|h| h["chain"] == "c-wan").unwrap();
+    let wan_hop = hops.iter().find(|h| h["chain"] == "c-waneso").unwrap();
     assert_eq!(wan_hop["address"], "relay.sg.example");
     assert_eq!(wan_hop["security"]["t"], "reality");
 
@@ -3406,6 +4097,31 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         securities.contains(&"none") && securities.contains(&"reality"),
         "两条链各用各的传输层：{securities:?}"
     );
+}
+
+async fn apply_step_json(
+    app: &Router,
+    token: &str,
+    app_id: &str,
+    chain_id: &str,
+    node_id: &str,
+    step: Value,
+) -> (StatusCode, Value) {
+    post_json(
+        app,
+        token,
+        "/model/apply",
+        json!({
+            "ops": [{
+                "op": "put_step",
+                "app_id": app_id,
+                "chain_id": chain_id,
+                "node_id": node_id,
+                "step": step,
+            }],
+        }),
+    )
+    .await
 }
 
 async fn get_json(app: &Router, token: &str, uri: &str) -> (StatusCode, Value) {
@@ -3826,7 +4542,10 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
                 .method("GET")
                 .uri("/agent/v1/agent-release")
                 .header("authorization", format!("Bearer {token}"))
-                .header("x-brocade-protocol-version", "1");
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION.to_string(),
+                );
             if let Some(arch) = arch {
                 request = request.header("x-brocade-arch", arch);
             }
@@ -4008,6 +4727,87 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_grant_probe_plan_is_frozen_and_contains_no_connection_material() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let revision = seed_subscription_serving(&db).await;
+    let (app, token) = admin_app(&db).await;
+
+    let response = get_json(&app, &token, "/users/platform.acme/alice/grant-probes").await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["serving_revision"], revision);
+    assert_eq!(response.1["serving_generation"], 1);
+    assert!(!response.1["items"].as_array().unwrap().is_empty());
+
+    let created = post_json(
+        &app,
+        &token,
+        "/admin/operators",
+        json!({
+            "id": "probe-reader",
+            "display_name": "Probe Reader",
+            "role": "readonly",
+            "tenant_scope": "platform.acme",
+            "password": "reader-secret"
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED);
+    let reader_token = post_json(
+        &app,
+        &token,
+        "/admin/operators/probe-reader/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(reader_token.0, StatusCode::CREATED);
+    let reader_token = reader_token.1["token"].as_str().unwrap();
+    let readonly_plan = get_json_with_token(
+        &app,
+        "/users/platform.acme/alice/grant-probes",
+        reader_token,
+    )
+    .await;
+    assert_eq!(readonly_plan.0, StatusCode::OK);
+    assert_eq!(readonly_plan.1["serving_revision"], revision);
+    assert_eq!(
+        post_json(
+            &app,
+            reader_token,
+            "/users/platform.acme/alice/grant-probes",
+            json!({ "item_ids": [] }),
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN,
+        "readonly may inspect the plan but must never execute its credentials"
+    );
+
+    let serialized = response.1.to_string();
+    let readonly_serialized = readonly_plan.1.to_string();
+    for secret in [
+        "2d2304da-f114-4574-8d44-625afdb1db5c",
+        "n1.example.net",
+        "reality-public",
+        "8337a0bf",
+        "www.example.com",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "grant probe plan leaked connection material {secret}: {serialized}"
+        );
+        assert!(
+            !readonly_serialized.contains(secret),
+            "readonly grant probe plan leaked connection material {secret}: {readonly_serialized}"
+        );
+    }
+}
+
 async fn insert_node(pool: &PgPool) {
     sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.acme', 'Platform Acme')")
         .execute(pool)
@@ -4054,13 +4854,13 @@ async fn insert_usage_model(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO apps (id, label) VALUES ('app-main', 'Main App')")
+    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-main', 'Main App', 0)")
         .execute(pool)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO chains (id, app_id, tenant_id, name)
-         VALUES ('c-main', 'app-main', 'platform.acme', 'Main Chain')",
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('c-bacemu', 'app-main', 'platform.acme', 'Main Chain', 0)",
     )
     .execute(pool)
     .await
@@ -4075,7 +4875,7 @@ async fn insert_usage_model(pool: &PgPool) {
             reality_dest, reality_server_names, reality_fingerprint, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            'i-main', 'app-main', 'c-main', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
+            'i-dafino', 'app-main', 'c-bacemu', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'chrome', 'xtls-rprx-vision',
             'custom-site'
@@ -4086,14 +4886,14 @@ async fn insert_usage_model(pool: &PgPool) {
     .unwrap();
     sqlx::query(
         "INSERT INTO steps (chain_id, node_id, rules)
-         VALUES ('c-main', 'n1', '[{\"match\":{\"t\":\"any\"},\"action\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
+         VALUES ('c-bacemu', 'n1', '[{\"match\":{\"t\":\"any\"},\"action\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
     )
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
-         VALUES ('app-main', 'platform.acme', 'alice', 'i-main')",
+         VALUES ('app-main', 'platform.acme', 'alice', 'i-dafino')",
     )
     .execute(pool)
     .await

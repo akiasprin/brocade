@@ -1,7 +1,7 @@
 mod certfile;
 mod command;
 mod conntrack;
-mod e2e;
+use brocade_probe as e2e;
 mod fsutil;
 mod http;
 mod hy2_port_hop;
@@ -9,6 +9,7 @@ mod icmp;
 mod identity;
 mod inetdiag;
 mod load;
+mod logcap;
 mod options;
 mod phantun;
 mod probe;
@@ -46,9 +47,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use brocade_core::hash::sha256_hex;
@@ -71,6 +73,62 @@ const ROUTE_IPV6_HEADER: &str = "X-Brocade-Route-IPv6";
 /// architecture and has no other source for this value: enrolment records no architecture, and
 /// an incorrect guess would hand a machine a binary that downloads, verifies, and cannot run.
 const ARCH_HEADER: &str = "X-Brocade-Arch";
+const USAGE_CURSOR_FILE: &str = "usage-cursor.json";
+const USAGE_GENERATION_FILE: &str = "usage-generation";
+/// Presence means the running Xray was launched through the bounded sink. It deliberately sits
+/// outside xray.json: logging is agent runtime state, not part of the compiled Xray artifact.
+const XRAY_BOUNDED_LOG_MARKER: &str = "xray.bounded-log-v2";
+const XRAY_OLD_BOUNDED_LOG_MARKER: &str = "xray.bounded-log-v1";
+const AGENT_LOG_MAX_MIB_HEADER: &str = "x-brocade-log-max-mib";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UsageCursor {
+    agent_instance_id: String,
+    last_sequence: u64,
+}
+
+fn reserve_usage_sequence(state_dir: &Path) -> Result<(String, u64), String> {
+    let path = state_dir.join(USAGE_CURSOR_FILE);
+    let mut cursor = match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<UsageCursor>(&text)
+            .map_err(|error| format!("failed to decode usage cursor: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut bytes = [0_u8; 16];
+            getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
+            UsageCursor {
+                agent_instance_id: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+                last_sequence: 0,
+            }
+        }
+        Err(error) => return Err(format!("failed to read usage cursor: {error}")),
+    };
+    cursor.last_sequence = cursor
+        .last_sequence
+        .checked_add(1)
+        .ok_or("usage sequence exhausted")?;
+    let text = serde_json::to_string(&cursor).map_err(|error| error.to_string())?;
+    fsutil::atomic_write_private(&path, text.as_bytes())?;
+    Ok((cursor.agent_instance_id, cursor.last_sequence))
+}
+
+fn read_usage_generation(state_dir: &Path) -> Result<Option<i64>, String> {
+    match fs::read_to_string(state_dir.join(USAGE_GENERATION_FILE)) {
+        Ok(text) => text
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|error| format!("failed to decode usage generation: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("failed to read usage generation: {error}")),
+    }
+}
+
+fn write_usage_generation(state_dir: &Path, generation_id: i64) -> Result<(), String> {
+    fsutil::atomic_write_private(
+        &state_dir.join(USAGE_GENERATION_FILE),
+        generation_id.to_string().as_bytes(),
+    )
+}
 
 /// Self-healing runs without operator involvement, so every occurrence has to emit a
 /// line whose level appears at the start. journald collects logs on these machines and
@@ -108,6 +166,9 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("health") => return health(&health_state_dir(&args)),
         Some("repair") => return reconcile_local(&health_state_dir(&args), Drift::Always),
+        // Internal stdin consumer used by the Xray/Phantun launch pipelines. It must not require
+        // a control-plane URL or token: doing so would put a secret on every child command line.
+        Some("log-sink") => return logcap::run_args(&args[1..]),
         _ => {}
     }
 
@@ -294,7 +355,7 @@ fn reconcile_local_inner(
         // Local reconcile does not contact the control plane and therefore has no
         // distribution source. The binary was installed by the last release, so its
         // absence is an error; deriving a download URL is outside this path's scope.
-        apply_phantun(&content, None)?;
+        apply_phantun(state_dir, &content, None)?;
         acted.push("phantun".to_owned());
     }
 
@@ -435,9 +496,9 @@ fn grants_drifted(want: &[GrantInbound], api_port: u16) -> bool {
 /// Pure comparison, so that the layer above only has to fetch.
 fn grants_drifted_in(want: &[GrantClient], live: &[ObservedClient]) -> bool {
     let missing = want.iter().any(|client| {
-        !live
-            .iter()
-            .any(|seen| seen.email == client.email && seen.uuid == client.uuid)
+        !live.iter().any(|seen| {
+            seen.email == client.email && seen.uuid == client.uuid && seen.flow == client.flow
+        })
     });
     let extra = live
         .iter()
@@ -747,6 +808,16 @@ const E2E_INTERVAL_FALLBACK: Duration = Duration::from_secs(5 * 60);
 /// across the xray restart, so that the sampling thread does not read a freshly
 /// started, empty process and mistake the reset for users sending no traffic.
 fn run_forever(options: Options) -> Result<(), String> {
+    match logcap::ensure_agent_journal_namespace(&options.state_dir) {
+        Ok(true) => {
+            println!("agent 日志已切到独立 journal，重启一次使配置生效");
+            return Ok(());
+        }
+        Ok(false) => {}
+        // Log policy is operational hygiene, not permission to stop convergence or accounting.
+        // Keep serving and leave a searchable warning for the operator.
+        Err(error) => warn(format!("agent 日志上限未能落地：{error}")),
+    }
     let meter = Arc::new(Mutex::new(()));
     // Set by the self-update thread once a new binary is in place, and read by the loop at the
     // bottom of this function. The replacement itself is safe at any moment, because the running
@@ -848,16 +919,57 @@ fn run_forever(options: Options) -> Result<(), String> {
         // It also must not delay usage. A netlink dump on a machine with thousands of
         // connections has a measurable cost, and usage reporting drives billing, so anything
         // that can slow it runs on a separate thread.
+        // Sampling must never wait for the control plane. A load request may legally spend up to
+        // 30 seconds in an HTTP read, which used to stretch the next nominal 10-second sample and
+        // then label the mixed interval as 30 seconds. A one-slot best-effort handoff preserves
+        // the existing "do not spool stale telemetry" rule while keeping the sampling clock free.
+        let (load_tx, load_rx) = std::sync::mpsc::sync_channel::<LoadReportRequest>(1);
+        let report_options = options.clone();
+        thread::Builder::new()
+            .name("load-report".to_owned())
+            .spawn(move || {
+                while let Ok(report) = load_rx.recv() {
+                    each_round("load-report", || {
+                        if let Err(error) = send_load_report(&report_options, report) {
+                            eprintln!("load: {error}");
+                        }
+                    });
+                }
+            })
+            .map_err(|error| format!("cannot spawn load-report thread: {error}"))?;
+
         let options = options.clone();
         thread::Builder::new()
             .name("load".to_owned())
-            .spawn(move || loop {
-                each_round("load", || {
-                    if let Err(error) = load_cycle(&options) {
-                        eprintln!("load: {error}");
+            .spawn(move || {
+                let mut next_tick = Instant::now();
+                loop {
+                    each_round("load", || match build_load_report(&options) {
+                        Ok(Some(report)) => match load_tx.try_send(report) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                // There is no telemetry spool by design. Keeping a stale window
+                                // would delay the current one and eventually recreate the same
+                                // timing error this queue exists to prevent.
+                                eprintln!("load: previous report is still in flight; dropping this window");
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                eprintln!("load: report worker stopped; dropping this window");
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(error) => eprintln!("load: {error}"),
+                    });
+
+                    next_tick += LOAD_INTERVAL;
+                    let now = Instant::now();
+                    if next_tick <= now {
+                        // Do not run catch-up samples back-to-back. The raw counter interval will
+                        // carry the delay and mark the resulting window as a gap.
+                        next_tick = now + LOAD_INTERVAL;
                     }
-                });
-                thread::sleep(LOAD_INTERVAL);
+                    thread::sleep(next_tick.saturating_duration_since(now));
+                }
             })
             .map_err(|error| format!("cannot spawn load thread: {error}"))?;
     }
@@ -927,6 +1039,47 @@ fn apply_once(options: Options) -> Result<(), String> {
     apply_once_inner(options, None)
 }
 
+fn upgrade_dynamic_log_sinks(
+    options: &Options,
+    meter: Option<&Arc<Mutex<()>>>,
+) -> Result<(), String> {
+    let state_dir = &options.state_dir;
+    let phantun_conf = state_dir.join("phantun.json");
+    if phantun_conf.exists()
+        && !state_dir.join("phantun.disabled").exists()
+        && !state_dir.join(phantun::PHANTUN_BOUNDED_LOG_MARKER).exists()
+    {
+        let content = fs::read_to_string(&phantun_conf)
+            .map_err(|error| format!("读取 phantun 日志迁移配置失败：{error}"))?;
+        apply_phantun(state_dir, &content, None)?;
+        println!("phantun 日志已切到动态上限");
+    }
+
+    let xray_conf = state_dir.join("xray.json");
+    if xray_conf.exists()
+        && !state_dir.join("xray.disabled").exists()
+        && !state_dir.join(XRAY_BOUNDED_LOG_MARKER).exists()
+    {
+        let content = fs::read_to_string(&xray_conf)
+            .map_err(|error| format!("读取 xray 日志迁移配置失败：{error}"))?;
+        let api_port = xray_api_port(&content).unwrap_or(10085);
+        let _guard = meter.map(|meter| {
+            meter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if let Err(error) = usage_cycle(options) {
+            // The migration remains necessary for the disk bound. Preserve the same release
+            // policy as a normal restart: report a failed pre-sample, then continue rather than
+            // leaving an unbounded/fixed child forever.
+            eprintln!("usage: 切换动态日志前的采集没成功：{error}");
+        }
+        apply_xray(&xray_conf, api_port)?;
+        println!("xray 日志已切到动态上限");
+    }
+    Ok(())
+}
+
 fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<(), String> {
     let client = HttpClient::new(&options.server)?;
     // Flush the convergence results still owed from earlier rounds before asking for
@@ -954,12 +1107,27 @@ fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<
             return Err(error);
         }
     };
+    if let Some(raw) = response.header(AGENT_LOG_MAX_MIB_HEADER) {
+        match raw.parse::<u32>() {
+            Ok(max_mib) => match logcap::apply_policy(&options.state_dir, max_mib) {
+                Ok(true) => println!("日志上限已更新为 {max_mib} MiB"),
+                Ok(false) => {}
+                Err(error) => warn(format!("日志上限未能落地：{error}")),
+            },
+            Err(error) => warn(format!("控制面返回的日志上限 {raw:?} 无效：{error}")),
+        }
+    }
     if response.status == 204 {
         println!("no desired state");
         // Record it on disk: `health` runs in another process and cannot contact the
         // control plane, yet it has to distinguish a machine not included in any plan
         // from one that cannot reach the control plane.
         mark_no_desired(&options.state_dir);
+        // Version 2 changes a fixed-size child sink into one following the live policy file. It
+        // needs one workload restart to replace the old pipe, but that restart must sample Xray's
+        // volatile counters first. General local reconcile cannot do that safely because it has
+        // no meter; perform the migration here, where the accounting lock is available.
+        upgrade_dynamic_log_sinks(&options, meter)?;
         // 204 means the control plane judged both dimensions converged: no deployment
         // owed, and the reported certificate sha matches the serving certificate.
         // The control plane compares artifacts only against what was last reported and
@@ -1023,7 +1191,14 @@ fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<
             .map(|_| observe_linux_state(&options.state_dir, &desired)),
     };
     let (result, after, error) = match applied {
-        Ok(after) => successful_apply_outcome(&options.state_dir, after),
+        Ok(after) => {
+            let outcome = successful_apply_outcome(&options.state_dir, after);
+            persist_converged_usage_generation(
+                &options.state_dir,
+                desired.usage_generation_id,
+                outcome,
+            )
+        }
         Err(error) => {
             let after = observe_state(&options.state_dir, &desired, options.apply_mode)
                 .unwrap_or_else(|_| unknown_state());
@@ -1056,6 +1231,29 @@ fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<
         return Err(error);
     }
     Ok(())
+}
+
+fn persist_converged_usage_generation(
+    state_dir: &Path,
+    generation_id: Option<i64>,
+    outcome: (TargetApplyResult, ReportedNodeState, Option<String>),
+) -> (TargetApplyResult, ReportedNodeState, Option<String>) {
+    let Some(generation_id) = generation_id else {
+        return outcome;
+    };
+    match write_usage_generation(state_dir, generation_id) {
+        Ok(()) => outcome,
+        Err(error) => (
+            TargetApplyResult::FailedDirty,
+            outcome.1,
+            Some(match outcome.2 {
+                Some(existing) => {
+                    format!("{existing}；运行态已经应用，但 usage generation 写入失败：{error}")
+                }
+                None => format!("运行态已经应用，但 usage generation 写入失败：{error}"),
+            }),
+        ),
+    }
 }
 
 /// Persisting the state-dir cache is part of a clean convergence, but its
@@ -1143,35 +1341,59 @@ fn health_cycle(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// One host-sampling tick. Most ticks accumulate and send nothing.
+/// One host-sampling tick. Most ticks accumulate and produce nothing.
 ///
 /// Nothing here is spooled, unlike usage and observations. The spool exists so a locally
 /// established fact survives an outage: usage drives billing, and a convergence result is the
 /// only record that convergence happened. A CPU reading from five minutes ago is neither, so
 /// spooling it would add a file that can fill a disk in exchange for readings that are no longer
 /// used. A failed send drops the window, and the next one is sent 30 seconds later.
-fn load_cycle(options: &Options) -> Result<(), String> {
+fn build_load_report(options: &Options) -> Result<Option<LoadReportRequest>, String> {
     let now = current_unix_secs()? as u64;
-    let Some((sample, processes)) = load::tick(&options.state_dir, now) else {
+    let Some((mut sample, processes)) = load::tick(&options.state_dir, now) else {
         // Still filling the window, or this was the first tick and there is no baseline to
         // difference against yet.
-        return Ok(());
+        return Ok(None);
     };
 
-    let hops = collect_hops(
-        options,
-        sample.window_start_unix_secs,
-        sample.window_end_unix_secs,
-    );
-    let report = LoadReportRequest {
+    // One all-state inet_diag dump serves two consumers: established connections feed per-hop
+    // quality, while every non-listening state feeds anonymous local-port pressure. Keeping it
+    // here makes the O(number of sockets) walk happen once per finished window, not per 10-second
+    // sub-sample and not twice for the two views.
+    let hops = match crate::inetdiag::dump() {
+        Ok(conns) => {
+            if let Some(range) = load::read_ephemeral_port_range() {
+                crate::inetdiag::apply_port_pressure(
+                    sample.network_detail.get_or_insert_default(),
+                    &conns,
+                    range,
+                );
+            }
+            collect_hops(
+                options,
+                &conns,
+                sample.window_start_unix_secs,
+                sample.window_end_unix_secs,
+            )
+        }
+        Err(error) => {
+            // Insufficient privilege and a kernel without inet_diag are both legitimate legacy
+            // environments. Lose these optional details, never the host sample around them.
+            eprintln!("load: inet_diag unavailable: {error}");
+            Vec::new()
+        }
+    };
+    Ok(Some(LoadReportRequest {
         read_at_unix_secs: now as i64,
         btime_unix_secs: load::current_btime(),
         host: load::host_facts(&options.state_dir),
         samples: vec![sample],
         processes,
         hops,
-    };
+    }))
+}
 
+fn send_load_report(options: &Options, report: LoadReportRequest) -> Result<(), String> {
     let client = HttpClient::new(&options.server)?;
     let body = serde_json::to_string(&report).map_err(|error| error.to_string())?;
     let response = client.request("POST", "/agent/v1/load", &options.token, Some(&body))?;
@@ -1189,10 +1411,18 @@ fn load_cycle(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+fn load_cycle(options: &Options) -> Result<(), String> {
+    if let Some(report) = build_load_report(options)? {
+        send_load_report(options, report)?;
+    }
+    Ok(())
+}
+
 /// Per-hop link quality for this window. Empty is a normal answer on a machine with no xray, or
 /// one whose hops have no connections right now.
 fn collect_hops(
     options: &Options,
+    conns: &[crate::inetdiag::Conn],
     window_start: i64,
     window_end: i64,
 ) -> Vec<brocade_deployment::protocol::HopLinkSample> {
@@ -1205,16 +1435,7 @@ fn collect_hops(
         // every socket to attribute none of them is work for nothing.
         return Vec::new();
     }
-    match crate::inetdiag::dump() {
-        Ok(conns) => crate::inetdiag::aggregate(&conns, &targets, window_start, window_end),
-        Err(error) => {
-            // Losing link quality must not cost the host sample it travels with. Insufficient
-            // privilege and a kernel without inet_diag both land here, and both are facts about
-            // this machine rather than about its links.
-            eprintln!("load: inet_diag unavailable: {error}");
-            Vec::new()
-        }
-    }
+    crate::inetdiag::aggregate(conns, &targets, window_start, window_end)
 }
 
 fn usage_once(options: Options) -> Result<(), String> {
@@ -1248,9 +1469,17 @@ fn read_usage_report(state_dir: &Path) -> Result<UsageReportRequest, String> {
     let xray_content = fs::read_to_string(state_dir.join("xray.json"))
         .map_err(|error| format!("failed to read xray.json from state dir: {error}"))?;
     let api_port = xray_api_port(&xray_content).ok_or("xray.json does not contain api port")?;
+    // Reserve and persist before touching the volatile counters. A crash may leave a harmless
+    // sequence gap; reserving after the read could reuse the same id for different traffic.
+    let (agent_instance_id, sequence) = reserve_usage_sequence(state_dir)?;
+    let process = xray_process_identity()?;
     Ok(UsageReportRequest {
+        agent_instance_id: Some(agent_instance_id),
+        sequence: Some(sequence),
+        usage_generation_id: read_usage_generation(state_dir)?,
         read_at_unix_secs: current_unix_secs()?,
-        xray_started_at_unix_secs: xray_started_at_unix_secs()?,
+        xray_started_at_unix_secs: process.started_at_unix_secs,
+        xray_epoch: Some(process.epoch),
         route: Some(route_ip_report()),
         counters: read_xray_usage_counters(api_port)?,
     })
@@ -1390,7 +1619,7 @@ fn converge_linux(
     // xray's counters are in memory and reset on restart. Without a sample here,
     // everything since the last one is lost, and the loss is not reported anywhere; it
     // appears only as an understated bill.
-    if matches!(desired.desired.xray, DesiredArtifact::Present { .. }) {
+    if desired.usage_generation_id.is_some() {
         before_xray_restart();
     }
     converge_linux_xray(state_dir, &desired.desired.xray)?;
@@ -1489,12 +1718,13 @@ fn converge_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> Result<()
             write_private(&path, content)?;
             let _ = fs::remove_file(state_dir.join("xray.disabled"));
             let api_port = xray_api_port(content).unwrap_or(10085);
+            let bounded_log = state_dir.join(XRAY_BOUNDED_LOG_MARKER).exists();
 
             // The file is already on disk, so a cold start uses the new config whichever
             // branch runs. That is what makes the swap an optimization rather than a
             // second source of truth: it removes a restart, and a failed swap costs only
             // the restart it was avoiding.
-            if command_success("pgrep", &["-x", "xray"]) && !splice_mode_changed {
+            if command_success("pgrep", &["-x", "xray"]) && !splice_mode_changed && bounded_log {
                 if let Some(swap) = previous
                     .as_deref()
                     .and_then(|previous| hot_swap(previous, content))
@@ -1515,7 +1745,10 @@ fn converge_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> Result<()
         }
         DesiredArtifact::Disabled { reason } => {
             let _ = run_shell("pkill -x xray 2>/dev/null || true")?;
+            let _ = fs::remove_file("/tmp/brocade-agent-xray.log");
             let _ = fs::remove_file(state_dir.join("xray.json"));
+            let _ = fs::remove_file(state_dir.join(XRAY_BOUNDED_LOG_MARKER));
+            let _ = fs::remove_file(state_dir.join(XRAY_OLD_BOUNDED_LOG_MARKER));
             fs::write(state_dir.join("xray.disabled"), reason)
                 .map_err(|error| error.to_string())?;
             Ok(())
@@ -1656,12 +1889,19 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     } else {
         format!("xray run -config {conf}")
     };
+    let state_dir = path.parent().ok_or("xray config has no state directory")?;
+    let log_dir = state_dir.join("logs");
+    create_private_dir(&log_dir)?;
+    let log_path = log_dir.join("xray.log");
+    let sink = logcap::command(&log_path, state_dir)?;
+    let pipeline = shell_quote(&format!("{launch} 2>&1 | {sink}"));
+    let log = shell_quote(&log_path.display().to_string());
     run_command("xray", &["-test", "-config", &path.display().to_string()])?;
     run_shell(&format!(
         "set -eu\n\
          pkill -x xray 2>/dev/null || true\n\
          for _ in $(seq 1 40); do pgrep -x xray >/dev/null 2>&1 || break; sleep 0.25; done\n\
-         nohup {launch} >/tmp/brocade-agent-xray.log 2>&1 &\n\
+         nohup sh -c {pipeline} >/dev/null 2>&1 &\n\
          port_up() {{\n\
            if command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -q ':{api_port} ';\n\
            else netstat -ltn 2>/dev/null | grep -q ':{api_port} '; fi\n\
@@ -1670,9 +1910,15 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
            port_up && exit 0\n\
            sleep 0.25\n\
          done\n\
-         cat /tmp/brocade-agent-xray.log 2>/dev/null || true\n\
+         cat {log} 2>/dev/null || true\n\
          exit 1"
     ))?;
+    fs::write(state_dir.join(XRAY_BOUNDED_LOG_MARKER), b"dynamic\n")
+        .map_err(|error| format!("failed to record bounded xray logging: {error}"))?;
+    let _ = fs::remove_file(state_dir.join(XRAY_OLD_BOUNDED_LOG_MARKER));
+    // The legacy file is no longer held open once the old Xray has exited. Removing it here, not
+    // during installation, guarantees its blocks are actually released immediately.
+    let _ = fs::remove_file("/tmp/brocade-agent-xray.log");
     Ok(())
 }
 
@@ -1825,6 +2071,9 @@ fn observe_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> AppliedArt
             };
             if !tcp_port_listening(api_port) {
                 return artifact_dirty(format!("xray api port {api_port} is not listening"));
+            }
+            if !state_dir.join(XRAY_BOUNDED_LOG_MARKER).exists() {
+                return artifact_dirty("xray is still using the legacy unbounded log");
             }
             AppliedArtifactState::Present {
                 sha256: sha256_hex(content.as_bytes()),
@@ -2338,26 +2587,40 @@ fn parse_xray_stat_name(name: &str) -> Option<(&str, &str)> {
 /// serving for hours reported a start time two seconds old every few minutes, and the control
 /// plane recorded each of those as a restart. The serving instance is the long-lived one by
 /// construction: probe children last seconds and api calls last milliseconds.
-fn xray_started_at_unix_secs() -> Result<i64, String> {
+#[derive(Debug, Clone)]
+struct XrayProcessIdentity {
+    started_at_unix_secs: i64,
+    start_ticks: u64,
+    epoch: String,
+}
+
+fn xray_process_identity() -> Result<XrayProcessIdentity, String> {
     // `pgrep` exits 1 when nothing matches, which `run_command` turns into an error with no
     // stderr, giving no information in the agent log. This replaces it with an explicit
     // message.
     let pids = run_command("pgrep", &["-x", "xray"])
         .map_err(|_| "xray process is not running".to_owned())?;
-    let mut oldest: Option<i64> = None;
+    let mut oldest: Option<XrayProcessIdentity> = None;
     let mut last_error = None;
     for pid in pids.split_whitespace() {
         // A process that exits between `pgrep` and reading its `stat` is expected rather than a
         // failure, because the short-lived processes make up most of the list.
-        match xray_started_at_unix_secs_from_proc(pid) {
-            Ok(started) => oldest = Some(oldest.map_or(started, |seen: i64| seen.min(started))),
+        match xray_process_identity_from_proc(pid) {
+            Ok(identity) => {
+                if oldest.as_ref().is_none_or(|seen| {
+                    (identity.started_at_unix_secs, identity.start_ticks)
+                        < (seen.started_at_unix_secs, seen.start_ticks)
+                }) {
+                    oldest = Some(identity);
+                }
+            }
             Err(error) => last_error = Some(error),
         }
     }
     oldest.ok_or_else(|| last_error.unwrap_or_else(|| "xray process is not running".to_owned()))
 }
 
-fn xray_started_at_unix_secs_from_proc(pid: &str) -> Result<i64, String> {
+fn xray_process_identity_from_proc(pid: &str) -> Result<XrayProcessIdentity, String> {
     let stat_path = format!("/proc/{pid}/stat");
     let stat = fs::read_to_string(&stat_path)
         .map_err(|error| format!("failed to read {stat_path}: {error}"))?;
@@ -2380,7 +2643,12 @@ fn xray_started_at_unix_secs_from_proc(pid: &str) -> Result<i64, String> {
     let started = btime
         .checked_add(start_ticks / clock_ticks)
         .ok_or("xray start time overflow")?;
-    i64::try_from(started).map_err(|_| "xray start time is out of range".to_owned())
+    Ok(XrayProcessIdentity {
+        started_at_unix_secs: i64::try_from(started)
+            .map_err(|_| "xray start time is out of range".to_owned())?,
+        start_ticks,
+        epoch: format!("{btime}:{start_ticks}"),
+    })
 }
 
 fn parse_proc_stat_start_ticks(stat: &str) -> Result<u64, String> {
@@ -2769,6 +3037,16 @@ mod tests {
             &want(&[("alice@t#i", "uuid-new")]),
             &live(&[a])
         ));
+
+        // Flow is part of a VLESS account. Keeping the same label and UUID with yesterday's flow
+        // is still drift: without this comparison a runtime-only mutation survives every
+        // 15-second local reconcile even though a control-plane deployment would reject it.
+        let mut vision = want(&[a]);
+        vision[0].flow = Some("xtls-rprx-vision".to_owned());
+        assert!(grants_drifted_in(&vision, &live(&[a])));
+        let mut live_vision = live(&[a]);
+        live_vision[0].flow = Some("xtls-rprx-vision".to_owned());
+        assert!(!grants_drifted_in(&vision, &live_vision));
     }
 
     /// A newly enrolled machine belongs to no released plan, so `/agent/v1/desired`
@@ -3749,6 +4027,67 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
         dir
     }
 
+    #[test]
+    fn usage_sequence_is_reserved_on_disk_and_survives_process_restart() {
+        let dir = test_state_dir("usage-cursor");
+        let (instance_a, first) = super::reserve_usage_sequence(&dir).unwrap();
+        let (instance_b, second) = super::reserve_usage_sequence(&dir).unwrap();
+        assert_eq!(instance_a, instance_b);
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(instance_a.len(), 32);
+
+        let persisted: super::UsageCursor =
+            serde_json::from_str(&fs::read_to_string(dir.join(super::USAGE_CURSOR_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(persisted.last_sequence, 2);
+        assert_eq!(persisted.agent_instance_id, instance_a);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn usage_generation_persistence_is_part_of_clean_convergence() {
+        let dir = test_state_dir("usage-generation");
+        let after = ReportedNodeState {
+            phantun: AppliedArtifactState::Disabled,
+            wireguard: AppliedArtifactState::Disabled,
+            xray: AppliedArtifactState::Disabled,
+            hy2_port_hop: AppliedArtifactState::Disabled,
+            grants: AppliedGrantsState::Disabled,
+        };
+        let outcome = super::persist_converged_usage_generation(
+            &dir,
+            Some(42),
+            (
+                brocade_deployment::protocol::TargetApplyResult::Applied,
+                after.clone(),
+                None,
+            ),
+        );
+        assert_eq!(
+            outcome.0,
+            brocade_deployment::protocol::TargetApplyResult::Applied
+        );
+        assert_eq!(super::read_usage_generation(&dir).unwrap(), Some(42));
+
+        fs::remove_file(dir.join(super::USAGE_GENERATION_FILE)).unwrap();
+        fs::create_dir(dir.join(super::USAGE_GENERATION_FILE)).unwrap();
+        let failed = super::persist_converged_usage_generation(
+            &dir,
+            Some(43),
+            (
+                brocade_deployment::protocol::TargetApplyResult::Applied,
+                after,
+                None,
+            ),
+        );
+        assert_eq!(
+            failed.0,
+            brocade_deployment::protocol::TargetApplyResult::FailedDirty
+        );
+        assert!(failed.2.unwrap().contains("usage generation"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// The two spools write to separate files. This is the property most likely to break
     /// now that they share code: an incorrect path makes the usage drain post convergence
     /// results to `/agent/v1/usage` as readings, producing wrong data on both sides with
@@ -3827,6 +4166,7 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
             max: 3,
             what: "tiny",
             unit: "条",
+            terminal_statuses: &[400],
         };
 
         for n in 0..5 {

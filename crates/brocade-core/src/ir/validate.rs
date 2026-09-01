@@ -9,12 +9,17 @@ use ipnet::IpNet;
 use crate::{
     diagnostic::Diagnostic,
     model::{
-        Action, Dns, DomainStrategy, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial, HopPool, HopWire, Hysteria2,
-        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, HysteriaQuic, ModelSnapshot,
-        RealityFallbackLimits, RealityFallbackRateLimit, Transport, Xhttp, XhttpMode,
+        Action, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback,
+        EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
+        ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial,
+        HopPool, HopWire, Hysteria2, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
+        HysteriaQuic, ModelSnapshot, RealityFallbackLimits, RealityFallbackRateLimit, Transport,
+        Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, EXTERNAL_WIREGUARD_MAX_WORKERS,
     },
-    text::parse_semver3,
+    text::{
+        is_nonzero_host_port, is_reality_fingerprint, is_reality_public_key,
+        is_reality_server_name, is_reality_short_id, parse_semver3,
+    },
 };
 
 use super::{
@@ -57,17 +62,64 @@ pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<D
         snapshot
             .external_outbounds
             .iter()
-            .map(|outbound| format!("{}/{}", outbound.app, outbound.id)),
+            .map(|outbound| outbound.id.as_str()),
         "external-outbound.dup",
         "ModelSnapshot.external_outbounds",
         diagnostics,
     );
-    for outbound in &snapshot.external_outbounds {
-        if !snapshot.apps.iter().any(|app| app.id == outbound.app) {
+    unique_by(
+        snapshot
+            .node_egress_dns
+            .iter()
+            .map(|policy| format!("{}:{}", policy.node, policy.position)),
+        "dns.position-dup",
+        "ModelSnapshot.node_egress_dns",
+        diagnostics,
+    );
+    unique_by(
+        snapshot.node_egress_dns.iter().map(|policy| {
+            let selector = policy
+                .selector
+                .canonical_egress_dns_selector()
+                .unwrap_or_else(|| policy.selector.clone());
+            format!(
+                "{}:{}",
+                policy.node,
+                serde_json::to_string(&selector).unwrap_or_default()
+            )
+        }),
+        "dns.selector-dup",
+        "ModelSnapshot.node_egress_dns",
+        diagnostics,
+    );
+    for policy in &snapshot.node_egress_dns {
+        let path = format!("{}/{}", policy.node, policy.position);
+        if !snapshot.nodes.iter().any(|node| node.id == policy.node) {
             diagnostics.push(Diagnostic::error(
-                "external-outbound.unknown-app",
-                format!("{}/{}", outbound.app, outbound.id),
-                format!("外部出站 {} 指向不存在的项目 {}", outbound.id, outbound.app),
+                "dns.node-missing",
+                &path,
+                format!("DNS 策略引用了不存在的机器 {}", policy.node),
+            ));
+        }
+        if policy.selector.canonical_egress_dns_selector().is_none() {
+            diagnostics.push(Diagnostic::error(
+                "dns.selector-unsupported",
+                &path,
+                "DNS 策略只支持域名后缀、域名关键词、域名正则和 Geosite",
+            ));
+        }
+        if policy.resolution.address.trim().parse::<IpAddr>().is_err() {
+            diagnostics.push(Diagnostic::error(
+                "dns.address",
+                &path,
+                "DNS 策略地址必须是 IPv4 或 IPv6 字面量，不能填写域名",
+            ));
+        }
+        if policy.resolution.port == 0 {
+            diagnostics.push(Diagnostic::error(
+                "dns.port",
+                &path,
+                "DNS 策略端口必须在 1–65535 之间",
             ));
         }
     }
@@ -127,12 +179,26 @@ fn validate_reality_client_version(
 ) -> Option<(u64, u64, u64)> {
     let value = value?;
     match parse_semver3(value) {
-        Some(version) => Some(version),
+        Some(version)
+            if [version.0, version.1, version.2]
+                .into_iter()
+                .all(|part| part <= 255) =>
+        {
+            Some(version)
+        }
         None => {
             diagnostics.push(Diagnostic::error(
                 "reality.client-ver",
                 location,
                 format!("版本「{value}」不符合 x.y.z 格式"),
+            ));
+            None
+        }
+        Some(_) => {
+            diagnostics.push(Diagnostic::error(
+                "reality.client-ver",
+                location,
+                format!("版本「{value}」的每一段必须在 0–255 之间"),
             ));
             None
         }
@@ -266,9 +332,8 @@ pub fn validate_app(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnosti
 }
 
 fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
-    let app_name = app.app_id.as_deref().unwrap_or("?");
     for outbound in &app.external_outbounds {
-        let at = format!("{app_name}/{}", outbound.id);
+        let at = format!("{}/{}", outbound.tenant, outbound.id);
         validate_slug(&outbound.id, at.clone(), diagnostics);
         if outbound.name.trim().is_empty() {
             diagnostics.push(Diagnostic::error(
@@ -467,6 +532,157 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     ));
                 }
             }
+            ExternalOutboundProtocol::Warp {
+                mtu,
+                allowed_ips,
+                domain_strategy,
+                workers,
+                ..
+            } => {
+                if !(576..=9000).contains(mtu) {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.warp-mtu",
+                        &at,
+                        "WARP MTU 必须在 576–9000 之间；Cloudflare 默认使用 1280",
+                    ));
+                }
+                if allowed_ips.is_empty()
+                    || allowed_ips
+                        .iter()
+                        .any(|network| network.parse::<IpNet>().is_err())
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.warp-allowed-ips",
+                        &at,
+                        "WARP Allowed IPs 至少填写一个合法 CIDR",
+                    ));
+                }
+                if !matches!(
+                    domain_strategy.as_str(),
+                    "ForceIP" | "ForceIPv4" | "ForceIPv6" | "ForceIPv4v6" | "ForceIPv6v4"
+                ) {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.warp-domain-strategy",
+                        &at,
+                        "WARP 域名策略不是 Xray 支持的 ForceIP 系列取值",
+                    ));
+                }
+                if *workers > EXTERNAL_WIREGUARD_MAX_WORKERS {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.warp-workers",
+                        &at,
+                        format!(
+                            "WARP Workers 必须在 0–{EXTERNAL_WIREGUARD_MAX_WORKERS} 之间；0 表示自动"
+                        ),
+                    ));
+                }
+
+                let mut nodes = BTreeSet::new();
+                for binding in &outbound.bindings {
+                    let binding_at = format!("{at}/{}", binding.node);
+                    if !nodes.insert(binding.node.as_str()) {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-duplicate-binding",
+                            &binding_at,
+                            "同一条 WARP 隧道在一台机器上只能有一个设备身份",
+                        ));
+                    }
+                    if !wireguard_key_is_valid(&binding.private_key)
+                        || !wireguard_key_is_valid(&binding.peer_public_key)
+                    {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-key",
+                            &binding_at,
+                            "WARP 注册返回的 WireGuard 密钥不是 Base64 编码的 32 字节密钥",
+                        ));
+                    }
+                    if binding.local_addresses.is_empty()
+                        || binding
+                            .local_addresses
+                            .iter()
+                            .any(|address| address.parse::<IpNet>().is_err())
+                    {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-addresses",
+                            &binding_at,
+                            "WARP 设备至少需要一个合法的隧道 CIDR",
+                        ));
+                    }
+                    if !binding.reserved.is_empty() && binding.reserved.len() != 3 {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-reserved",
+                            &binding_at,
+                            "WARP client_id 必须为空或恰好解码为 3 个 reserved 字节",
+                        ));
+                    }
+                    if binding.endpoint_address.as_deref().is_some_and(|address| {
+                        address.trim().is_empty() || address.chars().any(char::is_whitespace)
+                    }) {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-endpoint-address",
+                            &binding_at,
+                            "WARP 机器 Endpoint 地址不能为空或含空白；不覆盖时应省略该字段",
+                        ));
+                    }
+                    if binding.endpoint_port == Some(0) {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-endpoint-port",
+                            &binding_at,
+                            "WARP 机器 Endpoint 端口必须在 1–65535 之间",
+                        ));
+                    }
+                    if binding.mtu.is_some_and(|mtu| !(576..=9000).contains(&mtu)) {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-binding-mtu",
+                            &binding_at,
+                            "WARP 机器 MTU 必须在 576–9000 之间",
+                        ));
+                    }
+                    if binding.allowed_ips.is_some() != binding.domain_strategy.is_some() {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-binding-address-policy",
+                            &binding_at,
+                            "WARP 机器地址策略必须同时覆盖 Allowed IPs 与域名策略",
+                        ));
+                    }
+                    if binding.allowed_ips.as_ref().is_some_and(|networks| {
+                        networks.is_empty()
+                            || networks
+                                .iter()
+                                .any(|network| network.parse::<IpNet>().is_err())
+                    }) {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-binding-allowed-ips",
+                            &binding_at,
+                            "WARP 机器 Allowed IPs 至少需要一个合法 CIDR",
+                        ));
+                    }
+                    if binding.domain_strategy.as_deref().is_some_and(|strategy| {
+                        !matches!(
+                            strategy,
+                            "ForceIP" | "ForceIPv4" | "ForceIPv6" | "ForceIPv4v6" | "ForceIPv6v4"
+                        )
+                    }) {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-binding-domain-strategy",
+                            &binding_at,
+                            "WARP 机器域名策略不是 Xray 支持的 ForceIP 系列取值",
+                        ));
+                    }
+                    if binding
+                        .workers
+                        .is_some_and(|workers| workers > EXTERNAL_WIREGUARD_MAX_WORKERS)
+                    {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.warp-binding-workers",
+                            &binding_at,
+                            format!(
+                                "WARP 机器 Workers 必须在 0–{EXTERNAL_WIREGUARD_MAX_WORKERS} 之间；0 表示自动"
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         match &outbound.security {
             ExternalOutboundSecurity::None
@@ -495,6 +711,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     &outbound.protocol,
                     ExternalOutboundProtocol::Socks5 { .. }
                         | ExternalOutboundProtocol::Wireguard { .. }
+                        | ExternalOutboundProtocol::Warp { .. }
                 ) =>
             {
                 diagnostics.push(Diagnostic::error(
@@ -537,19 +754,14 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 short_id,
                 fingerprint,
             } => {
-                if server_name.trim().is_empty()
-                    || public_key.trim().is_empty()
-                    || fingerprint.trim().is_empty()
-                    || short_id.is_empty()
-                    || short_id.len() > 16
-                    || !short_id.chars().all(|c| c.is_ascii_hexdigit())
-                {
-                    diagnostics.push(Diagnostic::error(
-                        "external-outbound.reality",
-                        &at,
-                        "REALITY 的 SNI、公钥、指纹不能为空，short id 必须为 1–16 位十六进制",
-                    ));
-                }
+                validate_external_reality(
+                    server_name,
+                    public_key,
+                    short_id,
+                    fingerprint,
+                    &at,
+                    diagnostics,
+                );
             }
             _ => {}
         }
@@ -577,6 +789,21 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 ));
                 continue;
             };
+            if matches!(target.protocol, ExternalOutboundProtocol::Warp { .. })
+                && !target
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.node == step.node)
+            {
+                diagnostics.push(Diagnostic::error(
+                    "rule.warp-unbound-node",
+                    format!("{}/{}", step.chain, step.node),
+                    format!(
+                        "规则使用 WARP 隧道 {}，但机器 {} 还没有独立的 WARP 设备身份",
+                        target.name, step.node
+                    ),
+                ));
+            }
             if chain_tenant.is_some_and(|tenant| !under(tenant, &target.tenant)) {
                 diagnostics.push(Diagnostic::error(
                     "tenant.scope",
@@ -691,22 +918,53 @@ fn validate_external_xhttp_download(
             short_id,
             fingerprint,
         } => {
-            if server_name.trim().is_empty()
-                || public_key.trim().is_empty()
-                || fingerprint.trim().is_empty()
-                || short_id.is_empty()
-                || short_id.len() > 16
-                || !short_id
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit())
-            {
-                diagnostics.push(Diagnostic::error(
-                    "external-outbound.xhttp-download-reality",
-                    at,
-                    "XHTTP 独立下载 REALITY 的 SNI、公钥、指纹不能为空，short id 必须为 1–16 位十六进制",
-                ));
-            }
+            validate_external_reality(
+                server_name,
+                public_key,
+                short_id,
+                fingerprint,
+                at,
+                diagnostics,
+            );
         }
+    }
+}
+
+fn validate_external_reality(
+    server_name: &str,
+    public_key: &str,
+    short_id: &str,
+    fingerprint: &str,
+    at: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_reality_server_name(server_name.trim()) {
+        diagnostics.push(Diagnostic::error(
+            "reality.server-name",
+            at,
+            "REALITY 的 SNI 不能为空，且不能包含端口、空白或通配符",
+        ));
+    }
+    if !is_reality_public_key(public_key.trim()) {
+        diagnostics.push(Diagnostic::error(
+            "reality.public-key-length",
+            at,
+            "REALITY 公钥必须是 base64url（无填充）编码的 32 字节 X25519 公钥",
+        ));
+    }
+    if !is_reality_short_id(short_id.trim()) {
+        diagnostics.push(Diagnostic::error(
+            "reality.short-id-hex",
+            at,
+            "REALITY short id 必须是 2–16 位、偶数长度的十六进制字符串",
+        ));
+    }
+    if !is_reality_fingerprint(fingerprint.trim()) {
+        diagnostics.push(Diagnostic::error(
+            "reality.fingerprint-unsupported",
+            at,
+            "REALITY 指纹不受当前 Xray 版本支持，且不能使用 unsafe 或 hellogolang",
+        ));
     }
 }
 
@@ -951,9 +1209,73 @@ fn validate_app_set_labels(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
+#[derive(Clone)]
+struct RuleDnsUse {
+    identity: String,
+    scope: String,
+    chain: String,
+    summary: String,
+}
+
+fn display_resource(name: &str, id: &str) -> String {
+    if name == id {
+        id.to_owned()
+    } else {
+        format!("{name}（{id}）")
+    }
+}
+
+fn rule_dns_summary(
+    send_through: Option<IpAddr>,
+    resolution: Option<&EgressDnsResolution>,
+) -> String {
+    let Some(resolution) = resolution else {
+        return "默认 DNS 解析".to_owned();
+    };
+    let address = resolution.address.trim();
+    let endpoint = match address.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{address}]:{}", resolution.port),
+        _ => format!("{address}:{}", resolution.port),
+    };
+    let transport = match resolution.transport {
+        EgressDnsTransport::Tcp => "TCP",
+        EgressDnsTransport::Udp => "UDP",
+    };
+    let strategy = match resolution.address_strategy {
+        EgressDnsAddressStrategy::UseIp => "UseIP",
+        EgressDnsAddressStrategy::UseIpv4 => "UseIPv4",
+        EgressDnsAddressStrategy::UseIpv6 => "UseIPv6",
+        EgressDnsAddressStrategy::UseIpv4v6 => "UseIPv4v6",
+        EgressDnsAddressStrategy::UseIpv6v4 => "UseIPv6v4",
+    };
+    let fallback = match resolution.fallback {
+        EgressDnsFallback::Stop => "停止连接",
+        EgressDnsFallback::Machine => "回退机器 DNS",
+    };
+    let source = send_through.map_or_else(String::new, |address| format!(" / 源地址 {address}"));
+    format!("{endpoint} / {transport} / {strategy} / {fallback}{source}")
+}
+
+fn app_egress_dns_resolution<'a>(
+    app: &'a AppIr,
+    node_id: &str,
+    dest_match: &DestMatch,
+) -> Option<&'a EgressDnsResolution> {
+    let selector = dest_match.canonical_egress_dns_selector()?;
+    app.nodes
+        .iter()
+        .find(|node| node.id == node_id)?
+        .egress_dns
+        .iter()
+        .find(|policy| policy.selector.canonical_egress_dns_selector().as_ref() == Some(&selector))
+        .map(|policy| &policy.resolution)
+}
+
 fn validate_app_set_dns(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
     let mut dns_by_node = BTreeMap::<String, (Dns, DomainStrategy)>::new();
     let mut egress_by_node = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut rule_dns = BTreeMap::<(String, String), RuleDnsUse>::new();
+    let mut first_rule_by_scope = BTreeSet::<(String, String, String)>::new();
 
     for app in apps {
         for node in &app.nodes {
@@ -963,11 +1285,101 @@ fn validate_app_set_dns(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
         }
         for step in &app.steps {
             for rule in &step.rules {
-                if let Action::Egress { send_through } = rule.action {
+                if let Action::Egress { send_through, dns } = &rule.action {
                     egress_by_node
                         .entry(step.node.clone())
                         .or_default()
                         .insert(egress_tag(send_through.as_ref()));
+
+                    if let Some(domains) = rule_dns_domains(&rule.dest_match) {
+                        let resolution = dns
+                            .then(|| app_egress_dns_resolution(app, &step.node, &rule.dest_match))
+                            .flatten();
+                        if *dns && resolution.is_none() {
+                            diagnostics.push(Diagnostic::error(
+                                "dns.reference-missing",
+                                format!("{}/{}", step.chain, step.node),
+                                format!(
+                                    "规则引用了机器 DNS 策略，但 {} 上没有与该域名条件完全相同的策略；请先创建策略或取消引用",
+                                    step.node
+                                ),
+                            ));
+                        }
+                        let identity = resolution.as_ref().map_or_else(
+                            || "machine".to_owned(),
+                            |resolution| {
+                                format!(
+                                    "custom:{}:{}",
+                                    send_through
+                                        .map(|address| address.to_string())
+                                        .unwrap_or_default(),
+                                    serde_json::to_string(resolution).unwrap_or_default()
+                                )
+                            },
+                        );
+                        let chain = app
+                            .chains
+                            .iter()
+                            .find(|chain| chain.id == step.chain)
+                            .map_or_else(
+                                || step.chain.clone(),
+                                |chain| display_resource(&chain.name, &chain.id),
+                            );
+                        let node = app
+                            .nodes
+                            .iter()
+                            .find(|node| node.id == step.node)
+                            .map_or_else(
+                                || step.node.clone(),
+                                |node| display_resource(&node.name, &node.id),
+                            );
+                        let usage = RuleDnsUse {
+                            identity,
+                            scope: format!(
+                                "{}/{}",
+                                app.app_id.as_deref().unwrap_or_default(),
+                                step.chain
+                            ),
+                            chain,
+                            summary: rule_dns_summary(*send_through, resolution),
+                        };
+                        for domain in domains {
+                            if !first_rule_by_scope.insert((
+                                usage.scope.clone(),
+                                step.node.clone(),
+                                domain.clone(),
+                            )) {
+                                continue;
+                            }
+                            let key = (step.node.clone(), domain.clone());
+                            if let Some(previous) = rule_dns.get(&key) {
+                                // Overlapping selectors in one chain are ordered rules: the first
+                                // match wins, so a later machine policy may still usefully cover
+                                // its remaining domains. Across chains there is no single shared
+                                // order, and one Xray DNS instance cannot honor two resolutions.
+                                if previous.scope != usage.scope
+                                    && previous.identity != usage.identity
+                                {
+                                    diagnostics.push(Diagnostic::error(
+                                        "dns.rule-conflict",
+                                        format!("{}/{}", step.node, domain),
+                                        format!(
+                                            "{node}上的 {domain} DNS 配置冲突：线路「{}」使用 {}；线路「{}」使用 {}。Xray 的 DNS 匹配在机器内全局生效，出站引用只决定策略是否下发，不能隔离同一域名的解析上下文；请统一这两条规则",
+                                            previous.chain, previous.summary, usage.chain, usage.summary
+                                        ),
+                                    ));
+                                }
+                            } else {
+                                rule_dns.insert(key, usage.clone());
+                            }
+                        }
+                    } else if *dns {
+                        diagnostics.push(Diagnostic::error(
+                            "dns.reference-selector",
+                            format!("{}/{}", step.chain, step.node),
+                            "机器 DNS 策略只能由域名后缀、域名关键词、域名正则或 Geosite 的落地规则引用",
+                        ));
+                    }
                 }
             }
         }
@@ -1010,6 +1422,26 @@ fn validate_app_set_dns(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
                 format!("{node_id} 内建 DNS 的出网口不唯一，共 {count} 个"),
             )),
         }
+    }
+}
+
+fn rule_dns_domains(dest_match: &DestMatch) -> Option<Vec<String>> {
+    match dest_match {
+        DestMatch::DomainSuffix(values) => Some(
+            values
+                .iter()
+                .map(|value| format!("domain:{value}"))
+                .collect(),
+        ),
+        DestMatch::DomainKeyword(values) => Some(values.clone()),
+        DestMatch::DomainRegex(value) => Some(vec![format!("regexp:{value}")]),
+        DestMatch::Geosite(values) => Some(
+            values
+                .iter()
+                .map(|value| format!("geosite:{value}"))
+                .collect(),
+        ),
+        _ => None,
     }
 }
 
@@ -1903,22 +2335,39 @@ fn validate_ingress_stream(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress)
         ));
     }
 
-    // Refused rather than clamped, on the same reasoning as a relay hop's pool: a value silently
-    // changed reads back as something the operator did not choose.
-    if let Some(mux) = xhttp.mux {
-        if !(Xhttp::MUX_MIN..=Xhttp::MUX_MAX).contains(&mux) {
+    // A custom XMUX policy is one complete unit. Xray changes every omitted lifecycle field to
+    // unlimited as soon as any XMUX field is present, so validating only maxConcurrency would
+    // preserve the exact hidden side effect this model is meant to remove.
+    if let Some(xmux) = &xhttp.xmux {
+        if !(XhttpXmux::CONCURRENCY_MIN..=XhttpXmux::CONCURRENCY_MAX)
+            .contains(&xmux.max_concurrency)
+        {
             diagnostics.push(Diagnostic::error(
-                "ingress.xhttp-mux-range",
+                "ingress.xhttp-xmux-concurrency",
                 &ingress.id,
                 format!(
-                    "接入面 {} 的并发数 {mux} 超出 {}–{} 的范围。1 表示连接池（一条连接同时只承载一条流，空闲后复用），\
-                     留空不表示关闭复用，而是所有流共用一条连接",
+                    "接入面 {} 的 XMUX 最大并发 {} 超出 {}–{} 的范围",
                     ingress.id,
-                    Xhttp::MUX_MIN,
-                    Xhttp::MUX_MAX
+                    xmux.max_concurrency,
+                    XhttpXmux::CONCURRENCY_MIN,
+                    XhttpXmux::CONCURRENCY_MAX
                 ),
             ));
         }
+        validate_xhttp_xmux_range(
+            diagnostics,
+            &ingress.id,
+            "ingress.xhttp-xmux-request-times",
+            "最大请求次数",
+            &xmux.h_max_request_times,
+        );
+        validate_xhttp_xmux_range(
+            diagnostics,
+            &ingress.id,
+            "ingress.xhttp-xmux-reusable-secs",
+            "最大复用时长",
+            &xmux.h_max_reusable_secs,
+        );
     }
 
     if xhttp
@@ -2002,6 +2451,27 @@ fn validate_ingress_stream(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress)
                  未设置该项的客户端会自行选择上行模式——在 REALITY 下会使用 stream-one 并被拒绝；\
                  修改前已下发的订阅需要重新获取",
                 ingress.id
+            ),
+        ));
+    }
+}
+
+fn validate_xhttp_xmux_range(
+    diagnostics: &mut Vec<Diagnostic>,
+    at: &str,
+    code: &'static str,
+    label: &str,
+    range: &XhttpXmuxRange,
+) {
+    if range.from == 0 || range.from > range.to || range.to > XhttpXmux::VALUE_MAX {
+        diagnostics.push(Diagnostic::error(
+            code,
+            at,
+            format!(
+                "XMUX {label}范围 {}–{} 无效：下限必须至少为 1、不能大于上限，且上限不能超过 {}",
+                range.from,
+                range.to,
+                XhttpXmux::VALUE_MAX
             ),
         ));
     }
@@ -2188,7 +2658,7 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
         // and not one ingress under that group connects. A warning rather than an error —
         // the most common cause is a member machine being decommissioned, where the
         // decommissioning should still ship, just not silently.
-        if front.via.is_empty() && has_downstream(app, &front.id) {
+        if front.via.is_empty() && front.external_via.is_empty() && has_downstream(app, &front.id) {
             diagnostics.push(Diagnostic::warn(
                 "front.no-via",
                 &front.id,
@@ -2239,6 +2709,35 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                         ),
                     ));
                 }
+            }
+        }
+
+        for outbound_id in &front.external_via {
+            let Some(outbound) = app
+                .external_outbounds
+                .iter()
+                .find(|outbound| outbound.id == *outbound_id)
+            else {
+                diagnostics.push(Diagnostic::error(
+                    "front.unknown-external-via",
+                    &front.id,
+                    format!("前置组指向的隧道 {outbound_id} 不存在"),
+                ));
+                continue;
+            };
+            if outbound.tenant != front.tenant {
+                diagnostics.push(Diagnostic::error(
+                    "tenant.scope",
+                    format!("{}/{}", front.id, outbound.id),
+                    "前置组与订阅前置隧道必须属于同一租户",
+                ));
+            }
+            if matches!(outbound.protocol, ExternalOutboundProtocol::Warp { .. }) {
+                diagnostics.push(Diagnostic::error(
+                    "front.warp-machine-identity",
+                    format!("{}/{}", front.id, outbound.id),
+                    "WARP 身份按机器生成，没有可安全下发给用户的共享身份；请使用手工隧道作为 Clash 前置",
+                ));
             }
         }
     }
@@ -2372,11 +2871,30 @@ fn validate_reality(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     "server_names 不能为空",
                 ));
             }
-            if !is_host_port(&reality.dest) {
+            if !is_nonzero_host_port(&reality.dest) {
                 diagnostics.push(Diagnostic::error(
                     "reality.dest",
                     &ingress.id,
-                    format!("dest「{}」不符合 host:port 格式", reality.dest),
+                    format!(
+                        "dest「{}」必须使用 host:port，且端口为 1–65535",
+                        reality.dest
+                    ),
+                ));
+            }
+            for server_name in &reality.server_names {
+                if !is_reality_server_name(server_name) {
+                    diagnostics.push(Diagnostic::error(
+                        "reality.server-name",
+                        &ingress.id,
+                        format!("server_name「{server_name}」不能包含端口、空白或通配符"),
+                    ));
+                }
+            }
+            if !is_reality_fingerprint(&reality.fingerprint) {
+                diagnostics.push(Diagnostic::error(
+                    "reality.fingerprint-unsupported",
+                    &ingress.id,
+                    "REALITY 指纹不受当前 Xray 版本支持，且不能使用 unsafe 或 hellogolang",
                 ));
             }
         }
@@ -2392,14 +2910,11 @@ fn validate_reality(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             ));
         }
         for short_id in &ingress.identity.short_ids {
-            let ok = !short_id.is_empty()
-                && short_id.len() <= 16
-                && short_id.bytes().all(|byte| byte.is_ascii_hexdigit());
-            if !ok {
+            if !is_reality_short_id(short_id) {
                 diagnostics.push(Diagnostic::error(
                     "reality.short-id",
                     &ingress.id,
-                    format!("short_id「{short_id}」不是长度不超过 16 的十六进制字符串"),
+                    format!("short_id「{short_id}」必须是 2–16 位、偶数长度的十六进制字符串"),
                 ));
             }
         }
@@ -2828,11 +3343,4 @@ fn ip_match(host: &str, values: &[String]) -> MatchVerdict {
     }
 
     MatchVerdict::Miss
-}
-
-fn is_host_port(value: &str) -> bool {
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
-    };
-    !host.is_empty() && port.parse::<u16>().is_ok()
 }

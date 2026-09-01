@@ -6,15 +6,15 @@ use crate::artifacts::{
     grants::{GrantClient, GrantSyncBatch},
     phantun::{PhantunArtifact, PhantunConfig},
     xray::{
-        XrayArtifact, XrayConfig, XrayHopInboundWire, XrayHopOutboundWire, XrayInbound,
-        XrayIngressSecurity, XrayMatchCondition, XrayMux, XrayOutbound, XrayPolicy,
+        XrayArtifact, XrayConfig, XrayDnsServer, XrayHopInboundWire, XrayHopOutboundWire,
+        XrayInbound, XrayIngressSecurity, XrayMatchCondition, XrayMux, XrayOutbound, XrayPolicy,
         XrayRoutingRule, XrayStream,
     },
 };
 use crate::model::{
     ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttp,
     ExternalVlessXhttpDownload, HysteriaBbrProfile, HysteriaCongestion, HysteriaMasquerade,
-    HysteriaObfs,
+    HysteriaObfs, XhttpXmux, XhttpXmuxRange,
 };
 
 pub fn xray(artifact: &XrayArtifact) -> String {
@@ -220,7 +220,35 @@ fn dns_config(config: &XrayConfig) -> Value {
     if let Some(tag) = &config.dns.tag {
         object.insert("tag".to_owned(), json!(tag));
     }
-    object.insert("servers".to_owned(), json!(config.dns.servers));
+    object.insert(
+        "servers".to_owned(),
+        Value::Array(
+            config
+                .dns
+                .servers
+                .iter()
+                .map(|server| match server {
+                    XrayDnsServer::Address(address) => json!(address),
+                    XrayDnsServer::Scoped {
+                        address,
+                        port,
+                        domains,
+                        query_strategy,
+                        tag,
+                        final_query,
+                    } => json!({
+                        "address": address,
+                        "port": port,
+                        "domains": domains,
+                        "queryStrategy": query_strategy,
+                        "skipFallback": true,
+                        "finalQuery": final_query,
+                        "tag": tag,
+                    }),
+                })
+                .collect(),
+        ),
+    );
     Value::Object(object)
 }
 
@@ -815,9 +843,12 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             port,
             protocol,
             security,
+            wireguard_workers,
         } => {
-            let supports_stream_settings =
-                !matches!(protocol, ExternalOutboundProtocol::Wireguard { .. });
+            let supports_stream_settings = !matches!(
+                protocol,
+                ExternalOutboundProtocol::Wireguard { .. } | ExternalOutboundProtocol::Warp { .. }
+            );
             let mut vless_transport = None;
             let (protocol_name, settings) = match protocol {
                 ExternalOutboundProtocol::Vless {
@@ -894,7 +925,16 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                             .unwrap()
                             .insert("reserved".to_owned(), json!(reserved));
                     }
+                    if *wireguard_workers != 0 {
+                        settings
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("workers".to_owned(), json!(wireguard_workers));
+                    }
                     ("wireguard", settings)
+                }
+                ExternalOutboundProtocol::Warp { .. } => {
+                    unreachable!("managed WARP must be lowered to WireGuard for its target node")
                 }
             };
             let stream_settings = match vless_transport {
@@ -1057,9 +1097,28 @@ fn external_xhttp_base(
         settings.insert("mode".to_owned(), json!(mode));
     }
     if let Some(mux) = mux {
-        settings.insert("xmux".to_owned(), json!({ "maxConcurrency": mux }));
+        settings.insert(
+            "xmux".to_owned(),
+            xhttp_xmux(&XhttpXmux::with_concurrency(mux)),
+        );
     }
     Value::Object(settings)
+}
+
+fn xhttp_xmux(xmux: &XhttpXmux) -> Value {
+    json!({
+        "maxConcurrency": xmux.max_concurrency,
+        "hMaxRequestTimes": xhttp_range(&xmux.h_max_request_times),
+        "hMaxReusableSecs": xhttp_range(&xmux.h_max_reusable_secs),
+    })
+}
+
+fn xhttp_range(range: &XhttpXmuxRange) -> Value {
+    if range.from == range.to {
+        json!(range.from)
+    } else {
+        json!(format!("{}-{}", range.from, range.to))
+    }
 }
 
 fn external_authenticated_proxy_settings(

@@ -1,5 +1,13 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import { fetchAuthState, fetchSessionWhoami, logoutAdmin } from './api';
+import { useQuery } from '@tanstack/react-query';
+import {
+  DEFAULT_BRANDING,
+  fetchAuthState,
+  fetchBranding,
+  fetchSessionWhoami,
+  logoutAdmin,
+  type BrandingSettings,
+} from './api';
 import { Login } from './ui/login';
 import { Topbar, openTab, visibleTabs } from './ui/topbar';
 import { WinLayer, useWm } from './ui/windows';
@@ -40,6 +48,8 @@ async function restorePublic() {
 }
 
 export function App() {
+  const brandingQuery = useQuery({ queryKey: ['branding'], queryFn: fetchBranding, retry: false });
+  const branding = brandingQuery.data ?? DEFAULT_BRANDING;
   /* 浏览器会话依赖 HttpOnly cookie；内存中只保存 whoami，用于菜单和权限提示。 */
   const [session, setSession] = useState<Session | null>(null);
   // 刷新后先用 cookie 恢复会话：恢复完成前渲染空白占位，避免短暂显示登录页。
@@ -53,12 +63,16 @@ export function App() {
       .finally(() => setRestoring(false));
   }, []);
 
+  useEffect(() => {
+    document.title = `${branding.site_name} · console`;
+  }, [branding.site_name]);
+
   if (restoring) return <div id="stage" />;
   if (!session)
     return (
       <>
         <div id="stage" />
-        <Login onLogin={setSession} />
+        <Login branding={branding} onLogin={setSession} />
       </>
     );
 
@@ -82,18 +96,26 @@ export function App() {
   return (
     <SessionProvider value={session}>
       {SHELL === 'forge' ? (
-        <ForgeShell session={session} onLogout={onLogout} />
+        <ForgeShell branding={branding} session={session} onLogout={onLogout} />
       ) : (
         <>
           <div id="stage" />
-          <Workbench session={session} onLogout={onLogout} />
+          <Workbench branding={branding} session={session} onLogout={onLogout} />
         </>
       )}
     </SessionProvider>
   );
 }
 
-function Workbench({ session, onLogout }: { session: Session; onLogout: () => void }) {
+function Workbench({
+  branding,
+  session,
+  onLogout,
+}: {
+  branding: BrandingSettings;
+  session: Session;
+  onLogout: () => void;
+}) {
   useEffect(() => {
     wm.init(session.who.operator_id);
     const first = visibleTabs(session.who.role)[0];
@@ -110,7 +132,7 @@ function Workbench({ session, onLogout }: { session: Session; onLogout: () => vo
 
   return (
     <>
-      <Topbar who={session.who} onLogout={onLogout} />
+      <Topbar branding={branding} who={session.who} onLogout={onLogout} />
       {snap.floor === 'topo' && <TopoCanvas />}
       <WinLayer render={win => <Pane win={win} />} />
       <ArtifactPanel />

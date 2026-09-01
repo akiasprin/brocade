@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    convert::Infallible,
     env,
     net::IpAddr,
     sync::{
@@ -10,12 +11,14 @@ use std::{
 };
 
 use tokio::sync::Notify;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
+    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -23,6 +26,7 @@ use axum::{
 use brocade_core::{
     hash::{hex_lower, sha256_hex},
     model::{IpFamily, ModelSettings},
+    physical::user::{SubscriptionFilter, SubscriptionProtocol},
 };
 use brocade_deployment::plan::DeploymentKind;
 use brocade_deployment::protocol::{
@@ -30,24 +34,27 @@ use brocade_deployment::protocol::{
     TargetConvergenceReport, UsageReportRequest,
 };
 use brocade_store::{
-    AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentRelease, AuthenticatedAdmin,
-    AuthenticatedNode, BinarySource, ChangeAdminPasswordRequest, CreateAdminOperatorRequest,
-    CreateAppRequest, CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest,
-    CreateGrantRequest, CreateIngressRequest, CreateRollbackRequest, CreateTenantRequest,
-    CreateUserRequest, DistributionSettings, E2eProbeRequest, LinkHealthRequest, LinkProbeRequest,
-    LoadReportRequest, ModelOp, PgStore, PhantunBinaries, ProvisionNodeRequest,
-    ProvisionNodeResult, ProvisionedNode, PutStepRequest, SetUserAppQuotaRequest, StoreError,
-    UpdateNodeRequest, UpdateNodeStatusRequest, UpdateUserStatusRequest, VerifyDeploymentRequest,
-    PUBLIC_OPERATOR_ID,
+    AbandonNodeRequest, AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentRelease,
+    AuthenticatedAdmin, AuthenticatedNode, BinarySource, BrandingSettings,
+    ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest,
+    CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
+    CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DistributionSettings,
+    E2eProbeRequest, LinkHealthRequest, LinkProbeRequest, LoadReportRequest, ModelOp,
+    NodeLifecyclePhase, PgStore, PhantunBinaries, ProvisionNodeRequest, ProvisionNodeResult,
+    ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest, SetUserAppQuotaRequest,
+    StoreError, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    UpdateNodeStatusRequest, UpdateUserStatusRequest, UpdateWarpBindingRequest,
+    VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower_http::services::ServeDir;
 
 const ADMIN_SESSION_COOKIE: &str = "brocade_session";
 const ROUTE_IPV4_HEADER: &str = "x-brocade-route-ipv4";
 const ROUTE_IPV6_HEADER: &str = "x-brocade-route-ipv6";
+const AGENT_LOG_MAX_MIB_HEADER: &str = "x-brocade-log-max-mib";
 /// Which architecture the asking agent was built for, in `uname -m`'s vocabulary. Only the node
 /// knows this, and the control plane has no other source for it: enrolment records no
 /// architecture, and an incorrect guess would hand a machine a binary that installs, verifies,
@@ -201,6 +208,9 @@ pub struct AppState {
     // convenience: an operator who has just corrected a wrong DNS token should not have to wait
     // out the retry floor to see whether it now works.
     cert_wake: Arc<Notify>,
+    // On-demand authorization verification. Jobs and their latest results are intentionally
+    // process-local: this is an operator action, not durable health telemetry.
+    grant_probes: crate::grant_probe::GrantProbeService,
 }
 
 #[derive(Clone, Copy)]
@@ -295,6 +305,7 @@ impl AppState {
             // console built without the worker (the tests, brocade-preview) still answers the
             // route instead of failing to construct.
             cert_wake: Arc::new(Notify::new()),
+            grant_probes: crate::grant_probe::GrantProbeService::from_env(),
             dist: AgentDistribution {
                 agent_public_url,
                 agent_binary_url: env::var("BROCADE_AGENT_BIN_URL")
@@ -519,6 +530,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
     const PUBLIC_PATHS: &[&str] = &[
         "/healthz",
         "/auth/state",
+        "/branding",
         "/whoami",
         "/model/snapshot",
         "/nodes/agent-state",
@@ -540,6 +552,20 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         // two cannot be written as exact strings.
         || path.starts_with("/compile/")
         || path.starts_with("/load/nodes/")
+        // The response is the credential-free Serving authorization matrix. Executing it is a
+        // POST to the same path and remains closed by the method gate above.
+        || is_user_grant_probe_plan_path(path)
+}
+
+fn is_user_grant_probe_plan_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/users/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(tenant), Some(user), Some("grant-probes"), None) if !tenant.is_empty() && !user.is_empty()
+    )
 }
 
 /// Hold the `public` account to the pages it is meant to open.
@@ -566,6 +592,7 @@ async fn public_scope(request: Request, next: Next) -> Response {
 fn skips_admin_auth(method: &axum::http::Method, path: &str) -> bool {
     path == "/healthz"
         || path == "/auth/state"
+        || (method == axum::http::Method::GET && path == "/branding")
         || (method == axum::http::Method::POST
             && matches!(path, "/auth/init" | "/auth/login" | "/auth/logout"))
 }
@@ -633,6 +660,9 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
         .route("/whoami", get(whoami))
+        // Public read: the login page must know its name and mark before a session exists. Writes
+        // still require a system administrator in the handler below.
+        .route("/branding", get(get_branding).put(update_branding))
         .route("/settings", get(get_settings).put(update_settings))
         // Its own route rather than a section of /settings: writing this one creates no revision
         // and triggers no release, and sharing a handler would give one PUT two halves with
@@ -640,6 +670,16 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/distribution",
             get(get_distribution).put(update_distribution),
+        )
+        // Runtime disk-safety policy. Like distribution it compiles into no artifact and stamps
+        // no revision, but the consumer is a running agent rather than an install command.
+        .route(
+            "/agent-log-policy",
+            get(get_agent_log_policy).put(update_agent_log_default),
+        )
+        .route(
+            "/agent-log-policy/nodes/{node_id}",
+            put(update_node_log_policy),
         )
         // Alongside /distribution and for the same reason: no revision and no release. Separate
         // from it because the two are read on different schedules by different callers.
@@ -713,6 +753,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/nodes/provision", post(provision_node))
         .route("/nodes/{node_id}", put(update_node))
         .route("/nodes/{node_id}/status", put(update_node_status))
+        .route("/nodes/{node_id}/lifecycle/abandon", post(abandon_node))
         .route("/nodes/{node_id}/cert-group", put(set_node_cert_group))
         .route("/nodes/{node_id}/agent-token", post(issue_node_token))
         .route("/nodes/{node_id}/agent-token", delete(revoke_node_token))
@@ -726,18 +767,41 @@ fn admin_router_with_state(state: AppState) -> Router {
             get(clash_subscription_info),
         )
         .route(
+            "/users/{tenant_id}/{user_id}/clash-subscription/haitun",
+            post(issue_clash_haitun_subscription).delete(revoke_clash_haitun_subscription),
+        )
+        .route(
             "/users/{tenant_id}/{user_id}/status",
             put(update_user_status),
         )
+        .route(
+            "/users/{tenant_id}/{user_id}/grant-probes",
+            get(user_grant_probe_plan).post(start_user_grant_probe),
+        )
+        .route("/grant-probes/capability", get(grant_probe_capability))
+        .route(
+            "/grant-probes/{probe_id}",
+            get(grant_probe_status).delete(cancel_grant_probe),
+        )
+        .route("/grant-probes/{probe_id}/events", get(grant_probe_events))
         .route("/grants", post(upsert_grant))
+        .route("/grants/automation", get(grant_automation_status))
         .route("/quotas", get(list_user_app_quotas).put(set_user_app_quota))
         .route("/apps", post(upsert_app))
+        .route(
+            "/tenants/{tenant_id}/tunnels/{outbound_id}/warp-bindings",
+            post(register_warp_binding),
+        )
+        .route(
+            "/tenants/{tenant_id}/tunnels/{outbound_id}/warp-bindings/{node_id}",
+            put(update_warp_binding).delete(remove_warp_binding),
+        )
         .route("/apps/{app_id}/chains", post(upsert_chain))
         .route("/apps/{app_id}/fronts", post(upsert_front))
         .route("/apps/{app_id}/ingresses", post(upsert_ingress))
         .route(
             "/apps/{app_id}/chains/{chain_id}/steps/{node_id}",
-            put(put_step).delete(delete_step),
+            delete(delete_step),
         )
         .route("/apps/{app_id}/chains/{chain_id}/prune", post(prune_chain))
         .route(
@@ -827,6 +891,10 @@ fn agent_routes() -> Router<AppState> {
         .route("/enroll/dist", get(install_dist))
         .route("/brocade-agent/{arch}", get(agent_binary))
         .route("/sub/v1/{uuid}/clash.yaml", get(public_clash_subscription))
+        .route(
+            "/sub/v1/haitun/{token}/clash.yaml",
+            get(public_haitun_clash_subscription),
+        )
         .route("/agent/v1/enroll", post(agent_enroll))
         .route("/agent/v1/desired", get(agent_desired))
         .route("/agent/v1/observation", post(agent_observation))
@@ -868,23 +936,93 @@ async fn public_clash_subscription(
         return subscription_no_store(response);
     }
 
-    let family = match query.family.as_deref() {
-        None | Some("") | Some("both") => None,
-        Some("v4") => Some(IpFamily::V4),
-        Some("v6") => Some(IpFamily::V6),
-        Some(_) => return public_subscription_not_found(),
+    let Some(family) = public_subscription_family(&query) else {
+        return public_subscription_not_found();
+    };
+    let Some(protocol) = public_subscription_protocol(&query) else {
+        return public_subscription_not_found();
     };
 
     let subscription = match state
         .store
-        .clash_subscription_by_uuid_for_family(&uuid, family)
+        .clash_subscription_by_uuid_filtered(&uuid, SubscriptionFilter { family, protocol })
         .await
     {
         Ok(subscription) => subscription,
         Err(StoreError::NotFound(_)) => return public_subscription_not_found(),
+        Err(StoreError::Unavailable(_)) => return public_subscription_unavailable(),
         Err(error) => return subscription_no_store(ApiError::Store(error).into_response()),
     };
 
+    public_clash_subscription_response(subscription)
+}
+
+async fn public_haitun_clash_subscription(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Query(query): Query<PublicClashSubscriptionQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !looks_like_uuid(&token) {
+        return public_subscription_not_found();
+    }
+    if !subscription_rate_allowed(&state, &headers, &token) {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "too many requests" })),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        return subscription_no_store(response);
+    }
+    let Some(family) = public_subscription_family(&query) else {
+        return public_subscription_not_found();
+    };
+    let Some(protocol) = public_subscription_protocol(&query) else {
+        return public_subscription_not_found();
+    };
+    let subscription = match state
+        .store
+        .clash_subscription_by_haitun_token_filtered(
+            &token,
+            SubscriptionFilter { family, protocol },
+        )
+        .await
+    {
+        Ok(subscription) => subscription,
+        Err(StoreError::NotFound(_)) => return public_subscription_not_found(),
+        Err(StoreError::Unavailable(_)) => return public_subscription_unavailable(),
+        Err(error) => return subscription_no_store(ApiError::Store(error).into_response()),
+    };
+
+    public_clash_subscription_response(subscription)
+}
+
+fn public_subscription_family(query: &PublicClashSubscriptionQuery) -> Option<Option<IpFamily>> {
+    match query.family.as_deref() {
+        None | Some("") | Some("both") => Some(None),
+        Some("v4") => Some(Some(IpFamily::V4)),
+        Some("v6") => Some(Some(IpFamily::V6)),
+        Some(_) => None,
+    }
+}
+
+fn public_subscription_protocol(
+    query: &PublicClashSubscriptionQuery,
+) -> Option<Option<SubscriptionProtocol>> {
+    match query.protocol.as_deref() {
+        None | Some("") | Some("both") => Some(None),
+        Some("vless") => Some(Some(SubscriptionProtocol::Vless)),
+        Some("hysteria2") => Some(Some(SubscriptionProtocol::Hysteria2)),
+        Some(_) => None,
+    }
+}
+
+fn public_clash_subscription_response(
+    subscription: brocade_store::DynamicClashSubscription,
+) -> Response {
     let filename = safe_filename_slug(&subscription.user_id);
     let mut response = subscription.content.into_response();
     let response_headers = response.headers_mut();
@@ -920,6 +1058,7 @@ async fn public_clash_subscription(
 #[derive(Debug, Default, Deserialize)]
 struct PublicClashSubscriptionQuery {
     family: Option<String>,
+    protocol: Option<String>,
 }
 
 fn public_subscription_not_found() -> Response {
@@ -930,6 +1069,18 @@ fn public_subscription_not_found() -> Response {
         )
             .into_response(),
     )
+}
+
+fn public_subscription_unavailable() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "subscription temporarily unavailable" })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("15"));
+    subscription_no_store(response)
 }
 
 fn subscription_no_store(mut response: Response) -> Response {
@@ -1110,12 +1261,15 @@ struct RevisionQuery {
     revision: Option<u64>,
 }
 
-/// `GET /artifacts/content`'s query. `family` narrows a user subscription to one address family;
-/// absent means every family, which is what the fleet is served and what every other reader wants.
+/// `GET /artifacts/content`'s query. The optional fields narrow a user subscription by network
+/// family and/or protocol; absent dimensions retain their complete view.
 #[derive(Debug, Deserialize)]
 struct ArtifactContentQuery {
     revision: Option<u64>,
     family: Option<IpFamily>,
+    protocol: Option<SubscriptionProtocol>,
+    #[serde(default)]
+    serving: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1278,17 +1432,34 @@ async fn artifact_content(
     Query(query): Query<ArtifactContentQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
-    let result = state
-        .store
-        .artifact_content(
-            &admin,
-            query.revision,
-            &target_kind,
-            &target_id,
-            &artifact_kind,
-            query.family,
-        )
-        .await?;
+    let filter = SubscriptionFilter {
+        family: query.family,
+        protocol: query.protocol,
+    };
+    let result = if query.serving {
+        if target_kind != "user" || query.revision.is_some() {
+            return Err(StoreError::InvalidData(
+                "serving artifact must be a user artifact without an explicit revision".to_owned(),
+            )
+            .into());
+        }
+        state
+            .store
+            .serving_user_artifact_content(&admin, &target_id, &artifact_kind, filter)
+            .await?
+    } else {
+        state
+            .store
+            .artifact_content(
+                &admin,
+                query.revision,
+                &target_kind,
+                &target_id,
+                &artifact_kind,
+                filter,
+            )
+            .await?
+    };
     Ok(Json(result).into_response())
 }
 
@@ -1306,6 +1477,19 @@ async fn create_tenant(
     let admin = require_admin_context(&state, &headers, AdminPermission::ManageTenants).await?;
     let result = state.store.create_tenant(&admin, request).await?;
     Ok((StatusCode::CREATED, Json(result)).into_response())
+}
+
+async fn get_branding(State(state): State<AppState>) -> ApiResult<Response> {
+    Ok(Json(state.store.branding().await?).into_response())
+}
+
+async fn update_branding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<BrandingSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(state.store.update_branding(&admin, settings).await?).into_response())
 }
 
 async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
@@ -1360,6 +1544,41 @@ async fn update_distribution(
     // Read back rather than echo what was written: the store normalizes (a trailing slash goes,
     // blank clears), and the page has to show what took effect, not what was typed.
     Ok(Json(distribution_response(&state).await?).into_response())
+}
+
+async fn get_agent_log_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.agent_log_policy(&admin).await?).into_response())
+}
+
+async fn update_agent_log_default(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateAgentLogDefaultRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .update_agent_log_default(&admin, request)
+        .await?;
+    Ok(Json(state.store.agent_log_policy(&admin).await?).into_response())
+}
+
+async fn update_node_log_policy(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateNodeLogPolicyRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .update_node_log_policy(&admin, &node_id, request)
+        .await?;
+    Ok(Json(state.store.agent_log_policy(&admin).await?).into_response())
 }
 
 /// The recorded clearance, plus what this control plane is actually able to serve.
@@ -2182,16 +2401,26 @@ struct ClashSubscriptionInfoResponse {
     url: String,
     urls: ClashSubscriptionUrlsResponse,
     template: &'static str,
+    haitun: ClashHaitunSubscriptionInfoResponse,
     remaining_bytes: Option<u64>,
     reset_at: String,
     usage_has_gap: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ClashSubscriptionUrlsResponse {
     both: String,
     v4: String,
     v6: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ClashHaitunSubscriptionInfoResponse {
+    template: &'static str,
+    status: &'static str,
+    urls: Option<ClashSubscriptionUrlsResponse>,
+    created_at: Option<String>,
+    revoked_at: Option<String>,
 }
 
 async fn clash_subscription_info(
@@ -2210,20 +2439,109 @@ async fn clash_subscription_info(
         .store
         .clash_subscription_for_user(&admin, &tenant_id, &user_id)
         .await?;
+    let haitun = state
+        .store
+        .clash_haitun_link_for_user(&admin, &tenant_id, &user_id)
+        .await?;
     let url = format!("{origin}/sub/v1/{}/clash.yaml", subscription.uuid);
     Ok(Json(ClashSubscriptionInfoResponse {
         url: url.clone(),
-        urls: ClashSubscriptionUrlsResponse {
-            both: url.clone(),
-            v4: format!("{url}?family=v4"),
-            v6: format!("{url}?family=v6"),
-        },
+        urls: clash_subscription_urls(url),
         template: "SubBoost 标准版",
+        haitun: clash_haitun_subscription_info(origin, haitun.as_ref()),
         remaining_bytes: subscription.usage.remaining_bytes,
         reset_at: subscription.usage.reset_at,
         usage_has_gap: subscription.usage.has_gap,
     })
     .into_response())
+}
+
+async fn issue_clash_haitun_subscription(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let origin = state
+        .subscription_public_url
+        .as_deref()
+        .ok_or(ApiError::Unavailable(
+            "BROCADE_SUBSCRIPTION_PUBLIC_URL is not configured",
+        ))?;
+    // Do not mint a bearer that can only return 404. This performs the same serving-model and
+    // effective-entry checks as opening the normal Clash subscription.
+    state
+        .store
+        .clash_subscription_for_user(&admin, &tenant_id, &user_id)
+        .await?;
+    let link = state
+        .store
+        .issue_clash_haitun_link(&admin, &tenant_id, &user_id)
+        .await?;
+    Ok(Json(clash_haitun_subscription_info(origin, Some(&link))).into_response())
+}
+
+async fn revoke_clash_haitun_subscription(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let link = state
+        .store
+        .revoke_clash_haitun_link(&admin, &tenant_id, &user_id)
+        .await?;
+    // A revoked response has no URL, so this operation remains available even when the public
+    // subscription origin was removed from a broken deployment.
+    Ok(Json(ClashHaitunSubscriptionInfoResponse {
+        template: "koipy 测速",
+        status: "revoked",
+        urls: None,
+        created_at: Some(link.created_at),
+        revoked_at: link.revoked_at,
+    })
+    .into_response())
+}
+
+fn clash_subscription_urls(url: String) -> ClashSubscriptionUrlsResponse {
+    ClashSubscriptionUrlsResponse {
+        both: url.clone(),
+        v4: format!("{url}?family=v4"),
+        v6: format!("{url}?family=v6"),
+    }
+}
+
+fn clash_haitun_subscription_info(
+    origin: &str,
+    link: Option<&brocade_store::ClashHaitunLink>,
+) -> ClashHaitunSubscriptionInfoResponse {
+    let Some(link) = link else {
+        return ClashHaitunSubscriptionInfoResponse {
+            template: "koipy 测速",
+            status: "not-created",
+            urls: None,
+            created_at: None,
+            revoked_at: None,
+        };
+    };
+    if link.revoked_at.is_some() {
+        return ClashHaitunSubscriptionInfoResponse {
+            template: "koipy 测速",
+            status: "revoked",
+            urls: None,
+            created_at: Some(link.created_at.clone()),
+            revoked_at: link.revoked_at.clone(),
+        };
+    }
+
+    let url = format!("{origin}/sub/v1/haitun/{}/clash.yaml", link.token);
+    ClashHaitunSubscriptionInfoResponse {
+        template: "koipy 测速",
+        status: "active",
+        urls: Some(clash_subscription_urls(url)),
+        created_at: Some(link.created_at.clone()),
+        revoked_at: None,
+    }
 }
 
 /// Decommissioning and restoring a node. It requires system-admin, because whether a machine is
@@ -2239,6 +2557,25 @@ async fn update_node_status(
         .store
         .update_node_status(&admin, &node_id, request)
         .await?;
+    if result.lifecycle.phase == NodeLifecyclePhase::Retired {
+        cleanup_retired_warp_bindings(&state, &node_id).await;
+    }
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
+async fn abandon_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<AbandonNodeRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let unregister_warp = request.unregister_warp;
+    let result = state.store.abandon_node(&admin, &node_id, request).await?;
+    if unregister_warp {
+        cleanup_retired_warp_bindings(&state, &node_id).await;
+    }
     state.grants_wake.notify_one();
     Ok(Json(result).into_response())
 }
@@ -2258,6 +2595,191 @@ async fn update_user_status(
     Ok(Json(result).into_response())
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartGrantProbeRequest {
+    /// Empty means every effective Serving entry. A single-row action sends exactly one id; ids
+    /// are checked against the freshly projected plan and never interpreted as addresses.
+    #[serde(default)]
+    item_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StartGrantProbeResponse {
+    job: crate::grant_probe::ProbeJobSnapshot,
+    reused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct GrantProbePlanResponse {
+    serving_revision: u64,
+    serving_generation: u64,
+    items: Vec<GrantProbePlanItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct GrantProbePlanItemResponse {
+    id: String,
+    name: String,
+    app_id: String,
+    app_name: String,
+    chain_id: String,
+    ingress_id: String,
+    family: &'static str,
+    protocol: &'static str,
+}
+
+async fn user_grant_probe_plan(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    // This projection deliberately contains no endpoint, port or credential (the executable
+    // target remains server-side), so readonly reviewers may inspect the effective Serving
+    // matrix. POST below still requires ViewArtifacts because it actually uses those secrets.
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let plan = state
+        .store
+        .user_grant_probe_plan(&admin, &tenant_id, &user_id)
+        .await?;
+    Ok(Json(GrantProbePlanResponse {
+        serving_revision: plan.serving_revision,
+        serving_generation: plan.serving_generation,
+        items: plan
+            .items
+            .into_iter()
+            .map(|item| GrantProbePlanItemResponse {
+                id: item.id,
+                name: item.name,
+                app_id: item.app_id,
+                app_name: item.app_name,
+                chain_id: item.chain_id,
+                ingress_id: item.ingress_id,
+                family: item.family,
+                protocol: item.protocol,
+            })
+            .collect(),
+    })
+    .into_response())
+}
+
+async fn grant_probe_capability(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    Ok(Json(state.grant_probes.capability()).into_response())
+}
+
+async fn start_user_grant_probe(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<StartGrantProbeRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    // This call is the server-side publication gate. It reads the same frozen Serving projection
+    // as subscriptions and refuses open releases, queued grant sync, dirty runtime, and partial
+    // settlement. The browser's disabled button is only presentation and is never trusted.
+    let plan = state
+        .store
+        .user_grant_probe_plan(&admin, &tenant_id, &user_id)
+        .await?;
+    let (job, reused) = state
+        .grant_probes
+        .start_for_user(
+            state.store.clone(),
+            &tenant_id,
+            &user_id,
+            plan,
+            &request.item_ids,
+        )
+        .await?;
+    Ok((
+        if reused {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(StartGrantProbeResponse { job, reused }),
+    )
+        .into_response())
+}
+
+async fn grant_probe_status(
+    State(state): State<AppState>,
+    Path(probe_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    let job = state
+        .grant_probes
+        .snapshot_for(&probe_id)
+        .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
+    admin.require_tenant_access(&job.tenant_id, "grant probe")?;
+    Ok(Json(job).into_response())
+}
+
+async fn cancel_grant_probe(
+    State(state): State<AppState>,
+    Path(probe_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    let current = state
+        .grant_probes
+        .snapshot_for(&probe_id)
+        .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
+    admin.require_tenant_access(&current.tenant_id, "grant probe")?;
+    let job = state
+        .grant_probes
+        .cancel(&probe_id)
+        .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
+    Ok(Json(job).into_response())
+}
+
+async fn grant_probe_events(
+    State(state): State<AppState>,
+    Path(probe_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    let (initial, receiver) = state
+        .grant_probes
+        .subscribe(&probe_id)
+        .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
+    admin.require_tenant_access(&initial.tenant_id, "grant probe")?;
+    let first = tokio_stream::once(Ok::<Event, Infallible>(probe_sse_event(&initial)));
+    let updates = BroadcastStream::new(receiver).filter_map(|message| match message {
+        Ok(snapshot) => Some(Ok::<Event, Infallible>(probe_sse_event(&snapshot))),
+        // A lagged browser does not need every intermediate frame: each event is a complete
+        // snapshot, and the next one catches it up. A closed sender ends the stream naturally.
+        Err(_) => None,
+    });
+    let mut response = Sse::new(first.chain(updates))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response();
+    // This endpoint normally passes through nginx's generic location, whose response buffering
+    // is enabled. Without this header a complete snapshot can sit in the proxy buffer while the
+    // browser keeps displaying the running state forever. Polling in the browser is a fallback,
+    // not a reason to delay the event stream.
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    Ok(response)
+}
+
+fn probe_sse_event(snapshot: &crate::grant_probe::ProbeJobSnapshot) -> Event {
+    Event::default().event("snapshot").data(
+        serde_json::to_string(snapshot)
+            .unwrap_or_else(|_| r#"{"status":"failed","message":"结果无法编码"}"#.to_owned()),
+    )
+}
+
 async fn upsert_grant(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2267,6 +2789,14 @@ async fn upsert_grant(
     let result = state.store.upsert_grant(&admin, request).await?;
     state.grants_wake.notify_one();
     Ok(Json(result).into_response())
+}
+
+async fn grant_automation_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.grant_automation_status().await?).into_response())
 }
 
 async fn list_user_app_quotas(
@@ -2308,6 +2838,222 @@ async fn upsert_app(
     Ok(Json(result).into_response())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterWarpBindingHttpRequest {
+    node_id: String,
+    /// The compatible registration endpoint submits Cloudflare's application terms timestamp.
+    /// Requiring an explicit acknowledgement keeps an operator action distinct from merely
+    /// opening the drawer or previewing a draft.
+    accept_terms: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterWarpBindingHttpResponse {
+    revision_id: u64,
+    binding: Value,
+    /// What Cloudflare returned, for comparison with the editable endpoint on the tunnel. The
+    /// existing endpoint is never overwritten: changing it is ordinary model editing and remains
+    /// reviewable in a draft.
+    suggested_endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateWarpBindingHttpRequest {
+    /// NULL/absent means inherit the logical tunnel default for that field. `allowed_ips` and
+    /// `domain_strategy` are the two wire fields of one operator-facing address policy.
+    #[serde(default)]
+    endpoint_address: Option<String>,
+    #[serde(default)]
+    endpoint_port: Option<u16>,
+    #[serde(default)]
+    mtu: Option<u16>,
+    #[serde(default)]
+    keep_alive: Option<u16>,
+    #[serde(default)]
+    allowed_ips: Option<Vec<String>>,
+    #[serde(default)]
+    no_kernel_tun: Option<bool>,
+    #[serde(default)]
+    domain_strategy: Option<String>,
+    #[serde(default)]
+    workers: Option<u16>,
+}
+
+async fn register_warp_binding(
+    State(state): State<AppState>,
+    Path((tenant_id, outbound_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterWarpBindingHttpRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    if !request.accept_terms {
+        return Err(ApiError::Store(StoreError::InvalidData(
+            "申请 WARP 设备前需要确认 Cloudflare Application Terms，并知悉该 WireGuard 兼容注册接口不是官方 Brocade 集成"
+                .to_owned(),
+        )));
+    }
+    // Check this before contacting Cloudflare. Otherwise an absent sealing key creates a valid
+    // remote device whose only local copy cannot be committed.
+    if !brocade_store::secrets::sealing_available() {
+        return Err(ApiError::Store(StoreError::InvalidData(
+            "BROCADE_SECRET_KEY 未配置，不能安全保存 WARP 私钥和设备令牌".to_owned(),
+        )));
+    }
+
+    // The committed, actor-scoped snapshot is the preflight boundary. WARP cannot bind a tunnel
+    // which exists only in a browser draft: draft preview may be discarded, while the provider
+    // registration cannot be rolled back with that transaction.
+    let snapshot = state.store.redacted_snapshot(&admin, None).await?;
+    let tunnels = snapshot
+        .snapshot
+        .get("external_outbounds")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tunnel = tunnels
+        .iter()
+        .find(|tunnel| {
+            tunnel.get("tenant").and_then(Value::as_str) == Some(tenant_id.as_str())
+                && tunnel.get("id").and_then(Value::as_str) == Some(outbound_id.as_str())
+        })
+        .ok_or_else(|| {
+            ApiError::Store(StoreError::NotFound(format!(
+                "committed WARP tunnel {tenant_id}/{outbound_id} not found"
+            )))
+        })?;
+    if tunnel.pointer("/protocol/t").and_then(Value::as_str) != Some("warp") {
+        return Err(ApiError::Store(StoreError::InvalidData(format!(
+            "tunnel {tenant_id}/{outbound_id} is not Cloudflare WARP"
+        ))));
+    }
+    if tunnel
+        .get("bindings")
+        .and_then(Value::as_array)
+        .is_some_and(|bindings| {
+            bindings.iter().any(|binding| {
+                binding.get("node").and_then(Value::as_str) == Some(request.node_id.as_str())
+            })
+        })
+    {
+        return Err(ApiError::Store(StoreError::InvalidData(format!(
+            "WARP tunnel {tenant_id}/{outbound_id} is already bound to {}",
+            request.node_id
+        ))));
+    }
+    let node = snapshot
+        .snapshot
+        .get("nodes")
+        .and_then(Value::as_array)
+        .and_then(|nodes| {
+            nodes.iter().find(|node| {
+                node.get("id").and_then(Value::as_str) == Some(request.node_id.as_str())
+            })
+        })
+        .ok_or_else(|| {
+            ApiError::Store(StoreError::NotFound(format!(
+                "node {} not found or is outside your tenant scope",
+                request.node_id
+            )))
+        })?;
+    let node_name = node
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(&request.node_id);
+
+    let keys = brocade_store::generate_wireguard_keypair()?;
+    let registration = crate::warp::register(&keys.public_key, node_name)
+        .await
+        .map_err(ApiError::Provider)?;
+    let result = state
+        .store
+        .register_warp_binding(
+            &admin,
+            RegisterWarpBindingRequest {
+                outbound_id,
+                node_id: request.node_id,
+                device_id: registration.device_id,
+                account_id: registration.account_id,
+                access_token: registration.access_token,
+                private_key: keys.private_key,
+                peer_public_key: registration.peer_public_key,
+                local_addresses: registration.local_addresses,
+                reserved: registration.reserved,
+                note: None,
+            },
+        )
+        .await?;
+    Ok(Json(RegisterWarpBindingHttpResponse {
+        revision_id: result.revision_id,
+        binding: result.binding,
+        suggested_endpoint: registration.suggested_endpoint,
+    })
+    .into_response())
+}
+
+async fn update_warp_binding(
+    State(state): State<AppState>,
+    Path((tenant_id, outbound_id, node_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateWarpBindingHttpRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let result = state
+        .store
+        .update_warp_binding(
+            &admin,
+            UpdateWarpBindingRequest {
+                tenant_id,
+                outbound_id,
+                node_id,
+                endpoint_address: request.endpoint_address,
+                endpoint_port: request.endpoint_port,
+                mtu: request.mtu,
+                keep_alive: request.keep_alive,
+                allowed_ips: request.allowed_ips,
+                no_kernel_tun: request.no_kernel_tun,
+                domain_strategy: request.domain_strategy,
+                workers: request.workers,
+                note: None,
+            },
+        )
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn remove_warp_binding(
+    State(state): State<AppState>,
+    Path((tenant_id, outbound_id, node_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    // Every reversible check happens before the provider call. Once Cloudflare has retired the
+    // credential, removing the exact matching local row is the repair path even if another model
+    // edit happens in the narrow interval between these two operations.
+    let removal = state
+        .store
+        .prepare_warp_binding_removal(&admin, &tenant_id, &outbound_id, &node_id)
+        .await?;
+    crate::warp::unregister(&removal.device_id, &removal.access_token)
+        .await
+        .map_err(ApiError::Provider)?;
+    let result = state
+        .store
+        .remove_warp_binding(
+            &admin,
+            RemoveWarpBindingRequest {
+                tenant_id,
+                outbound_id,
+                node_id,
+                expected_device_id: removal.device_id,
+                note: None,
+            },
+        )
+        .await?;
+    Ok(Json(result).into_response())
+}
+
 async fn upsert_chain(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -2340,21 +3086,6 @@ async fn upsert_ingress(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
     let result = state.store.upsert_ingress(&admin, &app_id, request).await?;
-    state.grants_wake.notify_one();
-    Ok(Json(result).into_response())
-}
-
-async fn put_step(
-    State(state): State<AppState>,
-    Path((app_id, chain_id, node_id)): Path<(String, String, String)>,
-    headers: HeaderMap,
-    Json(request): Json<PutStepRequest>,
-) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    let result = state
-        .store
-        .put_step(&admin, &app_id, &chain_id, &node_id, request)
-        .await?;
     state.grants_wake.notify_one();
     Ok(Json(result).into_response())
 }
@@ -2433,6 +3164,13 @@ async fn change_admin_password(
 
 async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    // Operational policy rides on the response header so it is present even when the node is
+    // otherwise converged and the body is 204. Older agents ignore it; newer agents can change
+    // retention without inventing a fake deployment or restarting Xray.
+    let log_max_mib = state
+        .store
+        .effective_node_log_max_mib(&node.node_id)
+        .await?;
     let agent_version = user_agent(&headers).map(str::to_owned);
     let protocol_version = agent_protocol_version(&headers);
     state
@@ -2456,45 +3194,58 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             "x-brocade-agent-upgrade-required",
             HeaderValue::from_static("1"),
         );
-        return Ok(response);
+        return Ok(with_agent_log_policy(response, log_max_mib));
     }
 
     // The certificate check runs before the claim: it is a read, the claim is a take, and a
     // failure after the take would 500 a node that has just been handed a deployment. A failure
     // here degrades to "no certificate owed" rather than erroring the whole response — one
     // malformed cert row must not block a deployment.
-    let certificate = match state.store.cert_delta_for_node(&node.node_id).await {
-        Ok(certificate) => certificate,
-        Err(error) => {
-            eprintln!(
-                "证书：{node} 的证书差异判定失败（{error}），这一轮不带证书",
-                node = node.node_id
-            );
-            None
+    let certificate = if node.lifecycle_phase == NodeLifecyclePhase::Active {
+        match state.store.cert_delta_for_node(&node.node_id).await {
+            Ok(certificate) => certificate,
+            Err(error) => {
+                eprintln!(
+                    "证书：{node} 的证书差异判定失败（{error}），这一轮不带证书",
+                    node = node.node_id
+                );
+                None
+            }
         }
+    } else {
+        None
     };
 
-    match state.store.claim_desired_for_node(&node.node_id).await? {
+    let response = match state.store.claim_desired_for_node(&node.node_id).await? {
         Some(mut desired) => {
             // The distribution source is filled in at this layer: it is configuration of the
             // runtime environment, and store should not know env exists.
             desired.phantun_binary = state.dist.phantun();
-            Ok(Json(
+            Json(
                 brocade_deployment::protocol::DesiredStateResponse::Deployment {
                     deployment: desired,
                     certificate,
                 },
             )
-            .into_response())
+            .into_response()
         }
         None => match certificate {
-            Some(material) => Ok(Json(
-                brocade_deployment::protocol::DesiredStateResponse::Certificate(material),
-            )
-            .into_response()),
-            None => Ok(StatusCode::NO_CONTENT.into_response()),
+            Some(material) => {
+                Json(brocade_deployment::protocol::DesiredStateResponse::Certificate(material))
+                    .into_response()
+            }
+            None => StatusCode::NO_CONTENT.into_response(),
         },
-    }
+    };
+    Ok(with_agent_log_policy(response, log_max_mib))
+}
+
+fn with_agent_log_policy(mut response: Response, max_mib: u32) -> Response {
+    response.headers_mut().insert(
+        AGENT_LOG_MAX_MIB_HEADER,
+        HeaderValue::from_str(&max_mib.to_string()).expect("u32 is a valid HTTP header value"),
+    );
+    response
 }
 
 /// Which agent this node should be running, if it should be running a different one.
@@ -2537,6 +3288,9 @@ async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> Api
     let release = state.store.agent_release().await?;
     let legacy_protocol = agent_protocol_version(&headers).unwrap_or(0)
         < brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION;
+    if node.lifecycle_phase != NodeLifecyclePhase::Active && !legacy_protocol {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     if !(release.offers(&node.node_id, embedded_release_id())
         || legacy_protocol && release.offers_protocol_rescue(&node.node_id))
     {
@@ -2624,17 +3378,88 @@ async fn agent_observation(
         .store
         .report_target_result(TargetConvergenceReport {
             deployment_id: request.deployment_id,
-            node_id: node.node_id,
+            node_id: node.node_id.clone(),
             result: request.result,
             observed_before: request.observed_before,
             observed_after: request.observed_after,
             error: request.error,
         })
         .await?;
+    if state
+        .store
+        .node_lifecycle(&node.node_id)
+        .await
+        .is_ok_and(|lifecycle| lifecycle.phase == NodeLifecyclePhase::Retired)
+    {
+        cleanup_retired_warp_bindings(&state, &node.node_id).await;
+    }
     // A successful configuration report may satisfy the prerequisite of queued permission work.
     // Wake it now instead of making that node wait for the periodic recovery scan.
     state.grants_wake.notify_one();
     Ok(Json(result).into_response())
+}
+
+/// Provider cleanup is deliberately after the convergence transaction. A provider outage must not
+/// make the agent retry a report which the control plane has already accepted; it becomes visible
+/// lifecycle cleanup debt and can be retried independently.
+async fn cleanup_retired_warp_bindings(state: &AppState, node_id: &str) {
+    let actor = AdminContext::system_admin("system:node-retirement");
+    let bindings = match state.store.retired_node_warp_bindings(node_id).await {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            let message = format!("cannot list WARP bindings for retirement cleanup: {error}");
+            let _ = state
+                .store
+                .set_node_lifecycle_cleanup_error(node_id, Some(&message))
+                .await;
+            return;
+        }
+    };
+    let mut errors = Vec::new();
+    for (tenant_id, outbound_id) in bindings {
+        let removal = match state
+            .store
+            .prepare_warp_binding_removal(&actor, &tenant_id, &outbound_id, node_id)
+            .await
+        {
+            Ok(removal) => removal,
+            Err(error) => {
+                errors.push(format!("{outbound_id}: {error}"));
+                continue;
+            }
+        };
+        if let Err(error) = crate::warp::unregister(&removal.device_id, &removal.access_token).await
+        {
+            errors.push(format!("{outbound_id}: {error}"));
+            continue;
+        }
+        if let Err(error) = state
+            .store
+            .remove_warp_binding(
+                &actor,
+                RemoveWarpBindingRequest {
+                    tenant_id,
+                    outbound_id: outbound_id.clone(),
+                    node_id: node_id.to_owned(),
+                    expected_device_id: removal.device_id,
+                    note: Some(format!(
+                        "remove WARP binding {outbound_id} after node {node_id} retired"
+                    )),
+                },
+            )
+            .await
+        {
+            errors.push(format!("{outbound_id}: {error}"));
+        }
+    }
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    if let Err(store_error) = state
+        .store
+        .set_node_lifecycle_cleanup_error(node_id, error.as_deref())
+        .await
+    {
+        eprintln!("退役清理：无法记录 {node_id} 的 WARP 清理状态：{store_error}");
+    }
 }
 
 async fn agent_usage(
@@ -2643,6 +3468,19 @@ async fn agent_usage(
     Json(request): Json<UsageReportRequest>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    // Retirement convergence samples one final round immediately before disabling Xray. The
+    // token remains authenticated in `retiring`, so usage must remain open through that exact
+    // phase; after completion authentication itself closes because retired nodes are excluded.
+    if !matches!(
+        node.lifecycle_phase,
+        NodeLifecyclePhase::Active | NodeLifecyclePhase::Retiring
+    ) {
+        return Err(ApiError::Store(StoreError::Forbidden(format!(
+            "node {} is {}; usage reporting is closed",
+            node.node_id,
+            node.lifecycle_phase.as_str()
+        ))));
+    }
     let result = state
         .store
         .record_usage_report(&node.node_id, request)
@@ -2662,6 +3500,7 @@ async fn agent_load(
     Json(request): Json<LoadReportRequest>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
     let result = state
         .store
         .record_load_report(&node.node_id, request)
@@ -2677,6 +3516,7 @@ async fn agent_probe_targets(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
     Ok(Json(state.store.probe_targets(&node.node_id).await?).into_response())
 }
 
@@ -2688,6 +3528,7 @@ async fn agent_link_probe(
     Json(request): Json<LinkProbeRequest>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
     let result = state
         .store
         .record_link_probe(&node.node_id, request)
@@ -2702,6 +3543,7 @@ async fn agent_link_health(
     Json(request): Json<LinkHealthRequest>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
     Ok(Json(
         state
             .store
@@ -2719,6 +3561,7 @@ async fn agent_e2e_targets(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
     Ok(Json(state.store.e2e_probe_targets(&node.node_id).await?).into_response())
 }
 
@@ -2730,6 +3573,7 @@ async fn agent_e2e_probe(
     Json(request): Json<E2eProbeRequest>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
     Ok(Json(state.store.record_e2e_probe(&node.node_id, request).await?).into_response())
 }
 
@@ -2777,7 +3621,7 @@ async fn load_node(
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     let result = state
         .store
-        .node_load_view(&admin, &node_id, query.windows.unwrap_or(24).min(240))
+        .node_load_view(&admin, &node_id, detail_load_windows(query.windows))
         .await?;
     Ok(Json(result).into_response())
 }
@@ -2799,6 +3643,12 @@ async fn link_quality(
 #[derive(Debug, Deserialize)]
 struct LoadQuery {
     windows: Option<u32>,
+}
+
+/// 24 h / 30 s = 2,880 windows. This applies only to the single-machine endpoint; the fleet
+/// endpoint remains capped at 240 so one request cannot multiply a day of detail by the fleet.
+fn detail_load_windows(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(24).min(2_880)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2843,6 +3693,8 @@ struct UsageSeriesQuery {
     /// How long the series covers, in seconds. The default is 12 minutes, because the bar chart
     /// at the right of the machine list has 24 cells, one per 30-second reporting window.
     window_secs: Option<u32>,
+    /// Machine detail narrows long ranges to one node. Omitted by fleet and usage pages.
+    node_id: Option<String>,
 }
 
 /// The per-machine usage series plus the month total. The bar chart at the right of the machine
@@ -2855,7 +3707,11 @@ async fn list_usage_node_series(
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     let result = state
         .store
-        .list_usage_node_series(&admin, query.window_secs.unwrap_or(720))
+        .list_usage_node_series(
+            &admin,
+            query.window_secs.unwrap_or(720),
+            query.node_id.as_deref(),
+        )
         .await?;
     Ok(Json(result).into_response())
 }
@@ -2875,6 +3731,17 @@ async fn authenticate_agent(store: &PgStore, headers: &HeaderMap) -> ApiResult<A
         .authenticate_node_token(token)
         .await?
         .ok_or(ApiError::Unauthorized)
+}
+
+fn require_active_agent(node: &AuthenticatedNode) -> ApiResult<()> {
+    if node.lifecycle_phase != NodeLifecyclePhase::Active {
+        return Err(ApiError::Store(StoreError::Forbidden(format!(
+            "node {} is {}; business observations are closed",
+            node.node_id,
+            node.lifecycle_phase.as_str()
+        ))));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3158,6 +4025,7 @@ type ApiResult<T> = Result<T, ApiError>;
 #[derive(Debug)]
 enum ApiError {
     Store(StoreError),
+    Provider(String),
     Unauthorized,
     Forbidden,
     PreconditionRequired,
@@ -3173,6 +4041,7 @@ impl From<StoreError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message, reference) = match self {
+            ApiError::Provider(message) => (StatusCode::BAD_GATEWAY, message, None),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_owned(), None),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_owned(), None),
             ApiError::PreconditionRequired => (
@@ -3191,6 +4060,10 @@ impl IntoResponse for ApiError {
             }
             ApiError::Store(StoreError::Forbidden(message)) => {
                 (StatusCode::FORBIDDEN, message, None)
+            }
+            ApiError::Store(StoreError::Conflict(message)) => (StatusCode::CONFLICT, message, None),
+            ApiError::Store(StoreError::Unavailable(message)) => {
+                (StatusCode::SERVICE_UNAVAILABLE, message, None)
             }
             ApiError::Store(StoreError::InvalidData(message)) => {
                 (StatusCode::BAD_REQUEST, message, None)
@@ -3261,17 +4134,24 @@ mod tests {
     use brocade_store::StoreError;
 
     use super::{
-        bearer_token, dist_json, expired_session_cookie, install_command, looks_like_uuid,
-        public_may, route_from_headers, safe_filename_slug, session_cookie, AgentDistribution,
-        ApiError, ArtifactContentQuery, InstallCredential, IpFamily, EMBEDDED_AGENTS,
-        INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
+        bearer_token, detail_load_windows, dist_json, expired_session_cookie, install_command,
+        looks_like_uuid, public_may, route_from_headers, safe_filename_slug, session_cookie,
+        AgentDistribution, ApiError, ArtifactContentQuery, InstallCredential, IpFamily,
+        SubscriptionProtocol, EMBEDDED_AGENTS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
     };
 
-    /// The wire form of the family, pinned here because it belongs to the console's own URL
-    /// rather than to the model's serde attribute. Absent stays absent: every other caller of
-    /// this route passes no family and has to keep receiving both.
     #[test]
-    fn the_artifact_family_is_read_from_the_query_string() {
+    fn machine_load_range_reaches_one_day_but_never_exceeds_it() {
+        assert_eq!(detail_load_windows(None), 24);
+        assert_eq!(detail_load_windows(Some(2_880)), 2_880);
+        assert_eq!(detail_load_windows(Some(u32::MAX)), 2_880);
+    }
+
+    /// The wire form of both subscription filters is pinned here because it belongs to the
+    /// console's URL. Absent stays absent: every other artifact reader must keep receiving the
+    /// complete subscription.
+    #[test]
+    fn the_artifact_filters_are_read_from_the_query_string() {
         let parse = |uri: &str| {
             axum::extract::Query::<ArtifactContentQuery>::try_from_uri(&uri.parse().unwrap())
                 .map(|query| query.0)
@@ -3299,9 +4179,28 @@ mod tests {
                 .revision,
             Some(7)
         );
+        assert!(matches!(
+            parse("/artifacts/content/user/t:u/clash?protocol=vless")
+                .unwrap()
+                .protocol,
+            Some(SubscriptionProtocol::Vless)
+        ));
+        assert!(matches!(
+            parse("/artifacts/content/user/t:u/clash?family=v4&protocol=hysteria2")
+                .unwrap()
+                .protocol,
+            Some(SubscriptionProtocol::Hysteria2)
+        ));
+        assert!(
+            parse("/artifacts/content/user/t:u/uri?serving=true")
+                .unwrap()
+                .serving
+        );
+        assert!(!parse("/artifacts/content/user/t:u/uri").unwrap().serving);
         // A misspelling is refused rather than read as both: the operator requested one family,
         // and returning every entry would be the opposite result.
         assert!(parse("/artifacts/content/user/t:u/clash?family=ipv4").is_err());
+        assert!(parse("/artifacts/content/user/t:u/clash?protocol=hy2").is_err());
     }
 
     /// Setting and clearing have to carry the same attributes, or signing out does not clear the
@@ -3341,6 +4240,7 @@ mod tests {
     fn the_public_account_reaches_the_pages_it_is_opened_for_and_nothing_else() {
         use axum::http::Method;
         for path in [
+            "/branding",
             "/whoami",
             "/model/snapshot",
             "/nodes/agent-state",
@@ -3357,6 +4257,7 @@ mod tests {
             "/quotas",
             "/usage/samples",
             "/usage/monthly-summary",
+            "/users/platform.acme/alice/grant-probes",
         ] {
             assert!(public_may(&Method::GET, path), "should allow GET {path}");
         }
@@ -3373,9 +4274,20 @@ mod tests {
         assert!(public_may(&Method::POST, "/auth/logout"));
         // Every other write, including on a path whose GET is allowed.
         assert!(!public_may(&Method::POST, "/model/apply"));
+        assert!(!public_may(&Method::PUT, "/branding"));
         assert!(!public_may(&Method::PUT, "/nodes/hk-01"));
         assert!(!public_may(&Method::POST, "/nodes/provision"));
         assert!(!public_may(&Method::POST, "/revisions"));
+        assert!(!public_may(
+            &Method::POST,
+            "/users/platform.acme/alice/grant-probes"
+        ));
+        // Do not let the dynamic suffix accidentally open a broader subtree.
+        assert!(!public_may(
+            &Method::GET,
+            "/users/platform.acme/alice/grant-probes/p1"
+        ));
+        assert!(!public_may(&Method::GET, "/users//alice/grant-probes"));
     }
 
     #[tokio::test]
@@ -3723,6 +4635,17 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn store_unavailable_maps_to_http_503() {
+        let response = ApiError::from(StoreError::Unavailable("release in progress".to_owned()))
+            .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]

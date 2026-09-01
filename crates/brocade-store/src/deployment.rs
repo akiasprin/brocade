@@ -1,8 +1,8 @@
 use brocade_core::hash::sha256_hex;
 use brocade_core::model::{
-    AppView, Dns, DomainStrategy, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
-    IngressWires, ModelSnapshot, Node, RealityFallbackLimits, RealityFallbackMode, RealitySettings,
-    RealitySite,
+    AppView, Dns, DomainStrategy, ExternalOutbound, HysteriaCongestion, HysteriaMasquerade,
+    HysteriaObfs, IngressWires, ModelSnapshot, Node, RealityFallbackLimits, RealityFallbackMode,
+    RealitySettings, RealitySite,
 };
 use brocade_deployment::plan::{
     grants_match, narrow_to_kind, plan_deployment as plan_snapshot_deployment,
@@ -18,10 +18,13 @@ use brocade_deployment::protocol::{
     ReportTargetResult, ReportedNodeState, TargetApplyResult, TargetConvergenceReport,
 };
 use serde_json::{json, Value};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{console, materialize, settings, AdminContext, Result, StoreError};
+use crate::{
+    console, materialize, settings, AdminContext, NodeLifecyclePhase,
+    NodeLifecycleTransitionResult, Result, StoreError,
+};
 
 const DISPATCH_LEASE_INTERVAL: &str = "15 minutes";
 
@@ -35,6 +38,8 @@ struct RollbackTarget {
     deployment_id: i64,
     revision_id: u64,
 }
+
+type WarpBindingTokenMap = BTreeMap<(String, String, String, String), String>;
 
 /// The automatic grants worker's atomic result. `deferred` contains real conflicts: a
 /// configuration target already handed to an agent is changing xray, so a permission writer may
@@ -83,7 +88,34 @@ async fn plan_deployment_unscoped(pool: &PgPool, revision_id: u64) -> Result<Dep
     let snapshot = load_snapshot_for_deployment(pool, revision_id).await?;
     let mut applied = load_applied_states(pool).await?;
     attach_running_xray(pool, &mut applied).await?;
-    plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)
+    let plan = plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?;
+    let terminal = terminal_lifecycle_nodes(pool).await?;
+    Ok(without_terminal_lifecycle_targets(plan, &terminal))
+}
+
+async fn terminal_lifecycle_nodes<'e, E>(executor: E) -> Result<BTreeSet<String>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT node_id
+           FROM node_lifecycle_state
+          WHERE phase IN ('retired', 'abandoned')",
+    )
+    .fetch_all(executor)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+fn without_terminal_lifecycle_targets(
+    mut plan: DeploymentPlan,
+    terminal: &BTreeSet<String>,
+) -> DeploymentPlan {
+    plan.targets
+        .retain(|target| !terminal.contains(&target.node_id));
+    plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
+    plan
 }
 
 /// Works out, for each machine, the text of the xray config it is running.
@@ -264,6 +296,289 @@ pub async fn create_deployment(
     })
 }
 
+/// Change a machine's lifecycle as one operational action: commit the model intent, fence every
+/// older target, cancel active work orders, and create a replacement configuration deployment
+/// from the newest revision. Retirement is therefore never a label which still waits for someone
+/// to remember a separate publish step.
+pub async fn transition_node_status(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: console::UpdateNodeStatusRequest,
+) -> Result<NodeLifecycleTransitionResult> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can change node lifecycle".to_owned(),
+        ));
+    }
+    let status = request.status.trim();
+    let retiring = match status {
+        "retired" => true,
+        "active" => false,
+        other => {
+            return Err(StoreError::InvalidData(format!(
+                "node status must be active or retired, got {other}"
+            )))
+        }
+    };
+    let note = console::note_or(request.note.as_deref(), || {
+        if retiring {
+            format!("retire node {node_id} and create teardown deployment")
+        } else {
+            format!("reactivate node {node_id} and create convergence deployment")
+        }
+    });
+
+    let mut tx = pool.begin().await?;
+    // Report, retry, cancel and rollback all lock the deployment row before any target or
+    // lifecycle row. Preserve that global order here too: changing the epoch first and only then
+    // waiting for an in-flight report's deployment row forms the inverse lock order and lets a
+    // simultaneous retirement/report deadlock.
+    let active_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id
+           FROM deployments
+          WHERE active = TRUE AND status IN ('planned', 'running', 'halted')
+          ORDER BY CASE kind WHEN 'config' THEN 0 ELSE 1 END, id
+          FOR UPDATE",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let previous = console::lock_control_state(&mut tx).await?;
+    let proposed_revision = console::insert_revision(&mut tx, actor.operator_id(), &note).await?;
+    let changed =
+        console::update_node_status_tx(&mut tx, actor, proposed_revision, node_id, request, &note)
+            .await?;
+    let revision_id =
+        console::commit_revision(&mut tx, proposed_revision, previous, changed).await?;
+
+    let lifecycle = sqlx::query(
+        "SELECT lifecycle_epoch, phase, deployment_id
+           FROM node_lifecycle_state
+          WHERE node_id = $1
+          FOR UPDATE",
+    )
+    .bind(node_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let lifecycle_epoch: i64 = lifecycle.try_get("lifecycle_epoch")?;
+    let lifecycle_phase: String = lifecycle.try_get("phase")?;
+    let attached_deployment_id: Option<i64> = lifecycle.try_get("deployment_id")?;
+    let attached_is_open = if let Some(deployment_id) = attached_deployment_id {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM deployments
+                  WHERE id = $1
+                    AND active = TRUE
+                    AND status IN ('planned', 'running', 'halted')
+             )",
+        )
+        .bind(deployment_id)
+        .fetch_one(&mut *tx)
+        .await?
+    } else {
+        false
+    };
+    // Repeating an ordinary status write is a no-op. Repeating retirement while its operational
+    // work order is missing or terminal is deliberately different: it is the repair path for a
+    // legacy retired_at backfill and for a canceled teardown, and reuses the same epoch rather
+    // than pretending that model intent changed again.
+    let repairs_missing_teardown = !changed
+        && retiring
+        && lifecycle_phase == NodeLifecyclePhase::Retiring.as_str()
+        && !attached_is_open;
+    if !changed && !repairs_missing_teardown {
+        tx.commit().await?;
+        let lifecycle = crate::lifecycle::load(pool, node_id).await?;
+        return Ok(NodeLifecycleTransitionResult {
+            revision_id,
+            node_id: node_id.to_owned(),
+            deployment_id: lifecycle.deployment_id,
+            lifecycle,
+            canceled_deployment_ids: Vec::new(),
+        });
+    }
+
+    // Both configuration and hot-grant targets carry the old epoch. Leaving either active can
+    // block its wave forever even though the changed machine can no longer claim it, so cancel
+    // both complete work orders and let the ordinary workers re-plan from the newest revision.
+    let mut canceled_deployment_ids = Vec::new();
+    for deployment_id in active_ids {
+        cancel_deployment_tx(&mut tx, deployment_id).await?;
+        canceled_deployment_ids.push(deployment_id);
+    }
+
+    let snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
+    let applied = load_applied_states(&mut *tx).await?;
+    let plan = narrow_to_kind(
+        plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?,
+        DeploymentKind::Config,
+    );
+    let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
+    let plan = without_terminal_lifecycle_targets(plan, &terminal);
+    let retirement_target_pending = plan
+        .targets
+        .iter()
+        .any(|target| target.node_id == node_id && target.status == PlannedTargetStatus::Pending);
+    let deployment_id = if plan.summary.changed_targets > 0 {
+        let idempotency_base = format!("system:node-lifecycle:{node_id}:{lifecycle_epoch}");
+        let prior_attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)
+               FROM deployments
+              WHERE idempotency_key = $1
+                 OR idempotency_key LIKE $1 || ':retry:%'",
+        )
+        .bind(&idempotency_base)
+        .fetch_one(&mut *tx)
+        .await?;
+        let idempotency_key = if prior_attempts == 0 {
+            idempotency_base
+        } else {
+            format!("{idempotency_base}:retry:{prior_attempts}")
+        };
+        let deployment_id = insert_lifecycle_deployment_tx(
+            &mut tx,
+            actor.operator_id(),
+            &idempotency_key,
+            &note,
+            &plan,
+        )
+        .await?;
+        if lifecycle_phase == NodeLifecyclePhase::Retiring.as_str() {
+            if !retirement_target_pending {
+                return Err(StoreError::InvalidData(format!(
+                    "retiring node {node_id} has no teardown target"
+                )));
+            }
+            crate::lifecycle::attach_deployment_tx(
+                &mut tx,
+                node_id,
+                lifecycle_epoch,
+                deployment_id,
+            )
+            .await?;
+        }
+        Some(deployment_id)
+    } else {
+        if lifecycle_phase == NodeLifecyclePhase::Retiring.as_str() {
+            crate::lifecycle::complete_retirement_tx(
+                &mut tx,
+                node_id,
+                lifecycle_epoch,
+                None,
+                actor.operator_id(),
+            )
+            .await?;
+        }
+        None
+    };
+
+    tx.commit().await?;
+    Ok(NodeLifecycleTransitionResult {
+        revision_id,
+        node_id: node_id.to_owned(),
+        lifecycle: crate::lifecycle::load(pool, node_id).await?,
+        deployment_id,
+        canceled_deployment_ids,
+    })
+}
+
+pub async fn abandon_node(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: crate::AbandonNodeRequest,
+) -> Result<NodeLifecycleTransitionResult> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can force-retire nodes".to_owned(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    // Same lock order as report/cancel: deployment, then lifecycle/target.
+    let active_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id
+           FROM deployments
+          WHERE active = TRUE AND status IN ('planned', 'running', 'halted')
+          ORDER BY CASE kind WHEN 'config' THEN 0 ELSE 1 END, id
+          FOR UPDATE",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let lifecycle_epoch =
+        crate::lifecycle::abandon_tx(&mut tx, node_id, actor.operator_id(), &request.reason)
+            .await?;
+    let mut canceled_deployment_ids = Vec::new();
+    for deployment_id in active_ids {
+        cancel_deployment_tx(&mut tx, deployment_id).await?;
+        canceled_deployment_ids.push(deployment_id);
+    }
+
+    let snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
+    let applied = load_applied_states(&mut *tx).await?;
+    let plan = narrow_to_kind(
+        plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?,
+        DeploymentKind::Config,
+    );
+    let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
+    let plan = without_terminal_lifecycle_targets(plan, &terminal);
+    let deployment_id = if plan.summary.changed_targets > 0 {
+        Some(
+            insert_lifecycle_deployment_tx(
+                &mut tx,
+                actor.operator_id(),
+                &format!("system:node-abandon:{node_id}:{lifecycle_epoch}"),
+                &format!("replace active deployment after force-retiring node {node_id}"),
+                &plan,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let revision_id = snapshot.revision;
+    tx.commit().await?;
+    Ok(NodeLifecycleTransitionResult {
+        revision_id,
+        node_id: node_id.to_owned(),
+        lifecycle: crate::lifecycle::load(pool, node_id).await?,
+        deployment_id,
+        canceled_deployment_ids,
+    })
+}
+
+async fn insert_lifecycle_deployment_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_id: &str,
+    idempotency_key: &str,
+    note: &str,
+    plan: &DeploymentPlan,
+) -> Result<i64> {
+    let warnings = serde_json::to_value(&plan.warnings)?;
+    let revision_id = revision_to_i64(plan.revision)?;
+    let base_revision_id = last_succeeded_revision(&mut **tx, DeploymentKind::Config).await?;
+    let deployment_id: i64 = sqlx::query_scalar(
+        "INSERT INTO deployments (
+             revision_id, status, actor, idempotency_key, active, warnings, note, kind,
+             base_revision_id
+         )
+         VALUES ($1, 'planned', $2, $3, TRUE, $4, $5, 'config', $6)
+         RETURNING id",
+    )
+    .bind(revision_id)
+    .bind(actor_id)
+    .bind(idempotency_key)
+    .bind(warnings)
+    .bind(note)
+    .bind(base_revision_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    for target in &plan.targets {
+        insert_target(tx, deployment_id, target).await?;
+    }
+    Ok(deployment_id)
+}
+
 /// Create the permission work that can safely run against what each machine is running now.
 ///
 /// A normal plan is compiled from the newest model. That is the wrong topology for this job when
@@ -308,6 +623,10 @@ pub(crate) async fn create_automatic_grants_deployment(
            ON dt.deployment_id = dts.deployment_id
           AND dt.node_id = dts.node_id
           AND dt.status = 'succeeded'
+         JOIN node_lifecycle_state lifecycle
+           ON lifecycle.node_id = s.node_id
+          AND lifecycle.lifecycle_epoch = dts.lifecycle_epoch
+          AND lifecycle.phase IN ('active', 'retiring')
          JOIN deployments d
            ON d.id = dts.deployment_id
           AND d.kind = 'config'
@@ -342,6 +661,10 @@ pub(crate) async fn create_automatic_grants_deployment(
          JOIN deployment_target_state dts
            ON dts.deployment_id = dt.deployment_id
           AND dts.node_id = dt.node_id
+         JOIN node_lifecycle_state lifecycle
+           ON lifecycle.node_id = dt.node_id
+          AND lifecycle.lifecycle_epoch = dts.lifecycle_epoch
+          AND lifecycle.phase IN ('active', 'retiring')
          WHERE d.kind = 'config'
            AND d.active = TRUE
            AND d.status IN ('planned', 'running', 'halted')
@@ -374,7 +697,7 @@ pub(crate) async fn create_automatic_grants_deployment(
         };
         projected_by_revision.insert(
             base_revision,
-            projected_grants(permission_projection(base, &latest))?,
+            projected_grants(crate::serving::permission_projection(base, &latest))?,
         );
     }
 
@@ -540,52 +863,6 @@ pub(crate) async fn create_automatic_grants_deployment(
     })
 }
 
-fn permission_projection(
-    mut topology: ModelSnapshot,
-    permissions: &ModelSnapshot,
-) -> ModelSnapshot {
-    topology.revision = permissions.revision;
-    topology.users = permissions.users.clone();
-    let latest_apps = permissions
-        .apps
-        .iter()
-        .map(|app| (app.id.as_str(), app))
-        .collect::<BTreeMap<_, _>>();
-    for app in &mut topology.apps {
-        let ingress_ids = app
-            .ingresses
-            .iter()
-            .map(|ingress| ingress.id.clone())
-            .collect::<BTreeSet<_>>();
-        if let Some(latest) = latest_apps.get(app.id.as_str()) {
-            // Flow is carried by each hot-added VLESS client, not by the listener itself. It is
-            // consequently permission state even though its source field lives on the ingress.
-            // Keep the running listener/tag/identity, but take the newest client flow.
-            let latest_ingresses = latest
-                .ingresses
-                .iter()
-                .map(|ingress| (ingress.id.as_str(), ingress))
-                .collect::<BTreeMap<_, _>>();
-            for ingress in &mut app.ingresses {
-                if let Some(latest_ingress) = latest_ingresses.get(ingress.id.as_str()) {
-                    ingress
-                        .wires
-                        .set_flow(latest_ingress.wires.flow().map(str::to_owned));
-                }
-            }
-            app.grants = latest
-                .grants
-                .iter()
-                .filter(|grant| ingress_ids.contains(&grant.ingress))
-                .cloned()
-                .collect();
-        } else {
-            app.grants.clear();
-        }
-    }
-    topology
-}
-
 fn projected_grants(snapshot: ModelSnapshot) -> Result<BTreeMap<String, DesiredGrants>> {
     Ok(plan_snapshot_deployment(&snapshot, &[])
         .map_err(plan_error)?
@@ -714,6 +991,8 @@ pub async fn create_rollback_deployment(
         let snapshot = materialize::load_snapshot_tx(&mut tx, Some(revision_id)).await?;
         let applied = load_applied_states(&mut *tx).await?;
         let plan = plan_forced_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?;
+        let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
+        let plan = without_terminal_lifecycle_targets(plan, &terminal);
         tx.commit().await?;
         return Ok(CreateDeploymentResult {
             deployment_id,
@@ -762,6 +1041,8 @@ pub async fn create_rollback_deployment(
         );
     }
     let plan = plan_forced_snapshot_deployment(&restored_snapshot, &applied).map_err(plan_error)?;
+    let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
+    let plan = without_terminal_lifecycle_targets(plan, &terminal);
     if plan.summary.total_targets == 0 {
         return Err(StoreError::InvalidData(
             "cannot create rollback deployment for an empty target set".to_owned(),
@@ -1241,14 +1522,20 @@ pub async fn load_desired_for_node(
         // Its creator built it against the running inbound topology and rebased every pending
         // config target that could later overwrite it. Giving every merely-pending config
         // unconditional priority is what made permissions wait behind an arbitrarily long queue.
-        "WITH active_deployment AS (
+         "WITH active_deployment AS (
             SELECT d.id
             FROM deployments d
             JOIN deployment_targets dt ON dt.deployment_id = d.id
+            JOIN deployment_target_state dts
+              ON dts.deployment_id = dt.deployment_id
+             AND dts.node_id = dt.node_id
+            JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = dt.node_id
             WHERE d.active = TRUE
               AND d.status IN ('planned', 'running')
               AND dt.node_id = $1
               AND dt.status IN ('pending', 'dispatched', 'converging')
+              AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
+              AND lifecycle.phase IN ('active', 'retiring')
             ORDER BY CASE
                        WHEN d.kind = 'config'
                         AND dt.status IN ('dispatched', 'converging') THEN 0
@@ -1313,8 +1600,12 @@ pub async fn load_desired_for_node(
          JOIN deployment_target_state dts
            ON dts.deployment_id = dt.deployment_id
           AND dts.node_id = dt.node_id
+         JOIN node_lifecycle_state lifecycle
+           ON lifecycle.node_id = dt.node_id
          WHERE dt.node_id = $1
            AND dt.status IN ('pending', 'dispatched', 'converging')
+           AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
+           AND lifecycle.phase IN ('active', 'retiring')
            AND dts.wave = cw.wave
            AND (NOT wg.requires_confirmation OR wg.confirmed)",
     )
@@ -1363,10 +1654,16 @@ pub async fn claim_desired_for_node(
             SELECT d.id
             FROM deployments d
             JOIN deployment_targets dt ON dt.deployment_id = d.id
+            JOIN deployment_target_state dts
+              ON dts.deployment_id = dt.deployment_id
+             AND dts.node_id = dt.node_id
+            JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = dt.node_id
             WHERE d.active = TRUE
               AND d.status IN ('planned', 'running')
               AND dt.node_id = $1
               AND dt.status IN ('pending', 'dispatched', 'converging')
+              AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
+              AND lifecycle.phase IN ('active', 'retiring')
             ORDER BY CASE
                        WHEN d.kind = 'config'
                         AND dt.status IN ('dispatched', 'converging') THEN 0
@@ -1431,8 +1728,12 @@ pub async fn claim_desired_for_node(
          JOIN deployment_target_state dts
            ON dts.deployment_id = dt.deployment_id
           AND dts.node_id = dt.node_id
+         JOIN node_lifecycle_state lifecycle
+           ON lifecycle.node_id = dt.node_id
          WHERE dt.node_id = $1
            AND dt.status IN ('pending', 'dispatched', 'converging')
+           AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
+           AND lifecycle.phase IN ('active', 'retiring')
            AND dts.wave = cw.wave
            AND (NOT wg.requires_confirmation OR wg.confirmed)
            AND (
@@ -1442,7 +1743,7 @@ pub async fn claim_desired_for_node(
            )
          ORDER BY ad.id
          LIMIT 1
-         FOR UPDATE OF dt, dts SKIP LOCKED",
+         FOR UPDATE OF d, dt, dts, lifecycle SKIP LOCKED",
     )
     .bind(node_id)
     .bind(DISPATCH_LEASE_INTERVAL)
@@ -1550,13 +1851,18 @@ pub async fn report_target_result(
     }
 
     let target = sqlx::query(
-        "SELECT dt.status, dts.desired_structure, dts.dispatched_grants
+        "SELECT dt.status, dts.desired_structure, dts.dispatched_grants,
+                dts.usage_generation_id,
+                dts.lifecycle_epoch AS target_lifecycle_epoch,
+                lifecycle.lifecycle_epoch AS current_lifecycle_epoch,
+                lifecycle.phase AS lifecycle_phase
          FROM deployment_targets dt
          JOIN deployment_target_state dts
            ON dts.deployment_id = dt.deployment_id
           AND dts.node_id = dt.node_id
+         JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = dt.node_id
          WHERE dt.deployment_id = $1 AND dt.node_id = $2
-         FOR UPDATE OF dt, dts",
+         FOR UPDATE OF dt, dts, lifecycle",
     )
     .bind(report.deployment_id)
     .bind(&report.node_id)
@@ -1576,6 +1882,21 @@ pub async fn report_target_result(
         return Err(StoreError::Unsupported(format!(
             "target {}/{} is not accepting reports in status {}",
             report.deployment_id, report.node_id, target_status
+        )));
+    }
+    let target_lifecycle_epoch: i64 = target.try_get("target_lifecycle_epoch")?;
+    let current_lifecycle_epoch: i64 = target.try_get("current_lifecycle_epoch")?;
+    let lifecycle_phase: String = target.try_get("lifecycle_phase")?;
+    if target_lifecycle_epoch != current_lifecycle_epoch {
+        return Err(StoreError::Conflict(format!(
+            "target {}/{} belongs to lifecycle epoch {}, current epoch is {}",
+            report.deployment_id, report.node_id, target_lifecycle_epoch, current_lifecycle_epoch
+        )));
+    }
+    if !matches!(lifecycle_phase.as_str(), "active" | "retiring") {
+        return Err(StoreError::Unsupported(format!(
+            "node {} is {}; it no longer accepts deployment reports",
+            report.node_id, lifecycle_phase
         )));
     }
 
@@ -1643,14 +1964,59 @@ pub async fn report_target_result(
         .bind(report.deployment_id)
         .fetch_one(&mut *tx)
         .await?;
+    let kind = DeploymentKind::parse(&kind).unwrap_or_default();
     upsert_node_applied_state(
         &mut tx,
         report.deployment_id,
         &report.node_id,
         &report.observed_after,
-        DeploymentKind::parse(&kind).unwrap_or_default(),
+        kind,
     )
     .await?;
+
+    if final_status == "succeeded" {
+        if let Some(generation_id) = target.try_get::<Option<i64>, _>("usage_generation_id")? {
+            crate::usage::activate_usage_generation(
+                &mut tx,
+                &report.node_id,
+                generation_id,
+                report.deployment_id,
+            )
+            .await?;
+        }
+    }
+
+    if kind == DeploymentKind::Config
+        && final_status == "succeeded"
+        && lifecycle_phase == "retiring"
+        && desired_structure_is_full_teardown(&desired_structure)
+        && crate::lifecycle::fully_disabled(&report.observed_after)
+    {
+        crate::lifecycle::complete_retirement_tx(
+            &mut tx,
+            &report.node_id,
+            current_lifecycle_epoch,
+            Some(report.deployment_id),
+            "agent",
+        )
+        .await?;
+    } else if lifecycle_phase == "retiring" && final_status != "succeeded" {
+        sqlx::query(
+            "UPDATE node_lifecycle_state
+                SET last_error = $3, updated_at = now()
+              WHERE node_id = $1 AND lifecycle_epoch = $2 AND phase = 'retiring'",
+        )
+        .bind(&report.node_id)
+        .bind(current_lifecycle_epoch)
+        .bind(
+            report
+                .error
+                .as_deref()
+                .unwrap_or("retirement deployment did not converge"),
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
 
     let deployment_status =
         refresh_deployment_status(&mut tx, report.deployment_id, final_status).await?;
@@ -1801,6 +2167,8 @@ pub async fn cancel_deployment_and_rollback(
         );
     }
     let plan = plan_forced_snapshot_deployment(&restored_snapshot, &applied).map_err(plan_error)?;
+    let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
+    let plan = without_terminal_lifecycle_targets(plan, &terminal);
     if plan.summary.total_targets == 0 {
         return Err(StoreError::InvalidData(
             "cannot create rollback deployment for an empty target set".to_owned(),
@@ -1852,10 +2220,16 @@ pub async fn retry_target(
     }
 
     let target = sqlx::query(
-        "SELECT status
-         FROM deployment_targets
-         WHERE deployment_id = $1 AND node_id = $2
-         FOR UPDATE",
+        "SELECT dt.status,
+                dts.lifecycle_epoch AS target_lifecycle_epoch,
+                lifecycle.lifecycle_epoch AS current_lifecycle_epoch,
+                lifecycle.phase AS lifecycle_phase
+           FROM deployment_targets dt
+           JOIN deployment_target_state dts
+             ON dts.deployment_id = dt.deployment_id AND dts.node_id = dt.node_id
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = dt.node_id
+          WHERE dt.deployment_id = $1 AND dt.node_id = $2
+          FOR UPDATE OF dt, dts, lifecycle",
     )
     .bind(deployment_id)
     .bind(node_id)
@@ -1865,6 +2239,14 @@ pub async fn retry_target(
     if !matches!(target_status.as_str(), "failed-recovered" | "failed-dirty") {
         return Err(StoreError::Unsupported(format!(
             "target {deployment_id}/{node_id} cannot be retried from status {target_status}"
+        )));
+    }
+    let target_epoch: i64 = target.try_get("target_lifecycle_epoch")?;
+    let current_epoch: i64 = target.try_get("current_lifecycle_epoch")?;
+    let lifecycle_phase: String = target.try_get("lifecycle_phase")?;
+    if target_epoch != current_epoch || !matches!(lifecycle_phase.as_str(), "active" | "retiring") {
+        return Err(StoreError::Conflict(format!(
+            "target {deployment_id}/{node_id} belongs to an obsolete node lifecycle"
         )));
     }
 
@@ -2170,12 +2552,48 @@ async fn restore_model_snapshot_tx(
     revision_id: u64,
     snapshot: &ModelSnapshot,
 ) -> Result<()> {
+    // Provider control tokens are operational state and intentionally absent from model
+    // snapshots. Preserve one when the target restores the exact same Cloudflare device.
+    let warp_binding_tokens = load_warp_binding_tokens_tx(tx).await?;
     restore_settings_tx(tx, snapshot).await?;
     restore_tenants_tx(tx, revision_id, snapshot).await?;
     restore_users_tx(tx, revision_id, snapshot).await?;
     restore_nodes_tx(tx, revision_id, snapshot).await?;
     clear_app_model_tx(tx).await?;
-    restore_apps_tx(tx, revision_id, snapshot).await?;
+    restore_apps_tx(tx, revision_id, snapshot, &warp_binding_tokens).await?;
+    restore_node_egress_dns_tx(tx, revision_id, snapshot).await?;
+    Ok(())
+}
+
+async fn restore_node_egress_dns_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    revision_id: u64,
+    snapshot: &ModelSnapshot,
+) -> Result<()> {
+    sqlx::query("DELETE FROM node_egress_dns")
+        .execute(&mut **tx)
+        .await?;
+    let revision_id = revision_to_i64(revision_id)?;
+    for (node_id, position, selector, resolution) in
+        crate::egress_dns::policies_from_snapshot(snapshot)
+    {
+        sqlx::query(
+            "INSERT INTO node_egress_dns (
+                node_id, position, selector, resolution, created_revision
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(node_id)
+        .bind(
+            i32::try_from(position).map_err(|_| {
+                StoreError::InvalidData("机器 DNS 策略优先级超出数据库范围".to_owned())
+            })?,
+        )
+        .bind(serde_json::to_value(selector)?)
+        .bind(serde_json::to_value(resolution)?)
+        .bind(revision_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2217,8 +2635,14 @@ fn ensure_restored_snapshot(
     if expected.nodes != restored.nodes {
         sections.push("nodes");
     }
+    if expected.node_egress_dns != restored.node_egress_dns {
+        sections.push("node_egress_dns");
+    }
     if expected.users != restored.users {
         sections.push("users");
+    }
+    if expected.external_outbounds != restored.external_outbounds {
+        sections.push("external_outbounds");
     }
     if expected.apps != restored.apps {
         sections.push("apps");
@@ -2310,6 +2734,7 @@ async fn restore_nodes_tx(
     revision_id: u64,
     snapshot: &ModelSnapshot,
 ) -> Result<()> {
+    let lifecycle_revision = revision_id;
     let node_ids = snapshot
         .nodes
         .iter()
@@ -2328,6 +2753,36 @@ async fn restore_nodes_tx(
     let revision_id = revision_to_i64(revision_id)?;
     for node in &snapshot.nodes {
         restore_node_tx(tx, revision_id, node).await?;
+    }
+    let rows = sqlx::query(
+        "SELECT n.id, n.retired_at IS NOT NULL AS retired, lifecycle.phase
+           FROM nodes n
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = n.id
+          ORDER BY n.id
+          FOR UPDATE OF n, lifecycle",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let node_id: String = row.try_get("id")?;
+        let retired: bool = row.try_get("retired")?;
+        let phase: String = row.try_get("phase")?;
+        let intent_changed = if retired {
+            phase == "active"
+        } else {
+            phase != "active"
+        };
+        if intent_changed {
+            crate::lifecycle::advance_intent_tx(
+                tx,
+                &node_id,
+                retired,
+                lifecycle_revision,
+                "system:rollback",
+                "restore node lifecycle from rollback snapshot",
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -2414,8 +2869,110 @@ async fn restore_node_tx(
     Ok(())
 }
 
+async fn load_warp_binding_tokens_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<WarpBindingTokenMap> {
+    let rows = sqlx::query(
+        "SELECT external_outbounds.tenant_id, external_outbound_bindings.outbound_id,
+                node_id, device_id, access_token_sealed
+         FROM external_outbound_bindings
+         JOIN external_outbounds ON external_outbounds.id = external_outbound_bindings.outbound_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                (
+                    row.try_get("tenant_id")?,
+                    row.try_get("outbound_id")?,
+                    row.try_get("node_id")?,
+                    row.try_get("device_id")?,
+                ),
+                row.try_get("access_token_sealed")?,
+            ))
+        })
+        .collect()
+}
+
+async fn restore_warp_bindings_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    revision_id: i64,
+    outbound: &ExternalOutbound,
+    tokens: &WarpBindingTokenMap,
+) -> Result<()> {
+    for binding in &outbound.bindings {
+        let token_key = (
+            outbound.tenant.clone(),
+            outbound.id.clone(),
+            binding.node.clone(),
+            binding.device_id.clone(),
+        );
+        let access_token_sealed = match tokens.get(&token_key) {
+            Some(token) => token.clone(),
+            None => crate::secrets::seal(
+                &crate::secrets::external_outbound_binding_token_context(
+                    &outbound.tenant,
+                    &outbound.id,
+                    &binding.node,
+                ),
+                &format!(
+                    "rollback-control-token-unavailable:undefined:device={}",
+                    binding.device_id
+                ),
+            )?,
+        };
+        let private_key_sealed = crate::secrets::seal(
+            &crate::secrets::external_outbound_binding_key_context(
+                &outbound.tenant,
+                &outbound.id,
+                &binding.node,
+            ),
+            &binding.private_key,
+        )?;
+        sqlx::query(
+            "INSERT INTO external_outbound_bindings
+                (outbound_id, node_id, device_id, account_id, access_token_sealed,
+                 private_key_sealed, peer_public_key, local_addresses, reserved,
+                 endpoint_address, endpoint_port, mtu, keep_alive, allowed_ips,
+                 no_kernel_tun, domain_strategy, workers, registered_at, created_revision)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     $13, $14, $15, $16, $17, $18::timestamptz, $19)",
+        )
+        .bind(&outbound.id)
+        .bind(&binding.node)
+        .bind(&binding.device_id)
+        .bind(&binding.account_id)
+        .bind(access_token_sealed)
+        .bind(private_key_sealed)
+        .bind(&binding.peer_public_key)
+        .bind(serde_json::to_value(&binding.local_addresses)?)
+        .bind(serde_json::to_value(&binding.reserved)?)
+        .bind(&binding.endpoint_address)
+        .bind(binding.endpoint_port.map(i32::from))
+        .bind(binding.mtu.map(i32::from))
+        .bind(binding.keep_alive.map(i32::from))
+        .bind(
+            binding
+                .allowed_ips
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+        )
+        .bind(binding.no_kernel_tun)
+        .bind(&binding.domain_strategy)
+        .bind(binding.workers.map(i32::from))
+        .bind(&binding.registered_at)
+        .bind(revision_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn clear_app_model_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     for statement in [
+        "DELETE FROM front_external_vias",
         "DELETE FROM front_vias",
         "DELETE FROM grants",
         "DELETE FROM steps",
@@ -2423,6 +2980,7 @@ async fn clear_app_model_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         "DELETE FROM fronts",
         "DELETE FROM chains",
         "DELETE FROM apps",
+        "DELETE FROM external_outbounds",
     ] {
         sqlx::query(statement).execute(&mut **tx).await?;
     }
@@ -2433,39 +2991,86 @@ async fn restore_apps_tx(
     tx: &mut Transaction<'_, Postgres>,
     revision_id: u64,
     snapshot: &ModelSnapshot,
+    warp_binding_tokens: &WarpBindingTokenMap,
 ) -> Result<()> {
-    let revision_id = revision_to_i64(revision_id)?;
-    for app in &snapshot.apps {
-        restore_app_tx(tx, revision_id, app, &snapshot.settings.reality_site).await?;
+    // Tunnels are tenant resources, independent from projects. Restore them once before any app
+    // front can recreate its references.
+    for outbound in &snapshot.external_outbounds {
+        console::upsert_external_outbound_tx(
+            tx,
+            &AdminContext::system_admin("system:rollback"),
+            revision_id,
+            console::UpsertExternalOutboundRequest {
+                id: outbound.id.clone(),
+                tenant_id: outbound.tenant.clone(),
+                name: outbound.name.clone(),
+                address: outbound.address.clone(),
+                port: outbound.port,
+                protocol: outbound.protocol.clone(),
+                security: outbound.security.clone(),
+                note: None,
+            },
+        )
+        .await?;
+        restore_warp_bindings_tx(
+            tx,
+            revision_to_i64(revision_id)?,
+            outbound,
+            warp_binding_tokens,
+        )
+        .await?;
+    }
+    for (position, app) in snapshot.apps.iter().enumerate() {
+        restore_app_tx(
+            tx,
+            revision_id,
+            u32::try_from(position)
+                .map_err(|_| StoreError::InvalidData("app position out of range".to_owned()))?,
+            app,
+            &snapshot.settings.reality_site,
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn restore_app_tx(
     tx: &mut Transaction<'_, Postgres>,
-    revision_id: i64,
+    revision_id: u64,
+    position: u32,
     app: &AppView,
     site: &RealitySite,
 ) -> Result<()> {
+    let revision_id = revision_to_i64(revision_id)?;
     sqlx::query(
-        "INSERT INTO apps (id, label, created_revision)
-         VALUES ($1, $2, $3)",
+        "INSERT INTO apps (id, label, position, created_revision)
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(&app.id)
     .bind(&app.label)
+    .bind(
+        i32::try_from(position).map_err(|_| {
+            StoreError::InvalidData(format!("app {} position out of range", app.id))
+        })?,
+    )
     .bind(revision_id)
     .execute(&mut **tx)
     .await?;
 
-    for chain in &app.chains {
+    for (chain_position, chain) in app.chains.iter().enumerate() {
         sqlx::query(
-            "INSERT INTO chains (id, app_id, tenant_id, name, created_revision)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO chains
+                (id, app_id, tenant_id, name, subscription_country, position, created_revision)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&chain.id)
         .bind(&app.id)
         .bind(&chain.tenant)
         .bind(&chain.name)
+        .bind(&chain.subscription_country)
+        .bind(i32::try_from(chain_position).map_err(|_| {
+            StoreError::InvalidData(format!("chain {} position out of range", chain.id))
+        })?)
         .bind(revision_id)
         .execute(&mut **tx)
         .await?;
@@ -2505,6 +3110,10 @@ async fn restore_app_tx(
             fallback_guard,
         } = ingress_reality_override_columns(ingress.wires.reality(), site, &ingress.wires);
         let xhttp = ingress.wires.xhttp();
+        let xhttp_xmux = xhttp
+            .and_then(|xhttp| xhttp.xmux.as_ref())
+            .map(serde_json::to_value)
+            .transpose()?;
         let hysteria2 = ingress.wires.hysteria2();
         let quic = hysteria2.map(|h| h.quic).unwrap_or_default();
         let (hy2_masquerade_kind, hy2_masquerade_url) = match hysteria2.map(|h| &h.masquerade) {
@@ -2518,7 +3127,7 @@ async fn restore_app_tx(
                 reality_dest, reality_server_names, reality_fingerprint, reality_flow,
                 reality_fallback_mode, reality_fallback_limits,
                 reality_fallback_guard,
-                transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_mux, xhttp_mode,
+                transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_mode,
                 hy2_port, hy2_hop_start, hy2_hop_end,
                 hy2_up, hy2_down, hy2_congestion, hy2_obfs_password,
                 hy2_masquerade_kind, hy2_masquerade_url,
@@ -2578,7 +3187,7 @@ async fn restore_app_tx(
         .bind(ingress.wires.has_udp())
         .bind(xhttp.map(|xhttp| xhttp.path.clone()))
         .bind(xhttp.and_then(|xhttp| xhttp.host.clone()))
-        .bind(xhttp.and_then(|xhttp| xhttp.mux.map(i32::from)))
+        .bind(xhttp_xmux)
         .bind(xhttp.and_then(|xhttp| xhttp.mode.as_str()))
         .bind(hysteria2.map(|h| i32::from(h.port)))
         .bind(hysteria2.and_then(|h| h.hop.map(|hop| i32::from(hop.start))))
@@ -2723,6 +3332,22 @@ async fn restore_app_tx(
             .execute(&mut **tx)
             .await?;
         }
+        for (ordinal, outbound_id) in front.external_via.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO front_external_vias (front_id, outbound_id, ordinal)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(&front.id)
+            .bind(outbound_id)
+            .bind(i32::try_from(ordinal).map_err(|_| {
+                StoreError::InvalidData(format!(
+                    "front {} external tunnel list is too long",
+                    front.id
+                ))
+            })?)
+            .execute(&mut **tx)
+            .await?;
+        }
     }
 
     for step in &app.steps {
@@ -2771,6 +3396,12 @@ fn snapshot_tenant_ids(snapshot: &ModelSnapshot) -> BTreeSet<String> {
     let mut tenants = BTreeSet::new();
     tenants.extend(snapshot.nodes.iter().map(|node| node.tenant.clone()));
     tenants.extend(snapshot.users.iter().map(|user| user.tenant.clone()));
+    tenants.extend(
+        snapshot
+            .external_outbounds
+            .iter()
+            .map(|outbound| outbound.tenant.clone()),
+    );
     for app in &snapshot.apps {
         tenants.extend(app.chains.iter().map(|chain| chain.tenant.clone()));
         tenants.extend(app.fronts.iter().map(|front| front.tenant.clone()));
@@ -2947,6 +3578,10 @@ async fn insert_rollback_deployment_tx(
 
     for target in &plan.targets {
         insert_target(tx, deployment_id, target).await?;
+    }
+
+    if status == "succeeded" {
+        crate::serving::activate_deployment_tx(tx, deployment_id).await?;
     }
 
     Ok((deployment_id, status.to_owned()))
@@ -3420,6 +4055,14 @@ async fn desired_deployment_from_structure_connection(
         serde_json::from_value(desired_structure.get("actions").cloned().ok_or_else(|| {
             StoreError::InvalidData("desired_structure.actions is missing".to_owned())
         })?)?;
+    let usage_generation_id: Option<i64> = sqlx::query_scalar(
+        "SELECT usage_generation_id FROM deployment_target_state
+         WHERE deployment_id = $1 AND node_id = $2",
+    )
+    .bind(deployment_id)
+    .bind(&node_id)
+    .fetch_one(&mut *connection)
+    .await?;
 
     Ok(NodeDesiredDeployment {
         deployment_id,
@@ -3427,6 +4070,7 @@ async fn desired_deployment_from_structure_connection(
         wave: u32::try_from(wave)
             .map_err(|_| StoreError::InvalidData("deployment wave is out of range".to_owned()))?,
         actions,
+        usage_generation_id,
         // The distribution source is filled in by the HTTP layer: it is configuration of the
         // runtime environment (env), which store should not know about.
         phantun_binary: None,
@@ -3482,6 +4126,7 @@ async fn insert_target(
         PlannedTargetStatus::Pending => "pending",
         PlannedTargetStatus::Skipped => "skipped",
     };
+    let lifecycle_epoch = crate::lifecycle::current_epoch_tx(tx, &target.node_id).await?;
     sqlx::query(
         "INSERT INTO deployment_targets (deployment_id, node_id, status)
          VALUES ($1, $2, $3)",
@@ -3494,9 +4139,10 @@ async fn insert_target(
 
     sqlx::query(
         "INSERT INTO deployment_target_state (
-            deployment_id, node_id, wave, disruptive, desired_structure, desired_grants
+            deployment_id, node_id, wave, disruptive, desired_structure, desired_grants,
+            lifecycle_epoch
          )
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(deployment_id)
     .bind(&target.node_id)
@@ -3506,8 +4152,36 @@ async fn insert_target(
     .bind(target.disruptive)
     .bind(desired_structure_json(target)?)
     .bind(serde_json::to_value(&target.desired.grants)?)
+    .bind(lifecycle_epoch)
     .execute(&mut **tx)
     .await?;
+
+    let revision_id: i64 = sqlx::query_scalar("SELECT revision_id FROM deployments WHERE id = $1")
+        .bind(deployment_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let snapshot =
+        crate::materialize::load_snapshot_tx(tx, Some(revision_to_u64(revision_id)?)).await?;
+    let usage_generation_id = crate::usage::create_usage_generation_for_target(
+        tx,
+        deployment_id,
+        &target.node_id,
+        &snapshot,
+        &target.desired,
+        &target.actions,
+    )
+    .await?;
+    if let Some(usage_generation_id) = usage_generation_id {
+        sqlx::query(
+            "UPDATE deployment_target_state SET usage_generation_id = $3
+             WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(deployment_id)
+        .bind(&target.node_id)
+        .bind(usage_generation_id)
+        .execute(&mut **tx)
+        .await?;
+    }
 
     Ok(())
 }
@@ -3813,6 +4487,7 @@ async fn refresh_deployment_status(
         .bind(deployment_id)
         .execute(&mut **tx)
         .await?;
+        crate::serving::activate_deployment_tx(tx, deployment_id).await?;
         Ok("succeeded".to_owned())
     } else {
         sqlx::query(
@@ -3886,6 +4561,16 @@ fn desired_structure_json(target: &PlannedTarget) -> Result<Value> {
         structure.insert(artifact.field().to_owned(), artifact_metadata(desired));
     }
     Ok(Value::Object(structure))
+}
+
+fn desired_structure_is_full_teardown(structure: &Value) -> bool {
+    ConfigArtifact::ALL.into_iter().all(|artifact| {
+        structure
+            .get(artifact.field())
+            .and_then(|metadata| metadata.get("state"))
+            .and_then(Value::as_str)
+            == Some("disabled")
+    })
 }
 
 fn artifact_metadata(artifact: &DesiredArtifact) -> Value {

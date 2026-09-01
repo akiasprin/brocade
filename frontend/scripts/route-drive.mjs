@@ -185,6 +185,12 @@ fire('hashchange');
 check('nav 跟过去', forge.snapshot().nav, 'chains');
 check('下钻跟过去', drillOf('chains'), { p: 'chain', app: 'app-1', chain: 'c-a' });
 
+console.log('\n— 用户深链同时恢复租户与用户名 —');
+win.location.hash = '#/users/user/acme%2Fapac/alice';
+fire('hashchange');
+check('用户深链切到用户面', forge.snapshot().nav, 'users');
+check('用户深链恢复完整身份', drillOf('users'), { p: 'user', tenant: 'acme/apac', id: 'alice' });
+
 console.log('\n— 深链进向导 —');
 win.location.hash = '#/nodes/provision';
 fire('hashchange');

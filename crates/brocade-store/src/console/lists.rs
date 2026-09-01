@@ -208,7 +208,7 @@ pub async fn list_user_app_quotas(
                 OR q.tenant_id = $2
                 OR q.tenant_id LIKE $3 ESCAPE '\\'
            )
-         ORDER BY q.tenant_id, q.user_id, q.app_id",
+         ORDER BY q.tenant_id, q.user_id, a.position, a.id",
     )
     .bind(tenant_id)
     .bind(actor.tenant_scope())

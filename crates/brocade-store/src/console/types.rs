@@ -7,9 +7,9 @@ use serde::{de::Deserializer, Deserialize, Serialize};
 use serde_json::Value;
 
 use brocade_core::model::{
-    Chain, Dns, DomainStrategy, ExternalOutboundProtocol, ExternalOutboundSecurity, Front,
-    FrontStrategy, Grant, Hysteria2, IngressGuard, NodeConnection, Projection,
-    RealityFallbackLimits, RealityFallbackMode, Rule, User, WgTransport, Xhttp,
+    Chain, DestMatch, Dns, DomainStrategy, EgressDnsResolution, ExternalOutboundProtocol,
+    ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2, IngressGuard, NodeConnection,
+    Projection, RealityFallbackLimits, RealityFallbackMode, Rule, User, WgTransport, Xhttp,
 };
 use brocade_deployment::plan::{PlanSummary, PlannedTarget};
 
@@ -23,7 +23,19 @@ pub type RedactedModelSnapshot = Value;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleSnapshot {
     pub snapshot: RedactedModelSnapshot,
+    /// Machine-owned DNS policies, repeated beside the redacted model for the console's
+    /// narrow TypeScript snapshot declaration. The canonical copy also lives in ModelSnapshot so
+    /// drafts, historical revisions and rollback retain policies with no current chain reference.
+    pub node_egress_dns: Vec<ConsoleEgressDnsPolicy>,
     pub redacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleEgressDnsPolicy {
+    pub node: String,
+    pub position: u32,
+    pub selector: DestMatch,
+    pub resolution: EgressDnsResolution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -112,6 +124,11 @@ pub struct NodeAgentStateItem {
     pub geodata_observed: Option<serde_json::Value>,
     pub last_poll_at: Option<String>,
     pub last_usage_report_at: Option<String>,
+    /// Exact result of the last committed idempotent usage round. Empty means the machine has
+    /// never spoken protocol v3. The store may decorate the response with process-local findings;
+    /// those fields are never written back to this JSON column.
+    pub usage_last_result: Option<serde_json::Value>,
+    pub usage_generation_id: Option<i64>,
     pub xray_started_at: Option<String>,
     /// `udp` or `fake_tcp`: how others dial this machine's wg port.
     pub wg_transport_kind: String,
@@ -147,8 +164,14 @@ pub struct NodeAgentStateItem {
     pub dns: Dns,
     pub domain_strategy: DomainStrategy,
     /// The decommission time. Non-null means retired; the machine remains in the plan, with a
-    /// desired state of all three artifacts off.
+    /// desired state of all four configuration artifacts off.
     pub retired_at: Option<String>,
+    /// Operational progress of that intent. Unlike retired_at this is not part of model snapshots.
+    pub lifecycle_phase: String,
+    pub lifecycle_epoch: u64,
+    pub lifecycle_deployment_id: Option<i64>,
+    pub lifecycle_completed_at: Option<String>,
+    pub lifecycle_last_error: Option<String>,
     pub applied: Option<Value>,
 }
 
@@ -225,6 +248,18 @@ pub struct DynamicClashSubscription {
     pub usage: ClashSubscriptionUsage,
 }
 
+/// Revocable bearer for the deliberately small Clash document consumed by Haitun's test bot.
+/// The token is stored because an operator must be able to reopen the dialog and copy the same
+/// active URL; unlike generated YAML, this operational grant is durable state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClashHaitunLink {
+    pub tenant_id: String,
+    pub user_id: String,
+    pub token: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClashSubscriptionUsage {
     pub upload_bytes: u64,
@@ -287,6 +322,8 @@ pub struct DeploymentVerification {
     pub converged: bool,
     pub summary: PlanSummary,
     pub targets: Vec<PlannedTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_lifecycle: Option<crate::lifecycle::NodeLifecycleState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,7 +427,6 @@ pub struct UpsertAppResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpsertExternalOutboundRequest {
-    pub app_id: String,
     pub id: String,
     pub tenant_id: String,
     pub name: String,
@@ -402,12 +438,117 @@ pub struct UpsertExternalOutboundRequest {
     pub note: Option<String>,
 }
 
+/// A completed provider registration ready to be committed as one machine binding.
+///
+/// This is intentionally not the public HTTP request: the console creates the key locally and
+/// obtains the remaining fields from Cloudflare before handing the complete, verified record to
+/// the store. Draft preview never constructs this type and therefore cannot perform registration
+/// as a side effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterWarpBindingRequest {
+    pub outbound_id: String,
+    pub node_id: String,
+    pub device_id: String,
+    pub account_id: String,
+    pub access_token: String,
+    pub private_key: String,
+    pub peer_public_key: String,
+    pub local_addresses: Vec<String>,
+    pub reserved: Vec<u8>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterWarpBindingResult {
+    pub revision_id: u64,
+    /// Redacted machine binding. Its private key has already been removed.
+    pub binding: Value,
+}
+
+/// Replaces the optional route overrides for one already-registered WARP machine identity.
+/// `None` means inherit that field from the logical tunnel. Fields inherit independently except
+/// `allowed_ips` and `domain_strategy`, which form one address-policy override and move together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWarpBindingRequest {
+    pub tenant_id: String,
+    pub outbound_id: String,
+    pub node_id: String,
+    #[serde(default)]
+    pub endpoint_address: Option<String>,
+    #[serde(default)]
+    pub endpoint_port: Option<u16>,
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    #[serde(default)]
+    pub keep_alive: Option<u16>,
+    #[serde(default)]
+    pub allowed_ips: Option<Vec<String>>,
+    #[serde(default)]
+    pub no_kernel_tun: Option<bool>,
+    #[serde(default)]
+    pub domain_strategy: Option<String>,
+    #[serde(default)]
+    pub workers: Option<u16>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateWarpBindingResult {
+    pub revision_id: u64,
+    /// Safe machine binding fields only; provider token and WireGuard private key are absent.
+    pub binding: Value,
+}
+
+/// Provider identity needed for the irreversible half of removing one machine registration.
+///
+/// This type deliberately has no serde implementation: the access token crosses only the
+/// store/console process boundary and must never become an HTTP response by accident.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WarpBindingRemoval {
+    pub device_id: String,
+    pub access_token: String,
+}
+
+impl std::fmt::Debug for WarpBindingRemoval {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WarpBindingRemoval")
+            .field("device_id", &self.device_id)
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Commits the local half after Cloudflare has confirmed that the device is gone.
+/// `expected_device_id` closes the small provider/database race: a delayed response may remove
+/// only the identity it prepared, never a different registration later attached to the same node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveWarpBindingRequest {
+    pub tenant_id: String,
+    pub outbound_id: String,
+    pub node_id: String,
+    pub expected_device_id: String,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveWarpBindingResult {
+    pub revision_id: u64,
+    pub node_id: String,
+    pub device_id: String,
+    pub removed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateChainRequest {
     pub id: String,
     pub tenant_id: String,
     pub name: String,
+    #[serde(default)]
+    pub subscription_country: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -426,6 +567,8 @@ pub struct CreateFrontRequest {
     pub name: String,
     pub strategy: FrontStrategy,
     pub via: Vec<String>,
+    #[serde(default)]
+    pub external_via: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -672,15 +815,6 @@ pub struct StepAcceptRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpsertStepResult {
-    pub revision_id: u64,
-    /// Already redacted. `hop_in.security` holds a REALITY private key and this result goes out
-    /// over HTTP, so like an ingress it passes through `redacted_value` (private keys do not
-    /// leave over HTTP).
-    pub step: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteStepResult {
     pub revision_id: u64,
     /// True only where something was really deleted. Deleting a step the database does not have
@@ -812,6 +946,18 @@ pub struct UpdateNodeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warp_removal_debug_never_prints_the_provider_token() {
+        let removal = WarpBindingRemoval {
+            device_id: "device-1".to_owned(),
+            access_token: "provider-secret".to_owned(),
+        };
+        let debug = format!("{removal:?}");
+        assert!(debug.contains("device-1"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("provider-secret"));
+    }
 
     #[test]
     fn hysteria2_wires_request_has_a_typed_nested_payload() {

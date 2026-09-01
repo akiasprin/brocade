@@ -1,12 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  fetchAgentRelease,
-  fetchNodes,
-  saveAgentRelease,
-  type AgentReleaseScope,
-  type AgentReleaseView,
-} from '../api';
+import { fetchAgentRelease, fetchNodes, saveAgentRelease, type AgentReleaseScope, type AgentReleaseView } from '../api';
 import { Ago, ErrorBox, Loading } from '../ui/bits';
 
 const bareBuild = (raw: string | null) => raw?.replace(/^brocade-agent\//, '') ?? null;
@@ -27,7 +21,6 @@ export function useAgentDrift(): { pending: number; loading: boolean } {
   return { pending: inScope.filter(n => !onThisBuild(view, n.agent_version)).length, loading: false };
 }
 
-
 export function AgentReleaseSection({ editable, no }: { editable: boolean; no: string }) {
   const qc = useQueryClient();
   const rel = useQuery({ queryKey: ['agent-release'], queryFn: () => fetchAgentRelease() });
@@ -46,9 +39,8 @@ export function AgentReleaseSection({ editable, no }: { editable: boolean; no: s
     setSyncedFrom(rel.data);
     setForm({
       scope: rel.data.released.scope,
-      nodes: rel.data.released.scope === 'all'
-        ? (nodes.data?.nodes ?? []).map(n => n.node_id)
-        : rel.data.released.nodes,
+      nodes:
+        rel.data.released.scope === 'all' ? (nodes.data?.nodes ?? []).map(n => n.node_id) : rel.data.released.nodes,
       note: '',
     });
   }
@@ -126,29 +118,20 @@ export function AgentReleaseSection({ editable, no }: { editable: boolean; no: s
                 {view.released.version ? `v${view.released.version}` : '—'}
               </span>
               <span className="dim" style={{ marginLeft: 8 }}>
-                {[
-                  view.released.released_at?.slice(0, 16),
-                  view.released.released_by,
-                ].filter(Boolean).join(' · ')}
+                {[view.released.released_at?.slice(0, 16), view.released.released_by].filter(Boolean).join(' · ')}
               </span>
             </>
           ) : (
             <span className="dim">未批准，机队不会自行更新</span>
           )}
         </dd>
-
       </dl>
 
       <table className="tbl ag-t" style={{ marginTop: 10 }}>
         <thead>
           <tr>
             <th className="pick">
-              <input
-                type="checkbox"
-                checked={allSelected}
-                disabled={!editable}
-                onChange={toggleAll}
-              />
+              <input type="checkbox" checked={allSelected} disabled={!editable} onChange={toggleAll} />
             </th>
             <th>机器</th>
             <th>当前构建</th>
@@ -163,12 +146,7 @@ export function AgentReleaseSection({ editable, no }: { editable: boolean; no: s
             return (
               <tr key={n.node_id} className={picked ? undefined : 'out'}>
                 <td className="pick">
-                  <input
-                    type="checkbox"
-                    checked={picked}
-                    disabled={!editable}
-                    onChange={() => toggle(n.node_id)}
-                  />
+                  <input type="checkbox" checked={picked} disabled={!editable} onChange={() => toggle(n.node_id)} />
                 </td>
                 <td className="nm">{n.name || n.node_id}</td>
                 <td className="bd">{bareBuild(n.agent_version)?.slice(0, 12) ?? '—'}</td>
@@ -183,7 +161,9 @@ export function AgentReleaseSection({ editable, no }: { editable: boolean; no: s
                     <span className="st st-skipped">不在范围</span>
                   )}
                 </td>
-                <td className="r"><Ago at={n.last_poll_at} /></td>
+                <td className="r">
+                  <Ago at={n.last_poll_at} />
+                </td>
               </tr>
             );
           })}
@@ -199,7 +179,6 @@ export function AgentReleaseSection({ editable, no }: { editable: boolean; no: s
           {save.isPending ? '批准中…' : '批准'}
         </button>
       </div>
-
     </section>
   );
 }

@@ -155,9 +155,7 @@ export function UsagePane() {
                     .join('、')}
                   {gaps.length > 3 ? ` 等 ${gaps.length} 行` : ''}
                 </span>
-                <span className="sum-when">
-                  少收了至少一跳，账面只会偏小。翻原始样本按用户筛查。
-                </span>
+                <span className="sum-when">少收了至少一跳，账面只会偏小。翻原始样本按用户筛查。</span>
               </span>
             </div>
           </section>

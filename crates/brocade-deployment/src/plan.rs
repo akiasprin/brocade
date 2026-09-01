@@ -481,10 +481,15 @@ pub fn plan_deployment(
         })
         .collect::<Vec<_>>();
 
+    let retired = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.retired)
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut node_ids = snapshot
         .nodes
         .iter()
-        .filter(|node| !node.retired)
         .map(|node| node.id.as_str())
         .collect::<Vec<_>>();
     node_ids.sort_unstable();
@@ -500,12 +505,40 @@ pub fn plan_deployment(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(plan_desired_deployment(
-        snapshot.revision,
-        desired,
-        applied,
-        warnings,
-    ))
+    let mut plan = plan_desired_deployment(snapshot.revision, desired, applied, warnings);
+    let applied_by_node = applied
+        .iter()
+        .map(|state| (state.node_id.as_str(), state))
+        .collect::<BTreeMap<_, _>>();
+    for target in &mut plan.targets {
+        if !retired.contains(target.node_id.as_str()) {
+            continue;
+        }
+        // Outside retirement, Unmanaged explicitly means that Brocade must leave an artifact
+        // alone. Retirement is the one stronger contract: absence of proof is not proof that a
+        // listener, interface or rule is gone, so every non-Disabled observation gets one
+        // idempotent disable and read-back.
+        let applied = applied_by_node.get(target.node_id.as_str()).copied();
+        target.actions = retirement_actions(&target.desired, applied);
+        target.disruptive = target
+            .actions
+            .iter()
+            .any(|action| is_disruptive(action, applied, &target.desired));
+        target.status = if target.actions.is_empty() {
+            PlannedTargetStatus::Skipped
+        } else {
+            PlannedTargetStatus::Pending
+        };
+    }
+    // A retired machine remains a target only while teardown is owed. Once all managed artifacts
+    // have been observed Disabled, carrying it forever in every future release adds noise and
+    // falsely suggests that the machine still participates in the fleet.
+    plan.targets.retain(|target| {
+        !retired.contains(target.node_id.as_str()) || target.status == PlannedTargetStatus::Pending
+    });
+    assign_waves(&mut plan.targets);
+    plan.summary = summarize_targets(&plan.targets);
+    Ok(plan)
 }
 
 pub fn plan_forced_deployment(
@@ -535,7 +568,12 @@ pub fn plan_forced_deployment(
     let mut node_ids = snapshot
         .nodes
         .iter()
-        .filter(|node| !node.retired)
+        .filter(|node| {
+            !node.retired
+                || !applied_by_node
+                    .get(node.id.as_str())
+                    .is_some_and(|state| retirement_artifacts_disabled(state))
+        })
         .map(|node| node.id.as_str())
         .collect::<Vec<_>>();
     node_ids.sort_unstable();
@@ -828,6 +866,54 @@ fn artifact_needs_action(
             Some(AppliedArtifactState::Disabled | AppliedArtifactState::Unmanaged)
         ),
     }
+}
+
+fn retirement_actions(
+    desired: &NodeDesiredState,
+    applied: Option<&NodeAppliedState>,
+) -> Vec<PlannedAction> {
+    let mut actions = Vec::new();
+    let mut require_disabled =
+        |desired: &DesiredArtifact, observed: Option<&AppliedArtifactState>, action| {
+            if matches!(desired, DesiredArtifact::Disabled { .. })
+                && !matches!(observed, Some(AppliedArtifactState::Disabled))
+            {
+                actions.push(action);
+            }
+        };
+    require_disabled(
+        &desired.phantun,
+        applied.map(|state| &state.phantun),
+        PlannedAction::DisablePhantun,
+    );
+    require_disabled(
+        &desired.hy2_port_hop,
+        applied.map(|state| &state.hy2_port_hop),
+        PlannedAction::DisableHy2PortHop,
+    );
+    require_disabled(
+        &desired.wireguard,
+        applied.map(|state| &state.wireguard),
+        PlannedAction::DisableWireGuard,
+    );
+    require_disabled(
+        &desired.xray,
+        applied.map(|state| &state.xray),
+        PlannedAction::DisableXray,
+    );
+    actions.sort();
+    actions
+}
+
+fn retirement_artifacts_disabled(applied: &NodeAppliedState) -> bool {
+    [
+        &applied.phantun,
+        &applied.hy2_port_hop,
+        &applied.wireguard,
+        &applied.xray,
+    ]
+    .into_iter()
+    .all(|state| matches!(state, AppliedArtifactState::Disabled))
 }
 
 fn grants_need_action(desired: &DesiredGrants, applied: Option<&AppliedGrantsState>) -> bool {

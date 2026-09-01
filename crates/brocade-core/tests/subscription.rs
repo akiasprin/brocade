@@ -3,15 +3,16 @@ use std::net::{IpAddr, Ipv4Addr};
 use brocade_core::{
     artifacts::subscription,
     format::{uri, yaml},
-    ir::routing::compile_app,
+    ir::{routing::compile_app, system::compile_system, validate::validate_app},
     model::{
-        AppView, Chain, Dns, DomainStrategy, Front, FrontStrategy, Grant, Hysteria2,
-        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
-        IngressWires, IpFamily, ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint,
-        ProjectionEndpoint, RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User,
-        WireGuardKeys, Xhttp, XhttpMode,
+        AppView, Chain, Dns, DomainStrategy, ExternalOutbound, ExternalOutboundProtocol,
+        ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2, HysteriaBandwidth,
+        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily,
+        ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
+        RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp,
+        XhttpMode, XhttpXmux,
     },
-    physical::user::project_user,
+    physical::user::{project_user, SubscriptionProtocol, UserPlan},
     Level,
 };
 use ipnet::Ipv4Net;
@@ -36,6 +37,7 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
             tenant: "platform.acme".to_owned(),
             name: "入口组".to_owned(),
             via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
             strategy: FrontStrategy::UrlTest,
         }],
         steps: Vec::new(),
@@ -54,6 +56,7 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
     let artifact = subscription::build(&plan);
     let uri_text = uri::subscription(&artifact);
     let clash_text = yaml::clash_subscription(&artifact);
+    let haitun_text = yaml::clash_haitun_subscription(&artifact);
 
     let mut front_only = artifact.clone();
     front_only
@@ -77,11 +80,136 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
 
     assert!(clash_text.contains("server: hk.example.net"));
     assert!(clash_text.contains("server: us.example.net"));
+    assert!(clash_text.contains("  skip-domain:"), "{clash_text}");
+    assert!(
+        clash_text.contains("    - \"www.example.com\""),
+        "{clash_text}"
+    );
+    assert_eq!(
+        clash_text.matches("    - \"www.example.com\"").count(),
+        1,
+        "多个节点共用一个 servername 时只能输出一条 skip-domain：{clash_text}"
+    );
     assert!(clash_text.contains("dialer-proxy: \"入口组\""));
     assert!(clash_text.contains("type: url-test"));
     assert!(clash_text.contains("proxies: [\"香港入口\"]"));
     assert!(!clash_text.contains("priv-i-front"));
     assert!(!clash_text.contains("priv-i-us"));
+
+    assert!(
+        haitun_text.starts_with("# Brocade · koipy 测速（请求时动态生成）"),
+        "{haitun_text}"
+    );
+    assert!(haitun_text.contains("server: hk.example.net"));
+    assert!(haitun_text.contains("server: us.example.net"));
+    assert!(haitun_text.contains("dialer-proxy: \"入口组\""));
+    assert!(haitun_text.contains("  - name: \"入口组\"\n    type: url-test"));
+    assert!(haitun_text.contains(
+        "  - name: \"koipy 测速\"\n    type: select\n    proxies: [\"香港入口\", \"美国出口\"]"
+    ));
+    assert!(haitun_text.contains("  - MATCH,koipy 测速"));
+    assert!(!haitun_text.contains("rule-providers:"));
+    assert!(!haitun_text.contains("dns:"));
+    assert!(!haitun_text.contains("skip-domain:"));
+    assert!(!haitun_text.contains("gstatic.com"));
+}
+
+#[test]
+fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
+    let mut doc = doc(vec![
+        node("hk", "hk.example.net", [10, 66, 0, 1]),
+        node("us", "us.example.net", [10, 66, 0, 2]),
+    ]);
+    doc.users.push(user("platform.acme", "alice", "uuid-alice"));
+    let socks = |id: &str, name: &str, address: &str, credential: &str| ExternalOutbound {
+        id: id.to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: name.to_owned(),
+        address: address.to_owned(),
+        port: 1080,
+        protocol: ExternalOutboundProtocol::Socks5 {
+            username: Some("alice".to_owned()),
+            credential: credential.to_owned(),
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: Vec::new(),
+    };
+    doc.external_outbounds = vec![
+        socks(
+            "joined",
+            "供应商前置",
+            "joined.proxy.example",
+            "joined-secret",
+        ),
+        socks(
+            "unused",
+            "未加入隧道",
+            "unused.proxy.example",
+            "unused-secret",
+        ),
+        ExternalOutbound {
+            id: "warp".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "Cloudflare WARP".to_owned(),
+            address: "engage.cloudflareclient.com".to_owned(),
+            port: 2408,
+            protocol: ExternalOutboundProtocol::Warp {
+                mtu: 1280,
+                keep_alive: 25,
+                allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+                no_kernel_tun: true,
+                domain_strategy: "ForceIP".to_owned(),
+                workers: 0,
+            },
+            security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
+        },
+    ];
+    let app = AppView {
+        id: "front".to_owned(),
+        label: "前置".to_owned(),
+        chains: vec![chain("c-front", "香港入口"), chain("c-us", "美国出口")],
+        ingresses: vec![
+            ingress("i-front", "c-front", "hk", None),
+            ingress("i-us", "c-us", "us", Some("f")),
+        ],
+        fronts: vec![Front {
+            id: "f".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "入口组".to_owned(),
+            via: vec!["i-front".to_owned()],
+            // Include WARP deliberately: validation must reject it and projection must still
+            // fail closed if a caller renders despite the diagnostic.
+            external_via: vec!["joined".to_owned(), "warp".to_owned()],
+            strategy: FrontStrategy::UrlTest,
+        }],
+        steps: Vec::new(),
+        grants: vec![grant("alice", "i-front"), grant("alice", "i-us")],
+    };
+    let mut diagnostics = Vec::new();
+    let system = compile_system(&doc, &mut diagnostics);
+    let ir = compile_app(&doc, &app, &mut diagnostics);
+    validate_app(&system, &ir, &mut diagnostics);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "front.warp-machine-identity"),
+        "{diagnostics:#?}"
+    );
+
+    let artifact = subscription::build(&project_user(&[ir], "platform.acme", "alice"));
+    let clash = yaml::clash_subscription(&artifact);
+    assert!(clash.contains("name: \"供应商前置\""), "{clash}");
+    assert!(clash.contains("server: joined.proxy.example"), "{clash}");
+    assert!(clash.contains("password: joined-secret"), "{clash}");
+    assert!(
+        clash.contains("proxies: [\"香港入口\", \"供应商前置\"]"),
+        "{clash}"
+    );
+    assert!(!clash.contains("unused.proxy.example"), "{clash}");
+    assert!(!clash.contains("unused-secret"), "{clash}");
+    assert!(!clash.contains("engage.cloudflareclient.com"), "{clash}");
+    assert!(!clash.contains("Cloudflare WARP"), "{clash}");
 }
 
 #[test]
@@ -213,6 +341,59 @@ fn subscription_expands_dual_stack_ingress_and_labels_ipv6() {
 }
 
 #[test]
+fn explicit_subscription_country_prefixes_every_format_and_front_reference() {
+    let mut hk = node("hk", "hk.example.net", [10, 66, 0, 1]);
+    hk.public_ipv6 = Some("2001:db8::10".to_owned());
+    let mut doc = doc(vec![hk, node("us", "us.example.net", [10, 66, 0, 2])]);
+    doc.users.push(user("platform.acme", "alice", "uuid-alice"));
+    let mut hk_chain = chain("c-front", "台湾入口");
+    hk_chain.subscription_country = Some("TW".to_owned());
+    let app = AppView {
+        id: "front".to_owned(),
+        label: "前置".to_owned(),
+        chains: vec![hk_chain, chain("c-us", "美国出口")],
+        ingresses: vec![
+            ingress("i-front", "c-front", "hk", None),
+            ingress("i-us", "c-us", "us", Some("f")),
+        ],
+        fronts: vec![Front {
+            id: "f".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "入口组".to_owned(),
+            via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
+            strategy: FrontStrategy::UrlTest,
+        }],
+        steps: Vec::new(),
+        grants: vec![grant("alice", "i-front"), grant("alice", "i-us")],
+    };
+    let mut diagnostics = Vec::new();
+    let ir = compile_app(&doc, &app, &mut diagnostics);
+
+    let artifact = subscription::build(&project_user(&[ir], "platform.acme", "alice"));
+    let uri_text = uri::subscription(&artifact);
+    let clash_text = yaml::clash_subscription(&artifact);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.level == Level::Error),
+        "{diagnostics:#?}"
+    );
+    assert!(artifact
+        .entries
+        .iter()
+        .any(|entry| entry.name == "🇹🇼 台湾入口"));
+    assert!(artifact
+        .entries
+        .iter()
+        .any(|entry| entry.name == "🇹🇼 台湾入口（IPv6）"));
+    assert!(uri_text.contains("#%F0%9F%87%B9%F0%9F%87%BC%20%E5%8F%B0%E6%B9%BE%E5%85%A5%E5%8F%A3"));
+    assert!(clash_text.contains("name: \"🇹🇼 台湾入口\""));
+    assert!(clash_text.contains("proxies: [\"🇹🇼 台湾入口\", \"🇹🇼 台湾入口（IPv6）\"]"));
+}
+
+#[test]
 fn subscription_skips_nat_public_ipv6() {
     let mut hk = node("hk", "hk.example.net", [10, 66, 0, 1]);
     hk.public_ipv6 = Some("2001:db8::10".to_owned());
@@ -261,6 +442,7 @@ fn clash_front_group_keeps_dual_stack_via_members() {
             tenant: "platform.acme".to_owned(),
             name: "入口组".to_owned(),
             via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
             strategy: FrontStrategy::UrlTest,
         }],
         steps: Vec::new(),
@@ -320,6 +502,7 @@ fn doc(nodes: Vec<Node>) -> ModelSnapshot {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes,
+        node_egress_dns: Vec::new(),
         users: Vec::new(),
         external_outbounds: Vec::new(),
         apps: Vec::new(),
@@ -367,6 +550,7 @@ fn chain(id: &str, name: &str) -> Chain {
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),
         name: name.to_owned(),
+        subscription_country: None,
     }
 }
 
@@ -429,7 +613,7 @@ fn an_xhttp_ingress_reaches_both_subscription_formats() {
     let (uri_text, clash_text) = render_with_xhttp(Some(Xhttp {
         path: "/probe".to_owned(),
         host: None,
-        mux: Some(16),
+        xmux: Some(XhttpXmux::with_concurrency(16)),
         mode: XhttpMode::Auto,
     }));
 
@@ -444,10 +628,13 @@ fn an_xhttp_ingress_reaches_both_subscription_formats() {
     // families read it from — and it has to travel even with no independent download, which is
     // the case this pins: before, `extra` was written only alongside `downloadSettings` and the
     // upload concurrency reached nobody.
-    assert!(
-        uri_text.contains("extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A16%7D%7D"),
-        "{uri_text}"
-    );
+    for field in [
+        "%22maxConcurrency%22%3A16",
+        "%22hMaxRequestTimes%22%3A%22600-900%22",
+        "%22hMaxReusableSecs%22%3A%221800-3000%22",
+    ] {
+        assert!(uri_text.contains(field), "{field} 没进入 URI：{uri_text}");
+    }
 
     assert!(clash_text.contains("network: xhttp"), "{clash_text}");
     assert!(clash_text.contains("xhttp-opts:"), "{clash_text}");
@@ -457,6 +644,14 @@ fn an_xhttp_ingress_reaches_both_subscription_formats() {
     assert!(clash_text.contains("reuse-settings:"), "{clash_text}");
     assert!(!clash_text.contains("x-mux"), "{clash_text}");
     assert!(clash_text.contains("max-concurrency: 16"), "{clash_text}");
+    assert!(
+        clash_text.contains("h-max-request-times: \"600-900\""),
+        "{clash_text}"
+    );
+    assert!(
+        clash_text.contains("h-max-reusable-secs: \"1800-3000\""),
+        "{clash_text}"
+    );
 }
 
 /// One is the connection pool — a connection per stream, handed on when it goes idle — and it is
@@ -467,16 +662,19 @@ fn a_concurrency_of_one_is_a_pool_and_reaches_both_subscription_formats() {
     let (uri_text, clash_text) = render_with_xhttp(Some(Xhttp {
         path: "/probe".to_owned(),
         host: None,
-        mux: Some(1),
+        xmux: Some(XhttpXmux::with_concurrency(1)),
         mode: XhttpMode::Auto,
     }));
 
+    for field in [
+        "%22maxConcurrency%22%3A1",
+        "%22hMaxRequestTimes%22%3A%22600-900%22",
+        "%22hMaxReusableSecs%22%3A%221800-3000%22",
+    ] {
+        assert!(uri_text.contains(field), "{field} 没进入 URI：{uri_text}");
+    }
     assert!(
-        uri_text.contains("extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A1%7D%7D"),
-        "{uri_text}"
-    );
-    assert!(
-        clash_text.contains("      reuse-settings:\n        max-concurrency: 1"),
+        clash_text.contains("      reuse-settings:\n        max-concurrency: 1\n        h-max-request-times: \"600-900\"\n        h-max-reusable-secs: \"1800-3000\""),
         "{clash_text}"
     );
 }
@@ -489,7 +687,7 @@ fn an_explicit_upload_mode_reaches_both_subscription_formats() {
     let (uri_text, clash_text) = render_with_xhttp(Some(Xhttp {
         path: "/probe".to_owned(),
         host: None,
-        mux: None,
+        xmux: None,
         mode: XhttpMode::PacketUp,
     }));
 
@@ -505,7 +703,7 @@ fn the_default_upload_mode_is_written_nowhere() {
     let (uri_text, clash_text) = render_with_xhttp(Some(Xhttp {
         path: "/probe".to_owned(),
         host: None,
-        mux: None,
+        xmux: None,
         mode: XhttpMode::Auto,
     }));
 
@@ -560,7 +758,7 @@ fn a_tls_xhttp_ingress_carries_both_halves() {
     let (uri_text, clash_text) = render_with_tls(Some(Xhttp {
         path: "/probe".to_owned(),
         host: None,
-        mux: Some(8),
+        xmux: Some(XhttpXmux::with_concurrency(8)),
         mode: XhttpMode::Auto,
     }));
 
@@ -584,7 +782,7 @@ fn a_tls_xhttp_projection_can_use_an_independent_download_endpoint() {
             xhttp: Xhttp {
                 path: "/probe".to_owned(),
                 host: None,
-                mux: Some(8),
+                xmux: Some(XhttpXmux::with_concurrency(8)),
                 mode: XhttpMode::Auto,
             },
         }));
@@ -651,7 +849,7 @@ fn a_reality_xhttp_projection_uses_tls_only_for_its_download() {
             xhttp: Xhttp {
                 path: "/probe".to_owned(),
                 host: Some("upload.route.example".to_owned()),
-                mux: Some(8),
+                xmux: Some(XhttpXmux::with_concurrency(8)),
                 mode: XhttpMode::Auto,
             },
         }));
@@ -849,6 +1047,42 @@ fn an_ingress_serving_both_wires_lists_both_and_keeps_the_names_apart() {
     assert!(names.iter().any(|name| name.contains("QUIC")), "{names:#?}");
 }
 
+#[test]
+fn a_dual_wire_subscription_can_be_narrowed_to_either_protocol() {
+    let make_plan = || {
+        plan(|face| {
+            let vless = face.wires.vless().unwrap().clone();
+            face.wires = IngressWires::Both {
+                vless,
+                hysteria2: Hysteria2::default(),
+            };
+        })
+    };
+
+    let mut vless = make_plan();
+    vless.retain_protocol(SubscriptionProtocol::Vless);
+    let vless = subscription::build(&vless);
+    let vless_uri = uri::subscription(&vless);
+    let vless_clash = yaml::clash_subscription(&vless);
+    assert!(vless_uri.contains("vless://"), "{vless_uri}");
+    assert!(!vless_uri.contains("hysteria2://"), "{vless_uri}");
+    assert!(vless_clash.contains("type: vless"), "{vless_clash}");
+    assert!(!vless_clash.contains("type: hysteria2"), "{vless_clash}");
+
+    let mut hysteria = make_plan();
+    hysteria.retain_protocol(SubscriptionProtocol::Hysteria2);
+    let hysteria = subscription::build(&hysteria);
+    let hysteria_uri = uri::subscription(&hysteria);
+    let hysteria_clash = yaml::clash_subscription(&hysteria);
+    assert!(!hysteria_uri.contains("vless://"), "{hysteria_uri}");
+    assert!(hysteria_uri.contains("hysteria2://"), "{hysteria_uri}");
+    assert!(!hysteria_clash.contains("type: vless"), "{hysteria_clash}");
+    assert!(
+        hysteria_clash.contains("type: hysteria2"),
+        "{hysteria_clash}"
+    );
+}
+
 /// No subscription this fleet hands out may tell a client to skip certificate verification, on
 /// either wire. xray removed `allowInsecure` in v26.2.6 and rejects the whole config from v26.6.1
 /// on, so the fleet's own core cannot load a configuration carrying the equivalent field; a
@@ -903,6 +1137,18 @@ fn node_certificate_fallback_uses_the_certificate_name_as_reality_sni() {
         clash_text.contains("servername: hk-cert.example.net"),
         "{clash_text}"
     );
+    assert!(
+        clash_text.contains("  skip-domain:\n    - \"hk-cert.example.net\""),
+        "{clash_text}"
+    );
+    assert!(
+        !clash_text
+            .split("proxies:")
+            .next()
+            .unwrap_or_default()
+            .contains("www.example.com"),
+        "节点证书回落不能把外部站点名留在 skip-domain：{clash_text}"
+    );
 }
 
 fn render_with_xhttp(xhttp: Option<Xhttp>) -> (String, String) {
@@ -917,6 +1163,14 @@ fn render_with_xhttp(xhttp: Option<Xhttp>) -> (String, String) {
 }
 
 fn render(shape: impl FnOnce(&mut Ingress)) -> (String, String) {
+    let artifact = subscription::build(&plan(shape));
+    (
+        uri::subscription(&artifact),
+        yaml::clash_subscription(&artifact),
+    )
+}
+
+fn plan(shape: impl FnOnce(&mut Ingress)) -> UserPlan {
     let mut hk = node("hk", "203.0.113.7", [10, 66, 0, 1]);
     hk.certificate_name = Some("hk-cert.example.net".to_owned());
     let mut doc = doc(vec![hk]);
@@ -940,11 +1194,7 @@ fn render(shape: impl FnOnce(&mut Ingress)) -> (String, String) {
             .any(|diagnostic| diagnostic.level == Level::Error),
         "{diagnostics:#?}"
     );
-    let artifact = subscription::build(&project_user(&[ir], "platform.acme", "alice"));
-    (
-        uri::subscription(&artifact),
-        yaml::clash_subscription(&artifact),
-    )
+    project_user(&[ir], "platform.acme", "alice")
 }
 
 fn render_with_projection(projection: Projection) -> (String, String) {
@@ -1180,6 +1430,7 @@ fn a_family_that_empties_a_front_group_drops_the_exits_behind_it() {
             tenant: "platform.acme".to_owned(),
             name: "入口组".to_owned(),
             via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
             strategy: FrontStrategy::UrlTest,
         }],
         steps: Vec::new(),

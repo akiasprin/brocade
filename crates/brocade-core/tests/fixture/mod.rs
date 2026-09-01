@@ -48,6 +48,7 @@ pub fn demo_snapshot() -> ModelSnapshot {
             .iter()
             .map(|node| model_node(node, &system_nodes))
             .collect(),
+        node_egress_dns: Vec::new(),
         users: array(&route["users"]).iter().map(model_user).collect(),
         external_outbounds: Vec::new(),
         apps: array(&meta["apps"])
@@ -150,6 +151,7 @@ fn model_chain(chain: &Value) -> Chain {
         id: str_value(&chain["id"]).to_owned(),
         tenant: str_value(&chain["tenant"]).to_owned(),
         name: str_value(&chain["name"]).to_owned(),
+        subscription_country: chain["subscription_country"].as_str().map(str::to_owned),
     }
 }
 
@@ -192,6 +194,15 @@ fn model_front(front: &Value) -> Front {
         tenant: str_value(&front["tenant"]).to_owned(),
         name: str_value(&front["name"]).to_owned(),
         via: string_array(&front["via"]),
+        external_via: front["external_via"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| str_value(value).to_owned())
+                    .collect()
+            })
+            .unwrap_or_default(),
         strategy: match str_value(&front["strategy"]) {
             "url-test" => FrontStrategy::UrlTest,
             "select" => FrontStrategy::Select,
@@ -279,6 +290,7 @@ fn model_action(value: &Value) -> Action {
         },
         "egress" => Action::Egress {
             send_through: optional_string(&value["via"]).map(|value| value.parse().unwrap()),
+            dns: false,
         },
         "block" => Action::Block,
         value => panic!("unknown action kind {value}"),

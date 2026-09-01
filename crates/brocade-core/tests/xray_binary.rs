@@ -28,14 +28,15 @@ use brocade_core::{
     format::{json, uri},
     ir::{hops::compile_hops, routing::compile_app, system::compile_system},
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, ExternalOutbound,
+        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
+        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutbound,
         ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
-        ExternalVlessXhttp, ExternalVlessXhttpDownload, HopDial, HopEncryption, HopIn, HopPool,
-        HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade,
-        HysteriaObfs, Ingress, IngressWires, IpFamily, ModelSnapshot, Node,
-        ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
-        RealityFallbackMode, RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport, User,
-        WireGuardKeys, Xhttp, XhttpMode,
+        ExternalVlessXhttp, ExternalVlessXhttpDownload, ExternalWarpBinding, HopDial,
+        HopEncryption, HopIn, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion,
+        HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily, ModelSnapshot, Node,
+        NodeEgressDnsPolicy, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
+        RealityFallbackLimits, RealityFallbackMode, RealityXhttp, Rule, Step, Tls, TlsXhttp,
+        Transport, User, WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
     },
     physical::{node::project_node, user::project_user},
     Level,
@@ -51,6 +52,90 @@ const INGRESS_PRIVATE: &str = "gM453ZKs-8Ahf4hPV2SVK1yf7XXC4NLV6V424ETpe2g";
 const INGRESS_PUBLIC: &str = "EdUDF5q3f-LSCmqeYUT5AfA3EBJWUAdqzCPHji78pxY";
 
 #[test]
+fn referenced_machine_egress_dns_loads_in_the_real_binary() {
+    let Some(binary) = xray_binary() else {
+        eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
+        return;
+    };
+    let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    doc.node_egress_dns = vec![
+        NodeEgressDnsPolicy {
+            node: "sg".to_owned(),
+            position: 0,
+            selector: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
+            resolution: EgressDnsResolution {
+                address: "192.0.2.53".to_owned(),
+                port: 53,
+                transport: EgressDnsTransport::Tcp,
+                address_strategy: EgressDnsAddressStrategy::UseIpv4,
+                fallback: EgressDnsFallback::Stop,
+            },
+        },
+        NodeEgressDnsPolicy {
+            node: "sg".to_owned(),
+            position: 1,
+            selector: DestMatch::DomainKeyword(vec!["ipv6-only".to_owned()]),
+            resolution: EgressDnsResolution {
+                address: "2001:db8::53".to_owned(),
+                port: 5353,
+                transport: EgressDnsTransport::Udp,
+                address_strategy: EgressDnsAddressStrategy::UseIpv6,
+                fallback: EgressDnsFallback::Machine,
+            },
+        },
+    ];
+    let egress = app
+        .steps
+        .iter_mut()
+        .find(|step| step.node == "sg")
+        .expect("sg 是落地端");
+    // Definitions alone do not create routes. Both authored egress rules explicitly activate the
+    // matching machine policies; the automatic Any -> Egress remains on the default resolver.
+    egress.rules = vec![
+        Rule {
+            dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
+            action: Action::Egress {
+                send_through: None,
+                dns: true,
+            },
+        },
+        Rule {
+            dest_match: DestMatch::DomainKeyword(vec!["ipv6-only".to_owned()]),
+            action: Action::Egress {
+                send_through: None,
+                dns: true,
+            },
+        },
+    ];
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.iter().all(|d| d.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let config = json::xray(&xray::build(&project_node(&sys, &[app_ir], "sg")));
+    let path = std::env::temp_dir().join("brocade-xray-machine-egress-dns.json");
+    fs::write(&path, &config).unwrap();
+    let output = Command::new(&binary)
+        .args(["-test", "-c"])
+        .arg(&path)
+        .output()
+        .expect("跑不起来 xray");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Configuration OK"),
+        "指定落地解析的产物 xray 不认：\n{stdout}\n{}\n----\n{config}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn external_proxy_protocols_load_in_the_real_binary() {
     let Some(binary) = xray_binary() else {
         eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
@@ -59,7 +144,6 @@ fn external_proxy_protocols_load_in_the_real_binary() {
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
     doc.external_outbounds = vec![
         ExternalOutbound {
-            app: app.id.clone(),
             id: "vless-external".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS".to_owned(),
@@ -77,9 +161,9 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 short_id: "abcdef0123456789".to_owned(),
                 fingerprint: "chrome".to_owned(),
             },
+            bindings: Vec::new(),
         },
         ExternalOutbound {
-            app: app.id.clone(),
             id: "socks-external".to_owned(),
             tenant: "platform".to_owned(),
             name: "SOCKS5".to_owned(),
@@ -90,9 +174,9 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 credential: "proxy-password".to_owned(),
             },
             security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
         },
         ExternalOutbound {
-            app: app.id.clone(),
             id: "xhttp-external".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS XHTTP".to_owned(),
@@ -127,9 +211,9 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 short_id: "abcdef0123456789".to_owned(),
                 fingerprint: "chrome".to_owned(),
             },
+            bindings: Vec::new(),
         },
         ExternalOutbound {
-            app: app.id.clone(),
             id: "http-external".to_owned(),
             tenant: "platform".to_owned(),
             name: "HTTP CONNECT".to_owned(),
@@ -143,9 +227,9 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 server_name: "http.example.net".to_owned(),
                 fingerprint: "chrome".to_owned(),
             },
+            bindings: Vec::new(),
         },
         ExternalOutbound {
-            app: app.id.clone(),
             id: "ss2022-external".to_owned(),
             tenant: "platform".to_owned(),
             name: "SS2022".to_owned(),
@@ -156,9 +240,9 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 method: "2022-blake3-aes-256-gcm".to_owned(),
             },
             security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
         },
         ExternalOutbound {
-            app: app.id.clone(),
             id: "wireguard-external".to_owned(),
             tenant: "platform".to_owned(),
             name: "WireGuard".to_owned(),
@@ -176,6 +260,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 domain_strategy: "ForceIPv4".to_owned(),
             },
             security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
         },
     ];
     app.steps[0].rules = [
@@ -219,6 +304,97 @@ fn external_proxy_protocols_load_in_the_real_binary() {
     assert!(
         stdout.contains("Configuration OK"),
         "外部协议产物 xray 不认：\n{stdout}\n{}\n----\n{config}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
+    let Some(binary) = xray_binary() else {
+        eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
+        return;
+    };
+    let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    doc.external_outbounds = vec![ExternalOutbound {
+        id: "warp".to_owned(),
+        tenant: "platform".to_owned(),
+        name: "Cloudflare WARP".to_owned(),
+        address: "engage.cloudflareclient.com".to_owned(),
+        port: 2408,
+        protocol: ExternalOutboundProtocol::Warp {
+            mtu: 1280,
+            keep_alive: 25,
+            allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+            no_kernel_tun: true,
+            domain_strategy: "ForceIP".to_owned(),
+            workers: 4,
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: vec![ExternalWarpBinding {
+            node: "hk".to_owned(),
+            device_id: "device-hk".to_owned(),
+            account_id: "account-hk".to_owned(),
+            registered_at: "2026-08-27T00:00:00.000Z".to_owned(),
+            endpoint_address: None,
+            endpoint_port: None,
+            mtu: None,
+            keep_alive: None,
+            allowed_ips: None,
+            no_kernel_tun: None,
+            domain_strategy: None,
+            workers: None,
+            private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
+            peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+            local_addresses: vec![
+                "172.16.0.2/32".to_owned(),
+                "2606:4700:110:8::2/128".to_owned(),
+            ],
+            reserved: vec![1, 2, 3],
+        }],
+    }];
+    app.steps[0].rules = vec![Rule {
+        dest_match: DestMatch::Any,
+        action: Action::Proxy {
+            outbound: "warp".to_owned(),
+        },
+    }];
+
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let config = json::xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let parsed = serde_json::from_str::<Value>(&config).unwrap();
+    let warp = parsed["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|outbound| outbound["tag"] == "out:external/warp")
+        .expect("managed WARP outbound");
+    assert_eq!(warp["protocol"], "wireguard");
+    assert_eq!(warp["settings"]["reserved"], json!([1, 2, 3]));
+
+    let path = std::env::temp_dir().join("brocade-xray-managed-warp.json");
+    fs::write(&path, &config).unwrap();
+    let output = Command::new(&binary)
+        .args(["-test", "-c"])
+        .arg(&path)
+        .output()
+        .expect("跑不起来 xray");
+    let _ = fs::remove_file(&path);
+    assert!(
+        output.status.success(),
+        "managed WARP 产物 xray 不认：\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -312,7 +488,7 @@ fn the_share_link_extra_carries_the_pool_into_a_config_the_real_binary_reads() {
             host: None,
             // One: a connection per stream, reused once it goes idle. The whole point of the
             // exercise, and the value that used to reach no client at all.
-            mux: Some(1),
+            xmux: Some(XhttpXmux::with_concurrency(1)),
             mode: XhttpMode::Auto,
         },
     }));
@@ -338,7 +514,13 @@ fn the_share_link_extra_carries_the_pool_into_a_config_the_real_binary_reads() {
     let extra = share_link_extra(&uri_text);
     assert_eq!(
         extra,
-        json!({ "xmux": { "maxConcurrency": 1 } }),
+        json!({
+            "xmux": {
+                "maxConcurrency": 1,
+                "hMaxRequestTimes": "600-900",
+                "hMaxReusableSecs": "1800-3000"
+            }
+        }),
         "{uri_text}"
     );
 
@@ -524,7 +706,10 @@ fn reverse_fixture() -> (
             hop_in: None,
             rules: vec![Rule {
                 dest_match: DestMatch::Any,
-                action: Action::Egress { send_through: None },
+                action: Action::Egress {
+                    send_through: None,
+                    dns: false,
+                },
             }],
         },
     ];
@@ -583,7 +768,7 @@ fn an_xhttp_ingress_loads_in_the_real_binary() {
             xhttp: Xhttp {
                 path: "/probe".to_owned(),
                 host: None,
-                mux,
+                xmux: mux.map(XhttpXmux::with_concurrency),
                 mode,
             },
         }));
@@ -654,7 +839,7 @@ fn split_reality_upload_and_tls_download_load_in_the_real_binary() {
         xhttp: Xhttp {
             path: "/split-probe".to_owned(),
             host: None,
-            mux: Some(8),
+            xmux: Some(XhttpXmux::with_concurrency(8)),
             mode: XhttpMode::Auto,
         },
     }));
@@ -916,7 +1101,10 @@ fn valid_reality_traffic_still_passes_with_the_local_cover_enabled() {
         hop_in: None,
         rules: vec![Rule {
             dest_match: DestMatch::Any,
-            action: Action::Egress { send_through: None },
+            action: Action::Egress {
+                send_through: None,
+                dns: false,
+            },
         }],
     }];
     let hk = doc.nodes.iter_mut().find(|node| node.id == "hk").unwrap();
@@ -1386,7 +1574,7 @@ fn a_tls_ingress_loads_in_the_real_binary() {
             Some(Xhttp {
                 path: "/probe".to_owned(),
                 host: None,
-                mux: Some(8),
+                xmux: Some(XhttpXmux::with_concurrency(8)),
                 mode: XhttpMode::StreamOne,
             }),
         ),
@@ -1625,6 +1813,7 @@ fn base_model(dial: HopDial, security: HopWire) -> (ModelSnapshot, AppView) {
         overlay_cidr: Ipv4Net::new(Ipv4Addr::new(10, 66, 0, 0), 16).unwrap(),
         settings: Default::default(),
         nodes: vec![node("hk", [10, 66, 0, 1]), node("sg", [10, 66, 0, 2])],
+        node_egress_dns: Vec::new(),
         users: vec![User {
             tenant: "platform".to_owned(),
             id: "alice".to_owned(),
@@ -1641,6 +1830,7 @@ fn base_model(dial: HopDial, security: HopWire) -> (ModelSnapshot, AppView) {
             id: "c-relay".to_owned(),
             tenant: "platform".to_owned(),
             name: "中转链".to_owned(),
+            subscription_country: None,
         }],
         ingresses: vec![Ingress {
             id: "i-relay".to_owned(),
@@ -1697,7 +1887,10 @@ fn base_model(dial: HopDial, security: HopWire) -> (ModelSnapshot, AppView) {
                 }),
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress { send_through: None },
+                    action: Action::Egress {
+                        send_through: None,
+                        dns: false,
+                    },
                 }],
             },
         ],

@@ -2,6 +2,9 @@ import { useMemo, useState } from 'react';
 import { HOP_WIRE_OPTIONS, type HopWireKind } from '../ui/format';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  createApp,
+  createChain,
+  createIngress,
   fetchCompileView,
   fetchNodes,
   fetchRevisions,
@@ -10,12 +13,10 @@ import {
   fetchUsers,
   putStep,
   stageGrant,
-  upsertApp,
-  upsertChain,
-  upsertIngress,
   type HopDial,
   type HopInRequest,
   type NodeAgentStateItem,
+  type RealityFallbackMode,
   type Rule,
 } from '../api';
 import { can, useSession } from '../session';
@@ -31,7 +32,9 @@ import {
   forwardAction,
 } from './rules';
 import { ErrorBox, Loading } from '../ui/bits';
-import { freePortAcross, hopListener, hopListeners, isValidSlug, occupiedPorts, portClash, scopedId } from './ports';
+import { freePortAcross, hopListener, hopListeners, isValidSlug, occupiedPorts, portClash } from './ports';
+import { friendlyId } from '../friendly-id';
+import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 
 // 使一台机器运行 xray 的方式：为其创建一条链和一个接入面。
 // 是否运行 xray 由编译器计算得出（physical/node.rs 的 xray_plan），节点上没有也不应有
@@ -48,7 +51,7 @@ import { freePortAcross, hopListener, hopListeners, isValidSlug, occupiedPorts, 
 // 与链详情页保持一致（创建时看到的结构与创建后看到的相同）；第二个依据是
 // 明文直连是逐跳的属性，警告需要显示在对应的跳上，修改也在该位置进行。
 //
-// 三个 id 收入折叠区：它们可自动计算，只在出现问题时需要查看。
+// 链和入口的两个内部 id 自动生成并隐藏；App id 是运营者维护的 slug，新建 App 时仍显示。
 //
 // # 两个入口，同一套界面
 //
@@ -102,14 +105,13 @@ export function ChainWizard({
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const ingressBase = settings.data?.ports?.ingress_base || 8443;
   const hopBase = settings.data?.ports?.hop_base || 20000;
-  // 中转端口选择 REALITY 时请求中需要填写的站点。取自全局设置——该值已为接入面配置过一次，
-  // 中转跳不需要重复填写。全局设置中没有时才使用兜底站点。
+  // 中转端口选择 REALITY 时请求中需要填写的站点。它没有接入面的“本机证书”模式，必须
+  // 使用已经明确配置的全局站点；没有站点时该选择会被拦截，而不是静默塞入工厂域名。
   const realitySite = {
-    dest: settings.data?.reality_site?.dest || 'apps.apple.com:443',
-    names: settings.data?.reality_site?.server_names?.length
-      ? settings.data.reality_site.server_names
-      : ['apps.apple.com'],
+    dest: settings.data?.reality_site?.dest ?? '',
+    names: settings.data?.reality_site?.server_names ?? [],
   };
+  const globalRealityReady = realitySite.dest.trim() !== '' && realitySite.names.length > 0;
 
   const apps = snapshot.data?.snapshot.apps ?? [];
 
@@ -134,6 +136,10 @@ export function ChainWizard({
   /* 键是监听的机器而非跳。见 PortEdit。 */
   const [portEdits, setPortEdits] = useState<Record<string, PortEdit>>({});
   const [showOps, setShowOps] = useState(false);
+  const [realityTarget, setRealityTarget] = useState<RealityFallbackMode | ''>('');
+  const [customRealityDest, setCustomRealityDest] = useState('');
+  const [customRealityNames, setCustomRealityNames] = useState('');
+  const [customRealityFingerprint, setCustomRealityFingerprint] = useState('chrome');
   const [done, setDone] = useState<string[] | null>(null);
   const [error, setError] = useState<unknown>(null);
 
@@ -143,8 +149,23 @@ export function ChainWizard({
   // 因此在未选择之前本页无法给出任何默认值——`ready` 会拦截提交。
   const head = (nodes.data?.nodes ?? []).find(n => n.node_id === spine[0]) ?? node ?? null;
   const headLabel = head ? head.name || head.node_id : '';
-  // 名称和 id 的默认值随链头变化，不使用 useState 的初始值：从线路页进入时链头
-  // 是后续选择的，初始化时尚不存在（原因同 id 和端口部分的说明）。
+  const headCertificate =
+    snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === head?.node_id)?.certificate_name ?? null;
+  const customRealityServerNames = customRealityNames
+    .split(/[\s,]+/)
+    .map(value => value.trim())
+    .filter(Boolean);
+  const realityTargetReady =
+    (realityTarget === 'node-certificate' && !!headCertificate) ||
+    (realityTarget === 'global-site' && globalRealityReady) ||
+    (realityTarget === 'custom-site' &&
+      /^\S+:[1-9]\d*$/.test(customRealityDest.trim()) &&
+      Number(customRealityDest.trim().split(':').at(-1)) <= 65535 &&
+      customRealityServerNames.length > 0 &&
+      customRealityServerNames.every(realityServerNameIsValid) &&
+      realityFingerprintIsValid(customRealityFingerprint));
+  // App 是运营侧长期稳定的 slug，不参与随机 ID 迁移。新建时仍从入口机器给出一个可编辑
+  // 的 slug 默认值；链和接入面的内部 ID 才使用短友好随机值。
   const slug = (head?.node_id ?? '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -168,26 +189,16 @@ export function ChainWizard({
     enabled: !!current,
   });
 
-  // id 和端口的默认值随数据计算，不使用 useState 的初始值：快照尚未返回时
-  // 计算结果为没有任何链，数据返回后再修改已经太晚——此时可能已按当前 id 提交创建，
-  // 覆盖了已有的同名链。因此 state 存储的是是否手动修改过（null 表示未修改），
-  // 显示值一律实时计算。
-  const [chainIdRaw, setChainId] = useState<string | null>(null);
-  const [ingressIdRaw, setIngressId] = useState<string | null>(null);
+  // 技术 ID 在向导的整个生命周期中保持不变：后续的链、接入面、授权与规则操作都引用
+  // 同一组值。端口则随已占用端口计算，只有用户明确修改后才固定。
+  const [chainId] = useState(() => friendlyId('chain'));
+  const [ingressId] = useState(() => friendlyId('ingress', new Set([chainId])));
   const [portRaw, setPort] = useState<number | null>(null);
 
   const targetApp = appMode === 'new' ? appId.trim() : pickedApp;
 
-  // 需要避开所有线路中已有的 id，而非只避开目标线路的：库中 `chains.id` /
-  // `ingresses.id` 是 TEXT PRIMARY KEY，全局唯一。冲突时不报错——写入接口的
-  // `ON CONFLICT (id) DO UPDATE` 会整体替换归属（console.rs 的 upsert_chain），
-  // 既是覆盖也是迁移：steps 按 chain_id 关联并随之迁移，而 `ingresses` 有独立的 app_id
-  // 不随之迁移，导致两个线路各产生一条 error（ingress.no-chain / chain.no-ingress）。
-  const chainIds = new Set(apps.flatMap(a => (a.chains ?? []).map(c => c.id)));
-  const ingressIds = new Set(apps.flatMap(a => (a.ingresses ?? []).map(i => i.id)));
-  const chainId = chainIdRaw ?? scopedId(targetApp, 'c', chainIds);
-  const ingressId = ingressIdRaw ?? scopedId(targetApp, 'i', ingressIds);
-
+  // 端口需要避开所有线路中已有的监听，而非只避开目标线路。技术 ID 的极小概率冲突
+  // 由同一草稿中的 create-only 操作在服务端原子拒绝，不会再把已有对象当成更新目标。
   const taken = useMemo(
     () => occupiedPorts(apps, nodes.data?.nodes ?? [], compile.data?.system),
     /* snapshot 尚未返回时 apps 每次都是新建的空数组，以它作为依赖会每帧重新计算；
@@ -322,7 +333,15 @@ export function ChainWizard({
     });
     list.push({
       op: 'upsert_ingress',
-      arg: `${ingressId.trim()} → ${headLabel} ${bind.trim()}:${port} · REALITY（全局站点）`,
+      arg: `${ingressId.trim()} → ${headLabel} ${bind.trim()}:${port} · REALITY（${
+        realityTarget === 'node-certificate'
+          ? '本机证书'
+          : realityTarget === 'global-site'
+            ? '全局站点'
+            : realityTarget === 'custom-site'
+              ? '自定义站点'
+              : '未选择目标'
+      }）`,
     });
     if (spine.length > 1) {
       spine.forEach((id, i) => {
@@ -362,26 +381,35 @@ export function ChainWizard({
     pickedUsers,
     users.data,
     ingressTenant,
+    realityTarget,
   ]);
 
   const submit = async () => {
     setError(null);
     try {
       const app = targetApp;
-      if (appMode === 'new') await upsertApp({ id: app, label: appLabel.trim() || app });
-      await upsertChain(app, {
+      if (appMode === 'new') await createApp({ id: app, label: appLabel.trim() || app });
+      await createChain(app, {
         id: chainId.trim(),
         tenant_id: head?.tenant_id ?? '',
         name: chainName.trim() || chainId.trim(),
+        subscription_country: null,
       });
-      await upsertIngress(app, {
+      await createIngress(app, {
         id: ingressId.trim(),
         chain_id: chainId.trim(),
         node_id: head?.node_id ?? '',
         bind: bind.trim(),
         port,
-        /* 留空表示使用全局设置中的 REALITY 站点；密钥对由 store 生成 */
-        reality: {},
+        reality:
+          realityTarget === 'custom-site'
+            ? {
+                fallback_mode: realityTarget,
+                dest: customRealityDest.trim(),
+                server_names: customRealityServerNames,
+                fingerprint: customRealityFingerprint,
+              }
+            : { fallback_mode: realityTarget as Exclude<RealityFallbackMode, 'custom-site'> },
       });
 
       // 线性中继：每台转发给下一台，最后一台出网。
@@ -462,7 +490,9 @@ export function ChainWizard({
     !chainClash &&
     !ingressClash &&
     !portTaken &&
-    hopPortIssues.length === 0;
+    hopPortIssues.length === 0 &&
+    realityTargetReady &&
+    (!listeners.some(host => hostSecOf(host) === 'reality') || globalRealityReady);
 
   if (done) {
     return (
@@ -689,8 +719,54 @@ export function ChainWizard({
                     </span>
                     <span className="attr">
                       <span className="k">伪装</span>
-                      <span className="st">REALITY · 全局设置里的站点</span>
+                      <select
+                        className="f"
+                        aria-label="REALITY 目标来源"
+                        value={realityTarget}
+                        onChange={event => setRealityTarget(event.target.value as RealityFallbackMode | '')}
+                      >
+                        <option value="">— 选择 REALITY 目标 —</option>
+                        <option value="node-certificate" disabled={!headCertificate}>
+                          本机证书{headCertificate ? ` · ${headCertificate}` : '（尚未签发）'}
+                        </option>
+                        <option value="global-site" disabled={!globalRealityReady}>
+                          全局站点{globalRealityReady ? ` · ${realitySite.dest}` : '（尚未配置）'}
+                        </option>
+                        <option value="custom-site">自定义站点…</option>
+                      </select>
                     </span>
+                    {realityTarget === 'custom-site' && (
+                      <span className="attr wz-reality-custom">
+                        <span className="k">目标 / SNI</span>
+                        <input
+                          className="f mono"
+                          value={customRealityDest}
+                          placeholder="example.com:443"
+                          onChange={event => setCustomRealityDest(event.target.value)}
+                        />
+                        <input
+                          className="f mono"
+                          value={customRealityNames}
+                          placeholder="example.com"
+                          onChange={event => setCustomRealityNames(event.target.value)}
+                        />
+                        <select
+                          className="f"
+                          aria-label="自定义 REALITY 指纹"
+                          value={customRealityFingerprint}
+                          onChange={event => setCustomRealityFingerprint(event.target.value)}
+                        >
+                          {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                            <option value={value} key={value}>
+                              {label}
+                            </option>
+                          ))}
+                        </select>
+                      </span>
+                    )}
+                    {realityTarget !== '' && !realityTargetReady && (
+                      <span className="note warn">该目标尚不完整，补齐后才能创建。</span>
+                    )}
                   </>
                 ) : (
                   <>
@@ -750,9 +826,14 @@ export function ChainWizard({
                         {/* `rev` 表示该跳是反向接入，该端口承载的是反向隧道。
                             隧道基于 VLESS 账号建立，shadowsocks 没有对应的账号机制。 */}
                         {HOP_WIRE_OPTIONS.map(option => (
-                          <option key={option.kind} value={option.kind} disabled={rev && !option.reverseOk}>
+                          <option
+                            key={option.kind}
+                            value={option.kind}
+                            disabled={(rev && !option.reverseOk) || (option.kind === 'reality' && !globalRealityReady)}
+                          >
                             {option.label}
                             {rev && !option.reverseOk ? ' — 反向隧道只有 VLESS 承载' : ''}
+                            {option.kind === 'reality' && !globalRealityReady ? ' — 先配置全局站点' : ''}
                           </option>
                         ))}
                       </select>
@@ -889,33 +970,7 @@ export function ChainWizard({
         </>
       )}
 
-      {/* ── ID 和归属：可自动计算，只在出现问题时需要查看 ── */}
-      <details className="wz-adv">
-        <summary>ID 和归属（都已经算好了）</summary>
-        <div className="wz-fields">
-          <div className="wz-fld">
-            <label>链 ID</label>
-            <input className="f mono" value={chainId} onChange={e => setChainId(e.target.value)} />
-            {chainClash ? <p className="note warn">{chainClash}</p> : <p className="note">唯一键。</p>}
-          </div>
-          <div className="wz-fld">
-            <label>接入面 ID</label>
-            <input className="f mono" value={ingressId} onChange={e => setIngressId(e.target.value)} />
-            {ingressClash ? (
-              <p className="note warn">{ingressClash}</p>
-            ) : (
-              <p className="note">唯一键，关联入口监听地址。</p>
-            )}
-          </div>
-          <div className="wz-fld">
-            <label>归属租户</label>
-            {/* 外观为输入框但不可编辑：该字段是只读值而非选项——租户随链头机器确定。
-                使用纯文本时它与相邻的两个输入框不对齐，会被理解为未填写。 */}
-            <input className="f mono" value={head?.tenant_id ?? ''} disabled readOnly />
-            <p className="note">资源归属入口机器的租户。</p>
-          </div>
-        </div>
-      </details>
+      {(chainClash || ingressClash) && <div className="callout red">{chainClash || ingressClash}</div>}
 
       {error != null && <ErrorBox error={error} />}
 

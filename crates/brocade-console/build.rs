@@ -207,6 +207,8 @@ fn main() {
     for watched in [
         "../brocade-agent/src",
         "../brocade-agent/Cargo.toml",
+        "../brocade-probe/src",
+        "../brocade-probe/Cargo.toml",
         "../brocade-deployment/src",
         "../brocade-deployment/Cargo.toml",
         "../brocade-core/src",

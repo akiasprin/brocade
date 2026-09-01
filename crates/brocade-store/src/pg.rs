@@ -1,6 +1,9 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
-use brocade_core::model::{IpFamily, ModelSettings, ModelSnapshot};
+use brocade_core::{
+    model::{IpFamily, ModelSettings, ModelSnapshot},
+    physical::user::SubscriptionFilter,
+};
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
     Connection, Executor, PgConnection, PgPool,
@@ -8,11 +11,13 @@ use sqlx::{
 
 use crate::admin;
 use crate::agent_release;
+use crate::branding;
 use crate::cert;
 use crate::console;
 use crate::deployment;
 use crate::distribution;
 use crate::grant_automation;
+use crate::grant_probe;
 use crate::load;
 use crate::probe;
 use crate::provision;
@@ -22,8 +27,8 @@ use crate::usage;
 use crate::{
     agent, materialize, AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult,
     AdminLoginRequest, AdminLoginResult, AdminOperator, ArtifactContent, ArtifactIndex,
-    AuthenticatedAdmin, AuthenticatedNode, ChangeAdminPasswordRequest, CompileView,
-    ConsoleSnapshot, CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest,
+    AuthenticatedAdmin, AuthenticatedNode, ChangeAdminPasswordRequest, ClashHaitunLink,
+    CompileView, ConsoleSnapshot, CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest,
     CreateDeploymentRequest, CreateDeploymentResult, CreateFrontRequest, CreateGrantRequest,
     CreateIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
     DeleteStepResult, DeploymentCommandResult, DeploymentDetail, DeploymentList,
@@ -32,21 +37,24 @@ use crate::{
     IssuedAdminToken, IssuedNodeToken, LinkHealthItem, LinkHealthRequest, LinkHealthResult,
     LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult,
     NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, ProbeTargetList,
-    ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult, PutStepRequest,
-    QuotaEnforcementOutcome, QuotaEnforcementPlan, ReportTargetResult, ResetAdminPasswordResult,
-    Result, RevisionList, RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult,
-    StoreError, TargetConvergenceReport, TenantList, UpdateNodeRequest, UpdateNodeResult,
-    UpdateSettingsResult, UpdateUserStatusRequest, UpdateUserStatusResult, UpsertAppResult,
-    UpsertChainResult, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertStepResult,
-    UpsertTenantResult, UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList,
-    UsageReportRequest, UsageReportResult, UsageSampleList, UserAppQuotaList, UserList,
-    VerifyDeploymentRequest,
+    ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome,
+    QuotaEnforcementPlan, RegisterWarpBindingRequest, RegisterWarpBindingResult,
+    RemoveWarpBindingRequest, RemoveWarpBindingResult, ReportTargetResult,
+    ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult, SetUserAppQuotaRequest,
+    SetUserAppQuotaResult, StoreError, TargetConvergenceReport, TenantList, UpdateNodeRequest,
+    UpdateNodeResult, UpdateSettingsResult, UpdateUserStatusRequest, UpdateUserStatusResult,
+    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
+    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
+    UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest,
+    UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan, UserList,
+    VerifyDeploymentRequest, WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+    usage_runtime: Arc<usage::UsageRuntimeState>,
 }
 
 /// SQLSTATE for "the database named in the connection string is not on this server".
@@ -73,7 +81,10 @@ impl PgStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            usage_runtime: Arc::new(usage::UsageRuntimeState::default()),
+        })
     }
 
     /// Create the database named in `database_url` if the server does not have it, returning its
@@ -156,19 +167,23 @@ impl PgStore {
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            usage_runtime: Arc::new(usage::UsageRuntimeState::default()),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
-    pub async fn migrate(&self) -> Result<()> {
+    pub async fn migrate(&self) -> Result<usize> {
         // Keep migrations embedded in the store crate; cargo only refreshes this
         // list when the crate is rebuilt.
         sqlx::migrate!("./migrations").run(&self.pool).await?;
+        let default_warps = console::ensure_default_warp_outbounds(&self.pool).await?;
         materialize::ensure_current_snapshot(&self.pool).await?;
-        Ok(())
+        Ok(default_warps)
     }
 
     pub async fn materialize_snapshot(&self, revision: Option<u64>) -> Result<ModelSnapshot> {
@@ -191,12 +206,55 @@ impl PgStore {
         distribution::load_distribution(&self.pool).await
     }
 
+    /// Operational log policy. Unlike model settings, these writes create no revision and are
+    /// resolved again on every agent poll.
+    pub async fn agent_log_policy(
+        &self,
+        actor: &AdminContext,
+    ) -> Result<crate::AgentLogPolicyView> {
+        crate::log_policy::load_agent_log_policy(&self.pool, actor).await
+    }
+
+    pub async fn update_agent_log_default(
+        &self,
+        actor: &AdminContext,
+        request: crate::UpdateAgentLogDefaultRequest,
+    ) -> Result<()> {
+        crate::log_policy::update_agent_log_default(&self.pool, actor, request).await
+    }
+
+    pub async fn update_node_log_policy(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: crate::UpdateNodeLogPolicyRequest,
+    ) -> Result<()> {
+        crate::log_policy::update_node_log_policy(&self.pool, actor, node_id, request).await
+    }
+
+    pub async fn effective_node_log_max_mib(&self, node_id: &str) -> Result<u32> {
+        crate::log_policy::effective_node_log_max_mib(&self.pool, node_id).await
+    }
+
     pub async fn update_distribution(
         &self,
         actor: &AdminContext,
         settings: crate::DistributionSettings,
     ) -> Result<crate::DistributionSettings> {
         distribution::update_distribution(&self.pool, actor, settings).await
+    }
+
+    /// Read on every request so a saved name or icon appears without restarting the console.
+    pub async fn branding(&self) -> Result<crate::BrandingSettings> {
+        branding::load_branding(&self.pool).await
+    }
+
+    pub async fn update_branding(
+        &self,
+        actor: &AdminContext,
+        settings: crate::BrandingSettings,
+    ) -> Result<crate::BrandingSettings> {
+        branding::update_branding(&self.pool, actor, settings).await
     }
 
     // ── Node certificates ────────────────────────────────────────────────────────────────────
@@ -445,7 +503,20 @@ impl PgStore {
     }
 
     pub async fn list_node_agent_states(&self, actor: &AdminContext) -> Result<NodeAgentStateList> {
-        console::list_node_agent_states(&self.pool, actor).await
+        let mut result = console::list_node_agent_states(&self.pool, actor).await?;
+        for node in &mut result.nodes {
+            let Some(growing) = self.usage_runtime.growing_unknown_counters(&node.node_id) else {
+                continue;
+            };
+            let Some(serde_json::Value::Object(last_result)) = &mut node.usage_last_result else {
+                continue;
+            };
+            last_result.insert(
+                "growing_unknown_counters".to_owned(),
+                serde_json::Value::from(growing),
+            );
+        }
+        Ok(result)
     }
 
     pub async fn list_revisions(&self, actor: &AdminContext, limit: u32) -> Result<RevisionList> {
@@ -467,7 +538,7 @@ impl PgStore {
         target_kind: &str,
         target_id: &str,
         artifact_kind: &str,
-        family: Option<IpFamily>,
+        filter: SubscriptionFilter,
     ) -> Result<ArtifactContent> {
         console::artifact_content(
             &self.pool,
@@ -476,9 +547,20 @@ impl PgStore {
             target_kind,
             target_id,
             artifact_kind,
-            family,
+            filter,
         )
         .await
+    }
+
+    pub async fn serving_user_artifact_content(
+        &self,
+        actor: &AdminContext,
+        target_id: &str,
+        artifact_kind: &str,
+        filter: SubscriptionFilter,
+    ) -> Result<ArtifactContent> {
+        console::serving_user_artifact_content(&self.pool, actor, target_id, artifact_kind, filter)
+            .await
     }
 
     pub async fn clash_subscription_by_uuid(&self, uuid: &str) -> Result<DynamicClashSubscription> {
@@ -493,6 +575,30 @@ impl PgStore {
         console::clash_subscription_by_uuid_for_family(&self.pool, uuid, family).await
     }
 
+    pub async fn clash_subscription_by_uuid_filtered(
+        &self,
+        uuid: &str,
+        filter: SubscriptionFilter,
+    ) -> Result<DynamicClashSubscription> {
+        console::clash_subscription_by_uuid_filtered(&self.pool, uuid, filter).await
+    }
+
+    pub async fn clash_subscription_by_haitun_token_for_family(
+        &self,
+        token: &str,
+        family: Option<IpFamily>,
+    ) -> Result<DynamicClashSubscription> {
+        console::clash_subscription_by_haitun_token_for_family(&self.pool, token, family).await
+    }
+
+    pub async fn clash_subscription_by_haitun_token_filtered(
+        &self,
+        token: &str,
+        filter: SubscriptionFilter,
+    ) -> Result<DynamicClashSubscription> {
+        console::clash_subscription_by_haitun_token_filtered(&self.pool, token, filter).await
+    }
+
     pub async fn clash_subscription_for_user(
         &self,
         actor: &AdminContext,
@@ -500,6 +606,46 @@ impl PgStore {
         user_id: &str,
     ) -> Result<DynamicClashSubscription> {
         console::clash_subscription_for_user(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn user_grant_probe_plan(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<UserGrantProbePlan> {
+        grant_probe::user_grant_probe_plan(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn user_grant_probe_generation_matches(&self, expected: u64) -> Result<bool> {
+        grant_probe::user_grant_probe_generation_matches(&self.pool, expected).await
+    }
+
+    pub async fn clash_haitun_link_for_user(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ClashHaitunLink>> {
+        console::clash_haitun_link_for_user(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn issue_clash_haitun_link(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<ClashHaitunLink> {
+        console::issue_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn revoke_clash_haitun_link(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<ClashHaitunLink> {
+        console::revoke_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
     }
 
     pub async fn verify_deployment(
@@ -672,8 +818,33 @@ impl PgStore {
         actor: &crate::AdminContext,
         node_id: &str,
         request: crate::console::UpdateNodeStatusRequest,
-    ) -> Result<crate::console::UpdateNodeResult> {
-        crate::console::update_node_status(&self.pool, actor, node_id, request).await
+    ) -> Result<crate::NodeLifecycleTransitionResult> {
+        crate::deployment::transition_node_status(&self.pool, actor, node_id, request).await
+    }
+
+    pub async fn node_lifecycle(&self, node_id: &str) -> Result<crate::NodeLifecycleState> {
+        crate::lifecycle::load(&self.pool, node_id).await
+    }
+
+    pub async fn abandon_node(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: crate::AbandonNodeRequest,
+    ) -> Result<crate::NodeLifecycleTransitionResult> {
+        crate::deployment::abandon_node(&self.pool, actor, node_id, request).await
+    }
+
+    pub async fn retired_node_warp_bindings(&self, node_id: &str) -> Result<Vec<(String, String)>> {
+        crate::lifecycle::managed_warp_bindings(&self.pool, node_id).await
+    }
+
+    pub async fn set_node_lifecycle_cleanup_error(
+        &self,
+        node_id: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        crate::lifecycle::set_cleanup_error(&self.pool, node_id, error).await
     }
 
     pub async fn update_node(
@@ -759,6 +930,10 @@ impl PgStore {
         grant_automation::process_jobs(&self.pool).await
     }
 
+    pub async fn grant_automation_status(&self) -> Result<crate::GrantAutomationStatus> {
+        grant_automation::status(&self.pool).await
+    }
+
     pub async fn plan_quota_enforcement(&self) -> Result<QuotaEnforcementPlan> {
         quota::plan_quota_enforcement(&self.pool).await
     }
@@ -769,6 +944,41 @@ impl PgStore {
         request: CreateAppRequest,
     ) -> Result<UpsertAppResult> {
         console::upsert_app(&self.pool, actor, request).await
+    }
+
+    pub async fn register_warp_binding(
+        &self,
+        actor: &AdminContext,
+        request: RegisterWarpBindingRequest,
+    ) -> Result<RegisterWarpBindingResult> {
+        console::register_warp_binding(&self.pool, actor, request).await
+    }
+
+    pub async fn update_warp_binding(
+        &self,
+        actor: &AdminContext,
+        request: UpdateWarpBindingRequest,
+    ) -> Result<UpdateWarpBindingResult> {
+        console::update_warp_binding(&self.pool, actor, request).await
+    }
+
+    pub async fn prepare_warp_binding_removal(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        outbound_id: &str,
+        node_id: &str,
+    ) -> Result<WarpBindingRemoval> {
+        console::prepare_warp_binding_removal(&self.pool, actor, tenant_id, outbound_id, node_id)
+            .await
+    }
+
+    pub async fn remove_warp_binding(
+        &self,
+        actor: &AdminContext,
+        request: RemoveWarpBindingRequest,
+    ) -> Result<RemoveWarpBindingResult> {
+        console::remove_warp_binding(&self.pool, actor, request).await
     }
 
     pub async fn upsert_chain(
@@ -796,17 +1006,6 @@ impl PgStore {
         request: CreateIngressRequest,
     ) -> Result<UpsertIngressResult> {
         console::upsert_ingress(&self.pool, actor, app_id, request).await
-    }
-
-    pub async fn put_step(
-        &self,
-        actor: &AdminContext,
-        app_id: &str,
-        chain_id: &str,
-        node_id: &str,
-        request: PutStepRequest,
-    ) -> Result<UpsertStepResult> {
-        console::put_step(&self.pool, actor, app_id, chain_id, node_id, request).await
     }
 
     pub async fn delete_step(
@@ -945,7 +1144,7 @@ impl PgStore {
         node_id: &str,
         request: UsageReportRequest,
     ) -> Result<UsageReportResult> {
-        usage::record_usage_report(&self.pool, node_id, request).await
+        usage::record_usage_report(&self.pool, &self.usage_runtime, node_id, request).await
     }
 
     /// Asked once by the agent before each probing round: which endpoints to probe, and how
@@ -1035,8 +1234,9 @@ impl PgStore {
         &self,
         actor: &AdminContext,
         window_secs: u32,
+        node_id: Option<&str>,
     ) -> Result<UsageNodeSeriesList> {
-        usage::list_usage_node_series(&self.pool, actor, window_secs).await
+        usage::list_usage_node_series(&self.pool, actor, window_secs, node_id).await
     }
 
     // Telemetry. Like quotas, none of this enters the model, so none of these take a revision or

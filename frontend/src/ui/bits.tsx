@@ -88,6 +88,7 @@ export function Confirm({
   confirmLabel,
   danger = true,
   requireWord,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: {
@@ -96,6 +97,7 @@ export function Confirm({
   confirmLabel: string;
   danger?: boolean;
   requireWord?: string;
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -126,7 +128,11 @@ export function Confirm({
           <button className="btn" onClick={onCancel}>
             取消
           </button>
-          <button className={`btn ${danger ? 'danger' : 'primary'}`} disabled={!ok} onClick={onConfirm}>
+          <button
+            className={`btn ${danger ? 'danger' : 'primary'}`}
+            disabled={!ok || confirmDisabled}
+            onClick={onConfirm}
+          >
             {confirmLabel}
           </button>
         </div>

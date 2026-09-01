@@ -20,6 +20,7 @@
 //! time. That is deliberate and not worked around — working around it would mean
 //! not checking validity at all.
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     sync::{Arc, OnceLock},
@@ -355,6 +356,15 @@ pub(crate) fn host_header(host: &str, port: u16, default_port: u16) -> String {
 pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) body: String,
+    headers: BTreeMap<String, String>,
+}
+
+impl HttpResponse {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
 }
 
 pub(crate) fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
@@ -376,11 +386,15 @@ pub(crate) fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
         .ok_or("HTTP response missing status")?
         .parse::<u16>()
         .map_err(|_| "HTTP response has invalid status".to_owned())?;
-    let transfer_encoding = head.lines().skip(1).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("transfer-encoding")
-            .then(|| value.trim().to_ascii_lowercase())
-    });
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let transfer_encoding = headers
+        .get("transfer-encoding")
+        .map(|value| value.to_ascii_lowercase());
     if transfer_encoding
         .as_deref()
         .is_some_and(|value| value.split(',').any(|part| part.trim() == "chunked"))
@@ -390,6 +404,7 @@ pub(crate) fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
     Ok(HttpResponse {
         status,
         body: String::from_utf8(body).map_err(|error| error.to_string())?,
+        headers,
     })
 }
 
@@ -435,6 +450,16 @@ pub(crate) fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{decode_chunked_body, parse_http_response, HttpClient};
+
+    #[test]
+    fn response_headers_are_case_insensitive() {
+        let response = parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Log-Max-MiB: 256\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(response.header("x-brocade-log-max-mib"), Some("256"));
+        assert_eq!(response.header("X-BROCADE-LOG-MAX-MIB"), Some("256"));
+    }
 
     /// Without an explicit port the Host header must not carry one either. With
     /// it, a name-based reverse proxy on the far side finds no matching site and

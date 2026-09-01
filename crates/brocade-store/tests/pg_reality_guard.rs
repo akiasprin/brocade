@@ -51,13 +51,13 @@ async fn fallback_guard_round_trips() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO apps (id, label) VALUES ('app-main', 'Main App')")
+    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-main', 'Main App', 0)")
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO chains (id, app_id, tenant_id, name)
-         VALUES ('c-main', 'app-main', 'platform.acme', 'Main Chain')",
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('c-main', 'app-main', 'platform.acme', 'Main Chain', 0)",
     )
     .execute(&pool)
     .await

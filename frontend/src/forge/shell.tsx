@@ -20,11 +20,13 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCompileView,
   fetchDeployments,
+  fetchGrantAutomationStatus,
   fetchNodes,
   fetchRevisions,
   fetchSnapshot,
   verifyDeployment,
   type AdminRole,
+  type BrandingSettings,
   type DiagNames,
   type Diagnostic,
   type Whoami,
@@ -48,6 +50,8 @@ import { forge, useForge, type NavKey } from './state';
 import { theme } from './theme';
 import { palette, PALETTES } from './palette';
 import { Icon, type IconName } from '../ui/icons';
+import { BrandIcon } from '../ui/branding';
+import { compactGrantAutomation, RuntimeCrumbStatus, type RuntimeCrumbState } from '../ui/grant-automation';
 
 interface Face {
   key: NavKey;
@@ -58,20 +62,25 @@ interface Face {
   roles?: AdminRole[];
 }
 
-// 顶栏中显示的六项。超过该数量后，导航从可一次看全变为需要横向查找。
-// 窄屏同样是这六项，与品牌名同一行（见 FaceBar）。
+// 顶栏只显示当前主工作流。外部出站已经在规则的「转发给」中管理，独立隧道页暂时
+// 保留作兼容入口但不再占一个导航位。
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
   { key: 'chains', label: '线路', icon: 'chains' },
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },
-  { key: 'settings', label: '设置', icon: 'settings', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
 ];
 
+/* 手机端只把三项高频配置入口留在顶栏，腾出的宽度用于恢复按钮文字。发布和用量仍使用
+   同一份 Face 定义，只是移动到更多菜单，避免两套角色权限和名称逐渐分叉。 */
+const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'users');
+const MOBILE_MORE = NAV.filter(f => f.key === 'deploy' || f.key === 'usage');
+
 // 收入「⋯」的项：都是低频访问的页面，占用顶栏位置的收益较低。
-// 窄屏同理：该行只放 NAV 的六项，这四项仍从「⋯」进入。
+// 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从「⋯」进入。
 const MORE: Face[] = [
+  { key: 'settings', label: '设置', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'tenants', label: '租户' },
   { key: 'topo', label: '拓扑' },
   { key: 'operators', label: '操作者', roles: ['tenant-admin', 'system-admin'] },
@@ -88,7 +97,15 @@ const LABEL: Record<NavKey, string> = Object.fromEntries(
 /* 访客与登录操作者看到同一组导航：都按角色的 roles 字段过滤。 */
 const visible = (faces: Face[], who: Whoami) => faces.filter(f => !f.roles || f.roles.includes(who.role));
 
-export function ForgeShell({ session, onLogout }: { session: { who: Whoami }; onLogout: () => void }) {
+export function ForgeShell({
+  branding,
+  session,
+  onLogout,
+}: {
+  branding: BrandingSettings;
+  session: { who: Whoami };
+  onLogout: () => void;
+}) {
   const st = useForge();
   const narrow = useNarrow();
   /* 评审角色无法获取产物（服务端返回 403），入口一并隐藏 */
@@ -167,6 +184,14 @@ export function ForgeShell({ session, onLogout }: { session: { who: Whoami }; on
   // 等待确认与执行中需要区分：含破坏性动作的波需要人工确认后才继续下发，而顶栏两种情况
   // 都只显示一个红色角标，会导致持续等待一个不会自动继续的操作。
   const awaitingDeploy = (deployments.data?.deployments ?? []).find(d => d.awaiting_confirmation);
+  // 权限任务在生成 deployment 之前就可能失败，因此不能从发布列表推断这层状态。
+  // 放在全局面包屑后，每个页面都能看到同一份队列读数。
+  const grantAutomation = useQuery({
+    queryKey: ['grant-automation'],
+    queryFn: () => fetchGrantAutomationStatus(),
+    enabled: !pub,
+    refetchInterval: 5_000,
+  });
 
   const { list, changed, dirty } = useChangedArtifacts(current, prev);
   const draftBlast = useMemo(() => blastRadius(list, changed), [list, changed]);
@@ -183,10 +208,32 @@ export function ForgeShell({ session, onLogout }: { session: { who: Whoami }; on
     return { node: id => nodes.get(id), chain: id => chains.get(id) };
   }, [nodeList.data, snapshot.data]);
 
+  const grantRuntime = compactGrantAutomation(grantAutomation.data, grantAutomation.isPending, !!grantAutomation.error);
+  // 面包屑只留一段短状态：需要人工介入和失败优先，安静时才显示队列健康。
+  // 修订号由相邻的 Rn 只显示一次，避免“已收敛到修订 n · 修订 n”。
+  const crumbRuntime: RuntimeCrumbState = dirty
+    ? {
+        text: draftBlast.size ? `草稿 · ${draftBlast.size} 台` : '草稿 · 无产物变更',
+        tone: draftBlast.size ? 'hot' : 'normal',
+        title: draftBlast.size ? [...draftBlast].join(', ') : undefined,
+      }
+    : verify.isPending
+      ? { text: '检查中', tone: 'normal' }
+      : verify.error
+        ? { text: '发布状态未知', tone: 'bad' }
+        : awaitingDeploy
+          ? { text: `发布 #${awaitingDeploy.id} · 待确认`, tone: 'bad' }
+          : grantRuntime.tone === 'bad'
+            ? grantRuntime
+            : pendingTargets
+              ? { text: `待发布 ${pendingTargets} 台`, tone: 'hot' }
+              : grantRuntime;
+
   return (
     <div className={`forge${narrow ? ' narrow' : ''}`}>
       <div className="fg-left">
         <TopBar
+          branding={branding}
           who={session.who}
           narrow={narrow}
           nav={st.nav}
@@ -209,29 +256,7 @@ export function ForgeShell({ session, onLogout }: { session: { who: Whoami }; on
                 而这两个查询在该身份下无权访问——保留会始终停留在检查中的状态。 */}
             {!pub && (
               <span className="fg-crumb-right">
-                <span
-                  className={`fg-blast${dirty ? (draftBlast.size ? ' hot' : '') : pendingTargets ? ' hot' : ''}`}
-                  title={dirty && draftBlast.size ? [...draftBlast].join(', ') : undefined}
-                >
-                  {/* 存在草稿时该说明描述的是草稿而非当前版本——比较基准变为
-                    当前已提交的修订（见 useChangedArtifacts）。 */}
-                  {dirty
-                    ? draftBlast.size
-                      ? `草稿会动 ${draftBlast.size} 台机器`
-                      : '草稿不改动任何产物'
-                    : verify.isPending
-                      ? '检查发布状态…'
-                      : verify.error
-                        ? '发布状态未知'
-                        : awaitingDeploy
-                          ? `发布 #${awaitingDeploy.id} 等你确认波次`
-                          : pendingTargets
-                            ? `${pendingTargets} 台待发布`
-                            : current == null
-                              ? '修订 …'
-                              : `已收敛到修订 ${current}`}
-                </span>
-                <span className="fg-meta">修订 {current ?? '…'}</span>
+                <RuntimeCrumbStatus state={crumbRuntime} revision={current} />
               </span>
             )}
           </div>
@@ -275,12 +300,13 @@ export function ForgeShell({ session, onLogout }: { session: { who: Whoami }; on
 // 此处此前是屏幕底部的固定 tab bar，与顶栏两行合计占用 140px（占 844 屏高的 16.6%）。
 // 两层都移到顶部后为 86px，底部空间留给草稿条。
 //
-// 只放 NAV 的六项，与宽屏顶栏一致。按钮直接复用宽屏的 fg-nv，不在这里维护
+// 只放 NAV 的主工作流，与宽屏顶栏一致。按钮直接复用宽屏的 fg-nv，不在这里维护
 // 第二套尺寸、图标和选中态；窄屏的差异只有容器允许横向滚动。
 // 曾尝试将 MORE 的四项也加入（带横向滚动），结果是右侧部分始终不可见——与收入「⋯」
 // 的效果相同，且会产生该处有更多内容的错误预期。
 function MainNav({
   className,
+  faces,
   who,
   nav,
   pendingTargets,
@@ -288,6 +314,7 @@ function MainNav({
   awaitingDeploy,
 }: {
   className: 'fg-nav' | 'fg-facebar';
+  faces: Face[];
   who: Whoami;
   nav: NavKey;
   pendingTargets: number | undefined;
@@ -296,15 +323,17 @@ function MainNav({
 }) {
   return (
     <nav className={className} aria-label="主导航">
-      {visible(NAV, who).map(f => (
+      {visible(faces, who).map(f => (
         <button
           key={f.key}
           className="fg-nv"
           aria-current={nav === f.key ? 'true' : 'false'}
+          aria-label={f.label}
+          title={f.label}
           onClick={() => navigate(f.key)}
         >
           {f.icon && <Icon of={f.icon} size={14} className="fg-nv-ic" />}
-          {f.label}
+          <span className="fg-nv-label">{f.label}</span>
           {f.key === 'deploy' && activeDeploy && (
             <span
               className={`fg-badge ${awaitingDeploy ? 'chg' : 'err'}`}
@@ -333,24 +362,8 @@ function MainNav({
 
 /* ══ 顶栏 ══ */
 
-/* 品牌图标：2×2 织格（双经双纬），题材取「织锦」本义。dasharray 断口是经纬的
-   上下交错点（同侧交错才读作编织而非井字）。图标与字标统一跟随主题色。
-   3×3 版本在 20px 下读作 #，已否决；候选对比见 mockups/logo.html。 */
-function BrandMark() {
-  return (
-    <svg className="fg-logo" viewBox="0 0 24 24" aria-hidden="true" fill="none">
-      <g strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-        <path className="wp" d="M8.5,5V19" strokeDasharray="1.7 3.6 8.7" />
-        <path className="wp" d="M15.5,5V19" strokeDasharray="8.7 3.6 1.7" />
-        <path className="wn" d="M5,8.5H19" strokeDasharray="8.7 3.6 1.7" />
-        <path className="wn" d="M5,15.5H19" strokeDasharray="1.7 3.6 8.7" />
-      </g>
-    </svg>
-  );
-}
-
 /** Logo 与字标是同一个品牌入口。navigate 不带 drill 会清掉机器详情层级并回到机器列表。 */
-function BrandHome() {
+function BrandHome({ branding }: { branding: BrandingSettings }) {
   return (
     <button
       className="fg-home"
@@ -359,13 +372,14 @@ function BrandHome() {
       title="返回机器首页"
       onClick={() => navigate('nodes')}
     >
-      <BrandMark />
-      <span className="fg-brand">Brocade</span>
+      <BrandIcon branding={branding} />
+      <span className="fg-brand">{branding.site_name}</span>
     </button>
   );
 }
 
 function TopBar({
+  branding,
   who,
   narrow,
   nav,
@@ -378,6 +392,7 @@ function TopBar({
   railOpen,
   onLogout,
 }: {
+  branding: BrandingSettings;
   who: Whoami;
   /* 窄屏使用另一套结构：品牌与页面导航并入一行，不是压缩桌面顶栏。 */
   narrow: boolean;
@@ -426,7 +441,14 @@ function TopBar({
   // 提示不计入：它表示无法判定的事实，在全局位置显示会与分级的目的相悖。
   const errors = summary?.errors ?? 0;
   const warnings = summary?.warnings ?? 0;
-  const rest = visible(MORE, who);
+  const rest = visible(narrow ? [...MOBILE_MORE, ...MORE] : MORE, who);
+  const deploymentMenuHint = awaitingDeploy
+    ? `发布 #${awaitingDeploy.id} 等待确认`
+    : activeDeploy
+      ? `发布 #${activeDeploy.id} 进行中`
+      : (pendingTargets ?? 0) > 0
+        ? `${pendingTargets} 台待发布`
+        : undefined;
 
   const diagPop = st.diag && (
     <div className="fg-pop" onClick={e => e.stopPropagation()}>
@@ -439,6 +461,7 @@ function TopBar({
       {rest.map(f => (
         <button key={f.key} onClick={() => navigate(f.key)}>
           {f.label}
+          {f.key === 'deploy' && deploymentMenuHint && <small>{deploymentMenuHint}</small>}
         </button>
       ))}
       {/* 分隔线用于区分页面项和设置项。上方没有任何项时（公开访客在 MORE 中没有可见页面），
@@ -493,14 +516,14 @@ function TopBar({
   );
 
   if (narrow) {
-    /* 窄屏只有这一行：品牌 + 六个页面 + 诊断 + ⋯。修订读数（`r77 · 3 台待发`）移除——
-       同一信息由「发布」按钮上的角标承担（等确认 / #id / 待发数）。下钻不再增加第二行，
-       理由见上方 `.fg-backrow` 的说明。 */
+    /* 窄屏只有这一行：品牌 + 三个高频页面 + 诊断 + ⋯。发布和用量收入更多菜单，
+       发布状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
     return (
       <div className="fg-top fg-navrow">
-        <BrandHome />
+        <BrandHome branding={branding} />
         <MainNav
           className="fg-facebar"
+          faces={MOBILE_NAV}
           who={who}
           nav={nav}
           pendingTargets={pendingTargets}
@@ -550,11 +573,12 @@ function TopBar({
 
   return (
     <div className="fg-top">
-      <BrandHome />
+      <BrandHome branding={branding} />
       <span className="fg-vr" />
 
       <MainNav
         className="fg-nav"
+        faces={NAV}
         who={who}
         nav={st.nav}
         pendingTargets={pendingTargets}

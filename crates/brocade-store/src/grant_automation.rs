@@ -35,6 +35,23 @@ pub struct GrantAutomationOutcome {
     pub waiting: Option<String>,
 }
 
+/// Read-only health of the durable permission outbox.
+///
+/// A job is created before a deployment. Exposing only the deployment list therefore hides the
+/// exact failure class this status represents: planning may retry forever without ever producing
+/// a deployment row. Timestamps stay PostgreSQL text, matching the rest of the console API.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantAutomationStatus {
+    pub pending_jobs: u64,
+    pub retrying_jobs: u64,
+    pub failed_jobs: u64,
+    pub max_attempts: u64,
+    pub latest_revision_id: Option<u64>,
+    pub oldest_pending_at: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
 pub(crate) async fn enqueue_tx(
     tx: &mut Transaction<'_, Postgres>,
     revision_id: u64,
@@ -56,6 +73,59 @@ pub(crate) async fn enqueue_tx(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+pub async fn status(pool: &PgPool) -> Result<GrantAutomationStatus> {
+    let row = sqlx::query(
+        "SELECT count(*) FILTER (WHERE status IN ('queued', 'running')) AS pending_jobs,
+                count(*) FILTER (
+                    WHERE status IN ('queued', 'running') AND attempts > 0
+                ) AS retrying_jobs,
+                count(*) FILTER (WHERE status = 'failed') AS failed_jobs,
+                COALESCE((max(attempts) FILTER (
+                    WHERE status IN ('queued', 'running')
+                ))::bigint, 0::bigint) AS max_attempts,
+                max((payload->>'revision_id')::bigint) FILTER (
+                    WHERE status IN ('queued', 'running')
+                ) AS latest_revision_id,
+                (min(created_at) FILTER (
+                    WHERE status IN ('queued', 'running')
+                ))::text AS oldest_pending_at,
+                (max(updated_at) FILTER (
+                    WHERE status IN ('queued', 'running') AND attempts > 0
+                ))::text AS last_attempt_at,
+                (array_agg(last_error ORDER BY updated_at DESC, id DESC) FILTER (
+                    WHERE status IN ('queued', 'running') AND last_error IS NOT NULL
+                ))[1] AS last_error
+         FROM jobs
+         WHERE kind = $1",
+    )
+    .bind(JOB_KIND)
+    .fetch_one(pool)
+    .await?;
+    let nonnegative = |field: &str| -> Result<u64> {
+        let value: i64 = row.try_get(field)?;
+        u64::try_from(value)
+            .map_err(|_| StoreError::InvalidData(format!("jobs.{field} is negative: {value}")))
+    };
+    let latest_revision_id = row
+        .try_get::<Option<i64>, _>("latest_revision_id")?
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                StoreError::InvalidData(format!("grant automation revision is negative: {value}"))
+            })
+        })
+        .transpose()?;
+    Ok(GrantAutomationStatus {
+        pending_jobs: nonnegative("pending_jobs")?,
+        retrying_jobs: nonnegative("retrying_jobs")?,
+        failed_jobs: nonnegative("failed_jobs")?,
+        max_attempts: nonnegative("max_attempts")?,
+        latest_revision_id,
+        oldest_pending_at: row.try_get("oldest_pending_at")?,
+        last_attempt_at: row.try_get("last_attempt_at")?,
+        last_error: row.try_get("last_error")?,
+    })
 }
 
 /// Queue an automatic release only when the committed model revision actually changes the
@@ -246,7 +316,7 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
         });
     }
 
-    finish(pool, &job_ids, prepared.deployment_id).await?;
+    finish(pool, &job_ids, prepared.deployment_id, revision_id).await?;
     Ok(GrantAutomationOutcome {
         merged_jobs: job_ids.len(),
         revision_id: Some(revision_id),
@@ -289,7 +359,13 @@ async fn reschedule(pool: &PgPool, job_ids: &[i64], error: &str) -> Result<()> {
     Ok(())
 }
 
-async fn finish(pool: &PgPool, job_ids: &[i64], deployment_id: Option<i64>) -> Result<()> {
+async fn finish(
+    pool: &PgPool,
+    job_ids: &[i64],
+    deployment_id: Option<i64>,
+    revision_id: u64,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE jobs
          SET status = 'succeeded',
@@ -304,7 +380,11 @@ async fn finish(pool: &PgPool, job_ids: &[i64], deployment_id: Option<i64>) -> R
     )
     .bind(job_ids)
     .bind(deployment_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if deployment_id.is_none() {
+        crate::serving::activate_permissions_revision_tx(&mut tx, revision_id).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
