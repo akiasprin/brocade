@@ -976,10 +976,7 @@ fn encryption() -> HopWire {
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     }
 }
 

@@ -24,20 +24,15 @@ use brocade_core::{
 use ipnet::Ipv4Net;
 
 #[test]
-fn legacy_egress_resolution_is_ignored_and_cleaned_when_serialized() {
+fn legacy_egress_dns_binding_is_ignored_and_cleaned_when_serialized() {
     let action: Action = serde_json::from_value(serde_json::json!({
         "t": "egress",
         "send_through": null,
+        "dns": true,
         "resolution": { "address": "192.0.2.53", "port": 53 }
     }))
     .unwrap();
-    assert_eq!(
-        action,
-        Action::Egress {
-            send_through: None,
-            dns: false
-        }
-    );
+    assert_eq!(action, Action::Egress { send_through: None });
     assert_eq!(
         serde_json::to_value(action).unwrap(),
         serde_json::json!({ "t": "egress", "send_through": null })
@@ -753,10 +748,7 @@ fn reverse_hop_ir(
                 hop_in: None,
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: false,
-                    },
+                    action: Action::Egress { send_through: None },
                 }],
             },
         ],
@@ -1292,10 +1284,7 @@ fn two_hop_ir(
                 }),
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: false,
-                    },
+                    action: Action::Egress { send_through: None },
                 }],
             },
         ],
@@ -2085,10 +2074,7 @@ fn validate_app_reports_reverse_upstream_hop_in_clashing_with_its_own_ingress() 
                     "sg",
                     vec![Rule {
                         dest_match: DestMatch::Any,
-                        action: Action::Egress {
-                            send_through: None,
-                            dns: false,
-                        },
+                        action: Action::Egress { send_through: None },
                     }],
                     Some(Accept {
                         uuid: "uuid-sg".to_owned(),
@@ -2294,10 +2280,7 @@ fn validate_rejects_invalid_or_non_domain_machine_dns() {
             "hk",
             vec![Rule {
                 dest_match: DestMatch::IpCidr(vec!["203.0.113.0/24".to_owned()]),
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             }],
             None,
         )],
@@ -2335,7 +2318,7 @@ fn validate_rejects_invalid_or_non_domain_machine_dns() {
 }
 
 #[test]
-fn validate_rejects_missing_or_non_domain_dns_references() {
+fn route_matches_neither_require_nor_activate_machine_dns() {
     let app = AppView {
         id: "app".to_owned(),
         label: "应用".to_owned(),
@@ -2348,17 +2331,11 @@ fn validate_rejects_missing_or_non_domain_dns_references() {
             vec![
                 Rule {
                     dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 },
                 Rule {
                     dest_match: DestMatch::IpCidr(vec!["203.0.113.0/24".to_owned()]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 },
             ],
             None,
@@ -2378,12 +2355,16 @@ fn validate_rejects_missing_or_non_domain_dns_references() {
     validate_app(&sys, &app_ir, &mut diagnostics);
     validate_app_set(&[app_ir], &mut diagnostics);
 
-    assert_has(&diagnostics, Level::Error, "dns.reference-missing");
-    assert_has(&diagnostics, Level::Error, "dns.reference-selector");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with("dns.reference")),
+        "线路动作不再持有 DNS 引用：{diagnostics:#?}"
+    );
 }
 
 #[test]
-fn validate_explains_which_chains_have_conflicting_dns_on_one_node() {
+fn machine_dns_overlap_is_resolved_by_machine_priority_not_chain_order() {
     let mut direct = chain("c-direct");
     direct.name = "线路 A".to_owned();
     let mut transit = chain("c-transit");
@@ -2402,10 +2383,7 @@ fn validate_explains_which_chains_have_conflicting_dns_on_one_node() {
                 "hk",
                 vec![Rule {
                     dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 }],
                 None,
             ),
@@ -2417,10 +2395,7 @@ fn validate_explains_which_chains_have_conflicting_dns_on_one_node() {
                         "example.com".to_owned(),
                         "other.example".to_owned(),
                     ]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 }],
                 None,
             ),
@@ -2467,15 +2442,11 @@ fn validate_explains_which_chains_have_conflicting_dns_on_one_node() {
     validate_app(&sys, &app_ir, &mut diagnostics);
     validate_app_set(&[app_ir], &mut diagnostics);
 
-    assert_has(&diagnostics, Level::Error, "dns.rule-conflict");
-    let conflict = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "dns.rule-conflict")
-        .unwrap();
-    assert_eq!(conflict.location, "hk/domain:example.com");
-    assert_eq!(
-        conflict.message,
-        "出口节点（hk）上的 domain:example.com DNS 配置冲突：线路「线路 A（c-direct）」使用 192.0.2.53:53 / TCP / UseIP / 回退机器 DNS；线路「线路 B（c-transit）」使用 198.51.100.53:53 / TCP / UseIPv6 / 回退机器 DNS。Xray 的 DNS 匹配在机器内全局生效，出站引用只决定策略是否下发，不能隔离同一域名的解析上下文；请统一这两条规则"
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "dns.rule-conflict"),
+        "DNS 由机器策略顺序唯一决定，不应再从链路顺序推导冲突：{diagnostics:#?}"
     );
 
     app.steps[1].rules[0].dest_match = app.steps[0].rules[0].dest_match.clone();
@@ -2613,10 +2584,7 @@ fn validate_app_reports_front_blocked_and_unproven_paths() {
                 vec![
                     Rule {
                         dest_match: DestMatch::Geosite(vec!["netflix".to_owned()]),
-                        action: Action::Egress {
-                            send_through: None,
-                            dns: false,
-                        },
+                        action: Action::Egress { send_through: None },
                     },
                     any_block(),
                 ],
@@ -3552,10 +3520,7 @@ fn forward(to: &str) -> Rule {
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     }
 }
 
@@ -3728,10 +3693,7 @@ fn pool_ir_rules(
                 }),
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: false,
-                    },
+                    action: Action::Egress { send_through: None },
                 }],
             },
         ],

@@ -189,9 +189,9 @@ pub struct XrayPlan {
     /// the renderer, which then only writes values.
     pub connection: ResolvedConnection,
     pub dns_route: Option<String>,
-    /// Domain-scoped resolvers requested by terminal egress rules. They are independent of the
-    /// machine default above: each query is tagged and routed through the same source-bound
-    /// Freedom outbound as the connection it resolves.
+    /// Machine-owned domain-scoped resolvers. They are independent of the machine default above:
+    /// each query is tagged and routed through a dedicated direct Freedom outbound. They do not
+    /// inherit any chain rule's source address or outbound context.
     pub egress_dns: Vec<XrayEgressDnsPlan>,
     pub inbounds: Vec<XrayIngressPlan>,
     /// The relay inbounds on this machine, one per chain. A relay serving two chains
@@ -696,11 +696,11 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
             }
         },
         dns_route: None,
-        egress_dns: xray_egress_dns(apps, node_id, &app_node.egress_dns),
+        egress_dns: xray_egress_dns(&app_node.egress_dns),
         inbounds: xray_ingresses(apps, node_id, app_node.api_port),
         hop_inbounds: xray_hop_inbounds(system_node, apps, node_id),
         forward_outbounds: xray_forward_outbounds(apps, node_id),
-        egress_outbounds: xray_egress_outbounds(apps, node_id),
+        egress_outbounds: xray_egress_outbounds(apps, node_id, &app_node.egress_dns),
         external_outbounds: xray_external_outbounds(apps, node_id),
         reverse_portals: xray_reverse_portals(apps, node_id),
         reverse_bridges: xray_reverse_bridges(apps, node_id),
@@ -1167,18 +1167,24 @@ fn xray_reverse_bridges(apps: &[AppIr], node_id: &str) -> Vec<XrayReverseBridgeP
     plans
 }
 
-fn xray_egress_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayEgressOutboundPlan> {
+fn xray_egress_outbounds(
+    apps: &[AppIr],
+    node_id: &str,
+    policies: &[crate::model::NodeEgressDnsPolicy],
+) -> Vec<XrayEgressOutboundPlan> {
     let mut outbounds = BTreeMap::<String, XrayEgressOutboundPlan>::new();
 
     for app in sorted_apps(apps) {
         for step in app.steps.iter().filter(|step| step.node == node_id) {
             for rule in &step.rules {
-                let Action::Egress { send_through, dns } = &rule.action else {
+                let Action::Egress { send_through } = &rule.action else {
                     continue;
                 };
-                let resolution = dns
-                    .then(|| egress_dns_resolution(app, node_id, &rule.dest_match))
-                    .flatten();
+                // The policy is not activated by this route, but an exact selector match still
+                // supplies the Freedom address-family strategy. This is required for the ordered
+                // UseIPv4v6 / UseIPv6v4 modes, which Xray's DNS-server queryStrategy cannot
+                // express. Resolver selection itself remains global and independently emitted.
+                let resolution = egress_dns_resolution(app, node_id, &rule.dest_match);
                 let (tag, domain_strategy) = match resolution {
                     Some(resolution) => (
                         custom_egress_tag(*send_through, resolution),
@@ -1197,17 +1203,31 @@ fn xray_egress_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayEgressOutboun
         }
     }
 
+    // A machine DNS policy is complete on its own. Its query path is deliberately direct and
+    // source-unbound; deriving this from a chain rule would recreate an outbound association that
+    // Xray cannot preserve when it later chooses the resolver.
+    for policy in policies {
+        if custom_dns_domains(&policy.selector).is_none() {
+            continue;
+        }
+        let resolution = &policy.resolution;
+        let tag = custom_egress_tag(None, resolution);
+        outbounds
+            .entry(tag.clone())
+            .or_insert(XrayEgressOutboundPlan {
+                tag,
+                send_through: None,
+                domain_strategy: Some(custom_dns_domain_strategy(resolution.address_strategy)),
+            });
+    }
+
     outbounds.into_values().collect()
 }
 
-fn xray_egress_dns(
-    apps: &[AppIr],
-    node_id: &str,
-    policies: &[crate::model::NodeEgressDnsPolicy],
-) -> Vec<XrayEgressDnsPlan> {
+fn xray_egress_dns(policies: &[crate::model::NodeEgressDnsPolicy]) -> Vec<XrayEgressDnsPlan> {
     // DNS priority is machine-owned and deliberately independent from app/chain/rule order.
-    // Walk that canonical list first, locating only a rule which actually references each policy
-    // so an unused machine policy does not create an unused outbound in the artifact.
+    // Every stored entry belongs to this Xray instance and is therefore emitted; a route rule is
+    // neither an activation switch nor an isolation boundary.
     let mut plans = Vec::<XrayEgressDnsPlan>::new();
     let mut ordered = policies.iter().collect::<Vec<_>>();
     ordered.sort_by(|a, b| {
@@ -1224,33 +1244,13 @@ fn xray_egress_dns(
         };
         domains.sort();
         domains.dedup();
-        let Some(canonical) = policy.selector.canonical_egress_dns_selector() else {
+        if policy.selector.canonical_egress_dns_selector().is_none() {
             continue;
-        };
-        let usage = sorted_apps(apps).into_iter().find_map(|app| {
-            app.steps
-                .iter()
-                .filter(|step| step.node == node_id)
-                .flat_map(|step| step.rules.iter())
-                .find_map(|rule| {
-                    let Action::Egress {
-                        send_through,
-                        dns: true,
-                    } = &rule.action
-                    else {
-                        return None;
-                    };
-                    (rule.dest_match.canonical_egress_dns_selector().as_ref() == Some(&canonical))
-                        .then_some(*send_through)
-                })
-        });
-        let Some(send_through) = usage else {
-            continue;
-        };
+        }
         let resolution = &policy.resolution;
         plans.push(XrayEgressDnsPlan {
-            tag: custom_dns_policy_tag(send_through, resolution, policy.position, &domains),
-            outbound_tag: custom_egress_tag(send_through, resolution),
+            tag: custom_dns_policy_tag(None, resolution, policy.position, &domains),
+            outbound_tag: custom_egress_tag(None, resolution),
             address: resolution.address.clone(),
             port: resolution.port,
             transport: resolution.transport,
@@ -1658,9 +1658,7 @@ fn action_tag(app: &AppIr, chain: &str, node: &str, rule: &Rule) -> String {
                 forward_tag(app, chain, to)
             }
         }
-        Action::Egress { send_through, dns } => dns
-            .then(|| egress_dns_resolution(app, node, &rule.dest_match))
-            .flatten()
+        Action::Egress { send_through } => egress_dns_resolution(app, node, &rule.dest_match)
             .map_or_else(
                 || egress_tag(*send_through),
                 |resolution| custom_egress_tag(*send_through, resolution),

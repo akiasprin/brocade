@@ -1640,6 +1640,89 @@ pub struct NodeLoadList {
     pub nodes: Vec<NodeLoadView>,
 }
 
+// ── Active TCP connect probe ───────────────────────────────────────────────────────────────
+//
+// This wire contract is intentionally narrower than TCP_INFO. The feature answers one operator
+// question — can this machine establish a TCP connection to this target, and how long did that
+// handshake take? — so the only measurement carried or persisted is `connect_ms`. Name resolution
+// happens before the timer starts and failures remain a missing sample; neither DNS diagnostics,
+// kernel RTT/RTO nor retransmission counters belong in this protocol.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpProbeTarget {
+    pub name: String,
+    /// Canonical `tcp://host:port` address. It is also the stable series identifier.
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpProbeSettings {
+    pub targets: Vec<TcpProbeTarget>,
+    pub interval_secs: u32,
+    /// Maximum TCP handshake duration. A result above this threshold is represented as no
+    /// response rather than a latency sample.
+    pub timeout_ms: u32,
+}
+
+impl Default for TcpProbeSettings {
+    fn default() -> Self {
+        Self {
+            targets: Vec::new(),
+            interval_secs: 60,
+            timeout_ms: 420,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpProbeSample {
+    /// Matches `TcpProbeTarget.address` from the settings fetched for this round.
+    pub target: String,
+    /// `None` is the complete failure representation. No hidden error classification accompanies
+    /// it because the chart renders every kind of no-response identically.
+    pub connect_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpProbeReportRequest {
+    pub probed_at_unix_secs: i64,
+    pub samples: Vec<TcpProbeSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpProbeReportResult {
+    pub node_id: String,
+    pub accepted_samples: u64,
+    pub skipped_samples: u64,
+    pub unknown_targets: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpProbePoint {
+    pub probed_at_unix_secs: i64,
+    pub connect_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpProbeTargetSeries {
+    pub name: String,
+    pub address: String,
+    /// Oldest first. Missing rounds remain explicit points with `connect_ms = null`, allowing the
+    /// client to break the line and paint the unavailable interval without another status field.
+    pub samples: Vec<TcpProbePoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTcpProbeView {
+    pub node_id: String,
+    pub targets: Vec<TcpProbeTargetSeries>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTcpProbeList {
+    pub nodes: Vec<NodeTcpProbeView>,
+}
+
 /// One hop, as the console reads it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HopLinkView {

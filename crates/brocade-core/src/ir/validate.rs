@@ -9,12 +9,11 @@ use ipnet::IpNet;
 use crate::{
     diagnostic::Diagnostic,
     model::{
-        Action, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback,
-        EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
-        ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial,
-        HopPool, HopWire, Hysteria2, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
-        HysteriaQuic, ModelSnapshot, RealityFallbackLimits, RealityFallbackRateLimit, Transport,
-        Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, EXTERNAL_WIREGUARD_MAX_WORKERS,
+        Action, Dns, DomainStrategy, ExternalOutboundProtocol, ExternalOutboundSecurity,
+        ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial, HopPool, HopWire, Hysteria2,
+        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, HysteriaQuic, ModelSnapshot,
+        RealityFallbackLimits, RealityFallbackRateLimit, Transport, Xhttp, XhttpMode, XhttpXmux,
+        XhttpXmuxRange, EXTERNAL_WIREGUARD_MAX_WORKERS,
     },
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_public_key,
@@ -1209,202 +1208,60 @@ fn validate_app_set_labels(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
-#[derive(Clone)]
-struct RuleDnsUse {
-    identity: String,
-    scope: String,
-    chain: String,
-    summary: String,
-}
-
-fn display_resource(name: &str, id: &str) -> String {
-    if name == id {
-        id.to_owned()
-    } else {
-        format!("{name}（{id}）")
-    }
-}
-
-fn rule_dns_summary(
-    send_through: Option<IpAddr>,
-    resolution: Option<&EgressDnsResolution>,
-) -> String {
-    let Some(resolution) = resolution else {
-        return "默认 DNS 解析".to_owned();
-    };
-    let address = resolution.address.trim();
-    let endpoint = match address.parse::<IpAddr>() {
-        Ok(IpAddr::V6(_)) => format!("[{address}]:{}", resolution.port),
-        _ => format!("{address}:{}", resolution.port),
-    };
-    let transport = match resolution.transport {
-        EgressDnsTransport::Tcp => "TCP",
-        EgressDnsTransport::Udp => "UDP",
-    };
-    let strategy = match resolution.address_strategy {
-        EgressDnsAddressStrategy::UseIp => "UseIP",
-        EgressDnsAddressStrategy::UseIpv4 => "UseIPv4",
-        EgressDnsAddressStrategy::UseIpv6 => "UseIPv6",
-        EgressDnsAddressStrategy::UseIpv4v6 => "UseIPv4v6",
-        EgressDnsAddressStrategy::UseIpv6v4 => "UseIPv6v4",
-    };
-    let fallback = match resolution.fallback {
-        EgressDnsFallback::Stop => "停止连接",
-        EgressDnsFallback::Machine => "回退机器 DNS",
-    };
-    let source = send_through.map_or_else(String::new, |address| format!(" / 源地址 {address}"));
-    format!("{endpoint} / {transport} / {strategy} / {fallback}{source}")
-}
-
-fn app_egress_dns_resolution<'a>(
-    app: &'a AppIr,
-    node_id: &str,
-    dest_match: &DestMatch,
-) -> Option<&'a EgressDnsResolution> {
-    let selector = dest_match.canonical_egress_dns_selector()?;
-    app.nodes
-        .iter()
-        .find(|node| node.id == node_id)?
-        .egress_dns
-        .iter()
-        .find(|policy| policy.selector.canonical_egress_dns_selector().as_ref() == Some(&selector))
-        .map(|policy| &policy.resolution)
-}
-
 fn validate_app_set_dns(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
-    let mut dns_by_node = BTreeMap::<String, (Dns, DomainStrategy)>::new();
+    let mut dns_by_node = BTreeMap::<String, (Dns, DomainStrategy, bool)>::new();
     let mut egress_by_node = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut rule_dns = BTreeMap::<(String, String), RuleDnsUse>::new();
-    let mut first_rule_by_scope = BTreeSet::<(String, String, String)>::new();
 
     for app in apps {
         for node in &app.nodes {
             dns_by_node
                 .entry(node.id.clone())
-                .or_insert_with(|| (node.dns.clone(), node.domain_strategy));
+                .and_modify(|entry| entry.2 |= !node.egress_dns.is_empty())
+                .or_insert_with(|| {
+                    (
+                        node.dns.clone(),
+                        node.domain_strategy,
+                        !node.egress_dns.is_empty(),
+                    )
+                });
         }
         for step in &app.steps {
             for rule in &step.rules {
-                if let Action::Egress { send_through, dns } = &rule.action {
+                if let Action::Egress { send_through } = &rule.action {
                     egress_by_node
                         .entry(step.node.clone())
                         .or_default()
                         .insert(egress_tag(send_through.as_ref()));
-
-                    if let Some(domains) = rule_dns_domains(&rule.dest_match) {
-                        let resolution = dns
-                            .then(|| app_egress_dns_resolution(app, &step.node, &rule.dest_match))
-                            .flatten();
-                        if *dns && resolution.is_none() {
-                            diagnostics.push(Diagnostic::error(
-                                "dns.reference-missing",
-                                format!("{}/{}", step.chain, step.node),
-                                format!(
-                                    "规则引用了机器 DNS 策略，但 {} 上没有与该域名条件完全相同的策略；请先创建策略或取消引用",
-                                    step.node
-                                ),
-                            ));
-                        }
-                        let identity = resolution.as_ref().map_or_else(
-                            || "machine".to_owned(),
-                            |resolution| {
-                                format!(
-                                    "custom:{}:{}",
-                                    send_through
-                                        .map(|address| address.to_string())
-                                        .unwrap_or_default(),
-                                    serde_json::to_string(resolution).unwrap_or_default()
-                                )
-                            },
-                        );
-                        let chain = app
-                            .chains
-                            .iter()
-                            .find(|chain| chain.id == step.chain)
-                            .map_or_else(
-                                || step.chain.clone(),
-                                |chain| display_resource(&chain.name, &chain.id),
-                            );
-                        let node = app
-                            .nodes
-                            .iter()
-                            .find(|node| node.id == step.node)
-                            .map_or_else(
-                                || step.node.clone(),
-                                |node| display_resource(&node.name, &node.id),
-                            );
-                        let usage = RuleDnsUse {
-                            identity,
-                            scope: format!(
-                                "{}/{}",
-                                app.app_id.as_deref().unwrap_or_default(),
-                                step.chain
-                            ),
-                            chain,
-                            summary: rule_dns_summary(*send_through, resolution),
-                        };
-                        for domain in domains {
-                            if !first_rule_by_scope.insert((
-                                usage.scope.clone(),
-                                step.node.clone(),
-                                domain.clone(),
-                            )) {
-                                continue;
-                            }
-                            let key = (step.node.clone(), domain.clone());
-                            if let Some(previous) = rule_dns.get(&key) {
-                                // Overlapping selectors in one chain are ordered rules: the first
-                                // match wins, so a later machine policy may still usefully cover
-                                // its remaining domains. Across chains there is no single shared
-                                // order, and one Xray DNS instance cannot honor two resolutions.
-                                if previous.scope != usage.scope
-                                    && previous.identity != usage.identity
-                                {
-                                    diagnostics.push(Diagnostic::error(
-                                        "dns.rule-conflict",
-                                        format!("{}/{}", step.node, domain),
-                                        format!(
-                                            "{node}上的 {domain} DNS 配置冲突：线路「{}」使用 {}；线路「{}」使用 {}。Xray 的 DNS 匹配在机器内全局生效，出站引用只决定策略是否下发，不能隔离同一域名的解析上下文；请统一这两条规则",
-                                            previous.chain, previous.summary, usage.chain, usage.summary
-                                        ),
-                                    ));
-                                }
-                            } else {
-                                rule_dns.insert(key, usage.clone());
-                            }
-                        }
-                    } else if *dns {
-                        diagnostics.push(Diagnostic::error(
-                            "dns.reference-selector",
-                            format!("{}/{}", step.chain, step.node),
-                            "机器 DNS 策略只能由域名后缀、域名关键词、域名正则或 Geosite 的落地规则引用",
-                        ));
-                    }
                 }
             }
         }
     }
 
-    for (node_id, (dns, strategy)) in dns_by_node {
-        if !dns.needs_route() {
-            continue;
-        }
-
+    for (node_id, (dns, strategy, has_machine_policies)) in dns_by_node {
         // AsIs never asks xray's DNS at all — the domain goes to the dialer untouched and
-        // the machine's own resolver settles it — so the servers configured here are dead
-        // weight. Reported rather than rejected: the combination is legal, just useless,
-        // and which of the two the operator meant to change is theirs to say.
+        // the machine's own resolver settles it — so both the default servers and machine
+        // policies configured here are dead weight. Reported rather than rejected: the
+        // combination is legal, just useless, and which value the operator meant to change is
+        // theirs to say.
         //
         // It returns before the route count below on purpose. That check exists to give the
         // internal DNS's own queries a definite way out, and under AsIs there are no such
         // queries; letting it run would reject a legal machine over an ambiguity that
         // cannot be reached.
         if strategy == DomainStrategy::AsIs {
-            diagnostics.push(Diagnostic::warn(
-                "node.dns-bypassed",
-                &node_id,
-                format!("{node_id} 配置了外部 DNS，但域名解析设为 AsIs，该配置不会生效"),
-            ));
+            if dns.needs_route() || has_machine_policies {
+                diagnostics.push(Diagnostic::warn(
+                    "node.dns-bypassed",
+                    &node_id,
+                    format!(
+                        "{node_id} 的域名策略为 AsIs，Freedom 不调用 Xray 内建 DNS；配置的 DNS 服务器和机器 DNS 策略不会被查询"
+                    ),
+                ));
+            }
+            continue;
+        }
+
+        if !dns.needs_route() {
             continue;
         }
 
@@ -1413,35 +1270,15 @@ fn validate_app_set_dns(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
             0 => diagnostics.push(Diagnostic::warn(
                 "node.dns-unused",
                 &node_id,
-                format!("{node_id} 配置了外部 DNS，但没有出网动作"),
+                format!("{node_id} 配置了 Xray 内建 DNS 服务器，但没有可承载其查询流量的落地出站"),
             )),
             1 => {}
             count => diagnostics.push(Diagnostic::error(
                 "dns.route-ambiguous",
                 &node_id,
-                format!("{node_id} 内建 DNS 的出网口不唯一，共 {count} 个"),
+                format!("{node_id} 有 {count} 个普通落地出站，Xray 内建 DNS 查询没有唯一出口"),
             )),
         }
-    }
-}
-
-fn rule_dns_domains(dest_match: &DestMatch) -> Option<Vec<String>> {
-    match dest_match {
-        DestMatch::DomainSuffix(values) => Some(
-            values
-                .iter()
-                .map(|value| format!("domain:{value}"))
-                .collect(),
-        ),
-        DestMatch::DomainKeyword(values) => Some(values.clone()),
-        DestMatch::DomainRegex(value) => Some(vec![format!("regexp:{value}")]),
-        DestMatch::Geosite(values) => Some(
-            values
-                .iter()
-                .map(|value| format!("geosite:{value}"))
-                .collect(),
-        ),
-        _ => None,
     }
 }
 

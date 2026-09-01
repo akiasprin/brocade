@@ -54,6 +54,18 @@
   --ink-2: #c2c5c9;
   --ink-3: #8d9196;
   --ink-4: #676b71;
+  /* 观测图固定使用相邻高对比的柔和分类盘，不随站点操作色切换。ECharts canvas 与 HTML
+     图例共读这些直接色值，避免 canvas 无法解析嵌套 var()/color-mix()。 */
+  --observe-1: #6d90c4;
+  --observe-2: #c88a5e;
+  --observe-3: #77a67d;
+  --observe-4: #c47b83;
+  --observe-5: #9789bd;
+  --observe-6: #bda65f;
+  --observe-7: #5c9ca0;
+  --observe-8: #b98aa8;
+  --observe-9: #7f8ab0;
+  --observe-10: #9c9384;
   /* 语义色全局共享，不参与调色盘。--gold 表示「已变更 / 需注意」；状态标签只是偶尔出现的
      元素，因此三者都压低饱和度，避免抢过操作与数据。 */
   --ok: #43b789;
@@ -1090,6 +1102,16 @@
   --ink-2: #3b3e42;
   --ink-3: #5c6165;
   --ink-4: #7e8286;
+  --observe-1: #4a6fa5;
+  --observe-2: #b06a3e;
+  --observe-3: #4f7d57;
+  --observe-4: #a85560;
+  --observe-5: #6f629c;
+  --observe-6: #94793a;
+  --observe-7: #3a7a7e;
+  --observe-8: #8f5f80;
+  --observe-9: #5a6690;
+  --observe-10: #736b5c;
   --ok: #168e6b;
   --gold: #b47a21;
   --err: #a64a51;
@@ -1101,7 +1123,7 @@
   --hover-2: color-mix(in srgb, var(--action) 13%, transparent);
   /* 白底白按钮，由边框成立；hover 染主色。 */
   --btn: var(--sheet);
-  --btn-h: color-mix(in srgb, var(--action) 7%, transparent);
+  --btn-h: color-mix(in srgb, var(--action) 7%, var(--sheet));
   --btn-a: color-mix(in srgb, var(--action) 12%, var(--sheet));
   --glass: rgba(255, 255, 255, 0.88);
   --glass-strong: rgba(255, 255, 255, 0.96);
@@ -2050,26 +2072,6 @@ input.f::placeholder {
   line-height: 1.7;
   margin: 0 0 8px;
 }
-/* 骨架屏：加载占位，替代「读取中」文字。灰条粗细贴近正文行，颜色与台面同族——
-   它只占位，不表态。每条错开半拍的呼吸，避免整块同步闪烁。 */
-.skel {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  margin: 0 0 8px;
-}
-.skel i {
-  height: 11px;
-  border-radius: 3px;
-  background: color-mix(in srgb, var(--ink) 12%, transparent);
-  animation: pulse 1.6s ease-in-out infinite;
-}
-.skel i:nth-child(2) {
-  animation-delay: 0.18s;
-}
-.skel i:nth-child(3) {
-  animation-delay: 0.36s;
-}
 /* 说明文字的两个强度等级。`note warn` / `note bad` 在二十余处使用，但此前没有对应规则，
    导致「保存后会有用户断线」与背景说明使用同一个灰色，无法区分优先级。
    只改变文字颜色，不加底色和边框：它们是段落，不是需要成块显示的内容。 */
@@ -2448,19 +2450,14 @@ input.f::placeholder {
   background: var(--card);
   box-shadow: var(--sheet-shadow);
 }
-/* 旗保持 3:2（RegionFlag 让一格无损填满自身盒子）。底板 22×22，1px 边框包含在尺寸内，
-   因此内容区是 20×20；旗高取内容区的 100%（20），宽取 150%（30），与 mockup A 的
-   background-size: cover 完全同构。绝对定位以 clip 中心对齐，左右各溢出 5px 由
-   overflow 对称裁掉，不拉伸、不改 RegionFlag 的数学。（不能用 grid place-items 居中：
-   单 auto 列会被旗撑宽并向右溢出，只露左边、裁切不对称。）
-   竖条旗（FR/IT）侧条会被切到半宽、比例失真但仍可辨，是方形化的既定代价。 */
+/* 机器标识用方形旗面。RegionFlag 自己把 3:2 原图左右各裁 1/6，并把裁切量算入
+   雪碧图坐标；这里只让它铺满 20×20 内容区。不再用 150% 宽子元素加 transform
+   的二次裁切，避免边框和百分比定位共同参与后产生左右偏差。 */
 .nd-idplate-clip .geo-flag {
   position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 150%;
+  inset: 0;
+  width: 100%;
   height: 100%;
-  transform: translate(-50%, -50%);
   border-radius: 0;
 }
 /* 状态灯落右下角作 presence 点：不透明纸色描一圈，像从底板边角抠出来。
@@ -2832,6 +2829,64 @@ input.f::placeholder {
   min-width: 0;
   margin: 0;
 }
+.tcp-connect-panel {
+  min-width: 0;
+  margin: 0;
+}
+.tcp-connect-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 18px;
+  margin: 0;
+  padding: 10px 15px 11px;
+  border-top: 1px solid var(--line-soft);
+}
+.tcp-connect-summary > span {
+  display: inline-grid;
+  grid-template-columns: 12px minmax(0, auto) auto auto;
+  align-items: baseline;
+  gap: 4px 7px;
+  min-width: 190px;
+  color: var(--ink-3);
+  font: 10px var(--mono);
+}
+.tcp-connect-summary i {
+  width: 12px;
+  height: 2px;
+  border-radius: 2px;
+  align-self: center;
+}
+.tcp-connect-summary b {
+  overflow: hidden;
+  color: var(--ink-2);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tcp-connect-summary em {
+  color: var(--ink);
+  font-size: 11.5px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+.tcp-connect-summary small {
+  color: var(--ink-4);
+  font-size: 9px;
+  white-space: nowrap;
+}
+.tcp-connect-chart {
+  width: 100%;
+  height: 204px;
+}
+.tcp-connect-panel > .note {
+  margin: 11px 13px;
+}
+.tcp-connect-panel > .tcp-connect-empty {
+  min-height: 150px;
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+}
 @container (min-width: 1200px) {
   .nd-observed-status {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3001,6 +3056,29 @@ input.f::placeholder {
   flex-direction: column;
   gap: 10px;
 }
+/* 规则卡沿用用户页「授权验证」的紧凑卡壳：标题贴住内容，不保留普通配置卡标题下方
+   额外的 11px 空档。单独命名而不复用 `.grant-probe`，避免把拨测状态样式带进规则页。 */
+.panel.config-panel.rule-sheet-card > header {
+  gap: 8px;
+  min-height: 38px;
+  margin: -11px -13px 0;
+  padding: 7px 12px;
+}
+.panel.config-panel.rule-sheet-card > header .btn {
+  min-height: 27px;
+  padding-inline: 10px;
+  font-size: 11.5px;
+}
+.rule-sheet-meta {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink-4);
+  background: var(--block);
+  font: 9.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .node-egress-rule-sheet,
 .node-chain-sheet,
 .node-chain-use.chain-tree {
@@ -3021,9 +3099,12 @@ input.f::placeholder {
   padding: 0;
   border: 0;
 }
-.node-egress-rules-table td {
-  padding-top: 8px;
-  padding-bottom: 8px;
+.node-egress-dns-new-row {
+  background: color-mix(in srgb, var(--violet) 4%, transparent);
+}
+.rule-new-dns-value {
+  min-width: 0;
+  flex: 1 1 180px;
 }
 .dns-priority-cell {
   width: 1%;
@@ -3033,12 +3114,6 @@ input.f::placeholder {
 .dns-priority-index {
   color: var(--violet);
   font-weight: 600;
-}
-.node-egress-rules-foot {
-  margin: 0;
-  padding: 8px 12px;
-  border-top: 1px solid var(--line-soft);
-  background: var(--band);
 }
 .node-rules-empty {
   margin: 0;
@@ -4185,7 +4260,6 @@ input.f {
 }
 .rule-readonly-value {
   width: 190px;
-  margin-left: 6px;
   padding: 0 9px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4233,12 +4307,20 @@ input.f {
   cursor: default;
 }
 
-/* 终点规则的解析策略由落地机器统一持有；规则表里的引用决定策略是否进入机器配置，
-   并不会把 DNS 隔离到该出站。宽屏时匹配、动作和全部自定义参数共用一行；匹配列只拿实际需要的
-   宽度，把原先域名输入框右侧的大段空白交给 DNS 参数。 */
+/* 终点规则的解析策略由落地机器统一持有，保存后始终进入机器配置。线路规则只提供创建和
+   编辑入口，不绑定或隔离 DNS。宽屏时匹配、动作和全部自定义参数共用一行。 */
 .rule-match-cell {
   width: 1%;
   white-space: nowrap;
+}
+.rule-match-cell > .f + .f {
+  margin-left: 6px;
+}
+.rule-table .rule-match-cell > :is(select.f, .rule-readonly-select) {
+  width: 112px;
+}
+.rule-table .rule-match-cell > :is(input.f, .rule-readonly-value) {
+  width: 190px;
 }
 .rule-action-cell {
   white-space: nowrap;
@@ -4247,14 +4329,8 @@ input.f {
   width: 112px;
   font-weight: 500;
 }
-.rule-action-select.rule-action-forward,
-.rule-ro[disabled] .rule-action-select.rule-action-forward {
-  color: var(--action);
-  border-color: color-mix(in srgb, var(--action) 42%, var(--line));
-  background-color: var(--action-wash);
-}
-.rule-action-select.rule-action-egress,
-.rule-ro[disabled] .rule-action-select.rule-action-egress {
+.rule-action-select:is(.rule-action-forward, .rule-action-egress),
+.rule-ro[disabled] .rule-action-select:is(.rule-action-forward, .rule-action-egress) {
   color: var(--ink-2);
   border-color: color-mix(in srgb, var(--ink-3) 30%, var(--line));
   background-color: color-mix(in srgb, var(--ink) 3%, var(--sunk));
@@ -4267,21 +4343,28 @@ input.f {
 }
 .egress-dns-choice {
   width: 154px;
-  margin-left: 7px;
   vertical-align: middle;
 }
 .egress-dns-reference {
   display: inline-flex;
   align-items: center;
   min-width: 0;
+  margin-left: 7px;
 }
 .node-egress-dns-limit {
-  margin: 0 0 9px;
-  padding: 7px 9px;
-  border: 1px solid color-mix(in srgb, var(--gold) 30%, var(--line-soft));
-  border-radius: var(--r-ctl);
-  background: color-mix(in srgb, var(--gold) 7%, transparent);
-  line-height: 1.5;
+  margin: 1px 0 9px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-4);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.machine-dns-shared-row > td {
+  color: var(--ink-3);
+}
+.machine-dns-shared-row :is(.rule-readonly-select, .rule-readonly-value) {
+  font-size: 12px;
 }
 .egress-dns-editor-row > td {
   width: auto !important;
@@ -4308,6 +4391,15 @@ input.f {
 .egress-dns-editor > .f {
   width: 100%;
   margin: 0;
+}
+.egress-dns-port[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.egress-dns-port[type='number']::-webkit-inner-spin-button,
+.egress-dns-port[type='number']::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
 }
 .egress-dns-endpoint > i {
   color: var(--ink-4);
@@ -4356,7 +4448,7 @@ input.f {
   padding: 3px 6px;
 }
 @container rules (max-width: 1050px) {
-  .rule-match-cell {
+  .rule-table .rule-match-cell {
     width: auto;
   }
 }
@@ -4372,28 +4464,28 @@ input.f {
   margin: 0 0 5px;
   line-height: 1.45;
 }
-.chain-rule-tree .rule-editor > .tbl td {
+.rule-table td {
   padding: 5px 7px;
 }
-.chain-rule-tree .rule-editor > .tbl td:first-child {
+.rule-table td:first-child {
   width: 18px !important;
 }
-.chain-rule-tree .rule-editor > .tbl tr.egress-dns-editor-row > td:first-child {
+.rule-table tr.egress-dns-editor-row > td:first-child {
   width: auto !important;
   padding: 0 !important;
 }
-.chain-rule-tree .rule-editor .btn {
+.rule-table .btn {
   padding: 3px 8px;
   font-size: 12px;
 }
-.chain-rule-tree .rule-editor input.f {
+.rule-table input.f {
   padding: 4px 7px;
   font-size: 12px;
 }
 /* 四个值需要全部声明，不能简写为两个：全局 select.f 的右内距是 26px，该空间用于放置
    下拉箭头（background-image，绘制在 right 9px 处）。写成 `3px 7px` 会一并覆盖，
    导致箭头与最后一个字重叠。 */
-.chain-rule-tree .rule-editor select.f {
+.rule-table select.f {
   padding: 0 23px 0 7px;
   font-size: 12px;
 }
@@ -4474,15 +4566,18 @@ input.f {
      DNS 参数栅格减列。
    · ≤640px：整行折成卡片——序号做抬头、重排做卡脚，匹配 / 动作各补一枚小标签，
      控件占满整宽，DNS 参数落成一列、这一跳逐项一行。
-   同一套覆盖三处：链路规则、线路里的 XRAY 链路（都是 .rule-editor）、机器 DNS 策略
-   （.node-egress-rules-table）。 */
+   所有规则表统一使用 `.rule-table`，链路规则、线路里的 XRAY 链路和机器 DNS 策略不再
+   分别维护一份响应式选择器。 */
 @container rules (max-width: 1050px) {
   /* 动作格里 inline 子元素之间未必有空白文本节点，white-space 不足以断行，改 flex-wrap。 */
-  :is(.rule-editor, .node-egress-rules-table) .rule-action-cell {
+  .rule-table .rule-action-cell {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 6px;
+  }
+  .rule-table .rule-action-cell > :is(.egress-dns-reference, .egress-dns-editor, .egress-dns-usage) {
+    margin-left: 0;
   }
   .egress-dns-editor {
     grid-template-columns: minmax(0, 1fr) 116px 130px;
@@ -4495,15 +4590,12 @@ input.f {
 
 @container rules (max-width: 640px) {
   /* 表 → 块流 */
-  .rule-editor > .tbl,
-  .rule-editor > .tbl > tbody,
-  .node-egress-rules-table,
-  .node-egress-rules-table > tbody {
+  .rule-table,
+  .rule-table > tbody {
     display: block;
   }
   /* 每行一张卡片 */
-  .rule-editor > .tbl > tbody > tr,
-  .node-egress-rules-table > tbody > tr {
+  .rule-table > tbody > tr {
     display: block;
     margin: 8px 0;
     padding: 9px 11px;
@@ -4511,8 +4603,7 @@ input.f {
     border-radius: var(--r-ctl);
     background: color-mix(in srgb, var(--block) 42%, transparent);
   }
-  .rule-editor > .tbl > tbody > tr > td,
-  .node-egress-rules-table > tbody > tr > td {
+  .rule-table > tbody > tr > td {
     display: block;
     width: auto !important;
     padding: 0 !important;
@@ -4522,8 +4613,8 @@ input.f {
     white-space: normal;
   }
   /* 序号 = 卡片抬头 */
-  .rule-editor > .tbl > tbody > tr > td:first-child,
-  .node-egress-rules-table > tbody > tr > td:first-child {
+  .rule-table > tbody > tr > td:first-child {
+    width: auto !important;
     margin-bottom: 7px;
     padding-bottom: 6px !important;
     border-bottom: 1px solid var(--line-soft);
@@ -4531,18 +4622,11 @@ input.f {
     font: 600 11px var(--mono);
     text-align: left;
   }
-  /* 规则树桌面版将序号列固定为 18px；手机卡片中它是整行抬头，需要越过那条更具体的规则，
-     否则分隔线只剩序号下方的一小截。 */
-  .chain-rule-tree .rule-editor > .tbl > tbody > tr > td:first-child {
-    width: auto !important;
-  }
   /* 匹配 / 动作：小标签落在左侧 38px 栏（绝对定位，不打断控件流），控件在右侧铺开——
      与 mockup 一致（标签在控件左边，而不是上方），也把每格压回一行的高度。
      !important 越过更具体的 td 选择器。 */
-  .rule-editor > .tbl > tbody > tr > td.rule-match-cell,
-  .rule-editor > .tbl > tbody > tr > td.rule-action-cell,
-  .node-egress-rules-table > tbody > tr > td.rule-match-cell,
-  .node-egress-rules-table > tbody > tr > td.rule-action-cell {
+  .rule-table > tbody > tr > td.rule-match-cell,
+  .rule-table > tbody > tr > td.rule-action-cell {
     position: relative;
     display: flex !important;
     flex-wrap: wrap;
@@ -4551,14 +4635,13 @@ input.f {
     padding-left: 38px !important;
     min-height: 26px;
   }
-  .rule-editor > .tbl > tbody > tr > td.rule-action-cell,
-  .node-egress-rules-table > tbody > tr > td.rule-action-cell {
+  .rule-table > tbody > tr > td.rule-action-cell {
     flex-direction: column;
     align-items: stretch;
     margin-top: 7px;
   }
-  :is(.rule-editor, .node-egress-rules-table) .rule-match-cell::before,
-  :is(.rule-editor, .node-egress-rules-table) .rule-action-cell::before {
+  .rule-table .rule-match-cell::before,
+  .rule-table .rule-action-cell::before {
     position: absolute;
     left: 0;
     top: 8px;
@@ -4567,29 +4650,29 @@ input.f {
     letter-spacing: 0.04em;
     color: var(--ink-4);
   }
-  :is(.rule-editor, .node-egress-rules-table) .rule-match-cell::before {
+  .rule-table .rule-match-cell::before {
     content: '匹配';
   }
-  :is(.rule-editor, .node-egress-rules-table) .rule-action-cell::before {
+  .rule-table .rule-action-cell::before {
     content: '动作';
   }
   /* 匹配：类别定宽，值占余下整行 */
-  .rule-match-cell > .f {
+  .rule-table .rule-match-cell > .f {
     margin-left: 0 !important;
   }
-  .rule-match-cell select.f {
+  .rule-table .rule-match-cell select.f {
     flex: 0 0 auto;
     width: auto !important;
     min-width: 96px;
   }
-  .rule-match-cell input.f,
-  .rule-match-cell .rule-readonly-value {
+  .rule-table .rule-match-cell input.f,
+  .rule-table .rule-match-cell .rule-readonly-value {
     flex: 1 1 120px;
     width: auto !important;
     min-width: 0;
   }
   /* 动作：逐项整宽堆叠 */
-  .rule-action-cell > * {
+  .rule-table .rule-action-cell > * {
     margin-left: 0 !important;
   }
   .egress-dns-reference {
@@ -4599,17 +4682,17 @@ input.f {
     gap: 6px;
     width: 100%;
   }
-  .rule-action-cell .f,
-  .rule-action-cell .rule-action-select,
-  .rule-action-cell .rule-readonly-select,
-  .egress-dns-choice {
+  .rule-table .rule-action-cell .f,
+  .rule-table .rule-action-cell .rule-action-select,
+  .rule-table .rule-action-cell .rule-readonly-select,
+  .rule-table .egress-dns-choice {
     display: block;
     width: 100% !important;
     box-sizing: border-box;
   }
   /* 目标选择器整宽，但触发器保留内部三栏（角标 | 名称 | 箭头），别压成三行——
      不要覆盖它的 display:grid，只放开外壳宽度。 */
-  .rule-action-cell .external-target-picker {
+  .rule-table .rule-action-cell .external-target-picker {
     display: block;
     width: 100% !important;
     min-width: 0;
@@ -4630,15 +4713,13 @@ input.f {
     grid-template-columns: minmax(0, 1fr) 8px 74px;
   }
   /* 重排 / 优先级 = 卡片脚；空脚（机器 DNS 行占位的 120px 空格）不占位 */
-  .rule-editor > .tbl > tbody > tr > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell),
-  .node-egress-rules-table > tbody > tr > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
+  .rule-table > tbody > tr > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
     margin-top: 7px;
     padding-top: 6px !important;
     border-top: 1px dashed var(--line-soft);
     text-align: right;
   }
-  .rule-editor > .tbl > tbody > tr > td:last-child:empty,
-  .node-egress-rules-table > tbody > tr > td:last-child:empty {
+  .rule-table > tbody > tr > td:last-child:empty {
     display: none;
   }
   .dns-priority-cell {
@@ -13010,7 +13091,8 @@ input.f.ing-pj-port {
 /* ── 遥测：LOAD 趋势总览、主机事实与逐跳链路 ──────────────── */
 .load-cluster {
   display: grid;
-  gap: 8px;
+  /* 与 .nd-tab-observed、.history-primary、.history-grid 的图表间距统一。 */
+  gap: 12px;
   min-width: 0;
 }
 .load-dashboard {
@@ -13066,6 +13148,9 @@ input.f.ing-pj-port {
 .load-network-cap > span.stale {
   color: var(--gold);
 }
+.load-network-cap > span.hot {
+  color: var(--gold);
+}
 /* 双联吞吐曲线卡（NETWORK / XRAY）：卡框与原 .load-network 同一套卡面语言，图区交给
    echarts（.ndtp-ec）。标题条 .load-network-cap 与图例 .load-network-legend 原样复用。 */
 .chart-card {
@@ -13119,6 +13204,10 @@ input.f.ing-pj-port {
   margin-left: 1px;
   font-size: 9.5px;
   color: var(--ink-4);
+}
+.kpi .kpi-v.kpi-uptime {
+  font-size: 14px;
+  letter-spacing: -0.025em;
 }
 /* 芯片值的后缀读数（CPU 芯片的 STEAL）：同 small 的字号色阶，只在大数值非零时出现。 */
 .kpi .kpi-sub {
@@ -13201,97 +13290,274 @@ input.f.ing-pj-port {
 /* 原始观测范围。此区域不表达健康结论：边框与曲线始终使用数据色，缺口直接断线；
    所有点的绝对时间和值交给 tooltip，避免只看最后一个瞬时窗口。 */
 .observe-range {
-  display: inline-flex;
+  position: relative;
+  display: inline-block;
   flex: 0 0 auto;
-  overflow: hidden;
+}
+.observe-link-switch {
+  gap: 6px;
+  height: 28px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.observe-link-switch .switch-ui {
+  width: 32px;
+  height: 18px;
+  padding: 2px;
+}
+.observe-link-switch .switch-ui span {
+  width: 12px;
+  height: 12px;
+}
+.observe-link-switch input:checked + .switch-ui span {
+  transform: translateX(14px);
+}
+.observe-link-switch .switch-label {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.observe-range.open {
+  z-index: 60;
+}
+.observe-range-trigger {
+  display: inline-flex;
+  height: 28px;
+  padding: 0 9px 0 11px;
+  align-items: center;
+  gap: 8px;
   border: 1px solid var(--line);
   border-radius: 7px;
-  background: var(--sunk);
-}
-.observe-range button {
-  min-width: 42px;
-  height: 27px;
-  padding: 0 9px;
-  border: 0;
-  border-left: 1px solid var(--line-soft);
-  background: transparent;
-  color: var(--ink-4);
-  cursor: pointer;
-  font: 600 9.5px var(--mono);
-}
-.observe-range button:first-child {
-  border-left: 0;
-}
-.observe-range button:hover {
+  background: var(--block);
   color: var(--ink-2);
-  background: color-mix(in srgb, var(--action-wash) 35%, transparent);
+  cursor: pointer;
+  font: 500 11.5px var(--sans);
+  white-space: nowrap;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease;
 }
-.observe-range button[aria-pressed='true'] {
-  background: var(--card);
-  color: var(--action);
-  box-shadow: 0 1px 4px rgb(0 0 0 / 7%);
+.observe-range-trigger:hover {
+  border-color: color-mix(in srgb, var(--action) 40%, var(--line));
+  background: var(--surface);
 }
-.observe-range button:focus-visible {
-  position: relative;
+.observe-range.open .observe-range-trigger {
+  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+  background: var(--surface);
+}
+.observe-range-trigger:focus-visible,
+.observe-range-menu button:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--action) 45%, transparent);
-  outline-offset: -2px;
+  outline-offset: 1px;
 }
-.load-range-loading {
-  min-height: 150px;
+.observe-range-clock {
+  flex: none;
+  color: var(--ink-4);
+}
+.observe-range-menu {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 5px);
+  right: 0;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--glass-strong);
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow);
+}
+.observe-range-menu[hidden] {
+  display: none;
+}
+.observe-range-menu button {
+  display: flex;
+  width: 100%;
+  padding: 6px 9px;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font: 11.5px var(--sans);
+  text-align: left;
+  white-space: nowrap;
+}
+.observe-range-menu button:hover,
+.observe-range-menu button:focus-visible {
+  background: color-mix(in srgb, var(--action-wash) 60%, transparent);
+}
+.observe-range-menu button[aria-selected='true'] {
+  color: var(--action);
+  font-weight: 500;
+}
+.observe-range-check {
+  margin-left: auto;
+  color: var(--action);
+  font-size: 10px;
+  opacity: 0;
+}
+.observe-range-menu button[aria-selected='true'] .observe-range-check {
+  opacity: 1;
 }
 .observe-history {
+  --observe-user: var(--data);
+  --observe-system: #1ba1ac;
+  --observe-softirq: var(--hue-3);
+  --observe-iowait: var(--gold);
+  --observe-steal: var(--err);
+  --observe-load: var(--ok);
+  --observe-peak: var(--ink);
+  --observe-free: color-mix(in srgb, var(--ink) 12%, transparent);
   min-width: 0;
-  padding: 10px;
+  /* 底部分割线之后补 5px，再加父层 .load-cluster 的 12px gap，线到下一面板共 17px。 */
+  padding: 0 0 5px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.observe-history::after {
+  content: '';
+  display: block;
+  width: 100%;
+  height: 1px;
+  margin-top: 17px;
+  background: var(--line);
+}
+.history-primary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+.history-primary > .history-chart-card:only-child {
+  grid-column: 1 / -1;
+}
+.history-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+  min-width: 0;
+}
+.history-chart-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r-card);
   background: var(--card);
   box-shadow: var(--sheet-shadow);
 }
-.observe-history-head {
+.history-chart-card-wide {
+  grid-column: 1 / -1;
+}
+.history-chart-cap {
   display: flex;
-  align-items: center;
-  min-height: 34px;
-  margin-bottom: 8px;
-}
-.observe-history-head > span {
-  display: grid;
-  gap: 3px;
-}
-.observe-history-head b {
-  color: var(--ink);
-  font: 600 11px var(--mono);
-  letter-spacing: 0.05em;
-}
-.observe-history-head small {
-  color: var(--ink-4);
-  font-size: 9.5px;
-}
-.history-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
   min-width: 0;
+  min-height: 34px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
 }
-.history-chart-card {
+.history-chart-cap > b {
+  padding: 2px 8px;
+  border-radius: 5px;
+  background: var(--action-wash);
+  color: var(--ink);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.history-chart-cap > small {
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--line-soft);
-  border-radius: 7px;
-  background: var(--sheet);
+  color: var(--ink-4);
+  font: 9px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.history-chart-card > header {
-  padding: 8px 10px 0;
+.history-chart-cap > strong {
+  margin-left: auto;
+  color: var(--ink-4);
+  font: 9px var(--mono);
+  letter-spacing: normal;
+  white-space: nowrap;
+}
+.history-chart-legend {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px 13px;
+  padding: 10px 13px 12px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.history-chart-legend > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+.history-chart-legend i {
+  width: 9px;
+  height: 2px;
+  border-radius: 2px;
+  align-self: center;
+}
+.history-chart-legend .area i {
+  height: 8px;
+  border-radius: 2px;
+}
+.history-chart-legend .dashed i {
+  background: repeating-linear-gradient(90deg, currentcolor 0 4px, transparent 4px 6px) !important;
+}
+.history-chart-legend b {
   color: var(--ink-2);
-  font-size: 10.5px;
-  font-weight: 600;
+  font: 500 10.5px var(--mono);
+  letter-spacing: -0.02em;
 }
 .history-chart {
   width: 100%;
-  height: 190px;
+  height: 154px;
+}
+.history-chart-card-main .history-chart {
+  height: 216px;
+}
+.history-chart-card-secondary {
+  margin-top: 0;
+}
+.history-chart-card-secondary .history-chart {
+  height: 216px;
 }
 @container (max-width: 720px) {
+  .history-primary,
   .history-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .history-primary > .history-chart-card:only-child {
+    grid-column: auto;
+  }
+  .history-chart-card-wide {
+    grid-column: auto;
+  }
+  .observe-diagnostic-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .history-chart-cap {
+    flex-wrap: wrap;
+  }
+  .history-chart-cap > strong {
+    margin-left: 0;
   }
 }
 
@@ -13791,7 +14057,8 @@ input.f.ing-pj-port {
   min-width: 0;
   align-items: center;
   gap: 7px 15px;
-  padding: 9px 10px 0;
+  padding: 9px 15px 10px;
+  border-top: 1px solid var(--line-soft);
   color: var(--ink-4);
   font: 9.5px var(--mono);
 }
@@ -13809,10 +14076,10 @@ input.f.ing-pj-port {
   height: 2px;
   flex: none;
   border-radius: 2px;
-  background: var(--data);
+  background: var(--observe-1);
 }
 .load-network-legend .tx i {
-  background: var(--data-secondary);
+  background: var(--observe-2);
 }
 .load-network-legend b {
   color: var(--ink-2);
@@ -14067,70 +14334,6 @@ input.f.ing-pj-port {
   }
 }
 
-/* 主机事实和正常进程结论组成一条紧凑的信息带；图表本身已经有边界，不再套 LOAD 外框。 */
-.load-host-strip {
-  display: flex;
-  flex-wrap: wrap;
-  min-width: 0;
-  align-items: center;
-  gap: 7px 16px;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  /* 与 .panel / .load-* 同一套卡面：--r-card 圆角 + --card 白卡 + 柔投影。 */
-  border-radius: var(--r-card);
-  background: var(--card);
-  box-shadow: var(--sheet-shadow);
-}
-.load-host-strip .tfacts {
-  flex: 1 1 420px;
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-.load-host-strip .tfacts > span {
-  white-space: nowrap;
-}
-.load-host-strip .tproc-fold {
-  flex: 0 1 auto;
-  width: auto;
-  min-width: min(100%, 255px);
-  margin: 0;
-  padding: 0 0 0 14px;
-  border-top: 0;
-  border-left: 1px solid var(--line-soft);
-}
-.load-host-strip > .rt-dx {
-  flex: 1 1 100%;
-  margin-top: 1px;
-}
-.load-process-panel {
-  min-width: 0;
-  padding: 7px 10px;
-  overflow: auto;
-  border: 1px solid var(--line);
-  /* 与 .load-host-strip 同一套卡面，避免同一 LOAD 面板里两卡不一致。 */
-  border-radius: var(--r-card);
-  background: var(--card);
-  box-shadow: var(--sheet-shadow);
-}
-.load-process-panel .tproc {
-  min-width: 500px;
-  margin-top: 0;
-}
-@container (max-width: 650px) {
-  .load-host-strip .tfacts {
-    flex-basis: 100%;
-  }
-  .load-host-strip .tproc-fold {
-    flex-basis: 100%;
-    width: 100%;
-    padding: 7px 0 0;
-    border-top: 1px solid var(--line-soft);
-    border-left: 0;
-  }
-}
-
 /* 占比条：三种受限时间是同一个 100% 的三个部分，写成三个数字需要自行还原其比例关系 */
 .tmeter {
   display: flex;
@@ -14189,49 +14392,6 @@ input.f.ing-pj-port {
 }
 .tfacts b.dim {
   color: var(--ink-4);
-}
-
-/* 折叠的进程行。正常机器上该表二十个单元格中有十一个是 0.0% 或 —，
-   占用近半张卡而不提供有效信息；其结论「四个进程均正常」一行即可表达。 */
-.tproc-fold {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  margin-top: 8px;
-  padding: 8px 0 0;
-  border: 0;
-  border-top: 1px solid var(--line-soft);
-  background: none;
-  color: var(--ink-3);
-  font: inherit;
-  font-size: 11.5px;
-  text-align: left;
-  cursor: pointer;
-}
-.tproc-fold:hover {
-  color: var(--ink-2);
-}
-.tproc-fold .lamp {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex: none;
-  box-shadow: none;
-}
-.tproc-fold .mono {
-  font-size: 11.5px;
-}
-
-/* 进程表。密度比默认表格高一档：它是卡内的附表，不是主要内容 */
-.tproc {
-  margin-top: 2px;
-}
-.tproc th,
-.tproc td {
-  padding-top: 3px;
-  padding-bottom: 3px;
-  font-size: 11.5px;
 }
 
 /* 逐跳链路表 */
@@ -14418,8 +14578,14 @@ input.f.ing-pj-port {
   place-items: center;
   margin-right: 10px;
 }
-.nc-idplate {
-  margin-right: 10px;
+.nc-status-slot.with-region {
+  margin-right: 7px;
+}
+.nc-region-flag {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  margin-right: 9px;
 }
 .nc-pick-slot {
   display: inline-grid;
@@ -14508,6 +14674,7 @@ input.f.ing-pj-port {
    此时遮挡 IP 不影响使用。.btn 自带不透明底色，覆盖部分不会与 IP 文字重叠。 */
 .nc-dock {
   position: absolute;
+  z-index: 10;
   /* 比正文内距更靠近右下角，同时为圆角边框保留可见的间距。 */
   right: 10px;
   bottom: 10px;
@@ -14517,6 +14684,7 @@ input.f.ing-pj-port {
 }
 .ncard:hover .nc-dock,
 .ncard:focus-within .nc-dock {
+  z-index: 10;
   visibility: visible;
   opacity: 1;
 }
@@ -15071,6 +15239,39 @@ input.f.ing-pj-port {
   grid-column: 3 / -1;
   color: var(--err);
   font-size: 10px;
+}
+
+.tcp-probe-targets {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.tcp-probe-target {
+  display: grid;
+  grid-template-columns: minmax(96px, 0.7fr) minmax(210px, 1.5fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.tcp-probe-target .f {
+  width: 100%;
+  min-width: 0;
+}
+
+.tcp-probe-settings input[type='number'] {
+  width: 90px;
+}
+
+@media (max-width: 720px) {
+  .tcp-probe-target {
+    grid-template-columns: 1fr auto;
+  }
+
+  .tcp-probe-target .f:nth-child(2) {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
 }
 .agent-log-node > .err,
 .agent-log-node > .error {
@@ -15691,6 +15892,28 @@ input.f.ing-pj-port {
 .node-nic-plot .plot-label {
   left: 16px;
 }
+.nc-tcp-p95 {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--ink-4);
+  font-family: var(--mono);
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0.82;
+}
+.nc-tcp-p95 .values {
+  color: inherit;
+  font-size: 9.5px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.nc-tcp-p95 em {
+  color: inherit;
+  font-size: 7px;
+  font-style: normal;
+}
 .history-plot > .exit {
   right: 15px;
   display: inline-flex;
@@ -15867,6 +16090,18 @@ input.f.ing-pj-port {
   color: var(--ink);
   cursor: pointer;
   text-align: left;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+.external-target-trigger.node-target {
+  border-color: color-mix(in srgb, var(--action) 42%, var(--line));
+  background: var(--action-wash);
+}
+.external-target-trigger.node-target .external-target-kind {
+  border-color: color-mix(in srgb, var(--action) 42%, var(--line));
+  background: color-mix(in srgb, var(--action) 10%, transparent);
+  color: var(--action);
 }
 .external-target-trigger:hover,
 .external-target-trigger[aria-expanded='true'] {
@@ -15934,10 +16169,28 @@ input.f.ing-pj-port {
   border-radius: 7px;
   background: var(--sheet);
   box-shadow: var(--shadow);
+  transform-origin: bottom center;
+  animation: external-target-menu-in 90ms ease-out;
 }
 .external-target-menu.below {
   top: calc(100% + 5px);
   bottom: auto;
+  transform-origin: top center;
+}
+@keyframes external-target-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px) scale(0.995);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .external-target-menu {
+    animation: none;
+  }
 }
 /* 规则树卡片平时裁切圆角；目标菜单向上越过卡片时必须临时放开，否则菜单只有落在卡片内的
    最后一截可见，看起来像“无法滚动”。给整棵规则树提升层级，菜单也不会被上方配置卡盖住。 */

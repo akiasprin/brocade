@@ -23,6 +23,7 @@ use crate::probe;
 use crate::provision;
 use crate::quota;
 use crate::settings;
+use crate::tcp_probe;
 use crate::usage;
 use crate::{
     agent, materialize, AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult,
@@ -36,12 +37,13 @@ use crate::{
     E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, HopLinkList,
     IssuedAdminToken, IssuedNodeToken, LinkHealthItem, LinkHealthRequest, LinkHealthResult,
     LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult,
-    NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, ProbeTargetList,
-    ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome,
-    QuotaEnforcementPlan, RegisterWarpBindingRequest, RegisterWarpBindingResult,
-    RemoveWarpBindingRequest, RemoveWarpBindingResult, ReportTargetResult,
-    ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult, SetUserAppQuotaRequest,
-    SetUserAppQuotaResult, StoreError, TargetConvergenceReport, TenantList, UpdateNodeRequest,
+    NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, NodeTcpProbeList,
+    NodeTcpProbeView, ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult,
+    QuotaEnforcementOutcome, QuotaEnforcementPlan, RegisterWarpBindingRequest,
+    RegisterWarpBindingResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
+    ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
+    SetUserAppQuotaRequest, SetUserAppQuotaResult, StoreError, TargetConvergenceReport,
+    TcpProbeReportRequest, TcpProbeReportResult, TcpProbeSettings, TenantList, UpdateNodeRequest,
     UpdateNodeResult, UpdateSettingsResult, UpdateUserStatusRequest, UpdateUserStatusResult,
     UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
     UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
@@ -1260,6 +1262,43 @@ impl PgStore {
 
     pub async fn list_node_load(&self, actor: &AdminContext, windows: u32) -> Result<NodeLoadList> {
         load::list_node_load(&self.pool, actor, windows).await
+    }
+
+    pub async fn tcp_probe_settings(&self) -> Result<TcpProbeSettings> {
+        tcp_probe::load_settings(&self.pool).await
+    }
+
+    pub async fn update_tcp_probe_settings(
+        &self,
+        actor: &AdminContext,
+        settings: TcpProbeSettings,
+    ) -> Result<TcpProbeSettings> {
+        tcp_probe::update_settings(&self.pool, actor, settings).await
+    }
+
+    pub async fn record_tcp_probe(
+        &self,
+        node_id: &str,
+        request: TcpProbeReportRequest,
+    ) -> Result<TcpProbeReportResult> {
+        tcp_probe::record_report(&self.pool, node_id, request).await
+    }
+
+    pub async fn node_tcp_probe_view(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        window_secs: u32,
+    ) -> Result<NodeTcpProbeView> {
+        tcp_probe::node_view(&self.pool, actor, node_id, window_secs).await
+    }
+
+    pub async fn list_node_tcp_probes(
+        &self,
+        actor: &AdminContext,
+        window_secs: u32,
+    ) -> Result<NodeTcpProbeList> {
+        tcp_probe::list_nodes(&self.pool, actor, window_secs).await
     }
 
     pub async fn hop_link_list(

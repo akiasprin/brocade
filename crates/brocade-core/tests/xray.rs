@@ -1891,7 +1891,7 @@ fn project_node_adds_hop_inbound_and_dns_route() {
 }
 
 #[test]
-fn referenced_machine_egress_dns_uses_the_same_egress_without_replacing_default_dns() {
+fn machine_egress_dns_is_global_without_replacing_default_dns() {
     let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
     doc.node_egress_dns = vec![
         NodeEgressDnsPolicy {
@@ -1956,30 +1956,20 @@ fn referenced_machine_egress_dns_uses_the_same_egress_without_replacing_default_
                 Rule {
                     dest_match: DestMatch::Geosite(vec!["netflix".to_owned()]),
                     action: Action::Egress {
-                        send_through: None,
-                        dns: true,
+                        send_through: Some("198.51.100.9".parse().unwrap()),
                     },
                 },
                 Rule {
                     dest_match: DestMatch::DomainKeyword(vec!["disney".to_owned()]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 },
                 Rule {
                     dest_match: DestMatch::DomainKeyword(vec!["v4-first".to_owned()]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 },
                 Rule {
                     dest_match: DestMatch::DomainKeyword(vec!["v6-first".to_owned()]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 },
                 any_egress(),
             ],
@@ -2039,27 +2029,35 @@ fn referenced_machine_egress_dns_uses_the_same_egress_without_replacing_default_
 
     let dns_tag = servers[0]["tag"].as_str().unwrap();
     assert!(dns_tag.starts_with("dns:egress:"));
-    let custom_outbound = value["outbounds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|outbound| outbound["settings"]["domainStrategy"] == "UseIPv4")
-        .unwrap();
-    assert_eq!(custom_outbound["protocol"], "freedom");
-    assert_eq!(custom_outbound["settings"]["domainStrategy"], "UseIPv4");
-    let custom_outbound_tag = custom_outbound["tag"].as_str().unwrap();
-
     let routes = value["routing"]["rules"].as_array().unwrap();
     let dns_route = routes
         .iter()
         .find(|rule| rule["inboundTag"] == serde_json::json!([dns_tag]))
         .unwrap();
-    assert_eq!(dns_route["outboundTag"], custom_outbound_tag);
+    let dns_outbound_tag = dns_route["outboundTag"].as_str().unwrap();
+    let dns_outbound = outbounds
+        .iter()
+        .find(|outbound| outbound["tag"] == dns_outbound_tag)
+        .unwrap();
+    assert_eq!(dns_outbound["protocol"], "freedom");
+    assert_eq!(dns_outbound["settings"]["domainStrategy"], "UseIPv4");
+    assert_eq!(
+        dns_outbound["sendThrough"],
+        serde_json::Value::Null,
+        "DNS 查询不能继承线路的源地址绑定"
+    );
     let traffic_route = routes
         .iter()
         .find(|rule| rule["domain"] == serde_json::json!(["geosite:netflix"]))
         .unwrap();
-    assert_eq!(traffic_route["outboundTag"], custom_outbound_tag);
+    let traffic_outbound_tag = traffic_route["outboundTag"].as_str().unwrap();
+    assert_ne!(traffic_outbound_tag, dns_outbound_tag);
+    let traffic_outbound = outbounds
+        .iter()
+        .find(|outbound| outbound["tag"] == traffic_outbound_tag)
+        .unwrap();
+    assert_eq!(traffic_outbound["sendThrough"], "198.51.100.9");
+    assert_eq!(traffic_outbound["settings"]["domainStrategy"], "UseIPv4");
 
     let v6_dns_tag = servers[1]["tag"].as_str().unwrap();
     let v6_outbound_tag = value["outbounds"]
@@ -2090,7 +2088,7 @@ fn referenced_machine_egress_dns_uses_the_same_egress_without_replacing_default_
 }
 
 #[test]
-fn unreferenced_machine_egress_dns_does_not_create_a_route() {
+fn machine_egress_dns_is_emitted_without_a_route_reference() {
     let selector = DestMatch::DomainSuffix(vec!["stream.example".to_owned()]);
     let mut doc = doc(vec![node("exit", [10, 66, 0, 1], true, Dns::System)]);
     doc.node_egress_dns = vec![NodeEgressDnsPolicy {
@@ -2111,8 +2109,8 @@ fn unreferenced_machine_egress_dns_does_not_create_a_route() {
         chains: vec![chain("stream")],
         ingresses: vec![ingress("stream-in", "stream", "exit")],
         fronts: Vec::new(),
-        // No stored route activates the selector. The definition must remain detached metadata;
-        // it must not create a route or enter Xray's global DNS server list by itself.
+        // No authored route mentions the selector. The machine policy must still enter Xray's
+        // global DNS list; the compiler-added Any route is unrelated to that activation.
         steps: vec![step("stream", "exit", Vec::new(), None)],
         grants: Vec::new(),
     };
@@ -2132,7 +2130,30 @@ fn unreferenced_machine_egress_dns_does_not_create_a_route() {
 
     let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "exit")));
     let servers = value["dns"]["servers"].as_array().unwrap();
-    assert_eq!(servers, &vec![serde_json::json!("localhost")]);
+    assert_eq!(servers.len(), 2);
+    assert_eq!(servers[0]["address"], "tcp://192.0.2.53");
+    assert_eq!(
+        servers[0]["domains"],
+        serde_json::json!(["domain:stream.example"])
+    );
+    assert_eq!(servers[1], "localhost");
+
+    let dns_tag = servers[0]["tag"].as_str().unwrap();
+    let dns_route = value["routing"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rule| rule["inboundTag"] == serde_json::json!([dns_tag]))
+        .expect("机器 DNS server 必须有独立查询路由");
+    let outbound_tag = dns_route["outboundTag"].as_str().unwrap();
+    let outbound = value["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|outbound| outbound["tag"] == outbound_tag)
+        .expect("机器 DNS 查询路由必须指向真实 Freedom outbound");
+    assert_eq!(outbound["protocol"], "freedom");
+    assert_eq!(outbound["sendThrough"], serde_json::Value::Null);
 }
 
 #[test]
@@ -2177,17 +2198,11 @@ fn machine_dns_priority_overrides_chain_rule_order() {
             vec![
                 Rule {
                     dest_match: alpha,
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 },
                 Rule {
                     dest_match: beta,
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: true,
-                    },
+                    action: Action::Egress { send_through: None },
                 },
                 any_egress(),
             ],
@@ -2606,10 +2621,7 @@ fn unexpanded_front_downstream_renders_as_never_match() {
             "hk",
             vec![Rule {
                 dest_match: DestMatch::FrontDownstream,
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             }],
             None,
         )],
@@ -2748,7 +2760,6 @@ fn all_match_with_distinct_xray_fields_renders_as_and() {
                     ]),
                     action: Action::Egress {
                         send_through: Some(IpAddr::from(Ipv4Addr::new(192, 0, 2, 10))),
-                        dns: false,
                     },
                 },
                 any_egress(),
@@ -2953,10 +2964,7 @@ fn forward_dial(to: &str, dial: HopDial) -> Rule {
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     }
 }
 

@@ -29,10 +29,10 @@ pub struct ModelSnapshot {
     #[serde(default)]
     pub settings: ModelSettings,
     pub nodes: Vec<Node>,
-    /// DNS policies belong to one machine's Xray instance. Chain egress rules may activate a
-    /// matching policy, but Xray applies every activated policy machine-wide rather than keeping
-    /// resolver context per outbound. Keeping definitions here gives drafts, historical revisions
-    /// and rollback one canonical copy even while no chain currently activates a policy.
+    /// DNS policies belong to one machine's Xray instance. Every stored policy is emitted and
+    /// applies machine-wide; chain egress rules neither activate it nor provide resolver context.
+    /// Keeping definitions here gives drafts, historical revisions and rollback one canonical
+    /// ordered copy.
     pub node_egress_dns: Vec<NodeEgressDnsPolicy>,
     pub users: Vec<User>,
     /// Tenant-owned proxy servers which rules and subscription fronts may share across projects.
@@ -571,11 +571,10 @@ fn is_local_dns(server: &str) -> bool {
 
 /// The resolver half of one machine-owned DNS policy.
 ///
-/// This does not replace [`Node::dns`] and never reaches the operating system resolver. The
-/// A chain egress rule can activate the policy for its selector. The compiler then lowers it to an
-/// Xray DNS server and routes both the DNS query and resulting connection through that rule's
-/// source address. Xray does not preserve which outbound requested a lookup, so an activated
-/// policy affects every matching lookup in this machine's Xray instance.
+/// This does not replace [`Node::dns`] and never reaches the operating system resolver. Every
+/// policy stored on a machine is lowered into that machine's single Xray DNS instance. Xray does
+/// not preserve which route or outbound requested a lookup, so the selector applies to every
+/// matching lookup on the machine.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressDnsResolution {
@@ -631,9 +630,9 @@ pub enum EgressDnsFallback {
 
 /// How this machine resolves a domain to an address on its default egresses.
 ///
-/// This node-level value remains the default when no matching [`NodeEgressDnsPolicy`] is active.
-/// An active policy is lowered to its own freedom outbound. Its domain match is global to the
-/// machine's Xray instance, even though a chain egress rule is what activates it.
+/// This node-level value remains the default when no [`NodeEgressDnsPolicy`] selector matches.
+/// Each machine policy is lowered to its own DNS-query Freedom outbound, while its domain match
+/// remains global to the machine's Xray instance.
 ///
 /// The variants are xray's, written in the model's naming convention; the artifact layer
 /// (`artifacts/xray.rs`) maps them to xray's casing, the same separation `HopEncryption`
@@ -2388,13 +2387,6 @@ pub enum Action {
     Egress {
         #[serde(default)]
         send_through: Option<IpAddr>,
-        /// Activate this machine's DNS policy whose selector is the rule's domain match.
-        ///
-        /// This is an inclusion reference, not an isolated per-outbound resolver choice. Xray's
-        /// built-in DNS loses the originating outbound context, so once any rule activates the
-        /// policy it affects all matching lookups on this machine.
-        #[serde(default, skip_serializing_if = "is_false")]
-        dns: bool,
     },
     /// Send through a tenant-owned external proxy. This is terminal like `Egress`, not an edge
     /// in the Brocade node graph; the referenced id is resolved within the current project.
@@ -2402,10 +2394,6 @@ pub enum Action {
         outbound: String,
     },
     Block,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

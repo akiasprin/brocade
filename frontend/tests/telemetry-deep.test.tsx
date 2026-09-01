@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostFacts, LoadSample, NodeLoadView } from '../src/api';
+import { observeAreaFill, observeTimeTick, observeValueAxis } from '../src/ui/observe-chart';
 
 const chartMock = vi.hoisted(() => ({
   setOption: vi.fn(),
@@ -13,7 +14,7 @@ vi.mock('echarts/core', () => ({
   init: vi.fn(() => ({ setOption: chartMock.setOption, resize: vi.fn(), dispose: vi.fn(), group: '' })),
 }));
 vi.mock('echarts/charts', () => ({ LineChart: {} }));
-vi.mock('echarts/components', () => ({ GridComponent: {}, TooltipComponent: {} }));
+vi.mock('echarts/components', () => ({ GridComponent: {}, MarkLineComponent: {}, TooltipComponent: {} }));
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 let LoadCard: typeof import('../src/panes/telemetry').LoadCard;
@@ -216,33 +217,65 @@ function reportWith(change: (sample: LoadSample) => void): NodeLoadView {
 }
 
 describe('deep host telemetry', () => {
+  it('uses seven time marks and advances the value ceiling by one standard tick', () => {
+    const timeMarks = Array.from({ length: 60 }, (_, index) => index).filter(index => observeTimeTick(index, 60));
+    expect(timeMarks).toEqual([0, 10, 20, 30, 39, 49, 59]);
+
+    expect(observeValueAxis(873_410_000)).toEqual({ interval: 200_000_000, max: 1_000_000_000 });
+    expect(observeValueAxis(500_000_000)).toEqual({ interval: 100_000_000, max: 600_000_000 });
+    expect(observeValueAxis(100)).toEqual({ interval: 25, max: 125 });
+  });
+
+  it('uses unified, normal, light fills in the light theme', () => {
+    expect(observeAreaFill('#4a6fa5', 'light')).toBe('rgba(114,133,161,0.1)');
+    expect(observeAreaFill('#c26526', 'light')).toBe('rgba(159,129,112,0.1)');
+    expect(observeAreaFill('#6d90c4', 'dark')).toBe('rgba(124,142,168,0.18)');
+  });
+
+  it('never exposes the removed LOAD placeholder title when telemetry has no samples', () => {
+    const value = report();
+    value.series = [];
+    const view = render(<LoadCard report={value} />);
+
+    expect(view.queryByText('LOAD')).toBeNull();
+    expect(view.getByText('还没有负载读数。')).toBeTruthy();
+  });
+
   it('starts collapsed and switches between complete CPU, memory, disk and network histories', () => {
     const view = render(<LoadCard report={report()} />);
-    expect(view.queryByText('CPU · 30 MINUTES')).toBeNull();
-    expect(view.queryByText('MEMORY · 30 MINUTES')).toBeNull();
+    expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
+    expect(view.queryByRole('region', { name: '内存 30 MINUTES 数值' })).toBeNull();
 
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
-    expect(view.getByText('CPU · 30 MINUTES')).toBeTruthy();
+    expect(view.getByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeTruthy();
+    expect(view.queryByText('CPU · 30 MINUTES')).toBeNull();
+    expect(view.queryByText(/30 秒窗口 · 缺口断线/)).toBeNull();
     expect(view.getByText('CPU 时间占比')).toBeTruthy();
+    const cpuLegend = view.getByLabelText('CPU 时间占比 图例');
+    expect(cpuLegend.tagName).toBe('FOOTER');
+    expect(cpuLegend.previousElementSibling?.classList.contains('history-chart')).toBe(true);
     expect(view.getByText('CPU 与 I/O 压力')).toBeTruthy();
     expect(view.getByText('负载与运行队列')).toBeTruthy();
     expect(view.getByText('逐核繁忙度 · 2 核')).toBeTruthy();
+    expect(view.queryByText('诊断指标')).toBeNull();
     expect(view.queryByText('CPU 频率')).toBeNull();
-    expect(view.queryByText('MEMORY · 30 MINUTES')).toBeNull();
+    expect(view.queryByRole('region', { name: '内存 30 MINUTES 数值' })).toBeNull();
 
     fireEvent.click(view.getByRole('button', { name: /内存/ }));
-    expect(view.getByText('MEMORY · 30 MINUTES')).toBeTruthy();
+    expect(view.getByRole('region', { name: '内存 30 MINUTES 数值' })).toBeTruthy();
+    expect(view.queryByText('MEMORY · 30 MINUTES')).toBeNull();
     expect(view.getByText('容量构成')).toBeTruthy();
     expect(view.getByText('内核缓存与固定页')).toBeTruthy();
     expect(view.getByText('Swap、脏页与回写')).toBeTruthy();
     expect(view.getByText('缺页与直接回收')).toBeTruthy();
-    expect(view.queryByText('CPU · 30 MINUTES')).toBeNull();
+    expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
 
     fireEvent.click(view.getByRole('button', { name: /内存/ }));
-    expect(view.queryByText('MEMORY · 30 MINUTES')).toBeNull();
+    expect(view.queryByRole('region', { name: '内存 30 MINUTES 数值' })).toBeNull();
 
     fireEvent.click(view.getByRole('button', { name: /磁盘/ }));
-    expect(view.getByText('DISK · 30 MINUTES')).toBeTruthy();
+    expect(view.getByRole('region', { name: '磁盘 30 MINUTES 数值' })).toBeTruthy();
+    expect(view.queryByText('DISK · 30 MINUTES')).toBeNull();
     expect(view.getByText('块设备吞吐')).toBeTruthy();
     expect(view.getByText('块设备 IOPS')).toBeTruthy();
     expect(view.getByText('完成延迟')).toBeTruthy();
@@ -250,7 +283,8 @@ describe('deep host telemetry', () => {
     expect(view.getByText('队列')).toBeTruthy();
 
     fireEvent.click(view.getByRole('button', { name: /连接表/ }));
-    expect(view.getByText('NETWORK · 30 MINUTES')).toBeTruthy();
+    expect(view.getByRole('region', { name: '网络 30 MINUTES 数值' })).toBeTruthy();
+    expect(view.queryByText('NETWORK · 30 MINUTES')).toBeNull();
     expect(view.getByText('出站端口压力（估算）· 最繁忙目标')).toBeTruthy();
     expect(view.getByText('出站临时端口套接字')).toBeTruthy();
     expect(view.getByText('连接与套接字')).toBeTruthy();
@@ -258,7 +292,121 @@ describe('deep host telemetry', () => {
     expect(view.getByText('TCP 重传与异常')).toBeTruthy();
     expect(view.getByText('监听队列与 UDP 丢弃')).toBeTruthy();
     expect(view.getByText('套接字资源')).toBeTruthy();
-    expect(view.queryByText('CPU · 30 MINUTES')).toBeNull();
+    expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
+  });
+
+  it('keeps the network throughput legend in a separate footer below its chart', () => {
+    const value = reportWith(sample => {
+      sample.nic_rx_drop = 15;
+    });
+    const view = render(<LoadCard report={value} />);
+    const legend = view.getByLabelText('网卡流量图例');
+    const header = view.getByText('网卡流量').parentElement;
+
+    expect(legend.tagName).toBe('FOOTER');
+    expect(legend.previousElementSibling?.classList.contains('ndtp-ec')).toBe(true);
+    expect(header?.textContent).toContain('接收丢弃 15 · eth0 · MTU 1500');
+    expect(header?.textContent).not.toContain('上报');
+    expect(legend.textContent).not.toContain('接收丢弃');
+    expect(legend.textContent).not.toContain('eth0');
+
+    const chart = chartMock.setOption.mock.calls.find(
+      ([option]) =>
+        option.series?.length === 2 && option.series[0]?.name === '接收' && option.series[1]?.name === '发送',
+    )?.[0];
+    expect(chart.color).toEqual(['#6d90c4', '#c88a5e']);
+    expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
+    expect(chart.xAxis.splitLine.show).toBe(true);
+    expect(chart.yAxis.splitLine.show).toBe(true);
+    for (const line of chart.series) {
+      expect(line.smooth).toBe(false);
+      expect(line.areaStyle.color).toMatch(/^rgba\(\d+,\d+,\d+,0\.18\)$/);
+      expect(line.areaStyle.opacity).toBe(1);
+    }
+    expect(chartMock.connect).not.toHaveBeenCalled();
+  });
+
+  it('connects throughput and expanded history charts only after linking is enabled', () => {
+    const view = render(<LoadCard report={report()} linked />);
+
+    expect(chartMock.connect).toHaveBeenCalledWith('nd-tp-n1');
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+    expect(chartMock.connect).toHaveBeenCalledWith('nd-cpu-history-n1');
+  });
+
+  it('does not render the host summary strip', () => {
+    const view = render(<LoadCard report={report()} />);
+
+    expect(view.container.querySelector('.load-host-strip')).toBeNull();
+    expect(view.queryByText(/个进程都正常/)).toBeNull();
+  });
+
+  it('formats multi-day uptime with spaced day and hour units only', () => {
+    const value = reportWith(sample => {
+      sample.uptime_secs = 15 * 86_400 + 2 * 3_600 + 11 * 60;
+    });
+    const view = render(<LoadCard report={value} />);
+
+    expect(view.getByText('15 天 2 小时')).toBeTruthy();
+    expect(view.queryByText(/15 天 2 小时 11 分钟/)).toBeNull();
+  });
+
+  it('places one-core utilization beside Cgroup throttling', () => {
+    const value = reportWith(sample => {
+      sample.cpu_detail!.cores = sample.cpu_detail!.cores.slice(0, 1);
+    });
+    const view = render(<LoadCard report={value} />);
+
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+    const throttling = view.getByText('Cgroup 限流时间').closest('section');
+    const oneCore = view.getByText('逐核繁忙度 · 1 核').closest('section');
+    expect(throttling?.classList.contains('history-chart-card-wide')).toBe(false);
+    expect(oneCore?.classList.contains('history-chart-card-wide')).toBe(false);
+  });
+
+  it('renders multi-core utilization as one ECharts line per core instead of a heatmap', () => {
+    const view = render(<LoadCard report={report()} />);
+
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+    const perCore = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === 'CPU 0'),
+    )?.[0];
+    expect(perCore).toBeTruthy();
+    expect(perCore.series.map((line: { name: string }) => line.name)).toEqual(['CPU 0', 'CPU 1']);
+    expect(view.getByLabelText('逐核繁忙度 · 2 核 图例').tagName).toBe('FOOTER');
+    expect(view.container.querySelector('.core-heat-cells')).toBeNull();
+  });
+
+  it('uses the muted, straight, medium-fill history chart visual contract', () => {
+    const view = render(<LoadCard report={report()} />);
+
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+    const chart = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === '用户态'),
+    )?.[0];
+    expect(chart).toBeTruthy();
+    expect(chart.color.slice(0, 6)).toEqual(['#6d90c4', '#c88a5e', '#77a67d', '#c47b83', '#9789bd', '#bda65f']);
+    expect(chart.xAxis.splitLine.show).toBe(true);
+    expect(chart.yAxis.splitLine.show).toBe(true);
+    expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
+    expect(chart.xAxis.axisLabel.fontSize).toBe(9.5);
+    expect(chart.yAxis.axisLabel.fontSize).toBe(9.5);
+    expect(chart.tooltip.extraCssText).toContain('box-shadow');
+
+    for (const line of chart.series) {
+      expect(line.smooth).toBe(false);
+      expect(line.areaStyle.opacity).toBe(1);
+      expect(line.areaStyle.color).toMatch(/^rgba\(\d+,\d+,\d+,0\.18\)$/);
+      expect(line.blendMode).toBeUndefined();
+    }
+    expect(chart.series[0].stack).toBe('cpu');
+    expect(chart.series[0].areaStyle.color).toBe('rgba(124,142,168,0.18)');
+
+    const tooltip = chart.tooltip.formatter([
+      { seriesName: '低值', color: '#111', value: 1, dataIndex: 0 },
+      { seriesName: '高值', color: '#222', value: 2, dataIndex: 0 },
+    ]);
+    expect(tooltip.indexOf('高值')).toBeLessThan(tooltip.indexOf('低值'));
   });
 
   it('keeps old-agent KPI values but disables unavailable drill-downs', () => {
@@ -284,7 +432,7 @@ describe('deep host telemetry', () => {
 
     const view = render(<LoadCard report={value} />);
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
-    expect(view.getByText(/60 \/ 60 个 30 秒窗口/)).toBeTruthy();
+    expect(view.queryByText(/60 \/ 60 个 30 秒窗口/)).toBeNull();
     const pressure = chartMock.setOption.mock.calls.find(
       ([option]) =>
         option.xAxis?.data?.length === 60 &&
@@ -319,8 +467,9 @@ describe('deep host telemetry', () => {
     const view = render(<LoadCard report={report()} historyLabel="24 HOURS" historyWindows={2_880} />);
 
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
-    expect(view.getByText('CPU · 24 HOURS')).toBeTruthy();
-    expect(view.getByText(/1 \/ 2,880 个 30 秒窗口/)).toBeTruthy();
+    expect(view.getByRole('region', { name: 'CPU 24 HOURS 数值' })).toBeTruthy();
+    expect(view.queryByText('CPU · 24 HOURS')).toBeNull();
+    expect(view.queryByText(/1 \/ 2,880 个 30 秒窗口/)).toBeNull();
     const network = chartMock.setOption.mock.calls.find(
       ([option]) =>
         option.xAxis?.data?.length === 2_880 && option.series?.some((line: { name: string }) => line.name === '接收'),

@@ -18,6 +18,8 @@ import {
   fetchNodeLoad,
   fetchCerts,
   fetchNodeLoadList,
+  fetchNodeTcpProbe,
+  fetchNodeTcpProbeList,
   monthBytes,
   issueNodeToken,
   provisionNode,
@@ -31,6 +33,7 @@ import {
   type LinkHealthItem,
   type NodeAgentStateItem,
   type NodeLoadView,
+  type NodeTcpProbeView,
   type LoadSample,
   type ProvisionNodeResult,
   type UsageNodeSeries,
@@ -53,6 +56,7 @@ import { useCrumb } from '../wm/crumb';
 import { openTabByKey } from '../ui/topbar';
 import { RegionFlag } from '../ui/region-flag';
 import { navigate } from '../forge/route';
+import { OBSERVE_COLOR_VARS, observeColors, observeValueAxis } from '../ui/observe-chart';
 import { LoadCard, bps, ThroughputChart, dur, iso } from './telemetry';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
@@ -390,6 +394,16 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     retry: false,
   });
   const loadOf = useMemo(() => new Map((load.data?.nodes ?? []).map(n => [n.node_id, n])), [load.data]);
+  const tcpProbe = useQuery({
+    queryKey: ['tcp-probe-nodes', 3600],
+    queryFn: () => fetchNodeTcpProbeList(3600),
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  const tcpProbeOf = useMemo(
+    () => new Map((tcpProbe.data?.nodes ?? []).map(node => [node.node_id, node])),
+    [tcpProbe.data],
+  );
   // 各机器在链中的角色。窄屏下第二行显示的即是该信息——扫视列表时需要的是
   // 该机器是入口还是出口、参与了几条链，而不是它的公网地址。
   // 使用详情页的 `chainUseOf`（同一套判定，两处不会给出不同角色），
@@ -524,6 +538,8 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
           node={n}
           series={seriesOf.get(n.node_id)}
           load={loadOf.get(n.node_id)}
+          tcpProbe={tcpProbeOf.get(n.node_id)}
+          tcpProbeReady={tcpProbe.isSuccess}
           usagePending={usage.isPending}
           selecting={selecting}
           checked={picked.has(n.node_id)}
@@ -667,6 +683,8 @@ function NodeAddr({ node }: { node: NodeAgentStateItem }) {
 function NodeCard({
   node,
   load,
+  tcpProbe,
+  tcpProbeReady,
   series,
   usagePending,
   selecting,
@@ -677,6 +695,10 @@ function NodeCard({
   node: NodeAgentStateItem;
   /** 该机器的近期负载。undefined 表示尚未读取，或当前控制面版本没有该端点 */
   load?: NodeLoadView;
+  /** 近一小时 TCP Connect 读数；配置目标后在卡片右下角替换 IP。 */
+  tcpProbe?: NodeTcpProbeView;
+  /** 只有接口成功返回才能证明「没有配置目标」；加载中和请求失败都不能回退显示 IP。 */
+  tcpProbeReady: boolean;
   series?: UsageNodeSeries;
   usagePending: boolean;
   selecting: boolean;
@@ -708,8 +730,8 @@ function NodeCard({
       }}
     >
       <div className="nc-head">
-        {/* 多选框临时插在组合标识之前，不再替换状态灯：旗帜与右下角状态灯在列表和详情中
-            始终是同一个 identity 对象，进入多选也不会丢掉异常状态。 */}
+        {/* 多选框临时插在身份信息之前，不替换状态灯。列表卡保持一条扁平的
+            「状态灯 → 完整区域旗 → 名字」阅读顺序，不复用详情页的方形组合徽标。 */}
         {selecting && (
           <span className="nc-pick-slot">
             <input
@@ -723,16 +745,12 @@ function NodeCard({
             />
           </span>
         )}
-        {node.public_ipv4_country ? (
-          <span className="nd-idplate nc-idplate">
-            <span className="nd-idplate-clip">
-              <RegionFlag code={node.public_ipv4_country} />
-            </span>
-            <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
-          </span>
-        ) : (
-          <span className="nc-status-slot">
-            <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
+        <span className={`nc-status-slot${node.public_ipv4_country ? ' with-region' : ''}`}>
+          <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
+        </span>
+        {node.public_ipv4_country && (
+          <span className="nc-region-flag">
+            <RegionFlag code={node.public_ipv4_country} />
           </span>
         )}
         <b className={node.name ? undefined : 'mono'}>{node.name || node.node_id}</b>
@@ -748,8 +766,8 @@ function NodeCard({
       <div className="nc-foot">
         <MonthTotal series={series} pending={usagePending} retired={retired} />
         <span className="sp" />
-        {/* 按钮位于卡片右下角（CSS 中 position:absolute），悬停时覆盖在 IP 之上。
-            由于脱离文档流，它的显示和隐藏都不会改变 IP 的位置。
+        {/* 按钮位于卡片右下角（CSS 中 position:absolute），悬停时覆盖在 IP 或 TCP P95 之上。
+            由于脱离文档流，它的显示和隐藏都不会改变右下角摘要的位置。
             「打开」已移除——整张卡片本身可点击，一屏九张各带一个按钮会形成密集的按钮排列。 */}
         <span className="nc-dock" onClick={e => e.stopPropagation()}>
           {!narrow && !retired && (
@@ -758,34 +776,161 @@ function NodeCard({
             </button>
           )}
         </span>
-        <NodeAddr node={node} />
+        {!tcpProbeReady || (tcpProbe && tcpProbe.targets.length > 0) ? (
+          <TcpProbeP95 view={tcpProbe} pending={!tcpProbeReady} />
+        ) : (
+          <NodeAddr node={node} />
+        )}
       </div>
     </article>
   );
 }
 
 export const LOAD_RANGES = [
-  { seconds: 30 * 60, label: '30m', heading: '30 MINUTES' },
-  { seconds: 60 * 60, label: '1h', heading: '1 HOUR' },
-  { seconds: 6 * 60 * 60, label: '6h', heading: '6 HOURS' },
-  { seconds: 12 * 60 * 60, label: '12h', heading: '12 HOURS' },
-  { seconds: 24 * 60 * 60, label: '24h', heading: '24 HOURS' },
+  { seconds: 30 * 60, label: '30m', menuLabel: '近 30 分钟', heading: '30 MINUTES' },
+  { seconds: 60 * 60, label: '1h', menuLabel: '近 1 小时', heading: '1 HOUR' },
+  { seconds: 6 * 60 * 60, label: '6h', menuLabel: '近 6 小时', heading: '6 HOURS' },
+  { seconds: 12 * 60 * 60, label: '12h', menuLabel: '近 12 小时', heading: '12 HOURS' },
+  { seconds: 24 * 60 * 60, label: '24h', menuLabel: '近 24 小时', heading: '24 HOURS' },
 ] as const;
 export type LoadRange = (typeof LOAD_RANGES)[number];
 
-export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onChange: (value: LoadRange) => void }) {
+export function ObserveLinkControl({ value, onChange }: { value: boolean; onChange: (value: boolean) => void }) {
   return (
-    <span className="observe-range" role="group" aria-label="观测时间范围">
-      {LOAD_RANGES.map(option => (
-        <button
-          key={option.seconds}
-          type="button"
-          aria-pressed={value.seconds === option.seconds}
-          onClick={() => onChange(option)}
+    <label
+      className="switch observe-link-switch"
+      title={value ? '已同步同组图表的时间位置与 Tooltip' : '各图表独立显示 Tooltip'}
+    >
+      <span className="switch-label">同组图表联动</span>
+      <input
+        type="checkbox"
+        role="switch"
+        aria-label="同组图表联动"
+        aria-checked={value}
+        checked={value}
+        onChange={event => onChange(event.target.checked)}
+      />
+      <span className="switch-ui" aria-hidden="true">
+        <span />
+      </span>
+    </label>
+  );
+}
+
+export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onChange: (value: LoadRange) => void }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLSpanElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  useEffect(() => {
+    if (!open) return;
+    const outside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    document.addEventListener('pointerdown', outside);
+    document.addEventListener('keydown', escape);
+    return () => {
+      document.removeEventListener('pointerdown', outside);
+      document.removeEventListener('keydown', escape);
+    };
+  }, [open]);
+
+  const focusOption = (index: number) => {
+    const count = LOAD_RANGES.length;
+    optionRefs.current[(index + count) % count]?.focus();
+  };
+  const openFromKeyboard = (index: number) => {
+    setOpen(true);
+    window.requestAnimationFrame(() => focusOption(index));
+  };
+
+  return (
+    <span ref={rootRef} className={`observe-range${open ? ' open' : ''}`}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="observe-range-trigger"
+        aria-label={`观测时间范围：${value.menuLabel}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen(current => !current)}
+        onKeyDown={event => {
+          const selected = LOAD_RANGES.findIndex(option => option.seconds === value.seconds);
+          if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            openFromKeyboard(selected);
+          } else if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            openFromKeyboard(selected);
+          }
+        }}
+      >
+        <svg
+          className="observe-range-clock"
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          aria-hidden="true"
         >
-          {option.label}
-        </button>
-      ))}
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7.5v5l3.5 2" />
+        </svg>
+        <span>{value.menuLabel}</span>
+      </button>
+      <span
+        className="observe-range-menu"
+        role="listbox"
+        aria-label="观测时间范围"
+        hidden={!open}
+        onKeyDown={event => {
+          const current = optionRefs.current.indexOf(document.activeElement as HTMLButtonElement);
+          if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            focusOption(current + 1);
+          } else if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            focusOption(current - 1);
+          } else if (event.key === 'Home') {
+            event.preventDefault();
+            focusOption(0);
+          } else if (event.key === 'End') {
+            event.preventDefault();
+            focusOption(LOAD_RANGES.length - 1);
+          }
+        }}
+      >
+        {LOAD_RANGES.map((option, index) => (
+          <button
+            key={option.seconds}
+            ref={element => {
+              optionRefs.current[index] = element;
+            }}
+            type="button"
+            role="option"
+            aria-selected={value.seconds === option.seconds}
+            onClick={() => {
+              onChange(option);
+              setOpen(false);
+              triggerRef.current?.focus();
+            }}
+          >
+            {option.menuLabel}
+            <span className="observe-range-check" aria-hidden="true">
+              ✓
+            </span>
+          </button>
+        ))}
+      </span>
     </span>
   );
 }
@@ -855,9 +1000,41 @@ function smoothPath(xs: number[], ys: number[]): string {
  * 该下限与原来的 1 Mb/s 等价，避免将系统心跳放大成满幅波峰。卡片只表达该机自身的流量趋势，
  * 极值圆点悬停显示的是字节/窗口，不是 bit/s。`has_gap` 样本的速率不可比，直接断线，
  * 不补 0（补 0 会把「无法测量」说成「实际没有流量」）。 */
+function p95(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.ceil(sorted.length * 0.95) - 1];
+}
+
+function nodeCardP95(value: number | null): string {
+  return value == null ? '—' : String(value);
+}
+
+function TcpProbeP95({ view, pending = false }: { view?: NodeTcpProbeView; pending?: boolean }) {
+  if (pending && !view) return null;
+  if (!view || view.targets.length === 0) return null;
+  const values = view.targets.map(target => ({
+    name: target.name,
+    value: p95(target.samples.flatMap(sample => (sample.connect_ms == null ? [] : [sample.connect_ms]))),
+  }));
+  const compact = values
+    .slice(0, 3)
+    .map(item => nodeCardP95(item.value))
+    .join(' / ');
+  const title = values
+    .map(item => `${item.name}：${nodeCardP95(item.value)}${item.value == null ? '' : ' ms'}`)
+    .join('\n');
+  return (
+    <span className="nc-tcp-p95" title={title}>
+      <span className="values">{compact}</span>
+      {values.some(item => item.value != null) && <em>ms</em>}
+    </span>
+  );
+}
+
 function NicWave({ load }: { load?: NodeLoadView }) {
   const samples = (load?.series ?? []).slice(-LIST_NIC_WINDOWS);
-  const label = 'NIC RX + TX · 30 秒 / 窗口';
+  const label = 'NIC · 30 秒 / 窗口';
   const windowBytes = (sample: LoadSample) => {
     const seconds = sample.window_end_unix_secs - sample.window_start_unix_secs;
     return ((sample.nic_rx_bps + sample.nic_tx_bps) * seconds) / 8;
@@ -1079,7 +1256,7 @@ function usageRoleSlots(series: UsageNodeSeries | undefined, slots: number): { u
 /* 该机器的 xray 承载吞吐曲线。与网卡曲线（LoadCard 内）同窗口、同粒度、用 group 联动十字线，
  * 但口径不同：网卡按方向（接收/发送）统计全部流量，此处按角色（用户/中继）只统计 xray 转发
  * 的字节——两者不能合并进一张图，各自的 Y 轴与图例保持这个差异可见。 */
-function XrayThroughputCard({ nodeId, range }: { nodeId: string; range: LoadRange }) {
+function XrayThroughputCard({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
   const series = useQuery({
     queryKey: ['usage-node-series', nodeId, range.seconds],
     queryFn: () => fetchUsageNodeSeries(range.seconds, nodeId),
@@ -1091,11 +1268,17 @@ function XrayThroughputCard({ nodeId, range }: { nodeId: string; range: LoadRang
   return (
     <section className="chart-card">
       <div className="load-network-cap">
-        <b>XRAY THROUGHPUT</b>
-        {/* 口径写在标题行：与网卡曲线的区别就是按角色、只算 xray 转发 */}
-        <span>按角色 · 仅 xray 转发 · 30 秒 / 窗口</span>
+        <b>XRAY 流量</b>
+        <span>本月 {bytes(total)}</span>
       </div>
-      <div className="load-network-legend">
+      <ThroughputChart
+        rx={user}
+        tx={relay}
+        rxName="用户"
+        txName="中继"
+        group={linked ? `nd-tp-${nodeId}` : undefined}
+      />
+      <footer className="load-network-legend" aria-label="XRAY 流量图例">
         <span className="rx">
           <i />
           用户 <b>{bps(user[user.length - 1])}</b>
@@ -1104,16 +1287,7 @@ function XrayThroughputCard({ nodeId, range }: { nodeId: string; range: LoadRang
           <i />
           中继 <b>{bps(relay[relay.length - 1])}</b>
         </span>
-        <span className="sp" />
-        <span className="mono">本月 {bytes(total)}</span>
-      </div>
-      <ThroughputChart rx={user} tx={relay} rxName="用户" txName="中继" group={`nd-tp-${nodeId}`} />
-      {/* 缺口只在存在时显示。无缺口时显示「数据完整」属于冗余表述。 */}
-      {mine?.month_has_gap && (
-        <p className="note" style={{ margin: '0 12px 10px' }}>
-          本月至少一次采集存在缺口，该数值只会偏小。
-        </p>
-      )}
+      </footer>
     </section>
   );
 }
@@ -2451,7 +2625,7 @@ export function FleetNetPanel() {
   );
 }
 
-function LoadCardFor({ nodeId, range }: { nodeId: string; range: LoadRange }) {
+function LoadCardFor({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
   /* 10s 而不是与上报窗口相同的 30s。窗口每 30 秒关一次（agent 的
      `SUBS_PER_WINDOW × SUB_INTERVAL_SECS`），前端也每 30 秒拉一次时两者不同相：
      最坏情况拿到的是刚过期 30 秒的窗口，再等 30 秒才拉下一次，端到端能到 60 秒。
@@ -2466,24 +2640,215 @@ function LoadCardFor({ nodeId, range }: { nodeId: string; range: LoadRange }) {
     refetchInterval: range.seconds <= 60 * 60 ? 10_000 : 30_000,
     retry: false,
   });
-  if (!load.data) {
-    return (
-      <div className="panel load-range-loading">
-        <header>
-          <h4>LOAD</h4>
-        </header>
-        <Loading />
-      </div>
-    );
-  }
+  if (!load.data) return null;
   // XRAY 曲线用 group 与 LoadCard 内的网卡曲线联动十字线；usage 数据由该卡自行获取。
   return (
     <LoadCard
       report={load.data}
       historyLabel={range.heading}
       historyWindows={range.seconds / 30}
-      xrayChart={<XrayThroughputCard nodeId={nodeId} range={range} />}
+      linked={linked}
+      xrayChart={<XrayThroughputCard nodeId={nodeId} range={range} linked={linked} />}
     />
+  );
+}
+
+const TCP_SERIES_CSS = OBSERVE_COLOR_VARS;
+
+function html(value: string): string {
+  return value.replace(
+    /[&<>"']/g,
+    char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!,
+  );
+}
+
+function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadRange }) {
+  const elRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
+  const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
+  const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
+
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const chart = echarts.init(el, null, { renderer: 'canvas' });
+    chartRef.current = chart;
+    const ro = new ResizeObserver(() => chart.resize());
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      chart.dispose();
+      chartRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const css = getComputedStyle(document.documentElement);
+    const cv = (name: string) => css.getPropertyValue(name).trim();
+    const colors = observeColors(themeName, cv);
+    const ink = cv('--ink');
+    const ink3 = cv('--ink-3');
+    const ink4 = cv('--ink-4');
+    const line = cv('--line');
+    const lineSoft = cv('--line-soft');
+    const glass = cv('--glass-strong');
+    const byTarget = view.targets.map(
+      target => new Map(target.samples.map(sample => [sample.probed_at_unix_secs, sample.connect_ms])),
+    );
+    const times = [
+      ...new Set(view.targets.flatMap(target => target.samples.map(sample => sample.probed_at_unix_secs))),
+    ].sort((a, b) => a - b);
+    const valuesAt = new Map(times.map(time => [time, byTarget.map(samples => samples.get(time))] as const));
+    const successful = view.targets.flatMap(target =>
+      target.samples.flatMap(sample => (sample.connect_ms == null ? [] : [sample.connect_ms])),
+    );
+    const valueAxis = observeValueAxis(Math.max(10, ...(successful.length > 0 ? successful : [0])));
+    const now = Date.now();
+    const start = now - range.seconds * 1000;
+
+    const series: Array<Record<string, unknown>> = view.targets.map((target, index) => ({
+      name: target.name,
+      type: 'line' as const,
+      symbol: 'circle',
+      symbolSize: 5,
+      showSymbol: false,
+      smooth: false,
+      connectNulls: false,
+      lineStyle: { color: colors[index % colors.length], width: 1.1 },
+      itemStyle: { color: colors[index % colors.length], borderColor: glass, borderWidth: 1.5 },
+      emphasis: { disabled: true },
+      data: times.map(time => [time * 1000, byTarget[index].get(time) ?? null] as [number, number | null]),
+    }));
+    chart.setOption(
+      {
+        animation: false,
+        color: colors,
+        grid: { left: 10, right: 14, top: 12, bottom: 10, containLabel: true },
+        textStyle: { fontFamily: NET_MONO },
+        tooltip: {
+          trigger: 'axis',
+          confine: true,
+          backgroundColor: glass,
+          borderColor: line,
+          borderWidth: 1,
+          padding: [7, 9],
+          textStyle: { color: ink3, fontSize: 11, fontFamily: NET_MONO },
+          extraCssText: 'border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); backdrop-filter:blur(8px);',
+          axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' }, z: 0 },
+          formatter: (params: unknown) => {
+            const entries = params as { axisValue: number }[];
+            const atMs = Number(entries[0]?.axisValue ?? 0);
+            const at = Math.round(atMs / 1000);
+            const values = valuesAt.get(at) ?? view.targets.map(() => null);
+            const when = new Date(atMs).toLocaleString('zh-CN', {
+              month: '2-digit',
+              day: '2-digit',
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+              hour12: false,
+            });
+            const rows = view.targets
+              .map((target, index) => ({ target, index, value: values[index] }))
+              .sort(
+                (left, right) => (right.value ?? Number.NEGATIVE_INFINITY) - (left.value ?? Number.NEGATIVE_INFINITY),
+              )
+              .map(({ target, index, value }) => {
+                return (
+                  `<div style="display:flex;align-items:center;gap:7px;line-height:1.75">` +
+                  `<span style="width:8px;height:8px;border-radius:2px;background:${colors[index % colors.length]};flex:none"></span>` +
+                  `<span style="color:${ink3}">${html(target.name)}</span>` +
+                  `<b style="margin-left:auto;color:${ink};font-weight:500">${value == null ? '—' : `${value} ms`}</b></div>`
+                );
+              })
+              .join('');
+            return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${when}</div>${rows}`;
+          },
+        },
+        xAxis: {
+          type: 'time',
+          min: start,
+          max: now,
+          splitNumber: 6,
+          axisLabel: {
+            color: ink3,
+            fontSize: 9.5,
+            margin: 8,
+            hideOverlap: true,
+            formatter: (value: number) => {
+              const seconds = Math.max(0, (now - value) / 1000);
+              if (seconds < 30) return '现在';
+              if (seconds < 3600) return `−${Math.max(1, Math.round(seconds / 60))}m`;
+              return `−${Math.max(1, Math.round(seconds / 3600))}h`;
+            },
+          },
+          axisLine: { lineStyle: { color: line } },
+          axisTick: { show: false },
+          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
+        },
+        yAxis: {
+          type: 'value',
+          min: 0,
+          max: valueAxis.max,
+          interval: valueAxis.interval,
+          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (value: number) => `${Math.round(value)} ms` },
+          axisLine: { show: false },
+          axisTick: { show: false },
+          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
+        },
+        series,
+      },
+      true,
+    );
+  }, [view, range, themeName, paletteKey]);
+
+  return <div ref={elRef} className="tcp-connect-chart" />;
+}
+
+function TcpProbePanel({ nodeId, range }: { nodeId: string; range: LoadRange }) {
+  const probe = useQuery({
+    queryKey: ['node-tcp-probe', nodeId, range.seconds],
+    queryFn: () => fetchNodeTcpProbe(nodeId, range.seconds),
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  if (probe.error) return null;
+  const targets = probe.data?.targets ?? [];
+  return (
+    <section className="chart-card tcp-connect-panel" aria-label="TCP Ping">
+      <div className="load-network-cap">
+        <b>TCP PING</b>
+      </div>
+      {targets.length === 0 ? (
+        <p className="note">尚未在设置中配置 TCP 探测目标。</p>
+      ) : (
+        <>
+          {targets.some(target => target.samples.length > 0) ? (
+            <TcpConnectChart view={probe.data!} range={range} />
+          ) : (
+            <p className="note tcp-connect-empty">目标已经配置，尚无 Agent 样本。</p>
+          )}
+          <footer className="tcp-connect-summary" aria-label="TCP PING 图例">
+            {targets.map((target, index) => {
+              const latest = target.samples.at(-1)?.connect_ms ?? null;
+              const percentile = p95(
+                target.samples.flatMap(sample => (sample.connect_ms == null ? [] : [sample.connect_ms])),
+              );
+              return (
+                <span key={target.address} title={target.address}>
+                  <i style={{ background: `var(${TCP_SERIES_CSS[index % TCP_SERIES_CSS.length]})` }} />
+                  <b>{target.name}</b>
+                  <em>{latest == null ? '—' : `${latest} ms`}</em>
+                  <small>P95 {percentile == null ? '—' : `${percentile} ms`}</small>
+                </span>
+              );
+            })}
+          </footer>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -2872,7 +3237,6 @@ function NodeChainRuleTree({
         nodes={nodes}
         selected={nodeId}
         showHeader={false}
-        defaultOpenSelected
         rootLabel={use.chain.name || use.chain.id}
         rootLabelTitle={`${use.appId} / ${use.chain.id}`}
         rootSummary={
@@ -2905,16 +3269,14 @@ function NodeChainsSection({
     <>
       <header>
         <h4>链路规则</h4>
-        <span className="hint">{inChains.length} 条相关链，当前机器默认展开</span>
+        <span className="rule-sheet-meta">{inChains.length} 条相关链</span>
         <span className="sp" />
         <button className="btn" disabled={!canCreate} title="以当前节点作为入口" onClick={() => go({ p: 'chain', id })}>
           添加新链
         </button>
       </header>
 
-      {inChains.length === 0 ? (
-        <p className="note node-rules-empty">这台机器尚未加入任何链路。</p>
-      ) : canEdit ? (
+      {inChains.length === 0 ? null : canEdit ? (
         // 一台机器可能属于多条链，每条链又递归展开多台——若每张规则表各带一个
         // 「保存到草稿」，本屏会出现七八个。统一收敛为整段末尾的一个。
         <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
@@ -2979,7 +3341,7 @@ function NodeDetailLayout({
           <span className="nd-idplate">
             {/* clip 层裁切铺满的旗；角灯放在 clip 外，探出板角不被裁。 */}
             <span className="nd-idplate-clip">
-              <RegionFlag code={node.public_ipv4_country} />
+              <RegionFlag code={node.public_ipv4_country} square />
             </span>
             <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
           </span>
@@ -3132,6 +3494,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
     id,
     range: LOAD_RANGES[0],
   });
+  const [chartLinkState, setChartLinkState] = useState<{ id: string; linked: boolean }>({ id, linked: false });
 
   /* 页头的稀有/危险操作（重签 token、退役下线）收进 ⋯ 菜单：它们的视觉权重原与
      使用频率成反比——最稀有的危险操作画着最抢眼的红框。菜单项可以带一行说明，
@@ -3207,6 +3570,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   // 各自显示空状态，不能再把“无链路”等同于“没有规则页面”。
   const tab: NodeTab = tabState.id !== id ? 'observed' : tabState.tab;
   const loadRange = loadRangeState.id === id ? loadRangeState.range : LOAD_RANGES[0];
+  const chartsLinked = chartLinkState.id === id ? chartLinkState.linked : false;
 
   /* 观测页的角标数。此处不按 `detailOnly` 过滤：那个标记的含义是「列表里不占标记位，
      进详情页才读」，而这里就是详情页——角标指向的正是它下面那几张卡里会展开的说明。
@@ -3243,7 +3607,10 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
       {(tab === 'observed' || !pub) && (
         <div className="nd-tools">
           {tab === 'observed' && (
-            <ObserveRangeControl value={loadRange} onChange={range => setLoadRangeState({ id, range })} />
+            <>
+              <ObserveLinkControl value={chartsLinked} onChange={linked => setChartLinkState({ id, linked })} />
+              <ObserveRangeControl value={loadRange} onChange={range => setLoadRangeState({ id, range })} />
+            </>
           )}
           {!pub && (
             <div className="nd-acts">
@@ -3455,9 +3822,10 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
       )}
 
       {tab === 'observed' && (
-        /* LOAD 是监控页的第一视图；三张状态卡横排，让机器、运行时与配置收敛并行扫读。 */
+        /* LOAD 是监控页的第一视图；TCP PING 紧随流量曲线，三张机器状态卡顺延到下一块。 */
         <section className="nd-tab-observed">
-          <LoadCardFor nodeId={id} range={loadRange} />
+          <LoadCardFor nodeId={id} range={loadRange} linked={chartsLinked} />
+          <TcpProbePanel nodeId={id} range={loadRange} />
           <div className="nd-observed-status">
             <AgentCard
               node={n}
@@ -3583,14 +3951,16 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
       {tab === 'chains' && (
         <section className="nd-tab-rules">
-          <div className="panel node-egress-rule-sheet">
-            <header>
-              <h4>DNS 解析策略</h4>
-              <span className="hint">{machineEgressPolicies.length} 条，按 D1 起在这台机器的 Xray 内全局匹配</span>
-            </header>
-            <MachineEgressDnsRules key={id} nodeId={id} nodeName={n.name || id} readOnly={!can(who.role, 'edit')} />
+          <div className="panel config-panel rule-sheet-card node-egress-rule-sheet">
+            <MachineEgressDnsRules
+              key={id}
+              nodeId={id}
+              nodeName={n.name || id}
+              readOnly={!can(who.role, 'edit')}
+              showHeader
+            />
           </div>
-          <div className="panel node-chain-sheet">
+          <div className="panel config-panel rule-sheet-card node-chain-sheet">
             <NodeChainsSection
               id={id}
               inChains={inChains}

@@ -23,6 +23,7 @@ mod quota;
 pub mod secrets;
 mod serving;
 mod settings;
+mod tcp_probe;
 mod usage;
 
 pub use admin::{
@@ -42,11 +43,12 @@ pub use brocade_deployment::protocol::{
     E2eProbeTarget, E2eProbeTargetList, HopLinkList, HopLinkSample, HopLinkView, HostFacts,
     LinkHealth, LinkHealthRequest, LinkHealthResult, LinkProbe, LinkProbeRequest, LinkProbeResult,
     LinkProbeStatus, LoadReportRequest, LoadReportResult, LoadSample, NodeDesiredDeployment,
-    NodeLoadList, NodeLoadView, PhantunBinaries, ProbeTarget, ProbeTargetList, ProbeTransport,
-    ReportTargetResult, ReportedNodeState, RouteIpReport, TargetApplyResult,
-    TargetConvergenceReport, UsageCounter, UsageMonthlySummary, UsageMonthlyViewRow,
-    UsageNodeBucket, UsageNodeSeries, UsageNodeSeriesList, UsageReportRequest, UsageReportResult,
-    UsageSample, UsageSampleList,
+    NodeLoadList, NodeLoadView, NodeTcpProbeList, NodeTcpProbeView, PhantunBinaries, ProbeTarget,
+    ProbeTargetList, ProbeTransport, ReportTargetResult, ReportedNodeState, RouteIpReport,
+    TargetApplyResult, TargetConvergenceReport, TcpProbePoint, TcpProbeReportRequest,
+    TcpProbeReportResult, TcpProbeSample, TcpProbeSettings, TcpProbeTarget, TcpProbeTargetSeries,
+    UsageCounter, UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries,
+    UsageNodeSeriesList, UsageReportRequest, UsageReportResult, UsageSample, UsageSampleList,
 };
 pub use cert::{
     CertDomain, CertDomainInput, CertGroup, CertificateDnsTarget, CertificateOrder,

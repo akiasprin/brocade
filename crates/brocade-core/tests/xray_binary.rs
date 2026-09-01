@@ -52,7 +52,7 @@ const INGRESS_PRIVATE: &str = "gM453ZKs-8Ahf4hPV2SVK1yf7XXC4NLV6V424ETpe2g";
 const INGRESS_PUBLIC: &str = "EdUDF5q3f-LSCmqeYUT5AfA3EBJWUAdqzCPHji78pxY";
 
 #[test]
-fn referenced_machine_egress_dns_loads_in_the_real_binary() {
+fn machine_egress_dns_without_route_references_loads_in_the_real_binary() {
     let Some(binary) = xray_binary() else {
         eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
         return;
@@ -89,24 +89,9 @@ fn referenced_machine_egress_dns_loads_in_the_real_binary() {
         .iter_mut()
         .find(|step| step.node == "sg")
         .expect("sg 是落地端");
-    // Definitions alone do not create routes. Both authored egress rules explicitly activate the
-    // matching machine policies; the automatic Any -> Egress remains on the default resolver.
-    egress.rules = vec![
-        Rule {
-            dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
-            action: Action::Egress {
-                send_through: None,
-                dns: true,
-            },
-        },
-        Rule {
-            dest_match: DestMatch::DomainKeyword(vec!["ipv6-only".to_owned()]),
-            action: Action::Egress {
-                send_through: None,
-                dns: true,
-            },
-        },
-    ];
+    // No authored route mentions either selector. Machine ownership alone must be enough to emit
+    // both DNS servers, their tagged query routes, and their direct outbounds.
+    egress.rules.clear();
     let mut diagnostics = Vec::new();
     let sys = compile_system(&doc, &mut diagnostics);
     let app_ir = compile_hops(
@@ -706,10 +691,7 @@ fn reverse_fixture() -> (
             hop_in: None,
             rules: vec![Rule {
                 dest_match: DestMatch::Any,
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             }],
         },
     ];
@@ -1101,10 +1083,7 @@ fn valid_reality_traffic_still_passes_with_the_local_cover_enabled() {
         hop_in: None,
         rules: vec![Rule {
             dest_match: DestMatch::Any,
-            action: Action::Egress {
-                send_through: None,
-                dns: false,
-            },
+            action: Action::Egress { send_through: None },
         }],
     }];
     let hk = doc.nodes.iter_mut().find(|node| node.id == "hk").unwrap();
@@ -1887,10 +1866,7 @@ fn base_model(dial: HopDial, security: HopWire) -> (ModelSnapshot, AppView) {
                 }),
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: false,
-                    },
+                    action: Action::Egress { send_through: None },
                 }],
             },
         ],

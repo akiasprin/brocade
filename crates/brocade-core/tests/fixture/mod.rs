@@ -290,7 +290,6 @@ fn model_action(value: &Value) -> Action {
         },
         "egress" => Action::Egress {
             send_through: optional_string(&value["via"]).map(|value| value.parse().unwrap()),
-            dns: false,
         },
         "block" => Action::Block,
         value => panic!("unknown action kind {value}"),

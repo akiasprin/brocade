@@ -2076,12 +2076,10 @@ fn parse_action(value: &Value) -> Result<Action> {
                     invalid_error("egress send_through must be null or a string IP")
                 })?)?),
             };
-            // Old development rows may still carry `resolution`. Ignore it: machine DNS is the
-            // only authoritative source, and re-serializing the rule naturally cleans the key.
-            Ok(Action::Egress {
-                send_through,
-                dns: false,
-            })
+            // Old development rows may still carry `resolution` or the later `dns` activation
+            // flag. Ignore both: machine DNS is the only authoritative source, and re-serializing
+            // the rule naturally cleans those keys.
+            Ok(Action::Egress { send_through })
         }
         "proxy" => {
             let outbound = value
@@ -2255,6 +2253,7 @@ mod tests {
                 "action": {
                     "t": "egress",
                     "send_through": null,
+                    "dns": true,
                     "resolution": {
                         "address": "192.0.2.53",
                         "port": 5353,
@@ -2288,7 +2287,6 @@ mod tests {
                     ]),
                     action: Action::Egress {
                         send_through: Some("10.66.0.4".parse().unwrap()),
-                        dns: false,
                     },
                 },
                 Rule {
@@ -2297,10 +2295,7 @@ mod tests {
                 },
                 Rule {
                     dest_match: DestMatch::Geosite(vec!["netflix".to_owned()]),
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: false
-                    },
+                    action: Action::Egress { send_through: None },
                 },
             ]
         );

@@ -891,10 +891,7 @@ fn terminal_default(
     }
 
     if node.egress_allowed {
-        Action::Egress {
-            send_through: None,
-            dns: false,
-        }
+        Action::Egress { send_through: None }
     } else {
         diagnostics.push(Diagnostic::warn(
             "step.no-egress",

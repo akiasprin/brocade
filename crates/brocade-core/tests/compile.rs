@@ -3,9 +3,10 @@ use std::net::{IpAddr, Ipv4Addr};
 use brocade_core::{
     compile::compile,
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, Front, FrontStrategy,
-        Grant, HopDial, HopIn, HopPool, Ingress, IngressGuard, IngressWires, ModelSnapshot, Node,
-        Rule, Step, Transport, User, WireGuardKeys,
+        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
+        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, Front, FrontStrategy, Grant,
+        HopDial, HopIn, HopPool, Ingress, IngressGuard, IngressWires, ModelSnapshot, Node,
+        NodeEgressDnsPolicy, Rule, Step, Transport, User, WireGuardKeys,
     },
     Level,
 };
@@ -155,7 +156,6 @@ fn compile_output_warns_when_as_is_bypasses_configured_dns() {
                 dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
                 action: Action::Egress {
                     send_through: Some("10.66.0.1".parse().unwrap()),
-                    dns: false,
                 },
             },
             any_egress(),
@@ -176,6 +176,34 @@ fn compile_output_warns_when_as_is_bypasses_configured_dns() {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "dns.route-ambiguous"));
+}
+
+#[test]
+fn compile_output_warns_when_as_is_bypasses_machine_dns_policies() {
+    let mut snapshot = snapshot(vec![Node {
+        domain_strategy: DomainStrategy::AsIs,
+        ..node("hk", [10, 66, 0, 1], Dns::System)
+    }]);
+    snapshot.node_egress_dns = vec![NodeEgressDnsPolicy {
+        node: "hk".to_owned(),
+        position: 0,
+        selector: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
+        resolution: EgressDnsResolution {
+            address: "192.0.2.53".to_owned(),
+            port: 53,
+            transport: EgressDnsTransport::Tcp,
+            address_strategy: EgressDnsAddressStrategy::UseIp,
+            fallback: EgressDnsFallback::Stop,
+        },
+    }];
+    snapshot.apps = vec![app("a", "c-a", "i-a", 443, any_egress())];
+
+    let output = compile(&snapshot);
+
+    assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
+    assert!(output.diagnostics.iter().any(|diagnostic| {
+        diagnostic.level == Level::Warn && diagnostic.code == "node.dns-bypassed"
+    }));
 }
 
 /// A decommissioned node's world shuts down automatically: the ingresses on it are not
@@ -614,10 +642,7 @@ fn blocking_torrents_needs_an_entrance_that_sniffs() {
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     }
 }
 

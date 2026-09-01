@@ -3943,13 +3943,13 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
       </div>
       {moveIngress.error && <ErrorBox error={moveIngress.error} />}
 
-      {/* ── XRAY 链路 ──
-          该节不使用块容器：下方的规则树本身已构成完整结构（每行一条分隔线、缩进表示层级），
-          再为其添加带底色的标题相当于在已有结构外再包一层容器。 */}
-      <h4 className="sec">
-        XRAY 链路
-        <span className="rule" />
-        <span className="st">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳中继`}</span>
+      {/* 线路与机器详情使用同一种规则卡：标题、摘要和规则树属于同一块，不再用独立的
+          `h4.sec` 分节线。卡面尺寸与用户页的「授权验证」一致。 */}
+      <section className="panel config-panel rule-sheet-card node-chain-sheet">
+        <header>
+          <h4>链路规则</h4>
+          <span className="rule-sheet-meta">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳中继`}</span>
+        </header>
         {/* 此处不提供「追加一跳」和「改顺序」。这两项操作都在下方的规则表中完成：
             转发目标的候选是全部机器，链外的机器标注为「链外」——选中后该机器即成为该链的
             下一跳；将某条规则的转发目标改为另一台机器即为重排。
@@ -3957,16 +3957,39 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
 
             单独提供「追加一跳」或上移下移相当于为同一操作增加第二个入口，
             且重写整张规则表顺序的保存会覆盖分流规则。 */}
-      </h4>
-      {/* 只读角色看到的是同一棵树，而不是权限提示。此前该块整体替换为一行提示，
+        {/* 只读角色看到的是同一棵树，而不是权限提示。此前该块整体替换为一行提示，
           导致 readonly 角色在链详情页无法查看该链的选路配置——而这正是本页的用途。
           禁用由 RuleEditor 的 readOnly 控制。
 
           保存条（RuleDraftScope）只在可编辑时包裹：它是一个「保存到草稿」按钮，
           只读时始终处于禁用状态。 */}
-      {editable ? (
-        <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
+        {editable ? (
+          <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
+            <div className="node-chain-use chain-tree">
+              <ChainRulesPanel
+                appId={app}
+                chain={c}
+                spine={spine}
+                steps={chainSteps}
+                nodes={nodes.data?.nodes ?? []}
+                selected={ingress?.node ?? spine[0]}
+                onRemove={node => {
+                  // 删除 step 即删除成员：steps 的记录是链上成员的唯一数据来源，
+                  // 只修改规则表时该成员在编译产物中仍然存在。上游规则表中指向它的
+                  // forward 保留，可在编辑器中改为其他目标或改为出网。
+                  deleteStep(app, c.id, node);
+                }}
+                showHeader={false}
+              />
+            </div>
+          </RuleDraftScope>
+        ) : (
           <div className="node-chain-use chain-tree">
+            {/* 提示置于树之外：树内每张规则表的标题在该档位下是隐藏的（见 styles.css 的
+                `.chain-rule-tree .rule-editor>.toolbar:first-child`），写在内部不可见。 */}
+            <p className="note" style={{ margin: '0 0 8px' }}>
+              只读：规则按原样列出。
+            </p>
             <ChainRulesPanel
               appId={app}
               chain={c}
@@ -3974,35 +3997,12 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
               steps={chainSteps}
               nodes={nodes.data?.nodes ?? []}
               selected={ingress?.node ?? spine[0]}
-              onRemove={node => {
-                // 删除 step 即删除成员：steps 的记录是链上成员的唯一数据来源，
-                // 只修改规则表时该成员在编译产物中仍然存在。上游规则表中指向它的
-                // forward 保留，可在编辑器中改为其他目标或改为出网。
-                deleteStep(app, c.id, node);
-              }}
               showHeader={false}
+              readOnly
             />
           </div>
-        </RuleDraftScope>
-      ) : (
-        <div className="node-chain-use chain-tree">
-          {/* 提示置于树之外：树内每张规则表的标题在该档位下是隐藏的（见 styles.css 的
-              `.chain-rule-tree .rule-editor>.toolbar:first-child`），写在内部不可见。 */}
-          <p className="note" style={{ margin: '0 0 8px' }}>
-            只读：规则按原样列出。
-          </p>
-          <ChainRulesPanel
-            appId={app}
-            chain={c}
-            spine={spine}
-            steps={chainSteps}
-            nodes={nodes.data?.nodes ?? []}
-            selected={ingress?.node ?? spine[0]}
-            showHeader={false}
-            readOnly
-          />
-        </div>
-      )}
+        )}
+      </section>
     </>
   );
 }

@@ -26,8 +26,8 @@ use phantun::{
     prepare_phantun_binaries,
 };
 use probe::{
-    e2e_cycle, e2e_once, judge_hops, probe_cycle, probe_once, read_hop_downlinks,
-    xray_listen_ports, XrayListenProtocol,
+    e2e_cycle, e2e_once, judge_hops, probe_cycle, probe_once, read_hop_downlinks, tcp_probe_cycle,
+    tcp_probe_once, xray_listen_ports, XrayListenProtocol,
 };
 use spool::{
     record_local_reconcile, runtime_cycle, spool_drain, spool_push, OBSERVATION_SPOOL, USAGE_SPOOL,
@@ -195,9 +195,10 @@ fn run() -> Result<(), String> {
         // One manual end-to-end probe. The cycle is a minute, which is still a wait
         // after editing a chain's rule table.
         "e2e-once" => e2e_once(options),
+        "tcp-probe-once" => tcp_probe_once(options),
         "run" => run_forever(options),
         value => Err(format!(
-            "unknown command {value}; expected run, desired, apply-once, usage-once, probe-once, e2e-once, health, or repair"
+            "unknown command {value}; expected run, desired, apply-once, usage-once, probe-once, e2e-once, tcp-probe-once, health, or repair"
         )),
     }
 }
@@ -794,6 +795,7 @@ const LOAD_INTERVAL: Duration = Duration::from_secs(load::SUB_INTERVAL_SECS);
 /// control plane usually has nothing measurable either, and a longer interval reduces
 /// load in that state.
 const E2E_INTERVAL_FALLBACK: Duration = Duration::from_secs(5 * 60);
+const TCP_PROBE_INTERVAL_FALLBACK: Duration = Duration::from_secs(60);
 
 /// One process, two loops.
 ///
@@ -972,6 +974,28 @@ fn run_forever(options: Options) -> Result<(), String> {
                 }
             })
             .map_err(|error| format!("cannot spawn load thread: {error}"))?;
+    }
+
+    {
+        // One TCP Connect per configured target and round. The control plane owns the cadence;
+        // the one-minute fallback is only the retry interval when settings cannot be fetched.
+        let options = options.clone();
+        thread::Builder::new()
+            .name("tcp-probe".to_owned())
+            .spawn(move || loop {
+                let mut interval = TCP_PROBE_INTERVAL_FALLBACK;
+                each_round("tcp-probe", || {
+                    interval = match tcp_probe_cycle(&options) {
+                        Ok(settings) => Duration::from_secs(u64::from(settings.interval_secs)),
+                        Err(error) => {
+                            eprintln!("tcp-probe: {error}");
+                            TCP_PROBE_INTERVAL_FALLBACK
+                        }
+                    };
+                });
+                thread::sleep(interval);
+            })
+            .map_err(|error| format!("cannot spawn TCP probe thread: {error}"))?;
     }
 
     {

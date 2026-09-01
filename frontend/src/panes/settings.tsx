@@ -10,10 +10,12 @@ import {
   fetchAgentLogPolicy,
   fetchLinkMtu,
   fetchSettings,
+  fetchTcpProbeSettings,
   saveDistribution,
   saveAgentLogDefault,
   saveNodeLogPolicy,
   saveSettings,
+  saveTcpProbeSettings,
   createCertGroup,
   deleteCertGroup,
   requestSpareCertificate,
@@ -28,6 +30,7 @@ import {
   type NodeCertificateState,
   type LinkMtuItem,
   type ModelSettings,
+  type TcpProbeSettings,
 } from '../api';
 import { can, useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
@@ -186,7 +189,8 @@ const NAV: NavItem[] = [
   { id: 'set-ports', no: '08', label: '端口分配', apply: 'publish', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
   { id: 'set-probe', no: '09', label: '端到端探测', apply: 'cycle', key: 'probe' },
-  { id: 'set-geodata', no: '10', label: '规则库更新', apply: 'publish', key: 'geodata' },
+  { id: 'set-tcp-probe', no: '10', label: 'TCP 链路探测', apply: 'cycle' },
+  { id: 'set-geodata', no: '11', label: '规则库更新', apply: 'publish', key: 'geodata' },
 ];
 
 const APPLY_OF: Record<string, Apply> = Object.fromEntries(NAV.map(item => [item.id, item.apply]));
@@ -1321,6 +1325,172 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
   );
 }
 
+const validTcpProbeNumber = (value: number, min: number, max: number) =>
+  Number.isInteger(value) && value >= min && value <= max;
+
+function tcpProbeFormError(form: TcpProbeSettings): string | null {
+  if (!validTcpProbeNumber(form.interval_secs, 15, 86_400)) return '探测间隔必须为 15–86400 秒的整数';
+  if (!validTcpProbeNumber(form.timeout_ms, 1, 120_000)) return '连接超时必须为 1–120000 毫秒的整数';
+  if (form.targets.length > 32) return '最多配置 32 个目标';
+  const addresses = new Set<string>();
+  for (const target of form.targets) {
+    if (!target.name.trim()) return '每个目标都要填写名称';
+    if (!/^tcp:\/\/(?:\[[^\]]+\]|[^\s/:?#]+):(?:[1-9]\d{0,4})$/.test(target.address.trim()))
+      return '地址格式应为 tcp://host:port；IPv6 地址需放在方括号内';
+    const port = Number(target.address.trim().match(/:(\d+)$/)?.[1]);
+    if (port > 65_535) return 'TCP 端口不能超过 65535';
+    if (addresses.has(target.address.trim())) return `地址不能重复：${target.address.trim()}`;
+    addresses.add(target.address.trim());
+  }
+  return null;
+}
+
+function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: TcpProbeSettings }) {
+  const qc = useQueryClient();
+  const [form, setForm] = useState<TcpProbeSettings>(() => ({
+    ...data,
+    targets: data.targets.map(target => ({ ...target })),
+  }));
+  const [syncedFrom, setSyncedFrom] = useState(data);
+  const [saved, setSaved] = useState(false);
+  if (data !== syncedFrom) {
+    setSyncedFrom(data);
+    setForm({ ...data, targets: data.targets.map(target => ({ ...target })) });
+  }
+  const normalized = {
+    ...form,
+    targets: form.targets.map(target => ({ name: target.name.trim(), address: target.address.trim() })),
+  };
+  const dirty = JSON.stringify(normalized) !== JSON.stringify(data);
+  const invalid = tcpProbeFormError(normalized);
+  const save = useMutation({
+    mutationFn: () => saveTcpProbeSettings(normalized),
+    onSuccess: next => {
+      setSaved(true);
+      setForm({ ...next, targets: next.targets.map(target => ({ ...target })) });
+      qc.setQueryData(['tcp-probe-settings'], next);
+      qc.invalidateQueries({ queryKey: ['tcp-probe-nodes'] });
+    },
+  });
+
+  const updateTarget = (index: number, field: 'name' | 'address', value: string) =>
+    setForm(current => ({
+      ...current,
+      targets: current.targets.map((target, targetIndex) =>
+        targetIndex === index ? { ...target, [field]: value } : target,
+      ),
+    }));
+
+  return (
+    <section className="panel titled tcp-probe-settings" id="set-tcp-probe">
+      <header>
+        <span className="no">{NO_OF['set-tcp-probe']}</span>
+        <h4>TCP 链路探测</h4>
+        <ApplyBadge id="set-tcp-probe" />
+        <span className="sp" />
+        {dirty && <span className="dirty">有未保存的改动</span>}
+        {!dirty && saved && <span className="dirty done">已保存</span>}
+        <button
+          className={dirty ? 'btn primary save' : 'btn save idle'}
+          disabled={!editable || !dirty || invalid !== null || save.isPending}
+          onClick={() => save.mutate()}
+        >
+          {save.isPending ? '保存中…' : '保存这一段'}
+        </button>
+      </header>
+      <p className="cardsub">每台机器直接连接这些地址，用于描述机器到目标的 TCP 建连状态</p>
+      {save.error && <ErrorBox error={save.error} />}
+      <Group label="调度">
+        <Fld label="多久探一轮">
+          <input
+            className="f"
+            type="number"
+            min={15}
+            max={86_400}
+            value={form.interval_secs}
+            onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
+          />
+          <span className="unit">秒</span>
+          <span className="hint">默认 60；每轮每个目标只发起 1 次 Connect</span>
+        </Fld>
+        <Fld label="连接超时">
+          <input
+            className="f"
+            type="number"
+            min={1}
+            max={120_000}
+            value={form.timeout_ms}
+            onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
+          />
+          <span className="unit">毫秒</span>
+          <span className="hint">默认 420；超过该值记为丢包，不单独设置 SYN 重传次数</span>
+        </Fld>
+      </Group>
+      <Group label="TCP 目标">
+        <div className="tcp-probe-targets">
+          {form.targets.map((target, index) => (
+            <div className="tcp-probe-target" key={index}>
+              <input
+                className="f"
+                aria-label={`目标 ${index + 1} 名称`}
+                placeholder="Cloudflare"
+                value={target.name}
+                onChange={event => updateTarget(index, 'name', event.target.value)}
+              />
+              <input
+                className="f mono"
+                aria-label={`目标 ${index + 1} 地址`}
+                placeholder="tcp://1.1.1.1:443"
+                value={target.address}
+                onChange={event => updateTarget(index, 'address', event.target.value)}
+              />
+              <button
+                className="btn sm"
+                type="button"
+                disabled={!editable}
+                onClick={() =>
+                  setForm(current => ({
+                    ...current,
+                    targets: current.targets.filter((_, targetIndex) => targetIndex !== index),
+                  }))
+                }
+              >
+                移除
+              </button>
+            </div>
+          ))}
+          {form.targets.length === 0 && <span className="hint">尚未配置目标，Agent 不会执行 TCP 探测</span>}
+        </div>
+        <button
+          className="btn sm"
+          type="button"
+          disabled={!editable || form.targets.length >= 32}
+          onClick={() =>
+            setForm(current => ({
+              ...current,
+              targets: [...current.targets, { name: '', address: 'tcp://' }],
+            }))
+          }
+        >
+          ＋ 添加 TCP 目标
+        </button>
+        {invalid && <span className="agent-log-invalid">{invalid}</span>}
+        <div className="guard">
+          Connect 计时从域名解析完成后开始，仅包含 TCP 建连；无响应记为空值。不会采集 DNS 耗时、内核 RTT、RTO、SYN
+          重传或连接错误分类。机器没有可用 IPv6 路由时会跳过 IPv6 候选；双栈域名继续尝试 IPv4，纯 IPv6
+          目标不记为无响应。
+        </div>
+      </Group>
+      <Group label="ICMP · TODO">
+        <Fld label="Ping 地址">
+          <input className="f mono" disabled placeholder="icmp://1.1.1.1" />
+          <span className="hint">暂未实现，当前优先支持 TCP Connect</span>
+        </Fld>
+      </Group>
+    </section>
+  );
+}
+
 const Group = ({ label, children }: { label?: string; children: React.ReactNode }) => (
   <div className="setgrp">
     {label && <p className="eyebrow">{label}</p>}
@@ -1373,9 +1543,8 @@ export function SettingsPane() {
   const { who } = useSession();
   const qc = useQueryClient();
   const settings = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings() });
-  // 证书、分发与站点外观的查询统一放在页面层：各段各自结束时会先亮一次整页骨架，
-  // 再在刚渲染出的段落里亮第二次——加载态被看到两次。查询提到页面层、一次等齐，
-  // 加载期只呈现一个骨架。
+  // 证书、分发与站点外观的查询统一放在页面层，一次等齐后再呈现完整页面，
+  // 避免各段在不同时间出现而造成布局连续跳动。
   const branding = useQuery({ queryKey: ['branding'], queryFn: () => fetchBranding() });
   const certs = useQuery({
     queryKey: ['certs'],
@@ -1388,6 +1557,7 @@ export function SettingsPane() {
   });
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
+  const tcpProbe = useQuery({ queryKey: ['tcp-probe-settings'], queryFn: fetchTcpProbeSettings });
   const [form, setForm] = useState<Form>(EMPTY);
   const [saved, setSaved] = useState<Partial<Record<SectionKey, number>>>({});
 
@@ -1465,7 +1635,14 @@ export function SettingsPane() {
     },
   });
 
-  if (settings.isPending || branding.isPending || certs.isPending || dist.isPending || logPolicy.isPending)
+  if (
+    settings.isPending ||
+    branding.isPending ||
+    certs.isPending ||
+    dist.isPending ||
+    logPolicy.isPending ||
+    tcpProbe.isPending
+  )
     return <Loading />;
   if (settings.error) return <ErrorBox error={settings.error} />;
 
@@ -1813,6 +1990,12 @@ export function SettingsPane() {
               </div>
             </Group>
           </Section>
+
+          {tcpProbe.error ? (
+            <ErrorBox error={tcpProbe.error} />
+          ) : (
+            <TcpProbeSettingsSection editable={editable} data={tcpProbe.data!} />
+          )}
 
           {/* 不提供开关是有意的：规则表中的 geosite: / geoip: 依赖这两个文件，文件过期不会报错，
           而是导致规则匹配失败、流量走兜底规则且无提示。因此此处只能配置更新时间和

@@ -80,10 +80,7 @@ fn front_downstream_expands_to_sorted_domain_and_ip_rules() {
         "hk",
         vec![Rule {
             dest_match: ModelMatch::FrontDownstream,
-            action: Action::Egress {
-                send_through: None,
-                dns: false,
-            },
+            action: Action::Egress { send_through: None },
         }],
         None,
     )]);
@@ -130,10 +127,7 @@ fn front_downstream_deliberately_ignores_subscription_projection() {
         "hk",
         vec![Rule {
             dest_match: ModelMatch::FrontDownstream,
-            action: Action::Egress {
-                send_through: None,
-                dns: false,
-            },
+            action: Action::Egress { send_through: None },
         }],
         None,
     )]);
@@ -216,10 +210,7 @@ fn nested_front_downstream_blocks_publish_instead_of_becoming_a_dead_rule() {
                 ModelMatch::FrontDownstream,
                 ModelMatch::Port(vec!["443".to_owned()]),
             ]),
-            action: Action::Egress {
-                send_through: None,
-                dns: false,
-            },
+            action: Action::Egress { send_through: None },
         }],
         None,
     )]);
@@ -648,10 +639,7 @@ fn step(chain: &str, node: &str, rules: Vec<Rule>, accept: Option<Accept>) -> St
 fn any_egress() -> Rule {
     Rule {
         dest_match: ModelMatch::Any,
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     }
 }
 

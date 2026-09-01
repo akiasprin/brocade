@@ -2209,10 +2209,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
             hop_in: None,
             rules: vec![Rule {
                 dest_match: DestMatch::Any,
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             }],
             note: None,
         },
@@ -2573,7 +2570,27 @@ async fn deployment_schema_matches_convergence_design() {
     insert_minimal_fixture(db.pool()).await;
 
     assert_column_exists(db.pool(), "control_state", "agent_log_max_mib").await;
+    assert_column_exists(db.pool(), "control_state", "tcp_probe_targets").await;
+    assert_column_exists(db.pool(), "control_state", "tcp_probe_interval_secs").await;
+    assert_column_exists(db.pool(), "control_state", "tcp_probe_timeout_ms").await;
     assert_column_exists(db.pool(), "nodes", "agent_log_max_mib").await;
+    assert_table_exists(db.pool(), "node_tcp_probe_samples").await;
+    assert_column_exists(db.pool(), "node_tcp_probe_samples", "node_id").await;
+    assert_column_exists(db.pool(), "node_tcp_probe_samples", "target").await;
+    assert_column_exists(db.pool(), "node_tcp_probe_samples", "probed_at").await;
+    assert_column_exists(db.pool(), "node_tcp_probe_samples", "connect_ms").await;
+    // Pin the deliberately minimal collection contract. A future chart can add a measurement only
+    // together with a visible operator use; kernel/DNS diagnostics must not quietly accumulate.
+    for column in [
+        "dns_ms",
+        "resolved_ip",
+        "kernel_rtt_us",
+        "rto_ms",
+        "syn_retrans",
+        "error",
+    ] {
+        assert_column_missing(db.pool(), "node_tcp_probe_samples", column).await;
+    }
     assert_table_exists(db.pool(), "artifact_blobs").await;
     assert_column_exists(db.pool(), "artifact_snapshots", "content_byte_len").await;
     assert_column_missing(db.pool(), "artifact_snapshots", "content").await;
@@ -3412,10 +3429,7 @@ async fn hop_security_keeps_its_keys_until_the_kind_changes() {
                 }),
                 rules: vec![Rule {
                     dest_match: DestMatch::Any,
-                    action: Action::Egress {
-                        send_through: None,
-                        dns: false,
-                    },
+                    action: Action::Egress { send_through: None },
                 }],
                 note: None,
             },
@@ -4988,13 +5002,7 @@ async fn materialize_minimal_fixture_and_compile() {
     let step = &app.steps[0];
     assert_eq!(step.rules.len(), 1);
     assert_eq!(step.rules[0].dest_match, DestMatch::Any);
-    assert_eq!(
-        step.rules[0].action,
-        Action::Egress {
-            send_through: None,
-            dns: false
-        }
-    );
+    assert_eq!(step.rules[0].action, Action::Egress { send_through: None });
 
     let output = compile(&snapshot);
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
@@ -5039,10 +5047,7 @@ async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
     let selector = DestMatch::DomainSuffix(vec!["media.example".to_owned()]);
     let stored_rule = Rule {
         dest_match: selector.clone(),
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     };
     sqlx::query(
         "INSERT INTO steps (chain_id, node_id, rules)
@@ -5070,10 +5075,7 @@ async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
             hop_in: None,
             rules: vec![Rule {
                 dest_match: selector.clone(),
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             }],
             note: None,
         },
@@ -5112,7 +5114,7 @@ async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
         raw_rules
             .iter()
             .all(|rules| !rules.to_string().contains("resolution")),
-        "steps 只保留规则引用，不应复制机器级 DNS 配置"
+        "steps 不应复制机器级 DNS 配置"
     );
     let policy_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM node_egress_dns WHERE node_id = 'n1'")
@@ -5122,7 +5124,7 @@ async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
     assert_eq!(policy_count, 1);
 
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
-    let references = snapshot.apps[0]
+    let matching_routes = snapshot.apps[0]
         .steps
         .iter()
         .filter(|step| step.node == "n1")
@@ -5131,7 +5133,7 @@ async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
                 && matches!(step.rules[0].action, Action::Egress { .. })
         })
         .collect::<Vec<_>>();
-    assert_eq!(references.len(), 2);
+    assert_eq!(matching_routes.len(), 2);
     assert!(!serde_json::to_string(&snapshot.apps)
         .unwrap()
         .contains("resolution"));
@@ -13576,10 +13578,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
         if to.is_empty() {
             rules.push(Rule {
                 dest_match: DestMatch::Any,
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             });
         }
         put_step_draft(
@@ -13901,10 +13900,7 @@ async fn prune_chain_drops_stranded_steps_after_whole_tree_lands() {
         if to.is_empty() {
             rules.push(Rule {
                 dest_match: DestMatch::Any,
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             });
         }
         brocade_store::ModelOp::PutStep {

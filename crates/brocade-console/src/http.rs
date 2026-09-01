@@ -42,9 +42,9 @@ use brocade_store::{
     E2eProbeRequest, LinkHealthRequest, LinkProbeRequest, LoadReportRequest, ModelOp,
     NodeLifecyclePhase, PgStore, PhantunBinaries, ProvisionNodeRequest, ProvisionNodeResult,
     ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest, SetUserAppQuotaRequest,
-    StoreError, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
-    UpdateNodeStatusRequest, UpdateUserStatusRequest, UpdateWarpBindingRequest,
-    VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
+    StoreError, TcpProbeReportRequest, TcpProbeSettings, UpdateAgentLogDefaultRequest,
+    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateNodeStatusRequest,
+    UpdateUserStatusRequest, UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -536,6 +536,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/nodes/agent-state",
         "/revisions",
         "/load/nodes",
+        "/tcp-probe/nodes",
         "/usage/node-series",
         "/links/quality",
         "/links/mtu",
@@ -552,6 +553,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         // two cannot be written as exact strings.
         || path.starts_with("/compile/")
         || path.starts_with("/load/nodes/")
+        || path.starts_with("/tcp-probe/nodes/")
         // The response is the credential-free Serving authorization matrix. Executing it is a
         // POST to the same path and remains closed by the method gate above.
         || is_user_grant_probe_plan_path(path)
@@ -664,6 +666,12 @@ fn admin_router_with_state(state: AppState) -> Router {
         // still require a system administrator in the handler below.
         .route("/branding", get(get_branding).put(update_branding))
         .route("/settings", get(get_settings).put(update_settings))
+        // Active connection observation is operational state: agents read it immediately and it
+        // never becomes part of a release revision.
+        .route(
+            "/tcp-probe/settings",
+            get(get_tcp_probe_settings).put(update_tcp_probe_settings),
+        )
         // Its own route rather than a section of /settings: writing this one creates no revision
         // and triggers no release, and sharing a handler would give one PUT two halves with
         // different behavior, which leads to revisions being created for a domain typo.
@@ -826,6 +834,8 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/usage/monthly-summary", get(usage_monthly_summary))
         .route("/load/nodes", get(load_nodes))
         .route("/load/nodes/{node_id}", get(load_node))
+        .route("/tcp-probe/nodes", get(tcp_probe_nodes))
+        .route("/tcp-probe/nodes/{node_id}", get(tcp_probe_node))
         // Under /links rather than /load: this is a property of a hop, and it sits next to
         // link_health and path MTU both in meaning and on the page that renders it.
         .route("/links/quality", get(link_quality))
@@ -902,6 +912,8 @@ fn agent_routes() -> Router<AppState> {
         .route("/agent/v1/agent-release", get(agent_release))
         .route("/agent/v1/usage", post(agent_usage))
         .route("/agent/v1/load", post(agent_load))
+        .route("/agent/v1/tcp-probe-targets", get(agent_tcp_probe_targets))
+        .route("/agent/v1/tcp-probe", post(agent_tcp_probe))
         .route("/agent/v1/link-probe", post(agent_link_probe))
         .route("/agent/v1/probe-targets", get(agent_probe_targets))
         .route("/agent/v1/link-health", post(agent_link_health))
@@ -1490,6 +1502,29 @@ async fn update_branding(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     Ok(Json(state.store.update_branding(&admin, settings).await?).into_response())
+}
+
+async fn get_tcp_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.tcp_probe_settings().await?).into_response())
+}
+
+async fn update_tcp_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<TcpProbeSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(
+        state
+            .store
+            .update_tcp_probe_settings(&admin, settings)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
@@ -3508,6 +3543,27 @@ async fn agent_load(
     Ok(Json(result).into_response())
 }
 
+/// Runtime TCP targets. The same settings are returned to every active node; the address itself is
+/// the series identifier used when the result comes back.
+async fn agent_tcp_probe_targets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    Ok(Json(state.store.tcp_probe_settings().await?).into_response())
+}
+
+async fn agent_tcp_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<TcpProbeReportRequest>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    Ok(Json(state.store.record_tcp_probe(&node.node_id, request).await?).into_response())
+}
+
 /// Which endpoints to probe. The agent must not derive them from wireguard.conf itself: for a peer
 /// behind phantun that file's `Endpoint` is by design local loopback, and probing it measures
 /// ourselves (`ProbeTargetList`).
@@ -3626,6 +3682,41 @@ async fn load_node(
     Ok(Json(result).into_response())
 }
 
+async fn tcp_probe_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<TcpProbeQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(
+        state
+            .store
+            .list_node_tcp_probes(&admin, query.window_secs.unwrap_or(3_600).min(86_400))
+            .await?,
+    )
+    .into_response())
+}
+
+async fn tcp_probe_node(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    Query(query): Query<TcpProbeQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(
+        state
+            .store
+            .node_tcp_probe_view(
+                &admin,
+                &node_id,
+                query.window_secs.unwrap_or(86_400).min(7 * 86_400),
+            )
+            .await?,
+    )
+    .into_response())
+}
+
 /// Per-hop link quality, optionally narrowed to one chain.
 async fn link_quality(
     State(state): State<AppState>,
@@ -3643,6 +3734,11 @@ async fn link_quality(
 #[derive(Debug, Deserialize)]
 struct LoadQuery {
     windows: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TcpProbeQuery {
+    window_secs: Option<u32>,
 }
 
 /// 24 h / 30 s = 2,880 windows. This applies only to the single-machine endpoint; the fleet
@@ -4248,6 +4344,8 @@ mod tests {
             "/compile/77",
             "/load/nodes",
             "/load/nodes/hk-01",
+            "/tcp-probe/nodes",
+            "/tcp-probe/nodes/hk-01",
             "/usage/node-series",
             "/links/quality",
             "/links/health",
@@ -4264,6 +4362,7 @@ mod tests {
         for path in [
             "/deployments",
             "/settings",
+            "/tcp-probe/settings",
             "/distribution",
             "/admin/operators",
             "/artifacts/index",

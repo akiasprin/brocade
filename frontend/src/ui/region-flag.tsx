@@ -17,23 +17,30 @@ FLAG_SHEET.forEach((line, row) => {
   for (let col = 0; col * 2 < line.length; col += 1) CELLS.set(line.slice(col * 2, col * 2 + 2), { col, row });
 });
 
-export function RegionFlag({ code }: { code: string | null | undefined }) {
+export function RegionFlag({ code, square = false }: { code: string | null | undefined; square?: boolean }) {
   const normalized = code?.trim().toUpperCase() ?? '';
   // No shape check of its own: every key here is a real alpha-2 code, so a miss already covers the
   // empty string, a country the sheet does not carry, and the `PRIVATE`-style tags geoip.dat holds.
   const cell = CELLS.get(normalized.toLowerCase());
   if (!cell) return null;
-  // Percentage positioning rather than pixels: the sheet is scaled so that one cell fills the box,
-  // and then a cell's offset is a fraction of the sheet, independent of how large the box is.
+  // Percentage positioning rather than pixels keeps both regular flags and the square node mark
+  // independent of their rendered size. A square does not stretch a cell: each 3:2 cell is scaled
+  // to 150% of the square width, then exactly 25% is cropped from either side. Its x position must
+  // include that leading quarter-cell; col/(cols-1), which is correct for an uncropped cell, would
+  // make every square after the first drift horizontally through the sprite.
+  const backgroundSizeX = square ? FLAG_COLS * 150 : FLAG_COLS * 100;
+  const backgroundPositionX = square
+    ? ((cell.col * 1.5 + 0.25) / (FLAG_COLS * 1.5 - 1)) * 100
+    : (cell.col / (FLAG_COLS - 1)) * 100;
   return (
     <span
-      className="geo-flag"
+      className={`geo-flag${square ? ' square' : ''}`}
       role="img"
       aria-label={`${normalized} 地区旗`}
       title={normalized}
       style={{
-        backgroundSize: `${FLAG_COLS * 100}% ${FLAG_SHEET.length * 100}%`,
-        backgroundPosition: `${(cell.col / (FLAG_COLS - 1)) * 100}% ${(cell.row / (FLAG_SHEET.length - 1)) * 100}%`,
+        backgroundSize: `${backgroundSizeX}% ${FLAG_SHEET.length * 100}%`,
+        backgroundPosition: `${backgroundPositionX}% ${(cell.row / (FLAG_SHEET.length - 1)) * 100}%`,
       }}
     />
   );

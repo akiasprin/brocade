@@ -5,6 +5,7 @@ import { fetchUsageNodeSeries } from '../src/api';
 import type { LoadRange } from '../src/panes/nodes';
 
 let ObserveRangeControl: typeof import('../src/panes/nodes').ObserveRangeControl;
+let ObserveLinkControl: typeof import('../src/panes/nodes').ObserveLinkControl;
 let LOAD_RANGES: typeof import('../src/panes/nodes').LOAD_RANGES;
 
 beforeAll(async () => {
@@ -12,7 +13,7 @@ beforeAll(async () => {
     'matchMedia',
     vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
   );
-  ({ ObserveRangeControl, LOAD_RANGES } = await import('../src/panes/nodes'));
+  ({ ObserveRangeControl, ObserveLinkControl, LOAD_RANGES } = await import('../src/panes/nodes'));
 });
 
 afterEach(() => {
@@ -21,18 +22,62 @@ afterEach(() => {
 });
 
 describe('machine telemetry range', () => {
-  it('offers every supported range and switches the pressed item', () => {
+  it('keeps chart linking off by default and exposes it as a labelled slider', () => {
+    const Harness = () => {
+      const [linked, setLinked] = useState(false);
+      return <ObserveLinkControl value={linked} onChange={setLinked} />;
+    };
+    const view = render(<Harness />);
+    const control = view.getByRole('switch', { name: '同组图表联动' });
+
+    expect(control.getAttribute('aria-checked')).toBe('false');
+    expect(view.getByText('同组图表联动')).toBeTruthy();
+    fireEvent.click(control);
+    expect(control.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('uses the clock dropdown, offers every full range label and switches the selected item', () => {
     const Harness = () => {
       const [selected, setSelected] = useState<LoadRange>(LOAD_RANGES[0]);
       return <ObserveRangeControl value={selected} onChange={setSelected} />;
     };
     const view = render(<Harness />);
 
-    expect(view.getAllByRole('button').map(button => button.textContent)).toEqual(['30m', '1h', '6h', '12h', '24h']);
-    expect(view.getByRole('button', { name: '30m' }).getAttribute('aria-pressed')).toBe('true');
+    const trigger = view.getByRole('button', { name: '观测时间范围：近 30 分钟' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
 
-    fireEvent.click(view.getByRole('button', { name: '24h' }));
-    expect(view.getByRole('button', { name: '24h' }).getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    expect(view.getAllByRole('option').map(option => option.textContent)).toEqual([
+      '近 30 分钟✓',
+      '近 1 小时✓',
+      '近 6 小时✓',
+      '近 12 小时✓',
+      '近 24 小时✓',
+    ]);
+    expect(view.getByRole('option', { name: '近 30 分钟' }).getAttribute('aria-selected')).toBe('true');
+
+    fireEvent.click(view.getByRole('option', { name: '近 24 小时' }));
+    expect(view.getByRole('button', { name: '观测时间范围：近 24 小时' }).getAttribute('aria-expanded')).toBe('false');
+    expect(view.queryByRole('listbox')).toBeNull();
+  });
+
+  it('closes the range menu on outside interaction and Escape', () => {
+    const Harness = () => {
+      const [selected, setSelected] = useState<LoadRange>(LOAD_RANGES[0]);
+      return <ObserveRangeControl value={selected} onChange={setSelected} />;
+    };
+    const view = render(<Harness />);
+    const trigger = view.getByRole('button', { name: '观测时间范围：近 30 分钟' });
+
+    fireEvent.click(trigger);
+    fireEvent.pointerDown(document.body);
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(trigger);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(trigger);
   });
 
   it('narrows a long Xray series request to the current machine', async () => {

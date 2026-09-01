@@ -1120,13 +1120,7 @@ export type HopPool =
 
 export type RuleAction =
   | { t: 'forward'; to: string; dial?: HopDial; pool?: HopPool }
-  | {
-      t: 'egress';
-      send_through?: string | null;
-      /* Activates the matching machine DNS policy. This is not per-outbound isolation: once
-         activated, Xray applies the policy to every matching lookup on the machine. */
-      dns?: boolean;
-    }
+  | { t: 'egress'; send_through?: string | null }
   | { t: 'proxy'; outbound: string }
   | { t: 'block' };
 
@@ -1341,7 +1335,7 @@ export const putStep = (
   return Promise.resolve({ revision_id: 0 });
 };
 
-// DNS 策略是机器级配置；链路 Egress 规则只用 `dns` 激活同 selector 的策略。这里使用
+// DNS 策略是机器级配置，保存后由该机器始终下发。线路编辑器只是其中一个编辑入口；
 // 独立草稿操作写入或移除 `(node, selector)`，避免保存、删除链路时取得策略所有权。
 export const setNodeEgressDns = (nodeId: string, selector: DestMatch, resolution: EgressDnsResolution | null) => {
   draft.push({ op: 'set_node_egress_dns', node_id: nodeId, selector, resolution });
@@ -1627,7 +1621,7 @@ export interface ConsoleSnapshot {
     nodes?: { id: string; overlay?: boolean; certificate_name?: string | null; connection?: NodeConnection }[];
     settings?: { connection?: ConnectionSettings };
   };
-  /* DNS 策略由机器持有；链路 Egress 规则只保存是否激活匹配策略。 */
+  /* DNS 策略由机器持有，存在即下发，不由链路 Egress 规则启用。 */
   node_egress_dns: { node: string; position: number; selector: DestMatch; resolution: EgressDnsResolution }[];
   redacted: boolean;
 }
@@ -1809,6 +1803,22 @@ export const DEFAULT_BRANDING: BrandingSettings = { site_name: 'Brocade', icon_d
 export const fetchBranding = () => api<BrandingSettings>('/branding');
 export const saveBranding = (body: BrandingSettings) =>
   api<BrandingSettings>('/branding', '', { method: 'PUT', body: JSON.stringify(body) });
+
+export interface TcpProbeTarget {
+  name: string;
+  /** 同时作为序列标识；当前仅接受 tcp://host:port。 */
+  address: string;
+}
+
+export interface TcpProbeSettings {
+  targets: TcpProbeTarget[];
+  interval_secs: number;
+  timeout_ms: number;
+}
+
+export const fetchTcpProbeSettings = () => api<TcpProbeSettings>('/tcp-probe/settings');
+export const saveTcpProbeSettings = (body: TcpProbeSettings) =>
+  api<TcpProbeSettings>('/tcp-probe/settings', '', { method: 'PUT', body: JSON.stringify(body) });
 
 export interface ModelSettings {
   reality_client: {
@@ -2639,6 +2649,27 @@ export const fetchNodeLoadList = (windows = 24, token = '') =>
 
 export const fetchNodeLoad = (nodeId: string, windows = 24, token = '') =>
   api<NodeLoadView>(`/load/nodes/${encodeURIComponent(nodeId)}?windows=${windows}`, token);
+
+export interface TcpProbePoint {
+  probed_at_unix_secs: number;
+  /** null 是该轮无响应；服务端不保存更细的错误分类。 */
+  connect_ms: number | null;
+}
+
+export interface TcpProbeTargetSeries extends TcpProbeTarget {
+  samples: TcpProbePoint[];
+}
+
+export interface NodeTcpProbeView {
+  node_id: string;
+  targets: TcpProbeTargetSeries[];
+}
+
+export const fetchNodeTcpProbeList = (windowSecs = 3600, token = '') =>
+  api<{ nodes: NodeTcpProbeView[] }>(`/tcp-probe/nodes?window_secs=${windowSecs}`, token);
+
+export const fetchNodeTcpProbe = (nodeId: string, windowSecs = 86_400, token = '') =>
+  api<NodeTcpProbeView>(`/tcp-probe/nodes/${encodeURIComponent(nodeId)}?window_secs=${windowSecs}`, token);
 
 export const fetchLinkQuality = (chainId?: string, token = '') =>
   api<{ hops: HopLinkView[] }>(`/links/quality${chainId ? `?chain_id=${encodeURIComponent(chainId)}` : ''}`, token);

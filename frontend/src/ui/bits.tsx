@@ -57,22 +57,10 @@ export function Empty({ children }: { children: ReactNode }) {
   );
 }
 
-// 加载中状态：骨架条。不用「读取中」文字——文字每次查询都会闪现一次，反复出现的
-// 一行字容易被当作页面出错；骨架条只占位、不表态，与页面内容同属灰色块。
-//
-// `sheeted` 一档用于自行管理内容区的页面（机器、用户走外壳的 bare 分支）：
-// 它们的提前 return 发生在渲染 .fg-sheet 之前，不额外包一层时，骨架条会直接显示在
-// 台面网格上，而其他页面此时显示的是内容区已渲染、其中显示骨架。
-// 同一状态在两类页面上呈现不同，会被理解为其中一个出现异常。
-export function Loading({ sheeted = false }: { sheeted?: boolean }) {
-  const body = (
-    <div className="skel" aria-hidden="true">
-      <i style={{ width: '62%' }} />
-      <i style={{ width: '88%' }} />
-      <i style={{ width: '74%' }} />
-    </div>
-  );
-  return sheeted ? <div className="fg-sheet">{body}</div> : body;
+// 查询首次完成前保持空白。保留这个共享边界，避免每个页面各自实现等待分支；
+// `sheeted` 也暂留在接口中，让现有调用点不需要为了视觉策略变化而改写。
+export function Loading(_props: { sheeted?: boolean }) {
+  return null;
 }
 
 export function ErrorBox({ error }: { error: unknown }) {

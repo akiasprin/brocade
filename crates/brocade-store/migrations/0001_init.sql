@@ -424,6 +424,11 @@ CREATE TABLE IF NOT EXISTS control_state (
     site_name TEXT DEFAULT 'Brocade' NOT NULL,
     -- A validated PNG/JPEG/WebP data URL. NULL keeps the built-in woven vector mark.
     site_icon_data_url TEXT,
+    -- Active TCP-connect observation. Operational and read by agents every round; it creates no
+    -- model revision. The JSON contains only display names and tcp://host:port addresses.
+    tcp_probe_targets JSONB DEFAULT '[]'::jsonb NOT NULL,
+    tcp_probe_interval_secs INTEGER DEFAULT 60 NOT NULL,
+    tcp_probe_timeout_ms INTEGER DEFAULT 420 NOT NULL,
     -- Connection policy defaults. Merely the defaults: what reaches a machine is its own
     -- `nodes.conn_*` falling back to these, the same arrangement as overlay_mtu / nodes.mtu.
     --
@@ -509,6 +514,9 @@ CREATE TABLE IF NOT EXISTS control_state (
     CONSTRAINT control_state_reality_server_names_shape CHECK ((jsonb_typeof(reality_server_names) = 'array')),
     CONSTRAINT control_state_site_name_shape CHECK ((length(btrim(site_name)) BETWEEN 1 AND 64)),
     CONSTRAINT control_state_site_icon_size CHECK ((site_icon_data_url IS NULL) OR (octet_length(site_icon_data_url) <= 350000)),
+    CONSTRAINT control_state_tcp_probe_targets_shape CHECK ((jsonb_typeof(tcp_probe_targets) = 'array')),
+    CONSTRAINT control_state_tcp_probe_interval_range CHECK (((tcp_probe_interval_secs >= 15) AND (tcp_probe_interval_secs <= 86400))),
+    CONSTRAINT control_state_tcp_probe_timeout_range CHECK (((tcp_probe_timeout_ms >= 1) AND (tcp_probe_timeout_ms <= 120000))),
     CONSTRAINT control_state_pkey PRIMARY KEY (id),
     CONSTRAINT control_state_current_revision_fkey FOREIGN KEY (current_revision) REFERENCES revisions(id)
 );
@@ -519,6 +527,12 @@ ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'Brocade' NOT NULL;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS site_icon_data_url TEXT;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS tcp_probe_targets JSONB DEFAULT '[]'::jsonb NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS tcp_probe_interval_secs INTEGER DEFAULT 60 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS tcp_probe_timeout_ms INTEGER DEFAULT 420 NOT NULL;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS agent_log_max_mib INTEGER DEFAULT 100 NOT NULL;
 ALTER TABLE control_state
@@ -536,6 +550,21 @@ ALTER TABLE control_state
 ALTER TABLE control_state
     ADD CONSTRAINT control_state_site_icon_size
         CHECK ((site_icon_data_url IS NULL) OR (octet_length(site_icon_data_url) <= 350000));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_tcp_probe_targets_shape;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_tcp_probe_targets_shape
+        CHECK ((jsonb_typeof(tcp_probe_targets) = 'array'));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_tcp_probe_interval_range;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_tcp_probe_interval_range
+        CHECK (((tcp_probe_interval_secs >= 15) AND (tcp_probe_interval_secs <= 86400)));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_tcp_probe_timeout_range;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_tcp_probe_timeout_range
+        CHECK (((tcp_probe_timeout_ms >= 1) AND (tcp_probe_timeout_ms <= 120000)));
 
 -- One release.
 --
@@ -731,9 +760,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     CONSTRAINT nodes_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT
 );
 
--- Custom DNS is owned by the machine's Xray instance, not by any one chain. An Egress rule may
--- activate the policy with the same domain selector (`a.dns = true`), but no resolver value or DNS
--- order is copied into route JSON. Once activated, Xray applies the policy machine-wide.
+-- Custom DNS is owned by the machine's Xray instance, not by any one chain. Every stored policy
+-- is emitted to that machine; resolver values and DNS order never live in route JSON.
 CREATE TABLE IF NOT EXISTS node_egress_dns (
     node_id TEXT NOT NULL,
     position INTEGER NOT NULL,
@@ -2104,6 +2132,21 @@ CREATE TABLE IF NOT EXISTS node_load_samples (
     CONSTRAINT node_load_samples_pkey PRIMARY KEY (node_id, window_start),
     CONSTRAINT node_load_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
+
+-- One TCP-connect result per machine, target and round. This deliberately does not contain
+-- resolved IPs, DNS duration, kernel RTT/RTO, retransmissions or error categories: none is shown,
+-- so none is collected. NULL connect_ms is the single representation of no response.
+CREATE TABLE IF NOT EXISTS node_tcp_probe_samples (
+    node_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    probed_at TIMESTAMPTZ NOT NULL,
+    connect_ms INTEGER,
+    CONSTRAINT node_tcp_probe_samples_connect_ms CHECK (((connect_ms IS NULL) OR (connect_ms >= 0))),
+    CONSTRAINT node_tcp_probe_samples_pkey PRIMARY KEY (node_id, target, probed_at),
+    CONSTRAINT node_tcp_probe_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS node_tcp_probe_samples_probed_at_idx
+    ON node_tcp_probe_samples (probed_at);
 
 -- The processes we put on the machine. Latest only — one row per (node, process).
 --

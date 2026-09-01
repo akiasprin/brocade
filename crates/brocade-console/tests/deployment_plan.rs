@@ -787,10 +787,7 @@ fn hopping_app(
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     }
 }
 
@@ -820,10 +817,7 @@ fn a_change_the_running_xray_can_absorb_is_not_disruptive() {
             true,
             Rule {
                 dest_match: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
-                action: Action::Egress {
-                    send_through: None,
-                    dns: false,
-                },
+                action: Action::Egress { send_through: None },
             },
         )],
     );

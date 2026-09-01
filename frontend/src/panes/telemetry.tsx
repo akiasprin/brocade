@@ -10,11 +10,17 @@
 import { memo, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import * as echarts from 'echarts/core';
 import { LineChart } from 'echarts/charts';
-import { GridComponent, TooltipComponent } from 'echarts/components';
+import { GridComponent, MarkLineComponent, TooltipComponent } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 import { bytes } from '../ui/format';
 import { Ago } from '../ui/bits';
-import { useNow } from '../ui/clock';
+import {
+  OBSERVE_COLOR_VARS,
+  observeAreaFill,
+  observeColors,
+  observeTimeTick,
+  observeValueAxis,
+} from '../ui/observe-chart';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import type {
@@ -25,12 +31,11 @@ import type {
   MemoryDetailSample,
   NetworkDetailSample,
   NodeLoadView,
-  ProcessSample,
 } from '../api';
 
 // 与 nodes.tsx 的 FleetNetChart 共用同一套注册；echarts.use 对重复注册幂等，
 // 但本模块独立使用 echarts，需要自己声明所依赖的组件。
-echarts.use([LineChart, GridComponent, TooltipComponent, CanvasRenderer]);
+echarts.use([LineChart, GridComponent, MarkLineComponent, TooltipComponent, CanvasRenderer]);
 
 /** canvas 里字体要给具体栈，不能写 var(--mono)。 */
 const TP_MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -543,34 +548,19 @@ function congestionFindings(r: NodeLoadView): Finding[] {
 
 /* ── LOAD 卡 ────────────────────────────────────────────────── */
 
-const PROC_LABEL: Record<ProcessSample['proc'], string> = {
-  xray: 'xray',
-  wg: 'wireguard',
-  phantun: 'phantun',
-  agent: 'agent',
-};
-
 /** 该机器的当前负载。
  *
  * 位于观测主栏首位：监控页先回答当前资源是否充足，再向下解释 agent、运行时和配置状态。
  * 卡片底部的进程表是主要内容而非附加信息——只有该部分能区分机器整体负载高和本系统
  * 进程负载高，而机器出现问题时首先会怀疑本系统部署的这几个进程。 */
-/** 上报多久后视为数据过期。取两个采样窗口——正常机器每 30 秒上报一次，连续丢失十次才达到该值。
- *
- * 不在顶部标注时，26 分钟前的读数与实时数据的显示相同，而该卡片中每个数值的含义
- * 都取决于它是否为当前时刻的数据。 */
-const STALE_SECS = 300;
-
 /** 双序列吞吐曲线（echarts）。NETWORK（网卡，按方向）与 XRAY（承载，按角色）共用这一个组件：
- * 两者口径不同、绝不能合并进一张图，但时间轴一致、用 `echarts.connect(group)` 联动十字线——
- * 悬停任一时刻两图同时高亮，这才是「可对比」。各自独立的 Y 轴与图例标明口径差异。
+ * 两者口径不同、绝不能合并进一张图。用户打开观测页的「同组图表联动」后才传入 group，
+ * 用 `echarts.connect(group)` 同步十字线与 Tooltip；默认各图独立。
  *
  * 细节约定（与现网手绘 SVG 一致，逐项对应）：
- * - Y 量程 = 峰值 × 1.12，按三等分画刻度（max / 2/3 / 1/3 / 0），间距必然均匀；写死 max 加
- *   splitNumber 会出现顶格被压扁的不均匀刻度。
- * - option 顶层给 `color: [data, data-secondary]`：否则 tooltip 的圆点回退到 echarts 默认
- *   调色板（蓝/绿），跟线条和 HTML 图例都对不上。
- * - rx 画面积、tx 只画线：面积属于主流向，使两条同族蓝线在不改配色的前提下可区分。
+ * - Y 量程使用 1 / 2 / 2.5 / 5 × 10ⁿ 标准步长，顶部永远保留峰值之后的一整格。
+ * - 两条线使用观测分类盘的前两色，与 HistoryChart 和 TCP Ping 保持同一视觉语法。
+ * - 两条线都使用「淡化 + 正常 + 中」填充；填充不是流向主次，不改变数据口径。
  * - 缺口（has_gap / null）断开不连接。 */
 export function ThroughputChart({
   rx,
@@ -620,8 +610,7 @@ export function ThroughputChart({
     lastSig.current = sig;
     const css = getComputedStyle(document.documentElement);
     const cv = (name: string) => css.getPropertyValue(name).trim();
-    const data = cv('--data');
-    const dataSecondary = cv('--data-secondary');
+    const colors = observeColors(themeName, cv).slice(0, 2);
     const ink = cv('--ink');
     const ink3 = cv('--ink-3');
     const ink4 = cv('--ink-4');
@@ -634,7 +623,7 @@ export function ThroughputChart({
       ...tx.filter((v): v is number => v !== null),
       1,
     );
-    const max = peak * 1.12;
+    const valueAxis = observeValueAxis(peak);
     const slots = Math.max(rx.length, tx.length, 1);
     const slot = (i: number) => {
       if (i === slots - 1) return '现在';
@@ -643,17 +632,19 @@ export function ThroughputChart({
         ? `−${Number((minutes / 60).toFixed(minutes % 60 === 0 ? 0 : 1))}h`
         : `−${Math.round(minutes)}m`;
     };
-    const tick = (index: number) =>
-      index === 0 || index === slots - 1 || [1, 2, 3].some(part => index === Math.round(((slots - 1) * part) / 4));
+    const tick = (index: number) => observeTimeTick(index, slots);
 
-    const mk = (name: string, data: (number | null)[], color: string, area: boolean) => ({
+    const mk = (name: string, data: (number | null)[], color: string) => ({
       name,
       type: 'line' as const,
+      symbol: 'circle',
+      symbolSize: 5,
       showSymbol: false,
-      smooth: 0.32,
+      smooth: false,
       connectNulls: false,
-      lineStyle: { color, width: area ? 1.6 : 1.25 },
-      ...(area ? { areaStyle: { color, opacity: 0.13 } } : {}),
+      lineStyle: { color, width: 1.1 },
+      areaStyle: { color: observeAreaFill(color, themeName), opacity: 1 },
+      itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
       emphasis: { disabled: true },
       data,
     });
@@ -661,8 +652,8 @@ export function ThroughputChart({
     chart.setOption(
       {
         animation: false,
-        color: [data, dataSecondary],
-        grid: { left: 52, right: 14, top: 10, bottom: 20 },
+        color: colors,
+        grid: { left: 10, right: 14, top: 10, bottom: 10, containLabel: true },
         textStyle: { fontFamily: TP_MONO },
         tooltip: {
           trigger: 'axis',
@@ -672,16 +663,20 @@ export function ThroughputChart({
           borderWidth: 1,
           padding: [7, 9],
           textStyle: { color: ink3, fontSize: 11, fontFamily: TP_MONO },
-          axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' } },
+          extraCssText: 'border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); backdrop-filter:blur(8px);',
+          axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' }, z: 0 },
           formatter: (params: unknown) => {
             const arr = params as { seriesName: string; color: string; value: number | null; dataIndex: number }[];
             const head = slot(arr[0].dataIndex);
             const row = (p: { seriesName: string; color: string; value: number | null }) =>
-              `<div style="display:flex;gap:8px;align-items:center;line-height:1.75">` +
-              `<span style="width:8px;height:8px;border-radius:2px;background:${p.color}"></span>` +
-              `<span>${p.seriesName}</span>` +
-              `<b style="margin-left:auto;color:${ink}">${p.value === null ? '—' : bps(p.value)}</b></div>`;
-            return `<div style="color:${ink4};font-size:9px;margin-bottom:3px">${head}</div>${arr.map(row).join('')}`;
+              `<div style="display:flex;gap:7px;align-items:center;line-height:1.75">` +
+              `<span style="width:8px;height:8px;border-radius:2px;background:${p.color};flex:none"></span>` +
+              `<span style="color:${ink3}">${p.seriesName}</span>` +
+              `<b style="margin-left:auto;color:${ink};font-weight:500">${p.value === null ? '—' : bps(p.value)}</b></div>`;
+            const rows = [...arr].sort(
+              (left, right) => (right.value ?? Number.NEGATIVE_INFINITY) - (left.value ?? Number.NEGATIVE_INFINITY),
+            );
+            return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${head}</div>${rows.map(row).join('')}`;
           },
         },
         xAxis: {
@@ -690,10 +685,11 @@ export function ThroughputChart({
           boundaryGap: false,
           axisLine: { lineStyle: { color: line } },
           axisTick: { show: false },
-          splitLine: { show: false },
+          splitLine: { show: true, interval: (i: number) => tick(i), lineStyle: { color: lineSoft, width: 1 } },
           axisLabel: {
-            color: ink4,
-            fontSize: 8,
+            color: ink3,
+            fontSize: 9.5,
+            margin: 8,
             interval: (i: number) => tick(i),
             formatter: (_v: string, i: number) => slot(i),
           },
@@ -701,14 +697,14 @@ export function ThroughputChart({
         yAxis: {
           type: 'value',
           min: 0,
-          max,
-          interval: max / 3,
+          max: valueAxis.max,
+          interval: valueAxis.interval,
           axisLine: { show: false },
           axisTick: { show: false },
-          axisLabel: { color: ink4, fontSize: 8, formatter: (v: number) => (v === 0 ? '0' : bps(v)) },
-          splitLine: { lineStyle: { color: lineSoft } },
+          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (v: number) => (v === 0 ? '0' : bps(v)) },
+          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
-        series: [mk(rxName, rx, data, true), mk(txName, tx, dataSecondary, false)],
+        series: [mk(rxName, rx, colors[0]), mk(txName, tx, colors[1])],
       },
       true,
     );
@@ -722,7 +718,31 @@ export function ThroughputChart({
 type HistoryLine = {
   name: string;
   values: (number | null)[];
+  /** Stable semantic color role. HistoryChart maps it into the categorical observation palette. */
+  color?: string;
+  /** Lines sharing a stack become a filled composition instead of crossing independent traces. */
+  stack?: string;
+  area?: boolean;
+  dashed?: boolean;
 };
+
+const HISTORY_COLOR_SLOT: Record<string, number> = {
+  '--observe-user': 0,
+  '--observe-system': 1,
+  '--observe-softirq': 2,
+  '--observe-iowait': 3,
+  '--observe-steal': 4,
+  '--observe-load': 5,
+  '--observe-peak': 5,
+  '--observe-free': 9,
+};
+
+const historyLineColorVar = (line: HistoryLine, index: number) => {
+  const slot = line.color === undefined ? index : (HISTORY_COLOR_SLOT[line.color] ?? index);
+  return OBSERVE_COLOR_VARS[slot % OBSERVE_COLOR_VARS.length];
+};
+
+type HistoryChartVariant = 'main' | 'secondary' | 'diagnostic';
 
 /** 原始时序曲线。这里不放阈值、状态词或自动结论，只负责把服务端保留的窗口逐点画出。
  * null 与 has_gap 都断线，不用 0 填补；tooltip 显示窗口结束的绝对时间和原始数值。 */
@@ -732,14 +752,24 @@ function HistoryChart({
   lines,
   formatValue,
   group,
-  legend = true,
+  variant = 'diagnostic',
+  current,
+  meta,
+  max,
+  threshold,
+  wide = false,
 }: {
   title: string;
   samples: LoadSample[];
   lines: HistoryLine[];
   formatValue: (value: number) => string;
-  group: string;
-  legend?: boolean;
+  group?: string;
+  variant?: HistoryChartVariant;
+  current?: ReactNode;
+  meta?: ReactNode;
+  max?: number;
+  threshold?: { value: number; label: string };
+  wide?: boolean;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
@@ -751,7 +781,7 @@ function HistoryChart({
     const el = elRef.current;
     if (!el) return;
     const chart = echarts.init(el, null, { renderer: 'canvas' });
-    chart.group = group;
+    if (group) chart.group = group;
     chartRef.current = chart;
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(el);
@@ -766,27 +796,40 @@ function HistoryChart({
     const chart = chartRef.current;
     if (!chart) return;
     const times = samples.map(sample => sample.window_end_unix_secs);
-    const sig = JSON.stringify([times, lines, title, themeName, paletteKey]);
+    const sig = JSON.stringify([times, lines, title, max, threshold, group, themeName, paletteKey]);
     if (sig === lastSig.current) return;
     lastSig.current = sig;
-    const css = getComputedStyle(document.documentElement);
+    const css = getComputedStyle(elRef.current ?? document.documentElement);
     const cv = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
-    const colors = [
-      cv('--data', '#3976d8'),
-      cv('--data-secondary', '#62a4be'),
-      cv('--action', '#775ad8'),
-      cv('--gold', '#ae7a16'),
-      cv('--err', '#bd4b4b'),
-      cv('--ok', '#3c8b6b'),
-      cv('--ink-3', '#707780'),
-      '#a56a9a',
-    ];
+    const paletteColors = observeColors(themeName, name => cv(name, ''));
+    const colors = lines.map((line, index) => {
+      const variable = historyLineColorVar(line, index);
+      return paletteColors[OBSERVE_COLOR_VARS.indexOf(variable)];
+    });
     const ink = cv('--ink', '#20242a');
     const ink3 = cv('--ink-3', '#707780');
     const ink4 = cv('--ink-4', '#9298a1');
     const line = cv('--line', '#d9dde3');
     const lineSoft = cv('--line-soft', '#edf0f3');
     const glass = cv('--glass-strong', '#fff');
+    const stackTotals = new Map<string, number[]>();
+    let observedPeak = threshold?.value ?? 0;
+    for (const lineSeries of lines) {
+      if (lineSeries.stack) {
+        const totals = stackTotals.get(lineSeries.stack) ?? Array.from({ length: lineSeries.values.length }, () => 0);
+        lineSeries.values.forEach((value, index) => {
+          if (value !== null) totals[index] += Math.max(0, value);
+        });
+        stackTotals.set(lineSeries.stack, totals);
+        observedPeak = Math.max(observedPeak, ...totals);
+      } else {
+        observedPeak = lineSeries.values.reduce<number>(
+          (valuePeak, value) => (value === null ? valuePeak : Math.max(valuePeak, value)),
+          observedPeak,
+        );
+      }
+    }
+    const valueAxis = max === undefined ? observeValueAxis(observedPeak) : null;
     const labelAt = (index: number) => {
       const at = times[index];
       if (at === undefined) return '';
@@ -801,18 +844,15 @@ function HistoryChart({
       {
         animation: false,
         color: colors,
-        grid: { left: 58, right: 14, top: legend ? 36 : 14, bottom: 24 },
+        grid: {
+          left: 10,
+          right: 14,
+          top: variant === 'main' ? 12 : 10,
+          bottom: 10,
+          containLabel: true,
+        },
         textStyle: { fontFamily: TP_MONO },
-        legend: legend
-          ? {
-              top: 5,
-              left: 8,
-              right: 8,
-              itemWidth: 10,
-              itemHeight: 3,
-              textStyle: { color: ink3, fontSize: 9, fontFamily: TP_MONO },
-            }
-          : { show: false },
+        legend: { show: false },
         tooltip: {
           trigger: 'axis',
           confine: true,
@@ -821,20 +861,25 @@ function HistoryChart({
           borderWidth: 1,
           padding: [7, 9],
           textStyle: { color: ink3, fontSize: 11, fontFamily: TP_MONO },
-          axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' } },
+          extraCssText: 'border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); backdrop-filter:blur(8px);',
+          axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' }, z: 0 },
           formatter: (params: unknown) => {
             const rows = params as { seriesName: string; color: string; value: number | null; dataIndex: number }[];
-            const body = rows
+            const body = [...rows]
+              .sort(
+                (left, right) => (right.value ?? Number.NEGATIVE_INFINITY) - (left.value ?? Number.NEGATIVE_INFINITY),
+              )
               .map(row => {
                 const value = row.value === null ? '—' : formatValue(Number(row.value));
                 return (
-                  `<div style="display:flex;gap:8px;align-items:center;line-height:1.7">` +
-                  `<span style="width:8px;height:3px;background:${row.color}"></span>` +
-                  `<span>${row.seriesName}</span><b style="margin-left:auto;color:${ink}">${value}</b></div>`
+                  `<div style="display:flex;gap:7px;align-items:center;line-height:1.75">` +
+                  `<span style="width:8px;height:8px;border-radius:2px;background:${row.color};flex:none"></span>` +
+                  `<span style="color:${ink3}">${row.seriesName}</span>` +
+                  `<b style="margin-left:auto;color:${ink};font-weight:500">${value}</b></div>`
                 );
               })
               .join('');
-            return `<div style="color:${ink4};font-size:9px;margin-bottom:3px">${labelAt(rows[0]?.dataIndex ?? 0)}</div>${body}`;
+            return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${labelAt(rows[0]?.dataIndex ?? 0)}</div>${body}`;
           },
         },
         xAxis: {
@@ -843,45 +888,106 @@ function HistoryChart({
           boundaryGap: false,
           axisLine: { lineStyle: { color: line } },
           axisTick: { show: false },
+          splitLine: {
+            show: true,
+            interval: (index: number) => observeTimeTick(index, times.length),
+            lineStyle: { color: lineSoft, width: 1 },
+          },
           axisLabel: {
-            color: ink4,
-            fontSize: 8,
-            interval: (index: number) =>
-              index === 0 ||
-              index === times.length - 1 ||
-              [1, 2, 3].some(part => index === Math.round(((times.length - 1) * part) / 4)),
-            formatter: (_value: string, index: number) => labelAt(index).slice(0, 5),
+            color: ink3,
+            fontSize: 9.5,
+            margin: 8,
+            interval: (index: number) => observeTimeTick(index, times.length),
+            formatter: (_value: string, index: number) => {
+              if (index === times.length - 1) return '现在';
+              const seconds = Math.max(0, (times[times.length - 1] ?? 0) - (times[index] ?? 0));
+              if (seconds < 3600) return `−${Math.max(1, Math.round(seconds / 60))}m`;
+              return `−${Math.max(1, Math.round(seconds / 3600))}h`;
+            },
           },
         },
         yAxis: {
           type: 'value',
           min: 0,
+          max: max ?? valueAxis?.max,
+          interval: max === undefined ? valueAxis?.interval : undefined,
           scale: true,
           axisLine: { show: false },
           axisTick: { show: false },
-          axisLabel: { color: ink4, fontSize: 8, formatter: (value: number) => formatValue(value) },
-          splitLine: { lineStyle: { color: lineSoft } },
+          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (value: number) => formatValue(value) },
+          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
-        series: lines.map((series, index) => ({
-          name: series.name,
+        series: lines.map((lineSeries, index) => ({
+          name: lineSeries.name,
           type: 'line' as const,
+          symbol: 'circle',
+          symbolSize: 5,
           showSymbol: false,
           smooth: false,
           connectNulls: false,
-          lineStyle: { color: colors[index % colors.length], width: index === 0 ? 1.8 : 1.25 },
-          emphasis: { focus: 'series' as const },
-          data: series.values,
+          stack: lineSeries.stack,
+          stackStrategy: lineSeries.stack ? ('all' as const) : undefined,
+          areaStyle: { color: observeAreaFill(colors[index], themeName), opacity: 1 },
+          lineStyle: {
+            color: colors[index],
+            width: 1.1,
+            type: lineSeries.dashed ? ('dashed' as const) : ('solid' as const),
+            opacity: 1,
+          },
+          itemStyle: { color: colors[index], borderColor: glass, borderWidth: 1.5 },
+          emphasis: { disabled: true },
+          data: lineSeries.values,
+          markLine:
+            index === 0 && threshold
+              ? {
+                  silent: true,
+                  symbol: ['none', 'none'],
+                  label: {
+                    show: true,
+                    position: 'insideEndTop',
+                    formatter: threshold.label,
+                    color: cv('--err', '#bd4b4b'),
+                    fontSize: 8,
+                    fontFamily: TP_MONO,
+                  },
+                  lineStyle: { color: cv('--err', '#bd4b4b'), width: 1, type: 'dashed', opacity: 0.55 },
+                  data: [{ yAxis: threshold.value }],
+                }
+              : undefined,
         })),
       },
       true,
     );
-    echarts.connect(group);
-  }, [formatValue, group, legend, lines, paletteKey, samples, themeName, title]);
+    if (group) echarts.connect(group);
+  }, [formatValue, group, lines, max, paletteKey, samples, themeName, threshold, title, variant]);
+
+  const latest = (values: (number | null)[]) => {
+    for (let index = values.length - 1; index >= 0; index -= 1) {
+      if (values[index] !== null) return values[index];
+    }
+    return null;
+  };
 
   return (
-    <section className="history-chart-card">
-      <header>{title}</header>
+    <section className={`history-chart-card history-chart-card-${variant}${wide ? ' history-chart-card-wide' : ''}`}>
+      <header className="history-chart-cap">
+        <b>{title}</b>
+        {meta && <small>{meta}</small>}
+        {current && <strong>{current}</strong>}
+      </header>
       <div ref={elRef} className="history-chart" />
+      <footer className="history-chart-legend" aria-label={`${title} 图例`}>
+        {lines.map((line, index) => {
+          const value = latest(line.values);
+          const color = `var(${historyLineColorVar(line, index)})`;
+          return (
+            <span key={line.name} className={line.area ? 'area' : line.dashed ? 'dashed' : undefined}>
+              <i style={{ background: color }} />
+              {line.name} <b>{value === null ? '—' : formatValue(value)}</b>
+            </span>
+          );
+        })}
+      </footer>
     </section>
   );
 }
@@ -893,49 +999,81 @@ const CpuHistory = memo(function CpuHistory({
   report,
   label,
   windows,
+  linked,
 }: {
   report: NodeLoadView;
   label: string;
   windows: number;
+  linked: boolean;
 }) {
   const samples = report.series.slice(-windows);
-  const group = `nd-cpu-history-${report.node_id}`;
+  const group = linked ? `nd-cpu-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: CpuDetailSample) => number | null) =>
     sample.cpu_detail ? read(sample.cpu_detail) : null;
   const coreIds = Array.from(
     new Set(samples.flatMap(sample => sample.cpu_detail?.cores.map(core => core.cpu) ?? [])),
   ).sort((a, b) => a - b);
-  const coreLines = coreIds.map(cpu => ({
-    name: `CPU ${cpu}`,
-    values: historyValues(samples, sample => {
-      const core = sample.cpu_detail?.cores.find(value => value.cpu === cpu);
-      return core ? core.user_pct + core.system_pct + core.softirq_pct : null;
-    }),
-  }));
+  const last = samples[samples.length - 1];
+  const current =
+    last.cpu_user_pct +
+    last.cpu_sys_pct +
+    last.cpu_softirq_pct +
+    (last.cpu_detail?.iowait_pct ?? 0) +
+    last.cpu_steal_pct;
   return (
     <section className="observe-history" aria-label={`CPU ${label} 数值`}>
-      <header className="observe-history-head">
-        <span>
-          <b>CPU · {label}</b>
-          <small>
-            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个 30 秒窗口 · 缺口断线 ·
-            悬停查看绝对时间与原始值
-          </small>
-        </span>
-      </header>
-      <div className="history-grid">
+      <div className="history-primary">
         <HistoryChart
           title="CPU 时间占比"
           samples={samples}
           group={group}
           formatValue={value => pct(value, 1)}
+          variant="main"
+          current={pct(current, 0)}
+          meta={`窗口峰值 ${pct(last.cpu_peak_pct, 0)}`}
+          max={100}
+          threshold={{ value: CPU_PEAK_WARN, label: `${CPU_PEAK_WARN}% 峰值阈值` }}
           lines={[
-            { name: '用户态', values: historyValues(samples, sample => sample.cpu_user_pct) },
-            { name: '内核态', values: historyValues(samples, sample => sample.cpu_sys_pct) },
-            { name: 'SoftIRQ', values: historyValues(samples, sample => sample.cpu_softirq_pct) },
-            { name: 'IOwait', values: historyValues(samples, sample => detail(sample, value => value.iowait_pct)) },
-            { name: 'Steal', values: historyValues(samples, sample => sample.cpu_steal_pct) },
-            { name: '窗口峰值', values: historyValues(samples, sample => sample.cpu_peak_pct) },
+            {
+              name: '用户态',
+              color: '--observe-user',
+              stack: 'cpu',
+              area: true,
+              values: historyValues(samples, sample => sample.cpu_user_pct),
+            },
+            {
+              name: '内核态',
+              color: '--observe-system',
+              stack: 'cpu',
+              area: true,
+              values: historyValues(samples, sample => sample.cpu_sys_pct),
+            },
+            {
+              name: 'SoftIRQ',
+              color: '--observe-softirq',
+              stack: 'cpu',
+              area: true,
+              values: historyValues(samples, sample => sample.cpu_softirq_pct),
+            },
+            {
+              name: 'IOwait',
+              color: '--observe-iowait',
+              stack: 'cpu',
+              area: true,
+              values: historyValues(samples, sample => detail(sample, value => value.iowait_pct)),
+            },
+            {
+              name: 'Steal',
+              color: '--observe-steal',
+              stack: 'cpu',
+              area: true,
+              values: historyValues(samples, sample => sample.cpu_steal_pct),
+            },
+            {
+              name: '窗口峰值',
+              color: '--observe-peak',
+              values: historyValues(samples, sample => sample.cpu_peak_pct),
+            },
           ]}
         />
         <HistoryChart
@@ -943,21 +1081,27 @@ const CpuHistory = memo(function CpuHistory({
           samples={samples}
           group={group}
           formatValue={value => pct(value, 2)}
+          variant="secondary"
           lines={[
             {
               name: 'CPU PSI some',
+              color: '--observe-softirq',
               values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
             },
             {
               name: 'I/O PSI some',
+              color: '--observe-iowait',
               values: historyValues(samples, sample => detail(sample, value => value.io_pressure_some_pct)),
             },
             {
               name: 'I/O PSI full',
+              color: '--observe-steal',
               values: historyValues(samples, sample => detail(sample, value => value.io_pressure_full_pct)),
             },
           ]}
         />
+      </div>
+      <div className="history-grid">
         <HistoryChart
           title="负载与运行队列"
           samples={samples}
@@ -1007,14 +1151,20 @@ const CpuHistory = memo(function CpuHistory({
             },
           ]}
         />
-        {coreLines.length > 0 && (
+        {coreIds.length > 0 && (
           <HistoryChart
-            title={`逐核繁忙度 · ${coreLines.length} 核`}
+            title={`逐核繁忙度 · ${coreIds.length} 核`}
             samples={samples}
             group={group}
             formatValue={value => pct(value, 1)}
-            lines={coreLines}
-            legend={coreLines.length <= 16}
+            max={100}
+            lines={coreIds.map(cpu => ({
+              name: `CPU ${cpu}`,
+              values: historyValues(samples, sample => {
+                const core = sample.cpu_detail?.cores.find(value => value.cpu === cpu);
+                return core ? core.user_pct + core.system_pct + core.softirq_pct : null;
+              }),
+            }))}
           />
         )}
       </div>
@@ -1026,54 +1176,91 @@ const MemoryHistory = memo(function MemoryHistory({
   report,
   label,
   windows,
+  linked,
 }: {
   report: NodeLoadView;
   label: string;
   windows: number;
+  linked: boolean;
 }) {
   const samples = report.series.slice(-windows);
-  const group = `nd-memory-history-${report.node_id}`;
+  const group = linked ? `nd-memory-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: MemoryDetailSample) => number | null) =>
     sample.memory_detail ? read(sample.memory_detail) : null;
+  const last = samples[samples.length - 1];
+  const memTotal = report.host?.mem_total_bytes ?? 0;
   return (
     <section className="observe-history" aria-label={`内存 ${label} 数值`}>
-      <header className="observe-history-head">
-        <span>
-          <b>MEMORY · {label}</b>
-          <small>
-            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个窗口 ·
-            容量均为字节；交换、回收与缺页均为每个 30 秒窗口的增量
-          </small>
-        </span>
-      </header>
-      <div className="history-grid">
+      <div className="history-primary">
         <HistoryChart
           title="容量构成"
           samples={samples}
           group={group}
           formatValue={bytes}
+          variant="main"
+          current={`可用 ${bytes(last.mem_available_bytes)}`}
+          meta={last.memory_detail ? `窗口最低可用 ${bytes(last.memory_detail.available_min_bytes)}` : undefined}
+          max={memTotal > 0 ? memTotal : undefined}
+          threshold={memTotal > 0 ? { value: memTotal * 0.85, label: '可用 15% 阈值' } : undefined}
           lines={[
-            { name: '可用', values: historyValues(samples, sample => sample.mem_available_bytes) },
             {
-              name: '窗口最低可用',
-              values: historyValues(samples, sample => detail(sample, value => value.available_min_bytes)),
-            },
-            { name: '匿名页', values: historyValues(samples, sample => detail(sample, value => value.anon_bytes)) },
-            {
-              name: '文件缓存',
-              values: historyValues(samples, sample => detail(sample, value => value.file_cache_bytes)),
+              name: '匿名页',
+              color: '--observe-user',
+              stack: 'memory',
+              area: true,
+              values: historyValues(samples, sample => detail(sample, value => value.anon_bytes)),
             },
             {
               name: '共享/tmpfs',
+              color: '--observe-softirq',
+              stack: 'memory',
+              area: true,
               values: historyValues(samples, sample => detail(sample, value => value.shmem_bytes)),
             },
             {
               name: '内核/其他',
+              color: '--observe-iowait',
+              stack: 'memory',
+              area: true,
               values: historyValues(samples, sample => detail(sample, value => value.kernel_other_bytes)),
             },
-            { name: '空闲', values: historyValues(samples, sample => detail(sample, value => value.free_bytes)) },
+            {
+              name: '文件缓存',
+              color: '--observe-system',
+              stack: 'memory',
+              area: true,
+              values: historyValues(samples, sample => detail(sample, value => value.file_cache_bytes)),
+            },
+            {
+              name: '空闲',
+              color: '--observe-free',
+              stack: 'memory',
+              area: true,
+              values: historyValues(samples, sample => detail(sample, value => value.free_bytes)),
+            },
           ]}
         />
+        <HistoryChart
+          title="内存压力"
+          samples={samples}
+          group={group}
+          formatValue={value => pct(value, 2)}
+          variant="secondary"
+          lines={[
+            {
+              name: 'Memory PSI some',
+              color: '--observe-iowait',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
+            },
+            {
+              name: 'Memory PSI full',
+              color: '--observe-steal',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_full_pct)),
+            },
+          ]}
+        />
+      </div>
+      <div className="history-grid">
         <HistoryChart
           title="内核缓存与固定页"
           samples={samples}
@@ -1111,31 +1298,10 @@ const MemoryHistory = memo(function MemoryHistory({
               name: 'Swap cache',
               values: historyValues(samples, sample => detail(sample, value => value.swap_cached_bytes)),
             },
-            { name: 'Zswap', values: historyValues(samples, sample => detail(sample, value => value.zswap_bytes)) },
-            {
-              name: 'Zswapped',
-              values: historyValues(samples, sample => detail(sample, value => value.zswapped_bytes)),
-            },
             { name: 'Dirty', values: historyValues(samples, sample => detail(sample, value => value.dirty_bytes)) },
             {
               name: 'Writeback',
               values: historyValues(samples, sample => detail(sample, value => value.writeback_bytes)),
-            },
-          ]}
-        />
-        <HistoryChart
-          title="内存压力"
-          samples={samples}
-          group={group}
-          formatValue={value => pct(value, 2)}
-          lines={[
-            {
-              name: 'Memory PSI some',
-              values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
-            },
-            {
-              name: 'Memory PSI full',
-              values: historyValues(samples, sample => detail(sample, value => value.pressure_full_pct)),
             },
           ]}
         />
@@ -1174,47 +1340,81 @@ const DiskHistory = memo(function DiskHistory({
   report,
   label,
   windows,
+  linked,
 }: {
   report: NodeLoadView;
   label: string;
   windows: number;
+  linked: boolean;
 }) {
   const samples = report.series.slice(-windows);
   const host = report.host;
-  const group = `nd-disk-history-${report.node_id}`;
+  const group = linked ? `nd-disk-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: DiskDetailSample) => number | null) =>
     sample.disk_detail ? read(sample.disk_detail) : null;
   const total = (sample: LoadSample) => sample.disk_detail?.total_bytes ?? host?.disk_total_bytes ?? 0;
-  const identity = [host?.disk_device, host?.disk_filesystem, host?.disk_mount].filter(Boolean).join(' · ');
+  const last = samples[samples.length - 1];
+  const totalNow = total(last);
+  const diskUsed = totalNow > 0 ? Math.max(0, totalNow - last.disk_free_bytes) : null;
   return (
     <section className="observe-history" aria-label={`磁盘 ${label} 数值`}>
-      <header className="observe-history-head">
-        <span>
-          <b>DISK · {label}</b>
-          <small>
-            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个窗口
-            {identity && ` · ${identity}`}
-            {host?.disk_read_only === true && ' · 只读'}
-          </small>
-        </span>
-      </header>
-      <div className="history-grid">
+      <div className="history-primary">
         <HistoryChart
           title="容量"
           samples={samples}
           group={group}
           formatValue={bytes}
+          variant="main"
+          current={diskUsed === null ? '—' : pct((diskUsed / totalNow) * 100, 0)}
+          meta={`可用 ${bytes(last.disk_free_bytes)} · inode ${pct(100 - last.disk_inode_free_pct, 0)}`}
+          max={totalNow > 0 ? totalNow : undefined}
+          threshold={totalNow > 0 ? { value: totalNow * 0.9, label: '90% 容量阈值' } : undefined}
           lines={[
             {
               name: '已用',
+              color: '--observe-user',
+              stack: 'disk',
+              area: true,
               values: historyValues(samples, sample => {
                 const capacity = total(sample);
                 return capacity > 0 ? capacity - sample.disk_free_bytes : null;
               }),
             },
-            { name: '可用', values: historyValues(samples, sample => sample.disk_free_bytes) },
+            {
+              name: '可用',
+              color: '--observe-free',
+              stack: 'disk',
+              area: true,
+              values: historyValues(samples, sample => sample.disk_free_bytes),
+            },
           ]}
         />
+        <HistoryChart
+          title="设备繁忙与 I/O 压力"
+          samples={samples}
+          group={group}
+          formatValue={value => pct(value, 2)}
+          variant="secondary"
+          lines={[
+            {
+              name: '设备繁忙',
+              color: '--observe-user',
+              values: historyValues(samples, sample => detail(sample, value => value.busy_pct)),
+            },
+            {
+              name: 'I/O PSI some',
+              color: '--observe-iowait',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
+            },
+            {
+              name: 'I/O PSI full',
+              color: '--observe-steal',
+              values: historyValues(samples, sample => detail(sample, value => value.pressure_full_pct)),
+            },
+          ]}
+        />
+      </div>
+      <div className="history-grid">
         <HistoryChart
           title="容量与 inode"
           samples={samples}
@@ -1231,26 +1431,6 @@ const DiskHistory = memo(function DiskHistory({
             {
               name: 'inode 占用',
               values: historyValues(samples, sample => 100 - sample.disk_inode_free_pct),
-            },
-          ]}
-        />
-        <HistoryChart
-          title="inode"
-          samples={samples}
-          group={group}
-          formatValue={value => Math.round(value).toLocaleString()}
-          lines={[
-            {
-              name: '已用',
-              values: historyValues(samples, sample => {
-                const total = sample.disk_detail?.inode_total;
-                const free = sample.disk_detail?.inode_free;
-                return total != null && free != null ? Math.max(0, total - free) : null;
-              }),
-            },
-            {
-              name: '可用',
-              values: historyValues(samples, sample => sample.disk_detail?.inode_free ?? null),
             },
           ]}
         />
@@ -1291,23 +1471,6 @@ const DiskHistory = memo(function DiskHistory({
           ]}
         />
         <HistoryChart
-          title="设备繁忙与 I/O 压力"
-          samples={samples}
-          group={group}
-          formatValue={value => pct(value, 2)}
-          lines={[
-            { name: '设备繁忙', values: historyValues(samples, sample => detail(sample, value => value.busy_pct)) },
-            {
-              name: 'I/O PSI some',
-              values: historyValues(samples, sample => detail(sample, value => value.pressure_some_pct)),
-            },
-            {
-              name: 'I/O PSI full',
-              values: historyValues(samples, sample => detail(sample, value => value.pressure_full_pct)),
-            },
-          ]}
-        />
-        <HistoryChart
           title="队列"
           samples={samples}
           group={group}
@@ -1332,13 +1495,15 @@ const NetworkHistory = memo(function NetworkHistory({
   report,
   label,
   windows,
+  linked,
 }: {
   report: NodeLoadView;
   label: string;
   windows: number;
+  linked: boolean;
 }) {
   const samples = report.series.slice(-windows);
-  const group = `nd-network-history-${report.node_id}`;
+  const group = linked ? `nd-network-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: NetworkDetailSample) => number | null | undefined) =>
     sample.network_detail ? (read(sample.network_detail) ?? null) : null;
   const hasDeep = samples.some(sample => sample.network_detail);
@@ -1349,91 +1514,154 @@ const NetworkHistory = memo(function NetworkHistory({
     const occupied = read(value);
     return typeof occupied === 'number' ? (occupied / capacity) * 100 : null;
   };
-  const range =
-    report.host?.ephemeral_port_low != null && report.host.ephemeral_port_high != null
-      ? `${report.host.ephemeral_port_low}–${report.host.ephemeral_port_high}`
-      : null;
+  const last = samples[samples.length - 1];
+  const conntrackMax = report.host?.conntrack_max ?? null;
+  const socketPart = (sample: LoadSample, key: 'tcp_curr_estab' | 'tcp_time_wait' | 'tcp_orphan' | 'udp_inuse') =>
+    sample.network_detail?.[key] ?? null;
+  const otherConntrack = (sample: LoadSample) => {
+    if (sample.conntrack_count === null || !sample.network_detail) return null;
+    const known =
+      (sample.network_detail.tcp_curr_estab ?? 0) +
+      (sample.network_detail.tcp_time_wait ?? 0) +
+      (sample.network_detail.tcp_orphan ?? 0) +
+      (sample.network_detail.udp_inuse ?? 0);
+    return Math.max(0, sample.conntrack_count - known);
+  };
+  const hasPortPressure = samples.some(sample => sample.network_detail?.ephemeral_port_capacity != null);
   return (
     <section className="observe-history" aria-label={`网络 ${label} 数值`}>
-      <header className="observe-history-head">
-        <span>
-          <b>NETWORK · {label}</b>
-          <small>
-            已载入 {samples.length.toLocaleString()} / {windows.toLocaleString()} 个窗口 ·
-            连接数为窗口末快照；建立、重传、溢出与错误为每个 30 秒窗口的增量
-            {range && ` · 临时端口 ${range}`}
-            {report.host?.ephemeral_port_capacity != null &&
-              ` · 可用 ${report.host.ephemeral_port_capacity.toLocaleString()} · 最繁忙目标仅在节点内聚合，不上传地址`}
-          </small>
-        </span>
-      </header>
-      <div className="history-grid">
-        {samples.some(sample => sample.network_detail?.ephemeral_port_capacity != null) && (
-          <>
-            <HistoryChart
-              title="出站端口压力（估算）· 最繁忙目标"
-              samples={samples}
-              group={group}
-              formatValue={value => pct(value, 2)}
-              lines={[
-                {
-                  name: 'IPv4',
-                  values: historyValues(samples, sample =>
-                    pressure(sample, value => value.tcp_ephemeral_top_target_v4),
-                  ),
-                },
-                {
-                  name: 'IPv6',
-                  values: historyValues(samples, sample =>
-                    pressure(sample, value => value.tcp_ephemeral_top_target_v6),
-                  ),
-                },
-              ]}
-            />
-            <HistoryChart
-              title="出站临时端口套接字"
-              samples={samples}
-              group={group}
-              formatValue={value => compact(value)}
-              lines={[
-                {
-                  name: 'IPv4 范围内',
-                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_inuse_v4)),
-                },
-                {
-                  name: 'IPv4 TIME_WAIT',
-                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_time_wait_v4)),
-                },
-                {
-                  name: 'IPv6 范围内',
-                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_inuse_v6)),
-                },
-                {
-                  name: 'IPv6 TIME_WAIT',
-                  values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_time_wait_v6)),
-                },
-              ]}
-            />
-          </>
-        )}
+      <div className="history-primary">
         <HistoryChart
           title="连接与套接字"
           samples={samples}
           group={group}
           formatValue={value => compact(value)}
+          variant="main"
+          current={
+            last.conntrack_count === null || conntrackMax === null || conntrackMax <= 0
+              ? last.conntrack_count === null
+                ? '—'
+                : compact(last.conntrack_count)
+              : pct((last.conntrack_count / conntrackMax) * 100, 0)
+          }
+          meta={
+            last.conntrack_count === null
+              ? undefined
+              : `conntrack ${compact(last.conntrack_count)}${conntrackMax ? ` / ${compact(conntrackMax)}` : ''}`
+          }
+          max={conntrackMax && conntrackMax > 0 ? conntrackMax : undefined}
+          threshold={
+            conntrackMax && conntrackMax > 0 ? { value: conntrackMax * 0.8, label: 'conntrack 80%' } : undefined
+          }
           lines={[
-            { name: 'Conntrack', values: historyValues(samples, sample => sample.conntrack_count) },
             {
               name: 'TCP 已建立',
-              values: historyValues(samples, sample => detail(sample, value => value.tcp_curr_estab)),
+              color: '--observe-system',
+              stack: 'conntrack',
+              area: true,
+              values: historyValues(samples, sample => socketPart(sample, 'tcp_curr_estab')),
             },
-            { name: 'TCP in-use', values: historyValues(samples, sample => detail(sample, value => value.tcp_inuse)) },
             {
               name: 'TIME_WAIT',
-              values: historyValues(samples, sample => detail(sample, value => value.tcp_time_wait)),
+              color: '--observe-iowait',
+              stack: 'conntrack',
+              area: true,
+              values: historyValues(samples, sample => socketPart(sample, 'tcp_time_wait')),
             },
-            { name: 'TCP orphan', values: historyValues(samples, sample => detail(sample, value => value.tcp_orphan)) },
-            { name: 'UDP in-use', values: historyValues(samples, sample => detail(sample, value => value.udp_inuse)) },
+            {
+              name: 'TCP orphan',
+              color: '--observe-steal',
+              stack: 'conntrack',
+              area: true,
+              values: historyValues(samples, sample => socketPart(sample, 'tcp_orphan')),
+            },
+            {
+              name: 'UDP',
+              color: '--observe-softirq',
+              stack: 'conntrack',
+              area: true,
+              values: historyValues(samples, sample => socketPart(sample, 'udp_inuse')),
+            },
+            {
+              name: '其他',
+              color: '--observe-user',
+              stack: 'conntrack',
+              area: true,
+              values: historyValues(samples, otherConntrack),
+            },
+            ...(conntrackMax && conntrackMax > 0
+              ? [
+                  {
+                    name: '余量',
+                    color: '--observe-free',
+                    stack: 'conntrack',
+                    area: true,
+                    values: historyValues(samples, sample =>
+                      sample.conntrack_count === null ? null : Math.max(0, conntrackMax - sample.conntrack_count),
+                    ),
+                  },
+                ]
+              : []),
+          ]}
+        />
+        {hasPortPressure && (
+          <HistoryChart
+            title="出站端口压力（估算）· 最繁忙目标"
+            samples={samples}
+            group={group}
+            formatValue={value => pct(value, 2)}
+            variant="secondary"
+            max={100}
+            lines={[
+              {
+                name: 'IPv4',
+                color: '--observe-user',
+                values: historyValues(samples, sample => pressure(sample, value => value.tcp_ephemeral_top_target_v4)),
+              },
+              {
+                name: 'IPv6',
+                color: '--observe-softirq',
+                values: historyValues(samples, sample => pressure(sample, value => value.tcp_ephemeral_top_target_v6)),
+              },
+            ]}
+          />
+        )}
+      </div>
+      <div className="history-grid">
+        {hasPortPressure && (
+          <HistoryChart
+            title="出站临时端口套接字"
+            samples={samples}
+            group={group}
+            formatValue={value => compact(value)}
+            lines={[
+              {
+                name: 'IPv4 范围内',
+                values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_inuse_v4)),
+              },
+              {
+                name: 'IPv4 TIME_WAIT',
+                values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_time_wait_v4)),
+              },
+              {
+                name: 'IPv6 范围内',
+                values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_inuse_v6)),
+              },
+              {
+                name: 'IPv6 TIME_WAIT',
+                values: historyValues(samples, sample => detail(sample, value => value.tcp_ephemeral_time_wait_v6)),
+              },
+            ]}
+          />
+        )}
+        <HistoryChart
+          title="连接快照"
+          samples={samples}
+          group={group}
+          formatValue={value => compact(value)}
+          lines={[
+            { name: 'Conntrack', values: historyValues(samples, sample => sample.conntrack_count) },
+            { name: 'TCP in-use', values: historyValues(samples, sample => detail(sample, value => value.tcp_inuse)) },
           ]}
         />
         {hasDeep && (
@@ -1575,6 +1803,17 @@ function sampleWindow(sample: LoadSample): string {
   return seconds === 30 ? '最近 30 秒' : `实际窗口 ${dur(seconds)}`;
 }
 
+function uptimeLabel(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(whole / 86_400);
+  const hours = Math.floor((whole % 86_400) / 3_600);
+  const minutes = Math.floor((whole % 3_600) / 60);
+  if (days > 0) return `${days} 天 ${hours} 小时`;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
+  if (minutes > 0) return `${minutes} 分钟`;
+  return '不足 1 分钟';
+}
+
 const compact = (value: number): string => {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
@@ -1583,16 +1822,14 @@ const compact = (value: number): string => {
 
 const LoadDashboard = memo(function LoadDashboard({
   report,
-  reportedAt,
-  stale,
   historyLabel,
   historyWindows,
+  linked,
 }: {
   report: NodeLoadView;
-  reportedAt: number | null;
-  stale: boolean;
   historyLabel: string;
   historyWindows: number;
+  linked: boolean;
 }) {
   const series = report.series;
   const last = series[series.length - 1];
@@ -1610,7 +1847,7 @@ const LoadDashboard = memo(function LoadDashboard({
   const diskNow = disk(last);
   const drops = last.nic_rx_drop + last.nic_tx_drop + last.nic_err;
   // 与 usage 对齐的 30 秒窗口；缺口断开，历史不足选定范围时左侧补 null。
-  const group = `nd-tp-${report.node_id}`;
+  const group = linked ? `nd-tp-${report.node_id}` : undefined;
   const tail = series.slice(-historyWindows);
   const pad = historyWindows - tail.length;
   const rxData: (number | null)[] = [
@@ -1621,11 +1858,18 @@ const LoadDashboard = memo(function LoadDashboard({
     ...Array<number | null>(pad).fill(null),
     ...tail.map(s => (s.has_gap ? null : s.nic_tx_bps)),
   ];
-  const [upNum, upUnit] = dur(last.uptime_secs).split(' ');
+  const uptime = uptimeLabel(last.uptime_secs);
   const ctMax = host?.conntrack_max ?? null;
   const ctRatio = last.conntrack_count !== null && ctMax !== null && ctMax > 0 ? last.conntrack_count / ctMax : null;
   const hasNetworkHistory = series.some(sample => sample.conntrack_count !== null || sample.network_detail);
   const window = sampleWindow(last);
+  const networkMeta = [
+    last.nic_rx_drop > 0 ? `接收丢弃 ${last.nic_rx_drop.toLocaleString()}` : null,
+    last.nic_tx_drop > 0 ? `发送丢弃 ${last.nic_tx_drop.toLocaleString()}` : null,
+    last.nic_err > 0 ? `网卡错误 ${last.nic_err.toLocaleString()}` : null,
+    host?.nic ?? null,
+    typeof host?.nic_mtu === 'number' ? `MTU ${host.nic_mtu}` : null,
+  ].filter((value): value is string => value !== null);
 
   return (
     <>
@@ -1687,18 +1931,6 @@ const LoadDashboard = memo(function LoadDashboard({
           </span>
           <Spark series={series} valueOf={disk} percent />
         </button>
-        <div className="kpi">
-          <span className="kpi-l">Load 1m</span>
-          <span className="kpi-v">{last.load1.toFixed(2)}</span>
-          <Spark series={series} valueOf={sample => sample.load1} />
-        </div>
-        <div className="kpi">
-          <span className="kpi-l">已运行</span>
-          <span className="kpi-v">
-            {upNum}
-            <small>{upUnit}</small>
-          </span>
-        </div>
         <button
           type="button"
           className={`kpi kpi-expand ${openDetail === 'network' ? 'open' : ''}`}
@@ -1714,31 +1946,49 @@ const LoadDashboard = memo(function LoadDashboard({
           </span>
           <Spark series={series} valueOf={sample => sample.conntrack_count} />
         </button>
+        <div className="kpi">
+          <span className="kpi-l">Load 1m</span>
+          <span className="kpi-v">{last.load1.toFixed(2)}</span>
+          <Spark series={series} valueOf={sample => sample.load1} />
+        </div>
+        <div className="kpi">
+          <span className="kpi-l">已运行</span>
+          <span className="kpi-v kpi-uptime">{uptime}</span>
+        </div>
       </div>
 
       {openDetail === 'cpu' && last.cpu_detail && (
-        <CpuHistory report={report} label={historyLabel} windows={historyWindows} />
+        <CpuHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
       )}
       {openDetail === 'memory' && last.memory_detail && (
-        <MemoryHistory report={report} label={historyLabel} windows={historyWindows} />
+        <MemoryHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
       )}
       {openDetail === 'disk' && last.disk_detail && (
-        <DiskHistory report={report} label={historyLabel} windows={historyWindows} />
+        <DiskHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
       )}
       {openDetail === 'network' && hasNetworkHistory && (
-        <NetworkHistory report={report} label={historyLabel} windows={historyWindows} />
+        <NetworkHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
       )}
 
       {/* 卡框沿用 .chart-card（即原 .load-network 的卡框语言），图区交给 echarts。 */}
       <section className="chart-card">
         <div className="load-network-cap">
-          <b>NETWORK THROUGHPUT</b>
-          <span className={stale ? 'stale' : undefined}>
-            <Ago at={reportedAt === null ? null : iso(reportedAt)} />
-            {stale ? ' · 数据不新了' : ' 上报'} · {window}
-          </span>
+          <b>网卡流量</b>
+          {networkMeta.length > 0 && (
+            <span
+              className={drops > 0 ? 'hot' : undefined}
+              title={
+                drops > 0
+                  ? `${window}增量。接收丢弃可能包含 802.2/LLC 等二层控制帧，不等同于业务链路丢包；不是开机累计值`
+                  : undefined
+              }
+            >
+              {networkMeta.join(' · ')}
+            </span>
+          )}
         </div>
-        <div className="load-network-legend">
+        <ThroughputChart rx={rxData} tx={txData} rxName="接收" txName="发送" group={group} />
+        <footer className="load-network-legend" aria-label="网卡流量图例">
           <span className="rx">
             <i />
             接收 <b>{bps(last.nic_rx_bps)}</b>
@@ -1747,29 +1997,7 @@ const LoadDashboard = memo(function LoadDashboard({
             <i />
             发送 <b>{bps(last.nic_tx_bps)}</b>
           </span>
-          <span className="sp" />
-          {drops > 0 && (
-            <span
-              className="hot"
-              title={`${window}增量：接收丢弃 ${last.nic_rx_drop}，发送丢弃 ${last.nic_tx_drop}，网卡错误 ${last.nic_err}。接收丢弃可能包含 802.2/LLC 等二层控制帧，不等同于业务链路丢包；不是开机累计值`}
-            >
-              {[
-                last.nic_rx_drop > 0 ? `接收丢弃 ${last.nic_rx_drop.toLocaleString()}` : null,
-                last.nic_tx_drop > 0 ? `发送丢弃 ${last.nic_tx_drop.toLocaleString()}` : null,
-                last.nic_err > 0 ? `网卡错误 ${last.nic_err.toLocaleString()}` : null,
-              ]
-                .filter(Boolean)
-                .join(' · ')}
-            </span>
-          )}
-          {host && (
-            <span className="mono">
-              {host.nic}
-              {typeof host.nic_mtu === 'number' && ` · MTU ${host.nic_mtu}`}
-            </span>
-          )}
-        </div>
-        <ThroughputChart rx={rxData} tx={txData} rxName="接收" txName="发送" group={group} />
+        </footer>
       </section>
     </>
   );
@@ -1780,153 +2008,28 @@ export function LoadCard({
   xrayChart,
   historyLabel = '30 MINUTES',
   historyWindows = LOAD_SLOTS,
+  linked = false,
 }: {
   report: NodeLoadView;
   xrayChart?: ReactNode;
   historyLabel?: string;
   historyWindows?: number;
+  linked?: boolean;
 }) {
-  // 计时器需要在提前 return 之前获取（hook 不能有条件地跳过），也不能在渲染中直接调用
-  // Date.now()：该调用不是纯函数，同一次渲染的两处会得到不同的值。
-  const now = useNow();
-  const [showProcs, setShowProcs] = useState(false);
-  const reportedAt = report.reported_at_unix_secs;
-  const stale = reportedAt !== null && now / 1000 - reportedAt > STALE_SECS;
-  const head = (
-    <header>
-      <h4>LOAD</h4>
-      <span className="sp" />
-      <span className={stale ? 'hint stale' : 'hint'}>
-        <Ago at={reportedAt === null ? null : iso(reportedAt)} />
-        {stale ? ' · 数据不新了' : ' 上报'}
-      </span>
-    </header>
-  );
-
   if (report.series.length === 0) {
     return (
-      <div className="panel">
-        {head}
+      <div className="panel" aria-label="观测数据为空">
         <p className="note">还没有负载读数。</p>
       </div>
     );
   }
 
-  const last = report.series[report.series.length - 1];
-  // 低频变量位于 host 中，不在每个窗口内。缺失只可能是某一轮上报被中断，下一轮即完整——
-  // 因此此处大量使用 `?.`，而不用零参与比例计算（分母为零得出的百分比会触发一批误报）。
-  const host = report.host;
-  // 标量事实保留在趋势总览下方；磁盘已在上方同时显示占用率和剩余量，不在信息带重复。
-  const ctMax = host?.conntrack_max ?? null;
-  const ctRatio = last.conntrack_count !== null && ctMax !== null && ctMax > 0 ? last.conntrack_count / ctMax : null;
-
-  const xray = report.processes.find(p => p.proc === 'xray');
-  const open = showProcs;
-
   return (
     <div className="load-cluster">
-      <LoadDashboard
-        report={report}
-        reportedAt={reportedAt}
-        stale={stale}
-        historyLabel={historyLabel}
-        historyWindows={historyWindows}
-      />
+      <LoadDashboard report={report} historyLabel={historyLabel} historyWindows={historyWindows} linked={linked} />
       {/* XRAY 承载曲线紧跟 NETWORK 之后（两者时间轴一致、联动十字线）；数据来自 usage，
           由 nodes.tsx 组装后经 xrayChart 传入，本卡只负责把它放在正确的位置。 */}
       {xrayChart}
-
-      {/* 没有时序意义的标量项集中在一条信息带内。 */}
-      <div className="load-host-strip">
-        <div className="tfacts">
-          <span>
-            连接表{' '}
-            {ctRatio === null ? (
-              // 未加载 nf_conntrack 不是故障，而是该机器未配置 NAT。显示「—」会被理解为读取失败。
-              <b className="dim">没开</b>
-            ) : (
-              <>
-                <b>{pct(ctRatio * 100, 1)}</b>
-                <span className="dim"> · {(last.conntrack_count as number).toLocaleString()} 条</span>
-              </>
-            )}
-          </span>
-          <span>
-            已运行 <b>{dur(last.uptime_secs)}</b>
-          </span>
-          {host?.cc_algo && (
-            <span>
-              拥塞 <b>{host.cc_algo}</b>
-              <span className="dim"> · {host.nic_qdisc || '?'}</span>
-            </span>
-          )}
-        </div>
-        {/* ── 进程 ──
-            区分机器整体负载高和本系统进程负载高，该区分决定后续是扩容还是排查本系统。
-            正常时和主机事实共用一条信息带，不再额外制造一层卡片。 */}
-        {!open && (
-          <button type="button" className="tproc-fold" onClick={() => setShowProcs(true)}>
-            <i className="lamp ok" />
-            <span>
-              {report.processes.filter(p => p.started_at_unix_secs !== null || p.proc === 'wg').length} 个进程都正常
-            </span>
-            {xray?.rss_bytes != null && (
-              <span className="mono dim">
-                xray {bytes(xray.rss_bytes)}
-                {xray.fds !== null && ` · ${xray.fds} fd`}
-              </span>
-            )}
-            <span className="sp" />
-            <span className="dim">展开</span>
-          </button>
-        )}
-      </div>
-
-      {open && (
-        <div className="load-process-panel">
-          <table className="t tproc">
-            <thead>
-              <tr>
-                <th>进程</th>
-                <th className="d2">内存</th>
-                <th className="d2">CPU</th>
-                <th className="d2">fd</th>
-                <th>起于</th>
-              </tr>
-            </thead>
-            <tbody>
-              {report.processes.map(p => (
-                <tr key={p.proc}>
-                  <td className="mono">{PROC_LABEL[p.proc]}</td>
-                  <td className="d2 mono">
-                    {p.rss_bytes === null ? <span className="dim">—</span> : bytes(p.rss_bytes)}
-                  </td>
-                  <td className="d2 mono">{p.cpu_pct === null ? <span className="dim">—</span> : pct(p.cpu_pct, 1)}</td>
-                  <td className="d2 mono">
-                    {p.fds === null ? (
-                      <span className="dim">—</span>
-                    ) : (
-                      // 分母显示实际数值。`512k` 是由 524287 近似得到的整数，与 ulimit 中的值不符，
-                      // 而调整该上限时需要的正是实际值。
-                      <span>
-                        {p.fds.toLocaleString()}
-                        {p.fd_limit && <span className="dim"> / {p.fd_limit.toLocaleString()}</span>}
-                      </span>
-                    )}
-                  </td>
-                  <td className="d2">
-                    {p.started_at_unix_secs === null ? (
-                      <span className="dim">{p.proc === 'wg' ? '内核模块' : '没在跑'}</span>
-                    ) : (
-                      <span className="mono">{dur(Math.floor(now / 1000) - p.started_at_unix_secs)}前</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
     </div>
   );
 }

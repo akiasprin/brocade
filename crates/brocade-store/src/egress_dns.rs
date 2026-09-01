@@ -1,8 +1,7 @@
 //! Machine-owned Xray DNS policies.
 //!
-//! The resolver is stored once per node and selector. A chain egress rule may activate that
-//! selector, but the policy remains global to the machine's Xray instance and is never copied
-//! into a chain.
+//! The resolver is stored once per node and selector. Every stored policy is emitted to that
+//! machine's Xray instance and is never copied into, activated by, or owned by a chain.
 
 use std::net::IpAddr;
 
@@ -37,7 +36,7 @@ pub(crate) fn model_policies(policies: &[StoredPolicy]) -> Vec<NodeEgressDnsPoli
 }
 
 /// Write the machine policy directly. Route-table writes deliberately do not call this: a chain
-/// may activate a selector, but it does not own the resolver or its lifetime.
+/// can provide an editing entry point, but it does not own the resolver or its lifetime.
 pub(crate) async fn set_policy_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,

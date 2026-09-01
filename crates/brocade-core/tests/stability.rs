@@ -363,10 +363,7 @@ fn step(chain: &str, node: &str, rules: Vec<Rule>, accept: Option<Accept>) -> St
 fn any_egress() -> Rule {
     Rule {
         dest_match: DestMatch::Any,
-        action: Action::Egress {
-            send_through: None,
-            dns: false,
-        },
+        action: Action::Egress { send_through: None },
     }
 }
 

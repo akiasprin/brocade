@@ -197,6 +197,31 @@ interface RuleDraftBus {
 
 const RuleDraftCtx = createContext<RuleDraftBus | null>(null);
 
+function DraftSaveToolbar({
+  hint,
+  status,
+  saving,
+  canSave,
+  onSave,
+}: {
+  hint?: string;
+  status: string;
+  saving: boolean;
+  canSave: boolean;
+  onSave: () => void;
+}) {
+  return (
+    <div className="toolbar">
+      {hint && <span className="note">{hint}</span>}
+      <span className="sp" />
+      <span className="note">{status}</span>
+      <button className="btn primary" disabled={saving || !canSave} onClick={onSave}>
+        {saving ? '保存中…' : '保存到草稿'}
+      </button>
+    </div>
+  );
+}
+
 export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?: string }) {
   // Registration order is structural (entry first, downstream later), while each editor's draft
   // changes on every keystroke. Keep the order and the current value together in React state:
@@ -344,14 +369,13 @@ export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?:
           )}
         </div>
       )}
-      <div className="toolbar">
-        {hint && <span className="note">{hint}</span>}
-        <span className="sp" />
-        <span className="note">{pending.length === 0 ? '没有待保存的改动' : `${pending.length} 项配置有改动`}</span>
-        <button className="btn primary" disabled={saving || pending.length === 0} onClick={() => void saveAll()}>
-          {saving ? '保存中…' : '保存到草稿'}
-        </button>
-      </div>
+      <DraftSaveToolbar
+        hint={hint}
+        status={pending.length === 0 ? '没有待保存的改动' : `${pending.length} 项配置有改动`}
+        saving={saving}
+        canSave={pending.length > 0}
+        onSave={() => void saveAll()}
+      />
     </RuleDraftCtx.Provider>
   );
 }
@@ -406,7 +430,7 @@ function MachineEgressDnsControls({
   nodeName,
   accessibleSuffix = '',
   showChoice = true,
-  removalBlockedReason,
+  showEditor = true,
 }: {
   resolution: EgressDnsResolution | null;
   supported: boolean;
@@ -415,7 +439,7 @@ function MachineEgressDnsControls({
   nodeName: string;
   accessibleSuffix?: string;
   showChoice?: boolean;
-  removalBlockedReason?: string;
+  showEditor?: boolean;
 }) {
   const previousCustom = useRef<EgressDnsResolution | null>(resolution);
   useEffect(() => {
@@ -429,26 +453,22 @@ function MachineEgressDnsControls({
           className="f egress-dns-choice"
           aria-label={label('DNS 解析方式')}
           value={resolution ? 'custom' : 'machine'}
-          title={
-            removalBlockedReason ?? (supported ? `修改 ${nodeName} 的机器 DNS 策略` : '自定义 DNS 只支持域名类规则')
-          }
+          title={supported ? `修改 ${nodeName} 的机器 DNS 策略` : '自定义 DNS 只支持域名类规则'}
           onChange={event =>
             onChange(event.target.value === 'custom' ? (previousCustom.current ?? newEgressDns()) : null)
           }
         >
-          <option value="machine" disabled={!!removalBlockedReason}>
-            默认 DNS 解析
-          </option>
+          <option value="machine">默认 DNS 解析</option>
           <option value="custom" disabled={!supported}>
             自定义 DNS 解析
           </option>
         </select>
       )}
-      {resolution && supported && (
+      {showEditor && resolution && supported && (
         <span className="egress-dns-editor">
           <span className="egress-dns-endpoint">
             <input
-              className="f mono"
+              className="f mono egress-dns-address"
               aria-label={label('DNS 地址')}
               title="DNS 地址"
               value={resolution.address}
@@ -458,7 +478,7 @@ function MachineEgressDnsControls({
             />
             <i>:</i>
             <input
-              className="f mono"
+              className="f mono egress-dns-port"
               aria-label={label('端口')}
               title="端口"
               type={readOnly ? 'text' : 'number'}
@@ -517,7 +537,7 @@ function MachineEgressDnsControls({
             <option value="machine">回退机器 DNS</option>
           </select>
           <span className="egress-dns-note">
-            <b>机器全局</b> · {nodeName}
+            <b>Xray 全局生效</b> · {nodeName}
           </span>
         </span>
       )}
@@ -529,92 +549,133 @@ const matchValues = (m: DestMatch): string => ('v' in m ? (Array.isArray(m.v) ? 
 
 const isAnyRule = (rule: Rule): boolean => rule.m.t === 'any';
 
+type MachineDnsDraftRow = {
+  id: string;
+  originalSelector: DestMatch | null;
+  selector: DestMatch;
+  resolution: EgressDnsResolution | null;
+};
+
 /** 机器详情页中的机器级 DNS 策略。它不属于任何一条链，所以单独读取并写入
- * `node_egress_dns`；把它塞进某张链表单会重新制造已经移除的链路所有权。 */
+ * `node_egress_dns`；保存后始终进入这台机器的 Xray 配置。 */
 export function MachineEgressDnsRules({
   nodeId,
   nodeName,
   readOnly = false,
+  showHeader = false,
 }: {
   nodeId: string;
   nodeName: string;
   readOnly?: boolean;
+  showHeader?: boolean;
 }) {
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
-  const [overrides, setOverrides] = useState<EgressDnsDraft>({});
-  const [order, setOrder] = useState<EgressDnsOrderDraft>(null);
-
   const policies = sortedDnsPolicies((snapshot.data?.node_egress_dns ?? []).filter(policy => policy.node === nodeId));
-  const referencesFor = (selector: DestMatch): string[] =>
-    (snapshot.data?.snapshot.apps ?? []).flatMap(app =>
-      app.steps.flatMap(step => {
-        if (step.node !== nodeId) return [];
-        const referenced = step.rules.some(
-          rule =>
-            rule.a.t === 'egress' &&
-            rule.a.dns === true &&
-            egressDnsSelectorKey(rule.m) === egressDnsSelectorKey(selector),
-        );
-        if (!referenced) return [];
-        const chain = app.chains.find(candidate => candidate.id === step.chain);
-        return [`${app.label || app.id} / ${chain?.name || step.chain}`];
-      }),
-    );
-  const displayedPolicies = orderedDnsPolicies(policies, order);
-  const storedFor = (selector: DestMatch): EgressDnsResolution | null =>
-    policies.find(policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector))?.resolution ??
-    null;
-  const effectiveFor = (selector: DestMatch): EgressDnsResolution | null => {
-    const override = overrides[egressDnsSelectorKey(selector)];
-    return override ? override.resolution : storedFor(selector);
-  };
-  const patch = (selector: DestMatch, resolution: EgressDnsResolution | null) => {
-    const key = egressDnsSelectorKey(selector);
-    setOverrides(current => {
-      const next = { ...current };
-      if (JSON.stringify(resolution) === JSON.stringify(storedFor(selector))) delete next[key];
-      else next[key] = { selector, resolution };
-      return next;
-    });
-  };
-  const changes = Object.values(overrides).filter(
-    change => JSON.stringify(change.resolution) !== JSON.stringify(storedFor(change.selector)),
+  const rowsFromPolicies = (): MachineDnsDraftRow[] =>
+    policies.map(policy => ({
+      id: `stored:${egressDnsSelectorKey(policy.selector)}`,
+      originalSelector: policy.selector,
+      selector: policy.selector,
+      resolution: policy.resolution,
+    }));
+  const [rows, setRows] = useState<MachineDnsDraftRow[] | null>(null);
+  const nextRowId = useRef(1);
+  const displayedRows = rows ?? rowsFromPolicies();
+  const activeRows = displayedRows.filter(
+    (row): row is MachineDnsDraftRow & { resolution: EgressDnsResolution } => row.resolution !== null,
   );
-  const orderDirty =
-    displayedPolicies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0') !==
-    policies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0');
-  const movePolicy = (selector: DestMatch, delta: number) => {
-    const index = displayedPolicies.findIndex(
-      policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector),
+  const selectorCounts = new Map<string, number>();
+  for (const row of activeRows) {
+    const key = egressDnsSelectorKey(row.selector);
+    selectorCounts.set(key, (selectorCounts.get(key) ?? 0) + 1);
+  }
+  const rowReady = (row: MachineDnsDraftRow): boolean =>
+    row.resolution === null ||
+    Boolean(
+      matchValues(row.selector).trim() &&
+      row.resolution.address.trim() &&
+      row.resolution.port >= 1 &&
+      row.resolution.port <= 65535 &&
+      selectorCounts.get(egressDnsSelectorKey(row.selector)) === 1,
     );
+  const baselineSignature = policies
+    .map(policy => `${egressDnsSelectorKey(policy.selector)}\0${JSON.stringify(policy.resolution)}`)
+    .join('\u0001');
+  const currentSignature = activeRows
+    .map(row => `${egressDnsSelectorKey(row.selector)}\0${JSON.stringify(row.resolution)}`)
+    .join('\u0001');
+  const selectorListDirty =
+    activeRows.map(row => egressDnsSelectorKey(row.selector)).join('\0') !==
+    policies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0');
+  const dirty = rows !== null && currentSignature !== baselineSignature;
+  const changedRows = rows
+    ? displayedRows.filter(row => {
+        if (!row.originalSelector) return row.resolution !== null;
+        const stored = policies.find(
+          policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(row.originalSelector!),
+        );
+        return (
+          row.resolution === null ||
+          egressDnsSelectorKey(row.selector) !== egressDnsSelectorKey(row.originalSelector) ||
+          JSON.stringify(row.resolution) !== JSON.stringify(stored?.resolution)
+        );
+      }).length
+    : 0;
+  const retainedOriginalOrder = activeRows.flatMap(row =>
+    row.originalSelector ? [egressDnsSelectorKey(row.originalSelector)] : [],
+  );
+  const retainedSet = new Set(retainedOriginalOrder);
+  const baselineRetainedOrder = policies
+    .map(policy => egressDnsSelectorKey(policy.selector))
+    .filter(key => retainedSet.has(key));
+  const orderDirty = retainedOriginalOrder.join('\0') !== baselineRetainedOrder.join('\0');
+  const updateRow = (id: string, patch: (row: MachineDnsDraftRow) => MachineDnsDraftRow) =>
+    setRows(current => (current ?? rowsFromPolicies()).map(row => (row.id === id ? patch(row) : row)));
+  const removeNewRow = (id: string) => setRows(current => (current ?? rowsFromPolicies()).filter(row => row.id !== id));
+  const movePolicy = (id: string, delta: number) => {
+    const current = rows ?? rowsFromPolicies();
+    const index = current.findIndex(row => row.id === id);
     const target = index + delta;
-    if (index < 0 || target < 0 || target >= displayedPolicies.length) return;
-    const next = displayedPolicies.map(policy => policy.selector);
+    if (index < 0 || target < 0 || target >= current.length) return;
+    const next = [...current];
     [next[index], next[target]] = [next[target], next[index]];
-    setOrder(next);
+    setRows(next);
   };
   const save = useMutation({
     mutationFn: async () => {
-      for (const change of changes) await setNodeEgressDns(nodeId, change.selector, change.resolution);
-      if (orderDirty) {
-        const selectors = displayedPolicies
-          .filter(policy => effectiveFor(policy.selector) !== null)
-          .map(policy => policy.selector);
-        for (const change of changes) {
-          if (
-            change.resolution &&
-            !selectors.some(selector => egressDnsSelectorKey(selector) === egressDnsSelectorKey(change.selector))
-          ) {
-            selectors.push(change.selector);
-          }
+      if (!rows || !dirty || !rows.every(rowReady)) return;
+      for (const row of rows) {
+        if (
+          row.originalSelector &&
+          (row.resolution === null || egressDnsSelectorKey(row.originalSelector) !== egressDnsSelectorKey(row.selector))
+        ) {
+          await setNodeEgressDns(nodeId, row.originalSelector, null);
         }
-        await reorderNodeEgressDns(nodeId, selectors);
+      }
+      for (const row of activeRows) {
+        const stored = row.originalSelector
+          ? policies.find(
+              policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(row.originalSelector!),
+            )
+          : null;
+        if (
+          !stored ||
+          egressDnsSelectorKey(stored.selector) !== egressDnsSelectorKey(row.selector) ||
+          JSON.stringify(stored.resolution) !== JSON.stringify(row.resolution)
+        ) {
+          await setNodeEgressDns(nodeId, row.selector, row.resolution);
+        }
+      }
+      if (selectorListDirty) {
+        await reorderNodeEgressDns(
+          nodeId,
+          activeRows.map(row => row.selector),
+        );
       }
     },
     onSuccess: () => {
-      setOverrides({});
-      setOrder(null);
+      setRows(null);
       qc.invalidateQueries({ queryKey: ['snapshot'] });
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
@@ -623,84 +684,162 @@ export function MachineEgressDnsRules({
 
   if (snapshot.error) return <ErrorBox error={snapshot.error} />;
   return (
-    <fieldset className="node-egress-rules rule-ro" disabled={readOnly}>
-      <p className="note node-egress-dns-limit">
-        Xray 在一台机器内共用一个 DNS 实例。链路出站的“引用”只决定策略是否下发；任一出站引用后，
-        所有匹配该域名条件的解析都会使用它，不能用 tag 隔离同一域名的不同 DNS。
-      </p>
-      {policies.length === 0 ? (
-        <p className="note node-rules-empty">这台机器没有自定义 DNS 策略。请在链路的落地规则中创建并引用。</p>
-      ) : (
-        <table className="tbl node-egress-rules-table">
-          <tbody>
-            {displayedPolicies.map((policy, index) => {
-              const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
-              const value = matchValues(policy.selector);
-              const suffix = `（${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`;
-              const references = referencesFor(policy.selector);
-              const removalBlockedReason =
-                references.length > 0
-                  ? `仍被 ${references.length} 条链路出站引用，请先在链路规则中取消引用`
-                  : undefined;
-              return (
-                <tr key={egressDnsSelectorKey(policy.selector)}>
-                  <td className="mono dim" style={{ width: 24 }}>
-                    D{index + 1}
-                  </td>
-                  <td className="rule-match-cell">
-                    <span className="f rule-readonly-select">{kind?.label ?? policy.selector.t}</span>
-                    {value && <span className="f rule-readonly-value">{value}</span>}
-                  </td>
-                  <td className="rule-action-cell">
-                    <MachineEgressDnsControls
-                      key={egressDnsSelectorKey(policy.selector)}
-                      resolution={effectiveFor(policy.selector)}
-                      supported
-                      onChange={next => patch(policy.selector, next)}
-                      readOnly={readOnly}
-                      nodeName={nodeName}
-                      accessibleSuffix={suffix}
-                      removalBlockedReason={removalBlockedReason}
-                    />
-                    <span className="egress-dns-usage" title={references.join('\n')}>
-                      {references.length > 0 ? `${references.length} 条出站引用` : '未引用 · 不下发'}
-                    </span>
-                  </td>
-                  <td className="dns-priority-cell">
-                    <DnsPriorityControl
-                      index={index}
-                      count={displayedPolicies.length}
-                      label={`${kind?.label ?? policy.selector.t} ${value}`.trim()}
-                      readOnly={readOnly}
-                      showLabel={false}
-                      onMove={delta => movePolicy(policy.selector, delta)}
-                    />
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
-      {!readOnly && policies.length > 0 && (
-        <div className="toolbar node-egress-rules-foot">
-          <span className="note">
-            {changes.length === 0 && !orderDirty
-              ? '没有待保存的改动'
-              : `${changes.length} 条策略有改动${orderDirty ? '，DNS 优先级已调整' : ''}`}
+    <>
+      {showHeader && (
+        <header>
+          <h4>DNS 解析策略</h4>
+          <span
+            className="rule-sheet-meta"
+            title="Xray 按 D1 起依次选择解析器；DNS 顺序不参与链路规则匹配"
+          >
+            {activeRows.length} 条
           </span>
           <span className="sp" />
-          {save.error && <ErrorBox error={save.error} />}
           <button
-            className="btn primary"
-            disabled={save.isPending || (changes.length === 0 && !orderDirty)}
-            onClick={() => save.mutate()}
+            type="button"
+            className="btn"
+            disabled={readOnly}
+            onClick={() =>
+              setRows(current => [
+                ...(current ?? rowsFromPolicies()),
+                {
+                  id: `new:${nextRowId.current++}`,
+                  originalSelector: null,
+                  selector: { t: 'domain_suffix', v: [] },
+                  resolution: newEgressDns(),
+                },
+              ])
+            }
           >
-            {save.isPending ? '保存中…' : '保存到草稿'}
+            添加新策略
           </button>
-        </div>
+        </header>
       )}
-    </fieldset>
+      <fieldset className="node-egress-rules rule-ro" disabled={readOnly}>
+        <p className="note node-egress-dns-limit">
+          Xray 的 DNS 选择不携带原路由和出站上下文；DNS 查询可以指定出口，但解析结果无法按出站隔离。
+        </p>
+        {displayedRows.length > 0 && (
+          <table className="tbl rule-table node-egress-rules-table">
+            <tbody>
+              {displayedRows.map((row, index) => {
+                const kind = MATCH_KINDS.find(candidate => candidate.t === row.selector.t);
+                const value = matchValues(row.selector);
+                const suffix = `（${kind?.label ?? row.selector.t}${value ? ` ${value}` : ''}）`;
+                const duplicate =
+                  row.resolution !== null &&
+                  value.trim().length > 0 &&
+                  selectorCounts.get(egressDnsSelectorKey(row.selector)) !== 1;
+                return (
+                  <tr key={row.id} className={row.originalSelector ? undefined : 'node-egress-dns-new-row'}>
+                    <td className="mono dim" style={{ width: 24 }}>
+                      D{index + 1}
+                    </td>
+                    <td className="rule-match-cell">
+                      {readOnly ? (
+                        <>
+                          <span className="f rule-readonly-select">{kind?.label ?? row.selector.t}</span>
+                          {value && <span className="f rule-readonly-value">{value}</span>}
+                        </>
+                      ) : (
+                        <>
+                          <select
+                            className="f"
+                            aria-label={`DNS 匹配类型${suffix}`}
+                            disabled={row.resolution === null}
+                            value={row.selector.t}
+                            onChange={event =>
+                              updateRow(row.id, current => ({
+                                ...current,
+                                selector: buildMatch(event.target.value as DestMatch['t'], ''),
+                              }))
+                            }
+                          >
+                            {MATCH_KINDS.filter(candidate => supportsEgressDns(buildMatch(candidate.t, 'value'))).map(
+                              candidate => (
+                                <option key={candidate.t} value={candidate.t}>
+                                  {candidate.label}
+                                </option>
+                              ),
+                            )}
+                          </select>
+                          <input
+                            className="f rule-new-dns-value"
+                            aria-label={`DNS 匹配内容${suffix}`}
+                            disabled={row.resolution === null}
+                            value={value}
+                            placeholder={kind?.hint}
+                            spellCheck={false}
+                            onChange={event =>
+                              updateRow(row.id, current => ({
+                                ...current,
+                                selector: buildMatch(current.selector.t, event.target.value),
+                              }))
+                            }
+                          />
+                        </>
+                      )}
+                      {duplicate && <span className="sub err">已有相同策略</span>}
+                    </td>
+                    <td className="rule-action-cell">
+                      <MachineEgressDnsControls
+                        key={row.id}
+                        resolution={row.resolution}
+                        supported
+                        onChange={next =>
+                          next === null && row.originalSelector === null
+                            ? removeNewRow(row.id)
+                            : updateRow(row.id, current => ({ ...current, resolution: next }))
+                        }
+                        readOnly={readOnly}
+                        nodeName={nodeName}
+                        accessibleSuffix={suffix}
+                      />
+                      {(row.resolution === null || row.originalSelector) && (
+                        <span className="egress-dns-usage">
+                          {row.resolution === null ? '保存后移除' : '机器全局下发'}
+                        </span>
+                      )}
+                    </td>
+                    <td className="dns-priority-cell">
+                      <DnsPriorityControl
+                        index={index}
+                        count={displayedRows.length}
+                        label={`${kind?.label ?? row.selector.t} ${value}`.trim()}
+                        readOnly={readOnly}
+                        showLabel={false}
+                        onMove={delta => movePolicy(row.id, delta)}
+                      />
+                      {!row.originalSelector && !readOnly && (
+                        <button type="button" className="btn danger" onClick={() => removeNewRow(row.id)}>
+                          取消
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+        {!readOnly && displayedRows.length > 0 && (
+          <>
+            {save.error && <ErrorBox error={save.error} />}
+            <DraftSaveToolbar
+              hint="改动落进草稿，顶栏按「提交」才写进库。"
+              status={
+                !dirty
+                  ? '没有待保存的改动'
+                  : `${changedRows || 1} 项配置有改动${orderDirty ? '，DNS 优先级已调整' : ''}`
+              }
+              saving={save.isPending}
+              canSave={dirty && displayedRows.every(rowReady)}
+              onSave={() => save.mutate()}
+            />
+          </>
+        )}
+      </fieldset>
+    </>
   );
 }
 
@@ -1263,8 +1402,8 @@ export function RuleEditor({
     };
   }, [targetPickerRule]);
   /* 这是可搜索、可分组且带「新建」动作的自定义菜单，浏览器不会像处理原生
-     <select> 那样替它选择展开方向。每次展开、搜索改变高度、滚动或窗口缩放时重算：
-     下方能容纳就向下；否则使用空间较多的一边，并把菜单高度限在可见区内。 */
+     <select> 那样替它选择展开方向。点击时先按可用空间选择一次方向；展开后搜索只更新
+     可用高度，不跨过触发器翻面。滚动或缩放使原方向不可用时才切换。 */
   useLayoutEffect(() => {
     if (targetPickerRule === null) return;
     const place = () => {
@@ -1280,12 +1419,18 @@ export function RuleEditor({
       const above = Math.max(0, rootRect.top - viewportTop - edge - gap);
       const below = Math.max(0, viewportBottom - rootRect.bottom - edge - gap);
       const wanted = Math.min(520, menu.scrollHeight);
-      const openBelow = above < wanted && (below >= wanted || below > above);
-      const available = openBelow ? below : above;
-      const maxHeight = Math.max(80, Math.min(520, Math.floor(available)));
-      setTargetMenuPlacement(current =>
-        current.below === openBelow && current.maxHeight === maxHeight ? current : { below: openBelow, maxHeight },
-      );
+      setTargetMenuPlacement(current => {
+        // The click handler chooses the side before mounting. Keep it while filtering changes the
+        // menu height; moving a live menu across the trigger looks like browser focus jumped.
+        const chosen = current.below ? below : above;
+        const opposite = current.below ? above : below;
+        const openBelow = chosen < 80 && opposite > chosen ? !current.below : current.below;
+        const available = openBelow ? below : above;
+        const maxHeight = Math.max(80, Math.min(wanted, Math.floor(available)));
+        return current.below === openBelow && current.maxHeight === maxHeight
+          ? current
+          : { below: openBelow, maxHeight };
+      });
     };
     place();
     window.addEventListener('resize', place);
@@ -1324,7 +1469,6 @@ export function RuleEditor({
   const nodeDnsPolicies = sortedDnsPolicies(
     (snapshot.data?.node_egress_dns ?? []).filter(policy => policy.node === nodeId),
   );
-  const orderedNodeDnsPolicies = orderedDnsPolicies(nodeDnsPolicies, dnsOrder);
   const storedDnsFor = (selector: DestMatch): EgressDnsResolution | null =>
     nodeDnsPolicies.find(policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector))
       ?.resolution ?? null;
@@ -1339,6 +1483,21 @@ export function RuleEditor({
     else next[key] = { selector, resolution };
     setDnsOverrides(next);
   };
+  // A policy created from an egress row does not exist in the snapshot until the draft is saved.
+  // Include it in the shared machine rows immediately; otherwise selecting “引用” appears to do
+  // nothing now that resolver parameters live in their own row instead of inside the route row.
+  const pendingDnsPolicies: EgressDnsPolicy[] = Object.values(dnsOverrides).flatMap((change, index) => {
+    if (!change.resolution || storedDnsFor(change.selector)) return [];
+    return [
+      {
+        node: nodeId,
+        position: nodeDnsPolicies.length + index,
+        selector: change.selector,
+        resolution: change.resolution,
+      },
+    ];
+  });
+  const orderedNodeDnsPolicies = orderedDnsPolicies([...nodeDnsPolicies, ...pendingDnsPolicies], dnsOrder);
   const dnsPolicyIndex = (selector: DestMatch) =>
     orderedNodeDnsPolicies.findIndex(
       policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector),
@@ -1619,9 +1778,6 @@ export function RuleEditor({
     patch(i, {
       ...rule,
       m: match,
-      // A DNS reference identifies the policy by this exact selector. Changing the selector must
-      // make the operator opt in again rather than silently activating another machine policy.
-      a: rule.a.t === 'egress' ? { ...rule.a, dns: false } : rule.a,
     });
   const move = (i: number, delta: number) => {
     const j = i + delta;
@@ -1712,9 +1868,7 @@ export function RuleEditor({
     const next: Rule = {
       // 已有兜底时，新行必须插在它之前；再创建一个 Any 会让原兜底之后的内容永远不可达。
       m: anyIndex >= 0 ? { t: 'domain_suffix', v: [] } : { t: 'any' },
-      a: defaultTarget
-        ? forwardAction(defaultTarget, defaultDial(defaultTarget))
-        : { t: 'egress', send_through: null, dns: false },
+      a: defaultTarget ? forwardAction(defaultTarget, defaultDial(defaultTarget)) : { t: 'egress', send_through: null },
     };
     const updated = [...rules];
     updated.splice(anyIndex >= 0 ? anyIndex : updated.length, 0, next);
@@ -1729,7 +1883,7 @@ export function RuleEditor({
         <b className="mono">
           {chainId} / {nodeId}
         </b>
-        <span className="note">DNS 引用写在落地规则内；引用后按机器全局生效</span>
+        <span className="note">DNS 策略按机器生效；线路只提供编辑入口</span>
         <span className="sp" />
         {onClose && (
           <button className="btn" onClick={onClose}>
@@ -1740,12 +1894,11 @@ export function RuleEditor({
 
       {(nodeDnsPolicies.length > 0 || rules.some(rule => rule.a.t === 'egress' && supportsEgressDns(rule.m))) && (
         <p className="note node-egress-dns-limit">
-          Xray 限制：DNS 在机器内全局匹配。这里的引用只决定策略是否下发；任一出站引用后，
-          这台机器上所有匹配域名的解析都会受影响，tag 不能提供出站级隔离。
+          Xray 的 DNS 选择不携带原路由和出站上下文；DNS 查询可以指定出口，但解析结果无法按出站隔离。
         </p>
       )}
 
-      <table className="tbl">
+      <table className="tbl rule-table">
         <tbody>
           {rules.map((r, i) => {
             const kind = MATCH_KINDS.find(k => k.t === r.m.t);
@@ -1790,7 +1943,6 @@ export function RuleEditor({
                     {kind?.list !== false && r.m.t !== 'any' && r.m.t !== 'front_downstream' && (
                       <input
                         className="f"
-                        style={{ marginLeft: 6, width: 190 }}
                         placeholder={kind?.hint}
                         value={matchValues(r.m)}
                         onChange={e => patchMatch(i, r, buildMatch(r.m.t, e.target.value))}
@@ -1813,7 +1965,7 @@ export function RuleEditor({
                                 ? { t: 'proxy', outbound: externalOutbounds[0].id }
                                 : { t: 'forward', to: '' }
                             : t === 'egress'
-                              ? { t: 'egress', send_through: null, dns: false }
+                              ? { t: 'egress', send_through: null }
                               : { t: 'block' };
                         patch(i, { ...r, a });
                         setTargetPickerRule(t === 'forward' ? i : null);
@@ -1830,10 +1982,24 @@ export function RuleEditor({
                       >
                         <button
                           type="button"
-                          className="external-target-trigger"
+                          className={`external-target-trigger${r.a.t === 'forward' ? ' node-target' : ''}`}
                           aria-expanded={targetPickerRule === i}
-                          onClick={() => {
+                          onClick={event => {
                             const opening = targetPickerRule !== i;
+                            if (opening) {
+                              const rect = event.currentTarget.getBoundingClientRect();
+                              const viewportTop = window.visualViewport?.offsetTop ?? 0;
+                              const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+                              const viewportBottom = viewportTop + viewportHeight;
+                              const edgeAndGap = 15;
+                              const above = Math.max(0, rect.top - viewportTop - edgeAndGap);
+                              const below = Math.max(0, viewportBottom - rect.bottom - edgeAndGap);
+                              const openBelow = below >= 320 || below >= above;
+                              setTargetMenuPlacement({
+                                below: openBelow,
+                                maxHeight: Math.max(80, Math.min(520, Math.floor(openBelow ? below : above))),
+                              });
+                            }
                             setTargetPickerRule(opening ? i : null);
                             if (opening) setTargetQuery('');
                           }}
@@ -1851,7 +2017,6 @@ export function RuleEditor({
                             style={{ maxHeight: targetMenuPlacement.maxHeight }}
                           >
                             <input
-                              autoFocus
                               className="f external-target-search"
                               placeholder="搜索节点或外部出站"
                               value={targetQuery}
@@ -2022,50 +2187,15 @@ export function RuleEditor({
                     )}
                     {r.a.t === 'egress' && (
                       <span className="egress-dns-reference">
-                        <select
-                          className="f egress-dns-choice"
-                          aria-label={`DNS 策略（${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
-                          value={r.a.dns ? 'policy' : 'none'}
-                          title={
-                            supportsEgressDns(r.m)
-                              ? `引用 ${selfNode?.name || nodeId} 的机器 DNS 策略`
-                              : '机器 DNS 策略只支持域名类匹配条件'
-                          }
-                          onChange={event => {
-                            if (r.a.t !== 'egress') return;
-                            const referenced = event.target.value === 'policy';
-                            patch(i, { ...r, a: { ...r.a, dns: referenced } });
-                            if (referenced && !effectiveDnsFor(r.m)) patchMachineDns(r.m, newEgressDns());
-                          }}
-                        >
-                          <option value="none">不引用 DNS 策略</option>
-                          <option value="policy" disabled={!supportsEgressDns(r.m)}>
-                            引用机器 DNS 策略
-                          </option>
-                        </select>
-                        {r.a.dns && supportsEgressDns(r.m) && effectiveDnsFor(r.m) && (
-                          <>
-                            <MachineEgressDnsControls
-                              resolution={effectiveDnsFor(r.m)}
-                              supported
-                              onChange={next => patchMachineDns(r.m, next)}
-                              readOnly={readOnly}
-                              nodeName={selfNode?.name || nodeId}
-                              accessibleSuffix={`（${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
-                              showChoice={false}
-                            />
-                            {dnsPolicyIndex(r.m) >= 0 && (
-                              <DnsPriorityControl
-                                index={dnsPolicyIndex(r.m)}
-                                count={orderedNodeDnsPolicies.length}
-                                label={`${kind?.label ?? r.m.t} ${matchValues(r.m)}`.trim()}
-                                readOnly={readOnly}
-                                showLabel
-                                onMove={delta => moveMachineDns(r.m, delta)}
-                              />
-                            )}
-                          </>
-                        )}
+                        <MachineEgressDnsControls
+                          resolution={effectiveDnsFor(r.m)}
+                          supported={supportsEgressDns(r.m)}
+                          onChange={next => patchMachineDns(r.m, next)}
+                          readOnly={readOnly}
+                          nodeName={selfNode?.name || nodeId}
+                          accessibleSuffix={`（线路规则：${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
+                          showEditor={false}
+                        />
                       </span>
                     )}
                   </td>
@@ -2103,6 +2233,44 @@ export function RuleEditor({
                   )}
                 </tr>
               </Fragment>
+            );
+          })}
+          {orderedNodeDnsPolicies.map((policy, index) => {
+            const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
+            const value = matchValues(policy.selector);
+            return (
+              <tr className="machine-dns-shared-row" key={`machine-dns-${egressDnsSelectorKey(policy.selector)}`}>
+                <td className="mono dim" style={{ width: 24 }}>
+                  D{index + 1}
+                </td>
+                <td className="rule-match-cell">
+                  <span className="f rule-readonly-select">{kind?.label ?? policy.selector.t}</span>
+                  {value && <span className="f rule-readonly-value">{value}</span>}
+                </td>
+                <td className="rule-action-cell">
+                  <MachineEgressDnsControls
+                    resolution={effectiveDnsFor(policy.selector)}
+                    supported
+                    onChange={next => patchMachineDns(policy.selector, next)}
+                    readOnly={readOnly}
+                    nodeName={selfNode?.name || nodeId}
+                    accessibleSuffix={`（机器策略：${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`}
+                  />
+                  <span className="egress-dns-usage">机器全局下发</span>
+                </td>
+                {!readOnly && (
+                  <td className="dns-priority-cell" style={{ width: 120, textAlign: 'right' }}>
+                    <DnsPriorityControl
+                      index={index}
+                      count={orderedNodeDnsPolicies.length}
+                      label={`${kind?.label ?? policy.selector.t} ${value}`.trim()}
+                      readOnly={readOnly}
+                      showLabel={false}
+                      onMove={delta => moveMachineDns(policy.selector, delta)}
+                    />
+                  </td>
+                )}
+              </tr>
             );
           })}
           {fallback?.pending && (
