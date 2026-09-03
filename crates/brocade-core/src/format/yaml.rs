@@ -5,10 +5,9 @@ use crate::artifacts::subscription::{
     SubscriptionStream,
 };
 use crate::model::{
-    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport, XhttpXmux,
-    XhttpXmuxRange,
+    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport, XhttpTuning,
+    XhttpXmux, XhttpXmuxRange,
 };
-
 const TEST_URL: &str = "https://www.gstatic.com/generate_204";
 const TEST_INTERVAL: u32 = 300;
 // Pinned at implementation time. The generated configuration never follows a mutable branch,
@@ -656,25 +655,29 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
     }
     lines.push("    tls: true".to_owned());
     lines.push("    udp: true".to_owned());
+    // Mihomo's common proxy field. It only affects a TCP transport, so the Hysteria 2 branch
+    // above deliberately never reaches this line. A server or path without TFO support falls
+    // back to the ordinary handshake.
+    lines.push("    tfo: true".to_owned());
     // `reality-opts` is what tells mihomo to borrow a site rather than verify a certificate.
     // Written for a TLS entry it would have the client authenticate against a public key nobody
     // holds; omitted for a REALITY one, the client verifies a certificate that does not exist.
-    let (server_name, fingerprint, flow, reality) = match &entry.security {
-        SubscriptionSecurity::Reality(reality) => (
-            &reality.server_name,
-            &reality.fingerprint,
-            &reality.flow,
-            Some(reality),
-        ),
-        SubscriptionSecurity::Tls(tls) => (&tls.server_name, &tls.fingerprint, &tls.flow, None),
+    let (server_name, flow, reality) = match &entry.security {
+        SubscriptionSecurity::Reality(reality) => {
+            (&reality.server_name, &reality.flow, Some(reality))
+        }
+        SubscriptionSecurity::Tls(tls) => (&tls.server_name, &tls.flow, None),
         SubscriptionSecurity::Hysteria2(_) => unreachable!("Hysteria 已在上方单独渲染"),
     };
     if let Some(flow) = flow {
         lines.push(format!("    flow: {}", scalar(flow)));
     }
     lines.push(format!("    servername: {}", scalar(server_name)));
-    lines.push(format!("    client-fingerprint: {}", scalar(fingerprint)));
     if let Some(reality) = reality {
+        lines.push(format!(
+            "    client-fingerprint: {}",
+            scalar(&reality.fingerprint)
+        ));
         lines.push("    reality-opts:".to_owned());
         lines.push(format!("      public-key: {}", scalar(&reality.public_key)));
         lines.push(format!("      short-id: {}", yaml_quote(&reality.short_id)));
@@ -684,6 +687,7 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
         host,
         download,
         xmux,
+        tuning,
         mode,
     } = &entry.stream
     {
@@ -696,6 +700,9 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
         // shape refuses every client that does not name the same one.
         if let Some(mode) = mode {
             lines.push(format!("      mode: {}", yaml_quote(mode)));
+        }
+        if let Some(tuning) = tuning {
+            push_xhttp_tuning(lines, 6, tuning);
         }
         // `reuse-settings`, spelled exactly so. mihomo's `XHTTPOptions` has no `x-mux` key at
         // all, and its decoder reports nothing for input keys it does not recognise — it errors
@@ -717,10 +724,6 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
             lines.push(format!(
                 "        servername: {}",
                 scalar(&download.server_name)
-            ));
-            lines.push(format!(
-                "        client-fingerprint: {}",
-                scalar(&download.fingerprint)
             ));
             lines.push(format!(
                 "        host: {}",
@@ -874,7 +877,12 @@ fn push_xhttp_reuse_settings(lines: &mut Vec<String>, indent: usize, xmux: &Xhtt
     let base = " ".repeat(indent);
     let field = " ".repeat(indent + 2);
     lines.push(format!("{base}reuse-settings:"));
-    lines.push(format!("{field}max-concurrency: {}", xmux.max_concurrency));
+    if let Some(concurrency) = xmux.max_concurrency {
+        lines.push(format!("{field}max-concurrency: {concurrency}"));
+    }
+    if let Some(connections) = xmux.max_connections {
+        lines.push(format!("{field}max-connections: {connections}"));
+    }
     lines.push(format!(
         "{field}h-max-request-times: {}",
         yaml_quote(&xhttp_range(&xmux.h_max_request_times))
@@ -883,6 +891,19 @@ fn push_xhttp_reuse_settings(lines: &mut Vec<String>, indent: usize, xmux: &Xhtt
         "{field}h-max-reusable-secs: {}",
         yaml_quote(&xhttp_range(&xmux.h_max_reusable_secs))
     ));
+    if let Some(period) = xmux.h_keep_alive_period_secs {
+        lines.push(format!("{field}h-keep-alive-period: {period}"));
+    }
+}
+
+fn push_xhttp_tuning(lines: &mut Vec<String>, indent: usize, tuning: &XhttpTuning) {
+    let field = " ".repeat(indent);
+    if let Some(range) = &tuning.x_padding_bytes {
+        lines.push(format!(
+            "{field}x-padding-bytes: {}",
+            yaml_quote(&xhttp_range(range))
+        ));
+    }
 }
 
 fn xhttp_range(range: &XhttpXmuxRange) -> String {
@@ -965,6 +986,30 @@ fn push_hysteria2_proxy(
         }
         if let Some(down) = &hysteria.settings.bandwidth.down {
             lines.push(format!("    down: {}", scalar(down)));
+        }
+    }
+    // These are receive-side flow-control limits, so writing them only into the server artifact
+    // tunes uploads but leaves downloads at mihomo's own (usually smaller) defaults. Keep the
+    // subscription paired with the ingress exactly as the xray probe client is: an absent model
+    // value remains absent, while an explicit value reaches both endpoints.
+    let quic = &hysteria.settings.quic;
+    for (key, value) in [
+        (
+            "initial-stream-receive-window",
+            quic.init_stream_receive_window,
+        ),
+        ("max-stream-receive-window", quic.max_stream_receive_window),
+        (
+            "initial-connection-receive-window",
+            quic.init_connection_receive_window,
+        ),
+        (
+            "max-connection-receive-window",
+            quic.max_connection_receive_window,
+        ),
+    ] {
+        if let Some(value) = value {
+            lines.push(format!("    {key}: {value}"));
         }
     }
     if let Some(front_name) = &entry.front_name {

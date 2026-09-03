@@ -27,7 +27,7 @@ use brocade_core::{
         IngressWires, IngressWiresWire, ModelSnapshot, NodeConnection, Projection,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
         RealityFallbackMode, RealityFallbackRateLimit, RealitySettings, RealityXhttp, Tls,
-        TlsXhttp, Transport, User, WgTransport, EXTERNAL_WIREGUARD_MAX_WORKERS,
+        TlsXhttp, Transport, User, WgTransport, Xhttp, XhttpTuning, EXTERNAL_WIREGUARD_MAX_WORKERS,
     },
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_server_name, normalize_host_port,
@@ -1878,9 +1878,18 @@ pub(crate) async fn upsert_ingress_tx(
     let server_names = serde_json::to_value(&reality.server_names)?;
     let fallback_limits_json = serde_json::to_value(&fallback_limits)?;
     let short_ids = serde_json::json!([short_id]);
-    let xhttp = request.wires.xhttp();
+    // The console owns only Padding. POST upload controls and client-only transport selectors may
+    // still arrive from a stale browser or an old immutable snapshot, but a new managed write
+    // must not persist them.
+    let xhttp = request.wires.xhttp().map(managed_xhttp);
     let xhttp_xmux = xhttp
+        .as_ref()
         .and_then(|xhttp| xhttp.xmux.as_ref())
+        .map(serde_json::to_value)
+        .transpose()?;
+    let xhttp_tuning = xhttp
+        .as_ref()
+        .and_then(|xhttp| xhttp.tuning.as_ref())
         .map(serde_json::to_value)
         .transpose()?;
     let hysteria2 = request.wires.hysteria2.as_ref();
@@ -1921,10 +1930,10 @@ pub(crate) async fn upsert_ingress_tx(
         "INSERT INTO ingresses (
             id, app_id, chain_id, node_id, bind, port, front_id,
             reality_private_key, reality_public_key, reality_short_ids,
-            reality_dest, reality_server_names, reality_fingerprint, reality_flow,
+            reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode, reality_fallback_limits,
             reality_fallback_guard,
-            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_mode,
+            transport_kind, hy2_enabled, xhttp_path, xhttp_mode,
             hy2_port, hy2_hop_start, hy2_hop_end,
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password,
             hy2_masquerade_kind, hy2_masquerade_url,
@@ -1943,23 +1952,25 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_quic_init_stream_window, hy2_quic_max_stream_window,
             hy2_quic_init_conn_window, hy2_quic_max_conn_window,
             hy2_quic_max_idle_secs, hy2_quic_keepalive_secs,
-            hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud
+            hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud,
+            xhttp_tuning
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
-            $11, $12, $13, $14,
-            $15, $16,
-            $17,
-            $18, $19, $20, $21, $22, $23,
-            $24, $25, $26,
-            $27, $28, $29, $30, $31, $32,
-            $33, $34, $35, $36, $37, $38, $39,
-            $40, $41, $42, $43, $44, $45, $46,
-            $47, $48, $49, $50, $51,
-            $52,
-            $53,
-            $54, $55, $56, $57,
-            $58, $59, $60, $61
+            $11, $12, $13,
+            $14, $15,
+            $16,
+            $17, $18, $19, $20,
+            $21, $22, $23,
+            $24, $25, $26, $27, $28, $29,
+            $30, $31, $32, $33, $34, $35, $36,
+            $37, $38, $39, $40, $41, $42, $43,
+            $44, $45, $46, $47, $48,
+            $49,
+            $50,
+            $51, $52, $53, $54,
+            $55, $56, $57, $58,
+            $59
          )
          ON CONFLICT (id) DO UPDATE SET
             app_id = EXCLUDED.app_id,
@@ -1970,7 +1981,6 @@ pub(crate) async fn upsert_ingress_tx(
             front_id = EXCLUDED.front_id,
             reality_dest = EXCLUDED.reality_dest,
             reality_server_names = EXCLUDED.reality_server_names,
-            reality_fingerprint = EXCLUDED.reality_fingerprint,
             reality_flow = EXCLUDED.reality_flow,
             reality_fallback_mode = EXCLUDED.reality_fallback_mode,
             reality_fallback_limits = EXCLUDED.reality_fallback_limits,
@@ -1978,8 +1988,6 @@ pub(crate) async fn upsert_ingress_tx(
             transport_kind = EXCLUDED.transport_kind,
             hy2_enabled = EXCLUDED.hy2_enabled,
             xhttp_path = EXCLUDED.xhttp_path,
-            xhttp_host = EXCLUDED.xhttp_host,
-            xhttp_xmux = EXCLUDED.xhttp_xmux,
             xhttp_mode = EXCLUDED.xhttp_mode,
             hy2_port = EXCLUDED.hy2_port,
             hy2_hop_start = EXCLUDED.hy2_hop_start,
@@ -2018,13 +2026,14 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_quic_keepalive_secs = EXCLUDED.hy2_quic_keepalive_secs,
             hy2_quic_max_incoming_streams = EXCLUDED.hy2_quic_max_incoming_streams,
             hy2_quic_disable_pmtud = EXCLUDED.hy2_quic_disable_pmtud,
+            xhttp_tuning = EXCLUDED.xhttp_tuning,
             created_revision = COALESCE(ingresses.created_revision, EXCLUDED.created_revision)
          WHERE ROW(ingresses.app_id, ingresses.chain_id, ingresses.node_id, ingresses.bind,
                    ingresses.port, ingresses.front_id, ingresses.reality_dest,
-                   ingresses.reality_server_names, ingresses.reality_fingerprint,
-                   ingresses.reality_flow, ingresses.reality_fallback_mode,
+                   ingresses.reality_server_names, ingresses.reality_flow,
+                   ingresses.reality_fallback_mode,
                    ingresses.reality_fallback_limits, ingresses.reality_fallback_guard,
-                   ingresses.transport_kind, ingresses.hy2_enabled, ingresses.xhttp_path, ingresses.xhttp_host, ingresses.xhttp_xmux,
+                   ingresses.transport_kind, ingresses.hy2_enabled, ingresses.xhttp_path,
                    ingresses.hy2_port, ingresses.hy2_hop_start, ingresses.hy2_hop_end,
                    ingresses.xhttp_mode, ingresses.hy2_up, ingresses.hy2_down,
                    ingresses.hy2_congestion, ingresses.hy2_obfs_password,
@@ -2044,15 +2053,15 @@ pub(crate) async fn upsert_ingress_tx(
                    ingresses.hy2_quic_init_stream_window, ingresses.hy2_quic_max_stream_window,
                    ingresses.hy2_quic_init_conn_window, ingresses.hy2_quic_max_conn_window,
                    ingresses.hy2_quic_max_idle_secs, ingresses.hy2_quic_keepalive_secs,
-                   ingresses.hy2_quic_max_incoming_streams, ingresses.hy2_quic_disable_pmtud)
+                   ingresses.hy2_quic_max_incoming_streams, ingresses.hy2_quic_disable_pmtud,
+                   ingresses.xhttp_tuning)
             IS DISTINCT FROM
             ROW(EXCLUDED.app_id, EXCLUDED.chain_id, EXCLUDED.node_id, EXCLUDED.bind,
                 EXCLUDED.port, EXCLUDED.front_id, EXCLUDED.reality_dest,
-                EXCLUDED.reality_server_names, EXCLUDED.reality_fingerprint,
-                EXCLUDED.reality_flow, EXCLUDED.reality_fallback_mode,
+                EXCLUDED.reality_server_names, EXCLUDED.reality_flow,
+                EXCLUDED.reality_fallback_mode,
                 EXCLUDED.reality_fallback_limits, EXCLUDED.reality_fallback_guard,
                 EXCLUDED.transport_kind, EXCLUDED.hy2_enabled, EXCLUDED.xhttp_path,
-                EXCLUDED.xhttp_host, EXCLUDED.xhttp_xmux,
                 EXCLUDED.hy2_port, EXCLUDED.hy2_hop_start, EXCLUDED.hy2_hop_end,
                 EXCLUDED.xhttp_mode, EXCLUDED.hy2_up, EXCLUDED.hy2_down,
                 EXCLUDED.hy2_congestion, EXCLUDED.hy2_obfs_password,
@@ -2072,7 +2081,8 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.hy2_quic_init_stream_window, EXCLUDED.hy2_quic_max_stream_window,
                 EXCLUDED.hy2_quic_init_conn_window, EXCLUDED.hy2_quic_max_conn_window,
                 EXCLUDED.hy2_quic_max_idle_secs, EXCLUDED.hy2_quic_keepalive_secs,
-                EXCLUDED.hy2_quic_max_incoming_streams, EXCLUDED.hy2_quic_disable_pmtud)
+                EXCLUDED.hy2_quic_max_incoming_streams, EXCLUDED.hy2_quic_disable_pmtud,
+                EXCLUDED.xhttp_tuning)
          RETURNING reality_private_key,
                    reality_public_key,
                    reality_short_ids",
@@ -2089,7 +2099,6 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(short_ids)
     .bind(&reality.dest)
     .bind(server_names)
-    .bind(&reality.fingerprint)
     .bind(&reality.flow)
     .bind(match fallback_mode {
         RealityFallbackMode::GlobalSite => "global-site",
@@ -2100,10 +2109,8 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(fallback_guard)
     .bind(request.wires.vless_kind())
     .bind(request.wires.hysteria2.is_some())
-    .bind(xhttp.map(|xhttp| xhttp.path.clone()))
-    .bind(xhttp.and_then(|xhttp| xhttp.host.clone()))
-    .bind(xhttp_xmux)
-    .bind(xhttp.and_then(|xhttp| xhttp.mode.as_str()))
+    .bind(xhttp.as_ref().map(|xhttp| xhttp.path.clone()))
+    .bind(xhttp.as_ref().and_then(|xhttp| xhttp.mode.as_str()))
     .bind(hysteria2.map(|h| i32::from(h.port)))
     .bind(hysteria2.and_then(|h| h.hop.map(|hop| i32::from(hop.start))))
     .bind(hysteria2.and_then(|h| h.hop.map(|hop| i32::from(hop.end))))
@@ -2141,8 +2148,20 @@ pub(crate) async fn upsert_ingress_tx(
             .and_then(|to| to.download.as_ref())
             .and_then(|to| to.origin_port.map(i32::from)),
     )
-    .bind(projection.v4.as_ref().and_then(|to| to.download.as_ref()).and_then(|to| to.http_host.clone()))
-    .bind(projection.v4.as_ref().and_then(|to| to.download.as_ref()).and_then(|to| to.mux.map(i32::from)))
+    .bind(
+        projection
+            .v4
+            .as_ref()
+            .and_then(|to| to.download.as_ref())
+            .and_then(|to| to.http_host.clone()),
+    )
+    .bind(
+        projection
+            .v4
+            .as_ref()
+            .and_then(|to| to.download.as_ref())
+            .and_then(|to| to.mux.map(i32::from)),
+    )
     .bind(projection.v6.as_ref().map(|to| to.host.clone()))
     .bind(projection.v6.as_ref().map(|to| i32::from(to.port)))
     .bind(
@@ -2166,8 +2185,20 @@ pub(crate) async fn upsert_ingress_tx(
             .and_then(|to| to.download.as_ref())
             .and_then(|to| to.origin_port.map(i32::from)),
     )
-    .bind(projection.v6.as_ref().and_then(|to| to.download.as_ref()).and_then(|to| to.http_host.clone()))
-    .bind(projection.v6.as_ref().and_then(|to| to.download.as_ref()).and_then(|to| to.mux.map(i32::from)))
+    .bind(
+        projection
+            .v6
+            .as_ref()
+            .and_then(|to| to.download.as_ref())
+            .and_then(|to| to.http_host.clone()),
+    )
+    .bind(
+        projection
+            .v6
+            .as_ref()
+            .and_then(|to| to.download.as_ref())
+            .and_then(|to| to.mux.map(i32::from)),
+    )
     .bind(request.guard.no_private)
     .bind(request.guard.no_bittorrent)
     .bind(request.guard.no_mail)
@@ -2175,8 +2206,8 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(request.guard.tcp_and_quic_only)
     .bind(u64_to_i64(revision_id, "revision_id")?)
     /* 九个 QUIC 调优项排在 created_revision 之后，是为了不动前面 53 个占位符的编号。
-       这条 INSERT 的参数是位置式的，插在中间会把后面每一个绑定挪到邻居身上——不报错、
-       不失败，只是这个接入面读回来带着别人的值（见 tests/pg_reality_guard.rs 的模块头）。 */
+    这条 INSERT 的参数是位置式的，插在中间会把后面每一个绑定挪到邻居身上——不报错、
+    不失败，只是这个接入面读回来带着别人的值（见 tests/pg_reality_guard.rs 的模块头）。 */
     .bind(
         hysteria2
             .map(|h| h.bbr_profile)
@@ -2191,14 +2222,42 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(quic.keep_alive_period_secs.map(i64::from))
     .bind(quic.max_incoming_streams.map(i64::from))
     .bind(quic.disable_path_mtu_discovery)
+    .bind(xhttp_tuning)
     .fetch_optional(&mut **tx)
     .await?;
+    let client_changed = sqlx::query(
+        "INSERT INTO ingress_client_settings (
+             ingress_id, reality_fingerprint, xhttp_host, xhttp_xmux
+         ) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (ingress_id) DO UPDATE SET
+             reality_fingerprint = EXCLUDED.reality_fingerprint,
+             xhttp_host = EXCLUDED.xhttp_host,
+             xhttp_xmux = EXCLUDED.xhttp_xmux,
+             updated_at = now()
+         WHERE ROW(
+                 ingress_client_settings.reality_fingerprint,
+                 ingress_client_settings.xhttp_host,
+                 ingress_client_settings.xhttp_xmux
+               ) IS DISTINCT FROM ROW(
+                 EXCLUDED.reality_fingerprint,
+                 EXCLUDED.xhttp_host,
+                 EXCLUDED.xhttp_xmux
+               )",
+    )
+    .bind(&id)
+    .bind(&reality.fingerprint)
+    .bind(xhttp.as_ref().and_then(|xhttp| xhttp.host.clone()))
+    .bind(xhttp_xmux)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        > 0;
     // With the WHERE blocking it, RETURNING yields no row at all, and that is what "nothing
     // changed" means. The keys still have to be echoed, so the existing row is read as usual —
     // note that it reads the database's values rather than the keypair generated above: that pair
     // only lands on creation, and an existing ingress keeps its own (those three columns are
     // absent from DO UPDATE's SET list to begin with).
-    let changed = row.is_some();
+    let changed = row.is_some() || client_changed;
     let row = match row {
         Some(row) => row,
         None => {
@@ -2256,18 +2315,22 @@ pub(crate) async fn upsert_ingress_tx(
         wires: IngressWires::try_from(IngressWiresWire {
             vless: request.wires.vless.as_ref().map(|vless| match vless {
                 TransportRequest::VlessReality => Transport::VlessReality(effective.clone()),
-                TransportRequest::VlessRealityXhttp { xhttp } => {
+                TransportRequest::VlessRealityXhttp { .. } => {
                     Transport::VlessRealityXhttp(RealityXhttp {
                         reality: effective.clone(),
-                        xhttp: xhttp.clone(),
+                        xhttp: xhttp
+                            .clone()
+                            .expect("XHTTP request has normalized settings"),
                     })
                 }
                 // The echo mirrors what a read of this ingress will return, and a read of a shape
                 // holding a certificate returns no borrowed site — so neither does this.
                 TransportRequest::VlessTls => Transport::VlessTls(tls_echo(&effective)),
-                TransportRequest::VlessTlsXhttp { xhttp } => Transport::VlessTlsXhttp(TlsXhttp {
+                TransportRequest::VlessTlsXhttp { .. } => Transport::VlessTlsXhttp(TlsXhttp {
                     tls: tls_echo(&effective),
-                    xhttp: xhttp.clone(),
+                    xhttp: xhttp
+                        .clone()
+                        .expect("XHTTP request has normalized settings"),
                 }),
             }),
             hysteria2: request.wires.hysteria2.clone(),
@@ -2300,13 +2363,25 @@ pub(crate) async fn create_ingress_tx(
     upsert_ingress_tx(tx, actor, revision_id, app_id, request).await
 }
 
-/// The certificate-holding shapes carry the two settings that were never REALITY's — which
-/// ClientHello to imitate and whether to run flow control.
+/// The certificate-holding shapes retain only their flow-control policy. ClientHello selection is
+/// deliberately left to each client implementation's default.
 fn tls_echo(effective: &RealitySettings) -> Tls {
     Tls {
         flow: effective.flow.clone(),
-        fingerprint: effective.fingerprint.clone(),
     }
+}
+
+fn managed_xhttp(value: &Xhttp) -> Xhttp {
+    let mut value = value.clone();
+    value.tuning = value.tuning.as_ref().and_then(|tuning| {
+        tuning
+            .x_padding_bytes
+            .clone()
+            .map(|x_padding_bytes| XhttpTuning {
+                x_padding_bytes: Some(x_padding_bytes),
+            })
+    });
+    value
 }
 
 /// Existing non-friendly IDs may still be updated while an old development fixture is being
@@ -2330,7 +2405,7 @@ async fn reject_non_friendly_new_model_id_tx(
         _ => {
             return Err(StoreError::InvalidData(format!(
                 "unknown friendly model id kind {kind}"
-            )))
+            )));
         }
     }
     .bind(id)
@@ -2908,6 +2983,7 @@ async fn set_current_revision(tx: &mut Transaction<'_, Postgres>, revision_id: u
         .execute(&mut **tx)
         .await?;
     crate::materialize::store_current_snapshot_tx(tx, revision_id).await?;
+    crate::subscription_client::advance_from_committed_tx(tx, revision_id).await?;
     Ok(())
 }
 

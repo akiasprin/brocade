@@ -1,0 +1,13 @@
+# Brocade's vendored Xray baseline. Keep the Go module path unchanged so upstream
+# packages and future protocol patches continue to use their canonical imports.
+
+repository = "https://github.com/XTLS/Xray-core.git"
+tag = "v26.4.25"
+commit = "b4f08981becb71eaa995fa98ed2098ade92566bb"
+imported_at = "2026-09-03"
+license = "MPL-2.0"
+
+# AnyTLS is intentionally absent from this baseline. It will be introduced as a
+# separately reviewed Brocade patch after the vendored build and deployment path
+# is established.
+anytls = false

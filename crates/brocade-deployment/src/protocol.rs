@@ -22,6 +22,76 @@ pub const DEFAULT_AGENT_LOG_MAX_MIB: u32 = 100;
 pub const MIN_AGENT_LOG_MAX_MIB: u32 = 16;
 pub const MAX_AGENT_LOG_MAX_MIB: u32 = 4096;
 
+/// Live telemetry is an operational stream, not another diagnostic or accounting cadence.
+/// These are deliberately the only accepted values so the control plane can bound fan-out and
+/// memory use while still giving the operator a genuinely live view.
+pub const DEFAULT_REALTIME_INTERVAL_SECS: u32 = 1;
+pub const REALTIME_INTERVAL_OPTIONS: &[u32] = &[1, 2, 5];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeTelemetryPolicy {
+    pub enabled: bool,
+    pub interval_secs: u32,
+}
+
+impl Default for RealtimeTelemetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: DEFAULT_REALTIME_INTERVAL_SECS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateRealtimeTelemetryPolicyRequest {
+    pub enabled: bool,
+    pub interval_secs: u32,
+}
+
+/// Commands travel down the long-lived Agent WebSocket. An idle connection receives `Stop` and
+/// sends no samples; opening a console stream leases the node and changes that to `Start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentRealtimeCommand {
+    Start { interval_millis: u32 },
+    Stop,
+}
+
+/// One rate computed by the Agent from two monotonically increasing NIC counters.
+///
+/// It is intentionally not a cumulative accounting record. The control plane holds it only in
+/// memory, and reconnects, interface changes and counter regressions are represented by
+/// `has_gap` rather than guessed across.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRealtimeSample {
+    pub sequence: u64,
+    pub sampled_at_unix_millis: i64,
+    pub elapsed_millis: u32,
+    pub interface: String,
+    pub rx_bytes_per_sec: u64,
+    pub tx_bytes_per_sec: u64,
+    pub has_gap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeSampleEvent {
+    pub node_id: String,
+    /// Server receipt time is the display timeline shared by the fleet. The Agent timestamp above
+    /// remains available for diagnosing a bad node clock, but it never orders different nodes.
+    pub received_at_unix_millis: i64,
+    pub sample: AgentRealtimeSample,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeNodeSnapshot {
+    pub node_id: String,
+    pub connected: bool,
+    pub active: bool,
+    pub interval_secs: u32,
+    pub samples: Vec<RealtimeSampleEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateDeploymentRequest {
     pub revision_id: u64,
@@ -231,6 +301,10 @@ pub struct TargetConvergenceReport {
     pub observed_before: ReportedNodeState,
     pub observed_after: ReportedNodeState,
     pub error: Option<String>,
+    /// Agent-clock instant immediately before applying the counter namespace change. It is the
+    /// lower boundary for a newly authorized label whose first Xray counter starts at zero.
+    #[serde(default)]
+    pub usage_activated_at_unix_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +504,10 @@ pub struct AgentObservationRequest {
     pub error: Option<String>,
     #[serde(default)]
     pub route: Option<RouteIpReport>,
+    /// See [`TargetConvergenceReport::usage_activated_at_unix_secs`]. Optional for rolling
+    /// compatibility with agents that predate first-window accounting.
+    #[serde(default)]
+    pub usage_activated_at_unix_secs: Option<i64>,
 }
 
 /// The control plane telling the agent which endpoints to probe.
@@ -889,15 +967,22 @@ pub struct E2eProbeXhttp {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xmux: Option<E2eProbeXhttpXmux>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_padding_bytes: Option<E2eProbeXhttpRange>,
     /// The literal value xray expects, or `None` to let both ends resolve it themselves.
     pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2eProbeXhttpXmux {
-    pub max_concurrency: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u16>,
     pub h_max_request_times: E2eProbeXhttpRange,
     pub h_max_reusable_secs: E2eProbeXhttpRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h_keep_alive_period_secs: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -911,7 +996,6 @@ pub struct E2eProbeTls {
     /// The name on the machine's certificate. The client verifies it, so unlike REALITY's
     /// impersonated name, an incorrect value fails the probe at the client end.
     pub server_name: String,
-    pub fingerprint: String,
     pub flow: Option<String>,
 }
 
@@ -1014,6 +1098,11 @@ pub struct E2eProbeResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRuntimeReport {
+    /// When this snapshot finished being collected on the node. Older agents omit it; the control
+    /// plane then falls back to receipt time. New agents supply it so a delayed older snapshot
+    /// cannot overwrite runtime state observed later.
+    #[serde(default)]
+    pub observed_at_unix_secs: Option<i64>,
     pub versions: NodeVersions,
     /// Which certificate this machine is actually holding.
     ///
@@ -1640,31 +1729,30 @@ pub struct NodeLoadList {
     pub nodes: Vec<NodeLoadView>,
 }
 
-// ── Active TCP connect probe ───────────────────────────────────────────────────────────────
+// ── Active PING probe (TCP connect + ICMP echo) ────────────────────────────────────────────
 //
-// This wire contract is intentionally narrower than TCP_INFO. The feature answers one operator
-// question — can this machine establish a TCP connection to this target, and how long did that
-// handshake take? — so the only measurement carried or persisted is `connect_ms`. Name resolution
-// happens before the timer starts and failures remain a missing sample; neither DNS diagnostics,
-// kernel RTT/RTO nor retransmission counters belong in this protocol.
+// A target's URI selects the operation: `tcp://host:port` measures a TCP handshake and
+// `icmp://host` measures one echo round trip. Both may be present in the same round. Name
+// resolution and local capability checks happen outside the timer. The durable contract keeps
+// only what the graph uses: whether a wire attempt actually happened and its optional latency.
+// Detailed DNS/socket/errno diagnostics remain in the node-local journal.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpProbeTarget {
+pub struct PingProbeTarget {
     pub name: String,
-    /// Canonical `tcp://host:port` address. It is also the stable series identifier.
+    /// Canonical `tcp://host:port` or `icmp://host` address. It is also the stable series id.
     pub address: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpProbeSettings {
-    pub targets: Vec<TcpProbeTarget>,
+pub struct PingProbeSettings {
+    pub targets: Vec<PingProbeTarget>,
     pub interval_secs: u32,
-    /// Maximum TCP handshake duration. A result above this threshold is represented as no
-    /// response rather than a latency sample.
+    /// Maximum handshake/echo duration. A reply above the boundary is represented as no response.
     pub timeout_ms: u32,
 }
 
-impl Default for TcpProbeSettings {
+impl Default for PingProbeSettings {
     fn default() -> Self {
         Self {
             targets: Vec::new(),
@@ -1675,22 +1763,25 @@ impl Default for TcpProbeSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpProbeSample {
-    /// Matches `TcpProbeTarget.address` from the settings fetched for this round.
+pub struct PingProbeSample {
+    /// Matches `PingProbeTarget.address` from the settings fetched for this round.
     pub target: String,
-    /// `None` is the complete failure representation. No hidden error classification accompanies
-    /// it because the chart renders every kind of no-response identically.
-    pub connect_ms: Option<u32>,
+    /// False means no wire measurement was possible (for example no IPv6 route or no ICMP socket).
+    /// It must stay distinct from an attempted probe that received no response.
+    pub attempted: bool,
+    /// Whole microseconds preserve sub-millisecond ICMP readings without storing a floating point
+    /// value. `None` with `attempted = true` means no response within the configured timeout.
+    pub latency_us: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpProbeReportRequest {
+pub struct PingProbeReportRequest {
     pub probed_at_unix_secs: i64,
-    pub samples: Vec<TcpProbeSample>,
+    pub samples: Vec<PingProbeSample>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpProbeReportResult {
+pub struct PingProbeReportResult {
     pub node_id: String,
     pub accepted_samples: u64,
     pub skipped_samples: u64,
@@ -1698,29 +1789,30 @@ pub struct TcpProbeReportResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpProbePoint {
+pub struct PingProbePoint {
     pub probed_at_unix_secs: i64,
-    pub connect_ms: Option<u32>,
+    pub attempted: bool,
+    pub latency_us: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpProbeTargetSeries {
+pub struct PingProbeTargetSeries {
     pub name: String,
     pub address: String,
-    /// Oldest first. Missing rounds remain explicit points with `connect_ms = null`, allowing the
-    /// client to break the line and paint the unavailable interval without another status field.
-    pub samples: Vec<TcpProbePoint>,
+    /// Oldest first. Attempted null points are no-response intervals; unattempted null points are
+    /// capability/route gaps and must not be counted as packet loss by clients.
+    pub samples: Vec<PingProbePoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeTcpProbeView {
+pub struct NodePingProbeView {
     pub node_id: String,
-    pub targets: Vec<TcpProbeTargetSeries>,
+    pub targets: Vec<PingProbeTargetSeries>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeTcpProbeList {
-    pub nodes: Vec<NodeTcpProbeView>,
+pub struct NodePingProbeList {
+    pub nodes: Vec<NodePingProbeView>,
 }
 
 /// One hop, as the console reads it.
@@ -1742,6 +1834,21 @@ pub struct HopLinkList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realtime_commands_have_a_small_stable_wire_shape() {
+        assert_eq!(
+            serde_json::to_string(&AgentRealtimeCommand::Start {
+                interval_millis: 1000
+            })
+            .unwrap(),
+            r#"{"type":"start","interval_millis":1000}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentRealtimeCommand::Stop).unwrap(),
+            r#"{"type":"stop"}"#
+        );
+    }
 
     /// The wire shape is the contract. The enum serializes tagged, so an older agent's
     /// `NodeDesiredDeployment` parser fails loudly on it instead of silently skipping the

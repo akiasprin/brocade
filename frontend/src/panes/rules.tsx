@@ -63,20 +63,21 @@ const forwardDial = (a: RuleAction): HopDial => (a.t === 'forward' ? (a.dial ?? 
 // 同理，未填写 pool 的规则读取后为 undefined，表示每次新建连接。
 const forwardPool = (a: RuleAction): HopPool => (a.t === 'forward' ? (a.pool ?? { t: 'none' }) : { t: 'none' });
 
-// 三档按复用程度递增排列，不按哪一档为默认值排列——新建的默认值是连接池（POOL_DEFAULT），
-// 位于中间：该顺序表示代价梯度，按顺序阅读即可了解每一档的取舍。
+// 三档按复用程度递增排列。该顺序表示代价梯度，按顺序阅读即可了解每一档的取舍。
 // 与 DIAL_ORDER 一样将排列定义在模块层，避免下拉框的顺序和其他位置的判定分别定义后不一致。
 export const POOL_ORDER: HopPool['t'][] = ['none', 'pool', 'merge'];
 export const POOL_LABEL: Record<HopPool['t'], string> = {
   none: '每次新建',
-  pool: '连接池',
+  pool: '连接池（实验）',
   merge: '合并流',
 };
 /* 新建一跳时的出站连接配置。与上面 `forwardPool` 的回退值不同，两者必须区分：
    后者表示该规则中未填写 pool，只能取 none——模型中 HopPool 的 #[default] 即为 none，
    历史修订重新编译需要逐字节一致，修改读取逻辑会使机队中已有的跳全部启用连接池。
-   本值是新建一跳时的初始值，与历史数据无关。 */
-export const POOL_DEFAULT: HopPool = { t: 'pool' };
+   本值是新建一跳时的初始值，与历史数据无关。Mux.cool 的 concurrency=1 会复用未经
+   借出前探活的空闲 worker，半失效连接可能一直卡到连接超时，因此新建规则采用稳妥的
+   每次建连；已有规则仍保留其显式选择。 */
+export const POOL_DEFAULT: HopPool = { t: 'none' };
 
 /* 新建转发规则的动作，四个建链入口共用同一份。分散定义时增加一档默认值需要修改四处，
    遗漏的一处不会报错，只是行为与其他位置不同。
@@ -688,10 +689,7 @@ export function MachineEgressDnsRules({
       {showHeader && (
         <header>
           <h4>DNS 解析策略</h4>
-          <span
-            className="rule-sheet-meta"
-            title="Xray 按 D1 起依次选择解析器；DNS 顺序不参与链路规则匹配"
-          >
+          <span className="rule-sheet-meta" title="Xray 按 D1 起依次选择解析器；DNS 顺序不参与链路规则匹配">
             {activeRows.length} 条
           </span>
           <span className="sp" />
@@ -2610,16 +2608,16 @@ export function RuleEditor({
                     {/* 分别说明各档的影响：三档各有取舍，其中合并流需要明确说明——
                         它不是性能更高的连接池，在跨境丢包链路上可能劣于每次新建连接。 */}
                     {pool.t === 'pool' && (
-                      <span className="sub">
-                        连接在流结束后保留约 30 秒供下一条流复用，期间新流不再握手；同一时刻只跑一条流，彼此不影响。
-                        超过空闲时间即回收，下一条重新建连。
+                      <span className="sub" style={{ color: 'var(--gold)' }}>
+                        Xray 以 Mux.cool 的 <code>concurrency=1</code> 保留空闲连接约 16–32 秒，下一条流可免握手复用；
+                        但它在借出前不探活，半失效连接可能卡到超时。遇到过卡顿的链路请选“每次新建”。
                       </span>
                     )}
                     {pool.t === 'merge' && (
                       <span className="sub" style={{ color: 'var(--gold)' }}>
                         多条流合并到同一条 TCP 上，握手开销最低，但<b>一条流丢包会阻塞同一连接上的其他流</b>，
-                        在跨境丢包链路上可能不如每次新建。取值 {MERGE_MIN}–{MERGE_MAX}；填 1
-                        等同于连接池，请直接选那一档。
+                        在跨境丢包链路上可能不如每次新建。取值 {MERGE_MIN}–{MERGE_MAX}；不接受 1， 因为 Xray 的单并发
+                        worker 存在上述卡顿风险。
                       </span>
                     )}
                     {pool.t !== 'none' && (

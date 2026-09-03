@@ -34,6 +34,8 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 
 除配置收敛外，agent 还负责上报用量与运行指标、执行链路探测，并给出路径 MTU 建议。用量按固定窗口累计，配额状态的变化会触发相应的授权调整。机器观测以 30 秒窗口保存：磁盘面板针对 agent 状态目录所在文件系统，区分容量、inode、块设备吞吐、IOPS、完成延迟、队列与 I/O PSI；网络面板除连接与内核错误外，还按真实匿名端口范围估算最繁忙目标的出站端口压力。目标地址只在节点内参与聚合，不会上报控制面。
 
+实时网卡速率是第三条独立通道：Agent 主动维持到控制面的 WebSocket，无浏览器查看时只保活、不采样；查看机器或机器总览时，控制面下发临时租约并按全局 1/2/5 秒配置采样，最后一个查看者离开 15 秒后停止。控制面只保留每台机器最近 120 秒、最多 600 点的内存环，进程重启即可丢失，不写数据库、不进入离线重放，也不改变诊断和用量的 30 秒口径。浏览器仅通过控制面的 SSE 读取数据，永远不连接 Agent，也不会收到节点地址或节点令牌。
+
 节点日志默认有界：设置页配置全局上限（默认 100 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。Agent 使用独立 journald namespace；Agent 拉起的 Xray 与每个 Phantun 实例分别写入 `$BROCADE_AGENT_STATE_DIR/logs`，每个日志项的当前段与前一段合计不超过生效上限。降低上限会在线截断已有分段，不重启 Xray/Phantun。查看 Agent 日志使用 `journalctl --namespace=brocade-agent -u brocade-agent`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动，旧版 `/tmp/brocade-agent-*.log` 会在对应进程完成一次受控重启后移除。
 
 ## 代码结构
@@ -48,8 +50,9 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 | `brocade-probe`      | Agent 与控制面共用的临时 Xray 客户端和端到端拨测执行器     |
 | `brocade-preview`    | 基于 Docker 的本地集群预览环境                             |
 | `frontend`           | React + Vite 控制台                                        |
+| `third_party/xray-core` | Brocade Xray fork 源码；当前钉在官方 `v26.4.25` 基线     |
 
-生产构建会把前端资源以及 `x86_64`、`aarch64` 两种架构的静态 agent 一并嵌入 `brocade-console`。因此，控制面部署只需分发一个二进制文件，前端、API 与 agent 发行物也不会因独立部署而发生版本漂移。
+生产构建会把前端资源以及 `x86_64`、`aarch64` 两种架构的静态 Agent 和 Brocade Xray 一并嵌入 `brocade-console`。因此，控制面部署只需分发一个二进制文件，前端、API 与节点发行物也不会因独立部署而发生版本漂移。
 
 ## 构建与验证
 
@@ -58,6 +61,7 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 仓库通过 [`rust-toolchain.toml`](rust-toolchain.toml) 固定 Rust 工具链和 agent 所需的 musl targets。完整构建还需要：
 
 - Node.js 22 与 npm，用于构建前端；
+- Go 1.26，用于从仓库内源码构建 Brocade Xray；
 - Zig 0.16，用于交叉编译静态 agent；
 - Docker，用于执行 PostgreSQL 集成测试；
 - 目标平台的交叉链接器，仅在控制面本身需要交叉编译时使用。
@@ -68,7 +72,7 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 cargo build --release --locked -p brocade-console
 ```
 
-输出位于 `target/release/brocade-console`。构建脚本会执行 `npm ci` 与前端生产构建，并分别生成两种架构的 agent。若前端已由其他流水线构建，可通过绝对路径指定待嵌入目录，从而跳过 npm：
+输出位于 `target/release/brocade-console`。构建脚本会执行 `npm ci` 与前端生产构建，并分别生成两种架构的 Agent 和 Brocade Xray。若前端已由其他流水线构建，可通过绝对路径指定待嵌入目录，从而跳过 npm：
 
 ```sh
 BROCADE_CONSOLE_ASSETS_DIR=/absolute/path/to/frontend/dist \
@@ -154,27 +158,22 @@ sudo -u postgres createdb --owner=brocade brocade
 
 ### 3. 安装控制面拨测所需的 Xray
 
-用户页的「授权验证」由控制面使用当前 Serving 中的真实用户授权发起，因此控制面主机也必须安装与机队版本一致的 Xray。它只作为短生命周期的客户端执行，不运行常驻 Xray 服务。固定版本和校验和应取自 [XTLS/Xray-core 对应版本的官方 release](https://github.com/XTLS/Xray-core/releases)。以下是 `aarch64` 上已验证的 `v26.4.25`：
+用户页的「授权验证」由控制面使用当前 Serving 中的真实用户授权发起，因此控制面主机也必须安装与机队版本一致的 Brocade Xray。它只作为短生命周期的客户端执行，不运行常驻 Xray 服务。源码固定在仓库的 `third_party/xray-core/`，当前基线为 `v26.4.25`；部署流程不再下载社区 Xray。以下命令在构建机生成 `aarch64` 产物：
 
 ```sh
-BROCADE_INSTALL_XRAY_VERSION=v26.4.25
-BROCADE_INSTALL_XRAY_SHA256=020416fa7e1b1b04c4f97209b33f1bd4683e15272feda48c769ae2c9beb1c3de
-BROCADE_XRAY_TMP="$(mktemp -d)"
-trap 'rm -rf -- "$BROCADE_XRAY_TMP"' EXIT
-
-curl --fail --location --proto '=https' --tlsv1.2 \
-  --output "$BROCADE_XRAY_TMP/xray.zip" \
-  "https://github.com/XTLS/Xray-core/releases/download/${BROCADE_INSTALL_XRAY_VERSION}/Xray-linux-arm64-v8a.zip"
-printf '%s  %s\n' "$BROCADE_INSTALL_XRAY_SHA256" "$BROCADE_XRAY_TMP/xray.zip" \
-  | sha256sum --check --strict
-unzip -j "$BROCADE_XRAY_TMP/xray.zip" xray -d "$BROCADE_XRAY_TMP/unpacked"
-sudo install -d -o root -g root -m 0755 /opt/brocade/libexec
-sudo install -o root -g root -m 0755 \
-  "$BROCADE_XRAY_TMP/unpacked/xray" /opt/brocade/libexec/xray
-/opt/brocade/libexec/xray version | head -n 1
+mkdir -p target/brocade-xray
+BROCADE_COMMIT=$(git rev-parse --short=7 HEAD)
+git status --porcelain | grep -q . && BROCADE_COMMIT="${BROCADE_COMMIT}-dirty"
+cd third_party/xray-core
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=local \
+  go build -mod=readonly -trimpath -buildvcs=false -gcflags=all=-l=4 \
+  -ldflags="-X github.com/xtls/xray-core/core.build=${BROCADE_COMMIT} -s -w -buildid=" \
+  -o ../../target/brocade-xray/xray-aarch64 ./main
+cd ../..
+target/brocade-xray/xray-aarch64 version | head -n 1
 ```
 
-`x86_64` 主机应改用同一 release 的 `Xray-linux-64.zip`，并使用该资产自己的 SHA-256；不能沿用上面的 ARM64 校验值。
+`x86_64` 构建将 `GOARCH` 改为 `amd64`，输出名改为 `xray-x86_64`。`brocade-console/build.rs` 会自动构建并内嵌这两个架构；上面的独立产物用于安装控制面自己的拨测 Xray，也可通过 `BROCADE_XRAY_BIN_X86_64` / `BROCADE_XRAY_BIN_AARCH64` 复用给 Console 构建。
 
 ### 4. 安装二进制与环境文件
 
@@ -267,6 +266,11 @@ sudo journalctl -u brocade-console -n 100 --no-pager
 控制面应只监听回环地址，由 Nginx 负责公网 TLS 终止。将以下配置写入 `/etc/nginx/sites-available/brocade`。示例假定证书已安装于 `/etc/letsencrypt/live/console.example.net/`：
 
 ```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80;
     server_name console.example.net;
@@ -287,6 +291,11 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # Agent 实时遥测使用出站 WebSocket；浏览器实时视图使用 SSE。两者都经过控制面，
+        # 浏览器不会连接或获知节点地址。
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 1h;
     }
 }
 ```

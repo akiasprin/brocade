@@ -431,7 +431,10 @@ const GRANT_PROBE_SLOTS = [
 
 const GRANT_PROBE_POLL_MS = 1_000;
 
-const probeBaseName = (name: string) => name.replaceAll('（IPv6）', '').replaceAll('（QUIC）', '');
+const probeBaseName = (item: GrantProbeDisplayItem) => {
+  const withoutFamily = item.family === 'ipv6' ? item.name.replace(/ \| v6$/, '') : item.name;
+  return item.protocol === 'hysteria2' ? withoutFamily.replace(/ \| QUIC$/, '') : withoutFamily;
+};
 
 const probeStatusText = (item: GrantProbeDisplayItem) => {
   switch (item.status) {
@@ -558,7 +561,7 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
   for (const item of source) {
     const key = `${item.app_id}/${item.chain_id}/${item.ingress_id}`;
     const group = groups.get(key) ?? {
-      name: probeBaseName(item.name),
+      name: probeBaseName(item),
       items: [],
     };
     group.items.push(item);

@@ -77,7 +77,10 @@
             "8337a0bf"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:brc/i-brc-hk"
     },
@@ -126,7 +129,10 @@
             "c71c181a"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:frt/i-frt-hk"
     },
@@ -180,7 +186,10 @@
             "78373993"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:lin/i-lin-au"
     },
@@ -234,7 +243,10 @@
             "7d07b06e"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:lin/i-lin-us"
     },
@@ -283,7 +295,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:brc/c-brc-smart>sg-01"
     },
@@ -309,7 +324,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:lin/c-lin-au>sg-01"
     },
@@ -331,7 +349,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:lin/c-lin-us>sg-01"
     },

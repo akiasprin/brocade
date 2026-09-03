@@ -11,6 +11,8 @@ export const REALITY_FINGERPRINT_OPTIONS = [
   ['randomized', 'Randomized'],
 ] as const;
 
+export const TLS_FINGERPRINT_OPTIONS = [['none', '关闭（原生 TLS）'], ...REALITY_FINGERPRINT_OPTIONS] as const;
+
 const REALITY_FINGERPRINTS = new Set<string>(REALITY_FINGERPRINT_OPTIONS.map(([value]) => value));
 
 export function realityPublicKeyIsValid(value: string): boolean {
@@ -30,6 +32,10 @@ export function realityShortIdIsValid(value: string): boolean {
 
 export function realityFingerprintIsValid(value: string): boolean {
   return REALITY_FINGERPRINTS.has(value.trim().toLowerCase());
+}
+
+export function tlsFingerprintIsValid(value: string): boolean {
+  return value.trim().toLowerCase() === 'none' || realityFingerprintIsValid(value);
 }
 
 export function realityServerNameIsValid(value: string): boolean {

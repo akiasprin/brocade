@@ -509,13 +509,14 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
         // certificate does not verify therefore fails here — correctly, because a subscriber's
         // client fails in the same place. Pinning the certificate (`pinnedPeerCertSha256`) is the
         // replacement, and it needs the digest, which this target does not carry.
-        Some(tls) => serde_json::json!({
-            "security": "tls",
-            "tlsSettings": {
-                "serverName": tls.server_name,
-                "fingerprint": tls.fingerprint,
-            },
-        }),
+        Some(tls) => {
+            serde_json::json!({
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": tls.server_name,
+                },
+            })
+        }
         None => serde_json::json!({
             "security": "reality",
             "realitySettings": {
@@ -535,11 +536,28 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
                 options["host"] = serde_json::json!(host);
             }
             if let Some(xmux) = &xhttp.xmux {
-                options["xmux"] = serde_json::json!({
-                    "maxConcurrency": xmux.max_concurrency,
-                    "hMaxRequestTimes": xhttp_range(&xmux.h_max_request_times),
-                    "hMaxReusableSecs": xhttp_range(&xmux.h_max_reusable_secs),
-                });
+                let mut value = serde_json::Map::new();
+                if let Some(concurrency) = xmux.max_concurrency {
+                    value.insert("maxConcurrency".to_owned(), serde_json::json!(concurrency));
+                }
+                if let Some(connections) = xmux.max_connections {
+                    value.insert("maxConnections".to_owned(), serde_json::json!(connections));
+                }
+                value.insert(
+                    "hMaxRequestTimes".to_owned(),
+                    xhttp_range(&xmux.h_max_request_times),
+                );
+                value.insert(
+                    "hMaxReusableSecs".to_owned(),
+                    xhttp_range(&xmux.h_max_reusable_secs),
+                );
+                if let Some(period) = xmux.h_keep_alive_period_secs {
+                    value.insert("hKeepAlivePeriod".to_owned(), serde_json::json!(period));
+                }
+                options["xmux"] = serde_json::Value::Object(value);
+            }
+            if let Some(range) = &xhttp.x_padding_bytes {
+                options["xPaddingBytes"] = xhttp_range(range);
             }
             // Absent means both ends resolve it the same way by themselves. Named, it has to
             // match: a server told to expect one upload shape refuses every client naming another.
@@ -991,7 +1009,7 @@ fn read_exact_until(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "early eof",
-                ))
+                ));
             }
             read => buffer = &mut buffer[read..],
         }
@@ -1117,7 +1135,8 @@ mod tests {
             path: "/probe".to_owned(),
             host: Some("upload.route.example".to_owned()),
             xmux: Some(brocade_deployment::protocol::E2eProbeXhttpXmux {
-                max_concurrency: 16,
+                max_concurrency: Some(16),
+                max_connections: None,
                 h_max_request_times: brocade_deployment::protocol::E2eProbeXhttpRange {
                     from: 600,
                     to: 900,
@@ -1126,6 +1145,11 @@ mod tests {
                     from: 1800,
                     to: 3000,
                 },
+                h_keep_alive_period_secs: Some(15),
+            }),
+            x_padding_bytes: Some(brocade_deployment::protocol::E2eProbeXhttpRange {
+                from: 200,
+                to: 600,
             }),
             mode: Some("stream-one".to_owned()),
         });
@@ -1144,6 +1168,13 @@ mod tests {
             stream["xhttpSettings"]["xmux"]["hMaxReusableSecs"],
             "1800-3000"
         );
+        assert_eq!(stream["xhttpSettings"]["xmux"]["hKeepAlivePeriod"], 15);
+        assert_eq!(stream["xhttpSettings"]["xPaddingBytes"], "200-600");
+        assert!(stream["xhttpSettings"].get("scMaxEachPostBytes").is_none());
+        assert!(stream["xhttpSettings"]
+            .get("scMinPostsIntervalMs")
+            .is_none());
+        assert!(stream["xhttpSettings"].get("uplinkChunkSize").is_none());
         assert_eq!(stream["xhttpSettings"]["mode"], "stream-one");
     }
 
@@ -1155,7 +1186,6 @@ mod tests {
         let mut t = target(&[]);
         t.tls = Some(brocade_deployment::protocol::E2eProbeTls {
             server_name: "a1b2.example.net".to_owned(),
-            fingerprint: "chrome".to_owned(),
             flow: None,
         });
         let out: serde_json::Value =
@@ -1163,6 +1193,7 @@ mod tests {
         let stream = &out["outbounds"][0]["streamSettings"];
         assert_eq!(stream["security"], "tls");
         assert_eq!(stream["tlsSettings"]["serverName"], "a1b2.example.net");
+        assert!(stream["tlsSettings"].get("fingerprint").is_none());
         // xray rejects a config carrying `allowInsecure` outright (removed in v26.2.6, fatal
         // from v26.6.1). Writing it does not loosen verification, it prevents the probe process
         // from starting — which reported as "探测进程没起来：（没有输出）" on every VLESS+TLS chain.

@@ -5,8 +5,7 @@
 //! a person connects in; this projects how the chain head itself connects in — both
 //! read the same fields (ingress address, port, REALITY's five parameters), because
 //! a probe is only meaningful when it travels byte for byte the same path as a real
-//! user. One differing fingerprint is enough to measure the health of a different
-//! path.
+//! user. One differing transport parameter is enough to measure the health of a different path.
 //!
 //! Why the head must originate it: this chain's ingress exists only on that machine,
 //! and nowhere else can dial the port a user sees. The control plane least of all —
@@ -81,7 +80,6 @@ pub struct ProbeTlsParams {
     /// The name on the machine's own certificate. Unlike REALITY's borrowed name this one has to
     /// be right, because the client verifies it against a chain a public CA signed.
     pub server_name: String,
-    pub fingerprint: String,
     pub flow: Option<String>,
 }
 
@@ -131,7 +129,6 @@ fn probe_security(ingress: &crate::ir::routing::Ingress) -> ProbeSecurity {
         }),
         None => ProbeSecurity::Tls(ProbeTlsParams {
             server_name: ingress.certificate_name.clone().unwrap_or_default(),
-            fingerprint: ingress.wires.fingerprint().to_owned(),
             flow: ingress.wires.flow().map(str::to_owned),
         }),
     }

@@ -18,8 +18,8 @@ import {
   fetchNodeLoad,
   fetchCerts,
   fetchNodeLoadList,
-  fetchNodeTcpProbe,
-  fetchNodeTcpProbeList,
+  fetchNodePingProbe,
+  fetchNodePingProbeList,
   monthBytes,
   issueNodeToken,
   provisionNode,
@@ -33,7 +33,7 @@ import {
   type LinkHealthItem,
   type NodeAgentStateItem,
   type NodeLoadView,
-  type NodeTcpProbeView,
+  type NodePingProbeView,
   type LoadSample,
   type ProvisionNodeResult,
   type UsageNodeSeries,
@@ -46,17 +46,27 @@ import { can, isPublic, useSession } from '../session';
 import { Ago, Confirm, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { Icon, ListIcon } from '../ui/icons';
 import { bytes } from '../ui/format';
-import { useNodeNames } from '../ui/node-name';
 import { copyText } from '../ui/platform';
 import { useNarrow } from '../ui/viewport';
 import { useNow } from '../ui/clock';
 import { useAgentLiveness } from '../ui/agent-alive';
+import { pingLatencyMs, pingLatencyText, pingSampleText } from '../ui/ping-probe';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { openTabByKey } from '../ui/topbar';
 import { RegionFlag } from '../ui/region-flag';
 import { navigate } from '../forge/route';
-import { OBSERVE_COLOR_VARS, observeColors, observeValueAxis } from '../ui/observe-chart';
+import {
+  OBSERVE_SERIES_COLOR_VARS,
+  observeAreaStyle,
+  observeAxisLine,
+  observeAxisTick,
+  observeColors,
+  observeMinorTick,
+  observeSeriesLine,
+  observeTimeInterval,
+  observeValueAxis,
+} from '../ui/observe-chart';
 import { LoadCard, bps, ThroughputChart, dur, iso } from './telemetry';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
@@ -65,7 +75,6 @@ import { ChainRulesPanel, IngressPortEditor } from './chains';
 import { MachineEgressDnsRules, RuleDraftScope, isForwardTargetInChain } from './rules';
 import { chainSpine, fetchSnapshot, type SnapshotChain, type SnapshotIngress, type SnapshotStep } from '../api';
 import type { AppIr } from '../topo/model';
-import { fmtBytes } from '../forge/diff';
 
 // 纳管分两个阶段，中间是一次不可逆的写库：
 // `provision` 是填写信息（此时机器尚未创建），`install` 是为已创建的机器安装 agent。
@@ -394,15 +403,15 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     retry: false,
   });
   const loadOf = useMemo(() => new Map((load.data?.nodes ?? []).map(n => [n.node_id, n])), [load.data]);
-  const tcpProbe = useQuery({
-    queryKey: ['tcp-probe-nodes', 3600],
-    queryFn: () => fetchNodeTcpProbeList(3600),
-    refetchInterval: 30_000,
+  const pingProbe = useQuery({
+    queryKey: ['ping-probe-nodes', 3600],
+    queryFn: () => fetchNodePingProbeList(3600),
+    refetchInterval: 5_000,
     retry: false,
   });
-  const tcpProbeOf = useMemo(
-    () => new Map((tcpProbe.data?.nodes ?? []).map(node => [node.node_id, node])),
-    [tcpProbe.data],
+  const pingProbeOf = useMemo(
+    () => new Map((pingProbe.data?.nodes ?? []).map(node => [node.node_id, node])),
+    [pingProbe.data],
   );
   // 各机器在链中的角色。窄屏下第二行显示的即是该信息——扫视列表时需要的是
   // 该机器是入口还是出口、参与了几条链，而不是它的公网地址。
@@ -538,8 +547,8 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
           node={n}
           series={seriesOf.get(n.node_id)}
           load={loadOf.get(n.node_id)}
-          tcpProbe={tcpProbeOf.get(n.node_id)}
-          tcpProbeReady={tcpProbe.isSuccess}
+          pingProbe={pingProbeOf.get(n.node_id)}
+          pingProbeReady={pingProbe.isSuccess}
           usagePending={usage.isPending}
           selecting={selecting}
           checked={picked.has(n.node_id)}
@@ -683,8 +692,8 @@ function NodeAddr({ node }: { node: NodeAgentStateItem }) {
 function NodeCard({
   node,
   load,
-  tcpProbe,
-  tcpProbeReady,
+  pingProbe,
+  pingProbeReady,
   series,
   usagePending,
   selecting,
@@ -695,10 +704,10 @@ function NodeCard({
   node: NodeAgentStateItem;
   /** 该机器的近期负载。undefined 表示尚未读取，或当前控制面版本没有该端点 */
   load?: NodeLoadView;
-  /** 近一小时 TCP Connect 读数；配置目标后在卡片右下角替换 IP。 */
-  tcpProbe?: NodeTcpProbeView;
+  /** 近一小时 Ping 读数；配置 TCP 目标后在卡片右下角替换 IP。 */
+  pingProbe?: NodePingProbeView;
   /** 只有接口成功返回才能证明「没有配置目标」；加载中和请求失败都不能回退显示 IP。 */
-  tcpProbeReady: boolean;
+  pingProbeReady: boolean;
   series?: UsageNodeSeries;
   usagePending: boolean;
   selecting: boolean;
@@ -776,8 +785,8 @@ function NodeCard({
             </button>
           )}
         </span>
-        {!tcpProbeReady || (tcpProbe && tcpProbe.targets.length > 0) ? (
-          <TcpProbeP95 view={tcpProbe} pending={!tcpProbeReady} />
+        {!pingProbeReady || (pingProbe && pingProbe.targets.some(target => target.address.startsWith('tcp://'))) ? (
+          <TcpProbeP95 view={pingProbe} pending={!pingProbeReady} />
         ) : (
           <NodeAddr node={node} />
         )}
@@ -1007,16 +1016,24 @@ function p95(values: number[]): number | null {
 }
 
 function nodeCardP95(value: number | null): string {
-  return value == null ? '—' : String(value);
+  return value == null ? '—' : String(Math.round(value));
 }
 
-function TcpProbeP95({ view, pending = false }: { view?: NodeTcpProbeView; pending?: boolean }) {
+function TcpProbeP95({ view, pending = false }: { view?: NodePingProbeView; pending?: boolean }) {
   if (pending && !view) return null;
   if (!view || view.targets.length === 0) return null;
-  const values = view.targets.map(target => ({
-    name: target.name,
-    value: p95(target.samples.flatMap(sample => (sample.connect_ms == null ? [] : [sample.connect_ms]))),
-  }));
+  const values = view.targets
+    .filter(target => target.address.startsWith('tcp://'))
+    .map(target => ({
+      name: target.name,
+      value: p95(
+        target.samples.flatMap(sample => {
+          const latency = pingLatencyMs(sample);
+          return latency == null ? [] : [latency];
+        }),
+      ),
+    }));
+  if (values.length === 0) return null;
   const compact = values
     .slice(0, 3)
     .map(item => nodeCardP95(item.value))
@@ -1181,9 +1198,7 @@ function PollAgo({ at }: { at: string | null }) {
 // 与上面的「已应用」属于两类事实，因此分开显示：
 // 「已应用」表示配置是否已下发到该机器，此处表示链路是否连通。配置全部正常而用户无法连接，
 // 正是因为此前只有前者。
-// 链路统计单独提取：顶部的状态条和 RELAY STATUS 表使用同一份数据，
-// 分别计算会得出不一致的结果。两个查询键与卡片内原有的完全相同，因此第二个调用方
-// 命中缓存，不产生额外的网络请求。
+// 链路统计单独提取：观测页顶部的状态条使用这份数据（RELAY STATUS 表已移除）。
 function useHopStats(nodeId: string) {
   const health = useQuery({
     queryKey: ['link-health'],
@@ -1253,140 +1268,93 @@ function usageRoleSlots(series: UsageNodeSeries | undefined, slots: number): { u
   };
 }
 
-/* 该机器的 xray 承载吞吐曲线。与网卡曲线（LoadCard 内）同窗口、同粒度、用 group 联动十字线，
- * 但口径不同：网卡按方向（接收/发送）统计全部流量，此处按角色（用户/中继）只统计 xray 转发
- * 的字节——两者不能合并进一张图，各自的 Y 轴与图例保持这个差异可见。 */
-function XrayThroughputCard({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
-  const series = useQuery({
+/* 网卡吞吐与 XRAY 承载吞吐堆进一个面板。两者同窗口、同粒度、用 group 联动十字线，但口径
+ * 不同：网卡按方向（接收/发送）统计全部流量，XRAY 按角色（用户/中继）只统计 xray 转发的
+ * 字节——不能合并进一张图，各自的 Y 轴与图例保持这个差异可见，所以是同卡内的两张图。
+ * node-load 与 usage 两个查询的 queryKey 都与页面其它处一致，React Query 去重、不多发请求。 */
+export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
+  const load = useQuery({
+    queryKey: ['node-load-history', nodeId, range.seconds],
+    queryFn: () => fetchNodeLoad(nodeId, range.seconds / 30),
+    refetchInterval: range.seconds <= 60 * 60 ? 10_000 : 30_000,
+    retry: false,
+  });
+  const usage = useQuery({
     queryKey: ['usage-node-series', nodeId, range.seconds],
     queryFn: () => fetchUsageNodeSeries(range.seconds, nodeId),
     refetchInterval: 30_000,
   });
-  const mine = series.data?.nodes.find(n => n.node_id === nodeId);
-  const { user, relay } = usageRoleSlots(mine, range.seconds / 30);
-  const total = mine ? monthBytes(mine) : 0;
-  return (
-    <section className="chart-card">
-      <div className="load-network-cap">
-        <b>XRAY 流量</b>
-        <span>本月 {bytes(total)}</span>
-      </div>
-      <ThroughputChart
-        rx={user}
-        tx={relay}
-        rxName="用户"
-        txName="中继"
-        group={linked ? `nd-tp-${nodeId}` : undefined}
-      />
-      <footer className="load-network-legend" aria-label="XRAY 流量图例">
-        <span className="rx">
-          <i />
-          用户 <b>{bps(user[user.length - 1])}</b>
-        </span>
-        <span className="tx">
-          <i />
-          中继 <b>{bps(relay[relay.length - 1])}</b>
-        </span>
-      </footer>
-    </section>
-  );
-}
+  const report = load.data;
+  if (!report || report.series.length === 0) return null;
 
-function HopHealth({ nodeId }: { nodeId: string }) {
-  const { list, loading, dead, reported, observatory, windowSecs } = useHopStats(nodeId);
-  // 链路列显示名称而非 id。健康上报中的 `chain_id` 是 `<项目>/<链>` 拼接的技术标识，
-  // 而识别依据的是链名。查询键与其他位置一致，命中缓存。
-  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
-  const chainNames = new Map<string, { app: string; chain: string }>();
-  for (const app of snapshot.data?.snapshot.apps ?? []) {
-    for (const chain of app.chains ?? []) chainNames.set(chain.id, { app: app.label, chain: chain.name });
-  }
-  // 上报中的 id 带项目前缀（`app-hk-01/app-hk-01.c2`），模型中的链 id 不带，
-  // 取最后一段进行匹配。匹配失败时按原样显示——这表示链刚被删除或重命名，
-  // 显示一个可检索的 id 优于显示空白。
-  const chainLabel = (chainId: string) => chainNames.get(chainId.split('/').pop() ?? chainId) ?? null;
-  /* 下一跳同理：显示机器名称。未设置名称的机器回退到 id——该列不能为空。 */
-  const nodeName = useNodeNames();
-  if (loading) return null;
-  if (list.length === 0) return null;
+  const group = linked ? `nd-tp-${nodeId}` : undefined;
+  const windows = range.seconds / 30;
+
+  // 网卡：按方向统计全部流量。右对齐、缺口断开、历史不足选定范围时左侧补 null。
+  const series = report.series;
+  const last = series[series.length - 1];
+  const host = report.host;
+  const tail = series.slice(-windows);
+  const pad = windows - tail.length;
+  const nicRx: (number | null)[] = [
+    ...Array<number | null>(pad).fill(null),
+    ...tail.map(s => (s.has_gap ? null : s.nic_rx_bps)),
+  ];
+  const nicTx: (number | null)[] = [
+    ...Array<number | null>(pad).fill(null),
+    ...tail.map(s => (s.has_gap ? null : s.nic_tx_bps)),
+  ];
+  const drops = last.nic_rx_drop + last.nic_tx_drop + last.nic_err;
+  const nicMeta = [
+    last.nic_rx_drop > 0 ? `接收丢弃 ${last.nic_rx_drop.toLocaleString()}` : null,
+    last.nic_tx_drop > 0 ? `发送丢弃 ${last.nic_tx_drop.toLocaleString()}` : null,
+    last.nic_err > 0 ? `网卡错误 ${last.nic_err.toLocaleString()}` : null,
+    host?.nic ?? null,
+    typeof host?.nic_mtu === 'number' ? `MTU ${host.nic_mtu}` : null,
+  ].filter((value): value is string => value !== null);
+
+  // XRAY：按角色只统计 xray 转发的字节。
+  const mine = usage.data?.nodes.find(n => n.node_id === nodeId);
+  const { user, relay } = usageRoleSlots(mine, windows);
+  const monthTotal = mine ? monthBytes(mine) : 0;
+
   return (
-    <div className="panel">
-      <header>
-        <h4>RELAY STATUS</h4>
-      </header>
-      <table className="t">
-        <thead>
-          <tr>
-            <th className="mid">状态</th>
-            <th>XRAY 链路</th>
-            <th>下一跳</th>
-            {/* 命名为「回程字节」而非「流量」：该数值包含 observatory 每 10 秒一次的
-                探测流量（论证见 artifacts/xray.rs——活性判定正是依据它使计数器持续增长），
-                且只统计回程方向、只统计转发出口，不包含落地段的任何字节。
-                命名为流量会被当作用量读取，而用量在「用量」页，按 user label 统计。 */}
-            <th title="这一跳回来的字节数，含每 10 秒一次的探测流量。它是判活的凭据，不是用量">
-              {windowSecs ? `${windowSecs} 秒的回程字节` : '回程字节'}
-            </th>
-            <th>最后确认</th>
-          </tr>
-        </thead>
-        <tbody>
-          {list.map(row => (
-            <tr key={row.subject}>
-              <td className="mid">
-                {row.health ? (
-                  <i className={`lamp ${row.health.alive ? 'ok' : 'bad'}`} title={row.health.alive ? '通' : '不通'} />
-                ) : (
-                  <span className="st st-pending">未上报</span>
-                )}
-              </td>
-              <td>
-                {(() => {
-                  const named = chainLabel(row.chainId);
-                  if (!named) return <span className="mono">{row.chainId}</span>;
-                  return (
-                    <span title={row.chainId}>
-                      {named.chain}
-                      {/* 一台机器常同时属于多个项目的链，只有链名无法区分所属项目 */}
-                      <span className="dim" style={{ marginLeft: 7, fontSize: 11 }}>
-                        {named.app}
-                      </span>
-                    </span>
-                  );
-                })()}
-              </td>
-              <td title={row.peerNodeId}>{nodeName(row.peerNodeId)}</td>
-              <td className="mono d2">
-                {/* 窗口长度已在表头显示。只有该行的窗口与表头不同时才额外标注——
-                    正常情况下同一次上报中所有跳共用一个窗口，不会产生额外标注。 */}
-                {row.health ? (
-                  <>
-                    {fmtBytes(row.health.downlink_bytes)}
-                    {windowSecs !== null && row.health.window_secs !== windowSecs && (
-                      <span className="dim"> / {row.health.window_secs}s</span>
-                    )}
-                  </>
-                ) : (
-                  '—'
-                )}
-              </td>
-              {/* 与全站一致显示为相对时间，绝对时刻在 title 中 */}
-              <td className="d2">{row.health ? <Ago at={row.health.checked_at} /> : '—'}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {reported === 0 && observatory && (
-        <p className="note" style={{ margin: '9px 0 0' }}>
-          首轮没有基线，需等待下一个计数器窗口才能判定存活。
-        </p>
-      )}
-      {dead.length > 0 && (
-        <p className="note" style={{ color: 'var(--gold)', margin: '9px 0 0' }}>
-          {dead.map(h => `${h.chain_id}→${h.peer_node_id}`).join('、')} 探测无响应。检查对端的 xray 与凭据。
-        </p>
-      )}
-    </div>
+    <section className="chart-card nd-throughput-panel" aria-label="吞吐">
+      <div className="nd-throughput-block">
+        <div className="load-network-cap">
+          <b>网卡流量</b>
+          {nicMeta.length > 0 && <span className={drops > 0 ? 'hot' : undefined}>{nicMeta.join(' · ')}</span>}
+          <footer className="load-network-legend" aria-label="网卡流量图例">
+            <span className="rx">
+              <i />
+              接收 <b>{bps(last.nic_rx_bps)}</b>
+            </span>
+            <span className="tx">
+              <i />
+              发送 <b>{bps(last.nic_tx_bps)}</b>
+            </span>
+          </footer>
+        </div>
+        <ThroughputChart rx={nicRx} tx={nicTx} rxName="接收" txName="发送" group={group} />
+      </div>
+      <div className="nd-throughput-block">
+        <div className="load-network-cap">
+          <b>XRAY 流量</b>
+          <span>本月 {bytes(monthTotal)}</span>
+          <footer className="load-network-legend" aria-label="XRAY 流量图例">
+            <span className="rx">
+              <i />
+              用户 <b>{bps(user[user.length - 1])}</b>
+            </span>
+            <span className="tx">
+              <i />
+              中继 <b>{bps(relay[relay.length - 1])}</b>
+            </span>
+          </footer>
+        </div>
+        <ThroughputChart rx={user} tx={relay} rxName="用户" txName="中继" group={group} />
+      </div>
+    </section>
   );
 }
 
@@ -1397,7 +1365,11 @@ function HopHealth({ nodeId }: { nodeId: string }) {
 //
 // 建议值来自探测：agent 按对测量路径 MTU，该机器的建议值等于其所有路径中的最小值减 60。
 function NodeMtuRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit: boolean; onSaved: () => void }) {
-  const probe = useQuery({ queryKey: ['link-mtu'], queryFn: () => fetchLinkMtu() });
+  const probe = useQuery({
+    queryKey: ['link-mtu'],
+    queryFn: () => fetchLinkMtu(),
+    refetchInterval: 60_000,
+  });
   const [value, setValue] = useState<string | null>(null);
   const mine = probe.data?.nodes.find(n => n.node_id === node.node_id);
   const effective = node.mtu ?? probe.data?.default_mtu ?? null;
@@ -2386,7 +2358,7 @@ const FLEET_WINDOWS = 240; // 2 小时 / 30 秒。列表端点上限即 240，�
 const FLEET_SECS = FLEET_WINDOWS * 30;
 const GRID_SECS = 30; // 汇总时间网格：agent 的上报窗口即 30 秒。
 
-// 只此面板用 ECharts，按需注册（核心 + 折线 + 网格 + 提示 + 标线 + canvas），不引全量。
+// 只此面板用 ECharts，按需注册（核心 + 折线 + 网格 + 提示 + 标记区域/线 + canvas），不引全量。
 echarts.use([LineChart, GridComponent, TooltipComponent, MarkLineComponent, CanvasRenderer]);
 
 const NET_MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -2493,8 +2465,10 @@ function FleetNetChart({ times, pts, peak }: { times: number[]; pts: NetPoint[];
         xAxis: {
           type: 'time',
           axisLabel: { color: ink4, fontSize: 9, hideOverlap: true },
-          axisLine: { lineStyle: { color: line } },
-          axisTick: { show: false },
+          // onZero:false 把 x 轴框落到镜像底部；零线另由 series[0] 的 markLine 画。
+          axisLine: { ...observeAxisLine(ink4), onZero: false },
+          axisTick: observeAxisTick(ink4),
+          minorTick: observeMinorTick(lineSoft),
           splitLine: { show: false },
         },
         yAxis: {
@@ -2502,8 +2476,8 @@ function FleetNetChart({ times, pts, peak }: { times: number[]; pts: NetPoint[];
           min: -peak,
           max: peak,
           axisLabel: { color: ink4, fontSize: 9, formatter: (v: number) => bps(Math.abs(v)) },
-          axisLine: { show: false },
-          axisTick: { show: false },
+          axisLine: observeAxisLine(ink4),
+          axisTick: observeAxisTick(ink4),
           splitLine: { lineStyle: { color: lineSoft } },
         },
         series,
@@ -2641,19 +2615,14 @@ function LoadCardFor({ nodeId, range, linked }: { nodeId: string; range: LoadRan
     retry: false,
   });
   if (!load.data) return null;
-  // XRAY 曲线用 group 与 LoadCard 内的网卡曲线联动十字线；usage 数据由该卡自行获取。
+  // 吞吐两图（网卡 / XRAY）已移到 ThroughputPanel，与 Ping 面板并列；本卡只留生命体征与历史。
   return (
-    <LoadCard
-      report={load.data}
-      historyLabel={range.heading}
-      historyWindows={range.seconds / 30}
-      linked={linked}
-      xrayChart={<XrayThroughputCard nodeId={nodeId} range={range} linked={linked} />}
-    />
+    <LoadCard report={load.data} historyLabel={range.heading} historyWindows={range.seconds / 30} linked={linked} />
   );
 }
 
-const TCP_SERIES_CSS = OBSERVE_COLOR_VARS;
+const PING_SERIES_CSS = OBSERVE_SERIES_COLOR_VARS;
+type PingProtocol = 'icmp' | 'tcp';
 
 function html(value: string): string {
   return value.replace(
@@ -2662,7 +2631,7 @@ function html(value: string): string {
   );
 }
 
-function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadRange }) {
+function PingLatencyChart({ view, range, group }: { view: NodePingProbeView; range: LoadRange; group?: string }) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
   const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
@@ -2672,6 +2641,7 @@ function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadR
     const el = elRef.current;
     if (!el) return;
     const chart = echarts.init(el, null, { renderer: 'canvas' });
+    if (group) chart.group = group;
     chartRef.current = chart;
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(el);
@@ -2680,7 +2650,7 @@ function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadR
       chart.dispose();
       chartRef.current = null;
     };
-  }, []);
+  }, [group]);
 
   useEffect(() => {
     const chart = chartRef.current;
@@ -2695,32 +2665,48 @@ function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadR
     const lineSoft = cv('--line-soft');
     const glass = cv('--glass-strong');
     const byTarget = view.targets.map(
-      target => new Map(target.samples.map(sample => [sample.probed_at_unix_secs, sample.connect_ms])),
+      target => new Map(target.samples.map(sample => [sample.probed_at_unix_secs, sample])),
     );
     const times = [
       ...new Set(view.targets.flatMap(target => target.samples.map(sample => sample.probed_at_unix_secs))),
     ].sort((a, b) => a - b);
     const valuesAt = new Map(times.map(time => [time, byTarget.map(samples => samples.get(time))] as const));
     const successful = view.targets.flatMap(target =>
-      target.samples.flatMap(sample => (sample.connect_ms == null ? [] : [sample.connect_ms])),
+      target.samples.flatMap(sample => {
+        const latency = pingLatencyMs(sample);
+        return latency == null ? [] : [latency];
+      }),
     );
-    const valueAxis = observeValueAxis(Math.max(10, ...(successful.length > 0 ? successful : [0])));
+    const valueAxis = observeValueAxis(Math.max(...successful, 0.1));
     const now = Date.now();
     const start = now - range.seconds * 1000;
-
-    const series: Array<Record<string, unknown>> = view.targets.map((target, index) => ({
-      name: target.name,
-      type: 'line' as const,
-      symbol: 'circle',
-      symbolSize: 5,
-      showSymbol: false,
-      smooth: false,
-      connectNulls: false,
-      lineStyle: { color: colors[index % colors.length], width: 1.1 },
-      itemStyle: { color: colors[index % colors.length], borderColor: glass, borderWidth: 1.5 },
-      emphasis: { disabled: true },
-      data: times.map(time => [time * 1000, byTarget[index].get(time) ?? null] as [number, number | null]),
-    }));
+    // x 轴显示墙钟时刻（hh:mm）。轴起点即首个样本时刻（无样本时退回窗口起点），曲线紧贴
+    // y 轴；不再向下取整到整分，以免首点的秒数变成左端留白。见 ThroughputChart 同处说明。
+    const firstMs = times.length > 0 ? times[0] * 1000 : start;
+    const xStep = observeTimeInterval(now - firstMs);
+    const xMin = Math.min(firstMs, now - 30_000);
+    const hm = (ms: number) =>
+      new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const series: Array<Record<string, unknown>> = view.targets.map((target, index) => {
+      const color = colors[index % colors.length];
+      return {
+        name: target.name,
+        type: 'line' as const,
+        symbol: 'circle',
+        symbolSize: 5,
+        showSymbol: false,
+        smooth: false,
+        connectNulls: false,
+        lineStyle: observeSeriesLine(color),
+        areaStyle: observeAreaStyle(color, themeName, { count: view.targets.length }),
+        itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
+        emphasis: { disabled: true },
+        data: times.map(time => {
+          const sample = byTarget[index].get(time);
+          return [time * 1000, sample ? pingLatencyMs(sample) : null] as [number, number | null];
+        }),
+      };
+    });
     chart.setOption(
       {
         animation: false,
@@ -2741,7 +2727,7 @@ function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadR
             const entries = params as { axisValue: number }[];
             const atMs = Number(entries[0]?.axisValue ?? 0);
             const at = Math.round(atMs / 1000);
-            const values = valuesAt.get(at) ?? view.targets.map(() => null);
+            const values = valuesAt.get(at) ?? view.targets.map(() => undefined);
             const when = new Date(atMs).toLocaleString('zh-CN', {
               month: '2-digit',
               day: '2-digit',
@@ -2751,16 +2737,21 @@ function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadR
               hour12: false,
             });
             const rows = view.targets
-              .map((target, index) => ({ target, index, value: values[index] }))
+              .map((target, index) => ({
+                target,
+                index,
+                sample: values[index],
+                value: values[index] ? pingLatencyMs(values[index]!) : null,
+              }))
               .sort(
                 (left, right) => (right.value ?? Number.NEGATIVE_INFINITY) - (left.value ?? Number.NEGATIVE_INFINITY),
               )
-              .map(({ target, index, value }) => {
+              .map(({ target, index, sample }) => {
                 return (
                   `<div style="display:flex;align-items:center;gap:7px;line-height:1.75">` +
                   `<span style="width:8px;height:8px;border-radius:2px;background:${colors[index % colors.length]};flex:none"></span>` +
                   `<span style="color:${ink3}">${html(target.name)}</span>` +
-                  `<b style="margin-left:auto;color:${ink};font-weight:500">${value == null ? '—' : `${value} ms`}</b></div>`
+                  `<b style="margin-left:auto;color:${ink};font-weight:500">${pingSampleText(sample)}</b></div>`
                 );
               })
               .join('');
@@ -2768,24 +2759,22 @@ function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadR
           },
         },
         xAxis: {
-          type: 'time',
-          min: start,
+          // 数值轴承载毫秒时间戳：echarts 6 的 time 轴无视 interval，会把竖网格铺成 2 分钟一格；
+          // 数值轴才能把主网格钉在稀疏的整分位置，同时保留次刻度。
+          type: 'value',
+          min: xMin,
           max: now,
-          splitNumber: 6,
+          interval: xStep,
           axisLabel: {
             color: ink3,
             fontSize: 9.5,
             margin: 8,
             hideOverlap: true,
-            formatter: (value: number) => {
-              const seconds = Math.max(0, (now - value) / 1000);
-              if (seconds < 30) return '现在';
-              if (seconds < 3600) return `−${Math.max(1, Math.round(seconds / 60))}m`;
-              return `−${Math.max(1, Math.round(seconds / 3600))}h`;
-            },
+            formatter: (value: number) => hm(value),
           },
-          axisLine: { lineStyle: { color: line } },
-          axisTick: { show: false },
+          axisLine: observeAxisLine(ink4),
+          axisTick: observeAxisTick(ink4),
+          minorTick: observeMinorTick(lineSoft),
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
         yAxis: {
@@ -2793,61 +2782,105 @@ function TcpConnectChart({ view, range }: { view: NodeTcpProbeView; range: LoadR
           min: 0,
           max: valueAxis.max,
           interval: valueAxis.interval,
-          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (value: number) => `${Math.round(value)} ms` },
-          axisLine: { show: false },
-          axisTick: { show: false },
+          axisLabel: {
+            color: ink3,
+            fontSize: 9.5,
+            margin: 8,
+            formatter: (value: number) => (value === 0 ? '0' : pingLatencyText(value)),
+          },
+          axisLine: observeAxisLine(ink4),
+          axisTick: observeAxisTick(ink4),
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
         series,
       },
       true,
     );
-  }, [view, range, themeName, paletteKey]);
+    if (group) echarts.connect(group);
+  }, [view, range, group, themeName, paletteKey]);
 
-  return <div ref={elRef} className="tcp-connect-chart" />;
+  return <div ref={elRef} className="ping-probe-chart" />;
 }
 
-function TcpProbePanel({ nodeId, range }: { nodeId: string; range: LoadRange }) {
+function PingProbeLegend({ view }: { view: NodePingProbeView }) {
+  const shown = view.targets.slice(0, 3);
+  return (
+    <footer className="load-network-legend ping-probe-legend" aria-label="Ping 图例">
+      {shown.map((target, index) => {
+        const latest = target.samples.at(-1);
+        const percentile = p95(
+          target.samples.flatMap(sample => {
+            const latency = pingLatencyMs(sample);
+            return latency == null ? [] : [latency];
+          }),
+        );
+        const state = !latest?.attempted ? 'gap' : latest.latency_us == null ? 'loss' : undefined;
+        const title = `${target.address}\nP95 ${percentile == null ? '—' : pingLatencyText(percentile)}`;
+        return (
+          <span key={`${target.address}-${index}`} title={title}>
+            <i style={{ background: `var(${PING_SERIES_CSS[index % PING_SERIES_CSS.length]})` }} />
+            <span className="ping-probe-name">{target.name}</span>
+            <b className={state}>{pingSampleText(latest)}</b>
+          </span>
+        );
+      })}
+      {view.targets.length > shown.length && (
+        <span className="ping-probe-more">+{view.targets.length - shown.length}</span>
+      )}
+    </footer>
+  );
+}
+
+function PingProbeBlock({
+  view,
+  protocol,
+  range,
+  group,
+  loading,
+}: {
+  view: NodePingProbeView;
+  protocol: PingProtocol;
+  range: LoadRange;
+  group?: string;
+  loading: boolean;
+}) {
+  const targets = view.targets.filter(target => target.address.startsWith(`${protocol}://`));
+  const protocolView = { ...view, targets };
+  const label = `${protocol.toUpperCase()} PING`;
+  const hasSamples = targets.some(target => target.samples.length > 0);
+  return (
+    <div className="ping-probe-block" aria-label={label}>
+      <div className="load-network-cap">
+        <b>{label}</b>
+        {targets.length > 0 && <PingProbeLegend view={protocolView} />}
+      </div>
+      {loading ? (
+        <p className="note ping-probe-empty">正在读取探测数据…</p>
+      ) : targets.length === 0 ? (
+        <p className="note ping-probe-empty">尚未在设置中配置 {protocol.toUpperCase()} 探测目标。</p>
+      ) : hasSamples ? (
+        <PingLatencyChart view={protocolView} range={range} group={group} />
+      ) : (
+        <p className="note ping-probe-empty">目标已经配置，尚无 Agent 样本。</p>
+      )}
+    </div>
+  );
+}
+
+function PingProbePanel({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
   const probe = useQuery({
-    queryKey: ['node-tcp-probe', nodeId, range.seconds],
-    queryFn: () => fetchNodeTcpProbe(nodeId, range.seconds),
-    refetchInterval: 30_000,
+    queryKey: ['node-ping-probe', nodeId, range.seconds],
+    queryFn: () => fetchNodePingProbe(nodeId, range.seconds),
+    refetchInterval: 5_000,
     retry: false,
   });
-  if (probe.error) return null;
-  const targets = probe.data?.targets ?? [];
+  if (probe.error && !probe.data) return null;
+  const view = probe.data ?? { node_id: nodeId, targets: [] };
+  const group = linked ? `nd-ping-${nodeId}` : undefined;
   return (
-    <section className="chart-card tcp-connect-panel" aria-label="TCP Ping">
-      <div className="load-network-cap">
-        <b>TCP PING</b>
-      </div>
-      {targets.length === 0 ? (
-        <p className="note">尚未在设置中配置 TCP 探测目标。</p>
-      ) : (
-        <>
-          {targets.some(target => target.samples.length > 0) ? (
-            <TcpConnectChart view={probe.data!} range={range} />
-          ) : (
-            <p className="note tcp-connect-empty">目标已经配置，尚无 Agent 样本。</p>
-          )}
-          <footer className="tcp-connect-summary" aria-label="TCP PING 图例">
-            {targets.map((target, index) => {
-              const latest = target.samples.at(-1)?.connect_ms ?? null;
-              const percentile = p95(
-                target.samples.flatMap(sample => (sample.connect_ms == null ? [] : [sample.connect_ms])),
-              );
-              return (
-                <span key={target.address} title={target.address}>
-                  <i style={{ background: `var(${TCP_SERIES_CSS[index % TCP_SERIES_CSS.length]})` }} />
-                  <b>{target.name}</b>
-                  <em>{latest == null ? '—' : `${latest} ms`}</em>
-                  <small>P95 {percentile == null ? '—' : `${percentile} ms`}</small>
-                </span>
-              );
-            })}
-          </footer>
-        </>
-      )}
+    <section className="chart-card ping-probe-panel" aria-label="Ping">
+      <PingProbeBlock view={view} protocol="icmp" range={range} group={group} loading={probe.isPending} />
+      <PingProbeBlock view={view} protocol="tcp" range={range} group={group} loading={probe.isPending} />
     </section>
   );
 }
@@ -3332,6 +3365,8 @@ function NodeDetailLayout({
   toolbar: ReactNode;
   children: ReactNode;
 }) {
+  /* 标题下的第二行只放公网 IP：名称/地区由标题行与旗板承担，id 不在这里重复。 */
+  const identIp = node.public_ipv4 ?? node.public_ipv6 ?? null;
   const pageHeader = (
     <header className="nd-page-head">
       <div className="nd-page-identity">
@@ -3350,12 +3385,17 @@ function NodeDetailLayout({
             <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
           </span>
         )}
-        <h1 className={node.name ? 'nd-id nd-name' : 'nd-id'}>{node.name || node.node_id}</h1>
-        {nodeLifecycleLabel(node) && (
-          <span className={`st ${node.lifecycle_phase === 'abandoned' ? 'st-failed-dirty' : 'st-halted'}`}>
-            {nodeLifecycleLabel(node)}
-          </span>
-        )}
+        <div className="nd-ident-text">
+          <div className="nd-ident-row">
+            <h1 className={node.name ? 'nd-id nd-name' : 'nd-id'}>{node.name || node.node_id}</h1>
+            {nodeLifecycleLabel(node) && (
+              <span className={`st ${node.lifecycle_phase === 'abandoned' ? 'st-failed-dirty' : 'st-halted'}`}>
+                {nodeLifecycleLabel(node)}
+              </span>
+            )}
+          </div>
+          {identIp && <span className="nd-ident-meta">{identIp}</span>}
+        </div>
       </div>
       {toolbar}
     </header>
@@ -3494,7 +3534,6 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
     id,
     range: LOAD_RANGES[0],
   });
-  const [chartLinkState, setChartLinkState] = useState<{ id: string; linked: boolean }>({ id, linked: false });
 
   /* 页头的稀有/危险操作（重签 token、退役下线）收进 ⋯ 菜单：它们的视觉权重原与
      使用频率成反比——最稀有的危险操作画着最抢眼的红框。菜单项可以带一行说明，
@@ -3570,7 +3609,8 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   // 各自显示空状态，不能再把“无链路”等同于“没有规则页面”。
   const tab: NodeTab = tabState.id !== id ? 'observed' : tabState.tab;
   const loadRange = loadRangeState.id === id ? loadRangeState.range : LOAD_RANGES[0];
-  const chartsLinked = chartLinkState.id === id ? chartLinkState.linked : false;
+  /* 同一观测页里的图表始终共享时间位置与 Tooltip，不再把页面级一致行为做成用户开关。 */
+  const chartsLinked = true;
 
   /* 观测页的角标数。此处不按 `detailOnly` 过滤：那个标记的含义是「列表里不占标记位，
      进详情页才读」，而这里就是详情页——角标指向的正是它下面那几张卡里会展开的说明。
@@ -3607,10 +3647,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
       {(tab === 'observed' || !pub) && (
         <div className="nd-tools">
           {tab === 'observed' && (
-            <>
-              <ObserveLinkControl value={chartsLinked} onChange={linked => setChartLinkState({ id, linked })} />
-              <ObserveRangeControl value={loadRange} onChange={range => setLoadRangeState({ id, range })} />
-            </>
+            <ObserveRangeControl value={loadRange} onChange={range => setLoadRangeState({ id, range })} />
           )}
           {!pub && (
             <div className="nd-acts">
@@ -3822,10 +3859,14 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
       )}
 
       {tab === 'observed' && (
-        /* LOAD 是监控页的第一视图；TCP PING 紧随流量曲线，三张机器状态卡顺延到下一块。 */
+        /* LOAD 是监控页的第一视图；Ping 紧随流量曲线，三张机器状态卡顺延到下一块。 */
         <section className="nd-tab-observed">
           <LoadCardFor nodeId={id} range={loadRange} linked={chartsLinked} />
-          <TcpProbePanel nodeId={id} range={loadRange} />
+          {/* 吞吐（网卡 + XRAY）与 Ping（ICMP + TCP）分别同卡堆叠，两栏并排。 */}
+          <div className="nd-observe-throughput">
+            <ThroughputPanel nodeId={id} range={loadRange} linked={chartsLinked} />
+            <PingProbePanel nodeId={id} range={loadRange} linked={chartsLinked} />
+          </div>
           <div className="nd-observed-status">
             <AgentCard
               node={n}
@@ -3847,8 +3888,6 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
               )}
             </AppliedCard>
           </div>
-          {/* 链路质量通栏：用量已上移为 LoadCard 内的 XRAY 曲线，这里不再并排。 */}
-          <HopHealth nodeId={id} />
         </section>
       )}
 

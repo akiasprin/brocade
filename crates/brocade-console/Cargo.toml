@@ -7,7 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
+async-stream = "0.3"
 brocade-deployment = { path = "../brocade-deployment" }
 brocade-probe = { path = "../brocade-probe" }
 brocade-core = { path = "../brocade-core" }
@@ -40,12 +41,14 @@ time = { version = "0.3", default-features = false, features = ["formatting", "s
 base64 = "0.22"
 
 [dev-dependencies]
+futures-util = "0.3"
 ipnet = "2.11.0"
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
 testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tower = { version = "0.5.3", features = ["util"] }
+tokio-tungstenite = { version = "0.29", features = ["connect"] }
 
 # The agent binaries and the console front end are compiled into the control plane (argued at the
 # top of build.rs): sha2 for the agents' digests, flate2 to gzip the front end's files once at build

@@ -780,6 +780,7 @@ fn validate_refuses_xhttp_together_with_vision() {
             path: "/probe".to_owned(),
             host: None,
             xmux: None,
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -801,6 +802,7 @@ fn validate_accepts_xhttp_with_flow_turned_off() {
             path: "/probe".to_owned(),
             host: None,
             xmux: Some(XhttpXmux::with_concurrency(16)),
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -834,6 +836,7 @@ fn validate_warns_about_an_upload_mode_that_locks_out_existing_clients() {
             path: "/probe".to_owned(),
             host: None,
             xmux: None,
+            tuning: None,
             mode: XhttpMode::PacketUp,
         },
     }));
@@ -858,6 +861,7 @@ fn validate_says_nothing_about_the_other_upload_modes() {
                 path: "/probe".to_owned(),
                 host: None,
                 xmux: None,
+                tuning: None,
                 mode,
             },
         }));
@@ -884,7 +888,6 @@ fn validate_refuses_a_tls_ingress_on_a_machine_without_a_certificate() {
     let ingress = &mut app_ir.ingresses[0];
     ingress.wires = IngressWires::Vless(Transport::VlessTls(Tls {
         flow: Some(String::new()),
-        fingerprint: "chrome".to_owned(),
     }));
     ingress.certificate_name = None;
 
@@ -933,7 +936,6 @@ fn validate_accepts_a_tls_ingress_once_the_machine_holds_a_certificate() {
         let ingress = &mut app_ir.ingresses[0];
         ingress.wires = IngressWires::Vless(Transport::VlessTls(Tls {
             flow: Some(String::new()),
-            fingerprint: "chrome".to_owned(),
         }));
         ingress.certificate_name = name.map(str::to_owned);
 
@@ -1165,7 +1167,6 @@ fn validate_holds_reality_to_account_only_where_a_site_is_borrowed() {
     let ingress = &mut app_ir.ingresses[0];
     ingress.wires = IngressWires::Vless(Transport::VlessTls(Tls {
         flow: Some(String::new()),
-        fingerprint: "chrome".to_owned(),
     }));
     ingress.certificate_name = Some("a1b2.example.net".to_owned());
 
@@ -1191,6 +1192,7 @@ fn validate_refuses_a_path_that_cannot_round_trip() {
                     path: path.to_owned(),
                     host: None,
                     xmux: None,
+                    tuning: None,
                     mode: XhttpMode::Auto,
                 },
             }));
@@ -1216,6 +1218,7 @@ fn validate_refuses_a_concurrency_outside_the_range() {
                     path: "/probe".to_owned(),
                     host: None,
                     xmux: Some(XhttpXmux::with_concurrency(mux)),
+                    tuning: None,
                     mode: XhttpMode::Auto,
                 },
             }));
@@ -1913,6 +1916,7 @@ fn validate_app_set_reports_a_split_download_port_used_by_another_view() {
             path: "/split".to_owned(),
             host: None,
             xmux: None,
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -1966,6 +1970,7 @@ fn validate_rejects_stream_one_with_an_independent_download() {
             path: "/split".to_owned(),
             host: None,
             xmux: None,
+            tuning: None,
             mode: XhttpMode::StreamOne,
         },
     }));
@@ -3206,6 +3211,7 @@ fn validate_accepts_reality_xhttp_with_a_tls_download_front() {
             path: "/split".to_owned(),
             host: Some("upload.route.example".to_owned()),
             xmux: None,
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -3260,6 +3266,7 @@ fn validate_rejects_invalid_xhttp_client_routing_fields() {
             path: "/split".to_owned(),
             host: Some("  ".to_owned()),
             xmux: None,
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -3319,6 +3326,7 @@ fn validate_reality_split_requires_a_certificate_and_a_distinct_port() {
             path: "/split".to_owned(),
             host: None,
             xmux: None,
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -3567,6 +3575,29 @@ fn a_connection_setting_on_a_reverse_hop_is_refused() {
         !diagnostics.iter().any(|d| d.code == "rule.pool-on-reverse"),
         "{diagnostics:#?}"
     );
+}
+
+/// The concurrency-one pool remains valid for existing authored models, but it must not look as
+/// safe as a normal connection pool. Xray selects an idle Mux.cool worker without probing the
+/// underlying TCP connection first, which is the observed source of long stalls after idle reuse.
+#[test]
+fn a_concurrency_one_pool_warns_once_per_edge() {
+    let mut diagnostics = Vec::new();
+    let (sys, app_ir) = pool_ir_rules(
+        vec![
+            forward_pool("relay", HopDial::Overlay, HopPool::Pool),
+            forward_pool("relay", HopDial::Overlay, HopPool::Pool),
+        ],
+        &mut diagnostics,
+    );
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "rule.pool-concurrency-one")
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{diagnostics:#?}");
+    assert_eq!(warnings[0].level, Level::Warn);
 }
 
 /// The merge count is refused outside 2..=128 rather than clamped into it.

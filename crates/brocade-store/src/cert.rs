@@ -1021,17 +1021,34 @@ pub async fn record_observation(
     state: &str,
     sha256: Option<&str>,
 ) -> Result<()> {
+    record_observation_at(pool, node_id, state, sha256, None).await
+}
+
+pub async fn record_observation_at(
+    pool: &PgPool,
+    node_id: &str,
+    state: &str,
+    sha256: Option<&str>,
+    observed_at_unix_secs: Option<i64>,
+) -> Result<()> {
+    if observed_at_unix_secs.is_some_and(|at| at <= 0) {
+        return Err(StoreError::InvalidData(
+            "certificate observation timestamp must be positive unix seconds".to_owned(),
+        ));
+    }
     sqlx::query(
         "INSERT INTO node_cert_state (node_id, observed_state, observed_sha256, observed_at)
-         VALUES ($1, $2, $3, now())
+         VALUES ($1, $2, $3, COALESCE(to_timestamp($4), now()))
          ON CONFLICT (node_id) DO UPDATE
             SET observed_state = EXCLUDED.observed_state,
                 observed_sha256 = EXCLUDED.observed_sha256,
-                observed_at = EXCLUDED.observed_at",
+                observed_at = EXCLUDED.observed_at
+          WHERE node_cert_state.observed_at <= EXCLUDED.observed_at",
     )
     .bind(node_id)
     .bind(state)
     .bind(sha256)
+    .bind(observed_at_unix_secs.map(|at| at as f64))
     .execute(pool)
     .await?;
     Ok(())

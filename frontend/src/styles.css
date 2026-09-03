@@ -55,17 +55,31 @@
   --ink-3: #8d9196;
   --ink-4: #676b71;
   /* 观测图固定使用相邻高对比的柔和分类盘，不随站点操作色切换。ECharts canvas 与 HTML
-     图例共读这些直接色值，避免 canvas 无法解析嵌套 var()/color-mix()。 */
-  --observe-1: #6d90c4;
-  --observe-2: #c88a5e;
-  --observe-3: #77a67d;
-  --observe-4: #c47b83;
-  --observe-5: #9789bd;
-  --observe-6: #bda65f;
-  --observe-7: #5c9ca0;
-  --observe-8: #b98aa8;
-  --observe-9: #7f8ab0;
-  --observe-10: #9c9384;
+     图例共读这些直接色值，避免 canvas 无法解析嵌套 var()/color-mix()。
+
+     取自 Rosé Pine（暗色用 Moon，亮色用 Dawn）。该色卡只有六个强调色，第 6、8、10 档是
+     补出来的：按它自身的中位明度与彩度，落在它空着的色相弧上。最大的一段空弧是 75°→210°
+     ——Rosé Pine 没有绿色，第 6 档就补在那里。第 9 档直接取它的中性色 subtle，正好当
+     「空闲内存」这类不表达类别的底档。
+     它自带两对相近色（love/rose 差 19°、foam/pine 差 18°），在槽位次序上各隔 6 档拆开。
+
+     次序先按状态色相排除，再按对比度。本色卡有四个色落在状态色相上：rose 离 --err 4°、
+     gold 离 --gold 3°、love 离 --err 14°、补的绿离 --ok 13°。红与金一律排出前四档——红色
+     在监控台上是警示语义，普通序列用它会读成告警。1、2 档是吞吐图的收发线，绿也一并排除
+     （见 .load-net-tx 处的说明），因此只能从 pine/foam/靛/iris/紫红/subtle 里取，取了相隔
+     110° 的 pine 与紫红。绿留在第 3 档：把它也排掉，前四档就只剩一条蓝→紫的同调渐变，
+     ΔE 从 0.087 掉到 0.063，代价比收益大。
+     第 10 档必须是中性色：historyLineColorVar 把 --observe-free（内存「空闲」）映到这里。 */
+  --observe-1: #3e8fb0; /* pine */
+  --observe-2: #e99cd3; /* 紫红 338°，补 */
+  --observe-3: #8bbe95; /* 绿 150°，补 */
+  --observe-4: #7da1e3; /* 靛 262°，补 */
+  --observe-5: #ea9a97; /* rose */
+  --observe-6: #9ccfd8; /* foam */
+  --observe-7: #c4a7e7; /* iris */
+  --observe-8: #f6c177; /* gold */
+  --observe-9: #eb6f92; /* love */
+  --observe-10: #908caa; /* subtle，中性底档 → --observe-free */
   /* 语义色全局共享，不参与调色盘。--gold 表示「已变更 / 需注意」；状态标签只是偶尔出现的
      元素，因此三者都压低饱和度，避免抢过操作与数据。 */
   --ok: #43b789;
@@ -1089,11 +1103,12 @@
 :root[data-theme='light'],
 [data-theme='light'] {
   color-scheme: light;
-  --ground: #f2f2f1;
+  --ground: #ededec;
   --sheet: #ffffff;
   --surface: #e9e9e8;
   --block: #f8f8f7;
-  --card: var(--block);
+  /* 卡片从 --block 解耦提到纯白：台面压深、面板抬亮，两者拉开一档做出自然的浮起感。 */
+  --card: #ffffff;
   --band: #f0f0ef;
   --sunk: #f5f5f4;
   --line: #dbdcda;
@@ -1102,16 +1117,19 @@
   --ink-2: #3b3e42;
   --ink-3: #5c6165;
   --ink-4: #7e8286;
-  --observe-1: #4a6fa5;
-  --observe-2: #b06a3e;
-  --observe-3: #4f7d57;
-  --observe-4: #a85560;
-  --observe-5: #6f629c;
-  --observe-6: #94793a;
-  --observe-7: #3a7a7e;
-  --observe-8: #8f5f80;
-  --observe-9: #5a6690;
-  --observe-10: #736b5c;
+  /* Rosé Pine Dawn，与暗色的 Moon 同源同色相同次序。Dawn 本是为 #faf4ed 那张暖白纸配的，
+     落到纯白卡片上 gold 只有 2.24、rose 只有 2.84 的对比度——改深了就不再是 Rosé Pine，
+     所以原样保留，改由槽位次序处理：两者都排在第 5 档之后。 */
+  --observe-1: #286983; /* pine */
+  --observe-2: #b66fa2; /* 紫红 338°，补 */
+  --observe-3: #5b8e66; /* 绿 150°，补 */
+  --observe-4: #4d70b2; /* 靛 262°，补 */
+  --observe-5: #d7827e; /* rose */
+  --observe-6: #56949f; /* foam */
+  --observe-7: #907aa9; /* iris */
+  --observe-8: #ea9d34; /* gold */
+  --observe-9: #b4637a; /* love */
+  --observe-10: #797593; /* subtle，中性底档 → --observe-free */
   --ok: #168e6b;
   --gold: #b47a21;
   --err: #a64a51;
@@ -2393,8 +2411,9 @@ input.f::placeholder {
 }
 .nd-sheet > .nd-paper > .nd-page-head {
   box-sizing: border-box;
-  height: 52px;
-  min-height: 52px;
+  /* identity 两行化（名称 + meta）后由内容撑高，60px 是两行排版的最小值。 */
+  height: auto;
+  min-height: 60px;
   margin: 0;
   padding: 0 14px 0 18px;
   align-items: stretch;
@@ -2419,7 +2438,7 @@ input.f::placeholder {
   white-space: nowrap;
 }
 .nd-sheet > .nd-paper > .nd-page-head .nd-id {
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 700;
   line-height: 1;
 }
@@ -2434,8 +2453,8 @@ input.f::placeholder {
    cover 裁切交给内层 clip。 */
 .nd-idplate {
   position: relative;
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   flex: none;
 }
 .nd-idplate-clip {
@@ -2446,7 +2465,7 @@ input.f::placeholder {
   height: 100%;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 8px;
   background: var(--card);
   box-shadow: var(--sheet-shadow);
 }
@@ -2483,6 +2502,28 @@ input.f::placeholder {
 .nd-name {
   font-family: var(--sans);
   letter-spacing: 0;
+}
+/* 两行 identity：上行名称（+ 生命周期状态片），下行 meta——node id、公网 IP、国别码。
+   名称是显示属性，id 才是定位标识；没有 meta 行时改名后 id 在页面上无处可查。 */
+.nd-ident-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 4px;
+}
+.nd-ident-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.nd-ident-meta {
+  overflow: hidden;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  letter-spacing: 0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* 名称旁的 node id。面包屑显示名称之后 id 在页面上无处可查，补在这里；
    12px dim 等宽，不抢 21px 的名称。 */
@@ -2829,63 +2870,67 @@ input.f::placeholder {
   min-width: 0;
   margin: 0;
 }
-.tcp-connect-panel {
+/* AGENT/HOST/CONFIGURATIONS 三卡的标题与历史指标面板共用排版，具体规则见
+   `.history-chart-cap > b`；这里仅负责标题行的垂直对齐。 */
+.nd-observed-status > .panel > header {
+  align-items: center;
+}
+/* 三卡并列时行分隔线密度高，淡一档。 */
+.nd-observed-status .fstrip .k,
+.nd-observed-status .fstrip .v {
+  border-top-color: color-mix(in srgb, var(--line-soft) 62%, transparent);
+}
+.ping-probe-panel {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   margin: 0;
 }
-.tcp-connect-summary {
+.ping-probe-block {
   display: flex;
-  flex-wrap: wrap;
-  gap: 7px 18px;
-  margin: 0;
-  padding: 10px 15px 11px;
-  border-top: 1px solid var(--line-soft);
+  flex-direction: column;
+  min-width: 0;
 }
-.tcp-connect-summary > span {
-  display: inline-grid;
-  grid-template-columns: 12px minmax(0, auto) auto auto;
-  align-items: baseline;
-  gap: 4px 7px;
-  min-width: 190px;
-  color: var(--ink-3);
-  font: 10px var(--mono);
+.ping-probe-block + .ping-probe-block {
+  border-top: 1px solid var(--line);
 }
-.tcp-connect-summary i {
-  width: 12px;
-  height: 2px;
-  border-radius: 2px;
-  align-self: center;
-}
-.tcp-connect-summary b {
-  overflow: hidden;
-  color: var(--ink-2);
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.tcp-connect-summary em {
-  color: var(--ink);
-  font-size: 11.5px;
-  font-style: normal;
-  font-variant-numeric: tabular-nums;
-}
-.tcp-connect-summary small {
-  color: var(--ink-4);
-  font-size: 9px;
-  white-space: nowrap;
-}
-.tcp-connect-chart {
+.ping-probe-chart {
   width: 100%;
-  height: 204px;
-}
-.tcp-connect-panel > .note {
-  margin: 11px 13px;
-}
-.tcp-connect-panel > .tcp-connect-empty {
-  min-height: 150px;
+  height: 216px;
+  min-height: 216px;
   box-sizing: border-box;
+}
+.ping-probe-empty {
   display: grid;
+  width: auto;
+  height: 216px;
+  min-height: 216px;
+  margin: 0 13px;
+  box-sizing: border-box;
   place-items: center;
+}
+.ping-probe-legend {
+  flex: 1;
+  justify-content: flex-end;
+  overflow: hidden;
+}
+.ping-probe-legend > span {
+  max-width: 190px;
+}
+.ping-probe-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ping-probe-legend b {
+  flex: none;
+  font-weight: 500;
+}
+.ping-probe-legend b.loss {
+  color: var(--ink-3);
+}
+.ping-probe-legend b.gap,
+.ping-probe-more {
+  color: var(--ink-4);
 }
 @container (min-width: 1200px) {
   .nd-observed-status {
@@ -2927,7 +2972,6 @@ input.f::placeholder {
    是一屏里面积最大的着色面，一页九段排下来是九条各自着色的横带，读起来是九种状态而不是
    九个子系统。段色仍然只落在编号那一个小元素上，理由见下文 `.no` 那条。 */
 .b-col > .panel > :is(header, summary),
-.nd-observed-status > .panel > :is(header, summary),
 .nd-tab-observed > .panel > :is(header, summary),
 .nd-tab-pair > .panel > :is(header, summary),
 .panel.config-panel > :is(header, summary),
@@ -2946,7 +2990,6 @@ input.f::placeholder {
    页面标题——页面级标题见列表页那条 15px 规则。曾改为 12.5px 无衬线深墨并撤掉色带，
    已随色带一并恢复。 */
 .b-col > .panel > :is(header, summary) h4,
-.nd-observed-status > .panel > :is(header, summary) h4,
 .nd-tab-observed > .panel > :is(header, summary) h4,
 .nd-tab-pair > .panel > :is(header, summary) h4,
 .panel.config-panel > :is(header, summary) h4,
@@ -3054,20 +3097,21 @@ input.f::placeholder {
 .node-chain-sheet {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 0;
 }
-/* 规则卡沿用用户页「授权验证」的紧凑卡壳：标题贴住内容，不保留普通配置卡标题下方
-   额外的 11px 空档。单独命名而不复用 `.grant-probe`，避免把拨测状态样式带进规则页。 */
-.panel.config-panel.rule-sheet-card > header {
-  gap: 8px;
-  min-height: 38px;
-  margin: -11px -13px 0;
-  padding: 7px 12px;
+/* 规则卡的卡壳与标题条完全交给上面的 `.panel.config-panel` 公共规则：相同的 --band、
+   33px 基线、13px 水平基线和标题字体，不在这里复制第二套标题尺寸。只有标题栏里的操作钮
+   缩成精密条带所需的 25px；否则全局 30px 控件加上标题条 16px 内距，会把色带撑到 47px。 */
+.rule-sheet-card {
+  /* 不写 width:100%：本仓库没有全局 border-box，content-box 下它先把内容盒撑到容器宽，
+     padding 和 border 再往外顶 28px——两张规则卡在所有视口下恒溢出纸张右缘。
+     网格项默认拉伸（stretch）已填满轨道，无需声明宽度。 */
+  margin: 0;
 }
 .panel.config-panel.rule-sheet-card > header .btn {
-  min-height: 27px;
-  padding-inline: 10px;
-  font-size: 11.5px;
+  min-height: 25px;
+  padding-inline: 9px;
+  font-size: 11px;
 }
 .rule-sheet-meta {
   padding: 2px 6px;
@@ -3101,6 +3145,27 @@ input.f::placeholder {
 }
 .node-egress-dns-new-row {
   background: color-mix(in srgb, var(--violet) 4%, transparent);
+}
+/* 方案 A：技术限制是一条低对比说明带，紧贴标题与规则表。标题本身仍保留公共规则规定的
+   11px 下外边距；这里用等量负外边距接住它，不改标题条的任何计算样式。 */
+.rule-sheet-card .node-egress-dns-limit {
+  margin: -11px -13px 0;
+  padding: 8px 13px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--action) 2.5%, transparent);
+  font-size: 10.5px;
+}
+.rule-sheet-card.node-chain-sheet > header + .node-chain-use {
+  margin-top: -11px;
+}
+/* 保存状态属于卡片的收口，不是内容区里又一条浮动工具栏。DNS 面板的保存条位于 fieldset
+   内，链路面板的保存条由 RuleDraftScope 直接渲染，因此需要覆盖这两种真实 DOM。 */
+.rule-sheet-card > .toolbar:last-child,
+.rule-sheet-card > .node-egress-rules > .toolbar:last-child {
+  min-height: 42px;
+  margin: 0 -13px -11px;
+  padding: 7px 11px;
+  border-top: 1px solid var(--line-soft);
 }
 .rule-new-dns-value {
   min-width: 0;
@@ -4560,15 +4625,17 @@ input.f {
 
 /* ═══ 规则表的窄屏适配 ═══
    桌面是一张表：序号 | 匹配 | 动作 | 重排，一行铺开。窄下来单行放不下——动作格里还
-   串着转发目标、走法、推导地址，DNS 策略的参数栅格更有七百余像素。分两档，且
+   串着转发目标、走法、推导地址，DNS 策略的参数栅格更有七百余像素。分三档，且
    **表结构保持不变**（tests 依赖 tbody/tr/td、兜底 `*`、每行四格）：
-   · ≤1050px：动作格改 flex 换行，目标 / 走法落到动作选择器下方，不再横向溢出；
-     DNS 参数栅格减列。
+   · ≤1440px：动作格改 flex 换行，目标 / 走法落到动作选择器下方，不再横向溢出；
+     DNS 参数栅格减列。断点取自五列栅格的实测最小内容宽（约 1412px）：1050–1412 之间
+     若仍用五列，整表比卡片宽，被卡的 overflow:hidden 裁掉右侧按钮。
+   · ≤1050px：匹配格放开定宽（上方独立的 1050px 断点块）。
    · ≤640px：整行折成卡片——序号做抬头、重排做卡脚，匹配 / 动作各补一枚小标签，
      控件占满整宽，DNS 参数落成一列、这一跳逐项一行。
    所有规则表统一使用 `.rule-table`，链路规则、线路里的 XRAY 链路和机器 DNS 策略不再
    分别维护一份响应式选择器。 */
-@container rules (max-width: 1050px) {
+@container rules (max-width: 1440px) {
   /* 动作格里 inline 子元素之间未必有空白文本节点，white-space 不足以断行，改 flex-wrap。 */
   .rule-table .rule-action-cell {
     display: flex;
@@ -13125,16 +13192,9 @@ input.f.ing-pj-port {
   /* 分隔改由卡面投影承担，撤掉标题下分隔线（与 .panel 标题条一致）。 */
 }
 .load-network-cap > b {
-  padding: 2px 8px;
-  border-radius: 5px;
-  background: var(--action-wash);
-  color: var(--ink);
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
+  white-space: nowrap;
 }
 .load-network-cap > span {
-  margin-left: auto;
   color: var(--ink-4);
   font: 9px var(--mono);
   white-space: nowrap;
@@ -13164,8 +13224,33 @@ input.f.ing-pj-port {
 }
 .ndtp-ec {
   width: 100%;
-  height: 150px;
+  height: 216px;
   box-sizing: border-box;
+}
+/* 吞吐面板：网卡 + XRAY 两块同卡堆叠，块间一条分隔线；每块沿用 .load-network-cap/-legend。 */
+.nd-throughput-block + .nd-throughput-block {
+  border-top: 1px solid var(--line);
+}
+/* 图例收进标题栏最右、填掉留白：去掉它作页脚时的上边线与内边距，收紧列距。
+   提示信息（网卡/用量 span）跟在标题旁：标题(b) → 提示(span) → 图例(margin-left:auto 顶最右)。 */
+.load-network-cap > .load-network-legend {
+  margin-left: auto;
+  border-top: 0;
+  padding: 0;
+  gap: 5px 12px;
+}
+/* 吞吐与 Ping 两栏并排（窄屏折叠为一列），两边都由两个同高图块组成。 */
+.nd-observe-throughput {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+  min-width: 0;
+}
+@container (min-width: 900px) {
+  .nd-observe-throughput {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
 }
 /* KPI 芯片带：CPU/内存/磁盘/负载 等生命体征收进标题下一条带。读数（数字＋单位）原子贴左，
    迷你趋势线落在右下角，不与读数抢基线。金/红语气由阈值算出，spark 用 currentColor 随之变色。 */
@@ -13181,7 +13266,9 @@ input.f.ing-pj-port {
   flex-direction: column;
   gap: 5px;
   min-width: 0;
-  padding: 10px 12px;
+  /* 底部 32px 留给通栏落底的迷你趋势线（.kpi-spark），overflow 裁出砖的底缘圆角。 */
+  padding: 10px 12px 32px;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r-card);
   background: var(--card);
@@ -13189,13 +13276,14 @@ input.f.ing-pj-port {
   box-sizing: border-box;
 }
 .kpi .kpi-l {
-  font: 9px var(--mono);
-  letter-spacing: 0.06em;
+  font: 9.5px var(--mono);
+  letter-spacing: 0.08em;
   color: var(--ink-4);
   text-transform: uppercase;
 }
 .kpi .kpi-v {
-  font: 500 19px var(--mono);
+  font: 600 20px var(--mono);
+  font-feature-settings: 'tnum';
   letter-spacing: -0.03em;
   color: var(--ink);
   white-space: nowrap;
@@ -13216,12 +13304,14 @@ input.f.ing-pj-port {
   letter-spacing: 0.04em;
   color: var(--ink-4);
 }
+/* 迷你趋势线通栏落底：从右下角小块改为铺满砖宽的面积带，趋势形状的可读面积大四倍。 */
 .kpi .kpi-spark {
   position: absolute;
-  right: 11px;
-  bottom: 11px;
-  width: 48px;
-  height: 20px;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 24px;
   color: var(--data);
 }
 .kpi.kpi-expand {
@@ -13277,16 +13367,15 @@ input.f.ing-pj-port {
 .kpi-spark-line {
   fill: none;
   stroke: currentColor;
-  stroke-width: 2.4;
+  stroke-width: 1.8;
   stroke-linecap: round;
   stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
 .kpi-spark-area {
   fill: currentColor;
-  opacity: 0.12;
+  opacity: 0.14;
 }
-
 /* 原始观测范围。此区域不表达健康结论：边框与曲线始终使用数据色，缺口直接断线；
    所有点的绝对时间和值交给 tooltip，避免只看最后一个瞬时窗口。 */
 .observe-range {
@@ -13464,15 +13553,23 @@ input.f.ing-pj-port {
   gap: 8px;
   padding: 0 10px;
 }
-.history-chart-cap > b {
-  padding: 2px 8px;
-  border-radius: 5px;
-  background: var(--action-wash);
+.history-chart-cap > b,
+.load-network-cap > b,
+.nd-observed-status > .panel > header h4 {
   color: var(--ink);
-  font-size: 11.5px;
+  font-size: 12.5px;
   font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+/* 后两种标题原先是 chip，清掉其盒样式；文字排版直接复用上面的历史指标标题规则。 */
+.load-network-cap > b,
+.nd-observed-status > .panel > header h4 {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-family: var(--sans);
 }
 .history-chart-cap > small {
   min-width: 0;
@@ -13526,16 +13623,11 @@ input.f.ing-pj-port {
 }
 .history-chart {
   width: 100%;
-  height: 154px;
-}
-.history-chart-card-main .history-chart {
+  /* 所有历史图统一取原 main 的高度：诊断小图不再压成 154，与主图同高。 */
   height: 216px;
 }
 .history-chart-card-secondary {
   margin-top: 0;
-}
-.history-chart-card-secondary .history-chart {
-  height: 216px;
 }
 @container (max-width: 720px) {
   .history-primary,
@@ -14112,21 +14204,21 @@ input.f.ing-pj-port {
    健康与否无关。此前取 --ok 绿和 --gold 金，正是文件开头禁的那件事：装饰色与状态色
    同色相时，阅读者得先判断这个颜色是不是在表示某种状态。现在收进冷色，绿和金退出。
 
-   发送取 --data-secondary；两档靠明度差 + 图例 + 0.2px 线宽差区分。 */
+   发送取邻近的 --observe-1 雾蓝；两档靠色相差 + 图例 + 0.2px 线宽差区分。 */
 .load-net-area {
-  fill: color-mix(in srgb, var(--data) 13%, transparent);
+  fill: color-mix(in srgb, var(--observe-1) 13%, transparent);
 }
 .load-net-rx,
 .load-net-tx {
   fill: none;
-  stroke: var(--data);
+  stroke: var(--observe-1);
   stroke-width: 1.35;
   stroke-linecap: round;
   stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
 .load-net-tx {
-  stroke: var(--data-secondary);
+  stroke: var(--observe-2);
   stroke-width: 1.15;
 }
 .load-net-y {
@@ -14331,6 +14423,16 @@ input.f.ing-pj-port {
   }
   .load-network-legend {
     gap: 7px 10px;
+  }
+  .ping-probe-block > .load-network-cap {
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    padding-block: 6px;
+  }
+  .ping-probe-block .ping-probe-legend {
+    flex-basis: 100%;
+    justify-content: flex-start;
+    margin-left: 0;
   }
 }
 
@@ -15241,34 +15343,60 @@ input.f.ing-pj-port {
   font-size: 10px;
 }
 
-.tcp-probe-targets {
+.ping-probe-targets {
   display: grid;
   gap: 8px;
   margin-bottom: 10px;
 }
 
-.tcp-probe-target {
+.ping-probe-target {
   display: grid;
-  grid-template-columns: minmax(96px, 0.7fr) minmax(210px, 1.5fr) auto;
+  grid-template-columns: 48px minmax(96px, 0.7fr) minmax(210px, 1.5fr) auto;
   gap: 8px;
   align-items: center;
 }
 
-.tcp-probe-target .f {
+.ping-probe-target .f {
   width: 100%;
   min-width: 0;
 }
 
-.tcp-probe-settings input[type='number'] {
+.ping-probe-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-4);
+  font: 9px var(--mono);
+}
+.ping-probe-kind::before {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--observe-1);
+  content: '';
+}
+.ping-probe-kind.icmp::before {
+  background: var(--observe-2);
+}
+.ping-probe-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ping-probe-settings .setgrp > .ping-probe-note {
+  display: block;
+}
+.ping-probe-settings input[type='number'] {
   width: 90px;
 }
 
 @media (max-width: 720px) {
-  .tcp-probe-target {
-    grid-template-columns: 1fr auto;
+  .ping-probe-target {
+    grid-template-columns: 48px minmax(0, 1fr) auto;
   }
 
-  .tcp-probe-target .f:nth-child(2) {
+  .ping-probe-target .f:nth-child(3) {
     grid-column: 1 / -1;
     grid-row: 2;
   }
@@ -16956,4 +17084,33 @@ input.f.ing-pj-port {
   .chain-card-foot {
     gap: 10px;
   }
+}
+
+/* ── 亮色机器详情：弱化常驻卡片的边界 ──
+ * 网格、内距和标题层级均沿用原版；承托卡片的纸面使用较深的 --block。
+ * 观测页的读数与图表使用白色 --card；配置和规则面板回到 --block，避免所有页签
+ * 都呈现为一组同等凸起的白卡。常驻卡片同时撤掉阴影并改用弱边框。
+ * 语义警告的边框色仍由 .warn / .bad 覆盖。 */
+:root[data-theme='light'] .nd-sheet > .nd-paper {
+  background: var(--block);
+}
+
+:root[data-theme='light']
+  .nd-sheet
+  :is(.kpi:not(.warn, .bad), .chart-card, .history-chart-card, .load-network, .load-metric, .panel) {
+  border-color: color-mix(in srgb, var(--ink) 12%, transparent);
+  background: var(--card);
+  box-shadow: none;
+}
+
+:root[data-theme='light'] .nd-sheet :is(.nd-tab-config, .nd-tab-rules) .panel {
+  background: var(--block);
+}
+
+/* 配置与规则的标题不再单独铺一层底色；保留原有尺寸与分隔线，避免卡片内容位置随主题跳动。 */
+:root[data-theme='light']
+  .nd-sheet
+  :is(.nd-observed-status > .panel, .nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel)
+  > :is(header, summary) {
+  background: transparent;
 }

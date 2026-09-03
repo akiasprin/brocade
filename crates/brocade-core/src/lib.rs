@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod client_config;
 pub mod compile;
 pub mod diagnostic;
 pub mod format;

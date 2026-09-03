@@ -16,14 +16,61 @@ use brocade_core::{
         HopEncryption, HopIn, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion,
         HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily, ModelSettings,
         ModelSnapshot, Network, Node, NodeEgressDnsPolicy, OverlaySettings, Reality,
-        RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySite, Rule, Step,
-        Transport, User, WireGuardKeys, XhttpMode,
+        RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySite, RealityXhttp,
+        Rule, Step, Transport, User, WireGuardKeys, Xhttp, XhttpMode, XhttpTuning, XhttpXmuxRange,
     },
     physical::node::{project_node, reality_fallback_limits},
     Level,
 };
 use ipnet::Ipv4Net;
 use serde_json::Value;
+
+#[test]
+fn managed_xhttp_listener_tuning_reaches_the_server_artifact() {
+    let doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
+    let mut face = ingress("i", "c", "hk");
+    face.wires = IngressWires::Vless(Transport::VlessRealityXhttp(RealityXhttp {
+        reality: face.wires.reality().unwrap().clone(),
+        xhttp: Xhttp {
+            path: "/probe".to_owned(),
+            host: None,
+            xmux: None,
+            tuning: Some(XhttpTuning {
+                x_padding_bytes: Some(XhttpXmuxRange::new(200, 600)),
+            }),
+            mode: XhttpMode::PacketUp,
+        },
+    }));
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.iter().all(|d| d.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let settings = &inbound(&value, "in:app/i")["streamSettings"]["xhttpSettings"];
+
+    assert_eq!(settings["xPaddingBytes"], "200-600");
+    assert!(settings.get("scMaxEachPostBytes").is_none());
+    assert!(settings.get("scMaxBufferedPosts").is_none());
+    assert!(settings.get("scMinPostsIntervalMs").is_none());
+    assert!(settings.get("uplinkChunkSize").is_none());
+    assert!(settings.get("xmux").is_none());
+}
 
 #[test]
 fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_node() {
@@ -1396,8 +1443,16 @@ fn the_connection_setting_reaches_the_hop_outbound() {
         );
         assert!(diagnostics.is_empty(), "{pool:?}: {diagnostics:#?}");
 
-        let hk = parse_xray(&xray::build(&project_node(&sys, &[ir], "hk")));
+        let hk = parse_xray(&xray::build(&project_node(
+            &sys,
+            std::slice::from_ref(&ir),
+            "hk",
+        )));
         let out = outbound(&hk, "out:relay/c-relay>sg");
+        assert_eq!(
+            out["streamSettings"]["sockopt"]["tcpFastOpen"], true,
+            "{pool:?}: relay dialer must enable client-side TFO"
+        );
         match expected {
             None => assert!(out["mux"].is_null(), "{pool:?}: {out:#?}"),
             Some(concurrency) => {
@@ -1405,6 +1460,26 @@ fn the_connection_setting_reaches_the_hop_outbound() {
                 assert_eq!(out["mux"]["concurrency"], concurrency, "{pool:?}");
             }
         }
+
+        let sg = parse_xray(&xray::build(&project_node(
+            &sys,
+            std::slice::from_ref(&ir),
+            "sg",
+        )));
+        let hop_in = inbound(&sg, "in:hop:relay/c-relay");
+        assert_eq!(
+            hop_in["streamSettings"]["sockopt"]["tcpFastOpen"], 256,
+            "{pool:?}: relay listener must offer a bounded TFO backlog"
+        );
+
+        // The subscription enables client-side TFO, so its corresponding listener has to offer
+        // the same bounded server backlog. Otherwise every client silently pays the ordinary
+        // handshake even though its imported profile says TFO is on.
+        let user_in = inbound(&hk, "in:relay/i-relay");
+        assert_eq!(
+            user_in["streamSettings"]["sockopt"]["tcpFastOpen"], 256,
+            "{pool:?}: subscriber listener must offer a bounded TFO backlog"
+        );
     }
 }
 
@@ -1486,6 +1561,10 @@ fn a_shadowsocks_hop_renders_as_shadowsocks_on_both_ends() {
     );
     assert!(hop["settings"]["decryption"].is_null(), "{hop:#?}");
     assert_eq!(hop["streamSettings"]["security"], "none");
+    assert_eq!(
+        hop["streamSettings"]["sockopt"]["tcpFastOpen"], 256,
+        "the relay listener must enable server-side TFO"
+    );
     // Both networks, explicitly. Left out, xray hears TCP alone and the chain's UDP — DNS and
     // QUIC — disappears while TCP goes on working, which is the shape of failure nobody reports
     // as "the relay is down".
@@ -1501,6 +1580,10 @@ fn a_shadowsocks_hop_renders_as_shadowsocks_on_both_ends() {
         .find(|outbound| outbound["tag"] == "out:relay/c-relay>sg")
         .expect("forward outbound");
     assert_eq!(out["protocol"], "shadowsocks");
+    assert_eq!(
+        out["streamSettings"]["sockopt"]["tcpFastOpen"], true,
+        "the relay dialer must enable client-side TFO"
+    );
     let server = &out["settings"]["servers"][0];
     assert_eq!(server["address"], "10.66.0.2");
     assert_eq!(server["port"], 20000);

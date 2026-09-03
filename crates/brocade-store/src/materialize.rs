@@ -251,6 +251,26 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
     })
 }
 
+/// The immutable JSON already written for the current revision, fetched in one round trip.
+/// Agent work-list GETs need a coherent published model, not six live-table scans per node.
+pub(crate) async fn load_current_immutable_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
+    let row = sqlx::query(
+        "SELECT state.current_revision, snapshots.snapshot
+           FROM control_state AS state
+           JOIN model_snapshots AS snapshots ON snapshots.revision_id = state.current_revision
+          WHERE state.id = TRUE",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        // Compatibility for a database created by an older build before revision snapshots were
+        // mandatory. Its next successful revision creates the row and moves this path to one GET.
+        return load_current_snapshot(pool).await;
+    };
+    let revision = revision_to_u64(row.try_get::<i64, _>("current_revision")?)?;
+    decode_stored_snapshot(row.try_get("snapshot")?, revision)
+}
+
 async fn load_stored_snapshot(pool: &PgPool, revision: u64) -> Result<Option<ModelSnapshot>> {
     let row = sqlx::query("SELECT snapshot FROM model_snapshots WHERE revision_id = $1")
         .bind(revision_to_i64(revision)?)
@@ -272,10 +292,30 @@ pub(crate) async fn load_immutable_snapshot(pool: &PgPool, revision: u64) -> Res
     })
 }
 
+/// Transaction-scoped immutable snapshot load for serving checkpoint composition. Unlike
+/// `load_snapshot_tx`, this never rematerializes the current mutable tables.
+pub(crate) async fn load_immutable_snapshot_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    revision: u64,
+) -> Result<ModelSnapshot> {
+    let row = sqlx::query("SELECT snapshot FROM model_snapshots WHERE revision_id = $1")
+        .bind(revision_to_i64(revision)?)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map(|row| decode_stored_snapshot(row.try_get("snapshot")?, revision))
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "serving revision {revision} has no immutable model snapshot"
+            ))
+        })
+}
+
 fn decode_stored_snapshot(mut snapshot: Value, revision: u64) -> Result<ModelSnapshot> {
     fold_legacy_node_egress_dns_positions(&mut snapshot)?;
     fold_legacy_stream(&mut snapshot);
     fold_legacy_xhttp_mux(&mut snapshot)?;
+    fold_removed_ingress_client_controls(&mut snapshot);
     fold_legacy_ingress_identity(&mut snapshot)?;
     // Last, because the two above reach into `transport` by name and this is what moves it.
     fold_legacy_transport(&mut snapshot);
@@ -335,13 +375,13 @@ fn fold_legacy_node_egress_dns_positions(snapshot: &mut Value) -> Result<()> {
 /// JSONB history table into a plaintext secret archive. The model's tagged protocol enum places
 /// the shared credential at `protocol.v.credential`; only that narrowly identified field is
 /// transformed, leaving ordinary ids and labels untouched.
-fn seal_snapshot_external_credentials(snapshot: &mut Value) -> Result<()> {
+pub(crate) fn seal_snapshot_external_credentials(snapshot: &mut Value) -> Result<()> {
     transform_snapshot_external_credentials(snapshot, |context, credential| {
         crate::secrets::seal(context, credential)
     })
 }
 
-fn open_snapshot_external_credentials(snapshot: &mut Value) -> Result<()> {
+pub(crate) fn open_snapshot_external_credentials(snapshot: &mut Value) -> Result<()> {
     transform_snapshot_external_credentials(snapshot, |context, credential| {
         crate::secrets::open(context, credential)
     })
@@ -590,6 +630,64 @@ fn fold_legacy_xhttp_mux(snapshot: &mut Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Remove fields written during the short period when ordinary TLS ClientHello selection and
+/// POST upload tuning were managed. They no longer belong to the model: TLS clients use their
+/// own defaults, and XHTTP retains only the settings Brocade applies coherently at both ends.
+fn fold_removed_ingress_client_controls(snapshot: &mut Value) {
+    let Some(apps) = snapshot.get_mut("apps").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for ingress in apps
+        .iter_mut()
+        .filter_map(|app| app.get_mut("ingresses").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let Some(ingress) = ingress.as_object_mut() else {
+            continue;
+        };
+        let vless = if ingress.contains_key("wires") {
+            ingress
+                .get_mut("wires")
+                .and_then(|wires| wires.get_mut("vless"))
+        } else {
+            ingress.get_mut("transport")
+        };
+        let Some(vless) = vless.and_then(Value::as_object_mut) else {
+            continue;
+        };
+        match vless.get("kind").and_then(Value::as_str) {
+            Some("vless-tls") => {
+                vless.remove("fingerprint");
+            }
+            Some("vless-tls-xhttp") => {
+                vless.remove("fingerprint");
+                vless.remove("alpn");
+            }
+            _ => {}
+        }
+        let Some(xhttp) = vless.get_mut("xhttp").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let remove_tuning =
+            if let Some(tuning) = xhttp.get_mut("tuning").and_then(Value::as_object_mut) {
+                for field in [
+                    "sc_max_each_post_bytes",
+                    "sc_min_posts_interval_ms",
+                    "sc_max_buffered_posts",
+                    "uplink_chunk_size",
+                ] {
+                    tuning.remove(field);
+                }
+                tuning.is_empty()
+            } else {
+                false
+            };
+        if remove_tuning {
+            xhttp.remove("tuning");
+        }
+    }
 }
 
 /// Move the single `transport` an earlier build wrote into the two-wire `wires`.
@@ -1506,7 +1604,7 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
-            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_mode, \
+            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password, \
             hy2_bbr_profile, \
             hy2_quic_init_stream_window, hy2_quic_max_stream_window, \
@@ -1525,7 +1623,8 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             projection_v6_download_origin_port, \
             projection_v6_download_http_host, projection_v6_download_mux \
          FROM ingresses \
-         WHERE app_id = $1 \
+         LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
+         WHERE ingresses.app_id = $1 \
          ORDER BY (SELECT chains.position FROM chains WHERE chains.id = ingresses.chain_id), \
                   chain_id, id",
     )
@@ -1549,7 +1648,7 @@ async fn load_ingresses_tx(
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
-            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_mode, \
+            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password, \
             hy2_bbr_profile, \
             hy2_quic_init_stream_window, hy2_quic_max_stream_window, \
@@ -1568,7 +1667,8 @@ async fn load_ingresses_tx(
             projection_v6_download_origin_port, \
             projection_v6_download_http_host, projection_v6_download_mux \
          FROM ingresses \
-         WHERE app_id = $1 \
+         LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
+         WHERE ingresses.app_id = $1 \
          ORDER BY (SELECT chains.position FROM chains WHERE chains.id = ingresses.chain_id), \
                   chain_id, id",
     )
@@ -1665,6 +1765,13 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             .map_err(|error| {
                 StoreError::InvalidData(format!("ingresses.xhttp_xmux is invalid: {error}"))
             })?,
+        tuning: row
+            .try_get::<Option<Value>, _>("xhttp_tuning")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                StoreError::InvalidData(format!("ingresses.xhttp_tuning is invalid: {error}"))
+            })?,
         // Same rollback reasoning: a value this build does not know reads as the default,
         // which is the one shape every client can speak.
         mode: match row.try_get::<Option<String>, _>("xhttp_mode")?.as_deref() {
@@ -1679,7 +1786,6 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
     // moving it back does not mint a new public key behind everybody's back.
     let tls = Tls {
         flow: reality.flow.clone(),
-        fingerprint: reality.fingerprint.clone(),
     };
     let hysteria2 = Hysteria2 {
         // The column is NULL exactly where this ingress has no UDP wire, and the value is then
@@ -1831,7 +1937,7 @@ fn projection_endpoint(
                 _ => {
                     return Err(StoreError::InvalidData(format!(
                         "ingresses.{download_host_column}/{download_port_column} 只填了一半"
-                    )))
+                    )));
                 }
             };
             Ok(Some(ProjectionEndpoint {
@@ -2406,6 +2512,68 @@ mod tests {
         assert!(ingress["wires"]["vless"]["xhttp"].get("mux").is_none());
         assert!(ingress["wires"]["vless"]["xhttp"].get("xmux").is_none());
         assert_eq!(ingress["projection"]["v4"]["download"]["mux"], 8);
+    }
+
+    #[test]
+    fn removed_tls_and_post_controls_are_folded_out_of_historical_snapshots() {
+        let mut snapshot = serde_json::json!({
+            "apps": [{
+                "ingresses": [
+                    {
+                        "transport": {
+                            "kind": "vless-tls",
+                            "flow": "",
+                            "fingerprint": "none"
+                        }
+                    },
+                    {
+                        "wires": { "vless": {
+                            "kind": "vless-tls-xhttp",
+                            "flow": "",
+                            "fingerprint": "chrome",
+                            "alpn": "http1",
+                            "xhttp": {
+                                "path": "/tls",
+                                "tuning": {
+                                    "x_padding_bytes": { "from": 200, "to": 600 },
+                                    "sc_max_each_post_bytes": { "from": 500000, "to": 1000000 },
+                                    "sc_min_posts_interval_ms": { "from": 10, "to": 30 },
+                                    "sc_max_buffered_posts": 64,
+                                    "uplink_chunk_size": { "from": 65536, "to": 131072 }
+                                }
+                            }
+                        }}
+                    },
+                    {
+                        "wires": { "vless": {
+                            "kind": "vless-reality-xhttp",
+                            "fingerprint": "chrome",
+                            "xhttp": {
+                                "path": "/reality",
+                                "tuning": { "sc_max_buffered_posts": 64 }
+                            }
+                        }}
+                    }
+                ]
+            }]
+        });
+
+        super::fold_removed_ingress_client_controls(&mut snapshot);
+
+        let ingresses = &snapshot["apps"][0]["ingresses"];
+        assert!(ingresses[0]["transport"].get("fingerprint").is_none());
+        assert!(ingresses[1]["wires"]["vless"].get("fingerprint").is_none());
+        assert!(ingresses[1]["wires"]["vless"].get("alpn").is_none());
+        assert_eq!(
+            ingresses[1]["wires"]["vless"]["xhttp"]["tuning"],
+            serde_json::json!({
+                "x_padding_bytes": { "from": 200, "to": 600 }
+            })
+        );
+        assert_eq!(ingresses[2]["wires"]["vless"]["fingerprint"], "chrome");
+        assert!(ingresses[2]["wires"]["vless"]["xhttp"]
+            .get("tuning")
+            .is_none());
     }
 
     /// Every revision written before `wires` existed carries `transport`, and `Ingress` denies

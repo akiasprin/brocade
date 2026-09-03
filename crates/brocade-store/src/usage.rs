@@ -126,6 +126,25 @@ fn unknown_counter_fingerprint(node_id: &str, label: &str) -> [u8; 32] {
     digest.finalize().into()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FirstReadingPolicy {
+    /// The control plane did not witness this counter being created. Its first absolute value may
+    /// contain historical traffic, so it can only establish the durable head.
+    #[default]
+    EstablishBaseline,
+    /// This label became billable after a previously known generation did not own it. Xray's
+    /// counter therefore starts at zero for this authorization, and the first absolute value is
+    /// real traffic rather than an unknown historical balance.
+    CountFromZero,
+}
+
+impl FirstReadingPolicy {
+    fn establishes_baseline(value: &Self) -> bool {
+        *value == Self::EstablishBaseline
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum FrozenBinding {
@@ -135,6 +154,14 @@ enum FrozenBinding {
         user_id: String,
         ingress_id: String,
         app_id: String,
+        /// Missing on generations written before first-reading provenance existed. Defaulting to
+        /// the conservative policy prevents a rolling upgrade from billing an old cumulative
+        /// counter as if this control plane had watched it start at zero.
+        #[serde(
+            default,
+            skip_serializing_if = "FirstReadingPolicy::establishes_baseline"
+        )]
+        first_reading: FirstReadingPolicy,
     },
     ChainHop {
         tenant_id: String,
@@ -153,6 +180,7 @@ impl FrozenBinding {
                 user_id,
                 ingress_id,
                 app_id,
+                ..
             } => Some(CounterOwner::User(GrantMapping {
                 tenant_id: tenant_id.clone(),
                 user_id: user_id.clone(),
@@ -174,6 +202,44 @@ impl FrozenBinding {
             })),
         }
     }
+
+    fn first_reading_policy(&self) -> FirstReadingPolicy {
+        match self {
+            Self::User { first_reading, .. } => *first_reading,
+            Self::Foreign | Self::ChainHop { .. } => FirstReadingPolicy::EstablishBaseline,
+        }
+    }
+
+    fn same_user_owner(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::User {
+                    tenant_id,
+                    user_id,
+                    ingress_id,
+                    app_id,
+                    ..
+                },
+                Self::User {
+                    tenant_id: other_tenant,
+                    user_id: other_user,
+                    ingress_id: other_ingress,
+                    app_id: other_app,
+                    ..
+                }
+            ) if tenant_id == other_tenant
+                && user_id == other_user
+                && ingress_id == other_ingress
+                && app_id == other_app
+        )
+    }
+
+    fn set_first_reading_policy(&mut self, policy: FirstReadingPolicy) {
+        if let Self::User { first_reading, .. } = self {
+            *first_reading = policy;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -182,6 +248,7 @@ struct UsageGeneration {
     deployment_id: Option<i64>,
     revision_id: Option<i64>,
     bindings: BTreeMap<String, FrozenBinding>,
+    activated_at_unix_secs: Option<i64>,
 }
 
 fn report_identity(request: &UsageReportRequest) -> Result<(String, u64)> {
@@ -227,6 +294,17 @@ pub(crate) async fn create_usage_generation_for_target(
     } else {
         frozen_bindings(snapshot, node_id, Some(&desired.grants))
     };
+    let previous = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT g.bindings
+         FROM node_agent_state s
+         JOIN usage_generations g ON g.id = s.usage_generation_id
+         WHERE s.node_id = $1",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(serde_json::from_value::<BTreeMap<String, FrozenBinding>>)
+    .transpose()?;
     if let DesiredArtifact::Present { content, .. } = &desired.xray {
         let actual = xray_client_labels(content)?;
         for (label, binding) in &mut bindings {
@@ -246,22 +324,11 @@ pub(crate) async fn create_usage_generation_for_target(
             )
         });
     if grants_only {
-        let previous = sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT g.bindings
-             FROM node_agent_state s
-             JOIN usage_generations g ON g.id = s.usage_generation_id
-             WHERE s.node_id = $1",
-        )
-        .bind(node_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(serde_json::from_value::<BTreeMap<String, FrozenBinding>>)
-        .transpose()?;
-        if let Some(previous) = previous {
+        if let Some(previous) = &previous {
             // SyncGrants changes only runtime users; the Xray topology stays exactly as it was in
             // the previous generation, even when a newer unshipped model revision already exists.
             bindings.retain(|label, _| parse_grant_label(label).is_some());
-            for (label, owner) in &previous {
+            for (label, owner) in previous {
                 if parse_grant_label(label).is_none() {
                     bindings.insert(label.clone(), owner.clone());
                 }
@@ -280,6 +347,14 @@ pub(crate) async fn create_usage_generation_for_target(
             }
         }
     }
+    let headed_labels =
+        sqlx::query_scalar::<_, String>("SELECT label FROM usage_counter_heads WHERE node_id = $1")
+            .bind(node_id)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+    assign_first_reading_policies(&mut bindings, previous.as_ref(), &headed_labels);
     let revision_id: i64 = sqlx::query_scalar("SELECT revision_id FROM deployments WHERE id = $1")
         .bind(deployment_id)
         .fetch_one(&mut **tx)
@@ -297,6 +372,36 @@ pub(crate) async fn create_usage_generation_for_target(
     .fetch_one(&mut **tx)
     .await?;
     Ok(Some(id))
+}
+
+/// Attach provenance to a newly frozen namespace.
+///
+/// A missing durable head alone is not enough to count the first absolute reading: on the first
+/// generation after an upgrade it may be an old Xray counter. A prior generation is the witness.
+/// If that known namespace did not own this label, the new authorization starts from zero. The
+/// marker is carried across unrelated generations until a head exists, so a quiet new user does
+/// not lose their first window merely because another release landed before they connected.
+fn assign_first_reading_policies(
+    bindings: &mut BTreeMap<String, FrozenBinding>,
+    previous: Option<&BTreeMap<String, FrozenBinding>>,
+    headed_labels: &BTreeSet<String>,
+) {
+    for (label, binding) in bindings {
+        if !matches!(binding, FrozenBinding::User { .. }) {
+            continue;
+        }
+        let policy = if headed_labels.contains(label) {
+            FirstReadingPolicy::EstablishBaseline
+        } else if let Some(previous) = previous {
+            match previous.get(label) {
+                Some(old) if binding.same_user_owner(old) => old.first_reading_policy(),
+                Some(_) | None => FirstReadingPolicy::CountFromZero,
+            }
+        } else {
+            FirstReadingPolicy::EstablishBaseline
+        };
+        binding.set_first_reading_policy(policy);
+    }
 }
 
 fn xray_client_labels(content: &str) -> Result<BTreeSet<String>> {
@@ -328,16 +433,23 @@ pub(crate) async fn activate_usage_generation(
     node_id: &str,
     generation_id: i64,
     deployment_id: i64,
+    activated_at_unix_secs: Option<i64>,
 ) -> Result<()> {
+    if activated_at_unix_secs.is_some_and(|value| value <= 0) {
+        return Err(StoreError::InvalidData(
+            "usage activation timestamp must be a positive unix second".to_owned(),
+        ));
+    }
     sqlx::query(
         "INSERT INTO usage_generation_activations
              (node_id, generation_id, deployment_id, activated_at)
-         VALUES ($1, $2, $3, now())
+         VALUES ($1, $2, $3, coalesce(to_timestamp($4::double precision), now()))
          ON CONFLICT (node_id, generation_id) DO NOTHING",
     )
     .bind(node_id)
     .bind(generation_id)
     .bind(deployment_id)
+    .bind(activated_at_unix_secs)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -384,6 +496,7 @@ fn frozen_bindings(
                     user_id: grant.user.clone(),
                     ingress_id: grant.ingress.clone(),
                     app_id: app.id.clone(),
+                    first_reading: FirstReadingPolicy::EstablishBaseline,
                 }
             } else {
                 FrozenBinding::Foreign
@@ -501,6 +614,20 @@ async fn resolve_usage_generation(
         deployment_id: row.try_get("deployment_id")?,
         revision_id: row.try_get("revision_id")?,
         bindings: serde_json::from_value(row.try_get("bindings")?)?,
+        activated_at_unix_secs: sqlx::query_scalar(
+            "SELECT CASE
+                      WHEN activated_at > '-infinity'::timestamptz
+                       AND activated_at < 'infinity'::timestamptz
+                      THEN extract(epoch FROM activated_at)::bigint
+                    END
+             FROM usage_generation_activations
+             WHERE node_id = $1 AND generation_id = $2",
+        )
+        .bind(node_id)
+        .bind(row.try_get::<i64, _>("id")?)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten(),
     })
 }
 
@@ -676,6 +803,7 @@ pub async fn record_usage_report(
             }
             continue;
         };
+        let first_reading_policy = binding.first_reading_policy();
         let Some(owner) = binding.to_counter_owner(&label) else {
             rejected_counters += 1;
             continue;
@@ -771,6 +899,46 @@ pub async fn record_usage_report(
                         if has_gap {
                             gap_samples += 1;
                         }
+                    }
+                }
+            }
+        } else if first_reading_policy == FirstReadingPolicy::CountFromZero {
+            // This is not the generic "first time the control plane saw a counter" case. The
+            // frozen generation records that a known preceding namespace did not authorize this
+            // label, so its first absolute value is the complete usage since authorization.
+            let (candidate_start, has_gap) = match generation.activated_at_unix_secs {
+                Some(activated_at) if activated_at <= request.read_at_unix_secs => {
+                    (activated_at.max(request.xray_started_at_unix_secs), false)
+                }
+                // An old Agent did not report the application boundary, or this queued reading
+                // arrived before the convergence observation. Keep every byte, use a minimal
+                // non-empty window, and expose the imprecise boundary through has_gap.
+                Some(_) | None => (request.read_at_unix_secs.saturating_sub(1), true),
+            };
+            // Unix seconds have one-second resolution. A user can transfer bytes in the same
+            // second as authorization, while the schema correctly requires end > start.
+            let window_start = candidate_start.min(request.read_at_unix_secs.saturating_sub(1));
+            if window_start < request.read_at_unix_secs {
+                let insert = UsageSampleInsert {
+                    node_id,
+                    owner: &owner,
+                    window_start_unix_secs: window_start,
+                    window_end_unix_secs: request.read_at_unix_secs,
+                    uplink_bytes,
+                    downlink_bytes,
+                    has_gap,
+                    revision_id: metadata.revision_id,
+                    deployment_id: metadata.deployment_id,
+                    generation_id: generation.id,
+                };
+                let sample_inserted = match &owner {
+                    CounterOwner::User(_) => insert_usage_sample(&mut tx, insert).await?,
+                    CounterOwner::ChainHop(_) => insert_chain_sample(&mut tx, insert).await?,
+                };
+                if sample_inserted {
+                    inserted_samples += 1;
+                    if has_gap {
+                        gap_samples += 1;
                     }
                 }
             }
@@ -1605,7 +1773,104 @@ fn revision_to_u64(revision: i64) -> Result<u64> {
 
 #[cfg(test)]
 mod runtime_tests {
-    use super::{unknown_counter_fingerprint, UnknownCounterObservation, UsageRuntimeState};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{
+        assign_first_reading_policies, unknown_counter_fingerprint, FirstReadingPolicy,
+        FrozenBinding, UnknownCounterObservation, UsageRuntimeState,
+    };
+
+    fn user_binding(user_id: &str, first_reading: FirstReadingPolicy) -> FrozenBinding {
+        FrozenBinding::User {
+            tenant_id: "platform.acme".to_owned(),
+            user_id: user_id.to_owned(),
+            ingress_id: "i-main".to_owned(),
+            app_id: "app-main".to_owned(),
+            first_reading,
+        }
+    }
+
+    #[test]
+    fn first_generation_and_legacy_bindings_remain_conservative_baselines() {
+        let mut bindings = BTreeMap::from([(
+            "alice@platform.acme#i-main".to_owned(),
+            user_binding("alice", FirstReadingPolicy::EstablishBaseline),
+        )]);
+        assign_first_reading_policies(&mut bindings, None, &BTreeSet::new());
+        assert_eq!(
+            bindings.values().next().unwrap().first_reading_policy(),
+            FirstReadingPolicy::EstablishBaseline
+        );
+
+        let legacy: FrozenBinding = serde_json::from_value(serde_json::json!({
+            "kind": "user",
+            "tenant_id": "platform.acme",
+            "user_id": "alice",
+            "ingress_id": "i-main",
+            "app_id": "app-main"
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy.first_reading_policy(),
+            FirstReadingPolicy::EstablishBaseline
+        );
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("first_reading")
+                .is_none(),
+            "the default stays absent so old generation JSON remains byte-shape compatible"
+        );
+    }
+
+    #[test]
+    fn a_new_authorization_counts_from_zero_until_a_durable_head_exists() {
+        let alice_label = "alice@platform.acme#i-main".to_owned();
+        let bob_label = "bob@platform.acme#i-main".to_owned();
+        let previous = BTreeMap::from([(
+            alice_label.clone(),
+            user_binding("alice", FirstReadingPolicy::EstablishBaseline),
+        )]);
+        let mut introduced = BTreeMap::from([
+            (
+                alice_label.clone(),
+                user_binding("alice", FirstReadingPolicy::EstablishBaseline),
+            ),
+            (
+                bob_label.clone(),
+                user_binding("bob", FirstReadingPolicy::EstablishBaseline),
+            ),
+        ]);
+        assign_first_reading_policies(&mut introduced, Some(&previous), &BTreeSet::new());
+        assert_eq!(
+            introduced[&alice_label].first_reading_policy(),
+            FirstReadingPolicy::EstablishBaseline
+        );
+        assert_eq!(
+            introduced[&bob_label].first_reading_policy(),
+            FirstReadingPolicy::CountFromZero
+        );
+
+        // An unrelated generation can land before Bob transfers anything. Carry the proof that
+        // this is a newly created counter instead of turning his eventual first report into a
+        // baseline again.
+        let mut next = BTreeMap::from([(
+            bob_label.clone(),
+            user_binding("bob", FirstReadingPolicy::EstablishBaseline),
+        )]);
+        assign_first_reading_policies(&mut next, Some(&introduced), &BTreeSet::new());
+        assert_eq!(
+            next[&bob_label].first_reading_policy(),
+            FirstReadingPolicy::CountFromZero
+        );
+
+        let heads = BTreeSet::from([bob_label.clone()]);
+        assign_first_reading_policies(&mut next, Some(&introduced), &heads);
+        assert_eq!(
+            next[&bob_label].first_reading_policy(),
+            FirstReadingPolicy::EstablishBaseline
+        );
+    }
 
     fn observation(
         label: &str,

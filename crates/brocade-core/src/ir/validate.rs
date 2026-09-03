@@ -2176,20 +2176,45 @@ fn validate_ingress_stream(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress)
     // unlimited as soon as any XMUX field is present, so validating only maxConcurrency would
     // preserve the exact hidden side effect this model is meant to remove.
     if let Some(xmux) = &xhttp.xmux {
-        if !(XhttpXmux::CONCURRENCY_MIN..=XhttpXmux::CONCURRENCY_MAX)
-            .contains(&xmux.max_concurrency)
-        {
+        let limits = usize::from(xmux.max_concurrency.is_some())
+            + usize::from(xmux.max_connections.is_some());
+        if limits != 1 {
             diagnostics.push(Diagnostic::error(
-                "ingress.xhttp-xmux-concurrency",
+                "ingress.xhttp-xmux-limit",
                 &ingress.id,
                 format!(
-                    "接入面 {} 的 XMUX 最大并发 {} 超出 {}–{} 的范围",
-                    ingress.id,
-                    xmux.max_concurrency,
-                    XhttpXmux::CONCURRENCY_MIN,
-                    XhttpXmux::CONCURRENCY_MAX
+                    "接入面 {} 的 XMUX 必须在最大并发流和最大连接数之间选择一项，不能同时设置",
+                    ingress.id
                 ),
             ));
+        }
+        for (code, label, value) in [
+            (
+                "ingress.xhttp-xmux-concurrency",
+                "最大并发流",
+                xmux.max_concurrency,
+            ),
+            (
+                "ingress.xhttp-xmux-connections",
+                "最大连接数",
+                xmux.max_connections,
+            ),
+        ] {
+            if value.is_some_and(|value| {
+                !(XhttpXmux::CONCURRENCY_MIN..=XhttpXmux::CONCURRENCY_MAX).contains(&value)
+            }) {
+                diagnostics.push(Diagnostic::error(
+                    code,
+                    &ingress.id,
+                    format!(
+                        "接入面 {} 的 XMUX {label} {} 超出 {}–{} 的范围",
+                        ingress.id,
+                        value.unwrap_or_default(),
+                        XhttpXmux::CONCURRENCY_MIN,
+                        XhttpXmux::CONCURRENCY_MAX
+                    ),
+                ));
+            }
         }
         validate_xhttp_xmux_range(
             diagnostics,
@@ -2205,6 +2230,33 @@ fn validate_ingress_stream(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress)
             "最大复用时长",
             &xmux.h_max_reusable_secs,
         );
+        if xmux
+            .h_keep_alive_period_secs
+            .is_some_and(|value| value != -1 && !(1..=3600).contains(&value))
+        {
+            diagnostics.push(Diagnostic::error(
+                "ingress.xhttp-xmux-keepalive",
+                &ingress.id,
+                format!(
+                    "接入面 {} 的 XMUX 保活间隔只能是 -1（关闭）或 1–3600 秒；留空使用 Xray 默认",
+                    ingress.id
+                ),
+            ));
+        }
+    }
+
+    if let Some(tuning) = &xhttp.tuning {
+        if let Some(range) = &tuning.x_padding_bytes {
+            validate_xhttp_range(
+                diagnostics,
+                &ingress.id,
+                "ingress.xhttp-padding-bytes",
+                "Padding 字节",
+                range,
+                1,
+                4096,
+            );
+        }
     }
 
     if xhttp
@@ -2314,6 +2366,27 @@ fn validate_xhttp_xmux_range(
     }
 }
 
+fn validate_xhttp_range(
+    diagnostics: &mut Vec<Diagnostic>,
+    at: &str,
+    code: &'static str,
+    label: &str,
+    range: &XhttpXmuxRange,
+    min: u32,
+    max: u32,
+) {
+    if range.from < min || range.from > range.to || range.to > max {
+        diagnostics.push(Diagnostic::error(
+            code,
+            at,
+            format!(
+                "XHTTP {label}范围 {}–{} 无效：允许 {}–{}，且下限不能大于上限",
+                range.from, range.to, min, max
+            ),
+        ));
+    }
+}
+
 fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Diagnostic>) {
     // Both fields describe the one outbound this edge compiles to, so both have to agree
     // across every rule pointing at the same target — two rules asking for different
@@ -2337,6 +2410,25 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
             ));
         }
 
+        // Keep accepting authored Pool values: changing them during compilation would make an
+        // old revision run differently without changing its model. It is nevertheless important
+        // that preview exposes why this is no longer the console default. In xray 26.4.25 the
+        // concurrency-one Mux.cool worker is selected without a health probe, so a half-dead idle
+        // TCP connection can stall the next stream until the connection timeout. Warn once per
+        // edge rather than once per routing rule that happens to point at it.
+        if *pool == HopPool::Pool
+            && !matches!(dial, HopDial::Reverse(_))
+            && !by_target.contains_key(to.as_str())
+        {
+            diagnostics.push(Diagnostic::warn(
+                "rule.pool-concurrency-one",
+                at.clone(),
+                format!(
+                    "{to} 的连接池使用 Xray Mux.cool concurrency=1；空闲连接复用前不探活，半失效连接可能卡到超时，遇到过卡顿请改为每次新建"
+                ),
+            ));
+        }
+
         // Refused rather than clamped. xray caps `concurrency` at 128 and reads 0 as 8, so
         // reproducing either would leave the console showing one number while the machine
         // runs another.
@@ -2347,7 +2439,7 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
                     at.clone(),
                     if *n < HopPool::MERGE_MIN {
                         format!(
-                            "{to} 的合并流数为 {n}，最小值为 {}；一条流对应一条连接对应连接池档位，请选择该档",
+                            "{to} 的合并流数为 {n}，最小值为 {}；1 会启用有卡顿风险的实验连接池，只能通过对应档位显式选择",
                             HopPool::MERGE_MIN
                         )
                     } else {

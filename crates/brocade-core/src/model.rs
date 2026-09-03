@@ -1101,14 +1101,12 @@ pub struct IngressIdentity {
 /// public IP. How the line delivers the packets is outside brocade; this field only supplies
 /// the address for the subscription.
 ///
-/// **This field affects only the subscription artifacts issued to users**: the `@host:port`
-/// of a VLESS URI and Clash's `server`/`port`. The xray config, node-to-node dialing,
-/// WireGuard, probing, billing, and reachability derivation all ignore it. In particular,
-/// `FrontDownstream` continues to match the node's declared public addresses rather than a
-/// projection, because the relay behind a projection is outside brocade and the compiler can
-/// neither infer nor validate how traffic reaches it. Changing a projection therefore
-/// restarts no process, and the remaining risk is a wrong address leaving users unable to
-/// connect.
+/// Its public host, public port, HTTP Host and client mux affect only subscription artifacts: the
+/// `@host:port` of a VLESS URI and Clash's `server`/`port`. One explicit exception is a REALITY +
+/// XHTTP independent download: its `origin_port`, or its public download port when origin is
+/// absent, creates a node-side TLS listener and therefore changes Xray. `FrontDownstream` still
+/// matches the node's declared public addresses rather than a projection, because the relay
+/// behind a projection is outside brocade and the compiler cannot infer how traffic reaches it.
 ///
 /// Two families rather than one address, because a line usually carries only v4 or only v6
 /// and each is projected separately. That separation is also why a machine behind NAT with
@@ -1267,24 +1265,20 @@ impl Transport {
         }
     }
 
-    /// The uTLS fingerprint a client imitates. Not a REALITY setting despite sitting beside them:
-    /// it names the TLS ClientHello to synthesize, and a client dialing plain TLS synthesizes one
-    /// for the same reason.
-    pub fn fingerprint(&self) -> &str {
-        match self {
-            Self::VlessReality(reality) => &reality.fingerprint,
-            Self::VlessRealityXhttp(shape) => &shape.reality.fingerprint,
-            Self::VlessTls(tls) => &tls.fingerprint,
-            Self::VlessTlsXhttp(shape) => &shape.tls.fingerprint,
-        }
-    }
-
     /// The HTTP layer's settings, or `None` for a shape that has no HTTP layer.
     pub fn xhttp(&self) -> Option<&Xhttp> {
         match self {
             Self::VlessReality(_) | Self::VlessTls(_) => None,
             Self::VlessRealityXhttp(shape) => Some(&shape.xhttp),
             Self::VlessTlsXhttp(shape) => Some(&shape.xhttp),
+        }
+    }
+
+    pub fn xhttp_mut(&mut self) -> Option<&mut Xhttp> {
+        match self {
+            Self::VlessReality(_) | Self::VlessTls(_) => None,
+            Self::VlessRealityXhttp(shape) => Some(&mut shape.xhttp),
+            Self::VlessTlsXhttp(shape) => Some(&mut shape.xhttp),
         }
     }
 
@@ -1674,14 +1668,12 @@ impl IngressWires {
         }
     }
 
-    /// The uTLS fingerprint the TCP half instructs a client to imitate. Empty where there is no
-    /// TCP half, because Hysteria 2 clients expose no such setting.
-    pub fn fingerprint(&self) -> &str {
-        self.vless().map(Transport::fingerprint).unwrap_or("")
-    }
-
     pub fn xhttp(&self) -> Option<&Xhttp> {
         self.vless().and_then(Transport::xhttp)
+    }
+
+    pub fn xhttp_mut(&mut self) -> Option<&mut Xhttp> {
+        self.vless_mut().and_then(Transport::xhttp_mut)
     }
 
     /// True when *either* half presents this machine's own certificate. Hysteria 2 always does;
@@ -1690,8 +1682,6 @@ impl IngressWires {
         self.has_udp() || self.vless().is_some_and(Transport::needs_node_certificate)
     }
 
-    /// Whether clients are told to skip verifying the machine certificate.
-    ///
     /// How the TCP half is named in storage, or `None` where there is no TCP half.
     pub fn vless_kind(&self) -> Option<&'static str> {
         self.vless().map(Transport::kind)
@@ -1702,8 +1692,8 @@ impl IngressWires {
 ///
 /// The struct is small by design rather than by omission: the certificate is not selected per
 /// ingress. Each machine holds one, issued for a name of its own, and every TLS ingress on it
-/// presents that certificate. The remaining settings are the ones REALITY never covered: whether
-/// to run flow control and which ClientHello the client imitates.
+/// presents that certificate. The remaining ingress-local setting is whether to run flow control;
+/// the client uses its native TLS stack and the model carries no ClientHello preset.
 ///
 /// Skipping certificate verification is deliberately absent, on this wire and on Hysteria 2
 /// alike: xray removed `allowInsecure` in v26.2.6 and rejects the whole config from v26.6.1 on,
@@ -1716,7 +1706,6 @@ pub struct Tls {
     /// Same three-state rule as [`Reality::flow`]: unset follows the fleet, empty is off.
     #[serde(default)]
     pub flow: Option<String>,
-    pub fingerprint: String,
 }
 
 /// VLESS over this machine's own TLS, carried inside HTTP.
@@ -1800,17 +1789,28 @@ impl XhttpXmuxRange {
 
 /// The complete subset of Xray's client-side XMUX policy managed by Brocade.
 ///
-/// This is deliberately one optional object rather than three optional fields. Xray injects its
-/// rotation defaults only when the entire `xmux` object is zero-valued. Emitting only
-/// `maxConcurrency` therefore changes the omitted request and lifetime limits to unlimited. A
-/// custom policy must carry all three values together; `None` means omit `xmux` completely and let
-/// the pinned Xray version own its defaults.
+/// This is deliberately one optional object rather than a collection of transport-level fields.
+/// Xray injects its rotation defaults only when the entire `xmux` object is zero-valued. Once a
+/// custom policy is emitted, Brocade therefore persists its connection limit and lifecycle ranges
+/// together; `None` means omit `xmux` completely and let the pinned Xray version own its defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct XhttpXmux {
-    pub max_concurrency: u16,
+    /// Maximum simultaneous proxy streams carried by one underlying HTTP connection.
+    /// Mutually exclusive with `max_connections`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u16>,
+    /// Maximum underlying HTTP connections in the pool. Before the pool reaches this size, a new
+    /// proxy stream opens a new connection; afterwards streams reuse the pool. Mutually exclusive
+    /// with `max_concurrency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u16>,
     pub h_max_request_times: XhttpXmuxRange,
     pub h_max_reusable_secs: XhttpXmuxRange,
+    /// H2/H3 idle keepalive interval in seconds. `None` keeps Xray's protocol-specific default.
+    /// `-1` disables idle keepalive, matching Xray's native setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h_keep_alive_period_secs: Option<i32>,
 }
 
 impl XhttpXmux {
@@ -1824,10 +1824,29 @@ impl XhttpXmux {
     /// otherwise have supplied for an entirely absent XMUX object.
     pub const fn with_concurrency(max_concurrency: u16) -> Self {
         Self {
-            max_concurrency,
+            max_concurrency: Some(max_concurrency),
+            max_connections: None,
             h_max_request_times: Self::DEFAULT_REQUEST_TIMES,
             h_max_reusable_secs: Self::DEFAULT_REUSABLE_SECS,
+            h_keep_alive_period_secs: None,
         }
+    }
+}
+
+/// Padding controls shared by XHTTP's listener and dialing projections.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpTuning {
+    /// Random padding bytes placed on every XHTTP request and response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_padding_bytes: Option<XhttpXmuxRange>,
+}
+
+impl XhttpTuning {
+    pub const DEFAULT_PADDING_BYTES: XhttpXmuxRange = XhttpXmuxRange::new(100, 1000);
+
+    pub fn is_empty(&self) -> bool {
+        self.x_padding_bytes.is_none()
     }
 }
 
@@ -1855,6 +1874,9 @@ pub struct Xhttp {
     /// cannot silently make connection rotation unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xmux: Option<XhttpXmux>,
+    /// Request/response padding. `None` omits the key and lets Xray own its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<XhttpTuning>,
     /// How the client sends its upload half.
     #[serde(default)]
     pub mode: XhttpMode,
@@ -2320,9 +2342,9 @@ impl IpFamily {
 ///
 /// The three variants are named rather than exposing xray's `concurrency` as a bare number,
 /// because 1 is a different arrangement rather than the low end of a range: at 1 each stream
-/// still gets its own connection and only reuses an idle one, so no stream stalls another.
-/// From 2 upward, streams share a live connection and a loss on one delays the rest. A flat
-/// 1–128 field would place that boundary in the middle of a range.
+/// gets its own worker and a later stream may reuse it once idle. From 2 upward, streams share a
+/// live connection and a loss on one delays the rest. A flat 1–128 field would place that
+/// boundary in the middle of a range.
 ///
 /// Applicable only where this machine dials. Under `HopDial::Reverse` the peer opens the
 /// connection and traffic travels back along it, so there is no outbound to pool; see the
@@ -2347,9 +2369,11 @@ pub enum HopPool {
     /// Idle connections are retained and reused by the next stream, one stream at a time.
     ///
     /// Measured against xray 26.4.25: 20 sequential streams used 1 connection, and 8
-    /// concurrent streams used 8. Retention is short, roughly 20 to 40 seconds of idle
-    /// rather than the 300 of `connIdle`, so a relay idle for a minute pays the handshakes
-    /// again.
+    /// concurrent streams used 8. Retention is short, 16 to 32 seconds of idle rather than the
+    /// 300 of `connIdle`, so a relay idle for a minute pays the handshakes again. Mux.cool does
+    /// not probe an idle worker before selecting it: a half-dead TCP connection can therefore
+    /// stall the next stream until its connection timeout. This variant remains for authored
+    /// model compatibility and explicit use, but new console rules default to `None`.
     Pool,
     /// Up to `n` streams share one connection.
     ///
@@ -2674,6 +2698,7 @@ mod transport_tests {
                 path: "/probe".to_owned(),
                 host: None,
                 xmux: None,
+                tuning: None,
                 mode: XhttpMode::Auto,
             },
         }))
@@ -2705,6 +2730,7 @@ mod transport_tests {
                     path: "/probe".to_owned(),
                     host: None,
                     xmux: Some(XhttpXmux::with_concurrency(16)),
+                    tuning: None,
                     mode: XhttpMode::StreamOne,
                 },
             }),

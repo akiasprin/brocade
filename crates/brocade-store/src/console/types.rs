@@ -622,6 +622,9 @@ impl<'de> Deserialize<'de> for TransportRequest {
         match kind {
             "vless-reality" => Ok(Self::VlessReality),
             "vless-reality-xhttp" => Ok(Self::VlessRealityXhttp { xhttp: xhttp()? }),
+            // `fingerprint` and `alpn` were briefly accepted here. The custom decoder
+            // deliberately ignores those legacy keys so a stale browser can still save, while
+            // the typed request and every new response stop advertising them as managed state.
             "vless-tls" => Ok(Self::VlessTls),
             "vless-tls-xhttp" => Ok(Self::VlessTlsXhttp { xhttp: xhttp()? }),
             other => Err(serde::de::Error::custom(format!(
@@ -705,7 +708,7 @@ impl TransportRequest {
     pub fn xhttp(&self) -> Option<&Xhttp> {
         match self {
             Self::VlessReality | Self::VlessTls => None,
-            Self::VlessRealityXhttp { xhttp } | Self::VlessTlsXhttp { xhttp, .. } => Some(xhttp),
+            Self::VlessRealityXhttp { xhttp } | Self::VlessTlsXhttp { xhttp } => Some(xhttp),
         }
     }
 }
@@ -987,5 +990,21 @@ mod tests {
             missing.is_err(),
             "missing settings must not silently use defaults"
         );
+    }
+
+    #[test]
+    fn stale_tls_client_overrides_are_ignored_by_the_request_decoder() {
+        let request: TransportRequest = serde_json::from_value(serde_json::json!({
+            "kind": "vless-tls-xhttp",
+            "fingerprint": "none",
+            "alpn": "http1",
+            "xhttp": { "path": "/probe" }
+        }))
+        .unwrap();
+
+        let TransportRequest::VlessTlsXhttp { xhttp } = request else {
+            panic!("expected TLS + XHTTP")
+        };
+        assert_eq!(xhttp.path, "/probe");
     }
 }

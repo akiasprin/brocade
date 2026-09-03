@@ -344,10 +344,10 @@ fn grants_need_action_when_uuid_changed_under_the_same_email() {
     assert_eq!(plan.targets[0].actions, vec![PlannedAction::SyncGrants]);
 }
 
-/// A changed flow with unchanged email and uuid must reload the user too. VLESS flow is per-client
-/// configuration and xray's `inbounduser` reads it back.
+/// A changed flow with unchanged email and uuid is topology work. It must force an Xray restart
+/// and restore the runtime grant list in the same configuration deployment.
 #[test]
-fn grants_need_action_when_flow_changed_under_the_same_email_and_uuid() {
+fn flow_change_forces_disruptive_xray_apply_and_grant_restore() {
     let snapshot = snapshot(
         vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
         vec![direct_app("direct", "hk", "i-hk", 8443, true, any_egress())],
@@ -373,7 +373,11 @@ fn grants_need_action_when_flow_changed_under_the_same_email_and_uuid() {
     }];
 
     let plan = plan_deployment(&snapshot, &applied).unwrap();
-    assert_eq!(plan.targets[0].actions, vec![PlannedAction::SyncGrants]);
+    assert_eq!(
+        plan.targets[0].actions,
+        vec![PlannedAction::ApplyXray, PlannedAction::SyncGrants]
+    );
+    assert!(plan.targets[0].disruptive);
 }
 
 /// With an empty or `Unknown` baseline, `Disabled` still calls for action. Otherwise it deadlocks:

@@ -419,16 +419,22 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- applies wherever nodes.agent_log_max_mib is NULL; changing either value is picked up by the
     -- agent poll and does not create a revision or require a topology release.
     agent_log_max_mib INTEGER DEFAULT 100 NOT NULL,
+    -- Live NIC rates are kept only in control-plane memory, but whether the channel is available
+    -- and its fleet-wide cadence must survive a restart. It is independent of both the persisted
+    -- 30-second diagnostic windows and the cumulative usage ledger.
+    realtime_enabled BOOLEAN DEFAULT TRUE NOT NULL,
+    realtime_interval_secs INTEGER DEFAULT 1 NOT NULL,
     -- Console identity. It compiles into nothing and takes effect on the next browser fetch, so it
     -- shares control_state with distribution but not the revisioned model settings above.
     site_name TEXT DEFAULT 'Brocade' NOT NULL,
     -- A validated PNG/JPEG/WebP data URL. NULL keeps the built-in woven vector mark.
     site_icon_data_url TEXT,
-    -- Active TCP-connect observation. Operational and read by agents every round; it creates no
-    -- model revision. The JSON contains only display names and tcp://host:port addresses.
-    tcp_probe_targets JSONB DEFAULT '[]'::jsonb NOT NULL,
-    tcp_probe_interval_secs INTEGER DEFAULT 60 NOT NULL,
-    tcp_probe_timeout_ms INTEGER DEFAULT 420 NOT NULL,
+    -- Active TCP-connect and ICMP-echo observation. Operational and read by agents every round;
+    -- it creates no model revision. The URI scheme selects tcp://host:port or icmp://host and both
+    -- kinds may be configured at the same time.
+    ping_probe_targets JSONB DEFAULT '[]'::jsonb NOT NULL,
+    ping_probe_interval_secs INTEGER DEFAULT 60 NOT NULL,
+    ping_probe_timeout_ms INTEGER DEFAULT 420 NOT NULL,
     -- Connection policy defaults. Merely the defaults: what reaches a machine is its own
     -- `nodes.conn_*` falling back to these, the same arrangement as overlay_mtu / nodes.mtu.
     --
@@ -493,6 +499,7 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- Refused here so that no code downstream has to decide what it means.
     CONSTRAINT control_state_agent_release_armed CHECK (((agent_release_scope = 'off') OR (agent_release_id IS NOT NULL))),
     CONSTRAINT control_state_agent_log_max_mib_range CHECK (((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096))),
+    CONSTRAINT control_state_realtime_interval_known CHECK ((realtime_interval_secs = ANY (ARRAY[1, 2, 5]))),
     CONSTRAINT control_state_geodata_cron_shape CHECK ((geodata_cron ~ '^((CRON_)?TZ=\S+\s+)?\S+(\s+\S+){4}$')),
     CONSTRAINT control_state_geodata_geoip_url_shape CHECK ((geodata_geoip_url ~ '^https?://')),
     CONSTRAINT control_state_geodata_geosite_url_shape CHECK ((geodata_geosite_url ~ '^https?://')),
@@ -514,32 +521,47 @@ CREATE TABLE IF NOT EXISTS control_state (
     CONSTRAINT control_state_reality_server_names_shape CHECK ((jsonb_typeof(reality_server_names) = 'array')),
     CONSTRAINT control_state_site_name_shape CHECK ((length(btrim(site_name)) BETWEEN 1 AND 64)),
     CONSTRAINT control_state_site_icon_size CHECK ((site_icon_data_url IS NULL) OR (octet_length(site_icon_data_url) <= 350000)),
-    CONSTRAINT control_state_tcp_probe_targets_shape CHECK ((jsonb_typeof(tcp_probe_targets) = 'array')),
-    CONSTRAINT control_state_tcp_probe_interval_range CHECK (((tcp_probe_interval_secs >= 15) AND (tcp_probe_interval_secs <= 86400))),
-    CONSTRAINT control_state_tcp_probe_timeout_range CHECK (((tcp_probe_timeout_ms >= 1) AND (tcp_probe_timeout_ms <= 120000))),
+    CONSTRAINT control_state_ping_probe_targets_shape CHECK ((jsonb_typeof(ping_probe_targets) = 'array')),
+    CONSTRAINT control_state_ping_probe_interval_range CHECK (((ping_probe_interval_secs >= 5) AND (ping_probe_interval_secs <= 86400))),
+    CONSTRAINT control_state_ping_probe_timeout_range CHECK (((ping_probe_timeout_ms >= 1) AND (ping_probe_timeout_ms <= 120000))),
     CONSTRAINT control_state_pkey PRIMARY KEY (id),
     CONSTRAINT control_state_current_revision_fkey FOREIGN KEY (current_revision) REFERENCES revisions(id)
 );
 
--- Development deployments replay 0001 after clearing its checksum. Reconcile databases created
--- before console branding existed instead of requiring them to be rebuilt for two additive fields.
+-- Development deployments replay 0001 after clearing its checksum. Reconcile objects introduced
+-- after the original schema dump without requiring those databases to be rebuilt wholesale.
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'Brocade' NOT NULL;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS site_icon_data_url TEXT;
+-- TCP-only probing was never a durable compatibility contract. Replaying 0001 drops those old
+-- settings before creating the shared TCP/ICMP model; the fleet deliberately starts this history
+-- afresh rather than carrying two names and two wire formats forever.
+ALTER TABLE control_state DROP COLUMN IF EXISTS tcp_probe_targets;
+ALTER TABLE control_state DROP COLUMN IF EXISTS tcp_probe_interval_secs;
+ALTER TABLE control_state DROP COLUMN IF EXISTS tcp_probe_timeout_ms;
 ALTER TABLE control_state
-    ADD COLUMN IF NOT EXISTS tcp_probe_targets JSONB DEFAULT '[]'::jsonb NOT NULL;
+    ADD COLUMN IF NOT EXISTS ping_probe_targets JSONB DEFAULT '[]'::jsonb NOT NULL;
 ALTER TABLE control_state
-    ADD COLUMN IF NOT EXISTS tcp_probe_interval_secs INTEGER DEFAULT 60 NOT NULL;
+    ADD COLUMN IF NOT EXISTS ping_probe_interval_secs INTEGER DEFAULT 60 NOT NULL;
 ALTER TABLE control_state
-    ADD COLUMN IF NOT EXISTS tcp_probe_timeout_ms INTEGER DEFAULT 420 NOT NULL;
+    ADD COLUMN IF NOT EXISTS ping_probe_timeout_ms INTEGER DEFAULT 420 NOT NULL;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS agent_log_max_mib INTEGER DEFAULT 100 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS realtime_enabled BOOLEAN DEFAULT TRUE NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS realtime_interval_secs INTEGER DEFAULT 1 NOT NULL;
 ALTER TABLE control_state
     DROP CONSTRAINT IF EXISTS control_state_agent_log_max_mib_range;
 ALTER TABLE control_state
     ADD CONSTRAINT control_state_agent_log_max_mib_range
         CHECK (((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096)));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_realtime_interval_known;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_realtime_interval_known
+        CHECK ((realtime_interval_secs = ANY (ARRAY[1, 2, 5])));
 ALTER TABLE control_state
     DROP CONSTRAINT IF EXISTS control_state_site_name_shape;
 ALTER TABLE control_state
@@ -551,20 +573,20 @@ ALTER TABLE control_state
     ADD CONSTRAINT control_state_site_icon_size
         CHECK ((site_icon_data_url IS NULL) OR (octet_length(site_icon_data_url) <= 350000));
 ALTER TABLE control_state
-    DROP CONSTRAINT IF EXISTS control_state_tcp_probe_targets_shape;
+    DROP CONSTRAINT IF EXISTS control_state_ping_probe_targets_shape;
 ALTER TABLE control_state
-    ADD CONSTRAINT control_state_tcp_probe_targets_shape
-        CHECK ((jsonb_typeof(tcp_probe_targets) = 'array'));
+    ADD CONSTRAINT control_state_ping_probe_targets_shape
+        CHECK ((jsonb_typeof(ping_probe_targets) = 'array'));
 ALTER TABLE control_state
-    DROP CONSTRAINT IF EXISTS control_state_tcp_probe_interval_range;
+    DROP CONSTRAINT IF EXISTS control_state_ping_probe_interval_range;
 ALTER TABLE control_state
-    ADD CONSTRAINT control_state_tcp_probe_interval_range
-        CHECK (((tcp_probe_interval_secs >= 15) AND (tcp_probe_interval_secs <= 86400)));
+    ADD CONSTRAINT control_state_ping_probe_interval_range
+        CHECK (((ping_probe_interval_secs >= 5) AND (ping_probe_interval_secs <= 86400)));
 ALTER TABLE control_state
-    DROP CONSTRAINT IF EXISTS control_state_tcp_probe_timeout_range;
+    DROP CONSTRAINT IF EXISTS control_state_ping_probe_timeout_range;
 ALTER TABLE control_state
-    ADD CONSTRAINT control_state_tcp_probe_timeout_range
-        CHECK (((tcp_probe_timeout_ms >= 1) AND (tcp_probe_timeout_ms <= 120000)));
+    ADD CONSTRAINT control_state_ping_probe_timeout_range
+        CHECK (((ping_probe_timeout_ms >= 1) AND (ping_probe_timeout_ms <= 120000)));
 
 -- One release.
 --
@@ -634,11 +656,48 @@ CREATE TABLE IF NOT EXISTS deployments (
     CONSTRAINT deployments_sync_of_deployment_id_fkey FOREIGN KEY (sync_of_deployment_id) REFERENCES deployments(id)
 );
 
+-- Immutable client-only input for subscriptions. It has its own committed head because a Chain
+-- rename or public projection address changes no machine artifact and must not advance the
+-- topology checkpoint. Credentials in document are sealed by the store before insertion.
+CREATE TABLE IF NOT EXISTS subscription_client_snapshots (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+    source_revision_id BIGINT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    document JSONB NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT subscription_client_snapshots_pkey PRIMARY KEY (id),
+    CONSTRAINT subscription_client_snapshots_source_revision_fkey
+        FOREIGN KEY (source_revision_id) REFERENCES revisions(id),
+    CONSTRAINT subscription_client_snapshots_document_check
+        CHECK (jsonb_typeof(document) = 'object'),
+    CONSTRAINT subscription_client_snapshots_schema_check CHECK (schema_version > 0),
+    CONSTRAINT subscription_client_snapshots_sha_check
+        CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT subscription_client_snapshots_revision_content_key
+        UNIQUE (source_revision_id, content_sha256)
+);
+
+-- Always present, including before the first topology release, so a model commit and first
+-- deployment have one real row on which to serialize their client checkpoint updates.
+CREATE TABLE IF NOT EXISTS subscription_client_state (
+    id BOOLEAN DEFAULT true NOT NULL,
+    head_snapshot_id BIGINT,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT subscription_client_state_singleton CHECK (id),
+    CONSTRAINT subscription_client_state_pkey PRIMARY KEY (id),
+    CONSTRAINT subscription_client_state_head_snapshot_fkey
+        FOREIGN KEY (head_snapshot_id) REFERENCES subscription_client_snapshots(id)
+);
+INSERT INTO subscription_client_state (id, head_snapshot_id)
+VALUES (TRUE, NULL)
+ON CONFLICT (id) DO NOTHING;
+
 -- User subscriptions are rendered on demand, but their input is a durable serving checkpoint —
--- never the mutable head revision. Configuration and grants converge independently, so one row
--- records both released dimensions. The row advances in the same transaction that makes a
--- deployment succeeded; planned, partial, halted and canceled revisions therefore cannot leak
--- into a URI or Clash subscription.
+-- never the mutable head revision. Configuration, grants and client-only fields advance
+-- independently. Planned, partial, halted and canceled topology revisions therefore cannot leak
+-- into a URI or Clash subscription, while a committed display name needs no machine deployment.
 --
 -- `generation` is a monotonic serving epoch. It changes even when the numeric model revision of
 -- only one dimension advances, and gives callers/diagnostics an unambiguous identity for the
@@ -648,6 +707,7 @@ CREATE TABLE IF NOT EXISTS subscription_serving_state (
     id BOOLEAN DEFAULT true NOT NULL,
     topology_revision_id BIGINT NOT NULL,
     permissions_revision_id BIGINT NOT NULL,
+    client_snapshot_id BIGINT,
     topology_deployment_id BIGINT,
     permissions_deployment_id BIGINT,
     generation BIGINT DEFAULT 1 NOT NULL,
@@ -657,9 +717,28 @@ CREATE TABLE IF NOT EXISTS subscription_serving_state (
     CONSTRAINT subscription_serving_state_pkey PRIMARY KEY (id),
     CONSTRAINT subscription_serving_state_topology_revision_fkey FOREIGN KEY (topology_revision_id) REFERENCES revisions(id),
     CONSTRAINT subscription_serving_state_permissions_revision_fkey FOREIGN KEY (permissions_revision_id) REFERENCES revisions(id),
+    CONSTRAINT subscription_serving_state_client_snapshot_fkey FOREIGN KEY (client_snapshot_id) REFERENCES subscription_client_snapshots(id),
     CONSTRAINT subscription_serving_state_topology_deployment_fkey FOREIGN KEY (topology_deployment_id) REFERENCES deployments(id),
     CONSTRAINT subscription_serving_state_permissions_deployment_fkey FOREIGN KEY (permissions_deployment_id) REFERENCES deployments(id)
 );
+
+-- Existing databases have the singleton already. Keep this evolution in 0001: this repository
+-- deliberately carries one replayable canonical migration rather than a stack of delta files.
+ALTER TABLE subscription_serving_state
+    ADD COLUMN IF NOT EXISTS client_snapshot_id BIGINT;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'subscription_serving_state_client_snapshot_fkey'
+           AND conrelid = 'subscription_serving_state'::regclass
+    ) THEN
+        ALTER TABLE subscription_serving_state
+            ADD CONSTRAINT subscription_serving_state_client_snapshot_fkey
+            FOREIGN KEY (client_snapshot_id) REFERENCES subscription_client_snapshots(id);
+    END IF;
+END $$;
 
 -- One machine. overlay is whether it joins the wg overlay; a relay port's shape is not here but on
 -- steps.
@@ -1095,6 +1174,9 @@ CREATE TABLE IF NOT EXISTS ingresses (
     -- hMaxRequestTimes=600-900 and hMaxReusableSecs=1800-3000 when every XMUX field is zero, so
     -- storing maxConcurrency alone silently turns both rotation limits into unlimited.
     xhttp_xmux JSONB,
+    -- Request/response Padding. NULL means the key is omitted and Xray owns its versioned
+    -- default; POST upload controls are intentionally not managed.
+    xhttp_tuning JSONB,
     -- How the client sends its upload half. NULL is "nobody chose", and then both ends resolve it
     -- the same way on their own. A stored value is written into the server config too, where it
     -- stops being a choice and becomes a filter: a server told to expect one shape refuses every
@@ -1169,8 +1251,15 @@ CREATE TABLE IF NOT EXISTS ingresses (
     CONSTRAINT ingresses_xhttp_xmux_shape CHECK (
         xhttp_xmux IS NULL OR ((
             jsonb_typeof(xhttp_xmux) = 'object'
-            AND jsonb_typeof(xhttp_xmux -> 'max_concurrency') = 'number'
-            AND (xhttp_xmux ->> 'max_concurrency')::INTEGER BETWEEN 1 AND 128
+            AND ((
+                jsonb_typeof(xhttp_xmux -> 'max_concurrency') = 'number'
+                AND (xhttp_xmux ->> 'max_concurrency')::INTEGER BETWEEN 1 AND 128
+                AND NOT (xhttp_xmux ? 'max_connections')
+            ) OR (
+                jsonb_typeof(xhttp_xmux -> 'max_connections') = 'number'
+                AND (xhttp_xmux ->> 'max_connections')::INTEGER BETWEEN 1 AND 128
+                AND NOT (xhttp_xmux ? 'max_concurrency')
+            ))
             AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times') = 'object'
             AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'from') = 'number'
             AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'to') = 'number'
@@ -1185,6 +1274,27 @@ CREATE TABLE IF NOT EXISTS ingresses (
             AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
             AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT
                 <= (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT
+            AND (
+                NOT (xhttp_xmux ? 'h_keep_alive_period_secs')
+                OR (
+                    jsonb_typeof(xhttp_xmux -> 'h_keep_alive_period_secs') = 'number'
+                    AND ((xhttp_xmux ->> 'h_keep_alive_period_secs')::INTEGER = -1
+                        OR (xhttp_xmux ->> 'h_keep_alive_period_secs')::INTEGER BETWEEN 1 AND 3600)
+                )
+            )
+        ) IS TRUE)
+    ),
+    CONSTRAINT ingresses_xhttp_tuning_shape CHECK (
+        xhttp_tuning IS NULL OR ((
+            jsonb_typeof(xhttp_tuning) = 'object'
+            AND xhttp_tuning - 'x_padding_bytes' = '{}'::jsonb
+            AND (NOT (xhttp_tuning ? 'x_padding_bytes') OR (
+                jsonb_typeof(xhttp_tuning -> 'x_padding_bytes') = 'object'
+                AND (xhttp_tuning -> 'x_padding_bytes' ->> 'from')::BIGINT BETWEEN 1 AND 4096
+                AND (xhttp_tuning -> 'x_padding_bytes' ->> 'to')::BIGINT BETWEEN 1 AND 4096
+                AND (xhttp_tuning -> 'x_padding_bytes' ->> 'from')::BIGINT
+                    <= (xhttp_tuning -> 'x_padding_bytes' ->> 'to')::BIGINT
+            ))
         ) IS TRUE)
     ),
     CONSTRAINT ingresses_xhttp_mode_known CHECK (((xhttp_mode IS NULL) OR (xhttp_mode IN ('packet-up', 'stream-up', 'stream-one')))),
@@ -2133,20 +2243,23 @@ CREATE TABLE IF NOT EXISTS node_load_samples (
     CONSTRAINT node_load_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
--- One TCP-connect result per machine, target and round. This deliberately does not contain
--- resolved IPs, DNS duration, kernel RTT/RTO, retransmissions or error categories: none is shown,
--- so none is collected. NULL connect_ms is the single representation of no response.
-CREATE TABLE IF NOT EXISTS node_tcp_probe_samples (
+-- One TCP-connect or ICMP-echo result per machine, target and round. `attempted` is the only status
+-- bit retained: it prevents missing IPv6 routes and unavailable ICMP sockets from becoming fake
+-- packet loss. No resolved IP, DNS duration, TTL, kernel metric, retransmission or errno is stored.
+DROP TABLE IF EXISTS node_tcp_probe_samples;
+CREATE TABLE IF NOT EXISTS node_ping_probe_samples (
     node_id TEXT NOT NULL,
     target TEXT NOT NULL,
     probed_at TIMESTAMPTZ NOT NULL,
-    connect_ms INTEGER,
-    CONSTRAINT node_tcp_probe_samples_connect_ms CHECK (((connect_ms IS NULL) OR (connect_ms >= 0))),
-    CONSTRAINT node_tcp_probe_samples_pkey PRIMARY KEY (node_id, target, probed_at),
-    CONSTRAINT node_tcp_probe_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+    attempted BOOLEAN NOT NULL,
+    latency_us INTEGER,
+    CONSTRAINT node_ping_probe_samples_latency_us CHECK (((latency_us IS NULL) OR (latency_us >= 0))),
+    CONSTRAINT node_ping_probe_samples_attempted_latency CHECK (((latency_us IS NULL) OR attempted)),
+    CONSTRAINT node_ping_probe_samples_pkey PRIMARY KEY (node_id, target, probed_at),
+    CONSTRAINT node_ping_probe_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS node_tcp_probe_samples_probed_at_idx
-    ON node_tcp_probe_samples (probed_at);
+CREATE INDEX IF NOT EXISTS node_ping_probe_samples_probed_at_idx
+    ON node_ping_probe_samples (probed_at);
 
 -- The processes we put on the machine. Latest only — one row per (node, process).
 --
@@ -2633,6 +2746,8 @@ ALTER TABLE chains
 -- explicit policy before dropping the legacy column.
 ALTER TABLE ingresses
     ADD COLUMN IF NOT EXISTS xhttp_xmux JSONB;
+ALTER TABLE ingresses
+    ADD COLUMN IF NOT EXISTS xhttp_tuning JSONB;
 DO $xhttp_xmux_compat$
 BEGIN
     IF EXISTS (
@@ -2665,8 +2780,15 @@ ALTER TABLE ingresses
     ADD CONSTRAINT ingresses_xhttp_xmux_shape CHECK (
         xhttp_xmux IS NULL OR ((
             jsonb_typeof(xhttp_xmux) = 'object'
-            AND jsonb_typeof(xhttp_xmux -> 'max_concurrency') = 'number'
-            AND (xhttp_xmux ->> 'max_concurrency')::INTEGER BETWEEN 1 AND 128
+            AND ((
+                jsonb_typeof(xhttp_xmux -> 'max_concurrency') = 'number'
+                AND (xhttp_xmux ->> 'max_concurrency')::INTEGER BETWEEN 1 AND 128
+                AND NOT (xhttp_xmux ? 'max_connections')
+            ) OR (
+                jsonb_typeof(xhttp_xmux -> 'max_connections') = 'number'
+                AND (xhttp_xmux ->> 'max_connections')::INTEGER BETWEEN 1 AND 128
+                AND NOT (xhttp_xmux ? 'max_concurrency')
+            ))
             AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times') = 'object'
             AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'from') = 'number'
             AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'to') = 'number'
@@ -2681,8 +2803,143 @@ ALTER TABLE ingresses
             AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
             AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT
                 <= (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT
+            AND (
+                NOT (xhttp_xmux ? 'h_keep_alive_period_secs')
+                OR (
+                    jsonb_typeof(xhttp_xmux -> 'h_keep_alive_period_secs') = 'number'
+                    AND ((xhttp_xmux ->> 'h_keep_alive_period_secs')::INTEGER = -1
+                        OR (xhttp_xmux ->> 'h_keep_alive_period_secs')::INTEGER BETWEEN 1 AND 3600)
+                )
+            )
         ) IS TRUE)
     );
+ALTER TABLE ingresses
+    DROP CONSTRAINT IF EXISTS ingresses_xhttp_tuning_shape;
+UPDATE ingresses
+SET xhttp_tuning = CASE
+        WHEN xhttp_tuning ? 'x_padding_bytes'
+            THEN jsonb_build_object('x_padding_bytes', xhttp_tuning -> 'x_padding_bytes')
+        ELSE NULL
+    END
+WHERE xhttp_tuning IS NOT NULL;
+ALTER TABLE ingresses
+    ADD CONSTRAINT ingresses_xhttp_tuning_shape CHECK (
+        xhttp_tuning IS NULL OR ((
+            jsonb_typeof(xhttp_tuning) = 'object'
+            AND xhttp_tuning - 'x_padding_bytes' = '{}'::jsonb
+            AND (NOT (xhttp_tuning ? 'x_padding_bytes') OR (
+                jsonb_typeof(xhttp_tuning -> 'x_padding_bytes') = 'object'
+                AND (xhttp_tuning -> 'x_padding_bytes' ->> 'from')::BIGINT BETWEEN 1 AND 4096
+                AND (xhttp_tuning -> 'x_padding_bytes' ->> 'to')::BIGINT BETWEEN 1 AND 4096
+                AND (xhttp_tuning -> 'x_padding_bytes' ->> 'from')::BIGINT
+                    <= (xhttp_tuning -> 'x_padding_bytes' ->> 'to')::BIGINT
+            ))
+        ) IS TRUE)
+    );
+ALTER TABLE ingresses
+    DROP CONSTRAINT IF EXISTS ingresses_xhttp_alpn_scope,
+    DROP CONSTRAINT IF EXISTS ingresses_tls_fingerprint_scope,
+    DROP COLUMN IF EXISTS xhttp_alpn,
+    DROP COLUMN IF EXISTS tls_fingerprint;
+
+-- Client dialer controls have an independent serving checkpoint. Keep their mutable authoring
+-- values outside the topology row as well: changing Host, XMUX or the REALITY ClientHello must
+-- not look like a node configuration edit.
+CREATE TABLE IF NOT EXISTS ingress_client_settings (
+    ingress_id TEXT NOT NULL,
+    -- NULL follows the global REALITY client default.
+    reality_fingerprint TEXT,
+    xhttp_host TEXT,
+    xhttp_xmux JSONB,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT ingress_client_settings_pkey PRIMARY KEY (ingress_id),
+    CONSTRAINT ingress_client_settings_ingress_fkey
+        FOREIGN KEY (ingress_id) REFERENCES ingresses(id)
+        ON UPDATE CASCADE ON DELETE CASCADE,
+    CONSTRAINT ingress_client_settings_reality_fingerprint_check
+        CHECK (reality_fingerprint IS NULL OR btrim(reality_fingerprint) <> ''),
+    CONSTRAINT ingress_client_settings_xhttp_host_check
+        CHECK (xhttp_host IS NULL OR btrim(xhttp_host) <> ''),
+    CONSTRAINT ingress_client_settings_xhttp_xmux_shape CHECK (
+        xhttp_xmux IS NULL OR ((
+            jsonb_typeof(xhttp_xmux) = 'object'
+            AND ((
+                jsonb_typeof(xhttp_xmux -> 'max_concurrency') = 'number'
+                AND (xhttp_xmux ->> 'max_concurrency')::INTEGER BETWEEN 1 AND 128
+                AND NOT (xhttp_xmux ? 'max_connections')
+            ) OR (
+                jsonb_typeof(xhttp_xmux -> 'max_connections') = 'number'
+                AND (xhttp_xmux ->> 'max_connections')::INTEGER BETWEEN 1 AND 128
+                AND NOT (xhttp_xmux ? 'max_concurrency')
+            ))
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times') = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'from') = 'number'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_request_times' -> 'to') = 'number'
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'from')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_request_times' ->> 'from')::BIGINT
+                <= (xhttp_xmux -> 'h_max_request_times' ->> 'to')::BIGINT
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs') = 'object'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs' -> 'from') = 'number'
+            AND jsonb_typeof(xhttp_xmux -> 'h_max_reusable_secs' -> 'to') = 'number'
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT BETWEEN 1 AND 2147483647
+            AND (xhttp_xmux -> 'h_max_reusable_secs' ->> 'from')::BIGINT
+                <= (xhttp_xmux -> 'h_max_reusable_secs' ->> 'to')::BIGINT
+            AND (
+                NOT (xhttp_xmux ? 'h_keep_alive_period_secs')
+                OR (
+                    jsonb_typeof(xhttp_xmux -> 'h_keep_alive_period_secs') = 'number'
+                    AND ((xhttp_xmux ->> 'h_keep_alive_period_secs')::INTEGER = -1
+                        OR (xhttp_xmux ->> 'h_keep_alive_period_secs')::INTEGER BETWEEN 1 AND 3600)
+                )
+            )
+        ) IS TRUE)
+    )
+);
+
+-- Friendly-ID compatibility later in this migration may rename an ingress. Existing databases
+-- which already created this table need the same update behavior as fresh installations.
+ALTER TABLE ingress_client_settings
+    DROP CONSTRAINT IF EXISTS ingress_client_settings_ingress_fkey;
+ALTER TABLE ingress_client_settings
+    ADD CONSTRAINT ingress_client_settings_ingress_fkey
+    FOREIGN KEY (ingress_id) REFERENCES ingresses(id)
+    ON UPDATE CASCADE ON DELETE CASCADE;
+
+-- On an already-compatible replay these columns were removed by the previous run. Recreate empty
+-- compatibility sources so the static copy statement remains valid; existing client rows win the
+-- conflict and retain their current values.
+ALTER TABLE ingresses
+    ADD COLUMN IF NOT EXISTS reality_fingerprint TEXT,
+    ADD COLUMN IF NOT EXISTS xhttp_host TEXT,
+    ADD COLUMN IF NOT EXISTS xhttp_xmux JSONB;
+
+DO $ingress_client_settings_compat$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'ingresses'
+           AND column_name = 'xhttp_xmux'
+    ) THEN
+        EXECUTE $sql$
+            INSERT INTO ingress_client_settings (
+                ingress_id, reality_fingerprint, xhttp_host, xhttp_xmux
+            )
+            SELECT id, reality_fingerprint, xhttp_host, xhttp_xmux
+              FROM ingresses
+            ON CONFLICT (ingress_id) DO NOTHING
+        $sql$;
+    END IF;
+END
+$ingress_client_settings_compat$;
+
+ALTER TABLE ingresses
+    DROP COLUMN IF EXISTS reality_fingerprint,
+    DROP COLUMN IF EXISTS xhttp_host,
+    DROP COLUMN IF EXISTS xhttp_xmux;
 
 ALTER TABLE node_egress_dns
     ADD COLUMN IF NOT EXISTS position INTEGER;

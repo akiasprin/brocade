@@ -154,7 +154,6 @@ mod tests {
         assert!(!is_reality_fingerprint("unsafe"));
         assert!(!is_reality_fingerprint("hellochrome_120"));
         assert!(!is_reality_fingerprint("not-a-fingerprint"));
-
         assert!(is_reality_server_name("www.example.com"));
         assert!(!is_reality_server_name("*.example.com"));
         assert!(!is_reality_server_name("www.example.com:443"));

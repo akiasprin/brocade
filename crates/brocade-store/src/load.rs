@@ -119,7 +119,7 @@ pub async fn record_load_report(
         }
     }
 
-    upsert_host_facts(
+    let latest = upsert_host_facts(
         &mut tx,
         node_id,
         &request.host,
@@ -127,13 +127,15 @@ pub async fn record_load_report(
         skew_secs,
     )
     .await?;
-    replace_process_state(
-        &mut tx,
-        node_id,
-        &request.processes,
-        request.read_at_unix_secs,
-    )
-    .await?;
+    if latest {
+        replace_process_state(
+            &mut tx,
+            node_id,
+            &request.processes,
+            request.read_at_unix_secs,
+        )
+        .await?;
+    }
 
     tx.commit().await?;
 
@@ -294,20 +296,22 @@ async fn upsert_host_facts(
     host: &HostFacts,
     read_at: i64,
     clock_skew_secs: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let json = serde_json::to_value(host).map_err(|error| {
         StoreError::InvalidData(format!("host facts not serializable: {error}"))
     })?;
     // The row is created by enrollment, but an UPSERT rather than an UPDATE anyway: a machine
     // provisioned by an older path may have no node_agent_state row, and losing every load report
     // until somebody notices is a silent failure.
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO node_agent_state (node_id, load_host_facts, load_reported_at, load_clock_skew_secs)
          VALUES ($1, $2, to_timestamp($3), $4)
          ON CONFLICT (node_id) DO UPDATE
             SET load_host_facts = EXCLUDED.load_host_facts,
                 load_reported_at = EXCLUDED.load_reported_at,
-                load_clock_skew_secs = EXCLUDED.load_clock_skew_secs",
+                load_clock_skew_secs = EXCLUDED.load_clock_skew_secs
+          WHERE node_agent_state.load_reported_at IS NULL
+             OR node_agent_state.load_reported_at <= EXCLUDED.load_reported_at",
     )
     .bind(node_id)
     .bind(json)
@@ -315,7 +319,7 @@ async fn upsert_host_facts(
     .bind(clock_skew_secs)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Replace this machine's process rows wholesale.

@@ -8,6 +8,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use brocade_deployment::protocol::{
@@ -76,12 +77,49 @@ const DROPPED_FILE: &str = "spool-dropped";
 /// subcommand, which is a different process.
 const LOCAL_RECONCILE_FILE: &str = "local-reconcile.json";
 
+// Sampling may append while a reporter is waiting on the network. Keep file mutation and network
+// serialization as two different locks: holding one lock across both would make the durable queue
+// exist on paper while still letting a slow POST move the sampling clock.
+static USAGE_FILE_LOCK: Mutex<()> = Mutex::new(());
+static OBSERVATION_FILE_LOCK: Mutex<()> = Mutex::new(());
+static OTHER_FILE_LOCK: Mutex<()> = Mutex::new(());
+static USAGE_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+static OBSERVATION_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+static OTHER_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+static DROPPED_LOCK: Mutex<()> = Mutex::new(());
+
+fn file_lock(spool: Spool) -> &'static Mutex<()> {
+    match spool.file {
+        file if file == USAGE_SPOOL.file => &USAGE_FILE_LOCK,
+        file if file == OBSERVATION_SPOOL.file => &OBSERVATION_FILE_LOCK,
+        _ => &OTHER_FILE_LOCK,
+    }
+}
+
+fn drain_lock(spool: Spool) -> &'static Mutex<()> {
+    match spool.file {
+        file if file == USAGE_SPOOL.file => &USAGE_DRAIN_LOCK,
+        file if file == OBSERVATION_SPOOL.file => &OBSERVATION_DRAIN_LOCK,
+        _ => &OTHER_DRAIN_LOCK,
+    }
+}
+
 fn bump_dropped(state_dir: &Path, by: u64) {
-    let now = read_dropped(state_dir) + by;
+    let _guard = DROPPED_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = read_dropped_unlocked(state_dir).saturating_add(by);
     let _ = fs::write(state_dir.join(DROPPED_FILE), now.to_string());
 }
 
 fn read_dropped(state_dir: &Path) -> u64 {
+    let _guard = DROPPED_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read_dropped_unlocked(state_dir)
+}
+
+fn read_dropped_unlocked(state_dir: &Path) -> u64 {
     fs::read_to_string(state_dir.join(DROPPED_FILE))
         .ok()
         .and_then(|text| text.trim().parse().ok())
@@ -148,30 +186,38 @@ fn first_line(output: Option<String>) -> Option<String> {
     (!line.is_empty()).then(|| line.to_owned())
 }
 
-fn observe_runtime(state_dir: &Path) -> NodeRuntimeReport {
-    NodeRuntimeReport {
-        versions: observe_versions(state_dir),
-        certificate: crate::certfile::observe(state_dir),
-        geodata: observe_geodata(),
-        local_reconcile: fs::read_to_string(state_dir.join(LOCAL_RECONCILE_FILE))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok()),
-        spool: SpoolBacklog {
-            observation: spool_read(OBSERVATION_SPOOL, state_dir)
-                .map(|lines| lines.len() as u32)
-                .unwrap_or(0),
-            usage: spool_read(USAGE_SPOOL, state_dir)
-                .map(|lines| lines.len() as u32)
-                .unwrap_or(0),
-            dropped: read_dropped(state_dir),
-        },
-    }
+pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeReport, String> {
+    let versions = observe_versions(state_dir);
+    let certificate = crate::certfile::observe(state_dir);
+    let geodata = observe_geodata();
+    let local_reconcile = fs::read_to_string(state_dir.join(LOCAL_RECONCILE_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let spool = SpoolBacklog {
+        observation: spool_read(OBSERVATION_SPOOL, state_dir)
+            .map(|lines| lines.len() as u32)
+            .unwrap_or(0),
+        usage: spool_read(USAGE_SPOOL, state_dir)
+            .map(|lines| lines.len() as u32)
+            .unwrap_or(0),
+        dropped: read_dropped(state_dir),
+    };
+    Ok(NodeRuntimeReport {
+        observed_at_unix_secs: Some(current_unix_secs()?),
+        versions,
+        certificate,
+        geodata,
+        local_reconcile,
+        spool,
+    })
 }
 
-pub(crate) fn runtime_cycle(options: &Options) -> Result<(), String> {
-    let report = observe_runtime(&options.state_dir);
+pub(crate) fn send_runtime_report(
+    options: &Options,
+    report: &NodeRuntimeReport,
+) -> Result<(), String> {
     let client = HttpClient::new(&options.server)?;
-    let body = serde_json::to_string(&report).map_err(|error| error.to_string())?;
+    let body = serde_json::to_string(report).map_err(|error| error.to_string())?;
     let response = client.request("POST", "/agent/v1/runtime", &options.token, Some(&body))?;
     if !(200..300).contains(&response.status) {
         return Err(format!(
@@ -180,6 +226,11 @@ pub(crate) fn runtime_cycle(options: &Options) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn runtime_cycle(options: &Options) -> Result<(), String> {
+    let report = collect_runtime_report(&options.state_dir)?;
+    send_runtime_report(options, &report)
 }
 
 fn spool_path(spool: Spool, state_dir: &Path) -> PathBuf {
@@ -191,7 +242,10 @@ pub(crate) fn spool_push<T: serde::Serialize>(
     state_dir: &Path,
     item: &T,
 ) -> Result<(), String> {
-    let mut lines = spool_read(spool, state_dir)?;
+    let _guard = file_lock(spool)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut lines = spool_read_unlocked(spool, state_dir)?;
     lines.push(serde_json::to_string(item).map_err(|error| error.to_string())?);
     if lines.len() > spool.max {
         let dropped = lines.len() - spool.max;
@@ -207,10 +261,17 @@ pub(crate) fn spool_push<T: serde::Serialize>(
         // non-zero means accounting was permanently lost.
         bump_dropped(state_dir, dropped as u64);
     }
-    spool_write(spool, state_dir, &lines)
+    spool_write_unlocked(spool, state_dir, &lines)
 }
 
 pub(crate) fn spool_read(spool: Spool, state_dir: &Path) -> Result<Vec<String>, String> {
+    let _guard = file_lock(spool)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    spool_read_unlocked(spool, state_dir)
+}
+
+fn spool_read_unlocked(spool: Spool, state_dir: &Path) -> Result<Vec<String>, String> {
     match fs::read_to_string(spool_path(spool, state_dir)) {
         Ok(text) => Ok(text
             .lines()
@@ -226,7 +287,7 @@ pub(crate) fn spool_read(spool: Spool, state_dir: &Path) -> Result<Vec<String>, 
 // Only after fsync and atomic rename does it count as on disk. The sample taken
 // before restarting xray depends on this most: the very next step is the restart,
 // the data inside xray is about to vanish, and a truncated spool is no copy at all.
-fn spool_write(spool: Spool, state_dir: &Path, lines: &[String]) -> Result<(), String> {
+fn spool_write_unlocked(spool: Spool, state_dir: &Path, lines: &[String]) -> Result<(), String> {
     let path = spool_path(spool, state_dir);
     let mut body = lines.join("\n");
     if !body.is_empty() {
@@ -241,7 +302,12 @@ fn spool_write(spool: Spool, state_dir: &Path, lines: &[String]) -> Result<(), S
 /// spool: one machine's convergence results within a release are ordered, and
 /// out-of-order delivery overwrites new with old.
 pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<(), String> {
-    let mut lines = spool_read(spool, &options.state_dir)?;
+    // Only reporters serialize here. Producers use the separate file lock and can append while
+    // any request below is blocked in DNS, connect, TLS or response IO.
+    let _drain_guard = drain_lock(spool)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lines = spool_read(spool, &options.state_dir)?;
     if lines.is_empty() {
         return Ok(());
     }
@@ -281,8 +347,20 @@ pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<(), String>
             }
         }
     }
-    lines.drain(..sent);
-    spool_write(spool, &options.state_dir, &lines)?;
+    if sent > 0 {
+        let _file_guard = file_lock(spool)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = spool_read_unlocked(spool, &options.state_dir)?;
+        if current.len() < sent || current[..sent] != lines[..sent] {
+            return Err(format!(
+                "{} spool changed at its head while reporting",
+                spool.what
+            ));
+        }
+        current.drain(..sent);
+        spool_write_unlocked(spool, &options.state_dir, &current)?;
+    }
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
@@ -296,7 +374,9 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         path::{Path, PathBuf},
+        sync::mpsc,
         thread::{self, JoinHandle},
+        time::{Duration, Instant},
     };
 
     use crate::options::{ApplyMode, Options};
@@ -480,6 +560,43 @@ mod tests {
         assert!(left[0].contains("\"n\":1"), "留下的要保持原顺序");
         assert!(left[1].contains("\"n\":2"));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_blocked_reporter_does_not_block_a_new_durable_append() {
+        let dir = state_dir("append-during-report");
+        spool_push(TEST_SPOOL, &dir, &serde_json::json!({ "n": 0 })).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_body(&mut stream);
+            accepted_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+
+        let drain_options = options(&server, &dir);
+        let drain = thread::spawn(move || spool_drain(TEST_SPOOL, &drain_options));
+        accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        spool_push(TEST_SPOOL, &dir, &serde_json::json!({ "n": 1 })).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "append waited for network IO"
+        );
+        release_tx.send(()).unwrap();
+        drain.join().unwrap().unwrap();
+        server_thread.join().unwrap();
+
+        let left = spool_read(TEST_SPOOL, &dir).unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].contains("\"n\":1"));
         let _ = fs::remove_dir_all(dir);
     }
 

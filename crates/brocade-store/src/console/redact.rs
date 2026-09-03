@@ -382,14 +382,12 @@ mod tests {
             fallback_guard: true,
             fallback_limits: Default::default(),
         };
-        let tls = || Tls {
-            flow: None,
-            fingerprint: "chrome".to_owned(),
-        };
+        let tls = || Tls { flow: None };
         let xhttp = || Xhttp {
             path: "/probe".to_owned(),
             host: None,
             xmux: None,
+            tuning: None,
             mode: XhttpMode::Auto,
         };
 

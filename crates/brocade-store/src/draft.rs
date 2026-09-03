@@ -232,6 +232,7 @@ pub struct ApplyDraftResult {
     /// falls back to the previous number (the rollback logic in `commit_revision`) and this is
     /// 0.
     pub changed: usize,
+    pub client_config: crate::ClientConfigCommitResult,
 }
 
 // Outbound only: `CompileView` is a projection of a compilation result, has no `Deserialize`,
@@ -408,11 +409,17 @@ pub async fn apply_ops(
     }
     let revision_id =
         crate::console::commit_revision(&mut tx, revision_id, previous, changed > 0).await?;
+    let mut client_config =
+        crate::subscription_client::commit_result_tx(&mut tx, revision_id).await?;
+    if changed == 0 {
+        client_config.status = crate::ClientConfigCommitStatus::Unchanged;
+    }
     tx.commit().await?;
 
     Ok(ApplyDraftResult {
         revision_id,
         changed,
+        client_config,
     })
 }
 

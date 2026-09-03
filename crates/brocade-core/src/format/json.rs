@@ -14,8 +14,17 @@ use crate::artifacts::{
 use crate::model::{
     ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttp,
     ExternalVlessXhttpDownload, HysteriaBbrProfile, HysteriaCongestion, HysteriaMasquerade,
-    HysteriaObfs, XhttpXmux, XhttpXmuxRange,
+    HysteriaObfs, XhttpTuning, XhttpXmux, XhttpXmuxRange,
 };
+
+/// Backlog offered by TCP listeners for TCP Fast Open requests.
+///
+/// Relay peers and subscriber endpoints have stable addresses and ports, so subsequent
+/// connections can carry the protocol header and first application bytes in the SYN instead of
+/// paying another TCP RTT. The kernel-wide `net.ipv4.tcp_fastopen` switch still controls whether
+/// the socket option takes effect. A peer or path that does not support TFO falls back to the
+/// ordinary handshake.
+const TCP_FAST_OPEN_BACKLOG: u16 = 256;
 
 pub fn xray(artifact: &XrayArtifact) -> String {
     let value = match artifact {
@@ -289,7 +298,11 @@ fn inbound(inbound: &XrayInbound) -> Value {
                     "password": user.password,
                 })).collect::<Vec<_>>(),
             },
-            "streamSettings": { "network": "tcp", "security": "none" },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "none",
+                "sockopt": { "tcpFastOpen": TCP_FAST_OPEN_BACKLOG },
+            },
         }),
         XrayInbound::Api {
             tag,
@@ -340,6 +353,8 @@ fn inbound(inbound: &XrayInbound) -> Value {
             } else {
                 json!({ "enabled": false })
             };
+            let mut stream_settings = stream_settings(stream, security);
+            enable_tcp_fast_open(&mut stream_settings, json!(TCP_FAST_OPEN_BACKLOG));
             json!({
                 "tag": tag,
                 "listen": listen,
@@ -349,7 +364,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
                     "clients": [],
                     "decryption": "none",
                 },
-                "streamSettings": stream_settings(stream, security),
+                "streamSettings": stream_settings,
                 "sniffing": sniffing,
             })
         }
@@ -446,7 +461,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
             // (where VLESS Encryption lands) and `streamSettings.security` the
             // transport layer (where REALITY lands). Across the three settings only
             // one is ever other than none.
-            let (decryption, stream_settings) = match security {
+            let (decryption, mut stream_settings) = match security {
                 XrayHopInboundWire::None => (
                     "none".to_owned(),
                     json!({ "network": "tcp", "security": "none" }),
@@ -474,6 +489,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
                     }),
                 ),
             };
+            enable_tcp_fast_open(&mut stream_settings, json!(TCP_FAST_OPEN_BACKLOG));
 
             json!({
                 "tag": tag,
@@ -613,10 +629,10 @@ fn stream_settings(stream: &XrayStream, security: &XrayIngressSecurity) -> Value
     if matches!(security, XrayIngressSecurity::None) {
         return match stream {
             XrayStream::Tcp => json!({ "network": "tcp", "security": "none" }),
-            XrayStream::Xhttp { path, mode } => json!({
+            XrayStream::Xhttp { path, mode, tuning } => json!({
                 "network": "xhttp",
                 "security": "none",
-                "xhttpSettings": xhttp_settings(path, *mode),
+                "xhttpSettings": xhttp_settings(path, *mode, tuning.as_ref()),
             }),
         };
     }
@@ -627,11 +643,11 @@ fn stream_settings(stream: &XrayStream, security: &XrayIngressSecurity) -> Value
             "security": security_name,
             settings_key: settings,
         }),
-        XrayStream::Xhttp { path, mode } => json!({
+        XrayStream::Xhttp { path, mode, tuning } => json!({
             "network": "xhttp",
             "security": security_name,
             settings_key: settings,
-            "xhttpSettings": xhttp_settings(path, *mode),
+            "xhttpSettings": xhttp_settings(path, *mode, tuning.as_ref()),
         }),
     }
 }
@@ -639,12 +655,17 @@ fn stream_settings(stream: &XrayStream, security: &XrayIngressSecurity) -> Value
 /// No `xmux` is written here, and the omission is the point: this block only ever lands on an
 /// inbound, and xray reads XMUX on the dialing side alone (`XrayStream::Xhttp`). The concurrency
 /// an operator sets reaches the client through the subscription instead.
-fn xhttp_settings(path: &str, mode: Option<&str>) -> Value {
+fn xhttp_settings(path: &str, mode: Option<&str>, tuning: Option<&XhttpTuning>) -> Value {
     let mut xhttp = Map::new();
     xhttp.insert("path".to_owned(), json!(path));
     // Absent leaves the server accepting every upload shape. A value turns it into a filter.
     if let Some(mode) = mode {
         xhttp.insert("mode".to_owned(), json!(mode));
+    }
+    if let Some(tuning) = tuning {
+        if let Some(range) = &tuning.x_padding_bytes {
+            xhttp.insert("xPaddingBytes".to_owned(), xhttp_range(range));
+        }
     }
     Value::Object(xhttp)
 }
@@ -750,7 +771,7 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             reverse_tag,
             mux,
         } => {
-            let (encryption, stream_settings) = match security {
+            let (encryption, mut stream_settings) = match security {
                 XrayHopOutboundWire::None => (
                     "none".to_owned(),
                     json!({ "network": "tcp", "security": "none" }),
@@ -778,6 +799,7 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                     }),
                 ),
             };
+            enable_tcp_fast_open(&mut stream_settings, json!(true));
 
             // Two shapes for one protocol, and the choice is not stylistic. xray honours
             // `reverse` only in the flat form: under `vnext` it refuses outright with
@@ -832,7 +854,11 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                         "password": password,
                     }]
                 },
-                "streamSettings": { "network": "tcp", "security": "none" },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none",
+                    "sockopt": { "tcpFastOpen": true },
+                },
             });
             insert_mux(&mut value, mux.as_ref());
             value
@@ -991,6 +1017,18 @@ fn outbound(outbound: &XrayOutbound) -> Value {
     }
 }
 
+/// Add TFO without rebuilding or duplicating the transport's security settings.
+///
+/// The caller chooses listener backlog (`256`) or client-side enablement (`true`). External
+/// provider outbounds use separate rendering paths and remain untouched because Brocade does not
+/// control the far endpoint.
+fn enable_tcp_fast_open(stream_settings: &mut Value, value: Value) {
+    stream_settings
+        .as_object_mut()
+        .expect("hop streamSettings must be an object")
+        .insert("sockopt".to_owned(), json!({ "tcpFastOpen": value }));
+}
+
 fn external_vless_stream_settings(
     transport: &ExternalVlessTransport,
     security: &ExternalOutboundSecurity,
@@ -1106,11 +1144,25 @@ fn external_xhttp_base(
 }
 
 fn xhttp_xmux(xmux: &XhttpXmux) -> Value {
-    json!({
-        "maxConcurrency": xmux.max_concurrency,
-        "hMaxRequestTimes": xhttp_range(&xmux.h_max_request_times),
-        "hMaxReusableSecs": xhttp_range(&xmux.h_max_reusable_secs),
-    })
+    let mut value = Map::new();
+    if let Some(concurrency) = xmux.max_concurrency {
+        value.insert("maxConcurrency".to_owned(), json!(concurrency));
+    }
+    if let Some(connections) = xmux.max_connections {
+        value.insert("maxConnections".to_owned(), json!(connections));
+    }
+    value.insert(
+        "hMaxRequestTimes".to_owned(),
+        xhttp_range(&xmux.h_max_request_times),
+    );
+    value.insert(
+        "hMaxReusableSecs".to_owned(),
+        xhttp_range(&xmux.h_max_reusable_secs),
+    );
+    if let Some(period) = xmux.h_keep_alive_period_secs {
+        value.insert("hKeepAlivePeriod".to_owned(), json!(period));
+    }
+    Value::Object(value)
 }
 
 fn xhttp_range(range: &XhttpXmuxRange) -> Value {

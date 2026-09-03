@@ -50,6 +50,7 @@ proxies:
     network: tcp
     tls: true
     udp: true
+    tfo: true
     flow: xtls-rprx-vision
     servername: www.amazon.co.jp
     client-fingerprint: chrome
@@ -64,6 +65,7 @@ proxies:
     network: tcp
     tls: true
     udp: true
+    tfo: true
     flow: xtls-rprx-vision
     servername: www.bing.com
     client-fingerprint: chrome
@@ -78,6 +80,7 @@ proxies:
     network: tcp
     tls: true
     udp: true
+    tfo: true
     flow: xtls-rprx-vision
     servername: www.yahoo.co.jp
     client-fingerprint: chrome
@@ -92,6 +95,7 @@ proxies:
     network: tcp
     tls: true
     udp: true
+    tfo: true
     flow: xtls-rprx-vision
     servername: www.bing.com
     client-fingerprint: chrome
@@ -106,6 +110,7 @@ proxies:
     network: tcp
     tls: true
     udp: true
+    tfo: true
     flow: xtls-rprx-vision
     servername: apps.apple.com
     client-fingerprint: chrome
@@ -120,6 +125,7 @@ proxies:
     network: tcp
     tls: true
     udp: true
+    tfo: true
     flow: xtls-rprx-vision
     servername: www.apple.com
     client-fingerprint: chrome

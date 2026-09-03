@@ -12,8 +12,8 @@ use std::{
 
 use brocade_deployment::protocol::{
     E2eExitVerdict, E2eProbeRequest, E2eProbeStatus, E2eProbeTargetList, LinkHealth,
-    LinkHealthRequest, LinkProbe, LinkProbeRequest, LinkProbeStatus, ProbeTargetList,
-    ProbeTransport, TcpProbeReportRequest, TcpProbeSample, TcpProbeSettings,
+    LinkHealthRequest, LinkProbe, LinkProbeRequest, LinkProbeStatus, PingProbeReportRequest,
+    PingProbeSample, PingProbeSettings, ProbeTargetList, ProbeTransport,
 };
 
 use crate::{current_unix_secs, e2e, http::HttpClient, icmp, options::Options};
@@ -175,7 +175,7 @@ pub(crate) fn judge_hops(now: BTreeMap<String, u64>, at: u64) -> Option<LinkHeal
     })
 }
 
-fn probe_links(options: &Options) -> Result<LinkProbeRequest, String> {
+pub(crate) fn fetch_probe_targets(options: &Options) -> Result<ProbeTargetList, String> {
     // Targets come from the control plane, not from the local wireguard.conf.
     // For a peer behind phantun that file's `Endpoint` is by design
     // `127.0.0.1:<local port>` — probing it measures our own loopback, reads
@@ -189,18 +189,24 @@ fn probe_links(options: &Options) -> Result<LinkProbeRequest, String> {
             response.status, response.body
         ));
     }
-    let list: ProbeTargetList =
-        serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+    serde_json::from_str(&response.body).map_err(|error| error.to_string())
+}
 
+pub(crate) fn collect_link_probe_report(
+    list: &ProbeTargetList,
+) -> Result<Option<LinkProbeRequest>, String> {
+    if list.targets.is_empty() {
+        return Ok(None);
+    }
     let links = list
         .targets
-        .into_iter()
+        .iter()
         .map(|target| {
             let (status, path_mtu, suggested_wg_mtu) =
                 probe_path_mtu(&target.host, target.transport);
             LinkProbe {
-                peer_node_id: target.peer_node_id,
-                endpoint_host: target.host,
+                peer_node_id: target.peer_node_id.clone(),
+                endpoint_host: target.host.clone(),
                 status,
                 path_mtu,
                 suggested_wg_mtu,
@@ -208,17 +214,16 @@ fn probe_links(options: &Options) -> Result<LinkProbeRequest, String> {
         })
         .collect();
 
-    Ok(LinkProbeRequest {
+    Ok(Some(LinkProbeRequest {
         probed_at_unix_secs: current_unix_secs()?,
         links,
-    })
+    }))
 }
 
-pub(crate) fn probe_cycle(options: &Options) -> Result<(), String> {
-    let report = probe_links(options)?;
-    if report.links.is_empty() {
-        return Ok(());
-    }
+pub(crate) fn send_link_probe_report(
+    options: &Options,
+    report: &LinkProbeRequest,
+) -> Result<(), String> {
     // Print before reporting. Whoever is chasing an MTU problem is reading logs
     // on this machine; making them open the console to see the probe they just
     // ran hides the most useful step, and leaves nothing at all when the control
@@ -254,12 +259,20 @@ pub(crate) fn probe_cycle(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn probe_cycle(options: &Options) -> Result<(), String> {
+    let targets = fetch_probe_targets(options)?;
+    if let Some(report) = collect_link_probe_report(&targets)? {
+        send_link_probe_report(options, &report)?;
+    }
+    Ok(())
+}
+
 /// Probe every chain once and report the results.
 ///
 /// Fetching the work list and reporting results are separate endpoints, as in the
 /// MTU family: the list is a function of the model (compiled on demand by the
 /// control plane), the results are facts the machine observed.
-pub(crate) fn e2e_cycle(options: &Options) -> Result<E2eProbeTargetList, String> {
+pub(crate) fn fetch_e2e_probe_targets(options: &Options) -> Result<E2eProbeTargetList, String> {
     let client = HttpClient::new(&options.server)?;
     let response = client.request("GET", "/agent/v1/e2e-targets", &options.token, None)?;
     if !(200..300).contains(&response.status) {
@@ -268,17 +281,20 @@ pub(crate) fn e2e_cycle(options: &Options) -> Result<E2eProbeTargetList, String>
             response.status, response.body
         ));
     }
-    let list: E2eProbeTargetList =
-        serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+    serde_json::from_str(&response.body).map_err(|error| error.to_string())
+}
 
+pub(crate) fn collect_e2e_probe_report(
+    list: &E2eProbeTargetList,
+) -> Result<Option<E2eProbeRequest>, String> {
     // This machine heads no chain. Report nothing — an empty batch would
     // conflate "no chains to probe" with "probed them all and every one
     // failed".
     if list.targets.is_empty() {
-        return Ok(list);
+        return Ok(None);
     }
 
-    let chains = e2e::probe_all(&list);
+    let chains = e2e::probe_all(list);
     for chain in &chains {
         match chain.status {
             E2eProbeStatus::Ok => println!(
@@ -300,17 +316,32 @@ pub(crate) fn e2e_cycle(options: &Options) -> Result<E2eProbeTargetList, String>
         }
     }
 
-    let request = E2eProbeRequest {
+    Ok(Some(E2eProbeRequest {
         probed_at_unix_secs: current_unix_secs()?,
         chains,
-    };
-    let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    }))
+}
+
+pub(crate) fn send_e2e_probe_report(
+    options: &Options,
+    request: &E2eProbeRequest,
+) -> Result<(), String> {
+    let client = HttpClient::new(&options.server)?;
+    let body = serde_json::to_string(request).map_err(|error| error.to_string())?;
     let response = client.request("POST", "/agent/v1/e2e-probe", &options.token, Some(&body))?;
     if !(200..300).contains(&response.status) {
         return Err(format!(
             "e2e probe report failed: HTTP {} {}",
             response.status, response.body
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn e2e_cycle(options: &Options) -> Result<E2eProbeTargetList, String> {
+    let list = fetch_e2e_probe_targets(options)?;
+    if let Some(report) = collect_e2e_probe_report(&list)? {
+        send_e2e_probe_report(options, &report)?;
     }
     Ok(list)
 }
@@ -319,27 +350,31 @@ pub(crate) fn e2e_once(options: Options) -> Result<(), String> {
     e2e_cycle(&options).map(|_| ())
 }
 
-/// Fetch the fleet's active TCP targets, probe each once, and send one compact round.
-///
-/// Resolution is completed before `connect_resolved` starts its timer. The wire report remains
-/// deliberately compact (`connect_ms` or null), while the node-local journal keeps enough
-/// diagnostics to tell malformed input, resolution failure, unavailable IPv6, an immediate socket
-/// error and a real timeout apart. Diagnostics never include a resolved IP or configured endpoint;
-/// the operator-selected target name plus IP family and errno are sufficient and do not turn the
-/// journal into another inventory of infrastructure addresses.
-pub(crate) fn tcp_probe_cycle(options: &Options) -> Result<TcpProbeSettings, String> {
+/// Fetch the fleet's active TCP and ICMP targets. The long-running agent caches the last successful
+/// value so a slow control plane cannot move the sampling clock; `ping-probe-once` composes this
+/// with collection and reporting below.
+pub(crate) fn fetch_ping_probe_settings(options: &Options) -> Result<PingProbeSettings, String> {
     let client = HttpClient::new(&options.server)?;
-    let response = client.request("GET", "/agent/v1/tcp-probe-targets", &options.token, None)?;
+    let response = client.request("GET", "/agent/v1/ping-probe-targets", &options.token, None)?;
     if !(200..300).contains(&response.status) {
         return Err(format!(
-            "TCP probe targets request failed: HTTP {} {}",
+            "PING probe targets request failed: HTTP {} {}",
             response.status, response.body
         ));
     }
-    let settings: TcpProbeSettings =
-        serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+    serde_json::from_str(&response.body).map_err(|error| error.to_string())
+}
+
+/// Probe one cached settings snapshot and produce the compact report without contacting the
+/// control plane. Both schemes may be configured together and are dispatched independently in
+/// parallel. DNS and local capability work finish before either protocol starts its timer. The
+/// wire report carries only attempted + latency; detailed diagnostics stay in the node-local
+/// journal and never include a resolved address or configured endpoint.
+pub(crate) fn collect_ping_probe_report(
+    settings: &PingProbeSettings,
+) -> Result<Option<PingProbeReportRequest>, String> {
     if settings.targets.is_empty() {
-        return Ok(settings);
+        return Ok(None);
     }
 
     let timeout = Duration::from_millis(u64::from(settings.timeout_ms));
@@ -353,48 +388,64 @@ pub(crate) fn tcp_probe_cycle(options: &Options) -> Result<TcpProbeSettings, Str
                 (
                     name,
                     address.clone(),
-                    scope.spawn(move || probe_tcp_target(&address, timeout)),
+                    scope.spawn(move || probe_ping_target(&address, timeout)),
                 )
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .filter_map(|(name, target, handle)| {
-                let outcome = handle.join().unwrap_or_else(|_| TcpProbeOutcome {
-                    sample: Some(failed_tcp_sample(&target)),
-                    diagnostic: TcpProbeDiagnostic::WorkerPanicked,
+            .map(|(name, target, handle)| {
+                let outcome = handle.join().unwrap_or_else(|_| PingProbeOutcome {
+                    sample: failed_ping_sample(&target, false),
+                    diagnostic: PingProbeDiagnostic::WorkerPanicked,
                 });
-                log_tcp_probe_diagnostic(&name, &outcome.diagnostic);
+                log_ping_probe_diagnostic(&name, &outcome.diagnostic);
                 outcome.sample
             })
             .collect::<Vec<_>>()
     });
 
-    let request = TcpProbeReportRequest {
+    Ok(Some(PingProbeReportRequest {
         probed_at_unix_secs: current_unix_secs()?,
         samples,
-    };
-    let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-    let response = client.request("POST", "/agent/v1/tcp-probe", &options.token, Some(&body))?;
+    }))
+}
+
+/// Send one already timestamped observation. Callers deliberately do not retry this request: Ping
+/// is freshness-oriented diagnostic data, so the runtime keeps at most one newer pending report.
+pub(crate) fn send_ping_probe_report(
+    options: &Options,
+    request: &PingProbeReportRequest,
+) -> Result<(), String> {
+    let client = HttpClient::new(&options.server)?;
+    let body = serde_json::to_string(request).map_err(|error| error.to_string())?;
+    let response = client.request("POST", "/agent/v1/ping-probe", &options.token, Some(&body))?;
     if !(200..300).contains(&response.status) {
         return Err(format!(
-            "TCP probe report failed: HTTP {} {}",
+            "PING probe report failed: HTTP {} {}",
             response.status, response.body
         ));
+    }
+    Ok(())
+}
+
+/// Fetch, probe, and send one complete round for the explicit `ping-probe-once` command.
+pub(crate) fn ping_probe_cycle(options: &Options) -> Result<PingProbeSettings, String> {
+    let settings = fetch_ping_probe_settings(options)?;
+    if let Some(report) = collect_ping_probe_report(&settings)? {
+        send_ping_probe_report(options, &report)?;
     }
     Ok(settings)
 }
 
 #[derive(Debug)]
-struct TcpProbeOutcome {
-    /// `None` means capability-based omission (currently an IPv6-only target on a node without an
-    /// IPv6 route). Every actual failure remains an explicit null sample on the wire.
-    sample: Option<TcpProbeSample>,
-    diagnostic: TcpProbeDiagnostic,
+struct PingProbeOutcome {
+    sample: PingProbeSample,
+    diagnostic: PingProbeDiagnostic,
 }
 
 #[derive(Debug)]
-enum TcpProbeDiagnostic {
+enum PingProbeDiagnostic {
     InvalidTarget,
     ResolutionFailed {
         elapsed_ms: u128,
@@ -409,18 +460,33 @@ enum TcpProbeDiagnostic {
         elapsed_ms: u128,
         resolved: usize,
     },
-    Connect {
+    TcpConnect {
         resolution_ms: u128,
         resolved: usize,
         filtered_ipv6: usize,
         trace: TcpConnectTrace,
     },
+    IcmpEcho {
+        resolution_ms: u128,
+        resolved: usize,
+        filtered_ipv6: usize,
+        family: &'static str,
+        result: IcmpEchoResult,
+    },
     WorkerPanicked,
 }
 
 #[derive(Debug)]
+enum IcmpEchoResult {
+    Reply(u32),
+    NoResponse,
+    Unavailable(String),
+}
+
+#[derive(Debug)]
 struct TcpConnectTrace {
-    connect_ms: Option<u32>,
+    attempted: bool,
+    latency_us: Option<u32>,
     attempts: Vec<TcpConnectAttempt>,
     budget_exhausted: bool,
     deadline_overflow: bool,
@@ -445,20 +511,33 @@ enum TcpConnectAttemptResult {
     },
 }
 
-fn probe_tcp_target(address: &str, timeout: Duration) -> TcpProbeOutcome {
+fn probe_ping_target(address: &str, timeout: Duration) -> PingProbeOutcome {
+    if address.starts_with("tcp://") {
+        probe_tcp_target(address, timeout)
+    } else if address.starts_with("icmp://") {
+        probe_icmp_target(address, timeout)
+    } else {
+        PingProbeOutcome {
+            sample: failed_ping_sample(address, false),
+            diagnostic: PingProbeDiagnostic::InvalidTarget,
+        }
+    }
+}
+
+fn probe_tcp_target(address: &str, timeout: Duration) -> PingProbeOutcome {
     let Some((host, port)) = parse_tcp_target(address) else {
-        return TcpProbeOutcome {
-            sample: Some(failed_tcp_sample(address)),
-            diagnostic: TcpProbeDiagnostic::InvalidTarget,
+        return PingProbeOutcome {
+            sample: failed_ping_sample(address, false),
+            diagnostic: PingProbeDiagnostic::InvalidTarget,
         };
     };
     let resolution_started = Instant::now();
     let addresses = match (host.as_str(), port).to_socket_addrs() {
         Ok(addresses) => addresses.collect::<Vec<_>>(),
         Err(error) => {
-            return TcpProbeOutcome {
-                sample: Some(failed_tcp_sample(address)),
-                diagnostic: TcpProbeDiagnostic::ResolutionFailed {
+            return PingProbeOutcome {
+                sample: failed_ping_sample(address, false),
+                diagnostic: PingProbeDiagnostic::ResolutionFailed {
                     elapsed_ms: resolution_started.elapsed().as_millis(),
                     kind: error.kind(),
                     errno: error.raw_os_error(),
@@ -469,21 +548,18 @@ fn probe_tcp_target(address: &str, timeout: Duration) -> TcpProbeOutcome {
     };
     let resolution_ms = resolution_started.elapsed().as_millis();
     if addresses.is_empty() {
-        return TcpProbeOutcome {
-            sample: Some(failed_tcp_sample(address)),
-            diagnostic: TcpProbeDiagnostic::ResolutionEmpty {
+        return PingProbeOutcome {
+            sample: failed_ping_sample(address, false),
+            diagnostic: PingProbeDiagnostic::ResolutionEmpty {
                 elapsed_ms: resolution_ms,
             },
         };
     };
-    let usable = usable_tcp_addresses(&addresses, ipv6_route_usable);
-    // An IPv6-only target is not a failed link on a machine with no route for IPv6. Omit it from
-    // the report entirely: the control plane can distinguish absence from an explicit null
-    // without collecting another capability or error-classification field.
+    let usable = usable_probe_addresses(&addresses, ipv6_route_usable);
     if usable.is_empty() && addresses.iter().all(SocketAddr::is_ipv6) {
-        return TcpProbeOutcome {
-            sample: None,
-            diagnostic: TcpProbeDiagnostic::Ipv6RouteUnavailable {
+        return PingProbeOutcome {
+            sample: failed_ping_sample(address, false),
+            diagnostic: PingProbeDiagnostic::Ipv6RouteUnavailable {
                 elapsed_ms: resolution_ms,
                 resolved: addresses.len(),
             },
@@ -492,12 +568,13 @@ fn probe_tcp_target(address: &str, timeout: Duration) -> TcpProbeOutcome {
     // DNS resolution and the route-only IPv6 filter are deliberately above this call: `Instant`
     // lives inside it, so only attempts to establish TCP are included in the duration.
     let trace = connect_resolved(&usable, timeout);
-    TcpProbeOutcome {
-        sample: Some(TcpProbeSample {
+    PingProbeOutcome {
+        sample: PingProbeSample {
             target: address.to_owned(),
-            connect_ms: trace.connect_ms,
-        }),
-        diagnostic: TcpProbeDiagnostic::Connect {
+            attempted: trace.attempted,
+            latency_us: trace.latency_us,
+        },
+        diagnostic: PingProbeDiagnostic::TcpConnect {
             resolution_ms,
             resolved: addresses.len(),
             filtered_ipv6: addresses.len().saturating_sub(usable.len()),
@@ -506,14 +583,81 @@ fn probe_tcp_target(address: &str, timeout: Duration) -> TcpProbeOutcome {
     }
 }
 
-fn failed_tcp_sample(address: &str) -> TcpProbeSample {
-    TcpProbeSample {
-        target: address.to_owned(),
-        connect_ms: None,
+fn probe_icmp_target(address: &str, timeout: Duration) -> PingProbeOutcome {
+    let Some(host) = parse_icmp_target(address) else {
+        return PingProbeOutcome {
+            sample: failed_ping_sample(address, false),
+            diagnostic: PingProbeDiagnostic::InvalidTarget,
+        };
+    };
+    let resolution_started = Instant::now();
+    let addresses = match (host.as_str(), 0_u16).to_socket_addrs() {
+        Ok(addresses) => addresses.collect::<Vec<_>>(),
+        Err(error) => {
+            return PingProbeOutcome {
+                sample: failed_ping_sample(address, false),
+                diagnostic: PingProbeDiagnostic::ResolutionFailed {
+                    elapsed_ms: resolution_started.elapsed().as_millis(),
+                    kind: error.kind(),
+                    errno: error.raw_os_error(),
+                    message: error.to_string(),
+                },
+            };
+        }
+    };
+    let resolution_ms = resolution_started.elapsed().as_millis();
+    if addresses.is_empty() {
+        return PingProbeOutcome {
+            sample: failed_ping_sample(address, false),
+            diagnostic: PingProbeDiagnostic::ResolutionEmpty {
+                elapsed_ms: resolution_ms,
+            },
+        };
+    }
+    let usable = usable_probe_addresses(&addresses, ipv6_route_usable);
+    let Some(target) = usable.first().copied() else {
+        return PingProbeOutcome {
+            sample: failed_ping_sample(address, false),
+            diagnostic: PingProbeDiagnostic::Ipv6RouteUnavailable {
+                elapsed_ms: resolution_ms,
+                resolved: addresses.len(),
+            },
+        };
+    };
+    let family = if target.is_ipv4() { "IPv4" } else { "IPv6" };
+    let (attempted, latency_us, result) = match icmp::echo_latency(target, timeout) {
+        Ok(icmp::EchoLatency::Reply(elapsed)) => {
+            let latency = u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX);
+            (true, Some(latency), IcmpEchoResult::Reply(latency))
+        }
+        Ok(icmp::EchoLatency::NoResponse) => (true, None, IcmpEchoResult::NoResponse),
+        Err(error) => (false, None, IcmpEchoResult::Unavailable(error)),
+    };
+    PingProbeOutcome {
+        sample: PingProbeSample {
+            target: address.to_owned(),
+            attempted,
+            latency_us,
+        },
+        diagnostic: PingProbeDiagnostic::IcmpEcho {
+            resolution_ms,
+            resolved: addresses.len(),
+            filtered_ipv6: addresses.len().saturating_sub(usable.len()),
+            family,
+            result,
+        },
     }
 }
 
-fn usable_tcp_addresses(
+fn failed_ping_sample(address: &str, attempted: bool) -> PingProbeSample {
+    PingProbeSample {
+        target: address.to_owned(),
+        attempted,
+        latency_us: None,
+    }
+}
+
+fn usable_probe_addresses(
     addresses: &[SocketAddr],
     mut ipv6_usable: impl FnMut(&SocketAddr) -> bool,
 ) -> Vec<SocketAddr> {
@@ -540,7 +684,8 @@ fn connect_resolved(addresses: &[SocketAddr], timeout: Duration) -> TcpConnectTr
     let started = Instant::now();
     let Some(deadline) = started.checked_add(timeout) else {
         return TcpConnectTrace {
-            connect_ms: None,
+            attempted: false,
+            latency_us: None,
             attempts: Vec::new(),
             budget_exhausted: false,
             deadline_overflow: true,
@@ -551,7 +696,8 @@ fn connect_resolved(addresses: &[SocketAddr], timeout: Duration) -> TcpConnectTr
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return TcpConnectTrace {
-                connect_ms: None,
+                attempted: !attempts.is_empty(),
+                latency_us: None,
                 attempts,
                 budget_exhausted: true,
                 deadline_overflow: false,
@@ -578,8 +724,9 @@ fn connect_resolved(addresses: &[SocketAddr], timeout: Duration) -> TcpConnectTr
                     },
                 });
                 return TcpConnectTrace {
-                    connect_ms: (!late)
-                        .then(|| u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX)),
+                    attempted: true,
+                    latency_us: (!late)
+                        .then(|| u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX)),
                     attempts,
                     budget_exhausted: false,
                     deadline_overflow: false,
@@ -598,46 +745,47 @@ fn connect_resolved(addresses: &[SocketAddr], timeout: Duration) -> TcpConnectTr
         }
     }
     TcpConnectTrace {
-        connect_ms: None,
+        attempted: !attempts.is_empty(),
+        latency_us: None,
         attempts,
         budget_exhausted: false,
         deadline_overflow: false,
     }
 }
 
-fn log_tcp_probe_diagnostic(name: &str, diagnostic: &TcpProbeDiagnostic) {
+fn log_ping_probe_diagnostic(name: &str, diagnostic: &PingProbeDiagnostic) {
     match diagnostic {
-        TcpProbeDiagnostic::InvalidTarget => {
-            println!("tcp-probe: {name} 无响应 · 目标格式无效");
+        PingProbeDiagnostic::InvalidTarget => {
+            println!("ping-probe: {name} 未探测 · 目标格式无效");
         }
-        TcpProbeDiagnostic::ResolutionFailed {
+        PingProbeDiagnostic::ResolutionFailed {
             elapsed_ms,
             kind,
             errno,
             message,
         } => {
             println!(
-                "tcp-probe: {name} 无响应 · 解析失败 {} · {kind:?}{} · {message}",
+                "ping-probe: {name} 未探测 · 解析失败 {} · {kind:?}{} · {message}",
                 format_millis(*elapsed_ms),
                 format_errno(*errno),
             );
         }
-        TcpProbeDiagnostic::ResolutionEmpty { elapsed_ms } => {
+        PingProbeDiagnostic::ResolutionEmpty { elapsed_ms } => {
             println!(
-                "tcp-probe: {name} 无响应 · 解析未返回地址 · {}",
+                "ping-probe: {name} 未探测 · 解析未返回地址 · {}",
                 format_millis(*elapsed_ms)
             );
         }
-        TcpProbeDiagnostic::Ipv6RouteUnavailable {
+        PingProbeDiagnostic::Ipv6RouteUnavailable {
             elapsed_ms,
             resolved,
         } => {
             println!(
-                "tcp-probe: {name} 已跳过 · 机器没有可用 IPv6 路由 · 候选 {resolved} · 解析 {}",
+                "ping-probe: {name} 已跳过 · 机器没有可用 IPv6 路由 · 候选 {resolved} · 解析 {}",
                 format_millis(*elapsed_ms)
             );
         }
-        TcpProbeDiagnostic::Connect {
+        PingProbeDiagnostic::TcpConnect {
             resolution_ms,
             resolved,
             filtered_ipv6,
@@ -678,23 +826,61 @@ fn log_tcp_probe_diagnostic(name: &str, diagnostic: &TcpProbeDiagnostic) {
             if details.is_empty() {
                 details.push("没有可尝试的候选地址".to_owned());
             }
-            let result = trace
-                .connect_ms
-                .map_or_else(|| "无响应".to_owned(), |ms| format!("Connect {ms}ms"));
+            let result = trace.latency_us.map_or_else(
+                || {
+                    if trace.attempted {
+                        "无响应"
+                    } else {
+                        "未探测"
+                    }
+                    .to_owned()
+                },
+                |us| format!("TCP {}", format_micros(us)),
+            );
             println!(
-                "tcp-probe: {name} {result} · 解析 {} · 候选 {resolved} · {}",
+                "ping-probe: {name} {result} · 解析 {} · 候选 {resolved} · {}",
                 format_millis(*resolution_ms),
                 details.join("；")
             );
         }
-        TcpProbeDiagnostic::WorkerPanicked => {
-            println!("tcp-probe: {name} 无响应 · 探测线程 panic");
+        PingProbeDiagnostic::IcmpEcho {
+            resolution_ms,
+            resolved,
+            filtered_ipv6,
+            family,
+            result,
+        } => {
+            let result = match result {
+                IcmpEchoResult::Reply(us) => format!("ICMP {}", format_micros(*us)),
+                IcmpEchoResult::NoResponse => "ICMP 无响应".to_owned(),
+                IcmpEchoResult::Unavailable(error) => format!("ICMP 未探测 · {error}"),
+            };
+            let filtered = if *filtered_ipv6 == 0 {
+                String::new()
+            } else {
+                format!(" · 已过滤 {filtered_ipv6} 个无路由 IPv6 候选")
+            };
+            println!(
+                "ping-probe: {name} {result} · {family} · 解析 {} · 候选 {resolved}{filtered}",
+                format_millis(*resolution_ms)
+            );
+        }
+        PingProbeDiagnostic::WorkerPanicked => {
+            println!("ping-probe: {name} 未探测 · 探测线程 panic");
         }
     }
 }
 
 fn format_millis(value: u128) -> String {
     format!("{value}ms")
+}
+
+fn format_micros(value: u32) -> String {
+    if value < 10_000 {
+        format!("{:.1}ms", f64::from(value) / 1_000.0)
+    } else {
+        format!("{}ms", value.saturating_add(500) / 1_000)
+    }
 }
 
 fn format_errno(errno: Option<i32>) -> String {
@@ -720,16 +906,37 @@ fn parse_tcp_target(address: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port))
 }
 
+fn parse_icmp_target(address: &str) -> Option<String> {
+    let authority = address.strip_prefix("icmp://")?;
+    if authority.is_empty()
+        || authority.chars().any(char::is_whitespace)
+        || authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+    {
+        return None;
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let host = bracketed.strip_suffix(']')?;
+        host.parse::<Ipv6Addr>().ok()?;
+        return Some(host.to_owned());
+    }
+    (!authority
+        .chars()
+        .any(|char| matches!(char, ':' | '[' | ']')))
+    .then(|| authority.to_owned())
+}
+
 #[cfg(test)]
-mod tcp_probe_tests {
+mod ping_probe_tests {
     use std::{
         net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
         time::Duration,
     };
 
     use super::{
-        connect_resolved, parse_tcp_target, probe_tcp_target, usable_tcp_addresses,
-        TcpConnectAttemptResult, TcpProbeDiagnostic,
+        connect_resolved, parse_icmp_target, parse_tcp_target, probe_ping_target,
+        usable_probe_addresses, PingProbeDiagnostic, TcpConnectAttemptResult,
     };
 
     #[test]
@@ -749,12 +956,30 @@ mod tcp_probe_tests {
     }
 
     #[test]
+    fn icmp_target_parser_accepts_hosts_and_bracketed_ipv6_without_a_port() {
+        assert_eq!(
+            parse_icmp_target("icmp://1.1.1.1"),
+            Some("1.1.1.1".to_owned())
+        );
+        assert_eq!(
+            parse_icmp_target("icmp://example.com"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            parse_icmp_target("icmp://[2001:db8::1]"),
+            Some("2001:db8::1".to_owned())
+        );
+        assert_eq!(parse_icmp_target("icmp://1.1.1.1:80"), None);
+        assert_eq!(parse_icmp_target("icmp://2001:db8::1"), None);
+    }
+
+    #[test]
     fn unavailable_ipv6_is_removed_without_hiding_ipv4_fallbacks() {
         let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
         let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 443));
-        assert_eq!(usable_tcp_addresses(&[v6, v4], |_| false), vec![v4]);
-        assert!(usable_tcp_addresses(&[v6], |_| false).is_empty());
-        assert_eq!(usable_tcp_addresses(&[v6], |_| true), vec![v6]);
+        assert_eq!(usable_probe_addresses(&[v6, v4], |_| false), vec![v4]);
+        assert!(usable_probe_addresses(&[v6], |_| false).is_empty());
+        assert_eq!(usable_probe_addresses(&[v6], |_| true), vec![v6]);
     }
 
     #[test]
@@ -763,7 +988,8 @@ mod tcp_probe_tests {
         let address = listener.local_addr().expect("listener address");
         let trace = connect_resolved(&[address], Duration::from_secs(1));
 
-        assert!(trace.connect_ms.is_some());
+        assert!(trace.latency_us.is_some());
+        assert!(trace.attempted);
         assert!(!trace.budget_exhausted);
         assert!(!trace.deadline_overflow);
         assert_eq!(trace.attempts.len(), 1);
@@ -782,7 +1008,8 @@ mod tcp_probe_tests {
         drop(listener);
 
         let trace = connect_resolved(&[address], Duration::from_secs(1));
-        assert_eq!(trace.connect_ms, None);
+        assert_eq!(trace.latency_us, None);
+        assert!(trace.attempted);
         assert_eq!(trace.attempts.len(), 1);
         assert!(matches!(
             &trace.attempts[0].result,
@@ -796,17 +1023,18 @@ mod tcp_probe_tests {
 
     #[test]
     fn malformed_target_has_an_explicit_local_diagnostic() {
-        let outcome = probe_tcp_target("not-a-tcp-target", Duration::from_secs(1));
+        let outcome = probe_ping_target("not-a-ping-target", Duration::from_secs(1));
         assert!(matches!(
             outcome.diagnostic,
-            TcpProbeDiagnostic::InvalidTarget
+            PingProbeDiagnostic::InvalidTarget
         ));
-        assert_eq!(outcome.sample.and_then(|sample| sample.connect_ms), None);
+        assert!(!outcome.sample.attempted);
+        assert_eq!(outcome.sample.latency_us, None);
     }
 }
 
-pub(crate) fn tcp_probe_once(options: Options) -> Result<(), String> {
-    tcp_probe_cycle(&options).map(|_| ())
+pub(crate) fn ping_probe_once(options: Options) -> Result<(), String> {
+    ping_probe_cycle(&options).map(|_| ())
 }
 
 pub(crate) fn probe_once(options: Options) -> Result<(), String> {

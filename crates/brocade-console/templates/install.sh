@@ -15,7 +15,9 @@ AGENT_BIN_URL=${BROCADE_AGENT_BIN_URL:-}
 AGENT_BIN_SHA256=${BROCADE_AGENT_BIN_SHA256:-}
 XRAY_BIN_URL=${BROCADE_XRAY_BIN_URL:-}
 XRAY_BIN_SHA256=${BROCADE_XRAY_BIN_SHA256:-}
-XRAY_VERSION=${BROCADE_XRAY_VERSION:-latest}
+if [ -n "${BROCADE_XRAY_VERSION:-}" ]; then XRAY_VERSION_EXPLICIT=1; else XRAY_VERSION_EXPLICIT=; fi
+XRAY_VERSION=${BROCADE_XRAY_VERSION:-v26.4.25}
+if [ -n "$XRAY_BIN_URL" ]; then XRAY_BIN_URL_EXPLICIT=1; else XRAY_BIN_URL_EXPLICIT=; fi
 PHANTUN_BIN_URL=${BROCADE_PHANTUN_BIN_URL:-}
 PHANTUN_BIN_SHA256=${BROCADE_PHANTUN_BIN_SHA256:-}
 PHANTUN_VERSION=${BROCADE_PHANTUN_VERSION:-latest}
@@ -131,34 +133,14 @@ install_binary_atomic() {
     mv -f "$stage" "$dest"
 }
 
-# Three tiers for xray, stopping at the first that succeeds:
-#   1) distributed by the control plane (preferred) — a node may not reach out, and this pins the
-#      version with a sha256
-#   2) already on the machine
-#   3) the upstream release as a fallback — keeping "one command installs and it runs", and bringing
-#      the geoip/geosite assets along, because the geosite: and geoip: matches in rule tables rest
-#      on those two .dat files
-# The version where `geodata` auto-update landed on Xray's main branch (XTLS/Xray-core#5992,
-# 2026-04-25). An xray below it **silently ignores** the geodata section of the config.
-XRAY_MIN_VERSION=26.4
+# Xray is a Brocade-owned build artifact. The normal source is this Console's embedded binary;
+# there is deliberately no community release fallback because future Brocade builds will carry
+# protocol changes that upstream Xray does not.
 # The first fallback directory xray searches for assets (GetAssetLocation in common/platform).
 XRAY_ASSET_DIR=${BROCADE_XRAY_ASSET_DIR:-/usr/local/share/xray}
 # Where the .dat files come from, the same source as the control plane's geodata defaults (the copy
 # Xray's own release workflow pulls).
 GEODATA_BASE=${BROCADE_GEODATA_BASE:-https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release}
-
-# Extract major.minor from a line such as `Xray 26.7.28 (…)` and compare against the floor.
-# Where it cannot be extracted it **passes**: an unrecognized version is usually self-built or has an
-# edited version string, and forcing an upgrade on it is more dangerous than leaving it.
-xray_version_ok() {
-    v=$(printf '%s' "$1" | sed -n 's/.*[Xx]ray[ v]*\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
-    [ -n "$v" ] || return 0
-    have_major=${v% *}; have_minor=${v#* }
-    min_major=${XRAY_MIN_VERSION%.*}; min_minor=${XRAY_MIN_VERSION#*.}
-    [ "$have_major" -gt "$min_major" ] && return 0
-    [ "$have_major" -lt "$min_major" ] && return 1
-    [ "$have_minor" -ge "$min_minor" ]
-}
 
 # Whether the installed binary is exactly the pinned release. The tag carries a leading `v`
 # and the banner does not, so compare on the bare number; anything unparseable answers "no",
@@ -182,25 +164,26 @@ xray_version_is() {
 # wrong is a far heavier act than refusing an installation, and installation is the moment where
 # nothing is running yet and failing is free.
 #
-# Two cases are deliberately exempt. Without a pin there is nothing to verify, and with an
-# operator-supplied --xray-bin-url the bytes were chosen by hand — the tag did not select them, so
-# holding them to it would only forbid a legitimate escape hatch.
+# An explicitly supplied URL is the operator escape hatch. The normal Console-selected path must
+# report the pinned version and have exactly the sha256 published by this Console; the Xray banner
+# remains upstream's and carries no Brocade marker.
 verify_xray_pin() {
-    [ "$XRAY_VERSION" != latest ] || return 0
-    [ -z "$XRAY_BIN_URL" ] || return 0
+    [ -z "$XRAY_BIN_URL_EXPLICIT" ] || return 0
 
     actual_path=$(command -v xray 2>/dev/null || echo "$XRAY_BIN")
     running=$("$actual_path" version 2>/dev/null | grep -i xray | head -n 1)
-    if xray_version_is "$running" "$XRAY_VERSION"; then
+    actual_sha=$(sha256sum "$actual_path" 2>/dev/null | cut -d' ' -f1)
+    if xray_version_is "$running" "$XRAY_VERSION" \
+       && [ -n "$XRAY_BIN_SHA256" ] && [ "$actual_sha" = "$XRAY_BIN_SHA256" ]; then
         return 0
     fi
-    echo "机队钉的 xray 是 $XRAY_VERSION，但这台上会被执行的是：" >&2
+    echo "机队要求 Brocade Xray $XRAY_VERSION，但这台上会被执行的是：" >&2
     echo "  $actual_path -> ${running:-（问不出版本）}" >&2
     if [ "$actual_path" != "$XRAY_BIN" ]; then
         echo "PATH 先找到的不是刚装的那份（$XRAY_BIN）。agent 是按名字起 xray 的，" >&2
         echo "所以真正服务的会是上面那个。把它移开、或让 $INSTALL_DIR 排在 PATH 前面。" >&2
     else
-        echo "刚装的那份版本就不对——检查 --xray-version 拼写，或上游是否撤了这个 tag。" >&2
+        echo "刚装的那份版本或 sha256 不对；拒绝把非 Console 分发的字节当作机队版本。" >&2
     fi
     return 1
 }
@@ -240,124 +223,24 @@ ensure_geodata() {
 }
 
 install_xray() {
-    if [ -n "$XRAY_BIN_URL" ]; then
-        fetch_binary "$XRAY_BIN_URL" "$XRAY_BIN_SHA256" "$XRAY_BIN" || return 1
+    if [ -z "$XRAY_BIN_URL" ]; then
+        if [ -z "$DIST_JSON" ]; then
+            echo "问不到 $SERVER/enroll/dist，拿不到 Brocade Xray；不会回退下载社区 Xray。" >&2
+            echo "请确认 --server 指向控制面的节点入口，或显式传 --xray-bin-url。" >&2
+        elif [ -z "$XRAY_ARCH" ]; then
+            echo "控制面只内嵌 x86_64 和 aarch64 的 Brocade Xray，本机是 $(uname -m)。" >&2
+            echo "请为这个架构构建 Brocade Xray，并用 --xray-bin-url 明确指定。" >&2
+        else
+            echo "控制面的分发清单缺少 $XRAY_ARCH 的 Brocade Xray；拒绝回退社区版本。" >&2
+        fi
+        return 1
+    fi
+    if [ -n "$XRAY_BIN_SHA256" ] && [ -s "$XRAY_BIN" ] \
+       && printf '%s  %s\n' "$XRAY_BIN_SHA256" "$XRAY_BIN" | sha256sum -c - >/dev/null 2>&1; then
         return 0
     fi
-    # The test must read the **output** rather than the exit code alone. A 0-byte file satisfies -x
-    # just as well, and executed as an empty shell script `xray version` exits 0 — sidestepping
-    # exactly the fault it is meant to catch. After xray was truncated to 0 bytes on jb-01, both -x
-    # and the exit code declared it healthy.
-    #
-    # But "it runs" is not "its version is acceptable". These used to be one test, and the
-    # consequence was that a machine with an old xray baked into its image, or one installed by the
-    # distribution's package manager, would **never upgrade** — `XRAY_VERSION=latest` applied only
-    # to brand-new machines. And an xray below $XRAY_MIN_VERSION silently ignores the `geodata`
-    # section (`app/geodata` landed on main only on 2026-04-25), presenting as a rule database that
-    # never updates while the config says it updates daily, with no error anywhere. So the version
-    # is an installation test too.
-    existing=$(xray version 2>/dev/null | grep -i xray | head -n 1)
-    [ -n "$existing" ] || existing=$("$XRAY_BIN" version 2>/dev/null | grep -i xray | head -n 1)
-    if [ -n "$existing" ]; then
-        if [ "$XRAY_VERSION" != latest ]; then
-            # A pinned fleet needs the version to *match*, not merely to clear the floor.
-            # Treating "new enough" as good enough here would leave a machine that already has
-            # a later xray sitting above the pin forever — and the reason for pinning is a
-            # regression in exactly those later versions, so the one machine that most needs
-            # the downgrade is the one that would never get it.
-            if xray_version_is "$existing" "$XRAY_VERSION"; then
-                ensure_geodata
-                return 0
-            fi
-            echo "机器上的 xray 是 $existing，机队钉的是 $XRAY_VERSION，换版本中 ..." >&2
-        elif xray_version_ok "$existing"; then
-            # A new enough binary is not re-downloaded, but **the .dat files are confirmed
-            # separately** — see the argument on ensure_geodata.
-            ensure_geodata
-            return 0
-        else
-            echo "机器上的 xray 低于 $XRAY_MIN_VERSION（$existing），升级中 ..." >&2
-        fi
-    fi
-
-    case "$(uname -m)" in
-        x86_64|amd64) asset=Xray-linux-64.zip ;;
-        aarch64|arm64) asset=Xray-linux-arm64-v8a.zip ;;
-        armv7l|armv7) asset=Xray-linux-arm32-v7a.zip ;;
-        *)
-            echo "不认识的架构 $(uname -m)，请用 --xray-bin-url 指定 xray 二进制" >&2
-            return 1
-            ;;
-    esac
-    if [ "$XRAY_VERSION" = "latest" ]; then
-        # **Prereleases must be included.** Upstream marks every version after 26.3.27 as a
-        # prerelease, while `releases/latest` resolves only to the newest stable — following it,
-        # `latest` stays at 26.3.27 forever and geodata auto-update (>=26.4) never arrives.
-        # This takes the first entry through the API (newest first, prereleases included), falling
-        # back to `releases/latest` when that fails — which at least yields a working xray rather
-        # than failing the whole installation.
-        tag=$(curl -fsSL --max-time 20 \
-            "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1" 2>/dev/null \
-            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-        if [ -n "$tag" ]; then
-            echo "上游最新版（含 prerelease）：$tag" >&2
-            base="https://github.com/XTLS/Xray-core/releases/download/$tag"
-        else
-            echo "取不到上游版本清单，退回 releases/latest（可能低于 $XRAY_MIN_VERSION）" >&2
-            base="https://github.com/XTLS/Xray-core/releases/latest/download"
-        fi
-    else
-        base="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION"
-    fi
-
-    echo "downloading xray ($asset) ..." >&2
-    zip=$(mktemp)
-    dgst=$(mktemp)
-    TMPFILES="$TMPFILES $zip $dgst"
-    if ! curl $CURL_FLAGS "$base/$asset" -o "$zip" || [ ! -s "$zip" ]; then
-        echo "下不到 $base/$asset（$XRAY_BIN 保持原样）" >&2
-        return 1
-    fi
-    # The release ships a .dgst, which catches truncated packages and CDN errors; to guard the
-    # supply chain, use tier 1 and pin the sha256
-    if curl -fsSL "$base/$asset.dgst" -o "$dgst" 2>/dev/null; then
-        want=$(sed -n 's/^SHA2-256=[[:space:]]*//p' "$dgst" | head -1 | tr -d '[:space:]')
-        if [ -n "$want" ]; then
-            got=$(sha256sum "$zip" | cut -d' ' -f1)
-            if [ "$want" != "$got" ]; then
-                echo "xray 压缩包 sha256 不匹配：want $want got $got" >&2
-                return 1
-            fi
-        fi
-    fi
-
-    if ! have unzip; then
-        install_pkg unzip || {
-            echo "需要 unzip 解开 xray 发行包，且无法自动安装" >&2
-            return 1
-        }
-    fi
-    dir=$(mktemp -d)
-    if ! unzip -oq "$zip" -d "$dir" || [ ! -s "$dir/xray" ]; then
-        echo "xray 发行包解不开或者里面没有 xray（$XRAY_BIN 保持原样）" >&2
-        rm -rf "$dir"
-        return 1
-    fi
-    install_binary_atomic "$dir/xray" "$XRAY_BIN" || { rm -rf "$dir"; return 1; }
-    install -d -m 0755 "$XRAY_ASSET_DIR"
-    if [ -f "$dir/geoip.dat" ]; then
-        install -m 0644 "$dir/geoip.dat" "$XRAY_ASSET_DIR/geoip.dat"
-        # No touch. mtime is not a test of freshness — Xray's releases are reproducible builds
-        # whose zip timestamps are normalized to a fixed date, while docker cp, rsync -a, and baking
-        # into an image each bring timestamps of their own. Touching merely exchanges a false age
-        # for a false freshness (it becomes "when install.sh ran") and still says nothing about
-        # which version the data is. Freshness is judged by comparing the sha against upstream's
-        # published .sha256sum; see GeodataSettings.
-    fi
-    if [ -f "$dir/geosite.dat" ]; then
-        install -m 0644 "$dir/geosite.dat" "$XRAY_ASSET_DIR/geosite.dat"
-    fi
-    rm -rf "$dir"
+    echo "downloading Brocade Xray ($XRAY_VERSION) ..." >&2
+    fetch_binary "$XRAY_BIN_URL" "$XRAY_BIN_SHA256" "$XRAY_BIN"
 }
 
 # phantun: WireGuard is UDP only, and this wears a TCP disguise for it when an upstream seals inbound
@@ -469,10 +352,12 @@ while [ "$#" -gt 0 ]; do
             ;;
         --xray-bin-url)
             XRAY_BIN_URL=${2:-}
+            XRAY_BIN_URL_EXPLICIT=1
             shift 2
             ;;
         --xray-version)
             XRAY_VERSION=${2:-}
+            XRAY_VERSION_EXPLICIT=1
             shift 2
             ;;
         --xray-bin-sha256)
@@ -588,16 +473,14 @@ if curl -fsSL "$SERVER/enroll/dist" -o /tmp/brocade-dist.$$ 2>/dev/null; then
     DIST_JSON=$(cat /tmp/brocade-dist.$$)
     TMPFILES="$TMPFILES /tmp/brocade-dist.$$"
 fi
-# The host architecture, used to select the matching agent from the manifest. The names align with
-# the control plane's `EMBEDDED_AGENTS` table, and with the same case branches used below to select
-# the xray and phantun releases.
+# The host architecture, used to select matching embedded artifacts from the manifest.
 case "$(uname -m)" in
-    x86_64|amd64) AGENT_ARCH=x86_64 ;;
-    aarch64|arm64) AGENT_ARCH=aarch64 ;;
+    x86_64|amd64) AGENT_ARCH=x86_64; XRAY_ARCH=x86_64 ;;
+    aarch64|arm64) AGENT_ARCH=aarch64; XRAY_ARCH=aarch64 ;;
     # The control plane embeds only these two architectures. No approximation is guessed for
     # others — what gets installed is an Exec format error, a symptom several layers from the real
     # cause. It is left empty and reported plainly below.
-    *) AGENT_ARCH= ;;
+    *) AGENT_ARCH=; XRAY_ARCH= ;;
 esac
 
 if [ -n "$DIST_JSON" ]; then
@@ -610,17 +493,20 @@ if [ -n "$DIST_JSON" ]; then
         AGENT_BIN_URL=$(dist_field "agent_bin_url_$AGENT_ARCH")
         AGENT_BIN_SHA256=$(dist_field "agent_bin_sha256_$AGENT_ARCH")
     fi
-    # The pin only applies where nobody said otherwise on the command line: a one-off
-    # `--xray-version` is how a machine gets bisected against a suspected upstream regression,
-    # and the manifest overriding that would make the experiment impossible to run.
-    if [ "$XRAY_VERSION" = latest ]; then
-        # Not `a && b`: under `set -e` a false test makes the whole line non-zero and aborts
-        # the install — the trap this file's header warns about.
+    if [ -z "$XRAY_VERSION_EXPLICIT" ]; then
         XRAY_VERSION=$(dist_field xray_version)
-        [ -n "$XRAY_VERSION" ] || XRAY_VERSION=latest
+        [ -n "$XRAY_VERSION" ] || XRAY_VERSION=v26.4.25
     fi
-    [ -n "$XRAY_BIN_URL" ]               || XRAY_BIN_URL=$(dist_field xray_bin_url)
-    [ -n "$XRAY_BIN_SHA256" ]            || XRAY_BIN_SHA256=$(dist_field xray_bin_sha256)
+    if [ -z "$XRAY_BIN_URL" ]; then
+        XRAY_BIN_URL=$(dist_field xray_bin_url)
+        if [ -n "$XRAY_BIN_URL" ]; then
+            XRAY_BIN_URL_EXPLICIT=1
+            XRAY_BIN_SHA256=$(dist_field xray_bin_sha256)
+        elif [ -n "$XRAY_ARCH" ]; then
+            XRAY_BIN_URL=$(dist_field "xray_bin_url_$XRAY_ARCH")
+            XRAY_BIN_SHA256=$(dist_field "xray_bin_sha256_$XRAY_ARCH")
+        fi
+    fi
     [ -n "$PHANTUN_SERVER_URL" ]         || PHANTUN_SERVER_URL=$(dist_field phantun_server_url)
     [ -n "$PHANTUN_SERVER_SHA" ]         || PHANTUN_SERVER_SHA=$(dist_field phantun_server_sha256)
     [ -n "$PHANTUN_CLIENT_URL" ]         || PHANTUN_CLIENT_URL=$(dist_field phantun_client_url)
@@ -783,7 +669,7 @@ chmod 0600 "$CONFIG_DIR/token" "$CONFIG_DIR/env"
 # 三种机器改不了，而且都是真实存在的：OpenVZ 和部分 LXC 的 sysctl 是只读的（低价 VPS
 # 里一抓一把）；4.9 以下的内核根本没有 BBR（CentOS 7 的 3.10 至今有人在跑）；
 # 极少数精简镜像没把 tcp_bbr 编进去。这三种情况下**继续装**——机器照样能跑 brocade，
-# 只是慢一点，而且慢一点比装不上强。这跟本脚本对 xray 的三级 fallback 是同一条原则。
+# 只是慢一点，而且慢一点比装不上强；这里保持兼容性的收益高于拒绝安装。
 tune_congestion() {
     # set -e 在被 `|| true` 包住的函数里不生效（见文件顶部），所以下面每一步自己判返回值。
     kernel=$(uname -r 2>/dev/null || echo 0.0)

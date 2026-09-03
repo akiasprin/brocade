@@ -7,15 +7,18 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use axum::{
     body::Body,
-    extract::{Path, Query, Request, State},
+    extract::{
+        ws::{Message as WebSocketMessage, WebSocket},
+        Path, Query, Request, State, WebSocketUpgrade,
+    },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::sse::{Event, KeepAlive, Sse},
@@ -30,8 +33,9 @@ use brocade_core::{
 };
 use brocade_deployment::plan::DeploymentKind;
 use brocade_deployment::protocol::{
-    AgentObservationRequest, DeploymentWaveConfirmationRequest, NodeRuntimeReport, RouteIpReport,
-    TargetConvergenceReport, UsageReportRequest,
+    AgentObservationRequest, AgentRealtimeSample, DeploymentWaveConfirmationRequest,
+    NodeRuntimeReport, RouteIpReport, TargetConvergenceReport,
+    UpdateRealtimeTelemetryPolicyRequest, UsageReportRequest,
 };
 use brocade_store::{
     AbandonNodeRequest, AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentRelease,
@@ -40,9 +44,9 @@ use brocade_store::{
     CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DistributionSettings,
     E2eProbeRequest, LinkHealthRequest, LinkProbeRequest, LoadReportRequest, ModelOp,
-    NodeLifecyclePhase, PgStore, PhantunBinaries, ProvisionNodeRequest, ProvisionNodeResult,
-    ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest, SetUserAppQuotaRequest,
-    StoreError, TcpProbeReportRequest, TcpProbeSettings, UpdateAgentLogDefaultRequest,
+    NodeLifecyclePhase, PgStore, PhantunBinaries, PingProbeReportRequest, PingProbeSettings,
+    ProvisionNodeRequest, ProvisionNodeResult, ProvisionedNode, RegisterWarpBindingRequest,
+    RemoveWarpBindingRequest, SetUserAppQuotaRequest, StoreError, UpdateAgentLogDefaultRequest,
     UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateNodeStatusRequest,
     UpdateUserStatusRequest, UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
 };
@@ -97,8 +101,32 @@ pub const EMBEDDED_AGENTS: &[(&str, &[u8], &str)] = &[
     ),
 ];
 
+/// The Brocade Xray builds carried by this Console. They are compiled from the vendored source in
+/// `third_party/xray-core`; nodes never select or download a community release directly.
+pub const EMBEDDED_XRAYS: &[(&str, &[u8], &str)] = &[
+    (
+        "x86_64",
+        include_bytes!(concat!(env!("OUT_DIR"), "/xray-x86_64")),
+        env!("BROCADE_EMBEDDED_XRAY_SHA256_X86_64"),
+    ),
+    (
+        "aarch64",
+        include_bytes!(concat!(env!("OUT_DIR"), "/xray-aarch64")),
+        env!("BROCADE_EMBEDDED_XRAY_SHA256_AARCH64"),
+    ),
+];
+
+pub const BROCADE_XRAY_VERSION: &str = env!("BROCADE_EMBEDDED_XRAY_VERSION");
+
 fn embedded_agent(arch: &str) -> Option<(&'static [u8], &'static str)> {
     EMBEDDED_AGENTS
+        .iter()
+        .find(|(name, ..)| *name == arch)
+        .map(|(_, bytes, sha)| (*bytes, *sha))
+}
+
+fn embedded_xray(arch: &str) -> Option<(&'static [u8], &'static str)> {
+    EMBEDDED_XRAYS
         .iter()
         .find(|(name, ..)| *name == arch)
         .map(|(_, bytes, sha)| (*bytes, *sha))
@@ -141,21 +169,11 @@ pub struct AgentDistribution {
     /// `Exec format error` passage in `install.sh`).
     agent_binary_url: Option<String>,
     agent_binary_sha256: Option<String>,
-    /// The control plane distributes xray itself: a node may not reach upstream, and this route
-    /// pins the version with a sha256. Unconfigured, the install script falls back to downloading
-    /// from the upstream release, so a single command still installs a working node.
+    /// Optional operator-provided Brocade Xray location. Unconfigured, the script selects the
+    /// matching Console-embedded build. It never falls back to a community release.
     xray_binary_url: Option<String>,
     xray_binary_sha256: Option<String>,
-    /// Which upstream xray release the fleet runs, as a tag (`v26.4.25`). Unset, the install
-    /// script takes the newest, which is not a safe default here: the two features this control
-    /// plane depends on overlap in only one release. Geodata's runtime
-    /// reload needs >= 26.4 (`app/geodata` landed 2026-04-25), while the VLESS reverse tunnel
-    /// carries traffic out but nothing back from 26.5 onwards (upstream #6242, reproduced across
-    /// 26.5.3 / 26.5.9 / 26.6.27 / 26.7.28 with the same config that works on 26.4.25).
-    ///
-    /// Kept as a tag rather than a pinned binary + sha because the machines fetch from upstream:
-    /// a pinned binary would mean hosting it, and `xray_binary_url` already covers the fleet that
-    /// cannot reach GitHub.
+    /// The version compiled into the embedded Brocade Xray source baseline.
     xray_version: Option<String>,
     /// phantun is distributed by the control plane too, and this route matters more than xray's:
     /// what it rescues is precisely the machines SSH cannot reach. The install script can install
@@ -211,6 +229,9 @@ pub struct AppState {
     // On-demand authorization verification. Jobs and their latest results are intentionally
     // process-local: this is an operator action, not durable health telemetry.
     grant_probes: crate::grant_probe::GrantProbeService,
+    // One process-local live channel shared by the admin and Agent route trees. It contains no
+    // durable samples; persistence is limited to the policy stored by PgStore.
+    realtime: crate::realtime::RealtimeService,
 }
 
 #[derive(Clone, Copy)]
@@ -239,10 +260,9 @@ impl AppState {
     /// The distribution as it stands right now: what the console has stored, over the environment
     /// this process started with, over the built-in default.
     ///
-    /// Resolved per call rather than held on the state. The two stored fields are editable from
-    /// the settings page, and a copy taken at startup would delay an edit until the service
-    /// restarted, which is the requirement storing them removed. Both callers are install-time
-    /// endpoints, so the extra query is negligible.
+    /// Resolved per call rather than held on the state. The public Agent origin is editable from
+    /// the settings page, and a copy taken at startup would delay an edit until restart. The Xray
+    /// version is intentionally taken from this build's vendored source baseline.
     ///
     /// A stored value takes precedence over the environment. The console is where the operator
     /// entered it, and a deployment whose env file overrode that would display one address and
@@ -252,9 +272,6 @@ impl AppState {
         let mut dist = self.dist.clone();
         if let Some(url) = stored.agent_public_url {
             dist.agent_public_url = url;
-        }
-        if stored.xray_version.is_some() {
-            dist.xray_version = stored.xray_version;
         }
         Ok(dist)
     }
@@ -275,6 +292,11 @@ impl AppState {
     /// the state keeps a lookup nothing ever feeds, and the machine list renders without flags.
     pub fn and_geoip(mut self, geoip: crate::geoip::GeoIpLookup) -> Self {
         self.geoip = geoip;
+        self
+    }
+
+    pub fn and_realtime(mut self, realtime: crate::realtime::RealtimeService) -> Self {
+        self.realtime = realtime;
         self
     }
 
@@ -306,6 +328,7 @@ impl AppState {
             // route instead of failing to construct.
             cert_wake: Arc::new(Notify::new()),
             grant_probes: crate::grant_probe::GrantProbeService::from_env(),
+            realtime: crate::realtime::RealtimeService::new(Default::default()),
             dist: AgentDistribution {
                 agent_public_url,
                 agent_binary_url: env::var("BROCADE_AGENT_BIN_URL")
@@ -320,9 +343,7 @@ impl AppState {
                 xray_binary_sha256: env::var("BROCADE_XRAY_BIN_SHA256")
                     .ok()
                     .and_then(normalize_token),
-                xray_version: env::var("BROCADE_XRAY_VERSION")
-                    .ok()
-                    .and_then(normalize_token),
+                xray_version: Some(BROCADE_XRAY_VERSION.to_owned()),
                 phantun_server_url: env::var("BROCADE_PHANTUN_SERVER_URL")
                     .ok()
                     .and_then(normalize_url),
@@ -452,6 +473,25 @@ pub fn admin_router_with_wakes(
     )
 }
 
+/// Production variant carrying the same process-local realtime service onto the admin face.
+/// Kept separate so existing test and preview constructors remain source-compatible.
+pub fn admin_router_with_wakes_and_realtime(
+    store: PgStore,
+    quota_wake: Arc<Notify>,
+    grants_wake: Arc<Notify>,
+    cert_wake: Arc<Notify>,
+    geoip: crate::geoip::GeoIpLookup,
+    realtime: crate::realtime::RealtimeService,
+) -> Router {
+    admin_router_with_state(
+        AppState::with_quota_wake(store, quota_wake)
+            .and_grants_wake(grants_wake)
+            .and_cert_wake(cert_wake)
+            .and_geoip(geoip)
+            .and_realtime(realtime),
+    )
+}
+
 pub fn merged_router_with_wakes(
     store: PgStore,
     quota_wake: Arc<Notify>,
@@ -464,6 +504,23 @@ pub fn merged_router_with_wakes(
         .and_grants_wake(grants_wake)
         .and_cert_wake(cert_wake)
         .and_geoip(geoip);
+    admin_router_with_state(state.clone()).merge(agent_routes().with_state(state))
+}
+
+pub fn merged_router_with_wakes_and_realtime(
+    store: PgStore,
+    quota_wake: Arc<Notify>,
+    grants_wake: Arc<Notify>,
+    cert_wake: Arc<Notify>,
+    geoip: crate::geoip::GeoIpLookup,
+    agent_origin: String,
+    realtime: crate::realtime::RealtimeService,
+) -> Router {
+    let state = AppState::with_agent_origin(store, quota_wake, agent_origin)
+        .and_grants_wake(grants_wake)
+        .and_cert_wake(cert_wake)
+        .and_geoip(geoip)
+        .and_realtime(realtime);
     admin_router_with_state(state.clone()).merge(agent_routes().with_state(state))
 }
 
@@ -536,7 +593,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/nodes/agent-state",
         "/revisions",
         "/load/nodes",
-        "/tcp-probe/nodes",
+        "/ping-probe/nodes",
         "/usage/node-series",
         "/links/quality",
         "/links/mtu",
@@ -547,13 +604,15 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/quotas",
         "/usage/samples",
         "/usage/monthly-summary",
+        "/realtime/nodes/events",
     ];
     PUBLIC_PATHS.contains(&path)
         // `/compile/{revision}` and `/load/nodes/{node_id}`: the id is a path segment, so these
         // two cannot be written as exact strings.
         || path.starts_with("/compile/")
         || path.starts_with("/load/nodes/")
-        || path.starts_with("/tcp-probe/nodes/")
+        || path.starts_with("/ping-probe/nodes/")
+        || (path.starts_with("/realtime/nodes/") && path.ends_with("/events"))
         // The response is the credential-free Serving authorization matrix. Executing it is a
         // POST to the same path and remains closed by the method gate above.
         || is_user_grant_probe_plan_path(path)
@@ -666,11 +725,20 @@ fn admin_router_with_state(state: AppState) -> Router {
         // still require a system administrator in the handler below.
         .route("/branding", get(get_branding).put(update_branding))
         .route("/settings", get(get_settings).put(update_settings))
+        .route(
+            "/realtime/settings",
+            get(get_realtime_settings).put(update_realtime_settings),
+        )
+        .route("/realtime/nodes/events", get(realtime_fleet_events))
+        .route(
+            "/realtime/nodes/{node_id}/events",
+            get(realtime_node_events),
+        )
         // Active connection observation is operational state: agents read it immediately and it
         // never becomes part of a release revision.
         .route(
-            "/tcp-probe/settings",
-            get(get_tcp_probe_settings).put(update_tcp_probe_settings),
+            "/ping-probe/settings",
+            get(get_ping_probe_settings).put(update_ping_probe_settings),
         )
         // Its own route rather than a section of /settings: writing this one creates no revision
         // and triggers no release, and sharing a handler would give one PUT two halves with
@@ -834,8 +902,8 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/usage/monthly-summary", get(usage_monthly_summary))
         .route("/load/nodes", get(load_nodes))
         .route("/load/nodes/{node_id}", get(load_node))
-        .route("/tcp-probe/nodes", get(tcp_probe_nodes))
-        .route("/tcp-probe/nodes/{node_id}", get(tcp_probe_node))
+        .route("/ping-probe/nodes", get(ping_probe_nodes))
+        .route("/ping-probe/nodes/{node_id}", get(ping_probe_node))
         // Under /links rather than /load: this is a property of a hop, and it sits next to
         // link_health and path MTU both in meaning and on the page that renders it.
         .route("/links/quality", get(link_quality))
@@ -875,6 +943,18 @@ pub fn agent_router_with_origin(store: PgStore, agent_origin: String) -> Router 
         .with_state(state)
 }
 
+pub fn agent_router_with_origin_and_realtime(
+    store: PgStore,
+    agent_origin: String,
+    realtime: crate::realtime::RealtimeService,
+) -> Router {
+    let state = AppState::with_agent_origin(store, Arc::new(Notify::new()), agent_origin)
+        .and_realtime(realtime);
+    agent_routes()
+        .route("/healthz", get(healthz))
+        .with_state(state)
+}
+
 /// Both faces on one listener, which is what a deployment gets unless it asks for them split.
 ///
 /// Splitting them is a deployment decision rather than a property of the software: the two route
@@ -900,6 +980,7 @@ fn agent_routes() -> Router<AppState> {
         .route("/enroll/install.sh", get(install_script))
         .route("/enroll/dist", get(install_dist))
         .route("/brocade-agent/{arch}", get(agent_binary))
+        .route("/brocade-xray/{arch}", get(xray_binary))
         .route("/sub/v1/{uuid}/clash.yaml", get(public_clash_subscription))
         .route(
             "/sub/v1/haitun/{token}/clash.yaml",
@@ -912,8 +993,12 @@ fn agent_routes() -> Router<AppState> {
         .route("/agent/v1/agent-release", get(agent_release))
         .route("/agent/v1/usage", post(agent_usage))
         .route("/agent/v1/load", post(agent_load))
-        .route("/agent/v1/tcp-probe-targets", get(agent_tcp_probe_targets))
-        .route("/agent/v1/tcp-probe", post(agent_tcp_probe))
+        .route("/agent/v1/realtime", get(agent_realtime))
+        .route(
+            "/agent/v1/ping-probe-targets",
+            get(agent_ping_probe_targets),
+        )
+        .route("/agent/v1/ping-probe", post(agent_ping_probe))
         .route("/agent/v1/link-probe", post(agent_link_probe))
         .route("/agent/v1/probe-targets", get(agent_probe_targets))
         .route("/agent/v1/link-health", post(agent_link_health))
@@ -1427,6 +1512,119 @@ async fn node_agent_state(
     Ok(Json(result).into_response())
 }
 
+async fn get_realtime_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let _admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.realtime_telemetry_policy().await?).into_response())
+}
+
+async fn update_realtime_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateRealtimeTelemetryPolicyRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let policy = state
+        .store
+        .update_realtime_telemetry_policy(&admin, request)
+        .await?;
+    // The database write is authoritative. Updating the live service afterwards means a process
+    // failure can at worst delay application until restart; it can never advertise a value that
+    // was not committed.
+    state.realtime.set_policy(policy).await;
+    Ok(Json(policy).into_response())
+}
+
+async fn realtime_node_events(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let visible = state.store.list_node_agent_states(&admin).await?;
+    let Some(node) = visible.nodes.iter().find(|node| node.node_id == node_id) else {
+        return Err(ApiError::Store(StoreError::NotFound(format!(
+            "node {node_id}"
+        ))));
+    };
+    if node.lifecycle_phase != "active" {
+        return Err(ApiError::Store(StoreError::Conflict(format!(
+            "node {node_id} is {}; realtime telemetry is closed",
+            node.lifecycle_phase
+        ))));
+    }
+    realtime_events_response(&state, vec![node_id]).await
+}
+
+async fn realtime_fleet_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let visible = state.store.list_node_agent_states(&admin).await?;
+    let nodes = visible
+        .nodes
+        .into_iter()
+        // A retired machine remains visible for history, but may not be leased for new live work.
+        .filter(|node| node.lifecycle_phase == "active")
+        .map(|node| node.node_id)
+        .collect::<Vec<_>>();
+    realtime_events_response(&state, nodes).await
+}
+
+async fn realtime_events_response(state: &AppState, nodes: Vec<String>) -> ApiResult<Response> {
+    let mut subscription = state.realtime.subscribe(nodes).await;
+    let initial = Event::default()
+        .event("snapshot")
+        .json_data(json!({ "policy": subscription.policy, "nodes": subscription.snapshots }))
+        .expect("realtime snapshot is JSON serializable");
+
+    let stream = async_stream::stream! {
+        // Keeping `subscription` inside this generator is intentional: its Drop implementation
+        // releases every per-node demand lease when the browser disconnects.
+        yield Ok::<Event, Infallible>(initial);
+        loop {
+            match subscription.events.recv().await {
+                Ok(event) if subscription.visible_nodes.contains(event.node_id()) => {
+                    let (name, value) = match event {
+                        crate::realtime::RealtimeBroadcast::Sample(value) => ("sample", json!(value)),
+                        crate::realtime::RealtimeBroadcast::Status(value) => ("status", json!(value)),
+                    };
+                    let event = Event::default()
+                        .event(name)
+                        .json_data(value)
+                        .expect("realtime event is JSON serializable");
+                    yield Ok(event);
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // A slow tab must not silently draw a continuous curve across discarded
+                    // points. The client refetches the stream and receives a fresh ring snapshot.
+                    yield Ok(Event::default().event("reset").data("lagged"));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, max-age=0"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    Ok(response)
+}
+
 async fn artifact_index(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1504,24 +1702,24 @@ async fn update_branding(
     Ok(Json(state.store.update_branding(&admin, settings).await?).into_response())
 }
 
-async fn get_tcp_probe_settings(
+async fn get_ping_probe_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_admin(&state, &headers, AdminPermission::Read).await?;
-    Ok(Json(state.store.tcp_probe_settings().await?).into_response())
+    Ok(Json(state.store.ping_probe_settings().await?).into_response())
 }
 
-async fn update_tcp_probe_settings(
+async fn update_ping_probe_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(settings): Json<TcpProbeSettings>,
+    Json(settings): Json<PingProbeSettings>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     Ok(Json(
         state
             .store
-            .update_tcp_probe_settings(&admin, settings)
+            .update_ping_probe_settings(&admin, settings)
             .await?,
     )
     .into_response())
@@ -2027,13 +2225,41 @@ async fn agent_binary(Path(arch): Path<String>) -> Response {
         .into_response()
 }
 
+/// The Brocade Xray build matching the node architecture. Unknown architectures fail rather than
+/// receiving a community build or a binary for another machine type.
+async fn xray_binary(Path(arch): Path<String>) -> Response {
+    let Some((bytes, _)) = embedded_xray(&arch) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "这个控制面没带 {arch} 架构的 Brocade Xray（带了：{}）。\n\
+                 用 --xray-bin-url 明确指定为该架构构建的 Brocade Xray。\n",
+                EMBEDDED_XRAYS
+                    .iter()
+                    .map(|(name, ..)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+            .into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"xray\""),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 async fn install_dist(State(state): State<AppState>) -> ApiResult<Response> {
     Ok(Json(dist_json(&state.distribution().await?)).into_response())
 }
 
 /// The distribution manifest's contents. Separate from the handler so it can be tested without a
-/// database. A mistyped key anywhere in this JSON has one symptom: the install script falls back
-/// to the binary already on the machine while the console reports nothing.
+/// database. A mistyped key can silently keep an old Agent or make Brocade Xray installation fail,
+/// so the shell parser and every architecture-specific key are tested below.
 fn dist_json(d: &AgentDistribution) -> serde_json::Value {
     // The embedded copies are listed per architecture and the script selects with `uname -m`. The
     // URL and the sha have to be supplied as a pair: one set of bytes checked against another's
@@ -2062,6 +2288,11 @@ fn dist_json(d: &AgentDistribution) -> serde_json::Value {
         dist[format!("agent_bin_url_{arch}")] =
             json!(format!("{}/brocade-agent/{arch}", d.agent_public_url));
         dist[format!("agent_bin_sha256_{arch}")] = json!(sha256);
+    }
+    for (arch, _, sha256) in EMBEDDED_XRAYS {
+        dist[format!("xray_bin_url_{arch}")] =
+            json!(format!("{}/brocade-xray/{arch}", d.agent_public_url));
+        dist[format!("xray_bin_sha256_{arch}")] = json!(sha256);
     }
     dist
 }
@@ -3384,13 +3615,23 @@ async fn agent_runtime(
         brocade_deployment::protocol::CertificateObservation::Absent => {
             state
                 .store
-                .record_certificate_observation(&node.node_id, "absent", None)
+                .record_certificate_observation_at(
+                    &node.node_id,
+                    "absent",
+                    None,
+                    request.observed_at_unix_secs,
+                )
                 .await?;
         }
         brocade_deployment::protocol::CertificateObservation::Present { sha256 } => {
             state
                 .store
-                .record_certificate_observation(&node.node_id, "present", Some(sha256))
+                .record_certificate_observation_at(
+                    &node.node_id,
+                    "present",
+                    Some(sha256),
+                    request.observed_at_unix_secs,
+                )
                 .await?;
         }
     }
@@ -3418,6 +3659,7 @@ async fn agent_observation(
             observed_before: request.observed_before,
             observed_after: request.observed_after,
             error: request.error,
+            usage_activated_at_unix_secs: request.usage_activated_at_unix_secs,
         })
         .await?;
     if state
@@ -3543,25 +3785,147 @@ async fn agent_load(
     Ok(Json(result).into_response())
 }
 
-/// Runtime TCP targets. The same settings are returned to every active node; the address itself is
-/// the series identifier used when the result comes back.
-async fn agent_tcp_probe_targets(
+async fn agent_realtime(
     State(state): State<AppState>,
     headers: HeaderMap,
+    websocket: WebSocketUpgrade,
 ) -> ApiResult<Response> {
+    let token = bearer_token(&headers)
+        .ok_or(ApiError::Unauthorized)?
+        .to_owned();
     let node = authenticate_agent(&state.store, &headers).await?;
     require_active_agent(&node)?;
-    Ok(Json(state.store.tcp_probe_settings().await?).into_response())
+    let node_id = node.node_id;
+    let store = state.store.clone();
+    Ok(websocket
+        // The complete sample is well below one KiB. Bound allocation before parsing so an
+        // authenticated but compromised node cannot make this process buffer a giant frame.
+        .max_frame_size(16 * 1024)
+        .max_message_size(16 * 1024)
+        .on_upgrade(move |socket| {
+            serve_agent_realtime(state.realtime, store, node_id, token, socket)
+        })
+        .into_response())
 }
 
-async fn agent_tcp_probe(
+async fn serve_agent_realtime(
+    realtime: crate::realtime::RealtimeService,
+    store: PgStore,
+    node_id: String,
+    token: String,
+    mut socket: WebSocket,
+) {
+    let mut session = realtime.register_agent(node_id.clone()).await;
+    let session_id = session.session;
+    let initial = *session.commands.borrow_and_update();
+    let Ok(initial) = serde_json::to_string(&initial) else {
+        realtime.unregister_agent(&node_id, session_id).await;
+        return;
+    };
+    if socket
+        .send(WebSocketMessage::Text(initial.into()))
+        .await
+        .is_err()
+    {
+        realtime.unregister_agent(&node_id, session_id).await;
+        return;
+    }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reauthenticate = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    reauthenticate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            changed = session.commands.changed() => {
+                if changed.is_err() { break; }
+                let command = *session.commands.borrow_and_update();
+                let Ok(text) = serde_json::to_string(&command) else { break };
+                if socket.send(WebSocketMessage::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(WebSocketMessage::Text(text))) => {
+                        let sample = match serde_json::from_str::<AgentRealtimeSample>(text.as_str()) {
+                            Ok(sample) => sample,
+                            Err(_) => break,
+                        };
+                        match realtime.record_sample(&node_id, session_id, sample).await {
+                            Ok(()) | Err(crate::realtime::RecordSampleError::Inactive) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    Some(Ok(WebSocketMessage::Ping(payload))) => {
+                        if socket.send(WebSocketMessage::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WebSocketMessage::Pong(_))) => {}
+                    Some(Ok(WebSocketMessage::Close(_))) | None | Some(Err(_)) => break,
+                    // This endpoint has one deliberately narrow JSON text protocol.
+                    Some(Ok(WebSocketMessage::Binary(_))) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                if socket
+                    .send(WebSocketMessage::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            _ = reauthenticate.tick() => {
+                // A WebSocket outlives the request that authenticated it. Re-check periodically so
+                // revoking a token or retiring a node also closes an already-open live channel.
+                let still_allowed = store
+                    .authenticate_node_token(&token)
+                    .await
+                    .is_ok_and(|node| {
+                        node.is_some_and(|node| {
+                            node.node_id == node_id
+                                && node.lifecycle_phase == NodeLifecyclePhase::Active
+                        })
+                    });
+                if !still_allowed {
+                    break;
+                }
+            }
+        }
+    }
+    realtime.unregister_agent(&node_id, session_id).await;
+}
+
+/// Runtime TCP and ICMP targets. The same settings are returned to every active node; each URI is
+/// the series identifier and its scheme selects the probe operation.
+async fn agent_ping_probe_targets(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<TcpProbeReportRequest>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     require_active_agent(&node)?;
-    Ok(Json(state.store.record_tcp_probe(&node.node_id, request).await?).into_response())
+    Ok(Json(state.store.ping_probe_settings().await?).into_response())
+}
+
+async fn agent_ping_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PingProbeReportRequest>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    Ok(Json(
+        state
+            .store
+            .record_ping_probe(&node.node_id, request)
+            .await?,
+    )
+    .into_response())
 }
 
 /// Which endpoints to probe. The agent must not derive them from wireguard.conf itself: for a peer
@@ -3682,32 +4046,32 @@ async fn load_node(
     Ok(Json(result).into_response())
 }
 
-async fn tcp_probe_nodes(
+async fn ping_probe_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<TcpProbeQuery>,
+    Query(query): Query<PingProbeQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(Json(
         state
             .store
-            .list_node_tcp_probes(&admin, query.window_secs.unwrap_or(3_600).min(86_400))
+            .list_node_ping_probes(&admin, query.window_secs.unwrap_or(3_600).min(86_400))
             .await?,
     )
     .into_response())
 }
 
-async fn tcp_probe_node(
+async fn ping_probe_node(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(node_id): Path<String>,
-    Query(query): Query<TcpProbeQuery>,
+    Query(query): Query<PingProbeQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(Json(
         state
             .store
-            .node_tcp_probe_view(
+            .node_ping_probe_view(
                 &admin,
                 &node_id,
                 query.window_secs.unwrap_or(86_400).min(7 * 86_400),
@@ -3737,7 +4101,7 @@ struct LoadQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct TcpProbeQuery {
+struct PingProbeQuery {
     window_secs: Option<u32>,
 }
 
@@ -4225,7 +4589,8 @@ const INSTALL_SCRIPT: &str = include_str!("../templates/install.sh");
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderMap, HeaderValue};
+    use axum::extract::Path;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use brocade_store::StoreError;
 
@@ -4233,7 +4598,8 @@ mod tests {
         bearer_token, detail_load_windows, dist_json, expired_session_cookie, install_command,
         looks_like_uuid, public_may, route_from_headers, safe_filename_slug, session_cookie,
         AgentDistribution, ApiError, ArtifactContentQuery, InstallCredential, IpFamily,
-        SubscriptionProtocol, EMBEDDED_AGENTS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
+        SubscriptionProtocol, BROCADE_XRAY_VERSION, EMBEDDED_AGENTS, EMBEDDED_XRAYS,
+        INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
     };
 
     #[test]
@@ -4344,8 +4710,8 @@ mod tests {
             "/compile/77",
             "/load/nodes",
             "/load/nodes/hk-01",
-            "/tcp-probe/nodes",
-            "/tcp-probe/nodes/hk-01",
+            "/ping-probe/nodes",
+            "/ping-probe/nodes/hk-01",
             "/usage/node-series",
             "/links/quality",
             "/links/health",
@@ -4355,6 +4721,8 @@ mod tests {
             "/quotas",
             "/usage/samples",
             "/usage/monthly-summary",
+            "/realtime/nodes/events",
+            "/realtime/nodes/hk-01/events",
             "/users/platform.acme/alice/grant-probes",
         ] {
             assert!(public_may(&Method::GET, path), "should allow GET {path}");
@@ -4362,7 +4730,8 @@ mod tests {
         for path in [
             "/deployments",
             "/settings",
-            "/tcp-probe/settings",
+            "/ping-probe/settings",
+            "/realtime/settings",
             "/distribution",
             "/admin/operators",
             "/artifacts/index",
@@ -4418,6 +4787,29 @@ mod tests {
         assert!(!INSTALL_SCRIPT.contains("-H \"Authorization: Bearer $ENROLL_TOKEN\""));
     }
 
+    #[test]
+    fn install_script_has_no_community_xray_fallback() {
+        let script_default =
+            format!("XRAY_VERSION=${{BROCADE_XRAY_VERSION:-{BROCADE_XRAY_VERSION}}}");
+        let upstream = include_str!("../../../third_party/xray-core/BROCADE_UPSTREAM.toml");
+        let build_script = include_str!("../build.rs");
+
+        assert!(INSTALL_SCRIPT.contains(&script_default));
+        assert!(upstream.contains(&format!("tag = \"{BROCADE_XRAY_VERSION}\"")));
+        assert!(upstream.contains("anytls = false"));
+        assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"b4f0898\""));
+        assert!(build_script.contains("core.build={build_id}"));
+        assert!(build_script.contains("fn repository_build_id"));
+        assert!(!build_script.contains("core.build=brocade"));
+        assert!(!INSTALL_SCRIPT.contains("brocade-$XRAY_VERSION"));
+        assert!(INSTALL_SCRIPT.contains("xray_bin_url_$XRAY_ARCH"));
+        assert!(INSTALL_SCRIPT.contains("xray_bin_sha256_$XRAY_ARCH"));
+        assert!(INSTALL_SCRIPT.contains("不会回退下载社区 Xray"));
+        assert!(!INSTALL_SCRIPT.contains("api.github.com/repos/XTLS/Xray-core"));
+        assert!(!INSTALL_SCRIPT.contains("github.com/XTLS/Xray-core/releases"));
+        assert!(!INSTALL_SCRIPT.contains("Xray-linux-64.zip"));
+    }
+
     /// The install script verifies the bytes it downloads against the sha256 `/enroll/dist`
     /// reports. Any divergence between them costs the whole fleet its agent, and the symptom (a
     /// sha256 mismatch) is a whole deployment chain away from the cause (a build-time
@@ -4426,7 +4818,7 @@ mod tests {
     #[test]
     fn the_advertised_sha256_is_computed_from_the_bytes_we_actually_serve() {
         use sha2::{Digest, Sha256};
-        for (arch, bytes, sha256) in EMBEDDED_AGENTS {
+        for (arch, bytes, sha256) in EMBEDDED_AGENTS.iter().chain(EMBEDDED_XRAYS) {
             let mut hasher = Sha256::new();
             hasher.update(bytes);
             assert_eq!(&format!("{:x}", hasher.finalize()), sha256, "{arch}");
@@ -4466,6 +4858,86 @@ mod tests {
                 "{arch} 那份实际是给 e_machine={machine} 编的"
             );
         }
+    }
+
+    #[test]
+    fn the_embedded_xrays_are_real_elves_for_the_arch_they_claim() {
+        const EM_X86_64: u16 = 62;
+        const EM_AARCH64: u16 = 183;
+
+        for (arch, bytes, _) in EMBEDDED_XRAYS {
+            assert!(
+                bytes.len() > 1_000_000,
+                "{arch} 的 Xray 只有 {} 字节，不像是完整二进制",
+                bytes.len()
+            );
+            assert_eq!(&bytes[..4], b"\x7fELF", "{arch}");
+            let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+            let want = match *arch {
+                "x86_64" => EM_X86_64,
+                "aarch64" => EM_AARCH64,
+                other => panic!("没给 {other} 写 e_machine 判据"),
+            };
+            assert_eq!(machine, want, "{arch} 那份实际是 e_machine={machine}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_xray_banner_keeps_upstream_shape_and_names_brocade_commit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let host_arch = std::env::consts::ARCH;
+        let (_, bytes, _) = EMBEDDED_XRAYS
+            .iter()
+            .find(|(arch, _, _)| *arch == host_arch)
+            .unwrap_or_else(|| panic!("没有可在当前 {host_arch} 主机执行的内嵌 Xray"));
+        let path = std::env::temp_dir().join(format!(
+            "brocade-xray-banner-{}-{}",
+            std::process::id(),
+            env!("BROCADE_EMBEDDED_XRAY_BUILD_ID")
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let output = std::process::Command::new(&path)
+            .arg("version")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(output.status.success());
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let first_line = stdout.lines().next().unwrap_or_default();
+        let version = env!("BROCADE_EMBEDDED_XRAY_VERSION").trim_start_matches('v');
+        let build_id = env!("BROCADE_EMBEDDED_XRAY_BUILD_ID");
+        assert!(
+            first_line.starts_with(&format!(
+                "Xray {version} (Xray, Penetrates Everything.) {build_id} (go"
+            )),
+            "Xray banner 没有保留上游格式或没有显示 Brocade 提交号：{first_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn xray_download_serves_the_requested_architecture_and_rejects_unknown_ones() {
+        for (arch, bytes, _) in EMBEDDED_XRAYS {
+            let response = super::xray_binary(Path((*arch).to_owned())).await;
+            assert_eq!(response.status(), StatusCode::OK, "{arch}");
+            let served = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(served.as_ref(), *bytes, "{arch}");
+        }
+
+        let response = super::xray_binary(Path("riscv64".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("--xray-bin-url"));
     }
 
     /// The embedded agent must contain no absolute path from the build machine.
@@ -4524,6 +4996,14 @@ mod tests {
             );
             assert_eq!(dist[format!("agent_bin_sha256_{arch}")], *sha256, "{arch}");
         }
+        for (arch, _, sha256) in EMBEDDED_XRAYS {
+            assert_eq!(
+                dist[format!("xray_bin_url_{arch}")],
+                format!("https://console.example.net:8443/brocade-xray/{arch}"),
+                "{arch}"
+            );
+            assert_eq!(dist[format!("xray_bin_sha256_{arch}")], *sha256, "{arch}");
+        }
         // With no override configured these two are null, on which the script falls back to
         // selecting by architecture
         assert!(dist["agent_bin_url"].is_null());
@@ -4544,14 +5024,26 @@ mod tests {
         });
         let json = serde_json::to_string(&dist).unwrap();
 
-        for (arch, _, sha256) in EMBEDDED_AGENTS {
-            for (key, want) in [
+        let expected = EMBEDDED_AGENTS
+            .iter()
+            .map(|(arch, _, sha256)| {
                 (
                     format!("agent_bin_url_{arch}"),
                     format!("https://console.example.net:8443/brocade-agent/{arch}"),
-                ),
-                (format!("agent_bin_sha256_{arch}"), (*sha256).to_owned()),
-            ] {
+                    format!("agent_bin_sha256_{arch}"),
+                    (*sha256).to_owned(),
+                )
+            })
+            .chain(EMBEDDED_XRAYS.iter().map(|(arch, _, sha256)| {
+                (
+                    format!("xray_bin_url_{arch}"),
+                    format!("https://console.example.net:8443/brocade-xray/{arch}"),
+                    format!("xray_bin_sha256_{arch}"),
+                    (*sha256).to_owned(),
+                )
+            }));
+        for (url_key, url, sha_key, sha) in expected {
+            for (key, want) in [(url_key, url), (sha_key, sha)] {
                 let script = format!(
                     r#"printf '%s' "$DIST_JSON" | tr ',' '\n' \
                        | sed -n 's/.*"{key}" *: *"\([^"]*\)".*/\1/p' | head -1"#
@@ -4647,7 +5139,7 @@ mod tests {
     fn the_xray_pin_travels_in_both_the_command_and_the_manifest() {
         let pinned = AgentDistribution {
             agent_public_url: "https://a.example.net".to_owned(),
-            xray_version: Some("v26.4.25".to_owned()),
+            xray_version: Some(BROCADE_XRAY_VERSION.to_owned()),
             ..AgentDistribution::default()
         };
         let command = install_command(
@@ -4657,15 +5149,14 @@ mod tests {
             InstallCredential::Enrollment("broc_enroll_x"),
         );
         assert!(
-            command.contains("--xray-version 'v26.4.25'"),
+            command.contains(&format!("--xray-version '{BROCADE_XRAY_VERSION}'")),
             "装机命令要带上钉的版本：{command}"
         );
-        assert_eq!(dist_json(&pinned)["xray_version"], "v26.4.25");
+        assert_eq!(dist_json(&pinned)["xray_version"], BROCADE_XRAY_VERSION);
 
-        // Unpinned, it has to be absent rather than empty. An empty `--xray-version ''` reaches
-        // the script as a tag, and the download URL becomes
-        // .../releases/download//Xray-linux-64.zip, a 404 that presents as a network fault rather
-        // than a misconfiguration.
+        // Unpinned, it has to be absent rather than empty. An empty `--xray-version ''` would make
+        // the installer reject the downloaded build, presenting as a binary problem
+        // rather than a malformed command.
         let loose = AgentDistribution {
             agent_public_url: "https://a.example.net".to_owned(),
             ..AgentDistribution::default()

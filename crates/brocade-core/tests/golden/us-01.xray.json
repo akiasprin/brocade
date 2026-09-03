@@ -65,7 +65,10 @@
             "cd033ce1"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:frt/i-frt-us"
     },
@@ -107,7 +110,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:brc/c-brc-jp"
     },
@@ -127,7 +133,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:brc/c-brc-smart"
     },
@@ -147,7 +156,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:lin/c-lin-jp"
     },
@@ -167,7 +179,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:lin/c-lin-us"
     }

@@ -1641,7 +1641,7 @@ fn ephemeral_port_range(low: u16, high: u16, reserved: &str) -> EphemeralPortRan
 ///
 /// Summing every interface would count wg0 and any tun on top of the physical one, reporting a
 /// machine's own traffic two or three times.
-fn main_interface() -> Option<String> {
+pub(crate) fn main_interface() -> Option<String> {
     let route = fs::read_to_string("/proc/net/route").ok()?;
     for line in route.lines().skip(1) {
         let mut f = line.split_whitespace();

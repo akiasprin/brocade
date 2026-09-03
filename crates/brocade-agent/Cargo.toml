@@ -32,3 +32,7 @@ rustls = { version = "0.23.43", default-features = false, features = ["ring", "s
 # the agent version — but the latter is in our hands and a new agent release fixes it, while
 # the former is not.
 webpki-roots = "1.0.9"
+# The live channel is the one place where the Agent keeps an HTTP connection open. Using a
+# protocol implementation here avoids inventing WebSocket framing, masking and close semantics;
+# TLS still uses compiled webpki roots, just like the Agent's ordinary HTTP client above.
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }

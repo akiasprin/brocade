@@ -71,9 +71,19 @@ pub(crate) fn apply_material(
     // which suited those: they change on nobody's schedule and mean nothing at finer resolution.
     // This one changes exactly here, and until it is reported the control plane keeps judging
     // the node as stale and repeats the material on every desired poll — fifteen seconds apart.
-    if let Err(error) = crate::spool::runtime_cycle(options) {
+    let report_options = options.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("certificate-report".to_owned())
+        .spawn(move || {
+            if let Err(error) = crate::spool::runtime_cycle(&report_options) {
+                warn(format!(
+                    "certificate: 换好了，但报不上去（{error}）；下一轮会补"
+                ));
+            }
+        })
+    {
         warn(format!(
-            "certificate: 换好了，但报不上去（{error}）；下一轮会补"
+            "certificate: 换好了，但启动即时上报线程失败（{error}）；下一轮会补"
         ));
     }
     Ok(())

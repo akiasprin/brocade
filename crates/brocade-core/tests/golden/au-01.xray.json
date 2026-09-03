@@ -65,7 +65,10 @@
             "9ee77f9e"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:frt/i-frt-au"
     },
@@ -107,7 +110,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:brc/c-brc-jp"
     },
@@ -127,7 +133,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:brc/c-brc-smart"
     },
@@ -147,7 +156,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:lin/c-lin-au"
     }

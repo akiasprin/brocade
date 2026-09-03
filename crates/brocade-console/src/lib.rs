@@ -6,4 +6,5 @@ pub mod geoip;
 mod grant_probe;
 pub mod http;
 pub mod mask;
+pub mod realtime;
 mod warp;

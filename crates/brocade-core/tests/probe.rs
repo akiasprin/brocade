@@ -255,7 +255,7 @@ fn probe_params(
             String::new(),
             String::new(),
             tls.server_name.clone(),
-            tls.fingerprint.clone(),
+            String::new(),
             tls.flow.clone(),
         ),
         ProbeSecurity::Hysteria2(hysteria) => (
@@ -286,7 +286,7 @@ fn user_params(
             String::new(),
             String::new(),
             tls.server_name.clone(),
-            tls.fingerprint.clone(),
+            String::new(),
             tls.flow.clone(),
         ),
         UserSecurityPlan::Hysteria2(hysteria) => (

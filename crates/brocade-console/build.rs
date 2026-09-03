@@ -123,9 +123,11 @@ use sha2::{Digest, Sha256};
 
 /// One architecture to distribute.
 struct Target {
-    /// In `uname -m`'s terms, because `install.sh` ultimately selects with `uname -m` (the same
-    /// case branches it uses to select the xray and phantun releases).
+    /// In `uname -m`'s terms, because `install.sh` ultimately selects embedded artifacts with
+    /// `uname -m`.
     arch: &'static str,
+    /// Go's spelling of the same architecture, used for the embedded Xray build.
+    go_arch: &'static str,
     /// rust's triple.
     triple: &'static str,
     /// zig's spelling of the same target. **Not the same thing as the rust triple**: zig has no
@@ -142,12 +144,14 @@ struct Target {
 const TARGETS: &[Target] = &[
     Target {
         arch: "x86_64",
+        go_arch: "amd64",
         triple: "x86_64-unknown-linux-musl",
         zig_target: "x86_64-linux-musl",
         linker: None,
     },
     Target {
         arch: "aarch64",
+        go_arch: "arm64",
         triple: "aarch64-unknown-linux-musl",
         zig_target: "aarch64-linux-musl",
         linker: Some("-C linker=rust-lld"),
@@ -179,6 +183,14 @@ const ZIG_FALLBACK_PATHS: &[&str] = &["~/.local/bin/zig", "~/.local/zig/zig", "/
 const CONSOLE_ASSETS_ENV: &str = "BROCADE_CONSOLE_ASSETS_DIR";
 /// The escape hatch naming where npm is, for a machine that keeps node outside PATH.
 const NPM_ENV_VAR: &str = "BROCADE_NPM";
+/// The vendored Xray baseline distributed to every new node.
+const XRAY_VERSION: &str = "v26.4.25";
+/// `git describe --always` for the upstream baseline, matching Xray's release workflow banner.
+const XRAY_UPSTREAM_BUILD: &str = "b4f0898";
+/// Xray source is part of this repository. The build must never clone or select an upstream tag.
+const XRAY_SOURCE_DIR: &str = "third_party/xray-core";
+/// Escape hatch for locating Go outside PATH.
+const GO_ENV_VAR: &str = "BROCADE_GO";
 /// Everything under `frontend/` whose change makes the built bundle stale, relative to the
 /// workspace root. Missing one has the same shape as missing a crate in the agent's chain above:
 /// build.rs does not re-run, the embedded bytes are the previous bundle, and every check is green.
@@ -218,7 +230,14 @@ fn main() {
         println!("cargo:rerun-if-changed={watched}");
     }
 
+    let workspace = workspace_root();
+    let xray_source = workspace.join(XRAY_SOURCE_DIR);
+    let xray_build_id = repository_build_id(&workspace);
+    watch_tree(&xray_source);
+
     describe_build();
+    println!("cargo:rustc-env=BROCADE_EMBEDDED_XRAY_VERSION={XRAY_VERSION}");
+    println!("cargo:rustc-env=BROCADE_EMBEDDED_XRAY_BUILD_ID={xray_build_id}");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo 一定会给 OUT_DIR"));
 
@@ -227,9 +246,17 @@ fn main() {
     // were knowable in the first second.
     let mut missing_targets = Vec::new();
     let mut needs_zig = false;
+    let mut needs_go = false;
     for target in TARGETS {
         println!("cargo:rerun-if-env-changed={}", override_var(target.arch));
+        println!(
+            "cargo:rerun-if-env-changed={}",
+            xray_override_var(target.arch)
+        );
         println!("cargo:rerun-if-env-changed={}", cc_var(target.triple));
+        if !env_set(&xray_override_var(target.arch)) {
+            needs_go = true;
+        }
         if env_set(&override_var(target.arch)) {
             continue;
         }
@@ -248,17 +275,23 @@ fn main() {
     // Found lazily: where everything takes an escape hatch, or both architectures bring their own
     // CC, a machine without zig builds all the same.
     let zig = if needs_zig { find_zig() } else { None };
+    let go = if needs_go { find_go() } else { None };
     // Same laziness for npm: pointed at a directory of already-built files, node is nobody's
     // business.
     println!("cargo:rerun-if-env-changed={CONSOLE_ASSETS_ENV}");
     let needs_npm = !env_set(CONSOLE_ASSETS_ENV);
     let npm = if needs_npm { find_npm() } else { None };
-    if !missing_targets.is_empty() || (needs_zig && zig.is_none()) || (needs_npm && npm.is_none()) {
+    if !missing_targets.is_empty()
+        || (needs_zig && zig.is_none())
+        || (needs_go && go.is_none())
+        || (needs_npm && npm.is_none())
+    {
         panic!(
             "{}",
             missing_prerequisites(
                 &missing_targets,
                 needs_zig && zig.is_none(),
+                needs_go && go.is_none(),
                 needs_npm && npm.is_none(),
             )
         );
@@ -268,6 +301,30 @@ fn main() {
     // take minutes, so a front end that fails to typecheck says so almost immediately instead of
     // after two cross-compiles that were going to be thrown away.
     embed_console(&out_dir, npm.as_deref());
+
+    for target in TARGETS {
+        let built = match env::var(xray_override_var(target.arch)) {
+            Ok(path) if !path.trim().is_empty() => {
+                let path = PathBuf::from(path.trim());
+                println!("cargo:rerun-if-changed={}", path.display());
+                path
+            }
+            _ => build_xray(
+                &out_dir,
+                &xray_source,
+                target,
+                go.as_deref().expect("前置检查保证 Go 存在"),
+                &xray_build_id,
+            ),
+        };
+        embed_binary(
+            &out_dir,
+            &built,
+            "xray",
+            target.arch,
+            "BROCADE_EMBEDDED_XRAY_SHA256",
+        );
+    }
 
     for target in TARGETS {
         let built = match env::var(override_var(target.arch)) {
@@ -287,18 +344,12 @@ fn main() {
             }
             _ => build_agent(&out_dir, target, zig.as_deref()),
         };
-        let arch = target.arch;
-
-        let bytes = fs::read(&built)
-            .unwrap_or_else(|error| panic!("读不了 agent 二进制 {}: {error}", built.display()));
-        if bytes.is_empty() {
-            panic!("agent 二进制是空的：{}", built.display());
-        }
-        fs::write(out_dir.join(format!("brocade-agent-{arch}")), &bytes).expect("写不进 OUT_DIR");
-        println!(
-            "cargo:rustc-env=BROCADE_EMBEDDED_AGENT_SHA256_{}={}",
-            arch.to_uppercase(),
-            sha256(&bytes)
+        embed_binary(
+            &out_dir,
+            &built,
+            "brocade-agent",
+            target.arch,
+            "BROCADE_EMBEDDED_AGENT_SHA256",
         );
     }
 }
@@ -309,7 +360,12 @@ fn main() {
 /// missing too — when both were knowable in the first second. Each line carries a command that can
 /// be pasted directly: whoever reads this file is stuck unable to build, and sending them off to
 /// search for installation instructions is indefensible.
-fn missing_prerequisites(missing_targets: &[&str], missing_zig: bool, missing_npm: bool) -> String {
+fn missing_prerequisites(
+    missing_targets: &[&str],
+    missing_zig: bool,
+    missing_go: bool,
+    missing_npm: bool,
+) -> String {
     let mut text = String::from("\n控制面编不出来，缺这些前置条件：\n");
     let mut n = 0;
     let mut next = move || {
@@ -352,6 +408,15 @@ fn missing_prerequisites(missing_targets: &[&str], missing_zig: bool, missing_np
         ));
     }
 
+    if missing_go {
+        text.push_str(&format!(
+            "\n[{}] Go 1.26（用仓库内的 {XRAY_SOURCE_DIR} 构建 Brocade Xray）\n\n\
+             装好 Go 1.26 后确保 `go version` 能运行，或者用 {GO_ENV_VAR} 指定完整路径。\n\
+             Xray 源码已经钉在仓库内，构建过程不会 clone 或切换上游仓库。\n",
+            next(),
+        ));
+    }
+
     if missing_npm {
         text.push_str(&format!(
             "\n[{}] npm（控制面把控制台前端也编进来了，理由见本文件开头）\n\n\
@@ -368,11 +433,16 @@ fn missing_prerequisites(missing_targets: &[&str], missing_zig: bool, missing_np
     }
 
     text.push_str(&format!(
-        "\n确实只想带部分架构、或者要嵌现成的文件，用 {} 指过去。\n\
+        "\n确实只想带部分架构、或者要嵌现成的文件，agent 用 {}，Xray 用 {} 指过去。\n\
          手上已经有 musl 交叉工具链的，设 {} 就不会再要 zig。\n",
         TARGETS
             .iter()
             .map(|t| override_var(t.arch))
+            .collect::<Vec<_>>()
+            .join(" / "),
+        TARGETS
+            .iter()
+            .map(|t| xray_override_var(t.arch))
             .collect::<Vec<_>>()
             .join(" / "),
         TARGETS
@@ -388,6 +458,11 @@ fn missing_prerequisites(missing_targets: &[&str], missing_zig: bool, missing_np
 /// `BROCADE_AGENT_BIN_AARCH64`.
 fn override_var(arch: &str) -> String {
     format!("BROCADE_AGENT_BIN_{}", arch.to_uppercase())
+}
+
+/// The escape hatch naming which prebuilt Xray file to embed for one architecture.
+fn xray_override_var(arch: &str) -> String {
+    format!("BROCADE_XRAY_BIN_{}", arch.to_uppercase())
 }
 
 /// The per-target compiler variable cc-rs recognizes, such as
@@ -419,6 +494,27 @@ fn resolve_in_path(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+/// Find a usable Go toolchain. Xray's go.mod pins the required language version; the build below
+/// sets GOTOOLCHAIN=local so an old binary fails rather than downloading a different compiler.
+fn find_go() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed={GO_ENV_VAR}");
+
+    let mut candidates = Vec::new();
+    if let Ok(explicit) = env::var(GO_ENV_VAR) {
+        if !explicit.trim().is_empty() {
+            candidates.push(PathBuf::from(explicit.trim()));
+        }
+    }
+    candidates.extend(resolve_in_path("go"));
+
+    candidates.into_iter().find(|candidate| {
+        Command::new(candidate)
+            .arg("version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
 }
 
 /// Find a usable zig.
@@ -563,6 +659,80 @@ fn target_installed(triple: &str) -> bool {
         .is_dir()
 }
 
+fn build_xray(
+    out_dir: &Path,
+    source: &Path,
+    target: &Target,
+    go: &Path,
+    build_id: &str,
+) -> PathBuf {
+    let output = out_dir.join(format!("xray-build-{}", target.arch));
+    let ldflags = format!("-X github.com/xtls/xray-core/core.build={build_id} -s -w -buildid=");
+    let status = Command::new(go)
+        .args([
+            "build",
+            "-mod=readonly",
+            "-trimpath",
+            "-buildvcs=false",
+            "-gcflags=all=-l=4",
+            "-ldflags",
+        ])
+        .arg(ldflags)
+        .arg("-o")
+        .arg(&output)
+        .arg("./main")
+        .current_dir(source)
+        .env("CGO_ENABLED", "0")
+        .env("GOOS", "linux")
+        .env("GOARCH", target.go_arch)
+        // Never make a Console build silently download and switch to another Go toolchain.
+        .env("GOTOOLCHAIN", "local")
+        .status()
+        .unwrap_or_else(|error| {
+            panic!(
+                "起不了 Go 去编 {} 的 Brocade Xray（源码 {}）：{error}",
+                target.arch,
+                source.display()
+            )
+        });
+    if !status.success() {
+        panic!(
+            "编不出 {} 的 Brocade Xray {XRAY_VERSION}（退出码 {:?}）。\n\
+             源码必须来自仓库内的 {XRAY_SOURCE_DIR}，不会回退到社区发行包。",
+            target.arch,
+            status.code()
+        );
+    }
+    output
+}
+
+/// Keep Xray's upstream banner shape while identifying the Brocade source revision that produced
+/// the embedded binary. A tarball build has no repository metadata and falls back to the imported
+/// upstream baseline.
+fn repository_build_id(workspace: &Path) -> String {
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| !out.stdout.is_empty());
+
+    match (commit, dirty) {
+        (Some(commit), true) => format!("{commit}-dirty"),
+        (Some(commit), false) => commit,
+        (None, _) => XRAY_UPSTREAM_BUILD.to_owned(),
+    }
+}
+
 fn build_agent(out_dir: &Path, target: &Target, zig: Option<&Path>) -> PathBuf {
     let triple = target.triple;
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
@@ -626,6 +796,20 @@ fn build_agent(out_dir: &Path, target: &Target, zig: Option<&Path>) -> PathBuf {
         );
     }
     target_dir.join(triple).join("release/brocade-agent")
+}
+
+fn embed_binary(out_dir: &Path, built: &Path, name: &str, arch: &str, sha_env_prefix: &str) {
+    let bytes = fs::read(built)
+        .unwrap_or_else(|error| panic!("读不了 {name} 二进制 {}: {error}", built.display()));
+    if bytes.is_empty() {
+        panic!("{name} 二进制是空的：{}", built.display());
+    }
+    fs::write(out_dir.join(format!("{name}-{arch}")), &bytes).expect("写不进 OUT_DIR");
+    println!(
+        "cargo:rustc-env={sha_env_prefix}_{}={}",
+        arch.to_uppercase(),
+        sha256(&bytes)
+    );
 }
 
 /// `sha2` is in the dependency graph anyway (both agent and core use it), and there is no reason to
@@ -701,6 +885,33 @@ fn workspace_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("工作区根目录一定在")
+}
+
+/// Watch the complete vendored source tree, including directories so newly added files also rerun
+/// the build script. Xray updates are source updates; a stale embedded binary must not survive one.
+fn watch_tree(root: &Path) {
+    fn visit(path: &Path) {
+        println!("cargo:rerun-if-changed={}", path.display());
+        if !path.is_dir() {
+            return;
+        }
+        let mut entries = fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("读不了 vendored source {}: {error}", path.display()))
+            .map(|entry| entry.expect("读 vendored source 目录项"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            visit(&entry.path());
+        }
+    }
+
+    if !root.join("go.mod").is_file() || !root.join("LICENSE").is_file() {
+        panic!(
+            "Brocade Xray 源码不完整：{} 必须同时包含 go.mod 和 LICENSE",
+            root.display()
+        );
+    }
+    visit(root);
 }
 
 /// Find a usable npm, on the same terms as `find_zig`: the test is that it runs, not that a file

@@ -156,13 +156,13 @@ fn mask_member(key: &str, value: &mut Value) {
     if HOST_KEYS.contains(&key) {
         match value {
             Value::String(text) => {
-                *text = mask_endpoint(text);
+                *text = mask_host_value(text);
                 return;
             }
             Value::Array(items) => {
                 for item in items.iter_mut() {
                     if let Value::String(text) = item {
-                        *text = mask_endpoint(text);
+                        *text = mask_host_value(text);
                     } else {
                         mask_json(item);
                     }
@@ -175,6 +175,18 @@ fn mask_member(key: &str, value: &mut Value) {
         }
     }
     mask_json(value);
+}
+
+/// A host-shaped member can also carry a typed endpoint such as
+/// `tcp://example.net:443` or `icmp://[2001:db8::1]`. Keep the scheme because it
+/// describes the probe kind rather than the asset, while masking the authority in
+/// exactly the same way as every other URL.
+fn mask_host_value(text: &str) -> String {
+    if text.contains("://") {
+        mask_url(text)
+    } else {
+        mask_endpoint(text)
+    }
 }
 
 fn hide_prose(value: &mut Value) {
@@ -567,6 +579,24 @@ mod tests {
             value["share"],
             "vless://***@123.123.***.***:***?sni=***.org&flow=xtls-rprx-vision#sg-01"
         );
+    }
+
+    #[test]
+    fn ping_probe_addresses_keep_their_protocol_after_masking() {
+        let mut value = json!({
+            "targets": [
+                { "name": "TCP", "address": "tcp://192.0.2.1:443" },
+                { "name": "ICMP", "address": "icmp://[2001:db8::1]" },
+            ]
+        });
+
+        mask_json(&mut value);
+
+        assert_eq!(value["targets"][0]["address"], "tcp://192.0.***.***:***");
+        assert_eq!(value["targets"][1]["address"], "icmp://[2001:db8:***]");
+        let encoded = value.to_string();
+        assert!(!encoded.contains("192.0.2.1"), "IPv4 leaked in {encoded}");
+        assert!(!encoded.contains("2001:db8::1"), "IPv6 leaked in {encoded}");
     }
 
     /// The three ports that used to survive masking: the hop range's `start`/`end` under a

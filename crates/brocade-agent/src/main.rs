@@ -13,6 +13,7 @@ mod logcap;
 mod options;
 mod phantun;
 mod probe;
+mod realtime;
 mod selfupdate;
 mod spool;
 mod wg;
@@ -26,11 +27,14 @@ use phantun::{
     prepare_phantun_binaries,
 };
 use probe::{
-    e2e_cycle, e2e_once, judge_hops, probe_cycle, probe_once, read_hop_downlinks, tcp_probe_cycle,
-    tcp_probe_once, xray_listen_ports, XrayListenProtocol,
+    collect_e2e_probe_report, collect_link_probe_report, collect_ping_probe_report, e2e_once,
+    fetch_e2e_probe_targets, fetch_ping_probe_settings, fetch_probe_targets, judge_hops,
+    ping_probe_once, probe_once, read_hop_downlinks, send_e2e_probe_report, send_link_probe_report,
+    send_ping_probe_report, xray_listen_ports, XrayListenProtocol,
 };
 use spool::{
-    record_local_reconcile, runtime_cycle, spool_drain, spool_push, OBSERVATION_SPOOL, USAGE_SPOOL,
+    collect_runtime_report, record_local_reconcile, send_runtime_report, spool_drain, spool_push,
+    Spool, OBSERVATION_SPOOL, USAGE_SPOOL,
 };
 
 use wg::{
@@ -45,7 +49,7 @@ use std::{
     net::IpAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -61,9 +65,11 @@ use brocade_deployment::{
         GrantInbound, ObservedClient, ObservedInbound,
     },
     protocol::{
-        AgentObservationRequest, DesiredStateResponse, GeodataFileState, GeodataObservation,
-        LoadReportRequest, NodeDesiredDeployment, ReportedNodeState, RouteIpReport,
-        TargetApplyResult, UsageCounter, UsageReportRequest,
+        AgentObservationRequest, DesiredStateResponse, E2eProbeRequest, E2eProbeTargetList,
+        GeodataFileState, GeodataObservation, LinkHealthRequest, LinkProbeRequest,
+        LoadReportRequest, NodeDesiredDeployment, NodeRuntimeReport, PingProbeReportRequest,
+        PingProbeSettings, ProbeTargetList, ReportedNodeState, RouteIpReport, TargetApplyResult,
+        UsageCounter, UsageReportRequest,
     },
 };
 
@@ -152,6 +158,199 @@ fn each_round(name: &str, body: impl FnOnce()) {
     }
 }
 
+/// Keep periodic work anchored to its previous tick instead of adding the work duration to every
+/// interval. An overrun advances to the first future point on the same grid: immediately replaying
+/// missed probes would create a burst without recovering the observations that were missed.
+fn next_periodic_tick(previous_tick: Instant, interval: Duration, now: Instant) -> Instant {
+    let next_tick = previous_tick + interval;
+    if next_tick > now {
+        return next_tick;
+    }
+    let elapsed = now.duration_since(previous_tick);
+    let remainder_nanos = elapsed.as_nanos() % interval.as_nanos();
+    let remainder = Duration::from_nanos(
+        u64::try_from(remainder_nanos).expect("PING probe interval fits into u64 nanoseconds"),
+    );
+    now + if remainder.is_zero() {
+        interval
+    } else {
+        interval - remainder
+    }
+}
+
+struct SettingsCache<T> {
+    current: Mutex<Option<T>>,
+    changed: Condvar,
+}
+
+impl<T> Default for SettingsCache<T> {
+    fn default() -> Self {
+        Self {
+            current: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+impl<T: Clone + PartialEq> SettingsCache<T> {
+    fn publish(&self, settings: T) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_ref() != Some(&settings) {
+            *current = Some(settings);
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_for_initial(&self) -> T {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(settings) = current.as_ref() {
+                return settings.clone();
+            }
+            current = self
+                .changed
+                .wait(current)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn latest(&self) -> Option<T> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Wait until either a different settings snapshot arrives or the sampling deadline is due.
+    fn wait_for_change_until(&self, previous: &T, deadline: Instant) -> Option<T> {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(settings) = current.as_ref().filter(|settings| *settings != previous) {
+                return Some(settings.clone());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            (current, _) = self
+                .changed
+                .wait_timeout(current, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+type PingProbeSettingsCache = SettingsCache<PingProbeSettings>;
+
+struct PendingLatestReport<T> {
+    report: Option<T>,
+    dropped: u64,
+}
+
+struct LatestReport<T> {
+    pending: Mutex<PendingLatestReport<T>>,
+    ready: Condvar,
+}
+
+impl<T> Default for LatestReport<T> {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(PendingLatestReport {
+                report: None,
+                dropped: 0,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+impl<T> LatestReport<T> {
+    /// Replace an unsent report instead of extending a FIFO of observations that are already stale.
+    fn publish(&self, report: T) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.report.replace(report).is_some() {
+            pending.dropped = pending.dropped.saturating_add(1);
+        }
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> (T, u64) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(report) = pending.report.take() {
+                return (report, std::mem::take(&mut pending.dropped));
+            }
+            pending = self
+                .ready
+                .wait(pending)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn try_take(&self) -> Option<(T, u64)> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending
+            .report
+            .take()
+            .map(|report| (report, std::mem::take(&mut pending.dropped)))
+    }
+}
+
+/// Deliver observations without coupling their producer to the network.
+///
+/// A failed current value is retried with a short bounded backoff. If a newer value arrives while
+/// waiting, it replaces the failed one: these reports describe current state, so replaying a FIFO
+/// of obsolete samples after an outage would be actively misleading.
+fn report_latest_forever<T>(
+    name: &'static str,
+    reports: &LatestReport<T>,
+    send: impl Fn(&T) -> Result<(), String>,
+) -> ! {
+    loop {
+        let (mut report, dropped) = reports.take();
+        if dropped > 0 {
+            eprintln!("{name}: sender busy; dropped {dropped} stale reports");
+        }
+        let mut retry = LATEST_REPORT_RETRY_MIN;
+        loop {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send(&report))) {
+                Ok(Ok(())) => break,
+                Ok(Err(error)) => eprintln!("{name}: {error}; retrying in {retry:?}"),
+                Err(_) => warn(format!("{name} 线程这一轮 panic 了，{retry:?} 后重试")),
+            }
+            thread::sleep(retry);
+            retry = retry.saturating_mul(2).min(LATEST_REPORT_RETRY_MAX);
+            if let Some((newer, dropped)) = reports.try_take() {
+                eprintln!(
+                    "{name}: replaced failed report and {} stale pending reports with the latest",
+                    dropped
+                );
+                report = newer;
+            }
+        }
+    }
+}
+
+type LatestPingProbeReport = LatestReport<PingProbeReportRequest>;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("brocade-agent: {error}");
@@ -195,10 +394,10 @@ fn run() -> Result<(), String> {
         // One manual end-to-end probe. The cycle is a minute, which is still a wait
         // after editing a chain's rule table.
         "e2e-once" => e2e_once(options),
-        "tcp-probe-once" => tcp_probe_once(options),
+        "ping-probe-once" => ping_probe_once(options),
         "run" => run_forever(options),
         value => Err(format!(
-            "unknown command {value}; expected run, desired, apply-once, usage-once, probe-once, e2e-once, tcp-probe-once, health, or repair"
+            "unknown command {value}; expected run, desired, apply-once, usage-once, probe-once, e2e-once, ping-probe-once, health, or repair"
         )),
     }
 }
@@ -785,6 +984,7 @@ const USAGE_INTERVAL: Duration = Duration::from_secs(30);
 /// upstream link and typically holds for hours. A shorter interval only adds traffic on
 /// both ends.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const PROBE_TARGETS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Host sampling. Shorter than every other cycle by necessity: CPU is differenced over this
 /// interval, and a 30-second difference averages a spike away, while spikes are the dominant
 /// component of forwarding load. The report is still sent every 30 seconds, carrying the peak
@@ -794,8 +994,34 @@ const LOAD_INTERVAL: Duration = Duration::from_secs(load::SUB_INTERVAL_SECS);
 /// unreachable. Longer than the normal cycle, because a machine that cannot reach the
 /// control plane usually has nothing measurable either, and a longer interval reduces
 /// load in that state.
-const E2E_INTERVAL_FALLBACK: Duration = Duration::from_secs(5 * 60);
-const TCP_PROBE_INTERVAL_FALLBACK: Duration = Duration::from_secs(60);
+const E2E_TARGETS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+/// Settings change much less often than samples. Refresh independently so even a day-long sampling
+/// interval learns a policy change promptly, without putting a GET in front of every observation.
+const PING_PROBE_SETTINGS_INTERVAL: Duration = Duration::from_secs(15);
+const SPOOL_IDLE_POLL: Duration = Duration::from_secs(1);
+const SPOOL_MAX_RETRY: Duration = Duration::from_secs(60);
+const LATEST_REPORT_RETRY_MIN: Duration = Duration::from_secs(1);
+const LATEST_REPORT_RETRY_MAX: Duration = Duration::from_secs(15);
+
+fn spawn_spool_reporter(name: &'static str, spool: Spool, options: Options) -> Result<(), String> {
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let mut retry = SPOOL_IDLE_POLL;
+            loop {
+                match spool_drain(spool, &options) {
+                    Ok(()) => retry = SPOOL_IDLE_POLL,
+                    Err(error) => {
+                        eprintln!("{name}: {error}");
+                        retry = retry.saturating_mul(2).min(SPOOL_MAX_RETRY);
+                    }
+                }
+                thread::sleep(retry);
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot spawn {name} thread: {error}"))
+}
 
 /// One process, two loops.
 ///
@@ -828,60 +1054,152 @@ fn run_forever(options: Options) -> Result<(), String> {
     // process; it sets this flag, and the main loop exits between rounds.
     let wants_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Convergence results are durable and ordered, but their network delivery is not part of the
+    // convergence transaction. The control plane already withholds new work while an observation
+    // is outstanding, so a dedicated drainer preserves ordering without delaying heartbeats.
+    spawn_spool_reporter("observation-report", OBSERVATION_SPOOL, options.clone())?;
+
     {
+        // One outbound connection, idle until the control plane says somebody is watching. It is
+        // independent of load and usage on purpose: neither their 30-second cadence nor their
+        // persistence/accounting semantics changes when this stream is enabled.
+        let options = options.clone();
+        thread::Builder::new()
+            .name("realtime".to_owned())
+            .spawn(move || realtime::run(&options))
+            .map_err(|error| format!("cannot spawn realtime telemetry thread: {error}"))?;
+    }
+
+    {
+        spawn_spool_reporter("usage-report", USAGE_SPOOL, options.clone())?;
+        let health_reports = Arc::new(LatestReport::<LinkHealthRequest>::default());
+
+        let report_options = options.clone();
+        let reports_in = Arc::clone(&health_reports);
+        thread::Builder::new()
+            .name("link-health-report".to_owned())
+            .spawn(move || {
+                report_latest_forever("link-health", &reports_in, |report| {
+                    send_health_report(&report_options, report)
+                })
+            })
+            .map_err(|error| format!("cannot spawn link-health-report thread: {error}"))?;
+
         let options = options.clone();
         let meter = Arc::clone(&meter);
+        let reports_out = Arc::clone(&health_reports);
         thread::Builder::new()
             .name("usage".to_owned())
-            .spawn(move || loop {
-                each_round("usage", || {
-                    let _guard = meter
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Err(error) = usage_cycle(&options) {
-                        eprintln!("usage: {error}");
-                    }
-                });
-                thread::sleep(USAGE_INTERVAL);
+            .spawn(move || {
+                let mut tick = Instant::now();
+                loop {
+                    each_round("usage", || {
+                        let _guard = meter
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Err(error) = collect_usage_report(&options) {
+                            eprintln!("usage: {error}");
+                        }
+                        match collect_health_report(&options) {
+                            Ok(Some(report)) => reports_out.publish(report),
+                            Ok(None) => {}
+                            Err(error) => eprintln!("link-health: {error}"),
+                        }
+                    });
+                    let now = Instant::now();
+                    tick = next_periodic_tick(tick, USAGE_INTERVAL, now);
+                    thread::sleep(tick.saturating_duration_since(now));
+                }
             })
             .map_err(|error| format!("cannot spawn usage thread: {error}"))?;
     }
 
     {
-        // A separate thread, because a round can take tens of seconds, sending about a
-        // dozen pings per peer and possibly hitting timeouts, and running it on the
-        // apply path would delay convergence.
-        // It also does not touch xray's counters, so it stays outside `meter`.
-        let options = options.clone();
+        let targets = Arc::new(SettingsCache::<ProbeTargetList>::default());
+        let reports = Arc::new(LatestReport::<LinkProbeRequest>::default());
+
+        let settings_options = options.clone();
+        let settings_out = Arc::clone(&targets);
+        thread::Builder::new()
+            .name("probe-targets".to_owned())
+            .spawn(move || {
+                let mut tick = Instant::now();
+                loop {
+                    each_round("probe-targets", || {
+                        match fetch_probe_targets(&settings_options) {
+                            Ok(next) => settings_out.publish(next),
+                            Err(error) => eprintln!("probe targets: {error}"),
+                        }
+                    });
+                    let now = Instant::now();
+                    tick = next_periodic_tick(tick, PROBE_TARGETS_REFRESH_INTERVAL, now);
+                    thread::sleep(tick.saturating_duration_since(now));
+                }
+            })
+            .map_err(|error| format!("cannot spawn probe-targets thread: {error}"))?;
+
+        let report_options = options.clone();
+        let reports_in = Arc::clone(&reports);
+        thread::Builder::new()
+            .name("probe-report".to_owned())
+            .spawn(move || {
+                report_latest_forever("probe", &reports_in, |report| {
+                    send_link_probe_report(&report_options, report)
+                })
+            })
+            .map_err(|error| format!("cannot spawn probe-report thread: {error}"))?;
+
+        let targets_in = Arc::clone(&targets);
+        let reports_out = Arc::clone(&reports);
         thread::Builder::new()
             .name("probe".to_owned())
-            .spawn(move || loop {
-                each_round("probe", || {
-                    if let Err(error) = probe_cycle(&options) {
-                        eprintln!("probe: {error}");
+            .spawn(move || {
+                let mut targets = targets_in.wait_for_initial();
+                let mut tick = Instant::now();
+                loop {
+                    each_round("probe", || match collect_link_probe_report(&targets) {
+                        Ok(Some(report)) => reports_out.publish(report),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("probe: {error}"),
+                    });
+                    let next_tick = next_periodic_tick(tick, PROBE_INTERVAL, Instant::now());
+                    while let Some(next) = targets_in.wait_for_change_until(&targets, next_tick) {
+                        targets = next;
                     }
-                });
-                thread::sleep(PROBE_INTERVAL);
+                    tick = next_tick;
+                }
             })
             .map_err(|error| format!("cannot spawn probe thread: {error}"))?;
     }
 
     {
-        // Runtime reconcile, at the same cadence as probing. All three values it
-        // reports — versions, local reconcile and backlog — are meaningful only at
-        // hourly resolution, while each round forks three or four `--version`
-        // children, so running it at the 15-second tier consumes CPU with no benefit.
-        // It is also separate from apply because it modifies no configuration.
-        let options = options.clone();
+        let reports = Arc::new(LatestReport::<NodeRuntimeReport>::default());
+        let report_options = options.clone();
+        let reports_in = Arc::clone(&reports);
+        thread::Builder::new()
+            .name("runtime-report".to_owned())
+            .spawn(move || {
+                report_latest_forever("runtime", &reports_in, |report| {
+                    send_runtime_report(&report_options, report)
+                })
+            })
+            .map_err(|error| format!("cannot spawn runtime-report thread: {error}"))?;
+
+        let state_dir = options.state_dir.clone();
+        let reports_out = Arc::clone(&reports);
         thread::Builder::new()
             .name("runtime".to_owned())
-            .spawn(move || loop {
-                each_round("runtime", || {
-                    if let Err(error) = runtime_cycle(&options) {
-                        eprintln!("runtime: {error}");
-                    }
-                });
-                thread::sleep(PROBE_INTERVAL);
+            .spawn(move || {
+                let mut tick = Instant::now();
+                loop {
+                    each_round("runtime", || match collect_runtime_report(&state_dir) {
+                        Ok(report) => reports_out.publish(report),
+                        Err(error) => eprintln!("runtime: {error}"),
+                    });
+                    let now = Instant::now();
+                    tick = next_periodic_tick(tick, PROBE_INTERVAL, now);
+                    thread::sleep(tick.saturating_duration_since(now));
+                }
             })
             .map_err(|error| format!("cannot spawn runtime thread: {error}"))?;
     }
@@ -925,51 +1243,33 @@ fn run_forever(options: Options) -> Result<(), String> {
         // 30 seconds in an HTTP read, which used to stretch the next nominal 10-second sample and
         // then label the mixed interval as 30 seconds. A one-slot best-effort handoff preserves
         // the existing "do not spool stale telemetry" rule while keeping the sampling clock free.
-        let (load_tx, load_rx) = std::sync::mpsc::sync_channel::<LoadReportRequest>(1);
+        let reports = Arc::new(LatestReport::<LoadReportRequest>::default());
         let report_options = options.clone();
+        let reports_in = Arc::clone(&reports);
         thread::Builder::new()
             .name("load-report".to_owned())
             .spawn(move || {
-                while let Ok(report) = load_rx.recv() {
-                    each_round("load-report", || {
-                        if let Err(error) = send_load_report(&report_options, report) {
-                            eprintln!("load: {error}");
-                        }
-                    });
-                }
+                report_latest_forever("load", &reports_in, |report| {
+                    send_load_report(&report_options, report)
+                })
             })
             .map_err(|error| format!("cannot spawn load-report thread: {error}"))?;
 
         let options = options.clone();
+        let reports_out = Arc::clone(&reports);
         thread::Builder::new()
             .name("load".to_owned())
             .spawn(move || {
                 let mut next_tick = Instant::now();
                 loop {
                     each_round("load", || match build_load_report(&options) {
-                        Ok(Some(report)) => match load_tx.try_send(report) {
-                            Ok(()) => {}
-                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                                // There is no telemetry spool by design. Keeping a stale window
-                                // would delay the current one and eventually recreate the same
-                                // timing error this queue exists to prevent.
-                                eprintln!("load: previous report is still in flight; dropping this window");
-                            }
-                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                eprintln!("load: report worker stopped; dropping this window");
-                            }
-                        },
+                        Ok(Some(report)) => reports_out.publish(report),
                         Ok(None) => {}
                         Err(error) => eprintln!("load: {error}"),
                     });
 
-                    next_tick += LOAD_INTERVAL;
                     let now = Instant::now();
-                    if next_tick <= now {
-                        // Do not run catch-up samples back-to-back. The raw counter interval will
-                        // carry the delay and mark the resulting window as a gap.
-                        next_tick = now + LOAD_INTERVAL;
-                    }
+                    next_tick = next_periodic_tick(next_tick, LOAD_INTERVAL, now);
                     thread::sleep(next_tick.saturating_duration_since(now));
                 }
             })
@@ -977,60 +1277,140 @@ fn run_forever(options: Options) -> Result<(), String> {
     }
 
     {
-        // One TCP Connect per configured target and round. The control plane owns the cadence;
-        // the one-minute fallback is only the retry interval when settings cannot be fetched.
-        let options = options.clone();
+        // Settings, sampling, and reporting have separate clocks. A slow control plane must not
+        // move a five-second observation tick, and recovering from an outage must not replay a
+        // queue of stale diagnostics. The cache wakes the sampler on policy changes; the report
+        // slot keeps only the newest observation that is not already in flight.
+        let settings = Arc::new(PingProbeSettingsCache::default());
+        let reports = Arc::new(LatestPingProbeReport::default());
+
+        let settings_options = options.clone();
+        let settings_out = Arc::clone(&settings);
         thread::Builder::new()
-            .name("tcp-probe".to_owned())
-            .spawn(move || loop {
-                let mut interval = TCP_PROBE_INTERVAL_FALLBACK;
-                each_round("tcp-probe", || {
-                    interval = match tcp_probe_cycle(&options) {
-                        Ok(settings) => Duration::from_secs(u64::from(settings.interval_secs)),
-                        Err(error) => {
-                            eprintln!("tcp-probe: {error}");
-                            TCP_PROBE_INTERVAL_FALLBACK
+            .name("ping-settings".to_owned())
+            .spawn(move || {
+                let mut tick = Instant::now();
+                loop {
+                    each_round("ping-settings", || {
+                        match fetch_ping_probe_settings(&settings_options) {
+                            Ok(next) => settings_out.publish(next),
+                            Err(error) => eprintln!("ping-probe settings: {error}"),
                         }
-                    };
-                });
-                thread::sleep(interval);
+                    });
+                    let now = Instant::now();
+                    tick = next_periodic_tick(tick, PING_PROBE_SETTINGS_INTERVAL, now);
+                    thread::sleep(tick.saturating_duration_since(now));
+                }
             })
-            .map_err(|error| format!("cannot spawn TCP probe thread: {error}"))?;
+            .map_err(|error| format!("cannot spawn PING settings thread: {error}"))?;
+
+        let report_options = options.clone();
+        let report_in = Arc::clone(&reports);
+        thread::Builder::new()
+            .name("ping-report".to_owned())
+            .spawn(move || {
+                report_latest_forever("ping-probe", &report_in, |report| {
+                    send_ping_probe_report(&report_options, report)
+                })
+            })
+            .map_err(|error| format!("cannot spawn PING report thread: {error}"))?;
+
+        let settings_in = Arc::clone(&settings);
+        let report_out = Arc::clone(&reports);
+        thread::Builder::new()
+            .name("ping-probe".to_owned())
+            .spawn(move || {
+                let mut settings = settings_in.wait_for_initial();
+                let mut tick = Instant::now();
+                loop {
+                    // A refresh can land on the deadline after the timed wait returned. Read once
+                    // more before sampling so that race costs no extra observation interval.
+                    settings = settings_in.latest().unwrap_or(settings);
+                    each_round("ping-probe", || {
+                        match collect_ping_probe_report(&settings) {
+                            Ok(Some(report)) => report_out.publish(report),
+                            Ok(None) => {}
+                            Err(error) => eprintln!("ping-probe: {error}"),
+                        }
+                    });
+
+                    let interval = Duration::from_secs(u64::from(settings.interval_secs));
+                    let mut next_tick = next_periodic_tick(tick, interval, Instant::now());
+                    while let Some(next) = settings_in.wait_for_change_until(&settings, next_tick) {
+                        settings = next;
+                        let interval = Duration::from_secs(u64::from(settings.interval_secs));
+                        next_tick = next_periodic_tick(tick, interval, Instant::now());
+                    }
+                    tick = next_tick;
+                }
+            })
+            .map_err(|error| format!("cannot spawn PING probe thread: {error}"))?;
     }
 
     {
-        // End-to-end probing runs on its own thread for the same reason as MTU
-        // probing: a round starts a short-lived xray per chain, waits for its
-        // handshake, and waits for the endpoint to answer, which takes seconds at
-        // minimum, and running it on the apply path would delay convergence.
-        // The control plane supplies the cycle (`ProbeSettings::interval_secs`)
-        // rather than a compile-time constant, because the cost depends on the fleet
-        // and on a machine with many chains one minute and ten minutes differ
-        // substantially. A failed fetch falls back to the default, so one network
-        // failure does not stop probing.
-        let options = options.clone();
+        let settings = Arc::new(SettingsCache::<E2eProbeTargetList>::default());
+        let reports = Arc::new(LatestReport::<E2eProbeRequest>::default());
+
+        let settings_options = options.clone();
+        let settings_out = Arc::clone(&settings);
+        thread::Builder::new()
+            .name("e2e-targets".to_owned())
+            .spawn(move || {
+                let mut tick = Instant::now();
+                loop {
+                    each_round("e2e-targets", || {
+                        match fetch_e2e_probe_targets(&settings_options) {
+                            Ok(next) => settings_out.publish(next),
+                            Err(error) => eprintln!("e2e targets: {error}"),
+                        }
+                    });
+                    let now = Instant::now();
+                    tick = next_periodic_tick(tick, E2E_TARGETS_REFRESH_INTERVAL, now);
+                    thread::sleep(tick.saturating_duration_since(now));
+                }
+            })
+            .map_err(|error| format!("cannot spawn e2e-targets thread: {error}"))?;
+
+        let report_options = options.clone();
+        let reports_in = Arc::clone(&reports);
+        thread::Builder::new()
+            .name("e2e-report".to_owned())
+            .spawn(move || {
+                report_latest_forever("e2e", &reports_in, |report| {
+                    send_e2e_probe_report(&report_options, report)
+                })
+            })
+            .map_err(|error| format!("cannot spawn e2e-report thread: {error}"))?;
+
+        let settings_in = Arc::clone(&settings);
+        let reports_out = Arc::clone(&reports);
         thread::Builder::new()
             .name("e2e".to_owned())
-            .spawn(move || loop {
-                // A panicking round falls back to the default cycle, the same
-                // treatment as a failed settings fetch.
-                let mut interval = E2E_INTERVAL_FALLBACK;
-                each_round("e2e", || {
-                    interval = match e2e_cycle(&options) {
-                        Ok(list) => list.interval(),
-                        Err(error) => {
-                            eprintln!("e2e: {error}");
-                            E2E_INTERVAL_FALLBACK
-                        }
-                    };
-                });
-                thread::sleep(interval);
+            .spawn(move || {
+                let mut settings = settings_in.wait_for_initial();
+                let mut tick = Instant::now();
+                loop {
+                    settings = settings_in.latest().unwrap_or(settings);
+                    each_round("e2e", || match collect_e2e_probe_report(&settings) {
+                        Ok(Some(report)) => reports_out.publish(report),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("e2e: {error}"),
+                    });
+                    let mut next_tick =
+                        next_periodic_tick(tick, settings.interval(), Instant::now());
+                    while let Some(next) = settings_in.wait_for_change_until(&settings, next_tick) {
+                        settings = next;
+                        next_tick = next_periodic_tick(tick, settings.interval(), Instant::now());
+                    }
+                    tick = next_tick;
+                }
             })
             .map_err(|error| format!("cannot spawn e2e thread: {error}"))?;
     }
 
     selfupdate::spawn_selfupdate(&options, &wants_exit);
 
+    let mut apply_tick = Instant::now();
     loop {
         if let Err(error) = apply_once_locked(&options, &meter) {
             eprintln!("apply: {error}");
@@ -1051,16 +1431,18 @@ fn run_forever(options: Options) -> Result<(), String> {
             println!("selfupdate: 这一轮收敛做完了，退出让 systemd 用新二进制拉起来");
             std::process::exit(0);
         }
-        thread::sleep(APPLY_INTERVAL);
+        let now = Instant::now();
+        apply_tick = next_periodic_tick(apply_tick, APPLY_INTERVAL, now);
+        thread::sleep(apply_tick.saturating_duration_since(now));
     }
 }
 
 fn apply_once_locked(options: &Options, meter: &Arc<Mutex<()>>) -> Result<(), String> {
-    apply_once_inner(options.clone(), Some(meter))
+    apply_once_inner(options.clone(), Some(meter), false)
 }
 
 fn apply_once(options: Options) -> Result<(), String> {
-    apply_once_inner(options, None)
+    apply_once_inner(options, None, true)
 }
 
 fn upgrade_dynamic_log_sinks(
@@ -1092,9 +1474,9 @@ fn upgrade_dynamic_log_sinks(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
-        if let Err(error) = usage_cycle(options) {
+        if let Err(error) = collect_usage_report(options) {
             // The migration remains necessary for the disk bound. Preserve the same release
-            // policy as a normal restart: report a failed pre-sample, then continue rather than
+            // policy as a normal restart: log a failed pre-sample, then continue rather than
             // leaving an unbounded/fixed child forever.
             eprintln!("usage: 切换动态日志前的采集没成功：{error}");
         }
@@ -1104,7 +1486,11 @@ fn upgrade_dynamic_log_sinks(
     Ok(())
 }
 
-fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<(), String> {
+fn apply_once_inner(
+    options: Options,
+    meter: Option<&Arc<Mutex<()>>>,
+    report_inline: bool,
+) -> Result<(), String> {
     let client = HttpClient::new(&options.server)?;
     // Flush the convergence results still owed from earlier rounds before asking for
     // new work. It runs before fetching desired state, because while an observation is
@@ -1113,8 +1499,10 @@ fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<
     // after that early 204 return would never run.
     // Failure does not stop this round: a failed flush usually means the control plane
     // is not reachable, which is the situation the local reconcile below covers.
-    if let Err(error) = spool_drain(OBSERVATION_SPOOL, &options) {
-        warn(format!("补发上一轮的收敛结果没成功：{error}"));
+    if report_inline {
+        if let Err(error) = spool_drain(OBSERVATION_SPOOL, &options) {
+            warn(format!("补发上一轮的收敛结果没成功：{error}"));
+        }
     }
     let response = match desired_request(&client, &options) {
         Ok(response) => response,
@@ -1194,25 +1582,32 @@ fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<
     // pkill and the new process would read freshly zeroed counters and record the reset
     // as an idle window.
     let mut held = None;
-    let mut collect = || {
-        if let Some(meter) = meter {
-            held = Some(
-                meter
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            );
+    let mut usage_activated_at_unix_secs = None;
+    let applied = {
+        let mut collect = || {
+            if let Some(meter) = meter {
+                held = Some(
+                    meter
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+            }
+            // A failed sample must not block the release: updating xray's config is what
+            // the operator requested, and a failed sample costs at most one window. It is
+            // still reported rather than dropped.
+            if let Err(error) = collect_usage_report(&options) {
+                eprintln!("usage: 重启 xray 前的采集没成功：{error}");
+            }
+            // This is deliberately after the pre-change sample and before converge_linux mutates
+            // Xray or its runtime grants. A newly introduced counter has value zero at this boundary,
+            // even though Xray does not expose the counter until that user first sends traffic.
+            usage_activated_at_unix_secs = current_unix_secs().ok();
+        };
+        match options.apply_mode {
+            ApplyMode::StateDir => converge_to_state_dir(&options.state_dir, &desired),
+            ApplyMode::Linux => converge_linux(&options.state_dir, &desired, &mut collect)
+                .map(|_| observe_linux_state(&options.state_dir, &desired)),
         }
-        // A failed sample must not block the release: updating xray's config is what
-        // the operator requested, and a failed sample costs at most one window. It is
-        // still reported rather than dropped.
-        if let Err(error) = usage_cycle(&options) {
-            eprintln!("usage: 重启 xray 前的采集没成功：{error}");
-        }
-    };
-    let applied = match options.apply_mode {
-        ApplyMode::StateDir => converge_to_state_dir(&options.state_dir, &desired),
-        ApplyMode::Linux => converge_linux(&options.state_dir, &desired, &mut collect)
-            .map(|_| observe_linux_state(&options.state_dir, &desired)),
     };
     let (result, after, error) = match applied {
         Ok(after) => {
@@ -1241,6 +1636,7 @@ fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<
         observed_after: after,
         error: error.clone(),
         route: Some(route_ip_report()),
+        usage_activated_at_unix_secs,
     };
     // Write to disk before sending. Convergence has already happened on this machine and
     // this result is its only record. If it is not delivered, the control plane stays at
@@ -1250,7 +1646,9 @@ fn apply_once_inner(options: Options, meter: Option<&Arc<Mutex<()>>>) -> Result<
     // has always worked this way, and both share the same persistence and retry
     // machinery (`Spool`).
     spool_push(OBSERVATION_SPOOL, &options.state_dir, &report)?;
-    spool_drain(OBSERVATION_SPOOL, &options)?;
+    if report_inline {
+        spool_drain(OBSERVATION_SPOOL, &options)?;
+    }
     if let Some(error) = error {
         return Err(error);
     }
@@ -1300,29 +1698,30 @@ fn successful_apply_outcome(
     }
 }
 
-/// One sampling round: read the counters → write to disk → drain the spool.
+/// One accounting sample: read the counters and durably append them.
 ///
 /// Separating sampling from reporting is a requirement. Reading the counters is local
 /// gRPC and costs little; only reporting goes over the network. The write in between is
 /// not a cache but the only copy of this data: xray's counters are in memory and reset on
 /// restart, so with the network down, skipping the write loses the traffic record.
-fn usage_cycle(options: &Options) -> Result<(), String> {
-    // A wg-only node has no xray workload to sample. That is not an error, and it must
-    // not skip delivery of readings left from an earlier role or an earlier outage.
-    let sampled = if options.state_dir.join("xray.json").exists()
+fn collect_usage_report(options: &Options) -> Result<(), String> {
+    // A wg-only node has no xray workload to sample. That is not an error; the independent
+    // spool reporter still delivers readings left from an earlier role or outage.
+    if options.state_dir.join("xray.json").exists()
         && !options.state_dir.join("xray.disabled").exists()
     {
         read_usage_report(&options.state_dir)
             .and_then(|report| spool_push(USAGE_SPOOL, &options.state_dir, &report))
     } else {
         Ok(())
-    };
+    }
+}
+
+/// Synchronous composition retained for `usage-once`; the daemon uses independent sampler and
+/// reporter workers so neither HTTP nor backlog recovery moves the accounting clock.
+fn usage_cycle(options: &Options) -> Result<(), String> {
+    let sampled = collect_usage_report(options);
     let drained = spool_drain(USAGE_SPOOL, options);
-    // Liveness rides on this sample rather than starting its own loop: what it needs
-    // is whether the counters grew between two readings, and usage already reads them
-    // per window. Semantically close things belong in one process.
-    //
-    // It must not block usage: liveness is observation, usage is money.
     if let Err(error) = health_cycle(options) {
         eprintln!("link-health: {error}");
     }
@@ -1336,23 +1735,21 @@ fn usage_cycle(options: &Options) -> Result<(), String> {
 
 /// Read the outbound counters once, compare against the previous round, and report
 /// each hop's liveness.
-fn health_cycle(options: &Options) -> Result<(), String> {
+fn collect_health_report(options: &Options) -> Result<Option<LinkHealthRequest>, String> {
     let xray_content = match fs::read_to_string(options.state_dir.join("xray.json")) {
         Ok(content) => content,
         // No xray on this machine (impossible for a pure backbone relay, but real for
         // a wg-only node)
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     let Some(api_port) = xray_api_port(&xray_content) else {
-        return Ok(());
+        return Ok(None);
     };
     let now = read_hop_downlinks(api_port)?;
-    let Some(report) = judge_hops(now, current_unix_secs()? as u64) else {
-        // The first round has no baseline, or this machine has no forwarding outbound
-        // at all
-        return Ok(());
-    };
+    Ok(judge_hops(now, current_unix_secs()? as u64))
+}
 
+fn send_health_report(options: &Options, report: &LinkHealthRequest) -> Result<(), String> {
     let client = HttpClient::new(&options.server)?;
     let body = serde_json::to_string(&report).map_err(|error| error.to_string())?;
     let response = client.request("POST", "/agent/v1/link-health", &options.token, Some(&body))?;
@@ -1361,6 +1758,13 @@ fn health_cycle(options: &Options) -> Result<(), String> {
             "link health report failed: HTTP {} {}",
             response.status, response.body
         ));
+    }
+    Ok(())
+}
+
+fn health_cycle(options: &Options) -> Result<(), String> {
+    if let Some(report) = collect_health_report(options)? {
+        send_health_report(options, &report)?;
     }
     Ok(())
 }
@@ -1417,7 +1821,7 @@ fn build_load_report(options: &Options) -> Result<Option<LoadReportRequest>, Str
     }))
 }
 
-fn send_load_report(options: &Options, report: LoadReportRequest) -> Result<(), String> {
+fn send_load_report(options: &Options, report: &LoadReportRequest) -> Result<(), String> {
     let client = HttpClient::new(&options.server)?;
     let body = serde_json::to_string(&report).map_err(|error| error.to_string())?;
     let response = client.request("POST", "/agent/v1/load", &options.token, Some(&body))?;
@@ -1437,7 +1841,7 @@ fn send_load_report(options: &Options, report: LoadReportRequest) -> Result<(), 
 
 fn load_cycle(options: &Options) -> Result<(), String> {
     if let Some(report) = build_load_report(options)? {
-        send_load_report(options, report)?;
+        send_load_report(options, &report)?;
     }
     Ok(())
 }
@@ -1509,14 +1913,29 @@ fn read_usage_report(state_dir: &Path) -> Result<UsageReportRequest, String> {
     })
 }
 
+const ROUTE_REPORT_TTL: Duration = Duration::from_secs(30);
+const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+static ROUTE_REPORT_CACHE: OnceLock<Mutex<Option<(Instant, RouteIpReport)>>> = OnceLock::new();
+
 fn route_ip_report() -> RouteIpReport {
-    RouteIpReport {
+    let cache = ROUTE_REPORT_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((observed_at, report)) = cached.as_ref() {
+        if observed_at.elapsed() < ROUTE_REPORT_TTL {
+            return report.clone();
+        }
+    }
+    let report = RouteIpReport {
         ipv4: route_source_ip(&["-4", "route", "get", "1.1.1.1"], RouteFamily::V4),
         ipv6: route_source_ip(
             &["-6", "route", "get", "2606:4700:4700::1111"],
             RouteFamily::V6,
         ),
-    }
+    };
+    *cached = Some((Instant::now(), report.clone()));
+    report
 }
 
 fn desired_request(client: &HttpClient, options: &Options) -> Result<HttpResponse, String> {
@@ -1543,7 +1962,7 @@ enum RouteFamily {
 }
 
 fn route_source_ip(args: &[&str], family: RouteFamily) -> Option<String> {
-    let output = run_command("ip", args).ok()?;
+    let output = command::run_command_with_timeout("ip", args, ROUTE_COMMAND_TIMEOUT).ok()?;
     let mut parts = output.split_whitespace();
     while let Some(part) = parts.next() {
         if part == "src" {
@@ -2929,6 +3348,72 @@ mod tests {
         // A third round ran after the panicking one, so the thread survived.
         assert!(worker.join().is_ok(), "线程被 panic 带走了");
         assert_eq!(ROUNDS.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_periodic_tick_does_not_add_the_round_duration() {
+        let started = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(5);
+
+        assert_eq!(
+            super::next_periodic_tick(
+                started,
+                interval,
+                started + std::time::Duration::from_secs(2),
+            ),
+            started + interval,
+        );
+    }
+
+    #[test]
+    fn an_overdue_periodic_tick_skips_catch_up_work() {
+        let started = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(5);
+        let finished = started + std::time::Duration::from_secs(7);
+
+        assert_eq!(
+            super::next_periodic_tick(started, interval, finished),
+            started + std::time::Duration::from_secs(10),
+        );
+    }
+
+    #[test]
+    fn a_busy_ping_sender_keeps_only_the_latest_pending_report() {
+        let reports = super::LatestPingProbeReport::default();
+        let report = |probed_at_unix_secs| brocade_deployment::protocol::PingProbeReportRequest {
+            probed_at_unix_secs,
+            samples: Vec::new(),
+        };
+
+        reports.publish(report(1));
+        reports.publish(report(2));
+        reports.publish(report(3));
+
+        let (latest, dropped) = reports.take();
+        assert_eq!(latest.probed_at_unix_secs, 3);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn a_ping_settings_refresh_replaces_the_cached_snapshot() {
+        let cache = super::PingProbeSettingsCache::default();
+        let settings = |interval_secs| brocade_deployment::protocol::PingProbeSettings {
+            targets: Vec::new(),
+            interval_secs,
+            timeout_ms: 420,
+        };
+
+        cache.publish(settings(60));
+        let previous = cache.wait_for_initial();
+        cache.publish(settings(5));
+
+        let updated = cache
+            .wait_for_change_until(
+                &previous,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect("changed settings should wake the sampler");
+        assert_eq!(updated.interval_secs, 5);
     }
 
     #[test]

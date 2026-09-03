@@ -65,8 +65,16 @@ function verdict(item: NodeMtuItem): { cls: string; text: string } {
 // 机器详情的 WIREGUARD 卡中也可修改。两个入口写入同一字段时，草稿中会出现两条来源
 // 不同的同名改动，而操作者只记得其中一次操作。
 export function LinksPane() {
-  const mtu = useQuery({ queryKey: ['link-mtu'], queryFn: () => fetchLinkMtu() });
-  const probes = useQuery({ queryKey: ['e2e-probes'], queryFn: () => fetchE2eProbes() });
+  const mtu = useQuery({
+    queryKey: ['link-mtu'],
+    queryFn: () => fetchLinkMtu(),
+    refetchInterval: 60_000,
+  });
+  const probes = useQuery({
+    queryKey: ['e2e-probes'],
+    queryFn: () => fetchE2eProbes(),
+    refetchInterval: 30_000,
+  });
   // 逐跳链路质量。与本页的另外三类并列，但取数方式不同：另外三类都是主动探测
   // （ping 测量 MTU、建立一次连接），本类不发送任何探测包，读取的是内核在实际转发连接上
   // 已计算的估计值。`retry: false` 是因为该端点是后增加的，旧版控制面返回 404，

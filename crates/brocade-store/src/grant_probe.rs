@@ -129,7 +129,6 @@ pub async fn user_grant_probe_plan(
                 empty_reality(),
                 Some(E2eProbeTls {
                     server_name: value.server_name.clone(),
-                    fingerprint: value.fingerprint.clone(),
                     flow: value.flow.clone(),
                 }),
                 None,
@@ -194,6 +193,7 @@ pub async fn user_grant_probe_plan(
                     host: xhttp.host.clone(),
                     xmux: xhttp.xmux.as_ref().map(|xmux| E2eProbeXhttpXmux {
                         max_concurrency: xmux.max_concurrency,
+                        max_connections: xmux.max_connections,
                         h_max_request_times: E2eProbeXhttpRange {
                             from: xmux.h_max_request_times.from,
                             to: xmux.h_max_request_times.to,
@@ -202,6 +202,16 @@ pub async fn user_grant_probe_plan(
                             from: xmux.h_max_reusable_secs.from,
                             to: xmux.h_max_reusable_secs.to,
                         },
+                        h_keep_alive_period_secs: xmux.h_keep_alive_period_secs,
+                    }),
+                    x_padding_bytes: xhttp.tuning.as_ref().and_then(|tuning| {
+                        tuning
+                            .x_padding_bytes
+                            .as_ref()
+                            .map(|range| E2eProbeXhttpRange {
+                                from: range.from,
+                                to: range.to,
+                            })
                     }),
                     mode: xhttp.mode.as_str().map(str::to_owned),
                 }),

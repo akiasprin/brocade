@@ -686,8 +686,7 @@ pub(crate) async fn create_automatic_grants_deployment(
     }
 
     // Compile each distinct topology only once. The permission projection retains that revision's
-    // nodes and listeners, replacing users, grant relations and hot-synced client flow with the
-    // latest ones.
+    // nodes, listeners and Flow, replacing only users and grant relations with the latest ones.
     let mut projected_by_revision = BTreeMap::new();
     for base_revision in revisions {
         let base = if base_revision == revision_id {
@@ -1981,6 +1980,7 @@ pub async fn report_target_result(
                 &report.node_id,
                 generation_id,
                 report.deployment_id,
+                report.usage_activated_at_unix_secs,
             )
             .await?;
         }
@@ -3103,15 +3103,14 @@ async fn restore_app_tx(
         let RealityOverrides {
             dest,
             server_names,
-            fingerprint,
             flow,
             fallback_mode,
             fallback_limits,
             fallback_guard,
         } = ingress_reality_override_columns(ingress.wires.reality(), site, &ingress.wires);
         let xhttp = ingress.wires.xhttp();
-        let xhttp_xmux = xhttp
-            .and_then(|xhttp| xhttp.xmux.as_ref())
+        let xhttp_tuning = xhttp
+            .and_then(|xhttp| xhttp.tuning.as_ref())
             .map(serde_json::to_value)
             .transpose()?;
         let hysteria2 = ingress.wires.hysteria2();
@@ -3124,10 +3123,10 @@ async fn restore_app_tx(
             "INSERT INTO ingresses (
                 id, app_id, chain_id, node_id, bind, port, front_id,
                 reality_private_key, reality_public_key, reality_short_ids,
-                reality_dest, reality_server_names, reality_fingerprint, reality_flow,
+                reality_dest, reality_server_names, reality_flow,
                 reality_fallback_mode, reality_fallback_limits,
                 reality_fallback_guard,
-                transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_mode,
+                transport_kind, hy2_enabled, xhttp_path, xhttp_mode,
                 hy2_port, hy2_hop_start, hy2_hop_end,
                 hy2_up, hy2_down, hy2_congestion, hy2_obfs_password,
                 hy2_masquerade_kind, hy2_masquerade_url,
@@ -3146,24 +3145,26 @@ async fn restore_app_tx(
                 hy2_quic_init_stream_window, hy2_quic_max_stream_window,
                 hy2_quic_init_conn_window, hy2_quic_max_conn_window,
                 hy2_quic_max_idle_secs, hy2_quic_keepalive_secs,
-                hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud
+                hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud,
+                xhttp_tuning
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
                 $8, $9, $10,
-                $11, $12, $13, $14,
-                $15, $16,
-                $17,
-                $18, $19, $20, $21, $22, $23,
-                $24, $25, $26,
-                $27, $28, $29, $30, $31, $32,
-                $33, $34, $35, $36, $37, $38, $39,
-                $40, $41, $42, $43, $44, $45, $46,
-                $47, $48, $49, $50, $51,
-                $52,
-                $53,
-                $54, $55, $56, $57,
-                $58, $59, $60, $61
+                $11, $12, $13,
+                $14, $15,
+                $16,
+                $17, $18, $19, $20,
+                $21, $22, $23,
+                $24, $25, $26, $27, $28, $29,
+                $30, $31, $32, $33, $34, $35, $36,
+                $37, $38, $39, $40, $41, $42, $43,
+                $44, $45, $46, $47, $48,
+                $49,
+                $50,
+                $51, $52, $53, $54,
+                $55, $56, $57, $58,
+                $59
              )",
         )
         .bind(&ingress.id)
@@ -3178,7 +3179,6 @@ async fn restore_app_tx(
         .bind(serde_json::to_value(&identity.short_ids)?)
         .bind(dest)
         .bind(serde_json::to_value(&server_names)?)
-        .bind(fingerprint)
         .bind(flow)
         .bind(fallback_mode)
         .bind(serde_json::to_value(fallback_limits)?)
@@ -3186,8 +3186,6 @@ async fn restore_app_tx(
         .bind(ingress.wires.vless_kind())
         .bind(ingress.wires.has_udp())
         .bind(xhttp.map(|xhttp| xhttp.path.clone()))
-        .bind(xhttp.and_then(|xhttp| xhttp.host.clone()))
-        .bind(xhttp_xmux)
         .bind(xhttp.and_then(|xhttp| xhttp.mode.as_str()))
         .bind(hysteria2.map(|h| i32::from(h.port)))
         .bind(hysteria2.and_then(|h| h.hop.map(|hop| i32::from(hop.start))))
@@ -3314,6 +3312,7 @@ async fn restore_app_tx(
         .bind(quic.keep_alive_period_secs.map(i64::from))
         .bind(quic.max_incoming_streams.map(i64::from))
         .bind(quic.disable_path_mtu_discovery)
+        .bind(xhttp_tuning)
         .execute(&mut **tx)
         .await?;
     }
@@ -3437,7 +3436,6 @@ fn domain_strategy_column(strategy: DomainStrategy) -> Result<String> {
 struct RealityOverrides {
     dest: Option<String>,
     server_names: Vec<String>,
-    fingerprint: Option<String>,
     flow: Option<String>,
     fallback_mode: &'static str,
     fallback_limits: RealityFallbackLimits,
@@ -3476,7 +3474,6 @@ fn ingress_reality_override_columns(
         return RealityOverrides {
             dest: None,
             server_names: Vec::new(),
-            fingerprint: None,
             flow: None,
             fallback_mode: "global-site",
             fallback_limits: RealityFallbackLimits::Off,
@@ -3484,16 +3481,10 @@ fn ingress_reality_override_columns(
         };
     }
     let Some(reality) = reality else {
-        let fingerprint = if site.fingerprint.as_deref() == Some(wires.fingerprint()) {
-            None
-        } else {
-            Some(wires.fingerprint().to_owned())
-        };
         let flow = flow_column(wires.flow().map(str::to_owned), &site.flow);
         return RealityOverrides {
             dest: None,
             server_names: Vec::new(),
-            fingerprint,
             flow,
             fallback_mode: "global-site",
             fallback_limits: RealityFallbackLimits::Off,
@@ -3508,11 +3499,6 @@ fn ingress_reality_override_columns(
             (Some(reality.dest.clone()), reality.server_names.clone())
         }
     };
-    let fingerprint = if site.fingerprint.as_deref() == Some(reality.fingerprint.as_str()) {
-        None
-    } else {
-        Some(reality.fingerprint.clone())
-    };
     // Three states, not two: equal to the site folds back to following the global setting (NULL),
     // an explicit value stays itself, and `None` while the site has a flow is Vision off on this
     // ingress and has to be the empty string — see `flow_column`.
@@ -3520,7 +3506,6 @@ fn ingress_reality_override_columns(
     RealityOverrides {
         dest,
         server_names,
-        fingerprint,
         flow,
         fallback_mode: match reality.fallback_mode {
             RealityFallbackMode::GlobalSite => "global-site",

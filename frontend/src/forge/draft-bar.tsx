@@ -35,15 +35,12 @@ export function DraftBar({ current }: { current: number | undefined }) {
     setBusy(true);
     setError(null);
     try {
-      const result = await applyDraft(draft.ops());
+      await applyDraft(draft.ops());
       // 先清除草稿再刷新：顺序相反时，刷新读取到的仍是草稿生效后的预览，
       // 与刚写库的内容相同，无法确认提交是否成功。
       draft.clear();
       setOpen(false);
       refresh();
-      if (result.changed === 0) {
-        setError('这些改动跟库里现有的值一模一样，没有产生新修订。');
-      }
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     } finally {

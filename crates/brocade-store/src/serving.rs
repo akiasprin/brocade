@@ -3,8 +3,8 @@
 //! A subscription is rebuilt on every request, but "dynamic" does not mean "read whatever was
 //! most recently committed". Configuration and runtime grants are released independently, so the
 //! serving model is the topology from the last successful configuration release composed with the
-//! permissions from the last successful grants release. The two immutable revision snapshots are
-//! the cache; rendered URI/YAML never is.
+//! permissions from the last successful grants release, then overlays the independently committed
+//! client configuration. The three immutable snapshots are the cache; rendered URI/YAML never is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,7 +32,7 @@ impl SubscriptionServingProjection {
     }
 }
 
-/// Read the checkpoint and its availability decision from one PostgreSQL statement. A release
+/// Read all checkpoint pointers and the availability decision from one PostgreSQL statement. A release
 /// which commits immediately after this statement is ordered after this request; a release already
 /// visible here blocks it. The two snapshots are immutable, so loading them afterwards cannot mix
 /// their contents with a newer model.
@@ -42,6 +42,7 @@ pub(crate) async fn load_subscription_serving_projection(
     let row = sqlx::query(
         "SELECT s.topology_revision_id,
                 s.permissions_revision_id,
+                s.client_snapshot_id,
                 s.generation,
                 EXISTS (
                     SELECT 1 FROM deployments d
@@ -99,6 +100,11 @@ pub(crate) async fn load_subscription_serving_projection(
 
     let topology_revision: i64 = row.try_get("topology_revision_id")?;
     let permissions_revision: i64 = row.try_get("permissions_revision_id")?;
+    let client_snapshot_id = row
+        .try_get::<Option<i64>, _>("client_snapshot_id")?
+        .ok_or_else(|| {
+            StoreError::Unavailable("订阅客户端配置检查点尚未完成回填；服务暂不可用".to_owned())
+        })?;
     let topology = crate::materialize::load_immutable_snapshot(
         pool,
         revision_to_u64("topology_revision_id", topology_revision)?,
@@ -107,6 +113,11 @@ pub(crate) async fn load_subscription_serving_projection(
     let permissions = crate::materialize::load_immutable_snapshot(
         pool,
         revision_to_u64("permissions_revision_id", permissions_revision)?,
+    )
+    .await?;
+    let client = crate::subscription_client::load_client_snapshot(
+        pool,
+        revision_to_u64("client_snapshot_id", client_snapshot_id)?,
     )
     .await?;
 
@@ -123,7 +134,7 @@ pub(crate) async fn load_subscription_serving_projection(
     };
 
     Ok(SubscriptionServingProjection {
-        snapshot: permission_projection(topology, &permissions),
+        snapshot: crate::subscription_client::compose(topology, &permissions, &client.config)?,
         _generation: revision_to_u64("subscription generation", row.try_get("generation")?)?,
         unavailable_reason,
     })
@@ -163,6 +174,13 @@ pub(crate) async fn activate_deployment_tx(
 
     match kind.as_str() {
         "config" => {
+            // Lock the client head before the serving singleton. This remains a real lock before
+            // the first release, where the serving row does not exist yet.
+            let client = crate::subscription_client::locked_head_for_revision_tx(
+                tx,
+                revision_to_u64("deployment revision_id", revision_id)?,
+            )
+            .await?;
             // A configuration target carries permissions only when it replaces/disables Xray.
             // Pending targets may have been rebased to a newer permission revision; that frozen
             // value is the one which actually landed, not necessarily deployments.revision_id.
@@ -188,14 +206,34 @@ pub(crate) async fn activate_deployment_tx(
             .fetch_one(&mut **tx)
             .await?;
             let initial_permissions = effective_permissions.unwrap_or(revision_id);
+            let existing_permissions = sqlx::query_scalar::<_, i64>(
+                "SELECT permissions_revision_id
+                   FROM subscription_serving_state
+                  WHERE id = TRUE
+                  FOR UPDATE",
+            )
+            .fetch_optional(&mut **tx)
+            .await?;
+            let composed_permissions = effective_permissions
+                .or(existing_permissions)
+                .unwrap_or(initial_permissions);
+            crate::subscription_client::validate_revision_combination_tx(
+                tx,
+                revision_to_u64("topology revision_id", revision_id)?,
+                revision_to_u64("permissions revision_id", composed_permissions)?,
+                &client.config,
+                &format!("config deployment {deployment_id}"),
+            )
+            .await?;
             sqlx::query(
                 "INSERT INTO subscription_serving_state (
-                    id, topology_revision_id, permissions_revision_id,
+                    id, topology_revision_id, permissions_revision_id, client_snapshot_id,
                     topology_deployment_id, permissions_deployment_id, generation
-                 ) VALUES (TRUE, $2, $3, $1, $4, 1)
+                 ) VALUES (TRUE, $2, $3, $5, $1, $4, 1)
                  ON CONFLICT (id) DO UPDATE SET
                     topology_revision_id = EXCLUDED.topology_revision_id,
                     topology_deployment_id = EXCLUDED.topology_deployment_id,
+                    client_snapshot_id = EXCLUDED.client_snapshot_id,
                     permissions_revision_id = CASE
                         WHEN $4::bigint IS NULL
                         THEN subscription_serving_state.permissions_revision_id
@@ -213,12 +251,50 @@ pub(crate) async fn activate_deployment_tx(
             .bind(revision_id)
             .bind(initial_permissions)
             .bind(effective_permissions.map(|_| deployment_id))
+            .bind(i64::try_from(client.id).map_err(|_| {
+                StoreError::InvalidData(format!(
+                    "subscription client snapshot id is out of range: {}",
+                    client.id
+                ))
+            })?)
             .execute(&mut **tx)
             .await?;
         }
         "grants" => {
             // A grant-only release cannot establish topology on a fresh installation. Once a
             // configuration checkpoint exists, it advances just the permission half.
+            let serving = sqlx::query(
+                "SELECT topology_revision_id, client_snapshot_id
+                   FROM subscription_serving_state
+                  WHERE id = TRUE
+                  FOR UPDATE",
+            )
+            .fetch_optional(&mut **tx)
+            .await?;
+            let Some(serving) = serving else {
+                return Ok(());
+            };
+            let topology_revision: i64 = serving.try_get("topology_revision_id")?;
+            let client_snapshot_id = serving
+                .try_get::<Option<i64>, _>("client_snapshot_id")?
+                .ok_or_else(|| {
+                    StoreError::InvalidData(
+                        "cannot advance permissions without a client checkpoint".to_owned(),
+                    )
+                })?;
+            let client = crate::subscription_client::load_client_snapshot_tx(
+                tx,
+                revision_to_u64("client_snapshot_id", client_snapshot_id)?,
+            )
+            .await?;
+            crate::subscription_client::validate_revision_combination_tx(
+                tx,
+                revision_to_u64("topology_revision_id", topology_revision)?,
+                revision_to_u64("permissions revision_id", revision_id)?,
+                &client.config,
+                &format!("grants deployment {deployment_id}"),
+            )
+            .await?;
             sqlx::query(
                 "UPDATE subscription_serving_state
                     SET permissions_revision_id = $2,
@@ -250,11 +326,43 @@ pub(crate) async fn activate_permissions_revision_tx(
     tx: &mut Transaction<'_, Postgres>,
     revision_id: u64,
 ) -> Result<()> {
-    let revision_id = i64::try_from(revision_id).map_err(|_| {
+    let revision_id_i64 = i64::try_from(revision_id).map_err(|_| {
         StoreError::InvalidData(format!(
             "subscription permissions revision is out of range: {revision_id}"
         ))
     })?;
+    let serving = sqlx::query(
+        "SELECT topology_revision_id, client_snapshot_id
+           FROM subscription_serving_state
+          WHERE id = TRUE
+          FOR UPDATE",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(serving) = serving else {
+        return Ok(());
+    };
+    let topology_revision: i64 = serving.try_get("topology_revision_id")?;
+    let client_snapshot_id = serving
+        .try_get::<Option<i64>, _>("client_snapshot_id")?
+        .ok_or_else(|| {
+            StoreError::InvalidData(
+                "cannot advance permissions without a client checkpoint".to_owned(),
+            )
+        })?;
+    let client = crate::subscription_client::load_client_snapshot_tx(
+        tx,
+        revision_to_u64("client_snapshot_id", client_snapshot_id)?,
+    )
+    .await?;
+    crate::subscription_client::validate_revision_combination_tx(
+        tx,
+        revision_to_u64("topology_revision_id", topology_revision)?,
+        revision_id,
+        &client.config,
+        "permission job without deployment",
+    )
+    .await?;
     sqlx::query(
         "UPDATE subscription_serving_state
             SET permissions_revision_id = $1,
@@ -262,7 +370,7 @@ pub(crate) async fn activate_permissions_revision_tx(
                 updated_at = now()
           WHERE id = TRUE",
     )
-    .bind(revision_id)
+    .bind(revision_id_i64)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -317,7 +425,8 @@ async fn deployment_covers_serving_fleet_tx(
 
 /// Combine the independently released state dimensions. This is also used by automatic grant
 /// planning; keeping one function prevents subscriptions and the Agent allow-list from developing
-/// different ideas of which flow/grant belongs to the running topology.
+/// different ideas of which grant belongs to the running topology. Flow stays with `topology` and
+/// therefore changes only through a configuration release.
 pub(crate) fn permission_projection(
     mut topology: ModelSnapshot,
     permissions: &ModelSnapshot,
@@ -336,18 +445,6 @@ pub(crate) fn permission_projection(
             .map(|ingress| ingress.id.clone())
             .collect::<BTreeSet<_>>();
         if let Some(latest) = latest_apps.get(app.id.as_str()) {
-            let latest_ingresses = latest
-                .ingresses
-                .iter()
-                .map(|ingress| (ingress.id.as_str(), ingress))
-                .collect::<BTreeMap<_, _>>();
-            for ingress in &mut app.ingresses {
-                if let Some(latest_ingress) = latest_ingresses.get(ingress.id.as_str()) {
-                    ingress
-                        .wires
-                        .set_flow(latest_ingress.wires.flow().map(str::to_owned));
-                }
-            }
             app.grants = latest
                 .grants
                 .iter()

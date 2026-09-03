@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostFacts, LoadSample, NodeLoadView } from '../src/api';
+import type { LoadRange } from '../src/panes/nodes';
 import { observeAreaFill, observeTimeTick, observeValueAxis } from '../src/ui/observe-chart';
 
 const chartMock = vi.hoisted(() => ({
@@ -18,6 +20,7 @@ vi.mock('echarts/components', () => ({ GridComponent: {}, MarkLineComponent: {},
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 let LoadCard: typeof import('../src/panes/telemetry').LoadCard;
+let ThroughputPanel: typeof import('../src/panes/nodes').ThroughputPanel;
 
 beforeAll(async () => {
   vi.stubGlobal(
@@ -32,6 +35,7 @@ beforeAll(async () => {
     },
   );
   ({ LoadCard } = await import('../src/panes/telemetry'));
+  ({ ThroughputPanel } = await import('../src/panes/nodes'));
 });
 
 afterEach(cleanup);
@@ -216,6 +220,35 @@ function reportWith(change: (sample: LoadSample) => void): NodeLoadView {
   return value;
 }
 
+const halfHour: LoadRange = { seconds: 30 * 60, label: '30m', menuLabel: '近 30 分钟', heading: '30 MINUTES' };
+
+function renderThroughput(value: NodeLoadView, linked = false, range: LoadRange = halfHour) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
+  });
+  client.setQueryData(['node-load-history', value.node_id, range.seconds], value);
+  client.setQueryData(['usage-node-series', value.node_id, range.seconds], {
+    since: '',
+    month_start: '',
+    nodes: [
+      {
+        node_id: value.node_id,
+        buckets: [],
+        month_user_uplink_bytes: 0,
+        month_user_downlink_bytes: 0,
+        month_relay_uplink_bytes: 0,
+        month_relay_downlink_bytes: 0,
+        month_has_gap: false,
+      },
+    ],
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <ThroughputPanel nodeId={value.node_id} range={range} linked={linked} />
+    </QueryClientProvider>,
+  );
+}
+
 describe('deep host telemetry', () => {
   it('uses seven time marks and advances the value ceiling by one standard tick', () => {
     const timeMarks = Array.from({ length: 60 }, (_, index) => index).filter(index => observeTimeTick(index, 60));
@@ -226,10 +259,76 @@ describe('deep host telemetry', () => {
     expect(observeValueAxis(100)).toEqual({ interval: 25, max: 125 });
   });
 
-  it('uses unified, normal, light fills in the light theme', () => {
-    expect(observeAreaFill('#4a6fa5', 'light')).toBe('rgba(114,133,161,0.1)');
-    expect(observeAreaFill('#c26526', 'light')).toBe('rgba(159,129,112,0.1)');
-    expect(observeAreaFill('#6d90c4', 'dark')).toBe('rgba(124,142,168,0.18)');
+  it('fills unstacked traces with a tint of the series color, keeping the hue', () => {
+    const stops = (fill: ReturnType<typeof observeAreaFill>) =>
+      (fill as Exclude<typeof fill, string>).colorStops.map(stop => stop.color);
+
+    // 12% of Rosé Pine pine over white paper: light enough that the split lines still read through.
+    expect(stops(observeAreaFill('#286983', 'light'))).toEqual(['rgba(229,237,240,0.62)', 'rgba(229,237,240,0.341)']);
+    expect(stops(observeAreaFill('#3e8fb0', 'dark'))).toEqual(['rgba(35,45,52,0.55)', 'rgba(35,45,52,0.3025)']);
+
+    // Each trace keeps its own hue — the fill is what tells them apart under their own lines.
+    expect(stops(observeAreaFill('#b66fa2', 'light'))[0]).toBe('rgba(246,238,244,0.62)');
+  });
+
+  it('thins the fill toward the zero line, where every unstacked trace piles up', () => {
+    const gradient = observeAreaFill('#286983', 'light', { count: 3 }) as Exclude<
+      ReturnType<typeof observeAreaFill>,
+      string
+    >;
+    // Vertical, over the filled shape: offset 0 is the series peak, offset 1 the shared zero line.
+    expect(gradient).toMatchObject({ type: 'linear', x: 0, y: 0, x2: 0, y2: 1 });
+
+    const alphaAt = (offset: number) =>
+      Number(gradient.colorStops.find(stop => stop.offset === offset)!.color.match(/,([\d.]+)\)$/)![1]);
+    // The baseline is lighter than the band under the line, but it is still a fill — not nothing.
+    expect(alphaAt(1)).toBeCloseTo(alphaAt(0) * 0.55, 4);
+    expect(alphaAt(1)).toBeGreaterThan(0);
+
+    // Both stops carry the same tinted color; only the alpha moves.
+    const rgbOf = (color: string) => color.slice(0, color.lastIndexOf(','));
+    expect(rgbOf(gradient.colorStops[1].color)).toBe(rgbOf(gradient.colorStops[0].color));
+  });
+
+  it('spreads the ink budget so a crowded chart does not repaint its floor', () => {
+    const topAlpha = (count: number) => {
+      const fill = observeAreaFill('#286983', 'light', { count }) as Exclude<
+        ReturnType<typeof observeAreaFill>,
+        string
+      >;
+      return Number(fill.colorStops[0].color.match(/,([\d.]+)\)$/)![1]);
+    };
+    expect(topAlpha(1)).toBeCloseTo(0.62, 3);
+    expect(topAlpha(3)).toBeLessThan(topAlpha(1));
+    expect(topAlpha(16)).toBeLessThan(topAlpha(3));
+    expect(topAlpha(256)).toBe(0.1);
+  });
+
+  it('starts the time axis on the first sample, not on the minute below it', () => {
+    // Samples land at :32 past the minute. Flooring the axis to 12:34:00 used to open 32 seconds
+    // of blank between the y axis and the first point.
+    const value = report();
+    const firstEnd = 3632; // 01:00:32
+    value.series = [0, 1, 2, 3].map(step => {
+      const next = sample();
+      next.window_start_unix_secs = firstEnd + step * 30 - 30;
+      next.window_end_unix_secs = firstEnd + step * 30;
+      return next;
+    });
+    const view = render(<LoadCard report={value} />);
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+
+    const chart = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === '用户态'),
+    )?.[0];
+    expect(chart.xAxis.min).toBe(firstEnd * 1000);
+    expect(chart.xAxis.min % 60_000).not.toBe(0);
+    expect(chart.xAxis.max).toBe((firstEnd + 90) * 1000);
+  });
+
+  it('keeps stacked bands flat and at full hue, since they never overlap', () => {
+    expect(observeAreaFill('#286983', 'light', { stacked: true })).toBe('rgba(40,105,131,0.28)');
+    expect(observeAreaFill('#3e8fb0', 'dark', { stacked: true })).toBe('rgba(62,143,176,0.34)');
   });
 
   it('never exposes the removed LOAD placeholder title when telemetry has no samples', () => {
@@ -295,16 +394,16 @@ describe('deep host telemetry', () => {
     expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
   });
 
-  it('keeps the network throughput legend in a separate footer below its chart', () => {
+  it('keeps the network throughput legend and metadata in the dedicated throughput panel', () => {
     const value = reportWith(sample => {
       sample.nic_rx_drop = 15;
     });
-    const view = render(<LoadCard report={value} />);
+    const view = renderThroughput(value);
     const legend = view.getByLabelText('网卡流量图例');
     const header = view.getByText('网卡流量').parentElement;
 
     expect(legend.tagName).toBe('FOOTER');
-    expect(legend.previousElementSibling?.classList.contains('ndtp-ec')).toBe(true);
+    expect(view.container.querySelector('.ndtp-ec')).toBeTruthy();
     expect(header?.textContent).toContain('接收丢弃 15 · eth0 · MTU 1500');
     expect(header?.textContent).not.toContain('上报');
     expect(legend.textContent).not.toContain('接收丢弃');
@@ -314,22 +413,26 @@ describe('deep host telemetry', () => {
       ([option]) =>
         option.series?.length === 2 && option.series[0]?.name === '接收' && option.series[1]?.name === '发送',
     )?.[0];
-    expect(chart.color).toEqual(['#6d90c4', '#c88a5e']);
+    expect(chart.color).toEqual(['#3e8fb0', '#e99cd3']);
     expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
     expect(chart.xAxis.splitLine.show).toBe(true);
     expect(chart.yAxis.splitLine.show).toBe(true);
     for (const line of chart.series) {
       expect(line.smooth).toBe(false);
-      expect(line.areaStyle.color).toMatch(/^rgba\(\d+,\d+,\d+,0\.18\)$/);
+      expect(line.areaStyle.color.type).toBe('linear');
+      expect(line.areaStyle.color.colorStops[0].color).toMatch(/^rgba\(\d+,\d+,\d+,0\.3889\)$/);
+      expect(line.areaStyle.color.colorStops[1].color).toMatch(/^rgba\(\d+,\d+,\d+,0\.2139\)$/);
       expect(line.areaStyle.opacity).toBe(1);
     }
     expect(chartMock.connect).not.toHaveBeenCalled();
   });
 
   it('connects throughput and expanded history charts only after linking is enabled', () => {
-    const view = render(<LoadCard report={report()} linked />);
+    const throughput = renderThroughput(report(), true);
 
     expect(chartMock.connect).toHaveBeenCalledWith('nd-tp-n1');
+    throughput.unmount();
+    const view = render(<LoadCard report={report()} linked />);
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
     expect(chartMock.connect).toHaveBeenCalledWith('nd-cpu-history-n1');
   });
@@ -385,7 +488,7 @@ describe('deep host telemetry', () => {
       option.series?.some((line: { name: string }) => line.name === '用户态'),
     )?.[0];
     expect(chart).toBeTruthy();
-    expect(chart.color.slice(0, 6)).toEqual(['#6d90c4', '#c88a5e', '#77a67d', '#c47b83', '#9789bd', '#bda65f']);
+    expect(chart.color.slice(0, 6)).toEqual(['#3e8fb0', '#e99cd3', '#8bbe95', '#7da1e3', '#ea9a97', '#9ccfd8']);
     expect(chart.xAxis.splitLine.show).toBe(true);
     expect(chart.yAxis.splitLine.show).toBe(true);
     expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
@@ -395,16 +498,22 @@ describe('deep host telemetry', () => {
 
     for (const line of chart.series) {
       expect(line.smooth).toBe(false);
-      expect(line.areaStyle.opacity).toBe(1);
-      expect(line.areaStyle.color).toMatch(/^rgba\(\d+,\d+,\d+,0\.18\)$/);
       expect(line.blendMode).toBeUndefined();
     }
-    expect(chart.series[0].stack).toBe('cpu');
-    expect(chart.series[0].areaStyle.color).toBe('rgba(124,142,168,0.18)');
+    // 五段成分堆叠，互不重叠，取平涂；「窗口峰值」是画在成分之上的包络，只画线不填色。
+    for (const line of chart.series.slice(0, 5)) {
+      expect(line.stack).toBe('cpu');
+      expect(line.areaStyle.opacity).toBe(1);
+      expect(line.areaStyle.color).toMatch(/^rgba\(\d+,\d+,\d+,0\.34\)$/);
+    }
+    expect(chart.series[0].areaStyle.color).toBe('rgba(62,143,176,0.34)');
+    const envelope = chart.series.find((line: { name: string }) => line.name === '窗口峰值');
+    expect(envelope.stack).toBeUndefined();
+    expect(envelope.areaStyle).toBeUndefined();
 
     const tooltip = chart.tooltip.formatter([
-      { seriesName: '低值', color: '#111', value: 1, dataIndex: 0 },
-      { seriesName: '高值', color: '#222', value: 2, dataIndex: 0 },
+      { seriesName: '低值', color: '#111', value: [130_000, 1], dataIndex: 0 },
+      { seriesName: '高值', color: '#222', value: [130_000, 2], dataIndex: 0 },
     ]);
     expect(tooltip.indexOf('高值')).toBeLessThan(tooltip.indexOf('低值'));
   });
@@ -433,16 +542,15 @@ describe('deep host telemetry', () => {
     const view = render(<LoadCard report={value} />);
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
     expect(view.queryByText(/60 \/ 60 个 30 秒窗口/)).toBeNull();
-    const pressure = chartMock.setOption.mock.calls.find(
-      ([option]) =>
-        option.xAxis?.data?.length === 60 &&
-        option.series?.some((line: { name: string }) => line.name === 'CPU PSI some'),
+    const pressure = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === 'CPU PSI some'),
     )?.[0];
     expect(pressure).toBeTruthy();
+    expect(pressure.xAxis.type).toBe('value');
     const cpuPsi = pressure.series.find((line: { name: string }) => line.name === 'CPU PSI some');
     expect(cpuPsi.data).toHaveLength(60);
-    expect(cpuPsi.data[8]).toBe(11.084);
-    expect(cpuPsi.data[24]).toBeNull();
+    expect(cpuPsi.data[8]).toEqual([(130 + 8 * 30) * 1000, 11.084]);
+    expect(cpuPsi.data[24]).toEqual([(130 + 24 * 30) * 1000, null]);
   });
 
   it('shows extreme values as data without producing an automatic diagnosis', () => {
@@ -464,16 +572,26 @@ describe('deep host telemetry', () => {
   });
 
   it('keeps the full 24-hour slot count in the network chart', () => {
-    const view = render(<LoadCard report={report()} historyLabel="24 HOURS" historyWindows={2_880} />);
+    const value = report();
+    const view = render(<LoadCard report={value} historyLabel="24 HOURS" historyWindows={2_880} />);
 
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
     expect(view.getByRole('region', { name: 'CPU 24 HOURS 数值' })).toBeTruthy();
     expect(view.queryByText('CPU · 24 HOURS')).toBeNull();
     expect(view.queryByText(/1 \/ 2,880 个 30 秒窗口/)).toBeNull();
+    view.unmount();
+    renderThroughput(value, false, {
+      seconds: 24 * 60 * 60,
+      label: '24h',
+      menuLabel: '近 24 小时',
+      heading: '24 HOURS',
+    });
     const network = chartMock.setOption.mock.calls.find(
       ([option]) =>
-        option.xAxis?.data?.length === 2_880 && option.series?.some((line: { name: string }) => line.name === '接收'),
+        option.series?.[0]?.data?.length === 2_880 &&
+        option.series?.some((line: { name: string }) => line.name === '接收'),
     )?.[0];
     expect(network).toBeTruthy();
+    expect(network.xAxis.type).toBe('value');
   });
 });

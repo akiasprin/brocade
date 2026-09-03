@@ -1,4 +1,4 @@
-# 一个镜像跑所有节点：xray + WireGuard 用户态工具 + 基本网络工具。
+# 一个镜像跑所有节点：WireGuard 用户态工具 + 基本网络工具。
 #
 # 用 Ubuntu 24.04 而不是 Alpine，这是 preview 这条路独有的约束：preview 把宿主机
 # `cargo build -p brocade-agent` 的产物直接发进容器，那份是动态链接 glibc 的
@@ -21,20 +21,15 @@ RUN apt-get update \
       iputils-ping \
  && rm -rf /var/lib/apt/lists/*
 
-ARG XRAY_VER=v26.3.27
-RUN wget -qO /tmp/x.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip" \
- && mkdir -p /opt/xray \
- && unzip -o -q /tmp/x.zip -d /opt/xray xray geoip.dat geosite.dat \
- && chmod +x /opt/xray/xray && ln -s /opt/xray/xray /usr/local/bin/xray \
- && rm /tmp/x.zip
-ENV XRAY_LOCATION_ASSET=/opt/xray
+# Xray 不烤进镜像。preview 也运行 Console 返回的 install.sh，由 /enroll/dist 选择并校验
+# Console 内嵌的 Brocade Xray；这样实验节点和真实节点不会各自走一套二进制来源。
 
 # phantun：伪 TCP 那条路的两个二进制。
 #
 # agent 找的是 `/usr/local/bin/phantun-server` / `-client`（连字符，见 phantun.rs
 # 的 ensure_phantun_binary），找不到就退而求其次用控制面下发的分发源；两条都没有
 # 就报「不在这台机器上，控制面也没配 phantun 分发源」，那台机器的发布直接 failed。
-# preview 这条路没有分发源可配，所以跟 xray 一样把二进制烤进镜像。
+# preview 这条路目前没有 phantun 分发源可配，所以仍把这两个二进制烤进镜像。
 #
 # 官方产物叫 `phantun_server` / `phantun_client`（下划线），跟 agent 要的名字差一个
 # 字符，所以装的时候要改名——照搬解压结果的话，agent 照样找不到。

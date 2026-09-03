@@ -4,17 +4,22 @@ use axum::{
     Router,
 };
 use brocade_console::http::{
-    admin_router, agent_router, agent_router_with_origin, merged_router, with_console_static,
+    admin_router, admin_router_with_wakes_and_realtime, agent_router, agent_router_with_origin,
+    agent_router_with_origin_and_realtime, merged_router, with_console_static, EMBEDDED_XRAYS,
 };
+use brocade_console::realtime::{RealtimeBroadcast, RealtimeService};
 use brocade_core::model::{ExternalOutboundProtocol, ExternalOutboundSecurity};
 use brocade_store::{
-    AdminContext, AdminInitRequest, IssuedAdminToken, IssuedNodeToken, ModelOp, PgStore,
+    AdminContext, AdminInitRequest, CreateChainRequest, IssuedAdminToken, IssuedNodeToken, ModelOp,
+    PgStore, PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeTarget,
     RegisterWarpBindingRequest, UpsertExternalOutboundRequest, ENROLLMENT_TOKEN_PREFIX,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tower::ServiceExt;
 
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
@@ -56,25 +61,19 @@ impl TestPg {
 }
 
 async fn seed_subscription_serving(db: &TestPg) -> u64 {
-    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
-    let revision = snapshot.revision;
-    sqlx::query(
-        "INSERT INTO model_snapshots (revision_id, snapshot)
-         VALUES ($1, $2)
-         ON CONFLICT (revision_id) DO UPDATE SET snapshot = EXCLUDED.snapshot",
-    )
-    .bind(i64::try_from(revision).unwrap())
-    .bind(serde_json::to_value(snapshot).unwrap())
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let revision = refresh_current_model_snapshot(db).await;
     sqlx::query(
         "INSERT INTO subscription_serving_state (
-             id, topology_revision_id, permissions_revision_id, generation
-         ) VALUES (TRUE, $1, $1, 1)
+             id, topology_revision_id, permissions_revision_id, client_snapshot_id, generation
+         ) VALUES (
+             TRUE, $1, $1,
+             (SELECT head_snapshot_id FROM subscription_client_state WHERE id = TRUE),
+             1
+         )
          ON CONFLICT (id) DO UPDATE SET
              topology_revision_id = EXCLUDED.topology_revision_id,
              permissions_revision_id = EXCLUDED.permissions_revision_id,
+             client_snapshot_id = EXCLUDED.client_snapshot_id,
              topology_deployment_id = NULL,
              permissions_deployment_id = NULL,
              generation = subscription_serving_state.generation + 1,
@@ -87,32 +86,28 @@ async fn seed_subscription_serving(db: &TestPg) -> u64 {
     revision
 }
 
-async fn commit_direct_fixture_revision(db: &TestPg, note: &str) -> u64 {
-    let revision: i64 = sqlx::query_scalar(
-        "INSERT INTO revisions (author, note) VALUES ('test:fixture', $1) RETURNING id",
+/// Direct SQL keeps these HTTP fixtures compact, but agent work-list routes deliberately read the
+/// immutable revision snapshot. Refresh that boundary explicitly after a fixture mutates model
+/// tables so the test exercises the same coherent view as production commits.
+async fn refresh_current_model_snapshot(db: &TestPg) -> u64 {
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let revision = snapshot.revision;
+    sqlx::query(
+        "INSERT INTO model_snapshots (revision_id, snapshot)
+         VALUES ($1, $2)
+         ON CONFLICT (revision_id) DO UPDATE SET snapshot = EXCLUDED.snapshot",
     )
-    .bind(note)
-    .fetch_one(db.pool())
+    .bind(i64::try_from(revision).unwrap())
+    .bind(serde_json::to_value(snapshot).unwrap())
+    .execute(db.pool())
     .await
     .unwrap();
-    sqlx::query("UPDATE control_state SET current_revision = $1 WHERE id = TRUE")
-        .bind(revision)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
-    sqlx::query("INSERT INTO model_snapshots (revision_id, snapshot) VALUES ($1, $2)")
-        .bind(revision)
-        .bind(serde_json::to_value(snapshot).unwrap())
-        .execute(db.pool())
-        .await
-        .unwrap();
-    u64::try_from(revision).unwrap()
+    revision
 }
 
-async fn admin_app(db: &TestPg) -> (Router, String) {
+async fn admin_token(db: &TestPg) -> String {
     let initialized = db.store.admin_auth_state().await.unwrap().initialized;
-    let token = if initialized {
+    if initialized {
         db.store
             .issue_admin_token(
                 &brocade_store::AdminContext::system_admin("test-admin"),
@@ -140,8 +135,11 @@ async fn admin_app(db: &TestPg) -> (Router, String) {
             .await
             .unwrap()
             .token
-    };
-    (admin_router(db.store.clone()), token)
+    }
+}
+
+async fn admin_app(db: &TestPg) -> (Router, String) {
+    (admin_router(db.store.clone()), admin_token(db).await)
 }
 
 #[tokio::test]
@@ -355,6 +353,39 @@ async fn split_agent_router_keeps_its_own_origin_and_refuses_console_paths() {
         dist["agent_bin_url_aarch64"],
         "http://10.0.0.7:9091/brocade-agent/aarch64"
     );
+    assert_eq!(
+        dist["xray_bin_url_aarch64"],
+        "http://10.0.0.7:9091/brocade-xray/aarch64"
+    );
+
+    let xray = agent
+        .clone()
+        .oneshot(
+            Request::get("/brocade-xray/aarch64")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(xray.status(), StatusCode::OK);
+    let xray = to_bytes(xray.into_body(), usize::MAX).await.unwrap();
+    let embedded = EMBEDDED_XRAYS
+        .iter()
+        .find(|(arch, ..)| *arch == "aarch64")
+        .unwrap()
+        .1;
+    assert_eq!(xray.as_ref(), embedded);
+
+    let unknown = agent
+        .clone()
+        .oneshot(
+            Request::get("/brocade-xray/riscv64")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
     // Split off, the agent face is exactly the agent face — and with no SPA fallback either, so an
     // unknown path is a plain 404 rather than the console's index.html.
@@ -378,6 +409,233 @@ async fn split_agent_router_keeps_its_own_origin_and_refuses_console_paths() {
         .await
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn realtime_websocket_authenticates_leases_and_forwards_a_sample() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let token = db.store.issue_node_token("n1").await.unwrap().token;
+    let service = RealtimeService::new(Default::default());
+    let app = agent_router_with_origin_and_realtime(
+        db.store.clone(),
+        "http://127.0.0.1:8080".to_owned(),
+        service.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut request = format!("ws://{address}/agent/v1/realtime")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let first = socket.next().await.unwrap().unwrap();
+    let first = serde_json::from_str::<brocade_deployment::protocol::AgentRealtimeCommand>(
+        first.into_text().unwrap().as_str(),
+    )
+    .unwrap();
+    assert_eq!(
+        first,
+        brocade_deployment::protocol::AgentRealtimeCommand::Stop
+    );
+
+    let mut subscription = service.subscribe(["n1".to_owned()]).await;
+    let start = socket.next().await.unwrap().unwrap();
+    let start = serde_json::from_str::<brocade_deployment::protocol::AgentRealtimeCommand>(
+        start.into_text().unwrap().as_str(),
+    )
+    .unwrap();
+    assert_eq!(
+        start,
+        brocade_deployment::protocol::AgentRealtimeCommand::Start {
+            interval_millis: 1000
+        }
+    );
+
+    let sample = brocade_deployment::protocol::AgentRealtimeSample {
+        sequence: 1,
+        sampled_at_unix_millis: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64,
+        elapsed_millis: 1000,
+        interface: "eth0".to_owned(),
+        rx_bytes_per_sec: 12_345,
+        tx_bytes_per_sec: 678,
+        has_gap: false,
+    };
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&sample).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let RealtimeBroadcast::Sample(event) = subscription.events.recv().await.unwrap() {
+                break event;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(forwarded.node_id, "n1");
+    assert_eq!(forwarded.sample.rx_bytes_per_sec, 12_345);
+    assert!(
+        forwarded.sample.has_gap,
+        "first connection sample marks a gap"
+    );
+
+    socket.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn realtime_settings_and_sse_create_one_bounded_node_lease() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let token = admin_token(&db).await;
+    let service = RealtimeService::new(Default::default());
+    let mut agent = service.register_agent("n1".to_owned()).await;
+    assert_eq!(
+        *agent.commands.borrow(),
+        brocade_deployment::protocol::AgentRealtimeCommand::Stop
+    );
+    let app = admin_router_with_wakes_and_realtime(
+        db.store.clone(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        brocade_console::geoip::GeoIpLookup::default(),
+        service,
+    );
+
+    let settings = app
+        .clone()
+        .oneshot(
+            Request::get("/realtime/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(settings).await,
+        json!({ "enabled": true, "interval_secs": 1 })
+    );
+
+    let invalid = app
+        .clone()
+        .oneshot(
+            Request::put("/realtime/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "enabled": true, "interval_secs": 3 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::put("/realtime/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "enabled": true, "interval_secs": 2 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(updated).await,
+        json!({ "enabled": true, "interval_secs": 2 })
+    );
+    assert_eq!(
+        *agent.commands.borrow(),
+        brocade_deployment::protocol::AgentRealtimeCommand::Stop,
+        "an idle websocket stays idle when only the global interval changes"
+    );
+
+    let events = app
+        .clone()
+        .oneshot(
+            Request::get("/realtime/nodes/n1/events")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.status(), StatusCode::OK);
+    assert_eq!(events.headers()["content-type"], "text/event-stream");
+    assert_eq!(
+        events.headers()["cache-control"],
+        "no-store, no-cache, max-age=0"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), agent.commands.changed())
+        .await
+        .expect("SSE subscription should lease the node")
+        .unwrap();
+    assert_eq!(
+        *agent.commands.borrow(),
+        brocade_deployment::protocol::AgentRealtimeCommand::Start {
+            interval_millis: 2000
+        }
+    );
+
+    let mut body = events.into_body().into_data_stream();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+        .await
+        .expect("SSE should immediately send its snapshot")
+        .expect("SSE body should contain one frame")
+        .unwrap();
+    let first = std::str::from_utf8(&first).unwrap();
+    assert!(first.contains("event: snapshot"), "{first}");
+    assert!(first.contains("\"interval_secs\":2"), "{first}");
+    assert!(first.contains("\"node_id\":\"n1\""), "{first}");
+    drop(body);
+
+    sqlx::query("UPDATE node_lifecycle_state SET phase = 'retired' WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let retired = app
+        .oneshot(
+            Request::get("/realtime/nodes/n1/events")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retired.status(),
+        StatusCode::CONFLICT,
+        "retired nodes retain history but may not create new live sampling leases"
+    );
 }
 
 /// One listener carries both faces, which is what a deployment gets unless it asks for the split.
@@ -429,6 +687,10 @@ async fn merged_router_serves_both_faces_on_one_listener() {
     assert_eq!(
         dist["agent_bin_url_x86_64"],
         "http://127.0.0.1:8080/brocade-agent/x86_64"
+    );
+    assert_eq!(
+        dist["xray_bin_url_x86_64"],
+        "http://127.0.0.1:8080/brocade-xray/x86_64"
     );
 
     insert_node(db.pool()).await;
@@ -671,13 +933,39 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
     assert!(!body.contains("server: n1.example.net"));
     assert!(body.contains("server: 2001:db8::10"));
 
-    // Every GET renders afresh, but committed head data is not serving data. Until a release
-    // succeeds, the old immutable snapshot remains authoritative.
-    sqlx::query("UPDATE chains SET name = 'Live Rename' WHERE id = 'c-bacemu'")
-        .execute(db.pool())
+    // The rename crosses the real HTTP commit boundary and advances only client config.
+    let (admin, token) = admin_app(&db).await;
+    let committed = admin
+        .clone()
+        .oneshot(
+            Request::post("/model/apply")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "ops": [{
+                            "op": "upsert_chain",
+                            "app_id": "app-main",
+                            "chain": CreateChainRequest {
+                                id: "c-bacemu".to_owned(),
+                                tenant_id: "platform.acme".to_owned(),
+                                name: "Live Rename".to_owned(),
+                                subscription_country: None,
+                                note: None,
+                            }
+                        }],
+                        "note": "rename live chain"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let renamed_revision = commit_direct_fixture_revision(&db, "rename live chain").await;
+    assert_eq!(committed.status(), StatusCode::OK);
+    let committed = response_json(committed).await;
+    let renamed_revision = committed["revision_id"].as_u64().unwrap();
+    assert_eq!(committed["client_config"]["status"], "activated");
     let response = agent
         .clone()
         .oneshot(
@@ -696,8 +984,8 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("name: \"Main Chain\""));
-    assert!(!body.contains("name: \"Live Rename\""));
+    assert!(!body.contains("name: \"Main Chain\""));
+    assert!(body.contains("name: \"Live Rename\""));
 
     let deployment_id: i64 = sqlx::query_scalar(
         "INSERT INTO deployments (revision_id, status, active, kind, note)
@@ -738,19 +1026,6 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
     .execute(db.pool())
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE subscription_serving_state
-            SET topology_revision_id = $1,
-                topology_deployment_id = $2,
-                generation = generation + 1,
-                updated_at = now()
-          WHERE id = TRUE",
-    )
-    .bind(i64::try_from(renamed_revision).unwrap())
-    .bind(deployment_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
     let response = agent
         .oneshot(
             Request::get(format!("/sub/v1/{uuid}/clash.yaml"))
@@ -770,7 +1045,6 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
     .unwrap();
     assert!(body.contains("name: \"Live Rename\""));
 
-    let (admin, token) = admin_app(&db).await;
     let response = admin
         .clone()
         .oneshot(
@@ -1694,8 +1968,12 @@ async fn http_agent_link_probe_records_and_admin_reads_the_per_node_view() {
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs() as i64;
     let body = json!({
-        "probed_at_unix_secs": 1_800_000_000_i64,
+        "probed_at_unix_secs": now,
         "links": [{
             "peer_node_id": "n2",
             "endpoint_host": "n2.example.net",
@@ -1788,6 +2066,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     };
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
+    refresh_current_model_snapshot(&db).await;
 
     let (admin, admin_token) = admin_app(&db).await;
     let agent = agent_router(db.store.clone());
@@ -1856,8 +2135,13 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     // (2) Report a "connected but exited in the wrong place". That outcome is the whole reason this
     // feature exists, so it gets its own pass: it must be recorded as neither success nor
     // failure.
+    let probe_base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs() as i64
+        - 120;
     let body = json!({
-        "probed_at_unix_secs": 1_800_000_000_i64,
+        "probed_at_unix_secs": probe_base,
         "chains": [{
             "app_id": "app-main",
             "chain_id": "c-bacemu",
@@ -1933,7 +2217,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     // (4) A failure carries no timing: the timeout value says nothing about the chain's speed and
     // would be drawn into the trend line.
     let broken = json!({
-        "probed_at_unix_secs": 1_800_000_060_i64,
+        "probed_at_unix_secs": probe_base + 60,
         "chains": [{
             "app_id": "app-main",
             "chain_id": "c-bacemu",
@@ -1987,7 +2271,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     // (5) Rows whose chain is absent from the model are dropped rather than failing the batch —
     // right after a chain is deleted the agent's work list is still stale.
     let stale = json!({
-        "probed_at_unix_secs": 1_800_000_120_i64,
+        "probed_at_unix_secs": probe_base + 120,
         "chains": [{
             "app_id": "app-main", "chain_id": "c-gone", "status": "ok", "ttfb_ms": 10,
             "exit_ip": null, "exit_loc": null, "exit_verdict": "unknown", "detail": null
@@ -4430,6 +4714,94 @@ async fn http_operator_password_lifecycle() {
     login_cookie(&app, "editor-1", "chosen-by-me").await;
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    db.store
+        .update_ping_probe_settings(
+            &AdminContext::system_admin("fixture"),
+            PingProbeSettings {
+                targets: vec![PingProbeTarget {
+                    name: "TCP".to_owned(),
+                    address: "tcp://192.0.2.1:443".to_owned(),
+                }],
+                interval_secs: 60,
+                timeout_ms: 420,
+            },
+        )
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    db.store
+        .record_ping_probe(
+            "n1",
+            PingProbeReportRequest {
+                probed_at_unix_secs: now,
+                samples: vec![PingProbeSample {
+                    target: "tcp://192.0.2.1:443".to_owned(),
+                    attempted: true,
+                    latency_us: Some(37_250),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+    let (app, admin_token) = admin_app(&db).await;
+    let created = post_json(
+        &app,
+        &admin_token,
+        "/admin/operators",
+        json!({
+            "id": "public",
+            "display_name": "Public",
+            "role": "readonly",
+            "tenant_scope": "platform.acme"
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED);
+    let cookie = login_cookie(&app, "public", "").await;
+
+    let list = get_json_with_cookie(&app, "/ping-probe/nodes?window_secs=3600", &cookie).await;
+    assert_eq!(list.0, StatusCode::OK);
+    assert_eq!(list.1["nodes"][0]["node_id"], "n1");
+    assert_eq!(
+        list.1["nodes"][0]["targets"][0]["samples"][0]["latency_us"],
+        37_250
+    );
+    let list_address = list.1["nodes"][0]["targets"][0]["address"]
+        .as_str()
+        .unwrap();
+    assert!(
+        list_address.starts_with("tcp://"),
+        "probe kind was lost: {list_address}"
+    );
+    assert!(
+        !list_address.contains("192.0.2.1"),
+        "probe address leaked: {list_address}"
+    );
+
+    let detail = get_json_with_cookie(&app, "/ping-probe/nodes/n1?window_secs=3600", &cookie).await;
+    assert_eq!(detail.0, StatusCode::OK);
+    assert_eq!(detail.1["targets"][0]["samples"][0]["latency_us"], 37_250);
+    assert!(detail.1["targets"][0]["address"]
+        .as_str()
+        .unwrap()
+        .starts_with("tcp://"));
+
+    let settings = get_json_with_cookie(&app, "/ping-probe/settings", &cookie).await;
+    assert_eq!(settings.0, StatusCode::FORBIDDEN);
+}
+
 /// Sign in once and extract the session cookie for the requests that follow.
 async fn login_cookie(app: &Router, operator_id: &str, password: &str) -> String {
     let response = app
@@ -4458,6 +4830,23 @@ async fn login_cookie(app: &Router, operator_id: &str, password: &str) -> String
         .to_str()
         .unwrap();
     set_cookie.split(';').next().unwrap().to_owned()
+}
+
+async fn get_json_with_cookie(app: &Router, uri: &str, cookie: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response_json(response).await)
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -4872,14 +5261,21 @@ async fn insert_usage_model(pool: &PgPool) {
         "INSERT INTO ingresses (
             id, app_id, chain_id, node_id, bind, port, front_id, transport_kind,
             reality_private_key, reality_public_key, reality_short_ids,
-            reality_dest, reality_server_names, reality_fingerprint, reality_flow,
+            reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode
          ) VALUES (
             'i-dafino', 'app-main', 'c-bacemu', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
-            'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'chrome', 'xtls-rprx-vision',
+            'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision',
             'custom-site'
          )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingress_client_settings (ingress_id, reality_fingerprint)
+         VALUES ('i-dafino', 'chrome')",
     )
     .execute(pool)
     .await

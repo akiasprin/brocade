@@ -1,5 +1,6 @@
 /target/
 crates/*/target/
+/node_modules/
 frontend/dist/
 frontend/node_modules/
 __pycache__/
@@ -9,3 +10,4 @@ __pycache__/
 /.tools/
 /.claude/worktrees/
 /mockups/
+.gstack/

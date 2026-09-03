@@ -8,7 +8,7 @@ use crate::{
     model::{
         Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsTransport,
         ExternalOutboundProtocol, ExternalOutboundSecurity, GeodataSettings, HopPool, HopWire,
-        Hysteria2, Network, RealityClientPolicy,
+        Hysteria2, Network, RealityClientPolicy, XhttpTuning,
     },
     physical::node::{
         IngressProtocol, IngressSecurity, NodePlan, XrayClientPlan, XrayEgressDnsPlan,
@@ -261,6 +261,8 @@ pub enum XrayStream {
         /// server accepting every upload shape; a value makes it a filter, which is why the
         /// default resolves to nothing here rather than to a named mode.
         mode: Option<&'static str>,
+        /// Listener-side request/response padding.
+        tuning: Option<XhttpTuning>,
     },
 }
 
@@ -1054,6 +1056,7 @@ fn ingress_inbounds(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> 
                         stream: XrayStream::Xhttp {
                             path: xhttp.path,
                             mode: xhttp.mode.as_str(),
+                            tuning: xhttp.tuning,
                         },
                     },
                 ];
@@ -1119,6 +1122,7 @@ fn ingress_inbound(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> X
                 Some(xhttp) => XrayStream::Xhttp {
                     path: xhttp.path.clone(),
                     mode: xhttp.mode.as_str(),
+                    tuning: xhttp.tuning.clone(),
                 },
             },
         },
@@ -1271,10 +1275,12 @@ fn forward_outbound(
 /// `HopPool` reduced to what the artifact carries.
 ///
 /// `Pool` is `concurrency: 1` rather than a separate mechanism: xray reuses an idle worker
-/// before creating one, and at a limit of one stream per worker that reuse is a connection
-/// pool, so no stream waits behind another and a finished stream leaves its connection
-/// available for the next. Measured on 26.4.25: 20 sequential streams used one connection, and
-/// 8 concurrent streams used eight.
+/// before creating one, and at a limit of one stream per worker a finished stream leaves its
+/// connection available for the next. Measured on 26.4.25: 20 sequential streams used one
+/// connection, and 8 concurrent streams used eight. The worker is not probed before reuse, so
+/// this mapping is retained for authored-model compatibility but is no longer the console's
+/// default; silently changing an existing `Pool` to no mux or concurrency 2 would change its
+/// requested semantics.
 fn mux_of(pool: HopPool) -> Option<XrayMux> {
     match pool {
         HopPool::None => None,

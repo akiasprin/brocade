@@ -68,7 +68,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:brc/c-brc-jp"
     },
@@ -88,7 +91,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:brc/c-brc-smart"
     },
@@ -108,7 +114,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:lin/c-lin-au"
     },
@@ -128,7 +137,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:hop:lin/c-lin-us"
     }
@@ -155,7 +167,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:brc/c-brc-jp>au-01"
     },
@@ -177,7 +192,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:brc/c-brc-jp>us-01"
     },
@@ -199,7 +217,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:brc/c-brc-smart>au-01"
     },
@@ -221,7 +242,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:brc/c-brc-smart>us-01"
     },
@@ -243,7 +267,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:lin/c-lin-au>au-01"
     },
@@ -269,7 +296,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:lin/c-lin-us>us-01"
     },

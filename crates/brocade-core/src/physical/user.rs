@@ -156,7 +156,6 @@ pub struct UserDownloadPlan {
     pub server: String,
     pub port: u16,
     pub server_name: String,
-    pub fingerprint: String,
     pub http_host: Option<String>,
     pub mux: Option<u16>,
 }
@@ -183,7 +182,6 @@ pub struct UserTlsPlan {
     /// certificate against. Wrong, and the client refuses the connection itself — unlike
     /// REALITY's borrowed name, which is only ever a label.
     pub server_name: String,
-    pub fingerprint: String,
     pub flow: Option<String>,
 }
 
@@ -221,12 +219,11 @@ pub struct UserExternalProxyPlan {
 /// One entry per wire: a client cannot speak both at once, so an ingress serving TCP and QUIC
 /// gives a person two lines to choose between rather than one line describing two things.
 ///
-/// The suffix disambiguates the names, and only when there is something to disambiguate — two
-/// entries under one chain name would collide, and mihomo refuses a proxy list with duplicate
-/// names outright. A single-wire ingress keeps the bare chain name it always had.
+/// VLESS is the default wire and keeps the bare chain name. The Hysteria2 wire is identified by
+/// its QUIC transport, which makes mixed-wire entries distinct without repeating the full protocol
+/// name in every subscription.
 fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
     let mut wires = Vec::new();
-    let both = ingress.wires.has_tcp() && ingress.wires.has_udp();
 
     if ingress.wires.vless().is_some() {
         let vless = match ingress.wires.reality() {
@@ -246,7 +243,6 @@ fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
                 // Empty only where the machine holds no certificate, which the compiler refuses
                 // outright (`ingress.tls-no-certificate`) rather than letting reach a subscription.
                 server_name: ingress.certificate_name.clone().unwrap_or_default(),
-                fingerprint: ingress.wires.fingerprint().to_owned(),
                 flow: ingress.wires.flow().map(str::to_owned),
             }),
         };
@@ -259,7 +255,7 @@ fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
                 server_name: ingress.certificate_name.clone().unwrap_or_default(),
                 settings: settings.clone(),
             }),
-            if both { "（QUIC）" } else { "" },
+            " | QUIC",
         ));
     }
 
@@ -330,7 +326,9 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                     entries.push(UserSubscriptionEntryPlan {
                         grant_id: grant.id.clone(),
                         ingress_id: ingress.id.clone(),
-                        name: format!("{}{}{}", chain_name, server.name_suffix, wire_suffix),
+                        // Protocol precedes address family so the optional v6 marker is always
+                        // the final segment: `name | QUIC | v6`.
+                        name: format!("{}{}{}", chain_name, wire_suffix, server.name_suffix),
                         server: server.address.clone(),
                         family: server.family,
                         // The QUIC wire announces its own port even where a projection set one.
@@ -354,7 +352,6 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                                 // machine's certificate. Validation prevents the empty case from
                                 // being published.
                                 server_name: ingress.certificate_name.clone().unwrap_or_default(),
-                                fingerprint: ingress.wires.fingerprint().to_owned(),
                                 http_host: download.http_host,
                                 mux: download.mux,
                             }
@@ -422,7 +419,7 @@ fn subscription_chain_name(name: &str, country: Option<&str>) -> String {
             char::from_u32(0x1f1e6 + u32::from(byte - b'A')).expect("valid regional indicator"),
         );
     }
-    format!("{flag} {name}")
+    format!("{flag}{name}")
 }
 
 struct SubscriptionServer {
@@ -458,7 +455,7 @@ fn subscription_servers(node: &AppNode, ingress: &Ingress) -> Vec<SubscriptionSe
         node.public_ipv6_nat,
         ingress.port,
         IpFamily::V6,
-        "（IPv6）",
+        " | v6",
     ));
     if servers.is_empty() {
         servers.push(SubscriptionServer {

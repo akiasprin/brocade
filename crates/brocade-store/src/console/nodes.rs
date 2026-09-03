@@ -35,7 +35,7 @@ pub(crate) async fn update_node_status_tx(
         other => {
             return Err(StoreError::InvalidData(format!(
                 "node status must be active or retired, got {other}"
-            )))
+            )));
         }
     };
     ensure_node_exists_tx(tx, &node_id).await?;
@@ -144,7 +144,7 @@ pub(crate) async fn update_node_tx(
         Some(value) => {
             return Err(StoreError::InvalidData(format!(
                 "mtu 必须在 1000 到 9000 之间，收到 {value}"
-            )))
+            )));
         }
     };
     if let Some(connection) = &request.connection {

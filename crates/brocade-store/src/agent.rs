@@ -8,6 +8,8 @@ use crate::{
     NodeLifecyclePhase, Result, StoreError,
 };
 
+const MAX_RUNTIME_CLOCK_SKEW_SECS: i64 = 600;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedNodeToken {
     pub node_id: String,
@@ -88,14 +90,23 @@ pub async fn authenticate_node_token(
 
     let token_hash = node_token_hash(token);
     let row = sqlx::query(
-        "UPDATE node_agent_state AS agent
-            SET token_last_used_at = now()
-           FROM node_lifecycle_state AS lifecycle
-          WHERE agent.token_hash = $1
-            AND agent.token_revoked_at IS NULL
-            AND lifecycle.node_id = agent.node_id
-            AND lifecycle.phase IN ('active', 'retiring')
-        RETURNING agent.node_id, agent.token_prefix, lifecycle.phase",
+        "WITH authenticated AS MATERIALIZED (
+             SELECT agent.node_id, agent.token_prefix, lifecycle.phase
+               FROM node_agent_state AS agent
+               JOIN node_lifecycle_state AS lifecycle ON lifecycle.node_id = agent.node_id
+              WHERE agent.token_hash = $1
+                AND agent.token_revoked_at IS NULL
+                AND lifecycle.phase IN ('active', 'retiring')
+         ), touched AS (
+             UPDATE node_agent_state AS agent
+                SET token_last_used_at = now()
+               FROM authenticated AS auth
+              WHERE agent.node_id = auth.node_id
+                AND (agent.token_last_used_at IS NULL
+                     OR agent.token_last_used_at < now() - interval '1 minute')
+          RETURNING agent.node_id
+         )
+         SELECT node_id, token_prefix, phase FROM authenticated",
     )
     .bind(token_hash)
     .fetch_optional(pool)
@@ -230,6 +241,21 @@ pub async fn record_node_runtime(
     node_id: &str,
     report: &brocade_deployment::protocol::NodeRuntimeReport,
 ) -> Result<()> {
+    let server_now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(pool)
+        .await?;
+    let observed_at = report.observed_at_unix_secs.unwrap_or(server_now);
+    if observed_at <= 0 {
+        return Err(StoreError::InvalidData(
+            "runtime observed_at must be positive unix seconds".to_owned(),
+        ));
+    }
+    let skew = observed_at.saturating_sub(server_now).abs();
+    if skew > MAX_RUNTIME_CLOCK_SKEW_SECS {
+        return Err(StoreError::InvalidData(format!(
+            "runtime clock skew {skew}s exceeds {MAX_RUNTIME_CLOCK_SKEW_SECS}s; check the node's clock"
+        )));
+    }
     let versions = serde_json::to_value(&report.versions)?;
     let spool = serde_json::to_value(&report.spool)?;
     let reconcile = report
@@ -256,20 +282,38 @@ pub async fn record_node_runtime(
              spool_backlog = $3,
              last_local_reconcile = COALESCE($4, last_local_reconcile),
              geodata_observed = $5,
-             runtime_reported_at = now()
+             runtime_reported_at = to_timestamp($6)
          WHERE node_id = $1
            AND token_hash IS NOT NULL
-           AND token_revoked_at IS NULL",
+           AND token_revoked_at IS NULL
+           AND (runtime_reported_at IS NULL OR runtime_reported_at <= to_timestamp($6))",
     )
     .bind(node_id)
     .bind(versions)
     .bind(spool)
     .bind(reconcile)
     .bind(geodata)
+    .bind(observed_at as f64)
     .execute(pool)
     .await?;
 
     if result.rows_affected() == 0 {
+        let active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM node_agent_state
+                 WHERE node_id = $1
+                   AND token_hash IS NOT NULL
+                   AND token_revoked_at IS NULL
+             )",
+        )
+        .bind(node_id)
+        .fetch_one(pool)
+        .await?;
+        if active {
+            // A newer runtime snapshot already won. The old report is accepted as a harmless
+            // duplicate so its sender does not retry a state that can never become current.
+            return Ok(());
+        }
         return Err(StoreError::Unauthorized(format!(
             "node {node_id} does not have an active node token"
         )));

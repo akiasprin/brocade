@@ -15,10 +15,14 @@ import { CanvasRenderer } from 'echarts/renderers';
 import { bytes } from '../ui/format';
 import { Ago } from '../ui/bits';
 import {
-  OBSERVE_COLOR_VARS,
-  observeAreaFill,
+  OBSERVE_SERIES_COLOR_VARS,
+  observeAreaStyle,
+  observeAxisLine,
+  observeAxisTick,
   observeColors,
-  observeTimeTick,
+  observeMinorTick,
+  observeSeriesLine,
+  observeTimeInterval,
   observeValueAxis,
 } from '../ui/observe-chart';
 import { theme } from '../forge/theme';
@@ -152,6 +156,9 @@ function trendPaths(
   valueOf: (sample: LoadSample) => number | null,
   domain: [number, number],
   floor: number = PLOT_BOTTOM,
+  /* 上报缺口是否断段。计数类指标缺口表示窗口不可信，必须断；uptime 这类读数
+     缺口行仍是真实采样（agent 的 has_gap 只标记窗口不完整），断开反而谎报了一次重启。 */
+  bridgeGaps = false,
 ): TrendPaths {
   const tail = series.slice(-LOAD_SLOTS);
   const offset = LOAD_SLOTS - tail.length;
@@ -164,7 +171,7 @@ function trendPaths(
   };
   tail.forEach((sample, index) => {
     const value = valueOf(sample);
-    if (sample.has_gap || value === null || !Number.isFinite(value)) {
+    if ((!bridgeGaps && sample.has_gap) || value === null || !Number.isFinite(value)) {
       finish();
       return;
     }
@@ -625,14 +632,33 @@ export function ThroughputChart({
     );
     const valueAxis = observeValueAxis(peak);
     const slots = Math.max(rx.length, tx.length, 1);
-    const slot = (i: number) => {
-      if (i === slots - 1) return '现在';
-      const minutes = ((slots - 1 - i) * 30) / 60;
-      return minutes >= 60
-        ? `−${Number((minutes / 60).toFixed(minutes % 60 === 0 ? 0 : 1))}h`
-        : `−${Math.round(minutes)}m`;
-    };
-    const tick = (index: number) => observeTimeTick(index, slots);
+    // 这里只收到按窗口索引的速率，没有真实时间戳。窗口固定 30 秒、末窗为当前，据此合成毫秒
+    // 时间轴：换来等距的时间刻度与次刻度，而点距与原 category 轴一致（窗口本就等距）。
+    const now = Math.floor(Date.now() / 30_000) * 30_000;
+    const at = (index: number) => now - (slots - 1 - index) * 30_000;
+    // x 轴显示墙钟时刻（hh:mm，与全机队镜像图及此前的 mockup 一致），tooltip 到秒。
+    const hm = (ms: number) =>
+      new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const hms = (ms: number) =>
+      new Date(ms).toLocaleTimeString('zh-CN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      });
+    // 轴起点即首个真实数据点：左侧补 null 的空槽不占轴，曲线紧贴 y 轴。
+    // 这里曾把起点向下取到整分钟，为的是让刻度落在整分上；代价是首点在 hh:mm:32 时左端
+    // 空出 32 秒。现在留白优先——刻度仍每 xStep 一格，只是整体带着首点的秒偏移，标签
+    // 截到分钟显示，读数间隔不变。now - 30_000 兜底：只有一个样本时轴不会退化成一个点。
+    const firstDataIndex = (() => {
+      for (let index = 0; index < slots; index++) {
+        if ((rx[index] ?? null) !== null || (tx[index] ?? null) !== null) return index;
+      }
+      return -1;
+    })();
+    const firstMs = firstDataIndex >= 0 ? at(firstDataIndex) : at(0);
+    const xStep = observeTimeInterval(now - firstMs);
+    const xMin = Math.min(firstMs, now - 30_000);
 
     const mk = (name: string, data: (number | null)[], color: string) => ({
       name,
@@ -642,11 +668,11 @@ export function ThroughputChart({
       showSymbol: false,
       smooth: false,
       connectNulls: false,
-      lineStyle: { color, width: 1.1 },
-      areaStyle: { color: observeAreaFill(color, themeName), opacity: 1 },
+      lineStyle: observeSeriesLine(color),
+      areaStyle: observeAreaStyle(color, themeName, { count: 2 }),
       itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
       emphasis: { disabled: true },
-      data,
+      data: data.map((value, index) => [at(index), value] as [number, number | null]),
     });
 
     chart.setOption(
@@ -666,32 +692,37 @@ export function ThroughputChart({
           extraCssText: 'border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); backdrop-filter:blur(8px);',
           axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' }, z: 0 },
           formatter: (params: unknown) => {
-            const arr = params as { seriesName: string; color: string; value: number | null; dataIndex: number }[];
-            const head = slot(arr[0].dataIndex);
-            const row = (p: { seriesName: string; color: string; value: number | null }) =>
+            const arr = params as { seriesName: string; color: string; value: [number, number | null] }[];
+            const head = hms(arr[0].value[0]);
+            const row = (p: { seriesName: string; color: string; value: [number, number | null] }) =>
               `<div style="display:flex;gap:7px;align-items:center;line-height:1.75">` +
               `<span style="width:8px;height:8px;border-radius:2px;background:${p.color};flex:none"></span>` +
               `<span style="color:${ink3}">${p.seriesName}</span>` +
-              `<b style="margin-left:auto;color:${ink};font-weight:500">${p.value === null ? '—' : bps(p.value)}</b></div>`;
+              `<b style="margin-left:auto;color:${ink};font-weight:500">${p.value[1] === null ? '—' : bps(p.value[1])}</b></div>`;
             const rows = [...arr].sort(
-              (left, right) => (right.value ?? Number.NEGATIVE_INFINITY) - (left.value ?? Number.NEGATIVE_INFINITY),
+              (left, right) =>
+                (right.value[1] ?? Number.NEGATIVE_INFINITY) - (left.value[1] ?? Number.NEGATIVE_INFINITY),
             );
             return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${head}</div>${rows.map(row).join('')}`;
           },
         },
         xAxis: {
-          type: 'category',
-          data: Array.from({ length: slots }, (_, i) => String(i)),
-          boundaryGap: false,
-          axisLine: { lineStyle: { color: line } },
-          axisTick: { show: false },
-          splitLine: { show: true, interval: (i: number) => tick(i), lineStyle: { color: lineSoft, width: 1 } },
+          // 数值轴而非 time 轴：x 是毫秒时间戳，等比排布即时间轴，但 echarts 6 的 time 轴
+          // 无视 interval/minInterval（实测固定 2 分钟一格 → 15 条网格），数值轴才认 interval。
+          type: 'value',
+          min: xMin,
+          max: now,
+          interval: xStep,
+          axisLine: observeAxisLine(ink4),
+          axisTick: observeAxisTick(ink4),
+          minorTick: observeMinorTick(lineSoft),
+          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
           axisLabel: {
             color: ink3,
             fontSize: 9.5,
             margin: 8,
-            interval: (i: number) => tick(i),
-            formatter: (_v: string, i: number) => slot(i),
+            hideOverlap: true,
+            formatter: (value: number) => hm(value),
           },
         },
         yAxis: {
@@ -699,8 +730,8 @@ export function ThroughputChart({
           min: 0,
           max: valueAxis.max,
           interval: valueAxis.interval,
-          axisLine: { show: false },
-          axisTick: { show: false },
+          axisLine: observeAxisLine(ink4),
+          axisTick: observeAxisTick(ink4),
           axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (v: number) => (v === 0 ? '0' : bps(v)) },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
@@ -739,7 +770,7 @@ const HISTORY_COLOR_SLOT: Record<string, number> = {
 
 const historyLineColorVar = (line: HistoryLine, index: number) => {
   const slot = line.color === undefined ? index : (HISTORY_COLOR_SLOT[line.color] ?? index);
-  return OBSERVE_COLOR_VARS[slot % OBSERVE_COLOR_VARS.length];
+  return OBSERVE_SERIES_COLOR_VARS[slot % OBSERVE_SERIES_COLOR_VARS.length];
 };
 
 type HistoryChartVariant = 'main' | 'secondary' | 'diagnostic';
@@ -804,7 +835,7 @@ function HistoryChart({
     const paletteColors = observeColors(themeName, name => cv(name, ''));
     const colors = lines.map((line, index) => {
       const variable = historyLineColorVar(line, index);
-      return paletteColors[OBSERVE_COLOR_VARS.indexOf(variable)];
+      return paletteColors[OBSERVE_SERIES_COLOR_VARS.indexOf(variable)];
     });
     const ink = cv('--ink', '#20242a');
     const ink3 = cv('--ink-3', '#707780');
@@ -812,6 +843,16 @@ function HistoryChart({
     const line = cv('--line', '#d9dde3');
     const lineSoft = cv('--line-soft', '#edf0f3');
     const glass = cv('--glass-strong', '#fff');
+    // 只有未堆叠的线会各自填到零线、在底部彼此重叠；填充的墨量按这个数分摊，堆叠段不计。
+    const overlapCount = Math.max(1, lines.filter(lineSeries => !lineSeries.stack).length);
+    const hasStack = lines.some(lineSeries => lineSeries.stack);
+    /** 堆叠段互不重叠，取平涂；纯曲线图的各条都填到零线，取渐变并按条数分摊墨量；
+     *  混合图里那条未堆叠的线是画在成分之上的包络（CPU 窗口峰值），填色会盖住成分，只画线。 */
+    const areaFill = (lineSeries: HistoryLine, index: number) => {
+      if (lineSeries.stack) return observeAreaStyle(colors[index], themeName, { stacked: true });
+      if (hasStack) return undefined;
+      return observeAreaStyle(colors[index], themeName, { count: overlapCount });
+    };
     const stackTotals = new Map<string, number[]>();
     let observedPeak = threshold?.value ?? 0;
     for (const lineSeries of lines) {
@@ -830,16 +871,21 @@ function HistoryChart({
       }
     }
     const valueAxis = max === undefined ? observeValueAxis(observedPeak) : null;
-    const labelAt = (index: number) => {
-      const at = times[index];
-      if (at === undefined) return '';
-      return new Date(at * 1000).toLocaleTimeString('zh-CN', {
+    const lastMs = (times[times.length - 1] ?? 0) * 1000;
+    const firstMs = (times[0] ?? 0) * 1000;
+    // x 轴显示墙钟时刻（hh:mm），tooltip 到秒；轴起点即首个样本时刻，曲线紧贴 y 轴。
+    // 见 ThroughputChart 同处说明：不再向下取整到整分，以免首点秒数变成左端留白。
+    const xStep = observeTimeInterval(lastMs - firstMs);
+    const xMin = Math.min(firstMs, lastMs - 30_000);
+    const hm = (ms: number) =>
+      new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const clockAt = (ms: number) =>
+      new Date(ms).toLocaleTimeString('zh-CN', {
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit',
         hour12: false,
       });
-    };
     chart.setOption(
       {
         animation: false,
@@ -847,7 +893,7 @@ function HistoryChart({
         grid: {
           left: 10,
           right: 14,
-          top: variant === 'main' ? 12 : 10,
+          top: 12,
           bottom: 10,
           containLabel: true,
         },
@@ -864,13 +910,14 @@ function HistoryChart({
           extraCssText: 'border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); backdrop-filter:blur(8px);',
           axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' }, z: 0 },
           formatter: (params: unknown) => {
-            const rows = params as { seriesName: string; color: string; value: number | null; dataIndex: number }[];
+            const rows = params as { seriesName: string; color: string; value: [number, number | null] }[];
             const body = [...rows]
               .sort(
-                (left, right) => (right.value ?? Number.NEGATIVE_INFINITY) - (left.value ?? Number.NEGATIVE_INFINITY),
+                (left, right) =>
+                  (right.value[1] ?? Number.NEGATIVE_INFINITY) - (left.value[1] ?? Number.NEGATIVE_INFINITY),
               )
               .map(row => {
-                const value = row.value === null ? '—' : formatValue(Number(row.value));
+                const value = row.value[1] === null ? '—' : formatValue(Number(row.value[1]));
                 return (
                   `<div style="display:flex;gap:7px;align-items:center;line-height:1.75">` +
                   `<span style="width:8px;height:8px;border-radius:2px;background:${row.color};flex:none"></span>` +
@@ -879,31 +926,26 @@ function HistoryChart({
                 );
               })
               .join('');
-            return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${labelAt(rows[0]?.dataIndex ?? 0)}</div>${body}`;
+            return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${clockAt(rows[0]?.value?.[0] ?? lastMs)}</div>${body}`;
           },
         },
         xAxis: {
-          type: 'category',
-          data: times.map(String),
-          boundaryGap: false,
-          axisLine: { lineStyle: { color: line } },
-          axisTick: { show: false },
-          splitLine: {
-            show: true,
-            interval: (index: number) => observeTimeTick(index, times.length),
-            lineStyle: { color: lineSoft, width: 1 },
-          },
+          // 数值轴承载毫秒时间戳（见 ThroughputChart 同处说明）：echarts 6 的 time 轴不认
+          // interval，数值轴才能把主网格钉在稀疏的整分位置，同时保留次刻度。
+          type: 'value',
+          min: xMin,
+          max: lastMs,
+          interval: xStep,
+          axisLine: observeAxisLine(ink4),
+          axisTick: observeAxisTick(ink4),
+          minorTick: observeMinorTick(lineSoft),
+          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
           axisLabel: {
             color: ink3,
             fontSize: 9.5,
             margin: 8,
-            interval: (index: number) => observeTimeTick(index, times.length),
-            formatter: (_value: string, index: number) => {
-              if (index === times.length - 1) return '现在';
-              const seconds = Math.max(0, (times[times.length - 1] ?? 0) - (times[index] ?? 0));
-              if (seconds < 3600) return `−${Math.max(1, Math.round(seconds / 60))}m`;
-              return `−${Math.max(1, Math.round(seconds / 3600))}h`;
-            },
+            hideOverlap: true,
+            formatter: (value: number) => hm(value),
           },
         },
         yAxis: {
@@ -912,8 +954,8 @@ function HistoryChart({
           max: max ?? valueAxis?.max,
           interval: max === undefined ? valueAxis?.interval : undefined,
           scale: true,
-          axisLine: { show: false },
-          axisTick: { show: false },
+          axisLine: observeAxisLine(ink4),
+          axisTick: observeAxisTick(ink4),
           axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (value: number) => formatValue(value) },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
@@ -927,16 +969,17 @@ function HistoryChart({
           connectNulls: false,
           stack: lineSeries.stack,
           stackStrategy: lineSeries.stack ? ('all' as const) : undefined,
-          areaStyle: { color: observeAreaFill(colors[index], themeName), opacity: 1 },
+          areaStyle: areaFill(lineSeries, index),
           lineStyle: {
-            color: colors[index],
-            width: 1.1,
+            ...observeSeriesLine(colors[index]),
             type: lineSeries.dashed ? ('dashed' as const) : ('solid' as const),
             opacity: 1,
           },
           itemStyle: { color: colors[index], borderColor: glass, borderWidth: 1.5 },
           emphasis: { disabled: true },
-          data: lineSeries.values,
+          data: lineSeries.values.map(
+            (value, valueIndex) => [(times[valueIndex] ?? 0) * 1000, value] as [number, number | null],
+          ),
           markLine:
             index === 0 && threshold
               ? {
@@ -1776,16 +1819,23 @@ function Spark({
   series,
   valueOf,
   percent = false,
+  domain,
+  bridgeGaps = false,
 }: {
   series: LoadSample[];
   valueOf: (sample: LoadSample) => number | null;
   percent?: boolean;
+  /* 调用方自定量程：uptime 这类大基数标量不能用 metricDomain 的 |max|·8% 余量，
+     那会把窗口内的变化压成平线。 */
+  domain?: [number, number];
+  /* uptime 用 true：缺口行的读数仍真实，线段只在真重启（值回落）处断开。 */
+  bridgeGaps?: boolean;
 }) {
   const values = series
     .filter(sample => !sample.has_gap)
     .map(valueOf)
     .filter((n): n is number => n !== null);
-  const paths = trendPaths(series, valueOf, metricDomain(values, percent), PLOT_H);
+  const paths = trendPaths(series, valueOf, domain ?? metricDomain(values, percent), PLOT_H, bridgeGaps);
   return (
     <svg className="kpi-spark" viewBox={`0 0 ${PLOT_W} ${PLOT_H}`} preserveAspectRatio="none" aria-hidden="true">
       {paths.areas.map((path, index) => (
@@ -1845,31 +1895,10 @@ const LoadDashboard = memo(function LoadDashboard({
   const cpuNow = cpu(last);
   const memNow = mem(last);
   const diskNow = disk(last);
-  const drops = last.nic_rx_drop + last.nic_tx_drop + last.nic_err;
-  // 与 usage 对齐的 30 秒窗口；缺口断开，历史不足选定范围时左侧补 null。
-  const group = linked ? `nd-tp-${report.node_id}` : undefined;
-  const tail = series.slice(-historyWindows);
-  const pad = historyWindows - tail.length;
-  const rxData: (number | null)[] = [
-    ...Array<number | null>(pad).fill(null),
-    ...tail.map(s => (s.has_gap ? null : s.nic_rx_bps)),
-  ];
-  const txData: (number | null)[] = [
-    ...Array<number | null>(pad).fill(null),
-    ...tail.map(s => (s.has_gap ? null : s.nic_tx_bps)),
-  ];
   const uptime = uptimeLabel(last.uptime_secs);
   const ctMax = host?.conntrack_max ?? null;
   const ctRatio = last.conntrack_count !== null && ctMax !== null && ctMax > 0 ? last.conntrack_count / ctMax : null;
   const hasNetworkHistory = series.some(sample => sample.conntrack_count !== null || sample.network_detail);
-  const window = sampleWindow(last);
-  const networkMeta = [
-    last.nic_rx_drop > 0 ? `接收丢弃 ${last.nic_rx_drop.toLocaleString()}` : null,
-    last.nic_tx_drop > 0 ? `发送丢弃 ${last.nic_tx_drop.toLocaleString()}` : null,
-    last.nic_err > 0 ? `网卡错误 ${last.nic_err.toLocaleString()}` : null,
-    host?.nic ?? null,
-    typeof host?.nic_mtu === 'number' ? `MTU ${host.nic_mtu}` : null,
-  ].filter((value): value is string => value !== null);
 
   return (
     <>
@@ -1954,6 +1983,12 @@ const LoadDashboard = memo(function LoadDashboard({
         <div className="kpi">
           <span className="kpi-l">已运行</span>
           <span className="kpi-v kpi-uptime">{uptime}</span>
+          {/* 标量没有趋势可画：uptime 的曲线恒为斜线，信息量配不上占据的面积。
+              画一条恒 0 的平线（等同趋势恒为 0 的形状），让该砖底部结构与其余砖一致。 */}
+          <svg className="kpi-spark" viewBox={`0 0 ${PLOT_W} ${PLOT_H}`} preserveAspectRatio="none" aria-hidden="true">
+            <path className="kpi-spark-area" d={`M0 ${PLOT_BOTTOM}H${PLOT_W}V${PLOT_H}H0Z`} />
+            <path className="kpi-spark-line" d={`M0 ${PLOT_BOTTOM}H${PLOT_W}`} />
+          </svg>
         </div>
       </div>
 
@@ -1969,49 +2004,17 @@ const LoadDashboard = memo(function LoadDashboard({
       {openDetail === 'network' && hasNetworkHistory && (
         <NetworkHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
       )}
-
-      {/* 卡框沿用 .chart-card（即原 .load-network 的卡框语言），图区交给 echarts。 */}
-      <section className="chart-card">
-        <div className="load-network-cap">
-          <b>网卡流量</b>
-          {networkMeta.length > 0 && (
-            <span
-              className={drops > 0 ? 'hot' : undefined}
-              title={
-                drops > 0
-                  ? `${window}增量。接收丢弃可能包含 802.2/LLC 等二层控制帧，不等同于业务链路丢包；不是开机累计值`
-                  : undefined
-              }
-            >
-              {networkMeta.join(' · ')}
-            </span>
-          )}
-        </div>
-        <ThroughputChart rx={rxData} tx={txData} rxName="接收" txName="发送" group={group} />
-        <footer className="load-network-legend" aria-label="网卡流量图例">
-          <span className="rx">
-            <i />
-            接收 <b>{bps(last.nic_rx_bps)}</b>
-          </span>
-          <span className="tx">
-            <i />
-            发送 <b>{bps(last.nic_tx_bps)}</b>
-          </span>
-        </footer>
-      </section>
     </>
   );
 });
 
 export function LoadCard({
   report,
-  xrayChart,
   historyLabel = '30 MINUTES',
   historyWindows = LOAD_SLOTS,
   linked = false,
 }: {
   report: NodeLoadView;
-  xrayChart?: ReactNode;
   historyLabel?: string;
   historyWindows?: number;
   linked?: boolean;
@@ -2027,9 +2030,6 @@ export function LoadCard({
   return (
     <div className="load-cluster">
       <LoadDashboard report={report} historyLabel={historyLabel} historyWindows={historyWindows} linked={linked} />
-      {/* XRAY 承载曲线紧跟 NETWORK 之后（两者时间轴一致、联动十字线）；数据来自 usage，
-          由 nodes.tsx 组装后经 xrayChart 传入，本卡只负责把它放在正确的位置。 */}
-      {xrayChart}
     </div>
   );
 }

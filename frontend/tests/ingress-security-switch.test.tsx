@@ -2,16 +2,27 @@ import { useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { SnapshotIngress, TransportKind, UpsertIngressBody, XhttpXmux } from '../src/api';
+import type {
+  SnapshotIngress,
+  TransportKind,
+  UpsertIngressBody,
+  XhttpTuning,
+  XhttpXmux,
+} from '../src/api';
 import { draft } from '../src/draft';
 import { IngressPanel, IngressStreamRow } from '../src/panes/chains';
 
-function ingress(kind: TransportKind, flow = '', xmux: XhttpXmux | null = null): SnapshotIngress {
+function ingress(
+  kind: TransportKind,
+  flow = '',
+  xmux: XhttpXmux | null = null,
+  tuning: XhttpTuning | null = null,
+): SnapshotIngress {
   const vless = kind.endsWith('-xhttp')
     ? {
         kind,
         flow,
-        xhttp: { path: '/existing', host: null, xmux, mode: 'auto' as const },
+        xhttp: { path: '/existing', host: null, xmux, tuning, mode: 'auto' as const },
       }
     : { kind, flow };
   return {
@@ -33,7 +44,17 @@ function ingress(kind: TransportKind, flow = '', xmux: XhttpXmux | null = null):
   };
 }
 
-function Harness({ kind, flow, xmux }: { kind: TransportKind; flow?: string; xmux?: XhttpXmux | null }) {
+function Harness({
+  kind,
+  flow,
+  xmux,
+  tuning,
+}: {
+  kind: TransportKind;
+  flow?: string;
+  xmux?: XhttpXmux | null;
+  tuning?: XhttpTuning | null;
+}) {
   const [client] = useState(() => {
     const queryClient = new QueryClient({
       defaultOptions: {
@@ -54,7 +75,7 @@ function Harness({ kind, flow, xmux }: { kind: TransportKind; flow?: string; xmu
     });
     return queryClient;
   });
-  const value = ingress(kind, flow, xmux);
+  const value = ingress(kind, flow, xmux, tuning);
 
   return (
     <QueryClientProvider client={client}>
@@ -193,8 +214,23 @@ describe('VLESS security draft', () => {
     const saved = await saveDraft(view);
     expect(saved.wires?.vless).toEqual({
       kind: 'vless-reality-xhttp',
-      xhttp: { path: '/existing', host: null, xmux: null, mode: 'auto' },
+      xhttp: { path: '/existing', host: null, xmux: null, tuning: null, mode: 'auto' },
     });
+  });
+
+  it('does not expose or resubmit TLS client fingerprint and HTTP version', async () => {
+    draft.clear();
+    const view = render(<Harness kind="vless-tls-xhttp" />);
+
+    expect(view.queryByRole('combobox', { name: 'XHTTP HTTP 版本' })).toBeNull();
+    expect(view.queryByRole('combobox', { name: 'TLS 客户端指纹' })).toBeNull();
+    fireEvent.change(view.getByDisplayValue('/existing'), { target: { value: '/changed' } });
+    const saved = await saveDraft(view);
+    expect(saved.wires?.vless).toMatchObject({
+      kind: 'vless-tls-xhttp',
+      xhttp: { path: '/changed', mode: 'auto' },
+    });
+    expect(saved.reality.fingerprint).toBeUndefined();
   });
 
   it('writes the XHTTP transport and clears Vision in the same draft operation', async () => {
@@ -218,7 +254,7 @@ describe('VLESS security draft', () => {
     draft.clear();
     const view = render(<Harness kind="vless-reality-xhttp" />);
 
-    expect(view.getByText('XMUX 调优（留空 = 用 Xray 默认）')).toBeTruthy();
+    expect(view.getByText('Padding 与 XMUX 调优（留空 = 用 Xray 默认）')).toBeTruthy();
     const concurrency = view.getByRole('spinbutton', { name: 'XMUX 最大并发流' }) as HTMLInputElement;
     const requestFrom = view.getByRole('spinbutton', { name: 'XMUX 请求轮换下限' }) as HTMLInputElement;
     const requestTo = view.getByRole('spinbutton', { name: 'XMUX 请求轮换上限' }) as HTMLInputElement;
@@ -245,8 +281,10 @@ describe('VLESS security draft', () => {
     const saved = await saveDraft(view);
     expect(savedXhttp(saved).xmux).toEqual({
       max_concurrency: 8,
+      max_connections: null,
       h_max_request_times: { from: 600, to: 900 },
       h_max_reusable_secs: { from: 1800, to: 3000 },
+      h_keep_alive_period_secs: null,
     });
   });
 
@@ -273,5 +311,40 @@ describe('VLESS security draft', () => {
 
     const saved = await saveDraft(view);
     expect(savedXhttp(saved).xmux).toBeNull();
+  });
+
+  it('saves only Padding with XMUX', async () => {
+    draft.clear();
+    const view = render(
+      <Harness
+        kind="vless-reality-xhttp"
+        tuning={{
+          x_padding_bytes: { from: 100, to: 1000 },
+        }}
+      />,
+    );
+    const set = (name: string, value: string) =>
+      fireEvent.change(view.getByRole('spinbutton', { name }), { target: { value } });
+
+    expect(view.queryByRole('spinbutton', { name: 'XHTTP 每次 POST 字节下限' })).toBeNull();
+    expect(view.queryByRole('spinbutton', { name: 'XHTTP POST 间隔下限' })).toBeNull();
+    expect(view.queryByRole('spinbutton', { name: 'XHTTP 服务端缓存 POST 数' })).toBeNull();
+    expect(view.queryByRole('spinbutton', { name: 'XHTTP 上传分块下限' })).toBeNull();
+    set('XMUX 最大连接数', '4');
+    set('XMUX 空闲保活间隔', '15');
+    set('XHTTP Padding 下限', '200');
+    set('XHTTP Padding 上限', '600');
+
+    const saved = await saveDraft(view);
+    expect(savedXhttp(saved).xmux).toEqual({
+      max_concurrency: null,
+      max_connections: 4,
+      h_max_request_times: { from: 600, to: 900 },
+      h_max_reusable_secs: { from: 1800, to: 3000 },
+      h_keep_alive_period_secs: 15,
+    });
+    expect(savedXhttp(saved).tuning).toEqual({
+      x_padding_bytes: { from: 200, to: 600 },
+    });
   });
 });

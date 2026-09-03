@@ -4,6 +4,8 @@
 //! The control plane does not measure it itself — it has no path to the underlay, and the line
 //! between two machines is visible only to its two ends.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use brocade_core::{
     model::{ModelSnapshot, WgTransport},
     physical::probe::{ProbePlan, ProbeSecurity},
@@ -15,9 +17,29 @@ use brocade_deployment::protocol::{
     LinkProbeResult, LinkProbeStatus, ProbeTarget, ProbeTargetList, ProbeTransport,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{admin::tenant_filter, AdminContext, Result, StoreError};
+
+const MAX_CLOCK_SKEW_SECS: i64 = 600;
+const MAX_ITEMS_PER_REPORT: usize = 512;
+
+async fn validate_observed_at(
+    tx: &mut Transaction<'_, Postgres>,
+    field: &str,
+    observed_at: i64,
+) -> Result<()> {
+    let server_now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let skew = observed_at.saturating_sub(server_now).abs();
+    if skew > MAX_CLOCK_SKEW_SECS {
+        return Err(StoreError::InvalidData(format!(
+            "{field} clock skew {skew}s exceeds {MAX_CLOCK_SKEW_SECS}s; check the node's clock"
+        )));
+    }
+    Ok(())
+}
 
 // How these views are scoped: `None` from `tenant_filter` means unscoped (a system-admin, or a
 // global operator with no tenant_scope); `Some((scope, pattern))` means this branch only.
@@ -69,7 +91,7 @@ pub struct LinkMtuItem {
 /// `public_ipv4` and wg transport. Peers behind NAT do not enter the list — they cannot be
 /// probed from this side, and that link is probed by them (`ProbeTarget`).
 pub async fn probe_targets(pool: &PgPool, node_id: &str) -> Result<ProbeTargetList> {
-    let snapshot = crate::materialize::load_current_snapshot(pool).await?;
+    let snapshot = crate::materialize::load_current_immutable_snapshot(pool).await?;
     // Links exist only between backbone members, and a decommissioned one is not on the
     // network. A machine does not probe itself.
     let mut targets = snapshot
@@ -103,6 +125,25 @@ pub async fn record_link_probe(
             "link probe timestamp must be positive unix seconds".to_owned(),
         ));
     }
+    if request.links.len() > MAX_ITEMS_PER_REPORT {
+        return Err(StoreError::InvalidData(format!(
+            "link probe report contains more than {MAX_ITEMS_PER_REPORT} links"
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    validate_observed_at(&mut tx, "link probe timestamp", request.probed_at_unix_secs).await?;
+    let peer_ids = request
+        .links
+        .iter()
+        .map(|link| link.peer_node_id.clone())
+        .collect::<Vec<_>>();
+    let known_peers = sqlx::query_scalar::<_, String>("SELECT id FROM nodes WHERE id = ANY($1)")
+        .bind(&peer_ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
 
     let mut accepted = 0_u64;
     let mut unknown = 0_u64;
@@ -114,13 +155,9 @@ pub async fn record_link_probe(
         }
         // A peer absent from the model is dropped: a freshly decommissioned machine lingers in
         // other people's wireguard.conf for a while, which is not an error but simply a row with
-        // no owner. The foreign key would error outright, hence asking first.
-        let known = sqlx::query("SELECT 1 FROM nodes WHERE id = $1")
-            .bind(&link.peer_node_id)
-            .fetch_optional(pool)
-            .await?
-            .is_some();
-        if !known {
+        // no owner. The foreign key would error outright, hence filtering against the batched
+        // lookup first.
+        if !known_peers.contains(&link.peer_node_id) {
             unknown += 1;
             continue;
         }
@@ -150,7 +187,8 @@ pub async fn record_link_probe(
                  path_mtu = EXCLUDED.path_mtu,
                  suggested_wg_mtu = EXCLUDED.suggested_wg_mtu,
                  probed_at = EXCLUDED.probed_at,
-                 updated_at = now()",
+                 updated_at = now()
+             WHERE link_probes.probed_at <= EXCLUDED.probed_at",
         )
         .bind(node_id)
         .bind(&link.peer_node_id)
@@ -159,10 +197,12 @@ pub async fn record_link_probe(
         .bind(path_mtu)
         .bind(suggested)
         .bind(request.probed_at_unix_secs as f64)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
         accepted += 1;
     }
+
+    tx.commit().await?;
 
     Ok(LinkProbeResult {
         node_id: node_id.to_owned(),
@@ -316,6 +356,52 @@ pub async fn record_link_health(
             "link health timestamp must be positive unix seconds".to_owned(),
         ));
     }
+    if request.hops.len() > MAX_ITEMS_PER_REPORT {
+        return Err(StoreError::InvalidData(format!(
+            "link health report contains more than {MAX_ITEMS_PER_REPORT} hops"
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    validate_observed_at(
+        &mut tx,
+        "link health timestamp",
+        request.checked_at_unix_secs,
+    )
+    .await?;
+    let peer_ids = request
+        .hops
+        .iter()
+        .map(|hop| hop.peer_node_id.clone())
+        .collect::<Vec<_>>();
+    let known_peers = sqlx::query_scalar::<_, String>("SELECT id FROM nodes WHERE id = ANY($1)")
+        .bind(&peer_ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let chain_ids = request
+        .hops
+        .iter()
+        .map(|hop| {
+            hop.chain_id
+                .rsplit('/')
+                .next()
+                .unwrap_or(&hop.chain_id)
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let mut known_chains = BTreeSet::new();
+    for row in sqlx::query("SELECT app_id, id FROM chains WHERE id = ANY($1)")
+        .bind(&chain_ids)
+        .fetch_all(&mut *tx)
+        .await?
+    {
+        known_chains.insert((
+            row.try_get::<String, _>("app_id")?,
+            row.try_get::<String, _>("id")?,
+        ));
+    }
 
     let mut accepted = 0_u64;
     let mut unknown = 0_u64;
@@ -328,12 +414,7 @@ pub async fn record_link_health(
         // A peer absent from the model is dropped: right after a chain is deleted or a machine
         // decommissioned, the agent's artifacts lag for a while. Not an error, simply a row with
         // no owner.
-        let known = sqlx::query("SELECT 1 FROM nodes WHERE id = $1")
-            .bind(&hop.peer_node_id)
-            .fetch_optional(pool)
-            .await?
-            .is_some();
-        if !known {
+        if !known_peers.contains(&hop.peer_node_id) {
             unknown += 1;
             continue;
         }
@@ -343,20 +424,11 @@ pub async fn record_link_health(
         // must not recreate the retired namespace in an operational table.
         let known_chain = match hop.chain_id.split_once('/') {
             Some((app_id, chain_id)) => {
-                sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM chains WHERE app_id = $1 AND id = $2)",
-                )
-                .bind(app_id)
-                .bind(chain_id)
-                .fetch_one(pool)
-                .await?
+                known_chains.contains(&(app_id.to_owned(), chain_id.to_owned()))
             }
-            None => {
-                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM chains WHERE id = $1)")
-                    .bind(&hop.chain_id)
-                    .fetch_one(pool)
-                    .await?
-            }
+            None => known_chains
+                .iter()
+                .any(|(_, chain_id)| chain_id == &hop.chain_id),
         };
         if !known_chain {
             unknown += 1;
@@ -372,7 +444,8 @@ pub async fn record_link_health(
                  downlink_bytes = EXCLUDED.downlink_bytes,
                  window_secs = EXCLUDED.window_secs,
                  checked_at = EXCLUDED.checked_at,
-                 updated_at = now()",
+                 updated_at = now()
+             WHERE link_health.checked_at <= EXCLUDED.checked_at",
         )
         .bind(node_id)
         .bind(&hop.chain_id)
@@ -381,10 +454,12 @@ pub async fn record_link_health(
         .bind(i64::try_from(hop.downlink_bytes).unwrap_or(i64::MAX))
         .bind(i64::try_from(request.window_secs).unwrap_or(i64::MAX))
         .bind(request.checked_at_unix_secs as f64)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
         accepted += 1;
     }
+
+    tx.commit().await?;
 
     Ok(LinkHealthResult {
         node_id: node_id.to_owned(),
@@ -481,7 +556,7 @@ pub struct E2eProbeSample {
 /// disagree — whose symptom is the probe knocking with a credential xray does not know, which
 /// looks exactly like a genuinely broken chain.
 pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeTargetList> {
-    let snapshot = crate::materialize::load_current_snapshot(pool).await?;
+    let snapshot = crate::materialize::load_current_immutable_snapshot(pool).await?;
     let probe_settings = snapshot.settings.probe.clone();
     let plan = e2e_probe_plan(&snapshot, node_id)?;
 
@@ -558,7 +633,6 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     ProbeSecurity::Reality(_) | ProbeSecurity::Hysteria2(_) => None,
                     ProbeSecurity::Tls(tls) => Some(E2eProbeTls {
                         server_name: tls.server_name.clone(),
-                        fingerprint: tls.fingerprint.clone(),
                         flow: tls.flow.clone(),
                     }),
                 },
@@ -567,6 +641,7 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     host: xhttp.host.clone(),
                     xmux: xhttp.xmux.as_ref().map(|xmux| E2eProbeXhttpXmux {
                         max_concurrency: xmux.max_concurrency,
+                        max_connections: xmux.max_connections,
                         h_max_request_times: E2eProbeXhttpRange {
                             from: xmux.h_max_request_times.from,
                             to: xmux.h_max_request_times.to,
@@ -575,6 +650,16 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                             from: xmux.h_max_reusable_secs.from,
                             to: xmux.h_max_reusable_secs.to,
                         },
+                        h_keep_alive_period_secs: xmux.h_keep_alive_period_secs,
+                    }),
+                    x_padding_bytes: xhttp.tuning.as_ref().and_then(|tuning| {
+                        tuning
+                            .x_padding_bytes
+                            .as_ref()
+                            .map(|range| E2eProbeXhttpRange {
+                                from: range.from,
+                                to: range.to,
+                            })
                     }),
                     mode: xhttp.mode.as_str().map(str::to_owned),
                 }),
@@ -606,22 +691,42 @@ pub async fn record_e2e_probe(
             "e2e probe timestamp must be positive unix seconds".to_owned(),
         ));
     }
+    if request.chains.len() > MAX_ITEMS_PER_REPORT {
+        return Err(StoreError::InvalidData(format!(
+            "e2e probe report contains more than {MAX_ITEMS_PER_REPORT} chains"
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    validate_observed_at(&mut tx, "e2e probe timestamp", request.probed_at_unix_secs).await?;
+    let chain_ids = request
+        .chains
+        .iter()
+        .map(|chain| chain.chain_id.clone())
+        .collect::<Vec<_>>();
+    let mut owners = BTreeMap::new();
+    for row in sqlx::query("SELECT id, app_id FROM chains WHERE id = ANY($1)")
+        .bind(&chain_ids)
+        .fetch_all(&mut *tx)
+        .await?
+    {
+        owners.insert(
+            row.try_get::<String, _>("id")?,
+            row.try_get::<String, _>("app_id")?,
+        );
+    }
 
     let mut accepted = 0_u64;
     let mut unknown = 0_u64;
     for chain in &request.chains {
         // A chain absent from the model is dropped: right after a chain is deleted or
         // reassigned, the agent's work list lags for a while. Not an error, simply a row with no
-        // owner. The foreign key would error outright, hence asking first.
-        let owner = sqlx::query("SELECT app_id FROM chains WHERE id = $1")
-            .bind(&chain.chain_id)
-            .fetch_optional(pool)
-            .await?;
-        let Some(owner) = owner else {
+        // owner. The foreign key would error outright, hence filtering against the batched
+        // lookup first.
+        let Some(app_id) = owners.get(&chain.chain_id) else {
             unknown += 1;
             continue;
         };
-        let app_id: String = owner.try_get("app_id")?;
 
         let status = status_text_e2e(chain.status);
         let ttfb = ttfb_for(chain);
@@ -642,10 +747,11 @@ pub async fn record_e2e_probe(
                  exit_verdict = EXCLUDED.exit_verdict,
                  detail = EXCLUDED.detail,
                  probed_at = EXCLUDED.probed_at,
-                 updated_at = now()",
+                 updated_at = now()
+             WHERE e2e_probes.probed_at <= EXCLUDED.probed_at",
         )
         .bind(&chain.chain_id)
-        .bind(&app_id)
+        .bind(app_id)
         .bind(node_id)
         .bind(status)
         .bind(ttfb)
@@ -654,7 +760,7 @@ pub async fn record_e2e_probe(
         .bind(verdict)
         .bind(chain.detail.as_deref())
         .bind(request.probed_at_unix_secs as f64)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
         // The sample table takes its own row. A repeat report within the same second collides
@@ -669,7 +775,7 @@ pub async fn record_e2e_probe(
         .bind(request.probed_at_unix_secs as f64)
         .bind(status)
         .bind(ttfb)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
         // Trim by age rather than row count. ProbeSettings::interval_secs is configurable, so a
@@ -682,11 +788,13 @@ pub async fn record_e2e_probe(
         )
         .bind(&chain.chain_id)
         .bind(SAMPLE_WINDOW_SECS)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
         accepted += 1;
     }
+
+    tx.commit().await?;
 
     Ok(E2eProbeResult {
         node_id: node_id.to_owned(),

@@ -1,6 +1,7 @@
 use crate::{
     model::{
-        ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2, XhttpXmux,
+        ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2, XhttpTuning,
+        XhttpXmux,
     },
     physical::user::{UserPlan, UserRealityPlan, UserSecurityPlan},
 };
@@ -50,6 +51,8 @@ pub enum SubscriptionStream {
         /// ends; a server that multiplexes and a client that does not simply opens one connection
         /// per stream, which is the cost this exists to avoid.
         xmux: Option<XhttpXmux>,
+        /// Padding carried into both URI and Clash clients.
+        tuning: Option<XhttpTuning>,
         /// Carried for a blunter reason than `xmux`: a server given an explicit mode refuses every
         /// client that disagrees, so a subscription that omits it hands out a configuration the
         /// server will turn away. `None` is the operator having chosen nothing, and then the two
@@ -63,7 +66,6 @@ pub struct SubscriptionDownload {
     pub server: String,
     pub port: u16,
     pub server_name: String,
-    pub fingerprint: String,
     pub http_host: Option<String>,
     pub mux: Option<u16>,
 }
@@ -88,7 +90,6 @@ pub struct SubscriptionHysteria2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionTls {
     pub server_name: String,
-    pub fingerprint: String,
     pub flow: Option<String>,
 }
 
@@ -133,11 +134,11 @@ pub fn build(plan: &UserPlan) -> Subscription {
                                 server: download.server.clone(),
                                 port: download.port,
                                 server_name: download.server_name.clone(),
-                                fingerprint: download.fingerprint.clone(),
                                 http_host: download.http_host.clone(),
                                 mux: download.mux,
                             }),
                         xmux: xhttp.xmux.clone(),
+                        tuning: xhttp.tuning.clone(),
                         mode: xhttp.mode.as_str(),
                     },
                 },
@@ -174,7 +175,6 @@ fn security(security: &UserSecurityPlan) -> SubscriptionSecurity {
         }
         UserSecurityPlan::Tls(tls) => SubscriptionSecurity::Tls(SubscriptionTls {
             server_name: tls.server_name.clone(),
-            fingerprint: tls.fingerprint.clone(),
             flow: tls.flow.clone(),
         }),
         UserSecurityPlan::Hysteria2(hysteria) => {

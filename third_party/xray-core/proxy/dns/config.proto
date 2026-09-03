@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package xray.proxy.dns;
+option csharp_namespace = "Xray.Proxy.Dns";
+option go_package = "github.com/xtls/xray-core/proxy/dns";
+option java_package = "com.xray.proxy.dns";
+option java_multiple_files = true;
+
+import "common/net/destination.proto";
+import "common/geodata/geodat.proto";
+
+enum RuleAction {
+  Direct = 0;
+  Drop = 1;
+  Reject = 2;
+  Hijack = 3;
+}
+
+message DNSRuleConfig {
+  RuleAction action = 1;
+  repeated int32 qtype = 2;
+  repeated xray.common.geodata.DomainRule domain = 3;
+}
+
+message Config {
+  uint32 user_level = 1;
+  repeated DNSRuleConfig rule = 2;
+  xray.common.net.Endpoint server = 3;
+}

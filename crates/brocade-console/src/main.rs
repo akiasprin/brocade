@@ -2,8 +2,8 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::Router;
 use brocade_console::http::{
-    admin_router_with_wakes, agent_router_with_origin, merged_router_with_wakes,
-    with_console_static, with_console_static_dir,
+    admin_router_with_wakes_and_realtime, agent_router_with_origin_and_realtime,
+    merged_router_with_wakes_and_realtime, with_console_static, with_console_static_dir,
 };
 use brocade_store::PgStore;
 use tokio::sync::Notify;
@@ -71,6 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "brocade-console created {default_warps} missing tenant default WARP resource(s)"
         );
     }
+    // Only the policy is durable. The service below is deliberately created once and shared by
+    // both listener faces; creating one per router would leave the browser leasing one instance
+    // while the Agent connected to another, and no samples would ever start.
+    let realtime =
+        brocade_console::realtime::RealtimeService::new(store.realtime_telemetry_policy().await?);
 
     // The console front end normally rides inside this binary (argued at the top of build.rs).
     // Set to a directory, this serves that directory instead — for iterating on the front end
@@ -254,18 +259,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(agent_listener) => {
             let admin = axum::serve(
                 admin_listener,
-                with_console(admin_router_with_wakes(
+                with_console(admin_router_with_wakes_and_realtime(
                     store.clone(),
                     quota_wake,
                     grants_wake,
                     cert_wake,
                     geoip,
+                    realtime.clone(),
                 )),
             )
             .with_graceful_shutdown(shutdown_when(shutdown_rx.clone()));
             let agent = axum::serve(
                 agent_listener,
-                agent_router_with_origin(store, agent_origin),
+                agent_router_with_origin_and_realtime(store, agent_origin, realtime),
             )
             .with_graceful_shutdown(shutdown_when(shutdown_rx));
             tokio::try_join!(admin, agent)?;
@@ -275,13 +281,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             axum::serve(
                 admin_listener,
-                with_console(merged_router_with_wakes(
+                with_console(merged_router_with_wakes_and_realtime(
                     store,
                     quota_wake,
                     grants_wake,
                     cert_wake,
                     geoip,
                     agent_origin,
+                    realtime,
                 )),
             )
             .with_graceful_shutdown(shutdown_when(shutdown_rx))

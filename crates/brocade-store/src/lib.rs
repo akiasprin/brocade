@@ -17,13 +17,15 @@ mod load;
 mod log_policy;
 mod materialize;
 mod pg;
+mod ping_probe;
 mod probe;
 mod provision;
 mod quota;
+mod realtime;
 pub mod secrets;
 mod serving;
 mod settings;
-mod tcp_probe;
+mod subscription_client;
 mod usage;
 
 pub use admin::{
@@ -43,11 +45,12 @@ pub use brocade_deployment::protocol::{
     E2eProbeTarget, E2eProbeTargetList, HopLinkList, HopLinkSample, HopLinkView, HostFacts,
     LinkHealth, LinkHealthRequest, LinkHealthResult, LinkProbe, LinkProbeRequest, LinkProbeResult,
     LinkProbeStatus, LoadReportRequest, LoadReportResult, LoadSample, NodeDesiredDeployment,
-    NodeLoadList, NodeLoadView, NodeTcpProbeList, NodeTcpProbeView, PhantunBinaries, ProbeTarget,
-    ProbeTargetList, ProbeTransport, ReportTargetResult, ReportedNodeState, RouteIpReport,
-    TargetApplyResult, TargetConvergenceReport, TcpProbePoint, TcpProbeReportRequest,
-    TcpProbeReportResult, TcpProbeSample, TcpProbeSettings, TcpProbeTarget, TcpProbeTargetSeries,
-    UsageCounter, UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries,
+    NodeLoadList, NodeLoadView, NodePingProbeList, NodePingProbeView, PhantunBinaries,
+    PingProbePoint, PingProbeReportRequest, PingProbeReportResult, PingProbeSample,
+    PingProbeSettings, PingProbeTarget, PingProbeTargetSeries, ProbeTarget, ProbeTargetList,
+    ProbeTransport, RealtimeTelemetryPolicy, ReportTargetResult, ReportedNodeState, RouteIpReport,
+    TargetApplyResult, TargetConvergenceReport, UpdateRealtimeTelemetryPolicyRequest, UsageCounter,
+    UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries,
     UsageNodeSeriesList, UsageReportRequest, UsageReportResult, UsageSample, UsageSampleList,
 };
 pub use cert::{
@@ -108,6 +111,7 @@ pub use provision::{
 };
 pub use quota::{QuotaEnforcementOutcome, QuotaEnforcementPlan, QuotaGrantChange, QUOTA_ACTOR};
 pub use settings::{SettingsSnapshot, UpdateSettingsResult};
+pub use subscription_client::{ClientConfigCommitResult, ClientConfigCommitStatus};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 

@@ -1,9 +1,9 @@
 /** Shared visual contract for machine-observation charts.
  *
- * CSS owns the real theme colors so canvas series and HTML legends stay identical. The fallback
- * arrays keep tests, print rendering, and partially loaded stylesheets categorical instead of
- * collapsing every series into the first color. */
-export const OBSERVE_COLOR_VARS = [
+ * Every trace comes from the categorical observation palette, including the primary trace. This
+ * keeps multi-series charts balanced instead of forcing their first line to a separate KPI color.
+ * CSS owns the real colors so canvas series and HTML legends stay identical. */
+export const OBSERVE_SERIES_COLOR_VARS = [
   '--observe-1',
   '--observe-2',
   '--observe-3',
@@ -16,53 +16,154 @@ export const OBSERVE_COLOR_VARS = [
   '--observe-10',
 ] as const;
 
+/* Fallbacks for the CSS tokens of the same name; keep both lists in sync with styles.css.
+   Rosé Pine Moon / Dawn, with slots 6, 8 and 10 filled in — the palette ships only six accents. */
 const DARK = [
-  '#6d90c4',
-  '#c88a5e',
-  '#77a67d',
-  '#c47b83',
-  '#9789bd',
-  '#bda65f',
-  '#5c9ca0',
-  '#b98aa8',
-  '#7f8ab0',
-  '#9c9384',
+  '#3e8fb0', // pine
+  '#e99cd3', // 紫红, added
+  '#8bbe95', // 绿, added
+  '#7da1e3', // 靛, added
+  '#ea9a97', // rose
+  '#9ccfd8', // foam
+  '#c4a7e7', // iris
+  '#f6c177', // gold
+  '#eb6f92', // love
+  '#908caa', // subtle
 ] as const;
 
 const LIGHT = [
-  '#4a6fa5',
-  '#b06a3e',
-  '#4f7d57',
-  '#a85560',
-  '#6f629c',
-  '#94793a',
-  '#3a7a7e',
-  '#8f5f80',
-  '#5a6690',
-  '#736b5c',
+  '#286983', // pine
+  '#b66fa2', // 紫红, added
+  '#5b8e66', // 绿, added
+  '#4d70b2', // 靛, added
+  '#d7827e', // rose
+  '#56949f', // foam
+  '#907aa9', // iris
+  '#ea9d34', // gold
+  '#b4637a', // love
+  '#797593', // subtle
 ] as const;
 
 export function observeColors(themeName: string, resolve: (name: string) => string): string[] {
   const fallback = themeName === 'light' ? LIGHT : DARK;
-  return OBSERVE_COLOR_VARS.map((name, index) => resolve(name) || fallback[index]);
+  return OBSERVE_SERIES_COLOR_VARS.map((name, index) => resolve(name) || fallback[index]);
+}
+
+/** The paper an area fill lands on — `--card` in each theme. The overlay fill is expressed as a
+ * tint of it, which is the whole mechanism behind the bound described on `observeAreaFill`. */
+const PAPER = { light: [255, 255, 255], dark: [31, 32, 35] } as const;
+
+/**
+ * Share of the series hue kept in an overlay fill; the rest is paper. Alpha compositing converges
+ * to the fill color itself, so N overlapping fills land on exactly this tint however large N
+ * grows — it is the constant the stack settles on, and the only number that decides how far from
+ * the paper that constant sits.
+ *
+ * One ratio serves both themes because PAPER differs: 12% lands the constant at L* 95.4–96.0 on
+ * white and L* 15.3–17.9 on the dark card, which in both themes is the narrow band between the
+ * paper and the split lines (L* 93.3 light, L* 18.5 dark). The grid therefore still reads through
+ * a filled region. Raising it pushes the fill past the grid and the chart starts looking pressed
+ * down (light) or hazy (dark) — that was the 0.22 / 0.34 this replaced.
+ */
+const OVERLAY_TINT = 0.12;
+const OVERLAY_ALPHA = { light: 0.62, dark: 0.55 } as const;
+/** Alpha of a stacked band. Bands never overlap, so this one is flat and keeps the full hue. */
+const BAND_INK = { light: 0.28, dark: 0.34 } as const;
+
+/**
+ * Share of an overlay fill's alpha still standing at the baseline. Every unstacked trace fills
+ * down to the same zero line, so the bottom of the plot is where they pile up — thinning them
+ * there takes the weight out of the pile while each trace keeps its own hue at full strength just
+ * under its own line, which is where the fill actually identifies anything.
+ *
+ * Not zero. A fill that fades to nothing stops being a fill and the trace loses its footing; the
+ * point is a lighter bottom, not an absent one. At 0.55 the baseline sits about 1 L* (light) and
+ * 2 L* (dark) off the region under the line — a hint of depth, not a ramp.
+ */
+const OVERLAY_BASE_FADE = 0.55;
+
+/** ECharts accepts this object form wherever it accepts a color; `graphic.LinearGradient` builds
+ * the same shape. Spelling it out keeps this module free of an echarts import. */
+export type ObserveFill =
+  | string
+  | {
+      type: 'linear';
+      x: number;
+      y: number;
+      x2: number;
+      y2: number;
+      colorStops: { offset: number; color: string }[];
+    };
+
+/**
+ * Area fill for an observation trace. Two modes, because the two kinds of area behave differently
+ * under overlap:
+ *
+ * - `stacked` bands sit on top of each other in y and never overlap, so they take a flat fill at
+ *   an alpha high enough to read as a composition.
+ * - unstacked traces all fill down to the same zero line, so N of them overlap there and their
+ *   alphas compound. The old fill was a full-strength color at alpha 0.10, whose composite
+ *   converges to that color: four traces already reached L* 87 on white and sixteen reached L* 66,
+ *   the gray-black floor. Filling with a *tint* of the series color instead makes the same
+ *   compositing converge to the tint, so the floor is a constant — `count` only sets how fast the
+ *   stack reaches it, never how far it goes. See OVERLAY_TINT for where that constant sits.
+ *
+ * A visible fill on white is necessarily darker than white, and on the dark card necessarily
+ * lighter than it, so a stack can only move away from the paper — the reachable best is to stop
+ * moving, close to it. Blend modes do not help: `lighten` and `screen` are inert on white paper
+ * (it is already the per-channel maximum), and `darken` holds the lightness flat only by fixing it
+ * darker than the split lines, which then stop reading through the fill.
+ *
+ * Unstacked fills also thin toward the zero line — see OVERLAY_BASE_FADE — so the pile-up at the
+ * bottom carries less weight than the band right under each line.
+ */
+export function observeAreaFill(
+  hex: string,
+  themeName: string,
+  options: { stacked?: boolean; count?: number } = {},
+): ObserveFill {
+  const value = Number.parseInt(hex.slice(1), 16);
+  const rgb = [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+  const key = themeName === 'light' ? 'light' : 'dark';
+  if (options.stacked) return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${BAND_INK[key]})`;
+  const paper = PAPER[key];
+  const tinted = rgb.map((channel, index) => Math.round(channel * OVERLAY_TINT + paper[index] * (1 - OVERLAY_TINT)));
+  // Fewer traces earn a more present fill; more traces reach the same floor more gently.
+  const alpha = Math.max(0.1, OVERLAY_ALPHA[key] / Math.sqrt(Math.max(1, options.count ?? 1)));
+  const at = (share: number) => `rgba(${tinted[0]},${tinted[1]},${tinted[2]},${Number((alpha * share).toFixed(4))})`;
+  // Offsets run over the filled shape, whose top is the series' own peak and whose bottom is the
+  // zero line every unstacked trace shares.
+  return {
+    type: 'linear',
+    x: 0,
+    y: 0,
+    x2: 0,
+    y2: 1,
+    colorStops: [
+      { offset: 0, color: at(1) },
+      { offset: 1, color: at(OVERLAY_BASE_FADE) },
+    ],
+  };
 }
 
 /**
- * Theme-specific production fill:
- * - dark: soften toward the line luminance, normal blend, medium 0.18;
- * - light: unify toward the mockup's neutral blue-gray family, normal blend, light 0.10.
+ * `areaStyle` for one trace. Every observation chart goes through here so the fill rule is decided
+ * in one place rather than per caller.
  */
-export function observeAreaFill(hex: string, themeName: string): string {
-  const value = Number.parseInt(hex.slice(1), 16);
-  const rgb = [(value >> 16) & 255, (value >> 8) & 255, value & 255];
-  if (themeName === 'light') {
-    const neutral = [138, 146, 158];
-    const unified = rgb.map((channel, index) => Math.round(channel + (neutral[index] - channel) * 0.62));
-    return `rgba(${unified[0]},${unified[1]},${unified[2]},0.1)`;
-  }
-  const gray = Math.round(rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114);
-  const softened = rgb.map(channel => Math.round(channel + (gray - channel) * 0.5));
-  return `rgba(${softened[0]},${softened[1]},${softened[2]},0.18)`;
+export function observeAreaStyle(
+  hex: string,
+  themeName: string,
+  options: { stacked?: boolean; count?: number } = {},
+): { color: ObserveFill; opacity: number } {
+  return { color: observeAreaFill(hex, themeName, options), opacity: 1 };
+}
+
+/**
+ * Full-size observation traces echo the 1.8px round KPI sparkline at an optically lighter 1.5px.
+ * Keeping this here makes throughput, ping, and expanded history use one stroke contract.
+ */
+export function observeSeriesLine(color: string) {
+  return { color, width: 1.5, cap: 'round' as const, join: 'round' as const };
 }
 
 /** Seven time marks (six equal spans) keep the vertical grid useful without crowding narrow cards. */
@@ -73,6 +174,52 @@ export function observeTimeTick(index: number, count: number): boolean {
     if (index === Math.round((last * part) / 6)) return true;
   }
   return false;
+}
+
+/**
+ * Engineering L-frame shared by every observation chart. Without it the series floated as thin
+ * sparklines; a solid axis line plus short outward ticks in the stronger ink-4 give the plot the
+ * instrument face the observe page asks for. Split lines (the grid) and labels stay with the
+ * caller — only the frame and its ticks are shared, so all four charts read as one instrument.
+ */
+export function observeAxisLine(strong: string) {
+  return { show: true, lineStyle: { color: strong, width: 1 } };
+}
+
+/**
+ * Short outward major tick in the same stronger ink. `interval` is only meaningful on a category
+ * axis, where it pins ticks under the sparse time labels instead of drawing one per window; time
+ * and value axes place their own ticks and ignore it.
+ */
+export function observeAxisTick(strong: string, interval?: (index: number) => boolean) {
+  const tick = { show: true, length: 4, lineStyle: { color: strong, width: 1 } };
+  return interval ? { ...tick, alignWithLabel: true, interval } : tick;
+}
+
+/**
+ * Faint minor ticks between the majors — the fine graduations of the instrument. Only time and
+ * value axes accept them (a category axis rejects minor ticks), so this stays on the time-axis
+ * charts' horizontal frame.
+ */
+export function observeMinorTick(soft: string, splitNumber = 4) {
+  return { show: true, splitNumber, length: 2, lineStyle: { color: soft } };
+}
+
+/** Round wall-clock steps a time axis is allowed to snap its major ticks to (milliseconds). */
+const TIME_STEPS_MS = [
+  30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_200_000, 1_800_000, 3_600_000, 7_200_000, 10_800_000,
+  21_600_000, 43_200_000, 86_400_000,
+];
+
+/**
+ * Pick a major-tick interval (ms) for a time axis so it lands ~6 divisions instead of letting
+ * ECharts choose — its `splitNumber` hint is loose on a time axis and readily overshoots to 15
+ * crowded labels. The returned step is a round wall-clock value (½m, 1m, 2m, 5m, …), so ticks fall
+ * on clock boundaries and the vertical grid stays sparse.
+ */
+export function observeTimeInterval(spanMs: number, targetDivisions = 6): number {
+  const target = spanMs / Math.max(2, targetDivisions);
+  return TIME_STEPS_MS.find(step => step >= target) ?? TIME_STEPS_MS[TIME_STEPS_MS.length - 1];
 }
 
 export type ObserveValueAxis = { max: number; interval: number };

@@ -474,6 +474,7 @@ fn the_share_link_extra_carries_the_pool_into_a_config_the_real_binary_reads() {
             // One: a connection per stream, reused once it goes idle. The whole point of the
             // exercise, and the value that used to reach no client at all.
             xmux: Some(XhttpXmux::with_concurrency(1)),
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -751,6 +752,7 @@ fn an_xhttp_ingress_loads_in_the_real_binary() {
                 path: "/probe".to_owned(),
                 host: None,
                 xmux: mux.map(XhttpXmux::with_concurrency),
+                tuning: None,
                 mode,
             },
         }));
@@ -775,6 +777,17 @@ fn an_xhttp_ingress_loads_in_the_real_binary() {
             std::slice::from_ref(&app_ir),
             "hk",
         )));
+        let value: Value = serde_json::from_str(&config).unwrap();
+        let subscriber = value["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "in:relay/i-relay")
+            .expect("subscriber XHTTP inbound");
+        assert_eq!(
+            subscriber["streamSettings"]["sockopt"]["tcpFastOpen"], 256,
+            "XHTTP subscriber listener must enable TFO: {subscriber:#?}"
+        );
         assert!(
             config.contains("\"network\": \"xhttp\"") && config.contains("\"path\": \"/probe\""),
             "产物里没有 xhttp 的痕迹：\n{config}"
@@ -822,6 +835,7 @@ fn split_reality_upload_and_tls_download_load_in_the_real_binary() {
             path: "/split-probe".to_owned(),
             host: None,
             xmux: Some(XhttpXmux::with_concurrency(8)),
+            tuning: None,
             mode: XhttpMode::Auto,
         },
     }));
@@ -1554,6 +1568,7 @@ fn a_tls_ingress_loads_in_the_real_binary() {
                 path: "/probe".to_owned(),
                 host: None,
                 xmux: Some(XhttpXmux::with_concurrency(8)),
+                tuning: None,
                 mode: XhttpMode::StreamOne,
             }),
         ),
@@ -1564,12 +1579,10 @@ fn a_tls_ingress_loads_in_the_real_binary() {
                 // Vision is legal over direct TLS, unlike over XHTTP, so this shape is the one
                 // place a certificate and flow control can be asked for together.
                 flow: Some("xtls-rprx-vision".to_owned()),
-                fingerprint: "chrome".to_owned(),
             }),
             Some(xhttp) => Transport::VlessTlsXhttp(TlsXhttp {
                 tls: Tls {
                     flow: Some(String::new()),
-                    fingerprint: "chrome".to_owned(),
                 },
                 xhttp,
             }),

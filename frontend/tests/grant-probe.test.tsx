@@ -28,7 +28,7 @@ const plan: GrantProbePlan = {
     },
     {
       id: 'g-friendly:ipv6:hysteria2',
-      name: '伦敦入口（IPv6）（QUIC）',
+      name: '伦敦入口 | QUIC | v6',
       app_id: 'app-global',
       app_name: '全球线路',
       chain_id: 'ch-blue',

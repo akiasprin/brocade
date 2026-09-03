@@ -28,9 +28,10 @@
 use brocade_deployment::protocol::ProbeTransport;
 use std::{
     io, mem,
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU16, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Result of one probe. "Did not fit" and "could not probe" must stay apart: the
@@ -40,6 +41,180 @@ use std::{
 pub enum Probe {
     Fits,
     TooBig,
+}
+
+/// Result of one ordinary ICMP echo used by the latency chart. A timeout is a valid measurement
+/// result; opening, routing, sending or receiving errors mean the machine could not measure and
+/// are returned as `Err` so callers do not turn them into packet loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoLatency {
+    Reply(Duration),
+    NoResponse,
+}
+
+static LATENCY_SEQUENCE: AtomicU16 = AtomicU16::new(0);
+const LATENCY_PAYLOAD_BYTES: u16 = 56;
+
+/// Send exactly one ICMPv4 or ICMPv6 Echo Request and measure only the wire round trip.
+///
+/// DNS resolution and route selection belong to the caller and therefore happen before this
+/// function starts its `Instant`. The socket itself is also opened and connected first. This is
+/// deliberately separate from `Pinger`: path-MTU probing below is IPv4-only, sets DF, has a fixed
+/// two-second timeout and interprets no reply as `TooBig`, none of which is the latency contract.
+pub fn echo_latency(target: SocketAddr, timeout: Duration) -> Result<EchoLatency, String> {
+    let family = EchoFamily::of(target.ip());
+    let fd = open_echo_socket(family)?;
+    connect_socket(fd.as_raw_fd(), target)?;
+
+    let seq = LATENCY_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let packet = latency_echo_request(family, seq, LATENCY_PAYLOAD_BYTES);
+    // Preparing the socket's receive policy is local work, just like opening and connecting the
+    // socket above. Do it before the clock starts so the chart measures send-to-reply only.
+    set_timeout_duration(fd.as_raw_fd(), timeout)?;
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout)
+        .ok_or_else(|| "ICMP timeout overflows monotonic clock".to_owned())?;
+    let sent = unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            packet.as_ptr() as *const libc::c_void,
+            packet.len(),
+            0,
+        )
+    };
+    if sent < 0 {
+        return Err(format!("发 ICMP 失败：{}", io::Error::last_os_error()));
+    }
+    if sent as usize != packet.len() {
+        return Err(format!("发 ICMP 不完整：{sent}/{} bytes", packet.len()));
+    }
+
+    let mut buf = [0_u8; 2048];
+    loop {
+        let got = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+            )
+        };
+        if got < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                if !reset_latency_timeout(fd.as_raw_fd(), deadline)? {
+                    return Ok(EchoLatency::NoResponse);
+                }
+                continue;
+            }
+            return match error.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Ok(EchoLatency::NoResponse),
+                _ => Err(format!("收 ICMP 失败：{error}")),
+            };
+        }
+        if latency_reply_seq(family, &buf[..got as usize]) == Some(seq) {
+            let elapsed = started.elapsed();
+            return Ok(if elapsed <= timeout {
+                EchoLatency::Reply(elapsed)
+            } else {
+                EchoLatency::NoResponse
+            });
+        }
+        // A late reply from another request must not restart the full timeout. Re-arm the socket
+        // with only the original deadline's remainder before waiting again.
+        if !reset_latency_timeout(fd.as_raw_fd(), deadline)? {
+            return Ok(EchoLatency::NoResponse);
+        }
+    }
+}
+
+fn reset_latency_timeout(fd: RawFd, deadline: Instant) -> Result<bool, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    set_timeout_duration(fd, remaining)?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoFamily {
+    V4,
+    V6,
+}
+
+impl EchoFamily {
+    fn of(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(_) => Self::V4,
+            IpAddr::V6(_) => Self::V6,
+        }
+    }
+
+    fn domain(self) -> libc::c_int {
+        match self {
+            Self::V4 => libc::AF_INET,
+            Self::V6 => libc::AF_INET6,
+        }
+    }
+
+    fn protocol(self) -> libc::c_int {
+        match self {
+            Self::V4 => libc::IPPROTO_ICMP,
+            Self::V6 => libc::IPPROTO_ICMPV6,
+        }
+    }
+}
+
+fn open_echo_socket(family: EchoFamily) -> Result<OwnedFd, String> {
+    let mut fd = unsafe { libc::socket(family.domain(), libc::SOCK_DGRAM, family.protocol()) };
+    if fd < 0 {
+        fd = unsafe { libc::socket(family.domain(), libc::SOCK_RAW, family.protocol()) };
+    }
+    if fd < 0 {
+        return Err(format!(
+            "开不了 {:?} Echo socket（dgram 和 raw 都不行）：{}。需要 ping_group_range 或 CAP_NET_RAW",
+            family,
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn latency_echo_request(family: EchoFamily, seq: u16, payload_len: u16) -> Vec<u8> {
+    let mut packet = echo_request(seq, payload_len);
+    if family == EchoFamily::V6 {
+        // ICMPv6 Echo Request = 128. Linux computes the mandatory pseudo-header checksum for both
+        // ping and raw ICMPv6 sockets; the checksum bytes stay zero on input.
+        packet[0] = 128;
+        packet[2..4].fill(0);
+    }
+    packet
+}
+
+fn latency_reply_seq(family: EchoFamily, buf: &[u8]) -> Option<u16> {
+    let body = match family {
+        EchoFamily::V4 if buf.first().is_some_and(|byte| byte >> 4 == 4) => {
+            let ihl = (*buf.first()? & 0x0f) as usize * 4;
+            buf.get(ihl..)?
+        }
+        // Linux raw ICMPv6 sockets normally return the ICMP body directly. Accept a fixed IPv6
+        // header as well for kernels/runtimes that retain it; Echo Replies do not carry extension
+        // headers in the environments Brocade supports.
+        EchoFamily::V6 if buf.first().is_some_and(|byte| byte >> 4 == 6) => buf.get(40..)?,
+        _ => buf,
+    };
+    let reply_type = match family {
+        EchoFamily::V4 => 0,
+        EchoFamily::V6 => 129,
+    };
+    if body.first().copied()? != reply_type || body.get(1).copied()? != 0 {
+        return None;
+    }
+    Some(u16::from_be_bytes([*body.get(6)?, *body.get(7)?]))
 }
 
 pub struct Pinger {
@@ -328,9 +503,16 @@ fn set_opt(
 }
 
 fn set_timeout(fd: RawFd, secs: i64) -> Result<(), String> {
+    set_timeout_duration(fd, Duration::from_secs(secs.max(0) as u64))
+}
+
+fn set_timeout_duration(fd: RawFd, duration: Duration) -> Result<(), String> {
+    // A zero timeval means "no timeout", the opposite of the deadline we want. Keep the smallest
+    // positive value when less than one microsecond remains.
+    let micros = duration.as_micros().max(1);
     let timeout = libc::timeval {
-        tv_sec: secs,
-        tv_usec: 0,
+        tv_sec: i64::try_from(micros / 1_000_000).unwrap_or(i64::MAX),
+        tv_usec: i64::try_from(micros % 1_000_000).expect("subsecond micros fit i64"),
     };
     let rc = unsafe {
         libc::setsockopt(
@@ -343,6 +525,54 @@ fn set_timeout(fd: RawFd, secs: i64) -> Result<(), String> {
     };
     if rc < 0 {
         return Err(format!("设置收超时失败：{}", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn connect_socket(fd: RawFd, target: SocketAddr) -> Result<(), String> {
+    let rc = match target {
+        SocketAddr::V4(target) => {
+            let addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(*target.ip()).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::connect(
+                    fd,
+                    &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                    mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(target) => {
+            let addr = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: 0,
+                sin6_flowinfo: target.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: target.ip().octets(),
+                },
+                sin6_scope_id: target.scope_id(),
+            };
+            unsafe {
+                libc::connect(
+                    fd,
+                    &addr as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if rc < 0 {
+        return Err(format!(
+            "connect {:?} ICMP 目标失败：{}",
+            EchoFamily::of(target.ip()),
+            io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -393,6 +623,61 @@ mod tests {
         let packet = echo_request(1, 1500 - 28);
         assert_eq!(packet.len(), 8 + 1472);
         assert_eq!(packet.len() + 20, 1500);
+    }
+
+    #[test]
+    fn latency_packets_cover_ipv4_and_ipv6_without_confusing_requests() {
+        let v4_request = latency_echo_request(EchoFamily::V4, 0x1234, 7);
+        assert_eq!(v4_request[0], 8);
+        assert_eq!(checksum(&v4_request), 0);
+
+        let v6_request = latency_echo_request(EchoFamily::V6, 0x4567, 7);
+        assert_eq!(v6_request[0], 128);
+        assert_eq!(&v6_request[2..4], &[0, 0]);
+
+        let v4_reply = [0_u8, 0, 0, 0, 0, 0, 0x12, 0x34];
+        assert_eq!(latency_reply_seq(EchoFamily::V4, &v4_reply), Some(0x1234));
+        assert_eq!(latency_reply_seq(EchoFamily::V6, &v4_reply), None);
+
+        let mut raw_v4_reply = vec![0_u8; 20];
+        raw_v4_reply[0] = 0x45;
+        raw_v4_reply.extend_from_slice(&v4_reply);
+        assert_eq!(
+            latency_reply_seq(EchoFamily::V4, &raw_v4_reply),
+            Some(0x1234)
+        );
+
+        let v6_reply = [129_u8, 0, 0, 0, 0, 0, 0x45, 0x67];
+        assert_eq!(latency_reply_seq(EchoFamily::V6, &v6_reply), Some(0x4567));
+        let mut raw_v6_reply = vec![0_u8; 40];
+        raw_v6_reply[0] = 0x60;
+        raw_v6_reply.extend_from_slice(&v6_reply);
+        assert_eq!(
+            latency_reply_seq(EchoFamily::V6, &raw_v6_reply),
+            Some(0x4567)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires permission to open a Linux ICMP echo socket"]
+    fn latency_echo_reaches_ipv4_loopback() {
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        match echo_latency(target, Duration::from_millis(420)) {
+            Ok(EchoLatency::Reply(elapsed)) => assert!(elapsed <= Duration::from_millis(420)),
+            Ok(EchoLatency::NoResponse) => panic!("IPv4 loopback did not answer ICMP echo"),
+            Err(error) => panic!("IPv4 loopback ICMP probe was unavailable: {error}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires permission to open a Linux ICMPv6 echo socket"]
+    fn latency_echo_reaches_ipv6_loopback() {
+        let target = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0));
+        match echo_latency(target, Duration::from_millis(420)) {
+            Ok(EchoLatency::Reply(elapsed)) => assert!(elapsed <= Duration::from_millis(420)),
+            Ok(EchoLatency::NoResponse) => panic!("IPv6 loopback did not answer ICMP echo"),
+            Err(error) => panic!("IPv6 loopback ICMP probe was unavailable: {error}"),
+        }
     }
 
     #[test]

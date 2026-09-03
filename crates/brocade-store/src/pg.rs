@@ -19,11 +19,11 @@ use crate::distribution;
 use crate::grant_automation;
 use crate::grant_probe;
 use crate::load;
+use crate::ping_probe;
 use crate::probe;
 use crate::provision;
 use crate::quota;
 use crate::settings;
-use crate::tcp_probe;
 use crate::usage;
 use crate::{
     agent, materialize, AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult,
@@ -37,19 +37,19 @@ use crate::{
     E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, HopLinkList,
     IssuedAdminToken, IssuedNodeToken, LinkHealthItem, LinkHealthRequest, LinkHealthResult,
     LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult,
-    NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, NodeTcpProbeList,
-    NodeTcpProbeView, ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult,
+    NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, NodePingProbeList,
+    NodePingProbeView, PingProbeReportRequest, PingProbeReportResult, PingProbeSettings,
+    ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult,
     QuotaEnforcementOutcome, QuotaEnforcementPlan, RegisterWarpBindingRequest,
     RegisterWarpBindingResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
     ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
-    SetUserAppQuotaRequest, SetUserAppQuotaResult, StoreError, TargetConvergenceReport,
-    TcpProbeReportRequest, TcpProbeReportResult, TcpProbeSettings, TenantList, UpdateNodeRequest,
-    UpdateNodeResult, UpdateSettingsResult, UpdateUserStatusRequest, UpdateUserStatusResult,
-    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
-    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
-    UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest,
-    UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan, UserList,
-    VerifyDeploymentRequest, WarpBindingRemoval,
+    SetUserAppQuotaRequest, SetUserAppQuotaResult, StoreError, TargetConvergenceReport, TenantList,
+    UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult, UpdateUserStatusRequest,
+    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
+    UpsertChainResult, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
+    UpsertTenantResult, UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList,
+    UsageReportRequest, UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan,
+    UserList, VerifyDeploymentRequest, WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -185,6 +185,7 @@ impl PgStore {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         let default_warps = console::ensure_default_warp_outbounds(&self.pool).await?;
         materialize::ensure_current_snapshot(&self.pool).await?;
+        crate::subscription_client::ensure_checkpoint(&self.pool).await?;
         Ok(default_warps)
     }
 
@@ -236,6 +237,20 @@ impl PgStore {
 
     pub async fn effective_node_log_max_mib(&self, node_id: &str) -> Result<u32> {
         crate::log_policy::effective_node_log_max_mib(&self.pool, node_id).await
+    }
+
+    /// Operational live-traffic policy. It is durable, but neither reading nor writing it creates
+    /// a model revision; the connected Agent sessions are updated separately by the console.
+    pub async fn realtime_telemetry_policy(&self) -> Result<crate::RealtimeTelemetryPolicy> {
+        crate::realtime::load_policy(&self.pool).await
+    }
+
+    pub async fn update_realtime_telemetry_policy(
+        &self,
+        actor: &AdminContext,
+        request: crate::UpdateRealtimeTelemetryPolicyRequest,
+    ) -> Result<crate::RealtimeTelemetryPolicy> {
+        crate::realtime::update_policy(&self.pool, actor, request).await
     }
 
     pub async fn update_distribution(
@@ -401,6 +416,16 @@ impl PgStore {
         sha256: Option<&str>,
     ) -> Result<()> {
         cert::record_observation(&self.pool, node_id, state, sha256).await
+    }
+
+    pub async fn record_certificate_observation_at(
+        &self,
+        node_id: &str,
+        state: &str,
+        sha256: Option<&str>,
+        observed_at_unix_secs: Option<i64>,
+    ) -> Result<()> {
+        cert::record_observation_at(&self.pool, node_id, state, sha256, observed_at_unix_secs).await
     }
 
     pub async fn record_certificate_failure(
@@ -1264,41 +1289,41 @@ impl PgStore {
         load::list_node_load(&self.pool, actor, windows).await
     }
 
-    pub async fn tcp_probe_settings(&self) -> Result<TcpProbeSettings> {
-        tcp_probe::load_settings(&self.pool).await
+    pub async fn ping_probe_settings(&self) -> Result<PingProbeSettings> {
+        ping_probe::load_settings(&self.pool).await
     }
 
-    pub async fn update_tcp_probe_settings(
+    pub async fn update_ping_probe_settings(
         &self,
         actor: &AdminContext,
-        settings: TcpProbeSettings,
-    ) -> Result<TcpProbeSettings> {
-        tcp_probe::update_settings(&self.pool, actor, settings).await
+        settings: PingProbeSettings,
+    ) -> Result<PingProbeSettings> {
+        ping_probe::update_settings(&self.pool, actor, settings).await
     }
 
-    pub async fn record_tcp_probe(
+    pub async fn record_ping_probe(
         &self,
         node_id: &str,
-        request: TcpProbeReportRequest,
-    ) -> Result<TcpProbeReportResult> {
-        tcp_probe::record_report(&self.pool, node_id, request).await
+        request: PingProbeReportRequest,
+    ) -> Result<PingProbeReportResult> {
+        ping_probe::record_report(&self.pool, node_id, request).await
     }
 
-    pub async fn node_tcp_probe_view(
+    pub async fn node_ping_probe_view(
         &self,
         actor: &AdminContext,
         node_id: &str,
         window_secs: u32,
-    ) -> Result<NodeTcpProbeView> {
-        tcp_probe::node_view(&self.pool, actor, node_id, window_secs).await
+    ) -> Result<NodePingProbeView> {
+        ping_probe::node_view(&self.pool, actor, node_id, window_secs).await
     }
 
-    pub async fn list_node_tcp_probes(
+    pub async fn list_node_ping_probes(
         &self,
         actor: &AdminContext,
         window_secs: u32,
-    ) -> Result<NodeTcpProbeList> {
-        tcp_probe::list_nodes(&self.pool, actor, window_secs).await
+    ) -> Result<NodePingProbeList> {
+        ping_probe::list_nodes(&self.pool, actor, window_secs).await
     }
 
     pub async fn hop_link_list(

@@ -196,7 +196,7 @@ impl HttpClient {
     }
 
     /// Plaintext passes through untouched; https gets a rustls layer on top.
-    fn wrap_tls(&self, tcp: TcpStream) -> Result<Stream, String> {
+    pub(crate) fn wrap_tls(&self, tcp: TcpStream) -> Result<Stream, String> {
         if !self.tls {
             return Ok(Stream::Plain(tcp));
         }
@@ -221,9 +221,18 @@ impl HttpClient {
 /// The TLS variant is boxed because `ClientConnection` carries its record
 /// buffers and is large. Unboxed, the whole enum would be sized for it, and every
 /// plaintext request would pay for that much stack it never uses.
-enum Stream {
+pub(crate) enum Stream {
     Plain(TcpStream),
     Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.set_nonblocking(nonblocking),
+            Self::Tls(stream) => stream.sock.set_nonblocking(nonblocking),
+        }
+    }
 }
 
 impl Read for Stream {

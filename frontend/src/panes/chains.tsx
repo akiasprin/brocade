@@ -30,8 +30,10 @@ import {
   type Hysteria2Settings,
   type Xhttp,
   DEFAULT_XHTTP_XMUX,
+  DEFAULT_XHTTP_TUNING,
   transportIsXhttp,
   type XhttpMode,
+  type XhttpTuning,
   type HysteriaBbrProfile,
   type HysteriaQuic,
   HY2_QUIC_LIMITS,
@@ -68,7 +70,11 @@ import {
   type FallbackLimitDraft,
   type FallbackRateDraft,
 } from '../reality-fallback';
-import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
+import {
+  REALITY_FINGERPRINT_OPTIONS,
+  realityFingerprintIsValid,
+  realityServerNameIsValid,
+} from '../reality';
 import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { FLAG_SHEET } from '../ui/flags';
@@ -1272,8 +1278,8 @@ function IngressRealityLimitsRow({
   );
 }
 
-/* TODO: 主界面暂不提供任意 Headers、Padding 细节、完整 XMUX 生命周期、ALPN/H3 和原始
- * extra JSON 的配置；这些仅用于实验或故障诊断。
+/* TODO: 主界面暂不提供任意 Headers、Padding 放置/编码细节、ALPN/H3 和原始 extra JSON；
+ * 这些仅用于实验或故障诊断。
  *
  * 接入面的网络层：TCP 或 XHTTP。
  *
@@ -1287,29 +1293,39 @@ function IngressRealityLimitsRow({
  * xray 自身不拦截该组合——其配置检查会通过，但运行时所有连接都会被拒绝。 */
 type XmuxDraft = {
   maxConcurrency: string;
+  maxConnections: string;
   requestFrom: string;
   requestTo: string;
   reusableFrom: string;
   reusableTo: string;
+  keepAlive: string;
 };
 
 function xmuxDraftOf(value: Xhttp['xmux']): XmuxDraft {
   const visible = (actual: number | undefined, fallback: number) =>
     actual === undefined || actual === fallback ? '' : String(actual);
   return {
-    maxConcurrency: visible(value?.max_concurrency, DEFAULT_XHTTP_XMUX.max_concurrency),
+    maxConcurrency: visible(value?.max_concurrency ?? undefined, DEFAULT_XHTTP_XMUX.max_concurrency ?? 1),
+    maxConnections: value?.max_connections ? String(value.max_connections) : '',
     requestFrom: visible(value?.h_max_request_times.from, DEFAULT_XHTTP_XMUX.h_max_request_times.from),
     requestTo: visible(value?.h_max_request_times.to, DEFAULT_XHTTP_XMUX.h_max_request_times.to),
     reusableFrom: visible(value?.h_max_reusable_secs.from, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from),
     reusableTo: visible(value?.h_max_reusable_secs.to, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to),
+    keepAlive: value?.h_keep_alive_period_secs == null ? '' : String(value.h_keep_alive_period_secs),
   };
 }
 
 function xmuxOfDraft(value: XmuxDraft): Exclude<Xhttp['xmux'], undefined> {
   if (Object.values(value).every(item => item.trim() === '')) return null;
   const number = (actual: string, fallback: number) => (actual.trim() === '' ? fallback : Number(actual));
+  const connections = value.maxConnections.trim();
   return {
-    max_concurrency: number(value.maxConcurrency, DEFAULT_XHTTP_XMUX.max_concurrency),
+    max_concurrency: connections
+      ? value.maxConcurrency.trim()
+        ? Number(value.maxConcurrency)
+        : null
+      : number(value.maxConcurrency, DEFAULT_XHTTP_XMUX.max_concurrency ?? 1),
+    max_connections: connections ? Number(connections) : null,
     h_max_request_times: {
       from: number(value.requestFrom, DEFAULT_XHTTP_XMUX.h_max_request_times.from),
       to: number(value.requestTo, DEFAULT_XHTTP_XMUX.h_max_request_times.to),
@@ -1318,7 +1334,37 @@ function xmuxOfDraft(value: XmuxDraft): Exclude<Xhttp['xmux'], undefined> {
       from: number(value.reusableFrom, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from),
       to: number(value.reusableTo, DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to),
     },
+    h_keep_alive_period_secs: value.keepAlive.trim() ? Number(value.keepAlive) : null,
   };
+}
+
+type TuningDraft = {
+  paddingFrom: string;
+  paddingTo: string;
+};
+
+function tuningDraftOf(value: Xhttp['tuning']): TuningDraft {
+  const range = (actual: { from: number; to: number } | null | undefined, fallback: { from: number; to: number }) => ({
+    from: !actual || (actual.from === fallback.from && actual.to === fallback.to) ? '' : String(actual.from),
+    to: !actual || (actual.from === fallback.from && actual.to === fallback.to) ? '' : String(actual.to),
+  });
+  const padding = range(value?.x_padding_bytes, DEFAULT_XHTTP_TUNING.x_padding_bytes);
+  return {
+    paddingFrom: padding.from,
+    paddingTo: padding.to,
+  };
+}
+
+function tuningOfDraft(value: TuningDraft): XhttpTuning | null {
+  const range = (from: string, to: string, fallback: { from: number; to: number }) =>
+    !from.trim() && !to.trim()
+      ? null
+      : {
+          from: from.trim() ? Number(from) : fallback.from,
+          to: to.trim() ? Number(to) : fallback.to,
+        };
+  const xPaddingBytes = range(value.paddingFrom, value.paddingTo, DEFAULT_XHTTP_TUNING.x_padding_bytes);
+  return xPaddingBytes ? { x_padding_bytes: xPaddingBytes } : null;
 }
 
 /* Hysteria 2 一侧的端口及其跳转区间。
@@ -1540,11 +1586,13 @@ export function IngressStreamRow({
   const path = current?.path ?? '';
   const host = current?.host ?? '';
   const xmux = current?.xmux ?? null;
+  const tuning = current?.tuning ?? null;
   const storedMode: XhttpMode = current?.mode ?? 'auto';
   const hasDownload = (['v4', 'v6'] as const).some(family => !!ingress.projection?.[family]?.download);
   const [draftPath, setDraftPath] = useState<string | null>(null);
   const [draftHost, setDraftHost] = useState<string | null>(null);
   const [draftXmux, setDraftXmux] = useState<XmuxDraft | undefined>(undefined);
+  const [draftTuning, setDraftTuning] = useState<TuningDraft | undefined>(undefined);
   const [draftMode, setDraftMode] = useState<XhttpMode | null>(null);
   const mode = draftMode ?? storedMode;
   /* 「跟随两端」在产物中不写入该字段，由两端各自解析。显示解析结果才是该字段的实际状态——
@@ -1572,6 +1620,7 @@ export function IngressStreamRow({
       setDraftPath(null);
       setDraftHost(null);
       setDraftXmux(undefined);
+      setDraftTuning(undefined);
       setDraftHy2(null);
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       setDraftMode(null);
@@ -1601,16 +1650,17 @@ export function IngressStreamRow({
         : '目标传输不支持独立下载，继续会移除现有下载线路。继续切换吗？';
       if (!window.confirm(message)) return;
     }
+    const nextXhttp: Xhttp = {
+      path: current?.path ?? `/${Math.random().toString(36).slice(2, 10)}`,
+      host: current?.host ?? null,
+      xmux: current?.xmux ?? null,
+      tuning: current?.tuning ?? null,
+      mode: current?.mode ?? 'auto',
+    };
     const nextTransport: Transport = transportIsXhttp(next)
-      ? {
-          kind: next as 'vless-tls-xhttp' | 'vless-reality-xhttp',
-          xhttp: {
-            path: current?.path ?? `/${Math.random().toString(36).slice(2, 10)}`,
-            host: current?.host ?? null,
-            xmux: current?.xmux ?? null,
-            mode: current?.mode ?? 'auto',
-          },
-        }
+      ? next === 'vless-tls-xhttp'
+        ? { kind: next, xhttp: nextXhttp }
+        : { kind: next, xhttp: nextXhttp }
       : next === 'vless-tls'
         ? { kind: next }
         : { kind: 'vless-reality' };
@@ -1652,6 +1702,8 @@ export function IngressStreamRow({
   const hostValue = draftHost ?? host;
   const xmuxDraft = draftXmux ?? xmuxDraftOf(xmux);
   const xmuxValue = draftXmux === undefined ? xmux : xmuxOfDraft(draftXmux);
+  const tuningDraft = draftTuning ?? tuningDraftOf(tuning);
+  const tuningValue = draftTuning === undefined ? tuning : tuningOfDraft(draftTuning);
   const badRange = (range: { from: number; to: number }) =>
     !Number.isSafeInteger(range.from) ||
     !Number.isSafeInteger(range.to) ||
@@ -1660,33 +1712,60 @@ export function IngressStreamRow({
     range.to > 2_147_483_647;
   const xmuxBad =
     xmuxValue !== null &&
-    (!Number.isInteger(xmuxValue.max_concurrency) ||
-      xmuxValue.max_concurrency < 1 ||
-      xmuxValue.max_concurrency > 128 ||
+    ((xmuxValue.max_concurrency == null) === (xmuxValue.max_connections == null) ||
+      (xmuxValue.max_concurrency != null &&
+        (!Number.isInteger(xmuxValue.max_concurrency) ||
+          xmuxValue.max_concurrency < 1 ||
+          xmuxValue.max_concurrency > 128)) ||
+      (xmuxValue.max_connections != null &&
+        (!Number.isInteger(xmuxValue.max_connections) ||
+          xmuxValue.max_connections < 1 ||
+          xmuxValue.max_connections > 128)) ||
       badRange(xmuxValue.h_max_request_times) ||
-      badRange(xmuxValue.h_max_reusable_secs));
+      badRange(xmuxValue.h_max_reusable_secs) ||
+      (xmuxValue.h_keep_alive_period_secs != null &&
+        xmuxValue.h_keep_alive_period_secs !== -1 &&
+        (!Number.isInteger(xmuxValue.h_keep_alive_period_secs) ||
+          xmuxValue.h_keep_alive_period_secs < 1 ||
+          xmuxValue.h_keep_alive_period_secs > 3600)));
+  const tuningRangeBad = (range: { from: number; to: number } | null | undefined, min: number, max: number) =>
+    !!range &&
+    (!Number.isSafeInteger(range.from) ||
+      !Number.isSafeInteger(range.to) ||
+      range.from < min ||
+      range.from > range.to ||
+      range.to > max);
+  const tuningBad = tuningValue !== null && tuningRangeBad(tuningValue.x_padding_bytes, 1, 4096);
   const pathBad = pathValue.trim() === '' || !pathValue.startsWith('/') || /[\s?#]/.test(pathValue);
   const xhttpForSave = (nextMode = mode): Xhttp => ({
     path: pathValue.trim(),
     host: hostValue.trim() || null,
     xmux: xmuxValue,
+    tuning: tuningValue,
     mode: nextMode,
   });
   const transportForXhttp = (nextMode = mode): Transport =>
     kind === 'vless-tls-xhttp'
       ? { kind, xhttp: xhttpForSave(nextMode) }
       : { kind: 'vless-reality-xhttp', xhttp: xhttpForSave(nextMode) };
-  /* 这一段待提交的 vless 取值：XHTTP 档要带上四个参数，TCP 档只有 kind
+  /* 这一段待提交的 vless 取值：XHTTP 档要带上完整的传输与调优参数，TCP 档只有 kind
      （目标站点、指纹那些在 body.reality 里，由目标站点行自己登记）。 */
   const vlessForSave = (): Transport | null =>
-    kind === null ? null : transportIsXhttp(kind) ? transportForXhttp() : ({ kind } as Transport);
-  /* 脏的两种来源：暂存了另一档安全层 / 网络层，或改了 XHTTP 的四个参数之一。 */
+    kind === null
+      ? null
+      : transportIsXhttp(kind)
+        ? transportForXhttp()
+        : kind === 'vless-tls'
+          ? { kind }
+          : { kind: 'vless-reality' };
+  /* 脏的两种来源：暂存了另一档安全层 / 网络层，或改了任一 XHTTP 参数。 */
   const dirty =
     stagedTransport !== null ||
     (on &&
       ((draftPath !== null && pathValue !== path) ||
         (draftHost !== null && hostValue !== host) ||
         (draftXmux !== undefined && JSON.stringify(xmuxValue) !== JSON.stringify(xmux)) ||
+        (draftTuning !== undefined && JSON.stringify(tuningValue) !== JSON.stringify(tuning)) ||
         (draftMode !== null && mode !== (current?.mode ?? 'auto'))));
   /* 两段各自登记进所在面板的那一次提交。三个下拉（协议 / 安全层 / 网络层）不在其中：
      它们改完即存，是切换而不是编辑。 */
@@ -1694,17 +1773,18 @@ export function IngressStreamRow({
     'vless-xhttp',
     dirty,
     {
-      blocked: on && (pathBad || xmuxBad),
+      blocked: on && (pathBad || xmuxBad || tuningBad),
       apply: body => ({ ...body, wires: { ...body.wires!, vless: vlessForSave() } }),
       reset: () => {
         setPendingTransport(null);
         setDraftPath(null);
         setDraftHost(null);
         setDraftXmux(undefined);
+        setDraftTuning(undefined);
         setDraftMode(null);
       },
     },
-    JSON.stringify([kind, pathValue, hostValue, xmuxValue, mode]),
+    JSON.stringify([kind, pathValue, hostValue, xmuxValue, tuningValue, mode]),
   );
   const hy2Up = hy2Value.bandwidth.up ?? '';
   const hy2Down = hy2Value.bandwidth.down ?? '';
@@ -2070,7 +2150,7 @@ export function IngressStreamRow({
       }
 
       {/* XHTTP 自身的参数单独一行，排在三层之后。
-          放入「网络层」字段时，启用 XHTTP 后该字段会包含四个控件和五条说明，
+          放入「网络层」字段时，启用 XHTTP 后该字段会包含大量调优控件和说明，
           将相邻排列的三行撑开——而这三行的连续排列正是表示它们属于三个层次的唯一方式。 */}
       {on && (
         <>
@@ -2088,8 +2168,40 @@ export function IngressStreamRow({
             </div>
             {pathBad && <div className="note bad">路径需以 / 开头，不能包含空白或 ? #</div>}
             <details className="form-adv" style={{ width: '100%' }}>
-              <summary>XMUX 调优（留空 = 用 Xray 默认）</summary>
+              <summary>Padding 与 XMUX 调优（留空 = 用 Xray 默认）</summary>
               <div className="hy2-quic xhttp-xmux">
+                <label className="hy2-quic-fld xhttp-xmux-range-fld">
+                  <span>
+                    Padding <small>字节</small>
+                  </span>
+                  <span className="xhttp-xmux-range">
+                    <input
+                      className="f mono"
+                      type="number"
+                      min={1}
+                      max={4096}
+                      inputMode="numeric"
+                      placeholder={String(DEFAULT_XHTTP_TUNING.x_padding_bytes.from)}
+                      value={tuningDraft.paddingFrom}
+                      disabled={!editable}
+                      aria-label="XHTTP Padding 下限"
+                      onChange={e => setDraftTuning({ ...tuningDraft, paddingFrom: e.target.value })}
+                    />
+                    <i>–</i>
+                    <input
+                      className="f mono"
+                      type="number"
+                      min={1}
+                      max={4096}
+                      inputMode="numeric"
+                      placeholder={String(DEFAULT_XHTTP_TUNING.x_padding_bytes.to)}
+                      value={tuningDraft.paddingTo}
+                      disabled={!editable}
+                      aria-label="XHTTP Padding 上限"
+                      onChange={e => setDraftTuning({ ...tuningDraft, paddingTo: e.target.value })}
+                    />
+                  </span>
+                </label>
                 <label className="hy2-quic-fld">
                   <span>
                     最大并发流 <small>流</small>
@@ -2100,11 +2212,40 @@ export function IngressStreamRow({
                     min={1}
                     max={128}
                     inputMode="numeric"
-                    placeholder={String(DEFAULT_XHTTP_XMUX.max_concurrency)}
+                    placeholder={String(DEFAULT_XHTTP_XMUX.max_concurrency ?? 1)}
                     value={xmuxDraft.maxConcurrency}
                     disabled={!editable}
                     aria-label="XMUX 最大并发流"
-                    onChange={e => setDraftXmux({ ...xmuxDraft, maxConcurrency: e.target.value })}
+                    onChange={e =>
+                      setDraftXmux({
+                        ...xmuxDraft,
+                        maxConcurrency: e.target.value,
+                        maxConnections: e.target.value ? '' : xmuxDraft.maxConnections,
+                      })
+                    }
+                  />
+                </label>
+                <label className="hy2-quic-fld">
+                  <span>
+                    最大连接数 <small>条</small>
+                  </span>
+                  <input
+                    className="f mono"
+                    type="number"
+                    min={1}
+                    max={128}
+                    inputMode="numeric"
+                    placeholder="不限制"
+                    value={xmuxDraft.maxConnections}
+                    disabled={!editable}
+                    aria-label="XMUX 最大连接数"
+                    onChange={e =>
+                      setDraftXmux({
+                        ...xmuxDraft,
+                        maxConnections: e.target.value,
+                        maxConcurrency: e.target.value ? '' : xmuxDraft.maxConcurrency,
+                      })
+                    }
                   />
                 </label>
                 {(
@@ -2162,17 +2303,40 @@ export function IngressStreamRow({
                     </span>
                   </label>
                 ))}
+                <label className="hy2-quic-fld">
+                  <span>
+                    空闲保活 <small>秒</small>
+                  </span>
+                  <input
+                    className="f mono"
+                    type="number"
+                    min={-1}
+                    max={3600}
+                    inputMode="numeric"
+                    placeholder="Xray 默认"
+                    value={xmuxDraft.keepAlive}
+                    disabled={!editable}
+                    aria-label="XMUX 空闲保活间隔"
+                    onChange={e => setDraftXmux({ ...xmuxDraft, keepAlive: e.target.value })}
+                  />
+                </label>
               </div>
               <div className="note">
-                最大并发流为 1 时只复用空闲连接；2–128 会并发承载多条流。请求轮换和复用时长使用随机范围，
-                避免连接按固定节奏同时重建。修改后需要发布并重启 xray。
+                最大并发流和最大连接数二选一；前者限制每条连接承载的流，后者固定连接池上限。保活填 -1 表示关闭，留空采用
+                Xray 的 H2/H3 默认值。
               </div>
               <div className="note">
+                Padding 默认 {DEFAULT_XHTTP_TUNING.x_padding_bytes.from}–{DEFAULT_XHTTP_TUNING.x_padding_bytes.to} 字节；XMUX
                 空值分别采用 {DEFAULT_XHTTP_XMUX.max_concurrency}、{DEFAULT_XHTTP_XMUX.h_max_request_times.from}–
                 {DEFAULT_XHTTP_XMUX.h_max_request_times.to} 次和 {DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from}–
                 {DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to} 秒；全部留空时不写入 xmux。
               </div>
-              {xmuxBad && <div className="note bad">并发需为 1–128；两个范围需为正整数，且下限不能大于上限。</div>}
+              {xmuxBad && (
+                <div className="note bad">
+                  并发流和连接数必须二选一且为 1–128；范围需为正整数；保活只能填 -1 或 1–3600。
+                </div>
+              )}
+              {tuningBad && <div className="note bad">Padding 必须是 1–4096 的有效整数范围。</div>}
             </details>
             <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
               <span className="dim">HTTP Host</span>
@@ -2661,7 +2825,11 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   // 探测结果使用独立查询，不与 snapshot 合并：它的更新频率远高于模型（一分钟一轮），
   // 合并后每轮探测都会导致整棵模型树重新渲染。
-  const probes = useQuery({ queryKey: ['e2e-probes'], queryFn: () => fetchE2eProbes() });
+  const probes = useQuery({
+    queryKey: ['e2e-probes'],
+    queryFn: () => fetchE2eProbes(),
+    refetchInterval: 30_000,
+  });
   const probeOf = byChain(probes.data?.chains);
 
   // 创建项目和重命名都调用 `upsert_app_tx`，该接口要求 system-admin（store/console.rs）。
@@ -3461,7 +3629,7 @@ function ChainPath({
 // 只有名称可修改。id 只显示：`chains.id` 是全局主键，修改 id 不是重命名而是将该链连同
 // 规则表迁移到其他项目下（论证见 ports.ts），提供输入框会使该迁移易于误触发。
 // 租户同样只显示，但必须显示——见下面保存部分的说明：它是该操作中最易写错的字段。
-function ChainTitle({ appId, chain, editable }: { appId: string; chain: SnapshotChain; editable: boolean }) {
+export function ChainTitle({ appId, chain, editable }: { appId: string; chain: SnapshotChain; editable: boolean }) {
   const qc = useQueryClient();
   /* null 表示未处于编辑状态。进入编辑时以当前名称为初值，显示值均实时计算。 */
   const [draft, setDraft] = useState<string | null>(null);
@@ -3471,10 +3639,14 @@ function ChainTitle({ appId, chain, editable }: { appId: string; chain: Snapshot
 
   const save = useMutation({
     mutationFn: async (name: string) => {
-      // 租户和项目原样回传。`upsert_chain` 的 `ON CONFLICT (id) DO UPDATE` 会整体替换归属，
-      // `app_id` 和 `tenant_id` 都包含在内——需从快照读取并原样带上，遗漏其一即成为迁移
-      // 而非重命名，而界面上仍显示为修改了名称。
-      await upsertChain(appId, { id: chain.id, tenant_id: chain.tenant, name });
+      // 项目、租户和出口地区标识原样回传。`upsert_chain` 会把这条链作为完整值更新，
+      // 所以改名时漏掉任何一个字段都会意外修改这条链的其他设置。
+      await upsertChain(appId, {
+        id: chain.id,
+        tenant_id: chain.tenant,
+        name,
+        subscription_country: chain.subscription_country ?? null,
+      });
     },
     onSuccess: () => {
       setDraft(null);
@@ -3608,7 +3780,7 @@ export function ChainSubscriptionCountryRow({
   const update = (country: string) => {
     if (country !== configured) save.mutate(country || null);
   };
-  const preview = `${configured ? `${subscriptionFlag(configured)} ` : ''}${chain.name}`;
+  const preview = `${configured ? subscriptionFlag(configured) : ''}${chain.name}`;
 
   return (
     <>
@@ -3654,7 +3826,11 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const editable = can(who.role, 'edit');
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const probes = useQuery({ queryKey: ['e2e-probes'], queryFn: () => fetchE2eProbes() });
+  const probes = useQuery({
+    queryKey: ['e2e-probes'],
+    queryFn: () => fetchE2eProbes(),
+    refetchInterval: 30_000,
+  });
   const nameOf = useNodeNames();
 
   const a = snapshot.data?.snapshot.apps.find(x => x.id === app);

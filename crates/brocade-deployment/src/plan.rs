@@ -772,6 +772,7 @@ fn planned_actions(
     applied: Option<&NodeAppliedState>,
 ) -> Vec<PlannedAction> {
     let mut actions = Vec::new();
+    let flow_changed = grants_flow_changed(&desired.grants, applied.map(|state| &state.grants));
     if artifact_needs_action(&desired.phantun, applied.map(|state| &state.phantun)) {
         actions.push(match desired.phantun {
             DesiredArtifact::Present { .. } => PlannedAction::ApplyPhantun,
@@ -786,7 +787,7 @@ fn planned_actions(
             DesiredArtifact::Unmanaged { .. } => unreachable!("unmanaged artifacts do not act"),
         });
     }
-    if artifact_needs_action(&desired.xray, applied.map(|state| &state.xray)) {
+    if artifact_needs_action(&desired.xray, applied.map(|state| &state.xray)) || flow_changed {
         actions.push(match desired.xray {
             DesiredArtifact::Present { .. } => PlannedAction::ApplyXray,
             DesiredArtifact::Disabled { .. } => PlannedAction::DisableXray,
@@ -936,6 +937,52 @@ fn grants_need_action(desired: &DesiredGrants, applied: Option<&AppliedGrantsSta
     }
 }
 
+/// Flow is stored on a VLESS account but released as topology. A difference on an account which
+/// exists on both sides therefore forces the configuration line to restart Xray; additions and
+/// removals alone remain ordinary permission work. Every VLESS ingress also carries its stable
+/// probe account, so an ingress-wide Flow edit is observable even when it has no subscriber.
+fn grants_flow_changed(desired: &DesiredGrants, applied: Option<&AppliedGrantsState>) -> bool {
+    let (
+        DesiredGrants::Present {
+            inbounds: desired_inbounds,
+        },
+        Some(AppliedGrantsState::Present {
+            inbounds: applied_inbounds,
+        }),
+    ) = (desired, applied)
+    else {
+        return false;
+    };
+
+    let applied = applied_inbounds
+        .iter()
+        .flat_map(|inbound| {
+            inbound.clients.iter().map(move |client| {
+                (
+                    (
+                        inbound.tag.as_str(),
+                        client.email.as_str(),
+                        client.uuid.as_str(),
+                    ),
+                    client.flow.as_deref(),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    desired_inbounds.iter().any(|inbound| {
+        inbound.clients.iter().any(|client| {
+            applied
+                .get(&(
+                    inbound.tag.as_str(),
+                    client.email.as_str(),
+                    client.uuid.as_str(),
+                ))
+                .is_some_and(|flow| *flow != client.flow.as_deref())
+        })
+    })
+}
+
 /// Whether desired and observed are the same grant set. The test is set equality of
 /// `(email, uuid, flow)` per tag, independent of order and independent of level — level is an
 /// argument to `adu` and cannot be read back from a machine.
@@ -1019,7 +1066,10 @@ fn is_disruptive(
         // installable costs one confirmation click; saying "harmless" about one that turns
         // out to need a restart breaks a promise on live traffic. Hence every uncertainty
         // resolving to true.
-        PlannedAction::ApplyXray => !can_apply_without_restart(applied, desired),
+        PlannedAction::ApplyXray => {
+            grants_flow_changed(&desired.grants, applied.map(|state| &state.grants))
+                || !can_apply_without_restart(applied, desired)
+        }
         PlannedAction::DisableXray => was_ours_and_running(applied.map(|state| &state.xray)),
         PlannedAction::DisableWireGuard => {
             was_ours_and_running(applied.map(|state| &state.wireguard))

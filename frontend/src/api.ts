@@ -93,7 +93,16 @@ export function draftPreview(): Promise<DraftPreview> {
 }
 
 export const applyDraft = (ops: ModelOp[], note?: string) =>
-  post<{ revision_id: number; changed: number }>('/model/apply', { ops, note: note ?? null });
+  post<{
+    revision_id: number;
+    changed: number;
+    client_config: {
+      snapshot_id: number;
+      status: 'unchanged' | 'activated' | 'awaiting-first-topology';
+      serving_generation: number | null;
+      pending_topology: string[];
+    };
+  }>('/model/apply', { ops, note: note ?? null });
 
 /* 草稿中某一份产物的内容。索引只提供清单和 sha256，展开某一份时才拉取其内容。 */
 export const previewDraftArtifact = (ops: ModelOp[], targetKind: string, targetId: string, artifactKind: string) =>
@@ -813,7 +822,7 @@ export const reorderChains = async (appId: string, ids: string[]) => {
 
 export const upsertChain = async (
   appId: string,
-  body: { id: string; tenant_id: string; name: string; subscription_country?: string | null; note?: string },
+  body: { id: string; tenant_id: string; name: string; subscription_country: string | null; note?: string },
 ) => {
   draft.push({
     op: 'upsert_chain',
@@ -881,21 +890,34 @@ export interface XhttpXmuxRange {
 }
 
 export interface XhttpXmux {
-  max_concurrency: number;
+  max_concurrency?: number | null;
+  max_connections?: number | null;
   h_max_request_times: XhttpXmuxRange;
   h_max_reusable_secs: XhttpXmuxRange;
+  h_keep_alive_period_secs?: number | null;
 }
 
 export const DEFAULT_XHTTP_XMUX: XhttpXmux = {
   max_concurrency: 1,
+  max_connections: null,
   h_max_request_times: { from: 600, to: 900 },
   h_max_reusable_secs: { from: 1800, to: 3000 },
+  h_keep_alive_period_secs: null,
 };
+
+export interface XhttpTuning {
+  x_padding_bytes?: XhttpXmuxRange | null;
+}
+
+export const DEFAULT_XHTTP_TUNING = {
+  x_padding_bytes: { from: 100, to: 1000 },
+} as const;
 
 export interface Xhttp {
   path: string;
   host?: string | null;
   xmux?: XhttpXmux | null;
+  tuning?: XhttpTuning | null;
   mode?: XhttpMode;
 }
 
@@ -1106,16 +1128,18 @@ export type HopDial =
 // 即该字段引入之前的行为。
 //
 // 同一维度上的三档：一条 TCP 同时承载多少条流、流结束后是否保留连接。使用三个名称而非
-// 直接暴露 xray 的 concurrency（1–128），是因为 1 不表示最小并发而是另一种模式——
-// 取 1 时每条流仍独占一条连接，只是复用空闲连接，各流之间不相互阻塞；从 2 开始才是多条流
-// 复用一条连接，一条流丢包会阻塞其余。用单一数值表示会使该区别不明显。
+// 直接暴露 xray 的 concurrency（1–128），是因为 1 是 Mux.cool 的特殊用法：每条流仍独占
+// 一个 worker，流结束后留下的连接可被下一条复用；从 2 开始才是多条流复用一条连接。
+// 单并发 worker 借出前不探活，半失效连接可能卡到超时，因此 pool 只为已有配置和明确选择保留，
+// 新建规则默认 none。
 //
 // 只对本机发起的跳有效。reverse 是对端连接本机，本机没有可复用的出站连接——该档位
 // 在界面上不显示（reverseTargets 使用另一个面板），编译器也会拒绝。
 export type HopPool =
   | { t: 'none' }
   | { t: 'pool' }
-  // v ∈ 2..=128。1 对应连接池档位，129 及以上 xray 会截断为 128 且不提示，两侧编译器均拒绝。
+  // v ∈ 2..=128。1 对应有卡顿风险的连接池档位，129 及以上 xray 会截断为 128 且不提示，
+  // 两侧编译器均拒绝。
   | { t: 'merge'; v: number };
 
 export type RuleAction =
@@ -1398,8 +1422,7 @@ export interface SnapshotIngress {
     vless?: {
       kind: TransportKind;
       xhttp?: Xhttp | null;
-      /* 下列字段只在 REALITY 两档中存在——借用站点是 REALITY 特有的概念。读取前需先判断 kind，
-       * 不能无条件展开：TLS 档下取值为 undefined，展开 undefined 会抛出异常。 */
+      /* 下列借用站点字段只在 REALITY 两档中存在。 */
       dest?: string;
       server_names?: string[];
       fingerprint?: string | null;
@@ -1419,14 +1442,14 @@ function currentVless(ingress: SnapshotIngress): Transport | null {
   if (!vless) return null;
   const { kind, xhttp } = vless;
   if (!transportIsXhttp(kind)) {
-    return { kind } as Transport;
+    return kind === 'vless-tls' ? { kind } : { kind: 'vless-reality' };
   }
   // 缺少 xhttp 的 XHTTP 档在库中无法表示（有 CHECK 约束），若出现则回退到同一安全层的
   // TCP 档——回退到 REALITY 会将使用自有证书的接入面切换为借用站点。
   if (!xhttp) {
     return kind === 'vless-tls-xhttp' ? { kind: 'vless-tls' } : { kind: 'vless-reality' };
   }
-  return kind === 'vless-tls-xhttp' ? { kind, xhttp } : { kind, xhttp };
+  return { kind, xhttp } as Transport;
 }
 
 export function currentWires(ingress: SnapshotIngress): Wires {
@@ -1459,7 +1482,7 @@ export function ingressUpsertBody(
       // 状态一致（这两列本身为 NULL）。
       dest: transport.dest ?? '',
       server_names: [...(transport.server_names ?? [])],
-      fingerprint: transport.fingerprint ?? undefined,
+      fingerprint: transport.kind.startsWith('vless-reality') ? (transport.fingerprint ?? undefined) : undefined,
       fallback_mode: transport.fallback_mode ?? 'global-site',
       fallback_limits: transport.fallback_limits ?? { mode: 'off' },
       // 需要显式回写，不能依赖「不携带即默认启用」：否则任何一次修改端口或迁移机器，
@@ -1804,21 +1827,21 @@ export const fetchBranding = () => api<BrandingSettings>('/branding');
 export const saveBranding = (body: BrandingSettings) =>
   api<BrandingSettings>('/branding', '', { method: 'PUT', body: JSON.stringify(body) });
 
-export interface TcpProbeTarget {
+export interface PingProbeTarget {
   name: string;
-  /** 同时作为序列标识；当前仅接受 tcp://host:port。 */
+  /** 同时作为序列标识；URI 选择 TCP Connect 或 ICMP Echo。 */
   address: string;
 }
 
-export interface TcpProbeSettings {
-  targets: TcpProbeTarget[];
+export interface PingProbeSettings {
+  targets: PingProbeTarget[];
   interval_secs: number;
   timeout_ms: number;
 }
 
-export const fetchTcpProbeSettings = () => api<TcpProbeSettings>('/tcp-probe/settings');
-export const saveTcpProbeSettings = (body: TcpProbeSettings) =>
-  api<TcpProbeSettings>('/tcp-probe/settings', '', { method: 'PUT', body: JSON.stringify(body) });
+export const fetchPingProbeSettings = () => api<PingProbeSettings>('/ping-probe/settings');
+export const savePingProbeSettings = (body: PingProbeSettings) =>
+  api<PingProbeSettings>('/ping-probe/settings', '', { method: 'PUT', body: JSON.stringify(body) });
 
 export interface ModelSettings {
   reality_client: {
@@ -2650,26 +2673,28 @@ export const fetchNodeLoadList = (windows = 24, token = '') =>
 export const fetchNodeLoad = (nodeId: string, windows = 24, token = '') =>
   api<NodeLoadView>(`/load/nodes/${encodeURIComponent(nodeId)}?windows=${windows}`, token);
 
-export interface TcpProbePoint {
+export interface PingProbePoint {
   probed_at_unix_secs: number;
-  /** null 是该轮无响应；服务端不保存更细的错误分类。 */
-  connect_ms: number | null;
+  /** false 表示受能力或路由限制而未实际发包，不应计作丢包。 */
+  attempted: boolean;
+  /** 微秒；已尝试且为 null 表示在超时前没有响应。 */
+  latency_us: number | null;
 }
 
-export interface TcpProbeTargetSeries extends TcpProbeTarget {
-  samples: TcpProbePoint[];
+export interface PingProbeTargetSeries extends PingProbeTarget {
+  samples: PingProbePoint[];
 }
 
-export interface NodeTcpProbeView {
+export interface NodePingProbeView {
   node_id: string;
-  targets: TcpProbeTargetSeries[];
+  targets: PingProbeTargetSeries[];
 }
 
-export const fetchNodeTcpProbeList = (windowSecs = 3600, token = '') =>
-  api<{ nodes: NodeTcpProbeView[] }>(`/tcp-probe/nodes?window_secs=${windowSecs}`, token);
+export const fetchNodePingProbeList = (windowSecs = 3600, token = '') =>
+  api<{ nodes: NodePingProbeView[] }>(`/ping-probe/nodes?window_secs=${windowSecs}`, token);
 
-export const fetchNodeTcpProbe = (nodeId: string, windowSecs = 86_400, token = '') =>
-  api<NodeTcpProbeView>(`/tcp-probe/nodes/${encodeURIComponent(nodeId)}?window_secs=${windowSecs}`, token);
+export const fetchNodePingProbe = (nodeId: string, windowSecs = 86_400, token = '') =>
+  api<NodePingProbeView>(`/ping-probe/nodes/${encodeURIComponent(nodeId)}?window_secs=${windowSecs}`, token);
 
 export const fetchLinkQuality = (chainId?: string, token = '') =>
   api<{ hops: HopLinkView[] }>(`/links/quality${chainId ? `?chain_id=${encodeURIComponent(chainId)}` : ''}`, token);

@@ -10,7 +10,7 @@ use brocade_core::{
         HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily,
         ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
         RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp,
-        XhttpMode, XhttpXmux,
+        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
     physical::user::{project_user, SubscriptionProtocol, UserPlan},
     Level,
@@ -80,6 +80,7 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
 
     assert!(clash_text.contains("server: hk.example.net"));
     assert!(clash_text.contains("server: us.example.net"));
+    assert!(clash_text.contains("    tfo: true"), "{clash_text}");
     assert!(clash_text.contains("  skip-domain:"), "{clash_text}");
     assert!(
         clash_text.contains("    - \"www.example.com\""),
@@ -102,6 +103,7 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
     );
     assert!(haitun_text.contains("server: hk.example.net"));
     assert!(haitun_text.contains("server: us.example.net"));
+    assert!(haitun_text.contains("    tfo: true"), "{haitun_text}");
     assert!(haitun_text.contains("dialer-proxy: \"入口组\""));
     assert!(haitun_text.contains("  - name: \"入口组\"\n    type: url-test"));
     assert!(haitun_text.contains(
@@ -298,8 +300,8 @@ fn uri_formats_ipv6_server_with_brackets() {
     assert!(artifact
         .entries
         .iter()
-        .any(|entry| entry.name == "香港入口（IPv6）"));
-    assert!(uri_text.contains("#%E9%A6%99%E6%B8%AF%E5%85%A5%E5%8F%A3%EF%BC%88IPv6%EF%BC%89"));
+        .any(|entry| entry.name == "香港入口 | v6"));
+    assert!(uri_text.contains("#%E9%A6%99%E6%B8%AF%E5%85%A5%E5%8F%A3%20%7C%20v6"));
 }
 
 #[test]
@@ -333,10 +335,10 @@ fn subscription_expands_dual_stack_ingress_and_labels_ipv6() {
     assert!(artifact
         .entries
         .iter()
-        .any(|entry| entry.name == "香港入口（IPv6）" && entry.server == "2001:db8::10"));
+        .any(|entry| entry.name == "香港入口 | v6" && entry.server == "2001:db8::10"));
     assert!(uri_text.contains("vless://uuid-alice@hk.example.net:443?"));
     assert!(uri_text.contains("vless://uuid-alice@[2001:db8::10]:443?"));
-    assert!(clash_text.contains("name: \"香港入口（IPv6）\""));
+    assert!(clash_text.contains("name: \"香港入口 | v6\""));
     assert!(clash_text.contains("server: 2001:db8::10"));
 }
 
@@ -383,14 +385,14 @@ fn explicit_subscription_country_prefixes_every_format_and_front_reference() {
     assert!(artifact
         .entries
         .iter()
-        .any(|entry| entry.name == "🇹🇼 台湾入口"));
+        .any(|entry| entry.name == "🇹🇼台湾入口"));
     assert!(artifact
         .entries
         .iter()
-        .any(|entry| entry.name == "🇹🇼 台湾入口（IPv6）"));
-    assert!(uri_text.contains("#%F0%9F%87%B9%F0%9F%87%BC%20%E5%8F%B0%E6%B9%BE%E5%85%A5%E5%8F%A3"));
-    assert!(clash_text.contains("name: \"🇹🇼 台湾入口\""));
-    assert!(clash_text.contains("proxies: [\"🇹🇼 台湾入口\", \"🇹🇼 台湾入口（IPv6）\"]"));
+        .any(|entry| entry.name == "🇹🇼台湾入口 | v6"));
+    assert!(uri_text.contains("#%F0%9F%87%B9%F0%9F%87%BC%E5%8F%B0%E6%B9%BE%E5%85%A5%E5%8F%A3"));
+    assert!(clash_text.contains("name: \"🇹🇼台湾入口\""));
+    assert!(clash_text.contains("proxies: [\"🇹🇼台湾入口\", \"🇹🇼台湾入口 | v6\"]"));
 }
 
 #[test]
@@ -460,7 +462,7 @@ fn clash_front_group_keeps_dual_stack_via_members() {
             .any(|diagnostic| diagnostic.level == Level::Error),
         "{diagnostics:#?}"
     );
-    assert!(clash_text.contains("proxies: [\"香港入口\", \"香港入口（IPv6）\"]"));
+    assert!(clash_text.contains("proxies: [\"香港入口\", \"香港入口 | v6\"]"));
 }
 
 #[test]
@@ -614,6 +616,7 @@ fn an_xhttp_ingress_reaches_both_subscription_formats() {
         path: "/probe".to_owned(),
         host: None,
         xmux: Some(XhttpXmux::with_concurrency(16)),
+        tuning: None,
         mode: XhttpMode::Auto,
     }));
 
@@ -654,6 +657,67 @@ fn an_xhttp_ingress_reaches_both_subscription_formats() {
     );
 }
 
+#[test]
+fn xhttp_xmux_and_padding_settings_reach_both_subscription_formats() {
+    let xmux = XhttpXmux {
+        max_concurrency: None,
+        max_connections: Some(4),
+        h_max_request_times: XhttpXmuxRange::new(700, 800),
+        h_max_reusable_secs: XhttpXmuxRange::new(1200, 1800),
+        h_keep_alive_period_secs: Some(15),
+    };
+    let tuning = XhttpTuning {
+        x_padding_bytes: Some(XhttpXmuxRange::new(200, 600)),
+    };
+    let (uri_text, clash_text) = render_with_xhttp(Some(Xhttp {
+        path: "/probe".to_owned(),
+        host: None,
+        xmux: Some(xmux),
+        tuning: Some(tuning),
+        mode: XhttpMode::PacketUp,
+    }));
+
+    for field in [
+        "%22maxConnections%22%3A4",
+        "%22hKeepAlivePeriod%22%3A15",
+        "%22xPaddingBytes%22%3A%22200-600%22",
+    ] {
+        assert!(uri_text.contains(field), "{field} 没进入 URI：{uri_text}");
+    }
+    for field in [
+        "max-connections: 4",
+        "h-keep-alive-period: 15",
+        "x-padding-bytes: \"200-600\"",
+    ] {
+        assert!(
+            clash_text.contains(field),
+            "{field} 没进入 Clash：{clash_text}"
+        );
+    }
+    for removed in [
+        "scMaxEachPostBytes",
+        "scMinPostsIntervalMs",
+        "scMaxBufferedPosts",
+        "uplinkChunkSize",
+    ] {
+        assert!(
+            !uri_text.contains(removed),
+            "{removed} 仍在 URI：{uri_text}"
+        );
+    }
+    for removed in [
+        "sc-max-each-post-bytes",
+        "sc-min-posts-interval-ms",
+        "sc-max-buffered-posts",
+        "uplink-chunk-size",
+    ] {
+        assert!(
+            !clash_text.contains(removed),
+            "{removed} 仍在 Clash：{clash_text}"
+        );
+    }
+}
+
 /// One is the connection pool — a connection per stream, handed on when it goes idle — and it is
 /// the only pooling a client can be given, Vision having closed the Mux.cool door. So it has to
 /// pass validation and reach both formats like any other value.
@@ -663,6 +727,7 @@ fn a_concurrency_of_one_is_a_pool_and_reaches_both_subscription_formats() {
         path: "/probe".to_owned(),
         host: None,
         xmux: Some(XhttpXmux::with_concurrency(1)),
+        tuning: None,
         mode: XhttpMode::Auto,
     }));
 
@@ -688,6 +753,7 @@ fn an_explicit_upload_mode_reaches_both_subscription_formats() {
         path: "/probe".to_owned(),
         host: None,
         xmux: None,
+        tuning: None,
         mode: XhttpMode::PacketUp,
     }));
 
@@ -704,6 +770,7 @@ fn the_default_upload_mode_is_written_nowhere() {
         path: "/probe".to_owned(),
         host: None,
         xmux: None,
+        tuning: None,
         mode: XhttpMode::Auto,
     }));
 
@@ -742,7 +809,6 @@ fn a_tls_entry_never_tells_the_client_to_skip_verification() {
         if let Some(Transport::VlessReality(reality)) = face.wires.vless() {
             face.wires = IngressWires::Vless(Transport::VlessTls(Tls {
                 flow: reality.flow.clone(),
-                fingerprint: reality.fingerprint.clone(),
             }));
         }
     });
@@ -759,16 +825,43 @@ fn a_tls_xhttp_ingress_carries_both_halves() {
         path: "/probe".to_owned(),
         host: None,
         xmux: Some(XhttpXmux::with_concurrency(8)),
+        tuning: None,
         mode: XhttpMode::Auto,
     }));
 
     assert!(uri_text.contains("security=tls"), "{uri_text}");
     assert!(uri_text.contains("type=xhttp"), "{uri_text}");
     assert!(uri_text.contains("path=%2Fprobe"), "{uri_text}");
+    assert!(
+        !uri_text.contains("alpn="),
+        "HTTP/2 默认档不应写 ALPN: {uri_text}"
+    );
+    assert!(!uri_text.contains("tfo="), "{uri_text}");
 
     assert!(clash_text.contains("network: xhttp"), "{clash_text}");
+    assert!(clash_text.contains("    tfo: true"), "{clash_text}");
     assert!(clash_text.contains("path: \"/probe\""), "{clash_text}");
+    assert!(
+        !clash_text.contains("    alpn:"),
+        "HTTP/2 默认档不应写 ALPN: {clash_text}"
+    );
     assert!(!clash_text.contains("reality-opts"), "{clash_text}");
+}
+
+#[test]
+fn tls_uses_client_defaults_in_both_formats() {
+    let (uri_text, clash_text) = render_with_tls(Some(Xhttp {
+        path: "/probe".to_owned(),
+        host: None,
+        xmux: None,
+        tuning: None,
+        mode: XhttpMode::Auto,
+    }));
+
+    assert!(!uri_text.contains("fp="), "{uri_text}");
+    assert!(!clash_text.contains("client-fingerprint:"), "{clash_text}");
+    assert!(!uri_text.contains("alpn="), "{uri_text}");
+    assert!(!clash_text.contains("    alpn:"), "{clash_text}");
 }
 
 #[test]
@@ -777,12 +870,12 @@ fn a_tls_xhttp_projection_can_use_an_independent_download_endpoint() {
         face.wires = IngressWires::Vless(Transport::VlessTlsXhttp(TlsXhttp {
             tls: Tls {
                 flow: Some(String::new()),
-                fingerprint: "chrome".to_owned(),
             },
             xhttp: Xhttp {
                 path: "/probe".to_owned(),
                 host: None,
                 xmux: Some(XhttpXmux::with_concurrency(8)),
+                tuning: None,
                 mode: XhttpMode::Auto,
             },
         }));
@@ -850,6 +943,7 @@ fn a_reality_xhttp_projection_uses_tls_only_for_its_download() {
                 path: "/probe".to_owned(),
                 host: Some("upload.route.example".to_owned()),
                 xmux: Some(XhttpXmux::with_concurrency(8)),
+                tuning: None,
                 mode: XhttpMode::Auto,
             },
         }));
@@ -897,24 +991,32 @@ fn a_reality_xhttp_projection_uses_tls_only_for_its_download() {
     assert!(!clash_text.contains("port: 8443"), "{clash_text}");
 }
 
-/// The default must keep saying `tcp` in both formats, since every client configuration already
-/// in somebody's hands was written against it.
+/// The default must keep saying `tcp` in both formats, while TFO uses only Mihomo's documented
+/// common proxy field rather than inventing an incompatible URI query parameter.
 #[test]
-fn a_tcp_ingress_is_unchanged_by_the_new_field() {
+fn a_tcp_ingress_enables_tfo_only_in_the_clash_format() {
     let (uri_text, clash_text) = render_with_xhttp(None);
 
     assert!(uri_text.contains("type=tcp"), "{uri_text}");
+    assert!(!uri_text.contains("tfo="), "{uri_text}");
     assert!(!uri_text.contains("path="), "{uri_text}");
     assert!(clash_text.contains("network: tcp"), "{clash_text}");
+    assert!(clash_text.contains("    tfo: true"), "{clash_text}");
     assert!(!clash_text.contains("xhttp-opts"), "{clash_text}");
 }
 
 #[test]
-fn hysteria2_subscription_carries_auth_obfs_sni_and_bandwidth() {
+fn hysteria2_subscription_carries_auth_obfs_sni_bandwidth_and_quic_windows() {
     let (uri_text, clash_text) = render(|face| {
         face.wires = IngressWires::Hysteria2(Hysteria2 {
             bbr_profile: brocade_core::model::HysteriaBbrProfile::default(),
-            quic: brocade_core::model::HysteriaQuic::default(),
+            quic: brocade_core::model::HysteriaQuic {
+                init_stream_receive_window: Some(16_777_216),
+                max_stream_receive_window: Some(16_777_216),
+                init_connection_receive_window: Some(41_943_040),
+                max_connection_receive_window: Some(41_943_040),
+                ..Default::default()
+            },
             port: 50000,
             hop: None,
             bandwidth: HysteriaBandwidth {
@@ -935,6 +1037,10 @@ fn hysteria2_subscription_carries_auth_obfs_sni_and_bandwidth() {
         uri_text.contains("hysteria2://uuid-alice@203.0.113.7:50000/"),
         "{uri_text}"
     );
+    assert!(
+        uri_text.contains("#%E9%A6%99%E6%B8%AF%20%7C%20QUIC"),
+        "{uri_text}"
+    );
     assert!(uri_text.contains("sni=hk-cert.example.net"), "{uri_text}");
     assert!(uri_text.contains("obfs=salamander"), "{uri_text}");
     assert!(
@@ -942,6 +1048,8 @@ fn hysteria2_subscription_carries_auth_obfs_sni_and_bandwidth() {
         "{uri_text}"
     );
     assert!(clash_text.contains("type: hysteria2"), "{clash_text}");
+    assert!(clash_text.contains("name: \"香港 | QUIC\""), "{clash_text}");
+    assert!(!clash_text.contains("    tfo:"), "{clash_text}");
     assert!(clash_text.contains("password: uuid-alice"), "{clash_text}");
     assert!(
         clash_text.contains("sni: hk-cert.example.net"),
@@ -950,6 +1058,25 @@ fn hysteria2_subscription_carries_auth_obfs_sni_and_bandwidth() {
     assert!(clash_text.contains("obfs: salamander"), "{clash_text}");
     assert!(clash_text.contains("up: \"20 mbps\""), "{clash_text}");
     assert!(clash_text.contains("down: \"100 mbps\""), "{clash_text}");
+    assert!(
+        clash_text.contains("initial-stream-receive-window: 16777216"),
+        "{clash_text}"
+    );
+    assert!(
+        clash_text.contains("max-stream-receive-window: 16777216"),
+        "{clash_text}"
+    );
+    assert!(
+        clash_text.contains("initial-connection-receive-window: 41943040"),
+        "{clash_text}"
+    );
+    assert!(
+        clash_text.contains("max-connection-receive-window: 41943040"),
+        "{clash_text}"
+    );
+    // The portable hysteria2 URI scheme has no receive-window parameters. A made-up query key
+    // would be silently ignored, so only the full mihomo configuration can carry these values.
+    assert!(!uri_text.contains("receive-window"), "{uri_text}");
     // Masquerade is server-only and must not leak into a subscription.
     assert!(!uri_text.contains("cover.example.net"), "{uri_text}");
     assert!(!clash_text.contains("cover.example.net"), "{clash_text}");
@@ -1006,6 +1133,7 @@ fn without_hopping_a_subscription_names_one_port() {
         "{uri_text}"
     );
     assert!(clash_text.contains("port: 50000"), "{clash_text}");
+    assert!(!clash_text.contains("receive-window"), "{clash_text}");
     assert!(!clash_text.contains("\n    ports:"), "{clash_text}");
 }
 
@@ -1033,6 +1161,11 @@ fn an_ingress_serving_both_wires_lists_both_and_keeps_the_names_apart() {
         1,
         "{clash_text}"
     );
+    assert_eq!(
+        clash_text.matches("    tfo: true").count(),
+        1,
+        "only the TCP-backed VLESS entry may enable TFO: {clash_text}"
+    );
 
     let proxy_section = clash_text
         .split_once("\nproxy-groups:")
@@ -1044,7 +1177,61 @@ fn an_ingress_serving_both_wires_lists_both_and_keeps_the_names_apart() {
         .collect::<Vec<_>>();
     assert_eq!(names.len(), 2, "{clash_text}");
     assert_ne!(names[0], names[1], "两条线重名，mihomo 会整份拒掉");
-    assert!(names.iter().any(|name| name.contains("QUIC")), "{names:#?}");
+    assert!(
+        names.iter().any(|name| name.contains(" | QUIC")),
+        "{names:#?}"
+    );
+}
+
+#[test]
+fn dual_stack_dual_wire_names_put_quic_before_the_final_v6_marker() {
+    let mut hk = node("hk", "203.0.113.7", [10, 66, 0, 1]);
+    hk.public_ipv6 = Some("2001:db8::10".to_owned());
+    hk.certificate_name = Some("hk-cert.example.net".to_owned());
+    let mut doc = doc(vec![hk]);
+    doc.users.push(user("platform.acme", "alice", "uuid-alice"));
+
+    let mut face = ingress("i-tw", "c-tw", "hk", None);
+    let vless = face.wires.vless().unwrap().clone();
+    face.wires = IngressWires::Both {
+        vless,
+        hysteria2: Hysteria2::default(),
+    };
+    let mut tw_chain = chain("c-tw", "台湾 02 | CN2 🏡");
+    tw_chain.subscription_country = Some("TW".to_owned());
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![tw_chain],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: Vec::new(),
+        grants: vec![grant("alice", "i-tw")],
+    };
+    let mut diagnostics = Vec::new();
+    let ir = compile_app(&doc, &app, &mut diagnostics);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.level == Level::Error),
+        "{diagnostics:#?}"
+    );
+
+    let plan = project_user(&[ir], "platform.acme", "alice");
+    let names = plan
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "🇹🇼台湾 02 | CN2 🏡",
+            "🇹🇼台湾 02 | CN2 🏡 | QUIC",
+            "🇹🇼台湾 02 | CN2 🏡 | QUIC | v6",
+            "🇹🇼台湾 02 | CN2 🏡 | v6",
+        ]
+    );
 }
 
 #[test]
@@ -1116,7 +1303,6 @@ fn render_with_tls(xhttp: Option<Xhttp>) -> (String, String) {
             // Off: this shape's XHTTP half refuses flow control, and the TCP half is not what
             // these two cases are about.
             flow: Some(String::new()),
-            fingerprint: "chrome".to_owned(),
         };
         face.wires = IngressWires::Vless(match xhttp.clone() {
             None => Transport::VlessTls(tls),

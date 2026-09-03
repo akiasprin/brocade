@@ -76,7 +76,10 @@
             "fba1c1c2"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:brc/i-brc-jp"
     },
@@ -130,7 +133,10 @@
             "d19361a0"
           ]
         },
-        "security": "reality"
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": 256
+        }
       },
       "tag": "in:lin/i-lin-jp"
     },
@@ -179,7 +185,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:brc/c-brc-jp>sg-01"
     },
@@ -201,7 +210,10 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       },
       "tag": "out:lin/c-lin-jp>us-01"
     },

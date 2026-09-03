@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { draft } from '../src/draft';
-import { ChainSubscriptionCountryRow, subscriptionFlag } from '../src/panes/chains';
+import { ChainSubscriptionCountryRow, ChainTitle, subscriptionFlag } from '../src/panes/chains';
 import type { E2eProbeItem, SnapshotChain } from '../src/api';
 
 const chain = (country: string | null = null): SnapshotChain => ({
@@ -71,6 +71,35 @@ describe('chain subscription country', () => {
     );
   });
 
+  it('preserves the configured country when renaming a chain', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <ChainTitle appId="app-main" chain={chain('TW')} editable />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: '台北直连' }));
+    const input = view.getByRole('textbox', { name: '链名' });
+    fireEvent.change(input, { target: { value: '台湾高速' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(draft.ops()).toEqual([
+        {
+          op: 'upsert_chain',
+          app_id: 'app-main',
+          chain: {
+            id: 'c-tw',
+            tenant_id: 'platform.acme',
+            name: '台湾高速',
+            subscription_country: 'TW',
+          },
+        },
+      ]),
+    );
+  });
+
   it('offers a successful E2E country as an explicit choice and previews the flag', async () => {
     const view = mount(chain(), probe('TW'));
     fireEvent.click(view.getByRole('button', { name: '采用当前出口 TW' }));
@@ -83,6 +112,6 @@ describe('chain subscription country', () => {
     const view = mount(chain('TW'), probe('JP'), false);
     expect(view.queryByRole('combobox', { name: '出口地区标识' })).toBeNull();
     expect(view.getByText('🇹🇼 TW · 台湾')).toBeTruthy();
-    expect(view.getByText('🇹🇼 台北直连')).toBeTruthy();
+    expect(view.getByText('🇹🇼台北直连')).toBeTruthy();
   });
 });

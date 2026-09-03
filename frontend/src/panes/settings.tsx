@@ -10,12 +10,12 @@ import {
   fetchAgentLogPolicy,
   fetchLinkMtu,
   fetchSettings,
-  fetchTcpProbeSettings,
+  fetchPingProbeSettings,
   saveDistribution,
   saveAgentLogDefault,
   saveNodeLogPolicy,
   saveSettings,
-  saveTcpProbeSettings,
+  savePingProbeSettings,
   createCertGroup,
   deleteCertGroup,
   requestSpareCertificate,
@@ -30,7 +30,7 @@ import {
   type NodeCertificateState,
   type LinkMtuItem,
   type ModelSettings,
-  type TcpProbeSettings,
+  type PingProbeSettings,
 } from '../api';
 import { can, useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
@@ -189,7 +189,7 @@ const NAV: NavItem[] = [
   { id: 'set-ports', no: '08', label: '端口分配', apply: 'publish', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
   { id: 'set-probe', no: '09', label: '端到端探测', apply: 'cycle', key: 'probe' },
-  { id: 'set-tcp-probe', no: '10', label: 'TCP 链路探测', apply: 'cycle' },
+  { id: 'set-ping-probe', no: '10', label: 'Ping 链路探测', apply: 'cycle' },
   { id: 'set-geodata', no: '11', label: '规则库更新', apply: 'publish', key: 'geodata' },
 ];
 
@@ -241,7 +241,11 @@ function Overhead({ link }: { link: LinkMtuItem }) {
 // MTU 会重新生成该机器的 wg 配置并中断一次链路，中断时机由运营者决定。
 function MtuProbe() {
   const nameOf = useNodeNames();
-  const probe = useQuery({ queryKey: ['link-mtu'], queryFn: () => fetchLinkMtu() });
+  const probe = useQuery({
+    queryKey: ['link-mtu'],
+    queryFn: () => fetchLinkMtu(),
+    refetchInterval: 60_000,
+  });
   const [open, setOpen] = useState(false);
 
   if (probe.isLoading) return null;
@@ -1325,29 +1329,68 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
   );
 }
 
-const validTcpProbeNumber = (value: number, min: number, max: number) =>
+const validPingProbeNumber = (value: number, min: number, max: number) =>
   Number.isInteger(value) && value >= min && value <= max;
 
-function tcpProbeFormError(form: TcpProbeSettings): string | null {
-  if (!validTcpProbeNumber(form.interval_secs, 15, 86_400)) return '探测间隔必须为 15–86400 秒的整数';
-  if (!validTcpProbeNumber(form.timeout_ms, 1, 120_000)) return '连接超时必须为 1–120000 毫秒的整数';
+function validIpv6Literal(host: string): boolean {
+  try {
+    new URL(`http://[${host}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function pingProbeAddressError(address: string): string | null {
+  if (address.length > 512) return '探测地址不能超过 512 个字符';
+  const tcp = address.match(/^tcp:\/\/(.+)$/);
+  if (tcp) {
+    const authority = tcp[1];
+    if (/\s|[/?#]/.test(authority)) return 'TCP 地址格式应为 tcp://host:port';
+    const bracketedMatch = authority.match(/^\[([^\]]+)]:(\d+)$/);
+    const bracketed = bracketedMatch && validIpv6Literal(bracketedMatch[1]) ? bracketedMatch : null;
+    const plainMatch = authority.match(/^(.+):(\d+)$/);
+    const plain =
+      plainMatch && !plainMatch[1].includes(':') && !plainMatch[1].includes('[') && !plainMatch[1].includes(']')
+        ? plainMatch
+        : null;
+    const match = bracketed ?? plain;
+    if (!match) return 'TCP 地址格式应为 tcp://host:port；IPv6 地址需放在方括号内';
+    const port = Number(match[2]);
+    return Number.isInteger(port) && port >= 1 && port <= 65_535 ? null : 'TCP 端口必须为 1–65535';
+  }
+  const icmp = address.match(/^icmp:\/\/(.+)$/);
+  if (icmp) {
+    const authority = icmp[1];
+    if (/\s|[/?#]/.test(authority)) return 'ICMP 地址格式应为 icmp://host，不接受路径或端口';
+    const bracketed = authority.match(/^\[([^\]]+)]$/);
+    if (bracketed) return validIpv6Literal(bracketed[1]) ? null : 'ICMP 方括号内必须是 IPv6 地址';
+    if (!authority || authority.includes(':') || authority.includes('[') || authority.includes(']'))
+      return 'ICMP 不接受端口；IPv6 地址需放在方括号内';
+    return null;
+  }
+  return '探测地址必须使用 tcp://host:port 或 icmp://host';
+}
+
+export function pingProbeFormError(form: PingProbeSettings): string | null {
+  if (!validPingProbeNumber(form.interval_secs, 5, 86_400)) return '探测间隔必须为 5–86400 秒的整数';
+  if (!validPingProbeNumber(form.timeout_ms, 1, 120_000)) return '探测超时必须为 1–120000 毫秒的整数';
   if (form.targets.length > 32) return '最多配置 32 个目标';
   const addresses = new Set<string>();
   for (const target of form.targets) {
     if (!target.name.trim()) return '每个目标都要填写名称';
-    if (!/^tcp:\/\/(?:\[[^\]]+\]|[^\s/:?#]+):(?:[1-9]\d{0,4})$/.test(target.address.trim()))
-      return '地址格式应为 tcp://host:port；IPv6 地址需放在方括号内';
-    const port = Number(target.address.trim().match(/:(\d+)$/)?.[1]);
-    if (port > 65_535) return 'TCP 端口不能超过 65535';
+    if (Array.from(target.name.trim()).length > 64) return '目标名称不能超过 64 个字符';
+    const addressError = pingProbeAddressError(target.address.trim());
+    if (addressError) return addressError;
     if (addresses.has(target.address.trim())) return `地址不能重复：${target.address.trim()}`;
     addresses.add(target.address.trim());
   }
   return null;
 }
 
-function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: TcpProbeSettings }) {
+function PingProbeSettingsSection({ editable, data }: { editable: boolean; data: PingProbeSettings }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState<TcpProbeSettings>(() => ({
+  const [form, setForm] = useState<PingProbeSettings>(() => ({
     ...data,
     targets: data.targets.map(target => ({ ...target })),
   }));
@@ -1362,14 +1405,14 @@ function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: 
     targets: form.targets.map(target => ({ name: target.name.trim(), address: target.address.trim() })),
   };
   const dirty = JSON.stringify(normalized) !== JSON.stringify(data);
-  const invalid = tcpProbeFormError(normalized);
+  const invalid = pingProbeFormError(normalized);
   const save = useMutation({
-    mutationFn: () => saveTcpProbeSettings(normalized),
+    mutationFn: () => savePingProbeSettings(normalized),
     onSuccess: next => {
       setSaved(true);
       setForm({ ...next, targets: next.targets.map(target => ({ ...target })) });
-      qc.setQueryData(['tcp-probe-settings'], next);
-      qc.invalidateQueries({ queryKey: ['tcp-probe-nodes'] });
+      qc.setQueryData(['ping-probe-settings'], next);
+      qc.invalidateQueries({ queryKey: ['ping-probe-nodes'] });
     },
   });
 
@@ -1382,11 +1425,11 @@ function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: 
     }));
 
   return (
-    <section className="panel titled tcp-probe-settings" id="set-tcp-probe">
+    <section className="panel titled ping-probe-settings" id="set-ping-probe">
       <header>
-        <span className="no">{NO_OF['set-tcp-probe']}</span>
-        <h4>TCP 链路探测</h4>
-        <ApplyBadge id="set-tcp-probe" />
+        <span className="no">{NO_OF['set-ping-probe']}</span>
+        <h4>Ping 链路探测</h4>
+        <ApplyBadge id="set-ping-probe" />
         <span className="sp" />
         {dirty && <span className="dirty">有未保存的改动</span>}
         {!dirty && saved && <span className="dirty done">已保存</span>}
@@ -1398,22 +1441,22 @@ function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: 
           {save.isPending ? '保存中…' : '保存这一段'}
         </button>
       </header>
-      <p className="cardsub">每台机器直接连接这些地址，用于描述机器到目标的 TCP 建连状态</p>
+      <p className="cardsub">每台机器按目标协议执行 TCP Connect 或 ICMP Echo，用于描述机器到目标的链路状态</p>
       {save.error && <ErrorBox error={save.error} />}
       <Group label="调度">
         <Fld label="多久探一轮">
           <input
             className="f"
             type="number"
-            min={15}
+            min={5}
             max={86_400}
             value={form.interval_secs}
             onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
           />
           <span className="unit">秒</span>
-          <span className="hint">默认 60；每轮每个目标只发起 1 次 Connect</span>
+          <span className="hint">默认 60；每轮对每个目标探测 1 次</span>
         </Fld>
-        <Fld label="连接超时">
+        <Fld label="探测超时">
           <input
             className="f"
             type="number"
@@ -1423,13 +1466,16 @@ function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: 
             onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
           />
           <span className="unit">毫秒</span>
-          <span className="hint">默认 420；超过该值记为丢包，不单独设置 SYN 重传次数</span>
+          <span className="hint">默认 420；TCP 建连或 ICMP Echo 超过该值均记为无响应</span>
         </Fld>
       </Group>
-      <Group label="TCP 目标">
-        <div className="tcp-probe-targets">
+      <Group label="探测目标">
+        <div className="ping-probe-targets">
           {form.targets.map((target, index) => (
-            <div className="tcp-probe-target" key={index}>
+            <div className="ping-probe-target" key={index}>
+              <span className={`ping-probe-kind ${target.address.startsWith('icmp://') ? 'icmp' : 'tcp'}`}>
+                {target.address.startsWith('icmp://') ? 'ICMP' : target.address.startsWith('tcp://') ? 'TCP' : '—'}
+              </span>
               <input
                 className="f"
                 aria-label={`目标 ${index + 1} 名称`}
@@ -1440,7 +1486,7 @@ function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: 
               <input
                 className="f mono"
                 aria-label={`目标 ${index + 1} 地址`}
-                placeholder="tcp://1.1.1.1:443"
+                placeholder="tcp://1.1.1.1:443 或 icmp://1.1.1.1"
                 value={target.address}
                 onChange={event => updateTarget(index, 'address', event.target.value)}
               />
@@ -1459,33 +1505,31 @@ function TcpProbeSettingsSection({ editable, data }: { editable: boolean; data: 
               </button>
             </div>
           ))}
-          {form.targets.length === 0 && <span className="hint">尚未配置目标，Agent 不会执行 TCP 探测</span>}
+          {form.targets.length === 0 && <span className="hint">尚未配置目标，Agent 不会执行 Ping 探测</span>}
         </div>
-        <button
-          className="btn sm"
-          type="button"
-          disabled={!editable || form.targets.length >= 32}
-          onClick={() =>
-            setForm(current => ({
-              ...current,
-              targets: [...current.targets, { name: '', address: 'tcp://' }],
-            }))
-          }
-        >
-          ＋ 添加 TCP 目标
-        </button>
+        <div className="ping-probe-add">
+          {(['tcp', 'icmp'] as const).map(protocol => (
+            <button
+              className="btn sm"
+              type="button"
+              key={protocol}
+              disabled={!editable || form.targets.length >= 32}
+              onClick={() =>
+                setForm(current => ({
+                  ...current,
+                  targets: [...current.targets, { name: '', address: `${protocol}://` }],
+                }))
+              }
+            >
+              ＋ 添加 {protocol.toUpperCase()} 目标
+            </button>
+          ))}
+        </div>
         {invalid && <span className="agent-log-invalid">{invalid}</span>}
-        <div className="guard">
-          Connect 计时从域名解析完成后开始，仅包含 TCP 建连；无响应记为空值。不会采集 DNS 耗时、内核 RTT、RTO、SYN
-          重传或连接错误分类。机器没有可用 IPv6 路由时会跳过 IPv6 候选；双栈域名继续尝试 IPv4，纯 IPv6
-          目标不记为无响应。
+        <div className="guard ping-probe-note">
+          两类计时都从域名解析完成后开始。TCP 只计建连，ICMP 只计 Echo 往返；不会采集 DNS 耗时、内核 RTT、RTO、SYN
+          重传或连接错误分类。没有可用 IPv6 路由或 ICMP Socket 权限时记为未探测，不计作丢包。
         </div>
-      </Group>
-      <Group label="ICMP · TODO">
-        <Fld label="Ping 地址">
-          <input className="f mono" disabled placeholder="icmp://1.1.1.1" />
-          <span className="hint">暂未实现，当前优先支持 TCP Connect</span>
-        </Fld>
       </Group>
     </section>
   );
@@ -1557,7 +1601,7 @@ export function SettingsPane() {
   });
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
-  const tcpProbe = useQuery({ queryKey: ['tcp-probe-settings'], queryFn: fetchTcpProbeSettings });
+  const pingProbe = useQuery({ queryKey: ['ping-probe-settings'], queryFn: fetchPingProbeSettings });
   const [form, setForm] = useState<Form>(EMPTY);
   const [saved, setSaved] = useState<Partial<Record<SectionKey, number>>>({});
 
@@ -1641,7 +1685,7 @@ export function SettingsPane() {
     certs.isPending ||
     dist.isPending ||
     logPolicy.isPending ||
-    tcpProbe.isPending
+    pingProbe.isPending
   )
     return <Loading />;
   if (settings.error) return <ErrorBox error={settings.error} />;
@@ -1991,10 +2035,10 @@ export function SettingsPane() {
             </Group>
           </Section>
 
-          {tcpProbe.error ? (
-            <ErrorBox error={tcpProbe.error} />
+          {pingProbe.error ? (
+            <ErrorBox error={pingProbe.error} />
           ) : (
-            <TcpProbeSettingsSection editable={editable} data={tcpProbe.data!} />
+            <PingProbeSettingsSection editable={editable} data={pingProbe.data!} />
           )}
 
           {/* 不提供开关是有意的：规则表中的 geosite: / geoip: 依赖这两个文件，文件过期不会报错，

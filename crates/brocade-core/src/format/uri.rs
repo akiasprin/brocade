@@ -1,7 +1,7 @@
 use crate::artifacts::subscription::{
     Subscription, SubscriptionEntry, SubscriptionSecurity, SubscriptionStream,
 };
-use crate::model::{XhttpXmux, XhttpXmuxRange};
+use crate::model::{XhttpTuning, XhttpXmux, XhttpXmuxRange};
 
 pub fn subscription(subscription: &Subscription) -> String {
     let mut lines = Vec::new();
@@ -35,13 +35,14 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
     // `type` names the network layer, and it is the field a client uses to decide how to dial.
     // XHTTP additionally needs the path: the server matches it and refuses anything else, so a
     // URI missing it imports cleanly and never connects.
-    let (kind, path, host, download, xmux, mode) = match &entry.stream {
-        SubscriptionStream::Tcp => ("tcp", None, None, None, None, None),
+    let (kind, path, host, download, xmux, tuning, mode) = match &entry.stream {
+        SubscriptionStream::Tcp => ("tcp", None, None, None, None, None, None),
         SubscriptionStream::Xhttp {
             path,
             host,
             download,
             xmux,
+            tuning,
             mode,
         } => (
             "xhttp",
@@ -49,6 +50,7 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
             host.as_deref(),
             download.as_ref(),
             xmux.as_ref(),
+            tuning.as_ref(),
             *mode,
         ),
     };
@@ -69,7 +71,6 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
         SubscriptionSecurity::Tls(tls) => {
             query.push(("security", "tls".to_owned()));
             query.push(("sni", tls.server_name.clone()));
-            query.push(("fp", tls.fingerprint.clone()));
             tls.flow.clone()
         }
         SubscriptionSecurity::Hysteria2(_) => unreachable!("Hysteria 已在上方单独渲染"),
@@ -99,6 +100,9 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
         if let Some(xmux) = xmux {
             extra.insert("xmux".to_owned(), xmux_json(xmux));
         }
+        if let Some(tuning) = tuning {
+            extra.extend(xhttp_tuning_json(tuning));
+        }
         if let Some(download) = download {
             let mut down_xhttp = serde_json::json!({
                 "host": download.http_host.as_deref().unwrap_or(&download.server_name),
@@ -109,7 +113,6 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
             }
             let tls_settings = serde_json::json!({
                 "serverName": download.server_name,
-                "fingerprint": download.fingerprint,
             });
             extra.insert(
                 "downloadSettings".to_owned(),
@@ -151,11 +154,33 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
 }
 
 fn xmux_json(xmux: &XhttpXmux) -> serde_json::Value {
-    serde_json::json!({
-        "maxConcurrency": xmux.max_concurrency,
-        "hMaxRequestTimes": xray_range(&xmux.h_max_request_times),
-        "hMaxReusableSecs": xray_range(&xmux.h_max_reusable_secs),
-    })
+    let mut value = serde_json::Map::new();
+    if let Some(concurrency) = xmux.max_concurrency {
+        value.insert("maxConcurrency".to_owned(), serde_json::json!(concurrency));
+    }
+    if let Some(connections) = xmux.max_connections {
+        value.insert("maxConnections".to_owned(), serde_json::json!(connections));
+    }
+    value.insert(
+        "hMaxRequestTimes".to_owned(),
+        xray_range(&xmux.h_max_request_times),
+    );
+    value.insert(
+        "hMaxReusableSecs".to_owned(),
+        xray_range(&xmux.h_max_reusable_secs),
+    );
+    if let Some(period) = xmux.h_keep_alive_period_secs {
+        value.insert("hKeepAlivePeriod".to_owned(), serde_json::json!(period));
+    }
+    serde_json::Value::Object(value)
+}
+
+fn xhttp_tuning_json(tuning: &XhttpTuning) -> serde_json::Map<String, serde_json::Value> {
+    let mut value = serde_json::Map::new();
+    if let Some(range) = &tuning.x_padding_bytes {
+        value.insert("xPaddingBytes".to_owned(), xray_range(range));
+    }
+    value
 }
 
 fn xray_range(range: &XhttpXmuxRange) -> serde_json::Value {
