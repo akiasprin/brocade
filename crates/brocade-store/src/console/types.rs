@@ -7,7 +7,7 @@ use serde::{de::Deserializer, Deserialize, Serialize};
 use serde_json::Value;
 
 use brocade_core::model::{
-    Chain, DestMatch, Dns, DomainStrategy, EgressDnsResolution, ExternalOutboundProtocol,
+    AnyTls, Chain, DestMatch, Dns, DomainStrategy, EgressDnsResolution, ExternalOutboundProtocol,
     ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2, IngressGuard, NodeConnection,
     Projection, RealityFallbackLimits, RealityFallbackMode, Rule, User, WgTransport, Xhttp,
 };
@@ -645,6 +645,8 @@ pub struct WiresRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vless: Option<TransportRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub anytls: Option<AnyTls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<Hysteria2>,
 }
 
@@ -653,6 +655,7 @@ impl Default for WiresRequest {
     fn default() -> Self {
         Self {
             vless: Some(TransportRequest::default()),
+            anytls: None,
             hysteria2: None,
         }
     }
@@ -669,16 +672,19 @@ impl<'de> Deserialize<'de> for WiresRequest {
             #[serde(default)]
             vless: Option<TransportRequest>,
             #[serde(default)]
+            anytls: Option<AnyTls>,
+            #[serde(default)]
             hysteria2: Option<Hysteria2>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        if wire.vless.is_none() && wire.hysteria2.is_none() {
+        if wire.vless.is_none() && wire.anytls.is_none() && wire.hysteria2.is_none() {
             return Err(serde::de::Error::custom(
-                "接入面至少要有一条线：wires.vless 和 wires.hysteria2 不能都空着",
+                "接入面至少要有一条线：wires.vless、wires.anytls 和 wires.hysteria2 不能都空着",
             ));
         }
         Ok(Self {
             vless: wire.vless,
+            anytls: wire.anytls,
             hysteria2: wire.hysteria2,
         })
     }

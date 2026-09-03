@@ -22,7 +22,7 @@ use brocade_core::{
     format::{ini, json as json_format, uri, yaml},
     hash::sha256_hex,
     model::{
-        Action, AppView, Chain, Dns, DomainStrategy, ExternalOutboundProtocol,
+        Action, AnyTlsMasquerade, AppView, Chain, Dns, DomainStrategy, ExternalOutboundProtocol,
         ExternalOutboundSecurity, ExternalWarpBinding, Front, Grant, HopEncryption, HopWire,
         HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressIdentity,
         IngressWires, IngressWiresWire, ModelSnapshot, NodeConnection, Projection,
@@ -1966,6 +1966,31 @@ pub(crate) async fn upsert_ingress_tx(
         Some(HysteriaMasquerade::Proxy { url }) => ("proxy", Some(url.clone())),
         _ => ("not-found", None),
     };
+    let anytls = request.wires.anytls.as_ref();
+    let anytls_padding_scheme = anytls
+        .map(|settings| serde_json::to_value(&settings.padding_scheme))
+        .transpose()?;
+    let (
+        anytls_masquerade_kind,
+        anytls_masquerade_content,
+        anytls_masquerade_headers,
+        anytls_masquerade_status_code,
+    ) = match anytls.map(|settings| &settings.masquerade) {
+        Some(AnyTlsMasquerade::String {
+            content,
+            headers,
+            status_code,
+        }) => (
+            "string",
+            Some(content.clone()),
+            Some(serde_json::to_value(headers)?),
+            Some(i32::from(*status_code)),
+        ),
+        Some(AnyTlsMasquerade::NotFound { headers }) if !headers.is_empty() => {
+            ("404", None, Some(serde_json::to_value(headers)?), None)
+        }
+        _ => ("404", None, None, None),
+    };
     let row = sqlx::query(
         "INSERT INTO ingresses (
             id, app_id, chain_id, node_id, bind, port, front_id,
@@ -1994,7 +2019,10 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_quic_max_idle_secs, hy2_quic_keepalive_secs,
             hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud,
             xhttp_tuning,
-            xhttp_download_v4_origin_port, xhttp_download_v6_origin_port
+            xhttp_download_v4_origin_port, xhttp_download_v6_origin_port,
+            anytls_enabled, anytls_port, anytls_padding_scheme,
+            anytls_masquerade_kind, anytls_masquerade_content,
+            anytls_masquerade_headers, anytls_masquerade_status_code
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
@@ -2011,7 +2039,8 @@ pub(crate) async fn upsert_ingress_tx(
             $50,
             $51, $52, $53, $54,
             $55, $56, $57, $58,
-            $59, $60, $61
+            $59, $60, $61,
+            $62, $63, $64, $65, $66, $67, $68
          )
          ON CONFLICT (id) DO UPDATE SET
             app_id = EXCLUDED.app_id,
@@ -2070,6 +2099,13 @@ pub(crate) async fn upsert_ingress_tx(
             xhttp_tuning = EXCLUDED.xhttp_tuning,
             xhttp_download_v4_origin_port = EXCLUDED.xhttp_download_v4_origin_port,
             xhttp_download_v6_origin_port = EXCLUDED.xhttp_download_v6_origin_port,
+            anytls_enabled = EXCLUDED.anytls_enabled,
+            anytls_port = EXCLUDED.anytls_port,
+            anytls_padding_scheme = EXCLUDED.anytls_padding_scheme,
+            anytls_masquerade_kind = EXCLUDED.anytls_masquerade_kind,
+            anytls_masquerade_content = EXCLUDED.anytls_masquerade_content,
+            anytls_masquerade_headers = EXCLUDED.anytls_masquerade_headers,
+            anytls_masquerade_status_code = EXCLUDED.anytls_masquerade_status_code,
             created_revision = COALESCE(ingresses.created_revision, EXCLUDED.created_revision)
          WHERE ROW(ingresses.app_id, ingresses.chain_id, ingresses.node_id, ingresses.bind,
                    ingresses.port, ingresses.front_id, ingresses.reality_dest,
@@ -2099,7 +2135,10 @@ pub(crate) async fn upsert_ingress_tx(
                    ingresses.hy2_quic_max_incoming_streams, ingresses.hy2_quic_disable_pmtud,
                    ingresses.xhttp_tuning,
                    ingresses.xhttp_download_v4_origin_port,
-                   ingresses.xhttp_download_v6_origin_port)
+                   ingresses.xhttp_download_v6_origin_port,
+                   ingresses.anytls_enabled, ingresses.anytls_port, ingresses.anytls_padding_scheme,
+                   ingresses.anytls_masquerade_kind, ingresses.anytls_masquerade_content,
+                   ingresses.anytls_masquerade_headers, ingresses.anytls_masquerade_status_code)
             IS DISTINCT FROM
             ROW(EXCLUDED.app_id, EXCLUDED.chain_id, EXCLUDED.node_id, EXCLUDED.bind,
                 EXCLUDED.port, EXCLUDED.front_id, EXCLUDED.reality_dest,
@@ -2129,7 +2168,10 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.hy2_quic_max_incoming_streams, EXCLUDED.hy2_quic_disable_pmtud,
                 EXCLUDED.xhttp_tuning,
                 EXCLUDED.xhttp_download_v4_origin_port,
-                EXCLUDED.xhttp_download_v6_origin_port)
+                EXCLUDED.xhttp_download_v6_origin_port,
+                EXCLUDED.anytls_enabled, EXCLUDED.anytls_port, EXCLUDED.anytls_padding_scheme,
+                EXCLUDED.anytls_masquerade_kind, EXCLUDED.anytls_masquerade_content,
+                EXCLUDED.anytls_masquerade_headers, EXCLUDED.anytls_masquerade_status_code)
          RETURNING reality_private_key,
                    reality_public_key,
                    reality_short_ids",
@@ -2272,6 +2314,13 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(xhttp_tuning)
     .bind(xhttp_download_v4_origin_port)
     .bind(xhttp_download_v6_origin_port)
+    .bind(anytls.is_some())
+    .bind(anytls.map(|settings| i32::from(settings.port)))
+    .bind(anytls_padding_scheme.unwrap_or_else(|| json!([])))
+    .bind(anytls_masquerade_kind)
+    .bind(anytls_masquerade_content.unwrap_or_default())
+    .bind(anytls_masquerade_headers.unwrap_or_else(|| json!({})))
+    .bind(anytls_masquerade_status_code.unwrap_or(200))
     .fetch_optional(&mut **tx)
     .await?;
     let client_changed = sqlx::query(
@@ -2391,6 +2440,7 @@ pub(crate) async fn upsert_ingress_tx(
                         .expect("XHTTP request has normalized settings"),
                 }),
             }),
+            anytls: request.wires.anytls.clone(),
             hysteria2: request.wires.hysteria2.clone(),
         })
         .map_err(|error| StoreError::InvalidData(error.to_owned()))?,

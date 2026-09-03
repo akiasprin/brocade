@@ -1112,6 +1112,7 @@ fn public_subscription_protocol(
     match query.protocol.as_deref() {
         None | Some("") | Some("both") => Some(None),
         Some("vless") => Some(Some(SubscriptionProtocol::Vless)),
+        Some("anytls") => Some(Some(SubscriptionProtocol::AnyTls)),
         Some("hysteria2") => Some(Some(SubscriptionProtocol::Hysteria2)),
         Some(_) => None,
     }
@@ -4796,7 +4797,7 @@ mod tests {
 
         assert!(INSTALL_SCRIPT.contains(&script_default));
         assert!(upstream.contains(&format!("tag = \"{BROCADE_XRAY_VERSION}\"")));
-        assert!(upstream.contains("anytls = false"));
+        assert!(upstream.contains("anytls = true"));
         assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"b4f0898\""));
         assert!(build_script.contains("core.build={build_id}"));
         assert!(build_script.contains("fn repository_build_id"));

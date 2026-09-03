@@ -343,6 +343,9 @@ fn client_config(target: &E2eProbeTarget, socks_port: u16, log_path: &str) -> St
     if let Some(hysteria) = &target.hysteria2 {
         return hysteria_client_config(target, hysteria, socks_port, log_path);
     }
+    if let Some(anytls) = &target.anytls {
+        return anytls_client_config(target, anytls, socks_port, log_path);
+    }
     let mut settings = serde_json::json!({
         "vnext": [{
             "address": target.dial_host,
@@ -387,6 +390,44 @@ fn client_config(target: &E2eProbeTarget, socks_port: u16, log_path: &str) -> St
             "protocol": "vless",
             "settings": settings,
             "streamSettings": stream_settings(target),
+        }],
+    });
+    serde_json::to_string(&config).unwrap_or_default()
+}
+
+fn anytls_client_config(
+    target: &E2eProbeTarget,
+    anytls: &brocade_deployment::protocol::E2eProbeAnyTls,
+    socks_port: u16,
+    log_path: &str,
+) -> String {
+    let config = serde_json::json!({
+        "log": {
+            "loglevel": "info",
+            "error": log_path,
+            "access": "none",
+        },
+        "inbounds": [{
+            "tag": "probe-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": { "auth": "noauth", "udp": false },
+        }],
+        "outbounds": [{
+            "tag": "probe-out",
+            "protocol": "anytls",
+            "settings": {
+                "address": target.dial_host,
+                "port": target.port,
+                "password": target.uuid,
+            },
+            "streamSettings": {
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": anytls.server_name,
+                },
+            },
         }],
     });
     serde_json::to_string(&config).unwrap_or_default()
@@ -1031,6 +1072,7 @@ mod tests {
             port: 8443,
             uuid: "u".to_owned(),
             hysteria2: None,
+            anytls: None,
             reality: brocade_deployment::protocol::E2eProbeReality {
                 public_key: "pk".to_owned(),
                 short_id: "sid".to_owned(),
@@ -1202,6 +1244,27 @@ mod tests {
         assert!(out["outbounds"][0]["settings"]["vnext"][0]["users"][0]
             .get("flow")
             .is_none());
+    }
+
+    #[test]
+    fn an_anytls_target_produces_an_anytls_client() {
+        let mut t = target(&[]);
+        t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
+            server_name: "anytls.example.net".to_owned(),
+        });
+        t.port = 19443;
+        let out: serde_json::Value =
+            serde_json::from_str(&client_config(&t, 1080, "/tmp/x")).unwrap();
+        let outbound = &out["outbounds"][0];
+        assert_eq!(outbound["protocol"], "anytls");
+        assert_eq!(outbound["settings"]["address"], "127.0.0.1");
+        assert_eq!(outbound["settings"]["port"], 19443);
+        assert_eq!(outbound["settings"]["password"], "u");
+        assert_eq!(
+            outbound["streamSettings"]["tlsSettings"]["serverName"],
+            "anytls.example.net"
+        );
+        assert!(outbound["streamSettings"].get("network").is_none());
     }
 
     #[test]

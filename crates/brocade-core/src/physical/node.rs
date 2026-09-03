@@ -13,7 +13,7 @@ use crate::{
         system::{Dial, Link, LinkWrap, SystemIr, SystemNode},
     },
     model::{
-        Action, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback,
+        Action, AnyTls, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback,
         EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
         ExternalOutboundSecurity, GeodataSettings, HopPool, HopWire, IngressGuard, Network,
         RealityClientPolicy, RealityFallbackLimits, RealityFallbackRateLimit, RealitySettings,
@@ -291,6 +291,7 @@ pub struct XrayIngressPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngressProtocol {
     Vless,
+    AnyTls(AnyTls),
     Hysteria2(crate::model::Hysteria2),
 }
 
@@ -767,11 +768,10 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
             let split = matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)))
                 && !download_ports.is_empty();
 
-            // Built as the TCP half first. The UDP half is the same value with four fields
-            // replaced.
-            let plan = XrayIngressPlan {
+            let base_tag = ingress_tag(app, &ingress.id);
+            let vless = ingress.wires.vless().map(|_| XrayIngressPlan {
                 id: ingress.id.clone(),
-                tag: ingress_tag(app, &ingress.id),
+                tag: base_tag.clone(),
                 listen: ingress.bind,
                 port: ingress.port,
                 sniff: ingress.sniff,
@@ -788,7 +788,7 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                 xhttp: ingress.wires.xhttp().cloned(),
                 split: split.then_some(XraySplitIngressPlan {
                     core_port: 0,
-                    download_ports,
+                    download_ports: download_ports.clone(),
                 }),
                 cover_port: ingress
                     .wires
@@ -800,14 +800,25 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                     .reality()
                     .is_some_and(RealitySettings::guards_fallback)
                     .then_some(0),
-            };
-
-            let tcp = ingress.wires.vless().is_some().then(|| plan.clone());
+            });
+            let anytls = ingress.wires.anytls().map(|settings| XrayIngressPlan {
+                id: ingress.id.clone(),
+                tag: format!("{base_tag}:anytls"),
+                listen: ingress.bind,
+                port: settings.port,
+                sniff: ingress.sniff,
+                protocol: IngressProtocol::AnyTls(settings.clone()),
+                security: IngressSecurity::Tls,
+                certificate_name: ingress.certificate_name.clone(),
+                xhttp: None,
+                split: None,
+                cover_port: None,
+                guard_port: None,
+            });
             let quic = ingress.wires.hysteria2().map(|settings| XrayIngressPlan {
-                tag: format!("{}:hy2", plan.tag),
-                // Its own port, taken from the wire rather than from the ingress. `..plan`
-                // would otherwise copy the TCP half's number, which is how the two previously
-                // shared one; see `Hysteria2::port` for why they no longer may.
+                tag: format!("{base_tag}:hy2"),
+                // Its own port, taken from the wire rather than from the ingress. The TCP
+                // listeners may have independent ports, and QUIC has its own port as well.
                 port: settings.port,
                 protocol: IngressProtocol::Hysteria2(settings.clone()),
                 // Hysteria 2 always presents this machine's certificate: REALITY cannot be
@@ -817,9 +828,12 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                 split: None,
                 cover_port: None,
                 guard_port: None,
-                ..plan.clone()
+                id: ingress.id.clone(),
+                listen: ingress.bind,
+                sniff: ingress.sniff,
+                certificate_name: ingress.certificate_name.clone(),
             });
-            tcp.into_iter().chain(quic)
+            vless.into_iter().chain(anytls).chain(quic)
         })
         .collect::<Vec<_>>();
     inbounds.sort_by(|a, b| a.tag.cmp(&b.tag));
@@ -833,7 +847,13 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
             app.ingresses
                 .iter()
                 .filter(|ingress| ingress.node == node_id)
-                .map(|ingress| ingress.port),
+                .filter_map(|ingress| ingress.wires.vless().map(|_| ingress.port)),
+        );
+        used.extend(
+            apps.iter()
+                .flat_map(|app| app.ingresses.iter())
+                .filter(|ingress| ingress.node == node_id)
+                .filter_map(|ingress| ingress.wires.anytls().map(|anytls| anytls.port)),
         );
         used.extend(
             app.steps
@@ -1592,10 +1612,23 @@ fn grant_sync_plan(apps: &[AppIr], node_id: &str) -> GrantSyncPlan {
             // inbounds, and xray's account list is per inbound: pushing to only one leaves every
             // client holding a subscription for the other half rejected as an unknown user.
             let tag = ingress_tag(app, &ingress.id);
-            if ingress.wires.has_tcp() {
+            if ingress.wires.vless().is_some() {
                 updates.push(GrantInboundUpdatePlan {
                     inbound_tag: tag.clone(),
                     clients: clients.clone(),
+                });
+            }
+            if ingress.wires.anytls().is_some() {
+                updates.push(GrantInboundUpdatePlan {
+                    inbound_tag: format!("{tag}:anytls"),
+                    clients: clients
+                        .clone()
+                        .into_iter()
+                        .map(|client| GrantClientPlan {
+                            flow: None,
+                            ..client
+                        })
+                        .collect(),
                 });
             }
             if ingress.wires.has_udp() {
@@ -1756,7 +1789,12 @@ fn ingress_inbound_tags(app: &AppIr, ingress: &Ingress) -> Vec<String> {
     let base = ingress_tag(app, &ingress.id);
     let mut tags = Vec::new();
     if ingress.wires.has_tcp() {
-        tags.push(base.clone());
+        if ingress.wires.vless().is_some() {
+            tags.push(base.clone());
+        }
+        if ingress.wires.anytls().is_some() {
+            tags.push(format!("{base}:anytls"));
+        }
     }
     if ingress.wires.has_udp() {
         tags.push(format!("{base}:hy2"));

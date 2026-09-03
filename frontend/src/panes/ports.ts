@@ -53,8 +53,12 @@ export function occupiedPorts(
         }
         continue;
       }
-      if (!ingress.wires.vless) continue;
-      put(ingress.node, ingress.port, `线路 ${app.id} 的接入面 ${ingress.id}`);
+      if (ingress.wires.vless) {
+        put(ingress.node, ingress.port, `线路 ${app.id} 的接入面 ${ingress.id} VLESS`);
+      }
+      if (ingress.wires.anytls) {
+        put(ingress.node, ingress.wires.anytls.port, `线路 ${app.id} 的接入面 ${ingress.id} AnyTLS`);
+      }
     }
     if (protocol === 'tcp') {
       for (const step of app.steps ?? []) {

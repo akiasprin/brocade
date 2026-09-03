@@ -8,16 +8,16 @@ use brocade_core::{
         validate::{validate_app, validate_app_set, validate_model_snapshot, validate_system},
     },
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
-        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutbound,
-        ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
-        ExternalVlessXhttp, ExternalVlessXhttpDownload, ExternalWarpBinding, Front, FrontStrategy,
-        Grant, HopDial, HopIn, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaMasquerade,
-        HysteriaObfs, HysteriaPortHop, Ingress, IngressWires, IpFamily, ModelSettings,
-        ModelSnapshot, Node, NodeEgressDnsPolicy, OverlaySettings, Projection,
-        ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityClientPolicy,
-        RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User,
-        WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
+        Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, DestMatch, Dns, DomainStrategy,
+        EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
+        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
+        ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
+        ExternalWarpBinding, Front, FrontStrategy, Grant, HopDial, HopIn, HopPool, HopWire,
+        Hysteria2, HysteriaBandwidth, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, Ingress,
+        IngressWires, IpFamily, ModelSettings, ModelSnapshot, Node, NodeEgressDnsPolicy,
+        OverlaySettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
+        RealityClientPolicy, RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls,
+        Transport, User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
     },
     Diagnostic, Level,
 };
@@ -1118,6 +1118,60 @@ fn validate_refuses_a_shared_hysteria2_port_and_a_hop_range_without_its_listener
 
     assert_has(&diagnostics, Level::Error, "ingress.hy2-port-shared");
     assert_has(&diagnostics, Level::Error, "ingress.hy2-hop-listener");
+}
+
+#[test]
+fn validate_anytls_checks_padding_masquerade_and_tcp_port_collisions() {
+    let mut diagnostics = Vec::new();
+    let (sys, mut app_ir) = two_hop_ir(HopDial::Overlay, HopWire::None, &mut diagnostics);
+    let ingress = &mut app_ir.ingresses[0];
+    ingress.certificate_name = Some("anytls.example.net".to_owned());
+    let vless = ingress.wires.vless().unwrap().clone();
+    ingress.wires = IngressWires::VlessAndAnyTls {
+        vless,
+        anytls: AnyTls {
+            // AnyTLS and VLESS are both TCP, so an equal port is a real socket collision.
+            port: ingress.port,
+            padding_scheme: vec!["0=30-30".to_owned(), "0=40-40".to_owned()],
+            masquerade: AnyTlsMasquerade::String {
+                content: String::new(),
+                headers: [("Bad Header".to_owned(), "line\nfeed".to_owned())]
+                    .into_iter()
+                    .collect(),
+                status_code: 199,
+            },
+        },
+    };
+
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert_has(&diagnostics, Level::Error, "ingress.anytls-padding");
+    assert_has(&diagnostics, Level::Error, "ingress.anytls-masquerade");
+    assert_has(&diagnostics, Level::Error, "node.port-clash");
+}
+
+#[test]
+fn validate_accepts_a_valid_anytls_only_ingress_with_a_certificate() {
+    let mut diagnostics = Vec::new();
+    let (sys, mut app_ir) = two_hop_ir(HopDial::Overlay, HopWire::None, &mut diagnostics);
+    let ingress = &mut app_ir.ingresses[0];
+    ingress.certificate_name = Some("anytls.example.net".to_owned());
+    ingress.wires = IngressWires::AnyTls(AnyTls {
+        port: 19443,
+        padding_scheme: vec!["stop=2".to_owned(), "0=30-30".to_owned()],
+        masquerade: AnyTlsMasquerade::NotFound {
+            headers: Default::default(),
+        },
+    });
+
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level != Level::Error),
+        "{diagnostics:#?}"
+    );
 }
 
 /// A coherent pair produces neither complaint, and the ports the hop covers are claimed on this

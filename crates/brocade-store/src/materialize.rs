@@ -6,15 +6,15 @@ use std::{
 use brocade_core::client_config::ClientProjectionDownloadEndpoint;
 use brocade_core::hash::hex_lower;
 use brocade_core::model::{
-    Accept, Action, AppView, Chain, ConnectionSettings, DestMatch, Dns, ExternalOutbound,
-    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding, Front, FrontStrategy,
-    GeodataSettings, Grant, HopDial, HopIn, HopPool, Hysteria2, HysteriaBandwidth,
-    HysteriaBbrProfile, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop,
-    HysteriaQuic, Ingress, IngressGuard, IngressIdentity, IngressWires, IngressWiresWire,
-    ModelSettings, ModelSnapshot, Network, Node, NodeConnection, OverlaySettings, PortSettings,
-    ProbeSettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint, RealityClientPolicy,
-    RealityFallbackLimits, RealityFallbackMode, RealitySettings, RealitySite, RealityXhttp, Rule,
-    Step, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp, XhttpMode,
+    Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, ConnectionSettings, DestMatch, Dns,
+    ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding,
+    Front, FrontStrategy, GeodataSettings, Grant, HopDial, HopIn, HopPool, Hysteria2,
+    HysteriaBandwidth, HysteriaBbrProfile, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
+    HysteriaPortHop, HysteriaQuic, Ingress, IngressGuard, IngressIdentity, IngressWires,
+    IngressWiresWire, ModelSettings, ModelSnapshot, Network, Node, NodeConnection, OverlaySettings,
+    PortSettings, ProbeSettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
+    RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySettings, RealitySite,
+    RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp, XhttpMode,
 };
 use ipnet::Ipv4Net;
 use serde_json::Value;
@@ -1605,7 +1605,9 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
-            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
+            transport_kind, anytls_enabled, anytls_port, anytls_padding_scheme, \
+            anytls_masquerade_kind, anytls_masquerade_content, anytls_masquerade_headers, anytls_masquerade_status_code, \
+            hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
             xhttp_download_v4_origin_port, xhttp_download_v6_origin_port, \
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password, \
             hy2_bbr_profile, \
@@ -1651,7 +1653,9 @@ async fn load_ingresses_tx(
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
-            transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
+            transport_kind, anytls_enabled, anytls_port, anytls_padding_scheme, \
+            anytls_masquerade_kind, anytls_masquerade_content, anytls_masquerade_headers, anytls_masquerade_status_code, \
+            hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
             xhttp_download_v4_origin_port, xhttp_download_v6_origin_port, \
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password, \
             hy2_bbr_profile, \
@@ -1787,6 +1791,39 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
         },
         download: xhttp_download_from_row(row)?,
     };
+    let anytls = if row.try_get::<bool, _>("anytls_enabled")? {
+        let padding_scheme = json_string_array(
+            "ingresses.anytls_padding_scheme",
+            &row.try_get::<Value, _>("anytls_padding_scheme")?,
+        )?;
+        let headers = serde_json::from_value::<BTreeMap<String, String>>(
+            row.try_get::<Value, _>("anytls_masquerade_headers")?,
+        )
+        .map_err(|error| {
+            StoreError::InvalidData(format!(
+                "ingresses.anytls_masquerade_headers is invalid: {error}"
+            ))
+        })?;
+        let masquerade = match text(row, "anytls_masquerade_kind")?.as_str() {
+            "string" => AnyTlsMasquerade::String {
+                content: text(row, "anytls_masquerade_content")?,
+                headers,
+                status_code: u16::try_from(row.try_get::<i32, _>("anytls_masquerade_status_code")?)
+                    .unwrap_or(200),
+            },
+            _ => AnyTlsMasquerade::NotFound { headers },
+        };
+        Some(AnyTls {
+            port: row
+                .try_get::<Option<i32>, _>("anytls_port")?
+                .and_then(|port| u16::try_from(port).ok())
+                .unwrap_or(brocade_core::model::ANYTLS_PORT_BASE),
+            padding_scheme,
+            masquerade,
+        })
+    } else {
+        None
+    };
     // The borrowed-site columns are read for every shape and simply go unused by the ones that
     // hold a certificate: an ingress keeps its REALITY identity in storage while it is on TLS, so
     // moving it back does not mint a new public key behind everybody's back.
@@ -1865,6 +1902,7 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
     let quic = row.try_get::<bool, _>("hy2_enabled")?.then_some(hysteria2);
     let wires = IngressWires::try_from(IngressWiresWire {
         vless,
+        anytls,
         hysteria2: quic,
     })
     .map_err(|error| StoreError::InvalidData(format!("ingresses 行没有任何一条线：{error}")))?;

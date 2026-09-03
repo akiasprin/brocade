@@ -7,7 +7,7 @@ commit = "b4f08981becb71eaa995fa98ed2098ade92566bb"
 imported_at = "2026-09-03"
 license = "MPL-2.0"
 
-# AnyTLS is intentionally absent from this baseline. It will be introduced as a
-# separately reviewed Brocade patch after the vendored build and deployment path
-# is established.
-anytls = false
+# AnyTLS is carried as a Brocade-maintained patch on top of this upstream baseline.
+# The fork is the only Xray runtime supported by Brocade; the unpatched community
+# binary is not a compatible deployment target.
+anytls = true

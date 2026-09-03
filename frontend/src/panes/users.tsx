@@ -425,6 +425,8 @@ type GrantProbeDisplayItem = GrantProbePlanItem & Partial<Pick<GrantProbeJobItem
 const GRANT_PROBE_SLOTS = [
   { protocol: 'vless', family: 'ipv4', protocolLabel: 'VLESS', familyLabel: 'V4' },
   { protocol: 'vless', family: 'ipv6', protocolLabel: 'VLESS', familyLabel: 'V6' },
+  { protocol: 'anytls', family: 'ipv4', protocolLabel: 'AnyTLS', familyLabel: 'V4' },
+  { protocol: 'anytls', family: 'ipv6', protocolLabel: 'AnyTLS', familyLabel: 'V6' },
   { protocol: 'hysteria2', family: 'ipv4', protocolLabel: 'Hysteria2', familyLabel: 'V4' },
   { protocol: 'hysteria2', family: 'ipv6', protocolLabel: 'Hysteria2', familyLabel: 'V6' },
 ] as const;
@@ -433,7 +435,9 @@ const GRANT_PROBE_POLL_MS = 1_000;
 
 const probeBaseName = (item: GrantProbeDisplayItem) => {
   const withoutFamily = item.family === 'ipv6' ? item.name.replace(/ \| v6$/, '') : item.name;
-  return item.protocol === 'hysteria2' ? withoutFamily.replace(/ \| QUIC$/, '') : withoutFamily;
+  if (item.protocol === 'hysteria2') return withoutFamily.replace(/ \| QUIC$/, '');
+  if (item.protocol === 'anytls') return withoutFamily.replace(/ \| AnyTLS$/, '');
+  return withoutFamily;
 };
 
 const probeStatusText = (item: GrantProbeDisplayItem) => {
@@ -567,7 +571,8 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
     group.items.push(item);
     groups.set(key, group);
   }
-  const order = (item: GrantProbeDisplayItem) => (item.protocol === 'vless' ? 0 : 2) + (item.family === 'ipv6' ? 1 : 0);
+  const order = (item: GrantProbeDisplayItem) =>
+    (item.protocol === 'vless' ? 0 : item.protocol === 'anytls' ? 2 : 4) + (item.family === 'ipv6' ? 1 : 0);
   for (const group of groups.values()) group.items.sort((a, b) => order(a) - order(b));
 
   const busy = job?.status === 'running' || start.isPending || cancel.isPending;

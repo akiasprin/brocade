@@ -6,7 +6,7 @@ use crate::{
     hash::hex_lower,
     ir::{hops::HopDialWire, routing::DestMatch},
     model::{
-        Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsTransport,
+        AnyTls, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsTransport,
         ExternalOutboundProtocol, ExternalOutboundSecurity, GeodataSettings, HopPool, HopWire,
         Hysteria2, Network, RealityClientPolicy, XhttpTuning,
     },
@@ -289,6 +289,14 @@ pub enum XrayInbound {
         security: XrayIngressSecurity,
         sniff: bool,
         settings: Hysteria2,
+    },
+    AnyTls {
+        tag: String,
+        listen: String,
+        port: u16,
+        security: XrayIngressSecurity,
+        sniff: bool,
+        settings: AnyTls,
     },
     /// A security-only public front. dokodemo-door preserves the decrypted byte stream and sends
     /// it to the loopback XHTTP inbound where VLESS identity, routing and accounting live.
@@ -1127,6 +1135,14 @@ fn ingress_inbound(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> X
             },
         },
         IngressProtocol::Hysteria2(settings) => XrayInbound::Hysteria2 {
+            tag: ingress.tag.clone(),
+            listen: ingress.listen.to_string(),
+            port: ingress.port,
+            security: ingress_security(ingress, policy),
+            sniff: ingress.sniff,
+            settings: settings.clone(),
+        },
+        IngressProtocol::AnyTls(settings) => XrayInbound::AnyTls {
             tag: ingress.tag.clone(),
             listen: ingress.listen.to_string(),
             port: ingress.port,

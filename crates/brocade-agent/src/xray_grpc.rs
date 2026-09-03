@@ -25,6 +25,7 @@ const ADD_USER_OPERATION: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER_OPERATION: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 const HYSTERIA2_ACCOUNT: &str = "xray.proxy.hysteria.account.Account";
+const ANYTLS_ACCOUNT: &str = "xray.proxy.anytls.Account";
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const END_STREAM: u8 = 0x1;
 const ACK: u8 = 0x1;
@@ -60,6 +61,7 @@ pub(crate) struct XrayUser {
 pub(crate) enum XrayAccount<'a> {
     Vless { id: &'a str, flow: Option<&'a str> },
     Hysteria2 { auth: &'a str },
+    AnyTls { password: &'a str },
 }
 
 pub(crate) fn add_user(
@@ -82,6 +84,11 @@ pub(crate) fn add_user(
             let mut value = Vec::new();
             bytes_field(&mut value, 1, auth.as_bytes());
             typed_message(HYSTERIA2_ACCOUNT, &value)
+        }
+        XrayAccount::AnyTls { password } => {
+            let mut value = Vec::new();
+            bytes_field(&mut value, 1, password.as_bytes());
+            typed_message(ANYTLS_ACCOUNT, &value)
         }
     };
 
@@ -529,6 +536,8 @@ fn decode_account(message: &[u8]) -> Result<Option<(String, Option<String>)>, St
             (HYSTERIA2_ACCOUNT, 1, Field::Bytes(bytes)) => {
                 id = Some(utf8(bytes, "Hysteria 2 auth")?)
             }
+            // xray.proxy.anytls.Account { string password = 1 }
+            (ANYTLS_ACCOUNT, 1, Field::Bytes(bytes)) => id = Some(utf8(bytes, "AnyTLS password")?),
             _ => {}
         }
     }

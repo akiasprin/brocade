@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 
 use crate::{
     ir::routing::{AppIr, AppNode},
-    model::{probe_uuid, Action, Hysteria2},
+    model::{probe_uuid, Action, AnyTls, Hysteria2},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +66,14 @@ pub struct ProbeChainTarget {
 pub enum ProbeSecurity {
     Reality(ProbeRealityParams),
     Tls(ProbeTlsParams),
+    AnyTls(ProbeAnyTlsParams),
     Hysteria2(ProbeHysteria2Params),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeAnyTlsParams {
+    pub server_name: String,
+    pub settings: AnyTls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +113,18 @@ pub struct ProbeRealityParams {
 /// working is not what this probe measures, and the chain still reports green. Until the probe
 /// grows a second target, UDP reachability has to be watched some other way.
 fn probe_security(ingress: &crate::ir::routing::Ingress) -> ProbeSecurity {
+    // The probe work list has historically been one target per ingress. For an AnyTLS-only
+    // ingress there is no VLESS half to prefer, so select AnyTLS and its independent port. A
+    // mixed VLESS+AnyTLS ingress keeps the established VLESS target until the result model grows
+    // a protocol dimension of its own.
+    if ingress.wires.vless().is_none() {
+        if let Some(settings) = ingress.wires.anytls() {
+            return ProbeSecurity::AnyTls(ProbeAnyTlsParams {
+                server_name: ingress.certificate_name.clone().unwrap_or_default(),
+                settings: settings.clone(),
+            });
+        }
+    }
     if !ingress.wires.has_tcp() {
         if let Some(settings) = ingress.wires.hysteria2() {
             return ProbeSecurity::Hysteria2(ProbeHysteria2Params {
@@ -145,6 +164,11 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
         {
             let chain = app.chains.iter().find(|chain| chain.id == ingress.chain);
             let exits = exit_nodes(app, &ingress.chain);
+            let security = probe_security(ingress);
+            let port = match &security {
+                ProbeSecurity::AnyTls(anytls) => anytls.settings.port,
+                _ => ingress.port,
+            };
 
             targets.push(ProbeChainTarget {
                 app_id: app.app_id.clone(),
@@ -154,9 +178,9 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
                     .unwrap_or_else(|| ingress.chain.clone()),
                 ingress_id: ingress.id.clone(),
                 dial_host: dial_host(&ingress.bind),
-                port: ingress.port,
+                port,
                 uuid: probe_uuid(&ingress.identity.private_key, &ingress.id),
-                security: probe_security(ingress),
+                security,
                 xhttp: ingress.wires.xhttp().cloned(),
                 expected_exit_ips: exits
                     .iter()

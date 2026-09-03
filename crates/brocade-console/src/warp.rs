@@ -573,6 +573,13 @@ mod tests {
         );
 
         if let Some(binary) = xray_binary() {
+            // Geodata is part of the production node artifact, but unrelated to this WARP
+            // compiler check. Keep the unit test independent from local geoip/geosite assets.
+            let mut config = config;
+            config
+                .as_object_mut()
+                .expect("Xray config object")
+                .remove("geodata");
             let dir = PrivateTempDir::create(
                 std::env::temp_dir().join(format!("brocade-warp-config-test-{socks_port}")),
             )

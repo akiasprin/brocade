@@ -28,6 +28,8 @@ import {
   type Transport,
   type TransportKind,
   type Hysteria2Settings,
+  type AnyTlsSettings,
+  type AnyTlsMasquerade,
   type Xhttp,
   DEFAULT_XHTTP_XMUX,
   DEFAULT_XHTTP_TUNING,
@@ -100,7 +102,63 @@ import { SLUG_MAX, freePortAcross, freeSpanAcross, isValidSlug, occupiedPorts, p
  * 时的回退值，写法与 rules.tsx 的 HOP_PORT_BASE 一致：直接使用硬编码时，运营者修改设置后
  * 界面仍会填入 18000。 */
 const HY2_PORT_BASE = 18000;
+const ANYTLS_PORT_BASE = 19000;
 const DEFAULT_HOP_SPAN = 100;
+
+function anyTlsHeadersText(headers: Record<string, string> | undefined): string {
+  return Object.entries(headers ?? {})
+    .map(([name, value]) => `${name}: ${value}`)
+    .join('\n');
+}
+
+function parseAnyTlsHeaders(text: string): Record<string, string> | null {
+  const headers: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const separator = line.indexOf(':');
+    if (separator <= 0) return null;
+    const name = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (!/^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/.test(name) || /[\r\n]/.test(value) || name in headers) {
+      return null;
+    }
+    headers[name] = value;
+  }
+  return headers;
+}
+
+function anyTlsPaddingValid(text: string): boolean {
+  if (new TextEncoder().encode(text).length > 65_535) return false;
+  const keys = new Set<string>();
+  let stopSeen = false;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator <= 0) return false;
+    const key = trimmed.slice(0, separator).trim();
+    const value = trimmed.slice(separator + 1).trim();
+    if (!key || !value || keys.has(key)) return false;
+    keys.add(key);
+    if (key === 'stop') {
+      if (!/^\d+$/.test(value)) return false;
+      stopSeen = true;
+      continue;
+    }
+    if (!/^\d+$/.test(key)) return false;
+    for (const token of value.split(',').map(item => item.trim())) {
+      if (token === 'c') continue;
+      const range = /^(\d+)\s*-\s*(\d+)$/.exec(token);
+      if (!range) return false;
+      const from = Number(range[1]);
+      const to = Number(range[2]);
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1 || from > to || to > 4 * 1024 * 1024) {
+        return false;
+      }
+    }
+  }
+  return stopSeen;
+}
 
 /** Hysteria 2 的起始端口，取自全局设置；设置尚未加载时使用回退值。 */
 function useHy2PortBase(): number {
@@ -252,6 +310,7 @@ function chainAccessLabel(ingress: SnapshotIngress | null): string {
     labels.push(transportIsXhttp(vless.kind) ? `${security} · XHTTP` : `VLESS · ${security}`);
   }
   if (ingress.wires.hysteria2) labels.push('HY2');
+  if (ingress.wires.anytls) labels.push('AnyTLS');
   return labels.join(' + ') || '—';
 }
 
@@ -1610,7 +1669,7 @@ export function IngressStreamRow({
    *  三段位于三块面板中，但状态、草稿和保存逻辑只有一份——修改一条线时需要将另一条原样带上
    *  （请求是全量覆盖），拆分为三个组件需要复制该逻辑三次。因此同一组件渲染三次，
    *  每次只渲染对应的一段。 */
-  section: 'protocols' | 'vless' | 'hy2';
+  section: 'protocols' | 'vless' | 'anytls' | 'hy2';
 }) {
   const qc = useQueryClient();
   const hy2Base = useHy2PortBase();
@@ -1622,16 +1681,47 @@ export function IngressStreamRow({
     queryFn: () => fetchCompileView(streamRevisions.data!.current_revision!),
     enabled: !!streamRevisions.data?.current_revision,
   });
+  const tcpTaken = useMemo(
+    () =>
+      occupiedPorts(
+        streamSnapshot.data?.snapshot.apps ?? [],
+        streamNodes.data?.nodes ?? [],
+        streamCompiled.data?.system,
+        ingress.id,
+        'tcp',
+      ),
+    [streamSnapshot.data, streamNodes.data, streamCompiled.data, ingress.id],
+  );
   /* 安全层字段表示客户端握手时看到的是哪张证书，REALITY 档对应的是其指向的站点，
      而该站点可能来自全局设置。使用相同的 queryKey，与 IngressRealityRow 共用缓存。 */
   /* 两条线是否启用是两个独立的状态。VLESS 一侧未启用时 `storedKind` 为 null，
      下方所有与安全层和承载层相关的控件都不显示——它们描述的是该侧。 */
   const storedVless = ingress.wires.vless ?? null;
   const storedKind = storedVless?.kind ?? null;
+  const storedAnyTls = useMemo<AnyTlsSettings>(() => {
+    if (ingress.wires.anytls) return ingress.wires.anytls;
+    let port = freePortAcross(tcpTaken, [ingress.node], ANYTLS_PORT_BASE);
+    // `occupiedPorts` excludes this ingress while editing. Its VLESS port still belongs to the
+    // same Xray process, so keep the generated AnyTLS default distinct from it explicitly.
+    while (port === ingress.port && port < 65536) port += 1;
+    return {
+      port,
+      padding_scheme: [],
+      masquerade: { kind: 'not-found' },
+    };
+  }, [ingress.node, ingress.port, ingress.wires.anytls, tcpTaken]);
   const [pendingTransport, setPendingTransport] = useState<Transport | null>(null);
   const stagedTransport = pendingTransport?.kind === storedKind ? null : pendingTransport;
   const kind: TransportKind | null = stagedTransport?.kind ?? storedKind;
   const vlessOn = kind !== null;
+  const [pendingAnyTlsOn, setPendingAnyTlsOn] = useState<boolean | null>(null);
+  const stagedAnyTlsOn = pendingAnyTlsOn === !!ingress.wires.anytls ? null : pendingAnyTlsOn;
+  const anytlsOn = stagedAnyTlsOn ?? !!ingress.wires.anytls;
+  const [draftAnyTls, setDraftAnyTls] = useState<AnyTlsSettings | null>(null);
+  const anytlsValue = draftAnyTls ?? storedAnyTls;
+  const [draftAnyTlsPadding, setDraftAnyTlsPadding] = useState<string | null>(null);
+  const [draftAnyTlsHeaders, setDraftAnyTlsHeaders] = useState<string | null>(null);
+  const [draftAnyTlsStatus, setDraftAnyTlsStatus] = useState<string | null>(null);
   const current = stagedTransport && 'xhttp' in stagedTransport ? stagedTransport.xhttp : (storedVless?.xhttp ?? null);
   const on = kind !== null && transportIsXhttp(kind);
   const tls = kind !== null && kind.startsWith('vless-tls');
@@ -1726,7 +1816,11 @@ export function IngressStreamRow({
               xhttp: { ...next.vless.xhttp, mode: compatibleXhttpMode(next.vless.xhttp.mode, true) },
             } as Transport)
           : (next.vless ?? null);
-      const wires: Wires = { vless, hysteria2: next.hysteria2 ?? null };
+      const wires: Wires = {
+        vless,
+        anytls: next.anytls ?? null,
+        hysteria2: next.hysteria2 ?? null,
+      };
       const base = ingressUpsertBody(ingress);
       return upsertIngress(appId, { ...base, wires }, base);
     },
@@ -1737,9 +1831,14 @@ export function IngressStreamRow({
       setDraftTuning(undefined);
       setDraftDownload(null);
       setDraftHy2(null);
+      setDraftAnyTls(null);
+      setDraftAnyTlsPadding(null);
+      setDraftAnyTlsHeaders(null);
+      setDraftAnyTlsStatus(null);
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       setDraftMode(null);
       setPendingTransport(null);
+      setPendingAnyTlsOn(null);
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
     },
@@ -1747,14 +1846,23 @@ export function IngressStreamRow({
       setDraftHy2(null);
       setDraftMode(null);
       setPendingTransport(null);
+      setPendingAnyTlsOn(null);
       setPendingHy2On(null);
+      setDraftAnyTls(null);
+      setDraftAnyTlsPadding(null);
+      setDraftAnyTlsHeaders(null);
+      setDraftAnyTlsStatus(null);
     },
   });
 
   /* 修改一侧时另一侧原样带上。请求是全量覆盖：遗漏即表示关闭该线路，而关闭一条线路会
      移除一个 inbound，导致其上的用户全部断开——这不应是修改一个下拉框的后果。 */
   const saveHy2 = (next: Hysteria2Settings | null) =>
-    save.mutate({ vless: vlessOn ? (stagedTransport ?? currentWires(ingress).vless) : null, hysteria2: next });
+    save.mutate({
+      vless: vlessOn ? (stagedTransport ?? currentWires(ingress).vless) : null,
+      anytls: anytlsOn ? anytlsValue : null,
+      hysteria2: next,
+    });
 
   const switchKind = (next: TransportKind) => {
     if (hasDownload && next !== storedKind) {
@@ -1787,8 +1895,10 @@ export function IngressStreamRow({
 
   /* 启用或关闭一条线路。两条都关闭表示该接入面不接收任何连接，服务端的类型定义和库中的
      CHECK 约束都不允许该状态，因此在点击前拦截，而不是点击后返回错误。 */
-  const toggleWire = (wire: 'vless' | 'hy2', enabled: boolean) => {
-    if (!enabled && !(wire === 'vless' ? hy2 : vlessOn)) {
+  const toggleWire = (wire: 'vless' | 'anytls' | 'hy2', enabled: boolean) => {
+    const otherWireOn =
+      wire === 'vless' ? anytlsOn || hy2 : wire === 'anytls' ? vlessOn || hy2 : vlessOn || anytlsOn;
+    if (!enabled && !otherWireOn) {
       window.alert('至少要保留一条线路：两条都关闭后，这个接入面不再接收任何流量。');
       return;
     }
@@ -1801,7 +1911,26 @@ export function IngressStreamRow({
       }
       const nextVless: Transport | null = enabled ? { kind: 'vless-reality' } : null;
       setPendingTransport(nextVless);
-      save.mutate({ vless: nextVless, hysteria2: hy2 ? hy2Value : null });
+      save.mutate({
+        vless: nextVless,
+        anytls: anytlsOn ? anytlsValue : null,
+        hysteria2: hy2 ? hy2Value : null,
+      });
+      return;
+    }
+    if (wire === 'anytls') {
+      if (
+        !enabled &&
+        !window.confirm('关闭 AnyTLS 会移除对应的 inbound，当前连接在其上的用户会断开一次。确定继续吗？')
+      ) {
+        return;
+      }
+      setPendingAnyTlsOn(enabled);
+      save.mutate({
+        vless: vlessOn ? (stagedTransport ?? currentWires(ingress).vless) : null,
+        anytls: enabled ? anytlsValue : null,
+        hysteria2: hy2 ? hy2Value : null,
+      });
       return;
     }
     if (
@@ -1962,17 +2091,80 @@ export function IngressStreamRow({
   );
   const updateHy2 = (patch: Partial<Hysteria2Settings>) => setDraftHy2({ ...hy2Value, ...patch });
 
+  const anytlsPaddingText = draftAnyTlsPadding ?? (anytlsValue.padding_scheme ?? []).join('\n');
+  const anytlsHeaders = anytlsValue.masquerade.headers;
+  const anytlsHeadersText = draftAnyTlsHeaders ?? anyTlsHeadersText(anytlsHeaders);
+  const anytlsMasqueradeIsString = anytlsValue.masquerade.kind === 'string';
+  const anytlsStoredStatus =
+    anytlsValue.masquerade.kind === 'string' ? anytlsValue.masquerade.status_code ?? 200 : 404;
+  const anytlsStatusText = draftAnyTlsStatus ?? String(anytlsStoredStatus);
+  const parsedAnyTlsHeaders = parseAnyTlsHeaders(anytlsHeadersText);
+  const anytlsPortBad =
+    editable &&
+    (!Number.isInteger(anytlsValue.port) ||
+      anytlsValue.port < 1 ||
+      anytlsValue.port > 65535 ||
+      !!portClash(tcpTaken, [ingress.node], anytlsValue.port) ||
+      (vlessOn && anytlsValue.port === ingress.port));
+  const anytlsStatus = Number(anytlsStatusText);
+  const anytlsStatusBad =
+    anytlsMasqueradeIsString &&
+    (!/^\d+$/.test(anytlsStatusText) || !Number.isInteger(anytlsStatus) || anytlsStatus < 200 || anytlsStatus > 599);
+  const anytlsPaddingBad = anytlsPaddingText.trim() !== '' && !anyTlsPaddingValid(anytlsPaddingText);
+  const anytlsHeadersBad = parsedAnyTlsHeaders === null;
+  const anytlsForSave: AnyTlsSettings = {
+    ...anytlsValue,
+    padding_scheme: anytlsPaddingText
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean),
+    masquerade: anytlsMasqueradeIsString
+      ? {
+          kind: 'string',
+          content: anytlsValue.masquerade.kind === 'string' ? anytlsValue.masquerade.content : '',
+          headers: parsedAnyTlsHeaders ?? {},
+          status_code: anytlsStatus,
+        }
+      : {
+          kind: 'not-found',
+          headers: parsedAnyTlsHeaders ?? {},
+        },
+  };
+  const anytlsDirty =
+    anytlsOn &&
+    (draftAnyTls !== null ||
+      draftAnyTlsPadding !== null ||
+      draftAnyTlsHeaders !== null ||
+      draftAnyTlsStatus !== null);
+  const anytlsBad = anytlsPortBad || anytlsPaddingBad || anytlsHeadersBad || anytlsStatusBad;
+  usePanelEntry(
+    'anytls',
+    anytlsDirty,
+    {
+      blocked: anytlsBad,
+      apply: body => ({ ...body, wires: { ...body.wires!, anytls: anytlsForSave } }),
+      reset: () => {
+        setDraftAnyTls(null);
+        setDraftAnyTlsPadding(null);
+        setDraftAnyTlsHeaders(null);
+        setDraftAnyTlsStatus(null);
+      },
+    },
+    JSON.stringify([anytlsValue, anytlsPaddingText, anytlsHeadersText, anytlsStatusText]),
+  );
+  const updateAnyTls = (patch: Partial<AnyTlsSettings>) => setDraftAnyTls({ ...anytlsValue, ...patch });
+  const updateAnyTlsMasquerade = (masquerade: AnyTlsMasquerade) => updateAnyTls({ masquerade });
+
   /* 端口归属协议栈：落点只表示由哪台机器接收，使用哪个端口由各线路自行决定。
-     因此此处分三段渲染——协议开关一段，VLESS 一段，Hysteria 2 一段，每段包含各自的端口。 */
+     因此此处分四段渲染——协议开关一段，VLESS、AnyTLS、Hysteria 2 各自包含自己的端口和参数。 */
   if (section === 'protocols') {
     return (
       <>
         <dt>协议</dt>
         <dd>
-          {/* 两个独立开关，不是二选一的下拉框：两条线可同时启用，各自建立一个 inbound，
-            共用同一份凭据和同一条授权，客户端可使用其中任意一条。UDP 被完全封禁的网络中
-            TCP 一侧仍可用，按 TLS 特征封禁的网络中 QUIC 一侧仍可用——这是并存的目的。
-            两条都关闭会被拦截：该状态下接入面不接收任何连接。 */}
+          {/* 三个独立开关，不是二选一的下拉框：每条线建立自己的 inbound，共用同一份
+            授权凭据。VLESS 与 AnyTLS 都是 TCP，但端口独立；HY2 使用独立 UDP 端口。
+            至少保留一条线路，避免把入口保存成完全不接收流量的状态。 */}
           <label className="toolbar" style={{ margin: 0, gap: 6 }}>
             <input
               type="checkbox"
@@ -1985,18 +2177,127 @@ export function IngressStreamRow({
           <label className="toolbar" style={{ margin: '4px 0 0', gap: 6 }}>
             <input
               type="checkbox"
+              checked={anytlsOn}
+              disabled={!editable || save.isPending || stagedAnyTlsOn !== null}
+              onChange={event => toggleWire('anytls', event.target.checked)}
+            />
+            <span>AnyTLS（TCP）</span>
+          </label>
+          <label className="toolbar" style={{ margin: '4px 0 0', gap: 6 }}>
+            <input
+              type="checkbox"
               checked={hy2}
               disabled={!editable || save.isPending || stagedHy2On !== null}
               onChange={event => toggleWire('hy2', event.target.checked)}
             />
             <span>Hysteria 2（QUIC over UDP）</span>
           </label>
-          {vlessOn && hy2 && (
+          {Number(vlessOn) + Number(anytlsOn) + Number(hy2) > 1 && (
             <div className="note">
-              两条线路同时开启：TCP 与 UDP 各一个监听，<b>各占一个端口</b>，由下方两块面板分别配置。
-              共用一份凭据和一条授权，订阅中输出两条，由客户端自行选择
+              多条线路同时开启：每条线各一个监听，<b>各占一个端口</b>，由下方各面板分别配置。
+              共用一份凭据和一条授权，订阅中分别输出，由客户端自行选择。
             </div>
           )}
+        </dd>
+      </>
+    );
+  }
+
+  if (section === 'anytls') {
+    if (!anytlsOn) return null;
+    const anytlsMasquerade = anytlsValue.masquerade;
+    return (
+      <>
+        <dt>监听端口</dt>
+        <dd>
+          <div className="toolbar" style={{ margin: 0, gap: 6 }}>
+            <input
+              className="f mono"
+              style={{ width: 86, borderColor: anytlsPortBad ? 'var(--err)' : undefined }}
+              value={String(anytlsValue.port)}
+              inputMode="numeric"
+              disabled={!editable}
+              aria-label="AnyTLS 监听端口"
+              onChange={event => updateAnyTls({ port: Number(event.target.value.replace(/\D/g, '')) || 0 })}
+            />
+            <span className="dim">TCP</span>
+          </div>
+          {anytlsPortBad && <div className="note bad">AnyTLS 端口必须是 1–65535，且不能与同机其他 TCP 监听冲突。</div>}
+        </dd>
+        <dt>Padding Scheme</dt>
+        <dd>
+          <textarea
+            className="f mono"
+            rows={5}
+            style={{ width: '100%', borderColor: anytlsPaddingBad ? 'var(--err)' : undefined }}
+            value={anytlsPaddingText}
+            disabled={!editable}
+            aria-label="AnyTLS Padding Scheme"
+            placeholder={'留空使用 Xray 默认\n例如：stop=2\n0=30-30'}
+            onChange={event => setDraftAnyTlsPadding(event.target.value)}
+          />
+          <div className="note">每行一条规则；自定义方案必须包含唯一的 `stop=...`，范围支持到 4 MiB。</div>
+          {anytlsPaddingBad && <div className="note bad">Padding Scheme 格式无效：请检查 `=`、重复编号、stop 和字节范围。</div>}
+        </dd>
+        <dt>Masquerade</dt>
+        <dd>
+          <select
+            className="f"
+            value={anytlsMasquerade.kind}
+            disabled={!editable}
+            aria-label="AnyTLS Masquerade 类型"
+            onChange={event =>
+              updateAnyTlsMasquerade(
+                event.target.value === 'string'
+                  ? { kind: 'string', content: '', headers: parsedAnyTlsHeaders ?? {}, status_code: 200 }
+                  : { kind: 'not-found', headers: parsedAnyTlsHeaders ?? {} },
+              )
+            }
+          >
+            <option value="not-found">404 Not Found（默认）</option>
+            <option value="string">自定义响应</option>
+          </select>
+          {anytlsMasquerade.kind === 'string' && (
+            <>
+              <div className="toolbar" style={{ margin: '6px 0 0', gap: 6, flexWrap: 'wrap' }}>
+                <span className="dim">状态码</span>
+                <input
+                  className="f mono"
+                  type="number"
+                  min={200}
+                  max={599}
+                  style={{ width: 86, borderColor: anytlsStatusBad ? 'var(--err)' : undefined }}
+                  value={anytlsStatusText}
+                  disabled={!editable}
+                  aria-label="AnyTLS Masquerade 状态码"
+                  onChange={event => setDraftAnyTlsStatus(event.target.value)}
+                />
+              </div>
+              <textarea
+                className="f"
+                rows={4}
+                style={{ width: '100%', marginTop: 6 }}
+                value={anytlsMasquerade.content}
+                disabled={!editable}
+                aria-label="AnyTLS Masquerade 正文"
+                placeholder="响应正文"
+                onChange={event => updateAnyTlsMasquerade({ ...anytlsMasquerade, content: event.target.value })}
+              />
+            </>
+          )}
+          <textarea
+            className="f mono"
+            rows={4}
+            style={{ width: '100%', marginTop: 6, borderColor: anytlsHeadersBad ? 'var(--err)' : undefined }}
+            value={anytlsHeadersText}
+            disabled={!editable}
+            aria-label="AnyTLS Masquerade Headers"
+            placeholder={'可选，每行一个 Header\nCache-Control: no-store'}
+            onChange={event => setDraftAnyTlsHeaders(event.target.value)}
+          />
+          {anytlsHeadersBad && <div className="note bad">Headers 必须是一行一个 `名称: 值`，名称不能重复或包含非法字符。</div>}
+          {anytlsStatusBad && <div className="note bad">自定义响应状态码必须是 200–599。</div>}
+          <div className="note">AnyTLS 客户端未完成握手时返回此 HTTP 响应；默认严格返回 404。</div>
         </dd>
       </>
     );
@@ -2710,7 +3011,7 @@ export function IngressProjectionRow({
         [family]: { host: draft.host.trim(), port },
       };
     },
-    [current, disabledDraft, draft, family, port, valid],
+    [disabledDraft, draft, family, port, valid],
   );
 
   const save = useMutation({
@@ -4212,6 +4513,19 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     }
                     editable={editable}
                     section="vless"
+                  />
+                </IngressPanel>
+              )}
+              {!!ingress.wires.anytls && (
+                <IngressPanel appId={app} ingress={ingress} title="AnyTLS" editable={editable}>
+                  <IngressStreamRow
+                    appId={app}
+                    ingress={ingress}
+                    certificateName={
+                      snapshot.data?.snapshot.nodes?.find(node => node.id === ingress.node)?.certificate_name
+                    }
+                    editable={editable}
+                    section="anytls"
                   />
                 </IngressPanel>
               )}

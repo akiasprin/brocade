@@ -12,9 +12,9 @@ use crate::artifacts::{
     },
 };
 use crate::model::{
-    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttp,
-    ExternalVlessXhttpDownload, HysteriaBbrProfile, HysteriaCongestion, HysteriaMasquerade,
-    HysteriaObfs, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+    AnyTlsMasquerade, ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
+    ExternalVlessXhttp, ExternalVlessXhttpDownload, HysteriaBbrProfile, HysteriaCongestion,
+    HysteriaMasquerade, HysteriaObfs, XhttpTuning, XhttpXmux, XhttpXmuxRange,
 };
 
 /// Backlog offered by TCP listeners for TCP Fast Open requests.
@@ -403,6 +403,33 @@ fn inbound(inbound: &XrayInbound) -> Value {
                 "sniffing": sniffing,
             })
         }
+        XrayInbound::AnyTls {
+            tag,
+            listen,
+            port,
+            security,
+            sniff,
+            settings,
+        } => {
+            let sniffing = if *sniff {
+                json!({ "enabled": true, "destOverride": ["tls", "http", "quic"] })
+            } else {
+                json!({ "enabled": false })
+            };
+            json!({
+                "tag": tag,
+                "listen": listen,
+                "port": port,
+                "protocol": "anytls",
+                "settings": {
+                    "users": [],
+                    "paddingScheme": settings.padding_scheme,
+                    "masquerade": anytls_masquerade(&settings.masquerade),
+                },
+                "streamSettings": stream_settings(&XrayStream::Tcp, security),
+                "sniffing": sniffing,
+            })
+        }
         XrayInbound::Dokodemo {
             tag,
             listen,
@@ -612,6 +639,33 @@ fn hysteria_stream_settings(
         },
         "finalmask": Value::Object(finalmask),
     })
+}
+
+fn anytls_masquerade(masquerade: &AnyTlsMasquerade) -> Value {
+    match masquerade {
+        AnyTlsMasquerade::NotFound { headers } => {
+            let mut value = Map::new();
+            value.insert("type".to_owned(), json!("404"));
+            if !headers.is_empty() {
+                value.insert("headers".to_owned(), json!(headers));
+            }
+            Value::Object(value)
+        }
+        AnyTlsMasquerade::String {
+            content,
+            headers,
+            status_code,
+        } => {
+            let mut value = Map::new();
+            value.insert("type".to_owned(), json!("string"));
+            value.insert("content".to_owned(), json!(content));
+            value.insert("statusCode".to_owned(), json!(status_code));
+            if !headers.is_empty() {
+                value.insert("headers".to_owned(), json!(headers));
+            }
+            Value::Object(value)
+        }
+    }
 }
 
 /// Add the `mux` block, or leave the outbound as it was.

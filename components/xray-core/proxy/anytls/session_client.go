@@ -205,7 +205,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	frames = append(frames, addrFrame...)
 
 	s.writeMu.Lock()
-	writeErr := s.writePacketWithPadding(s.pktCounter.Add(1)-1, frames)
+	writeErr := s.writePacketWithPadding(s.nextPacketIndex(), frames)
 	s.writeMu.Unlock()
 	if writeErr != nil {
 		s.finishStream(sid, writeErr)
@@ -250,7 +250,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 		}
 
 		s.writeMu.Lock()
-		err = s.writePacketWithPadding(s.pktCounter.Add(1)-1, UDPPSHframe)
+		err = s.writePacketWithPadding(s.nextPacketIndex(), UDPPSHframe)
 		s.writeMu.Unlock()
 
 		if err != nil {
@@ -281,18 +281,7 @@ func (st *stream) pumpUplink(s *session) {
 				return
 			}
 		}
-		var pktIndex uint32
-		s.schemeMu.RLock()
-		scheme := s.paddingScheme
-		s.schemeMu.RUnlock()
-
-		if scheme != nil && s.pktCounter.Load() < scheme.stop {
-			pktIndex = s.pktCounter.Add(1) - 1
-		} else {
-			pktIndex = 0
-		}
-
-		if sendErr := s.sendStreamData(st.sid, mb, pktIndex); sendErr != nil {
+		if sendErr := s.sendStreamData(st.sid, mb, s.nextPacketIndex()); sendErr != nil {
 			errors.LogDebug(context.Background(), "anytls: writePacketWithPadding error=", sendErr)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
 			s.close(sendErr)

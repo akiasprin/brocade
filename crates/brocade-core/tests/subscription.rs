@@ -5,12 +5,12 @@ use brocade_core::{
     format::{uri, yaml},
     ir::{routing::compile_app, system::compile_system, validate::validate_app},
     model::{
-        AppView, Chain, Dns, DomainStrategy, ExternalOutbound, ExternalOutboundProtocol,
-        ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2, HysteriaBandwidth,
-        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily,
-        ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
-        RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp,
-        XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+        AnyTls, AnyTlsMasquerade, AppView, Chain, Dns, DomainStrategy, ExternalOutbound,
+        ExternalOutboundProtocol, ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2,
+        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
+        IngressWires, IpFamily, ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint,
+        ProjectionEndpoint, RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User,
+        WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
     physical::user::{project_user, SubscriptionProtocol, UserPlan},
     Level,
@@ -1012,6 +1012,69 @@ fn a_tcp_ingress_enables_tfo_only_in_the_clash_format() {
     assert!(clash_text.contains("network: tcp"), "{clash_text}");
     assert!(clash_text.contains("    tfo: true"), "{clash_text}");
     assert!(!clash_text.contains("xhttp-opts"), "{clash_text}");
+}
+
+#[test]
+fn anytls_subscription_carries_the_independent_port_and_tls_name() {
+    let (uri_text, clash_text) = render(|face| {
+        let vless = face.wires.vless().unwrap().clone();
+        face.wires = IngressWires::VlessAndAnyTls {
+            vless,
+            anytls: AnyTls {
+                port: 19443,
+                padding_scheme: vec!["stop=2".to_owned(), "0=30-30".to_owned()],
+                masquerade: AnyTlsMasquerade::NotFound {
+                    headers: Default::default(),
+                },
+            },
+        };
+    });
+
+    assert!(uri_text.contains("vless://"), "{uri_text}");
+    assert!(
+        uri_text.contains("anytls://uuid-alice@203.0.113.7:19443?"),
+        "{uri_text}"
+    );
+    assert!(uri_text.contains("sni=hk-cert.example.net"), "{uri_text}");
+    assert!(
+        uri_text.contains("#%E9%A6%99%E6%B8%AF%20%7C%20AnyTLS"),
+        "{uri_text}"
+    );
+    // Padding and masquerade are server-only. Leaking either into a share link would describe
+    // settings a client does not parse and make future client imports misleading.
+    assert!(!uri_text.contains("paddingScheme"), "{uri_text}");
+    assert!(!uri_text.contains("masquerade"), "{uri_text}");
+
+    assert!(clash_text.contains("type: anytls"), "{clash_text}");
+    assert!(clash_text.contains("port: 19443"), "{clash_text}");
+    assert!(clash_text.contains("password: uuid-alice"), "{clash_text}");
+    assert!(
+        clash_text.contains("sni: hk-cert.example.net"),
+        "{clash_text}"
+    );
+    assert!(!clash_text.contains("padding_scheme"), "{clash_text}");
+    assert!(!clash_text.contains("masquerade"), "{clash_text}");
+}
+
+#[test]
+fn anytls_protocol_filter_removes_vless_entries() {
+    let plan = plan(|face| {
+        let vless = face.wires.vless().unwrap().clone();
+        face.wires = IngressWires::VlessAndAnyTls {
+            vless,
+            anytls: AnyTls::default(),
+        };
+    });
+    let mut anytls = plan.clone();
+    anytls.retain_protocol(brocade_core::physical::user::SubscriptionProtocol::AnyTls);
+    let artifact = subscription::build(&anytls);
+    let uri_text = uri::subscription(&artifact);
+    let clash_text = yaml::clash_subscription(&artifact);
+
+    assert!(!uri_text.contains("vless://"), "{uri_text}");
+    assert!(uri_text.contains("anytls://"), "{uri_text}");
+    assert!(!clash_text.contains("type: vless"), "{clash_text}");
+    assert!(clash_text.contains("type: anytls"), "{clash_text}");
 }
 
 #[test]

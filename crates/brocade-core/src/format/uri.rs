@@ -29,6 +29,9 @@ pub fn subscription(subscription: &Subscription) -> String {
 }
 
 fn entry_uri(entry: &SubscriptionEntry) -> String {
+    if let SubscriptionSecurity::AnyTls(anytls) = &entry.security {
+        return anytls_uri(entry, anytls);
+    }
     if let SubscriptionSecurity::Hysteria2(hysteria) = &entry.security {
         return hysteria2_uri(entry, hysteria);
     }
@@ -73,7 +76,9 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
             query.push(("sni", tls.server_name.clone()));
             tls.flow.clone()
         }
-        SubscriptionSecurity::Hysteria2(_) => unreachable!("Hysteria 已在上方单独渲染"),
+        SubscriptionSecurity::AnyTls(_) | SubscriptionSecurity::Hysteria2(_) => {
+            unreachable!("AnyTLS / Hysteria 已在上方单独渲染")
+        }
     };
     if let Some(flow) = &flow {
         query.push(("flow", flow.clone()));
@@ -145,6 +150,24 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
 
     format!(
         "vless://{}@{}:{}?{}#{}",
+        pct_encode(&entry.uuid),
+        uri_host(&entry.server),
+        entry.port,
+        query,
+        pct_encode(&entry.name)
+    )
+}
+
+fn anytls_uri(
+    entry: &SubscriptionEntry,
+    anytls: &crate::artifacts::subscription::SubscriptionAnyTls,
+) -> String {
+    // There is no upstream Xray share-link parser for AnyTLS. Keep the URI deliberately small
+    // and interoperable with clients that use the conventional anytls:// form; the server-side
+    // padding scheme is negotiated after the TLS session starts and masquerade is server-only.
+    let query = format!("sni={}", pct_encode(&anytls.server_name));
+    format!(
+        "anytls://{}@{}:{}?{}#{}",
         pct_encode(&entry.uuid),
         uri_host(&entry.server),
         entry.port,

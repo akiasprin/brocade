@@ -9,15 +9,16 @@ use brocade_core::{
         system::compile_system,
     },
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
-        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutbound,
-        ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
-        ExternalVlessXhttp, ExternalVlessXhttpDownload, ExternalWarpBinding, Grant, HopDial,
-        HopEncryption, HopIn, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion,
-        HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily, ModelSettings,
-        ModelSnapshot, Network, Node, NodeEgressDnsPolicy, OverlaySettings, Reality,
-        RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySite, RealityXhttp,
-        Rule, Step, Transport, User, WireGuardKeys, Xhttp, XhttpMode, XhttpTuning, XhttpXmuxRange,
+        Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, DestMatch, Dns, DomainStrategy,
+        EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
+        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
+        ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
+        ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn, HopPool, HopWire, Hysteria2,
+        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
+        IngressWires, IpFamily, ModelSettings, ModelSnapshot, Network, Node, NodeEgressDnsPolicy,
+        OverlaySettings, Reality, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
+        RealitySite, RealityXhttp, Rule, Step, Transport, User, WireGuardKeys, Xhttp, XhttpMode,
+        XhttpTuning, XhttpXmuxRange,
     },
     physical::node::{project_node, reality_fallback_limits},
     Level,
@@ -916,6 +917,78 @@ fn a_hysteria2_ingress_writes_h3_and_its_quic_parameters() {
     assert_eq!(
         stream["finalmask"]["udp"][0]["settings"]["password"],
         "k7f2c1a9e4b8"
+    );
+}
+
+/// AnyTLS is a second TLS-protected TCP listener, not a transport variant of VLESS. Keep both
+/// in the artifact at once and assert every server-side setting reaches the fork's JSON shape.
+#[test]
+fn an_anytls_ingress_writes_a_distinct_tls_listener_and_server_settings() {
+    let mut hk = node("hk", [10, 66, 0, 1], true, Dns::System);
+    hk.certificate_name = Some("hk.example.net".to_owned());
+    let doc = doc(vec![hk]);
+    let mut face = ingress("i", "c", "hk");
+    let vless = face.wires.vless().unwrap().clone();
+    face.wires = IngressWires::VlessAndAnyTls {
+        vless,
+        anytls: AnyTls {
+            port: 19443,
+            padding_scheme: vec![
+                "stop=2".to_owned(),
+                "0=30-30".to_owned(),
+                "1=70000-70000".to_owned(),
+            ],
+            masquerade: AnyTlsMasquerade::String {
+                content: "Forbidden".to_owned(),
+                headers: [("Content-Type".to_owned(), "text/plain".to_owned())]
+                    .into_iter()
+                    .collect(),
+                status_code: 403,
+            },
+        },
+    };
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let vless = inbound(&value, "in:app/i");
+    let anytls = inbound(&value, "in:app/i:anytls");
+    assert_eq!(vless["protocol"], "vless");
+    assert_eq!(vless["port"], 443);
+    assert_eq!(anytls["protocol"], "anytls");
+    assert_eq!(anytls["port"], 19443);
+    assert_eq!(anytls["settings"]["users"], serde_json::json!([]));
+    assert_eq!(
+        anytls["settings"]["paddingScheme"],
+        serde_json::json!(["stop=2", "0=30-30", "1=70000-70000"])
+    );
+    assert_eq!(anytls["settings"]["masquerade"]["type"], "string");
+    assert_eq!(anytls["settings"]["masquerade"]["content"], "Forbidden");
+    assert_eq!(anytls["settings"]["masquerade"]["statusCode"], 403);
+    assert_eq!(
+        anytls["settings"]["masquerade"]["headers"]["Content-Type"],
+        "text/plain"
+    );
+    assert_eq!(anytls["streamSettings"]["network"], "tcp");
+    assert_eq!(anytls["streamSettings"]["security"], "tls");
+    assert_eq!(
+        anytls["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"],
+        xray::NODE_CERTIFICATE_FILE
     );
 }
 

@@ -1,8 +1,8 @@
 use brocade_core::client_config::ClientProjectionDownloadEndpoint;
 use brocade_core::hash::sha256_hex;
 use brocade_core::model::{
-    AppView, Dns, DomainStrategy, ExternalOutbound, HysteriaCongestion, HysteriaMasquerade,
-    HysteriaObfs, Ingress, IngressWires, ModelSnapshot, Node, Projection,
+    AnyTlsMasquerade, AppView, Dns, DomainStrategy, ExternalOutbound, HysteriaCongestion,
+    HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, ModelSnapshot, Node, Projection,
     ProjectionDownloadEndpoint, ProjectionEndpoint, RealityFallbackLimits, RealityFallbackMode,
     RealitySettings, RealitySite, Transport, XhttpDownload,
 };
@@ -3152,6 +3152,31 @@ async fn restore_app_tx(
             Some(HysteriaMasquerade::Proxy { url }) => ("proxy", Some(url.clone())),
             _ => ("not-found", None),
         };
+        let anytls = ingress.wires.anytls();
+        let anytls_padding_scheme = anytls
+            .map(|settings| serde_json::to_value(&settings.padding_scheme))
+            .transpose()?;
+        let (
+            anytls_masquerade_kind,
+            anytls_masquerade_content,
+            anytls_masquerade_headers,
+            anytls_masquerade_status_code,
+        ) = match anytls.map(|settings| &settings.masquerade) {
+            Some(AnyTlsMasquerade::String {
+                content,
+                headers,
+                status_code,
+            }) => (
+                "string",
+                Some(content.clone()),
+                Some(serde_json::to_value(headers)?),
+                Some(i32::from(*status_code)),
+            ),
+            Some(AnyTlsMasquerade::NotFound { headers }) if !headers.is_empty() => {
+                ("404", None, Some(serde_json::to_value(headers)?), None)
+            }
+            _ => ("404", None, None, None),
+        };
         sqlx::query(
             "INSERT INTO ingresses (
                 id, app_id, chain_id, node_id, bind, port, front_id,
@@ -3180,7 +3205,10 @@ async fn restore_app_tx(
                 hy2_quic_max_idle_secs, hy2_quic_keepalive_secs,
                 hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud,
                 xhttp_tuning,
-                xhttp_download_v4_origin_port, xhttp_download_v6_origin_port
+                xhttp_download_v4_origin_port, xhttp_download_v6_origin_port,
+                anytls_enabled, anytls_port, anytls_padding_scheme,
+                anytls_masquerade_kind, anytls_masquerade_content,
+                anytls_masquerade_headers, anytls_masquerade_status_code
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
@@ -3198,7 +3226,8 @@ async fn restore_app_tx(
                 $50,
                 $51, $52, $53, $54,
                 $55, $56, $57, $58,
-                $59, $60, $61
+                $59, $60, $61,
+                $62, $63, $64, $65, $66, $67, $68
              )",
         )
         .bind(&ingress.id)
@@ -3279,6 +3308,13 @@ async fn restore_app_tx(
         .bind(xhttp_tuning)
         .bind(xhttp_download_v4_origin_port)
         .bind(xhttp_download_v6_origin_port)
+        .bind(anytls.is_some())
+        .bind(anytls.map(|settings| i32::from(settings.port)))
+        .bind(anytls_padding_scheme.unwrap_or_else(|| json!([])))
+        .bind(anytls_masquerade_kind)
+        .bind(anytls_masquerade_content.unwrap_or_default())
+        .bind(anytls_masquerade_headers.unwrap_or_else(|| json!({})))
+        .bind(anytls_masquerade_status_code.unwrap_or(200))
         .execute(&mut **tx)
         .await?;
 

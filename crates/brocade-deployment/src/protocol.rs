@@ -906,6 +906,11 @@ pub struct E2eProbeTarget {
     /// agent fail only this new target rather than reject the whole work list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<E2eProbeHysteria2>,
+    /// Present for an AnyTLS ingress. It supersedes both `reality` and `tls` and carries the
+    /// certificate name used by the AnyTLS client. The AnyTLS server sends its padding scheme
+    /// during the session handshake, so no client-side padding copy is needed here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls: Option<E2eProbeAnyTls>,
     /// Present when this ingress presents its own certificate, in which case `reality` above is
     /// placeholder data and is ignored.
     ///
@@ -929,6 +934,12 @@ pub struct E2eProbeTarget {
     /// reported explicitly rather than counted as a pass; otherwise a misconfigured chain would
     /// report as healthy only because the check could not run.
     pub expected_exit_ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eProbeAnyTls {
+    /// The name on the machine's certificate. The client verifies it as ordinary TLS.
+    pub server_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

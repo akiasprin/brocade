@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ir::routing::{AppIr, AppNode, Ingress},
     model::{
-        ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2, IpFamily,
-        ProjectionDownloadEndpoint, ProjectionEndpoint, Xhttp,
+        AnyTls, ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2,
+        IpFamily, ProjectionDownloadEndpoint, ProjectionEndpoint, Xhttp,
     },
 };
 
@@ -17,6 +17,7 @@ use crate::{
 #[serde(rename_all = "lowercase")]
 pub enum SubscriptionProtocol {
     Vless,
+    AnyTls,
     Hysteria2,
 }
 
@@ -81,10 +82,11 @@ impl UserPlan {
                 (
                     SubscriptionProtocol::Vless,
                     UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_)
-                ) | (
-                    SubscriptionProtocol::Hysteria2,
-                    UserSecurityPlan::Hysteria2(_)
-                )
+                ) | (SubscriptionProtocol::AnyTls, UserSecurityPlan::AnyTls(_))
+                    | (
+                        SubscriptionProtocol::Hysteria2,
+                        UserSecurityPlan::Hysteria2(_)
+                    )
             )
         });
         self.prune_empty_fronts();
@@ -167,7 +169,14 @@ pub struct UserDownloadPlan {
 pub enum UserSecurityPlan {
     Reality(UserRealityPlan),
     Tls(UserTlsPlan),
+    AnyTls(UserAnyTlsPlan),
     Hysteria2(UserHysteria2Plan),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAnyTlsPlan {
+    pub server_name: String,
+    pub settings: AnyTls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +268,16 @@ fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
         ));
     }
 
+    if let Some(settings) = ingress.wires.anytls() {
+        wires.push((
+            UserSecurityPlan::AnyTls(UserAnyTlsPlan {
+                server_name: ingress.certificate_name.clone().unwrap_or_default(),
+                settings: settings.clone(),
+            }),
+            " | AnyTLS",
+        ));
+    }
+
     wires
 }
 
@@ -340,6 +359,7 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                         // listens on at either end.
                         port: match security {
                             UserSecurityPlan::Hysteria2(plan) => plan.settings.port,
+                            UserSecurityPlan::AnyTls(plan) => plan.settings.port,
                             _ => server.port,
                         },
                         // The independent download belongs to the XHTTP half and to nothing else;

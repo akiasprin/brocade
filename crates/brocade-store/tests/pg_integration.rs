@@ -9,8 +9,8 @@ use brocade_core::{
         HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires, ModelSettings,
         NodeConnection, OverlaySettings, Projection, ProjectionDownloadEndpoint,
         ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
-        RealityFallbackRateLimit, RealitySite, Rule, Transport, WgTransport, Xhttp, XhttpMode,
-        XhttpTuning, XhttpXmux, XhttpXmuxRange,
+        RealityFallbackRateLimit, RealitySite, Rule, Transport, WgTransport, Xhttp, XhttpDownload,
+        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
 };
 use brocade_deployment::plan::{
@@ -7693,6 +7693,7 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
                 },
                 wires: WiresRequest {
                     vless: None,
+                    anytls: None,
                     hysteria2: Some(Hysteria2 {
                         port: 50000,
                         ..Default::default()
@@ -13524,6 +13525,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         vless: Some(TransportRequest::VlessRealityXhttp {
             xhttp: xhttp.clone(),
         }),
+        anytls: None,
         hysteria2: None,
     };
     let written = db
@@ -13603,6 +13605,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         vless: Some(TransportRequest::VlessTlsXhttp {
             xhttp: xhttp.clone(),
         }),
+        anytls: None,
         hysteria2: None,
     };
     let written = db
@@ -13696,6 +13699,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
                 443,
                 WiresRequest {
                     vless: None,
+                    anytls: None,
                     hysteria2: Some(hysteria("salamander-secret")),
                 },
             ),
@@ -13731,6 +13735,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
                 8443,
                 WiresRequest {
                     vless: None,
+                    anytls: None,
                     hysteria2: Some(hysteria("<redacted>")),
                 },
             ),
@@ -13773,38 +13778,63 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
 
-    let face = |projection: Projection| CreateIngressRequest {
-        wires: WiresRequest {
-            hysteria2: None,
-            vless: Some(TransportRequest::VlessRealityXhttp {
-                xhttp: Xhttp {
-                    path: "/projection-test".to_owned(),
-                    host: Some("upload.route.example".to_owned()),
-                    xmux: None,
-                    tuning: None,
-                    mode: XhttpMode::Auto,
-                    download: None,
-                },
+    let face = |projection: Projection| {
+        let download = XhttpDownload {
+            v4: projection
+                .v4
+                .as_ref()
+                .and_then(|endpoint| endpoint.download.clone()),
+            v6: projection
+                .v6
+                .as_ref()
+                .and_then(|endpoint| endpoint.download.clone()),
+        };
+        let projection = Projection {
+            v4: projection.v4.map(|endpoint| ProjectionEndpoint {
+                host: endpoint.host,
+                port: endpoint.port,
+                download: None,
             }),
-        },
-        id: "i-main".to_owned(),
-        chain_id: "c-main".to_owned(),
-        node_id: "n1".to_owned(),
-        bind: "0.0.0.0".parse().unwrap(),
-        port: 443,
-        front_id: None,
-        guard: brocade_core::model::IngressGuard::OPEN,
-        reality: CreateRealityIngressRequest {
-            fallback_mode: None,
-            fallback_limits: None,
-            fallback_guard: None,
-            dest: Some("www.example.com:443".to_owned()),
-            server_names: vec!["www.example.com".to_owned()],
-            fingerprint: Some("chrome".to_owned()),
-            flow: Some("xtls-rprx-vision".to_owned()),
-        },
-        projection,
-        note: None,
+            v6: projection.v6.map(|endpoint| ProjectionEndpoint {
+                host: endpoint.host,
+                port: endpoint.port,
+                download: None,
+            }),
+        };
+        CreateIngressRequest {
+            wires: WiresRequest {
+                hysteria2: None,
+                anytls: None,
+                vless: Some(TransportRequest::VlessRealityXhttp {
+                    xhttp: Xhttp {
+                        path: "/projection-test".to_owned(),
+                        host: Some("upload.route.example".to_owned()),
+                        xmux: None,
+                        tuning: None,
+                        mode: XhttpMode::Auto,
+                        download: (!download.is_empty()).then_some(download),
+                    },
+                }),
+            },
+            id: "i-main".to_owned(),
+            chain_id: "c-main".to_owned(),
+            node_id: "n1".to_owned(),
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 443,
+            front_id: None,
+            guard: brocade_core::model::IngressGuard::OPEN,
+            reality: CreateRealityIngressRequest {
+                fallback_mode: None,
+                fallback_limits: None,
+                fallback_guard: None,
+                dest: Some("www.example.com:443".to_owned()),
+                server_names: vec!["www.example.com".to_owned()],
+                fingerprint: Some("chrome".to_owned()),
+                flow: Some("xtls-rprx-vision".to_owned()),
+            },
+            projection,
+            note: None,
+        }
     };
 
     // v4 only.
@@ -13833,30 +13863,32 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
     let after_write = written.revision_id;
 
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
-    let stored = &snapshot.apps[0].ingresses[0].projection;
+    let stored = &snapshot.apps[0].ingresses[0];
     assert_eq!(
-        stored.v4,
+        stored.projection.v4,
         Some(ProjectionEndpoint {
             host: "cu.acc.example.net".to_owned(),
             port: 20443,
-            download: Some(ProjectionDownloadEndpoint {
+            download: None,
+        })
+    );
+    assert_eq!(stored.projection.v6, None);
+    assert_eq!(
+        stored.wires.xhttp().unwrap().host.as_deref(),
+        Some("upload.route.example")
+    );
+    assert_eq!(
+        stored.wires.xhttp().unwrap().download,
+        Some(XhttpDownload {
+            v4: Some(ProjectionDownloadEndpoint {
                 host: "down.acc.example.net".to_owned(),
                 port: 30443,
                 origin_port: Some(40443),
                 http_host: Some("download.route.example".to_owned()),
                 mux: Some(24),
             }),
+            v6: None,
         })
-    );
-    assert_eq!(stored.v6, None);
-    assert_eq!(
-        snapshot.apps[0].ingresses[0]
-            .wires
-            .xhttp()
-            .unwrap()
-            .host
-            .as_deref(),
-        Some("upload.route.example")
     );
 
     // Writing the same contents again must not advance the revision number: the change-detection
@@ -14933,6 +14965,7 @@ async fn hysteria2_quic_tuning_round_trips_field_by_field() {
     let face = |quic: HysteriaQuic, profile: HysteriaBbrProfile| CreateIngressRequest {
         wires: WiresRequest {
             vless: None,
+            anytls: None,
             hysteria2: Some(Hysteria2 {
                 port: 50000,
                 hop: None,

@@ -2695,6 +2695,7 @@ fn sync_grants(
 enum GrantAccount {
     Vless { id: String, flow: Option<String> },
     Hysteria2 { auth: String },
+    AnyTls { password: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2746,6 +2747,7 @@ impl GrantWriteBackend for GrpcGrantWriteBackend {
                     flow: flow.as_deref(),
                 },
                 GrantAccount::Hysteria2 { auth } => xray_grpc::XrayAccount::Hysteria2 { auth },
+                GrantAccount::AnyTls { password } => xray_grpc::XrayAccount::AnyTls { password },
             };
             xray_grpc::add_user(
                 api_port,
@@ -2773,6 +2775,10 @@ impl GrantWriteBackend for XrayCliGrantWriteBackend {
             GrantProtocol::Vless => Ok(()),
             GrantProtocol::Hysteria2 => Err(
                 "deprecated xray CLI grant backend cannot add Hysteria 2 users; use native gRPC"
+                    .to_owned(),
+            ),
+            GrantProtocol::AnyTls => Err(
+                "deprecated xray CLI grant backend cannot add AnyTLS users; use native gRPC"
                     .to_owned(),
             ),
         }
@@ -2882,7 +2888,7 @@ fn sync_grants_with_backend(
             .map(|client| {
                 let flow = match protocol {
                     GrantProtocol::Vless => client.flow.clone(),
-                    GrantProtocol::Hysteria2 => None,
+                    GrantProtocol::Hysteria2 | GrantProtocol::AnyTls => None,
                 };
                 (
                     client.email.clone(),
@@ -2913,7 +2919,7 @@ fn sync_grants_with_backend(
             .filter(|client| {
                 let flow = match protocol {
                     GrantProtocol::Vless => client.flow.clone(),
-                    GrantProtocol::Hysteria2 => None,
+                    GrantProtocol::Hysteria2 | GrantProtocol::AnyTls => None,
                 };
                 actual_by_email.get(&client.email) != Some(&(client.uuid.clone(), flow))
             })
@@ -2967,6 +2973,12 @@ fn grant_addition(
                 auth: client.uuid.clone(),
             }
         }
+        GrantProtocol::AnyTls => {
+            object.insert("password".to_owned(), serde_json::json!(client.uuid));
+            GrantAccount::AnyTls {
+                password: client.uuid.clone(),
+            }
+        }
     };
     (
         serde_json::Value::Object(object),
@@ -2983,12 +2995,14 @@ fn grant_addition(
 enum GrantProtocol {
     Vless,
     Hysteria2,
+    AnyTls,
 }
 
 fn grant_protocol(inbound: &serde_json::Value, tag: &str) -> Result<GrantProtocol, String> {
     match inbound.get("protocol").and_then(serde_json::Value::as_str) {
         Some("vless") => Ok(GrantProtocol::Vless),
         Some("hysteria") => Ok(GrantProtocol::Hysteria2),
+        Some("anytls") => Ok(GrantProtocol::AnyTls),
         Some(protocol) => Err(format!(
             "xray inbound {tag} protocol {protocol} does not support dynamic grants"
         )),

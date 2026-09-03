@@ -25,16 +25,32 @@ type Server struct {
 	usersByEmail  map[string]*protocol.MemoryUser
 	userMu        sync.RWMutex
 	paddingScheme string
+	padding       *paddingScheme
 	masquerade    *masquerade
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+	if config == nil {
+		return nil, errors.New("anytls: server config is required")
+	}
 	v := core.MustFromContext(ctx)
+	rawPaddingScheme := config.PaddingScheme
+	parsedPaddingScheme := getDefaultPaddingScheme()
+	if rawPaddingScheme == "" {
+		rawPaddingScheme = string(parsedPaddingScheme.rawScheme)
+	} else {
+		var err error
+		parsedPaddingScheme, err = parsePaddingScheme(rawPaddingScheme)
+		if err != nil {
+			return nil, errors.New("anytls: invalid padding scheme").Base(err)
+		}
+	}
 	s := &Server{
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		users:         make(map[[32]byte]*protocol.MemoryUser),
 		usersByEmail:  make(map[string]*protocol.MemoryUser),
-		paddingScheme: config.PaddingScheme,
+		paddingScheme: rawPaddingScheme,
+		padding:       parsedPaddingScheme,
 	}
 	var err error
 	s.masquerade, err = newMasquerade(config.Masquerade)
@@ -67,16 +83,18 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	_ = conn.SetReadDeadline(handshakeDeadline)
 
 	sess := &session{
-		isClient:   false,
-		server:     s,
-		conn:       conn,
-		br:         &buf.BufferedReader{Reader: buf.NewReader(conn)},
-		bw:         buf.NewBufferedWriter(buf.NewWriter(conn)),
-		streams:    make(map[uint32]*stream),
-		dispatcher: dispatcher,
+		isClient:      false,
+		server:        s,
+		conn:          conn,
+		br:            &buf.BufferedReader{Reader: buf.NewReader(conn)},
+		bw:            buf.NewBufferedWriter(buf.NewWriter(conn)),
+		streams:       make(map[uint32]*stream),
+		dispatcher:    dispatcher,
+		paddingScheme: s.padding,
 	}
 	sess.fw = newFrameWriter(sess.bw)
 	sess.peerVersion = 1
+	sess.pktCounter.Store(1)
 	failAuthentication := func(err error) error {
 		masquerade := s.masquerade
 		if masquerade == nil {

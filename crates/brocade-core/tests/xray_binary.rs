@@ -12,7 +12,7 @@
 
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Command, Stdio},
@@ -28,15 +28,16 @@ use brocade_core::{
     format::{json, uri},
     ir::{hops::compile_hops, routing::compile_app, system::compile_system},
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
-        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutbound,
-        ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
-        ExternalVlessXhttp, ExternalVlessXhttpDownload, ExternalWarpBinding, HopDial,
-        HopEncryption, HopIn, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion,
-        HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily, ModelSnapshot, Node,
-        NodeEgressDnsPolicy, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
-        RealityFallbackLimits, RealityFallbackMode, RealityXhttp, Rule, Step, Tls, TlsXhttp,
-        Transport, User, WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
+        Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, DestMatch, Dns, DomainStrategy,
+        EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
+        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
+        ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
+        ExternalWarpBinding, HopDial, HopEncryption, HopIn, HopPool, HopWire, Hysteria2,
+        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
+        IngressWires, IpFamily, ModelSnapshot, Node, NodeEgressDnsPolicy,
+        ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
+        RealityFallbackMode, RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport, User,
+        WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
     },
     physical::{node::project_node, user::project_user},
     Level,
@@ -721,6 +722,278 @@ fn xray_binary() -> Option<PathBuf> {
             .join(".tools/xray"),
     };
     path.is_file().then_some(path)
+}
+
+fn sing_box_binary() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("BROCADE_SING_BOX_BIN")?);
+    path.is_file().then_some(path)
+}
+
+/// A real AnyTLS client must be independent of this repository's probe implementation. This
+/// uses the locally built sing-box binary as the client, while Xray remains the server under test.
+/// It covers custom padding (including an oversized record) and the default non-AnyTLS 404 path.
+#[test]
+fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
+    let Some(xray_binary) = xray_binary() else {
+        eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
+        return;
+    };
+    let Some(sing_box_binary) = sing_box_binary() else {
+        eprintln!("跳过：没找到第三方 sing-box 二进制（设 BROCADE_SING_BOX_BIN）");
+        return;
+    };
+    if Command::new("curl").arg("--version").output().is_err() {
+        eprintln!("跳过：没找到 curl");
+        return;
+    }
+
+    const PASSWORD: &str = "anytls-e2e-password";
+    const SERVER_NAME: &str = "a1b2c3d4.example.net";
+    let ports = free_tcp_ports(3);
+    let server_port = ports[0];
+    let socks_port = ports[1];
+    let echo_port = ports[2];
+    let dir = std::env::temp_dir().join(format!("brocade-anytls-sing-box-{server_port}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let (certificate, key) = self_signed();
+    let certificate_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    fs::write(&certificate_path, certificate).unwrap();
+    fs::write(&key_path, key).unwrap();
+
+    let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    app.ingresses[0].wires = IngressWires::AnyTls(AnyTls {
+        port: server_port,
+        padding_scheme: vec![
+            "stop=2".to_owned(),
+            "0=30-30".to_owned(),
+            "1=70000-70000".to_owned(),
+        ],
+        masquerade: AnyTlsMasquerade::default(),
+    });
+    app.steps = vec![Step {
+        chain: "c-relay".to_owned(),
+        node: "hk".to_owned(),
+        accept: None,
+        hop_in: None,
+        rules: vec![Rule {
+            dest_match: DestMatch::Any,
+            action: Action::Egress { send_through: None },
+        }],
+    }];
+    let hk = doc.nodes.iter_mut().find(|node| node.id == "hk").unwrap();
+    hk.certificate_name = Some(SERVER_NAME.to_owned());
+    hk.api_port = None;
+
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+
+    let mut server_value: Value = serde_json::from_str(&json::xray(&xray::build(&project_node(
+        &sys,
+        &[app_ir],
+        "hk",
+    ))))
+    .unwrap();
+    let anytls = server_value["inbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|inbound| inbound["tag"] == "in:relay/i-relay:anytls")
+        .expect("AnyTLS inbound");
+    anytls["settings"]["users"] = json!([{"password": PASSWORD, "email": "e2e@example.com"}]);
+    // The generated node config normally includes the production geodata downloader. It is
+    // unrelated to this protocol E2E and would make the test depend on local geoip/geosite assets.
+    server_value
+        .as_object_mut()
+        .expect("Xray config object")
+        .remove("geodata");
+    let server_config = serde_json::to_string_pretty(&server_value)
+        .unwrap()
+        .replace(
+            xray::NODE_CERTIFICATE_FILE,
+            &certificate_path.display().to_string(),
+        )
+        .replace(
+            xray::NODE_CERTIFICATE_KEY_FILE,
+            &key_path.display().to_string(),
+        );
+    let server_config_path = dir.join("xray.json");
+    fs::write(&server_config_path, &server_config).unwrap();
+
+    let checked = Command::new(&xray_binary)
+        .args(["-test", "-c"])
+        .arg(&server_config_path)
+        .output()
+        .expect("跑不起来 xray -test");
+    assert!(
+        checked.status.success(),
+        "AnyTLS 产物 xray 不认：\n{}\n{}\n----\n{server_config}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let mut server = Command::new(&xray_binary)
+        .args(["run", "-c"])
+        .arg(&server_config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("跑不起来 xray");
+    let mut sing = None;
+    let outcome = (|| -> Result<(), String> {
+        let ready = (0..50).any(|_| {
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, server_port)).is_ok() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(50));
+                false
+            }
+        });
+        if !ready {
+            return Err("xray AnyTLS 没有监听服务端口".to_owned());
+        }
+
+        let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, echo_port))
+            .map_err(|error| format!("绑定 echo 端口失败：{error}"))?;
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nanytls-e2e-ok",
+            );
+        });
+
+        let sing_config = serde_json::json!({
+            "log": { "level": "error" },
+            "inbounds": [{
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "listen_port": socks_port,
+            }],
+            "outbounds": [{
+                "type": "anytls",
+                "server": "127.0.0.1",
+                "server_port": server_port,
+                "password": PASSWORD,
+                "tls": {
+                    "enabled": true,
+                    "server_name": SERVER_NAME,
+                    "insecure": true,
+                },
+            }],
+        });
+        let sing_config_path = dir.join("sing-box.json");
+        fs::write(
+            &sing_config_path,
+            serde_json::to_string_pretty(&sing_config).unwrap(),
+        )
+        .map_err(|error| format!("写入 sing-box 配置失败：{error}"))?;
+        let checked = Command::new(&sing_box_binary)
+            .args(["check", "-c"])
+            .arg(&sing_config_path)
+            .output()
+            .map_err(|error| format!("执行 sing-box check 失败：{error}"))?;
+        if !checked.status.success() {
+            return Err(format!(
+                "sing-box 不认 AnyTLS 客户端配置：\n{}\n{}",
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr)
+            ));
+        }
+        sing = Some(
+            Command::new(&sing_box_binary)
+                .args(["run", "-c"])
+                .arg(&sing_config_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("启动 sing-box 失败：{error}"))?,
+        );
+        let client_ready = (0..50).any(|_| {
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, socks_port)).is_ok() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(50));
+                false
+            }
+        });
+        if !client_ready {
+            return Err("sing-box SOCKS 监听没有起来".to_owned());
+        }
+
+        let response = Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--socks5-hostname",
+                &format!("127.0.0.1:{socks_port}"),
+                &format!("http://127.0.0.1:{echo_port}/"),
+            ])
+            .output()
+            .map_err(|error| format!("执行 curl AnyTLS E2E 失败：{error}"))?;
+        if !response.status.success() {
+            return Err(format!(
+                "第三方 sing-box 没能通过 AnyTLS 访问 echo：\n{}\n{}",
+                String::from_utf8_lossy(&response.stdout),
+                String::from_utf8_lossy(&response.stderr)
+            ));
+        }
+        let body = String::from_utf8_lossy(&response.stdout);
+        if !body.contains("anytls-e2e-ok") {
+            return Err(format!("AnyTLS E2E 响应正文不对：{body}"));
+        }
+
+        let fallback = Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--include",
+                "--http1.1",
+                "--insecure",
+                "--noproxy",
+                "*",
+                "--resolve",
+                &format!("{SERVER_NAME}:{server_port}:127.0.0.1"),
+                &format!("https://{SERVER_NAME}:{server_port}/"),
+            ])
+            .output()
+            .map_err(|error| format!("执行 AnyTLS fallback curl 失败：{error}"))?;
+        let fallback_text = String::from_utf8_lossy(&fallback.stdout);
+        if !fallback.status.success() || !fallback_text.starts_with("HTTP/1.1 404") {
+            return Err(format!(
+                "AnyTLS 默认 fallback 不是 404：\n{fallback_text}\n{}",
+                String::from_utf8_lossy(&fallback.stderr)
+            ));
+        }
+        Ok(())
+    })();
+
+    if let Some(mut sing) = sing {
+        let _ = sing.kill();
+        let _ = sing.wait();
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
 }
 
 /// An XHTTP ingress, checked against the real binary.

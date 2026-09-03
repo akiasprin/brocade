@@ -684,7 +684,7 @@ export interface GrantProbePlanItem {
   chain_id: string;
   ingress_id: string;
   family: 'ipv4' | 'ipv6' | 'unknown';
-  protocol: 'vless' | 'hysteria2';
+  protocol: 'vless' | 'anytls' | 'hysteria2';
 }
 
 export interface GrantProbePlan {
@@ -987,6 +987,19 @@ export interface Hysteria2Settings {
   masquerade: { kind: 'not-found' } | { kind: 'proxy'; url: string };
 }
 
+export type AnyTlsMasquerade =
+  | { kind: 'not-found'; headers?: Record<string, string> }
+  | { kind: 'string'; content: string; headers?: Record<string, string>; status_code?: number };
+
+export interface AnyTlsSettings {
+  /** AnyTLS owns its own TCP listener and does not reuse `Ingress.port`. */
+  port: number;
+  /** One padding grammar line per array item. Empty means Xray's built-in scheme. */
+  padding_scheme?: string[];
+  /** Default is the explicit 404 masquerade. */
+  masquerade: AnyTlsMasquerade;
+}
+
 export type Transport =
   | { kind: 'vless-reality' }
   | { kind: 'vless-reality-xhttp'; xhttp: Xhttp }
@@ -998,10 +1011,11 @@ export type Transport =
  * CHECK 约束都有此要求，前端通过 `wiresAreValid` 在保存前拦截。 */
 export interface Wires {
   vless?: Transport | null;
+  anytls?: AnyTlsSettings | null;
   hysteria2?: Hysteria2Settings | null;
 }
 
-export const wiresAreValid = (wires: Wires) => !!wires.vless || !!wires.hysteria2;
+export const wiresAreValid = (wires: Wires) => !!wires.vless || !!wires.anytls || !!wires.hysteria2;
 
 /* 该档位是否需要机器自有证书。REALITY 借用其他站点，机器上没有证书；TLS 使用自有证书，
  * 未签发时该接入面不可用（编译器会拦截，`ingress.tls-no-certificate`）。 */
@@ -1009,7 +1023,7 @@ export const transportNeedsCertificate = (kind: TransportKind) => kind === 'vles
 
 /* 只要有一条线使用自有证书就需要证书。hy2 必然使用，TLS 两档同样使用。 */
 export const wiresNeedCertificate = (wires: Wires) =>
-  !!wires.hysteria2 || (!!wires.vless && transportNeedsCertificate(wires.vless.kind));
+  !!wires.anytls || !!wires.hysteria2 || (!!wires.vless && transportNeedsCertificate(wires.vless.kind));
 
 export const transportIsXhttp = (kind: TransportKind) => kind === 'vless-reality-xhttp' || kind === 'vless-tls-xhttp';
 
@@ -1443,6 +1457,7 @@ export interface SnapshotIngress {
       fallback_limits?: RealityFallbackLimits;
       fallback_guard?: boolean;
     } | null;
+    anytls?: AnyTlsSettings | null;
     hysteria2?: Hysteria2Settings | null;
   };
 }
@@ -1467,6 +1482,7 @@ function currentVless(ingress: SnapshotIngress): Transport | null {
 export function currentWires(ingress: SnapshotIngress): Wires {
   return {
     vless: currentVless(ingress),
+    anytls: ingress.wires.anytls ?? null,
     hysteria2: ingress.wires.hysteria2 ?? null,
   };
 }
@@ -2400,7 +2416,7 @@ export const fetchArtifactContentView = (
 // proxy-groups 按代理名引用成员，在浏览器端按行删除会产生引用不存在代理的组，mihomo 会
 // 拒绝导入。
 export type ArtifactFamily = 'v4' | 'v6';
-export type ArtifactProtocol = 'vless' | 'hysteria2';
+export type ArtifactProtocol = 'vless' | 'anytls' | 'hysteria2';
 
 export const fetchArtifactContent = (
   targetKind: string,

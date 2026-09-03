@@ -96,6 +96,28 @@ func TestGenerateRecordPayloadSizes(t *testing.T) {
 	}
 }
 
+func TestSessionPacketPaddingStopsAtConfiguredLimit(t *testing.T) {
+	scheme, err := parsePaddingScheme("stop=3\n1=64-64\n2=96-96")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &session{paddingScheme: scheme}
+	s.pktCounter.Store(1)
+
+	if got := s.nextPacketIndex(); got != 1 {
+		t.Fatalf("first packet index = %d, want 1", got)
+	}
+	if got := s.nextPacketIndex(); got != 2 {
+		t.Fatalf("second packet index = %d, want 2", got)
+	}
+	if got := s.nextPacketIndex(); got != 0 {
+		t.Fatalf("packet after stop = %d, want 0", got)
+	}
+	if got := s.nextPacketIndex(); got != 0 {
+		t.Fatalf("later packet index = %d, want 0", got)
+	}
+}
+
 func TestPaddingSizeAndWasteFrameBoundaries(t *testing.T) {
 	if got := getPadding0Size(nil); got != 30 {
 		t.Fatalf("nil padding size = %d, want 30", got)

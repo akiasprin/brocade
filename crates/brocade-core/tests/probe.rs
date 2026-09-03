@@ -258,6 +258,14 @@ fn probe_params(
             String::new(),
             tls.flow.clone(),
         ),
+        ProbeSecurity::AnyTls(anytls) => (
+            "anytls",
+            serde_json::to_string(&anytls.settings).expect("serialize AnyTLS settings"),
+            String::new(),
+            anytls.server_name.clone(),
+            String::new(),
+            None,
+        ),
         ProbeSecurity::Hysteria2(hysteria) => (
             "hysteria2",
             serde_json::to_string(&hysteria.settings).expect("serialize Hysteria 2 settings"),
@@ -288,6 +296,14 @@ fn user_params(
             tls.server_name.clone(),
             String::new(),
             tls.flow.clone(),
+        ),
+        UserSecurityPlan::AnyTls(anytls) => (
+            "anytls",
+            serde_json::to_string(&anytls.settings).expect("serialize AnyTLS settings"),
+            String::new(),
+            anytls.server_name.clone(),
+            String::new(),
+            None,
         ),
         UserSecurityPlan::Hysteria2(hysteria) => (
             "hysteria2",

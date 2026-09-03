@@ -10,7 +10,7 @@ use brocade_core::{
     physical::user::UserSecurityPlan,
 };
 use brocade_deployment::protocol::{
-    E2eProbeHysteria2, E2eProbeReality, E2eProbeTarget, E2eProbeTls, E2eProbeXhttp,
+    E2eProbeAnyTls, E2eProbeHysteria2, E2eProbeReality, E2eProbeTarget, E2eProbeTls, E2eProbeXhttp,
     E2eProbeXhttpRange, E2eProbeXhttpXmux,
 };
 use sqlx::PgPool;
@@ -133,6 +133,7 @@ pub async fn user_grant_probe_plan(
                 }),
                 None,
             ),
+            UserSecurityPlan::AnyTls(_value) => ("anytls", empty_reality(), None, None),
             UserSecurityPlan::Hysteria2(value) => (
                 "hysteria2",
                 empty_reality(),
@@ -187,6 +188,12 @@ pub async fn user_grant_probe_plan(
                 uuid: entry.uuid,
                 reality,
                 hysteria2,
+                anytls: match &entry.security {
+                    UserSecurityPlan::AnyTls(value) => Some(E2eProbeAnyTls {
+                        server_name: value.server_name.clone(),
+                    }),
+                    _ => None,
+                },
                 tls,
                 xhttp: entry.xhttp.as_ref().map(|xhttp| E2eProbeXhttp {
                     path: xhttp.path.clone(),

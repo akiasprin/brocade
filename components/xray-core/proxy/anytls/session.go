@@ -326,7 +326,7 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 			}
 		}
 
-		if err := s.sendStreamData(sid, mb, 0); err != nil {
+		if err := s.sendStreamData(sid, mb, s.nextPacketIndex()); err != nil {
 			return
 		}
 	}
@@ -390,6 +390,19 @@ func (s *session) sendFrame(f *frame) error {
 		return err
 	}
 	return s.fw.flush()
+}
+
+// Packet indexes are session-wide because padding rules describe records, not individual
+// streams. Both directions use the same counter shape: once the configured stop value is
+// reached, a zero index keeps the wire unpadded without advancing the counter forever.
+func (s *session) nextPacketIndex() uint32 {
+	s.schemeMu.RLock()
+	scheme := s.paddingScheme
+	s.schemeMu.RUnlock()
+	if scheme != nil && s.pktCounter.Load() < scheme.stop {
+		return s.pktCounter.Add(1) - 1
+	}
+	return 0
 }
 
 func (s *session) sendStreamData(sid uint32, data buf.MultiBuffer, packetIndex uint32) error {

@@ -9,11 +9,11 @@ use ipnet::IpNet;
 use crate::{
     diagnostic::Diagnostic,
     model::{
-        Action, Dns, DomainStrategy, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial, HopPool, HopWire, Hysteria2,
-        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, HysteriaQuic, ModelSnapshot,
-        RealityFallbackLimits, RealityFallbackRateLimit, Transport, Xhttp, XhttpMode, XhttpXmux,
-        XhttpXmuxRange, EXTERNAL_WIREGUARD_MAX_WORKERS,
+        Action, AnyTlsMasquerade, Dns, DomainStrategy, ExternalOutboundProtocol,
+        ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial,
+        HopPool, HopWire, Hysteria2, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
+        HysteriaQuic, ModelSnapshot, RealityFallbackLimits, RealityFallbackRateLimit, Transport,
+        Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, EXTERNAL_WIREGUARD_MAX_WORKERS,
     },
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_public_key,
@@ -1339,6 +1339,9 @@ fn validate_chain_ingresses(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
         if let Some(settings) = ingress.wires.hysteria2() {
             validate_hysteria2(diagnostics, ingress, settings);
         }
+        if let Some(settings) = ingress.wires.anytls() {
+            validate_anytls(diagnostics, ingress, settings);
+        }
         validate_ingress_certificate(diagnostics, ingress);
         validate_ingress_guard(diagnostics, ingress);
         if !app.chains.iter().any(|chain| chain.id == ingress.chain) {
@@ -1518,6 +1521,14 @@ fn occupied_ingress_ports(ingress: &Ingress) -> Vec<OccupiedIngressPort> {
         });
     }
 
+    if let Some(anytls) = ingress.wires.anytls() {
+        occupied.push(OccupiedIngressPort {
+            proto: Proto::Tcp,
+            port: anytls.port,
+            suffix: " 的 AnyTLS",
+        });
+    }
+
     if let Some(hysteria2) = ingress.wires.hysteria2() {
         occupied.push(OccupiedIngressPort {
             proto: Proto::Udp,
@@ -1665,6 +1676,168 @@ fn validate_ports(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnostic>
                     diagnostics,
                 );
             }
+        }
+    }
+}
+
+fn validate_anytls(
+    diagnostics: &mut Vec<Diagnostic>,
+    ingress: &Ingress,
+    settings: &crate::model::AnyTls,
+) {
+    if settings.port == 0 {
+        diagnostics.push(Diagnostic::error(
+            "ingress.anytls-port",
+            &ingress.id,
+            format!("接入面 {} 的 AnyTLS 监听端口不能是 0", ingress.id),
+        ));
+    }
+
+    if settings.padding_scheme.is_empty() {
+        return validate_anytls_masquerade(diagnostics, ingress, &settings.masquerade);
+    }
+    let raw = settings.padding_scheme.join("\n");
+    if raw.len() > 65_535 {
+        diagnostics.push(Diagnostic::error(
+            "ingress.anytls-padding",
+            &ingress.id,
+            format!(
+                "接入面 {} 的 AnyTLS paddingScheme 超过 65535 字节",
+                ingress.id
+            ),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut stop_seen = false;
+    for (line_number, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            diagnostics.push(Diagnostic::error(
+                "ingress.anytls-padding",
+                &ingress.id,
+                format!(
+                    "接入面 {} 的 AnyTLS paddingScheme 第 {} 行缺少 =",
+                    ingress.id,
+                    line_number + 1
+                ),
+            ));
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() || !seen.insert(key.to_owned()) {
+            diagnostics.push(Diagnostic::error(
+                "ingress.anytls-padding",
+                &ingress.id,
+                format!(
+                    "接入面 {} 的 AnyTLS paddingScheme 第 {} 行无效或重复",
+                    ingress.id,
+                    line_number + 1
+                ),
+            ));
+            continue;
+        }
+        if key == "stop" {
+            stop_seen = true;
+            if decimal_u32(value).is_none() {
+                diagnostics.push(Diagnostic::error(
+                    "ingress.anytls-padding",
+                    &ingress.id,
+                    format!("接入面 {} 的 AnyTLS paddingScheme stop 无效", ingress.id),
+                ));
+            }
+            continue;
+        }
+        if decimal_u32(key).is_none() {
+            diagnostics.push(Diagnostic::error(
+                "ingress.anytls-padding",
+                &ingress.id,
+                format!(
+                    "接入面 {} 的 AnyTLS paddingScheme 数据包编号「{key}」无效",
+                    ingress.id
+                ),
+            ));
+            continue;
+        }
+        for token in value.split(',').map(str::trim) {
+            if token == "c" {
+                continue;
+            }
+            let valid = token
+                .split_once('-')
+                .and_then(|(from, to)| Some((decimal_u32(from.trim())?, decimal_u32(to.trim())?)))
+                .is_some_and(|(from, to)| {
+                    from > 0 && to > 0 && from <= to && to <= 4 * 1024 * 1024
+                });
+            if !valid {
+                diagnostics.push(Diagnostic::error(
+                    "ingress.anytls-padding",
+                    &ingress.id,
+                    format!(
+                        "接入面 {} 的 AnyTLS padding 范围「{token}」无效",
+                        ingress.id
+                    ),
+                ));
+            }
+        }
+    }
+    if !stop_seen {
+        diagnostics.push(Diagnostic::error(
+            "ingress.anytls-padding",
+            &ingress.id,
+            format!(
+                "接入面 {} 的 AnyTLS paddingScheme 必须包含 stop=...",
+                ingress.id
+            ),
+        ));
+    }
+    validate_anytls_masquerade(diagnostics, ingress, &settings.masquerade);
+}
+
+fn decimal_u32(value: &str) -> Option<u32> {
+    (!value.is_empty() && value == value.parse::<u32>().ok()?.to_string())
+        .then_some(value.parse().ok()?)
+}
+
+fn validate_anytls_masquerade(
+    diagnostics: &mut Vec<Diagnostic>,
+    ingress: &Ingress,
+    masquerade: &AnyTlsMasquerade,
+) {
+    let headers = match masquerade {
+        AnyTlsMasquerade::NotFound { headers } | AnyTlsMasquerade::String { headers, .. } => {
+            headers
+        }
+    };
+    for (name, value) in headers {
+        let valid_name = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c));
+        if !valid_name || value.contains(['\r', '\n']) {
+            diagnostics.push(Diagnostic::error(
+                "ingress.anytls-masquerade",
+                &ingress.id,
+                format!(
+                    "接入面 {} 的 AnyTLS masquerade header「{name}」无效",
+                    ingress.id
+                ),
+            ));
+        }
+    }
+    if let AnyTlsMasquerade::String { status_code, .. } = masquerade {
+        if !(200..=599).contains(status_code) {
+            diagnostics.push(Diagnostic::error(
+                "ingress.anytls-masquerade",
+                &ingress.id,
+                format!(
+                    "接入面 {} 的 AnyTLS masquerade statusCode 必须在 200-599",
+                    ingress.id
+                ),
+            ));
         }
     }
 }

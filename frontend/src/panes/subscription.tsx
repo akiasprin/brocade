@@ -27,8 +27,9 @@ const FAMILY_PICKS: { key: FamilyPick; label: string }[] = [
 
 const PROTOCOL_PICKS: { key: ProtocolPick; label: string }[] = [
   { key: 'vless', label: 'VLESS' },
+  { key: 'anytls', label: 'AnyTLS' },
   { key: 'hysteria2', label: 'Hysteria 2' },
-  { key: 'both', label: 'VLESS + Hysteria 2' },
+  { key: 'both', label: '全部协议' },
 ];
 
 function SubscriptionTabs<T extends string>({

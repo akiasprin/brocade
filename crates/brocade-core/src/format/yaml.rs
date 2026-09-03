@@ -450,6 +450,7 @@ fn subscription_server_names(subscription: &Subscription) -> BTreeSet<&str> {
         .map(|entry| match &entry.security {
             SubscriptionSecurity::Reality(reality) => reality.server_name.as_str(),
             SubscriptionSecurity::Tls(tls) => tls.server_name.as_str(),
+            SubscriptionSecurity::AnyTls(anytls) => anytls.server_name.as_str(),
             SubscriptionSecurity::Hysteria2(hysteria) => hysteria.server_name.as_str(),
         })
         .chain(
@@ -636,6 +637,10 @@ fn deduplicate(values: &mut Vec<String>) {
 }
 
 fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
+    if let SubscriptionSecurity::AnyTls(anytls) = &entry.security {
+        push_anytls_proxy(lines, entry, anytls);
+        return;
+    }
     if let SubscriptionSecurity::Hysteria2(hysteria) = &entry.security {
         push_hysteria2_proxy(lines, entry, hysteria);
         return;
@@ -667,7 +672,9 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
             (&reality.server_name, &reality.flow, Some(reality))
         }
         SubscriptionSecurity::Tls(tls) => (&tls.server_name, &tls.flow, None),
-        SubscriptionSecurity::Hysteria2(_) => unreachable!("Hysteria 已在上方单独渲染"),
+        SubscriptionSecurity::AnyTls(_) | SubscriptionSecurity::Hysteria2(_) => {
+            unreachable!("AnyTLS / Hysteria 已在上方单独渲染")
+        }
     };
     if let Some(flow) = flow {
         lines.push(format!("    flow: {}", scalar(flow)));
@@ -743,6 +750,21 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
     if let Some(front_name) = &entry.front_name {
         lines.push(format!("    dialer-proxy: {}", yaml_quote(front_name)));
     }
+}
+
+fn push_anytls_proxy(
+    lines: &mut Vec<String>,
+    entry: &SubscriptionEntry,
+    anytls: &crate::artifacts::subscription::SubscriptionAnyTls,
+) {
+    lines.push(format!("  - name: {}", yaml_quote(&entry.name)));
+    lines.push("    type: anytls".to_owned());
+    lines.push(format!("    server: {}", scalar(&entry.server)));
+    lines.push(format!("    port: {}", entry.port));
+    lines.push(format!("    password: {}", scalar(&entry.uuid)));
+    lines.push(format!("    sni: {}", scalar(&anytls.server_name)));
+    lines.push("    tls: true".to_owned());
+    lines.push("    udp: true".to_owned());
 }
 
 fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProxy) {

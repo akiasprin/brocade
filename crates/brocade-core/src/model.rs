@@ -15,7 +15,10 @@
 //! may not exit", the artifacts are produced as usual, and nothing in the output
 //! indicates the mistake.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
@@ -1344,6 +1347,72 @@ pub struct Hysteria2 {
     pub masquerade: HysteriaMasquerade,
 }
 
+/// AnyTLS's operator-controlled server shape.
+///
+/// The listener has only three meaningful configuration groups in the pinned Xray fork: its
+/// TCP port, the padding grammar and the response sent to connections which do not complete an
+/// AnyTLS handshake. User passwords are deliberately absent here because they are synchronized
+/// through Xray's gRPC API just like the other dynamic account types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnyTls {
+    /// The TCP port owned by the AnyTLS listener. It is separate from `Ingress::port`, which is
+    /// the VLESS side, so one ingress may expose both protocols on distinct ports.
+    pub port: u16,
+    /// One line per padding rule. An empty list means use Xray's built-in scheme.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub padding_scheme: Vec<String>,
+    /// HTTP response returned to non-AnyTLS clients. The default is an explicit 404 so the
+    /// public behavior remains stable across fork upgrades.
+    #[serde(default)]
+    pub masquerade: AnyTlsMasquerade,
+}
+
+impl Default for AnyTls {
+    fn default() -> Self {
+        Self {
+            port: ANYTLS_PORT_BASE,
+            padding_scheme: Vec::new(),
+            masquerade: AnyTlsMasquerade::default(),
+        }
+    }
+}
+
+/// Base used when the console creates an AnyTLS listener without an explicit port.
+pub const ANYTLS_PORT_BASE: u16 = 19_000;
+
+/// The response body and headers used by Xray's built-in `type: 404` masquerade are owned by
+/// Xray. Brocade stores only optional header overrides for that form; the status and body stay
+/// the stable upstream defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AnyTlsMasquerade {
+    NotFound {
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+    },
+    String {
+        #[serde(default)]
+        content: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+        #[serde(default = "default_anytls_status_code")]
+        status_code: u16,
+    },
+}
+
+impl Default for AnyTlsMasquerade {
+    fn default() -> Self {
+        Self::NotFound {
+            headers: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_anytls_status_code() -> u16 {
+    200
+}
+
 impl Default for Hysteria2 {
     fn default() -> Self {
         Self {
@@ -1557,9 +1626,23 @@ pub enum HysteriaMasquerade {
 #[serde(try_from = "IngressWiresWire", into = "IngressWiresWire")]
 pub enum IngressWires {
     Vless(Transport),
+    AnyTls(AnyTls),
     Hysteria2(Hysteria2),
+    VlessAndAnyTls {
+        vless: Transport,
+        anytls: AnyTls,
+    },
     Both {
         vless: Transport,
+        hysteria2: Hysteria2,
+    },
+    AnyTlsAndHysteria2 {
+        anytls: AnyTls,
+        hysteria2: Hysteria2,
+    },
+    VlessAnyTlsAndHysteria2 {
+        vless: Transport,
+        anytls: AnyTls,
         hysteria2: Hysteria2,
     },
 }
@@ -1573,6 +1656,8 @@ pub struct IngressWiresWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vless: Option<Transport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls: Option<AnyTls>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<Hysteria2>,
 }
 
@@ -1580,11 +1665,23 @@ impl TryFrom<IngressWiresWire> for IngressWires {
     type Error = &'static str;
 
     fn try_from(wire: IngressWiresWire) -> Result<Self, Self::Error> {
-        match (wire.vless, wire.hysteria2) {
-            (Some(vless), Some(hysteria2)) => Ok(Self::Both { vless, hysteria2 }),
-            (Some(vless), None) => Ok(Self::Vless(vless)),
-            (None, Some(hysteria2)) => Ok(Self::Hysteria2(hysteria2)),
-            (None, None) => Err("接入面至少要有一条线：vless 和 hysteria2 不能都空着"),
+        match (wire.vless, wire.anytls, wire.hysteria2) {
+            (Some(vless), Some(anytls), Some(hysteria2)) => Ok(Self::VlessAnyTlsAndHysteria2 {
+                vless,
+                anytls,
+                hysteria2,
+            }),
+            (Some(vless), Some(anytls), None) => Ok(Self::VlessAndAnyTls { vless, anytls }),
+            (Some(vless), None, Some(hysteria2)) => Ok(Self::Both { vless, hysteria2 }),
+            (Some(vless), None, None) => Ok(Self::Vless(vless)),
+            (None, Some(anytls), Some(hysteria2)) => {
+                Ok(Self::AnyTlsAndHysteria2 { anytls, hysteria2 })
+            }
+            (None, Some(anytls), None) => Ok(Self::AnyTls(anytls)),
+            (None, None, Some(hysteria2)) => Ok(Self::Hysteria2(hysteria2)),
+            (None, None, None) => {
+                Err("接入面至少要有一条线：vless、anytls 和 hysteria2 不能都空着")
+            }
         }
     }
 }
@@ -1594,14 +1691,41 @@ impl From<IngressWires> for IngressWiresWire {
         match wires {
             IngressWires::Vless(vless) => Self {
                 vless: Some(vless),
+                anytls: None,
+                hysteria2: None,
+            },
+            IngressWires::AnyTls(anytls) => Self {
+                vless: None,
+                anytls: Some(anytls),
                 hysteria2: None,
             },
             IngressWires::Hysteria2(hysteria2) => Self {
                 vless: None,
+                anytls: None,
                 hysteria2: Some(hysteria2),
+            },
+            IngressWires::VlessAndAnyTls { vless, anytls } => Self {
+                vless: Some(vless),
+                anytls: Some(anytls),
+                hysteria2: None,
             },
             IngressWires::Both { vless, hysteria2 } => Self {
                 vless: Some(vless),
+                anytls: None,
+                hysteria2: Some(hysteria2),
+            },
+            IngressWires::AnyTlsAndHysteria2 { anytls, hysteria2 } => Self {
+                vless: None,
+                anytls: Some(anytls),
+                hysteria2: Some(hysteria2),
+            },
+            IngressWires::VlessAnyTlsAndHysteria2 {
+                vless,
+                anytls,
+                hysteria2,
+            } => Self {
+                vless: Some(vless),
+                anytls: Some(anytls),
                 hysteria2: Some(hysteria2),
             },
         }
@@ -1613,36 +1737,59 @@ impl IngressWires {
     pub fn vless(&self) -> Option<&Transport> {
         match self {
             Self::Vless(vless) | Self::Both { vless, .. } => Some(vless),
-            Self::Hysteria2(_) => None,
+            Self::VlessAndAnyTls { vless, .. } | Self::VlessAnyTlsAndHysteria2 { vless, .. } => {
+                Some(vless)
+            }
+            Self::AnyTls(_) | Self::Hysteria2(_) | Self::AnyTlsAndHysteria2 { .. } => None,
         }
     }
 
     pub fn vless_mut(&mut self) -> Option<&mut Transport> {
         match self {
             Self::Vless(vless) | Self::Both { vless, .. } => Some(vless),
-            Self::Hysteria2(_) => None,
+            Self::VlessAndAnyTls { vless, .. } | Self::VlessAnyTlsAndHysteria2 { vless, .. } => {
+                Some(vless)
+            }
+            Self::AnyTls(_) | Self::Hysteria2(_) | Self::AnyTlsAndHysteria2 { .. } => None,
+        }
+    }
+
+    /// The AnyTLS TCP half, or `None` where this ingress is VLESS or QUIC only.
+    pub fn anytls(&self) -> Option<&AnyTls> {
+        match self {
+            Self::AnyTls(anytls)
+            | Self::VlessAndAnyTls { anytls, .. }
+            | Self::AnyTlsAndHysteria2 { anytls, .. }
+            | Self::VlessAnyTlsAndHysteria2 { anytls, .. } => Some(anytls),
+            Self::Vless(_) | Self::Hysteria2(_) | Self::Both { .. } => None,
         }
     }
 
     /// The UDP half, or `None` where this ingress is TCP only.
     pub fn hysteria2(&self) -> Option<&Hysteria2> {
         match self {
-            Self::Hysteria2(hysteria2) | Self::Both { hysteria2, .. } => Some(hysteria2),
-            Self::Vless(_) => None,
+            Self::Hysteria2(hysteria2)
+            | Self::Both { hysteria2, .. }
+            | Self::AnyTlsAndHysteria2 { hysteria2, .. }
+            | Self::VlessAnyTlsAndHysteria2 { hysteria2, .. } => Some(hysteria2),
+            Self::Vless(_) | Self::AnyTls(_) | Self::VlessAndAnyTls { .. } => None,
         }
     }
 
     pub fn hysteria2_mut(&mut self) -> Option<&mut Hysteria2> {
         match self {
-            Self::Hysteria2(hysteria2) | Self::Both { hysteria2, .. } => Some(hysteria2),
-            Self::Vless(_) => None,
+            Self::Hysteria2(hysteria2)
+            | Self::Both { hysteria2, .. }
+            | Self::AnyTlsAndHysteria2 { hysteria2, .. }
+            | Self::VlessAnyTlsAndHysteria2 { hysteria2, .. } => Some(hysteria2),
+            Self::Vless(_) | Self::AnyTls(_) | Self::VlessAndAnyTls { .. } => None,
         }
     }
 
     /// Whether a TCP listener exists. `false` for the QUIC-only shape, which is why the
     /// port-occupancy checks call this rather than assuming (`ir/validate.rs`).
     pub fn has_tcp(&self) -> bool {
-        self.vless().is_some()
+        self.vless().is_some() || self.anytls().is_some()
     }
 
     /// Whether a UDP listener exists.
@@ -1679,7 +1826,9 @@ impl IngressWires {
     /// True when *either* half presents this machine's own certificate. Hysteria 2 always does;
     /// the TCP half does in two of its four shapes.
     pub fn needs_node_certificate(&self) -> bool {
-        self.has_udp() || self.vless().is_some_and(Transport::needs_node_certificate)
+        self.has_udp()
+            || self.anytls().is_some()
+            || self.vless().is_some_and(Transport::needs_node_certificate)
     }
 
     /// How the TCP half is named in storage, or `None` where there is no TCP half.

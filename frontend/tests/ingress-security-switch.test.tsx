@@ -86,6 +86,54 @@ function Harness({
   );
 }
 
+function anytlsIngress(): SnapshotIngress {
+  const base = ingress('vless-reality');
+  return {
+    ...base,
+    wires: {
+      vless: base.wires.vless,
+      anytls: {
+        port: 19443,
+        padding_scheme: [],
+        masquerade: { kind: 'not-found' },
+      },
+    },
+  };
+}
+
+function AnyTlsHarness() {
+  const [client] = useState(() => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    queryClient.setQueryData(['snapshot'], { snapshot: { apps: [], nodes: [] } });
+    queryClient.setQueryData(['nodes'], { nodes: [] });
+    queryClient.setQueryData(['revisions'], { current_revision: null });
+    queryClient.setQueryData(['settings'], {
+      ports: { hy2_base: 18000 },
+      reality_site: {
+        dest: 'www.example.com:443',
+        server_names: ['www.example.com'],
+        fingerprint: 'chrome',
+      },
+    });
+    return queryClient;
+  });
+  const value = anytlsIngress();
+
+  return (
+    <QueryClientProvider client={client}>
+      <IngressPanel appId="app-1" ingress={value} title="AnyTLS" editable>
+        <IngressStreamRow appId="app-1" ingress={value} editable section="protocols" />
+        <IngressStreamRow appId="app-1" ingress={value} editable section="anytls" />
+      </IngressPanel>
+    </QueryClientProvider>
+  );
+}
+
 afterEach(() => {
   cleanup();
   draft.clear();
@@ -346,5 +394,74 @@ describe('VLESS security draft', () => {
     expect(savedXhttp(saved).tuning).toEqual({
       x_padding_bytes: { from: 200, to: 600 },
     });
+  });
+});
+
+describe('AnyTLS ingress draft', () => {
+  it('exposes the independent TCP port, padding scheme, and full masquerade response', async () => {
+    draft.clear();
+    const view = render(<AnyTlsHarness />);
+
+    expect((view.getByRole('checkbox', { name: 'AnyTLS（TCP）' }) as HTMLInputElement).checked).toBe(true);
+    expect((view.getByRole('textbox', { name: 'AnyTLS 监听端口' }) as HTMLInputElement).value).toBe('19443');
+    expect((view.getByRole('combobox', { name: 'AnyTLS Masquerade 类型' }) as HTMLSelectElement).value).toBe('not-found');
+    expect(view.queryByRole('spinbutton', { name: 'AnyTLS Masquerade 状态码' })).toBeNull();
+
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS 监听端口' }), {
+      target: { value: '20443' },
+    });
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Padding Scheme' }), {
+      target: { value: 'stop=2\n0=30-30\n1=70000-70000' },
+    });
+    fireEvent.change(view.getByRole('combobox', { name: 'AnyTLS Masquerade 类型' }), {
+      target: { value: 'string' },
+    });
+    fireEvent.change(view.getByRole('spinbutton', { name: 'AnyTLS Masquerade 状态码' }), {
+      target: { value: '403' },
+    });
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Masquerade 正文' }), {
+      target: { value: 'Forbidden' },
+    });
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Masquerade Headers' }), {
+      target: { value: 'Content-Type: text/plain\nCache-Control: no-store' },
+    });
+
+    const saved = await saveDraft(view);
+    expect(saved.wires?.vless).toEqual({ kind: 'vless-reality' });
+    expect(saved.wires?.anytls).toEqual({
+      port: 20443,
+      padding_scheme: ['stop=2', '0=30-30', '1=70000-70000'],
+      masquerade: {
+        kind: 'string',
+        content: 'Forbidden',
+        status_code: 403,
+        headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' },
+      },
+    });
+  });
+
+  it('keeps VLESS and AnyTLS enabled as separate TCP wires', async () => {
+    draft.clear();
+    const view = render(<AnyTlsHarness />);
+
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS 监听端口' }), {
+      target: { value: '20443' },
+    });
+    const saved = await saveDraft(view);
+
+    expect(saved.wires?.vless).toEqual({ kind: 'vless-reality' });
+    expect(saved.wires?.anytls).toMatchObject({ port: 20443 });
+    expect(saved.wires?.hysteria2).toBeNull();
+  });
+
+  it('blocks malformed padding before it can be saved', async () => {
+    draft.clear();
+    const view = render(<AnyTlsHarness />);
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Padding Scheme' }), {
+      target: { value: '0=30-30\n0=40-40' },
+    });
+
+    await waitFor(() => expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true));
+    expect(view.getByText(/Padding Scheme 格式无效/)).toBeTruthy();
   });
 });

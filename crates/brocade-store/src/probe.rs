@@ -11,8 +11,8 @@ use brocade_core::{
     physical::probe::{ProbePlan, ProbeSecurity},
 };
 use brocade_deployment::protocol::{
-    E2eExitVerdict, E2eProbe, E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest, E2eProbeResult,
-    E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList, E2eProbeTls, E2eProbeXhttp,
+    E2eExitVerdict, E2eProbe, E2eProbeAnyTls, E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest,
+    E2eProbeResult, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList, E2eProbeTls, E2eProbeXhttp,
     E2eProbeXhttpRange, E2eProbeXhttpXmux, LinkHealthRequest, LinkHealthResult, LinkProbeRequest,
     LinkProbeResult, LinkProbeStatus, ProbeTarget, ProbeTargetList, ProbeTransport,
 };
@@ -583,7 +583,9 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     // Filler beside a `tls` block that supersedes it. Empty rather than absent
                     // because the field is what an older agent parses, and one that cannot be
                     // parsed costs that agent every other probe on the machine.
-                    ProbeSecurity::Tls(_) | ProbeSecurity::Hysteria2(_) => E2eProbeReality {
+                    ProbeSecurity::Tls(_)
+                    | ProbeSecurity::AnyTls(_)
+                    | ProbeSecurity::Hysteria2(_) => E2eProbeReality {
                         public_key: String::new(),
                         short_id: String::new(),
                         server_name: String::new(),
@@ -629,8 +631,16 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     }),
                     _ => None,
                 },
+                anytls: match &target.security {
+                    ProbeSecurity::AnyTls(anytls) => Some(E2eProbeAnyTls {
+                        server_name: anytls.server_name.clone(),
+                    }),
+                    _ => None,
+                },
                 tls: match &target.security {
-                    ProbeSecurity::Reality(_) | ProbeSecurity::Hysteria2(_) => None,
+                    ProbeSecurity::Reality(_)
+                    | ProbeSecurity::AnyTls(_)
+                    | ProbeSecurity::Hysteria2(_) => None,
                     ProbeSecurity::Tls(tls) => Some(E2eProbeTls {
                         server_name: tls.server_name.clone(),
                         flow: tls.flow.clone(),

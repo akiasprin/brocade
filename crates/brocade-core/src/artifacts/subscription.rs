@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2, XhttpTuning,
-        XhttpXmux,
+        AnyTls, ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2,
+        XhttpTuning, XhttpXmux,
     },
     physical::user::{UserPlan, UserRealityPlan, UserSecurityPlan},
 };
@@ -78,7 +78,14 @@ pub struct SubscriptionDownload {
 pub enum SubscriptionSecurity {
     Reality(SubscriptionReality),
     Tls(SubscriptionTls),
+    AnyTls(SubscriptionAnyTls),
     Hysteria2(SubscriptionHysteria2),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionAnyTls {
+    pub server_name: String,
+    pub settings: AnyTls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +190,10 @@ fn security(security: &UserSecurityPlan) -> SubscriptionSecurity {
                 settings: hysteria.settings.clone(),
             })
         }
+        UserSecurityPlan::AnyTls(anytls) => SubscriptionSecurity::AnyTls(SubscriptionAnyTls {
+            server_name: anytls.server_name.clone(),
+            settings: anytls.settings.clone(),
+        }),
     }
 }
 
