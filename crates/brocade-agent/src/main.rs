@@ -33,8 +33,8 @@ use probe::{
     send_ping_probe_report, xray_listen_ports, XrayListenProtocol,
 };
 use spool::{
-    collect_runtime_report, record_local_reconcile, send_runtime_report, spool_drain, spool_push,
-    Spool, OBSERVATION_SPOOL, USAGE_SPOOL,
+    collect_runtime_report, collect_spool_backlog, record_local_reconcile, runtime_cycle,
+    send_runtime_report, spool_drain, spool_push, Spool, OBSERVATION_SPOOL, USAGE_SPOOL,
 };
 
 use wg::{
@@ -68,8 +68,8 @@ use brocade_deployment::{
         AgentObservationRequest, DesiredStateResponse, E2eProbeRequest, E2eProbeTargetList,
         GeodataFileState, GeodataObservation, LinkHealthRequest, LinkProbeRequest,
         LoadReportRequest, NodeDesiredDeployment, NodeRuntimeReport, PingProbeReportRequest,
-        PingProbeSettings, ProbeTargetList, ReportedNodeState, RouteIpReport, TargetApplyResult,
-        UsageCounter, UsageReportRequest,
+        PingProbeSettings, ProbeTargetList, ReportedNodeState, RouteIpReport, SpoolBacklog,
+        TargetApplyResult, UsageCounter, UsageReportRequest,
     },
 };
 
@@ -311,6 +311,63 @@ impl<T> LatestReport<T> {
             .report
             .take()
             .map(|report| (report, std::mem::take(&mut pending.dropped)))
+    }
+}
+
+/// Runtime reports are deliberately infrequent, but a healthy spool can be created and drained
+/// in one second. Remember the last backlog snapshot queued by this process and publish a fresh
+/// runtime report when a drain changes it. Collection and comparison share one lock so a periodic
+/// sample cannot publish a stale non-zero value after a concurrent drain has already cleared it.
+struct RuntimeReports {
+    reports: LatestReport<NodeRuntimeReport>,
+    last_spool: Mutex<Option<SpoolBacklog>>,
+}
+
+impl Default for RuntimeReports {
+    fn default() -> Self {
+        Self {
+            reports: LatestReport::default(),
+            last_spool: Mutex::new(None),
+        }
+    }
+}
+
+impl RuntimeReports {
+    fn publish_current(&self, state_dir: &Path) -> Result<(), String> {
+        let mut last_spool = self
+            .last_spool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let report = collect_runtime_report(state_dir)?;
+        *last_spool = Some(report.spool.clone());
+        self.reports.publish(report);
+        Ok(())
+    }
+
+    fn publish_if_spool_changed(&self, state_dir: &Path) -> Result<(), String> {
+        let mut last_spool = self
+            .last_spool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = collect_spool_backlog(state_dir)?;
+        if last_spool.as_ref() == Some(&current) {
+            return Ok(());
+        }
+        let report = collect_runtime_report(state_dir)?;
+        *last_spool = Some(report.spool.clone());
+        self.reports.publish(report);
+        Ok(())
+    }
+}
+
+static RUNTIME_REPORTS: OnceLock<Arc<RuntimeReports>> = OnceLock::new();
+
+/// Queue an immediate runtime snapshot in the daemon. One-shot commands do not start the shared
+/// reporter, so they retain the synchronous fallback.
+pub(crate) fn publish_runtime_now(options: &Options) -> Result<(), String> {
+    match RUNTIME_REPORTS.get() {
+        Some(reports) => reports.publish_current(&options.state_dir),
+        None => runtime_cycle(options),
     }
 }
 
@@ -1003,14 +1060,28 @@ const SPOOL_MAX_RETRY: Duration = Duration::from_secs(60);
 const LATEST_REPORT_RETRY_MIN: Duration = Duration::from_secs(1);
 const LATEST_REPORT_RETRY_MAX: Duration = Duration::from_secs(15);
 
-fn spawn_spool_reporter(name: &'static str, spool: Spool, options: Options) -> Result<(), String> {
+fn spawn_spool_reporter(
+    name: &'static str,
+    spool: Spool,
+    options: Options,
+    runtime_reports: Arc<RuntimeReports>,
+) -> Result<(), String> {
     thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
             let mut retry = SPOOL_IDLE_POLL;
             loop {
                 match spool_drain(spool, &options) {
-                    Ok(()) => retry = SPOOL_IDLE_POLL,
+                    Ok(changed) => {
+                        if changed {
+                            if let Err(error) =
+                                runtime_reports.publish_if_spool_changed(&options.state_dir)
+                            {
+                                eprintln!("{name}: backlog 即时快照没采集成：{error}");
+                            }
+                        }
+                        retry = SPOOL_IDLE_POLL;
+                    }
                     Err(error) => {
                         eprintln!("{name}: {error}");
                         retry = retry.saturating_mul(2).min(SPOOL_MAX_RETRY);
@@ -1054,10 +1125,30 @@ fn run_forever(options: Options) -> Result<(), String> {
     // process; it sets this flag, and the main loop exits between rounds.
     let wants_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let runtime_reports = Arc::new(RuntimeReports::default());
+    let _ = RUNTIME_REPORTS.set(Arc::clone(&runtime_reports));
+    {
+        let report_options = options.clone();
+        let reports_in = Arc::clone(&runtime_reports);
+        thread::Builder::new()
+            .name("runtime-report".to_owned())
+            .spawn(move || {
+                report_latest_forever("runtime", &reports_in.reports, |report| {
+                    send_runtime_report(&report_options, report)
+                })
+            })
+            .map_err(|error| format!("cannot spawn runtime-report thread: {error}"))?;
+    }
+
     // Convergence results are durable and ordered, but their network delivery is not part of the
     // convergence transaction. The control plane already withholds new work while an observation
     // is outstanding, so a dedicated drainer preserves ordering without delaying heartbeats.
-    spawn_spool_reporter("observation-report", OBSERVATION_SPOOL, options.clone())?;
+    spawn_spool_reporter(
+        "observation-report",
+        OBSERVATION_SPOOL,
+        options.clone(),
+        Arc::clone(&runtime_reports),
+    )?;
 
     {
         // One outbound connection, idle until the control plane says somebody is watching. It is
@@ -1071,7 +1162,12 @@ fn run_forever(options: Options) -> Result<(), String> {
     }
 
     {
-        spawn_spool_reporter("usage-report", USAGE_SPOOL, options.clone())?;
+        spawn_spool_reporter(
+            "usage-report",
+            USAGE_SPOOL,
+            options.clone(),
+            Arc::clone(&runtime_reports),
+        )?;
         let health_reports = Arc::new(LatestReport::<LinkHealthRequest>::default());
 
         let report_options = options.clone();
@@ -1173,28 +1269,17 @@ fn run_forever(options: Options) -> Result<(), String> {
     }
 
     {
-        let reports = Arc::new(LatestReport::<NodeRuntimeReport>::default());
-        let report_options = options.clone();
-        let reports_in = Arc::clone(&reports);
-        thread::Builder::new()
-            .name("runtime-report".to_owned())
-            .spawn(move || {
-                report_latest_forever("runtime", &reports_in, |report| {
-                    send_runtime_report(&report_options, report)
-                })
-            })
-            .map_err(|error| format!("cannot spawn runtime-report thread: {error}"))?;
-
         let state_dir = options.state_dir.clone();
-        let reports_out = Arc::clone(&reports);
+        let reports_out = Arc::clone(&runtime_reports);
         thread::Builder::new()
             .name("runtime".to_owned())
             .spawn(move || {
                 let mut tick = Instant::now();
                 loop {
-                    each_round("runtime", || match collect_runtime_report(&state_dir) {
-                        Ok(report) => reports_out.publish(report),
-                        Err(error) => eprintln!("runtime: {error}"),
+                    each_round("runtime", || {
+                        if let Err(error) = reports_out.publish_current(&state_dir) {
+                            eprintln!("runtime: {error}");
+                        }
                     });
                     let now = Instant::now();
                     tick = next_periodic_tick(tick, PROBE_INTERVAL, now);
@@ -1721,7 +1806,7 @@ fn collect_usage_report(options: &Options) -> Result<(), String> {
 /// reporter workers so neither HTTP nor backlog recovery moves the accounting clock.
 fn usage_cycle(options: &Options) -> Result<(), String> {
     let sampled = collect_usage_report(options);
-    let drained = spool_drain(USAGE_SPOOL, options);
+    let drained = spool_drain(USAGE_SPOOL, options).map(|_| ());
     if let Err(error) = health_cycle(options) {
         eprintln!("link-health: {error}");
     }
@@ -3392,6 +3477,29 @@ mod tests {
         let (latest, dropped) = reports.take();
         assert_eq!(latest.probed_at_unix_secs, 3);
         assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn a_drained_spool_replaces_a_stale_runtime_backlog_snapshot() {
+        let dir = test_state_dir("runtime-backlog");
+        super::spool_push(
+            super::USAGE_SPOOL,
+            &dir,
+            &serde_json::json!({ "sequence": 1 }),
+        )
+        .unwrap();
+
+        let reports = super::RuntimeReports::default();
+        reports.publish_current(&dir).unwrap();
+        assert_eq!(reports.reports.try_take().unwrap().0.spool.usage, 1);
+
+        fs::write(dir.join(super::USAGE_SPOOL.file), b"").unwrap();
+        reports.publish_if_spool_changed(&dir).unwrap();
+        assert_eq!(reports.reports.try_take().unwrap().0.spool.usage, 0);
+        reports.publish_if_spool_changed(&dir).unwrap();
+        assert!(reports.reports.try_take().is_none());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

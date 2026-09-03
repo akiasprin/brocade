@@ -193,15 +193,7 @@ pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeRepo
     let local_reconcile = fs::read_to_string(state_dir.join(LOCAL_RECONCILE_FILE))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
-    let spool = SpoolBacklog {
-        observation: spool_read(OBSERVATION_SPOOL, state_dir)
-            .map(|lines| lines.len() as u32)
-            .unwrap_or(0),
-        usage: spool_read(USAGE_SPOOL, state_dir)
-            .map(|lines| lines.len() as u32)
-            .unwrap_or(0),
-        dropped: read_dropped(state_dir),
-    };
+    let spool = collect_spool_backlog(state_dir)?;
     Ok(NodeRuntimeReport {
         observed_at_unix_secs: Some(current_unix_secs()?),
         versions,
@@ -209,6 +201,14 @@ pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeRepo
         geodata,
         local_reconcile,
         spool,
+    })
+}
+
+pub(crate) fn collect_spool_backlog(state_dir: &Path) -> Result<SpoolBacklog, String> {
+    Ok(SpoolBacklog {
+        observation: spool_read(OBSERVATION_SPOOL, state_dir)?.len() as u32,
+        usage: spool_read(USAGE_SPOOL, state_dir)?.len() as u32,
+        dropped: read_dropped(state_dir),
     })
 }
 
@@ -301,7 +301,7 @@ fn spool_write_unlocked(spool: Spool, state_dir: &Path, lines: &[String]) -> Res
 /// plane compute deltas in the wrong order. The same holds for the observation
 /// spool: one machine's convergence results within a release are ordered, and
 /// out-of-order delivery overwrites new with old.
-pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<(), String> {
+pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<bool, String> {
     // Only reporters serialize here. Producers use the separate file lock and can append while
     // any request below is blocked in DNS, connect, TLS or response IO.
     let _drain_guard = drain_lock(spool)
@@ -309,7 +309,7 @@ pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<(), String>
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let lines = spool_read(spool, &options.state_dir)?;
     if lines.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let client = HttpClient::new(&options.server)?;
     let mut sent = 0;
@@ -363,7 +363,7 @@ pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<(), String>
     }
     match failure {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(sent > 0),
     }
 }
 
@@ -493,7 +493,7 @@ mod tests {
         }
 
         let (server, handle) = fake_control_plane(vec![400, 200, 200]);
-        spool_drain(TEST_SPOOL, &options(&server, &dir)).unwrap();
+        assert!(spool_drain(TEST_SPOOL, &options(&server, &dir)).unwrap());
 
         let received = handle.join().unwrap();
         assert_eq!(received.len(), 3, "被拒的那条之后还要继续发后面的");
@@ -628,7 +628,7 @@ mod tests {
         let dir = state_dir("drain-empty");
         // An address nobody listens on: actually dialing returns Err here.
         let options = options("http://127.0.0.1:1", &dir);
-        assert!(spool_drain(TEST_SPOOL, &options).is_ok());
+        assert!(!spool_drain(TEST_SPOOL, &options).unwrap());
         let _ = fs::remove_dir_all(dir);
     }
 

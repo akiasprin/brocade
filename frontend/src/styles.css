@@ -8261,6 +8261,7 @@ body.has-artpanel .topo-deck {
   background-image: var(--grid-image);
   background-size: 32px 32px;
   background-position: center top;
+  background-attachment: fixed;
 }
 /* background-attachment:fixed 是必要的：网格固定在视口上不随内容滚动，
    才能表现为台面，而不是附着在内容背面的背景。 */

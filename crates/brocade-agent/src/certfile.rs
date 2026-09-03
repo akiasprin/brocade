@@ -75,7 +75,7 @@ pub(crate) fn apply_material(
     if let Err(error) = std::thread::Builder::new()
         .name("certificate-report".to_owned())
         .spawn(move || {
-            if let Err(error) = crate::spool::runtime_cycle(&report_options) {
+            if let Err(error) = crate::publish_runtime_now(&report_options) {
                 warn(format!(
                     "certificate: 换好了，但报不上去（{error}）；下一轮会补"
                 ));
