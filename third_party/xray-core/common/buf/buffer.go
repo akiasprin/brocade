@@ -11,6 +11,8 @@ import (
 const (
 	// Size of a regular buffer.
 	Size = 8192
+	// MaxPacketSize is the largest packet payload accepted by a UDP reader or writer.
+	MaxPacketSize = 65535
 )
 
 var ErrBufferFull = errors.New("buffer is full")

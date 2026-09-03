@@ -176,7 +176,7 @@ func SplitSize(mb MultiBuffer, size int32) (MultiBuffer, MultiBuffer) {
 	}
 
 	if mb[0].Len() > size {
-		b := New()
+		b := NewWithSize(size)
 		copy(b.Extend(size), mb[0].BytesTo(size))
 		mb[0].Advance(size)
 		return mb, MultiBuffer{b}

@@ -13518,6 +13518,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
             x_padding_bytes: Some(XhttpXmuxRange::new(200, 600)),
         }),
         mode: XhttpMode::PacketUp,
+        download: None,
     };
     let shape = WiresRequest {
         vless: Some(TransportRequest::VlessRealityXhttp {
@@ -13782,6 +13783,7 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                     xmux: None,
                     tuning: None,
                     mode: XhttpMode::Auto,
+                    download: None,
                 },
             }),
         },

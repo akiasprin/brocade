@@ -100,6 +100,7 @@ fn xhttp_topology() -> ModelSnapshot {
             xmux: Some(XhttpXmux::with_concurrency(8)),
             tuning: None,
             mode: Default::default(),
+            download: None,
         },
     }));
     topology

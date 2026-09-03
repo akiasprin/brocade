@@ -151,6 +151,63 @@ export interface DraftEntry {
   op: ModelOp;
 }
 
+type IngressWrite = Extract<ModelOp, { op: 'upsert_ingress' }>['ingress'];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameValue(value, right[index]))
+    );
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  return [...keys].every(key => sameValue(left[key], right[key]));
+}
+
+/* Each ingress editor builds a complete write body from the same snapshot, but different panels
+ * edit different nested fields. Merge only the fields changed from that snapshot so a later panel
+ * save cannot erase an earlier panel's pending change. Arrays remain atomic values. */
+function mergeChanged(base: unknown, next: unknown, pending: unknown): unknown {
+  if (sameValue(base, next)) return pending;
+  if (!isRecord(base) || !isRecord(next)) return next;
+
+  const result: Record<string, unknown> = isRecord(pending) ? { ...pending } : { ...base };
+  const keys = new Set([...Object.keys(base), ...Object.keys(next)]);
+  const changedKeys = [...keys].filter(key => !sameValue(base[key], next[key]));
+  // A projection endpoint being removed is an explicit user action. An XHTTP-only edit made
+  // from the old snapshot changes only that endpoint's `download` child; it must not resurrect
+  // the endpoint while the pending deletion is still in the draft.
+  if (pending === null && changedKeys.length === 1 && changedKeys[0] === 'download') return pending;
+  for (const key of keys) {
+    const baseHas = Object.prototype.hasOwnProperty.call(base, key);
+    const nextHas = Object.prototype.hasOwnProperty.call(next, key);
+    if (!nextHas) {
+      if (baseHas) delete result[key];
+      continue;
+    }
+    if (!baseHas || !sameValue(base[key], next[key])) {
+      const baseValue = base[key];
+      const nextValue = next[key];
+      const pendingValue = result[key];
+      result[key] =
+        isRecord(baseValue) && isRecord(nextValue) ? mergeChanged(baseValue, nextValue, pendingValue) : nextValue;
+    }
+  }
+  return result;
+}
+
+function mergeIngressChanges(base: IngressWrite, next: IngressWrite, pending: IngressWrite): IngressWrite {
+  return mergeChanged(base, next, pending) as IngressWrite;
+}
+
 /* 一条操作的作用对象。合并和界面上列出草稿都依据它。 */
 function entryOf(op: ModelOp): DraftEntry {
   switch (op.op) {
@@ -355,6 +412,19 @@ class DraftStore {
       this.entries.push(entry);
     }
     this.commit();
+  }
+
+  pushIngress(appId: string, base: IngressWrite, next: IngressWrite) {
+    const key = `ingress:${appId}/${next.id}`;
+    const previous = this.entries.find(entry => entry.key === key)?.op;
+    const pendingIngress =
+      previous?.op === 'upsert_ingress' || previous?.op === 'create_ingress' ? previous.ingress : next;
+    const ingress = previous ? mergeIngressChanges(base, next, pendingIngress) : next;
+    const op: ModelOp =
+      previous?.op === 'create_ingress'
+        ? { op: 'create_ingress', app_id: appId, ingress }
+        : { op: 'upsert_ingress', app_id: appId, ingress };
+    this.push(op);
   }
 
   drop(key: string) {

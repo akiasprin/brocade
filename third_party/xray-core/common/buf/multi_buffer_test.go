@@ -161,6 +161,29 @@ func TestSplitFirstBytes(t *testing.T) {
 	}
 }
 
+func TestSplitSizeSupportsPayloadsLargerThanBufferSize(t *testing.T) {
+	payload := make([]byte, Size+1)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	mb := MultiBuffer{FromBytes(payload)}
+
+	rest, first := SplitSize(mb, Size)
+	if first.Len() != Size {
+		t.Fatalf("first length = %d, want %d", first.Len(), Size)
+	}
+	got := make([]byte, Size)
+	first.Copy(got)
+	if !bytes.Equal(got, payload[:Size]) {
+		t.Fatal("first split changed payload")
+	}
+	if rest.Len() != 1 || rest[0].Bytes()[0] != payload[Size] {
+		t.Fatalf("rest = %v, want one trailing byte", rest)
+	}
+	ReleaseMulti(first)
+	ReleaseMulti(rest)
+}
+
 func TestCompact(t *testing.T) {
 	a := New()
 	common.Must2(a.WriteString("ab"))

@@ -217,8 +217,8 @@ s:
 }
 
 func (c *dispatcherConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	buffer := buf.New()
-	raw := buffer.Extend(buf.Size)
+	buffer := buf.NewWithSize(buf.MaxPacketSize)
+	raw := buffer.Extend(buf.MaxPacketSize)
 	n := copy(raw, p)
 	buffer.Resize(0, int32(n))
 

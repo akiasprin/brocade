@@ -1,6 +1,7 @@
 package udp_test
 
 import (
+	"bytes"
 	"context"
 	"sync/atomic"
 	"testing"
@@ -86,5 +87,45 @@ func TestSameDestinationDispatching(t *testing.T) {
 	}
 	if v := atomic.LoadUint32(&msgCount); v != 6 {
 		t.Error("msgCount: ", v)
+	}
+}
+
+func TestDispatcherConnWriteToPreservesLargeUDPPackets(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	uplinkReader, uplinkWriter := pipe.New(pipe.WithoutSizeLimit())
+	downlinkReader, downlinkWriter := pipe.New(pipe.WithoutSizeLimit())
+	defer uplinkWriter.Close()
+	defer downlinkWriter.Close()
+
+	conn, err := DialDispatcher(ctx, &TestDispatcher{
+		OnDispatch: func(context.Context, net.Destination) (*transport.Link, error) {
+			return &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	payload := bytes.Repeat([]byte{0x5a}, 32768)
+	if n, err := conn.WriteTo(payload, &net.UDPAddr{IP: net.LocalHostIP.IP(), Port: 53}); err != nil {
+		t.Fatal(err)
+	} else if n != len(payload) {
+		t.Fatalf("WriteTo wrote %d bytes, want %d", n, len(payload))
+	}
+
+	mb, err := uplinkReader.ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.ReleaseMulti(mb)
+	if got := mb.Len(); got != int32(len(payload)) {
+		t.Fatalf("dispatched packet length = %d, want %d", got, len(payload))
+	}
+	got := make([]byte, len(payload))
+	if n := mb.Copy(got); n != len(payload) || !bytes.Equal(got, payload) {
+		t.Fatalf("dispatched packet mismatch: copied %d bytes", n)
 	}
 }

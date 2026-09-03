@@ -1880,6 +1880,26 @@ pub struct Xhttp {
     /// How the client sends its upload half.
     #[serde(default)]
     pub mode: XhttpMode,
+    /// Independent downlink settings, kept on XHTTP rather than on the public address
+    /// projection.  The two address families can use different public download endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<XhttpDownload>,
+}
+
+/// XHTTP's optional independent downlink, one client endpoint per address family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v4: Option<ProjectionDownloadEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6: Option<ProjectionDownloadEndpoint>,
+}
+
+impl XhttpDownload {
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_none() && self.v6.is_none()
+    }
 }
 
 /// XHTTP's upload shape.
@@ -2700,6 +2720,7 @@ mod transport_tests {
                 xmux: None,
                 tuning: None,
                 mode: XhttpMode::Auto,
+                download: None,
             },
         }))
         .unwrap();
@@ -2732,6 +2753,7 @@ mod transport_tests {
                     xmux: Some(XhttpXmux::with_concurrency(16)),
                     tuning: None,
                     mode: XhttpMode::StreamOne,
+                    download: None,
                 },
             }),
         ] {

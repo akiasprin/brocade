@@ -63,6 +63,11 @@ func Version() string {
 	return fmt.Sprintf("%v.%v.%v", Version_x, Version_y, Version_z)
 }
 
+// Build returns the build identity shown in VersionStatement.
+func Build() string {
+	return build
+}
+
 // VersionStatement returns a list of strings representing the full version info.
 func VersionStatement() []string {
 	return []string{

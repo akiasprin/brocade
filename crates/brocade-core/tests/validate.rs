@@ -17,7 +17,7 @@ use brocade_core::{
         ModelSnapshot, Node, NodeEgressDnsPolicy, OverlaySettings, Projection,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityClientPolicy,
         RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User,
-        WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
+        WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
     },
     Diagnostic, Level,
 };
@@ -782,6 +782,7 @@ fn validate_refuses_xhttp_together_with_vision() {
             xmux: None,
             tuning: None,
             mode: XhttpMode::Auto,
+            download: None,
         },
     }));
     ingress.wires.set_flow(Some("xtls-rprx-vision".to_owned()));
@@ -804,6 +805,7 @@ fn validate_accepts_xhttp_with_flow_turned_off() {
             xmux: Some(XhttpXmux::with_concurrency(16)),
             tuning: None,
             mode: XhttpMode::Auto,
+            download: None,
         },
     }));
     // Both spellings of "off" reach here from the model — an explicit empty string set by the
@@ -838,6 +840,7 @@ fn validate_warns_about_an_upload_mode_that_locks_out_existing_clients() {
             xmux: None,
             tuning: None,
             mode: XhttpMode::PacketUp,
+            download: None,
         },
     }));
     ingress.wires.set_flow(Some(String::new()));
@@ -863,6 +866,7 @@ fn validate_says_nothing_about_the_other_upload_modes() {
                 xmux: None,
                 tuning: None,
                 mode,
+                download: None,
             },
         }));
         ingress.wires.set_flow(Some(String::new()));
@@ -1194,6 +1198,7 @@ fn validate_refuses_a_path_that_cannot_round_trip() {
                     xmux: None,
                     tuning: None,
                     mode: XhttpMode::Auto,
+                    download: None,
                 },
             }));
 
@@ -1220,6 +1225,7 @@ fn validate_refuses_a_concurrency_outside_the_range() {
                     xmux: Some(XhttpXmux::with_concurrency(mux)),
                     tuning: None,
                     mode: XhttpMode::Auto,
+                    download: None,
                 },
             }));
 
@@ -1918,18 +1924,22 @@ fn validate_app_set_reports_a_split_download_port_used_by_another_view() {
             xmux: None,
             tuning: None,
             mode: XhttpMode::Auto,
+            download: Some(XhttpDownload {
+                v4: Some(ProjectionDownloadEndpoint {
+                    host: "cdn.example.net".to_owned(),
+                    port: 443,
+                    origin_port: Some(8443),
+                    http_host: None,
+                    mux: None,
+                }),
+                v6: None,
+            }),
         },
     }));
     split.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: Some(ProjectionDownloadEndpoint {
-            host: "cdn.example.net".to_owned(),
-            port: 443,
-            origin_port: Some(8443),
-            http_host: None,
-            mux: None,
-        }),
+        download: None,
     });
     let app_a = AppView {
         id: "a".to_owned(),
@@ -1972,19 +1982,23 @@ fn validate_rejects_stream_one_with_an_independent_download() {
             xmux: None,
             tuning: None,
             mode: XhttpMode::StreamOne,
+            download: Some(XhttpDownload {
+                v4: Some(ProjectionDownloadEndpoint {
+                    host: "cdn.example.net".to_owned(),
+                    port: 443,
+                    origin_port: Some(8443),
+                    http_host: None,
+                    mux: None,
+                }),
+                v6: None,
+            }),
         },
     }));
     projected.wires.set_flow(None);
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: Some(ProjectionDownloadEndpoint {
-            host: "cdn.example.net".to_owned(),
-            port: 443,
-            origin_port: Some(8443),
-            http_host: None,
-            mux: None,
-        }),
+        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3160,7 +3174,7 @@ fn validate_app_stays_quiet_about_a_filled_in_projection() {
 }
 
 #[test]
-fn validate_app_rejects_download_projection_outside_xhttp() {
+fn legacy_projection_download_is_not_an_xhttp_download() {
     let mut projected = ingress("i", "c", "hk", None);
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "104.21.35.113".to_owned(),
@@ -3195,10 +3209,11 @@ fn validate_app_rejects_download_projection_outside_xhttp() {
 
     validate_app(&sys, &app_ir, &mut diagnostics);
 
-    assert_has(
-        &diagnostics,
-        Level::Error,
-        "ingress.projection-download-transport",
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with("ingress.xhttp-download")),
+        "legacy projection download must not become an active XHTTP setting: {diagnostics:#?}"
     );
 }
 
@@ -3213,19 +3228,23 @@ fn validate_accepts_reality_xhttp_with_a_tls_download_front() {
             xmux: None,
             tuning: None,
             mode: XhttpMode::Auto,
+            download: Some(XhttpDownload {
+                v4: Some(ProjectionDownloadEndpoint {
+                    host: "cdn.example.net".to_owned(),
+                    port: 443,
+                    origin_port: Some(8443),
+                    http_host: Some("download.route.example".to_owned()),
+                    mux: Some(24),
+                }),
+                v6: None,
+            }),
         },
     }));
     projected.wires.set_flow(None);
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: Some(ProjectionDownloadEndpoint {
-            host: "cdn.example.net".to_owned(),
-            port: 443,
-            origin_port: Some(8443),
-            http_host: Some("download.route.example".to_owned()),
-            mux: Some(24),
-        }),
+        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3268,19 +3287,23 @@ fn validate_rejects_invalid_xhttp_client_routing_fields() {
             xmux: None,
             tuning: None,
             mode: XhttpMode::Auto,
+            download: Some(XhttpDownload {
+                v4: Some(ProjectionDownloadEndpoint {
+                    host: "cdn.example.net".to_owned(),
+                    port: 443,
+                    origin_port: Some(8443),
+                    http_host: Some(" ".to_owned()),
+                    mux: Some(0),
+                }),
+                v6: None,
+            }),
         },
     }));
     projected.wires.set_flow(None);
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: Some(ProjectionDownloadEndpoint {
-            host: "cdn.example.net".to_owned(),
-            port: 443,
-            origin_port: Some(8443),
-            http_host: Some(" ".to_owned()),
-            mux: Some(0),
-        }),
+        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3308,12 +3331,12 @@ fn validate_rejects_invalid_xhttp_client_routing_fields() {
     assert_has(
         &diagnostics,
         Level::Error,
-        "ingress.projection-download-http-host",
+        "ingress.xhttp-download-http-host",
     );
     assert_has(
         &diagnostics,
         Level::Error,
-        "ingress.projection-download-mux-range",
+        "ingress.xhttp-download-mux-range",
     );
 }
 
@@ -3328,19 +3351,23 @@ fn validate_reality_split_requires_a_certificate_and_a_distinct_port() {
             xmux: None,
             tuning: None,
             mode: XhttpMode::Auto,
+            download: Some(XhttpDownload {
+                v4: Some(ProjectionDownloadEndpoint {
+                    host: "cdn.example.net".to_owned(),
+                    port: 443,
+                    origin_port: None,
+                    http_host: None,
+                    mux: None,
+                }),
+                v6: None,
+            }),
         },
     }));
     projected.wires.set_flow(None);
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: Some(ProjectionDownloadEndpoint {
-            host: "cdn.example.net".to_owned(),
-            port: 443,
-            origin_port: None,
-            http_host: None,
-            mux: None,
-        }),
+        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3367,7 +3394,7 @@ fn validate_reality_split_requires_a_certificate_and_a_distinct_port() {
     assert_has(
         &diagnostics,
         Level::Error,
-        "ingress.projection-download-port-clash",
+        "ingress.xhttp-download-port-clash",
     );
     assert_has(&diagnostics, Level::Error, "node.port-clash");
 }

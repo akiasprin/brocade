@@ -50,6 +50,7 @@ import {
   type E2eProbeSample,
   type UpsertIngressBody,
   type SnapshotStep,
+  type IngressProjection,
   type ProjectionEndpoint,
   type RealityFallbackMode,
   type Wires,
@@ -60,7 +61,6 @@ import {
 import { draft } from '../draft';
 import {
   compatibleXhttpMode,
-  projectionForTransport,
   transportKindFor,
   type IngressSecurity,
 } from '../ingress-transport';
@@ -70,11 +70,7 @@ import {
   type FallbackLimitDraft,
   type FallbackRateDraft,
 } from '../reality-fallback';
-import {
-  REALITY_FINGERPRINT_OPTIONS,
-  realityFingerprintIsValid,
-  realityServerNameIsValid,
-} from '../reality';
+import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { FLAG_SHEET } from '../ui/flags';
@@ -546,11 +542,14 @@ export function IngressPanel({
   const pending = Object.values(entries);
   const blocked = pending.some(entry => entry.blocked);
   const save = useMutation({
-    mutationFn: () =>
-      upsertIngress(
+    mutationFn: () => {
+      const base = ingressUpsertBody(ingress);
+      return upsertIngress(
         appId,
-        pending.reduce((body, entry) => entry.apply(body), ingressUpsertBody(ingress)),
-      ),
+        pending.reduce((body, entry) => entry.apply(body), base),
+        base,
+      );
+    },
     onSuccess: async () => {
       /* 先等快照回来再让各行收草稿：行的 dirty 是「草稿 ≠ 快照」，快照未更新时
          它们仍是脏的，会立刻重新登记一遍。 */
@@ -656,7 +655,10 @@ export function IngressPortEditor({
   );
   const nameOf = useNodeNames();
   const save = useMutation({
-    mutationFn: () => upsertIngress(appId, ingressUpsertBody(ingress, { port: parsed })),
+    mutationFn: () => {
+      const base = ingressUpsertBody(ingress);
+      return upsertIngress(appId, { ...base, port: parsed }, base);
+    },
     onSuccess: () => {
       setDraftPort(null);
       qc.invalidateQueries({ queryKey: ['snapshot'] });
@@ -716,7 +718,7 @@ export function IngressPortEditor({
 
 /* 流控（XTLS Vision）。
  *
- * 单独一行而非并入传输方式：它属于安全层，传输方式属于网络层。但两者存在一条硬约束——
+ * 单独一行而非并入传输方式：它属于安全层，传输方式属于传输层。但两者存在一条硬约束——
  * Vision 只支持直连的 TLS/REALITY，与 XHTTP 互斥，而 xray **只在运行时**拒绝该组合
  * （其配置检查会通过）。因此两行相邻放置，冲突在两侧都有说明。
  *
@@ -749,14 +751,10 @@ function IngressFlowRow({
   );
 
   const save = useMutation({
-    mutationFn: (next: string) =>
-      upsertIngress(appId, {
-        ...ingressUpsertBody(ingress),
-        reality: {
-          ...ingressUpsertBody(ingress).reality,
-          flow: next,
-        },
-      }),
+    mutationFn: (next: string) => {
+      const base = ingressUpsertBody(ingress);
+      return upsertIngress(appId, { ...base, reality: { ...base.reality, flow: next } }, base);
+    },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       setPending(null);
@@ -828,18 +826,22 @@ function IngressRealityRow({
         .split(',')
         .map(value => value.trim())
         .filter(Boolean);
-      return upsertIngress(appId, {
-        ...body,
-        reality: {
-          ...body.reality,
-          // This source also determines the compiler-owned fallback target. There is deliberately
-          // no second control that could make the certificate and fallback disagree.
-          fallback_mode: next.source,
-          dest: next.source === 'custom-site' ? next.dest.trim() : '',
-          server_names: next.source === 'custom-site' ? names : [],
-          fingerprint: next.source === 'custom-site' ? next.fingerprint.trim() : undefined,
+      return upsertIngress(
+        appId,
+        {
+          ...body,
+          reality: {
+            ...body.reality,
+            // This source also determines the compiler-owned fallback target. There is deliberately
+            // no second control that could make the certificate and fallback disagree.
+            fallback_mode: next.source,
+            dest: next.source === 'custom-site' ? next.dest.trim() : '',
+            server_names: next.source === 'custom-site' ? names : [],
+            fingerprint: next.source === 'custom-site' ? next.fingerprint.trim() : undefined,
+          },
         },
-      });
+        body,
+      );
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
@@ -1022,7 +1024,10 @@ function IngressGuardBlock({
   const form = draft ?? stored;
   const dirty = (Object.keys(stored) as (keyof IngressGuard)[]).some(key => form[key] !== stored[key]);
   const save = useMutation({
-    mutationFn: () => upsertIngress(appId, ingressUpsertBody(ingress, { guard: form })),
+    mutationFn: () => {
+      const base = ingressUpsertBody(ingress);
+      return upsertIngress(appId, { ...base, guard: form }, base);
+    },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       setDraft(null);
@@ -1138,10 +1143,14 @@ function IngressRealityGuardRow({
   const save = useMutation({
     mutationFn: () => {
       const body = ingressUpsertBody(ingress);
-      return upsertIngress(appId, {
-        ...body,
-        reality: { ...body.reality, fallback_guard: form },
-      });
+      return upsertIngress(
+        appId,
+        {
+          ...body,
+          reality: { ...body.reality, fallback_guard: form },
+        },
+        body,
+      );
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
@@ -1217,10 +1226,14 @@ function IngressRealityLimitsRow({
     mutationFn: () => {
       if (!policy) throw new Error('限速参数不完整');
       const body = ingressUpsertBody(ingress);
-      return upsertIngress(appId, {
-        ...body,
-        reality: { ...body.reality, fallback_limits: policy },
-      });
+      return upsertIngress(
+        appId,
+        {
+          ...body,
+          reality: { ...body.reality, fallback_limits: policy },
+        },
+        body,
+      );
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
@@ -1281,7 +1294,7 @@ function IngressRealityLimitsRow({
 /* TODO: 主界面暂不提供任意 Headers、Padding 放置/编码细节、ALPN/H3 和原始 extra JSON；
  * 这些仅用于实验或故障诊断。
  *
- * 接入面的网络层：TCP 或 XHTTP。
+ * 接入面的传输层：TCP 或 XHTTP。
  *
  * 它与安全层（REALITY）是两个独立维度。TCP 下每条客户端连接对应一条 TCP 连接，而在 REALITY
  * 下每条新连接都需要服务端建立一次到借用站点的 TLS 握手以获取证书——因此握手频繁的入口，
@@ -1291,6 +1304,9 @@ function IngressRealityLimitsRow({
  *
  * 有一项必须在保存前说明，不能等服务端报错：XHTTP 与流控（Vision）互斥，而流控默认启用。
  * xray 自身不拦截该组合——其配置检查会通过，但运行时所有连接都会被拒绝。 */
+type ProjectionFamily = 'v4' | 'v6';
+const PROJECTION_FAMILIES = ['v4', 'v6'] as const;
+
 type XmuxDraft = {
   maxConcurrency: string;
   maxConnections: string;
@@ -1365,6 +1381,78 @@ function tuningOfDraft(value: TuningDraft): XhttpTuning | null {
         };
   const xPaddingBytes = range(value.paddingFrom, value.paddingTo, DEFAULT_XHTTP_TUNING.x_padding_bytes);
   return xPaddingBytes ? { x_padding_bytes: xPaddingBytes } : null;
+}
+
+type XhttpDownloadDraft = {
+  host: string;
+  port: string;
+  originPort: string | null;
+  httpHost: string;
+  mux: string;
+};
+
+type XhttpDownloadDrafts = Partial<Record<ProjectionFamily, XhttpDownloadDraft | null>>;
+
+function xhttpDownloadDraftsOf(
+  downloadConfig: Xhttp['download'],
+  legacyProjection?: IngressProjection | null,
+): XhttpDownloadDrafts {
+  const drafts: XhttpDownloadDrafts = {};
+  for (const family of PROJECTION_FAMILIES) {
+    const download = downloadConfig?.[family] ?? legacyProjection?.[family]?.download;
+    if (!download) {
+      drafts[family] = null;
+      continue;
+    }
+    drafts[family] = {
+      host: download.host,
+      port: String(download.port),
+      originPort: download.origin_port == null ? null : String(download.origin_port),
+      httpHost: download.http_host ?? '',
+      mux: download.mux == null ? '' : String(download.mux),
+    };
+  }
+  return drafts;
+}
+
+function xhttpDownloadDraftOf(endpoint: ProjectionEndpoint, splitReality: boolean): XhttpDownloadDraft {
+  const download = endpoint.download;
+  return {
+    host: download?.host ?? endpoint.host,
+    port: String(download?.port ?? endpoint.port),
+    originPort: splitReality ? String(download?.origin_port ?? download?.port ?? endpoint.port) : null,
+    httpHost: download?.http_host ?? '',
+    mux: download?.mux == null ? '' : String(download.mux),
+  };
+}
+
+function currentXhttpDownloadDrafts(downloadConfig: Xhttp['download'], draft: XhttpDownloadDrafts | null): XhttpDownloadDrafts {
+  const current = xhttpDownloadDraftsOf(downloadConfig);
+  if (!draft) return current;
+  for (const family of PROJECTION_FAMILIES) {
+    if (family in draft) current[family] = draft[family];
+  }
+  return current;
+}
+
+function xhttpDownloadOfDrafts(drafts: XhttpDownloadDrafts, kind: TransportKind | null): Xhttp['download'] {
+  const allowDownload = kind !== null && transportIsXhttp(kind);
+  const splitReality = kind === 'vless-reality-xhttp';
+  if (!allowDownload) return null;
+  const next: NonNullable<Xhttp['download']> = {};
+  for (const family of PROJECTION_FAMILIES) {
+    const draft = drafts[family];
+    if (draft === undefined || draft === null) continue;
+    next[family] = {
+      host: draft.host.trim(),
+      port: Number(draft.port),
+      origin_port:
+        splitReality && draft.originPort !== null && draft.originPort.trim() ? Number(draft.originPort) : null,
+      http_host: draft.httpHost.trim() || null,
+      mux: draft.mux.trim() ? Number(draft.mux) : null,
+    };
+  }
+  return Object.keys(next).length > 0 ? next : null;
 }
 
 /* Hysteria 2 一侧的端口及其跳转区间。
@@ -1588,18 +1676,46 @@ export function IngressStreamRow({
   const xmux = current?.xmux ?? null;
   const tuning = current?.tuning ?? null;
   const storedMode: XhttpMode = current?.mode ?? 'auto';
-  const hasDownload = (['v4', 'v6'] as const).some(family => !!ingress.projection?.[family]?.download);
+  const storedDownloadDrafts = xhttpDownloadDraftsOf(current?.download, ingress.projection);
   const [draftPath, setDraftPath] = useState<string | null>(null);
   const [draftHost, setDraftHost] = useState<string | null>(null);
   const [draftXmux, setDraftXmux] = useState<XmuxDraft | undefined>(undefined);
   const [draftTuning, setDraftTuning] = useState<TuningDraft | undefined>(undefined);
+  const [draftDownload, setDraftDownload] = useState<XhttpDownloadDrafts | null>(null);
   const [draftMode, setDraftMode] = useState<XhttpMode | null>(null);
   const mode = draftMode ?? storedMode;
+  const downloadDrafts = currentXhttpDownloadDrafts(current?.download, draftDownload);
+  const hasDownload = PROJECTION_FAMILIES.some(
+    family => downloadDrafts[family] !== null && downloadDrafts[family] !== undefined,
+  );
+  const splitReality = kind === 'vless-reality-xhttp';
   /* 「跟随两端」在产物中不写入该字段，由两端各自解析。显示解析结果才是该字段的实际状态——
      只显示「跟随」需要自行记住两端的解析规则。 */
   const resolvedMode: XhttpMode = hasDownload ? 'stream-up' : tls ? 'packet-up' : 'stream-one';
   // 流控是该字段的前置条件而非并列项：同时启用 XHTTP 和 Vision 时，运行后所有连接都会失败。
   const flowOn = (storedVless?.flow ?? '').trim() !== '';
+  const downloadBad = PROJECTION_FAMILIES.some(family => {
+    const draft = downloadDrafts[family];
+    if (!draft) return false;
+    const port = Number(draft.port);
+    const effectiveOriginPort = draft.originPort ?? draft.port;
+    const originPort = Number(effectiveOriginPort);
+    const mux = draft.mux.trim() ? Number(draft.mux) : null;
+    return (
+      draft.host.trim() === '' ||
+      !/^\d+$/.test(draft.port) ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535 ||
+      (splitReality &&
+        (!/^\d+$/.test(effectiveOriginPort) ||
+          !Number.isInteger(originPort) ||
+          originPort < 1 ||
+          originPort > 65535)) ||
+      (mux !== null && (!Number.isInteger(mux) || mux < 2 || mux > 128))
+    );
+  });
+  const downloadDirty = on && JSON.stringify(downloadDrafts) !== JSON.stringify(storedDownloadDrafts);
 
   const save = useMutation({
     mutationFn: (next: Wires) => {
@@ -1610,17 +1726,16 @@ export function IngressStreamRow({
               xhttp: { ...next.vless.xhttp, mode: compatibleXhttpMode(next.vless.xhttp.mode, true) },
             } as Transport)
           : (next.vless ?? null);
-      // 投影跟随 TCP 一侧：独立下载属于 XHTTP 的机制，QUIC 没有第二条连接可供投影。
-      // 没有 TCP 一侧时按 REALITY+TCP 处理，结果是移除下载线路。
-      const projection = projectionForTransport(ingress.projection ?? {}, vless?.kind ?? 'vless-reality');
       const wires: Wires = { vless, hysteria2: next.hysteria2 ?? null };
-      return upsertIngress(appId, ingressUpsertBody(ingress, { wires, projection }));
+      const base = ingressUpsertBody(ingress);
+      return upsertIngress(appId, { ...base, wires }, base);
     },
     onSuccess: async () => {
       setDraftPath(null);
       setDraftHost(null);
       setDraftXmux(undefined);
       setDraftTuning(undefined);
+      setDraftDownload(null);
       setDraftHy2(null);
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       setDraftMode(null);
@@ -1656,6 +1771,7 @@ export function IngressStreamRow({
       xmux: current?.xmux ?? null,
       tuning: current?.tuning ?? null,
       mode: current?.mode ?? 'auto',
+      download: current?.download ?? null,
     };
     const nextTransport: Transport = transportIsXhttp(next)
       ? next === 'vless-tls-xhttp'
@@ -1743,6 +1859,7 @@ export function IngressStreamRow({
     xmux: xmuxValue,
     tuning: tuningValue,
     mode: nextMode,
+    download: xhttpDownloadOfDrafts(downloadDrafts, kind),
   });
   const transportForXhttp = (nextMode = mode): Transport =>
     kind === 'vless-tls-xhttp'
@@ -1758,7 +1875,7 @@ export function IngressStreamRow({
         : kind === 'vless-tls'
           ? { kind }
           : { kind: 'vless-reality' };
-  /* 脏的两种来源：暂存了另一档安全层 / 网络层，或改了任一 XHTTP 参数。 */
+  /* 脏的两种来源：暂存了另一档安全层 / 传输层，或改了任一 XHTTP 参数。 */
   const dirty =
     stagedTransport !== null ||
     (on &&
@@ -1766,25 +1883,30 @@ export function IngressStreamRow({
         (draftHost !== null && hostValue !== host) ||
         (draftXmux !== undefined && JSON.stringify(xmuxValue) !== JSON.stringify(xmux)) ||
         (draftTuning !== undefined && JSON.stringify(tuningValue) !== JSON.stringify(tuning)) ||
-        (draftMode !== null && mode !== (current?.mode ?? 'auto'))));
-  /* 两段各自登记进所在面板的那一次提交。三个下拉（协议 / 安全层 / 网络层）不在其中：
+        (draftMode !== null && mode !== (current?.mode ?? 'auto')))) ||
+    downloadDirty;
+  /* 两段各自登记进所在面板的那一次提交。三个下拉（协议 / 安全层 / 传输层）不在其中：
      它们改完即存，是切换而不是编辑。 */
   usePanelEntry(
     'vless-xhttp',
     dirty,
     {
-      blocked: on && (pathBad || xmuxBad || tuningBad),
-      apply: body => ({ ...body, wires: { ...body.wires!, vless: vlessForSave() } }),
+      blocked: on && (pathBad || xmuxBad || tuningBad || downloadBad),
+      apply: body => ({
+        ...body,
+        wires: { ...body.wires!, vless: vlessForSave() },
+      }),
       reset: () => {
         setPendingTransport(null);
         setDraftPath(null);
         setDraftHost(null);
         setDraftXmux(undefined);
         setDraftTuning(undefined);
+        setDraftDownload(null);
         setDraftMode(null);
       },
     },
-    JSON.stringify([kind, pathValue, hostValue, xmuxValue, tuningValue, mode]),
+    JSON.stringify([kind, pathValue, hostValue, xmuxValue, tuningValue, mode, downloadDrafts]),
   );
   const hy2Up = hy2Value.bandwidth.up ?? '';
   const hy2Down = hy2Value.bandwidth.down ?? '';
@@ -2117,7 +2239,7 @@ export function IngressStreamRow({
             <IngressRealityRow appId={appId} ingress={ingress} certificateName={certificateName} editable={editable} />
           )}
 
-          <dt>网络层</dt>
+          <dt>传输层</dt>
           <dd>
             <select
               className="f"
@@ -2150,7 +2272,7 @@ export function IngressStreamRow({
       }
 
       {/* XHTTP 自身的参数单独一行，排在三层之后。
-          放入「网络层」字段时，启用 XHTTP 后该字段会包含大量调优控件和说明，
+          放入「传输层」字段时，启用 XHTTP 后该字段会包含大量调优控件和说明，
           将相邻排列的三行撑开——而这三行的连续排列正是表示它们属于三个层次的唯一方式。 */}
       {on && (
         <>
@@ -2167,6 +2289,46 @@ export function IngressStreamRow({
               />
             </div>
             {pathBad && <div className="note bad">路径需以 / 开头，不能包含空白或 ? #</div>}
+            <div className="note">修改路径会使已下发的客户端配置全部失效，客户端需重新导入。</div>
+            <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
+              <span className="dim">上传 HTTP Host</span>
+              <input
+                className="f mono"
+                placeholder="跟随 SNI"
+                value={hostValue}
+                disabled={!editable}
+                onChange={e => setDraftHost(e.target.value)}
+              />
+            </div>
+            <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
+              <span className="dim">上行模式</span>
+              <select
+                className="f"
+                value={mode}
+                disabled={!editable || save.isPending}
+                onChange={e => setDraftMode(e.target.value as XhttpMode)}
+              >
+                <option value="auto">跟随两端</option>
+                <option value="packet-up">packet-up（拆成多个小 POST）</option>
+                <option value="stream-up">stream-up（上行一条流，下行另开）</option>
+                <option value="stream-one" disabled={hasDownload}>
+                  stream-one（上下行同一个请求）
+                </option>
+              </select>
+            </div>
+            {mode === 'auto' && (
+              <div className="note">
+                不写入该字段，由两端各自决定。当前解析为 <span className="mono">{resolvedMode}</span>。
+              </div>
+            )}
+            {mode === 'packet-up' && (
+              <div className="note warn">服务端仅接受 packet-up。已下发的客户端配置全部无法连接，需重新导入订阅。</div>
+            )}
+            {hasDownload && (
+              <div className="note">
+                已启用独立下载，Xray 不支持 <span className="mono">stream-one</span>。
+              </div>
+            )}
             <details className="form-adv" style={{ width: '100%' }}>
               <summary>Padding 与 XMUX 调优（留空 = 用 Xray 默认）</summary>
               <div className="hy2-quic xhttp-xmux">
@@ -2326,10 +2488,11 @@ export function IngressStreamRow({
                 Xray 的 H2/H3 默认值。
               </div>
               <div className="note">
-                Padding 默认 {DEFAULT_XHTTP_TUNING.x_padding_bytes.from}–{DEFAULT_XHTTP_TUNING.x_padding_bytes.to} 字节；XMUX
-                空值分别采用 {DEFAULT_XHTTP_XMUX.max_concurrency}、{DEFAULT_XHTTP_XMUX.h_max_request_times.from}–
-                {DEFAULT_XHTTP_XMUX.h_max_request_times.to} 次和 {DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from}–
-                {DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to} 秒；全部留空时不写入 xmux。
+                Padding 默认 {DEFAULT_XHTTP_TUNING.x_padding_bytes.from}–{DEFAULT_XHTTP_TUNING.x_padding_bytes.to}{' '}
+                字节；XMUX 空值分别采用 {DEFAULT_XHTTP_XMUX.max_concurrency}、
+                {DEFAULT_XHTTP_XMUX.h_max_request_times.from}–{DEFAULT_XHTTP_XMUX.h_max_request_times.to} 次和{' '}
+                {DEFAULT_XHTTP_XMUX.h_max_reusable_secs.from}–{DEFAULT_XHTTP_XMUX.h_max_reusable_secs.to}{' '}
+                秒；全部留空时不写入 xmux。
               </div>
               {xmuxBad && (
                 <div className="note bad">
@@ -2338,47 +2501,116 @@ export function IngressStreamRow({
               )}
               {tuningBad && <div className="note bad">Padding 必须是 1–4096 的有效整数范围。</div>}
             </details>
-            <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
-              <span className="dim">HTTP Host</span>
-              <input
-                className="f mono"
-                placeholder="跟随 SNI"
-                value={hostValue}
-                disabled={!editable}
-                onChange={e => setDraftHost(e.target.value)}
-              />
+            <div className="toolbar" style={{ margin: '8px 0 0', gap: 6 }}>
+              <span className="dim">独立下载</span>
             </div>
-            <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
-              <span className="dim">上行</span>
-              <select
-                className="f"
-                value={mode}
-                disabled={!editable || save.isPending}
-                onChange={e => {
-                  setDraftMode(e.target.value as XhttpMode);
-                }}
-              >
-                <option value="auto">跟随两端</option>
-                <option value="packet-up">packet-up（拆成多个小 POST）</option>
-                <option value="stream-up">stream-up（上行一条流，下行另开）</option>
-                <option value="stream-one" disabled={hasDownload}>
-                  stream-one（上下行同一个请求）
-                </option>
-              </select>
-            </div>
-            <div className="note">修改路径会使已下发的客户端配置全部失效，客户端需重新导入。</div>
-            {mode === 'auto' && (
-              <div className="note">
-                不写入该字段，由两端各自决定。当前解析为 <span className="mono">{resolvedMode}</span>。
+            {PROJECTION_FAMILIES.map(family => {
+              const node = streamNodes.data?.nodes.find(node => node.node_id === ingress.node);
+              const projected = ingress.projection?.[family];
+              const publicHost = family === 'v4' ? node?.public_ipv4 : node?.public_ipv6;
+              const publicNat = family === 'v4' ? node?.public_ipv4_nat : node?.public_ipv6_nat;
+              const endpoint =
+                projected ??
+                (publicHost && !publicNat
+                  ? {
+                      host: publicHost,
+                      port: ingress.port,
+                    }
+                  : null);
+              if (!endpoint) return null;
+              const draft = downloadDrafts[family];
+              const label = family === 'v4' ? 'IPv4' : 'IPv6';
+              const mux = draft?.mux.trim() ? Number(draft.mux) : null;
+              const muxBad = mux !== null && (!Number.isInteger(mux) || mux < 2 || mux > 128);
+              const setDownload = (next: XhttpDownloadDraft | null) =>
+                setDraftDownload({ ...downloadDrafts, [family]: next });
+              return (
+                <div key={family} style={{ marginTop: 8 }}>
+                  <div className="toolbar" style={{ margin: 0, gap: 6 }}>
+                    <span className="dim">{label}</span>
+                    <SegSwitch
+                      checked={draft !== null}
+                      disabled={!editable}
+                      onChange={next => setDownload(next ? xhttpDownloadDraftOf(endpoint, splitReality) : null)}
+                      off="跟随主连接"
+                      on="独立下载"
+                    />
+                  </div>
+                  {draft && (
+                    <>
+                      <div className="ing-pj">
+                        <span className="dim">下载地址</span>
+                        <input
+                          className="f mono"
+                          value={draft.host}
+                          placeholder="地址或域名"
+                          disabled={!editable}
+                          onChange={event => setDownload({ ...draft, host: event.target.value })}
+                        />
+                        <span className="dim">:</span>
+                        <input
+                          className="f mono ing-pj-port"
+                          value={draft.port}
+                          inputMode="numeric"
+                          disabled={!editable}
+                          onChange={event => setDownload({ ...draft, port: event.target.value })}
+                        />
+                      </div>
+                      {splitReality && (
+                        <div className="ing-pj">
+                          <span className="dim">节点实际监听端口</span>
+                          <input
+                            className="f mono ing-pj-port"
+                            value={draft.originPort ?? draft.port}
+                            inputMode="numeric"
+                            disabled={!editable}
+                            onChange={event => setDownload({ ...draft, originPort: event.target.value })}
+                          />
+                        </div>
+                      )}
+                      <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
+                        <span className="dim">下载 HTTP Host</span>
+                        <input
+                          className="f mono"
+                          placeholder="跟随下载 SNI"
+                          value={draft.httpHost}
+                          disabled={!editable}
+                          onChange={event => setDownload({ ...draft, httpHost: event.target.value })}
+                        />
+                        <span className="dim">下载 XMUX</span>
+                        <input
+                          className="f mono"
+                          type="number"
+                          min={2}
+                          max={128}
+                          inputMode="numeric"
+                          style={{ width: 100, borderColor: muxBad ? 'var(--err)' : undefined }}
+                          title="留空使用客户端默认"
+                          placeholder="两端默认"
+                          value={draft.mux}
+                          disabled={!editable}
+                          aria-label={`${label} 下载 XMUX`}
+                          onChange={event => setDownload({ ...draft, mux: event.target.value })}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+            {!PROJECTION_FAMILIES.some(family => {
+              const node = streamNodes.data?.nodes.find(node => node.node_id === ingress.node);
+              const publicHost = family === 'v4' ? node?.public_ipv4 : node?.public_ipv6;
+              const publicNat = family === 'v4' ? node?.public_ipv4_nat : node?.public_ipv6_nat;
+              return !!ingress.projection?.[family] || !!publicHost && !publicNat;
+            }) && <div className="note">节点没有可用的 IPv4 或 IPv6 公网入口，无法生成独立下载订阅。</div>}
+            {downloadBad && (
+              <div className="note bad">
+                独立下载的地址、端口、REALITY 节点实际监听端口和 XMUX 必须填写有效值；XMUX 范围为 2–128。
               </div>
             )}
-            {mode === 'packet-up' && (
-              <div className="note warn">服务端仅接受 packet-up。已下发的客户端配置全部无法连接，需重新导入订阅。</div>
-            )}
-            {hasDownload && (
-              <div className="note">
-                已启用独立下载，Xray 不支持 <span className="mono">stream-one</span>。
-              </div>
+            {splitReality && hasDownload && (
+              <div className="note">REALITY 独立下载需要本机证书，修改后需发布并重启 xray。</div>
             )}
           </dd>
         </>
@@ -2400,9 +2632,14 @@ export function IngressStreamRow({
 // 「不投影」表示开关关闭，不是地址留空。两者必须区分：空串写入库后无法判断是意图关闭
 // 还是填写不完整，而产物中会生成一个无法连接的地址，机器侧则一切正常。
 // 因此关闭时不渲染输入框——保留一个空输入框会使人认为清空也可以关闭投影。
-type ProjectionFamily = 'v4' | 'v6';
 
-export type ProjectionHandle = { dirty: boolean; blocked: boolean; save: () => void; reset: () => void };
+export type ProjectionHandle = {
+  dirty: boolean;
+  blocked: boolean;
+  apply: (projection: IngressProjection) => IngressProjection;
+  save: () => void;
+  reset: () => void;
+};
 
 export function useProjectionHandles() {
   const [projHandles, setProjHandles] = useState<Partial<Record<ProjectionFamily, ProjectionHandle>>>({});
@@ -2439,67 +2676,51 @@ export function IngressProjectionRow({
 }) {
   const qc = useQueryClient();
   const current = ingress.projection?.[family] ?? null;
-  const [draft, setDraft] = useState<{
-    host: string;
-    port: string;
-    download: { host: string; port: string; origin_port: string | null; http_host: string; mux: string } | null;
-  } | null>(null);
+  const [draft, setDraft] = useState<{ host: string; port: string } | null>(null);
+  const [disabledDraft, setDisabledDraft] = useState(false);
 
   const publicAddr = family === 'v4' ? node?.public_ipv4 : node?.public_ipv6;
   const label = family === 'v4' ? 'IPv4' : 'IPv6';
 
   const port = Number(draft?.port ?? '');
-  const downloadPort = Number(draft?.download?.port ?? '');
-  const originPort = Number(draft?.download?.origin_port ?? '');
-  const downloadMux = draft?.download?.mux.trim() ? Number(draft.download.mux) : null;
-  const splitReality = ingress.wires.vless?.kind === 'vless-reality-xhttp';
   const valid =
     !!draft &&
     draft.host.trim() !== '' &&
     /^\d+$/.test(draft.port) &&
     Number.isInteger(port) &&
     port > 0 &&
-    port < 65536 &&
-    (!draft.download ||
-      (draft.download.host.trim() !== '' &&
-        /^\d+$/.test(draft.download.port) &&
-        Number.isInteger(downloadPort) &&
-        downloadPort > 0 &&
-        downloadPort < 65536 &&
-        (downloadMux === null || (Number.isInteger(downloadMux) && downloadMux >= 1 && downloadMux <= 128)) &&
-        (!splitReality ||
-          (draft.download.origin_port !== null &&
-            /^\d+$/.test(draft.download.origin_port) &&
-            Number.isInteger(originPort) &&
-            originPort > 0 &&
-            originPort < 65536))));
-  const supportsDownload = splitReality || ingress.wires.vless?.kind === 'vless-tls-xhttp';
+    port < 65536;
+
+  const desired = useMemo(
+    () =>
+      disabledDraft
+        ? null
+        : draft && valid
+          ? { host: draft.host.trim(), port }
+          : current,
+    [current, disabledDraft, draft, port, valid],
+  );
+
+  const applyProjection = useCallback(
+    (projection: IngressProjection): IngressProjection => {
+      if (disabledDraft) return { ...projection, [family]: null };
+      if (!draft || !valid) return projection;
+      return {
+        ...projection,
+        [family]: { host: draft.host.trim(), port },
+      };
+    },
+    [current, disabledDraft, draft, family, port, valid],
+  );
 
   const save = useMutation({
     mutationFn: (next: ProjectionEndpoint | null) => {
-      const requestWires = ingressUpsertBody(ingress).wires!;
-      // 独立下载只与 TCP 一侧相关：QUIC 没有第二条连接可供投影，因此只涉及 vless 一侧。
-      const vless = requestWires.vless ?? null;
-      const wires: Wires = {
-        ...requestWires,
-        vless:
-          next?.download && vless && 'xhttp' in vless && vless.xhttp.mode === 'stream-one'
-            ? ({
-                ...vless,
-                xhttp: { ...vless.xhttp, mode: compatibleXhttpMode(vless.xhttp.mode, true) },
-              } as Transport)
-            : vless,
-      };
-      return upsertIngress(
-        appId,
-        ingressUpsertBody(ingress, {
-          wires,
-          projection: { ...(ingress.projection ?? {}), [family]: next },
-        }),
-      );
+      const base = ingressUpsertBody(ingress);
+      return upsertIngress(appId, { ...base, projection: { ...(base.projection ?? {}), [family]: next } }, base);
     },
     onSuccess: () => {
       setDraft(null);
+      setDisabledDraft(false);
       qc.invalidateQueries({ queryKey: ['snapshot'] });
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
@@ -2507,28 +2728,34 @@ export function IngressProjectionRow({
   });
   const mutateProjection = save.mutate;
 
-  const on = current !== null || draft !== null;
-  const dirty = draft !== null;
+  const managed = onHandle !== undefined;
+  const on = draft !== null || (current !== null && !disabledDraft);
+  const dirty = disabledDraft || draft !== null;
   const doSave = useCallback(() => {
-    if (!draft || !valid) return;
-    mutateProjection({
-      host: draft.host.trim(),
-      port,
-      download: draft.download
-        ? {
-            host: draft.download.host.trim(),
-            port: downloadPort,
-            origin_port: splitReality ? originPort : null,
-            http_host: draft.download.http_host.trim() || null,
-            mux: downloadMux,
-          }
-        : null,
-    });
-  }, [draft, valid, port, downloadPort, originPort, downloadMux, splitReality, mutateProjection]);
-  const resetProjection = useCallback(() => setDraft(null), []);
+    if (managed) {
+      if (disabledDraft) mutateProjection(null);
+      else if (desired) mutateProjection(desired);
+      return;
+    }
+    if (disabledDraft) {
+      mutateProjection(null);
+      return;
+    }
+    if (draft && valid) mutateProjection(desired);
+  }, [desired, disabledDraft, draft, managed, mutateProjection, valid]);
+  const resetProjection = useCallback(() => {
+    setDraft(null);
+    setDisabledDraft(false);
+  }, []);
   const handle = useMemo<ProjectionHandle>(
-    () => ({ dirty, blocked: dirty && !valid, save: doSave, reset: resetProjection }),
-    [dirty, valid, doSave, resetProjection],
+    () => ({
+      dirty,
+      blocked: dirty && !disabledDraft && !valid,
+      apply: applyProjection,
+      save: doSave,
+      reset: resetProjection,
+    }),
+    [applyProjection, disabledDraft, dirty, doSave, resetProjection, valid],
   );
   useEffect(() => {
     onHandle?.(handle);
@@ -2543,174 +2770,52 @@ export function IngressProjectionRow({
           disabled={!editable || save.isPending}
           onChange={next => {
             if (next) {
+              setDisabledDraft(false);
               setDraft({
                 host: current?.host ?? '',
                 port: String(current?.port ?? ingress.port),
-                download: current?.download
-                  ? {
-                      host: current.download.host,
-                      port: String(current.download.port),
-                      origin_port: splitReality ? String(current.download.origin_port ?? current.download.port) : null,
-                      http_host: current.download.http_host ?? '',
-                      mux: current.download.mux == null ? '' : String(current.download.mux),
-                    }
-                  : null,
               });
             } else if (current) {
-              // 关闭是一次实际写入（置为 NULL），不是丢弃本地草稿。
               setDraft(null);
-              save.mutate(null);
+              if (managed) setDisabledDraft(true);
+              else save.mutate(null);
             } else {
               setDraft(null);
+              setDisabledDraft(false);
             }
           }}
           off="默认"
           on="转换"
         />
         {draft ? (
-          <>
-            <div className="ing-pj">
-              <input
-                className="f mono"
-                value={draft.host}
-                placeholder="地址或域名"
-                onChange={e => setDraft({ ...draft, host: e.target.value })}
-              />
-              <span className="dim">:</span>
-              <input
-                className="f mono ing-pj-port"
-                value={draft.port}
-                inputMode="numeric"
-                onChange={e => setDraft({ ...draft, port: e.target.value })}
-              />
-            </div>
-            {supportsDownload && (
-              <>
-                <div className="toolbar" style={{ margin: '6px 0 0', gap: 6 }}>
-                  <span className="dim">下载线路</span>
-                  <SegSwitch
-                    checked={draft.download !== null}
-                    disabled={!editable || save.isPending}
-                    onChange={next =>
-                      setDraft({
-                        ...draft,
-                        download: next
-                          ? {
-                              host: current?.download?.host ?? '',
-                              port: String(current?.download?.port ?? (port > 0 ? port : ingress.port)),
-                              origin_port: splitReality
-                                ? String(
-                                    current?.download?.origin_port ??
-                                      current?.download?.port ??
-                                      (port > 0 ? port : ingress.port),
-                                  )
-                                : null,
-                              http_host: current?.download?.http_host ?? '',
-                              mux: current?.download?.mux == null ? '' : String(current.download.mux),
-                            }
-                          : null,
-                      })
-                    }
-                    off="跟随主连接"
-                    on="独立下载"
-                  />
-                </div>
-                {draft.download && (
-                  <div className="ing-pj">
-                    {splitReality && <span className="dim">公网</span>}
-                    <input
-                      className="f mono"
-                      value={draft.download.host}
-                      placeholder="下载地址或域名"
-                      onChange={e => setDraft({ ...draft, download: { ...draft.download!, host: e.target.value } })}
-                    />
-                    <span className="dim">:</span>
-                    <input
-                      className="f mono ing-pj-port"
-                      value={draft.download.port}
-                      inputMode="numeric"
-                      onChange={e => setDraft({ ...draft, download: { ...draft.download!, port: e.target.value } })}
-                    />
-                  </div>
-                )}
-                {draft.download && splitReality && (
-                  <div className="ing-pj">
-                    <span className="dim">回源端口</span>
-                    <input
-                      className="f mono ing-pj-port"
-                      value={draft.download.origin_port ?? ''}
-                      inputMode="numeric"
-                      onChange={e =>
-                        setDraft({ ...draft, download: { ...draft.download!, origin_port: e.target.value } })
-                      }
-                    />
-                  </div>
-                )}
-                {draft.download && (
-                  <div className="ing-pj">
-                    <span className="dim">下载 Host</span>
-                    <input
-                      className="f mono"
-                      placeholder="跟随下载 SNI"
-                      value={draft.download.http_host}
-                      onChange={e =>
-                        setDraft({ ...draft, download: { ...draft.download!, http_host: e.target.value } })
-                      }
-                    />
-                    <span className="dim">并发</span>
-                    <input
-                      className="f mono ing-pj-port"
-                      title="1 = 连接池；2 以上 = 几条流共用一条连接；留空 = 两端各自的默认，两种客户端读法相反"
-                      placeholder="两端默认"
-                      value={draft.download.mux}
-                      inputMode="numeric"
-                      onChange={e => setDraft({ ...draft, download: { ...draft.download!, mux: e.target.value } })}
-                    />
-                  </div>
-                )}
-              </>
-            )}
-          </>
-        ) : current ? (
+          <div className="ing-pj">
+            <input
+              className="f mono"
+              value={draft.host}
+              placeholder="地址或域名"
+              onChange={e => setDraft({ ...draft, host: e.target.value })}
+            />
+            <span className="dim">:</span>
+            <input
+              className="f mono ing-pj-port"
+              value={draft.port}
+              inputMode="numeric"
+              onChange={e => setDraft({ ...draft, port: e.target.value })}
+            />
+          </div>
+        ) : on && current ? (
           <>
             <span className="mono">
               {current.host}:{current.port}
             </span>
-            {current.download && (
-              <div className="note">
-                下载{' '}
-                <span className="mono">
-                  {current.download.host}:{current.download.port}
-                </span>
-                {splitReality && (
-                  <>
-                    {' → 节点:'}
-                    <span className="mono">{current.download.origin_port ?? current.download.port}</span>
-                  </>
-                )}
-              </div>
-            )}
             <button
               className="btn"
               style={{ marginLeft: 8 }}
               disabled={!editable || save.isPending}
-              onClick={() =>
-                setDraft({
-                  host: current.host,
-                  port: String(current.port),
-                  download: current.download
-                    ? {
-                        host: current.download.host,
-                        port: String(current.download.port),
-                        origin_port: splitReality
-                          ? String(current.download.origin_port ?? current.download.port)
-                          : null,
-                        http_host: current.download.http_host ?? '',
-                        mux: current.download.mux == null ? '' : String(current.download.mux),
-                      }
-                    : null,
-                })
-              }
+              onClick={() => {
+                setDisabledDraft(false);
+                setDraft({ host: current.host, port: String(current.port) });
+              }}
             >
               编辑
             </button>
@@ -2728,12 +2833,6 @@ export function IngressProjectionRow({
               <>机器无公网 {label}，不生成此条订阅</>
             )}
           </div>
-        )}
-        {/* 「投影只修改订阅地址」的说明已移至块级——两个地址族的含义相同，写在行内会重复两次，
-            且只在启用时显示。此处只保留独立下载一档：它不属于普通投影，
-            需要发布和重启，含义不同。 */}
-        {on && splitReality && (draft?.download || current?.download) && (
-          <div className="note">独立下载需要本机证书，修改后需发布并重启 xray。</div>
         )}
         {save.error && <ErrorBox error={save.error} />}
       </dd>
@@ -3835,6 +3934,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
 
   const a = snapshot.data?.snapshot.apps.find(x => x.id === app);
   const c = a?.chains?.find(x => x.id === chain);
+  const ingress = (a?.ingresses ?? []).find(x => x.chain === chain) ?? null;
   const [pendingIngressNode, setPendingIngressNode] = useState<string | null>(null);
   const [pendingBind, setPendingBind] = useState<string | null>(null);
   const { projHandles, projDirty, projBlocked, onV4Handle, onV6Handle } = useProjectionHandles();
@@ -3845,7 +3945,8 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     mutationFn: async (toNode: string) => {
       const g = (a?.ingresses ?? []).find(x => x.chain === chain);
       if (!g) throw new Error('这条链没有接入面');
-      await upsertIngress(app, ingressUpsertBody(g, { node_id: toNode }));
+      const base = ingressUpsertBody(g);
+      await upsertIngress(app, { ...base, node_id: toNode }, base);
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
@@ -3860,7 +3961,8 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     mutationFn: async (bind: string) => {
       const g = (a?.ingresses ?? []).find(x => x.chain === chain);
       if (!g) throw new Error('这条链没有接入面');
-      await upsertIngress(app, ingressUpsertBody(g, { bind }));
+      const base = ingressUpsertBody(g);
+      await upsertIngress(app, { ...base, bind }, base);
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
@@ -3871,11 +3973,27 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     onError: () => setPendingBind(null),
   });
 
+  const saveProjections = useMutation({
+    mutationFn: () => {
+      if (!ingress) throw new Error('这条链没有接入面');
+      const base = ingressUpsertBody(ingress);
+      const projection = Object.values(projHandles)
+        .filter(handle => handle.dirty)
+        .reduce((next, handle) => handle.apply(next), base.projection ?? {});
+      return upsertIngress(app, { ...base, projection }, base);
+    },
+    onSuccess: async () => {
+      Object.values(projHandles).forEach(handle => handle.reset());
+      await qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['revisions'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+    },
+  });
+
   if (snapshot.isPending) return <Loading />;
   if (snapshot.error) return <ErrorBox error={snapshot.error} />;
   if (!a || !c) return <ErrorBox error={new Error(`没有这条链：${app}/${chain}`)} />;
 
-  const ingress = (a.ingresses ?? []).find(x => x.chain === chain) ?? null;
   const spine = chainSpine(a, c.id);
   // 停用表示链上含退役节点（与编译器判定一致，即从入口 BFS 的可达范围）。此处列出
   // 具体是哪几台退役，在横幅中标明，无需返回列表核对。
@@ -3889,7 +4007,10 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const probe = byChain(probes.data?.chains).get(chain);
 
   return (
-    <>
+    // 外层不是空片段而是一个具名容器：这一页的内容是一列配置卡，纸只承担页面框，不再
+    // 兼任卡片的底。外壳按 `.fg-sheet:has(> .chain-detailpage)` 把亮色的纸压到台面档，
+    // 卡片才比它所落的面亮一档（论证见 styles.css 末尾「亮色详情页」一节）。
+    <div className="chain-detailpage">
       {/* 「主干」一节已移除：主干由规则表派生（chainSpine 沿 any→Forward 遍历得出），
           而规则树本身按跳排列，两者表达同一内容。添加一跳和重排都在规则表中完成
           （修改转发目标即为重排），删除收入规则树每行的 hover 状态。 */}
@@ -3897,7 +4018,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
 
       {/* 两列，按「用户连接到何处」和「隧道的协议配置」划分。
           左栏：结论 + 落点（由哪台机器接收）+ 订阅投影（客户端连接的地址）。
-          右栏：协议栈（协议 / 安全层 / 网络层，以及其下的相关参数）。
+          右栏：协议栈（协议 / 安全层 / 传输层，以及其下的相关参数）。
 
           此前的划分是「它是什么」和「它的配置」：左栏是状态和标识，右栏是整个接入面。
           问题不在划分方式，而在两侧的内容量——接入面的字段从两个增加到九个，
@@ -4026,21 +4147,22 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
               <div className="note" style={{ margin: 0 }}>
                 用于修改客户端入口地址配置。不影响服务端监听。
               </div>
+              {saveProjections.error && <ErrorBox error={saveProjections.error} />}
               {projDirty && (
                 <div className="toolbar">
-                  <button className="btn" onClick={() => Object.values(projHandles).forEach(h => h.reset())}>
+                  <button
+                    className="btn"
+                    disabled={saveProjections.isPending}
+                    onClick={() => Object.values(projHandles).forEach(h => h.reset())}
+                  >
                     还原
                   </button>
                   <button
                     className={!projBlocked ? 'btn primary' : 'btn'}
-                    disabled={!editable || projBlocked}
-                    onClick={() =>
-                      Object.values(projHandles)
-                        .filter(h => h.dirty)
-                        .forEach(h => h.save())
-                    }
+                    disabled={!editable || projBlocked || saveProjections.isPending}
+                    onClick={() => saveProjections.mutate()}
                   >
-                    保存
+                    {saveProjections.isPending ? '保存中…' : '保存'}
                   </button>
                 </div>
               )}
@@ -4055,12 +4177,12 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
 
         <div className="col">
           {/* ── 协议栈 ──
-            三层（协议 / 安全层 / 网络层）排在最前，三行相同形态的下拉框构成一组；
+            三层（协议 / 安全层 / 传输层）排在最前，三行相同形态的下拉框构成一组；
             单独命名的参数（目标站点 / 流控 / Fallback 限速）排在该组之后。
             不缩进、不画线、不加层级编号：本栏本身是一张表，增加形态会增加识别成本。
 
             顺序有明确依据——目标站点和流控都属于安全层，Fallback 限速作用于未通过
-            REALITY 校验、进入 fallback 的连接，同样属于安全层。网络层的参数
+            REALITY 校验、进入 fallback 的连接，同样属于安全层。传输层的参数
             （路径、并发、Host、上行）在 IngressStreamRow 中构成独立的「XHTTP」一行。 */}
           {ingress ? (
             <>
@@ -4179,7 +4301,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
           </div>
         )}
       </section>
-    </>
+    </div>
   );
 }
 

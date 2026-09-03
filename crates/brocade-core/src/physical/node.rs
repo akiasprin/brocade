@@ -740,19 +740,28 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
         // fallback cover inbound takes `:cover`. Routing, grants and usage all key off the tag,
         // so the two stay separate downstream without any of those layers needing a new concept.
         .flat_map(|(app, ingress)| {
-            let mut download_ports = [
-                ingress.projection.v4.as_ref(),
-                ingress.projection.v6.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .filter_map(|endpoint| {
-                endpoint
-                    .download
-                    .as_ref()
-                    .map(|download| download.node_port())
-            })
-            .collect::<Vec<_>>();
+            let mut download_ports = ingress
+                .wires
+                .xhttp()
+                .and_then(|xhttp| xhttp.download.as_ref())
+                .into_iter()
+                .flat_map(|download| [download.v4.as_ref(), download.v6.as_ref()])
+                .flatten()
+                .map(|download| download.node_port())
+                .collect::<Vec<_>>();
+            // Read the historical nested representation while old snapshots are still being
+            // served. New writes and new checkpoints use Xhttp.download exclusively.
+            if download_ports.is_empty() {
+                download_ports = [
+                    ingress.projection.v4.as_ref(),
+                    ingress.projection.v6.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|endpoint| endpoint.download.as_ref())
+                .map(|download| download.node_port())
+                .collect();
+            }
             download_ports.sort_unstable();
             download_ports.dedup();
             let split = matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)))

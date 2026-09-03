@@ -57,17 +57,19 @@ import { openTabByKey } from '../ui/topbar';
 import { RegionFlag } from '../ui/region-flag';
 import { navigate } from '../forge/route';
 import {
+  OBSERVE_MS_UNIT,
   OBSERVE_SERIES_COLOR_VARS,
   observeAreaStyle,
   observeAxisLine,
   observeAxisTick,
   observeColors,
   observeMinorTick,
+  observeMsUnit,
   observeSeriesLine,
   observeTimeInterval,
   observeValueAxis,
 } from '../ui/observe-chart';
-import { LoadCard, bps, ThroughputChart, dur, iso } from './telemetry';
+import { LoadCard, bps, ThroughputChart, dur, iso, throughputAxis } from './telemetry';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import { ChainWizard } from './chain-wizard';
@@ -1323,6 +1325,9 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
       <div className="nd-throughput-block">
         <div className="load-network-cap">
           <b>网卡流量</b>
+          {/* 量纲写在标题后，刻度只留数字。峰值与单位都取自 throughputAxis，
+              与图内那次调用同源，标题和刻度不会各说各话。 */}
+          <span className="chart-unit">({throughputAxis(nicRx, nicTx).unit.name})</span>
           {nicMeta.length > 0 && <span className={drops > 0 ? 'hot' : undefined}>{nicMeta.join(' · ')}</span>}
           <footer className="load-network-legend" aria-label="网卡流量图例">
             <span className="rx">
@@ -1340,6 +1345,7 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
       <div className="nd-throughput-block">
         <div className="load-network-cap">
           <b>XRAY 流量</b>
+          <span className="chart-unit">({throughputAxis(user, relay).unit.name})</span>
           <span>本月 {bytes(monthTotal)}</span>
           <footer className="load-network-legend" aria-label="XRAY 流量图例">
             <span className="rx">
@@ -2466,8 +2472,8 @@ function FleetNetChart({ times, pts, peak }: { times: number[]; pts: NetPoint[];
           type: 'time',
           axisLabel: { color: ink4, fontSize: 9, hideOverlap: true },
           // onZero:false 把 x 轴框落到镜像底部；零线另由 series[0] 的 markLine 画。
-          axisLine: { ...observeAxisLine(ink4), onZero: false },
-          axisTick: observeAxisTick(ink4),
+          axisLine: { ...observeAxisLine(ink3), onZero: false },
+          axisTick: observeAxisTick(ink3),
           minorTick: observeMinorTick(lineSoft),
           splitLine: { show: false },
         },
@@ -2476,8 +2482,8 @@ function FleetNetChart({ times, pts, peak }: { times: number[]; pts: NetPoint[];
           min: -peak,
           max: peak,
           axisLabel: { color: ink4, fontSize: 9, formatter: (v: number) => bps(Math.abs(v)) },
-          axisLine: observeAxisLine(ink4),
-          axisTick: observeAxisTick(ink4),
+          axisLine: observeAxisLine(ink3),
+          axisTick: observeAxisTick(ink3),
           splitLine: { lineStyle: { color: lineSoft } },
         },
         series,
@@ -2772,8 +2778,8 @@ function PingLatencyChart({ view, range, group }: { view: NodePingProbeView; ran
             hideOverlap: true,
             formatter: (value: number) => hm(value),
           },
-          axisLine: observeAxisLine(ink4),
-          axisTick: observeAxisTick(ink4),
+          axisLine: observeAxisLine(ink3),
+          axisTick: observeAxisTick(ink3),
           minorTick: observeMinorTick(lineSoft),
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
@@ -2782,14 +2788,11 @@ function PingLatencyChart({ view, range, group }: { view: NodePingProbeView; ran
           min: 0,
           max: valueAxis.max,
           interval: valueAxis.interval,
-          axisLabel: {
-            color: ink3,
-            fontSize: 9.5,
-            margin: 8,
-            formatter: (value: number) => (value === 0 ? '0' : pingLatencyText(value)),
-          },
-          axisLine: observeAxisLine(ink4),
-          axisTick: observeAxisTick(ink4),
+          // 刻度只写数字，单位由 PingProbeBlock 写在标题栏（`ICMP PING (ms)`）；
+          // 精度随步长走，见 observeMsUnit。tooltip 与图例仍用 pingSampleText。
+          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: observeMsUnit(valueAxis.interval).text },
+          axisLine: observeAxisLine(ink3),
+          axisTick: observeAxisTick(ink3),
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
         series,
@@ -2852,6 +2855,9 @@ function PingProbeBlock({
     <div className="ping-probe-block" aria-label={label}>
       <div className="load-network-cap">
         <b>{label}</b>
+        {/* 量纲跟着图走：没画图时刻度也不存在，标题栏就不该挂一个单位。
+            时延轴永远是毫秒（见 observeMsUnit），所以这里不必反算值轴。 */}
+        {hasSamples && <span className="chart-unit">({OBSERVE_MS_UNIT})</span>}
         {targets.length > 0 && <PingProbeLegend view={protocolView} />}
       </div>
       {loading ? (

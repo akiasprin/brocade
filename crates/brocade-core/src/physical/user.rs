@@ -440,6 +440,10 @@ struct SubscriptionServer {
 /// The two families are computed independently and do not affect each other: v4 may
 /// be projected alone, both may be, or neither.
 fn subscription_servers(node: &AppNode, ingress: &Ingress) -> Vec<SubscriptionServer> {
+    let xhttp_download = ingress
+        .wires
+        .xhttp()
+        .and_then(|xhttp| xhttp.download.as_ref());
     let mut servers = Vec::new();
     servers.extend(family_server(
         ingress.projection.v4.as_ref(),
@@ -448,6 +452,7 @@ fn subscription_servers(node: &AppNode, ingress: &Ingress) -> Vec<SubscriptionSe
         ingress.port,
         IpFamily::V4,
         "",
+        xhttp_download.and_then(|download| download.v4.as_ref()),
     ));
     servers.extend(family_server(
         ingress.projection.v6.as_ref(),
@@ -456,6 +461,7 @@ fn subscription_servers(node: &AppNode, ingress: &Ingress) -> Vec<SubscriptionSe
         ingress.port,
         IpFamily::V6,
         " | v6",
+        xhttp_download.and_then(|download| download.v6.as_ref()),
     ));
     if servers.is_empty() {
         servers.push(SubscriptionServer {
@@ -483,6 +489,7 @@ fn family_server(
     listen_port: u16,
     family: IpFamily,
     name_suffix: &'static str,
+    xhttp_download: Option<&ProjectionDownloadEndpoint>,
 ) -> Option<SubscriptionServer> {
     if let Some(projected) = projected {
         // An empty host means "projection is on but unfilled", not "no projection"
@@ -499,7 +506,9 @@ fn family_server(
             address: host.to_owned(),
             family: Some(family),
             port: projected.port,
-            download: projected.download.clone(),
+            download: xhttp_download
+                .cloned()
+                .or_else(|| projected.download.clone()),
             name_suffix,
         });
     }
@@ -510,7 +519,7 @@ fn family_server(
             address: address.to_owned(),
             family: Some(family),
             port: listen_port,
-            download: None,
+            download: xhttp_download.cloned(),
             name_suffix,
         })
 }

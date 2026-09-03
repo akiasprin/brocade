@@ -389,6 +389,7 @@ mod tests {
             xmux: None,
             tuning: None,
             mode: XhttpMode::Auto,
+            download: None,
         };
 
         for transport in [

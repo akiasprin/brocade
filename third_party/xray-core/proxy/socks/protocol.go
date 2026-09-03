@@ -347,16 +347,14 @@ func DecodeUDPPacket(packet *buf.Buffer) (*protocol.RequestHeader, error) {
 }
 
 func EncodeUDPPacket(request *protocol.RequestHeader, data []byte) (*buf.Buffer, error) {
-	b := buf.New()
+	// Reserve the maximum SOCKS5 address header so large UDP payloads are not
+	// silently dropped when they exceed the regular 8 KiB buffer capacity.
+	const maxAddressHeaderLength = 1 + 1 + 255 + 2
+	b := buf.NewWithSize(int32(3 + maxAddressHeaderLength + len(data)))
 	common.Must2(b.Write([]byte{0, 0, 0 /* Fragment */}))
 	if err := addrParser.WriteAddressPort(b, request.Address, request.Port); err != nil {
 		b.Release()
 		return nil, err
-	}
-	// if data is too large, return an empty buffer (drop too big data)
-	if b.Available() < int32(len(data)) {
-		b.Clear()
-		return b, nil
 	}
 	common.Must2(b.Write(data))
 	return b, nil

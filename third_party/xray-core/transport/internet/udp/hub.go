@@ -104,10 +104,10 @@ func (h *Hub) start() {
 	oobBytes := make([]byte, 256)
 
 	for {
-		buffer := buf.New()
+		buffer := buf.NewWithSize(buf.MaxPacketSize)
 		var noob int
 		var udpAddr *net.UDPAddr
-		rawBytes := buffer.Extend(buf.Size)
+		rawBytes := buffer.Extend(buf.MaxPacketSize)
 
 		var n int
 		var err error

@@ -39,6 +39,7 @@ fn managed_xhttp_listener_tuning_reaches_the_server_artifact() {
                 x_padding_bytes: Some(XhttpXmuxRange::new(200, 600)),
             }),
             mode: XhttpMode::PacketUp,
+            download: None,
         },
     }));
     let app = AppView {

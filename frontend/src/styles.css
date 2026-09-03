@@ -2766,8 +2766,23 @@ input.f::placeholder {
   gap: 12px;
   min-width: 0;
 }
+/* 卡面取块档，与设置页的段卡（`.cardpage .panel.titled`）同一档面，而不是 `.panel`
+   基线的纸档。亮色下 --card 被解耦成纯白（#fff），而纸（--sheet）也是 #fefefe：卡面与
+   它所落的纸只差 1，卡片自身读不出边界，一张卡里唯一读得出来的面反而是标题条那条更深的
+   --band——最深的一档落在了层级最上层。块档比台面亮一档、比标题条亮两档，三层顺序才成立。
+   暗色下 --card 即 --block，本条不改变暗色。 */
 .panel.config-panel {
   margin: 0;
+  background: var(--block);
+}
+/* 落在纸里的配置面板不投影。投影表达的是「浮在台面上」，而这两页的卡片落在纸里，纸自己
+   已经交代了边界；卡面与纸之间那一档明暗差是第一次说明边界，再挂一层投影是第二次说同一
+   件事，一栏四五张卡各挂一份还会把纸压暗。
+   `.nd-sheet` 是机器与隧道详情的连续纸，`.fg-sheet:has(> .chain-detailpage)` 是线路详情。
+   用户页的详情子卡不在此列：那一页脱了纸，卡片落在名册卡里，需要投影浮起，见 `.user-dcard`。 */
+.nd-sheet .panel.config-panel,
+.fg-sheet:has(> .chain-detailpage) .panel.config-panel {
+  box-shadow: none;
 }
 /* VLESS / Hysteria 的统一提交属于表单，不属于标题。操作条固定在内容末尾并始终占位：
    切换协议展开多行时按钮不会消失，标题色带也保持和其他配置面板相同的纯标题结构。 */
@@ -8286,10 +8301,10 @@ body.has-artpanel .topo-deck {
  *
  * `:has(> .deploypage)` / `:has(> .cardpage)` 精确匹配这两页的顶层。发布页下钻到计划
  * 预览和发布详情时，根元素两者都不是——那两页没有卡片列，内容直接落在纸上，
- * 仍然需要这张纸。 */
-/* 机器详情保留白纸：卡片用浅灰 --block（非纯白），在白纸上有图底对比，不脱纸。
-   （曾把卡片改纯白 + nd-page 一起脱纸让卡浮在台面网格上、更贴 mockup；但纯白卡落在白纸上
-   会融成一片，取舍后回到「白纸托灰卡」这套。） */
+ * 仍然需要这张纸。
+ *
+ * 线路详情和机器详情不在此列：两页都保留纸，纸就是它们的页面框。它们同样是一列配置卡，
+ * 同样不能让卡落在纯白纸上，解法是把纸压到台面档而不是脱掉纸——见文件末尾亮色一节。 */
 .fg-sheet:has(> .deploypage),
 .fg-sheet:has(> .cardpage) {
   padding: 0;
@@ -11442,9 +11457,13 @@ h4.sec > .btn {
 }
 
 /* 详情子卡：用量与额度 / 接入授权。卡壳与矮标题条直接沿用线路详情的
-   `.panel.config-panel`，这里仅补两张卡之间的间距和标题右侧读数。 */
+   `.panel.config-panel`，这里仅补两张卡之间的间距和标题右侧读数。
+   卡面是这一页唯一的例外，退回纸档 --card：本页的配置面板不落在台面上，而是落在
+   `.panel.titled` 这张名册卡里，而后者已经是块档——再取块档两张卡就同色了。
+   落在块上的一档比块亮，与「块落在台面上比台面亮」是同一条规则。 */
 .panel.config-panel.user-dcard {
   margin-top: 12px;
+  background: var(--card);
 }
 .user-dcard > header .rt {
   margin-left: auto;
@@ -13206,6 +13225,20 @@ input.f.ing-pj-port {
 .load-network-cap > span .mono {
   font-size: inherit;
 }
+/* 量纲。刻度上只剩数字，单位在标题后写一次（`网卡流量 (Mb/s)`）——它不是元信息，不能拿
+   上面那条 9px / --ink-4 的待遇，那是 `eth0 · MTU 1420` 那一级。字族、字号、字距与标题
+   `> b` 完全一致，只降字重与墨色，读起来是标题的后半句而不是另起一段。
+   归组靠间距不靠分隔符：cap 的 gap 是 8px，负 margin 把它拉到离标题 3px，margin-right
+   再把它推离后面的 meta 到 12px——近的成组，远的分开。 */
+.load-network-cap > .chart-unit {
+  flex: none;
+  margin-right: 4px;
+  margin-left: -5px;
+  color: var(--ink-3);
+  font: 400 12.5px var(--sans);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
 .load-network-cap > span.stale {
   color: var(--gold);
 }
@@ -14421,6 +14454,11 @@ input.f.ing-pj-port {
   }
   .load-network-cap > span {
     display: none;
+  }
+  /* 上一条把标题栏的元信息整体收掉，但单位不是元信息：刻度上已经没有它了，
+     这里再藏起来，整张图就没有量纲可读。 */
+  .load-network-cap > .chart-unit {
+    display: inline;
   }
   .load-network-legend {
     gap: 7px 10px;
@@ -17087,31 +17125,56 @@ input.f.ing-pj-port {
   }
 }
 
-/* ── 亮色机器详情：弱化常驻卡片的边界 ──
- * 网格、内距和标题层级均沿用原版；承托卡片的纸面使用较深的 --block。
- * 观测页的读数与图表使用白色 --card；配置和规则面板回到 --block，避免所有页签
- * 都呈现为一组同等凸起的白卡。常驻卡片同时撤掉阴影并改用弱边框。
+/* ── 亮色详情页：纸压到台面档 ──
+ *
+ * 机器详情和线路详情都保留纸——纸是这两页的页面框（机器详情的页头与纸更是连着的一块，
+ * 脱掉纸页头会散架）——但纸不能再取纸档。亮色下纸是 #fefefe、卡面那一档 --block 是
+ * #f8f9fb，卡落在纸上比纸暗，「卡片浮起」正好反过来；此前机器详情为此把配置与规则页签
+ * 的卡片一并压回 --block，纸与卡同色，整页只剩边框在表达边界。
+ *
+ * 改为把纸取台面那一档：设置页是「台面 → 块档卡 → 带」三层，这两页于是也是同样的三层，
+ * 只是外面多一圈页面框。网格、内距、标题层级和圆角均沿用原版。
+ *
+ * 只压亮色。暗色的三档本来就是递增的（纸 #161922 → 卡 #1d222c → 带 #151a23），
+ * 没有需要修的地方，压下去只会把两页与其他页面的纸拉开一档。
+ *
+ * 观测页的读数与图表仍使用白色 --card：它们是一屏并排的读数格，不是配置卡。
+ * 配置与规则的面板走 `.panel.config-panel` 的公共材质（块档卡面 + --band 标题条），
+ * 与设置页的段卡一致，因此不在下面这条覆盖里。两者都不投影：纸上的卡片一律不投影，
+ * 配置面板那一条见 `.nd-sheet .panel.config-panel`。
+ *
+ * 卡片一侧按容器点名（`.nd-observed-status > .panel` 等）而不是写一个笼统的 `.panel`：
+ * 规则页签里的规则编辑器本身也是 `.panel`，它嵌在规则卡内部、自带一套半透明的
+ * `--block 72%` / `--sunk 58%`（见 `.chain-rule-tree .rule-editor`），笼统的 `.panel`
+ * 特异性更高会把那套材质整片盖成一个色，嵌套关系就读不出来了。
  * 语义警告的边框色仍由 .warn / .bad 覆盖。 */
-:root[data-theme='light'] .nd-sheet > .nd-paper {
-  background: var(--block);
+:root[data-theme='light'] .nd-sheet > .nd-paper,
+:root[data-theme='light'] .fg-sheet:has(> .chain-detailpage) {
+  background: var(--ground);
 }
 
 :root[data-theme='light']
   .nd-sheet
-  :is(.kpi:not(.warn, .bad), .chart-card, .history-chart-card, .load-network, .load-metric, .panel) {
+  :is(
+    .kpi:not(.warn, .bad),
+    .chart-card,
+    .history-chart-card,
+    .load-network,
+    .load-metric,
+    .nd-observed-status > .panel,
+    .nd-tab-observed > .panel,
+    .nd-tab-pair > .panel
+  ) {
   border-color: color-mix(in srgb, var(--ink) 12%, transparent);
   background: var(--card);
   box-shadow: none;
 }
 
-:root[data-theme='light'] .nd-sheet :is(.nd-tab-config, .nd-tab-rules) .panel {
-  background: var(--block);
-}
-
-/* 配置与规则的标题不再单独铺一层底色；保留原有尺寸与分隔线，避免卡片内容位置随主题跳动。 */
+/* 观测页的卡片标题不单独铺底色：那一页的卡是白色读数格，色带会把它切成两块。
+   配置与规则的卡片不在此列——它们保留 --band 标题条，与设置页的段卡同一形状。 */
 :root[data-theme='light']
   .nd-sheet
-  :is(.nd-observed-status > .panel, .nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel)
+  :is(.nd-observed-status > .panel, .nd-tab-observed > .panel, .nd-tab-pair > .panel)
   > :is(header, summary) {
   background: transparent;
 }

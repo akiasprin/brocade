@@ -19,12 +19,15 @@ import {
   observeAreaStyle,
   observeAxisLine,
   observeAxisTick,
+  observeBpsRung,
+  observeBpsUnit,
   observeColors,
   observeMinorTick,
   observeSeriesLine,
   observeTimeInterval,
   observeValueAxis,
 } from '../ui/observe-chart';
+import type { ObserveAxisUnit, ObserveValueAxis } from '../ui/observe-chart';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import type {
@@ -53,12 +56,18 @@ export const iso = (secs: number) => new Date(secs * 1000).toISOString();
  * 将 184 MB 的 RSS 显示为 193 MB 又与 top 的输出不一致。
  */
 
+/* 单位阶梯与坐标轴共用一条规则，见 observeBpsRung：取商 ≥ 1 的最大单位，若在该单位下
+   只剩一位数就退回小一档。原先是 ≥1e6 就取整到 Mb/s——3.4 Mb/s 显示成「3 Mb/s」，抹掉
+   13%，而 1 到 10 Mb/s 之间每个读数都吃这个量级的误差；退档后写「3400 kb/s」，不损失。
+   Gb/s 那档原先靠两位小数保精度，现在同样退档，1.05 Gb/s 读作「1050 Mb/s」——与同卡里
+   「548 Mb/s」同量纲，可直接比大小，全站带宽读数也因此统一成三到四位整数、不带小数。 */
 export const bps = (n: number | null): string => {
   if (n === null) return '—';
-  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} Gb/s`;
-  if (n >= 1e6) return `${Math.round(n / 1e6)} Mb/s`;
-  if (n >= 1e3) return `${Math.round(n / 1e3)} kb/s`;
-  return `${Math.round(n)} b/s`;
+  const { divisor, name, ceiling } = observeBpsRung(n);
+  const scaled = n / divisor;
+  // 阶梯到顶（Gb/s 之上没有档）时退不了，两位数取整会抹掉 4%——全机队合计常年落在这一段。
+  // 只有这里带小数，是全站唯一的例外。
+  return `${ceiling && scaled < 100 ? scaled.toFixed(1) : Math.round(scaled)} ${name}`;
 };
 
 /** 微秒转毫秒。RTT 统一显示为毫秒——微秒级精度在跨境链路上没有意义，
@@ -569,6 +578,22 @@ function congestionFindings(r: NodeLoadView): Finding[] {
  * - 两条线使用观测分类盘的前两色，与 HistoryChart 和 TCP Ping 保持同一视觉语法。
  * - 两条线都使用「淡化 + 正常 + 中」填充；填充不是流向主次，不改变数据口径。
  * - 缺口（has_gap / null）断开不连接。 */
+
+/** 吞吐值轴的量程与单位。刻度由 ThroughputChart 画，单位由 ThroughputPanel 写在标题栏里
+ *  （`网卡流量 (Mb/s)`），两处都走这个函数取值——峰值只算一遍，量纲不可能对不上。 */
+export function throughputAxis(
+  rx: (number | null)[],
+  tx: (number | null)[],
+): { axis: ObserveValueAxis; unit: ObserveAxisUnit } {
+  const peak = Math.max(
+    ...rx.filter((value): value is number => value !== null),
+    ...tx.filter((value): value is number => value !== null),
+    1,
+  );
+  const axis = observeValueAxis(peak);
+  return { axis, unit: observeBpsUnit(axis) };
+}
+
 export function ThroughputChart({
   rx,
   tx,
@@ -625,12 +650,7 @@ export function ThroughputChart({
     const lineSoft = cv('--line-soft');
     const glass = cv('--glass-strong');
 
-    const peak = Math.max(
-      ...rx.filter((v): v is number => v !== null),
-      ...tx.filter((v): v is number => v !== null),
-      1,
-    );
-    const valueAxis = observeValueAxis(peak);
+    const { axis: valueAxis, unit } = throughputAxis(rx, tx);
     const slots = Math.max(rx.length, tx.length, 1);
     // 这里只收到按窗口索引的速率，没有真实时间戳。窗口固定 30 秒、末窗为当前，据此合成毫秒
     // 时间轴：换来等距的时间刻度与次刻度，而点距与原 category 轴一致（窗口本就等距）。
@@ -713,8 +733,8 @@ export function ThroughputChart({
           min: xMin,
           max: now,
           interval: xStep,
-          axisLine: observeAxisLine(ink4),
-          axisTick: observeAxisTick(ink4),
+          axisLine: observeAxisLine(ink3),
+          axisTick: observeAxisTick(ink3),
           minorTick: observeMinorTick(lineSoft),
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
           axisLabel: {
@@ -730,9 +750,12 @@ export function ThroughputChart({
           min: 0,
           max: valueAxis.max,
           interval: valueAxis.interval,
-          axisLine: observeAxisLine(ink4),
-          axisTick: observeAxisTick(ink4),
-          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (v: number) => (v === 0 ? '0' : bps(v)) },
+          axisLine: observeAxisLine(ink3),
+          axisTick: observeAxisTick(ink3),
+          // 刻度只写数字，单位由 ThroughputPanel 写在标题栏（`网卡流量 (Mb/s)`）。原先每格
+          // 各调一次 bps()，同一根轴上「1.00 Gb/s」与「500 Mb/s」并存，标签列宽在 3 到 9 字
+          // 之间跳，containLabel 还按最长那条留白。tooltip 与图例仍用 bps()：那是读数不是量程。
+          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: unit.text },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
         series: [mk(rxName, rx, colors[0]), mk(txName, tx, colors[1])],
@@ -936,8 +959,8 @@ function HistoryChart({
           min: xMin,
           max: lastMs,
           interval: xStep,
-          axisLine: observeAxisLine(ink4),
-          axisTick: observeAxisTick(ink4),
+          axisLine: observeAxisLine(ink3),
+          axisTick: observeAxisTick(ink3),
           minorTick: observeMinorTick(lineSoft),
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
           axisLabel: {
@@ -954,8 +977,8 @@ function HistoryChart({
           max: max ?? valueAxis?.max,
           interval: max === undefined ? valueAxis?.interval : undefined,
           scale: true,
-          axisLine: observeAxisLine(ink4),
-          axisTick: observeAxisTick(ink4),
+          axisLine: observeAxisLine(ink3),
+          axisTick: observeAxisTick(ink3),
           axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (value: number) => formatValue(value) },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },

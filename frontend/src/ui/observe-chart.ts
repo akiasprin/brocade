@@ -178,18 +178,24 @@ export function observeTimeTick(index: number, count: number): boolean {
 
 /**
  * Engineering L-frame shared by every observation chart. Without it the series floated as thin
- * sparklines; a solid axis line plus short outward ticks in the stronger ink-4 give the plot the
- * instrument face the observe page asks for. Split lines (the grid) and labels stay with the
- * caller — only the frame and its ticks are shared, so all four charts read as one instrument.
+ * sparklines; a solid axis line plus short outward ticks give the plot the instrument face the
+ * observe page asks for. Split lines (the grid) and labels stay with the caller — only the frame
+ * and its ticks are shared, so all four charts read as one instrument.
+ *
+ * Callers pass ink-3, not the ink-4 this started on. The frame reads as thin at 1px against a
+ * grid that sits only 6 L* off the card, and raising its contrast (L* 45 → 60) gives it presence
+ * without spending a second pixel — at 2px the frame becomes the heaviest stroke in the chart,
+ * heavier than the 1.5px series, which puts the chrome in front of the data.
  */
 export function observeAxisLine(strong: string) {
   return { show: true, lineStyle: { color: strong, width: 1 } };
 }
 
 /**
- * Short outward major tick in the same stronger ink. `interval` is only meaningful on a category
- * axis, where it pins ticks under the sparse time labels instead of drawing one per window; time
- * and value axes place their own ticks and ignore it.
+ * Short outward major tick. Takes the same ink and width as `observeAxisLine` — a tick thinner or
+ * paler than the axis it stands on shows the mismatch at the join. `interval` is only meaningful
+ * on a category axis, where it pins ticks under the sparse time labels instead of drawing one per
+ * window; time and value axes place their own ticks and ignore it.
  */
 export function observeAxisTick(strong: string, interval?: (index: number) => boolean) {
   const tick = { show: true, length: 4, lineStyle: { color: strong, width: 1 } };
@@ -244,4 +250,93 @@ export function observeValueAxis(peak: number, targetIntervals = 4): ObserveValu
   const completedTicks = Math.floor(safePeak / interval + Number.EPSILON * 8);
   const max = Number(((completedTicks + 1) * interval).toPrecision(12));
   return { max, interval };
+}
+
+/** One unit for a whole value axis: named once in the card's title bar, stripped from every tick. */
+export type ObserveAxisUnit = {
+  /** What the title bar prints, as in `网卡流量 (Mb/s)`. */
+  name: string;
+  /** One tick, bare — no unit, since the title bar already carries it. */
+  text: (value: number) => string;
+};
+
+const BPS_UNITS: readonly (readonly [number, string])[] = [
+  [1e9, 'Gb/s'],
+  [1e6, 'Mb/s'],
+  [1e3, 'kb/s'],
+  [1, 'b/s'],
+] as const;
+
+/**
+ * The one rule that picks a throughput unit, for axes and for readings alike.
+ *
+ * `pick` chooses the rung: the largest whose quotient is at least 1. For a reading that is the
+ * value; for an axis it is the tick interval, because the interval is the smallest quantity the
+ * axis has to spell out and so decides whether the labels need decimals — a 250 Mb/s step under a
+ * Gb/s heading reads 0 / 0.25 / 0.50 / 0.75 / 1.00, under Mb/s it reads 0 / 250 / 500 / 750 / 1000.
+ *
+ * `span` then decides whether to step down one rung: a single-digit span means the unit is too
+ * coarse for what is being shown. `3 Mb/s` is 3.4 Mb/s rounded — a 13% haircut, and every value
+ * between 1 and 10 Mb/s takes one of that order — while `3400 kb/s` takes none worth naming. For a
+ * reading `span` is the value; for an axis it is the ceiling, so an axis topping out at 4 Mb/s
+ * labels its ticks 1000 / 2000 / 3000 / 4000 kb/s rather than 1 / 2 / 3 / 4.
+ *
+ * Below the top rung the quotient therefore lands in 1000–9999: throughput reads as three or four
+ * digits, never a decimal, and the unit is stable across the whole card.
+ */
+function bpsRung(pick: number, span: number): { divisor: number; name: string; ceiling: boolean } {
+  const found = BPS_UNITS.findIndex(([step]) => pick / step >= 1);
+  const rung = found === -1 ? BPS_UNITS.length - 1 : found;
+  // b/s is the bottom of the ladder; there is nothing below it to step down to.
+  const stepDown = rung < BPS_UNITS.length - 1 && span / BPS_UNITS[rung][0] < 10;
+  const index = stepDown ? rung + 1 : rung;
+  const [divisor, name] = BPS_UNITS[index];
+  return { divisor, name, ceiling: index === 0 };
+}
+
+/**
+ * The rung a single throughput reading belongs on; `bps()` in panes/telemetry.tsx formats it.
+ *
+ * `ceiling` says the ladder ran out above — Gb/s with nothing larger to move to. It is the one
+ * place the step-down cannot rescue the reading, so the formatter spends a decimal there instead:
+ * a whole-fleet total of 12.4 Gb/s rounds to `12 Gb/s` otherwise, losing 3%.
+ */
+export function observeBpsRung(value: number): { divisor: number; name: string; ceiling: boolean } {
+  return bpsRung(value, value);
+}
+
+/**
+ * Unit for a throughput axis: one unit for every tick, named once in the title bar.
+ *
+ * This replaced `bps()` on the axis, which chose per tick and so put `1.00 Gb/s` and `500 Mb/s` on
+ * the same axis — a label column jumping between three and nine characters, with `containLabel`
+ * reserving room for the longest. `bps()` still formats the tooltip and the legend: those are
+ * readings, not a scale. Both now go through `bpsRung`, so a card's axis and its legend can differ
+ * by at most the rung their own magnitudes earn, never by the ad-hoc rounding they used before.
+ */
+export function observeBpsUnit(axis: ObserveValueAxis): ObserveAxisUnit {
+  const { divisor, name } = bpsRung(axis.interval, axis.max);
+  return {
+    name,
+    text: value => {
+      const scaled = value / divisor;
+      // Integers cover every 1 / 2 / 5 × 10ⁿ step; only the 2.5 step lands on a half.
+      return Number.isInteger(scaled) ? String(scaled) : String(Number(scaled.toFixed(2)));
+    },
+  };
+}
+
+/** Latency axes never change unit — see `observeMsUnit` — so a card can name it without an axis. */
+export const OBSERVE_MS_UNIT = 'ms';
+
+/**
+ * The same for latency, where the ladder has a single rung: `ui/ping-probe.ts` prints milliseconds
+ * only, because microsecond precision means nothing on the links these charts watch. Only the tick
+ * precision varies with the interval; the name never does.
+ */
+export function observeMsUnit(interval: number): ObserveAxisUnit {
+  return {
+    name: OBSERVE_MS_UNIT,
+    text: value => (interval >= 1 ? String(Math.round(value)) : String(Number(value.toFixed(1)))),
+  };
 }

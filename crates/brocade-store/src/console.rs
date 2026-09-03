@@ -17,6 +17,7 @@ pub use types::*;
 
 use brocade_core::{
     artifacts::{grants, hy2_port_hop, phantun, subscription, wireguard, xray},
+    client_config::ClientProjectionDownloadEndpoint,
     compile::compile,
     format::{ini, json as json_format, uri, yaml},
     hash::sha256_hex,
@@ -1881,7 +1882,14 @@ pub(crate) async fn upsert_ingress_tx(
     // The console owns only Padding. POST upload controls and client-only transport selectors may
     // still arrive from a stale browser or an old immutable snapshot, but a new managed write
     // must not persist them.
-    let xhttp = request.wires.xhttp().map(managed_xhttp);
+    let reality_split = matches!(
+        request.wires.vless.as_ref(),
+        Some(TransportRequest::VlessRealityXhttp { .. })
+    );
+    let xhttp = request
+        .wires
+        .xhttp()
+        .map(|xhttp| managed_xhttp(xhttp, reality_split));
     let xhttp_xmux = xhttp
         .as_ref()
         .and_then(|xhttp| xhttp.xmux.as_ref())
@@ -1892,6 +1900,38 @@ pub(crate) async fn upsert_ingress_tx(
         .and_then(|xhttp| xhttp.tuning.as_ref())
         .map(serde_json::to_value)
         .transpose()?;
+    let xhttp_download_v4 = xhttp
+        .as_ref()
+        .and_then(|xhttp| xhttp.download.as_ref())
+        .and_then(|download| download.v4.as_ref())
+        .map(client_download_json)
+        .transpose()?;
+    let xhttp_download_v6 = xhttp
+        .as_ref()
+        .and_then(|xhttp| xhttp.download.as_ref())
+        .and_then(|download| download.v6.as_ref())
+        .map(client_download_json)
+        .transpose()?;
+    let xhttp_download_v4_origin_port = reality_split
+        .then(|| {
+            xhttp
+                .as_ref()
+                .and_then(|xhttp| xhttp.download.as_ref())
+                .and_then(|download| download.v4.as_ref())
+                .and_then(|download| download.origin_port)
+                .map(i32::from)
+        })
+        .flatten();
+    let xhttp_download_v6_origin_port = reality_split
+        .then(|| {
+            xhttp
+                .as_ref()
+                .and_then(|xhttp| xhttp.download.as_ref())
+                .and_then(|download| download.v6.as_ref())
+                .and_then(|download| download.origin_port)
+                .map(i32::from)
+        })
+        .flatten();
     let hysteria2 = request.wires.hysteria2.as_ref();
     /* 四个接收窗口在模型里是 u64（跟上游 `uint64` 同宽），列是 BIGINT。超出 i64 的值只会
     来自手写请求，宁可在这里拒绝也不要截断——截断之后剩下的那个数很可能还满足 CHECK，
@@ -1953,7 +1993,8 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_quic_init_conn_window, hy2_quic_max_conn_window,
             hy2_quic_max_idle_secs, hy2_quic_keepalive_secs,
             hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud,
-            xhttp_tuning
+            xhttp_tuning,
+            xhttp_download_v4_origin_port, xhttp_download_v6_origin_port
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
@@ -1970,7 +2011,7 @@ pub(crate) async fn upsert_ingress_tx(
             $50,
             $51, $52, $53, $54,
             $55, $56, $57, $58,
-            $59
+            $59, $60, $61
          )
          ON CONFLICT (id) DO UPDATE SET
             app_id = EXCLUDED.app_id,
@@ -2027,6 +2068,8 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_quic_max_incoming_streams = EXCLUDED.hy2_quic_max_incoming_streams,
             hy2_quic_disable_pmtud = EXCLUDED.hy2_quic_disable_pmtud,
             xhttp_tuning = EXCLUDED.xhttp_tuning,
+            xhttp_download_v4_origin_port = EXCLUDED.xhttp_download_v4_origin_port,
+            xhttp_download_v6_origin_port = EXCLUDED.xhttp_download_v6_origin_port,
             created_revision = COALESCE(ingresses.created_revision, EXCLUDED.created_revision)
          WHERE ROW(ingresses.app_id, ingresses.chain_id, ingresses.node_id, ingresses.bind,
                    ingresses.port, ingresses.front_id, ingresses.reality_dest,
@@ -2054,7 +2097,9 @@ pub(crate) async fn upsert_ingress_tx(
                    ingresses.hy2_quic_init_conn_window, ingresses.hy2_quic_max_conn_window,
                    ingresses.hy2_quic_max_idle_secs, ingresses.hy2_quic_keepalive_secs,
                    ingresses.hy2_quic_max_incoming_streams, ingresses.hy2_quic_disable_pmtud,
-                   ingresses.xhttp_tuning)
+                   ingresses.xhttp_tuning,
+                   ingresses.xhttp_download_v4_origin_port,
+                   ingresses.xhttp_download_v6_origin_port)
             IS DISTINCT FROM
             ROW(EXCLUDED.app_id, EXCLUDED.chain_id, EXCLUDED.node_id, EXCLUDED.bind,
                 EXCLUDED.port, EXCLUDED.front_id, EXCLUDED.reality_dest,
@@ -2082,7 +2127,9 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.hy2_quic_init_conn_window, EXCLUDED.hy2_quic_max_conn_window,
                 EXCLUDED.hy2_quic_max_idle_secs, EXCLUDED.hy2_quic_keepalive_secs,
                 EXCLUDED.hy2_quic_max_incoming_streams, EXCLUDED.hy2_quic_disable_pmtud,
-                EXCLUDED.xhttp_tuning)
+                EXCLUDED.xhttp_tuning,
+                EXCLUDED.xhttp_download_v4_origin_port,
+                EXCLUDED.xhttp_download_v6_origin_port)
          RETURNING reality_private_key,
                    reality_public_key,
                    reality_short_ids",
@@ -2223,31 +2270,42 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(quic.max_incoming_streams.map(i64::from))
     .bind(quic.disable_path_mtu_discovery)
     .bind(xhttp_tuning)
+    .bind(xhttp_download_v4_origin_port)
+    .bind(xhttp_download_v6_origin_port)
     .fetch_optional(&mut **tx)
     .await?;
     let client_changed = sqlx::query(
         "INSERT INTO ingress_client_settings (
-             ingress_id, reality_fingerprint, xhttp_host, xhttp_xmux
-         ) VALUES ($1, $2, $3, $4)
+             ingress_id, reality_fingerprint, xhttp_host, xhttp_xmux,
+             xhttp_download_v4, xhttp_download_v6
+         ) VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (ingress_id) DO UPDATE SET
              reality_fingerprint = EXCLUDED.reality_fingerprint,
              xhttp_host = EXCLUDED.xhttp_host,
              xhttp_xmux = EXCLUDED.xhttp_xmux,
+             xhttp_download_v4 = EXCLUDED.xhttp_download_v4,
+             xhttp_download_v6 = EXCLUDED.xhttp_download_v6,
              updated_at = now()
          WHERE ROW(
                  ingress_client_settings.reality_fingerprint,
                  ingress_client_settings.xhttp_host,
-                 ingress_client_settings.xhttp_xmux
+                 ingress_client_settings.xhttp_xmux,
+                 ingress_client_settings.xhttp_download_v4,
+                 ingress_client_settings.xhttp_download_v6
                ) IS DISTINCT FROM ROW(
                  EXCLUDED.reality_fingerprint,
                  EXCLUDED.xhttp_host,
-                 EXCLUDED.xhttp_xmux
+                 EXCLUDED.xhttp_xmux,
+                 EXCLUDED.xhttp_download_v4,
+                 EXCLUDED.xhttp_download_v6
                )",
     )
     .bind(&id)
     .bind(&reality.fingerprint)
     .bind(xhttp.as_ref().and_then(|xhttp| xhttp.host.clone()))
     .bind(xhttp_xmux)
+    .bind(xhttp_download_v4)
+    .bind(xhttp_download_v6)
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -2371,7 +2429,7 @@ fn tls_echo(effective: &RealitySettings) -> Tls {
     }
 }
 
-fn managed_xhttp(value: &Xhttp) -> Xhttp {
+fn managed_xhttp(value: &Xhttp, reality_split: bool) -> Xhttp {
     let mut value = value.clone();
     value.tuning = value.tuning.as_ref().and_then(|tuning| {
         tuning
@@ -2381,7 +2439,26 @@ fn managed_xhttp(value: &Xhttp) -> Xhttp {
                 x_padding_bytes: Some(x_padding_bytes),
             })
     });
+    if !reality_split {
+        if let Some(download) = &mut value.download {
+            if let Some(v4) = &mut download.v4 {
+                v4.origin_port = None;
+            }
+            if let Some(v6) = &mut download.v6 {
+                v6.origin_port = None;
+            }
+        }
+    }
     value
+}
+
+fn client_download_json(download: &ProjectionDownloadEndpoint) -> Result<Value> {
+    Ok(serde_json::to_value(ClientProjectionDownloadEndpoint {
+        host: download.host.clone(),
+        port: download.port,
+        http_host: download.http_host.clone(),
+        mux: download.mux,
+    })?)
 }
 
 /// Existing non-friendly IDs may still be updated while an old development fixture is being
@@ -3433,7 +3510,8 @@ fn optional_owned_text(value: Option<String>) -> Option<String> {
 }
 
 /// Normalization of one family's projected endpoint. `None` on the way in means no projection,
-/// landing as two NULLs.
+/// landing as two NULLs. The nested download shape is historical client state and is deliberately
+/// discarded here; XHTTP downloads are persisted from `wires.*.xhttp.download` instead.
 ///
 /// An empty host is turned back here rather than left to the database's CHECK: what a constraint
 /// reports is "violates ingresses_projection_v4_check", from which the UI cannot tell which field
@@ -3448,27 +3526,10 @@ fn normalized_projection(
     };
     let host = required_text(endpoint.host, &format!("{field} host"))?;
     ensure_nonzero_port(endpoint.port, &format!("{field} port"))?;
-    let download = match endpoint.download {
-        Some(download) => {
-            let host = required_text(download.host, &format!("{field} download host"))?;
-            ensure_nonzero_port(download.port, &format!("{field} download port"))?;
-            if let Some(origin_port) = download.origin_port {
-                ensure_nonzero_port(origin_port, &format!("{field} download origin port"))?;
-            }
-            Some(ProjectionDownloadEndpoint {
-                host,
-                port: download.port,
-                origin_port: download.origin_port,
-                http_host: optional_owned_text(download.http_host),
-                mux: download.mux,
-            })
-        }
-        None => None,
-    };
     Ok(Some(ProjectionEndpoint {
         host,
         port: endpoint.port,
-        download,
+        download: None,
     }))
 }
 

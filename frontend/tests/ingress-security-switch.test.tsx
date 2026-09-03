@@ -214,7 +214,7 @@ describe('VLESS security draft', () => {
     const saved = await saveDraft(view);
     expect(saved.wires?.vless).toEqual({
       kind: 'vless-reality-xhttp',
-      xhttp: { path: '/existing', host: null, xmux: null, tuning: null, mode: 'auto' },
+      xhttp: { path: '/existing', host: null, xmux: null, tuning: null, mode: 'auto', download: null },
     });
   });
 

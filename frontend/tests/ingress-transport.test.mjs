@@ -16,26 +16,24 @@ const split = {
   },
 };
 
-test('switching between XHTTP security shapes preserves the public download', () => {
+test('switching between XHTTP security shapes keeps download out of public projection', () => {
   assert.deepEqual(projectionForTransport(split, 'vless-tls-xhttp'), {
     v4: {
       host: 'upload.example.net',
       port: 443,
-      download: {
-        host: 'cdn.example.net',
-        port: 443,
-        origin_port: null,
-        http_host: 'download.route.example',
-        mux: 24,
-      },
     },
   });
-  assert.deepEqual(projectionForTransport(split, 'vless-reality-xhttp'), split);
+  assert.deepEqual(projectionForTransport(split, 'vless-reality-xhttp'), {
+    v4: {
+      host: 'upload.example.net',
+      port: 443,
+    },
+  });
 });
 
-test('leaving XHTTP removes its unsupported independent download', () => {
+test('leaving XHTTP keeps public projection without a download child', () => {
   assert.deepEqual(projectionForTransport(split, 'vless-reality'), {
-    v4: { host: 'upload.example.net', port: 443, download: null },
+    v4: { host: 'upload.example.net', port: 443 },
   });
 });
 

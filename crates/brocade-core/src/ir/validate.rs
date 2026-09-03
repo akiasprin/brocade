@@ -1404,47 +1404,9 @@ fn validate_projection(ingress: &Ingress, diagnostics: &mut Vec<Diagnostic>) {
                 format!("接入面 {} 的 {family} 投影端口是 0", ingress.id),
             ));
         }
-        if let Some(download) = &endpoint.download {
-            if download.host.trim().is_empty() {
-                diagnostics.push(Diagnostic::error(
-                    "ingress.projection-download-blank",
-                    &ingress.id,
-                    format!("接入面 {} 的 {family} 下载投影没有填写地址", ingress.id),
-                ));
-            }
-            if download.port == 0 {
-                diagnostics.push(Diagnostic::error(
-                    "ingress.projection-download-port",
-                    &ingress.id,
-                    format!("接入面 {} 的 {family} 下载投影端口是 0", ingress.id),
-                ));
-            }
-            if !matches!(
-                ingress.wires.vless(),
-                Some(Transport::VlessTlsXhttp(_) | Transport::VlessRealityXhttp(_))
-            ) {
-                diagnostics.push(Diagnostic::error(
-                    "ingress.projection-download-transport",
-                    &ingress.id,
-                    format!(
-                        "接入面 {} 配置了 {family} 独立下载投影，但该配置只适用于 XHTTP",
-                        ingress.id
-                    ),
-                ));
-            }
-            if matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)))
-                && download.node_port() == ingress.port
-            {
-                diagnostics.push(Diagnostic::error(
-                    "ingress.projection-download-port-clash",
-                    &ingress.id,
-                    format!(
-                        "接入面 {} 的 REALITY 上行和 TLS 下载不能同时监听端口 {}",
-                        ingress.id, ingress.port
-                    ),
-                ));
-            }
-        }
+        // Independent download is an XHTTP setting, not part of the public address projection.
+        // Legacy nested values are ignored here and are migrated into Xhttp.download when the
+        // snapshot is materialized.
     }
 }
 
@@ -1576,19 +1538,26 @@ fn occupied_ingress_ports(ingress: &Ingress) -> Vec<OccupiedIngressPort> {
     }
 
     if matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_))) {
-        let mut download_ports = [
-            ingress.projection.v4.as_ref(),
-            ingress.projection.v6.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|endpoint| {
-            endpoint
-                .download
-                .as_ref()
-                .map(|download| download.node_port())
-        })
-        .collect::<Vec<_>>();
+        let mut download_ports = ingress
+            .wires
+            .xhttp()
+            .and_then(|xhttp| xhttp.download.as_ref())
+            .into_iter()
+            .flat_map(|download| [download.v4.as_ref(), download.v6.as_ref()])
+            .flatten()
+            .map(|download| download.node_port())
+            .collect::<Vec<_>>();
+        if download_ports.is_empty() {
+            download_ports = [
+                ingress.projection.v4.as_ref(),
+                ingress.projection.v6.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|endpoint| endpoint.download.as_ref())
+            .map(|download| download.node_port())
+            .collect();
+        }
         download_ports.sort_unstable();
         download_ports.dedup();
         occupied.extend(download_ports.into_iter().map(|port| OccupiedIngressPort {
@@ -2090,13 +2059,11 @@ fn validate_ingress_guard(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress) 
 
 fn validate_ingress_certificate(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress) {
     let split_download = matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)))
-        && [
-            ingress.projection.v4.as_ref(),
-            ingress.projection.v6.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|endpoint| endpoint.download.is_some());
+        && ingress
+            .wires
+            .xhttp()
+            .and_then(|xhttp| xhttp.download.as_ref())
+            .is_some_and(|download| download.v4.is_some() || download.v6.is_some());
     if !ingress.wires.needs_node_certificate() && !split_download {
         return;
     }
@@ -2274,16 +2241,40 @@ fn validate_ingress_stream(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress)
         ));
     }
 
-    for endpoint in [
-        ingress.projection.v4.as_ref(),
-        ingress.projection.v6.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
+    for download in ingress
+        .wires
+        .xhttp()
+        .and_then(|xhttp| xhttp.download.as_ref())
+        .into_iter()
+        .flat_map(|download| [download.v4.as_ref(), download.v6.as_ref()])
+        .flatten()
     {
-        let Some(download) = &endpoint.download else {
-            continue;
-        };
+        if download.host.trim().is_empty() {
+            diagnostics.push(Diagnostic::error(
+                "ingress.xhttp-download-blank",
+                &ingress.id,
+                format!("接入面 {} 的独立下载没有填写地址", ingress.id),
+            ));
+        }
+        if download.port == 0 {
+            diagnostics.push(Diagnostic::error(
+                "ingress.xhttp-download-port",
+                &ingress.id,
+                format!("接入面 {} 的独立下载端口是 0", ingress.id),
+            ));
+        }
+        if matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)))
+            && download.node_port() == ingress.port
+        {
+            diagnostics.push(Diagnostic::error(
+                "ingress.xhttp-download-port-clash",
+                &ingress.id,
+                format!(
+                    "接入面 {} 的 REALITY 上行和 TLS 下载不能同时监听端口 {}",
+                    ingress.id, ingress.port
+                ),
+            ));
+        }
         if xhttp.mode == XhttpMode::StreamOne {
             diagnostics.push(Diagnostic::error(
                 "ingress.xhttp-download-stream-one",
@@ -2300,7 +2291,7 @@ fn validate_ingress_stream(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress)
             .is_some_and(|host| host.trim().is_empty())
         {
             diagnostics.push(Diagnostic::error(
-                "ingress.projection-download-http-host",
+                "ingress.xhttp-download-http-host",
                 &ingress.id,
                 format!(
                     "接入面 {} 的下载 HTTP Host 不能为空白字符；不需要设置时请留空",
@@ -2311,7 +2302,7 @@ fn validate_ingress_stream(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress)
         if let Some(mux) = download.mux {
             if !(Xhttp::MUX_MIN..=Xhttp::MUX_MAX).contains(&mux) {
                 diagnostics.push(Diagnostic::error(
-                    "ingress.projection-download-mux-range",
+                    "ingress.xhttp-download-mux-range",
                     &ingress.id,
                     format!(
                         "接入面 {} 的下载并发数 {mux} 超出 {}–{} 的范围。1 表示连接池，留空表示所有流共用一条连接",

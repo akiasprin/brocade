@@ -476,6 +476,7 @@ fn the_share_link_extra_carries_the_pool_into_a_config_the_real_binary_reads() {
             xmux: Some(XhttpXmux::with_concurrency(1)),
             tuning: None,
             mode: XhttpMode::Auto,
+            download: None,
         },
     }));
     app.ingresses[0].wires.set_flow(None);
@@ -754,6 +755,7 @@ fn an_xhttp_ingress_loads_in_the_real_binary() {
                 xmux: mux.map(XhttpXmux::with_concurrency),
                 tuning: None,
                 mode,
+                download: None,
             },
         }));
         // Vision is the default and cannot ride XHTTP; the compiler refuses the pair, so the
@@ -837,6 +839,7 @@ fn split_reality_upload_and_tls_download_load_in_the_real_binary() {
             xmux: Some(XhttpXmux::with_concurrency(8)),
             tuning: None,
             mode: XhttpMode::Auto,
+            download: None,
         },
     }));
     app.ingresses[0].wires.set_flow(None);
@@ -1570,6 +1573,7 @@ fn a_tls_ingress_loads_in_the_real_binary() {
                 xmux: Some(XhttpXmux::with_concurrency(8)),
                 tuning: None,
                 mode: XhttpMode::StreamOne,
+                download: None,
             }),
         ),
     ] {

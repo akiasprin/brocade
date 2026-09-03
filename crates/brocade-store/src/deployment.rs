@@ -1,8 +1,10 @@
+use brocade_core::client_config::ClientProjectionDownloadEndpoint;
 use brocade_core::hash::sha256_hex;
 use brocade_core::model::{
     AppView, Dns, DomainStrategy, ExternalOutbound, HysteriaCongestion, HysteriaMasquerade,
-    HysteriaObfs, IngressWires, ModelSnapshot, Node, RealityFallbackLimits, RealityFallbackMode,
-    RealitySettings, RealitySite,
+    HysteriaObfs, Ingress, IngressWires, ModelSnapshot, Node, Projection,
+    ProjectionDownloadEndpoint, ProjectionEndpoint, RealityFallbackLimits, RealityFallbackMode,
+    RealitySettings, RealitySite, Transport, XhttpDownload,
 };
 use brocade_deployment::plan::{
     grants_match, narrow_to_kind, plan_deployment as plan_snapshot_deployment,
@@ -3113,6 +3115,37 @@ async fn restore_app_tx(
             .and_then(|xhttp| xhttp.tuning.as_ref())
             .map(serde_json::to_value)
             .transpose()?;
+        let xhttp_download = restored_xhttp_download(ingress);
+        let reality_split = matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)));
+        let xhttp_download_v4 = xhttp_download
+            .as_ref()
+            .and_then(|download| download.v4.as_ref())
+            .map(client_download_json)
+            .transpose()?;
+        let xhttp_download_v6 = xhttp_download
+            .as_ref()
+            .and_then(|download| download.v6.as_ref())
+            .map(client_download_json)
+            .transpose()?;
+        let xhttp_download_v4_origin_port = reality_split
+            .then(|| {
+                xhttp_download
+                    .as_ref()
+                    .and_then(|download| download.v4.as_ref())
+                    .and_then(|download| download.origin_port)
+                    .map(i32::from)
+            })
+            .flatten();
+        let xhttp_download_v6_origin_port = reality_split
+            .then(|| {
+                xhttp_download
+                    .as_ref()
+                    .and_then(|download| download.v6.as_ref())
+                    .and_then(|download| download.origin_port)
+                    .map(i32::from)
+            })
+            .flatten();
+        let projection = projection_without_download(&ingress.projection);
         let hysteria2 = ingress.wires.hysteria2();
         let quic = hysteria2.map(|h| h.quic).unwrap_or_default();
         let (hy2_masquerade_kind, hy2_masquerade_url) = match hysteria2.map(|h| &h.masquerade) {
@@ -3146,7 +3179,8 @@ async fn restore_app_tx(
                 hy2_quic_init_conn_window, hy2_quic_max_conn_window,
                 hy2_quic_max_idle_secs, hy2_quic_keepalive_secs,
                 hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud,
-                xhttp_tuning
+                xhttp_tuning,
+                xhttp_download_v4_origin_port, xhttp_download_v6_origin_port
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
@@ -3164,7 +3198,7 @@ async fn restore_app_tx(
                 $50,
                 $51, $52, $53, $54,
                 $55, $56, $57, $58,
-                $59
+                $59, $60, $61
              )",
         )
         .bind(&ingress.id)
@@ -3205,90 +3239,20 @@ async fn restore_app_tx(
         }))
         .bind(hy2_masquerade_kind)
         .bind(hy2_masquerade_url)
-        .bind(ingress.projection.v4.as_ref().map(|to| to.host.clone()))
-        .bind(ingress.projection.v4.as_ref().map(|to| i32::from(to.port)))
-        .bind(
-            ingress
-                .projection
-                .v4
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .map(|to| to.host.clone()),
-        )
-        .bind(
-            ingress
-                .projection
-                .v4
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .map(|to| i32::from(to.port)),
-        )
-        .bind(
-            ingress
-                .projection
-                .v4
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .and_then(|to| to.origin_port.map(i32::from)),
-        )
-        .bind(
-            ingress
-                .projection
-                .v4
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .and_then(|to| to.http_host.clone()),
-        )
-        .bind(
-            ingress
-                .projection
-                .v4
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .and_then(|to| to.mux.map(i32::from)),
-        )
-        .bind(ingress.projection.v6.as_ref().map(|to| to.host.clone()))
-        .bind(ingress.projection.v6.as_ref().map(|to| i32::from(to.port)))
-        .bind(
-            ingress
-                .projection
-                .v6
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .map(|to| to.host.clone()),
-        )
-        .bind(
-            ingress
-                .projection
-                .v6
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .map(|to| i32::from(to.port)),
-        )
-        .bind(
-            ingress
-                .projection
-                .v6
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .and_then(|to| to.origin_port.map(i32::from)),
-        )
-        .bind(
-            ingress
-                .projection
-                .v6
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .and_then(|to| to.http_host.clone()),
-        )
-        .bind(
-            ingress
-                .projection
-                .v6
-                .as_ref()
-                .and_then(|to| to.download.as_ref())
-                .and_then(|to| to.mux.map(i32::from)),
-        )
+        .bind(projection.v4.as_ref().map(|to| to.host.clone()))
+        .bind(projection.v4.as_ref().map(|to| i32::from(to.port)))
+        .bind(None::<String>)
+        .bind(None::<i32>)
+        .bind(None::<i32>)
+        .bind(None::<String>)
+        .bind(None::<i32>)
+        .bind(projection.v6.as_ref().map(|to| to.host.clone()))
+        .bind(projection.v6.as_ref().map(|to| i32::from(to.port)))
+        .bind(None::<String>)
+        .bind(None::<i32>)
+        .bind(None::<i32>)
+        .bind(None::<String>)
+        .bind(None::<i32>)
         .bind(ingress.guard.no_private)
         .bind(ingress.guard.no_bittorrent)
         .bind(ingress.guard.no_mail)
@@ -3313,6 +3277,39 @@ async fn restore_app_tx(
         .bind(quic.max_incoming_streams.map(i64::from))
         .bind(quic.disable_path_mtu_discovery)
         .bind(xhttp_tuning)
+        .bind(xhttp_download_v4_origin_port)
+        .bind(xhttp_download_v6_origin_port)
+        .execute(&mut **tx)
+        .await?;
+
+        let reality_fingerprint = ingress.wires.reality().and_then(|reality| {
+            let global = site.fingerprint.as_deref().unwrap_or("chrome");
+            (reality.fingerprint != global).then(|| reality.fingerprint.clone())
+        });
+        sqlx::query(
+            "INSERT INTO ingress_client_settings (
+                 ingress_id, reality_fingerprint, xhttp_host, xhttp_xmux,
+                 xhttp_download_v4, xhttp_download_v6
+             ) VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (ingress_id) DO UPDATE SET
+                 reality_fingerprint = EXCLUDED.reality_fingerprint,
+                 xhttp_host = EXCLUDED.xhttp_host,
+                 xhttp_xmux = EXCLUDED.xhttp_xmux,
+                 xhttp_download_v4 = EXCLUDED.xhttp_download_v4,
+                 xhttp_download_v6 = EXCLUDED.xhttp_download_v6,
+                 updated_at = now()",
+        )
+        .bind(&ingress.id)
+        .bind(reality_fingerprint)
+        .bind(xhttp.and_then(|xhttp| xhttp.host.clone()))
+        .bind(
+            xhttp
+                .and_then(|xhttp| xhttp.xmux.as_ref())
+                .map(serde_json::to_value)
+                .transpose()?,
+        )
+        .bind(xhttp_download_v4)
+        .bind(xhttp_download_v6)
         .execute(&mut **tx)
         .await?;
     }
@@ -3460,6 +3457,48 @@ fn flow_column(flow: Option<String>, site_flow: &Option<String>) -> Option<Strin
     } else {
         flow
     }
+}
+
+fn restored_xhttp_download(ingress: &Ingress) -> Option<XhttpDownload> {
+    let xhttp = ingress.wires.xhttp()?;
+    if let Some(download) = &xhttp.download {
+        return Some(download.clone());
+    }
+    let v4 = ingress
+        .projection
+        .v4
+        .as_ref()
+        .and_then(|endpoint| endpoint.download.clone());
+    let v6 = ingress
+        .projection
+        .v6
+        .as_ref()
+        .and_then(|endpoint| endpoint.download.clone());
+    (v4.is_some() || v6.is_some()).then_some(XhttpDownload { v4, v6 })
+}
+
+fn projection_without_download(projection: &Projection) -> Projection {
+    Projection {
+        v4: projection.v4.as_ref().map(|endpoint| ProjectionEndpoint {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            download: None,
+        }),
+        v6: projection.v6.as_ref().map(|endpoint| ProjectionEndpoint {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            download: None,
+        }),
+    }
+}
+
+fn client_download_json(download: &ProjectionDownloadEndpoint) -> Result<Value> {
+    Ok(serde_json::to_value(ClientProjectionDownloadEndpoint {
+        host: download.host.clone(),
+        port: download.port,
+        http_host: download.http_host.clone(),
+        mux: download.mux,
+    })?)
 }
 
 fn ingress_reality_override_columns(

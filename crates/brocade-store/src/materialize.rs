@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
+use brocade_core::client_config::ClientProjectionDownloadEndpoint;
 use brocade_core::hash::hex_lower;
 use brocade_core::model::{
     Accept, Action, AppView, Chain, ConnectionSettings, DestMatch, Dns, ExternalOutbound,
@@ -1605,6 +1606,7 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
             transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
+            xhttp_download_v4_origin_port, xhttp_download_v6_origin_port, \
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password, \
             hy2_bbr_profile, \
             hy2_quic_init_stream_window, hy2_quic_max_stream_window, \
@@ -1621,7 +1623,8 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             projection_v6_host, projection_v6_port, \
             projection_v6_download_host, projection_v6_download_port, \
             projection_v6_download_origin_port, \
-            projection_v6_download_http_host, projection_v6_download_mux \
+            projection_v6_download_http_host, projection_v6_download_mux, \
+            client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
          WHERE ingresses.app_id = $1 \
@@ -1649,6 +1652,7 @@ async fn load_ingresses_tx(
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
             transport_kind, hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
+            xhttp_download_v4_origin_port, xhttp_download_v6_origin_port, \
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password, \
             hy2_bbr_profile, \
             hy2_quic_init_stream_window, hy2_quic_max_stream_window, \
@@ -1665,7 +1669,8 @@ async fn load_ingresses_tx(
             projection_v6_host, projection_v6_port, \
             projection_v6_download_host, projection_v6_download_port, \
             projection_v6_download_origin_port, \
-            projection_v6_download_http_host, projection_v6_download_mux \
+            projection_v6_download_http_host, projection_v6_download_mux, \
+            client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
          WHERE ingresses.app_id = $1 \
@@ -1780,6 +1785,7 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             Some("stream-one") => XhttpMode::StreamOne,
             _ => XhttpMode::Auto,
         },
+        download: xhttp_download_from_row(row)?,
     };
     // The borrowed-site columns are read for every shape and simply go unused by the ones that
     // hold a certificate: an ingress keeps its REALITY identity in storage while it is on TLS, so
@@ -1884,6 +1890,44 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             tcp_and_quic_only: row.try_get("guard_tcp_and_quic_only")?,
         },
     })
+}
+
+fn xhttp_download_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<brocade_core::model::XhttpDownload>> {
+    let v4 = xhttp_download_endpoint_from_row(row, "v4")?;
+    let v6 = xhttp_download_endpoint_from_row(row, "v6")?;
+    Ok((v4.is_some() || v6.is_some()).then_some(brocade_core::model::XhttpDownload { v4, v6 }))
+}
+
+fn xhttp_download_endpoint_from_row(
+    row: &sqlx::postgres::PgRow,
+    family: &str,
+) -> Result<Option<ProjectionDownloadEndpoint>> {
+    let client_column = format!("xhttp_download_{family}");
+    let origin_column = format!("xhttp_download_{family}_origin_port");
+    if let Some(value) = row.try_get::<Option<Value>, _>(client_column.as_str())? {
+        let client =
+            serde_json::from_value::<ClientProjectionDownloadEndpoint>(value).map_err(|error| {
+                StoreError::InvalidData(format!(
+                    "ingress_client_settings.{client_column} is invalid: {error}"
+                ))
+            })?;
+        return Ok(Some(ProjectionDownloadEndpoint {
+            host: client.host,
+            port: client.port,
+            origin_port: row
+                .try_get::<Option<i32>, _>(origin_column.as_str())?
+                .map(port)
+                .transpose()?,
+            http_host: client.http_host,
+            mux: client.mux,
+        }));
+    }
+
+    // Old snapshots stored the entire download under projection. Keep this read fallback until
+    // all existing rows have passed through the idempotent migration and a normal save.
+    Ok(projection_endpoint(row, family)?.and_then(|endpoint| endpoint.download))
 }
 
 /// One family's projected endpoint. Both columns NULL means no projection.

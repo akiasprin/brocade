@@ -10,7 +10,7 @@ use brocade_core::{
         HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily,
         ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
         RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp,
-        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+        XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
     physical::user::{project_user, SubscriptionProtocol, UserPlan},
     Level,
@@ -618,6 +618,7 @@ fn an_xhttp_ingress_reaches_both_subscription_formats() {
         xmux: Some(XhttpXmux::with_concurrency(16)),
         tuning: None,
         mode: XhttpMode::Auto,
+        download: None,
     }));
 
     assert!(uri_text.contains("type=xhttp"), "{uri_text}");
@@ -675,6 +676,7 @@ fn xhttp_xmux_and_padding_settings_reach_both_subscription_formats() {
         xmux: Some(xmux),
         tuning: Some(tuning),
         mode: XhttpMode::PacketUp,
+        download: None,
     }));
 
     for field in [
@@ -729,6 +731,7 @@ fn a_concurrency_of_one_is_a_pool_and_reaches_both_subscription_formats() {
         xmux: Some(XhttpXmux::with_concurrency(1)),
         tuning: None,
         mode: XhttpMode::Auto,
+        download: None,
     }));
 
     for field in [
@@ -755,6 +758,7 @@ fn an_explicit_upload_mode_reaches_both_subscription_formats() {
         xmux: None,
         tuning: None,
         mode: XhttpMode::PacketUp,
+        download: None,
     }));
 
     assert!(uri_text.contains("mode=packet-up"), "{uri_text}");
@@ -772,6 +776,7 @@ fn the_default_upload_mode_is_written_nowhere() {
         xmux: None,
         tuning: None,
         mode: XhttpMode::Auto,
+        download: None,
     }));
 
     assert!(!uri_text.contains("mode="), "{uri_text}");
@@ -827,6 +832,7 @@ fn a_tls_xhttp_ingress_carries_both_halves() {
         xmux: Some(XhttpXmux::with_concurrency(8)),
         tuning: None,
         mode: XhttpMode::Auto,
+        download: None,
     }));
 
     assert!(uri_text.contains("security=tls"), "{uri_text}");
@@ -856,6 +862,7 @@ fn tls_uses_client_defaults_in_both_formats() {
         xmux: None,
         tuning: None,
         mode: XhttpMode::Auto,
+        download: None,
     }));
 
     assert!(!uri_text.contains("fp="), "{uri_text}");
@@ -877,6 +884,7 @@ fn a_tls_xhttp_projection_can_use_an_independent_download_endpoint() {
                 xmux: Some(XhttpXmux::with_concurrency(8)),
                 tuning: None,
                 mode: XhttpMode::Auto,
+                download: None,
             },
         }));
         face.projection.v4 = Some(ProjectionEndpoint {
@@ -945,6 +953,7 @@ fn a_reality_xhttp_projection_uses_tls_only_for_its_download() {
                 xmux: Some(XhttpXmux::with_concurrency(8)),
                 tuning: None,
                 mode: XhttpMode::Auto,
+                download: None,
             },
         }));
         face.wires.set_flow(None);
@@ -1414,6 +1423,48 @@ fn render_with_projection(projection: Projection) -> (String, String) {
     )
 }
 
+fn render_with_xhttp_download(download: XhttpDownload) -> (String, String) {
+    let mut hk = node("hk", "203.0.113.7", [10, 66, 0, 1]);
+    hk.public_ipv6 = Some("2001:db8::10".to_owned());
+    hk.certificate_name = Some("hk-cert.example.net".to_owned());
+    let mut doc = doc(vec![hk]);
+    doc.users.push(user("platform.acme", "alice", "uuid-alice"));
+    let mut face = ingress("i-hk", "c-hk", "hk", None);
+    face.wires = IngressWires::Vless(Transport::VlessRealityXhttp(RealityXhttp {
+        reality: face.wires.reality().unwrap().clone(),
+        xhttp: Xhttp {
+            path: "/probe".to_owned(),
+            host: None,
+            xmux: None,
+            tuning: None,
+            mode: XhttpMode::Auto,
+            download: Some(download),
+        },
+    }));
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c-hk", "香港")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: Vec::new(),
+        grants: vec![grant("alice", "i-hk")],
+    };
+    let mut diagnostics = Vec::new();
+    let ir = compile_app(&doc, &app, &mut diagnostics);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.level == Level::Error),
+        "{diagnostics:#?}"
+    );
+    let artifact = subscription::build(&project_user(&[ir], "platform.acme", "alice"));
+    (
+        uri::subscription(&artifact),
+        yaml::clash_subscription(&artifact),
+    )
+}
+
 #[test]
 fn no_projection_keeps_the_node_public_addresses() {
     let (uri_text, clash_text) = render_with_projection(Projection::default());
@@ -1422,6 +1473,78 @@ fn no_projection_keeps_the_node_public_addresses() {
     assert!(uri_text.contains("@[2001:db8::10]:443?"));
     assert!(clash_text.contains("server: 203.0.113.7"));
     assert!(clash_text.contains("server: 2001:db8::10"));
+}
+
+#[test]
+fn xhttp_download_can_use_ipv4_without_an_entry_projection() {
+    let (uri_text, clash_text) = render_with_xhttp_download(XhttpDownload {
+        v4: Some(ProjectionDownloadEndpoint {
+            host: "download-v4.example.net".to_owned(),
+            port: 8443,
+            origin_port: None,
+            http_host: Some("h4.example.net".to_owned()),
+            mux: Some(24),
+        }),
+        v6: None,
+    });
+
+    // The upload connection still dials the node's own public address: independent download is
+    // not an address projection and must not make the client wait for one.
+    assert!(uri_text.contains("@203.0.113.7:443?"), "{uri_text}");
+    assert!(clash_text.contains("server: 203.0.113.7"), "{clash_text}");
+    assert!(uri_text.contains("download-v4.example.net"), "{uri_text}");
+    assert!(uri_text.contains("h4.example.net"), "{uri_text}");
+    assert!(
+        clash_text.contains("server: download-v4.example.net"),
+        "{clash_text}"
+    );
+    assert!(clash_text.contains("host: h4.example.net"), "{clash_text}");
+    assert!(!uri_text.contains("download-v6.example.net"), "{uri_text}");
+    assert!(
+        !clash_text.contains("download-v6.example.net"),
+        "{clash_text}"
+    );
+}
+
+#[test]
+fn xhttp_download_can_use_both_address_families_without_projections() {
+    let (uri_text, clash_text) = render_with_xhttp_download(XhttpDownload {
+        v4: Some(ProjectionDownloadEndpoint {
+            host: "download-v4.example.net".to_owned(),
+            port: 8443,
+            origin_port: None,
+            http_host: None,
+            mux: None,
+        }),
+        v6: Some(ProjectionDownloadEndpoint {
+            host: "download-v6.example.net".to_owned(),
+            port: 9443,
+            origin_port: None,
+            http_host: None,
+            mux: None,
+        }),
+    });
+
+    assert_eq!(uri_text.matches("vless://").count(), 2, "{uri_text}");
+    assert!(uri_text.contains("@203.0.113.7:443?"), "{uri_text}");
+    assert!(uri_text.contains("@[2001:db8::10]:443?"), "{uri_text}");
+    assert!(uri_text.contains("download-v4.example.net"), "{uri_text}");
+    assert!(uri_text.contains("download-v6.example.net"), "{uri_text}");
+    assert_eq!(
+        clash_text.matches("download-settings:").count(),
+        2,
+        "{clash_text}"
+    );
+    assert!(
+        clash_text.contains("server: download-v4.example.net"),
+        "{clash_text}"
+    );
+    assert!(clash_text.contains("port: 8443"), "{clash_text}");
+    assert!(
+        clash_text.contains("server: download-v6.example.net"),
+        "{clash_text}"
+    );
+    assert!(clash_text.contains("port: 9443"), "{clash_text}");
 }
 
 #[test]

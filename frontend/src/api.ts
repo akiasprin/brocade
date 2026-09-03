@@ -919,9 +919,15 @@ export interface Xhttp {
   xmux?: XhttpXmux | null;
   tuning?: XhttpTuning | null;
   mode?: XhttpMode;
+  download?: XhttpDownload | null;
 }
 
-/* 接入面的完整链路配置：协议、安全层、网络层作为一个**经过验证的组合**统一命名，
+export interface XhttpDownload {
+  v4?: ProjectionDownloadEndpoint | null;
+  v6?: ProjectionDownloadEndpoint | null;
+}
+
+/* 接入面的完整链路配置：协议、安全层、传输层作为一个**经过验证的组合**统一命名，
  * 而不是三个独立的维度。
  *
  * 不拆分为正交字段的原因：这几个维度并不独立。Vision 流控 + XHTTP 可以编译通过、
@@ -1050,21 +1056,27 @@ export interface IngressProjection {
 export interface ProjectionEndpoint {
   host: string;
   port: number;
+  /** Legacy snapshots only. New independent download settings live on Xhttp.download. */
   download?: ProjectionDownloadEndpoint | null;
 }
 
 export interface ProjectionDownloadEndpoint {
   host: string;
   port: number;
-  /** REALITY 分离下载在节点上实际监听的 TLS 回源端口；TLS + XHTTP 不需要该字段。 */
+  /** REALITY 分离下载在节点上实际监听的 TLS 端口；TLS + XHTTP 不需要该字段。 */
   origin_port?: number | null;
   http_host?: string | null;
   mux?: number | null;
 }
 
-export const upsertIngress = async (appId: string, body: UpsertIngressBody) => {
+export const upsertIngress = async (appId: string, body: UpsertIngressBody, base?: UpsertIngressBody) => {
   const { note: _note, ...ingress } = body;
-  draft.push({ op: 'upsert_ingress', app_id: appId, ingress });
+  if (base) {
+    const { note: _baseNote, ...baseIngress } = base;
+    draft.pushIngress(appId, baseIngress, ingress);
+  } else {
+    draft.push({ op: 'upsert_ingress', app_id: appId, ingress });
+  }
   return { revision_id: 0 } as ModelWriteResult;
 };
 

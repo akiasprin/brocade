@@ -2,6 +2,7 @@ package socks_test
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -32,6 +33,38 @@ func TestUDPEncoding(t *testing.T) {
 	common.Must(err)
 	if r := cmp.Diff(decodedPayload[0].Bytes(), content); r != "" {
 		t.Error(r)
+	}
+}
+
+func TestEncodeUDPPacketSupportsLargePayloads(t *testing.T) {
+	request := &protocol.RequestHeader{
+		Address: net.IPAddress([]byte{1, 2, 3, 4}),
+		Port:    1024,
+	}
+
+	for _, length := range []int{12 * 1024, 60 * 1024} {
+		t.Run(fmt.Sprintf("payload-%d", length), func(t *testing.T) {
+			payload := bytes.Repeat([]byte("x"), length)
+			packet, err := EncodeUDPPacket(request, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer packet.Release()
+
+			decoded, err := DecodeUDPPacket(packet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(packet.Bytes(), payload); diff != "" {
+				t.Fatal(diff)
+			}
+			if diff := cmp.Diff(decoded.Address, request.Address); diff != "" {
+				t.Fatal(diff)
+			}
+			if decoded.Port != request.Port {
+				t.Fatalf("decoded port = %d, want %d", decoded.Port, request.Port)
+			}
+		})
 	}
 }
 

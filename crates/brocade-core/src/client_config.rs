@@ -76,6 +76,13 @@ pub struct ClientProjection {
     /// write `Some`, including `Some(None)` when XMUX is intentionally left to Xray.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp_xmux: Option<Option<XhttpXmux>>,
+    /// Client-side independent download for IPv4. The outer `None` preserves checkpoints from
+    /// before download settings moved out of the address projection; `Some(None)` disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhttp_download_v4: Option<Option<ClientProjectionDownloadEndpoint>>,
+    /// Client-side independent download for IPv6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhttp_download_v6: Option<Option<ClientProjectionDownloadEndpoint>>,
     /// ClientHello preset used by subscribers and probes. The REALITY listener never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_fingerprint: Option<String>,
@@ -280,13 +287,15 @@ impl SubscriptionClientConfig {
                 else {
                     continue;
                 };
-                ingress.projection = client.to_model(ingress)?;
+                ingress.projection = client.to_model()?;
                 if let (Some(reality), Some(fingerprint)) = (
                     ingress.wires.reality_mut(),
                     client.reality_fingerprint.as_ref(),
                 ) {
                     reality.fingerprint.clone_from(fingerprint);
                 }
+                let reality_split =
+                    matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)));
                 if let Some(xhttp) = ingress.wires.xhttp_mut() {
                     if let Some(host) = &client.xhttp_host {
                         xhttp.host.clone_from(host);
@@ -294,6 +303,7 @@ impl SubscriptionClientConfig {
                     if let Some(xmux) = &client.xhttp_xmux {
                         xhttp.xmux.clone_from(xmux);
                     }
+                    client.apply_xhttp_download(xhttp, reality_split)?;
                 }
             }
         }
@@ -384,6 +394,20 @@ impl From<&Ingress> for ClientProjection {
                 .map(ClientProjectionEndpoint::from),
             xhttp_host: xhttp.map(|xhttp| xhttp.host.clone()),
             xhttp_xmux: xhttp.map(|xhttp| xhttp.xmux.clone()),
+            xhttp_download_v4: xhttp.map(|xhttp| {
+                xhttp
+                    .download
+                    .as_ref()
+                    .and_then(|download| download.v4.as_ref())
+                    .map(ClientProjectionDownloadEndpoint::from)
+            }),
+            xhttp_download_v6: xhttp.map(|xhttp| {
+                xhttp
+                    .download
+                    .as_ref()
+                    .and_then(|download| download.v6.as_ref())
+                    .map(ClientProjectionDownloadEndpoint::from)
+            }),
             reality_fingerprint: value
                 .wires
                 .reality()
@@ -397,10 +421,9 @@ impl From<&ProjectionEndpoint> for ClientProjectionEndpoint {
         Self {
             host: value.host.clone(),
             port: value.port,
-            download: value
-                .download
-                .as_ref()
-                .map(ClientProjectionDownloadEndpoint::from),
+            // Historical checkpoints may still contain this nested value and are handled as a
+            // fallback during apply. New checkpoints keep download settings on ClientProjection.
+            download: None,
         }
     }
 }
@@ -417,60 +440,97 @@ impl From<&ProjectionDownloadEndpoint> for ClientProjectionDownloadEndpoint {
 }
 
 impl ClientProjection {
-    fn to_model(&self, serving: &Ingress) -> Result<Projection, String> {
-        let reality_split = matches!(serving.wires.vless(), Some(Transport::VlessRealityXhttp(_)));
+    fn to_model(&self) -> Result<Projection, String> {
         Ok(Projection {
             v4: self
                 .v4
                 .as_ref()
-                .map(|endpoint| endpoint.to_model(serving.projection.v4.as_ref(), reality_split))
+                .map(ClientProjectionEndpoint::to_model)
                 .transpose()?,
             v6: self
                 .v6
                 .as_ref()
-                .map(|endpoint| endpoint.to_model(serving.projection.v6.as_ref(), reality_split))
+                .map(ClientProjectionEndpoint::to_model)
                 .transpose()?,
         })
+    }
+
+    fn apply_xhttp_download(
+        &self,
+        xhttp: &mut crate::model::Xhttp,
+        reality_split: bool,
+    ) -> Result<(), String> {
+        let v4 = self.download_for(
+            self.xhttp_download_v4.as_ref(),
+            self.v4
+                .as_ref()
+                .and_then(|endpoint| endpoint.download.as_ref()),
+            xhttp
+                .download
+                .as_ref()
+                .and_then(|download| download.v4.as_ref()),
+            reality_split,
+        )?;
+        let v6 = self.download_for(
+            self.xhttp_download_v6.as_ref(),
+            self.v6
+                .as_ref()
+                .and_then(|endpoint| endpoint.download.as_ref()),
+            xhttp
+                .download
+                .as_ref()
+                .and_then(|download| download.v6.as_ref()),
+            reality_split,
+        )?;
+        xhttp.download =
+            (v4.is_some() || v6.is_some()).then_some(crate::model::XhttpDownload { v4, v6 });
+        Ok(())
+    }
+
+    fn download_for(
+        &self,
+        configured: Option<&Option<ClientProjectionDownloadEndpoint>>,
+        legacy: Option<&ClientProjectionDownloadEndpoint>,
+        serving: Option<&ProjectionDownloadEndpoint>,
+        reality_split: bool,
+    ) -> Result<Option<ProjectionDownloadEndpoint>, String> {
+        let Some(configured) = configured else {
+            return Ok(serving.cloned().or_else(|| {
+                legacy.map(|legacy| ProjectionDownloadEndpoint {
+                    host: legacy.host.clone(),
+                    port: legacy.port,
+                    origin_port: None,
+                    http_host: legacy.http_host.clone(),
+                    mux: legacy.mux,
+                })
+            }));
+        };
+        let Some(configured) = configured else {
+            return Ok(None);
+        };
+        let origin_port = serving.and_then(|download| download.origin_port);
+        if reality_split && origin_port.is_none() {
+            return Err(
+                "matching REALITY+XHTTP topology has no split download listener".to_owned(),
+            );
+        }
+        Ok(Some(ProjectionDownloadEndpoint {
+            host: configured.host.clone(),
+            port: configured.port,
+            origin_port: reality_split.then_some(origin_port).flatten(),
+            http_host: configured.http_host.clone(),
+            mux: configured.mux,
+        }))
     }
 }
 
 impl ClientProjectionEndpoint {
-    fn to_model(
-        &self,
-        serving: Option<&ProjectionEndpoint>,
-        reality_split: bool,
-    ) -> Result<ProjectionEndpoint, String> {
-        let download = self
-            .download
-            .as_ref()
-            .map(|download| -> Result<ProjectionDownloadEndpoint, String> {
-                let origin_port = if reality_split {
-                    Some(
-                        serving
-                            .and_then(|endpoint| endpoint.download.as_ref())
-                            .ok_or_else(|| {
-                                "matching REALITY+XHTTP topology has no split download listener"
-                                    .to_owned()
-                            })?
-                            .origin_port,
-                    )
-                    .flatten()
-                } else {
-                    None
-                };
-                Ok(ProjectionDownloadEndpoint {
-                    host: download.host.clone(),
-                    port: download.port,
-                    origin_port,
-                    http_host: download.http_host.clone(),
-                    mux: download.mux,
-                })
-            })
-            .transpose()?;
+    fn to_model(&self) -> Result<ProjectionEndpoint, String> {
         Ok(ProjectionEndpoint {
             host: self.host.clone(),
             port: self.port,
-            download,
+            // Legacy nested downloads are read by ClientProjection::apply_xhttp_download.
+            download: None,
         })
     }
 }
@@ -489,16 +549,16 @@ pub fn topology_contract_hash(nodes: &[Node], app_id: &str, ingress: &Ingress) -
     let split_download_ports = if reality_split {
         [
             ingress
-                .projection
-                .v4
-                .as_ref()
-                .and_then(|endpoint| endpoint.download.as_ref())
+                .wires
+                .xhttp()
+                .and_then(|xhttp| xhttp.download.as_ref())
+                .and_then(|download| download.v4.as_ref())
                 .map(ProjectionDownloadEndpoint::node_port),
             ingress
-                .projection
-                .v6
-                .as_ref()
-                .and_then(|endpoint| endpoint.download.as_ref())
+                .wires
+                .xhttp()
+                .and_then(|xhttp| xhttp.download.as_ref())
+                .and_then(|download| download.v6.as_ref())
                 .map(ProjectionDownloadEndpoint::node_port),
         ]
     } else {
