@@ -188,7 +188,7 @@ const XRAY_VERSION: &str = "v26.4.25";
 /// `git describe --always` for the upstream baseline, matching Xray's release workflow banner.
 const XRAY_UPSTREAM_BUILD: &str = "b4f0898";
 /// Xray source is part of this repository. The build must never clone or select an upstream tag.
-const XRAY_SOURCE_DIR: &str = "third_party/xray-core";
+const XRAY_SOURCE_DIR: &str = "components/xray-core";
 /// Escape hatch for locating Go outside PATH.
 const GO_ENV_VAR: &str = "BROCADE_GO";
 /// Everything under `frontend/` whose change makes the built bundle stale, relative to the

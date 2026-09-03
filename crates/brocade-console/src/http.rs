@@ -102,7 +102,7 @@ pub const EMBEDDED_AGENTS: &[(&str, &[u8], &str)] = &[
 ];
 
 /// The Brocade Xray builds carried by this Console. They are compiled from the vendored source in
-/// `third_party/xray-core`; nodes never select or download a community release directly.
+/// `components/xray-core`; nodes never select or download a community release directly.
 pub const EMBEDDED_XRAYS: &[(&str, &[u8], &str)] = &[
     (
         "x86_64",
@@ -4791,7 +4791,7 @@ mod tests {
     fn install_script_has_no_community_xray_fallback() {
         let script_default =
             format!("XRAY_VERSION=${{BROCADE_XRAY_VERSION:-{BROCADE_XRAY_VERSION}}}");
-        let upstream = include_str!("../../../third_party/xray-core/BROCADE_UPSTREAM.toml");
+        let upstream = include_str!("../../../components/xray-core/BROCADE_UPSTREAM.toml");
         let build_script = include_str!("../build.rs");
 
         assert!(INSTALL_SCRIPT.contains(&script_default));

@@ -25,6 +25,7 @@ type Server struct {
 	usersByEmail  map[string]*protocol.MemoryUser
 	userMu        sync.RWMutex
 	paddingScheme string
+	masquerade    *masquerade
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -34,6 +35,11 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		users:         make(map[[32]byte]*protocol.MemoryUser),
 		usersByEmail:  make(map[string]*protocol.MemoryUser),
 		paddingScheme: config.PaddingScheme,
+	}
+	var err error
+	s.masquerade, err = newMasquerade(config.Masquerade)
+	if err != nil {
+		return nil, errors.New("anytls: invalid masquerade").Base(err)
 	}
 	for _, u := range config.Users {
 		mu, err := u.ToMemoryUser()
@@ -57,7 +63,8 @@ func (s *Server) Network() []xnet.Network {
 
 func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	sessPol := s.policyManager.ForLevel(0)
-	_ = conn.SetReadDeadline(time.Now().Add(sessPol.Timeouts.Handshake))
+	handshakeDeadline := time.Now().Add(sessPol.Timeouts.Handshake)
+	_ = conn.SetReadDeadline(handshakeDeadline)
 
 	sess := &session{
 		isClient:   false,
@@ -70,11 +77,24 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	}
 	sess.fw = newFrameWriter(sess.bw)
 	sess.peerVersion = 1
+	failAuthentication := func(err error) error {
+		masquerade := s.masquerade
+		if masquerade == nil {
+			masquerade = defaultMasquerade404()
+		}
+		// The read deadline may already have expired (for example, when a
+		// browser sends an incomplete request). Give the masquerade response
+		// its own bounded write window.
+		_ = conn.SetWriteDeadline(time.Now().Add(sessPol.Timeouts.Handshake))
+		_ = masquerade.write(conn)
+		_ = conn.SetWriteDeadline(time.Time{})
+		return err
+	}
 
 	// auth header: 32B sha256(password) + 2B padlen
 	var h [34]byte
 	if _, err := io.ReadFull(sess.br, h[:]); err != nil {
-		return errors.New("anytls: read auth").Base(err)
+		return failAuthentication(errors.New("anytls: read auth").Base(err))
 	}
 
 	var sum [32]byte
@@ -83,16 +103,17 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	user := s.users[sum]
 	s.userMu.RUnlock()
 	if user == nil {
-		return errors.New("anytls: invalid user")
+		return failAuthentication(errors.New("anytls: invalid user"))
 	}
 
 	padlen := binary.BigEndian.Uint16(h[32:34])
 	if padlen > 0 {
 		if err := discardBytes(sess.br, int(padlen)); err != nil {
-			return errors.New("anytls: read padding0").Base(err)
+			return failAuthentication(errors.New("anytls: read padding0").Base(err))
 		}
 	}
 	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
 
 	inb := sessionctx.InboundFromContext(ctx)
 	inb.Name = protocolName

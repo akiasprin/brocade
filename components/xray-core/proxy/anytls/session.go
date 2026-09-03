@@ -87,11 +87,14 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	bodyReader := bytes.NewReader(body)
 	addr, err := M.SocksaddrSerializer.ReadAddrPort(bodyReader)
 	if err != nil {
-		return err
+		rejectErr := errors.New("anytls: invalid destination address in SYN").Base(err)
+		errors.LogWarning(ctx, "anytls: invalid destination address, streamId=", st.sid, " err=", err)
+		return s.rejectStream(st.sid, rejectErr)
 	}
 	dest := singbridge.ToDestination(addr, net.Network_TCP)
 	if dest.Address == nil {
-		return errors.New("anytls: invalid destination address in SYN")
+		rejectErr := errors.New("anytls: invalid destination address in SYN")
+		return s.rejectStream(st.sid, rejectErr)
 	}
 
 	// Check for UDP-over-TCP v2 magic domain in a new stream request.
@@ -131,6 +134,21 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		}
 	}
 	go s.pumpDownlink(st.sid, l)
+	return nil
+}
+
+// rejectStream reports a fully-read but unusable stream request without
+// tearing down the authenticated session. Frame-level failures still return
+// from readLoop because the peer may no longer be frame-synchronised.
+func (s *session) rejectStream(sid uint32, err error) error {
+	if err == nil {
+		err = errors.New("anytls: stream rejected")
+	}
+	if sendErr := s.sendFrame(&frame{cmd: cmdSYNACK, sid: sid, data: []byte(err.Error())}); sendErr != nil {
+		s.finishStream(sid, sendErr)
+		return sendErr
+	}
+	s.finishStream(sid, err)
 	return nil
 }
 
@@ -346,7 +364,7 @@ func (s *session) close(err error) {
 	}
 }
 
-func (s *session) finishStream(sid uint32, err error) {
+func (s *session) finishStream(sid uint32, err error) bool {
 	s.streamsMu.Lock()
 	st := s.streams[sid]
 	if st != nil {
@@ -355,13 +373,14 @@ func (s *session) finishStream(sid uint32, err error) {
 	s.streamsMu.Unlock()
 
 	if st == nil {
-		return
+		return false
 	}
 
 	if s.client != nil {
 		s.activeStreams.Add(-1)
 	}
 	st.close(err)
+	return true
 }
 
 func (s *session) sendFrame(f *frame) error {
@@ -587,9 +606,14 @@ func (s *session) readLoop(ctx context.Context) error {
 					return err
 				}
 				errors.LogWarning(ctx, "anytls: stream handshake rejected, streamId=", sid, " err=", bodyText)
-				s.finishStream(sid, errors.New(bodyText))
+				rejected := errors.New(bodyText)
+				if s.finishStream(sid, rejected) && !s.isClosed() {
+					if err := s.sendFrame(newFrame(cmdFIN, sid)); err != nil {
+						return err
+					}
+				}
 				if ch != nil {
-					ch <- errors.New(bodyText)
+					ch <- rejected
 				}
 			}
 		case cmdServerSettings:

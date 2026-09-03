@@ -2,7 +2,7 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-xray_root="$repo_root/third_party/xray-core"
+xray_root="$repo_root/components/xray-core"
 asset_dir="${XRAY_ASSET_DIR:-$xray_root/resources}"
 cache_dir="${XRAY_ASSET_CACHE_DIR:-$repo_root/.tools}"
 geodata_base="${BROCADE_GEODATA_BASE:-https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release}"

@@ -82,6 +82,40 @@ func TestAnyTLSClientConfigBuild(t *testing.T) {
 	}
 }
 
+func TestAnyTLSMasqueradeConfigBuild(t *testing.T) {
+	var config AnyTLSServerConfig
+	if err := json.Unmarshal([]byte(`{
+		"users": [{"password": "server-password"}],
+		"masquerade": {
+			"type": "string",
+			"content": "Forbidden",
+			"statusCode": 403,
+			"headers": {"Content-Type": "text/plain"}
+		}
+	}`), &config); err != nil {
+		t.Fatal(err)
+	}
+
+	actual, err := config.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := &proxyanytls.ServerConfig{
+		Users: []*protocol.User{{
+			Account: serial.ToTypedMessage(&proxyanytls.Account{Password: "server-password"}),
+		}},
+		Masquerade: &proxyanytls.Masquerade{
+			Type:       "string",
+			Content:    "Forbidden",
+			StatusCode: 403,
+			Headers:    map[string]string{"Content-Type": "text/plain"},
+		},
+	}
+	if !proto.Equal(actual, expected) {
+		t.Fatalf("server config = %v, want %v", actual, expected)
+	}
+}
+
 func TestAnyTLSConfigRejectsInvalidValues(t *testing.T) {
 	serverTests := []AnyTLSServerConfig{
 		{Users: []*AnyTLSUser{{Password: ""}}},

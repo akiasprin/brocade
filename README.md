@@ -50,7 +50,7 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 | `brocade-probe`      | Agent 与控制面共用的临时 Xray 客户端和端到端拨测执行器     |
 | `brocade-preview`    | 基于 Docker 的本地集群预览环境                             |
 | `frontend`           | React + Vite 控制台                                        |
-| `third_party/xray-core` | Brocade Xray fork 源码；当前钉在官方 `v26.4.25` 基线     |
+| `components/xray-core` | Brocade Xray fork 源码；当前钉在官方 `v26.4.25` 基线     |
 
 生产构建会把前端资源以及 `x86_64`、`aarch64` 两种架构的静态 Agent 和 Brocade Xray 一并嵌入 `brocade-console`。因此，控制面部署只需分发一个二进制文件，前端、API 与节点发行物也不会因独立部署而发生版本漂移。
 
@@ -158,13 +158,13 @@ sudo -u postgres createdb --owner=brocade brocade
 
 ### 3. 安装控制面拨测所需的 Xray
 
-用户页的「授权验证」由控制面使用当前 Serving 中的真实用户授权发起，因此控制面主机也必须安装与机队版本一致的 Brocade Xray。它只作为短生命周期的客户端执行，不运行常驻 Xray 服务。源码固定在仓库的 `third_party/xray-core/`，当前基线为 `v26.4.25`；部署流程不再下载社区 Xray。以下命令在构建机生成 `aarch64` 产物：
+用户页的「授权验证」由控制面使用当前 Serving 中的真实用户授权发起，因此控制面主机也必须安装与机队版本一致的 Brocade Xray。它只作为短生命周期的客户端执行，不运行常驻 Xray 服务。源码固定在仓库的 `components/xray-core/`，当前基线为 `v26.4.25`；部署流程不再下载社区 Xray。以下命令在构建机生成 `aarch64` 产物：
 
 ```sh
 mkdir -p target/brocade-xray
 BROCADE_COMMIT=$(git rev-parse --short=7 HEAD)
 git status --porcelain | grep -q . && BROCADE_COMMIT="${BROCADE_COMMIT}-dirty"
-cd third_party/xray-core
+cd components/xray-core
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=local \
   go build -mod=readonly -trimpath -buildvcs=false -gcflags=all=-l=4 \
   -ldflags="-X github.com/xtls/xray-core/core.build=${BROCADE_COMMIT} -s -w -buildid=" \

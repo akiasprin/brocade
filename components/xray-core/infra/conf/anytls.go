@@ -16,15 +16,34 @@ type AnyTLSUser struct {
 	Email    string `json:"email"`
 }
 
+type AnyTLSMasquerade struct {
+	Type       string            `json:"type"`
+	Content    string            `json:"content"`
+	Headers    map[string]string `json:"headers"`
+	StatusCode int32             `json:"statusCode"`
+}
+
 type AnyTLSServerConfig struct {
-	Users         []*AnyTLSUser `json:"users"`
-	PaddingScheme []string      `json:"paddingScheme"`
+	Users         []*AnyTLSUser     `json:"users"`
+	PaddingScheme []string          `json:"paddingScheme"`
+	Masquerade    *AnyTLSMasquerade `json:"masquerade"`
 }
 
 func (c *AnyTLSServerConfig) Build() (proto.Message, error) {
 	cfg := &anytls.ServerConfig{Users: make([]*protocol.User, 0, len(c.Users))}
 	if len(c.PaddingScheme) > 0 {
 		cfg.PaddingScheme = strings.Join(c.PaddingScheme, "\n")
+	}
+	if c.Masquerade != nil {
+		cfg.Masquerade = &anytls.Masquerade{
+			Type:       c.Masquerade.Type,
+			Content:    c.Masquerade.Content,
+			Headers:    c.Masquerade.Headers,
+			StatusCode: c.Masquerade.StatusCode,
+		}
+		if err := anytls.ValidateMasquerade(cfg.Masquerade); err != nil {
+			return nil, errors.New("ANYTLS: invalid masquerade").Base(err)
+		}
 	}
 	for _, u := range c.Users {
 		if u == nil || u.Password == "" {

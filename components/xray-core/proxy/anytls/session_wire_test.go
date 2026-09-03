@@ -179,6 +179,26 @@ func TestSessionSYNWithBodyReturnsSYNACKError(t *testing.T) {
 	}
 }
 
+func TestSessionInvalidDestinationRejectsOnlyStream(t *testing.T) {
+	s, output := newWireSession(marshalTestFrames(
+		testWireFrame{cmd: cmdSYN, sid: 7},
+		testWireFrame{cmd: cmdPSH, sid: 7, data: []byte{0xff, 0xff, 0xff}},
+		testWireFrame{cmd: cmdWaste, sid: 0, data: []byte("still aligned")},
+	), false)
+	s.handshakeDone = true
+
+	if err := s.readLoop(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("readLoop error = %v, want EOF after continuing past rejected stream", err)
+	}
+	frames := parseTestFrames(t, output.Bytes())
+	if len(frames) != 1 || frames[0].cmd != cmdSYNACK || frames[0].sid != 7 || !strings.Contains(string(frames[0].data), "invalid destination address in SYN") {
+		t.Fatalf("invalid destination response = %+v", frames)
+	}
+	if _, ok := s.streams[7]; ok {
+		t.Fatal("rejected stream remained registered")
+	}
+}
+
 func TestSessionFINClosesStream(t *testing.T) {
 	s, output := newWireSession(marshalTestFrames(testWireFrame{cmd: cmdFIN, sid: 4}), false)
 	st := newStream(4, nil)

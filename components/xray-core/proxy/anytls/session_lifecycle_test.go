@@ -219,7 +219,8 @@ func TestSessionSYNACKSignalsSuccessAndRejection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, _ := newWireSession(marshalTestFrames(testWireFrame{cmd: cmdSYNACK, sid: 7, data: tt.data}), true)
+			s, output := newWireSession(marshalTestFrames(testWireFrame{cmd: cmdSYNACK, sid: 7, data: tt.data}), true)
+			s.streams[7] = newStream(7, nil)
 			resultCh := make(chan error, 1)
 			s.synAckCh[7] = resultCh
 			if err := s.readLoop(context.Background()); !errors.Is(err, io.EOF) {
@@ -230,10 +231,17 @@ func TestSessionSYNACKSignalsSuccessAndRejection(t *testing.T) {
 				if result != nil {
 					t.Fatalf("SYNACK result = %v, want nil", result)
 				}
+				if frames := parseTestFrames(t, output.Bytes()); len(frames) != 0 {
+					t.Fatalf("successful SYNACK emitted frames: %+v", frames)
+				}
 				return
 			}
 			if result == nil || !strings.Contains(result.Error(), tt.wantResult) {
 				t.Fatalf("SYNACK result = %v, want text %q", result, tt.wantResult)
+			}
+			frames := parseTestFrames(t, output.Bytes())
+			if len(frames) != 1 || frames[0].cmd != cmdFIN || frames[0].sid != 7 || len(frames[0].data) != 0 {
+				t.Fatalf("rejected SYNACK did not emit FIN: %+v", frames)
 			}
 		})
 	}
