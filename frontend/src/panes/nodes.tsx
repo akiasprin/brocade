@@ -1008,8 +1008,8 @@ export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onC
   );
 }
 
-// 列表保留最近 24 个实际样本，使离线机器仍能显示停机前的最终趋势。返回范围来自这些
-// 样本自己的时间戳，曲线不会被平移到当前时刻；在线/离线由独立的活性状态表达。
+// 列表保留最近 24 个实际样本并按窗口槽位绘制。这里表达的是停机前最后一段趋势，不承担
+// 在线状态或墙上时间定位；在线/离线由机器卡已有的独立活性状态表达。
 const LIST_NIC_WINDOWS = 24;
 const LIST_NIC_WINDOW_SECS = 30;
 // 上一版的最低尺度是 1 Mbit/s。改为每窗口字节数后做等价换算，避免只因换单位就改变曲线高度。
@@ -1114,21 +1114,16 @@ function TcpProbeP95({ view, pending = false }: { view?: NodePingProbeView; pend
 }
 
 function NicWave({ load }: { load?: NodeLoadView }) {
-  const rangeStart = load?.range_start_unix_secs ?? 0;
-  const rangeEnd = load?.range_end_unix_secs ?? 0;
-  const rangeSpan = rangeEnd - rangeStart;
-  const samples = (load?.series ?? []).filter(
-    sample => sample.window_end_unix_secs > rangeStart && sample.window_start_unix_secs < rangeEnd,
-  );
+  const samples = (load?.series ?? []).slice(-LIST_NIC_WINDOWS);
   const label = 'NIC · 30 秒 / 窗口';
   const windowBytes = (sample: LoadSample) => {
     const seconds = sample.window_end_unix_secs - sample.window_start_unix_secs;
     return ((sample.nic_rx_bps + sample.nic_tx_bps) * seconds) / 8;
   };
   const valid = samples
-    .map(sample => ({ sample, value: windowBytes(sample) }))
+    .map((sample, index) => ({ sample, index, value: windowBytes(sample) }))
     .filter(point => !point.sample.has_gap && Number.isFinite(point.value) && point.value >= 0);
-  if (valid.length === 0 || rangeSpan <= 0) {
+  if (valid.length === 0) {
     return (
       <div className="history-plot node-nic-plot empty">
         <span className="plot-label">{label} · 尚无样本</span>
@@ -1138,8 +1133,9 @@ function NicWave({ load }: { load?: NodeLoadView }) {
 
   const W = 100;
   const H = 36;
-  const xOf = (sample: LoadSample) =>
-    (Math.max(0, Math.min(rangeSpan, sample.window_end_unix_secs - rangeStart)) * W) / rangeSpan;
+  // 样本不足 24 个时靠右放：右缘是最后一个窗口，新纳管机器不应把两个点拉满整张图。
+  const slotOffset = LIST_NIC_WINDOWS - samples.length;
+  const xOf = (index: number) => ((slotOffset + index) * W) / (LIST_NIC_WINDOWS - 1);
   const max = valid.reduce((top, point) => (point.value > top ? point.value : top), 0);
   const min = valid.reduce((bottom, point) => (point.value < bottom ? point.value : bottom), valid[0].value);
   const ceiling = Math.max(LIST_NIC_MIN_CEILING_BYTES, max);
@@ -1156,14 +1152,14 @@ function NicWave({ load }: { load?: NodeLoadView }) {
       segment = [];
       continue;
     }
-    segment.push({ x: xOf(sample), y: yOf(value) });
+    segment.push({ x: xOf(index), y: yOf(value) });
   }
   if (segment.length > 0) segments.push(segment);
 
   const maxPoint = valid.reduce((picked, point) => (point.value > picked.value ? point : picked));
   const minPoint = valid.reduce((picked, point) => (point.value <= picked.value ? point : picked));
   const marker = (kind: '最高' | '最低' | 'NIC', point: (typeof valid)[number], position: 'max' | 'min') => {
-    const x = xOf(point.sample);
+    const x = xOf(point.index);
     const y = yOf(point.value);
     // tooltip 宽约占小图的三分之一，14% 才贴边会在 268px 卡片上溢出约 10px。
     const edge = x < 22 ? ' edge-left' : x > 78 ? ' edge-right' : '';
