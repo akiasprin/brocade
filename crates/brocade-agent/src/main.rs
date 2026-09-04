@@ -552,7 +552,7 @@ fn phantun_runtime(path: &Path) -> WorkloadRuntime {
 }
 
 fn xray_runtime(content: &str) -> WorkloadRuntime {
-    let running = command_success("pgrep", &["-x", "xray"]);
+    let running = xray_running();
     if !running {
         return classify_workload_runtime(false, None, []);
     }
@@ -2265,7 +2265,7 @@ fn converge_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> Result<()
             // branch runs. That is what makes the swap an optimization rather than a
             // second source of truth: it removes a restart, and a failed swap costs only
             // the restart it was avoiding.
-            if command_success("pgrep", &["-x", "xray"]) && !splice_mode_changed && bounded_log {
+            if xray_running() && !splice_mode_changed && bounded_log {
                 if let Some(swap) = previous
                     .as_deref()
                     .and_then(|previous| hot_swap(previous, content))
@@ -2285,7 +2285,7 @@ fn converge_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> Result<()
             Ok(())
         }
         DesiredArtifact::Disabled { reason } => {
-            let _ = run_shell("pkill -x xray 2>/dev/null || true")?;
+            terminate_xray()?;
             let _ = fs::remove_file("/tmp/brocade-agent-xray.log");
             let _ = fs::remove_file(state_dir.join("xray.json"));
             let _ = fs::remove_file(state_dir.join(XRAY_BOUNDED_LOG_MARKER));
@@ -2438,18 +2438,23 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     let pipeline = shell_quote(&format!("{launch} 2>&1 | {sink}"));
     let log = shell_quote(&log_path.display().to_string());
     run_command("xray", &["-test", "-config", &path.display().to_string()])?;
+    // Xray closes its listeners as soon as SIGTERM starts the synchronous feature teardown.
+    // Waiting for that teardown before launching the replacement makes the entire wait a service
+    // outage. Bound the graceful phase tightly, then kill a stuck old process; a configuration
+    // restart cannot preserve its sessions in either case.
+    terminate_xray()?;
     run_shell(&format!(
         "set -eu\n\
-         pkill -x xray 2>/dev/null || true\n\
-         for _ in $(seq 1 40); do pgrep -x xray >/dev/null 2>&1 || break; sleep 0.25; done\n\
          nohup sh -c {pipeline} >/dev/null 2>&1 &\n\
+         launcher=$!\n\
          port_up() {{\n\
            if command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -q ':{api_port} ';\n\
            else netstat -ltn 2>/dev/null | grep -q ':{api_port} '; fi\n\
          }}\n\
-         for _ in $(seq 1 80); do\n\
+         for _ in $(seq 1 400); do\n\
            port_up && exit 0\n\
-           sleep 0.25\n\
+           kill -0 \"$launcher\" 2>/dev/null || break\n\
+           sleep 0.05\n\
          done\n\
          cat {log} 2>/dev/null || true\n\
          exit 1"
@@ -2597,7 +2602,7 @@ fn observe_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> AppliedArt
     let disabled_path = state_dir.join("xray.disabled");
     let has_config = path.exists();
     let has_disabled_marker = disabled_path.exists();
-    let has_xray = command_success("pgrep", &["-x", "xray"]);
+    let has_xray = xray_running();
 
     match (has_config, has_disabled_marker, has_xray) {
         (true, true, _) => artifact_dirty("xray.json and xray.disabled both exist"),
@@ -3145,41 +3150,139 @@ fn parse_xray_stat_name(name: &str) -> Option<(&str, &str)> {
 #[derive(Debug, Clone)]
 struct XrayProcessIdentity {
     started_at_unix_secs: i64,
-    start_ticks: u64,
     epoch: String,
 }
 
-fn xray_process_identity() -> Result<XrayProcessIdentity, String> {
-    // `pgrep` exits 1 when nothing matches, which `run_command` turns into an error with no
-    // stderr, giving no information in the agent log. This replaces it with an explicit
-    // message.
-    let pids = run_command("pgrep", &["-x", "xray"])
-        .map_err(|_| "xray process is not running".to_owned())?;
-    let mut oldest: Option<XrayProcessIdentity> = None;
-    let mut last_error = None;
-    for pid in pids.split_whitespace() {
-        // A process that exits between `pgrep` and reading its `stat` is expected rather than a
-        // failure, because the short-lived processes make up most of the list.
-        match xray_process_identity_from_proc(pid) {
-            Ok(identity) => {
-                if oldest.as_ref().is_none_or(|seen| {
-                    (identity.started_at_unix_secs, identity.start_ticks)
-                        < (seen.started_at_unix_secs, seen.start_ticks)
-                }) {
-                    oldest = Some(identity);
-                }
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    oldest.ok_or_else(|| last_error.unwrap_or_else(|| "xray process is not running".to_owned()))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessRef {
+    pid: libc::pid_t,
+    start_ticks: u64,
 }
 
-fn xray_process_identity_from_proc(pid: &str) -> Result<XrayProcessIdentity, String> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat = fs::read_to_string(&stat_path)
-        .map_err(|error| format!("failed to read {stat_path}: {error}"))?;
-    let start_ticks = parse_proc_stat_start_ticks(&stat)?;
+const XRAY_TERM_GRACE: Duration = Duration::from_millis(250);
+const XRAY_KILL_GRACE: Duration = Duration::from_millis(250);
+const PROCESS_EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Every live process whose kernel name is exactly `name`.
+///
+/// `pgrep` is deliberately not used here. It includes zombies, and Xray processes orphaned by
+/// the nohup pipeline can remain zombies after all sockets and memory have already gone away. A
+/// restart that waits for `pgrep` to become empty therefore waits for the parent to reap a process,
+/// not for the old listener to release its port.
+fn live_processes_named(name: &str) -> Vec<ProcessRef> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<libc::pid_t>().ok()?;
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+            if comm.trim() != name {
+                return None;
+            }
+            process_ref(pid)
+        })
+        .collect()
+}
+
+fn process_ref(pid: libc::pid_t) -> Option<ProcessRef> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (state, start_ticks) = parse_proc_stat(&stat).ok()?;
+    (state != 'Z').then_some(ProcessRef { pid, start_ticks })
+}
+
+fn process_is_live(process: ProcessRef) -> bool {
+    process_ref(process.pid).is_some_and(|current| current.start_ticks == process.start_ticks)
+}
+
+fn xray_running() -> bool {
+    !live_processes_named("xray").is_empty()
+}
+
+fn signal_processes(processes: &[ProcessRef], signal: libc::c_int) -> Result<(), String> {
+    for process in processes {
+        // Do not signal a PID that has been recycled since the snapshot. The second check cannot
+        // make kill and /proc atomic, but it narrows that race to the few instructions between
+        // them; starttime is the kernel identity available without retaining a pidfd.
+        if !process_is_live(*process) {
+            continue;
+        }
+        // SAFETY: `pid` came from /proc, is positive, and refers to one process rather than a
+        // process group. ESRCH only means it exited between the identity check and this call.
+        if unsafe { libc::kill(process.pid, signal) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!(
+                    "signal xray pid {} with {signal}: {error}",
+                    process.pid
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_process_exit(processes: &[ProcessRef], timeout: Duration) -> Vec<ProcessRef> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let survivors = processes
+            .iter()
+            .copied()
+            .filter(|process| process_is_live(*process))
+            .collect::<Vec<_>>();
+        if survivors.is_empty() || Instant::now() >= deadline {
+            return survivors;
+        }
+        thread::sleep(PROCESS_EXIT_POLL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+/// Stop the old Xray without allowing graceful teardown to become prolonged downtime.
+fn terminate_processes(
+    processes: &[ProcessRef],
+    term_grace: Duration,
+    kill_grace: Duration,
+) -> Result<(), String> {
+    if processes.is_empty() {
+        return Ok(());
+    }
+    signal_processes(processes, libc::SIGTERM)?;
+    let survivors = wait_for_process_exit(processes, term_grace);
+    if survivors.is_empty() {
+        return Ok(());
+    }
+    signal_processes(&survivors, libc::SIGKILL)?;
+    let survivors = wait_for_process_exit(&survivors, kill_grace);
+    if survivors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "xray 进程在 SIGKILL 后仍未退出：{}",
+            survivors
+                .iter()
+                .map(|process| process.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+fn terminate_xray() -> Result<(), String> {
+    terminate_processes(
+        &live_processes_named("xray"),
+        XRAY_TERM_GRACE,
+        XRAY_KILL_GRACE,
+    )
+}
+
+fn xray_process_identity() -> Result<XrayProcessIdentity, String> {
+    // The serving instance is the oldest live Xray by construction. Excluding zombies before
+    // choosing the oldest matters: the leftover zombie is normally older than its replacement.
+    let process = live_processes_named("xray")
+        .into_iter()
+        .min_by_key(|process| process.start_ticks)
+        .ok_or("xray process is not running")?;
     let btime = fs::read_to_string("/proc/stat")
         .map_err(|error| format!("failed to read /proc/stat: {error}"))?
         .lines()
@@ -3196,27 +3299,31 @@ fn xray_process_identity_from_proc(pid: &str) -> Result<XrayProcessIdentity, Str
         .filter(|value| *value > 0)
         .unwrap_or(100);
     let started = btime
-        .checked_add(start_ticks / clock_ticks)
+        .checked_add(process.start_ticks / clock_ticks)
         .ok_or("xray start time overflow")?;
     Ok(XrayProcessIdentity {
         started_at_unix_secs: i64::try_from(started)
             .map_err(|_| "xray start time is out of range".to_owned())?,
-        start_ticks,
-        epoch: format!("{btime}:{start_ticks}"),
+        epoch: format!("{btime}:{}", process.start_ticks),
     })
 }
 
-fn parse_proc_stat_start_ticks(stat: &str) -> Result<u64, String> {
+fn parse_proc_stat(stat: &str) -> Result<(char, u64), String> {
     let after_comm = stat
         .rsplit_once(") ")
         .map(|(_, rest)| rest)
         .ok_or("proc stat is missing process comm")?;
-    after_comm
-        .split_whitespace()
-        .nth(19)
+    let fields = after_comm.split_whitespace().collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|value| value.chars().next())
+        .ok_or("proc stat is missing process state")?;
+    let start_ticks = fields
+        .get(19)
         .ok_or("proc stat is missing starttime")?
         .parse::<u64>()
-        .map_err(|error| format!("failed to parse proc stat starttime: {error}"))
+        .map_err(|error| format!("failed to parse proc stat starttime: {error}"))?;
+    Ok((state, start_ticks))
 }
 
 fn current_unix_secs() -> Result<i64, String> {
@@ -3603,15 +3710,18 @@ mod tests {
     use std::{
         collections::BTreeMap,
         env, fs,
-        io::{Read, Write},
-        net::TcpListener,
-        path::PathBuf,
+        io::{ErrorKind, Read, Write},
+        net::{TcpListener, TcpStream},
+        os::unix::process::ExitStatusExt,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
         thread,
+        time::{Duration, Instant},
     };
 
     use super::{
-        converge_artifact, grants_drifted_in, observed_inbounds, parse_proc_stat_start_ticks,
-        route_headers, sha256_hex, usage_counters_from_stats,
+        converge_artifact, grants_drifted_in, observed_inbounds, route_headers, sha256_hex,
+        usage_counters_from_stats,
     };
     use crate::http::{
         decode_chunked_body, parse_http_response, HttpClient, MAX_HTTP_RESPONSE_BYTES,
@@ -4528,9 +4638,264 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
     }
 
     #[test]
-    fn parses_proc_stat_start_ticks() {
-        let stat = "267 (xray) S 1 190 190 0 -1 4194304 4733 0 1 0 11 2 0 0 20 0 22 0 6594102 1331986432 9415";
-        assert_eq!(parse_proc_stat_start_ticks(stat).unwrap(), 6594102);
+    fn parses_proc_stat_state_and_start_ticks() {
+        let live = "267 (xray) S 1 190 190 0 -1 4194304 4733 0 1 0 11 2 0 0 20 0 22 0 6594102 1331986432 9415";
+        let zombie = "481 (xray) Z 1 481 481 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 29695008";
+
+        assert_eq!(super::parse_proc_stat(live).unwrap(), ('S', 6594102));
+        assert_eq!(super::parse_proc_stat(zombie).unwrap(), ('Z', 29695008));
+    }
+
+    #[test]
+    fn a_zombie_does_not_count_as_a_live_process() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id() as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let became_zombie = loop {
+            let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| super::parse_proc_stat(&stat).ok())
+                .map(|(state, _)| state);
+            if state == Some('Z') {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let considered_live = super::process_ref(pid);
+        let _ = child.wait();
+
+        assert!(
+            became_zombie,
+            "short-lived child was not observed as a zombie"
+        );
+        assert_eq!(considered_live, None);
+    }
+
+    #[test]
+    fn a_stuck_process_is_killed_after_the_short_grace_period() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; printf r; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn TERM-ignoring child");
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .take()
+            .expect("child stdout")
+            .read_exact(&mut ready)
+            .expect("wait until TERM is ignored");
+        let process = super::process_ref(child.id() as libc::pid_t).expect("live child");
+        let started = Instant::now();
+
+        super::terminate_processes(
+            &[process],
+            Duration::from_millis(20),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        let status = child.wait().expect("reap killed child");
+
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stuck shutdown exceeded its bound"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository's pinned Xray binary"]
+    fn native_xray_restart_restores_listening_without_waiting_for_its_zombie() {
+        fn start_xray(binary: &Path, config: &Path) -> Result<std::process::Child, String> {
+            Command::new(binary)
+                .args([
+                    "run",
+                    "-config",
+                    config.to_str().ok_or("non-UTF-8 config path")?,
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("start native xray: {error}"))
+        }
+
+        fn wait_for_xray(child: &mut std::process::Child, port: u16) -> Result<TcpStream, String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+                    return Ok(stream);
+                }
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|error| format!("poll native xray: {error}"))?
+                {
+                    return Err(format!("native xray exited before listening: {status}"));
+                }
+                if Instant::now() >= deadline {
+                    return Err("native xray did not listen within 5 seconds".to_owned());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn closed_connection_shape(mut connection: TcpStream) -> Result<&'static str, String> {
+            connection
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .map_err(|error| error.to_string())?;
+            let mut bytes = [0_u8; 1024];
+            loop {
+                match connection.read(&mut bytes) {
+                    Ok(0) => return Ok("EOF/FIN"),
+                    Ok(_) => continue,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        return Ok("reset")
+                    }
+                    Err(error) => return Err(format!("old connection stayed open: {error}")),
+                }
+            }
+        }
+
+        fn wait_for_forwarded_connection(listener: &TcpListener) -> Result<TcpStream, String> {
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| error.to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Ok(stream),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(format!("accept xray forwarding: {error}")),
+                }
+                if Instant::now() >= deadline {
+                    return Err("xray did not forward the test connection within 5 seconds".into());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/xray");
+        assert!(binary.exists(), "{} is missing", binary.display());
+        let api_port = TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve API port")
+            .local_addr()
+            .expect("read API port")
+            .port();
+        let inbound_port = TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve inbound port")
+            .local_addr()
+            .expect("read inbound port")
+            .port();
+        let target_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind forwarding target");
+        let target_port = target_listener
+            .local_addr()
+            .expect("read forwarding target port")
+            .port();
+        let directory = test_state_dir("native-xray-restart");
+        let config = directory.join("xray.json");
+        fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({
+                "log": { "loglevel": "warning" },
+                "api": { "tag": "api", "services": ["HandlerService", "StatsService"] },
+                "stats": {},
+                "inbounds": [
+                    {
+                        "tag": "api",
+                        "listen": "127.0.0.1",
+                        "port": api_port,
+                        "protocol": "dokodemo-door",
+                        "settings": { "address": "127.0.0.1" }
+                    },
+                    {
+                        "tag": "test-data",
+                        "listen": "127.0.0.1",
+                        "port": inbound_port,
+                        "protocol": "dokodemo-door",
+                        "settings": {
+                            "address": "127.0.0.1",
+                            "port": target_port,
+                            "network": "tcp"
+                        }
+                    }
+                ],
+                "outbounds": [{ "tag": "direct", "protocol": "freedom" }],
+                "routing": { "rules": [{
+                    "type": "field",
+                    "inboundTag": ["api"],
+                    "outboundTag": "api"
+                }] }
+            }))
+            .expect("encode native xray config"),
+        )
+        .expect("write native xray config");
+
+        let mut old = start_xray(&binary, &config).expect("start old xray");
+        let mut replacement = None;
+        let result = (|| -> Result<(), String> {
+            drop(wait_for_xray(&mut old, api_port)?);
+            let mut old_connection = TcpStream::connect(("127.0.0.1", inbound_port))
+                .map_err(|error| format!("connect through old xray: {error}"))?;
+            old_connection
+                .write_all(b"u")
+                .map_err(|error| format!("write through old xray: {error}"))?;
+            let mut target_connection = wait_for_forwarded_connection(&target_listener)?;
+            let mut byte = [0_u8; 1];
+            target_connection
+                .read_exact(&mut byte)
+                .map_err(|error| format!("read xray-forwarded byte: {error}"))?;
+            target_connection
+                .write_all(b"d")
+                .map_err(|error| format!("write xray-forwarded byte: {error}"))?;
+            old_connection
+                .read_exact(&mut byte)
+                .map_err(|error| format!("read through old xray: {error}"))?;
+            let process =
+                super::process_ref(old.id() as libc::pid_t).ok_or("old native xray is not live")?;
+            let outage_started = Instant::now();
+            super::terminate_processes(&[process], super::XRAY_TERM_GRACE, super::XRAY_KILL_GRACE)?;
+            let stopped_after = outage_started.elapsed();
+            let old_connection = closed_connection_shape(old_connection)?;
+
+            replacement = Some(start_xray(&binary, &config)?);
+            let replacement_process = replacement.as_mut().expect("replacement assigned");
+            drop(wait_for_xray(replacement_process, api_port)?);
+            let unavailable_for = outage_started.elapsed();
+            eprintln!(
+                "native xray restart: stop={stopped_after:?}, listen restored={unavailable_for:?}, old connection={old_connection}"
+            );
+
+            if stopped_after > Duration::from_millis(500) {
+                return Err(format!(
+                    "native xray stop exceeded 500ms: {stopped_after:?}"
+                ));
+            }
+            if unavailable_for > Duration::from_secs(2) {
+                return Err(format!(
+                    "native xray listening gap exceeded 2s: {unavailable_for:?}"
+                ));
+            }
+            Ok(())
+        })();
+
+        let _ = old.kill();
+        let _ = old.wait();
+        if let Some(child) = replacement.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(directory);
+        result.unwrap();
     }
 
     #[test]
