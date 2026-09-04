@@ -765,6 +765,16 @@ fn push_anytls_proxy(
     lines.push(format!("    sni: {}", scalar(&anytls.server_name)));
     lines.push("    tls: true".to_owned());
     lines.push("    udp: true".to_owned());
+    // Mihomo models both time values as integer seconds rather than duration strings.
+    if let Some(value) = anytls.settings.idle_session_check_interval_secs {
+        lines.push(format!("    idle-session-check-interval: {value}"));
+    }
+    if let Some(value) = anytls.settings.idle_session_timeout_secs {
+        lines.push(format!("    idle-session-timeout: {value}"));
+    }
+    if let Some(value) = anytls.settings.min_idle_session {
+        lines.push(format!("    min-idle-session: {value}"));
+    }
 }
 
 fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProxy) {

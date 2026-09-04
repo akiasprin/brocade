@@ -7,9 +7,9 @@ use brocade_core::{
         system::compile_system,
     },
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, HopDial, HopEncryption,
-        HopIn, HopPool, HopWire, Ingress, IngressWires, IpFamily, ModelSnapshot, Node, Reality,
-        Rule, Step, Transport, User, WireGuardKeys,
+        Accept, Action, AppView, Chain, DestMatch, DisabledWireGuardLink, Dns, DomainStrategy,
+        HopDial, HopEncryption, HopIn, HopPool, HopWire, Ingress, IngressWires, IpFamily,
+        ModelSnapshot, Node, Reality, Rule, Step, Transport, User, WireGuardKeys,
     },
     Level,
 };
@@ -633,6 +633,39 @@ fn a_hop_over_the_overlay_without_a_link_is_rejected() {
     assert!(sys.links.is_empty(), "{:#?}", sys.links);
     assert!(
         diagnostics.iter().all(|d| d.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+
+    let rir = compile_app(&doc, &two_hop_app(), &mut diagnostics);
+    let rir = compile_hops(rir, &sys, &mut diagnostics);
+
+    assert!(rir.hops.is_empty());
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code == "hop.unreachable" && d.level == Level::Error),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_hop_over_an_explicitly_disabled_wireguard_link_is_rejected() {
+    let mut doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("sg", [10, 66, 0, 2], true),
+    ]);
+    doc.settings.overlay.disabled_links = vec![DisabledWireGuardLink {
+        a: "hk".to_owned(),
+        b: "sg".to_owned(),
+    }];
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+
+    assert!(sys.links.is_empty());
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code == "link.disabled" && d.level == Level::Info),
         "{diagnostics:#?}"
     );
 

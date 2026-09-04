@@ -3325,14 +3325,19 @@ async fn restore_app_tx(
         sqlx::query(
             "INSERT INTO ingress_client_settings (
                  ingress_id, reality_fingerprint, xhttp_host, xhttp_xmux,
-                 xhttp_download_v4, xhttp_download_v6
-             ) VALUES ($1, $2, $3, $4, $5, $6)
+                 xhttp_download_v4, xhttp_download_v6,
+                 anytls_idle_session_check_interval, anytls_idle_session_timeout,
+                 anytls_min_idle_session
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (ingress_id) DO UPDATE SET
                  reality_fingerprint = EXCLUDED.reality_fingerprint,
                  xhttp_host = EXCLUDED.xhttp_host,
                  xhttp_xmux = EXCLUDED.xhttp_xmux,
                  xhttp_download_v4 = EXCLUDED.xhttp_download_v4,
                  xhttp_download_v6 = EXCLUDED.xhttp_download_v6,
+                 anytls_idle_session_check_interval = EXCLUDED.anytls_idle_session_check_interval,
+                 anytls_idle_session_timeout = EXCLUDED.anytls_idle_session_timeout,
+                 anytls_min_idle_session = EXCLUDED.anytls_min_idle_session,
                  updated_at = now()",
         )
         .bind(&ingress.id)
@@ -3346,6 +3351,21 @@ async fn restore_app_tx(
         )
         .bind(xhttp_download_v4)
         .bind(xhttp_download_v6)
+        .bind(
+            anytls
+                .and_then(|settings| settings.idle_session_check_interval_secs)
+                .map(i64::from),
+        )
+        .bind(
+            anytls
+                .and_then(|settings| settings.idle_session_timeout_secs)
+                .map(i64::from),
+        )
+        .bind(
+            anytls
+                .and_then(|settings| settings.min_idle_session)
+                .map(i64::from),
+        )
         .execute(&mut **tx)
         .await?;
     }

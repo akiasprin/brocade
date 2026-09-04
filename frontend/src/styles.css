@@ -2872,28 +2872,206 @@ input.f::placeholder {
 }
 /* 观测是 C2 的主工作区，不再使用「不可编辑」的虚线语义。卡片保持实线，并用一层很轻的
    观测底色与右侧配置卡区分；告警仍由卡内的金色 / 红色承担。 */
-.b-col.observed > .panel,
-.nd-observed-status > .panel {
+.b-col.observed > .panel {
   border-color: var(--line);
 }
-.nd-observed-status {
+
+/* ═══ 运行状态卡：AGENT / HOST / CONFIG 三条横带 ═══
+ *
+ * 此前是并排的三张卡（`.nd-observed-status`，1200px 以上三栏）。卡宽约 380px，标签列
+ * 占 72px，而值多为 4–12 个字符（约 90px），每行右侧约 210px 空置，24 行即整块的空白
+ * 来源。并排还使三卡各自计算标签列宽（`grid-template-columns: max-content …`），值列
+ * 起点落在三个不同的 x；三卡行数 8 / 9 / 7，等高拉伸后剩余空白全部堆在最短的那张下缘。
+ *
+ * 现在是一张整宽卡、一条标题条，三个数据来源改由横带左侧的边栏区分。字段是标签在值
+ * 上方的单元格：标签与值不再争同一行的宽度，长值（CPU 型号、发行版、内核）不必截断。 */
+.nd-runtime > header h4 {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.nd-rt-head-ic,
+.nd-rt-bl-ic,
+.nd-rt-chip-ic,
+.nd-rt-hot-ic {
+  display: inline-flex;
+  flex: none;
+}
+/* Icon 组件固定 1.5 描边，在 9–10px 下被缩到 0.85px；低于一个物理像素后渲染为灰线。 */
+.nd-rt-chip-ic svg,
+.nd-rt-hot-ic svg {
+  stroke-width: 2.1;
+}
+
+/* 一条横带。窄容器下边栏压到字段上方一行：74px 边栏加 18px 间距合计 92px，
+   在 720px 容器里是内容宽度的 15%，而它承载的是带名，不是读数。 */
+.nd-rt-band {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
+  gap: 6px 0;
+  padding: 10px 0;
 }
-.nd-observed-status > .panel {
-  min-width: 0;
+.nd-rt-band:first-of-type {
+  padding-top: 0;
+}
+.nd-rt-band:last-of-type {
+  padding-bottom: 0;
+}
+.nd-rt-band + .nd-rt-band {
+  border-top: 1px solid var(--line-soft);
+}
+.nd-rt-bl {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding-top: 1px;
+}
+.nd-rt-bl b {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font: 600 10px var(--mono);
+  letter-spacing: 0.12em;
+  color: var(--ink-3);
+}
+/* 每条带自带时效读数：三条带的来源不同（agent 轮询 / 负载上报 / 收敛观测），
+   合并成一张卡后不能只在卡头写一个时间。 */
+.nd-rt-bl i {
+  font: normal 10px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-4);
+  white-space: nowrap;
+}
+.nd-rt-empty {
   margin: 0;
 }
-/* AGENT/HOST/CONFIGURATIONS 三卡的标题与历史指标面板共用排版，具体规则见
-   `.history-chart-cap > b`；这里仅负责标题行的垂直对齐。 */
-.nd-observed-status > .panel > header {
-  align-items: center;
+
+/* 字段网格。栏数随容器宽度递减：栏数固定时窄容器压窄的是每一格，而格内的值长度不变，
+   结果是 CPU / 发行版 / 内核 / 构建 同时被截断——版面还在，内容读不到。
+   跨栏数同步收窄：跨 5 栏的状态带在只有 2 栏时会溢出容器。 */
+.nd-rt-cells {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+  margin: 0;
 }
-/* 三卡并列时行分隔线密度高，淡一档。 */
-.nd-observed-status .fstrip .k,
-.nd-observed-status .fstrip .v {
-  border-top-color: color-mix(in srgb, var(--line-soft) 62%, transparent);
+.nd-rt-c {
+  min-width: 0;
+}
+.nd-rt-c.w2,
+.nd-rt-c.w3,
+.nd-rt-c.w5 {
+  grid-column: span 2;
+}
+.nd-rt-cells dt {
+  font: 500 9.5px/1.5 var(--sans);
+  letter-spacing: 0.07em;
+  color: var(--ink-4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 值列一律等宽：这一列全是读数——时间、版本、构建号、条数。混排时中文项用正文字体、
+   ASCII 项用等宽，同一列出现两种字宽，纵向扫读时列宽在跳。 */
+.nd-rt-cells dd {
+  margin: 0;
+  font: 500 12.5px/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nd-rt-cells dd .dim {
+  color: var(--ink-4);
+}
+/* 状态带自己换行，不参与值列的截断。 */
+.nd-rt-c:has(.nd-rt-chips) dd {
+  white-space: normal;
+  overflow: visible;
+}
+.nd-rt-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.st.nd-rt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 0;
+  padding-left: 6px;
+  line-height: 14px;
+  vertical-align: 0;
+}
+/* 同一字段的第二个取值（核数 / 虚拟化 / 架构 / 修订号）。不是单位，因此保留等宽
+   并只降色阶，用间隔点与主值分开。 */
+.nd-rt-q {
+  color: var(--ink-4);
+}
+.nd-rt-q::before {
+  content: '·';
+  margin: 0 5px;
+}
+/* 单位后缀。读数是数字，单位是注解：中文在等宽字体下字宽与数字不成比例，
+   「96 项」整体按等宽渲染时两段字宽对不上。 */
+.nd-rt-u {
+  margin-left: 3px;
+  font: 400 10.5px var(--sans);
+  letter-spacing: 0;
+  color: var(--ink-4);
+}
+/* 判定结果的着色。styles.css 中没有裸 `.hot` 规则（只有 .plate.hot 这类作用域版本），
+   此前时钟偏移超阈值 / 丢弃 >0 / 协议旧版 / 构建号读不出四处渲染为普通文字。
+   在这里补上，并由 Hot 组件同时给出一个形状，使异常项不依赖颜色也能定位。 */
+.nd-runtime .hot {
+  color: var(--gold);
+}
+.nd-runtime .hot .nd-rt-hot-ic {
+  vertical-align: -1.5px;
+  margin-right: 3px;
+}
+
+@container (min-width: 640px) {
+  .nd-rt-band {
+    grid-template-columns: 74px minmax(0, 1fr);
+    gap: 0 18px;
+  }
+  .nd-rt-bl {
+    display: block;
+    text-align: right;
+  }
+  .nd-rt-bl b {
+    justify-content: flex-end;
+  }
+  .nd-rt-bl i {
+    display: block;
+    margin-top: 2px;
+  }
+  .nd-rt-cells {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .nd-rt-c.w3,
+  .nd-rt-c.w5 {
+    grid-column: span 3;
+  }
+}
+@container (min-width: 900px) {
+  .nd-rt-cells {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+  .nd-rt-c.w5 {
+    grid-column: span 4;
+  }
+}
+@container (min-width: 1180px) {
+  .nd-rt-cells {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
+  .nd-rt-c.w5 {
+    grid-column: span 5;
+  }
 }
 .ping-probe-panel {
   display: flex;
@@ -2947,12 +3125,6 @@ input.f::placeholder {
 .ping-probe-more {
   color: var(--ink-4);
 }
-@container (min-width: 1200px) {
-  .nd-observed-status {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 8px;
-  }
-}
 /* 配置栏底色也统一为 --card：白卡靠投影浮起，不再单独下沉半档。 */
 
 /* 带独立标题栏的卡片：标题条横贯整卡，有底色和一条下边线，与内容区分开。
@@ -2967,7 +3139,6 @@ input.f::placeholder {
    `.b-col` 是双栏时期的容器，改成页签后已无处引用，这三条里留着它是为了不在这一次改动里
    顺手删掉别的东西——要清的话三条一起清，见文件末尾的说明。 */
 .b-col > .panel,
-.nd-observed-status > .panel,
 .nd-tab-observed > .panel,
 .nd-tab-pair > .panel,
 .panel.config-panel,
@@ -13226,18 +13397,29 @@ input.f.ing-pj-port {
   font-size: inherit;
 }
 /* 量纲。刻度上只剩数字，单位在标题后写一次（`网卡流量 (Mb/s)`）——它不是元信息，不能拿
-   上面那条 9px / --ink-4 的待遇，那是 `eth0 · MTU 1420` 那一级。字族、字号、字距与标题
-   `> b` 完全一致，只降字重与墨色，读起来是标题的后半句而不是另起一段。
-   归组靠间距不靠分隔符：cap 的 gap 是 8px，负 margin 把它拉到离标题 3px，margin-right
-   再把它推离后面的 meta 到 12px——近的成组，远的分开。 */
-.load-network-cap > .chart-unit {
+   上面那条 9px / --ink-4 的待遇，那是 `eth0 · MTU 1420` 那一级。
+   排版跟随它所属的那个标题，不是全站一套：两处标题本来就不同字族、不同字号，单位各自与
+   自己的标题同字族、同字号、同字距，只降一档字重与墨色，读起来是标题的后半句。
+   归组靠间距不靠分隔符：负 margin 抵掉一半行距把它拉到离标题 3px。 */
+.chart-unit {
   flex: none;
+  white-space: nowrap;
+}
+/* 曲线卡标题栏：标题是 12.5px 无衬线 600 --ink。margin-right 把它推离后面的 meta 到
+   12px——近的成组，远的分开。 */
+.load-network-cap > .chart-unit {
   margin-right: 4px;
   margin-left: -5px;
   color: var(--ink-3);
   font: 400 12.5px var(--sans);
   letter-spacing: 0.02em;
-  white-space: nowrap;
+}
+/* 面板标题条：标题是 10.5px 等宽大写 600 --ink-3，比卡片标题小两档、字距宽得多。 */
+.panel.titled > header > .chart-unit {
+  margin-left: -6px;
+  color: var(--ink-4);
+  font: 400 10.5px var(--mono);
+  letter-spacing: 0.11em;
 }
 .load-network-cap > span.stale {
   color: var(--gold);
@@ -13588,17 +13770,15 @@ input.f.ing-pj-port {
   padding: 0 10px;
 }
 .history-chart-cap > b,
-.load-network-cap > b,
-.nd-observed-status > .panel > header h4 {
+.load-network-cap > b {
   color: var(--ink);
   font-size: 12.5px;
   font-weight: 600;
   letter-spacing: 0.02em;
   white-space: nowrap;
 }
-/* 后两种标题原先是 chip，清掉其盒样式；文字排版直接复用上面的历史指标标题规则。 */
-.load-network-cap > b,
-.nd-observed-status > .panel > header h4 {
+/* 网卡流量标题原先是 chip，清掉其盒样式；文字排版直接复用上面的历史指标标题规则。 */
+.load-network-cap > b {
   padding: 0;
   border: 0;
   border-radius: 0;
@@ -17132,8 +17312,21 @@ input.f.ing-pj-port {
  * #f8f9fb，卡落在纸上比纸暗，「卡片浮起」正好反过来；此前机器详情为此把配置与规则页签
  * 的卡片一并压回 --block，纸与卡同色，整页只剩边框在表达边界。
  *
- * 改为把纸取台面那一档：设置页是「台面 → 块档卡 → 带」三层，这两页于是也是同样的三层，
- * 只是外面多一圈页面框。网格、内距、标题层级和圆角均沿用原版。
+ * 改为把纸压到台面与块档卡之间：设置页是「台面 → 块档卡 → 带」三层，这两页于是也是同样的
+ * 三层，只是外面多一圈页面框。网格、内距、标题层级和圆角均沿用原版。
+ *
+ * 纸曾直接取 --ground，与台面同色——页面框只剩那圈半透明边框和台面的网格在表达，整页偏灰。
+ * 现在抬到台面与块档卡之间，用 color-mix 而不是写死一个色值：每套 data-palette 的中性族
+ * 都带自己的色相（堇紫台面 #f4f3f6、黛蓝 #f2f4f7、松绿 #f3f4f1、藕粉 #f5f3f4），写死的中性
+ * 灰在默认配色下成立，换到那四套里色相就与周围对不上，而且它们的台面本来就比默认亮一档，
+ * 同一个灰值反而比台面还暗，浮起感是反的。插值把落点交给当前配色自己的两档去定。
+ *
+ * 55% 是按默认配色定的：台面 #ededec 到块档卡 #f8f8f7 之间 11 阶，取到 #f3f3f2，离台面
+ * 6 阶、离块档卡 5 阶（L* 93.8 → 95.8 → 97.6）。那四套配色的台面离块档卡只有 5 到 6 阶，
+ * 同一个比例抬起来自然也小——但它们的台面本就不灰，需要的提亮本来就少。
+ *
+ * 不能取纯白：白是 --card 那一档，观测页的读数格和图表卡靠它浮在纸上，纸取白这层关系就没
+ * 了。也不能再往上挤：块档卡离纯白只剩 2.4 L*，抬纸就得连它一起抬，没有余量。
  *
  * 只压亮色。暗色的三档本来就是递增的（纸 #161922 → 卡 #1d222c → 带 #151a23），
  * 没有需要修的地方，压下去只会把两页与其他页面的纸拉开一档。
@@ -17143,14 +17336,14 @@ input.f.ing-pj-port {
  * 与设置页的段卡一致，因此不在下面这条覆盖里。两者都不投影：纸上的卡片一律不投影，
  * 配置面板那一条见 `.nd-sheet .panel.config-panel`。
  *
- * 卡片一侧按容器点名（`.nd-observed-status > .panel` 等）而不是写一个笼统的 `.panel`：
+ * 卡片一侧按容器点名（`.nd-tab-observed > .panel` 等）而不是写一个笼统的 `.panel`：
  * 规则页签里的规则编辑器本身也是 `.panel`，它嵌在规则卡内部、自带一套半透明的
  * `--block 72%` / `--sunk 58%`（见 `.chain-rule-tree .rule-editor`），笼统的 `.panel`
  * 特异性更高会把那套材质整片盖成一个色，嵌套关系就读不出来了。
  * 语义警告的边框色仍由 .warn / .bad 覆盖。 */
 :root[data-theme='light'] .nd-sheet > .nd-paper,
 :root[data-theme='light'] .fg-sheet:has(> .chain-detailpage) {
-  background: var(--ground);
+  background: color-mix(in srgb, var(--block) 55%, var(--ground));
 }
 
 :root[data-theme='light']
@@ -17161,7 +17354,6 @@ input.f.ing-pj-port {
     .history-chart-card,
     .load-network,
     .load-metric,
-    .nd-observed-status > .panel,
     .nd-tab-observed > .panel,
     .nd-tab-pair > .panel
   ) {
@@ -17172,9 +17364,6 @@ input.f.ing-pj-port {
 
 /* 观测页的卡片标题不单独铺底色：那一页的卡是白色读数格，色带会把它切成两块。
    配置与规则的卡片不在此列——它们保留 --band 标题条，与设置页的段卡同一形状。 */
-:root[data-theme='light']
-  .nd-sheet
-  :is(.nd-observed-status > .panel, .nd-tab-observed > .panel, .nd-tab-pair > .panel)
-  > :is(header, summary) {
+:root[data-theme='light'] .nd-sheet :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel) > :is(header, summary) {
   background: transparent;
 }

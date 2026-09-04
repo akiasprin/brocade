@@ -401,6 +401,20 @@ fn anytls_client_config(
     socks_port: u16,
     log_path: &str,
 ) -> String {
+    let mut settings = serde_json::json!({
+        "address": target.dial_host,
+        "port": target.port,
+        "password": target.uuid,
+    });
+    if let Some(value) = anytls.idle_session_check_interval_secs {
+        settings["idleSessionCheckInterval"] = serde_json::json!(value);
+    }
+    if let Some(value) = anytls.idle_session_timeout_secs {
+        settings["idleSessionTimeout"] = serde_json::json!(value);
+    }
+    if let Some(value) = anytls.min_idle_session {
+        settings["minIdleSession"] = serde_json::json!(value);
+    }
     let config = serde_json::json!({
         "log": {
             "loglevel": "info",
@@ -417,11 +431,7 @@ fn anytls_client_config(
         "outbounds": [{
             "tag": "probe-out",
             "protocol": "anytls",
-            "settings": {
-                "address": target.dial_host,
-                "port": target.port,
-                "password": target.uuid,
-            },
+            "settings": settings,
             "streamSettings": {
                 "security": "tls",
                 "tlsSettings": {
@@ -1251,6 +1261,9 @@ mod tests {
         let mut t = target(&[]);
         t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
             server_name: "anytls.example.net".to_owned(),
+            idle_session_check_interval_secs: Some(11),
+            idle_session_timeout_secs: Some(22),
+            min_idle_session: Some(3),
         });
         t.port = 19443;
         let out: serde_json::Value =
@@ -1260,6 +1273,9 @@ mod tests {
         assert_eq!(outbound["settings"]["address"], "127.0.0.1");
         assert_eq!(outbound["settings"]["port"], 19443);
         assert_eq!(outbound["settings"]["password"], "u");
+        assert_eq!(outbound["settings"]["idleSessionCheckInterval"], 11);
+        assert_eq!(outbound["settings"]["idleSessionTimeout"], 22);
+        assert_eq!(outbound["settings"]["minIdleSession"], 3);
         assert_eq!(
             outbound["streamSettings"]["tlsSettings"]["serverName"],
             "anytls.example.net"

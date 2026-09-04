@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 )
@@ -44,6 +45,31 @@ func TestWriteWasteFramesKeepsWireLengthAndFrameHeaders(t *testing.T) {
 				remaining = remaining[frameLength:]
 			}
 		})
+	}
+}
+
+func TestSendStreamDataReleasesWriteLockAfterPaddingError(t *testing.T) {
+	var wire bytes.Buffer
+	s := &session{bw: buf.NewBufferedWriter(buf.NewWriter(&wire))}
+	s.fw = newFrameWriter(s.bw)
+	s.paddingScheme, _ = parsePaddingScheme("stop=2\n1=1-1")
+	s.pktCounter.Store(1)
+
+	if err := s.sendStreamData(1, buf.MultiBuffer{buf.FromBytes([]byte("first"))}); err == nil {
+		t.Fatal("invalid padding scheme unexpectedly succeeded")
+	}
+
+	secondWrite := make(chan error, 1)
+	go func() {
+		secondWrite <- s.sendStreamData(1, buf.MultiBuffer{buf.FromBytes([]byte("second"))})
+	}()
+	select {
+	case err := <-secondWrite:
+		if err != nil {
+			t.Fatalf("second write error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writeMu remained locked after padding error")
 	}
 }
 

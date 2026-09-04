@@ -104,17 +104,30 @@ func TestSessionPacketPaddingStopsAtConfiguredLimit(t *testing.T) {
 	s := &session{paddingScheme: scheme}
 	s.pktCounter.Store(1)
 
-	if got := s.nextPacketIndex(); got != 1 {
-		t.Fatalf("first packet index = %d, want 1", got)
+	if got, enabled := s.nextPacketIndex(); got != 1 || !enabled {
+		t.Fatalf("first packet = (%d, %v), want (1, true)", got, enabled)
 	}
-	if got := s.nextPacketIndex(); got != 2 {
-		t.Fatalf("second packet index = %d, want 2", got)
+	if got, enabled := s.nextPacketIndex(); got != 2 || !enabled {
+		t.Fatalf("second packet = (%d, %v), want (2, true)", got, enabled)
 	}
-	if got := s.nextPacketIndex(); got != 0 {
-		t.Fatalf("packet after stop = %d, want 0", got)
+	if got, enabled := s.nextPacketIndex(); got != 0 || enabled {
+		t.Fatalf("packet after stop = (%d, %v), want (0, false)", got, enabled)
 	}
-	if got := s.nextPacketIndex(); got != 0 {
-		t.Fatalf("later packet index = %d, want 0", got)
+	if got, enabled := s.nextPacketIndex(); got != 0 || enabled {
+		t.Fatalf("later packet = (%d, %v), want (0, false)", got, enabled)
+	}
+}
+
+func TestSessionWithoutPaddingDoesNotUsePacketZeroRule(t *testing.T) {
+	scheme, err := parsePaddingScheme("stop=1\n0=64-64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &session{paddingScheme: scheme}
+	s.pktCounter.Store(1)
+
+	if got, enabled := s.nextPacketIndex(); got != 0 || enabled {
+		t.Fatalf("packet after stop = (%d, %v), want (0, false)", got, enabled)
 	}
 }
 

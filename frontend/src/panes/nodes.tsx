@@ -25,6 +25,7 @@ import {
   provisionNode,
   setNodeCertGroup,
   setNodeStatus,
+  setWireGuardLinkDisabled,
   updateNode,
   verifyDeployment,
   type Dns,
@@ -44,7 +45,7 @@ import type { LinkIr } from '../topo/model';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
 import { can, isPublic, useSession } from '../session';
 import { Ago, Confirm, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
-import { Icon, ListIcon } from '../ui/icons';
+import { Icon, ListIcon, type IconName } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { copyText } from '../ui/platform';
 import { useNarrow } from '../ui/viewport';
@@ -62,6 +63,7 @@ import {
   observeAreaStyle,
   observeAxisLine,
   observeAxisTick,
+  observeBpsUnit,
   observeColors,
   observeMinorTick,
   observeMsUnit,
@@ -69,7 +71,7 @@ import {
   observeTimeInterval,
   observeValueAxis,
 } from '../ui/observe-chart';
-import { LoadCard, bps, ThroughputChart, dur, iso, throughputAxis } from './telemetry';
+import { LoadCard, ThroughputChart, dur, iso, throughputAxis } from './telemetry';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import { ChainWizard } from './chain-wizard';
@@ -215,27 +217,28 @@ function artifactState(node: NodeAgentStateItem, kind: ArtifactKind): string {
   return appliedOf(node)?.[kind]?.state ?? 'unknown';
 }
 
-function StateChip({ state }: { state: string }) {
+/** 产物状态片。片上写产物名而不是状态词：五件产物排成一条状态带后，五个「ON」并列
+ *  无法分辨说的是哪一件；状态由图标和颜色承担，名字才是这一片的标识。
+ *  图标不是颜色的重复——ON 与 DIFF 此前只由绿/红区分，形状让它们不依赖颜色也能分辨。 */
+function StateChip({ state, label }: { state: string; label: string }) {
+  const glyph = STATE_ICON[state];
   return (
-    <span className={`st ${STATE_CLASS[state] ?? ''}`} title={STATE_TITLE[state] ?? state}>
-      {STATE_SHORT[state] ?? state}
+    <span className={`st nd-rt-chip ${STATE_CLASS[state] ?? ''}`} title={`${label} ${STATE_TITLE[state] ?? state}`}>
+      {glyph && <Icon of={glyph} size={9} className="nd-rt-chip-ic" />}
+      {label}
     </span>
   );
 }
 
-/** 状态使用缩写。四件产物加授权同步共五格，三字的词会导致这一行换行。
- *  正常与异常已由 STATE_CLASS 的颜色区分，文字只需区分具体状态；全称写在 title 中。
- *
- *  ON 与 OFF 成对，说的是同一件事的两个值：这件产物在这台机器上开着还是关着。
- *  此处曾写作 OK，而 OK 的反义是失败，与旁边的 OFF 不构成一组，读起来像两套词混用。 */
-const STATE_SHORT: Record<string, string> = {
-  present: 'ON',
-  disabled: 'OFF',
-  unmanaged: 'N/A',
-  unknown: '?',
-  dirty: 'DIFF',
+const STATE_ICON: Record<string, IconName | undefined> = {
+  present: 'check',
+  disabled: 'dash',
+  dirty: 'neq',
 };
 
+/* 状态词此前显示在片上（ON / OFF / N/A / ? / DIFF），产物名在左侧的标签列。
+   五件产物合并成一条状态带后标签列不再存在，片上改写产物名，状态词移入 title。
+   未纳管与未知没有对应图标：二者都表示「读不到这一项」，给一个形状会读成一种结果。 */
 const STATE_TITLE: Record<string, string> = {
   present: '已应用',
   disabled: '已关闭',
@@ -246,27 +249,54 @@ const STATE_TITLE: Record<string, string> = {
 
 /* ── 字段的两种排列方式。选用依据见 styles.css，此处只提供结构。 ── */
 
-/* ⑥ 内联条：字段数量少、值较短、彼此平级 */
-/** 一个字段格。第三个元素写 'newline' 表示从新行开始——`.fstrip` 是 flex-wrap 布局，
-    插入一个占满整行、零高度的空元素后，后续元素自然换行。
-    该方式比为某个格设置固定宽度可靠：格宽取决于其中的值，而值在运行时才确定
-    （「重放了 …」可能很长，「正常」只有两个字），按最宽值排布会使常态下该行留出大片空白。
-    使用字面量而非 boolean，是为了在调用处能直接看出该参数的含义。 */
-type StripItem = [string, ReactNode] | [string, ReactNode, 'newline'];
+/* ⑥ 规格网格：字段数量多、值较短、彼此平级 */
 
-function Strip({ items }: { items: StripItem[] }) {
+/** 一个字段格。第三个元素是跨栏数——网格是 8 栏，长值（CPU 型号、发行版、内核）
+    占一栏放不下。跨栏数在窄容器下由 styles.css 按断点收窄，不在此处判断容器宽度。
+    使用字面量而非数字，是为了在调用处能直接看出这是跨栏而不是别的计数。 */
+type CellSpan = 'w2' | 'w3' | 'w5';
+type CellItem = [string, ReactNode] | [string, ReactNode, CellSpan];
+
+function Cells({ items }: { items: CellItem[] }) {
   return (
-    <div className="fstrip">
-      {items.map(([k, v, brk]) => (
-        <Fragment key={k}>
-          {brk === 'newline' && <span className="fstrip-brk" />}
-          <span className="p">
-            <span className="k">{k}</span>
-            <span className="v">{v}</span>
-          </span>
-        </Fragment>
+    <dl className="nd-rt-cells">
+      {items.map(([k, v, span]) => (
+        <div className={span ? `nd-rt-c ${span}` : 'nd-rt-c'} key={k}>
+          <dt>{k}</dt>
+          <dd>{v}</dd>
+        </div>
       ))}
-    </div>
+    </dl>
+  );
+}
+
+/** 一条横带：一个数据来源。三条带的来源互不相同——AGENT 是 agent 轮询时写入的状态，
+    HOST 来自负载上报，CONFIG 是收敛观测的结果——因此每条带自带时效读数，
+    合并成一张卡后不能只在卡头写一个时间。 */
+function Band({ name, icon, meta, children }: { name: string; icon: IconName; meta: ReactNode; children: ReactNode }) {
+  return (
+    <section className="nd-rt-band">
+      <div className="nd-rt-bl">
+        <b>
+          <Icon of={icon} size={12} className="nd-rt-bl-ic" />
+          {name}
+        </b>
+        <i>{meta}</i>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/** 异常读数前的标记。判定结果此前只由 `.hot` 的金色表达，而 styles.css 中没有裸
+    `.hot` 的规则（只有 .plate.hot 这类作用域版本），三处判定实际渲染为普通文字。
+    颜色之外再给一个形状，异常项在一片读数里才可定位。 */
+function Hot({ children }: { children: ReactNode }) {
+  return (
+    <span className="hot">
+      <Icon of="warn" size={10} className="nd-rt-hot-ic" />
+      {children}
+    </span>
   );
 }
 
@@ -1320,23 +1350,26 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
   const { user, relay } = usageRoleSlots(mine, windows);
   const monthTotal = mine ? monthBytes(mine) : 0;
 
+  /* 每块图一个单位：标题栏写它，图例按它读数，图内的刻度和 tooltip 走同一次 throughputAxis
+     的结果。峰值只算一遍，所以标题、刻度、图例三处不可能各说各话。 */
+  const nicUnit = throughputAxis(nicRx, nicTx).unit;
+  const xrayUnit = throughputAxis(user, relay).unit;
+
   return (
     <section className="chart-card nd-throughput-panel" aria-label="吞吐">
       <div className="nd-throughput-block">
         <div className="load-network-cap">
           <b>网卡流量</b>
-          {/* 量纲写在标题后，刻度只留数字。峰值与单位都取自 throughputAxis，
-              与图内那次调用同源，标题和刻度不会各说各话。 */}
-          <span className="chart-unit">({throughputAxis(nicRx, nicTx).unit.name})</span>
+          <span className="chart-unit">({nicUnit.name})</span>
           {nicMeta.length > 0 && <span className={drops > 0 ? 'hot' : undefined}>{nicMeta.join(' · ')}</span>}
           <footer className="load-network-legend" aria-label="网卡流量图例">
             <span className="rx">
               <i />
-              接收 <b>{bps(last.nic_rx_bps)}</b>
+              接收 <b>{nicUnit.read(last.nic_rx_bps)}</b>
             </span>
             <span className="tx">
               <i />
-              发送 <b>{bps(last.nic_tx_bps)}</b>
+              发送 <b>{nicUnit.read(last.nic_tx_bps)}</b>
             </span>
           </footer>
         </div>
@@ -1345,16 +1378,16 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
       <div className="nd-throughput-block">
         <div className="load-network-cap">
           <b>XRAY 流量</b>
-          <span className="chart-unit">({throughputAxis(user, relay).unit.name})</span>
+          <span className="chart-unit">({xrayUnit.name})</span>
           <span>本月 {bytes(monthTotal)}</span>
           <footer className="load-network-legend" aria-label="XRAY 流量图例">
             <span className="rx">
               <i />
-              用户 <b>{bps(user[user.length - 1])}</b>
+              用户 <b>{xrayUnit.read(user[user.length - 1])}</b>
             </span>
             <span className="tx">
               <i />
-              中继 <b>{bps(relay[relay.length - 1])}</b>
+              中继 <b>{xrayUnit.read(relay[relay.length - 1])}</b>
             </span>
           </footer>
         </div>
@@ -1449,6 +1482,85 @@ function NodeMtuRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
           <>还没有探测结果</>
         )}
       </span>
+    </Row>
+  );
+}
+
+function WgListenPortRow({
+  nodeId,
+  currentPort,
+  canEdit,
+  onSaved,
+}: {
+  nodeId: string;
+  currentPort: number | null;
+  canEdit: boolean;
+  onSaved: () => void;
+}) {
+  const qc = useQueryClient();
+  const [value, setValue] = useState<string | null>(null);
+  const parsed = Number(value ?? currentPort);
+  const valid =
+    value !== null && /^\d+$/.test(value.trim()) && Number.isInteger(parsed) && parsed >= 1 && parsed <= 65_535;
+  const dirty = valid && parsed !== currentPort;
+
+  const save = useMutation({
+    mutationFn: () => updateNode(nodeId, { wg_listen_port: parsed }),
+    onSuccess: () => {
+      setValue(null);
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+      onSaved();
+    },
+  });
+
+  if (value === null) {
+    return (
+      <Row k="UDP 监听端口">
+        <span className="mono">{currentPort ?? '—'}</span>
+        <button
+          className="btn"
+          style={{ marginLeft: 8 }}
+          disabled={!canEdit || currentPort === null}
+          onClick={() => setValue(String(currentPort ?? ''))}
+        >
+          改
+        </button>
+      </Row>
+    );
+  }
+
+  return (
+    <Row k="UDP 监听端口">
+      <input
+        className="f mono"
+        style={{ width: 110 }}
+        value={value}
+        inputMode="numeric"
+        min={1}
+        max={65_535}
+        aria-label="WireGuard UDP 监听端口"
+        onChange={event => setValue(event.target.value)}
+      />
+      {!valid && (
+        <span className="sub" style={{ color: 'var(--err)' }}>
+          端口必须为 1–65535。
+        </span>
+      )}
+      {dirty && (
+        <span className="sub" style={{ color: 'var(--gold)' }}>
+          所有对端的 wg0.conf 会随之变更，发布后链路将重新握手。
+        </span>
+      )}
+      {save.error && <ErrorBox error={save.error} />}
+      <div className="toolbar">
+        <button className="btn primary" disabled={!dirty || save.isPending} onClick={() => save.mutate()}>
+          {save.isPending ? '保存中…' : '保存到草稿'}
+        </button>
+        <button className="btn" disabled={save.isPending} onClick={() => setValue(null)}>
+          取消
+        </button>
+      </div>
     </Row>
   );
 }
@@ -2151,7 +2263,21 @@ function connValue(raw: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function WgCard({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit: boolean; onSaved: () => void }) {
+function WgCard({
+  node,
+  listenPort,
+  peers,
+  disabledLinks,
+  canEdit,
+  onSaved,
+}: {
+  node: NodeAgentStateItem;
+  listenPort: number | null;
+  peers: NodeAgentStateItem[];
+  disabledLinks: { a: string; b: string }[];
+  canEdit: boolean;
+  onSaved: () => void;
+}) {
   return (
     <div className="panel config-panel">
       <header>
@@ -2160,9 +2286,106 @@ function WgCard({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit:
       <div className="fgrid one">
         <OverlayRow node={node} canEdit={canEdit} onSaved={onSaved} />
         <NodeMtuRow node={node} canEdit={canEdit} onSaved={onSaved} />
+        <WgListenPortRow nodeId={node.node_id} currentPort={listenPort} canEdit={canEdit} onSaved={onSaved} />
+        <WgDisabledLinksRow
+          node={node}
+          peers={peers}
+          disabledLinks={disabledLinks}
+          canEdit={canEdit}
+          onSaved={onSaved}
+        />
         <WgTransportRow node={node} canEdit={canEdit} onSaved={onSaved} />
       </div>
     </div>
+  );
+}
+
+function WgDisabledLinksRow({
+  node,
+  peers,
+  disabledLinks,
+  canEdit,
+  onSaved,
+}: {
+  node: NodeAgentStateItem;
+  peers: NodeAgentStateItem[];
+  disabledLinks: { a: string; b: string }[];
+  canEdit: boolean;
+  onSaved: () => void;
+}) {
+  const qc = useQueryClient();
+  const [selected, setSelected] = useState('');
+  const disabledPeers = disabledLinks
+    .flatMap(link => (link.a === node.node_id ? [link.b] : link.b === node.node_id ? [link.a] : []))
+    .sort();
+  const candidates = peers
+    .filter(
+      peer =>
+        peer.node_id !== node.node_id &&
+        peer.overlay &&
+        peer.lifecycle_phase === 'active' &&
+        !disabledPeers.includes(peer.node_id),
+    )
+    .sort((a, b) => a.node_id.localeCompare(b.node_id));
+
+  const change = useMutation({
+    mutationFn: ({ peer, disabled }: { peer: string; disabled: boolean }) =>
+      setWireGuardLinkDisabled(node.node_id, peer, disabled),
+    onSuccess: () => {
+      setSelected('');
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+      onSaved();
+    },
+  });
+
+  return (
+    <Row k="禁用直连" hint="从 WireGuard 全互联中排除的对端">
+      {disabledPeers.length === 0 ? (
+        <span className="dim">无</span>
+      ) : (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+          {disabledPeers.map(peer => (
+            <span key={peer} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <code>{peer}</code>
+              <button
+                className="btn"
+                disabled={!canEdit || change.isPending}
+                onClick={() => change.mutate({ peer, disabled: false })}
+              >
+                恢复
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        <select
+          className="f"
+          style={{ width: 210 }}
+          value={selected}
+          disabled={!canEdit || !node.overlay || change.isPending || candidates.length === 0}
+          aria-label="选择要禁用直连的 WireGuard 对端"
+          onChange={event => setSelected(event.target.value)}
+        >
+          <option value="">选择对端…</option>
+          {candidates.map(peer => (
+            <option key={peer.node_id} value={peer.node_id}>
+              {peer.name || peer.node_id} ({peer.node_id})
+            </option>
+          ))}
+        </select>
+        <button
+          className="btn"
+          disabled={!canEdit || change.isPending || selected === ''}
+          onClick={() => change.mutate({ peer: selected, disabled: true })}
+        >
+          禁用
+        </button>
+      </div>
+      <span className="sub">发布后双方都不再配置该 peer；依赖它的业务跳会阻止发布。</span>
+      {change.error && <ErrorBox error={change.error} />}
+    </Row>
   );
 }
 
@@ -2229,6 +2452,58 @@ export function runtimeFindings(node: NodeAgentStateItem, wireguardEnabled?: boo
         </>
       ),
     });
+  }
+
+  const wg = node.wireguard_health;
+  if (wgEnabled && wgAppliedState !== 'disabled' && wg) {
+    if (!wg.enabled) {
+      out.push({
+        tone: 'bad',
+        chip: 'WG 未运行',
+        text: <>模型要求加入 overlay，但 agent 报告 WireGuard 巡检未启用。</>,
+      });
+    } else if (wg.error) {
+      out.push({
+        tone: 'bad',
+        chip: 'WG 巡检失败',
+        text: <>agent 无法读取 WireGuard 运行态：{wg.error}</>,
+      });
+    } else {
+      const down = wg.peers.filter(peer => peer.status === 'down');
+      if (down.length > 0) {
+        out.push({
+          tone: 'warn',
+          chip: `WG 断链 ${down.length}`,
+          text: (
+            <>
+              {down.map(peer => (
+                <span key={peer.peer_node_id}>
+                  <code>{peer.peer_node_id}</code>：{peer.detail ?? 'peer 无法通过 overlay 到达'}
+                  <br />
+                </span>
+              ))}
+            </>
+          ),
+        });
+      }
+      const unknown = wg.peers.filter(peer => peer.status === 'unknown');
+      if (unknown.length > 0) {
+        out.push({
+          tone: 'warn',
+          chip: `WG 待判定 ${unknown.length}`,
+          text: (
+            <>
+              {unknown.map(peer => (
+                <span key={peer.peer_node_id}>
+                  <code>{peer.peer_node_id}</code>：{peer.detail ?? '无法执行可达性探测'}
+                  <br />
+                </span>
+              ))}
+            </>
+          ),
+        });
+      }
+    }
   }
 
   const spool = node.spool_backlog;
@@ -2415,6 +2690,10 @@ function FleetNetChart({ times, pts, peak }: { times: number[]; pts: NetPoint[];
     const line = cv('--line');
     const lineSoft = cv('--line-soft');
     const glass = cv('--glass-strong');
+    // 一卡一单位：刻度、tooltip、面板标题共用它。接收在上、发送在下共用一个量程，两侧
+    // 因此也共用一个单位——镜像的意义就在于上下可直接比大小。
+    const valueAxis = observeValueAxis(peak);
+    const unit = observeBpsUnit(valueAxis);
 
     // sign=-1 把发送翻到零线下方，做镜像；inner=true 是 XRAY 实心内层。
     const area = (name: string, key: keyof NetPoint, color: string, sign: 1 | -1, inner: boolean) => ({
@@ -2464,7 +2743,7 @@ function FleetNetChart({ times, pts, peak }: { times: number[]; pts: NetPoint[];
               `<div style="display:flex;gap:8px;align-items:center;line-height:1.75">` +
               `<span style="width:8px;height:8px;border-radius:2px;background:${p.color}"></span>` +
               `<span>${p.seriesName}</span>` +
-              `<b style="margin-left:auto;color:${ink}">${bps(Math.abs(p.value[1]))}</b></div>`;
+              `<b style="margin-left:auto;color:${ink}">${unit.read(Math.abs(p.value[1]))}</b></div>`;
             return `<div style="color:${ink4};font-size:9px;margin-bottom:3px">${when}</div>${arr.map(row).join('')}`;
           },
         },
@@ -2479,9 +2758,12 @@ function FleetNetChart({ times, pts, peak }: { times: number[]; pts: NetPoint[];
         },
         yAxis: {
           type: 'value',
-          min: -peak,
-          max: peak,
-          axisLabel: { color: ink4, fontSize: 9, formatter: (v: number) => bps(Math.abs(v)) },
+          // 镜像轴对称到取整后的量程：原来直接用观测峰值当上下界，刻度落在 873.41 Mbps 这种
+          // 位置上；observeValueAxis 把它抬到下一个整格，与页内其它图同一套步长。
+          min: -valueAxis.max,
+          max: valueAxis.max,
+          interval: valueAxis.interval,
+          axisLabel: { color: ink4, fontSize: 9, formatter: (v: number) => unit.text(Math.abs(v)) },
           axisLine: observeAxisLine(ink3),
           axisTick: observeAxisTick(ink3),
           splitLine: { lineStyle: { color: lineSoft } },
@@ -2559,9 +2841,12 @@ export function FleetNetPanel() {
     return { pts, times, peak };
   }, [load.data, usage.data]);
 
+  // 与图内那次同源：都由 geo.peak 过 observeValueAxis 定档，标题和刻度不会各说各话。
+  const unitName = geo ? observeBpsUnit(observeValueAxis(geo.peak)).name : null;
   const head = (
     <header>
       <h4>网络吞吐 · 全机队</h4>
+      {unitName && <span className="chart-unit">({unitName})</span>}
       <span className="sp" />
       <span className="hint">网卡汇总 对 XRAY 承载 · 接收在上 / 发送在下 · 近 2 小时</span>
     </header>
@@ -2896,96 +3181,113 @@ function PingProbePanel({ nodeId, range, linked }: { nodeId: string; range: Load
 function HostCard({ load }: { load: NodeLoadView | undefined }) {
   const host = load?.host ?? null;
   const skew = load?.clock_skew_secs ?? null;
-  /* CPU 与内核分别成行：型号可能很长，用 rt-v 截断但 title 保留完整值。旧 Agent 没有
-     cpu_model 时仍显示核数；内核行只承担版本和架构，不再混入硬件信息。 */
-  const cpuParts = host ? [host.cpu_model || '', host.cores > 0 ? `${host.cores} 核` : ''].filter(p => p !== '') : [];
-  const kernelParts = host ? [host.kernel, host.arch].filter(p => p !== '') : [];
-  const osParts = host ? [host.os_pretty, host.virt].filter(p => p !== '') : [];
+  /* CPU / 发行版 / 内核各自的第二项事实（核数、虚拟化、架构）单独成段：它们不是单位，
+     而是同一字段的另一个取值，降一档色阶后主值在一列读数里仍然是最先被读到的。
+     旧 Agent 没有 cpu_model 时仍显示核数。 */
+  const cpu = host?.cpu_model || '';
+  const cores = host && host.cores > 0 ? `${host.cores} 核` : '';
+  const meta =
+    load?.reported_at_unix_secs != null ? (
+      <>
+        <Ago at={iso(load.reported_at_unix_secs)} /> 上报
+      </>
+    ) : (
+      '—'
+    );
+  if (!host)
+    return (
+      <Band name="HOST" icon="nodes" meta={meta}>
+        <p className="note nd-rt-empty">还没有主机信息上报。</p>
+      </Band>
+    );
   return (
-    <div className="panel">
-      <header>
-        <h4>HOST</h4>
-        <span className="sp" />
-        {/* 上报时间固定在标题行右端（与 USAGE 卡一致）：它表示该卡数据的时效，
-            不是卡内的一项内容——紧跟标题会被读作 HOST 的第一个字段。 */}
-        {load?.reported_at_unix_secs != null && (
-          <span className="hint">
-            <Ago at={iso(load.reported_at_unix_secs)} /> 上报
-          </span>
-        )}
-      </header>
-      {!host ? (
-        <p className="note" style={{ margin: 0 }}>
-          还没有主机信息上报。
-        </p>
-      ) : (
-        <Strip
-          items={[
-            [
-              'CPU',
-              cpuParts.length > 0 ? (
-                <span className="rt-v" title={host.cpu_model || cpuParts.join(' · ')}>
-                  {cpuParts.join(' · ')}
-                </span>
-              ) : (
-                <span className="dim">—</span>
-              ),
-            ],
-            ['内存', host.mem_total_bytes > 0 ? bytes(host.mem_total_bytes) : <span className="dim">—</span>],
-            ['磁盘', host.disk_total_bytes > 0 ? bytes(host.disk_total_bytes) : <span className="dim">—</span>],
-            ['发行版', osParts.length > 0 ? osParts.join(' · ') : <span className="dim">—</span>, 'newline'],
-            [
-              '内核',
-              kernelParts.length > 0 ? (
-                <span className="rt-v" title={host.kernel}>
-                  {kernelParts.join(' · ')}
-                </span>
-              ) : (
-                <span className="dim">—</span>
-              ),
-            ],
-            [
-              '时钟偏移',
-              skew !== null ? (
-                /* 接收上报时测得的 agent 钟减控制面钟。TLS 依赖对时；±5 秒是传输耗时的
-                   噪声上限，超过即标出。 */
-                <span
-                  className={Math.abs(skew) >= 5 ? 'hot' : undefined}
-                  title="agent 时钟减控制面时钟，接收上报时测得"
-                >
-                  {skew >= 0 ? '+' : '-'}
-                  {Math.abs(skew)} 秒
-                </span>
-              ) : (
-                <span className="dim">—</span>
-              ),
-            ],
-            /* 这两项安装器不管（install.sh 只调拥塞与连接表），机器上是什么就显示什么。
-               不用 .inherit 降色阶：取值来源恒定为「非纳管」，对一个从不变的答案做视觉区分
-               不携带信息。 */
-            [
-              '收发缓冲',
-              host.rmem_max > 0 || host.wmem_max > 0 ? (
-                `${bytes(host.rmem_max)} / ${bytes(host.wmem_max)}`
-              ) : (
-                <span className="dim">—</span>
-              ),
-              'newline',
-            ],
-            ['监听队列', host.somaxconn > 0 ? host.somaxconn.toLocaleString() : <span className="dim">—</span>],
-            [
-              '连接表上限',
-              host.conntrack_max !== null ? (
-                host.conntrack_max.toLocaleString()
-              ) : (
-                // 未加载 nf_conntrack 不是故障，而是该机器未配置 NAT。显示「—」会被理解为读取失败。
-                <span className="dim">没开</span>
-              ),
-            ],
-          ]}
-        />
-      )}
-    </div>
+    <Band name="HOST" icon="nodes" meta={meta}>
+      <Cells
+        items={[
+          [
+            'CPU',
+            cpu || cores ? (
+              <span title={cpu || cores}>
+                {cpu || cores}
+                {cpu && cores && <span className="nd-rt-q">{cores}</span>}
+              </span>
+            ) : (
+              <span className="dim">—</span>
+            ),
+            'w2',
+          ],
+          ['内存', host.mem_total_bytes > 0 ? bytes(host.mem_total_bytes) : <span className="dim">—</span>],
+          ['磁盘', host.disk_total_bytes > 0 ? bytes(host.disk_total_bytes) : <span className="dim">—</span>],
+          [
+            '发行版',
+            host.os_pretty || host.virt ? (
+              <span title={host.os_pretty || host.virt}>
+                {host.os_pretty || host.virt}
+                {host.os_pretty && host.virt && <span className="nd-rt-q">{host.virt}</span>}
+              </span>
+            ) : (
+              <span className="dim">—</span>
+            ),
+            'w2',
+          ],
+          [
+            '内核',
+            host.kernel || host.arch ? (
+              <span title={host.kernel || host.arch}>
+                {host.kernel || host.arch}
+                {host.kernel && host.arch && <span className="nd-rt-q">{host.arch}</span>}
+              </span>
+            ) : (
+              <span className="dim">—</span>
+            ),
+            'w2',
+          ],
+          [
+            '时钟偏移',
+            skew !== null ? (
+              /* 接收上报时测得的 agent 钟减控制面钟。TLS 依赖对时；±5 秒是传输耗时的
+                 噪声上限，超过即标出。 */
+              <span title="agent 时钟减控制面时钟，接收上报时测得">
+                {Math.abs(skew) >= 5 ? (
+                  <Hot>
+                    {skew >= 0 ? '+' : '-'}
+                    {Math.abs(skew)} 秒
+                  </Hot>
+                ) : (
+                  <>
+                    {skew >= 0 ? '+' : '-'}
+                    {Math.abs(skew)} 秒
+                  </>
+                )}
+              </span>
+            ) : (
+              <span className="dim">—</span>
+            ),
+          ],
+          /* 这两项安装器不管（install.sh 只调拥塞与连接表），机器上是什么就显示什么。
+             不用 .inherit 降色阶：取值来源恒定为「非纳管」，对一个从不变的答案做视觉区分
+             不携带信息。 */
+          [
+            '收发缓冲',
+            host.rmem_max > 0 || host.wmem_max > 0 ? (
+              `${bytes(host.rmem_max)} / ${bytes(host.wmem_max)}`
+            ) : (
+              <span className="dim">—</span>
+            ),
+          ],
+          ['监听队列', host.somaxconn > 0 ? host.somaxconn.toLocaleString() : <span className="dim">—</span>],
+          [
+            '连接表上限',
+            host.conntrack_max !== null ? (
+              host.conntrack_max.toLocaleString()
+            ) : (
+              // 未加载 nf_conntrack 不是故障，而是该机器未配置 NAT。显示「—」会被理解为读取失败。
+              <span className="dim">没开</span>
+            ),
+          ],
+        ]}
+      />
+    </Band>
   );
 }
 
@@ -3002,28 +3304,37 @@ function AgentCard({
   // 已运行 = 当前时刻减启动时刻，每秒都在变——与 PollAgo 同理用 useNow 而非 Date.now()。
   const now = useNow();
   return (
-    <div className="panel">
-      <header>
-        <h4>AGENT</h4>
-      </header>
-      <Strip
+    /* 「上次来拉」移到带名下方的时效位：它表示这条带的数据有多新，与 HOST 的上报时间、
+       CONFIG 的观察时间同一性质，三者在同一列上才能横向比对。 */
+    <Band
+      name="AGENT"
+      icon="agent"
+      meta={
+        <>
+          <Ago at={node.last_poll_at} /> 来拉
+        </>
+      }
+    >
+      <Cells
         items={[
-          ['上次来拉', <Ago at={node.last_poll_at} />],
           ['上次用量', <Ago at={node.last_usage_report_at} />],
           [
             '用量明目',
             node.usage_last_result ? (
-              <span className="mono">{node.usage_last_result.accepted_readings} 项</span>
+              <>
+                {node.usage_last_result.accepted_readings}
+                <span className="nd-rt-u">项</span>
+              </>
             ) : (
               <span className="dim">—</span>
             ),
           ],
-          // agent 进程自身的运行时长：崩溃循环的机器上该值恒为几分钟，与「上次来拉 6 秒前」
-          // 并排即可区分「连不上」与「一直在重启」。
+          // agent 进程自身的运行时长：崩溃循环的机器上该值恒为几分钟，与带名下的
+          // 「6 秒前来拉」并排即可区分「连不上」与「一直在重启」。
           [
             '已运行',
             agentStartedAt !== null ? (
-              <span className="mono">{dur(Math.max(0, Math.floor(now / 1000) - agentStartedAt))}</span>
+              dur(Math.max(0, Math.floor(now / 1000) - agentStartedAt))
             ) : (
               <span className="dim">—</span>
             ),
@@ -3033,14 +3344,27 @@ function AgentCard({
           ['构建', agentIdent(node.agent_version)],
           [
             '协议',
-            node.agent_protocol_version === null ? (
-              <span className="hot">旧版 · 等待救援升级</span>
+            node.agent_protocol_version === null ? <Hot>旧版 · 等待救援升级</Hot> : <>v{node.agent_protocol_version}</>,
+          ],
+          [
+            '上报积压',
+            node.spool_backlog ? (
+              <>
+                {node.spool_backlog.observation + node.spool_backlog.usage}
+                <span className="nd-rt-u">条</span>
+                <span className="dim"> · 丢弃 </span>
+                {node.spool_backlog.dropped > 0 ? (
+                  <Hot>{node.spool_backlog.dropped.toLocaleString()}</Hot>
+                ) : (
+                  node.spool_backlog.dropped.toLocaleString()
+                )}
+              </>
             ) : (
-              <span className="mono">v{node.agent_protocol_version}</span>
+              <span className="dim">—</span>
             ),
           ],
           // token 字段已移除：凭据只在签发时出现一次，此处只能显示前几位，既无法核对
-          // 也无法复制。需要确认的两项信息都在其他位置——连接状态见上面两个上报时间，
+          // 也无法复制。需要确认的两项信息都在其他位置——连接状态见带名下的时效读数，
           // 更换凭据使用标题栏的「重签 token」。
           // 「状态巡检」指 agent 侧的本地对账（brocade-agent/src/main.rs），在控制面返回
           // 204 时执行：机器配置发生偏移后由 agent 自行修复，该字段是其执行结果。
@@ -3050,7 +3374,7 @@ function AgentCard({
               node.last_local_reconcile.actions.length > 0 ? (
                 <>
                   <Ago at={new Date(node.last_local_reconcile.at * 1000).toISOString()} />
-                  <span className="dim rt-v" title={node.last_local_reconcile.actions.join('、')}>
+                  <span className="dim" title={node.last_local_reconcile.actions.join('、')}>
                     {' '}
                     · 重放了 {node.last_local_reconcile.actions.join('、')}
                   </span>
@@ -3061,92 +3385,114 @@ function AgentCard({
             ) : (
               <span className="dim">—</span>
             ),
-            // 从新行开始：其取值可能长至「重放了 xray、grants」，与前三项同行时
-            // 会使该行长度不一，而它是本卡中最需要被读取的一项。
-            'newline',
-          ],
-          [
-            '上报积压',
-            node.spool_backlog ? (
-              <span className="mono">
-                {node.spool_backlog.observation + node.spool_backlog.usage} 条<span className="dim"> · 丢弃 </span>
-                <span className={node.spool_backlog.dropped > 0 ? 'hot' : undefined}>
-                  {node.spool_backlog.dropped.toLocaleString()}
-                </span>
-              </span>
-            ) : (
-              <span className="dim">—</span>
-            ),
+            // 跨两栏：其取值可能长至「重放了 xray、grants」，占一栏会被截断，
+            // 而它是本带中最需要被读取的一项。
+            'w2',
           ],
         ]}
       />
-      <Findings
-        list={runtimeFindings(node).filter(
-          f =>
-            f.chip === '自修失败' ||
-            f.chip.startsWith('丢了') ||
-            f.chip.startsWith('agent ') ||
-            f.chip.startsWith('拒收 ') ||
-            f.chip.startsWith('未识别 ') ||
-            f.chip.startsWith('断点 '),
-        )}
-      />
-    </div>
+    </Band>
   );
 }
 
 function AppliedCard({
   node,
   revisionOf,
+}: {
+  node: NodeAgentStateItem;
+  revisionOf: (d: number) => number | undefined;
+}) {
+  const a = appliedOf(node);
+  const rev = a?.source_deployment_id != null ? revisionOf(a.source_deployment_id) : undefined;
+  const meta = a ? (
+    <>
+      <Ago at={a.observed_at ?? null} /> 观察
+    </>
+  ) : (
+    '—'
+  );
+  if (!a)
+    return (
+      <Band name="CONFIG" icon="artifacts" meta={meta}>
+        <p className="note nd-rt-empty">还没收敛过。</p>
+      </Band>
+    );
+  return (
+    <Band name="CONFIG" icon="artifacts" meta={meta}>
+      {/* 逐项状态合成一条状态带，不再逐件占一格：五件产物此前各占一格，而每格里只有一个
+          三字符的状态词，一格的其余宽度是空的。状态带上每片自带产物名，见 StateChip。
+          需要列全：它也是发布前判定待发布的依据，unknown 一律判定为需要操作。 */}
+      <Cells
+        items={[
+          [
+            '来自',
+            <>
+              {a.source_deployment_id != null ? `#${a.source_deployment_id}` : '—'}
+              {rev !== undefined && <span className="nd-rt-q">{`修订 ${rev}`}</span>}
+            </>,
+            'w2',
+          ],
+          [
+            '产物',
+            <span className="nd-rt-chips">
+              {ARTIFACT_KINDS.map(kind => (
+                <StateChip key={kind} state={artifactState(node, kind)} label={ARTIFACT_LABEL[kind]} />
+              ))}
+              <StateChip state={a.grants?.state ?? 'unknown'} label="授权同步" />
+            </span>,
+            'w5',
+          ],
+        ]}
+      />
+      {/* 此处原有 xray 和 wg 的 sha256，已移除：这条带表示的是收敛来源和各产物状态，
+          而 sha256 用于与产物面板逐字节核对，二者用途不同；两个 64 位值还会占满一行。
+          需要查看指纹时使用产物面板，那里有完整值。 */}
+    </Band>
+  );
+}
+
+/** 三条带合成一张整宽卡。
+ *
+ * 此前是并排的三张卡：卡宽约 380px，标签列占 72px，而值多为 4–12 个字符（约 90px），
+ * 每行右侧约 210px 空置，24 行即整块的空白来源。并排还使三卡各自计算标签列宽
+ * （`grid-template-columns: max-content …`），值列起点落在三个不同的 x；三卡行数
+ * 8 / 9 / 7，等高拉伸后剩余空白全部堆在最短的那张下缘。
+ *
+ * 合并后字段改为标签在值上方的单元格、8 栏对齐，栏数随容器宽度递减（见 styles.css）。
+ * 三个数据来源改由横带左侧的边栏区分，每条带自带时效读数。 */
+function RuntimeCard({
+  node,
+  load,
+  agentStartedAt,
+  revisionOf,
   wireguardEnabled,
   children,
 }: {
   node: NodeAgentStateItem;
+  load: NodeLoadView | undefined;
+  agentStartedAt: number | null;
   revisionOf: (d: number) => number | undefined;
   wireguardEnabled: boolean;
   children?: ReactNode;
 }) {
-  const a = appliedOf(node);
-  const rev = a?.source_deployment_id != null ? revisionOf(a.source_deployment_id) : undefined;
   return (
-    <div className="panel">
+    <div className="panel nd-runtime">
       <header>
-        <h4>CONFIGURATIONS</h4>
+        <h4>
+          <Icon of="observe" size={13} className="nd-rt-head-ic" />
+          运行状态
+        </h4>
       </header>
-      {!a ? (
-        <p className="note" style={{ margin: 0 }}>
-          还没收敛过。
-        </p>
-      ) : (
-        <>
-          {/* 收敛来源和逐项状态共用一个字段网格。拆成两组 Strip 时两组各自计算标签列宽，
-              「来自 / 上次观察」的值起点与组件状态不在同一条竖轴上。逐项状态需要列全：
-              它也是发布前判定待发布的依据，unknown 一律判定为需要操作。 */}
-          <Strip
-            items={[
-              [
-                '来自',
-                <span className="mono">
-                  {a.source_deployment_id != null ? `#${a.source_deployment_id}` : '—'}
-                  {rev !== undefined && ` · 修订 ${rev}`}
-                </span>,
-              ],
-              ['上次观察', <Ago at={a.observed_at ?? null} />],
-              ...ARTIFACT_KINDS.map((kind): StripItem => [
-                ARTIFACT_LABEL[kind],
-                <StateChip state={artifactState(node, kind)} />,
-              ]),
-              ['授权同步', <StateChip state={a.grants?.state ?? 'unknown'} />],
-            ]}
-          />
-          {/* 此处原有 xray 和 wg 的 sha256，已移除：这张卡表示的是收敛来源和各产物状态，
-              而 sha256 用于与产物面板逐字节核对，二者用途不同；两个 64 位值还会占满一行。
-              需要查看指纹时使用产物面板，那里有完整值。 */}
-        </>
-      )}
-      {/* 版本相关的判定（xray 过旧、wg 回落用户态）挂在这张卡。版本详情已从卡片移除，
-          但需要处理的结论不能随之隐藏。放在条件分支外：从未收敛过的机器同样需要这些提示。 */}
-      <Findings list={runtimeFindings(node, wireguardEnabled).filter(f => f.chip !== '自修失败')} />
+      <AgentCard node={node} agentStartedAt={agentStartedAt} />
+      {/* HOST 的数据来自负载上报（host facts 是其中的低频段），与节点状态是两个通道。 */}
+      <HostCard load={load} />
+      <AppliedCard node={node} revisionOf={revisionOf} />
+      {/* 判定统一挂在卡底。此前 AGENT 卡按 chip 前缀筛一份、CONFIGURATIONS 卡筛
+          `chip !== '自修失败'` 再来一份，两个集合相交——「丢了 …」这类同时命中两个条件，
+          在同一屏上渲染两次。合并后不再需要筛选，各条判定只出现一次。
+          放在条件分支外：从未收敛过的机器同样需要这些提示。 */}
+      <Findings list={runtimeFindings(node, wireguardEnabled)} />
+      {/* 验证结果仍留在卡内：页头的「验证接入」调用同一接口，不再产生另一块重复结果。 */}
       {children}
     </div>
   );
@@ -3591,6 +3937,8 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   // turning WG off removes the backend warning immediately, before the draft is committed and
   // before the agent's next half-hourly runtime report clears its old observation.
   const wireguardEnabled = snapshot.data?.snapshot.nodes?.find(modelNode => modelNode.id === id)?.overlay ?? n.overlay;
+  const wgListenPort =
+    snapshot.data?.snapshot.nodes?.find(modelNode => modelNode.id === id)?.wireguard?.listen_port ?? null;
 
   // 该机器所属的链。不能只列出 chain id：分叉节点、显式规则边、主干默认边都会影响
   // accept/hop_in 是否保留。此处将关系拆分计算，下方的整链规则树使用同一份数据。
@@ -3873,27 +4221,24 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
             <ThroughputPanel nodeId={id} range={loadRange} linked={chartsLinked} />
             <PingProbePanel nodeId={id} range={loadRange} linked={chartsLinked} />
           </div>
-          <div className="nd-observed-status">
-            <AgentCard
-              node={n}
-              agentStartedAt={load.data?.processes.find(p => p.proc === 'agent')?.started_at_unix_secs ?? null}
-            />
-            {/* HOST 的数据来自负载上报（host facts 是其中的低频段），与节点状态是两个通道。 */}
-            <HostCard load={load.data} />
-            {/* AGENT → HOST → CONFIGURATIONS 是一组状态事实。验证结果仍留在收敛卡内：
-                  页头的「验证接入」调用同一接口，不再产生另一块重复结果。 */}
-            <AppliedCard node={n} revisionOf={revisionOf} wireguardEnabled={wireguardEnabled}>
-              {verify.data && (
-                <div className={verify.data.converged ? 'callout blue' : 'callout warn'} style={{ marginBottom: 0 }}>
-                  {verify.data.converged
-                    ? `已收敛：跟修订 ${verify.data.revision_id} 一致，没有要改的。`
-                    : `还没对齐修订 ${verify.data.revision_id}：有变更待推（${
-                        verify.data.targets.find(t => t.node_id === id)?.actions.join('、') ?? '—'
-                      }）。到「发布 → 计划预览」创建 deployment 才会推下去。`}
-                </div>
-              )}
-            </AppliedCard>
-          </div>
+          {/* AGENT → HOST → CONFIG 是一组状态事实，合成一张整宽卡，见 RuntimeCard。 */}
+          <RuntimeCard
+            node={n}
+            load={load.data}
+            agentStartedAt={load.data?.processes.find(p => p.proc === 'agent')?.started_at_unix_secs ?? null}
+            revisionOf={revisionOf}
+            wireguardEnabled={wireguardEnabled}
+          >
+            {verify.data && (
+              <div className={verify.data.converged ? 'callout blue' : 'callout warn'} style={{ marginBottom: 0 }}>
+                {verify.data.converged
+                  ? `已收敛：跟修订 ${verify.data.revision_id} 一致，没有要改的。`
+                  : `还没对齐修订 ${verify.data.revision_id}：有变更待推（${
+                      verify.data.targets.find(t => t.node_id === id)?.actions.join('、') ?? '—'
+                    }）。到「发布 → 计划预览」创建 deployment 才会推下去。`}
+              </div>
+            )}
+          </RuntimeCard>
         </section>
       )}
 
@@ -3979,7 +4324,14 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
               )}
             </div>
 
-            <WgCard node={n} canEdit={system} onSaved={onSaved} />
+            <WgCard
+              node={n}
+              listenPort={wgListenPort}
+              peers={nodes.data?.nodes ?? []}
+              disabledLinks={snapshot.data?.snapshot.settings?.overlay.disabled_links ?? []}
+              canEdit={system}
+              onSaved={onSaved}
+            />
           </div>
 
           <div>

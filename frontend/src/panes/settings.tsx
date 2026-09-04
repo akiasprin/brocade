@@ -1643,6 +1643,8 @@ export function SettingsPane() {
         overlay: {
           keepalive_secs: Number(v('keepalive')) || 25,
           mtu: Number(v('mtu')) || 1420,
+          // 链路禁用由机器页的独立草稿操作维护；保存全局 WG 数值时必须原样带回。
+          disabled_links: settings.data?.overlay.disabled_links ?? [],
         },
         ports: {
           ingress_base: Number(v('ingressBase')) || 8443,

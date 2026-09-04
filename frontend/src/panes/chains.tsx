@@ -104,6 +104,7 @@ import { SLUG_MAX, freePortAcross, freeSpanAcross, isValidSlug, occupiedPorts, p
 const HY2_PORT_BASE = 18000;
 const ANYTLS_PORT_BASE = 19000;
 const DEFAULT_HOP_SPAN = 100;
+const U32_MAX = 4_294_967_295;
 
 function anyTlsHeadersText(headers: Record<string, string> | undefined): string {
   return Object.entries(headers ?? {})
@@ -1722,6 +1723,9 @@ export function IngressStreamRow({
   const [draftAnyTlsPadding, setDraftAnyTlsPadding] = useState<string | null>(null);
   const [draftAnyTlsHeaders, setDraftAnyTlsHeaders] = useState<string | null>(null);
   const [draftAnyTlsStatus, setDraftAnyTlsStatus] = useState<string | null>(null);
+  const [draftAnyTlsIdleCheck, setDraftAnyTlsIdleCheck] = useState<string | null>(null);
+  const [draftAnyTlsIdleTimeout, setDraftAnyTlsIdleTimeout] = useState<string | null>(null);
+  const [draftAnyTlsMinIdle, setDraftAnyTlsMinIdle] = useState<string | null>(null);
   const current = stagedTransport && 'xhttp' in stagedTransport ? stagedTransport.xhttp : (storedVless?.xhttp ?? null);
   const on = kind !== null && transportIsXhttp(kind);
   const tls = kind !== null && kind.startsWith('vless-tls');
@@ -1835,6 +1839,9 @@ export function IngressStreamRow({
       setDraftAnyTlsPadding(null);
       setDraftAnyTlsHeaders(null);
       setDraftAnyTlsStatus(null);
+      setDraftAnyTlsIdleCheck(null);
+      setDraftAnyTlsIdleTimeout(null);
+      setDraftAnyTlsMinIdle(null);
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       setDraftMode(null);
       setPendingTransport(null);
@@ -1852,6 +1859,9 @@ export function IngressStreamRow({
       setDraftAnyTlsPadding(null);
       setDraftAnyTlsHeaders(null);
       setDraftAnyTlsStatus(null);
+      setDraftAnyTlsIdleCheck(null);
+      setDraftAnyTlsIdleTimeout(null);
+      setDraftAnyTlsMinIdle(null);
     },
   });
 
@@ -2112,12 +2122,36 @@ export function IngressStreamRow({
     (!/^\d+$/.test(anytlsStatusText) || !Number.isInteger(anytlsStatus) || anytlsStatus < 200 || anytlsStatus > 599);
   const anytlsPaddingBad = anytlsPaddingText.trim() !== '' && !anyTlsPaddingValid(anytlsPaddingText);
   const anytlsHeadersBad = parsedAnyTlsHeaders === null;
+  const anytlsIdleCheckText =
+    draftAnyTlsIdleCheck ??
+    (anytlsValue.idle_session_check_interval_secs == null
+      ? ''
+      : String(anytlsValue.idle_session_check_interval_secs));
+  const anytlsIdleTimeoutText =
+    draftAnyTlsIdleTimeout ??
+    (anytlsValue.idle_session_timeout_secs == null ? '' : String(anytlsValue.idle_session_timeout_secs));
+  const anytlsMinIdleText =
+    draftAnyTlsMinIdle ?? (anytlsValue.min_idle_session == null ? '' : String(anytlsValue.min_idle_session));
+  const optionalUintBad = (text: string, allowZero: boolean) =>
+    text.trim() !== '' &&
+    (!/^\d+$/.test(text.trim()) ||
+      !Number.isSafeInteger(Number(text.trim())) ||
+      Number(text.trim()) > U32_MAX ||
+      (allowZero ? Number(text.trim()) < 0 : Number(text.trim()) < 1));
+  const anytlsSessionBad =
+    optionalUintBad(anytlsIdleCheckText, false) ||
+    optionalUintBad(anytlsIdleTimeoutText, false) ||
+    optionalUintBad(anytlsMinIdleText, true);
+  const optionalUint = (text: string) => (text.trim() === '' ? null : Number(text.trim()));
   const anytlsForSave: AnyTlsSettings = {
     ...anytlsValue,
     padding_scheme: anytlsPaddingText
       .split(/\r?\n/)
       .map(line => line.trim())
       .filter(Boolean),
+    idle_session_check_interval_secs: optionalUint(anytlsIdleCheckText),
+    idle_session_timeout_secs: optionalUint(anytlsIdleTimeoutText),
+    min_idle_session: optionalUint(anytlsMinIdleText),
     masquerade: anytlsMasqueradeIsString
       ? {
           kind: 'string',
@@ -2135,8 +2169,11 @@ export function IngressStreamRow({
     (draftAnyTls !== null ||
       draftAnyTlsPadding !== null ||
       draftAnyTlsHeaders !== null ||
-      draftAnyTlsStatus !== null);
-  const anytlsBad = anytlsPortBad || anytlsPaddingBad || anytlsHeadersBad || anytlsStatusBad;
+      draftAnyTlsStatus !== null ||
+      draftAnyTlsIdleCheck !== null ||
+      draftAnyTlsIdleTimeout !== null ||
+      draftAnyTlsMinIdle !== null);
+  const anytlsBad = anytlsPortBad || anytlsPaddingBad || anytlsHeadersBad || anytlsStatusBad || anytlsSessionBad;
   usePanelEntry(
     'anytls',
     anytlsDirty,
@@ -2148,9 +2185,20 @@ export function IngressStreamRow({
         setDraftAnyTlsPadding(null);
         setDraftAnyTlsHeaders(null);
         setDraftAnyTlsStatus(null);
+        setDraftAnyTlsIdleCheck(null);
+        setDraftAnyTlsIdleTimeout(null);
+        setDraftAnyTlsMinIdle(null);
       },
     },
-    JSON.stringify([anytlsValue, anytlsPaddingText, anytlsHeadersText, anytlsStatusText]),
+    JSON.stringify([
+      anytlsValue,
+      anytlsPaddingText,
+      anytlsHeadersText,
+      anytlsStatusText,
+      anytlsIdleCheckText,
+      anytlsIdleTimeoutText,
+      anytlsMinIdleText,
+    ]),
   );
   const updateAnyTls = (patch: Partial<AnyTlsSettings>) => setDraftAnyTls({ ...anytlsValue, ...patch });
   const updateAnyTlsMasquerade = (masquerade: AnyTlsMasquerade) => updateAnyTls({ masquerade });
@@ -2238,6 +2286,64 @@ export function IngressStreamRow({
           />
           <div className="note">每行一条规则；自定义方案必须包含唯一的 `stop=...`，范围支持到 4 MiB。</div>
           {anytlsPaddingBad && <div className="note bad">Padding Scheme 格式无效：请检查 `=`、重复编号、stop 和字节范围。</div>}
+        </dd>
+        <dt>Session</dt>
+        <dd>
+          <details className="form-adv" style={{ width: '100%' }}>
+            <summary>连接复用</summary>
+            <div className="toolbar" style={{ margin: '8px 0 0', gap: 8, flexWrap: 'wrap' }}>
+              <label>
+                <span className="dim">检查间隔（秒）</span>
+                <input
+                  className="f mono"
+                  type="number"
+                  min={1}
+                  max={U32_MAX}
+                  style={{ width: 92, borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  value={anytlsIdleCheckText}
+                  disabled={!editable}
+                  aria-label="AnyTLS Session 检查间隔"
+                  onChange={event => setDraftAnyTlsIdleCheck(event.target.value)}
+                />
+              </label>
+              <label>
+                <span className="dim">空闲超时（秒）</span>
+                <input
+                  className="f mono"
+                  type="number"
+                  min={1}
+                  max={U32_MAX}
+                  style={{ width: 92, borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  value={anytlsIdleTimeoutText}
+                  disabled={!editable}
+                  aria-label="AnyTLS Session 空闲超时"
+                  onChange={event => setDraftAnyTlsIdleTimeout(event.target.value)}
+                />
+              </label>
+              <label>
+                <span className="dim">最少保留（个）</span>
+                <input
+                  className="f mono"
+                  type="number"
+                  min={0}
+                  max={U32_MAX}
+                  style={{ width: 92, borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  value={anytlsMinIdleText}
+                  disabled={!editable}
+                  aria-label="AnyTLS Session 最少保留数量"
+                  onChange={event => setDraftAnyTlsMinIdle(event.target.value)}
+                />
+              </label>
+            </div>
+            {anytlsSessionBad && (
+              <div className="note bad">
+                Session 参数必须在 0 到 {U32_MAX} 之间；检查间隔和空闲超时必须大于 0。
+              </div>
+            )}
+            <div className="note">
+              留空时不下发，由客户端使用自身默认值；Xray 的空闲超时为 60s，Mihomo 为 30s。
+            </div>
+          </details>
         </dd>
         <dt>Masquerade</dt>
         <dd>

@@ -5,7 +5,9 @@ use brocade_core::{
     diagnostic::summarize_diagnostics,
     format::ini,
     ir::system::{compile_system, Dial, LinkWrap},
-    model::{Dns, DomainStrategy, ModelSnapshot, Node, WgTransport, WireGuardKeys},
+    model::{
+        DisabledWireGuardLink, Dns, DomainStrategy, ModelSnapshot, Node, WgTransport, WireGuardKeys,
+    },
     physical::node::{build_node_plan, project_node},
     Level,
 };
@@ -37,7 +39,7 @@ fn compile_system_derives_mesh_dial_from_reachability() {
 }
 
 #[test]
-fn nat_ipv4_is_skipped_when_ipv6_is_reachable() {
+fn a_v4_only_node_does_not_dial_a_nat_peers_public_ipv6() {
     let mut b = node("b", Some("b.example.net"), [10, 66, 0, 2], true);
     b.public_ipv4_nat = true;
     b.public_ipv6 = Some("2001:db8::2".to_owned());
@@ -50,12 +52,32 @@ fn nat_ipv4_is_skipped_when_ipv6_is_reachable() {
     let sys = compile_system(&doc, &mut diagnostics);
 
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    let b = sys.nodes.iter().find(|node| node.id == "b").unwrap();
-    assert_eq!(
-        b.wireguard.as_ref().unwrap().endpoint.as_deref(),
-        Some("[2001:db8::2]:51820")
-    );
-    assert_eq!(link_dial(&sys, "a", "b"), Some(Dial::Both));
+    // a has only IPv4 and therefore cannot dial b's otherwise-public IPv6.
+    // b can still dial a over IPv4 from behind NAT.
+    assert_eq!(link_dial(&sys, "a", "b"), Some(Dial::BtoA));
+
+    let a_plan = project_node(&sys, &[], "a");
+    let a_to_b = a_plan
+        .wireguard
+        .as_ref()
+        .unwrap()
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == "b")
+        .unwrap();
+    assert_eq!(a_to_b.endpoint, None);
+
+    let b_plan = project_node(&sys, &[], "b");
+    let b_to_a = b_plan
+        .wireguard
+        .as_ref()
+        .unwrap()
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == "a")
+        .unwrap();
+    assert_eq!(b_to_a.endpoint.as_deref(), Some("a.example.net:51820"));
+    assert_eq!(b_to_a.persistent_keepalive, Some(25));
 }
 
 // Neither side can reach the other: no link is generated, and the release is not blocked.
@@ -78,6 +100,41 @@ fn compile_system_skips_links_with_no_reachable_endpoint_without_blocking() {
     assert_eq!(diagnostics[0].level, Level::Info);
     assert_eq!(diagnostics[0].code, "link.no-endpoint");
     assert_eq!(diagnostics[0].location, "a|b");
+    assert!(summarize_diagnostics(&diagnostics).can_publish);
+}
+
+#[test]
+fn disabled_link_is_removed_from_both_wireguard_plans_without_blocking() {
+    let mut doc = doc(vec![
+        node("a", Some("a.example.net"), [10, 66, 0, 1], true),
+        node("b", Some("b.example.net"), [10, 66, 0, 2], true),
+    ]);
+    doc.settings.overlay.disabled_links = vec![DisabledWireGuardLink {
+        // Reverse order deliberately verifies that the model is undirected even before a store
+        // write has canonicalized it.
+        a: "b".to_owned(),
+        b: "a".to_owned(),
+    }];
+    let mut diagnostics = Vec::new();
+
+    let sys = compile_system(&doc, &mut diagnostics);
+
+    assert!(sys.links.is_empty());
+    for node_id in ["a", "b"] {
+        assert!(
+            project_node(&sys, &[], node_id)
+                .wireguard
+                .expect("overlay node must retain its wg interface")
+                .peers
+                .is_empty(),
+            "{node_id} still contains the disabled peer"
+        );
+    }
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.level == Level::Info
+            && diagnostic.code == "link.disabled"
+            && diagnostic.location == "a|b"
+    }));
     assert!(summarize_diagnostics(&diagnostics).can_publish);
 }
 
@@ -108,7 +165,12 @@ fn wireguard_plan_and_format_keep_endpoint_rules_in_one_place() {
 fn wireguard_endpoint_formats_ipv6_literal() {
     let mut a = node("a", None, [10, 66, 0, 1], true);
     a.public_ipv6 = Some("2001:db8::1".to_owned());
-    let doc = doc(vec![a, node("b", None, [10, 66, 0, 2], true)]);
+    let mut b = node("b", None, [10, 66, 0, 2], true);
+    // A NAT-marked address still establishes that b has IPv6 egress; it just
+    // cannot be used as b's inbound Endpoint.
+    b.public_ipv6 = Some("2001:db8::2".to_owned());
+    b.public_ipv6_nat = true;
+    let doc = doc(vec![a, b]);
     let mut diagnostics = Vec::new();
     let sys = compile_system(&doc, &mut diagnostics);
 
@@ -172,15 +234,12 @@ fn wireguard_endpoints_and_keepalives_hold_their_invariants() {
     }
 
     for link in &sys.links {
-        let endpoint_of = |id: &str| {
-            sys.nodes
-                .iter()
-                .find(|node| node.id == id)
-                .and_then(|node| node.wireguard.as_ref())
-                .and_then(|wireguard| wireguard.endpoint.clone())
+        let has_landing = match &link.wrap {
+            LinkWrap::Udp => !link.endpoints.is_empty(),
+            LinkWrap::FakeTcp { servers } => !servers.is_empty(),
         };
         assert!(
-            endpoint_of(&link.a).is_some() || endpoint_of(&link.b).is_some(),
+            has_landing,
             "链路 {} 两侧都没有 Endpoint，永远握不上手",
             link.id
         );

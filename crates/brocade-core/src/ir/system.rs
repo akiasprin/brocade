@@ -74,6 +74,11 @@ pub struct Link {
     pub b: String,
     pub dial: Dial,
     pub keepalive_secs: u16,
+    /// For bare UDP, the node being dialed to the Endpoint the other end can
+    /// actually reach. Endpoint selection belongs to the link rather than the
+    /// node: a v4-only machine cannot dial a peer's otherwise-public v6 address.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, String>,
     /// Whether this link wears a TCP disguise, and if so which end hosts the server.
     /// See `LinkWrap`.
     pub wrap: LinkWrap,
@@ -169,13 +174,37 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
         .filter(|node| node.wireguard.is_some())
         .cloned()
         .collect::<Vec<_>>();
+    let disabled_links = doc
+        .settings
+        .overlay
+        .disabled_links
+        .iter()
+        .map(|link| {
+            if link.a <= link.b {
+                (link.a.as_str(), link.b.as_str())
+            } else {
+                (link.b.as_str(), link.a.as_str())
+            }
+        })
+        .collect::<BTreeSet<_>>();
     let mut links = Vec::new();
     for i in 0..members.len() {
         for j in (i + 1)..members.len() {
             let a = &members[i];
             let b = &members[j];
-            let (a_wg, b_wg) = (a.wireguard.as_ref().unwrap(), b.wireguard.as_ref().unwrap());
+            if disabled_links.contains(&(a.id.as_str(), b.id.as_str())) {
+                diagnostics.push(Diagnostic::info(
+                    "link.disabled",
+                    format!("{}|{}", a.id, b.id),
+                    format!(
+                        "{} 与 {} 的 WireGuard 直连已由运营者禁用；双方配置都不生成该 peer",
+                        a.id, b.id
+                    ),
+                ));
+                continue;
+            }
             let wrap = link_wrap(doc, a, b, diagnostics);
+            let endpoints = direct_endpoints(doc, a, b, &wrap);
 
             // Dial direction rests on one test: whether the far side has an endpoint I
             // can reach. On a disguised link that endpoint is the far side's phantun
@@ -185,8 +214,8 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
             // bare the other" does not exist. Packets always leave through the local
             // phantun, the peer's roaming learns its own tun's address, and the return
             // path holds.
-            let a_can = has_landing(&wrap, b_wg, &b.id);
-            let b_can = has_landing(&wrap, a_wg, &a.id);
+            let a_can = has_landing(&wrap, &endpoints, &b.id);
+            let b_can = has_landing(&wrap, &endpoints, &a.id);
 
             // With neither side able to reach the other, no link is generated. The
             // level is `Info` rather than error or warning: the compiler does not know
@@ -201,8 +230,8 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
                     "link.no-endpoint",
                     format!("{}|{}", a.id, b.id),
                     format!(
-                        "{} 与 {} 互联的前提不成立：至少要有一端可拨入，\
-                         而两台的公网地址都标了 NAT。不生成这条链路——\
+                        "{} 与 {} 互联的前提不成立：至少要有一端能通过双方共有的地址族拨入，\
+                         而这对机器之间没有可达的非 NAT Endpoint。不生成这条链路——\
                          没有链走这一跳的话，这一对不通是无害的",
                         a.id, b.id
                     ),
@@ -224,6 +253,7 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
                     Dial::BtoA
                 },
                 keepalive_secs: doc.settings.overlay.keepalive_secs,
+                endpoints,
                 wrap,
             });
         }
@@ -254,6 +284,31 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
         nodes,
         links,
     }
+}
+
+/// The direct UDP landing on each end, selected against the address families the
+/// other end can use. The map key is the node being dialed.
+fn direct_endpoints(
+    doc: &ModelSnapshot,
+    a: &SystemNode,
+    b: &SystemNode,
+    wrap: &LinkWrap,
+) -> BTreeMap<String, String> {
+    if !matches!(wrap, LinkWrap::Udp) {
+        return BTreeMap::new();
+    }
+    let (Some(a_node), Some(b_node)) = (find_node(doc, &a.id), find_node(doc, &b.id)) else {
+        return BTreeMap::new();
+    };
+
+    let mut endpoints = BTreeMap::new();
+    if let Some(endpoint) = public_endpoint_for(a_node, b_node, b_node.wireguard.listen_port) {
+        endpoints.insert(b.id.clone(), endpoint);
+    }
+    if let Some(endpoint) = public_endpoint_for(b_node, a_node, a_node.wireguard.listen_port) {
+        endpoints.insert(a.id.clone(), endpoint);
+    }
+    endpoints
 }
 
 fn host_port(host: &str, port: u16) -> String {
@@ -299,17 +354,15 @@ fn link_wrap(
     }
 
     let mut servers = BTreeMap::new();
-    // A reachable declaring side hosts it itself; an unreachable one borrows the
-    // peer's address and uses its own port.
+    // A declaring side reachable from this peer hosts it itself; otherwise it
+    // borrows a peer address which it can reach and uses its own port.
     for (me, me_ft, peer, peer_id) in [(a_node, a_ft, b_node, &b.id), (b_node, b_ft, a_node, &a.id)]
     {
         let Some(port) = me_ft else { continue };
-        if let Some(host) = public_endpoint_host(me) {
-            servers.insert(me.id.clone(), host_port(host, port));
-        } else if let Some(host) = public_endpoint_host(peer) {
-            servers
-                .entry(peer_id.to_string())
-                .or_insert(host_port(host, port));
+        if let Some(endpoint) = public_endpoint_for(peer, me, port) {
+            servers.insert(me.id.clone(), endpoint);
+        } else if let Some(endpoint) = public_endpoint_for(me, peer, port) {
+            servers.entry(peer_id.to_string()).or_insert(endpoint);
         }
     }
 
@@ -340,9 +393,13 @@ fn link_wrap(
 
 /// Whether there is an endpoint when I dial the far side. On a disguised link that
 /// means whether the far side hosts a server; on a bare one, its UDP port.
-fn has_landing(wrap: &LinkWrap, peer_wg: &WireGuard, peer_id: &str) -> bool {
+fn has_landing(
+    wrap: &LinkWrap,
+    direct_endpoints: &BTreeMap<String, String>,
+    peer_id: &str,
+) -> bool {
     match wrap {
-        LinkWrap::Udp => peer_wg.endpoint.is_some(),
+        LinkWrap::Udp => direct_endpoints.contains_key(peer_id),
         LinkWrap::FakeTcp { servers } => servers.contains_key(peer_id),
     }
 }
@@ -388,4 +445,37 @@ fn public_endpoint_host(node: &crate::model::Node) -> Option<&str> {
                 .as_deref()
                 .filter(|_| !node.public_ipv6_nat)
         })
+}
+
+/// Pick a non-NAT address on `target` that `dialer` has a usable address family
+/// for. An addressless node retains the historical IPv4-egress assumption; once a
+/// node declares only IPv6, inventing IPv4 reachability would be worse than
+/// declining the link.
+fn public_endpoint_for(
+    dialer: &crate::model::Node,
+    target: &crate::model::Node,
+    port: u16,
+) -> Option<String> {
+    let dialer_v6 = dialer.public_ipv6.is_some();
+    let dialer_v4 = dialer.public_ipv4.is_some() || !dialer_v6;
+
+    if dialer_v4 {
+        if let Some(host) = target
+            .public_ipv4
+            .as_deref()
+            .filter(|_| !target.public_ipv4_nat)
+        {
+            return Some(host_port(host, port));
+        }
+    }
+    if dialer_v6 {
+        if let Some(host) = target
+            .public_ipv6
+            .as_deref()
+            .filter(|_| !target.public_ipv6_nat)
+        {
+            return Some(host_port(host, port));
+        }
+    }
+    None
 }

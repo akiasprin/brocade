@@ -13,7 +13,64 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/transport"
 )
+
+type blockingDeliveryWriter struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+type gatedDeliveryWriter struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+	mu          sync.Mutex
+	data        []byte
+	closed      bool
+}
+
+func (w *gatedDeliveryWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	w.startedOnce.Do(func() { close(w.started) })
+	<-w.release
+	data := make([]byte, mb.Len())
+	mb.Copy(data)
+	buf.ReleaseMulti(mb)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return io.ErrClosedPipe
+	}
+	w.data = append(w.data, data...)
+	return nil
+}
+
+func (w *gatedDeliveryWriter) unblock() {
+	w.releaseOnce.Do(func() { close(w.release) })
+}
+
+func (w *gatedDeliveryWriter) Close() error {
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+	w.unblock()
+	return nil
+}
+
+func (w *gatedDeliveryWriter) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return bytes.Clone(w.data)
+}
+
+func (w *blockingDeliveryWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	w.startedOnce.Do(func() { close(w.started) })
+	<-w.release
+	buf.ReleaseMulti(mb)
+	return nil
+}
 
 func TestStreamCloseIsIdempotentAndWakesReaders(t *testing.T) {
 	endpoint := newTestLinkEndpoint()
@@ -58,6 +115,21 @@ func TestStreamCloseIsIdempotentAndWakesReaders(t *testing.T) {
 	}
 	if got := stream.result(); !errors.Is(got, wantErr) {
 		t.Fatalf("stream result = %v, want %v", got, wantErr)
+	}
+}
+
+func TestStreamDieHookInstalledAfterCloseRunsImmediately(t *testing.T) {
+	stream := newStream(1, nil)
+	stream.close(nil)
+
+	var hookCalls atomic.Int32
+	stream.setDieHook(func() {
+		hookCalls.Add(1)
+	})
+	stream.close(nil)
+
+	if got := hookCalls.Load(); got != 1 {
+		t.Fatalf("late dieHook calls = %d, want 1", got)
 	}
 }
 
@@ -110,6 +182,145 @@ func TestSessionPreservesBufferedDataBeforeFIN(t *testing.T) {
 		buf.ReleaseMulti(mb)
 		t.Fatalf("read after buffered payload = (%v, %v), want EOF", mb, err)
 	}
+}
+
+func TestStreamDoneWaitsForQueuedDataBeforeFIN(t *testing.T) {
+	writer := &gatedDeliveryWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	stream := newStream(1, &transport.Link{Writer: writer})
+	s, _ := newWireSession(marshalTestFrames(
+		testWireFrame{cmd: cmdPSH, sid: 1, data: []byte("first-")},
+		testWireFrame{cmd: cmdPSH, sid: 1, data: []byte("tail")},
+		testWireFrame{cmd: cmdFIN, sid: 1},
+	), false)
+	s.streams[1] = stream
+
+	readDone := make(chan error, 1)
+	go func() { readDone <- s.readLoop(context.Background()) }()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("delivery writer did not start")
+	}
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("readLoop error = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readLoop did not consume FIN")
+	}
+	select {
+	case <-stream.done:
+		t.Fatal("stream completed before queued FIN tail was delivered")
+	default:
+	}
+
+	writer.unblock()
+	select {
+	case <-stream.done:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not complete after queued data was delivered")
+	}
+	if got := writer.bytes(); !bytes.Equal(got, []byte("first-tail")) {
+		t.Fatalf("delivered payload = %q, want first-tail", got)
+	}
+}
+
+func TestSessionCloseInterruptsGracefulDeliveryDrain(t *testing.T) {
+	writer := &gatedDeliveryWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	stream := newStream(1, &transport.Link{Writer: writer})
+	s, _ := newWireSession(marshalTestFrames(
+		testWireFrame{cmd: cmdPSH, sid: 1, data: []byte("blocked")},
+		testWireFrame{cmd: cmdFIN, sid: 1},
+	), false)
+	s.streams[1] = stream
+
+	if err := s.readLoop(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("readLoop error = %v, want EOF", err)
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("delivery writer did not block")
+	}
+	wantErr := errors.New("session stopped")
+	s.close(wantErr)
+	select {
+	case <-stream.done:
+	case <-time.After(time.Second):
+		t.Fatal("session close did not interrupt graceful delivery drain")
+	}
+	if got := stream.result(); !errors.Is(got, wantErr) {
+		t.Fatalf("stream result = %v, want %v", got, wantErr)
+	}
+}
+
+func TestSessionPSHDeliveryDoesNotBlockOtherStreams(t *testing.T) {
+	blocking := &blockingDeliveryWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	secondEndpoint := newTestLinkEndpoint()
+	defer secondEndpoint.closeInput()
+	defer secondEndpoint.closeOutput()
+
+	first := newStream(1, &transport.Link{Writer: blocking})
+	second := newStream(2, secondEndpoint.link)
+	s, _ := newWireSession(marshalTestFrames(
+		testWireFrame{cmd: cmdPSH, sid: 1, data: []byte("blocked")},
+		testWireFrame{cmd: cmdPSH, sid: 2, data: []byte("independent")},
+	), false)
+	s.streams[1] = first
+	s.streams[2] = second
+
+	readDone := make(chan error, 1)
+	go func() { readDone <- s.readLoop(context.Background()) }()
+	select {
+	case <-blocking.started:
+	case <-time.After(time.Second):
+		s.close(nil)
+		t.Fatal("first stream delivery worker did not start")
+	}
+
+	secondData := make(chan []byte, 1)
+	go func() {
+		mb, err := secondEndpoint.output.ReadMultiBuffer()
+		if err != nil {
+			secondData <- nil
+			return
+		}
+		data := make([]byte, mb.Len())
+		mb.Copy(data)
+		buf.ReleaseMulti(mb)
+		secondData <- data
+	}()
+	select {
+	case got := <-secondData:
+		if !bytes.Equal(got, []byte("independent")) {
+			t.Fatalf("second stream payload = %q, want independent", got)
+		}
+	case <-time.After(time.Second):
+		close(blocking.release)
+		s.close(nil)
+		t.Fatal("blocked first stream stopped the second stream")
+	}
+
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("readLoop error = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readLoop did not finish after parsing independent streams")
+	}
+	close(blocking.release)
+	s.close(nil)
 }
 
 func TestSessionTruncatedFramesReturnReadError(t *testing.T) {

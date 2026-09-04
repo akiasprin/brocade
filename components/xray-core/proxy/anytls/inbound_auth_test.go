@@ -25,6 +25,21 @@ func newAuthTestServer(password string) *Server {
 	}
 }
 
+func TestServerSessionDoesNotApplyDownlinkPadding(t *testing.T) {
+	server := &Server{paddingScheme: "stop=2\n0=30-30\n1=64-64"}
+	sess := server.newSession(nil, nil)
+
+	if sess.paddingScheme != nil {
+		t.Fatal("server session unexpectedly has a downlink padding scheme")
+	}
+	if got, enabled := sess.nextPacketIndex(); got != 0 || enabled {
+		t.Fatalf("server session packet = (%d, %v), want (0, false)", got, enabled)
+	}
+	if server.paddingScheme == "" {
+		t.Fatal("server lost padding scheme used for client negotiation")
+	}
+}
+
 func runAuthProcess(t *testing.T, auth []byte, closeAfterAuth bool) error {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
@@ -104,5 +119,54 @@ func TestInboundAuthenticationAcceptsValidHeader(t *testing.T) {
 	auth = append(auth, 7, 8, 9)
 	if err := runAuthProcess(t, auth, true); err == nil || !strings.Contains(err.Error(), "EOF") {
 		t.Fatalf("valid auth result = %v, want session EOF", err)
+	}
+}
+
+func TestRemoveUserClosesAuthenticatedConnection(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	server := newAuthTestServer("correct-password")
+	ctx := sessionctx.ContextWithInbound(context.Background(), &sessionctx.Inbound{})
+	processDone := make(chan error, 1)
+	go func() {
+		processDone <- server.Process(ctx, xnet.Network_TCP, serverConn, &testDispatcher{})
+	}()
+
+	hash := sha256.Sum256([]byte("correct-password"))
+	auth := append(append([]byte{}, hash[:]...), 0, 0)
+	if _, err := clientConn.Write(auth); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.userMu.RLock()
+		active := 0
+		for _, sessions := range server.activeSessions {
+			active += len(sessions)
+		}
+		server.userMu.RUnlock()
+		if active == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("authenticated session was not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := server.RemoveUser(context.Background(), "auth-test"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-processDone:
+		if err != nil {
+			t.Fatalf("revoked session returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("removing user did not stop authenticated connection")
+	}
+	if _, err := clientConn.Write(marshalTestFrame(cmdSYN, 1, nil)); err == nil {
+		t.Fatal("revoked connection still accepted a new stream frame")
 	}
 }

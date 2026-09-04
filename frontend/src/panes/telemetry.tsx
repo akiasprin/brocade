@@ -19,7 +19,7 @@ import {
   observeAreaStyle,
   observeAxisLine,
   observeAxisTick,
-  observeBpsRung,
+  observeBpsReading,
   observeBpsUnit,
   observeColors,
   observeMinorTick,
@@ -56,19 +56,11 @@ export const iso = (secs: number) => new Date(secs * 1000).toISOString();
  * 将 184 MB 的 RSS 显示为 193 MB 又与 top 的输出不一致。
  */
 
-/* 单位阶梯与坐标轴共用一条规则，见 observeBpsRung：取商 ≥ 1 的最大单位，若在该单位下
-   只剩一位数就退回小一档。原先是 ≥1e6 就取整到 Mb/s——3.4 Mb/s 显示成「3 Mb/s」，抹掉
-   13%，而 1 到 10 Mb/s 之间每个读数都吃这个量级的误差；退档后写「3400 kb/s」，不损失。
-   Gb/s 那档原先靠两位小数保精度，现在同样退档，1.05 Gb/s 读作「1050 Mb/s」——与同卡里
-   「548 Mb/s」同量纲，可直接比大小，全站带宽读数也因此统一成三到四位整数、不带小数。 */
-export const bps = (n: number | null): string => {
-  if (n === null) return '—';
-  const { divisor, name, ceiling } = observeBpsRung(n);
-  const scaled = n / divisor;
-  // 阶梯到顶（Gb/s 之上没有档）时退不了，两位数取整会抹掉 4%——全机队合计常年落在这一段。
-  // 只有这里带小数，是全站唯一的例外。
-  return `${ceiling && scaled < 100 ? scaled.toFixed(1) : Math.round(scaled)} ${name}`;
-};
+/* 孤立读数：KPI 芯片、本月合计、机队汇总——身后没有坐标轴，自己定档。图上的读数一律改走
+   observeBpsUnit(...).read，跟本卡的轴同一个单位，见那里的说明。
+   精度靠有效数字不靠换单位：原先 ≥1e6 就取整到 Mb/s，3.42 Mb/s 显示成「3 Mb/s」抹掉 13%，
+   1 到 10 Mb/s 之间每个读数都吃这个量级的误差。三位有效数字与 pingLatencyText 同一套规则。 */
+export const bps = (n: number | null): string => (n === null ? '—' : observeBpsReading(n));
 
 /** 微秒转毫秒。RTT 统一显示为毫秒——微秒级精度在跨境链路上没有意义，
     且多出三位数字会导致该列不对齐。 */
@@ -718,7 +710,7 @@ export function ThroughputChart({
               `<div style="display:flex;gap:7px;align-items:center;line-height:1.75">` +
               `<span style="width:8px;height:8px;border-radius:2px;background:${p.color};flex:none"></span>` +
               `<span style="color:${ink3}">${p.seriesName}</span>` +
-              `<b style="margin-left:auto;color:${ink};font-weight:500">${p.value[1] === null ? '—' : bps(p.value[1])}</b></div>`;
+              `<b style="margin-left:auto;color:${ink};font-weight:500">${p.value[1] === null ? '—' : unit.read(p.value[1])}</b></div>`;
             const rows = [...arr].sort(
               (left, right) =>
                 (right.value[1] ?? Number.NEGATIVE_INFINITY) - (left.value[1] ?? Number.NEGATIVE_INFINITY),

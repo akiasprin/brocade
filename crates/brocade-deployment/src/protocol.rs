@@ -940,6 +940,13 @@ pub struct E2eProbeTarget {
 pub struct E2eProbeAnyTls {
     /// The name on the machine's certificate. The client verifies it as ordinary TLS.
     pub server_name: String,
+    /// Optional client session-pool settings. Omitted values use the pinned Xray defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_session_check_interval_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_session_timeout_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_idle_session: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1100,10 +1107,10 @@ pub struct E2eProbeResult {
 //
 // This family covers state the control plane cannot observe through artifacts. None of these
 // values appear in any artifact: artifact reconciliation compares what the control plane sent,
-// and these three were never sent by it.
+// and these runtime observations were never sent by it.
 //
 // They use their own low-frequency endpoint rather than being folded into observations. An
-// observation carries a `deployment_id` and exists only during a release, whereas these three
+// observation carries a `deployment_id` and exists only during a release, whereas these values
 // matter most when nothing is being released: a machine that has not deployed for a month is the
 // one most likely to have drifted undetected.
 
@@ -1143,6 +1150,11 @@ pub struct NodeRuntimeReport {
     /// What the last local reconcile did. `None` where none ever ran.
     #[serde(default)]
     pub local_reconcile: Option<LocalReconcileReport>,
+    /// Latest verdict from the same WireGuard peer check used by the node health command and
+    /// watchdog. `None` identifies an older agent, or the few seconds before a new agent's first
+    /// watchdog round.
+    #[serde(default)]
+    pub wireguard_health: Option<WireGuardHealth>,
     pub spool: SpoolBacklog,
 }
 
@@ -1211,6 +1223,37 @@ pub struct LocalReconcileReport {
     /// means the state drifted and was repaired, this one means it drifted and was not.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// Current WireGuard state on one node. It is a runtime observation rather than an artifact
+/// verdict: a perfectly converged config can still have an unreachable peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireGuardHealth {
+    pub enabled: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub peers: Vec<WireGuardPeerHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireGuardPeerHealth {
+    pub peer_node_id: String,
+    #[serde(default)]
+    pub overlay_ip: Option<String>,
+    #[serde(default)]
+    pub handshake_age_secs: Option<i64>,
+    pub status: WireGuardPeerStatus,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireGuardPeerStatus {
+    Up,
+    Down,
+    Unknown,
 }
 
 /// How much undeliverable reporting has piled up locally.

@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use brocade_deployment::protocol::{WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus};
+
 use crate::phantun::phantun_servers;
 use crate::phantun::udp_bound;
 use crate::{
@@ -726,6 +728,85 @@ fn elapsed_at_least(mark: Option<Instant>, secs: u64) -> bool {
 
 static WG_GUARD: Mutex<Option<WgGuard>> = Mutex::new(None);
 
+/// Latest peer verdict for the runtime reporter. The watchdog refreshes the value every round,
+/// while `update_wireguard_health` reports a change only when the actionable state changes; a
+/// handshake age increasing by five seconds must not create a control-plane report every round.
+static WG_HEALTH: Mutex<Option<WireGuardHealth>> = Mutex::new(None);
+
+pub(crate) fn wireguard_health_snapshot(state_dir: &Path) -> Option<WireGuardHealth> {
+    let enabled =
+        state_dir.join("wireguard.conf").exists() && !state_dir.join("wireguard.disabled").exists();
+    if !enabled {
+        return Some(WireGuardHealth {
+            enabled: false,
+            error: None,
+            peers: Vec::new(),
+        });
+    }
+    WG_HEALTH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .filter(|health| health.enabled)
+}
+
+pub(crate) fn set_wireguard_disabled() -> bool {
+    update_wireguard_health(WireGuardHealth {
+        enabled: false,
+        error: None,
+        peers: Vec::new(),
+    })
+}
+
+fn peer_health(check: &PeerCheck) -> WireGuardPeerHealth {
+    let (status, detail) = match &check.state {
+        PeerState::Fresh | PeerState::Alive => (WireGuardPeerStatus::Up, None),
+        PeerState::Down { detail } => (WireGuardPeerStatus::Down, Some(detail.clone())),
+        PeerState::Unprobed { reason } => (WireGuardPeerStatus::Unknown, Some(reason.clone())),
+        // `check_wg_peers` settles every suspect before returning. Keeping this arm safe makes a
+        // future partial checker report uncertainty rather than a false outage.
+        PeerState::Suspect => (
+            WireGuardPeerStatus::Unknown,
+            Some("握手已过期，尚未完成可达性探测".to_owned()),
+        ),
+    };
+    WireGuardPeerHealth {
+        peer_node_id: check.name.clone(),
+        overlay_ip: check.overlay_ip.clone(),
+        handshake_age_secs: check.handshake_age,
+        status,
+        detail,
+    }
+}
+
+fn health_state_eq(left: &WireGuardHealth, right: &WireGuardHealth) -> bool {
+    left.enabled == right.enabled
+        && left.error == right.error
+        && left.peers.len() == right.peers.len()
+        && left.peers.iter().zip(&right.peers).all(|(left, right)| {
+            left.peer_node_id == right.peer_node_id && left.status == right.status
+        })
+}
+
+fn update_wireguard_health(next: WireGuardHealth) -> bool {
+    let mut current = WG_HEALTH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let changed = current
+        .as_ref()
+        .is_none_or(|previous| !health_state_eq(previous, &next));
+    *current = Some(next);
+    changed
+}
+
+fn update_wireguard_checks(checks: &[PeerCheck]) -> bool {
+    update_wireguard_health(WireGuardHealth {
+        enabled: true,
+        error: None,
+        peers: checks.iter().map(peer_health).collect(),
+    })
+}
+
 /// Exclusive lock over the backbone layer (wg0, and the phantun beneath it).
 ///
 /// The watchdog runs on its own thread and convergence on the apply loop, and both
@@ -779,18 +860,24 @@ fn mark_acted(at_top: bool) {
 /// timeouts, and with the post-remedy poke the upper bound is about 6 seconds. Those
 /// 6 seconds occur only on a machine whose backbone is already down, where letting
 /// the watchdog finish first is the correct order.
-pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
+pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) -> bool {
     let _backbone = backbone_lock();
 
     let checks = match check_wg_peers(conf) {
         Ok(checks) => checks,
         Err(error) => {
+            let changed = update_wireguard_health(WireGuardHealth {
+                enabled: true,
+                error: Some(error.clone()),
+                peers: Vec::new(),
+            });
             warn(format!(
                 "wireguard: 读不出 wg0 的运行态，这一轮判不了链路死活：{error}"
             ));
-            return;
+            return changed;
         }
     };
+    let health_changed = update_wireguard_checks(&checks);
     // No peer in the config: this machine is not in the backbone and has no link to
     // guard. The state is cleared with it, because a machine that goes from having
     // peers to having none, after being decommissioned or moved out of the backbone,
@@ -798,7 +885,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
     // carry an origin from days earlier straight to the last rung.
     if checks.is_empty() {
         with_wg_guard(|guard| *guard = WgGuard::default());
-        return;
+        return health_changed;
     }
 
     // An unprobeable peer stops here and never becomes a down peer. Without an ICMP
@@ -838,7 +925,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
             guard.dwell = WG_REMEDY_DWELL;
             guard.logged_peers.clear();
         });
-        return;
+        return health_changed;
     }
 
     // Record what is broken before selecting a remedy. Every branch below returns,
@@ -891,7 +978,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
     // and does not act. This is what the previous 60-second value provided, and it is
     // independent of the check interval.
     if !dwell_ok {
-        return;
+        return health_changed;
     }
 
     // There is a rung before the first: the passive side drifted to a public address.
@@ -937,7 +1024,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
         }
         mark_acted(false);
         poke(&stray);
-        return;
+        return health_changed;
     }
 
     // The first rung comes before judging liveness: at the instant roaming overwrites
@@ -973,7 +1060,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
         }
         mark_acted(false);
         poke(&drifted);
-        return;
+        return health_changed;
     }
 
     // Rung zero: when the cause is one layer down, do not act on wg. For a peer
@@ -1003,7 +1090,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
         }
         mark_acted(false);
         poke(&down);
-        return;
+        return health_changed;
     }
 
     let down_for = down_since;
@@ -1045,6 +1132,7 @@ pub(crate) fn guard_wireguard(state_dir: &Path, conf: &Path) {
             checks.len() - down.len()
         )),
     }
+    health_changed
 }
 
 /// Which remedy this round calls for.
@@ -1160,9 +1248,11 @@ mod tests {
 
     use serde_json::json;
 
+    use brocade_deployment::protocol::{WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus};
+
     use super::{
-        handshake_age_text, parse_wg_dump, parse_wireguard_conf_peers, peers_via_phantun_server,
-        phantun_passive_drift, wireguard_conf_peers, PhantunPassiveDrift,
+        handshake_age_text, health_state_eq, parse_wg_dump, parse_wireguard_conf_peers,
+        peers_via_phantun_server, phantun_passive_drift, wireguard_conf_peers, PhantunPassiveDrift,
     };
 
     fn state_dir(name: &str) -> PathBuf {
@@ -1170,6 +1260,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn runtime_health_change_ignores_age_but_detects_peer_verdicts() {
+        let previous = WireGuardHealth {
+            enabled: true,
+            error: None,
+            peers: vec![WireGuardPeerHealth {
+                peer_node_id: "jp-01".to_owned(),
+                overlay_ip: Some("10.66.0.2".to_owned()),
+                handshake_age_secs: Some(180),
+                status: WireGuardPeerStatus::Down,
+                detail: Some("handshake stale for 180 seconds".to_owned()),
+            }],
+        };
+        let mut next = previous.clone();
+        next.peers[0].handshake_age_secs = Some(185);
+        next.peers[0].detail = Some("handshake stale for 185 seconds".to_owned());
+
+        assert!(health_state_eq(&previous, &next));
+
+        next.peers[0].status = WireGuardPeerStatus::Up;
+        next.peers[0].detail = None;
+        assert!(!health_state_eq(&previous, &next));
     }
 
     /// A peer arriving through this machine's phantun server can only have a loopback

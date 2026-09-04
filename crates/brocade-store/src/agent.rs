@@ -263,6 +263,11 @@ pub async fn record_node_runtime(
         .as_ref()
         .map(serde_json::to_value)
         .transpose()?;
+    let wireguard_health = report
+        .wireguard_health
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
     // The rule database is the semantic inverse of `last_local_reconcile`: the latter is the
     // last thing that happened and must not be erased by a round in which it did not run,
     // whereas the rule database is the fact of this moment and is overwritten every round.
@@ -281,17 +286,19 @@ pub async fn record_node_runtime(
          SET runtime_versions = $2,
              spool_backlog = $3,
              last_local_reconcile = COALESCE($4, last_local_reconcile),
-             geodata_observed = $5,
-             runtime_reported_at = to_timestamp($6)
+             wireguard_health = COALESCE($5, wireguard_health),
+             geodata_observed = $6,
+             runtime_reported_at = to_timestamp($7)
          WHERE node_id = $1
            AND token_hash IS NOT NULL
            AND token_revoked_at IS NULL
-           AND (runtime_reported_at IS NULL OR runtime_reported_at <= to_timestamp($6))",
+           AND (runtime_reported_at IS NULL OR runtime_reported_at <= to_timestamp($7))",
     )
     .bind(node_id)
     .bind(versions)
     .bind(spool)
     .bind(reconcile)
+    .bind(wireguard_health)
     .bind(geodata)
     .bind(observed_at as f64)
     .execute(pool)

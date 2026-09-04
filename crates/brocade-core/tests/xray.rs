@@ -945,6 +945,7 @@ fn an_anytls_ingress_writes_a_distinct_tls_listener_and_server_settings() {
                     .collect(),
                 status_code: 403,
             },
+            ..AnyTls::default()
         },
     };
     let app = AppView {

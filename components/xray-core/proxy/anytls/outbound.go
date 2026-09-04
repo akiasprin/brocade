@@ -37,6 +37,7 @@ type Client struct {
 	defaultPaddingScheme *paddingScheme
 	authPadding          uint16
 	authHash             [32]byte
+	paddingMu            sync.RWMutex
 
 	poolMu       sync.Mutex
 	idleSessions []uint64
@@ -92,6 +93,19 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 
 func (c *Client) isClosed() bool {
 	return c == nil || c.closed.Load()
+}
+
+func (c *Client) paddingSnapshot() (*paddingScheme, uint16) {
+	c.paddingMu.RLock()
+	defer c.paddingMu.RUnlock()
+	return c.defaultPaddingScheme, c.authPadding
+}
+
+func (c *Client) updatePaddingScheme(scheme *paddingScheme) {
+	c.paddingMu.Lock()
+	c.defaultPaddingScheme = scheme
+	c.authPadding = getPadding0Size(scheme)
+	c.paddingMu.Unlock()
 }
 
 func (c *Client) Close() error {
@@ -189,9 +203,10 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			return errors.New("anytls: failed to establish connection").AtWarning().Base(err)
 		}
 
-		auth := make([]byte, 34+int(c.authPadding))
+		paddingScheme, authPadding := c.paddingSnapshot()
+		auth := make([]byte, 34+int(authPadding))
 		copy(auth[:32], c.authHash[:])
-		binary.BigEndian.PutUint16(auth[32:34], c.authPadding)
+		binary.BigEndian.PutUint16(auth[32:34], authPadding)
 		if err := writeFull(conn, auth); err != nil {
 			conn.Close()
 			return errors.New("anytls: write auth failed").Base(err)
@@ -207,7 +222,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			conn:          conn,
 			br:            &buf.BufferedReader{Reader: buf.NewReader(conn)},
 			bw:            buf.NewBufferedWriter(buf.NewWriter(conn)),
-			paddingScheme: c.defaultPaddingScheme,
+			paddingScheme: paddingScheme,
 			streams:       make(map[uint32]*stream),
 			synAckCh:      make(map[uint32]chan error),
 			errCh:         make(chan error, 1),
@@ -216,12 +231,12 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		sess.fw = newFrameWriter(sess.bw)
 		sess.nextSID.Store(1)
 		sess.pktCounter.Store(1)
-		sess.peerVersion = 1
-		sess.dieHook = func() {
+		sess.setPeerVersion(1)
+		sess.setDieHook(func() {
 			c.sessionsMu.Lock()
 			delete(c.sessions, sess.seq)
 			c.sessionsMu.Unlock()
-		}
+		})
 		c.poolMu.Lock()
 		if c.isClosed() {
 			c.poolMu.Unlock()
@@ -246,12 +261,12 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		sess.close(err)
 		return errors.New("anytls: failed to open stream").Base(err)
 	}
-	stream.dieHook = func() {
+	stream.setDieHook(func() {
 		if sess.isClosed() || sess.activeStreams.Load() != 0 {
 			return
 		}
 		c.markSessionIdle(sess)
-	}
+	})
 	go stream.pumpUplink(sess)
 
 	select {

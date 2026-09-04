@@ -4,7 +4,7 @@ use brocade_core::{
     client_config::SubscriptionClientConfig,
     compile::compile,
     model::{
-        Action, ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
+        Action, AnyTls, ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
         ExternalWarpBinding, Hysteria2, HysteriaMasquerade, HysteriaObfs, IngressWires,
         ModelSnapshot, Projection, ProjectionEndpoint, RealityXhttp, Transport, Xhttp, XhttpXmux,
     },
@@ -103,6 +103,17 @@ fn xhttp_topology() -> ModelSnapshot {
             download: None,
         },
     }));
+    topology
+}
+
+fn anytls_topology() -> ModelSnapshot {
+    let mut topology = demo_snapshot();
+    topology.apps[0].ingresses[0].wires = IngressWires::AnyTls(AnyTls {
+        idle_session_check_interval_secs: Some(5),
+        idle_session_timeout_secs: Some(10),
+        min_idle_session: Some(1),
+        ..AnyTls::default()
+    });
     topology
 }
 
@@ -339,6 +350,37 @@ fn hysteria_handshake_change_holds_projection_until_topology_matches() {
 }
 
 #[test]
+fn anytls_handshake_change_holds_projection_until_topology_matches() {
+    assert_topology_change_gates_projection(anytls_topology(), |desired| {
+        desired.apps[0].ingresses[0]
+            .wires
+            .anytls_mut()
+            .unwrap()
+            .port += 1;
+    });
+    assert_topology_change_gates_projection(anytls_topology(), |desired| {
+        let node_id = desired.apps[0].ingresses[0].node.clone();
+        desired
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .unwrap()
+            .certificate_name = Some("new-cert.example".to_owned());
+    });
+}
+
+#[test]
+fn server_only_anytls_change_does_not_hold_projection() {
+    assert_topology_change_allows_projection(anytls_topology(), |desired| {
+        desired.apps[0].ingresses[0]
+            .wires
+            .anytls_mut()
+            .unwrap()
+            .padding_scheme = vec!["stop=1".to_owned()];
+    });
+}
+
+#[test]
 fn hysteria_client_profile_change_holds_projection_until_topology_matches() {
     assert_topology_change_gates_projection(hysteria2_topology(), |desired| {
         desired.apps[0].ingresses[0]
@@ -407,6 +449,63 @@ fn ingress_client_transport_controls_advance_without_topology_release() {
         xhttp.xmux,
         desired.apps[0].ingresses[0].wires.xhttp().unwrap().xmux
     );
+}
+
+#[test]
+fn anytls_session_controls_advance_without_topology_release() {
+    let topology = anytls_topology();
+    let initial = SubscriptionClientConfig::from_snapshot(&topology);
+    let mut desired = topology.clone();
+    let anytls = desired.apps[0].ingresses[0].wires.anytls_mut().unwrap();
+    anytls.idle_session_check_interval_secs = Some(11);
+    anytls.idle_session_timeout_secs = Some(22);
+    anytls.min_idle_session = Some(3);
+
+    let next = SubscriptionClientConfig::advance(Some(&initial), &desired);
+    assert!(next.pending_topology(&topology).is_empty());
+
+    let composed = next.apply(topology).unwrap();
+    let anytls = composed.apps[0].ingresses[0].wires.anytls().unwrap();
+    assert_eq!(anytls.idle_session_check_interval_secs, Some(11));
+    assert_eq!(anytls.idle_session_timeout_secs, Some(22));
+    assert_eq!(anytls.min_idle_session, Some(3));
+}
+
+#[test]
+fn anytls_session_checkpoint_distinguishes_legacy_values_from_explicit_defaults() {
+    let topology = anytls_topology();
+    let initial = SubscriptionClientConfig::from_snapshot(&topology);
+    let mut desired = topology.clone();
+    let anytls = desired.apps[0].ingresses[0].wires.anytls_mut().unwrap();
+    anytls.idle_session_check_interval_secs = None;
+    anytls.idle_session_timeout_secs = None;
+    anytls.min_idle_session = None;
+
+    let next = SubscriptionClientConfig::advance(Some(&initial), &desired);
+    let composed = next.apply(topology.clone()).unwrap();
+    let anytls = composed.apps[0].ingresses[0].wires.anytls().unwrap();
+    assert_eq!(anytls.idle_session_check_interval_secs, None);
+    assert_eq!(anytls.idle_session_timeout_secs, None);
+    assert_eq!(anytls.min_idle_session, None);
+
+    let mut legacy = initial;
+    let projection = legacy
+        .ingresses
+        .values_mut()
+        .next()
+        .unwrap()
+        .projections
+        .values_mut()
+        .next()
+        .unwrap();
+    projection.anytls_idle_session_check_interval_secs = None;
+    projection.anytls_idle_session_timeout_secs = None;
+    projection.anytls_min_idle_session = None;
+    let composed = legacy.apply(topology).unwrap();
+    let anytls = composed.apps[0].ingresses[0].wires.anytls().unwrap();
+    assert_eq!(anytls.idle_session_check_interval_secs, Some(5));
+    assert_eq!(anytls.idle_session_timeout_secs, Some(10));
+    assert_eq!(anytls.min_idle_session, Some(1));
 }
 
 #[test]

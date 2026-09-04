@@ -60,6 +60,49 @@ func TestServerUserManagement(t *testing.T) {
 	}
 }
 
+func TestServerUserReplacementAndRemovalCloseActiveSessions(t *testing.T) {
+	server := &Server{
+		users:          make(map[[32]byte]*protocol.MemoryUser),
+		usersByEmail:   make(map[string]*protocol.MemoryUser),
+		activeSessions: make(map[*protocol.MemoryUser]map[*session]struct{}),
+	}
+	ctx := context.Background()
+	alice := testMemoryUser("alice", "first")
+	bob := testMemoryUser("bob", "second")
+	if err := server.AddUser(ctx, alice); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.AddUser(ctx, bob); err != nil {
+		t.Fatal(err)
+	}
+
+	aliceSession := &session{streams: make(map[uint32]*stream)}
+	bobSession := &session{streams: make(map[uint32]*stream)}
+	if got := server.registerSession(sha256ForTest("first"), aliceSession); got != alice {
+		t.Fatal("alice session was not registered")
+	}
+	if got := server.registerSession(sha256ForTest("second"), bobSession); got != bob {
+		t.Fatal("bob session was not registered")
+	}
+
+	if err := server.AddUser(ctx, testMemoryUser("alice", "replacement")); err != nil {
+		t.Fatal(err)
+	}
+	if !aliceSession.isClosed() {
+		t.Fatal("replacing alice did not close her active session")
+	}
+	if bobSession.isClosed() {
+		t.Fatal("replacing alice closed bob's active session")
+	}
+
+	if err := server.RemoveUser(ctx, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	if !bobSession.isClosed() {
+		t.Fatal("removing bob did not close his active session")
+	}
+}
+
 func TestMemoryAccountValueSemantics(t *testing.T) {
 	account := &MemoryAccount{Password: "secret"}
 	if !account.Equals(&MemoryAccount{Password: "secret"}) {

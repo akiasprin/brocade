@@ -410,6 +410,9 @@ CREATE TABLE IF NOT EXISTS control_state (
     reality_fingerprint TEXT DEFAULT 'chrome',
     overlay_keepalive_secs INTEGER DEFAULT 25 NOT NULL,
     overlay_mtu INTEGER DEFAULT 1420 NOT NULL,
+    -- Explicit exceptions to the otherwise full WireGuard mesh. Each JSON item is an
+    -- undirected {"a":"node-a","b":"node-b"} pair, canonicalized by the store.
+    overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL,
     port_ingress_base INTEGER DEFAULT 8443 NOT NULL,
     port_hop_base INTEGER DEFAULT 20000 NOT NULL,
     -- The same number as model.rs's HYSTERIA2_PORT_BASE, which is where a wire with no
@@ -530,6 +533,7 @@ CREATE TABLE IF NOT EXISTS control_state (
     CONSTRAINT control_state_id_check CHECK (id),
     CONSTRAINT control_state_overlay_keepalive_range CHECK (((overlay_keepalive_secs >= 1) AND (overlay_keepalive_secs <= 65535))),
     CONSTRAINT control_state_overlay_mtu_range CHECK (((overlay_mtu >= 1000) AND (overlay_mtu <= 9000))),
+    CONSTRAINT control_state_overlay_disabled_links_shape CHECK ((jsonb_typeof(overlay_disabled_links) = 'array')),
     CONSTRAINT control_state_port_hop_base_range CHECK (((port_hop_base >= 1) AND (port_hop_base <= 65535))),
     CONSTRAINT control_state_port_hy2_base_range CHECK (((port_hy2_base >= 1) AND (port_hy2_base <= 65535))),
     CONSTRAINT control_state_port_ingress_base_range CHECK (((port_ingress_base >= 1) AND (port_ingress_base <= 65535))),
@@ -558,6 +562,8 @@ ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'Brocade' NOT NULL;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS site_icon_data_url TEXT;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL;
 -- TCP-only probing was never a durable compatibility contract. Replaying 0001 drops those old
 -- settings before creating the shared TCP/ICMP model; the fleet deliberately starts this history
 -- afresh rather than carrying two names and two wire formats forever.
@@ -586,6 +592,11 @@ ALTER TABLE control_state
 ALTER TABLE control_state
     ADD CONSTRAINT control_state_realtime_interval_known
         CHECK ((realtime_interval_secs = ANY (ARRAY[1, 2, 5])));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_overlay_disabled_links_shape;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_overlay_disabled_links_shape
+        CHECK ((jsonb_typeof(overlay_disabled_links) = 'array'));
 ALTER TABLE control_state
     DROP CONSTRAINT IF EXISTS control_state_site_name_shape;
 ALTER TABLE control_state
@@ -1176,6 +1187,15 @@ CREATE TABLE IF NOT EXISTS ingresses (
     -- The UDP half. Separate from transport_kind rather than another value inside it: they are
     -- not alternatives, they coexist, and one column cannot hold two answers.
     hy2_enabled BOOLEAN DEFAULT FALSE NOT NULL,
+    -- AnyTLS is another independent TCP listener. It may coexist with VLESS and Hysteria 2 while
+    -- sharing this ingress's identity and grants.
+    anytls_enabled BOOLEAN DEFAULT FALSE NOT NULL,
+    anytls_port INTEGER,
+    anytls_padding_scheme JSONB DEFAULT '[]'::jsonb NOT NULL,
+    anytls_masquerade_kind TEXT DEFAULT '404' NOT NULL,
+    anytls_masquerade_content TEXT DEFAULT '' NOT NULL,
+    anytls_masquerade_headers JSONB DEFAULT '{}'::jsonb NOT NULL,
+    anytls_masquerade_status_code INTEGER DEFAULT 200 NOT NULL,
     reality_private_key TEXT NOT NULL,
     reality_public_key TEXT NOT NULL,
     reality_short_ids JSONB NOT NULL,
@@ -1450,10 +1470,22 @@ CREATE TABLE IF NOT EXISTS ingresses (
     CONSTRAINT ingresses_reality_server_names_check CHECK ((jsonb_typeof(reality_server_names) = 'array')),
     CONSTRAINT ingresses_reality_short_ids_check CHECK (brocade_valid_reality_short_ids(reality_short_ids)),
     CONSTRAINT ingresses_transport_kind_check CHECK ((transport_kind IS NULL OR transport_kind IN ('vless-reality', 'vless-reality-xhttp', 'vless-tls', 'vless-tls-xhttp'))),
+    CONSTRAINT ingresses_anytls_port_present CHECK ((anytls_port IS NOT NULL) = anytls_enabled),
+    CONSTRAINT ingresses_anytls_port_range CHECK (anytls_port IS NULL OR anytls_port BETWEEN 1 AND 65535),
+    CONSTRAINT ingresses_anytls_port_distinct CHECK (
+        anytls_port IS NULL OR transport_kind IS NULL OR anytls_port <> port
+    ),
+    CONSTRAINT ingresses_anytls_padding_scheme_check CHECK (jsonb_typeof(anytls_padding_scheme) = 'array'),
+    CONSTRAINT ingresses_anytls_masquerade_kind_check CHECK (anytls_masquerade_kind IN ('404', 'string')),
+    CONSTRAINT ingresses_anytls_masquerade_headers_check CHECK (jsonb_typeof(anytls_masquerade_headers) = 'object'),
+    CONSTRAINT ingresses_anytls_masquerade_status_check CHECK (
+        anytls_masquerade_kind <> 'string'
+        OR anytls_masquerade_status_code BETWEEN 200 AND 599
+    ),
     -- An ingress with neither wire listens on nothing and would compile to an inbound-less
     -- machine. The model makes it unrepresentable (`IngressWires` is an enum, not two Options);
     -- this is the same invariant at the layer that outlives the process.
-    CONSTRAINT ingresses_has_a_wire CHECK ((transport_kind IS NOT NULL OR hy2_enabled)),
+    CONSTRAINT ingresses_has_a_wire CHECK ((transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled)),
     CONSTRAINT ingresses_app_id_id_key UNIQUE (app_id, id),
 
     CONSTRAINT ingresses_pkey PRIMARY KEY (id),
@@ -1790,6 +1822,7 @@ CREATE TABLE IF NOT EXISTS node_agent_state (
     route_ipv6 TEXT,
     runtime_versions JSONB DEFAULT '{}'::jsonb NOT NULL,
     last_local_reconcile JSONB,
+    wireguard_health JSONB DEFAULT '{}'::jsonb NOT NULL,
     spool_backlog JSONB DEFAULT '{}'::jsonb NOT NULL,
     runtime_reported_at TIMESTAMPTZ,
     geodata_observed JSONB DEFAULT '{}'::jsonb NOT NULL,
@@ -2894,6 +2927,10 @@ CREATE TABLE IF NOT EXISTS ingress_client_settings (
     -- ingress topology row above; these JSON objects intentionally contain only dialer fields.
     xhttp_download_v4 JSONB,
     xhttp_download_v6 JSONB,
+    -- AnyTLS client session pooling. NULL leaves the choice to each consuming client.
+    anytls_idle_session_check_interval BIGINT,
+    anytls_idle_session_timeout BIGINT,
+    anytls_min_idle_session BIGINT,
     updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT ingress_client_settings_pkey PRIMARY KEY (ingress_id),
     CONSTRAINT ingress_client_settings_ingress_fkey
@@ -2907,6 +2944,18 @@ CREATE TABLE IF NOT EXISTS ingress_client_settings (
         CHECK (xhttp_download_v4 IS NULL OR brocade_valid_xhttp_download(xhttp_download_v4)),
     CONSTRAINT ingress_client_settings_xhttp_download_v6_check
         CHECK (xhttp_download_v6 IS NULL OR brocade_valid_xhttp_download(xhttp_download_v6)),
+    CONSTRAINT ingress_client_settings_anytls_idle_session_check_interval_check CHECK (
+        anytls_idle_session_check_interval IS NULL
+        OR anytls_idle_session_check_interval BETWEEN 1 AND 4294967295
+    ),
+    CONSTRAINT ingress_client_settings_anytls_idle_session_timeout_check CHECK (
+        anytls_idle_session_timeout IS NULL
+        OR anytls_idle_session_timeout BETWEEN 1 AND 4294967295
+    ),
+    CONSTRAINT ingress_client_settings_anytls_min_idle_session_check CHECK (
+        anytls_min_idle_session IS NULL
+        OR anytls_min_idle_session BETWEEN 0 AND 4294967295
+    ),
     CONSTRAINT ingress_client_settings_xhttp_xmux_shape CHECK (
         xhttp_xmux IS NULL OR ((
             jsonb_typeof(xhttp_xmux) = 'object'
@@ -2944,6 +2993,74 @@ CREATE TABLE IF NOT EXISTS ingress_client_settings (
         ) IS TRUE)
     )
 );
+
+-- Keep the initial migration replayable against development schemas created before AnyTLS. Stable
+-- deployments using an older migration checksum are upgraded manually before this file is used.
+ALTER TABLE ingresses
+    ADD COLUMN IF NOT EXISTS anytls_enabled BOOLEAN DEFAULT FALSE NOT NULL,
+    ADD COLUMN IF NOT EXISTS anytls_port INTEGER,
+    ADD COLUMN IF NOT EXISTS anytls_padding_scheme JSONB DEFAULT '[]'::jsonb NOT NULL,
+    ADD COLUMN IF NOT EXISTS anytls_masquerade_kind TEXT DEFAULT '404' NOT NULL,
+    ADD COLUMN IF NOT EXISTS anytls_masquerade_content TEXT DEFAULT '' NOT NULL,
+    ADD COLUMN IF NOT EXISTS anytls_masquerade_headers JSONB DEFAULT '{}'::jsonb NOT NULL,
+    ADD COLUMN IF NOT EXISTS anytls_masquerade_status_code INTEGER DEFAULT 200 NOT NULL;
+
+ALTER TABLE ingresses
+    DROP CONSTRAINT IF EXISTS ingresses_anytls_port_present,
+    DROP CONSTRAINT IF EXISTS ingresses_anytls_port_range,
+    DROP CONSTRAINT IF EXISTS ingresses_anytls_port_distinct,
+    DROP CONSTRAINT IF EXISTS ingresses_anytls_padding_scheme_check,
+    DROP CONSTRAINT IF EXISTS ingresses_anytls_masquerade_kind_check,
+    DROP CONSTRAINT IF EXISTS ingresses_anytls_masquerade_headers_check,
+    DROP CONSTRAINT IF EXISTS ingresses_anytls_masquerade_status_check,
+    DROP CONSTRAINT IF EXISTS ingresses_has_a_wire;
+
+ALTER TABLE ingresses
+    ADD CONSTRAINT ingresses_anytls_port_present CHECK ((anytls_port IS NOT NULL) = anytls_enabled),
+    ADD CONSTRAINT ingresses_anytls_port_range CHECK (anytls_port IS NULL OR anytls_port BETWEEN 1 AND 65535),
+    ADD CONSTRAINT ingresses_anytls_port_distinct CHECK (
+        anytls_port IS NULL OR transport_kind IS NULL OR anytls_port <> port
+    ),
+    ADD CONSTRAINT ingresses_anytls_padding_scheme_check CHECK (
+        jsonb_typeof(anytls_padding_scheme) = 'array'
+    ),
+    ADD CONSTRAINT ingresses_anytls_masquerade_kind_check CHECK (
+        anytls_masquerade_kind IN ('404', 'string')
+    ),
+    ADD CONSTRAINT ingresses_anytls_masquerade_headers_check CHECK (
+        jsonb_typeof(anytls_masquerade_headers) = 'object'
+    ),
+    ADD CONSTRAINT ingresses_anytls_masquerade_status_check CHECK (
+        anytls_masquerade_kind <> 'string'
+        OR anytls_masquerade_status_code BETWEEN 200 AND 599
+    ),
+    ADD CONSTRAINT ingresses_has_a_wire CHECK (
+        transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled
+    );
+
+ALTER TABLE ingress_client_settings
+    ADD COLUMN IF NOT EXISTS anytls_idle_session_check_interval BIGINT,
+    ADD COLUMN IF NOT EXISTS anytls_idle_session_timeout BIGINT,
+    ADD COLUMN IF NOT EXISTS anytls_min_idle_session BIGINT;
+
+ALTER TABLE ingress_client_settings
+    DROP CONSTRAINT IF EXISTS ingress_client_settings_anytls_idle_session_check_interval_check,
+    DROP CONSTRAINT IF EXISTS ingress_client_settings_anytls_idle_session_timeout_check,
+    DROP CONSTRAINT IF EXISTS ingress_client_settings_anytls_min_idle_session_check;
+
+ALTER TABLE ingress_client_settings
+    ADD CONSTRAINT ingress_client_settings_anytls_idle_session_check_interval_check CHECK (
+        anytls_idle_session_check_interval IS NULL
+        OR anytls_idle_session_check_interval BETWEEN 1 AND 4294967295
+    ),
+    ADD CONSTRAINT ingress_client_settings_anytls_idle_session_timeout_check CHECK (
+        anytls_idle_session_timeout IS NULL
+        OR anytls_idle_session_timeout BETWEEN 1 AND 4294967295
+    ),
+    ADD CONSTRAINT ingress_client_settings_anytls_min_idle_session_check CHECK (
+        anytls_min_idle_session IS NULL
+        OR anytls_min_idle_session BETWEEN 0 AND 4294967295
+    );
 
 -- Friendly-ID compatibility later in this migration may rename an ingress. Existing databases
 -- which already created this table need the same update behavior as fresh installations.

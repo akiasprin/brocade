@@ -20,13 +20,13 @@ import (
 )
 
 type Server struct {
-	policyManager policy.Manager
-	users         map[[32]byte]*protocol.MemoryUser
-	usersByEmail  map[string]*protocol.MemoryUser
-	userMu        sync.RWMutex
-	paddingScheme string
-	padding       *paddingScheme
-	masquerade    *masquerade
+	policyManager  policy.Manager
+	users          map[[32]byte]*protocol.MemoryUser
+	usersByEmail   map[string]*protocol.MemoryUser
+	activeSessions map[*protocol.MemoryUser]map[*session]struct{}
+	userMu         sync.RWMutex
+	paddingScheme  string
+	masquerade     *masquerade
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -35,22 +35,19 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	}
 	v := core.MustFromContext(ctx)
 	rawPaddingScheme := config.PaddingScheme
-	parsedPaddingScheme := getDefaultPaddingScheme()
 	if rawPaddingScheme == "" {
-		rawPaddingScheme = string(parsedPaddingScheme.rawScheme)
+		rawPaddingScheme = string(getDefaultPaddingScheme().rawScheme)
 	} else {
-		var err error
-		parsedPaddingScheme, err = parsePaddingScheme(rawPaddingScheme)
-		if err != nil {
+		if _, err := parsePaddingScheme(rawPaddingScheme); err != nil {
 			return nil, errors.New("anytls: invalid padding scheme").Base(err)
 		}
 	}
 	s := &Server{
-		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		users:         make(map[[32]byte]*protocol.MemoryUser),
-		usersByEmail:  make(map[string]*protocol.MemoryUser),
-		paddingScheme: rawPaddingScheme,
-		padding:       parsedPaddingScheme,
+		policyManager:  v.GetFeature(policy.ManagerType()).(policy.Manager),
+		users:          make(map[[32]byte]*protocol.MemoryUser),
+		usersByEmail:   make(map[string]*protocol.MemoryUser),
+		activeSessions: make(map[*protocol.MemoryUser]map[*session]struct{}),
+		paddingScheme:  rawPaddingScheme,
 	}
 	var err error
 	s.masquerade, err = newMasquerade(config.Masquerade)
@@ -73,6 +70,21 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	return s, nil
 }
 
+func (s *Server) newSession(conn stat.Connection, dispatcher routing.Dispatcher) *session {
+	// The configured scheme is advertised to clients for their uplink. The
+	// server does not apply it to its own downlink writes.
+	return &session{
+		isClient:        false,
+		server:          s,
+		conn:            conn,
+		br:              &buf.BufferedReader{Reader: buf.NewReader(conn)},
+		bw:              buf.NewBufferedWriter(buf.NewWriter(conn)),
+		streams:         make(map[uint32]*stream),
+		drainingStreams: make(map[uint32]*stream),
+		dispatcher:      dispatcher,
+	}
+}
+
 func (s *Server) Network() []xnet.Network {
 	return []xnet.Network{xnet.Network_TCP, xnet.Network_UNIX}
 }
@@ -82,19 +94,9 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	handshakeDeadline := time.Now().Add(sessPol.Timeouts.Handshake)
 	_ = conn.SetReadDeadline(handshakeDeadline)
 
-	sess := &session{
-		isClient:      false,
-		server:        s,
-		conn:          conn,
-		br:            &buf.BufferedReader{Reader: buf.NewReader(conn)},
-		bw:            buf.NewBufferedWriter(buf.NewWriter(conn)),
-		streams:       make(map[uint32]*stream),
-		dispatcher:    dispatcher,
-		paddingScheme: s.padding,
-	}
+	sess := s.newSession(conn, dispatcher)
 	sess.fw = newFrameWriter(sess.bw)
-	sess.peerVersion = 1
-	sess.pktCounter.Store(1)
+	sess.setPeerVersion(1)
 	failAuthentication := func(err error) error {
 		masquerade := s.masquerade
 		if masquerade == nil {
@@ -130,6 +132,16 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			return failAuthentication(errors.New("anytls: read padding0").Base(err))
 		}
 	}
+
+	sessionCtx, cancel := context.WithCancel(ctx)
+	sess.cancel = cancel
+	user = s.registerSession(sum, sess)
+	if user == nil {
+		cancel()
+		return failAuthentication(errors.New("anytls: invalid user"))
+	}
+	defer s.unregisterSession(user, sess)
+	defer sess.close(nil)
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 
@@ -138,5 +150,5 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inb.User = user
 	inb.CanSpliceCopy = 3
 
-	return sess.readLoop(ctx)
+	return sess.readLoop(sessionCtx)
 }

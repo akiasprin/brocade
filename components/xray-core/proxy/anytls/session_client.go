@@ -19,20 +19,31 @@ func (s *session) writePacketWithPadding(packetIndex uint32, frames buf.MultiBuf
 	if length == 0 {
 		return nil
 	}
+	b := frames
+	defer func() {
+		// The buffered writer owns buffers it accepts. Any remainder still held
+		// by the planner must be released when a later write or flush fails.
+		if b != nil {
+			buf.ReleaseMulti(b)
+		}
+	}()
 	s.schemeMu.RLock()
 	scheme := s.paddingScheme
 	s.schemeMu.RUnlock()
+	if scheme == nil || packetIndex >= scheme.stop {
+		if err := s.fw.bw.WriteMultiBuffer(frames); err != nil {
+			return err
+		}
+		return s.fw.flush()
+	}
 	pktSizes := scheme.GenerateRecordPayloadSizes(packetIndex)
-	if scheme == nil || packetIndex >= scheme.stop || len(pktSizes) == 0 {
-		err := s.fw.bw.WriteMultiBuffer(frames)
-		if err != nil {
-			buf.ReleaseMulti(frames)
+	if len(pktSizes) == 0 {
+		if err := s.fw.bw.WriteMultiBuffer(frames); err != nil {
 			return err
 		}
 		return s.fw.flush()
 	}
 
-	b := frames
 	for _, targetsize := range pktSizes {
 		size := targetsize
 		remain := int(b.Len())
@@ -153,7 +164,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	// demonstrated support by returning a zero-length SYNACK; this keeps
 	// stream creation compatible with sing-box/sing-anytls servers that do
 	// not send success confirmations.
-	waitForSynAck := sid >= 2 && s.peerVersion >= 2 && s.synAckSupported.Load() && target.Network != net.Network_UDP
+	waitForSynAck := sid >= 2 && s.peerVersionValue() >= 2 && s.synAckSupported.Load() && target.Network != net.Network_UDP
 	s.streamsMu.Lock()
 	s.streams[st.sid] = st
 	s.streamsMu.Unlock()
@@ -174,17 +185,6 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	}
 
 	var frames buf.MultiBuffer
-	if !s.settingsSent {
-		s.schemeMu.RLock()
-		md5Value := s.paddingScheme.md5
-		s.schemeMu.RUnlock()
-		settingsFrame, err := (&frame{cmd: cmdSettings, sid: 0, data: []byte("v=2\nclient=" + clientMetadata() + "\npadding-md5=" + md5Value)}).toMultiBuffer()
-		if err != nil {
-			return nil, err
-		}
-		frames = append(frames, settingsFrame...)
-		s.settingsSent = true
-	}
 	addrBuf := buf.New()
 	if err := M.SocksaddrSerializer.WriteAddrPort(addrBuf, singbridge.ToSocksaddr(actualDest)); err != nil {
 		addrBuf.Release()
@@ -205,7 +205,23 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	frames = append(frames, addrFrame...)
 
 	s.writeMu.Lock()
-	writeErr := s.writePacketWithPadding(s.nextPacketIndex(), frames)
+	if !s.settingsSent {
+		s.schemeMu.RLock()
+		md5Value := ""
+		if s.paddingScheme != nil {
+			md5Value = s.paddingScheme.md5
+		}
+		s.schemeMu.RUnlock()
+		settingsFrame, err := (&frame{cmd: cmdSettings, sid: 0, data: []byte("v=2\nclient=" + clientMetadata() + "\npadding-md5=" + md5Value)}).toMultiBuffer()
+		if err != nil {
+			s.writeMu.Unlock()
+			s.finishStream(sid, err)
+			return nil, err
+		}
+		frames = append(settingsFrame, frames...)
+		s.settingsSent = true
+	}
+	writeErr := s.writePacketLocked(frames)
 	s.writeMu.Unlock()
 	if writeErr != nil {
 		s.finishStream(sid, writeErr)
@@ -249,9 +265,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 			return nil, err
 		}
 
-		s.writeMu.Lock()
-		err = s.writePacketWithPadding(s.nextPacketIndex(), UDPPSHframe)
-		s.writeMu.Unlock()
+		err = s.writePacket(UDPPSHframe)
 
 		if err != nil {
 			s.finishStream(sid, err)
@@ -259,6 +273,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 		}
 	}
 
+	s.startStreamDelivery(st)
 	return st, nil
 }
 
@@ -281,7 +296,7 @@ func (st *stream) pumpUplink(s *session) {
 				return
 			}
 		}
-		if sendErr := s.sendStreamData(st.sid, mb, s.nextPacketIndex()); sendErr != nil {
+		if sendErr := s.sendStreamData(st.sid, mb); sendErr != nil {
 			errors.LogDebug(context.Background(), "anytls: writePacketWithPadding error=", sendErr)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
 			s.close(sendErr)

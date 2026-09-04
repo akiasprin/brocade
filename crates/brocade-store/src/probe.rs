@@ -634,6 +634,11 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                 anytls: match &target.security {
                     ProbeSecurity::AnyTls(anytls) => Some(E2eProbeAnyTls {
                         server_name: anytls.server_name.clone(),
+                        idle_session_check_interval_secs: anytls
+                            .settings
+                            .idle_session_check_interval_secs,
+                        idle_session_timeout_secs: anytls.settings.idle_session_timeout_secs,
+                        min_idle_session: anytls.settings.min_idle_session,
                     }),
                     _ => None,
                 },

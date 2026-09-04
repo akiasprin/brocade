@@ -191,6 +191,11 @@ pub async fn user_grant_probe_plan(
                 anytls: match &entry.security {
                     UserSecurityPlan::AnyTls(value) => Some(E2eProbeAnyTls {
                         server_name: value.server_name.clone(),
+                        idle_session_check_interval_secs: value
+                            .settings
+                            .idle_session_check_interval_secs,
+                        idle_session_timeout_secs: value.settings.idle_session_timeout_secs,
+                        min_idle_session: value.settings.min_idle_session,
                     }),
                     _ => None,
                 },

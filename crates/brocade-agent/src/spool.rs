@@ -17,7 +17,7 @@ use brocade_deployment::protocol::{
 
 use crate::{
     current_unix_secs, fsutil::atomic_write_private, http::HttpClient, observe_geodata,
-    options::Options, run_command,
+    options::Options, run_command, wg::wireguard_health_snapshot,
 };
 
 /// One on-disk retry spool.
@@ -200,6 +200,7 @@ pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeRepo
         certificate,
         geodata,
         local_reconcile,
+        wireguard_health: wireguard_health_snapshot(state_dir),
         spool,
     })
 }

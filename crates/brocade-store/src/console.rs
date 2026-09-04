@@ -2326,27 +2326,38 @@ pub(crate) async fn upsert_ingress_tx(
     let client_changed = sqlx::query(
         "INSERT INTO ingress_client_settings (
              ingress_id, reality_fingerprint, xhttp_host, xhttp_xmux,
-             xhttp_download_v4, xhttp_download_v6
-         ) VALUES ($1, $2, $3, $4, $5, $6)
+             xhttp_download_v4, xhttp_download_v6,
+             anytls_idle_session_check_interval, anytls_idle_session_timeout,
+             anytls_min_idle_session
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (ingress_id) DO UPDATE SET
              reality_fingerprint = EXCLUDED.reality_fingerprint,
              xhttp_host = EXCLUDED.xhttp_host,
              xhttp_xmux = EXCLUDED.xhttp_xmux,
              xhttp_download_v4 = EXCLUDED.xhttp_download_v4,
              xhttp_download_v6 = EXCLUDED.xhttp_download_v6,
+             anytls_idle_session_check_interval = EXCLUDED.anytls_idle_session_check_interval,
+             anytls_idle_session_timeout = EXCLUDED.anytls_idle_session_timeout,
+             anytls_min_idle_session = EXCLUDED.anytls_min_idle_session,
              updated_at = now()
          WHERE ROW(
                  ingress_client_settings.reality_fingerprint,
                  ingress_client_settings.xhttp_host,
                  ingress_client_settings.xhttp_xmux,
                  ingress_client_settings.xhttp_download_v4,
-                 ingress_client_settings.xhttp_download_v6
+                 ingress_client_settings.xhttp_download_v6,
+                 ingress_client_settings.anytls_idle_session_check_interval,
+                 ingress_client_settings.anytls_idle_session_timeout,
+                 ingress_client_settings.anytls_min_idle_session
                ) IS DISTINCT FROM ROW(
                  EXCLUDED.reality_fingerprint,
                  EXCLUDED.xhttp_host,
                  EXCLUDED.xhttp_xmux,
                  EXCLUDED.xhttp_download_v4,
-                 EXCLUDED.xhttp_download_v6
+                 EXCLUDED.xhttp_download_v6,
+                 EXCLUDED.anytls_idle_session_check_interval,
+                 EXCLUDED.anytls_idle_session_timeout,
+                 EXCLUDED.anytls_min_idle_session
                )",
     )
     .bind(&id)
@@ -2355,6 +2366,21 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(xhttp_xmux)
     .bind(xhttp_download_v4)
     .bind(xhttp_download_v6)
+    .bind(
+        anytls
+            .and_then(|settings| settings.idle_session_check_interval_secs)
+            .map(i64::from),
+    )
+    .bind(
+        anytls
+            .and_then(|settings| settings.idle_session_timeout_secs)
+            .map(i64::from),
+    )
+    .bind(
+        anytls
+            .and_then(|settings| settings.min_idle_session)
+            .map(i64::from),
+    )
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -2635,6 +2661,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 s.runtime_versions,
                 s.spool_backlog,
                 s.last_local_reconcile,
+                s.wireguard_health,
                 s.runtime_reported_at::text AS runtime_reported_at,
                 s.geodata_observed,
                 s.last_poll_at::text AS last_poll_at,
@@ -2695,6 +2722,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 s.runtime_versions,
                 s.spool_backlog,
                 s.last_local_reconcile,
+                s.wireguard_health,
                 s.runtime_reported_at::text AS runtime_reported_at,
                 s.geodata_observed,
                 s.last_poll_at::text AS last_poll_at,
@@ -2785,6 +2813,7 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         runtime_versions: non_empty_json(row.try_get("runtime_versions").ok()),
         spool_backlog: non_empty_json(row.try_get("spool_backlog").ok()),
         last_local_reconcile: row.try_get("last_local_reconcile").ok().flatten(),
+        wireguard_health: non_empty_json(row.try_get("wireguard_health").ok()),
         runtime_reported_at: row.try_get("runtime_reported_at")?,
         geodata_observed: non_empty_json(row.try_get("geodata_observed").ok()),
         last_poll_at: row.try_get("last_poll_at")?,

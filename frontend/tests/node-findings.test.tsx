@@ -45,6 +45,47 @@ describe('WireGuard runtime finding', () => {
   it('uses the draft-aware effective switch supplied by the detail page', () => {
     expect(hasUserspaceWarning(node(true), false)).toBe(false);
   });
+
+  it('surfaces unreachable peers as a warning without marking the node red', () => {
+    const value = node(true);
+    value.wireguard_health = {
+      enabled: true,
+      error: null,
+      peers: [
+        {
+          peer_node_id: 'akko-lon',
+          overlay_ip: '10.66.0.11',
+          handshake_age_secs: 302_867,
+          status: 'down',
+          detail: '握手 302867 秒前，且 10.66.0.11 探不通——隧道断了',
+        },
+      ],
+    };
+
+    const finding = runtimeFindings(value).find(item => item.chip === 'WG 断链 1');
+    expect(finding?.tone).toBe('warn');
+  });
+
+  it('does not report healthy peers or stale health after WireGuard is disabled', () => {
+    const value = node(true);
+    value.wireguard_health = {
+      enabled: true,
+      error: null,
+      peers: [
+        {
+          peer_node_id: 'akko-lon',
+          overlay_ip: '10.66.0.11',
+          handshake_age_secs: 3,
+          status: 'up',
+          detail: null,
+        },
+      ],
+    };
+    expect(runtimeFindings(value).some(item => item.chip.startsWith('WG '))).toBe(false);
+
+    value.wireguard_health.peers[0].status = 'down';
+    expect(runtimeFindings(value, false).some(item => item.chip.startsWith('WG '))).toBe(false);
+  });
 });
 
 describe('usage runtime findings', () => {

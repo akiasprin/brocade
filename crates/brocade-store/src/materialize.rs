@@ -6,15 +6,16 @@ use std::{
 use brocade_core::client_config::ClientProjectionDownloadEndpoint;
 use brocade_core::hash::hex_lower;
 use brocade_core::model::{
-    Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, ConnectionSettings, DestMatch, Dns,
-    ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding,
-    Front, FrontStrategy, GeodataSettings, Grant, HopDial, HopIn, HopPool, Hysteria2,
-    HysteriaBandwidth, HysteriaBbrProfile, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
-    HysteriaPortHop, HysteriaQuic, Ingress, IngressGuard, IngressIdentity, IngressWires,
-    IngressWiresWire, ModelSettings, ModelSnapshot, Network, Node, NodeConnection, OverlaySettings,
-    PortSettings, ProbeSettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
-    RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySettings, RealitySite,
-    RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp, XhttpMode,
+    Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, ConnectionSettings, DestMatch,
+    DisabledWireGuardLink, Dns, ExternalOutbound, ExternalOutboundProtocol,
+    ExternalOutboundSecurity, ExternalWarpBinding, Front, FrontStrategy, GeodataSettings, Grant,
+    HopDial, HopIn, HopPool, Hysteria2, HysteriaBandwidth, HysteriaBbrProfile, HysteriaCongestion,
+    HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, HysteriaQuic, Ingress, IngressGuard,
+    IngressIdentity, IngressWires, IngressWiresWire, ModelSettings, ModelSnapshot, Network, Node,
+    NodeConnection, OverlaySettings, PortSettings, ProbeSettings, Projection,
+    ProjectionDownloadEndpoint, ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits,
+    RealityFallbackMode, RealitySettings, RealitySite, RealityXhttp, Rule, Step, Tls, TlsXhttp,
+    Transport, User, WireGuardKeys, Xhttp, XhttpMode,
 };
 use ipnet::Ipv4Net;
 use serde_json::Value;
@@ -142,7 +143,7 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             reality_min_client_ver,
             reality_max_client_ver,
             reality_max_time_diff_ms, \
-            overlay_keepalive_secs, overlay_mtu, \
+            overlay_keepalive_secs, overlay_mtu, overlay_disabled_links, \
             reality_dest, \
             reality_server_names, \
             reality_fingerprint, \
@@ -183,6 +184,10 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
                 state.try_get("overlay_keepalive_secs")?,
             )?,
             mtu: u16_column("control_state.overlay_mtu", state.try_get("overlay_mtu")?)?,
+            disabled_links: disabled_wireguard_links(
+                "control_state.overlay_disabled_links",
+                &state.try_get::<Value, _>("overlay_disabled_links")?,
+            )?,
         },
         ports: PortSettings {
             ingress_base: u16_column(
@@ -760,7 +765,7 @@ pub(crate) async fn load_current_snapshot_tx(
             reality_min_client_ver,
             reality_max_client_ver,
             reality_max_time_diff_ms, \
-            overlay_keepalive_secs, overlay_mtu, \
+            overlay_keepalive_secs, overlay_mtu, overlay_disabled_links, \
             reality_dest, \
             reality_server_names, \
             reality_fingerprint, \
@@ -801,6 +806,10 @@ pub(crate) async fn load_current_snapshot_tx(
                 state.try_get("overlay_keepalive_secs")?,
             )?,
             mtu: u16_column("control_state.overlay_mtu", state.try_get("overlay_mtu")?)?,
+            disabled_links: disabled_wireguard_links(
+                "control_state.overlay_disabled_links",
+                &state.try_get::<Value, _>("overlay_disabled_links")?,
+            )?,
         },
         ports: PortSettings {
             ingress_base: u16_column(
@@ -1606,6 +1615,8 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
             transport_kind, anytls_enabled, anytls_port, anytls_padding_scheme, \
+            client.anytls_idle_session_check_interval, client.anytls_idle_session_timeout, \
+            client.anytls_min_idle_session, \
             anytls_masquerade_kind, anytls_masquerade_content, anytls_masquerade_headers, anytls_masquerade_status_code, \
             hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
             xhttp_download_v4_origin_port, xhttp_download_v6_origin_port, \
@@ -1654,6 +1665,8 @@ async fn load_ingresses_tx(
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
             transport_kind, anytls_enabled, anytls_port, anytls_padding_scheme, \
+            client.anytls_idle_session_check_interval, client.anytls_idle_session_timeout, \
+            client.anytls_min_idle_session, \
             anytls_masquerade_kind, anytls_masquerade_content, anytls_masquerade_headers, anytls_masquerade_status_code, \
             hy2_enabled, xhttp_path, xhttp_host, xhttp_xmux, xhttp_tuning, xhttp_mode, \
             xhttp_download_v4_origin_port, xhttp_download_v6_origin_port, \
@@ -1819,6 +1832,12 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
                 .and_then(|port| u16::try_from(port).ok())
                 .unwrap_or(brocade_core::model::ANYTLS_PORT_BASE),
             padding_scheme,
+            idle_session_check_interval_secs: optional_u32_bigint(
+                row,
+                "anytls_idle_session_check_interval",
+            )?,
+            idle_session_timeout_secs: optional_u32_bigint(row, "anytls_idle_session_timeout")?,
+            min_idle_session: optional_u32_bigint(row, "anytls_min_idle_session")?,
             masquerade,
         })
     } else {
@@ -2326,6 +2345,11 @@ pub(crate) fn json_string_array(field: &str, value: &Value) -> Result<Vec<String
         .collect()
 }
 
+fn disabled_wireguard_links(field: &str, value: &Value) -> Result<Vec<DisabledWireGuardLink>> {
+    serde_json::from_value(value.clone())
+        .map_err(|error| invalid_error(format!("{field} has invalid entries: {error}")))
+}
+
 fn text(row: &sqlx::postgres::PgRow, field: &str) -> Result<String> {
     Ok(row.try_get(field)?)
 }
@@ -2367,6 +2391,18 @@ fn optional_u64(location: &str, value: Option<i64>) -> Result<Option<u64>> {
         .map(|value| {
             u64::try_from(value)
                 .map_err(|_| invalid_error(format!("{location} out of range: {value}")))
+        })
+        .transpose()
+}
+
+fn optional_u32_bigint(row: &sqlx::postgres::PgRow, field: &str) -> Result<Option<u32>> {
+    row.try_get::<Option<i64>, _>(field)?
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                invalid_error(format!(
+                    "ingress_client_settings.{field} out of range: {value}"
+                ))
+            })
         })
         .transpose()
 }

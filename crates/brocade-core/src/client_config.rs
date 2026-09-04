@@ -86,6 +86,14 @@ pub struct ClientProjection {
     /// ClientHello preset used by subscribers and probes. The REALITY listener never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_fingerprint: Option<String>,
+    /// Outer `None` preserves a checkpoint written before AnyTLS session controls moved here;
+    /// `Some(None)` explicitly follows the consuming client's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls_idle_session_check_interval_secs: Option<Option<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls_idle_session_timeout_secs: Option<Option<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls_min_idle_session: Option<Option<u32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +125,8 @@ struct SubscriptionTopologyContract<'a> {
     node_id: &'a str,
     ingress_port: u16,
     vless: Option<VlessTopologyContract<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anytls: Option<AnyTlsTopologyContract<'a>>,
     hysteria2: Option<Hysteria2TopologyContract<'a>>,
     split_download_ports: [Option<u16>; 2],
     split_download_certificate_name: Option<&'a str>,
@@ -150,6 +160,14 @@ struct XhttpTopologyContract<'a> {
     path: &'a str,
     tuning: Option<&'a XhttpTuning>,
     mode: XhttpMode,
+}
+
+/// AnyTLS values which must match the listener before a new public endpoint can be advertised.
+/// Padding, masquerade and client session pooling are deliberately absent.
+#[derive(Debug, Serialize)]
+struct AnyTlsTopologyContract<'a> {
+    port: u16,
+    certificate_name: Option<&'a str>,
 }
 
 /// Hysteria 2 values which are either required to reach the listener or emitted by a supported
@@ -305,6 +323,17 @@ impl SubscriptionClientConfig {
                     }
                     client.apply_xhttp_download(xhttp, reality_split)?;
                 }
+                if let Some(anytls) = ingress.wires.anytls_mut() {
+                    if let Some(value) = client.anytls_idle_session_check_interval_secs {
+                        anytls.idle_session_check_interval_secs = value;
+                    }
+                    if let Some(value) = client.anytls_idle_session_timeout_secs {
+                        anytls.idle_session_timeout_secs = value;
+                    }
+                    if let Some(value) = client.anytls_min_idle_session {
+                        anytls.min_idle_session = value;
+                    }
+                }
             }
         }
 
@@ -381,6 +410,7 @@ impl SubscriptionClientConfig {
 impl From<&Ingress> for ClientProjection {
     fn from(value: &Ingress) -> Self {
         let xhttp = value.wires.xhttp();
+        let anytls = value.wires.anytls();
         Self {
             v4: value
                 .projection
@@ -412,6 +442,11 @@ impl From<&Ingress> for ClientProjection {
                 .wires
                 .reality()
                 .map(|reality| reality.fingerprint.clone()),
+            anytls_idle_session_check_interval_secs: anytls
+                .map(|settings| settings.idle_session_check_interval_secs),
+            anytls_idle_session_timeout_secs: anytls
+                .map(|settings| settings.idle_session_timeout_secs),
+            anytls_min_idle_session: anytls.map(|settings| settings.min_idle_session),
         }
     }
 }
@@ -541,6 +576,10 @@ pub fn topology_contract_hash(nodes: &[Node], app_id: &str, ingress: &Ingress) -
         .find(|node| node.id == ingress.node)
         .and_then(|node| node.certificate_name.as_deref());
     let vless = vless_topology_contract(ingress, certificate_name);
+    let anytls = ingress.wires.anytls().map(|wire| AnyTlsTopologyContract {
+        port: wire.port,
+        certificate_name,
+    });
     let hysteria2 = ingress
         .wires
         .hysteria2()
@@ -577,6 +616,7 @@ pub fn topology_contract_hash(nodes: &[Node], app_id: &str, ingress: &Ingress) -
         node_id: &ingress.node,
         ingress_port: ingress.port,
         vless,
+        anytls,
         hysteria2,
         split_download_ports,
         split_download_certificate_name,

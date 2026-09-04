@@ -252,13 +252,37 @@ export function observeValueAxis(peak: number, targetIntervals = 4): ObserveValu
   return { max, interval };
 }
 
-/** One unit for a whole value axis: named once in the card's title bar, stripped from every tick. */
+/**
+ * One unit for a whole card: named once in the title bar, and used by the ticks, the legend and
+ * the tooltip alike.
+ *
+ * A card that switches unit between its axis and its legend — `(Mb/s)` overhead, `3400 kb/s` in
+ * the strip — makes the reader convert before they can compare, and that happens exactly when a
+ * node is idling far below its own peak. So the unit is settled once, from the axis, and precision
+ * is bought with significant digits instead: `3.42 Mb/s`, never a rung change.
+ */
 export type ObserveAxisUnit = {
   /** What the title bar prints, as in `网卡流量 (Mb/s)`. */
   name: string;
   /** One tick, bare — no unit, since the title bar already carries it. */
   text: (value: number) => string;
+  /** One reading — legend, tooltip — in this unit, unit included. Three significant digits. */
+  read: (value: number) => string;
 };
+
+/**
+ * Three significant digits, which is the precision a reading needs and a tick does not.
+ *
+ * `ui/ping-probe.ts` has spelled latency this way all along; throughput used to round to whole
+ * units above 1 Mb/s, so a 3.42 Mb/s link read `3 Mb/s` — a 13% haircut, taken by every value
+ * between 1 and 10 Mb/s. Fixed decimals rather than trimmed ones: a legend is a column, and a
+ * column that keeps its width is easier to scan than one that grows and shrinks per sample.
+ */
+function significantText(scaled: number): string {
+  if (scaled < 10) return scaled.toFixed(2);
+  if (scaled < 100) return scaled.toFixed(1);
+  return String(Math.round(scaled));
+}
 
 const BPS_UNITS: readonly (readonly [number, string])[] = [
   [1e9, 'Gb/s'],
@@ -267,55 +291,43 @@ const BPS_UNITS: readonly (readonly [number, string])[] = [
   [1, 'b/s'],
 ] as const;
 
-/**
- * The one rule that picks a throughput unit, for axes and for readings alike.
- *
- * `pick` chooses the rung: the largest whose quotient is at least 1. For a reading that is the
- * value; for an axis it is the tick interval, because the interval is the smallest quantity the
- * axis has to spell out and so decides whether the labels need decimals — a 250 Mb/s step under a
- * Gb/s heading reads 0 / 0.25 / 0.50 / 0.75 / 1.00, under Mb/s it reads 0 / 250 / 500 / 750 / 1000.
- *
- * `span` then decides whether to step down one rung: a single-digit span means the unit is too
- * coarse for what is being shown. `3 Mb/s` is 3.4 Mb/s rounded — a 13% haircut, and every value
- * between 1 and 10 Mb/s takes one of that order — while `3400 kb/s` takes none worth naming. For a
- * reading `span` is the value; for an axis it is the ceiling, so an axis topping out at 4 Mb/s
- * labels its ticks 1000 / 2000 / 3000 / 4000 kb/s rather than 1 / 2 / 3 / 4.
- *
- * Below the top rung the quotient therefore lands in 1000–9999: throughput reads as three or four
- * digits, never a decimal, and the unit is stable across the whole card.
- */
-function bpsRung(pick: number, span: number): { divisor: number; name: string; ceiling: boolean } {
-  const found = BPS_UNITS.findIndex(([step]) => pick / step >= 1);
-  const rung = found === -1 ? BPS_UNITS.length - 1 : found;
-  // b/s is the bottom of the ladder; there is nothing below it to step down to.
-  const stepDown = rung < BPS_UNITS.length - 1 && span / BPS_UNITS[rung][0] < 10;
-  const index = stepDown ? rung + 1 : rung;
-  const [divisor, name] = BPS_UNITS[index];
-  return { divisor, name, ceiling: index === 0 };
+/** The rung a quantity sits on: the largest unit whose quotient is at least 1. */
+function bpsRung(value: number): readonly [number, string] {
+  return BPS_UNITS.find(([step]) => value / step >= 1) ?? BPS_UNITS[BPS_UNITS.length - 1];
 }
 
 /**
- * The rung a single throughput reading belongs on; `bps()` in panes/telemetry.tsx formats it.
+ * A throughput reading with nothing behind it to agree with — a KPI chip, a month total, a fleet
+ * sum. It picks its own rung, since there is no axis whose unit it should be borrowing.
  *
- * `ceiling` says the ladder ran out above — Gb/s with nothing larger to move to. It is the one
- * place the step-down cannot rescue the reading, so the formatter spends a decimal there instead:
- * a whole-fleet total of 12.4 Gb/s rounds to `12 Gb/s` otherwise, losing 3%.
+ * Anything drawn on a chart takes `observeBpsUnit(...).read` instead, so that the strip under a
+ * plot and the plot's own scale never name different units for the same quantity.
  */
-export function observeBpsRung(value: number): { divisor: number; name: string; ceiling: boolean } {
-  return bpsRung(value, value);
+export function observeBpsReading(value: number): string {
+  const [divisor, name] = bpsRung(value);
+  return `${significantText(value / divisor)} ${name}`;
 }
 
 /**
- * Unit for a throughput axis: one unit for every tick, named once in the title bar.
+ * Unit for a throughput card, taken from the tick interval.
+ *
+ * The interval is the smallest quantity the axis has to spell out, so it — not the peak — decides
+ * whether the ticks need decimals. A 250 Mb/s step under a Gb/s heading reads 0 / 0.25 / 0.50 /
+ * 0.75 / 1.00; under Mb/s it reads 0 / 250 / 500 / 750 / 1000. Choosing by the peak only bounds the
+ * top label and says nothing about the step, which is where the decimals come from.
+ *
+ * Ticks stay in that unit however small the numbers get: a peak of 3.4 Mb/s labels 0 / 1 / 2 / 3 / 4
+ * rather than moving down to 1000 / 2000 / 3000 / 4000 kb/s. A tick sits on a grid line, so its
+ * value is exact either way and the smaller unit would buy four zeros, four characters of label
+ * column, and no information. The precision a reader is actually missing there is between the grid
+ * lines, and that is what `read` supplies.
  *
  * This replaced `bps()` on the axis, which chose per tick and so put `1.00 Gb/s` and `500 Mb/s` on
  * the same axis — a label column jumping between three and nine characters, with `containLabel`
- * reserving room for the longest. `bps()` still formats the tooltip and the legend: those are
- * readings, not a scale. Both now go through `bpsRung`, so a card's axis and its legend can differ
- * by at most the rung their own magnitudes earn, never by the ad-hoc rounding they used before.
+ * reserving room for the longest.
  */
 export function observeBpsUnit(axis: ObserveValueAxis): ObserveAxisUnit {
-  const { divisor, name } = bpsRung(axis.interval, axis.max);
+  const [divisor, name] = bpsRung(axis.interval);
   return {
     name,
     text: value => {
@@ -323,6 +335,7 @@ export function observeBpsUnit(axis: ObserveValueAxis): ObserveAxisUnit {
       // Integers cover every 1 / 2 / 5 × 10ⁿ step; only the 2.5 step lands on a half.
       return Number.isInteger(scaled) ? String(scaled) : String(Number(scaled.toFixed(2)));
     },
+    read: value => `${significantText(value / divisor)} ${name}`,
   };
 }
 
@@ -338,5 +351,9 @@ export function observeMsUnit(interval: number): ObserveAxisUnit {
   return {
     name: OBSERVE_MS_UNIT,
     text: value => (interval >= 1 ? String(Math.round(value)) : String(Number(value.toFixed(1)))),
+    // Latency readings already satisfy this: `pingLatencyText` is the same three-digit rule, which
+    // is why the ping cards never had the unit drift the throughput cards did. They keep calling
+    // `pingSampleText`, which also has to say 未探测 / 无响应 — states a number cannot carry.
+    read: value => `${significantText(value)} ${OBSERVE_MS_UNIT}`,
   };
 }

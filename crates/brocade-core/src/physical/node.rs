@@ -646,7 +646,7 @@ fn peer_plan(
         // needs no change.
         match locals.get(&peer.id) {
             Some((local, _)) => Some(format!("127.0.0.1:{local}")),
-            None => peer.wireguard.as_ref()?.endpoint.clone(),
+            None => link.endpoints.get(&peer.id).cloned(),
         }
     } else {
         None

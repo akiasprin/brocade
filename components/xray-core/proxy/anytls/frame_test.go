@@ -112,7 +112,7 @@ func TestSendStreamDataSplitsLargePayload(t *testing.T) {
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	if err := s.sendStreamData(9, buf.MultiBuffer{buf.FromBytes(payload)}, 2); err != nil {
+	if err := s.sendStreamData(9, buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
 		t.Fatal(err)
 	}
 	frames := parseTestFrames(t, wire.Bytes())

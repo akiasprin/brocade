@@ -1023,6 +1023,9 @@ fn anytls_subscription_carries_the_independent_port_and_tls_name() {
             anytls: AnyTls {
                 port: 19443,
                 padding_scheme: vec!["stop=2".to_owned(), "0=30-30".to_owned()],
+                idle_session_check_interval_secs: Some(11),
+                idle_session_timeout_secs: Some(22),
+                min_idle_session: Some(3),
                 masquerade: AnyTlsMasquerade::NotFound {
                     headers: Default::default(),
                 },
@@ -1049,11 +1052,66 @@ fn anytls_subscription_carries_the_independent_port_and_tls_name() {
     assert!(clash_text.contains("port: 19443"), "{clash_text}");
     assert!(clash_text.contains("password: uuid-alice"), "{clash_text}");
     assert!(
+        clash_text.contains("idle-session-check-interval: 11"),
+        "{clash_text}"
+    );
+    assert!(
+        clash_text.contains("idle-session-timeout: 22"),
+        "{clash_text}"
+    );
+    assert!(!clash_text.contains("idle-session-check-interval: 11s"));
+    assert!(!clash_text.contains("idle-session-timeout: 22s"));
+    assert!(clash_text.contains("min-idle-session: 3"), "{clash_text}");
+    assert!(
         clash_text.contains("sni: hk-cert.example.net"),
         "{clash_text}"
     );
     assert!(!clash_text.contains("padding_scheme"), "{clash_text}");
     assert!(!clash_text.contains("masquerade"), "{clash_text}");
+}
+
+#[test]
+fn anytls_subscription_loads_in_the_real_mihomo_binary() {
+    let binary = std::env::var_os("BROCADE_MIHOMO_BIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tools/mihomo")
+        });
+    if !binary.is_file() {
+        eprintln!("skipping: set BROCADE_MIHOMO_BIN or place mihomo at .tools/mihomo");
+        return;
+    }
+
+    let artifact = subscription::build(&plan(|face| {
+        face.wires = IngressWires::AnyTls(AnyTls {
+            idle_session_check_interval_secs: Some(11),
+            idle_session_timeout_secs: Some(22),
+            min_idle_session: Some(3),
+            ..AnyTls::default()
+        });
+    }));
+    let config = yaml::clash_haitun_subscription(&artifact);
+    let dir = std::env::temp_dir().join(format!("brocade-mihomo-anytls-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.yaml");
+    std::fs::write(&path, config).unwrap();
+
+    let output = std::process::Command::new(binary)
+        .arg("-t")
+        .arg("-d")
+        .arg(&dir)
+        .arg("-f")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "mihomo rejected generated AnyTLS config:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

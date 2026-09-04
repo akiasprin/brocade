@@ -155,6 +155,12 @@ pub enum ModelOp {
         node_id: String,
         status: UpdateNodeStatusRequest,
     },
+    #[serde(rename = "set_wireguard_link_disabled")]
+    SetWireGuardLinkDisabled {
+        a: String,
+        b: String,
+        disabled: bool,
+    },
     UpdateSettings {
         settings: ModelSettings,
     },
@@ -220,6 +226,10 @@ impl ModelOp {
             ModelOp::UpdateNodeStatus { node_id, status } => {
                 format!("机器 {node_id} 置为 {}", status.status)
             }
+            ModelOp::SetWireGuardLinkDisabled { a, b, disabled } => format!(
+                "{} WireGuard 链路 {a} ↔ {b}",
+                if *disabled { "禁用" } else { "恢复" }
+            ),
             ModelOp::UpdateSettings { .. } => "全局设置".to_owned(),
         }
     }
@@ -363,7 +373,17 @@ async fn apply_op(
                     .to_owned(),
             ));
         }
-        ModelOp::UpdateSettings { settings } => {
+        ModelOp::SetWireGuardLinkDisabled { a, b, disabled } => {
+            crate::settings::set_wireguard_link_disabled_tx(tx, actor, a, b, disabled).await?
+        }
+        ModelOp::UpdateSettings { mut settings } => {
+            // Disabled mesh links have their own pair-scoped operation. Preserve the transaction's
+            // current list here so a whole-settings form saved later in the same draft cannot
+            // erase an earlier link change (and the reverse operation order behaves identically).
+            settings.overlay.disabled_links = crate::settings::load_settings_tx(tx)
+                .await?
+                .overlay
+                .disabled_links;
             crate::settings::update_settings_tx(tx, actor, settings)
                 .await?
                 .1
@@ -499,4 +519,33 @@ fn summarize(ops: &[ModelOp]) -> String {
         out.push(format!("等 {} 条", ops.len()));
     }
     out.join("、")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelOp;
+
+    #[test]
+    fn wireguard_link_operation_uses_the_frontend_wire_spelling() {
+        let value = serde_json::json!({
+            "op": "set_wireguard_link_disabled",
+            "a": "akile-twlite2",
+            "b": "akile-laxl2",
+            "disabled": true
+        });
+
+        let operation: ModelOp = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            operation,
+            ModelOp::SetWireGuardLinkDisabled {
+                ref a,
+                ref b,
+                disabled: true
+            } if a == "akile-twlite2" && b == "akile-laxl2"
+        ));
+        assert_eq!(
+            serde_json::to_value(operation).unwrap()["op"],
+            "set_wireguard_link_disabled"
+        );
+    }
 }

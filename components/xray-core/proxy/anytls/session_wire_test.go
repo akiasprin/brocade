@@ -56,20 +56,33 @@ func TestSessionControlFrames(t *testing.T) {
 	}
 }
 
-func TestSessionClientAppliesPaddingUpdate(t *testing.T) {
+func TestSessionClientAppliesPaddingUpdateToFutureSessions(t *testing.T) {
 	scheme := "stop=3\n0=30-30\n1=64-64"
 	s, output := newWireSession(marshalTestFrames(testWireFrame{
 		cmd:  cmdUpdatePaddingScheme,
 		sid:  0,
 		data: []byte(scheme),
 	}), true)
+	currentScheme := s.paddingScheme
+	client := &Client{
+		defaultPaddingScheme: currentScheme,
+		authPadding:          getPadding0Size(currentScheme),
+	}
+	s.client = client
 	err := s.readLoop(context.Background())
 	assertWireEOF(t, err)
 	if output.Len() != 0 {
 		t.Fatalf("client emitted unexpected response: %x", output.Bytes())
 	}
-	if s.paddingScheme == nil || string(s.paddingScheme.rawScheme) != scheme {
-		t.Fatalf("client padding scheme = %q, want %q", s.paddingScheme.rawScheme, scheme)
+	if s.paddingScheme != currentScheme {
+		t.Fatal("padding update changed the current session snapshot")
+	}
+	updatedScheme, authPadding := client.paddingSnapshot()
+	if updatedScheme == nil || string(updatedScheme.rawScheme) != scheme {
+		t.Fatalf("future session padding scheme = %q, want %q", updatedScheme.rawScheme, scheme)
+	}
+	if want := getPadding0Size(updatedScheme); authPadding != want {
+		t.Fatalf("future auth padding = %d, want %d", authPadding, want)
 	}
 }
 

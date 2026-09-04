@@ -2,8 +2,8 @@ use std::ops::RangeInclusive;
 
 use brocade_core::{
     model::{
-        ConnectionSettings, GeodataSettings, ModelSettings, NodeConnection, OverlaySettings,
-        PortSettings, ProbeSettings, RealityClientPolicy, RealitySite,
+        ConnectionSettings, DisabledWireGuardLink, GeodataSettings, ModelSettings, NodeConnection,
+        OverlaySettings, PortSettings, ProbeSettings, RealityClientPolicy, RealitySite,
     },
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_server_name, normalize_host_port,
@@ -65,6 +65,7 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             reality_flow,
             overlay_keepalive_secs,
             overlay_mtu,
+            overlay_disabled_links,
             port_ingress_base,
             port_hop_base,
             port_hy2_base,
@@ -152,6 +153,14 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
                 row.try_get("overlay_keepalive_secs")?,
             )?,
             mtu: u16_column("overlay_mtu", row.try_get("overlay_mtu")?)?,
+            disabled_links: serde_json::from_value(
+                row.try_get::<serde_json::Value, _>("overlay_disabled_links")?,
+            )
+            .map_err(|error| {
+                StoreError::InvalidData(format!(
+                    "control_state.overlay_disabled_links 格式错误: {error}"
+                ))
+            })?,
         },
         ports: PortSettings {
             ingress_base: u16_column("port_ingress_base", row.try_get("port_ingress_base")?)?,
@@ -249,7 +258,8 @@ pub(crate) async fn update_settings_tx(
              conn_downlink_only_secs = $21,
              conn_buffer_size_kb = $22,
              conn_handshake_secs = $23,
-             stats_user_online = $24
+             stats_user_online = $24,
+             overlay_disabled_links = $25
          WHERE id = TRUE",
     )
     .bind(settings.reality_client.min_client_ver.as_deref())
@@ -287,10 +297,47 @@ pub(crate) async fn update_settings_tx(
     )
     .bind(i32::try_from(settings.connection.handshake_secs).unwrap_or(i32::MAX))
     .bind(settings.stats_user_online)
+    .bind(serde_json::to_value(&settings.overlay.disabled_links)?)
     .execute(&mut **tx)
     .await?;
 
     Ok((settings, true))
+}
+
+pub(crate) async fn set_wireguard_link_disabled_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: &AdminContext,
+    a: String,
+    b: String,
+    disabled: bool,
+) -> Result<bool> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can disable WireGuard links".to_owned(),
+        ));
+    }
+    let mut a = crate::input::required_text(a, "WireGuard 链路端点 a")?;
+    let mut b = crate::input::required_text(b, "WireGuard 链路端点 b")?;
+    if a == b {
+        return Err(StoreError::InvalidData(
+            "WireGuard 链路的两个端点不能是同一台机器".to_owned(),
+        ));
+    }
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+
+    crate::console::ensure_node_exists_tx(tx, &a).await?;
+    crate::console::ensure_node_exists_tx(tx, &b).await?;
+
+    let mut settings = load_settings_tx(tx).await?;
+    let link = DisabledWireGuardLink { a, b };
+    if disabled {
+        settings.overlay.disabled_links.push(link);
+    } else {
+        settings.overlay.disabled_links.retain(|item| item != &link);
+    }
+    Ok(update_settings_tx(tx, actor, settings).await?.1)
 }
 
 /// The database has a CHECK constraint that would surface an out-of-range value as a 500;
@@ -338,6 +385,25 @@ fn u16_column(location: &str, value: i32) -> Result<u16> {
 }
 
 fn normalize_settings(settings: ModelSettings) -> ModelSettings {
+    let OverlaySettings {
+        keepalive_secs,
+        mtu,
+        disabled_links,
+    } = settings.overlay;
+    let mut disabled_links = disabled_links
+        .into_iter()
+        .map(|link| {
+            let mut a = link.a.trim().to_owned();
+            let mut b = link.b.trim().to_owned();
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            DisabledWireGuardLink { a, b }
+        })
+        .collect::<Vec<_>>();
+    disabled_links.sort();
+    disabled_links.dedup();
+
     ModelSettings {
         // Numbers, with nothing to trim or case-fold; they pass through untouched.
         connection: settings.connection,
@@ -359,7 +425,11 @@ fn normalize_settings(settings: ModelSettings) -> ModelSettings {
             fingerprint: normalize_optional_text(settings.reality_site.fingerprint),
             flow: normalize_optional_text(settings.reality_site.flow),
         },
-        overlay: settings.overlay,
+        overlay: OverlaySettings {
+            keepalive_secs,
+            mtu,
+            disabled_links,
+        },
         ports: settings.ports,
         probe: ProbeSettings {
             endpoint_url: settings.probe.endpoint_url.trim().to_owned(),
@@ -389,6 +459,18 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 }
 
 fn validate_settings(settings: &ModelSettings) -> Result<()> {
+    if let Some(link) = settings
+        .overlay
+        .disabled_links
+        .iter()
+        .find(|link| link.a.is_empty() || link.b.is_empty() || link.a == link.b)
+    {
+        return Err(StoreError::InvalidData(format!(
+            "overlay.disabled_links 必须引用两台不同的机器，收到 {:?} 与 {:?}",
+            link.a, link.b
+        )));
+    }
+
     let policy = &settings.reality_client;
     let min = validate_version(
         policy.min_client_ver.as_deref(),

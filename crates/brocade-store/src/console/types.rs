@@ -109,13 +109,14 @@ pub struct NodeAgentStateItem {
     /// Explicit wire compatibility, separate from the binary identity. `None` identifies an old
     /// agent which predates protocol negotiation and is being offered a rescue self-update.
     pub agent_protocol_version: Option<i32>,
-    /// The four runtime reconcile items. `None` means this machine has never reported (an older
+    /// Runtime observations. `None` means this machine has never reported (an older
     /// agent, or freshly enrolled and not yet due) — which must stay distinct from "reported
     /// zero": the UI shows an em dash, not 0, or the machine most worth worrying about displays
     /// as the healthiest.
     pub runtime_versions: Option<serde_json::Value>,
     pub spool_backlog: Option<serde_json::Value>,
     pub last_local_reconcile: Option<serde_json::Value>,
+    pub wireguard_health: Option<serde_json::Value>,
     pub runtime_reported_at: Option<String>,
     /// On-disk observations of the two `.dat` files. In the same row as `runtime_versions`
     /// (`node_agent_state`) — it is a periodic observation, not an artifact of a release; hung

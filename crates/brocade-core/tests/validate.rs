@@ -1140,6 +1140,7 @@ fn validate_anytls_checks_padding_masquerade_and_tcp_port_collisions() {
                     .collect(),
                 status_code: 199,
             },
+            ..AnyTls::default()
         },
     };
 
@@ -1162,6 +1163,7 @@ fn validate_accepts_a_valid_anytls_only_ingress_with_a_certificate() {
         masquerade: AnyTlsMasquerade::NotFound {
             headers: Default::default(),
         },
+        ..AnyTls::default()
     });
 
     validate_app(&sys, &app_ir, &mut diagnostics);
@@ -1170,6 +1172,32 @@ fn validate_accepts_a_valid_anytls_only_ingress_with_a_certificate() {
         diagnostics
             .iter()
             .all(|diagnostic| diagnostic.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_anytls_session_intervals_but_accepts_zero_minimum() {
+    let mut diagnostics = Vec::new();
+    let (sys, mut app_ir) = two_hop_ir(HopDial::Overlay, HopWire::None, &mut diagnostics);
+    let ingress = &mut app_ir.ingresses[0];
+    ingress.certificate_name = Some("anytls.example.net".to_owned());
+    ingress.wires = IngressWires::AnyTls(AnyTls {
+        port: 19443,
+        idle_session_check_interval_secs: Some(0),
+        idle_session_timeout_secs: Some(0),
+        min_idle_session: Some(0),
+        ..AnyTls::default()
+    });
+
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert_has(&diagnostics, Level::Error, "ingress.anytls-session");
+    assert!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.level == Level::Error)
+            .all(|diagnostic| diagnostic.code == "ingress.anytls-session"),
         "{diagnostics:#?}"
     );
 }

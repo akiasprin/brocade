@@ -413,6 +413,16 @@ describe('AnyTLS ingress draft', () => {
     fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Padding Scheme' }), {
       target: { value: 'stop=2\n0=30-30\n1=70000-70000' },
     });
+    fireEvent.click(view.getByText('连接复用'));
+    fireEvent.change(view.getByRole('spinbutton', { name: 'AnyTLS Session 检查间隔' }), {
+      target: { value: '11' },
+    });
+    fireEvent.change(view.getByRole('spinbutton', { name: 'AnyTLS Session 空闲超时' }), {
+      target: { value: '22' },
+    });
+    fireEvent.change(view.getByRole('spinbutton', { name: 'AnyTLS Session 最少保留数量' }), {
+      target: { value: '3' },
+    });
     fireEvent.change(view.getByRole('combobox', { name: 'AnyTLS Masquerade 类型' }), {
       target: { value: 'string' },
     });
@@ -431,6 +441,9 @@ describe('AnyTLS ingress draft', () => {
     expect(saved.wires?.anytls).toEqual({
       port: 20443,
       padding_scheme: ['stop=2', '0=30-30', '1=70000-70000'],
+      idle_session_check_interval_secs: 11,
+      idle_session_timeout_secs: 22,
+      min_idle_session: 3,
       masquerade: {
         kind: 'string',
         content: 'Forbidden',
@@ -463,5 +476,18 @@ describe('AnyTLS ingress draft', () => {
 
     await waitFor(() => expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true));
     expect(view.getByText(/Padding Scheme 格式无效/)).toBeTruthy();
+  });
+
+  it('blocks session values outside the backend u32 range', async () => {
+    draft.clear();
+    const view = render(<AnyTlsHarness />);
+    fireEvent.click(view.getByText('连接复用'));
+    const timeout = view.getByRole('spinbutton', { name: 'AnyTLS Session 空闲超时' }) as HTMLInputElement;
+    expect(timeout.max).toBe('4294967295');
+
+    fireEvent.change(timeout, { target: { value: '4294967296' } });
+
+    await waitFor(() => expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true));
+    expect(view.getByText(/0 到 4294967295/)).toBeTruthy();
   });
 });

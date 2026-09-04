@@ -771,6 +771,7 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
             "1=70000-70000".to_owned(),
         ],
         masquerade: AnyTlsMasquerade::default(),
+        ..AnyTls::default()
     });
     app.steps = vec![Step {
         chain: "c-relay".to_owned(),

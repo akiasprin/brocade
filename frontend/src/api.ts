@@ -262,6 +262,19 @@ export interface LocalReconcileReport {
   /** 有值表示配置已偏移且 agent 无法自行修复，严重程度高于 actions 非空。 */
   error: string | null;
 }
+export type WireGuardPeerStatus = 'up' | 'down' | 'unknown';
+export interface WireGuardPeerHealth {
+  peer_node_id: string;
+  overlay_ip: string | null;
+  handshake_age_secs: number | null;
+  status: WireGuardPeerStatus;
+  detail: string | null;
+}
+export interface WireGuardHealth {
+  enabled: boolean;
+  error: string | null;
+  peers: WireGuardPeerHealth[];
+}
 export interface GeodataFileState {
   sha256: string;
   bytes: number;
@@ -296,6 +309,7 @@ export interface NodeAgentStateItem {
   runtime_versions: NodeVersions | null;
   spool_backlog: SpoolBacklog | null;
   last_local_reconcile: LocalReconcileReport | null;
+  wireguard_health: WireGuardHealth | null;
   runtime_reported_at: string | null;
   geodata_observed: GeodataObservation | null;
   last_poll_at: string | null;
@@ -996,6 +1010,12 @@ export interface AnyTlsSettings {
   port: number;
   /** One padding grammar line per array item. Empty means Xray's built-in scheme. */
   padding_scheme?: string[];
+  /** Client session pool check interval in seconds. Empty means Xray's default of 30s. */
+  idle_session_check_interval_secs?: number | null;
+  /** Client idle session lifetime in seconds. Empty means Xray's default of 60s. */
+  idle_session_timeout_secs?: number | null;
+  /** Minimum number of idle client sessions to retain. Empty means Xray's default of 0. */
+  min_idle_session?: number | null;
   /** Default is the explicit 404 masquerade. */
   masquerade: AnyTlsMasquerade;
 }
@@ -1669,8 +1689,14 @@ export interface ConsoleSnapshot {
     external_outbounds?: ExternalOutbound[];
     /* 机器的模型字段。产物相关的字段（overlay / egress / dns 等）各页面有各自的数据来源，
        此处只声明连接策略：它没有其他支持草稿的读取方式。 */
-    nodes?: { id: string; overlay?: boolean; certificate_name?: string | null; connection?: NodeConnection }[];
-    settings?: { connection?: ConnectionSettings };
+    nodes?: {
+      id: string;
+      overlay?: boolean;
+      certificate_name?: string | null;
+      connection?: NodeConnection;
+      wireguard?: { listen_port: number };
+    }[];
+    settings?: ModelSettings;
   };
   /* DNS 策略由机器持有，存在即下发，不由链路 Egress 规则启用。 */
   node_egress_dns: { node: string; position: number; selector: DestMatch; resolution: EgressDnsResolution }[];
@@ -1890,6 +1916,8 @@ export interface ModelSettings {
     /* 只在单向连接（一端不可被直接连接）时写入 wg 配置 */
     keepalive_secs: number;
     mtu: number;
+    /* 从全互联中明确排除的无方向节点对；发布后双方都不生成对应 peer。 */
+    disabled_links: { a: string; b: string }[];
   };
   // 自动分配端口的起始值。只影响新建时的默认值——已写入模型的端口不受影响，
   // 修改已有端口会导致 xray 配置变更、进程重启、该机器上所有连接中断。
@@ -2342,6 +2370,11 @@ export const updateNode = (
 ) => {
   draft.push({ op: 'update_node', node_id: id, node: body });
   return Promise.resolve({} as unknown);
+};
+
+export const setWireGuardLinkDisabled = (a: string, b: string, disabled: boolean) => {
+  draft.push({ op: 'set_wireguard_link_disabled', a, b, disabled });
+  return Promise.resolve({ revision_id: 0 });
 };
 
 /* 重签会立即使机器上的旧 token 失效，因此响应中包含一条可将新 token 写入机器的完整命令 */

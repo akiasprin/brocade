@@ -64,13 +64,14 @@ func parseTestFrames(t *testing.T, wire []byte) []testWireFrame {
 func newWireSession(wire []byte, isClient bool) (*session, *bytes.Buffer) {
 	var output bytes.Buffer
 	s := &session{
-		isClient:    isClient,
-		br:          &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(wire))},
-		bw:          buf.NewBufferedWriter(buf.NewWriter(&output)),
-		streams:     make(map[uint32]*stream),
-		errCh:       make(chan error, 1),
-		synAckCh:    make(map[uint32]chan error),
-		peerVersion: 1,
+		isClient:        isClient,
+		br:              &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(wire))},
+		bw:              buf.NewBufferedWriter(buf.NewWriter(&output)),
+		streams:         make(map[uint32]*stream),
+		drainingStreams: make(map[uint32]*stream),
+		errCh:           make(chan error, 1),
+		synAckCh:        make(map[uint32]chan error),
+		peerVersion:     1,
 	}
 	s.fw = newFrameWriter(s.bw)
 	s.paddingScheme = getDefaultPaddingScheme()

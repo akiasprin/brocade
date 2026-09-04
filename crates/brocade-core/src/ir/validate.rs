@@ -137,6 +137,45 @@ pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<D
 }
 
 fn validate_settings(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) {
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut disabled_links = BTreeSet::new();
+    for link in &snapshot.settings.overlay.disabled_links {
+        let location = format!("{}|{}", link.a, link.b);
+        if link.a.trim().is_empty() || link.b.trim().is_empty() || link.a == link.b {
+            diagnostics.push(Diagnostic::error(
+                "link.disabled-invalid",
+                &location,
+                "禁用的 WireGuard 链路必须引用两台不同的机器",
+            ));
+            continue;
+        }
+        for node in [&link.a, &link.b] {
+            if !node_ids.contains(node.as_str()) {
+                diagnostics.push(Diagnostic::error(
+                    "link.disabled-node-missing",
+                    &location,
+                    format!("禁用的 WireGuard 链路引用了不存在的机器 {node}"),
+                ));
+            }
+        }
+        let pair = if link.a <= link.b {
+            (link.a.as_str(), link.b.as_str())
+        } else {
+            (link.b.as_str(), link.a.as_str())
+        };
+        if !disabled_links.insert(pair) {
+            diagnostics.push(Diagnostic::error(
+                "link.disabled-dup",
+                location,
+                "同一条 WireGuard 链路被重复禁用",
+            ));
+        }
+    }
+
     let policy = &snapshot.settings.reality_client;
     let min = validate_reality_client_version(
         policy.min_client_ver.as_deref(),
@@ -1690,6 +1729,23 @@ fn validate_anytls(
             "ingress.anytls-port",
             &ingress.id,
             format!("接入面 {} 的 AnyTLS 监听端口不能是 0", ingress.id),
+        ));
+    }
+
+    if settings
+        .idle_session_check_interval_secs
+        .is_some_and(|value| value == 0)
+        || settings
+            .idle_session_timeout_secs
+            .is_some_and(|value| value == 0)
+    {
+        diagnostics.push(Diagnostic::error(
+            "ingress.anytls-session",
+            &ingress.id,
+            format!(
+                "接入面 {} 的 AnyTLS session 检查间隔和超时必须大于 0 秒",
+                ingress.id
+            ),
         ));
     }
 

@@ -2,12 +2,12 @@ use brocade_core::{
     client_config::{SubscriptionClientConfig, SUBSCRIPTION_CLIENT_CONFIG_SCHEMA},
     compile::compile,
     model::{
-        Action, ConnectionSettings, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
-        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
-        ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttp,
-        ExternalVlessXhttpDownload, HopDial, HopPool, Hysteria2, HysteriaBandwidth,
-        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires, ModelSettings,
-        NodeConnection, OverlaySettings, Projection, ProjectionDownloadEndpoint,
+        Action, AnyTls, ConnectionSettings, DestMatch, Dns, DomainStrategy,
+        EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
+        ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
+        ExternalVlessXhttp, ExternalVlessXhttpDownload, HopDial, HopPool, Hysteria2,
+        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires,
+        ModelSettings, NodeConnection, OverlaySettings, Projection, ProjectionDownloadEndpoint,
         ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
         RealityFallbackRateLimit, RealitySite, Rule, Transport, WgTransport, Xhttp, XhttpDownload,
         XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
@@ -21,7 +21,7 @@ use brocade_deployment::plan::{
 use brocade_deployment::protocol::{
     DiskDetailSample, GeodataFileState, GeodataObservation, HostFacts, LoadReportRequest,
     LoadSample, LocalReconcileReport, NetworkDetailSample, NodeRuntimeReport, NodeVersions,
-    SpoolBacklog,
+    SpoolBacklog, WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus,
 };
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
@@ -3413,6 +3413,17 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
         geosite: None,
         asset_dir: "/usr/local/share/xray".to_owned(),
     };
+    let wireguard_health = WireGuardHealth {
+        enabled: true,
+        error: None,
+        peers: vec![WireGuardPeerHealth {
+            peer_node_id: "n2".to_owned(),
+            overlay_ip: Some("10.66.0.2".to_owned()),
+            handshake_age_secs: Some(302_867),
+            status: WireGuardPeerStatus::Down,
+            detail: Some("overlay 探不通".to_owned()),
+        }],
+    };
 
     db.store
         .record_node_runtime(
@@ -3423,6 +3434,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 versions: versions.clone(),
                 geodata: Some(geodata.clone()),
                 local_reconcile: Some(reconcile.clone()),
+                wireguard_health: Some(wireguard_health.clone()),
                 spool: SpoolBacklog {
                     observation: 3,
                     usage: 41,
@@ -3435,7 +3447,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
 
     let row = sqlx::query(
         "SELECT agent_version, runtime_versions, spool_backlog, last_local_reconcile,
-                geodata_observed,
+                wireguard_health, geodata_observed,
                 runtime_reported_at IS NOT NULL AS stamped
          FROM node_agent_state WHERE node_id = 'n1'",
     )
@@ -3467,6 +3479,9 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     let kept: LocalReconcileReport =
         serde_json::from_value(row.try_get("last_local_reconcile").unwrap()).unwrap();
     assert_eq!(kept, reconcile);
+    let stored_wireguard: WireGuardHealth =
+        serde_json::from_value(row.try_get("wireguard_health").unwrap()).unwrap();
+    assert_eq!(stored_wireguard, wireguard_health);
     // The rule database shares this row and this channel — it is not an artifact of a release
     // but an observation every 30 minutes. A version on node_applied_state existed, and that path
     // is taken only on a release: a machine that does not ship for a month leaves its .dat state
@@ -3495,6 +3510,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 // erased".
                 geodata: None,
                 local_reconcile: None,
+                wireguard_health: None,
                 spool: SpoolBacklog {
                     observation: 0,
                     usage: 0,
@@ -3506,7 +3522,8 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
         .unwrap();
 
     let row = sqlx::query(
-        "SELECT runtime_versions, spool_backlog, last_local_reconcile, geodata_observed
+        "SELECT runtime_versions, spool_backlog, last_local_reconcile, wireguard_health,
+                geodata_observed
          FROM node_agent_state WHERE node_id = 'n1'",
     )
     .fetch_one(db.pool())
@@ -3516,6 +3533,12 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     let kept: LocalReconcileReport =
         serde_json::from_value(row.try_get("last_local_reconcile").unwrap()).unwrap();
     assert_eq!(kept, reconcile, "空报告把上一次的本地对账抹掉了");
+    let kept_wireguard: WireGuardHealth =
+        serde_json::from_value(row.try_get("wireguard_health").unwrap()).unwrap();
+    assert_eq!(
+        kept_wireguard, wireguard_health,
+        "旧 agent 没有该字段时不该清掉最后一次 WG 判定"
+    );
     // Versions and backlog are the inverse — they are the fact of this moment and are
     // overwritten every round.
     let stored: NodeVersions =
@@ -3563,6 +3586,7 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
         },
         geodata: None,
         local_reconcile: None,
+        wireguard_health: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
@@ -3611,6 +3635,7 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         },
         geodata: None,
         local_reconcile: None,
+        wireguard_health: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
@@ -13639,6 +13664,177 @@ async fn an_ingress_keeps_its_stream_across_writes() {
     let Some(Transport::VlessTlsXhttp(_)) = stored.wires.vless() else {
         panic!("expected TLS + XHTTP");
     };
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    db.store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "example.test".to_owned(),
+                dns_credential: Some("token".to_owned()),
+                acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
+                acme_contact: Some("ops@example.test".to_owned()),
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    issue_certificate_for(&db, "n1", "Test CA").await;
+
+    let face = |check, timeout, minimum| CreateIngressRequest {
+        id: "i-main".to_owned(),
+        chain_id: "c-main".to_owned(),
+        node_id: "n1".to_owned(),
+        bind: "0.0.0.0".parse().unwrap(),
+        port: 443,
+        front_id: None,
+        reality: CreateRealityIngressRequest {
+            fallback_mode: None,
+            fallback_limits: None,
+            fallback_guard: None,
+            dest: Some("www.example.com:443".to_owned()),
+            server_names: vec!["www.example.com".to_owned()],
+            fingerprint: Some("chrome".to_owned()),
+            flow: None,
+        },
+        wires: WiresRequest {
+            vless: Some(TransportRequest::VlessReality),
+            anytls: Some(AnyTls {
+                port: 19443,
+                idle_session_check_interval_secs: check,
+                idle_session_timeout_secs: timeout,
+                min_idle_session: minimum,
+                ..AnyTls::default()
+            }),
+            hysteria2: None,
+        },
+        projection: Projection::default(),
+        guard: brocade_core::model::IngressGuard::OPEN,
+        note: None,
+    };
+
+    let first = db
+        .store
+        .upsert_ingress(
+            &system_admin(),
+            "app-main",
+            face(Some(11), Some(22), Some(3)),
+        )
+        .await
+        .unwrap();
+    let first_client: i64 = sqlx::query_scalar(
+        "SELECT head_snapshot_id FROM subscription_client_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO subscription_serving_state (
+             id, topology_revision_id, permissions_revision_id, client_snapshot_id, generation
+         ) VALUES (TRUE, $1, $1, $2, 1)",
+    )
+    .bind(i64::try_from(first.revision_id).unwrap())
+    .bind(first_client)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let stored: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT anytls_idle_session_check_interval, anytls_idle_session_timeout,
+                anytls_min_idle_session
+           FROM ingress_client_settings
+          WHERE ingress_id = 'i-main'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, (Some(11), Some(22), Some(3)));
+    assert_column_missing(db.pool(), "ingresses", "anytls_idle_session_check_interval").await;
+
+    let second = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertIngress {
+                app_id: "app-main".to_owned(),
+                ingress: face(Some(12), Some(24), None),
+            }],
+            Some("adjust AnyTLS client sessions".to_owned()),
+        )
+        .await
+        .unwrap();
+    assert!(second.revision_id > first.revision_id);
+    assert!(matches!(
+        second.client_config.status,
+        brocade_store::ClientConfigCommitStatus::Activated
+    ));
+    assert!(second.client_config.pending_topology.is_empty());
+    let second_client: i64 = sqlx::query_scalar(
+        "SELECT head_snapshot_id FROM subscription_client_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_ne!(second_client, first_client);
+
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let anytls = snapshot.apps[0].ingresses[0].wires.anytls().unwrap();
+    assert_eq!(anytls.idle_session_check_interval_secs, Some(12));
+    assert_eq!(anytls.idle_session_timeout_secs, Some(24));
+    assert_eq!(anytls.min_idle_session, None);
+    let deployments: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM deployments WHERE kind = 'config'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        deployments, 0,
+        "client-only tuning must not create a deployment"
+    );
+
+    let oversized = sqlx::query(
+        "UPDATE ingress_client_settings
+            SET anytls_idle_session_timeout = 4294967296
+          WHERE ingress_id = 'i-main'",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(
+        oversized.is_err(),
+        "database must enforce the model's u32 upper bound"
+    );
+
+    sqlx::query(
+        "ALTER TABLE ingress_client_settings
+         DROP CONSTRAINT ingress_client_settings_anytls_idle_session_timeout_check",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE ingress_client_settings
+            SET anytls_idle_session_timeout = 4294967296
+          WHERE ingress_id = 'i-main'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let corrupt = db.store.materialize_snapshot(None).await;
+    assert!(
+        matches!(corrupt, Err(StoreError::InvalidData(message)) if message.contains("anytls_idle_session_timeout out of range")),
+        "an oversized stored value must not silently become the client default"
+    );
 }
 
 #[tokio::test]

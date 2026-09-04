@@ -31,9 +31,13 @@ type session struct {
 	fw       *frameWriter
 
 	writeMu sync.Mutex
+	stateMu sync.RWMutex
 
 	streamsMu sync.Mutex
 	streams   map[uint32]*stream
+	// drainingStreams keeps FIN-closed streams reachable until their queued
+	// inbound payloads have been delivered or the session is force-closed.
+	drainingStreams map[uint32]*stream
 
 	peerVersion     byte
 	errCh           chan error
@@ -60,7 +64,59 @@ type session struct {
 	activeStreams atomic.Int32
 	idleSinceNano atomic.Int64
 	inIdlePool    atomic.Bool
+	dieHookMu     sync.Mutex
 	dieHook       func()
+	cancel        context.CancelFunc
+}
+
+func (s *session) peerVersionValue() byte {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.peerVersion
+}
+
+func (s *session) setPeerVersion(version byte) {
+	s.stateMu.Lock()
+	s.peerVersion = version
+	s.stateMu.Unlock()
+}
+
+func (s *session) handshakeDoneValue() bool {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.handshakeDone
+}
+
+func (s *session) setHandshakeDone() {
+	s.stateMu.Lock()
+	s.handshakeDone = true
+	s.stateMu.Unlock()
+}
+
+func (s *session) setClientPaddingMD5(value string) {
+	s.stateMu.Lock()
+	s.clientPaddingMD5 = value
+	s.stateMu.Unlock()
+}
+
+func (s *session) clientPaddingMD5Value() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.clientPaddingMD5
+}
+
+func (s *session) setDieHook(hook func()) {
+	if hook == nil {
+		return
+	}
+	s.dieHookMu.Lock()
+	if s.isClosed() {
+		s.dieHookMu.Unlock()
+		hook()
+		return
+	}
+	s.dieHook = hook
+	s.dieHookMu.Unlock()
 }
 
 func (s *session) handlePSH(ctx context.Context, st *stream, br *buf.BufferedReader, length int) error {
@@ -73,10 +129,27 @@ func (s *session) handlePSH(ctx context.Context, st *stream, br *buf.BufferedRea
 		return err
 	}
 
-	if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
+	s.startStreamDelivery(st)
+	if err := st.enqueueDelivery(body); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *session) startStreamDelivery(st *stream) {
+	st.startDeliveryWorker(func(body buf.MultiBuffer) error {
+		if st.isUDP {
+			data := make([]byte, body.Len())
+			body.Copy(data)
+			buf.ReleaseMulti(body)
+			return s.handleUDPData(st, data)
+		}
+		if st.link == nil || st.link.Writer == nil {
+			buf.ReleaseMulti(body)
+			return errors.New("anytls: stream writer is unavailable")
+		}
+		return st.link.Writer.WriteMultiBuffer(body)
+	})
 }
 
 func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.BufferedReader, length int) error {
@@ -98,7 +171,7 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	}
 
 	// Check for UDP-over-TCP v2 magic domain in a new stream request.
-	if strings.Contains(dest.Address.String(), "udp-over-tcp.arpa") {
+	if dest.Address.String() == "sp.v2.udp-over-tcp.arpa" && dest.Port == 0 {
 		st.isUDP = true
 		if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 			errors.LogWarning(ctx, "anytls: UDP SYNACK send error, streamId=", st.sid, " err=", err)
@@ -107,6 +180,9 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		return nil
 	}
 
+	if s.isClosed() {
+		return errors.New("anytls: session closed")
+	}
 	l, err := s.dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		errors.LogWarning(ctx, "anytls: new stream dispatcher error, streamId=", st.sid, " err=", err)
@@ -117,7 +193,10 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		s.finishStream(st.sid, err)
 		return nil
 	}
-	st.link = l
+	if !s.attachStreamLink(st, l) {
+		closeTransportLink(l)
+		return errors.New("anytls: session closed")
+	}
 
 	if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 		errors.LogWarning(ctx, "anytls: new stream SYNACK send error, streamId=", st.sid, " err=", err)
@@ -129,10 +208,12 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		if err != nil {
 			return err
 		}
-		if err := st.link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(initial)}); err != nil {
+		s.startStreamDelivery(st)
+		if err := st.enqueueDelivery(buf.MultiBuffer{buf.FromBytes(initial)}); err != nil {
 			return err
 		}
 	}
+	s.startStreamDelivery(st)
 	go s.pumpDownlink(st.sid, l)
 	return nil
 }
@@ -168,6 +249,9 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 		}
 		requestDest := singbridge.ToDestination(request.Destination, net.Network_UDP)
 
+		if s.isClosed() {
+			return errors.New("anytls: session closed")
+		}
 		link, err := s.dispatcher.Dispatch(ctx, requestDest)
 		if err != nil {
 			errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
@@ -176,7 +260,10 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 			return nil
 		}
 
-		st.link = link
+		if !s.attachStreamLink(st, link) {
+			closeTransportLink(link)
+			return errors.New("anytls: session closed")
+		}
 		st.uotConnect = request.IsConnect
 		st.udpTarget = &requestDest
 		if bodyReader.Len() > 0 {
@@ -184,11 +271,13 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 			if err != nil {
 				return err
 			}
-			if err := s.handleUDPData(st, initial); err != nil {
+			s.startStreamDelivery(st)
+			if err := st.enqueueDelivery(buf.MultiBuffer{buf.FromBytes(initial)}); err != nil {
 				return err
 			}
 		}
 
+		s.startStreamDelivery(st)
 		go s.pumpDownlink(st.sid, link)
 		return nil
 	}
@@ -267,12 +356,12 @@ func encodeUDPData(data buf.MultiBuffer, connect bool, defaultDestination *net.D
 			}
 			addressLength = uot.AddrParser.AddrPortLen(singbridge.ToSocksaddr(*destination))
 		}
-		recordLength := addressLength + 2 + len(payload)
-		if recordLength > maxFramePayload {
+		if len(payload) > maxFramePayload {
 			buf.ReleaseMulti(encoded)
 			buf.ReleaseMulti(data)
 			return nil, errors.New("anytls: UoT packet is too large")
 		}
+		recordLength := addressLength + 2 + len(payload)
 		record := buf.NewWithSize(int32(recordLength))
 		if !connect {
 			if err := uot.AddrParser.WriteAddrPort(record, singbridge.ToSocksaddr(*destination)); err != nil {
@@ -301,14 +390,7 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 	st := s.streams[sid]
 	s.streamsMu.Unlock()
 	defer func() {
-		s.streamsMu.Lock()
-		st := s.streams[sid]
-		delete(s.streams, sid)
-		s.streamsMu.Unlock()
-		if st != nil && st.link != nil {
-			common.Close(st.link.Writer)
-			common.Close(st.link.Reader)
-		}
+		s.finishStream(sid, nil)
 		if !s.isClosed() {
 			_ = s.sendFrame(newFrame(cmdFIN, sid))
 		}
@@ -326,7 +408,7 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 			}
 		}
 
-		if err := s.sendStreamData(sid, mb, s.nextPacketIndex()); err != nil {
+		if err := s.sendStreamData(sid, mb); err != nil {
 			return
 		}
 	}
@@ -346,22 +428,53 @@ func (s *session) close(err error) {
 		default:
 		}
 	}
-	_ = s.conn.Close()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
 
 	s.streamsMu.Lock()
-	streams := make([]*stream, 0, len(s.streams))
+	streams := make([]*stream, 0, len(s.streams)+len(s.drainingStreams))
 	for _, st := range s.streams {
 		streams = append(streams, st)
 	}
+	for _, st := range s.drainingStreams {
+		streams = append(streams, st)
+	}
 	s.streams = make(map[uint32]*stream)
+	s.drainingStreams = make(map[uint32]*stream)
 	s.streamsMu.Unlock()
 
 	for _, st := range streams {
 		st.close(err)
 	}
-	if s.dieHook != nil {
-		s.dieHook()
+	s.dieHookMu.Lock()
+	hook := s.dieHook
+	s.dieHook = nil
+	s.dieHookMu.Unlock()
+	if hook != nil {
+		hook()
 	}
+}
+
+func (s *session) attachStreamLink(st *stream, link *transport.Link) bool {
+	s.streamsMu.Lock()
+	defer s.streamsMu.Unlock()
+	if s.isClosed() || s.streams[st.sid] != st {
+		return false
+	}
+	st.link = link
+	return true
+}
+
+func closeTransportLink(link *transport.Link) {
+	if link == nil {
+		return
+	}
+	common.Close(link.Reader)
+	common.Close(link.Writer)
 }
 
 func (s *session) finishStream(sid uint32, err error) bool {
@@ -383,6 +496,36 @@ func (s *session) finishStream(sid uint32, err error) bool {
 	return true
 }
 
+func (s *session) finishStreamAfterDelivery(sid uint32, err error) bool {
+	s.streamsMu.Lock()
+	st := s.streams[sid]
+	if st != nil {
+		delete(s.streams, sid)
+		if s.drainingStreams == nil {
+			s.drainingStreams = make(map[uint32]*stream)
+		}
+		s.drainingStreams[sid] = st
+	}
+	s.streamsMu.Unlock()
+
+	if st == nil {
+		return false
+	}
+
+	if s.client != nil {
+		s.activeStreams.Add(-1)
+	}
+	st.setDeliveryDoneHook(func() {
+		s.streamsMu.Lock()
+		if s.drainingStreams[sid] == st {
+			delete(s.drainingStreams, sid)
+		}
+		s.streamsMu.Unlock()
+	})
+	st.closeAfterDelivery(err)
+	return true
+}
+
 func (s *session) sendFrame(f *frame) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -392,51 +535,74 @@ func (s *session) sendFrame(f *frame) error {
 	return s.fw.flush()
 }
 
-// Packet indexes are session-wide because padding rules describe records, not individual
-// streams. Both directions use the same counter shape: once the configured stop value is
-// reached, a zero index keeps the wire unpadded without advancing the counter forever.
-func (s *session) nextPacketIndex() uint32 {
+// nextPacketIndexLocked allocates the next session-wide packet index. The bool is
+// deliberately separate from the index: packet index 0 is a valid padding rule,
+// while a session past the stop value must send an unpadded packet.
+func (s *session) nextPacketIndexLocked() (uint32, bool) {
 	s.schemeMu.RLock()
 	scheme := s.paddingScheme
 	s.schemeMu.RUnlock()
 	if scheme != nil && s.pktCounter.Load() < scheme.stop {
-		return s.pktCounter.Add(1) - 1
+		return s.pktCounter.Add(1) - 1, true
 	}
-	return 0
+	return 0, false
 }
 
-func (s *session) sendStreamData(sid uint32, data buf.MultiBuffer, packetIndex uint32) error {
-	defer buf.ReleaseMulti(data)
+func (s *session) nextPacketIndex() (uint32, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.nextPacketIndexLocked()
+}
+
+func (s *session) writePacketLocked(frames buf.MultiBuffer) error {
+	packetIndex, paddingEnabled := s.nextPacketIndexLocked()
+	if paddingEnabled {
+		return s.writePacketWithPadding(packetIndex, frames)
+	}
+	if err := s.fw.bw.WriteMultiBuffer(frames); err != nil {
+		return err
+	}
+	return s.fw.flush()
+}
+
+func (s *session) writePacket(frames buf.MultiBuffer) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.writePacketLocked(frames)
+}
+
+func (s *session) writeFramesLocked(sid uint32, data buf.MultiBuffer, packetIndex uint32, paddingEnabled bool) error {
 	for !data.IsEmpty() {
 		var chunk buf.MultiBuffer
 		data, chunk = buf.SplitSize(data, maxFramePayload)
-		if packetIndex > 0 {
+		if paddingEnabled {
 			b := buf.New()
 			p := b.Extend(7)
 			p[0] = cmdPSH
 			binary.BigEndian.PutUint32(p[1:5], sid)
 			binary.BigEndian.PutUint16(p[5:7], uint16(chunk.Len()))
 			merge, _ := buf.MergeMulti(buf.MultiBuffer{b}, chunk)
-			s.writeMu.Lock()
 			if err := s.writePacketWithPadding(packetIndex, merge); err != nil {
 				return err
 			}
-			s.writeMu.Unlock()
-		} else {
-			s.writeMu.Lock()
-			err := s.fw.writeMultiBuffer(cmdPSH, sid, chunk)
-			if err == nil {
-				err = s.fw.flush()
-			}
-			s.writeMu.Unlock()
-			if err != nil {
-				buf.ReleaseMulti(data)
-				return err
-			}
+			continue
 		}
-
+		if err := s.fw.writeMultiBuffer(cmdPSH, sid, chunk); err != nil {
+			return err
+		}
+		if err := s.fw.flush(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (s *session) sendStreamData(sid uint32, data buf.MultiBuffer) error {
+	defer buf.ReleaseMulti(data)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	packetIndex, paddingEnabled := s.nextPacketIndexLocked()
+	return s.writeFramesLocked(sid, data, packetIndex, paddingEnabled)
 }
 
 func (s *session) readLoop(ctx context.Context) error {
@@ -474,7 +640,7 @@ func (s *session) readLoop(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if s.handshakeDone {
+			if s.handshakeDoneValue() {
 				return errors.New("anytls: duplicate settings")
 			}
 			settings, err := parseSettings(text)
@@ -482,23 +648,23 @@ func (s *session) readLoop(ctx context.Context) error {
 				return err
 			}
 			if settings.version > 2 {
-				s.peerVersion = 2
+				s.setPeerVersion(2)
 			} else {
-				s.peerVersion = settings.version
+				s.setPeerVersion(settings.version)
 			}
-			s.clientPaddingMD5 = settings.paddingMD5
+			s.setClientPaddingMD5(settings.paddingMD5)
 			if err := s.sendFrame(&frame{cmd: cmdServerSettings, sid: 0, data: []byte("v=2")}); err != nil {
 				return err
 			}
-			if s.server != nil && s.server.paddingScheme != "" && s.clientPaddingMD5 != "" {
+			if s.server != nil && s.server.paddingScheme != "" && s.clientPaddingMD5Value() != "" {
 				sum := md5.Sum([]byte(s.server.paddingScheme))
-				if strings.ToLower(hex.EncodeToString(sum[:])) != s.clientPaddingMD5 {
+				if strings.ToLower(hex.EncodeToString(sum[:])) != s.clientPaddingMD5Value() {
 					if err := s.sendFrame(&frame{cmd: cmdUpdatePaddingScheme, sid: 0, data: []byte(s.server.paddingScheme)}); err != nil {
 						return err
 					}
 				}
 			}
-			s.handshakeDone = true
+			s.setHandshakeDone()
 		case cmdHeartRequest:
 			if length > 0 {
 				if err := discardBytes(s.br, length); err != nil {
@@ -523,7 +689,7 @@ func (s *session) readLoop(ctx context.Context) error {
 				}
 				return errors.New("anytls: unexpected SYN from server")
 			} else {
-				if !s.handshakeDone {
+				if !s.handshakeDoneValue() {
 					alert := newFrame(cmdAlert, 0)
 					alert.data = []byte("client did not send its settings")
 					_ = s.sendFrame(alert)
@@ -541,7 +707,7 @@ func (s *session) readLoop(ctx context.Context) error {
 				}
 				s.streamsMu.Lock()
 				if _, ok := s.streams[sid]; !ok {
-					s.streams[sid] = &stream{sid: sid}
+					s.streams[sid] = newStream(sid, nil)
 				}
 				s.streamsMu.Unlock()
 			}
@@ -570,15 +736,6 @@ func (s *session) readLoop(ctx context.Context) error {
 					return err
 				}
 				continue
-			} else if st.isUDP {
-				body := make([]byte, length)
-				if _, err := io.ReadFull(s.br, body); err != nil {
-					return err
-				}
-				if err := s.handleUDPData(st, body); err != nil {
-					return err
-				}
-				continue
 			}
 			if err := s.handlePSH(ctx, st, s.br, length); err != nil {
 				return err
@@ -589,7 +746,7 @@ func (s *session) readLoop(ctx context.Context) error {
 					return err
 				}
 			}
-			s.finishStream(sid, nil)
+			s.finishStreamAfterDelivery(sid, nil)
 		case cmdSYNACK:
 			if !s.isClient {
 				if length > 0 {
@@ -647,9 +804,9 @@ func (s *session) readLoop(ctx context.Context) error {
 				return err
 			}
 			if settings.version > 2 {
-				s.peerVersion = 2
+				s.setPeerVersion(2)
 			} else {
-				s.peerVersion = settings.version
+				s.setPeerVersion(settings.version)
 			}
 		case cmdUpdatePaddingScheme:
 			if !s.isClient {
@@ -669,9 +826,10 @@ func (s *session) readLoop(ctx context.Context) error {
 				if perr != nil {
 					return errors.New("anytls: invalid padding update").Base(perr)
 				}
-				s.schemeMu.Lock()
-				s.paddingScheme = scheme
-				s.schemeMu.Unlock()
+				if s.client == nil {
+					return errors.New("anytls: padding update has no client")
+				}
+				s.client.updatePaddingScheme(scheme)
 			} else {
 				return errors.New("anytls: empty padding update")
 			}

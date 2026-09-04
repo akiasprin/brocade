@@ -39,8 +39,8 @@ use spool::{
 
 use wg::{
     backbone_lock, check_wg_peers, drift_is_fatal, guard_wireguard, handshake_age_text,
-    peer_overlay_ips, ping_all, reset_stale_phantun_passive_peers, wireguard_conf_mtu, PeerState,
-    WG_GUARD_INTERVAL,
+    peer_overlay_ips, ping_all, reset_stale_phantun_passive_peers, set_wireguard_disabled,
+    wireguard_conf_mtu, PeerState, WG_GUARD_INTERVAL,
 };
 
 use std::{
@@ -1298,6 +1298,7 @@ fn run_forever(options: Options) -> Result<(), String> {
         // It contends with convergence over wg0, so both share `BACKBONE` (taken
         // inside `guard_wireguard`).
         let state_dir = options.state_dir.clone();
+        let reports_out = Arc::clone(&runtime_reports);
         thread::Builder::new()
             .name("wg-guard".to_owned())
             .spawn(move || loop {
@@ -1306,8 +1307,16 @@ fn run_forever(options: Options) -> Result<(), String> {
                     // No config, or an explicit disable marker, means no check runs:
                     // that state is not a failure, it means the machine is not in
                     // the backbone.
-                    if conf.exists() && !state_dir.join("wireguard.disabled").exists() {
-                        guard_wireguard(&state_dir, &conf);
+                    let changed = if conf.exists() && !state_dir.join("wireguard.disabled").exists()
+                    {
+                        guard_wireguard(&state_dir, &conf)
+                    } else {
+                        set_wireguard_disabled()
+                    };
+                    if changed {
+                        if let Err(error) = reports_out.publish_current(&state_dir) {
+                            eprintln!("wg-guard runtime: {error}");
+                        }
                     }
                 });
                 thread::sleep(WG_GUARD_INTERVAL);

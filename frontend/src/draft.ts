@@ -142,6 +142,7 @@ export type ModelOp =
       };
     }
   | { op: 'update_node_status'; node_id: string; status: { status: string } }
+  | { op: 'set_wireguard_link_disabled'; a: string; b: string; disabled: boolean }
   | { op: 'update_settings'; settings: ModelSettings };
 
 export interface DraftEntry {
@@ -320,6 +321,15 @@ function entryOf(op: ModelOp): DraftEntry {
         label: `机器 ${op.node_id} 置为 ${op.status.status}`,
         op,
       };
+    case 'set_wireguard_link_disabled': {
+      const [a, b] = [op.a, op.b].sort();
+      const canonical = { ...op, a, b };
+      return {
+        key: `wireguard-link:${a}/${b}`,
+        label: `${op.disabled ? '禁用' : '恢复'} WG 链路 ${a} ↔ ${b}`,
+        op: canonical,
+      };
+    }
     case 'update_settings':
       return { key: 'settings', label: '全局设置', op };
   }
@@ -393,6 +403,15 @@ class DraftStore {
       entry = entryOf({ op: 'create_chain', app_id: op.app_id, chain: op.chain });
     } else if (previous?.op === 'create_ingress' && op.op === 'upsert_ingress') {
       entry = entryOf({ op: 'create_ingress', app_id: op.app_id, ingress: op.ingress });
+    } else if (previous?.op === 'update_node' && op.op === 'update_node') {
+      // The node detail page deliberately splits one machine across independent cards. Keep the
+      // fields saved by those cards in one operation; replacing the whole partial body would make
+      // a later WireGuard transport edit silently discard an earlier listen-port or MTU edit.
+      entry = entryOf({
+        op: 'update_node',
+        node_id: op.node_id,
+        node: { ...previous.node, ...op.node },
+      });
     }
     if (
       at >= 0 &&

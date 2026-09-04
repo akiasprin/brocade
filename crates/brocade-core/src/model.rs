@@ -295,7 +295,7 @@ impl Default for PortSettings {
 }
 
 /// The backbone's global parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlaySettings {
     /// Written into the wg config only for one-way dialing (`Dial::Both` needs no
@@ -312,6 +312,19 @@ pub struct OverlaySettings {
     /// `[Peer]` has no such key (`format/ini.rs`). The value is therefore node-level, and
     /// `Node.mtu` is authoritative.
     pub mtu: u16,
+    /// Node pairs intentionally excluded from the otherwise full WireGuard mesh.
+    ///
+    /// Each pair is undirected. Store writes canonicalize it to `a < b`; the compiler still
+    /// treats either order identically so imported and historical snapshots remain robust.
+    #[serde(default)]
+    pub disabled_links: Vec<DisabledWireGuardLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisabledWireGuardLink {
+    pub a: String,
+    pub b: String,
 }
 
 impl Default for OverlaySettings {
@@ -319,6 +332,7 @@ impl Default for OverlaySettings {
         Self {
             keepalive_secs: 25,
             mtu: 1420,
+            disabled_links: Vec::new(),
         }
     }
 }
@@ -1349,10 +1363,11 @@ pub struct Hysteria2 {
 
 /// AnyTLS's operator-controlled server shape.
 ///
-/// The listener has only three meaningful configuration groups in the pinned Xray fork: its
-/// TCP port, the padding grammar and the response sent to connections which do not complete an
-/// AnyTLS handshake. User passwords are deliberately absent here because they are synchronized
-/// through Xray's gRPC API just like the other dynamic account types.
+/// The listener has three server-side configuration groups in the pinned Xray fork: its TCP port,
+/// the padding grammar and the response sent to connections which do not complete an AnyTLS
+/// handshake. The same object also carries the client-side session pool settings used by
+/// subscriptions and probes. User passwords are deliberately absent here because they are
+/// synchronized through Xray's gRPC API just like the other dynamic account types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnyTls {
@@ -1362,6 +1377,16 @@ pub struct AnyTls {
     /// One line per padding rule. An empty list means use Xray's built-in scheme.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub padding_scheme: Vec<String>,
+    /// Client-side session pool check interval. Empty follows the consuming client's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_session_check_interval_secs: Option<u32>,
+    /// Client-side idle session lifetime. Empty follows the consuming client's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_session_timeout_secs: Option<u32>,
+    /// Minimum number of idle client sessions to retain. Empty follows the consuming client's
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_idle_session: Option<u32>,
     /// HTTP response returned to non-AnyTLS clients. The default is an explicit 404 so the
     /// public behavior remains stable across fork upgrades.
     #[serde(default)]
@@ -1373,6 +1398,9 @@ impl Default for AnyTls {
         Self {
             port: ANYTLS_PORT_BASE,
             padding_scheme: Vec::new(),
+            idle_session_check_interval_secs: None,
+            idle_session_timeout_secs: None,
+            min_idle_session: None,
             masquerade: AnyTlsMasquerade::default(),
         }
     }
@@ -1756,6 +1784,16 @@ impl IngressWires {
 
     /// The AnyTLS TCP half, or `None` where this ingress is VLESS or QUIC only.
     pub fn anytls(&self) -> Option<&AnyTls> {
+        match self {
+            Self::AnyTls(anytls)
+            | Self::VlessAndAnyTls { anytls, .. }
+            | Self::AnyTlsAndHysteria2 { anytls, .. }
+            | Self::VlessAnyTlsAndHysteria2 { anytls, .. } => Some(anytls),
+            Self::Vless(_) | Self::Hysteria2(_) | Self::Both { .. } => None,
+        }
+    }
+
+    pub fn anytls_mut(&mut self) -> Option<&mut AnyTls> {
         match self {
             Self::AnyTls(anytls)
             | Self::VlessAndAnyTls { anytls, .. }
