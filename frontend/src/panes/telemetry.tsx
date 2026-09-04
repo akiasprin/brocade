@@ -591,13 +591,21 @@ export function throughputAxis(
 }
 
 export function ThroughputChart({
+  timesUnixSecs,
+  rangeStartUnixSecs,
+  rangeEndUnixSecs,
   rx,
   tx,
   rxName,
   txName,
   group,
 }: {
-  /** 60 个 30 秒窗口的速率（bps），下标 59 为最近；null 表示缺口，断开不连。 */
+  /** 每个速率点对应的真实窗口结束时间。 */
+  timesUnixSecs: number[];
+  /** 前端请求并由服务端回显的绝对区间。 */
+  rangeStartUnixSecs: number;
+  rangeEndUnixSecs: number;
+  /** null 表示缺口，折线在此断开。 */
   rx: (number | null)[];
   tx: (number | null)[];
   rxName: string;
@@ -633,7 +641,18 @@ export function ThroughputChart({
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
-    const sig = JSON.stringify([rx, tx, rxName, txName, group, themeName, paletteKey]);
+    const sig = JSON.stringify([
+      timesUnixSecs,
+      rangeStartUnixSecs,
+      rangeEndUnixSecs,
+      rx,
+      tx,
+      rxName,
+      txName,
+      group,
+      themeName,
+      paletteKey,
+    ]);
     if (sig === lastSig.current) return;
     lastSig.current = sig;
     const css = getComputedStyle(document.documentElement);
@@ -647,11 +666,8 @@ export function ThroughputChart({
     const glass = cv('--glass-strong');
 
     const { axis: valueAxis, unit } = throughputAxis(rx, tx);
-    const slots = Math.max(rx.length, tx.length, 1);
-    // 这里只收到按窗口索引的速率，没有真实时间戳。窗口固定 30 秒、末窗为当前，据此合成毫秒
-    // 时间轴：换来等距的时间刻度与次刻度，而点距与原 category 轴一致（窗口本就等距）。
-    const now = Math.floor(Date.now() / 30_000) * 30_000;
-    const at = (index: number) => now - (slots - 1 - index) * 30_000;
+    const xMin = rangeStartUnixSecs * 1000;
+    const xMax = rangeEndUnixSecs * 1000;
     // x 轴显示墙钟时刻（hh:mm，与全机队镜像图及此前的 mockup 一致），tooltip 到秒。
     const hm = (ms: number) =>
       new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
@@ -662,19 +678,7 @@ export function ThroughputChart({
         second: '2-digit',
         hour12: false,
       });
-    // 轴起点即首个真实数据点：左侧补 null 的空槽不占轴，曲线紧贴 y 轴。
-    // 这里曾把起点向下取到整分钟，为的是让刻度落在整分上；代价是首点在 hh:mm:32 时左端
-    // 空出 32 秒。现在留白优先——刻度仍每 xStep 一格，只是整体带着首点的秒偏移，标签
-    // 截到分钟显示，读数间隔不变。now - 30_000 兜底：只有一个样本时轴不会退化成一个点。
-    const firstDataIndex = (() => {
-      for (let index = 0; index < slots; index++) {
-        if ((rx[index] ?? null) !== null || (tx[index] ?? null) !== null) return index;
-      }
-      return -1;
-    })();
-    const firstMs = firstDataIndex >= 0 ? at(firstDataIndex) : at(0);
-    const xStep = observeTimeInterval(now - firstMs);
-    const xMin = Math.min(firstMs, now - 30_000);
+    const xStep = observeTimeInterval(Math.max(30_000, xMax - xMin));
 
     const mk = (name: string, data: (number | null)[], color: string) => ({
       name,
@@ -688,7 +692,7 @@ export function ThroughputChart({
       areaStyle: observeAreaStyle(color, themeName, { count: 2 }),
       itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
       emphasis: { disabled: true },
-      data: data.map((value, index) => [at(index), value] as [number, number | null]),
+      data: data.map((value, index) => [timesUnixSecs[index] * 1000, value] as [number, number | null]),
     });
 
     chart.setOption(
@@ -727,7 +731,7 @@ export function ThroughputChart({
           // 无视 interval/minInterval（实测固定 2 分钟一格 → 15 条网格），数值轴才认 interval。
           type: 'value',
           min: xMin,
-          max: now,
+          max: xMax,
           interval: xStep,
           axisLine: observeAxisLine(ink3),
           axisTick: observeAxisTick(ink3),
@@ -760,7 +764,7 @@ export function ThroughputChart({
     );
     // connect 按组联动所有已建实例；任一图重设 option 后重连一次，保证最新成员都在组内。
     if (group) echarts.connect(group);
-  }, [rx, tx, rxName, txName, group, themeName, paletteKey]);
+  }, [timesUnixSecs, rangeStartUnixSecs, rangeEndUnixSecs, rx, tx, rxName, txName, group, themeName, paletteKey]);
 
   return <div ref={elRef} className="ndtp-ec" />;
 }

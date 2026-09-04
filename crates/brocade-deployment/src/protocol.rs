@@ -1815,6 +1815,11 @@ pub struct LoadReportResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeLoadView {
     pub node_id: String,
+    /// Exact interval requested by the reader. Samples overlap this half-open interval; echoing
+    /// it lets charts keep missing time at its real position instead of moving the last row to
+    /// the right edge and making stale telemetry look current.
+    pub range_start_unix_secs: i64,
+    pub range_end_unix_secs: i64,
     /// `None` means this machine has never reported, which is distinct from reporting zeros. The
     /// UI has to state that explicitly: a newly enrolled machine, or one running an agent from
     /// before this feature, is not a machine with a fault.

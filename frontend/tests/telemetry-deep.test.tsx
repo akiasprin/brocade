@@ -214,6 +214,8 @@ function sample(deep = true): LoadSample {
 function report(deep = true): NodeLoadView {
   return {
     node_id: 'n1',
+    range_start_unix_secs: 0,
+    range_end_unix_secs: 130,
     reported_at_unix_secs: 130,
     clock_skew_secs: 0,
     host,
@@ -634,7 +636,7 @@ describe('deep host telemetry', () => {
     expect(view.getByRole('button', { name: /CPU/ }).classList.contains('warn')).toBe(false);
   });
 
-  it('keeps the full 24-hour slot count in the network chart', () => {
+  it('keeps the full 24-hour absolute axis without synthesizing load slots', () => {
     const value = report();
     const view = render(<LoadCard report={value} historyLabel="24 HOURS" historyWindows={2_880} />);
 
@@ -643,18 +645,33 @@ describe('deep host telemetry', () => {
     expect(view.queryByText('CPU · 24 HOURS')).toBeNull();
     expect(view.queryByText(/1 \/ 2,880 个 30 秒窗口/)).toBeNull();
     view.unmount();
+    value.range_start_unix_secs = 1_000;
+    value.range_end_unix_secs = 87_400;
+    value.series[0].window_start_unix_secs = 10_000;
+    value.series[0].window_end_unix_secs = 10_030;
     renderThroughput(value, false, {
       seconds: 24 * 60 * 60,
       label: '24h',
       menuLabel: '近 24 小时',
       heading: '24 HOURS',
     });
-    const network = chartMock.setOption.mock.calls.find(
-      ([option]) =>
-        option.series?.[0]?.data?.length === 2_880 &&
-        option.series?.some((line: { name: string }) => line.name === '接收'),
+    const network = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === '接收'),
     )?.[0];
     expect(network).toBeTruthy();
     expect(network.xAxis.type).toBe('value');
+    expect(network.xAxis.min).toBe(1_000_000);
+    expect(network.xAxis.max).toBe(87_400_000);
+    expect(network.series[0].data).toEqual([[10_030_000, 100]]);
+    expect(network.series[1].data).toEqual([[10_030_000, 200]]);
+  });
+
+  it('does not present an old load sample as the current NIC reading', () => {
+    const value = report();
+    value.range_end_unix_secs = value.series[0].window_end_unix_secs + 91;
+    const view = renderThroughput(value);
+
+    expect(view.getByLabelText('网卡流量图例').textContent).toContain('接收 —');
+    expect(view.getByLabelText('网卡流量图例').textContent).toContain('发送 —');
   });
 });

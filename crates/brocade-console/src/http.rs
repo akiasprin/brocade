@@ -4054,20 +4054,22 @@ async fn link_health(State(state): State<AppState>, headers: HeaderMap) -> ApiRe
     Ok(Json(json!({ "hops": state.store.link_health(&admin).await? })).into_response())
 }
 
-/// Every machine's recent load windows, for the list page's sparkline column.
-///
-/// `windows` rather than a single latest reading: one bar cannot show a trend, and the trend is
-/// what the column exists to show. A machine whose load is rising is the finding; its current
-/// percentage is not.
+/// Every machine's load windows overlapping the browser-provided absolute interval.
 async fn load_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<LoadQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let (range_start, range_end) = load_range(query, LIST_LOAD_MAX_RANGE_SECS)?;
     let result = state
         .store
-        .list_node_load(&admin, query.windows.unwrap_or(24).min(240))
+        .list_node_load(
+            &admin,
+            range_start,
+            range_end,
+            LIST_LOAD_MAX_SAMPLES_PER_NODE,
+        )
         .await?;
     Ok(Json(result).into_response())
 }
@@ -4079,9 +4081,16 @@ async fn load_node(
     Query(query): Query<LoadQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let (range_start, range_end) = load_range(query, DETAIL_LOAD_MAX_RANGE_SECS)?;
     let result = state
         .store
-        .node_load_view(&admin, &node_id, detail_load_windows(query.windows))
+        .node_load_view(
+            &admin,
+            &node_id,
+            range_start,
+            range_end,
+            DETAIL_LOAD_MAX_SAMPLES,
+        )
         .await?;
     Ok(Json(result).into_response())
 }
@@ -4135,9 +4144,10 @@ async fn link_quality(
     Ok(Json(result).into_response())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 struct LoadQuery {
-    windows: Option<u32>,
+    start_unix_secs: i64,
+    end_unix_secs: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4145,10 +4155,34 @@ struct PingProbeQuery {
     window_secs: Option<u32>,
 }
 
-/// 24 h / 30 s = 2,880 windows. This applies only to the single-machine endpoint; the fleet
-/// endpoint remains capped at 240 so one request cannot multiply a day of detail by the fleet.
-fn detail_load_windows(requested: Option<u32>) -> u32 {
-    requested.unwrap_or(24).min(2_880)
+const LIST_LOAD_MAX_RANGE_SECS: i64 = 2 * 60 * 60;
+const DETAIL_LOAD_MAX_RANGE_SECS: i64 = 24 * 60 * 60;
+// Normal 30-second telemetry produces at most 241/2,881 overlapping rows. Higher caps leave room
+// for boundary windows while still bounding a malformed high-frequency history.
+const LIST_LOAD_MAX_SAMPLES_PER_NODE: u32 = 512;
+const DETAIL_LOAD_MAX_SAMPLES: u32 = 4_096;
+const MAX_LOAD_UNIX_SECS: i64 = 253_402_300_799;
+
+fn load_range(query: LoadQuery, max_span_secs: i64) -> Result<(i64, i64), StoreError> {
+    if query.start_unix_secs < 0 || query.end_unix_secs > MAX_LOAD_UNIX_SECS {
+        return Err(StoreError::InvalidData(
+            "load range is outside the supported timestamp interval".to_owned(),
+        ));
+    }
+    let Some(span) = query.end_unix_secs.checked_sub(query.start_unix_secs) else {
+        return Err(StoreError::InvalidData("invalid load range".to_owned()));
+    };
+    if span <= 0 {
+        return Err(StoreError::InvalidData(
+            "load range end must be after start".to_owned(),
+        ));
+    }
+    if span > max_span_secs {
+        return Err(StoreError::InvalidData(format!(
+            "load range spans {span}s, over the {max_span_secs}s limit"
+        )));
+    }
+    Ok((query.start_unix_secs, query.end_unix_secs))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4635,18 +4669,39 @@ mod tests {
     use brocade_store::StoreError;
 
     use super::{
-        bearer_token, detail_load_windows, dist_json, expired_session_cookie, install_command,
+        bearer_token, dist_json, expired_session_cookie, install_command, load_range,
         looks_like_uuid, public_may, route_from_headers, safe_filename_slug, session_cookie,
-        AgentDistribution, ApiError, ArtifactContentQuery, InstallCredential, IpFamily,
-        SubscriptionProtocol, BROCADE_XRAY_VERSION, EMBEDDED_AGENTS, EMBEDDED_XRAYS,
-        INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
+        AgentDistribution, ApiError, ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery,
+        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS, EMBEDDED_AGENTS,
+        EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
     };
 
     #[test]
-    fn machine_load_range_reaches_one_day_but_never_exceeds_it() {
-        assert_eq!(detail_load_windows(None), 24);
-        assert_eq!(detail_load_windows(Some(2_880)), 2_880);
-        assert_eq!(detail_load_windows(Some(u32::MAX)), 2_880);
+    fn machine_load_range_accepts_absolute_day_and_rejects_invalid_intervals() {
+        let day = LoadQuery {
+            start_unix_secs: 1_700_000_000,
+            end_unix_secs: 1_700_086_400,
+        };
+        assert_eq!(
+            load_range(day, DETAIL_LOAD_MAX_RANGE_SECS).unwrap(),
+            (day.start_unix_secs, day.end_unix_secs)
+        );
+        assert!(load_range(
+            LoadQuery {
+                end_unix_secs: day.end_unix_secs + 1,
+                ..day
+            },
+            DETAIL_LOAD_MAX_RANGE_SECS
+        )
+        .is_err());
+        assert!(load_range(
+            LoadQuery {
+                end_unix_secs: day.start_unix_secs,
+                ..day
+            },
+            DETAIL_LOAD_MAX_RANGE_SECS
+        )
+        .is_err());
     }
 
     /// The wire form of both subscription filters is pinned here because it belongs to the

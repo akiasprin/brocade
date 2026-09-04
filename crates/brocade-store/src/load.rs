@@ -363,12 +363,14 @@ async fn replace_process_state(
     Ok(())
 }
 
-/// One machine's recent windows, oldest first.
+/// One machine's windows overlapping an absolute interval, oldest first.
 pub async fn node_load_view(
     pool: &PgPool,
     actor: &AdminContext,
     node_id: &str,
-    windows: u32,
+    range_start_unix_secs: i64,
+    range_end_unix_secs: i64,
+    max_samples: u32,
 ) -> Result<NodeLoadView> {
     // Scope check first, and as an early return rather than a filter woven through the three
     // queries below: out of scope means this machine does not exist as far as this operator is
@@ -376,6 +378,8 @@ pub async fn node_load_view(
     if !node_in_scope(pool, actor, node_id).await? {
         return Ok(NodeLoadView {
             node_id: node_id.to_owned(),
+            range_start_unix_secs,
+            range_end_unix_secs,
             reported_at_unix_secs: None,
             clock_skew_secs: None,
             host: None,
@@ -408,9 +412,10 @@ pub async fn node_load_view(
         None => (None, None, None),
     };
 
-    // ORDER BY DESC + LIMIT to take the newest N, then reversed in Rust so the caller gets oldest
-    // first. Sorting ascending and limiting would return the oldest N, which on a machine
-    // reporting for a week is a chart of last Tuesday.
+    // The caller owns the wall-clock interval. A sample belongs when its window overlaps the
+    // requested half-open interval; this deliberately includes a partial boundary window. The
+    // row cap is only a cardinality guard for corrupt or unexpectedly fine-grained data, not the
+    // meaning of the requested range.
     // Epochs extracted in SQL rather than read as timestamps and converted here: the alternative
     // is a chrono dependency on this crate for one field, and the neighbouring queries
     // (`load_reported_at`, `started_at`) already do it this way.
@@ -424,11 +429,15 @@ pub async fn node_load_view(
                 conntrack_count, network_detail, uptime_secs
          FROM node_load_samples
          WHERE node_id = $1
+           AND window_end > to_timestamp($2)
+           AND window_start < to_timestamp($3)
          ORDER BY window_start DESC
-         LIMIT $2",
+         LIMIT $4",
     )
     .bind(node_id)
-    .bind(i64::from(windows))
+    .bind(range_start_unix_secs)
+    .bind(range_end_unix_secs)
+    .bind(i64::from(max_samples))
     .fetch_all(pool)
     .await?;
     let mut series = rows
@@ -452,6 +461,8 @@ pub async fn node_load_view(
 
     Ok(NodeLoadView {
         node_id: node_id.to_owned(),
+        range_start_unix_secs,
+        range_end_unix_secs,
         reported_at_unix_secs: reported_at,
         clock_skew_secs: clock_skew,
         host,
@@ -460,14 +471,13 @@ pub async fn node_load_view(
     })
 }
 
-/// Every live machine's latest window, for the list page.
-///
-/// `windows` per machine rather than one, because the list draws a sparkline: one reading makes a
-/// single bar, and a single bar cannot show a trend, which is the whole reason the column exists.
+/// Every live machine's windows overlapping one absolute interval, for the list page.
 pub async fn list_node_load(
     pool: &PgPool,
     actor: &AdminContext,
-    windows: u32,
+    range_start_unix_secs: i64,
+    range_end_unix_secs: i64,
+    max_samples_per_node: u32,
 ) -> Result<NodeLoadList> {
     let filter = tenant_filter(actor);
     let (scope, pattern) = split_filter(&filter);
@@ -483,7 +493,17 @@ pub async fn list_node_load(
     .await?;
     let mut nodes = Vec::with_capacity(ids.len());
     for id in ids {
-        nodes.push(node_load_view(pool, actor, &id, windows).await?);
+        nodes.push(
+            node_load_view(
+                pool,
+                actor,
+                &id,
+                range_start_unix_secs,
+                range_end_unix_secs,
+                max_samples_per_node,
+            )
+            .await?,
+        );
     }
     Ok(NodeLoadList { nodes })
 }

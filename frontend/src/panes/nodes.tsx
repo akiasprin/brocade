@@ -429,7 +429,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   // 列表正常显示，状态点回退为只反映活性。
   const load = useQuery({
     queryKey: ['node-load-list'],
-    queryFn: () => fetchNodeLoadList(LIST_NIC_WINDOWS),
+    queryFn: () => fetchNodeLoadListFor(LIST_NIC_RANGE_SECS),
     refetchInterval: 30_000,
     retry: false,
   });
@@ -852,6 +852,21 @@ export const LOAD_RANGES = [
 ] as const;
 export type LoadRange = (typeof LOAD_RANGES)[number];
 
+function absoluteLoadRange(seconds: number): { startUnixSecs: number; endUnixSecs: number } {
+  const endUnixSecs = Math.floor(Date.now() / 1000);
+  return { startUnixSecs: endUnixSecs - seconds, endUnixSecs };
+}
+
+function fetchNodeLoadFor(nodeId: string, seconds: number) {
+  const { startUnixSecs, endUnixSecs } = absoluteLoadRange(seconds);
+  return fetchNodeLoad(nodeId, startUnixSecs, endUnixSecs);
+}
+
+function fetchNodeLoadListFor(seconds: number) {
+  const { startUnixSecs, endUnixSecs } = absoluteLoadRange(seconds);
+  return fetchNodeLoadList(startUnixSecs, endUnixSecs);
+}
+
 export function ObserveLinkControl({ value, onChange }: { value: boolean; onChange: (value: boolean) => void }) {
   return (
     <label
@@ -992,10 +1007,10 @@ export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onC
   );
 }
 
-// 列表的 NIC 曲线使用 24 个 30 秒窗口，即近 12 分钟。该值同时是 load 端点的请求数和绘图上限，
-// 不分成两个常量，避免「拉了 12 格却为 24 格留位」这类错位。
+// 列表 NIC 曲线使用 12 分钟绝对区间。样本按真实 window_end 定位，不按返回行数右对齐。
 const LIST_NIC_WINDOWS = 24;
 const LIST_NIC_WINDOW_SECS = 30;
+const LIST_NIC_RANGE_SECS = LIST_NIC_WINDOWS * LIST_NIC_WINDOW_SECS;
 // 上一版的最低尺度是 1 Mbit/s。改为每窗口字节数后做等价换算，避免只因换单位就改变曲线高度。
 const LIST_NIC_MIN_CEILING_BYTES = (1_000_000 * LIST_NIC_WINDOW_SECS) / 8;
 // usage 查询仍需要一个近期窗口参数，但列表现在只读其中的本月累计字段。
@@ -1098,16 +1113,21 @@ function TcpProbeP95({ view, pending = false }: { view?: NodePingProbeView; pend
 }
 
 function NicWave({ load }: { load?: NodeLoadView }) {
-  const samples = (load?.series ?? []).slice(-LIST_NIC_WINDOWS);
+  const rangeStart = load?.range_start_unix_secs ?? 0;
+  const rangeEnd = load?.range_end_unix_secs ?? 0;
+  const rangeSpan = rangeEnd - rangeStart;
+  const samples = (load?.series ?? []).filter(
+    sample => sample.window_end_unix_secs > rangeStart && sample.window_start_unix_secs < rangeEnd,
+  );
   const label = 'NIC · 30 秒 / 窗口';
   const windowBytes = (sample: LoadSample) => {
     const seconds = sample.window_end_unix_secs - sample.window_start_unix_secs;
     return ((sample.nic_rx_bps + sample.nic_tx_bps) * seconds) / 8;
   };
   const valid = samples
-    .map((sample, index) => ({ sample, index, value: windowBytes(sample) }))
+    .map(sample => ({ sample, value: windowBytes(sample) }))
     .filter(point => !point.sample.has_gap && Number.isFinite(point.value) && point.value >= 0);
-  if (valid.length === 0) {
+  if (valid.length === 0 || rangeSpan <= 0) {
     return (
       <div className="history-plot node-nic-plot empty">
         <span className="plot-label">{label} · 尚无样本</span>
@@ -1117,9 +1137,8 @@ function NicWave({ load }: { load?: NodeLoadView }) {
 
   const W = 100;
   const H = 36;
-  // 样本不足 24 个时靠右放：右缘是最近窗口，新纳管机器不应把两个点拉满 12 分钟。
-  const slotOffset = LIST_NIC_WINDOWS - samples.length;
-  const xOf = (index: number) => ((slotOffset + index) * W) / (LIST_NIC_WINDOWS - 1);
+  const xOf = (sample: LoadSample) =>
+    (Math.max(0, Math.min(rangeSpan, sample.window_end_unix_secs - rangeStart)) * W) / rangeSpan;
   const max = valid.reduce((top, point) => (point.value > top ? point.value : top), 0);
   const min = valid.reduce((bottom, point) => (point.value < bottom ? point.value : bottom), valid[0].value);
   const ceiling = Math.max(LIST_NIC_MIN_CEILING_BYTES, max);
@@ -1136,14 +1155,14 @@ function NicWave({ load }: { load?: NodeLoadView }) {
       segment = [];
       continue;
     }
-    segment.push({ x: xOf(index), y: yOf(value) });
+    segment.push({ x: xOf(sample), y: yOf(value) });
   }
   if (segment.length > 0) segments.push(segment);
 
   const maxPoint = valid.reduce((picked, point) => (point.value > picked.value ? point : picked));
   const minPoint = valid.reduce((picked, point) => (point.value <= picked.value ? point : picked));
   const marker = (kind: '最高' | '最低' | 'NIC', point: (typeof valid)[number], position: 'max' | 'min') => {
-    const x = xOf(point.index);
+    const x = xOf(point.sample);
     const y = yOf(point.value);
     // tooltip 宽约占小图的三分之一，14% 才贴边会在 268px 卡片上溢出约 10px。
     const edge = x < 22 ? ' edge-left' : x > 78 ? ' edge-right' : '';
@@ -1301,19 +1320,27 @@ function useHopStats(nodeId: string) {
   return { list, loading, dead, expected, reported, alive, observatory, windowSecs };
 }
 
-/** 把 usage 桶按角色拆成速率序列（bps），右对齐：最近的完整窗口在下标 59——与网卡曲线
- * （LoadDashboard 的 `slice(-LOAD_SLOTS)`）同一对齐方式，两张图的右缘是同一个 30 秒窗口。
- * 字节/窗口 ×8 转比特、÷30 窗口秒，得到窗口平均速率——与网卡上报的速率同型，因此可对比。
- * 不用 since 推算绝对槽位：since 与桶的窗口边界存在相位差，最近一个完整桶会被算进 slot 22，
- * 把「现在」（slot 23）留空，表现为曲线右缘永远掉到 0。无桶的窗口计 0（无转发字节），不是缺失。 */
-function usageRoleSlots(series: UsageNodeSeries | undefined, slots: number): { user: number[]; relay: number[] } {
-  const tail = (series?.buckets ?? []).slice(-slots);
-  const pad = slots - tail.length;
-  const padArr = new Array<number>(pad).fill(0);
-  return {
-    user: [...padArr, ...tail.map(b => ((b.user_uplink_bytes + b.user_downlink_bytes) * 8) / 30)],
-    relay: [...padArr, ...tail.map(b => ((b.relay_uplink_bytes + b.relay_downlink_bytes) * 8) / 30)],
-  };
+/** 把 usage 桶落到请求区间内的绝对 30 秒网格。无桶表示该窗口没有转发字节，按 0 处理。 */
+function usageRoleTimeline(
+  series: UsageNodeSeries | undefined,
+  rangeStartUnixSecs: number,
+  rangeEndUnixSecs: number,
+): { timesUnixSecs: number[]; user: number[]; relay: number[] } {
+  const slots = Math.max(1, Math.ceil((rangeEndUnixSecs - rangeStartUnixSecs) / GRID_SECS));
+  const endKey = Math.floor(rangeEndUnixSecs / GRID_SECS) * GRID_SECS;
+  const startKey = endKey - (slots - 1) * GRID_SECS;
+  const timesUnixSecs = Array.from({ length: slots }, (_, index) => startKey + index * GRID_SECS);
+  const user = new Array<number>(slots).fill(0);
+  const relay = new Array<number>(slots).fill(0);
+  for (const bucket of series?.buckets ?? []) {
+    const key = Math.floor(Date.parse(bucket.window_end) / 1000 / GRID_SECS) * GRID_SECS;
+    if (!Number.isFinite(key)) continue;
+    const index = Math.round((key - startKey) / GRID_SECS);
+    if (index < 0 || index >= slots) continue;
+    user[index] += ((bucket.user_uplink_bytes + bucket.user_downlink_bytes) * 8) / GRID_SECS;
+    relay[index] += ((bucket.relay_uplink_bytes + bucket.relay_downlink_bytes) * 8) / GRID_SECS;
+  }
+  return { timesUnixSecs, user, relay };
 }
 
 /* 网卡吞吐与 XRAY 承载吞吐堆进一个面板。两者同窗口、同粒度、用 group 联动十字线，但口径
@@ -1323,7 +1350,7 @@ function usageRoleSlots(series: UsageNodeSeries | undefined, slots: number): { u
 export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
   const load = useQuery({
     queryKey: ['node-load-history', nodeId, range.seconds],
-    queryFn: () => fetchNodeLoad(nodeId, range.seconds / 30),
+    queryFn: () => fetchNodeLoadFor(nodeId, range.seconds),
     refetchInterval: range.seconds <= 60 * 60 ? 10_000 : 30_000,
     retry: false,
   });
@@ -1336,34 +1363,30 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
   if (!report || report.series.length === 0) return null;
 
   const group = linked ? `nd-tp-${nodeId}` : undefined;
-  const windows = range.seconds / 30;
+  const rangeStart = report.range_start_unix_secs;
+  const rangeEnd = report.range_end_unix_secs;
 
-  // 网卡：按方向统计全部流量。右对齐、缺口断开、历史不足选定范围时左侧补 null。
+  // 网卡：每个点使用上报的真实结束时间。轴保持完整请求区间，因此尾部没有样本时会留白。
   const series = report.series;
   const last = series[series.length - 1];
+  const current =
+    !last.has_gap && rangeEnd >= last.window_end_unix_secs && rangeEnd - last.window_end_unix_secs <= 90 ? last : null;
   const host = report.host;
-  const tail = series.slice(-windows);
-  const pad = windows - tail.length;
-  const nicRx: (number | null)[] = [
-    ...Array<number | null>(pad).fill(null),
-    ...tail.map(s => (s.has_gap ? null : s.nic_rx_bps)),
-  ];
-  const nicTx: (number | null)[] = [
-    ...Array<number | null>(pad).fill(null),
-    ...tail.map(s => (s.has_gap ? null : s.nic_tx_bps)),
-  ];
-  const drops = last.nic_rx_drop + last.nic_tx_drop + last.nic_err;
+  const nicTimes = series.map(sample => sample.window_end_unix_secs);
+  const nicRx = series.map(sample => (sample.has_gap ? null : sample.nic_rx_bps));
+  const nicTx = series.map(sample => (sample.has_gap ? null : sample.nic_tx_bps));
+  const drops = current ? current.nic_rx_drop + current.nic_tx_drop + current.nic_err : 0;
   const nicMeta = [
-    last.nic_rx_drop > 0 ? `接收丢弃 ${last.nic_rx_drop.toLocaleString()}` : null,
-    last.nic_tx_drop > 0 ? `发送丢弃 ${last.nic_tx_drop.toLocaleString()}` : null,
-    last.nic_err > 0 ? `网卡错误 ${last.nic_err.toLocaleString()}` : null,
+    current && current.nic_rx_drop > 0 ? `接收丢弃 ${current.nic_rx_drop.toLocaleString()}` : null,
+    current && current.nic_tx_drop > 0 ? `发送丢弃 ${current.nic_tx_drop.toLocaleString()}` : null,
+    current && current.nic_err > 0 ? `网卡错误 ${current.nic_err.toLocaleString()}` : null,
     host?.nic ?? null,
     typeof host?.nic_mtu === 'number' ? `MTU ${host.nic_mtu}` : null,
   ].filter((value): value is string => value !== null);
 
   // XRAY：按角色只统计 xray 转发的字节。
   const mine = usage.data?.nodes.find(n => n.node_id === nodeId);
-  const { user, relay } = usageRoleSlots(mine, windows);
+  const { timesUnixSecs: xrayTimes, user, relay } = usageRoleTimeline(mine, rangeStart, rangeEnd);
   const monthTotal = mine ? monthBytes(mine) : 0;
 
   /* 每块图一个单位：标题栏写它，图例按它读数，图内的刻度和 tooltip 走同一次 throughputAxis
@@ -1381,15 +1404,24 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
           <footer className="load-network-legend" aria-label="网卡流量图例">
             <span className="rx">
               <i />
-              接收 <b>{nicUnit.read(last.nic_rx_bps)}</b>
+              接收 <b>{current ? nicUnit.read(current.nic_rx_bps) : '—'}</b>
             </span>
             <span className="tx">
               <i />
-              发送 <b>{nicUnit.read(last.nic_tx_bps)}</b>
+              发送 <b>{current ? nicUnit.read(current.nic_tx_bps) : '—'}</b>
             </span>
           </footer>
         </div>
-        <ThroughputChart rx={nicRx} tx={nicTx} rxName="接收" txName="发送" group={group} />
+        <ThroughputChart
+          timesUnixSecs={nicTimes}
+          rangeStartUnixSecs={rangeStart}
+          rangeEndUnixSecs={rangeEnd}
+          rx={nicRx}
+          tx={nicTx}
+          rxName="接收"
+          txName="发送"
+          group={group}
+        />
       </div>
       <div className="nd-throughput-block">
         <div className="load-network-cap">
@@ -1407,7 +1439,16 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
             </span>
           </footer>
         </div>
-        <ThroughputChart rx={user} tx={relay} rxName="用户" txName="中继" group={group} />
+        <ThroughputChart
+          timesUnixSecs={xrayTimes}
+          rangeStartUnixSecs={rangeStart}
+          rangeEndUnixSecs={rangeEnd}
+          rx={user}
+          tx={relay}
+          rxName="用户"
+          txName="中继"
+          group={group}
+        />
       </div>
     </section>
   );
@@ -2658,7 +2699,7 @@ function agentIdent(raw: string | null | undefined) {
    因此两条一律按 floor(window_end / 30) 落到同一时间网格再相加——相位错开的样本这才对齐。
    上下共用一个峰值缩放：接收、发送的相对大小要诚实，不各自拉满自己那半。
    月度累计不在这里重复：用量页已按机器 / 用户 / 中继给出。 */
-const FLEET_WINDOWS = 240; // 2 小时 / 30 秒。列表端点上限即 240，且它一次返回全机队。
+const FLEET_WINDOWS = 240; // 2 小时 / 30 秒。列表端点允许的最长绝对区间即 2 小时。
 const FLEET_SECS = FLEET_WINDOWS * 30;
 const GRID_SECS = 30; // 汇总时间网格：agent 的上报窗口即 30 秒。
 
@@ -2805,7 +2846,7 @@ export function FleetNetPanel() {
      240 窗口的 2 小时版做趋势；usage node-series 同样按 2 小时取，两者都逐机相加。 */
   const load = useQuery({
     queryKey: ['node-load-list', FLEET_WINDOWS],
-    queryFn: () => fetchNodeLoadList(FLEET_WINDOWS),
+    queryFn: () => fetchNodeLoadListFor(FLEET_SECS),
     refetchInterval: 30_000,
     retry: false,
   });
@@ -2922,8 +2963,8 @@ function LoadCardFor({ nodeId, range, linked }: { nodeId: string; range: LoadRan
      遥测页把流量柱和 CPU 线叠在同一根时间轴上就靠这个）。 */
   const load = useQuery({
     queryKey: ['node-load-history', nodeId, range.seconds],
-    queryFn: () => fetchNodeLoad(nodeId, range.seconds / 30),
-    // 长范围响应最大有 2,880 个深度窗口，而原数据本身每 30 秒才增加一点。
+    queryFn: () => fetchNodeLoadFor(nodeId, range.seconds),
+    // 长范围通常有约 2,880 个深度窗口，而原数据本身每 30 秒才增加一点。
     // 30m/1h 保留 10s 的低延迟；6h 以上按数据分辨率拉取，避免重复传输同一大段历史。
     refetchInterval: range.seconds <= 60 * 60 ? 10_000 : 30_000,
     retry: false,
@@ -3905,7 +3946,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
      跳的存活同理，与下面的 HopHealth 共用 useHopStats。 */
   const load = useQuery({
     queryKey: ['node-load-history', id, 30 * 60],
-    queryFn: () => fetchNodeLoad(id, 60),
+    queryFn: () => fetchNodeLoadFor(id, 30 * 60),
     refetchInterval: 10_000,
     retry: false,
   });

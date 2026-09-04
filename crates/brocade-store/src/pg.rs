@@ -1300,13 +1300,36 @@ impl PgStore {
         &self,
         actor: &AdminContext,
         node_id: &str,
-        windows: u32,
+        range_start_unix_secs: i64,
+        range_end_unix_secs: i64,
+        max_samples: u32,
     ) -> Result<NodeLoadView> {
-        load::node_load_view(&self.pool, actor, node_id, windows).await
+        load::node_load_view(
+            &self.pool,
+            actor,
+            node_id,
+            range_start_unix_secs,
+            range_end_unix_secs,
+            max_samples,
+        )
+        .await
     }
 
-    pub async fn list_node_load(&self, actor: &AdminContext, windows: u32) -> Result<NodeLoadList> {
-        load::list_node_load(&self.pool, actor, windows).await
+    pub async fn list_node_load(
+        &self,
+        actor: &AdminContext,
+        range_start_unix_secs: i64,
+        range_end_unix_secs: i64,
+        max_samples_per_node: u32,
+    ) -> Result<NodeLoadList> {
+        load::list_node_load(
+            &self.pool,
+            actor,
+            range_start_unix_secs,
+            range_end_unix_secs,
+            max_samples_per_node,
+        )
+        .await
     }
 
     pub async fn ping_probe_settings(&self) -> Result<PingProbeSettings> {

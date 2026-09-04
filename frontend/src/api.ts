@@ -2725,6 +2725,9 @@ export interface ProcessSample {
 
 export interface NodeLoadView {
   node_id: string;
+  /** 服务端实际采用的绝对查询区间；图表必须用它保留尾部缺失时间，不能把末条样本挪到现在。 */
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
   /** null 表示该机器从未上报。与上报值为零是两种状态，界面上必须明确区分 */
   reported_at_unix_secs: number | null;
   /** 最近一次上报到达时 agent 时钟减控制面时钟（秒，带符号）。只能在接收时测量。
@@ -2766,12 +2769,14 @@ export interface HopLinkView {
   cc_algo: string;
 }
 
-/** 列表页需要 24 个窗口：单根柱子无法体现趋势，而趋势是该列的作用所在。 */
-export const fetchNodeLoadList = (windows = 24, token = '') =>
-  api<{ nodes: NodeLoadView[] }>(`/load/nodes?windows=${windows}`, token);
+export const fetchNodeLoadList = (startUnixSecs: number, endUnixSecs: number, token = '') =>
+  api<{ nodes: NodeLoadView[] }>(`/load/nodes?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}`, token);
 
-export const fetchNodeLoad = (nodeId: string, windows = 24, token = '') =>
-  api<NodeLoadView>(`/load/nodes/${encodeURIComponent(nodeId)}?windows=${windows}`, token);
+export const fetchNodeLoad = (nodeId: string, startUnixSecs: number, endUnixSecs: number, token = '') =>
+  api<NodeLoadView>(
+    `/load/nodes/${encodeURIComponent(nodeId)}?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}`,
+    token,
+  );
 
 export interface PingProbePoint {
   probed_at_unix_secs: number;

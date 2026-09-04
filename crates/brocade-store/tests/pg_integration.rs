@@ -12900,13 +12900,22 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
     assert_eq!(accepted.accepted_samples, 1);
     let view = db
         .store
-        .node_load_view(&system_admin(), "net-observe", 60)
+        .node_load_view(&system_admin(), "net-observe", now - 60, now + 1, 64)
         .await
         .unwrap();
+    assert_eq!(view.range_start_unix_secs, now - 60);
+    assert_eq!(view.range_end_unix_secs, now + 1);
     assert_eq!(view.series.len(), 1);
     assert_eq!(view.series[0].network_detail.as_ref(), Some(&network));
     assert_eq!(view.series[0].disk_detail.as_ref(), Some(&disk));
     assert_eq!(view.series[0].conntrack_count, Some(1200));
+
+    let stale = db
+        .store
+        .node_load_view(&system_admin(), "net-observe", now + 60, now + 120, 64)
+        .await
+        .unwrap();
+    assert!(stale.series.is_empty());
 }
 
 async fn insert_usage_history_for_main_fixture(pool: &PgPool) {
