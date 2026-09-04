@@ -400,6 +400,7 @@ pub async fn verify_deployment(
                 total_targets: usize::from(lifecycle_debt),
                 changed_targets: usize::from(lifecycle_debt),
                 skipped_targets: 0,
+                deferred_targets: 0,
                 disruptive_targets: 0,
                 max_wave: 0,
             };

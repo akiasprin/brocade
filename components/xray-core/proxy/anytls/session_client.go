@@ -14,6 +14,11 @@ import (
 	"github.com/xtls/xray-core/transport"
 )
 
+var (
+	errSessionClosed     = errors.New("anytls: session closed")
+	errStreamIDExhausted = errors.New("anytls: stream ID space exhausted")
+)
+
 func (s *session) writePacketWithPadding(packetIndex uint32, frames buf.MultiBuffer) error {
 	length := frames.Len()
 	if length == 0 {
@@ -140,7 +145,7 @@ func (s *session) writeWasteFrames(total int) error {
 
 func (s *session) openStream(ctx context.Context, target net.Destination, link *transport.Link) (*stream, error) {
 	if s.isClosed() {
-		return nil, errors.New("anytls: session closed")
+		return nil, errSessionClosed
 	}
 
 	actualDest := target
@@ -152,7 +157,24 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 		}
 	}
 
-	sid := s.nextSID.Add(1) - 1
+	// ID assignment and the corresponding SYN write must stay in one order.
+	// Allocating before serialization lets concurrent callers put SID 2 on the
+	// wire before SID 1 even though both counters are individually atomic.
+	s.openMu.Lock()
+	openLocked := true
+	defer func() {
+		if openLocked {
+			s.openMu.Unlock()
+		}
+	}()
+	if s.isClosed() {
+		return nil, errSessionClosed
+	}
+	sid := s.nextSID.Load()
+	if sid == 0 {
+		return nil, errStreamIDExhausted
+	}
+	s.nextSID.Store(sid + 1)
 	st := newStream(sid, link)
 	if target.Network == net.Network_UDP {
 		st.isUDP = true
@@ -194,6 +216,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	synFrame, err := newFrame(cmdSYN, sid).toMultiBuffer()
 	if err != nil {
 		addrBuf.Release()
+		s.finishStream(sid, err)
 		return nil, err
 	}
 	frames = append(frames, synFrame...)
@@ -227,6 +250,8 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 		s.finishStream(sid, writeErr)
 		return nil, errors.New("anytls: send session open packet failed").Base(writeErr)
 	}
+	openLocked = false
+	s.openMu.Unlock()
 
 	if waitForSynAck {
 		select {
@@ -279,8 +304,9 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 
 func (st *stream) pumpUplink(s *session) {
 	defer func() {
-		_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-		s.finishStream(st.sid, nil)
+		if s.finishStream(st.sid, nil) && !s.isClosed() {
+			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+		}
 	}()
 	for {
 		mb, err := st.link.Reader.ReadMultiBuffer()

@@ -55,6 +55,7 @@ type Form = {
   keepalive: string;
   mtu: string;
   ingressBase: string;
+  anytlsBase: string;
   hopBase: string;
   hy2Base: string;
   probeUrl: string;
@@ -95,6 +96,7 @@ const EMPTY: Form = {
   keepalive: '25',
   mtu: '1420',
   ingressBase: '8443',
+  anytlsBase: '16000',
   hopBase: '20000',
   hy2Base: '18000',
   probeUrl: PROBE_URL_DEFAULT,
@@ -126,6 +128,7 @@ function formOf(s: ModelSettings): Form {
     keepalive: String(s.overlay?.keepalive_secs ?? 25),
     mtu: String(s.overlay?.mtu ?? 1420),
     ingressBase: String(s.ports?.ingress_base ?? 8443),
+    anytlsBase: String(s.ports?.anytls_base ?? 16000),
     hopBase: String(s.ports?.hop_base ?? 20000),
     hy2Base: String(s.ports?.hy2_base ?? 18000),
     probeUrl: s.probe?.endpoint_url ?? PROBE_URL_DEFAULT,
@@ -151,7 +154,7 @@ const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
   xray: ['dest', 'names', 'fp', 'flow', 'min', 'max', 'diff'],
   connection: ['connIdle', 'connUplink', 'connDownlink', 'connBuffer', 'connHandshake'],
   wireguard: ['keepalive', 'mtu'],
-  ports: ['ingressBase', 'hopBase', 'hy2Base'],
+  ports: ['ingressBase', 'anytlsBase', 'hopBase', 'hy2Base'],
   probe: ['probeUrl', 'probeTimeout', 'probeInterval'],
   geodata: ['geodataCron', 'geodataGeoip', 'geodataGeosite'],
 };
@@ -1648,6 +1651,7 @@ export function SettingsPane() {
         },
         ports: {
           ingress_base: Number(v('ingressBase')) || 8443,
+          anytls_base: Number(v('anytlsBase')) || 16000,
           hop_base: Number(v('hopBase')) || 20000,
           hy2_base: Number(v('hy2Base')) || 18000,
         },
@@ -1961,6 +1965,15 @@ export function SettingsPane() {
                   onChange={e => setForm({ ...form, ingressBase: e.target.value })}
                 />
                 <span className="hint">建链时从该端口向上查找空闲端口</span>
+              </Fld>
+              <Fld label="AnyTLS">
+                <input
+                  className={chg('anytlsBase')}
+                  style={{ width: 90 }}
+                  value={form.anytlsBase}
+                  onChange={e => setForm({ ...form, anytlsBase: e.target.value })}
+                />
+                <span className="hint">走 TCP；新开启 AnyTLS 时从该端口向上查找空闲端口</span>
               </Fld>
               <Fld label="Hysteria 2">
                 <input

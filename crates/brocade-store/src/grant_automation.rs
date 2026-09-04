@@ -382,7 +382,21 @@ async fn finish(
     .bind(deployment_id)
     .execute(&mut *tx)
     .await?;
-    if deployment_id.is_none() {
+    if let Some(deployment_id) = deployment_id {
+        let activated = sqlx::query_scalar::<_, bool>(
+            "SELECT status = 'succeeded' AND activation_status = 'waiting'
+               FROM deployments
+              WHERE id = $1
+              FOR UPDATE",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if activated {
+            crate::serving::activate_deployment_tx(&mut tx, deployment_id).await?;
+        }
+    } else {
         crate::serving::activate_permissions_revision_tx(&mut tx, revision_id).await?;
     }
     tx.commit().await?;

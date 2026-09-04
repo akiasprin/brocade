@@ -102,7 +102,7 @@ import { SLUG_MAX, freePortAcross, freeSpanAcross, isValidSlug, occupiedPorts, p
  * 时的回退值，写法与 rules.tsx 的 HOP_PORT_BASE 一致：直接使用硬编码时，运营者修改设置后
  * 界面仍会填入 18000。 */
 const HY2_PORT_BASE = 18000;
-const ANYTLS_PORT_BASE = 19000;
+const ANYTLS_PORT_BASE = 16000;
 const DEFAULT_HOP_SPAN = 100;
 const U32_MAX = 4_294_967_295;
 
@@ -165,6 +165,12 @@ function anyTlsPaddingValid(text: string): boolean {
 function useHy2PortBase(): number {
   const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
   return settings.data?.ports?.hy2_base || HY2_PORT_BASE;
+}
+
+/** AnyTLS 的起始端口，取自全局设置；设置尚未加载时使用回退值。 */
+function useAnyTlsPortBase(): number {
+  const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
+  return settings.data?.ports?.anytls_base || ANYTLS_PORT_BASE;
 }
 import { ChainWizard } from './chain-wizard';
 
@@ -1674,6 +1680,7 @@ export function IngressStreamRow({
 }) {
   const qc = useQueryClient();
   const hy2Base = useHy2PortBase();
+  const anytlsBase = useAnyTlsPortBase();
   const streamSnapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const streamNodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const streamRevisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
@@ -1701,7 +1708,7 @@ export function IngressStreamRow({
   const storedKind = storedVless?.kind ?? null;
   const storedAnyTls = useMemo<AnyTlsSettings>(() => {
     if (ingress.wires.anytls) return ingress.wires.anytls;
-    let port = freePortAcross(tcpTaken, [ingress.node], ANYTLS_PORT_BASE);
+    let port = freePortAcross(tcpTaken, [ingress.node], anytlsBase);
     // `occupiedPorts` excludes this ingress while editing. Its VLESS port still belongs to the
     // same Xray process, so keep the generated AnyTLS default distinct from it explicitly.
     while (port === ingress.port && port < 65536) port += 1;
@@ -1710,7 +1717,7 @@ export function IngressStreamRow({
       padding_scheme: [],
       masquerade: { kind: 'not-found' },
     };
-  }, [ingress.node, ingress.port, ingress.wires.anytls, tcpTaken]);
+  }, [anytlsBase, ingress.node, ingress.port, ingress.wires.anytls, tcpTaken]);
   const [pendingTransport, setPendingTransport] = useState<Transport | null>(null);
   const stagedTransport = pendingTransport?.kind === storedKind ? null : pendingTransport;
   const kind: TransportKind | null = stagedTransport?.kind ?? storedKind;

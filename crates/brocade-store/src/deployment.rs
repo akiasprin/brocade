@@ -16,8 +16,9 @@ use brocade_deployment::plan::{
 use brocade_deployment::protocol::{
     CreateDeploymentRequest, CreateDeploymentResult, CreateRollbackRequest,
     DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
-    DeploymentTargetDetail, DeploymentWaveConfirmationResult, NodeDesiredDeployment,
-    ReportTargetResult, ReportedNodeState, TargetApplyResult, TargetConvergenceReport,
+    DeploymentTargetDetail, DeploymentWaveConfirmationResult, IsolateDeploymentTargetRequest,
+    NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState,
+    RestoreNodeServiceRequest, TargetApplyResult, TargetConvergenceReport,
 };
 use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
@@ -67,6 +68,8 @@ pub async fn plan_deployment(
     // its baseline is the one fixed when the deployment was created (the same query as at
     // creation), and everything the preview page creates is a configuration deployment.
     plan.base_revision_id = last_succeeded_revision(pool, DeploymentKind::Config).await?;
+    let isolated = isolated_node_ids(pool).await?;
+    mark_isolated_targets(&mut plan, &isolated);
     Ok(plan)
 }
 
@@ -118,6 +121,28 @@ fn without_terminal_lifecycle_targets(
         .retain(|target| !terminal.contains(&target.node_id));
     plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
     plan
+}
+
+async fn isolated_node_ids<'e, E>(executor: E) -> Result<BTreeSet<String>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT node_id FROM node_operational_isolations ORDER BY node_id FOR SHARE",
+    )
+    .fetch_all(executor)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+fn mark_isolated_targets(plan: &mut DeploymentPlan, isolated: &BTreeSet<String>) {
+    for target in &mut plan.targets {
+        if target.status == PlannedTargetStatus::Pending && isolated.contains(&target.node_id) {
+            target.status = PlannedTargetStatus::Deferred;
+        }
+    }
+    plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
 }
 
 /// Works out, for each machine, the text of the xray config it is running.
@@ -182,7 +207,7 @@ pub async fn create_deployment(
     // Scope by the operator's tenant subtree first, then narrow to this kind of deployment. The
     // order cannot invert: narrowing recomputes the summary, and narrowing before scoping leaves
     // machines outside the subtree in it.
-    let plan = narrow_to_kind(
+    let mut plan = narrow_to_kind(
         scope_plan(
             pool,
             actor,
@@ -206,6 +231,8 @@ pub async fn create_deployment(
     }
 
     let mut tx = pool.begin().await?;
+    let isolated = isolated_node_ids(&mut *tx).await?;
+    mark_isolated_targets(&mut plan, &isolated);
 
     if let Some(existing) = sqlx::query(
         "SELECT id, revision_id, status
@@ -289,10 +316,20 @@ pub async fn create_deployment(
         insert_target(&mut tx, deployment_id, target).await?;
     }
 
+    let result_status = if plan
+        .targets
+        .iter()
+        .any(|target| target.status == PlannedTargetStatus::Pending)
+    {
+        status.to_owned()
+    } else {
+        refresh_deployment_status(&mut tx, deployment_id, "deferred").await?
+    };
+
     tx.commit().await?;
     Ok(CreateDeploymentResult {
         deployment_id,
-        status: status.to_owned(),
+        status: result_status,
         reused: false,
         plan,
     })
@@ -343,6 +380,15 @@ pub async fn transition_node_status(
           ORDER BY CASE kind WHEN 'config' THEN 0 ELSE 1 END, id
           FOR UPDATE",
     )
+    .fetch_all(&mut *tx)
+    .await?;
+    let uncertain_obligations = sqlx::query(
+        "SELECT source_deployment_id, kind
+           FROM node_convergence_obligations
+          WHERE node_id = $1
+            AND status IN ('dispatched', 'converging')",
+    )
+    .bind(node_id)
     .fetch_all(&mut *tx)
     .await?;
     let previous = console::lock_control_state(&mut tx).await?;
@@ -401,6 +447,24 @@ pub async fn transition_node_status(
         });
     }
 
+    for obligation in uncertain_obligations {
+        let source_deployment_id: i64 = obligation.try_get("source_deployment_id")?;
+        let kind_value: String = obligation.try_get("kind")?;
+        let kind = DeploymentKind::parse(&kind_value).ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "deployment {source_deployment_id} has unknown obligation kind {kind_value}"
+            ))
+        })?;
+        mark_node_applied_dirty_tx(
+            &mut tx,
+            source_deployment_id,
+            node_id,
+            kind,
+            "节点生命周期代次变化时隔离债务仍在执行，运行态不确定",
+        )
+        .await?;
+    }
+
     // Both configuration and hot-grant targets carry the old epoch. Leaving either active can
     // block its wave forever even though the changed machine can no longer claim it, so cancel
     // both complete work orders and let the ordinary workers re-plan from the newest revision.
@@ -417,7 +481,11 @@ pub async fn transition_node_status(
         DeploymentKind::Config,
     );
     let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
-    let plan = without_terminal_lifecycle_targets(plan, &terminal);
+    let mut plan = without_terminal_lifecycle_targets(plan, &terminal);
+    if lifecycle_phase == NodeLifecyclePhase::Active.as_str() {
+        let isolated = isolated_node_ids(&mut *tx).await?;
+        mark_isolated_targets(&mut plan, &isolated);
+    }
     let retirement_target_pending = plan
         .targets
         .iter()
@@ -578,6 +646,13 @@ async fn insert_lifecycle_deployment_tx(
     for target in &plan.targets {
         insert_target(tx, deployment_id, target).await?;
     }
+    if !plan
+        .targets
+        .iter()
+        .any(|target| target.status == PlannedTargetStatus::Pending)
+    {
+        refresh_deployment_status(tx, deployment_id, "deferred").await?;
+    }
     Ok(deployment_id)
 }
 
@@ -655,6 +730,7 @@ pub(crate) async fn create_automatic_grants_deployment(
                 d.revision_id,
                 dt.node_id,
                 dt.status AS target_status,
+                dts.wave,
                 dts.desired_structure,
                 dts.desired_grants,
                 dts.dispatched_grants
@@ -679,6 +755,36 @@ pub(crate) async fn create_automatic_grants_deployment(
     .fetch_all(&mut *tx)
     .await?;
 
+    // An isolated configuration target is no longer active deployment work, but an unclaimed
+    // obligation has the same rebase requirement. Once claimed, its bytes are immutable and the
+    // permission change must instead follow as a grants obligation.
+    let config_obligations = sqlx::query(
+        "SELECT obligation.node_id,
+                obligation.lifecycle_epoch,
+                obligation.generation,
+                obligation.source_deployment_id,
+                obligation.source_revision_id,
+                obligation.status,
+                obligation.claim_generation,
+                obligation.desired_structure,
+                obligation.desired_grants
+           FROM node_convergence_obligations obligation
+           JOIN node_operational_isolations isolation
+             ON isolation.node_id = obligation.node_id
+           JOIN node_lifecycle_state lifecycle
+             ON lifecycle.node_id = obligation.node_id
+            AND lifecycle.lifecycle_epoch = obligation.lifecycle_epoch
+            AND lifecycle.phase = 'active'
+          WHERE obligation.kind = 'config'
+            AND obligation.status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )
+          ORDER BY obligation.node_id
+          FOR UPDATE OF obligation",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
     let mut revisions = running_revision_by_node
         .values()
         .copied()
@@ -686,20 +792,23 @@ pub(crate) async fn create_automatic_grants_deployment(
     for row in &config_rows {
         revisions.insert(revision_to_u64(row.try_get("revision_id")?)?);
     }
+    for row in &config_obligations {
+        revisions.insert(revision_to_u64(row.try_get("source_revision_id")?)?);
+    }
 
     // Compile each distinct topology only once. The permission projection retains that revision's
     // nodes, listeners and Flow, replacing only users and grant relations with the latest ones.
     let mut projected_by_revision = BTreeMap::new();
+    let mut snapshots_by_revision = BTreeMap::new();
     for base_revision in revisions {
         let base = if base_revision == revision_id {
             latest.clone()
         } else {
             materialize::load_snapshot_tx(&mut tx, Some(base_revision)).await?
         };
-        projected_by_revision.insert(
-            base_revision,
-            projected_grants(crate::serving::permission_projection(base, &latest))?,
-        );
+        let projected = crate::serving::permission_projection(base, &latest);
+        projected_by_revision.insert(base_revision, projected_grants(projected.clone())?);
+        snapshots_by_revision.insert(base_revision, projected);
     }
 
     let mut desired_now = BTreeMap::<String, DesiredGrants>::new();
@@ -716,6 +825,126 @@ pub(crate) async fn create_automatic_grants_deployment(
         };
         if !grants_match(&desired, observed) {
             desired_now.insert(node_id.clone(), desired);
+        }
+    }
+
+    for row in config_obligations {
+        let node_id: String = row.try_get("node_id")?;
+        let config_revision = revision_to_u64(row.try_get("source_revision_id")?)?;
+        let future_grants = projected_by_revision
+            .get(&config_revision)
+            .and_then(|by_node| by_node.get(&node_id))
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::InvalidData(format!(
+                    "isolated config obligation for {node_id} has no permission projection at revision {config_revision}"
+                ))
+            })?;
+
+        let current_value: Value = row.try_get("desired_grants")?;
+        let future_value = serde_json::to_value(&future_grants)?;
+        if current_value != future_value {
+            // Keep a following grants generation even after rebasing. It is redundant when config
+            // succeeds, but is required when config was already in flight or fails before
+            // applying the newest runtime client list.
+            desired_now.insert(node_id.clone(), future_grants.clone());
+        }
+
+        let status: String = row.try_get("status")?;
+        let claim_generation: i64 = row.try_get("claim_generation")?;
+        if status != "pending" || claim_generation != 0 {
+            continue;
+        }
+
+        let mut structure: Value = row.try_get("desired_structure")?;
+        structure
+            .as_object_mut()
+            .ok_or_else(|| {
+                StoreError::InvalidData(format!(
+                    "isolated config obligation for {node_id} has a non-object desired structure"
+                ))
+            })?
+            .insert("grants_revision".to_owned(), json!(revision_id));
+        let desired_fingerprint = sha256_hex(&serde_json::to_vec(&json!({
+            "structure": &structure,
+            "grants": &future_value,
+        }))?);
+        let source_deployment_id: i64 = row.try_get("source_deployment_id")?;
+        let lifecycle_epoch: i64 = row.try_get("lifecycle_epoch")?;
+        let generation: i64 = row.try_get("generation")?;
+        let updated = sqlx::query(
+            "UPDATE node_convergence_obligations
+                SET desired_structure = $5,
+                    desired_grants = $6,
+                    desired_fingerprint = $7
+              WHERE node_id = $1
+                AND kind = 'config'
+                AND lifecycle_epoch = $2
+                AND generation = $3
+                AND source_deployment_id = $4
+                AND status = 'pending'
+                AND claim_generation = 0",
+        )
+        .bind(&node_id)
+        .bind(lifecycle_epoch)
+        .bind(generation)
+        .bind(source_deployment_id)
+        .bind(&structure)
+        .bind(&future_value)
+        .bind(desired_fingerprint)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(format!(
+                "isolated config obligation for {node_id} was claimed while permissions were rebased"
+            )));
+        }
+        sqlx::query(
+            "UPDATE deployment_target_state
+                SET desired_grants = $3,
+                    desired_structure = jsonb_set(
+                        desired_structure,
+                        '{grants_revision}',
+                        to_jsonb($4::bigint),
+                        TRUE
+                    )
+              WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(source_deployment_id)
+        .bind(&node_id)
+        .bind(future_value)
+        .bind(revision_to_i64(revision_id)?)
+        .execute(&mut *tx)
+        .await?;
+        let usage_generation_id = rebase_pending_config_usage_generation_tx(
+            &mut tx,
+            source_deployment_id,
+            &node_id,
+            0,
+            structure,
+            future_grants,
+            snapshots_by_revision
+                .get(&config_revision)
+                .expect("every projected revision retains its source snapshot"),
+        )
+        .await?;
+        if let Some(usage_generation_id) = usage_generation_id {
+            sqlx::query(
+                "UPDATE node_convergence_obligations
+                    SET usage_generation_id = $5
+                  WHERE node_id = $1
+                    AND kind = 'config'
+                    AND lifecycle_epoch = $2
+                    AND generation = $3
+                    AND source_deployment_id = $4",
+            )
+            .bind(&node_id)
+            .bind(lifecycle_epoch)
+            .bind(generation)
+            .bind(source_deployment_id)
+            .bind(usage_generation_id)
+            .execute(&mut *tx)
+            .await?;
         }
     }
 
@@ -760,24 +989,40 @@ pub(crate) async fn create_automatic_grants_deployment(
         }
 
         let future_value = serde_json::to_value(&future_grants)?;
+        let mut rebased_structure = structure;
+        rebased_structure
+            .as_object_mut()
+            .ok_or_else(|| {
+                StoreError::InvalidData(format!(
+                    "config target {deployment_id}/{node_id} has a non-object desired structure"
+                ))
+            })?
+            .insert("grants_revision".to_owned(), json!(revision_id));
         sqlx::query(
             "UPDATE deployment_target_state
              SET desired_grants = $3,
-                 desired_structure = jsonb_set(
-                     desired_structure,
-                     '{grants_revision}',
-                     to_jsonb($4::bigint),
-                     TRUE
-                 )
+                 desired_structure = $4
              WHERE deployment_id = $1
                AND node_id = $2
                AND dispatched_grants IS NULL",
         )
         .bind(deployment_id)
         .bind(&node_id)
-        .bind(future_value)
-        .bind(revision_to_i64(revision_id)?)
+        .bind(&future_value)
+        .bind(&rebased_structure)
         .execute(&mut *tx)
+        .await?;
+        rebase_pending_config_usage_generation_tx(
+            &mut tx,
+            deployment_id,
+            &node_id,
+            row.try_get("wave")?,
+            rebased_structure,
+            future_grants,
+            snapshots_by_revision
+                .get(&config_revision)
+                .expect("every projected revision retains its source snapshot"),
+        )
         .await?;
     }
 
@@ -801,6 +1046,8 @@ pub(crate) async fn create_automatic_grants_deployment(
         plan_desired_deployment(revision_id, desired, &applied, Vec::new()),
         DeploymentKind::Grants,
     );
+    let isolated = isolated_node_ids(&mut *tx).await?;
+    mark_isolated_targets(&mut plan, &isolated);
     plan.base_revision_id = last_succeeded_revision(&mut *tx, DeploymentKind::Grants).await?;
 
     if plan.summary.changed_targets == 0 {
@@ -856,6 +1103,13 @@ pub(crate) async fn create_automatic_grants_deployment(
     for target in &plan.targets {
         insert_target(&mut tx, deployment_id, target).await?;
     }
+    if !plan
+        .targets
+        .iter()
+        .any(|target| target.status == PlannedTargetStatus::Pending)
+    {
+        refresh_deployment_status(&mut tx, deployment_id, "deferred").await?;
+    }
 
     tx.commit().await?;
     Ok(AutomaticGrantsDeploymentResult {
@@ -882,6 +1136,48 @@ fn config_manages_xray(structure: &Value) -> bool {
                 .iter()
                 .any(|action| matches!(action.as_str(), Some("apply-xray" | "disable-xray")))
         })
+}
+
+async fn rebase_pending_config_usage_generation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: i64,
+    node_id: &str,
+    wave: i32,
+    desired_structure: Value,
+    grants: DesiredGrants,
+    topology: &ModelSnapshot,
+) -> Result<Option<i64>> {
+    let desired = desired_deployment_from_structure_tx(
+        tx,
+        deployment_id,
+        node_id.to_owned(),
+        wave,
+        desired_structure,
+        grants,
+    )
+    .await?;
+    let usage_generation_id = crate::usage::create_usage_generation_for_target(
+        tx,
+        deployment_id,
+        node_id,
+        topology,
+        &desired.desired,
+        &desired.actions,
+    )
+    .await?;
+    if let Some(usage_generation_id) = usage_generation_id {
+        sqlx::query(
+            "UPDATE deployment_target_state
+                SET usage_generation_id = $3
+              WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(deployment_id)
+        .bind(node_id)
+        .bind(usage_generation_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(usage_generation_id)
 }
 
 fn unmanaged_for_grants(reason: &str) -> DesiredArtifact {
@@ -991,9 +1287,11 @@ pub async fn create_rollback_deployment(
         let revision_id = revision_to_u64(existing.try_get("revision_id")?)?;
         let snapshot = materialize::load_snapshot_tx(&mut tx, Some(revision_id)).await?;
         let applied = load_applied_states(&mut *tx).await?;
-        let plan = plan_forced_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?;
+        let mut plan = plan_forced_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?;
         let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
-        let plan = without_terminal_lifecycle_targets(plan, &terminal);
+        plan = without_terminal_lifecycle_targets(plan, &terminal);
+        let isolated = isolated_node_ids(&mut *tx).await?;
+        mark_isolated_targets(&mut plan, &isolated);
         tx.commit().await?;
         return Ok(CreateDeploymentResult {
             deployment_id,
@@ -1006,7 +1304,7 @@ pub async fn create_rollback_deployment(
     let target_snapshot = rollback_target_snapshot(&mut tx, request.target_deployment_id).await?;
     let target_revision = target_snapshot.revision;
     let previous_revision = console::lock_control_state(&mut tx).await?;
-    let (canceled_active, uncertain_nodes) = cancel_active_deployment_for_rollback(&mut tx).await?;
+    let uncertain_nodes = cancel_active_deployment_for_rollback(&mut tx).await?;
     let actor_id = request
         .actor
         .as_deref()
@@ -1041,18 +1339,17 @@ pub async fn create_rollback_deployment(
             ),
         );
     }
-    let plan = plan_forced_snapshot_deployment(&restored_snapshot, &applied).map_err(plan_error)?;
+    let mut plan =
+        plan_forced_snapshot_deployment(&restored_snapshot, &applied).map_err(plan_error)?;
     let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
-    let plan = without_terminal_lifecycle_targets(plan, &terminal);
+    plan = without_terminal_lifecycle_targets(plan, &terminal);
+    let isolated = isolated_node_ids(&mut *tx).await?;
+    mark_isolated_targets(&mut plan, &isolated);
     if plan.summary.total_targets == 0 {
         return Err(StoreError::InvalidData(
             "cannot create rollback deployment for an empty target set".to_owned(),
         ));
     }
-    if let Some(active_id) = canceled_active {
-        mark_uncertain_cancel_targets_dirty(&mut tx, active_id, &uncertain_nodes).await?;
-    }
-
     let (deployment_id, status) = insert_rollback_deployment_tx(
         &mut tx,
         &actor_id,
@@ -1090,6 +1387,9 @@ pub async fn list_deployments(
             "SELECT d.id,
                     d.revision_id,
                     d.status,
+                    d.activation_status,
+                    d.settlement_status,
+                    d.activated_at::text AS activated_at,
                     d.active,
                     d.actor,
                     d.kind,
@@ -1104,6 +1404,10 @@ pub async fn list_deployments(
                     count(dt.node_id) FILTER (WHERE dt.status <> 'skipped') AS changed_targets,
                     count(dt.node_id) FILTER (WHERE dt.status = 'skipped') AS skipped_targets,
                     count(dt.node_id) FILTER (WHERE dt.status IN ('failed-recovered', 'failed-dirty')) AS failed_targets,
+                    (SELECT count(*)
+                       FROM node_convergence_obligations o
+                      WHERE o.source_deployment_id = d.id
+                        AND o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')) AS debt_targets,
                     count(dt.node_id) FILTER (WHERE dts.disruptive) AS disruptive_targets,
                     COALESCE(max(dts.wave), 0) AS max_wave,
                     -- 这一单是不是「在等人确认」而不是「在等机器」。两者在列表上长得
@@ -1167,6 +1471,9 @@ pub async fn list_deployments(
             "SELECT d.id,
                     d.revision_id,
                     d.status,
+                    d.activation_status,
+                    d.settlement_status,
+                    d.activated_at::text AS activated_at,
                     d.active,
                     d.actor,
                     d.kind,
@@ -1181,6 +1488,10 @@ pub async fn list_deployments(
                     count(dt.node_id) FILTER (WHERE dt.status <> 'skipped') AS changed_targets,
                     count(dt.node_id) FILTER (WHERE dt.status = 'skipped') AS skipped_targets,
                     count(dt.node_id) FILTER (WHERE dt.status IN ('failed-recovered', 'failed-dirty')) AS failed_targets,
+                    (SELECT count(*)
+                       FROM node_convergence_obligations o
+                      WHERE o.source_deployment_id = d.id
+                        AND o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')) AS debt_targets,
                     count(dt.node_id) FILTER (WHERE dts.disruptive) AS disruptive_targets,
                     COALESCE(max(dts.wave), 0) AS max_wave,
                     -- 这一单是不是「在等人确认」而不是「在等机器」。两者在列表上长得
@@ -1249,6 +1560,9 @@ pub async fn list_deployments(
                 id: row.try_get("id")?,
                 revision_id: revision_to_u64(row.try_get("revision_id")?)?,
                 status: row.try_get("status")?,
+                activation_status: row.try_get("activation_status")?,
+                settlement_status: row.try_get("settlement_status")?,
+                activated_at: row.try_get("activated_at")?,
                 active: row.try_get("active")?,
                 actor: row.try_get("actor")?,
                 kind: DeploymentKind::parse(row.try_get("kind")?).unwrap_or_default(),
@@ -1266,6 +1580,7 @@ pub async fn list_deployments(
                 changed_targets: i64_to_u64("changed_targets", row.try_get("changed_targets")?)?,
                 skipped_targets: i64_to_u64("skipped_targets", row.try_get("skipped_targets")?)?,
                 failed_targets: i64_to_u64("failed_targets", row.try_get("failed_targets")?)?,
+                debt_targets: i64_to_u64("debt_targets", row.try_get("debt_targets")?)?,
                 disruptive_targets: i64_to_u64(
                     "disruptive_targets",
                     row.try_get("disruptive_targets")?,
@@ -1288,14 +1603,19 @@ pub async fn deployment_detail(
     include_content: bool,
 ) -> Result<DeploymentDetail> {
     let deployment = sqlx::query(
-        "SELECT id, revision_id, status, active, actor, note, warnings, base_revision_id,
+        "SELECT id, revision_id, status, activation_status, settlement_status,
+                activated_at::text AS activated_at, active, actor, note, warnings, base_revision_id,
                 created_at::text AS created_at,
                 started_at::text AS started_at,
                 halted_at::text AS halted_at,
                 finished_at::text AS finished_at,
                 rollback_of_deployment_id,
                 sync_of_deployment_id,
-                divergence_cleared_at::text AS divergence_cleared_at
+                divergence_cleared_at::text AS divergence_cleared_at,
+                (SELECT count(*)
+                   FROM node_convergence_obligations o
+                  WHERE o.source_deployment_id = deployments.id
+                    AND o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')) AS debt_targets
          FROM deployments
          WHERE id = $1",
     )
@@ -1390,6 +1710,10 @@ pub async fn deployment_detail(
         id: deployment.try_get("id")?,
         revision_id: revision_to_u64(deployment.try_get("revision_id")?)?,
         status: deployment.try_get("status")?,
+        activation_status: deployment.try_get("activation_status")?,
+        settlement_status: deployment.try_get("settlement_status")?,
+        activated_at: deployment.try_get("activated_at")?,
+        debt_targets: i64_to_u64("debt_targets", deployment.try_get("debt_targets")?)?,
         active: deployment.try_get("active")?,
         actor: deployment.try_get("actor")?,
         note: deployment.try_get("note")?,
@@ -1517,6 +1841,61 @@ pub async fn load_desired_for_node(
     pool: &PgPool,
     node_id: &str,
 ) -> Result<Option<NodeDesiredDeployment>> {
+    if let Some(row) = sqlx::query(
+        "SELECT obligation.source_deployment_id AS deployment_id,
+                obligation.desired_structure,
+                obligation.desired_grants,
+                obligation.usage_generation_id,
+                obligation.claim_generation
+           FROM node_operational_isolations isolation
+           JOIN node_lifecycle_state lifecycle
+             ON lifecycle.node_id = isolation.node_id
+            AND lifecycle.phase = 'active'
+           JOIN node_convergence_obligations obligation
+             ON obligation.node_id = isolation.node_id
+            AND obligation.lifecycle_epoch = lifecycle.lifecycle_epoch
+            AND obligation.status IN ('pending', 'dispatched', 'converging')
+          WHERE isolation.node_id = $1
+          ORDER BY CASE obligation.kind WHEN 'config' THEN 0 ELSE 1 END,
+                   obligation.priority DESC,
+                   obligation.generation DESC
+          LIMIT 1",
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?
+    {
+        let deployment_id: i64 = row.try_get("deployment_id")?;
+        let mut desired = desired_deployment_from_structure(
+            pool,
+            deployment_id,
+            node_id.to_owned(),
+            0,
+            row.try_get("desired_structure")?,
+            serde_json::from_value(row.try_get("desired_grants")?)?,
+        )
+        .await?;
+        desired.claim_generation = i64_to_u64(
+            "obligation claim_generation",
+            row.try_get("claim_generation")?,
+        )?;
+        desired.usage_generation_id = row.try_get("usage_generation_id")?;
+        return Ok(Some(desired));
+    }
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM node_operational_isolations isolation
+               JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = isolation.node_id
+              WHERE isolation.node_id = $1 AND lifecycle.phase = 'active'
+         )",
+    )
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?
+    {
+        return Ok(None);
+    }
     let Some(row) = sqlx::query(
         // Both lines can be active at once. A configuration target already handed to the agent
         // keeps the machine until it reports; otherwise an automatic grants target goes first.
@@ -1648,6 +2027,111 @@ pub async fn claim_desired_for_node(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
+    let isolated = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM node_operational_isolations isolation
+               JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = isolation.node_id
+              WHERE isolation.node_id = $1 AND lifecycle.phase = 'active'
+         )",
+    )
+    .bind(node_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if isolated {
+        let obligation = sqlx::query(
+            "SELECT obligation.kind,
+                    obligation.lifecycle_epoch,
+                    obligation.generation,
+                    obligation.source_deployment_id AS deployment_id,
+                    obligation.desired_structure,
+                    obligation.desired_grants,
+                    obligation.usage_generation_id,
+                    obligation.claim_generation
+               FROM node_convergence_obligations obligation
+               JOIN node_lifecycle_state lifecycle
+                 ON lifecycle.node_id = obligation.node_id
+                AND lifecycle.lifecycle_epoch = obligation.lifecycle_epoch
+                AND lifecycle.phase = 'active'
+              WHERE obligation.node_id = $1
+                AND obligation.status IN ('pending', 'dispatched', 'converging')
+                AND (
+                    obligation.status = 'pending'
+                    OR COALESCE(obligation.claimed_at, '-infinity'::timestamptz)
+                         < now() - $2::interval
+                )
+                AND (
+                    obligation.kind = 'config'
+                    OR NOT EXISTS (
+                        SELECT 1
+                          FROM node_convergence_obligations config_obligation
+                         WHERE config_obligation.node_id = obligation.node_id
+                           AND config_obligation.lifecycle_epoch = obligation.lifecycle_epoch
+                           AND config_obligation.kind = 'config'
+                           AND config_obligation.status IN (
+                               'pending', 'dispatched', 'converging',
+                               'failed-recovered', 'failed-dirty'
+                           )
+                    )
+                )
+              ORDER BY CASE obligation.kind WHEN 'config' THEN 0 ELSE 1 END,
+                       obligation.priority DESC,
+                       obligation.generation DESC
+              LIMIT 1
+              FOR UPDATE OF obligation SKIP LOCKED",
+        )
+        .bind(node_id)
+        .bind(DISPATCH_LEASE_INTERVAL)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(obligation) = obligation else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let deployment_id: i64 = obligation.try_get("deployment_id")?;
+        let lifecycle_epoch: i64 = obligation.try_get("lifecycle_epoch")?;
+        let generation: i64 = obligation.try_get("generation")?;
+        let kind: String = obligation.try_get("kind")?;
+        let claim_generation = obligation
+            .try_get::<i64, _>("claim_generation")?
+            .checked_add(1)
+            .ok_or_else(|| {
+                StoreError::InvalidData(format!(
+                    "obligation claim generation overflow for {node_id}/{kind}"
+                ))
+            })?;
+        let mut desired = desired_deployment_from_structure_tx(
+            &mut tx,
+            deployment_id,
+            node_id.to_owned(),
+            0,
+            obligation.try_get("desired_structure")?,
+            serde_json::from_value(obligation.try_get("desired_grants")?)?,
+        )
+        .await?;
+        desired.claim_generation = i64_to_u64("obligation claim_generation", claim_generation)?;
+        desired.usage_generation_id = obligation.try_get("usage_generation_id")?;
+        sqlx::query(
+            "UPDATE node_convergence_obligations
+                SET status = 'dispatched',
+                    claim_generation = $5,
+                    claimed_at = now(),
+                    last_error = NULL
+              WHERE node_id = $1
+                AND kind = $2
+                AND lifecycle_epoch = $3
+                AND generation = $4",
+        )
+        .bind(node_id)
+        .bind(kind)
+        .bind(lifecycle_epoch)
+        .bind(generation)
+        .bind(claim_generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(Some(desired));
+    }
     let Some(row) = sqlx::query(
         // Same ordering as the read-only path above. A dispatched config keeps its lease; a
         // pending config has already been rebased and yields to the permission hot update.
@@ -1838,6 +2322,159 @@ pub async fn report_target_result(
     .await?
     .ok_or_else(|| StoreError::NotFound(format!("deployment {}", report.deployment_id)))?;
     let deployment_status: String = deployment.try_get("status")?;
+    let obligation = sqlx::query(
+        "SELECT obligation.kind,
+                obligation.lifecycle_epoch AS target_lifecycle_epoch,
+                obligation.generation,
+                obligation.claim_generation,
+                obligation.desired_structure,
+                obligation.desired_grants,
+                obligation.usage_generation_id,
+                lifecycle.lifecycle_epoch AS current_lifecycle_epoch,
+                lifecycle.phase AS lifecycle_phase,
+                dt.status AS target_status
+           FROM node_convergence_obligations obligation
+           JOIN deployment_targets dt
+             ON dt.deployment_id = obligation.source_deployment_id
+            AND dt.node_id = obligation.node_id
+           JOIN deployment_target_state dts
+             ON dts.deployment_id = dt.deployment_id
+            AND dts.node_id = dt.node_id
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = obligation.node_id
+           JOIN node_operational_isolations isolation ON isolation.node_id = obligation.node_id
+          WHERE obligation.source_deployment_id = $1
+            AND obligation.node_id = $2
+            AND obligation.status IN ('dispatched', 'converging')
+          FOR UPDATE OF obligation, dt, dts, lifecycle",
+    )
+    .bind(report.deployment_id)
+    .bind(&report.node_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(obligation) = obligation {
+        let expected_claim: i64 = obligation.try_get("claim_generation")?;
+        let reported_claim = i64::try_from(report.claim_generation).map_err(|_| {
+            StoreError::Conflict(format!(
+                "report claim generation is out of range: {}",
+                report.claim_generation
+            ))
+        })?;
+        if expected_claim != reported_claim {
+            return Err(StoreError::Conflict(format!(
+                "obligation report for {}/{} has claim generation {}, current generation is {}",
+                report.deployment_id, report.node_id, reported_claim, expected_claim
+            )));
+        }
+        let target_epoch: i64 = obligation.try_get("target_lifecycle_epoch")?;
+        let current_epoch: i64 = obligation.try_get("current_lifecycle_epoch")?;
+        let lifecycle_phase: String = obligation.try_get("lifecycle_phase")?;
+        if target_epoch != current_epoch || lifecycle_phase != "active" {
+            return Err(StoreError::Conflict(format!(
+                "obligation for {}/{} belongs to lifecycle epoch {}, current state is {}/{}",
+                report.deployment_id, report.node_id, target_epoch, current_epoch, lifecycle_phase
+            )));
+        }
+
+        let baseline_state = load_node_applied_state_for_update(&mut tx, &report.node_id).await?;
+        let baseline_matched = baseline_state
+            .as_ref()
+            .map(|state| state == &report.observed_before);
+        let desired_structure: Value = obligation.try_get("desired_structure")?;
+        let desired_grants: DesiredGrants =
+            serde_json::from_value(obligation.try_get("desired_grants")?)?;
+        let final_status = target_status_from_report(&report, &desired_structure, &desired_grants)?;
+        let observed_before = reported_node_state_json(&report.observed_before)?;
+        let observed_after = reported_node_state_json(&report.observed_after)?;
+        let verdict = json!({
+            "reported_result": target_apply_result_name(report.result),
+            "target_status": final_status,
+            "error": report.error,
+            "desired_matched": final_status == "succeeded",
+            "baseline_matched": baseline_matched,
+            "obligation_generation": obligation.try_get::<i64, _>("generation")?,
+            "claim_generation": expected_claim,
+        });
+        sqlx::query(
+            "UPDATE deployment_target_state
+                SET observed_before = $3,
+                    observed_after = $4,
+                    verdict = $5,
+                    dispatched_grants = NULL
+              WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(report.deployment_id)
+        .bind(&report.node_id)
+        .bind(observed_before)
+        .bind(observed_after)
+        .bind(verdict)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE deployment_targets
+                SET status = $3, error = $4
+              WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(report.deployment_id)
+        .bind(&report.node_id)
+        .bind(final_status)
+        .bind(&report.error)
+        .execute(&mut *tx)
+        .await?;
+        let kind_value: String = obligation.try_get("kind")?;
+        let kind = DeploymentKind::parse(&kind_value).ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "obligation has unknown deployment kind {kind_value}"
+            ))
+        })?;
+        upsert_node_applied_state(
+            &mut tx,
+            report.deployment_id,
+            &report.node_id,
+            &report.observed_after,
+            kind,
+        )
+        .await?;
+        if final_status == "succeeded" {
+            if let Some(generation_id) =
+                obligation.try_get::<Option<i64>, _>("usage_generation_id")?
+            {
+                crate::usage::activate_usage_generation(
+                    &mut tx,
+                    &report.node_id,
+                    generation_id,
+                    report.deployment_id,
+                    report.usage_activated_at_unix_secs,
+                )
+                .await?;
+            }
+        }
+        sqlx::query(
+            "UPDATE node_convergence_obligations
+                SET status = $5,
+                    settled_at = CASE WHEN $5 = 'succeeded' THEN now() ELSE NULL END,
+                    last_error = $6
+              WHERE node_id = $1
+                AND kind = $2
+                AND lifecycle_epoch = $3
+                AND generation = $4",
+        )
+        .bind(&report.node_id)
+        .bind(kind.as_str())
+        .bind(target_epoch)
+        .bind(obligation.try_get::<i64, _>("generation")?)
+        .bind(final_status)
+        .bind(&report.error)
+        .execute(&mut *tx)
+        .await?;
+        store_deployment_settlement_tx(&mut tx, report.deployment_id).await?;
+        tx.commit().await?;
+        return Ok(ReportTargetResult {
+            deployment_id: report.deployment_id,
+            node_id: report.node_id,
+            target_status: final_status.to_owned(),
+            deployment_status,
+        });
+    }
     if !matches!(deployment_status.as_str(), "planned" | "running") {
         return Err(StoreError::Unsupported(format!(
             "deployment {} is not accepting reports in status {}",
@@ -1848,6 +2485,12 @@ pub async fn report_target_result(
         return Err(StoreError::Unsupported(format!(
             "deployment {} is not active",
             report.deployment_id
+        )));
+    }
+    if report.claim_generation != 0 {
+        return Err(StoreError::Conflict(format!(
+            "active deployment target {}/{} does not accept claim generation {}",
+            report.deployment_id, report.node_id, report.claim_generation
         )));
     }
 
@@ -2032,6 +2675,450 @@ pub async fn report_target_result(
     })
 }
 
+pub async fn isolate_deployment_target(
+    pool: &PgPool,
+    actor: &AdminContext,
+    deployment_id: i64,
+    node_id: &str,
+    request: IsolateDeploymentTargetRequest,
+) -> Result<NodeIsolationCommandResult> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can isolate deployment targets".to_owned(),
+        ));
+    }
+    let reason = request.reason.trim();
+    if reason.is_empty() {
+        return Err(StoreError::InvalidData(
+            "isolation reason must not be empty".to_owned(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT d.id AS deployment_id,
+                d.revision_id,
+                d.kind,
+                dt.status AS target_status,
+                dts.wave,
+                dts.desired_structure,
+                dts.desired_grants,
+                dts.dispatched_grants,
+                dts.lifecycle_epoch
+           FROM deployments d
+           JOIN deployment_targets dt ON dt.deployment_id = d.id
+           JOIN deployment_target_state dts
+             ON dts.deployment_id = dt.deployment_id
+            AND dts.node_id = dt.node_id
+          WHERE d.active = TRUE
+            AND d.status IN ('planned', 'running', 'halted')
+            AND dt.node_id = $1
+            AND dt.status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )
+          ORDER BY d.id
+          FOR UPDATE OF d, dt, dts",
+    )
+    .bind(node_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let selected = rows
+        .iter()
+        .find(|row| row.try_get::<i64, _>("deployment_id").ok() == Some(deployment_id))
+        .ok_or_else(|| {
+            StoreError::NotFound(format!(
+                "active deployment target {deployment_id}/{node_id}"
+            ))
+        })?;
+    let selected_status: String = selected.try_get("target_status")?;
+    if selected_status != request.expected_target_status {
+        return Err(StoreError::Conflict(format!(
+            "target {deployment_id}/{node_id} changed from {} to {selected_status}",
+            request.expected_target_status
+        )));
+    }
+    let uncertain = rows.iter().any(|row| {
+        row.try_get::<String, _>("target_status")
+            .is_ok_and(|status| {
+                matches!(
+                    status.as_str(),
+                    "dispatched" | "converging" | "failed-recovered" | "failed-dirty"
+                )
+            })
+    });
+    if uncertain && !request.acknowledge_uncertain {
+        return Err(StoreError::Conflict(
+            "target state is uncertain; acknowledge_uncertain is required".to_owned(),
+        ));
+    }
+
+    let lifecycle = sqlx::query(
+        "SELECT lifecycle_epoch, phase
+           FROM node_lifecycle_state
+          WHERE node_id = $1
+          FOR UPDATE",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("node lifecycle {node_id}")))?;
+    let lifecycle_epoch: i64 = lifecycle.try_get("lifecycle_epoch")?;
+    let lifecycle_phase: String = lifecycle.try_get("phase")?;
+    if lifecycle_phase != "active" {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} is {lifecycle_phase}; operational isolation only applies to active nodes"
+        )));
+    }
+
+    let already_isolated = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM node_operational_isolations WHERE node_id = $1
+         )",
+    )
+    .bind(node_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO node_operational_isolations (
+             node_id, actor, reason, source_deployment_id
+         ) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (node_id) DO UPDATE SET
+             actor = EXCLUDED.actor,
+             reason = EXCLUDED.reason,
+             source_deployment_id = EXCLUDED.source_deployment_id,
+             updated_at = now()",
+    )
+    .bind(node_id)
+    .bind(actor.operator_id())
+    .bind(reason)
+    .bind(deployment_id)
+    .execute(&mut *tx)
+    .await?;
+    if !already_isolated {
+        sqlx::query(
+            "INSERT INTO node_operational_isolation_events (
+                 node_id, event, actor, reason, deployment_id, details
+             ) VALUES ($1, 'isolated', $2, $3, $4, $5)",
+        )
+        .bind(node_id)
+        .bind(actor.operator_id())
+        .bind(reason)
+        .bind(deployment_id)
+        .bind(json!({
+            "selected_target_status": selected_status,
+            "uncertain": uncertain,
+        }))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let mut affected = BTreeSet::new();
+    for row in rows {
+        let source_deployment_id: i64 = row.try_get("deployment_id")?;
+        let revision_id: i64 = row.try_get("revision_id")?;
+        let kind_value: String = row.try_get("kind")?;
+        let kind = DeploymentKind::parse(&kind_value).ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "deployment {source_deployment_id} has unknown kind {kind_value}"
+            ))
+        })?;
+        let target_status: String = row.try_get("target_status")?;
+        let target_epoch: i64 = row.try_get("lifecycle_epoch")?;
+        if target_epoch != lifecycle_epoch {
+            return Err(StoreError::Conflict(format!(
+                "target {source_deployment_id}/{node_id} belongs to lifecycle epoch {target_epoch}, current epoch is {lifecycle_epoch}"
+            )));
+        }
+        if matches!(
+            target_status.as_str(),
+            "dispatched" | "converging" | "failed-recovered" | "failed-dirty"
+        ) {
+            mark_node_applied_dirty_tx(
+                &mut tx,
+                source_deployment_id,
+                node_id,
+                kind,
+                "节点隔离时目标已下发或失败，运行态不确定",
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE deployment_target_state
+                    SET claim_generation = claim_generation + 1,
+                        dispatched_grants = NULL
+                  WHERE deployment_id = $1 AND node_id = $2",
+            )
+            .bind(source_deployment_id)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let snapshot =
+            crate::materialize::load_snapshot_tx(&mut tx, Some(revision_to_u64(revision_id)?))
+                .await?;
+        let obligation_target = if kind == DeploymentKind::Config {
+            plan_snapshot_deployment(&snapshot, &[])
+                .map_err(plan_error)?
+                .targets
+                .into_iter()
+                .find(|target| target.node_id == node_id)
+                .ok_or_else(|| {
+                    StoreError::InvalidData(format!(
+                        "node {node_id} is absent from deployment {source_deployment_id} full desired state"
+                    ))
+                })?
+        } else {
+            let grants_value = row
+                .try_get::<Option<Value>, _>("dispatched_grants")?
+                .or(row.try_get::<Option<Value>, _>("desired_grants")?)
+                .ok_or_else(|| {
+                    StoreError::InvalidData(format!(
+                        "target {source_deployment_id}/{node_id} has no frozen grants"
+                    ))
+                })?;
+            let desired = desired_deployment_from_structure_tx(
+                &mut tx,
+                source_deployment_id,
+                node_id.to_owned(),
+                row.try_get("wave")?,
+                row.try_get("desired_structure")?,
+                serde_json::from_value(grants_value)?,
+            )
+            .await?;
+            PlannedTarget {
+                node_id: node_id.to_owned(),
+                status: PlannedTargetStatus::Deferred,
+                wave: desired.wave,
+                disruptive: false,
+                actions: desired.actions,
+                desired: desired.desired,
+            }
+        };
+        for (_, artifact) in obligation_target.desired.artifacts() {
+            insert_artifact_blob(&mut tx, artifact).await?;
+        }
+        let usage_generation_id = crate::usage::create_usage_generation_for_target(
+            &mut tx,
+            source_deployment_id,
+            node_id,
+            &snapshot,
+            &obligation_target.desired,
+            &obligation_target.actions,
+        )
+        .await?;
+
+        sqlx::query(
+            "UPDATE deployment_targets
+                SET status = 'deferred',
+                    error = $3
+              WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(source_deployment_id)
+        .bind(node_id)
+        .bind(if uncertain {
+            "节点已隔离；旧执行状态不确定，恢复后补齐最新完整期望"
+        } else {
+            "节点已隔离；恢复后补齐最新完整期望"
+        })
+        .execute(&mut *tx)
+        .await?;
+        insert_or_supersede_obligation_tx(
+            &mut tx,
+            source_deployment_id,
+            revision_id,
+            lifecycle_epoch,
+            kind,
+            &obligation_target,
+            usage_generation_id,
+        )
+        .await?;
+        affected.insert(source_deployment_id);
+    }
+
+    for affected_deployment in &affected {
+        refresh_deployment_status(&mut tx, *affected_deployment, "deferred").await?;
+    }
+    let serving_generation = crate::serving::refresh_isolation_snapshot_tx(&mut tx).await?;
+    let debt_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM node_convergence_obligations
+          WHERE node_id = $1
+            AND lifecycle_epoch = $2
+            AND status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )",
+    )
+    .bind(node_id)
+    .bind(lifecycle_epoch)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(NodeIsolationCommandResult {
+        node_id: node_id.to_owned(),
+        isolated: true,
+        affected_deployments: affected.into_iter().collect(),
+        debt_count: i64_to_u64("isolation debt_count", debt_count)?,
+        serving_generation,
+    })
+}
+
+pub async fn restore_node_service(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: RestoreNodeServiceRequest,
+) -> Result<NodeIsolationCommandResult> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can restore an isolated node to service".to_owned(),
+        ));
+    }
+    let reason = request.reason.trim();
+    if reason.is_empty() {
+        return Err(StoreError::InvalidData(
+            "restore reason must not be empty".to_owned(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT lifecycle.phase,
+                lifecycle.lifecycle_epoch,
+                node.overlay,
+                agent.last_poll_at >= now() - interval '90 seconds' AS poll_fresh,
+                agent.runtime_reported_at >= now() - interval '2 minutes' AS runtime_fresh,
+                COALESCE((agent.wireguard_health->>'enabled')::boolean, FALSE) AS wg_enabled,
+                NULLIF(agent.wireguard_health->>'error', '') AS wg_error,
+                applied.phantun_state,
+                applied.wireguard_state,
+                applied.xray_state,
+                applied.hy2_port_hop_state,
+                applied.grants_state
+           FROM node_lifecycle_state lifecycle
+           JOIN nodes node ON node.id = lifecycle.node_id
+           LEFT JOIN node_agent_state agent ON agent.node_id = lifecycle.node_id
+           LEFT JOIN node_applied_state applied ON applied.node_id = lifecycle.node_id
+          WHERE lifecycle.node_id = $1
+          FOR UPDATE OF lifecycle",
+    )
+    .bind(node_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "SELECT node_id
+           FROM node_operational_isolations
+          WHERE node_id = $1
+          FOR UPDATE",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("node isolation {node_id}")))?;
+    let phase: String = row.try_get("phase")?;
+    if phase != "active" {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} is {phase}, not active"
+        )));
+    }
+    let lifecycle_epoch: i64 = row.try_get("lifecycle_epoch")?;
+    let debt_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM node_convergence_obligations
+          WHERE node_id = $1
+            AND lifecycle_epoch = $2
+            AND status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )",
+    )
+    .bind(node_id)
+    .bind(lifecycle_epoch)
+    .fetch_one(&mut *tx)
+    .await?;
+    if debt_count > 0 {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} still has {debt_count} convergence obligation(s)"
+        )));
+    }
+    if !row
+        .try_get::<Option<bool>, _>("poll_fresh")?
+        .unwrap_or(false)
+    {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} has no desired poll in the last 90 seconds"
+        )));
+    }
+    if !row
+        .try_get::<Option<bool>, _>("runtime_fresh")?
+        .unwrap_or(false)
+    {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} has no runtime report in the last 2 minutes"
+        )));
+    }
+    for field in [
+        "phantun_state",
+        "wireguard_state",
+        "xray_state",
+        "hy2_port_hop_state",
+        "grants_state",
+    ] {
+        let state = row.try_get::<Option<String>, _>(field)?;
+        if state
+            .as_deref()
+            .is_none_or(|state| matches!(state, "unknown" | "dirty"))
+        {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} has unconfirmed applied state in {field}"
+            )));
+        }
+    }
+    let overlay: bool = row.try_get("overlay")?;
+    if overlay
+        && (!row
+            .try_get::<Option<bool>, _>("wg_enabled")?
+            .unwrap_or(false)
+            || row.try_get::<Option<String>, _>("wg_error")?.is_some())
+    {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} WireGuard runtime health is not ready"
+        )));
+    }
+
+    let affected_deployments = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT source_deployment_id
+           FROM node_convergence_obligations
+          WHERE node_id = $1
+          ORDER BY source_deployment_id",
+    )
+    .bind(node_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM node_operational_isolations WHERE node_id = $1")
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO node_operational_isolation_events (
+             node_id, event, actor, reason, details
+         ) VALUES ($1, 'restored', $2, $3, $4)",
+    )
+    .bind(node_id)
+    .bind(actor.operator_id())
+    .bind(reason)
+    .bind(json!({ "lifecycle_epoch": lifecycle_epoch }))
+    .execute(&mut *tx)
+    .await?;
+    let serving_generation = crate::serving::refresh_isolation_snapshot_tx(&mut tx).await?;
+    tx.commit().await?;
+    Ok(NodeIsolationCommandResult {
+        node_id: node_id.to_owned(),
+        isolated: false,
+        affected_deployments,
+        debt_count: 0,
+        serving_generation,
+    })
+}
+
 pub async fn halt_deployment(
     pool: &PgPool,
     admin: &AdminContext,
@@ -2168,9 +3255,12 @@ pub async fn cancel_deployment_and_rollback(
             ),
         );
     }
-    let plan = plan_forced_snapshot_deployment(&restored_snapshot, &applied).map_err(plan_error)?;
+    let mut plan =
+        plan_forced_snapshot_deployment(&restored_snapshot, &applied).map_err(plan_error)?;
     let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
-    let plan = without_terminal_lifecycle_targets(plan, &terminal);
+    plan = without_terminal_lifecycle_targets(plan, &terminal);
+    let isolated = isolated_node_ids(&mut *tx).await?;
+    mark_isolated_targets(&mut plan, &isolated);
     if plan.summary.total_targets == 0 {
         return Err(StoreError::InvalidData(
             "cannot create rollback deployment for an empty target set".to_owned(),
@@ -2215,6 +3305,64 @@ pub async fn retry_target(
     .fetch_one(&mut *tx)
     .await?;
     let deployment_status: String = deployment.try_get("status")?;
+    let obligation = sqlx::query(
+        "SELECT obligation.kind, obligation.lifecycle_epoch, obligation.generation
+           FROM node_convergence_obligations obligation
+           JOIN node_operational_isolations isolation ON isolation.node_id = obligation.node_id
+           JOIN node_lifecycle_state lifecycle
+             ON lifecycle.node_id = obligation.node_id
+            AND lifecycle.lifecycle_epoch = obligation.lifecycle_epoch
+            AND lifecycle.phase = 'active'
+          WHERE obligation.source_deployment_id = $1
+            AND obligation.node_id = $2
+            AND obligation.status IN ('failed-recovered', 'failed-dirty')
+          FOR UPDATE OF obligation",
+    )
+    .bind(deployment_id)
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(obligation) = obligation {
+        if !actor.is_system_admin() {
+            return Err(StoreError::Forbidden(
+                "only system-admin can retry isolated convergence debt".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE node_convergence_obligations
+                SET status = 'pending',
+                    claimed_at = NULL,
+                    last_error = NULL
+              WHERE node_id = $1
+                AND kind = $2
+                AND lifecycle_epoch = $3
+                AND generation = $4",
+        )
+        .bind(node_id)
+        .bind(obligation.try_get::<String, _>("kind")?)
+        .bind(obligation.try_get::<i64, _>("lifecycle_epoch")?)
+        .bind(obligation.try_get::<i64, _>("generation")?)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE deployment_targets
+                SET status = 'deferred',
+                    error = '隔离节点债务等待重新领取'
+              WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(deployment_id)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+        store_deployment_settlement_tx(&mut tx, deployment_id).await?;
+        tx.commit().await?;
+        return Ok(ReportTargetResult {
+            deployment_id,
+            node_id: node_id.to_owned(),
+            target_status: "deferred".to_owned(),
+            deployment_status,
+        });
+    }
     if deployment_status != "halted" {
         return Err(StoreError::Unsupported(format!(
             "deployment {deployment_id} cannot retry targets from status {deployment_status}"
@@ -2385,11 +3533,53 @@ async fn cancel_deployment_tx(
 
     mark_uncertain_cancel_targets_dirty(tx, deployment_id, &uncertain_nodes).await?;
 
+    let obligation_rows = sqlx::query(
+        "SELECT node_id, kind, status
+           FROM node_convergence_obligations
+          WHERE source_deployment_id = $1
+            AND status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )
+          FOR UPDATE",
+    )
+    .bind(deployment_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for obligation in &obligation_rows {
+        let obligation_status: String = obligation.try_get("status")?;
+        if matches!(obligation_status.as_str(), "dispatched" | "converging") {
+            let kind_value: String = obligation.try_get("kind")?;
+            let kind = DeploymentKind::parse(&kind_value).ok_or_else(|| {
+                StoreError::InvalidData(format!("unknown obligation kind {kind_value}"))
+            })?;
+            let obligation_node: String = obligation.try_get("node_id")?;
+            mark_node_applied_dirty_tx(
+                tx,
+                deployment_id,
+                &obligation_node,
+                kind,
+                "隔离债务随未激活发布取消，旧执行结果不再可信",
+            )
+            .await?;
+        }
+    }
+    sqlx::query(
+        "UPDATE node_convergence_obligations
+            SET status = 'canceled', last_error = '来源发布已取消'
+          WHERE source_deployment_id = $1
+            AND status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )",
+    )
+    .bind(deployment_id)
+    .execute(&mut **tx)
+    .await?;
+
     sqlx::query(
         "UPDATE deployment_targets
          SET status = 'canceled'
          WHERE deployment_id = $1
-           AND status IN ('pending', 'dispatched', 'converging')",
+           AND status IN ('pending', 'dispatched', 'converging', 'deferred')",
     )
     .bind(deployment_id)
     .execute(&mut **tx)
@@ -2408,6 +3598,8 @@ async fn cancel_deployment_tx(
         "UPDATE deployments
          SET status = 'canceled',
              active = NULL,
+             activation_status = 'rejected',
+             settlement_status = 'converged',
              finished_at = COALESCE(finished_at, now())
          WHERE id = $1
          RETURNING status, active",
@@ -2432,6 +3624,7 @@ async fn latest_succeeded_deployment_before_tx(
          FROM deployments
          WHERE id < $1
            AND status = 'succeeded'
+           AND activation_status = 'activated'
          ORDER BY id DESC
          LIMIT 1",
     )
@@ -2452,7 +3645,7 @@ async fn latest_succeeded_deployment_before_tx(
 
 async fn cancel_active_deployment_for_rollback(
     tx: &mut Transaction<'_, Postgres>,
-) -> Result<(Option<i64>, Vec<String>)> {
+) -> Result<Vec<String>> {
     let Some(active) = sqlx::query(
         "SELECT id, status
          FROM deployments
@@ -2464,7 +3657,7 @@ async fn cancel_active_deployment_for_rollback(
     .fetch_optional(&mut **tx)
     .await?
     else {
-        return Ok((None, Vec::new()));
+        return Ok(Vec::new());
     };
     let deployment_id = active.try_get("id")?;
     let status: String = active.try_get("status")?;
@@ -2474,56 +3667,8 @@ async fn cancel_active_deployment_for_rollback(
         )));
     }
 
-    let rows = sqlx::query(
-        "SELECT node_id, status
-         FROM deployment_targets
-         WHERE deployment_id = $1
-           AND status IN ('pending', 'dispatched', 'converging')
-         ORDER BY node_id
-         FOR UPDATE",
-    )
-    .bind(deployment_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let uncertain_nodes = rows
-        .iter()
-        .filter_map(|row| {
-            let status: String = row.try_get("status").ok()?;
-            matches!(status.as_str(), "dispatched" | "converging").then(|| row.try_get("node_id"))
-        })
-        .collect::<std::result::Result<Vec<String>, sqlx::Error>>()?;
-
-    sqlx::query(
-        "UPDATE deployment_targets
-         SET status = 'canceled'
-         WHERE deployment_id = $1
-           AND status IN ('pending', 'dispatched', 'converging')",
-    )
-    .bind(deployment_id)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE deployment_target_state
-         SET dispatched_grants = NULL
-         WHERE deployment_id = $1",
-    )
-    .bind(deployment_id)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE deployments
-         SET status = 'canceled',
-             active = NULL,
-             finished_at = COALESCE(finished_at, now())
-         WHERE id = $1",
-    )
-    .bind(deployment_id)
-    .execute(&mut **tx)
-    .await?;
-
-    Ok((Some(deployment_id), uncertain_nodes))
+    let canceled = cancel_deployment_tx(tx, deployment_id).await?;
+    Ok(canceled.uncertain_nodes)
 }
 
 async fn rollback_target_snapshot(
@@ -2531,7 +3676,7 @@ async fn rollback_target_snapshot(
     target_deployment_id: i64,
 ) -> Result<ModelSnapshot> {
     let target = sqlx::query(
-        "SELECT revision_id, status
+        "SELECT revision_id, status, activation_status
          FROM deployments
          WHERE id = $1",
     )
@@ -2540,9 +3685,10 @@ async fn rollback_target_snapshot(
     .await?
     .ok_or_else(|| StoreError::NotFound(format!("deployment {target_deployment_id}")))?;
     let target_status: String = target.try_get("status")?;
-    if target_status != "succeeded" {
+    let activation_status: String = target.try_get("activation_status")?;
+    if target_status != "succeeded" || activation_status != "activated" {
         return Err(StoreError::Unsupported(format!(
-            "deployment {target_deployment_id} cannot be used as rollback target from status {target_status}"
+            "deployment {target_deployment_id} cannot be used as rollback target from status {target_status}/{activation_status}"
         )));
     }
     let target_revision = revision_to_u64(target.try_get("revision_id")?)?;
@@ -3620,12 +4766,12 @@ async fn insert_rollback_deployment_tx(
     target_deployment_id: i64,
     plan: &DeploymentPlan,
 ) -> Result<(i64, String)> {
-    let status = if plan.summary.changed_targets > 0 {
-        "planned"
-    } else {
-        "succeeded"
-    };
-    let active = (plan.summary.changed_targets > 0).then_some(true);
+    let has_pending = plan
+        .targets
+        .iter()
+        .any(|target| target.status == PlannedTargetStatus::Pending);
+    let status = if has_pending { "planned" } else { "succeeded" };
+    let active = has_pending.then_some(true);
     let warnings = serde_json::to_value(&plan.warnings)?;
     let revision_id = revision_to_i64(plan.revision)?;
     // A rollback deployment writes no kind, taking the default config, and its baseline is
@@ -3661,7 +4807,7 @@ async fn insert_rollback_deployment_tx(
     }
 
     if status == "succeeded" {
-        crate::serving::activate_deployment_tx(tx, deployment_id).await?;
+        refresh_deployment_status(tx, deployment_id, "deferred").await?;
     }
 
     Ok((deployment_id, status.to_owned()))
@@ -4147,6 +5293,7 @@ async fn desired_deployment_from_structure_connection(
     Ok(NodeDesiredDeployment {
         deployment_id,
         node_id,
+        claim_generation: 0,
         wave: u32::try_from(wave)
             .map_err(|_| StoreError::InvalidData("deployment wave is out of range".to_owned()))?,
         actions,
@@ -4178,7 +5325,9 @@ where
     Ok(sqlx::query(
         "SELECT revision_id
          FROM deployments
-         WHERE kind = $1 AND status = 'succeeded'
+         WHERE kind = $1
+           AND status = 'succeeded'
+           AND activation_status = 'activated'
          ORDER BY id DESC
          LIMIT 1",
     )
@@ -4204,6 +5353,7 @@ async fn insert_target(
 
     let target_status = match target.status {
         PlannedTargetStatus::Pending => "pending",
+        PlannedTargetStatus::Deferred => "deferred",
         PlannedTargetStatus::Skipped => "skipped",
     };
     let lifecycle_epoch = crate::lifecycle::current_epoch_tx(tx, &target.node_id).await?;
@@ -4263,7 +5413,197 @@ async fn insert_target(
         .await?;
     }
 
+    if target.status == PlannedTargetStatus::Deferred {
+        let kind: String = sqlx::query_scalar("SELECT kind FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        let kind = DeploymentKind::parse(&kind).ok_or_else(|| {
+            StoreError::InvalidData(format!("deployment {deployment_id} has invalid kind"))
+        })?;
+        let obligation_target = if kind == DeploymentKind::Config {
+            plan_snapshot_deployment(&snapshot, &[])
+                .map_err(plan_error)?
+                .targets
+                .into_iter()
+                .find(|candidate| candidate.node_id == target.node_id)
+                .ok_or_else(|| {
+                    StoreError::InvalidData(format!(
+                        "node {} is absent from deployment {} full desired state",
+                        target.node_id, deployment_id
+                    ))
+                })?
+        } else {
+            target.clone()
+        };
+        for (_, artifact) in obligation_target.desired.artifacts() {
+            insert_artifact_blob(tx, artifact).await?;
+        }
+        let obligation_usage_generation = crate::usage::create_usage_generation_for_target(
+            tx,
+            deployment_id,
+            &target.node_id,
+            &snapshot,
+            &obligation_target.desired,
+            &obligation_target.actions,
+        )
+        .await?;
+        insert_or_supersede_obligation_tx(
+            tx,
+            deployment_id,
+            revision_id,
+            lifecycle_epoch,
+            kind,
+            &obligation_target,
+            obligation_usage_generation,
+        )
+        .await?;
+    }
+
     Ok(())
+}
+
+async fn insert_or_supersede_obligation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: i64,
+    revision_id: i64,
+    lifecycle_epoch: i64,
+    kind: DeploymentKind,
+    target: &PlannedTarget,
+    usage_generation_id: Option<i64>,
+) -> Result<i64> {
+    let previous = sqlx::query(
+        "SELECT source_deployment_id, status
+           FROM node_convergence_obligations
+          WHERE node_id = $1
+            AND kind = $2
+            AND lifecycle_epoch = $3
+            AND status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )
+          ORDER BY generation
+          FOR UPDATE",
+    )
+    .bind(&target.node_id)
+    .bind(kind.as_str())
+    .bind(lifecycle_epoch)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    if previous.iter().any(|row| {
+        row.try_get::<String, _>("status")
+            .is_ok_and(|status| matches!(status.as_str(), "dispatched" | "converging"))
+    }) {
+        mark_node_applied_dirty_tx(
+            tx,
+            deployment_id,
+            &target.node_id,
+            kind,
+            "隔离债务被更新期望取代，旧执行结果不再可信",
+        )
+        .await?;
+    }
+
+    sqlx::query(
+        "UPDATE node_convergence_obligations
+            SET status = 'superseded', superseded_at = now()
+          WHERE node_id = $1
+            AND kind = $2
+            AND lifecycle_epoch = $3
+            AND status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )",
+    )
+    .bind(&target.node_id)
+    .bind(kind.as_str())
+    .bind(lifecycle_epoch)
+    .execute(&mut **tx)
+    .await?;
+
+    let mut old_deployments = BTreeSet::new();
+    for row in previous {
+        let old_deployment_id: i64 = row.try_get("source_deployment_id")?;
+        old_deployments.insert(old_deployment_id);
+        sqlx::query(
+            "UPDATE deployment_targets
+                SET status = 'superseded',
+                    error = '已被隔离节点的更新期望取代'
+              WHERE deployment_id = $1
+                AND node_id = $2
+                AND status IN ('deferred', 'failed-recovered', 'failed-dirty')",
+        )
+        .bind(old_deployment_id)
+        .bind(&target.node_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let desired_structure = desired_structure_json(target)?;
+    let desired_grants = serde_json::to_value(&target.desired.grants)?;
+    let desired_fingerprint = sha256_hex(&serde_json::to_vec(&json!({
+        "structure": desired_structure,
+        "grants": desired_grants,
+    }))?);
+    let generation: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(max(generation), 0) + 1
+           FROM node_convergence_obligations
+          WHERE node_id = $1 AND kind = $2 AND lifecycle_epoch = $3",
+    )
+    .bind(&target.node_id)
+    .bind(kind.as_str())
+    .bind(lifecycle_epoch)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO node_convergence_obligations (
+             node_id, kind, lifecycle_epoch, generation,
+             source_deployment_id, source_revision_id,
+             desired_structure, desired_grants, desired_fingerprint,
+             usage_generation_id, priority, status
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 'pending')",
+    )
+    .bind(&target.node_id)
+    .bind(kind.as_str())
+    .bind(lifecycle_epoch)
+    .bind(generation)
+    .bind(deployment_id)
+    .bind(revision_id)
+    .bind(desired_structure)
+    .bind(desired_grants)
+    .bind(desired_fingerprint)
+    .bind(usage_generation_id)
+    .execute(&mut **tx)
+    .await?;
+
+    for old_deployment_id in old_deployments {
+        if old_deployment_id != deployment_id {
+            store_deployment_settlement_tx(tx, old_deployment_id).await?;
+        }
+    }
+    Ok(generation)
+}
+
+async fn mark_node_applied_dirty_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: i64,
+    node_id: &str,
+    kind: DeploymentKind,
+    reason: &str,
+) -> Result<()> {
+    let state = if kind == DeploymentKind::Config {
+        dirty_reported_state(reason.to_owned())
+    } else {
+        ReportedNodeState {
+            phantun: AppliedArtifactState::Unmanaged,
+            wireguard: AppliedArtifactState::Unmanaged,
+            xray: AppliedArtifactState::Unmanaged,
+            hy2_port_hop: AppliedArtifactState::Unmanaged,
+            grants: AppliedGrantsState::Dirty {
+                reason: reason.to_owned(),
+            },
+        }
+    };
+    upsert_node_applied_state(tx, deployment_id, node_id, &state, kind).await
 }
 
 async fn insert_artifact_blob(
@@ -4519,6 +5859,7 @@ async fn refresh_deployment_status(
             "UPDATE deployments
              SET status = 'halted',
                  active = TRUE,
+                 settlement_status = 'uncertain',
                  started_at = COALESCE(started_at, now()),
                  halted_at = COALESCE(halted_at, now())
              WHERE id = $1",
@@ -4547,6 +5888,7 @@ async fn refresh_deployment_status(
             "UPDATE deployments
              SET status = 'halted',
                  active = TRUE,
+                 settlement_status = 'uncertain',
                  started_at = COALESCE(started_at, now()),
                  halted_at = COALESCE(halted_at, now())
              WHERE id = $1",
@@ -4556,15 +5898,18 @@ async fn refresh_deployment_status(
         .await?;
         Ok("halted".to_owned())
     } else if open_targets == 0 {
+        let settlement_status = refresh_deployment_settlement_tx(tx, deployment_id).await?;
         sqlx::query(
             "UPDATE deployments
              SET status = 'succeeded',
                  active = NULL,
+                 settlement_status = $2,
                  started_at = COALESCE(started_at, now()),
                  finished_at = COALESCE(finished_at, now())
              WHERE id = $1",
         )
         .bind(deployment_id)
+        .bind(settlement_status)
         .execute(&mut **tx)
         .await?;
         crate::serving::activate_deployment_tx(tx, deployment_id).await?;
@@ -4574,6 +5919,17 @@ async fn refresh_deployment_status(
             "UPDATE deployments
              SET status = 'running',
                  active = TRUE,
+                 settlement_status = CASE
+                     WHEN EXISTS (
+                         SELECT 1 FROM node_convergence_obligations obligation
+                          WHERE obligation.source_deployment_id = $1
+                            AND obligation.status IN (
+                                'pending', 'dispatched', 'converging',
+                                'failed-recovered', 'failed-dirty'
+                            )
+                     ) THEN 'debt'
+                     ELSE settlement_status
+                 END,
                  started_at = COALESCE(started_at, now())
              WHERE id = $1",
         )
@@ -4582,6 +5938,47 @@ async fn refresh_deployment_status(
         .await?;
         Ok("running".to_owned())
     }
+}
+
+async fn refresh_deployment_settlement_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: i64,
+) -> Result<&'static str> {
+    let row = sqlx::query(
+        "SELECT EXISTS (
+                    SELECT 1 FROM node_convergence_obligations
+                     WHERE source_deployment_id = $1
+                       AND status IN ('failed-recovered', 'failed-dirty')
+                ) AS uncertain,
+                EXISTS (
+                    SELECT 1 FROM node_convergence_obligations
+                     WHERE source_deployment_id = $1
+                       AND status IN ('pending', 'dispatched', 'converging')
+                ) AS debt",
+    )
+    .bind(deployment_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if row.try_get("uncertain")? {
+        Ok("uncertain")
+    } else if row.try_get("debt")? {
+        Ok("debt")
+    } else {
+        Ok("converged")
+    }
+}
+
+async fn store_deployment_settlement_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: i64,
+) -> Result<String> {
+    let status = refresh_deployment_settlement_tx(tx, deployment_id).await?;
+    sqlx::query("UPDATE deployments SET settlement_status = $2 WHERE id = $1")
+        .bind(deployment_id)
+        .bind(status)
+        .execute(&mut **tx)
+        .await?;
+    Ok(status.to_owned())
 }
 
 fn target_apply_result_name(result: TargetApplyResult) -> &'static str {
@@ -4892,6 +6289,7 @@ pub async fn discard_pending_changes(
         "SELECT revision_id
          FROM deployments
          WHERE status = 'succeeded'
+           AND activation_status = 'activated'
          ORDER BY id DESC
          LIMIT 1",
     )

@@ -14,8 +14,6 @@ import (
 
 const streamDeliveryQueueDepth = 8
 
-var errStreamDeliveryQueueFull = errors.New("anytls: stream delivery queue is full")
-
 type stream struct {
 	sid  uint32
 	link *transport.Link
@@ -30,6 +28,7 @@ type stream struct {
 	forceClosing bool
 
 	deliveryCh        chan buf.MultiBuffer
+	deliverySpace     chan struct{}
 	deliveryStart     sync.Once
 	deliveryStarted   atomic.Bool
 	deliveryStop      chan struct{}
@@ -39,6 +38,7 @@ type stream struct {
 	deliveryDoneMu    sync.Mutex
 	deliveryDoneHook  func()
 	deliveryFinished  bool
+	synAckReceived    atomic.Bool
 
 	isUDP      bool
 	udpTarget  *xnet.Destination
@@ -52,6 +52,7 @@ func newStream(sid uint32, link *transport.Link) *stream {
 		link:          link,
 		done:          make(chan struct{}),
 		deliveryCh:    make(chan buf.MultiBuffer, streamDeliveryQueueDepth),
+		deliverySpace: make(chan struct{}, 1),
 		deliveryStop:  make(chan struct{}),
 		deliveryDrain: make(chan struct{}),
 	}
@@ -80,7 +81,7 @@ func (st *stream) closeWithDelivery(err error, drain bool) {
 		st.hookMu.Unlock()
 		if firstClose {
 			if st.link != nil {
-				common.Close(st.link.Reader)
+				common.Interrupt(st.link.Reader)
 			}
 		}
 		st.deliveryDrainOnce.Do(func() { close(st.deliveryDrain) })
@@ -97,7 +98,7 @@ func (st *stream) closeWithDelivery(err error, drain bool) {
 		st.setCloseError(err, false)
 	}
 	if st.link != nil {
-		common.Close(st.link.Reader)
+		common.Interrupt(st.link.Reader)
 	}
 	st.stopDelivery()
 	if st.link != nil {
@@ -215,20 +216,34 @@ func (st *stream) enqueueDelivery(body buf.MultiBuffer) error {
 		buf.ReleaseMulti(body)
 		return errors.New("anytls: stream delivery is unavailable")
 	}
-	st.hookMu.Lock()
-	if st.closed {
-		st.hookMu.Unlock()
-		buf.ReleaseMulti(body)
-		return io.ErrClosedPipe
+	for {
+		st.hookMu.Lock()
+		if st.closed {
+			st.hookMu.Unlock()
+			buf.ReleaseMulti(body)
+			return io.ErrClosedPipe
+		}
+		select {
+		case st.deliveryCh <- body:
+			st.hookMu.Unlock()
+			return nil
+		default:
+			st.hookMu.Unlock()
+		}
+
+		select {
+		case <-st.deliverySpace:
+		case <-st.deliveryStop:
+			buf.ReleaseMulti(body)
+			return io.ErrClosedPipe
+		}
 	}
+}
+
+func (st *stream) signalDeliverySpace() {
 	select {
-	case st.deliveryCh <- body:
-		st.hookMu.Unlock()
-		return nil
+	case st.deliverySpace <- struct{}{}:
 	default:
-		st.hookMu.Unlock()
-		buf.ReleaseMulti(body)
-		return errStreamDeliveryQueueFull
 	}
 }
 
@@ -241,6 +256,7 @@ func (st *stream) deliveryLoop(deliver func(buf.MultiBuffer) error) {
 		for {
 			select {
 			case body := <-st.deliveryCh:
+				st.signalDeliverySpace()
 				buf.ReleaseMulti(body)
 			default:
 				st.finishDelivery()
@@ -251,6 +267,7 @@ func (st *stream) deliveryLoop(deliver func(buf.MultiBuffer) error) {
 	for {
 		select {
 		case body := <-st.deliveryCh:
+			st.signalDeliverySpace()
 			if err := deliver(body); err != nil {
 				st.close(err)
 				return
@@ -259,6 +276,7 @@ func (st *stream) deliveryLoop(deliver func(buf.MultiBuffer) error) {
 			for {
 				select {
 				case body := <-st.deliveryCh:
+					st.signalDeliverySpace()
 					if err := deliver(body); err != nil {
 						st.close(err)
 						return

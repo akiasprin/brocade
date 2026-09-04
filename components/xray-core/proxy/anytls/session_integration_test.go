@@ -229,6 +229,21 @@ func TestSessionPairUDPOverTCP(t *testing.T) {
 	if got := readPipeExact(t, clientEndpoint.output, len(maxPayload)); !bytes.Equal(got, maxPayload) {
 		t.Fatalf("maximum UDP-over-TCP payload mismatch: got %d bytes", len(got))
 	}
+	emptyPacket := buf.FromBytes(nil)
+	emptyDestination := xnet.UDPDestination(xnet.DomainAddress("dns.example"), 53)
+	emptyPacket.UDP = &emptyDestination
+	if err := clientEndpoint.input.WriteMultiBuffer(buf.MultiBuffer{emptyPacket}); err != nil {
+		t.Fatal(err)
+	}
+	emptyEcho, err := clientEndpoint.output.ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyEcho) != 1 || emptyEcho[0].Len() != 0 || emptyEcho[0].UDP == nil {
+		buf.ReleaseMulti(emptyEcho)
+		t.Fatalf("zero-length UDP-over-TCP packet was not preserved: %+v", emptyEcho)
+	}
+	buf.ReleaseMulti(emptyEcho)
 	clientEndpoint.closeInput()
 	select {
 	case <-stream.done:

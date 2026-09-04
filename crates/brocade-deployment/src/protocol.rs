@@ -13,8 +13,8 @@ use crate::plan::{
 /// response body as a `NodeDesiredDeployment`, and an enum-shaped body fails that outright —
 /// which is deliberate. An agent that silently ignored the `certificate` field would read as
 /// converged while never writing the file.
-pub const AGENT_PROTOCOL_VERSION: u32 = 3;
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 3;
+pub const AGENT_PROTOCOL_VERSION: u32 = 4;
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 4;
 
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
@@ -125,6 +125,10 @@ pub struct CreateRollbackRequest {
 pub struct NodeDesiredDeployment {
     pub deployment_id: i64,
     pub node_id: String,
+    /// Positive for work claimed from an isolation obligation. The report must echo it so an
+    /// older in-flight result cannot settle a newer desired generation for the same node.
+    #[serde(default)]
+    pub claim_generation: u64,
     pub wave: u32,
     pub actions: Vec<PlannedAction>,
     /// Immutable ownership map for the Xray counters created by this work order.  It advances
@@ -297,6 +301,8 @@ pub struct BinarySource {
 pub struct TargetConvergenceReport {
     pub deployment_id: i64,
     pub node_id: String,
+    #[serde(default)]
+    pub claim_generation: u64,
     pub result: TargetApplyResult,
     pub observed_before: ReportedNodeState,
     pub observed_after: ReportedNodeState,
@@ -409,6 +415,12 @@ pub struct DeploymentListItem {
     pub id: i64,
     pub revision_id: u64,
     pub status: String,
+    #[serde(default = "waiting_activation")]
+    pub activation_status: String,
+    #[serde(default = "converged_settlement")]
+    pub settlement_status: String,
+    #[serde(default)]
+    pub activated_at: Option<String>,
     pub active: Option<bool>,
     pub actor: Option<String>,
     // Configuration or grants. The two have to be distinguishable in the list, because they
@@ -433,6 +445,8 @@ pub struct DeploymentListItem {
     pub changed_targets: u64,
     pub skipped_targets: u64,
     pub failed_targets: u64,
+    #[serde(default)]
+    pub debt_targets: u64,
     pub disruptive_targets: u64,
     pub max_wave: u32,
     // Waiting on an operator rather than on machines. A destructive wave requires a
@@ -462,6 +476,14 @@ pub struct DeploymentDetail {
     pub id: i64,
     pub revision_id: u64,
     pub status: String,
+    #[serde(default = "waiting_activation")]
+    pub activation_status: String,
+    #[serde(default = "converged_settlement")]
+    pub settlement_status: String,
+    #[serde(default)]
+    pub activated_at: Option<String>,
+    #[serde(default)]
+    pub debt_targets: u64,
     pub active: Option<bool>,
     pub actor: Option<String>,
     pub note: Option<String>,
@@ -495,9 +517,41 @@ pub struct DeploymentTargetDetail {
     pub dispatched_at: Option<String>,
 }
 
+fn waiting_activation() -> String {
+    "waiting".to_owned()
+}
+
+fn converged_settlement() -> String {
+    "converged".to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolateDeploymentTargetRequest {
+    pub expected_target_status: String,
+    pub reason: String,
+    #[serde(default)]
+    pub acknowledge_uncertain: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreNodeServiceRequest {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeIsolationCommandResult {
+    pub node_id: String,
+    pub isolated: bool,
+    pub affected_deployments: Vec<i64>,
+    pub debt_count: u64,
+    pub serving_generation: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentObservationRequest {
     pub deployment_id: i64,
+    #[serde(default)]
+    pub claim_generation: u64,
     pub result: TargetApplyResult,
     pub observed_before: ReportedNodeState,
     pub observed_after: ReportedNodeState,

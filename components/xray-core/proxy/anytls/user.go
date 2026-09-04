@@ -10,33 +10,42 @@ import (
 
 // AddUser implements proxy.UserManager.AddUser().
 func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
+	return s.addUser(u)
+}
+
+func (s *Server) addUser(u *protocol.MemoryUser) error {
 	if u == nil || u.Account == nil {
 		return errors.New("anytls: invalid user")
+	}
+	if u.Email == "" {
+		return errors.New("anytls: empty email")
 	}
 	acc, ok := u.Account.(*MemoryAccount)
 	if !ok {
 		return errors.New("anytls: invalid account type")
 	}
+	if acc.Password == "" {
+		return errors.New("anytls: empty password")
+	}
 
 	sum := sha256.Sum256([]byte(acc.Password))
 
 	s.userMu.Lock()
-	var sessions []*session
-
-	if prev, ok := s.usersByEmail[u.Email]; ok {
-		sessions = s.detachUserSessionsLocked(prev)
-		prevAcc, ok := prev.Account.(*MemoryAccount)
-		if ok {
-			prevSum := sha256.Sum256([]byte(prevAcc.Password))
-			if prevSum != sum && s.users[prevSum] == prev {
-				delete(s.users, prevSum)
-			}
-		}
+	defer s.userMu.Unlock()
+	if _, exists := s.usersByEmail[u.Email]; exists {
+		return errors.New("anytls: user email already exists")
+	}
+	if _, exists := s.users[sum]; exists {
+		return errors.New("anytls: user password already exists")
+	}
+	if s.users == nil {
+		s.users = make(map[[32]byte]*protocol.MemoryUser)
+	}
+	if s.usersByEmail == nil {
+		s.usersByEmail = make(map[string]*protocol.MemoryUser)
 	}
 	s.users[sum] = u
 	s.usersByEmail[u.Email] = u
-	s.userMu.Unlock()
-	closeUserSessions(sessions)
 	return nil
 }
 

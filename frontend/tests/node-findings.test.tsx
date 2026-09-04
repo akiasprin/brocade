@@ -66,6 +66,28 @@ describe('WireGuard runtime finding', () => {
     expect(finding?.tone).toBe('warn');
   });
 
+  it('hides an unreachable peer only while that peer is operationally isolated', () => {
+    const value = node(true);
+    value.wireguard_health = {
+      enabled: true,
+      error: null,
+      peers: [
+        {
+          peer_node_id: 'akko-lon',
+          overlay_ip: '10.66.0.11',
+          handshake_age_secs: 302_867,
+          status: 'down',
+          detail: '握手 302867 秒前，且 10.66.0.11 探不通——隧道断了',
+        },
+      ],
+    };
+
+    expect(runtimeFindings(value, undefined, new Set(['akko-lon'])).some(item => item.chip.startsWith('WG '))).toBe(
+      false,
+    );
+    expect(runtimeFindings(value, undefined, new Set()).some(item => item.chip === 'WG 断链 1')).toBe(true);
+  });
+
   it('does not report healthy peers or stale health after WireGuard is disabled', () => {
     const value = node(true);
     value.wireguard_health = {

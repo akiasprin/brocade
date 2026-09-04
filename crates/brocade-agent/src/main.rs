@@ -1041,6 +1041,9 @@ const USAGE_INTERVAL: Duration = Duration::from_secs(30);
 /// upstream link and typically holds for hours. A shorter interval only adds traffic on
 /// both ends.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Runtime state is also a service re-entry gate for isolated nodes. Keep it fresh enough that an
+/// administrator does not have to wait for the path-MTU probe cadence after debt has converged.
+const RUNTIME_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_TARGETS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Host sampling. Shorter than every other cycle by necessity: CPU is differenced over this
 /// interval, and a 30-second difference averages a spike away, while spikes are the dominant
@@ -1282,7 +1285,7 @@ fn run_forever(options: Options) -> Result<(), String> {
                         }
                     });
                     let now = Instant::now();
-                    tick = next_periodic_tick(tick, PROBE_INTERVAL, now);
+                    tick = next_periodic_tick(tick, RUNTIME_INTERVAL, now);
                     thread::sleep(tick.saturating_duration_since(now));
                 }
             })
@@ -1725,6 +1728,7 @@ fn apply_once_inner(
 
     let report = AgentObservationRequest {
         deployment_id: desired.deployment_id,
+        claim_generation: desired.claim_generation,
         result,
         observed_before: before,
         observed_after: after,

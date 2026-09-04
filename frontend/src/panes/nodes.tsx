@@ -23,6 +23,7 @@ import {
   monthBytes,
   issueNodeToken,
   provisionNode,
+  restoreNodeService,
   setNodeCertGroup,
   setNodeStatus,
   setWireGuardLinkDisabled,
@@ -83,7 +84,7 @@ import type { AppIr } from '../topo/model';
 // 纳管分两个阶段，中间是一次不可逆的写库：
 // `provision` 是填写信息（此时机器尚未创建），`install` 是为已创建的机器安装 agent。
 // 因此 install 的标识是 node_id——它会进入地址栏，切换后返回仍可定位；
-// `result` 只是创建流程返回的一次性响应，重新进入后不再存在（见 ProvisionResult）。
+// `result` 只是创建流程返回的一次性响应，重新进入后不再存在（见 ProvisionInstall）。
 export type Drill =
   | { p: 'list' }
   | { p: 'node'; id: string }
@@ -300,16 +301,6 @@ function Hot({ children }: { children: ReactNode }) {
   );
 }
 
-function IpValue({ value, nat }: { value: string | null; nat: boolean }) {
-  if (!value) return <span className="dim">—</span>;
-  return (
-    <>
-      {value}
-      {nat && ' (NAT)'}
-    </>
-  );
-}
-
 /* ⑤ 双列表的一行。注解通过标签的 title 提供，不附加在值之后——值列只放数据 */
 function Row({ k, hint, children }: { k: string; hint?: string; children: ReactNode }) {
   return (
@@ -398,6 +389,14 @@ const parseHopSubject = (subject: string) => {
 
 /** 列表排序用的标签，与卡片上 `<b>` 渲染的是同一个值。 */
 const nodeLabel = (n: NodeAgentStateItem) => n.name || n.node_id;
+
+/** 隔离原因原文留在数据库作为审计记录；横条只显示能放进一句话的业务摘要。 */
+function isolationReasonSummary(reason: string | null | undefined): string {
+  const value = reason?.trim();
+  if (!value) return '节点暂不可用';
+  if (value === '节点长期不可达，隔离并继续发布') return '节点长期失联';
+  return value.replace(/[。！？.!?；;]+$/, '');
+}
 
 /* `numeric` 是必须的：字典序下 `tokyo-iij-10` 会排在 `tokyo-iij-2` 前面，机器名普遍带编号。
    指定 zh 让中文名走拼音序而不是码点序（代价是中日韩字符整体排在拉丁字母之前，
@@ -506,6 +505,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   );
   const live = list.filter(n => !n.retired_at);
   const retired = list.filter(n => !!n.retired_at);
+  const isolatedNodeIds = new Set(list.filter(n => n.operationally_isolated).map(n => n.node_id));
   const alive = live.filter(n => pollTone(n) === 'ok').length;
   const offline = live.filter(n => pollTone(n) === 'bad').length;
   const idle = live.filter(n => pollTone(n) === 'idle').length;
@@ -577,6 +577,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
         <NodeCard
           key={n.node_id}
           node={n}
+          isolatedNodeIds={isolatedNodeIds}
           series={seriesOf.get(n.node_id)}
           load={loadOf.get(n.node_id)}
           pingProbe={pingProbeOf.get(n.node_id)}
@@ -647,7 +648,11 @@ type NodeLampState = {
 
 /** 节点列表和详情书签共用的状态灯。在线状态优先，失联后不再用旧上报里的
  * finding 推断当前状态；detailOnly 只是详情说明，不改变灯色。 */
-function nodeLampState(node: NodeAgentStateItem, wireguardEnabled?: boolean): NodeLampState {
+function nodeLampState(
+  node: NodeAgentStateItem,
+  wireguardEnabled?: boolean,
+  isolatedNodeIds?: ReadonlySet<string>,
+): NodeLampState {
   if (node.lifecycle_phase === 'retiring') return { tone: 'warn', why: '退役中：等待停用收敛' };
   if (node.lifecycle_phase === 'retired') {
     return node.lifecycle_last_error
@@ -655,12 +660,21 @@ function nodeLampState(node: NodeAgentStateItem, wireguardEnabled?: boolean): No
       : { tone: 'idle', why: '已退役并确认停用' };
   }
   if (node.lifecycle_phase === 'abandoned') return { tone: 'bad', why: '强制退役：未确认远端停用' };
+  if (node.operationally_isolated) {
+    return {
+      tone: 'warn',
+      why:
+        node.convergence_debt_count > 0
+          ? `已隔离：${node.convergence_debt_count} 项收敛债务`
+          : '已隔离：等待管理员恢复服务',
+    };
+  }
 
   const live = pollTone(node);
   if (live === 'idle') return { tone: 'idle', why: '从未上报' };
   if (live === 'bad') return { tone: 'bad', why: '失联' };
 
-  const findings = runtimeFindings(node, wireguardEnabled).filter(f => !f.detailOnly);
+  const findings = runtimeFindings(node, wireguardEnabled, isolatedNodeIds).filter(f => !f.detailOnly);
   if (findings.length === 0) return { tone: 'ok', why: '没有要处理的' };
 
   return {
@@ -723,6 +737,7 @@ function NodeAddr({ node }: { node: NodeAgentStateItem }) {
  */
 function NodeCard({
   node,
+  isolatedNodeIds,
   load,
   pingProbe,
   pingProbeReady,
@@ -734,6 +749,7 @@ function NodeCard({
   go,
 }: {
   node: NodeAgentStateItem;
+  isolatedNodeIds: ReadonlySet<string>;
   /** 该机器的近期负载。undefined 表示尚未读取，或当前控制面版本没有该端点 */
   load?: NodeLoadView;
   /** 近一小时 Ping 读数；配置 TCP 目标后在卡片右下角替换 IP。 */
@@ -753,7 +769,7 @@ function NodeCard({
   const narrow = useNarrow();
   const live = pollTone(node);
   // 具体项写入 title，悬停即可在扫视列表时确认黄/红色对应的问题。
-  const lamp = nodeLampState(node);
+  const lamp = nodeLampState(node, undefined, isolatedNodeIds);
 
   const open = () => (selecting ? onPick() : go({ p: 'node', id: node.node_id }));
   return (
@@ -980,7 +996,7 @@ export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onC
 // 不分成两个常量，避免「拉了 12 格却为 24 格留位」这类错位。
 const LIST_NIC_WINDOWS = 24;
 const LIST_NIC_WINDOW_SECS = 30;
-// 上一版的最低尺度是 1 Mb/s。改为每窗口字节数后做等价换算，避免只因换单位就改变曲线高度。
+// 上一版的最低尺度是 1 Mbit/s。改为每窗口字节数后做等价换算，避免只因换单位就改变曲线高度。
 const LIST_NIC_MIN_CEILING_BYTES = (1_000_000 * LIST_NIC_WINDOW_SECS) / 8;
 // usage 查询仍需要一个近期窗口参数，但列表现在只读其中的本月累计字段。
 const LIST_USAGE_WINDOW_SECS = 5 * 60;
@@ -1038,7 +1054,7 @@ function smoothPath(xs: number[], ys: number[]): string {
  * 其他网络流量。下方「本月」仍是计费用量，两者的口径由各自标签明确区分。
  *
  * Y 轴从 0 到 `max(3.75 MB / 30s 窗口, 本机近期峰值)`，不再拿全页最忙的机器当公共上限。
- * 该下限与原来的 1 Mb/s 等价，避免将系统心跳放大成满幅波峰。卡片只表达该机自身的流量趋势，
+ * 该下限与原来的 1 Mbit/s 等价，避免将系统心跳放大成满幅波峰。卡片只表达该机自身的流量趋势，
  * 极值圆点悬停显示的是字节/窗口，不是 bit/s。`has_gap` 样本的速率不可比，直接断线，
  * 不补 0（补 0 会把「无法测量」说成「实际没有流量」）。 */
 function p95(values: number[]): number | null {
@@ -2415,7 +2431,11 @@ function xrayVer(raw: string | null | undefined): [number, number] | null {
 /** `geodata` 自动更新合入主线的版本。低于该版本的 xray 会忽略该段配置且不报错。 */
 const XRAY_GEODATA_MIN: [number, number] = [26, 4];
 
-export function runtimeFindings(node: NodeAgentStateItem, wireguardEnabled?: boolean): Finding[] {
+export function runtimeFindings(
+  node: NodeAgentStateItem,
+  wireguardEnabled?: boolean,
+  isolatedNodeIds?: ReadonlySet<string>,
+): Finding[] {
   const out: Finding[] = [];
   const v = node.runtime_versions;
 
@@ -2469,7 +2489,10 @@ export function runtimeFindings(node: NodeAgentStateItem, wireguardEnabled?: boo
         text: <>agent 无法读取 WireGuard 运行态：{wg.error}</>,
       });
     } else {
-      const down = wg.peers.filter(peer => peer.status === 'down');
+      // 隔离已经是对该节点不可达的业务处置。原始健康数据仍保存在控制面供审计，
+      // 界面不再在每台健康节点上重复展示指向该隔离节点的同一条断链 finding。
+      const visiblePeers = wg.peers.filter(peer => !isolatedNodeIds?.has(peer.peer_node_id));
+      const down = visiblePeers.filter(peer => peer.status === 'down');
       if (down.length > 0) {
         out.push({
           tone: 'warn',
@@ -2486,7 +2509,7 @@ export function runtimeFindings(node: NodeAgentStateItem, wireguardEnabled?: boo
           ),
         });
       }
-      const unknown = wg.peers.filter(peer => peer.status === 'unknown');
+      const unknown = visiblePeers.filter(peer => peer.status === 'unknown');
       if (unknown.length > 0) {
         out.push({
           tone: 'warn',
@@ -3466,6 +3489,7 @@ function RuntimeCard({
   agentStartedAt,
   revisionOf,
   wireguardEnabled,
+  isolatedNodeIds,
   children,
 }: {
   node: NodeAgentStateItem;
@@ -3473,6 +3497,7 @@ function RuntimeCard({
   agentStartedAt: number | null;
   revisionOf: (d: number) => number | undefined;
   wireguardEnabled: boolean;
+  isolatedNodeIds: ReadonlySet<string>;
   children?: ReactNode;
 }) {
   return (
@@ -3491,7 +3516,7 @@ function RuntimeCard({
           `chip !== '自修失败'` 再来一份，两个集合相交——「丢了 …」这类同时命中两个条件，
           在同一屏上渲染两次。合并后不再需要筛选，各条判定只出现一次。
           放在条件分支外：从未收敛过的机器同样需要这些提示。 */}
-      <Findings list={runtimeFindings(node, wireguardEnabled)} />
+      <Findings list={runtimeFindings(node, wireguardEnabled, isolatedNodeIds)} />
       {/* 验证结果仍留在卡内：页头的「验证接入」调用同一接口，不再产生另一块重复结果。 */}
       {children}
     </div>
@@ -3745,6 +3770,7 @@ function NodeDetailLayout({
                 {nodeLifecycleLabel(node)}
               </span>
             )}
+            {node.operationally_isolated && <span className="st st-gold">已隔离</span>}
           </div>
           {identIp && <span className="nd-ident-meta">{identIp}</span>}
         </div>
@@ -3781,8 +3807,9 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   const n = nodes.data?.nodes.find(x => x.node_id === id);
   /* 签发的 node token 同样只显示一次 */
   const [issued, setIssued] = useState<{ token: string; install_command: string } | null>(null);
-  const [lifecycleAction, setLifecycleAction] = useState<'retire' | 'restore' | 'abandon' | null>(null);
+  const [lifecycleAction, setLifecycleAction] = useState<'retire' | 'restore' | 'abandon' | 'serviceRestore' | null>(null);
   const [forceReason, setForceReason] = useState('');
+  const [serviceRestoreReason, setServiceRestoreReason] = useState('节点已完成补偿并通过运行状态检查');
 
   // 身份表单始终可编辑，不再设置「改名称 / 公网 IP」开关。
   // 取消编辑模式不会导致误改：不保存则不生效，且「保存到草稿」只在有修改时出现。
@@ -3855,6 +3882,14 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
       qc.invalidateQueries({ queryKey: ['nodes'] });
       qc.invalidateQueries({ queryKey: ['deployments'] });
       qc.invalidateQueries({ queryKey: ['snapshot'] });
+    },
+  });
+  const serviceRestore = useMutation({
+    mutationFn: (reason: string) => restoreNodeService(id, reason),
+    onSuccess: () => {
+      setLifecycleAction(null);
+      refresh();
+      qc.invalidateQueries({ queryKey: ['deployments'] });
     },
   });
 
@@ -3937,6 +3972,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   // turning WG off removes the backend warning immediately, before the draft is committed and
   // before the agent's next half-hourly runtime report clears its old observation.
   const wireguardEnabled = snapshot.data?.snapshot.nodes?.find(modelNode => modelNode.id === id)?.overlay ?? n.overlay;
+  const isolatedNodeIds = new Set((nodes.data?.nodes ?? []).filter(node => node.operationally_isolated).map(node => node.node_id));
   const wgListenPort =
     snapshot.data?.snapshot.nodes?.find(modelNode => modelNode.id === id)?.wireguard?.listen_port ?? null;
 
@@ -3969,8 +4005,8 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   /* 观测页的角标数。此处不按 `detailOnly` 过滤：那个标记的含义是「列表里不占标记位，
      进详情页才读」，而这里就是详情页——角标指向的正是它下面那几张卡里会展开的说明。
      跳不通与 finding 合计成一个数：两者在这一页上是同一件事，「有几处要看」。 */
-  const findingCount = runtimeFindings(n, wireguardEnabled).length + dead.length;
-  const lamp = nodeLampState(n, wireguardEnabled);
+  const findingCount = runtimeFindings(n, wireguardEnabled, isolatedNodeIds).length + dead.length;
+  const lamp = nodeLampState(n, wireguardEnabled, isolatedNodeIds);
 
   /* A1 页头：身份、页签与操作共用 sheet 内的一条横梁，当前页由满宽底部刻度标记。 */
   const detailToolbar = (
@@ -4176,6 +4212,66 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
           }
         />
       )}
+      {lifecycleAction === 'serviceRestore' && (
+        <Confirm
+          title={`恢复 ${nodeLabel(n)} 的服务入口？`}
+          confirmLabel={serviceRestore.isPending ? '正在恢复…' : '恢复服务'}
+          danger={false}
+          confirmDisabled={serviceRestore.isPending || serviceRestoreReason.trim().length === 0}
+          onCancel={() => setLifecycleAction(null)}
+          onConfirm={() => serviceRestore.mutate(serviceRestoreReason.trim())}
+          body={
+            <div className="node-lifecycle-confirm">
+              <p>节点会重新进入订阅入口和转发拓扑。生命周期不会改变，隔离与恢复记录会保留。</p>
+              <label className="field">
+                <span>恢复原因</span>
+                <textarea
+                  className="f"
+                  rows={3}
+                  value={serviceRestoreReason}
+                  onChange={event => setServiceRestoreReason(event.target.value)}
+                />
+              </label>
+              {serviceRestore.error && <ErrorBox error={serviceRestore.error} />}
+            </div>
+          }
+        />
+      )}
+      {n.operationally_isolated && (
+        <div className="callout warn node-isolation-banner">
+          <div className="node-isolation-copy" title={n.isolation_reason ?? undefined}>
+            <b>
+              已隔离
+              {n.isolated_at && (
+                <>
+                  {' '}
+                  <Ago at={n.isolated_at} />
+                </>
+              )}
+            </b>
+            ：{isolationReasonSummary(n.isolation_reason)}，已停止承载流量；
+            {n.convergence_debt_count > 0
+              ? `${pollTone(n) === 'ok' ? '' : '重新上线并'}同步剩余 ${n.convergence_debt_count} 项配置后`
+              : n.service_reentry_ready
+                ? '当前已满足恢复条件'
+                : `${pollTone(n) === 'ok' ? '状态恢复' : '重新上线'}后`}
+            ，可由管理员恢复服务。
+          </div>
+          <div className="toolbar">
+            <button
+              className="btn primary"
+              disabled={!system || !n.service_reentry_ready || serviceRestore.isPending}
+              onClick={() => {
+                serviceRestore.reset();
+                setServiceRestoreReason('节点已完成补偿并通过运行状态检查');
+                setLifecycleAction('serviceRestore');
+              }}
+            >
+              恢复服务
+            </button>
+          </div>
+        </div>
+      )}
       {issued && (
         <div className="callout warn">
           <b>{id}</b> 的 node token —— 只显示这一次：
@@ -4208,8 +4304,8 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
         </div>
       )}
 
-      {(issue.error || verify.error || retire.error || abandon.error) && (
-        <ErrorBox error={issue.error ?? verify.error ?? retire.error ?? abandon.error} />
+      {(issue.error || verify.error || retire.error || abandon.error || serviceRestore.error) && (
+        <ErrorBox error={issue.error ?? verify.error ?? retire.error ?? abandon.error ?? serviceRestore.error} />
       )}
 
       {tab === 'observed' && (
@@ -4228,6 +4324,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
             agentStartedAt={load.data?.processes.find(p => p.proc === 'agent')?.started_at_unix_secs ?? null}
             revisionOf={revisionOf}
             wireguardEnabled={wireguardEnabled}
+            isolatedNodeIds={isolatedNodeIds}
           >
             {verify.data && (
               <div className={verify.data.converged ? 'callout blue' : 'callout warn'} style={{ marginBottom: 0 }}>
@@ -4380,20 +4477,19 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 // （一条命令加一个状态指示）。步骤条表达的当前进度由这两种状态本身表示——页面标题从
 // 「纳管向导 · 新机器」变为「纳管向导 · hk-01」，比高亮第几格更直接。
 //
-// 此前分为五步，其中第 2、3 屏（store 补全、诊断）显示的是创建时的响应，从地址栏
-// 返回后不再存在，代码中还需要额外的提示说明这两屏只出现一次。它们是结果而非操作步骤，
-// 现已收入结果卡的折叠区。
+// 此前分为五步，其中第 2、3 屏显示 store 补全字段和编译诊断。它们只是创建回显，
+// 既不是后续操作，也会迫使用户确认一次“完成”；创建成功后现直接进入安装与上线步骤。
 //
 // 与建链向导的主要差异：建链向导写入的全部是草稿，提交前可随时丢弃；此处的按钮
 // 点击后立即写库并产生一版修订，没有草稿也无法撤销。因此主按钮不使用「提交」，
 // 页脚的提示文字也不是装饰性内容。
 
 function Provision({ drill, go }: { drill: WizDrill; go: (d: Drill) => void }) {
-  // 存在 node 表示机器已入库，本屏切换为结果卡；
+  // 存在 node 表示机器已入库，本屏切换为安装与上线页；
   // result 是创建时的响应，从地址栏返回时不存在。
   const node = drill.p === 'install' ? drill.node : null;
   const result = drill.p === 'install' ? drill.result : undefined;
-  if (node) return <ProvisionResult node={node} result={result} go={go} />;
+  if (node) return <ProvisionInstall node={node} result={result} go={go} />;
   return <ProvisionForm go={go} />;
 }
 
@@ -4469,8 +4565,8 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
     onSuccess: result => {
       qc.invalidateQueries({ queryKey: ['nodes'] });
       qc.invalidateQueries({ queryKey: ['revisions'] });
-      // 该操作完成后机器已入库，修订号也递增一版。此后的标识是 node_id：
-      // 此时切换离开再返回，进入的是结果卡而非空白表单。
+      // 该操作完成后机器已入库，直接进入唯一仍需处理的安装页。明文 token 只能在这次
+      // 响应中取得，不能为了“返回详情”而丢掉；页面不再展示创建字段或修订摘要。
       go({ p: 'install', node: result.node.id, step: 2, result });
     },
   });
@@ -4771,15 +4867,14 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
 
 // 第二种状态：机器已入库，但尚未上线。
 //
-// 一张卡包含两项内容——在机器上执行安装命令、等待其首次心跳——另有一个折叠区显示
-// store 补全的字段和编译诊断。这两项都是创建时的回显，从地址栏返回后不再存在；
-// 收入折叠区而非各占一屏，是因为它们仅供参考，不是需要执行的操作。
+// 页面只保留后续操作：在机器上执行安装命令、等待首次心跳、确认证书。创建字段、修订号
+// 和编译诊断不在成功后重复展示；当前配置与诊断分别由机器详情和全局诊断入口承载。
 //
 // 明文 token 只存在于创建时的响应中：服务端只保存 hash 和前缀
 // （brocade-store/src/agent.rs），无法再次获取。因此命令区分两种情况——
 // 从创建流程直接进入的显示完整命令；从地址栏返回的提供重签按钮，
 // 签发新 token 后旧 token 立即失效（旧 token 未被获取过）。
-function ProvisionResult({ node, result, go }: { node: string; result?: ProvisionNodeResult; go: (d: Drill) => void }) {
+function ProvisionInstall({ node, result, go }: { node: string; result?: ProvisionNodeResult; go: (d: Drill) => void }) {
   const { who } = useSession();
   const system = can(who.role, 'system');
   const qc = useQueryClient();
@@ -4789,11 +4884,6 @@ function ProvisionResult({ node, result, go }: { node: string; result?: Provisio
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 3_000 });
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   const current = revisions.data?.current_revision;
-  const compile = useQuery({
-    queryKey: ['compile', current],
-    queryFn: () => fetchCompileView(current!),
-    enabled: !!current,
-  });
   const [reissued, setReissued] = useState<{ token: string; install_command: string; token_prefix: string } | null>(
     null,
   );
@@ -4841,8 +4931,6 @@ function ProvisionResult({ node, result, go }: { node: string; result?: Provisio
   const certFailed = certGroup?.certificates.find(c => c.status === 'failed');
 
   const target = result?.revision_id ?? current;
-  const summary = compile.data?.summary;
-
   return (
     <>
       <div className="chain-hd">
@@ -4850,16 +4938,6 @@ function ProvisionResult({ node, result, go }: { node: string; result?: Provisio
         <span className="subid mono">
           {nodeLabel} / {node}
         </span>
-      </div>
-
-      <div className="callout blue" style={{ marginBottom: 14 }}>
-        <b>{nodeLabel} 已经进库</b>
-        {result ? (
-          <>
-            ，盖出<b>修订 {result.revision_id}</b>
-          </>
-        ) : null}
-        。下面两件事做完它才真的上线。
       </div>
 
       <div className="wz-hops">
@@ -4983,57 +5061,7 @@ function ProvisionResult({ node, result, go }: { node: string; result?: Provisio
         )}
       </div>
 
-      {/* 创建时的回显和当前编译诊断。收入折叠区：它们仅供参考，不是需要执行的操作。 */}
-      <details className="wz-adv">
-        <summary>
-          store 替这台补了什么
-          {summary ? `（编译 ${summary.errors} 错 · ${summary.warnings} 警）` : ''}
-        </summary>
-        {result ? (
-          <ul className="wz-ops">
-            <li>
-              <span className="op">overlay</span>
-              <span className="arg">{result.node.overlay_addr}/32</span>
-            </li>
-            <li>
-              <span className="op">公网 IPv4</span>
-              <span className="arg">
-                <IpValue value={result.node.public_ipv4} nat={result.node.public_ipv4_nat} />
-              </span>
-            </li>
-            <li>
-              <span className="op">公网 IPv6</span>
-              <span className="arg">
-                <IpValue value={result.node.public_ipv6} nat={result.node.public_ipv6_nat} />
-              </span>
-            </li>
-            <li>
-              <span className="op">wg 公钥</span>
-              <span className="arg">{result.node.wg_public_key}</span>
-            </li>
-            <li>
-              <span className="op">私钥</span>
-              <span className="arg">已 clamp 并落库，不下发</span>
-            </li>
-            <li>
-              <span className="op">盖出修订</span>
-              <span className="arg">修订 {result.revision_id}</span>
-            </li>
-          </ul>
-        ) : (
-          <p className="note">
-            以上为创建时的回显，只显示一次。当前状态见 <a onClick={() => go({ p: 'node', id: node })}>它的详情页</a>。
-          </p>
-        )}
-        {summary && summary.errors > 0 && (
-          <p className="note warn">编译有 {summary.errors} 条错误，发布会被阻止。诊断见顶栏徽章。</p>
-        )}
-      </details>
-
       <div className="wz-foot">
-        <span className="note">
-          纳管会变更<b>所有机器的对端表</b>。不断线，一次推送完成。
-        </span>
         <span className="sp" />
         <button className="btn" onClick={() => go({ p: 'list' })}>
           回机器列表

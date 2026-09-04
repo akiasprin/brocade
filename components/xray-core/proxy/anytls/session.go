@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -31,10 +32,15 @@ type session struct {
 	fw       *frameWriter
 
 	writeMu sync.Mutex
+	openMu  sync.Mutex
 	stateMu sync.RWMutex
 
 	streamsMu sync.Mutex
 	streams   map[uint32]*stream
+	// lastPeerSID is the greatest stream ID accepted from client SYN frames.
+	// The session reader is the only writer; streamsMu keeps tests and future
+	// readers from observing it independently of the stream maps.
+	lastPeerSID uint32
 	// drainingStreams keeps FIN-closed streams reachable until their queued
 	// inbound payloads have been delivered or the session is force-closed.
 	drainingStreams map[uint32]*stream
@@ -45,10 +51,11 @@ type session struct {
 	synAckSupported atomic.Bool
 	seq             uint64
 
-	server           *Server
-	dispatcher       routing.Dispatcher
-	handshakeDone    bool
-	clientPaddingMD5 string
+	server                 *Server
+	dispatcher             routing.Dispatcher
+	handshakeDone          bool
+	serverSettingsReceived bool
+	clientPaddingMD5       string
 
 	client       *Client
 	nextSID      atomic.Uint32
@@ -93,6 +100,16 @@ func (s *session) setHandshakeDone() {
 	s.stateMu.Unlock()
 }
 
+func (s *session) markServerSettingsReceived() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.serverSettingsReceived {
+		return false
+	}
+	s.serverSettingsReceived = true
+	return true
+}
+
 func (s *session) setClientPaddingMD5(value string) {
 	s.stateMu.Lock()
 	s.clientPaddingMD5 = value
@@ -131,6 +148,9 @@ func (s *session) handlePSH(ctx context.Context, st *stream, br *buf.BufferedRea
 
 	s.startStreamDelivery(st)
 	if err := st.enqueueDelivery(body); err != nil {
+		if err == io.ErrClosedPipe {
+			return nil
+		}
 		return err
 	}
 	return nil
@@ -298,7 +318,12 @@ func (s *session) handleUDPData(st *stream, data []byte) error {
 			}
 			payload := bytes.Clone(st.uotBuffer[2 : 2+length])
 			st.uotBuffer = st.uotBuffer[2+length:]
-			if err := st.link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
+			packet := buf.FromBytes(payload)
+			if st.udpTarget != nil {
+				destination := *st.udpTarget
+				packet.UDP = &destination
+			}
+			if err := st.link.Writer.WriteMultiBuffer(buf.MultiBuffer{packet}); err != nil {
 				return err
 			}
 			continue
@@ -390,8 +415,7 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 	st := s.streams[sid]
 	s.streamsMu.Unlock()
 	defer func() {
-		s.finishStream(sid, nil)
-		if !s.isClosed() {
+		if s.finishStream(sid, nil) && !s.isClosed() {
 			_ = s.sendFrame(newFrame(cmdFIN, sid))
 		}
 	}()
@@ -445,6 +469,9 @@ func (s *session) close(err error) {
 	}
 	s.streams = make(map[uint32]*stream)
 	s.drainingStreams = make(map[uint32]*stream)
+	if s.client != nil {
+		s.activeStreams.Store(0)
+	}
 	s.streamsMu.Unlock()
 
 	for _, st := range streams {
@@ -473,8 +500,34 @@ func closeTransportLink(link *transport.Link) {
 	if link == nil {
 		return
 	}
-	common.Close(link.Reader)
+	common.Interrupt(link.Reader)
 	common.Close(link.Writer)
+}
+
+func (s *session) signalSYNACK(sid uint32, result error) {
+	s.synAckMu.Lock()
+	ch := s.synAckCh[sid]
+	s.synAckMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- result:
+	default:
+	}
+}
+
+func (s *session) reservePeerStreamID(sid uint32) error {
+	s.streamsMu.Lock()
+	defer s.streamsMu.Unlock()
+	if sid == 0 {
+		return errors.New("anytls: SYN stream ID must not be zero")
+	}
+	if sid <= s.lastPeerSID {
+		return errors.New("anytls: SYN stream ID must increase, got ", sid, " after ", s.lastPeerSID)
+	}
+	s.lastPeerSID = sid
+	return nil
 }
 
 func (s *session) finishStream(sid uint32, err error) bool {
@@ -605,6 +658,101 @@ func (s *session) sendStreamData(sid uint32, data buf.MultiBuffer) error {
 	return s.writeFramesLocked(sid, data, packetIndex, paddingEnabled)
 }
 
+func validateIncomingFrame(isClient bool, cmd byte, sid uint32, length int) error {
+	switch cmd {
+	case cmdWaste:
+		return nil
+	case cmdSYN:
+		if isClient {
+			return fmt.Errorf("anytls: unexpected SYN from server")
+		}
+		if sid == 0 {
+			return fmt.Errorf("anytls: SYN stream ID must not be zero")
+		}
+		if length != 0 {
+			return fmt.Errorf("anytls: SYN body must be empty")
+		}
+	case cmdPSH:
+		if sid == 0 {
+			return fmt.Errorf("anytls: PSH stream ID must not be zero")
+		}
+		if length == 0 {
+			return fmt.Errorf("anytls: PSH frame with empty payload, streamId=%d", sid)
+		}
+	case cmdFIN:
+		if sid == 0 {
+			return fmt.Errorf("anytls: FIN stream ID must not be zero")
+		}
+		if length != 0 {
+			return fmt.Errorf("anytls: FIN body must be empty")
+		}
+	case cmdSettings:
+		if isClient {
+			return fmt.Errorf("anytls: unexpected cmdSettings from server")
+		}
+		if sid != 0 {
+			return fmt.Errorf("anytls: Settings stream ID must be zero")
+		}
+		if length == 0 {
+			return fmt.Errorf("anytls: Settings body must not be empty")
+		}
+	case cmdAlert:
+		if !isClient {
+			return fmt.Errorf("anytls: unexpected Alert from client")
+		}
+		if sid != 0 {
+			return fmt.Errorf("anytls: Alert stream ID must be zero")
+		}
+	case cmdUpdatePaddingScheme:
+		if !isClient {
+			return fmt.Errorf("anytls: unexpected UpdatePaddingScheme from client")
+		}
+		if sid != 0 {
+			return fmt.Errorf("anytls: UpdatePaddingScheme stream ID must be zero")
+		}
+		if length == 0 {
+			return fmt.Errorf("anytls: empty padding update")
+		}
+	case cmdSYNACK:
+		if !isClient {
+			return fmt.Errorf("anytls: unexpected SYNACK from client")
+		}
+		if sid == 0 {
+			return fmt.Errorf("anytls: SYNACK stream ID must not be zero")
+		}
+	case cmdHeartRequest, cmdHeartResponse:
+		if sid != 0 {
+			return fmt.Errorf("anytls: heartbeat stream ID must be zero")
+		}
+		if length != 0 {
+			return fmt.Errorf("anytls: heartbeat body must be empty")
+		}
+	case cmdServerSettings:
+		if !isClient {
+			return fmt.Errorf("anytls: unexpected ServerSettings from client")
+		}
+		if sid != 0 {
+			return fmt.Errorf("anytls: ServerSettings stream ID must be zero")
+		}
+		if length == 0 {
+			return fmt.Errorf("anytls: ServerSettings body must not be empty")
+		}
+	}
+	return nil
+}
+
+func (s *session) rejectIncomingFrame(length int, frameErr error) error {
+	if length > 0 {
+		if err := discardBytes(s.br, length); err != nil {
+			return err
+		}
+	}
+	if !s.isClient {
+		_ = s.sendFrame(&frame{cmd: cmdAlert, sid: 0, data: []byte(frameErr.Error())})
+	}
+	return frameErr
+}
+
 func (s *session) readLoop(ctx context.Context) error {
 	var head [7]byte
 	for {
@@ -620,6 +768,9 @@ func (s *session) readLoop(ctx context.Context) error {
 		sid := binary.BigEndian.Uint32(head[1:5])
 		length := int(binary.BigEndian.Uint16(head[5:7]))
 		//errors.LogDebug(ctx, "anytls: received frame cmd=", cmd, " streamId=", sid, " length=", length)
+		if frameErr := validateIncomingFrame(s.isClient, cmd, sid, length); frameErr != nil {
+			return s.rejectIncomingFrame(length, frameErr)
+		}
 		switch cmd {
 		case cmdWaste:
 			if length > 0 {
@@ -695,6 +846,14 @@ func (s *session) readLoop(ctx context.Context) error {
 					_ = s.sendFrame(alert)
 					return errors.New("anytls: client did not send its settings")
 				}
+				if idErr := s.reservePeerStreamID(sid); idErr != nil {
+					if length > 0 {
+						if err := discardBytes(s.br, length); err != nil {
+							return err
+						}
+					}
+					return idErr
+				}
 				if length > 0 {
 					if err := discardBytes(s.br, length); err != nil {
 						return err
@@ -724,8 +883,10 @@ func (s *session) readLoop(ctx context.Context) error {
 				if err := discardBytes(s.br, length); err != nil {
 					return err
 				}
-				err := errors.New("anytls: received PSH for unknown stream, streamId=", sid)
-				return err
+				// A locally closed stream may still have peer data in flight. The
+				// reference implementations discard it without sacrificing the
+				// multiplexed session.
+				continue
 			} else if st.isUDP && st.link == nil {
 				if err := s.handleFirstUDPFrame(ctx, st, s.br, length); err != nil {
 					return err
@@ -756,36 +917,36 @@ func (s *session) readLoop(ctx context.Context) error {
 				}
 				return errors.New("anytls: unexpected SYNACK from client")
 			}
-			if length == 0 {
+			var rejected error
+			if length > 0 {
+				bodyText, err := readText(s.br, length)
+				if err != nil {
+					return err
+				}
+				rejected = errors.New(bodyText)
+			}
+
+			s.streamsMu.Lock()
+			st := s.streams[sid]
+			s.streamsMu.Unlock()
+			if st == nil || !st.synAckReceived.CompareAndSwap(false, true) {
+				continue
+			}
+			if rejected == nil {
 				// A zero-length SYNACK is an optional success confirmation. Record
 				// it so later streams can wait for prompt dispatcher rejections,
 				// while remaining compatible with clients such as sing-box that do
 				// not send success confirmations at all.
 				s.synAckSupported.Store(true)
-			}
-			s.synAckMu.Lock()
-			ch := s.synAckCh[sid]
-			s.synAckMu.Unlock()
-			if length == 0 {
-				if ch != nil {
-					ch <- nil
-				}
 			} else {
-				bodyText, err := readText(s.br, length)
-				if err != nil {
-					return err
-				}
-				errors.LogWarning(ctx, "anytls: stream handshake rejected, streamId=", sid, " err=", bodyText)
-				rejected := errors.New(bodyText)
+				errors.LogWarning(ctx, "anytls: stream handshake rejected, streamId=", sid, " err=", rejected)
 				if s.finishStream(sid, rejected) && !s.isClosed() {
 					if err := s.sendFrame(newFrame(cmdFIN, sid)); err != nil {
 						return err
 					}
 				}
-				if ch != nil {
-					ch <- rejected
-				}
 			}
+			s.signalSYNACK(sid, rejected)
 		case cmdServerSettings:
 			if !s.isClient {
 				if length > 0 {
@@ -798,6 +959,9 @@ func (s *session) readLoop(ctx context.Context) error {
 			bodyText, err := readText(s.br, length)
 			if err != nil {
 				return err
+			}
+			if !s.markServerSettingsReceived() {
+				return errors.New("anytls: duplicate ServerSettings")
 			}
 			settings, err := parseSettings(bodyText)
 			if err != nil {

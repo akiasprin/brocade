@@ -83,6 +83,10 @@ func newPaddingScheme(rawScheme []byte) (*paddingScheme, error) {
 		if err != nil || strconv.FormatUint(packet, 10) != key {
 			return nil, fmt.Errorf("anytls: invalid padding scheme packet key %q", key)
 		}
+		maxTargetSize := uint64(maxPaddingTargetSize)
+		if packet == 0 {
+			maxTargetSize = maxFramePayload
+		}
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
 			if token == "c" {
@@ -94,7 +98,7 @@ func newPaddingScheme(rawScheme []byte) (*paddingScheme, error) {
 			}
 			min, minErr := strconv.ParseUint(strings.TrimSpace(rangeParts[0]), 10, 32)
 			max, maxErr := strconv.ParseUint(strings.TrimSpace(rangeParts[1]), 10, 32)
-			if minErr != nil || maxErr != nil || min == 0 || max == 0 || min > max || max > maxPaddingTargetSize {
+			if minErr != nil || maxErr != nil || min == 0 || max == 0 || min > max || max > maxTargetSize {
 				return nil, fmt.Errorf("anytls: invalid padding range %q", token)
 			}
 		}
@@ -184,7 +188,7 @@ func getPadding0Size(scheme *paddingScheme) uint16 {
 	}
 
 	sizes := scheme.GenerateRecordPayloadSizes(0)
-	if len(sizes) > 0 && sizes[0] != CheckMark {
+	if len(sizes) > 0 && sizes[0] > 0 && sizes[0] <= maxFramePayload {
 		return uint16(sizes[0])
 	}
 

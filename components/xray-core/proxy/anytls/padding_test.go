@@ -38,7 +38,10 @@ func TestPaddingSchemeParsing(t *testing.T) {
 		{name: "invalid-packet-key", raw: "stop=2\na=30-30", wantError: true},
 		{name: "invalid-range", raw: "stop=2\n0=0-30", wantError: true},
 		{name: "reversed-range", raw: "stop=2\n0=30-20", wantError: true},
-		{name: "oversized-range", raw: fmt.Sprintf("stop=2\n0=1-%d", maxPaddingTargetSize+1), wantError: true},
+		{name: "oversized-range", raw: fmt.Sprintf("stop=2\n1=1-%d", maxPaddingTargetSize+1), wantError: true},
+		{name: "packet-zero-maximum", raw: fmt.Sprintf("stop=1\n0=%d-%d", maxFramePayload, maxFramePayload), wantStop: 1},
+		{name: "packet-zero-over-uint16", raw: fmt.Sprintf("stop=1\n0=1-%d", maxFramePayload+1), wantError: true},
+		{name: "later-packet-over-uint16", raw: fmt.Sprintf("stop=2\n1=%d-%d", maxFramePayload+1, maxFramePayload+1), wantStop: 2},
 	}
 
 	for _, tt := range tests {
@@ -141,6 +144,10 @@ func TestPaddingSizeAndWasteFrameBoundaries(t *testing.T) {
 	}
 	if got := getPadding0Size(scheme); got != 64 {
 		t.Fatalf("padding size = %d, want 64", got)
+	}
+	scheme.scheme["0"] = "65536-65536"
+	if got := getPadding0Size(scheme); got != 30 {
+		t.Fatalf("defensive oversized packet 0 fallback = %d, want 30", got)
 	}
 
 	for _, total := range []int{0, 1, 6, maxPaddingTargetSize + 1} {

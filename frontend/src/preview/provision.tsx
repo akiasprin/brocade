@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { fetchCompileView, fetchNodes, fetchRevisions, fetchTenants } from '../api';
+import { fetchNodes, fetchRevisions, fetchTenants } from '../api';
 import { useAgentLiveness } from '../ui/agent-alive';
 import { useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
@@ -41,7 +41,7 @@ export function PreviewProvision({
   /* 存在 node 表示容器和库中的机器记录都已创建；result 只是创建时的响应 */
   const node = drill.p === 'install' ? drill.node : null;
   const result = drill.p === 'install' ? drill.result : undefined;
-  if (node) return <PreviewResult node={node} result={result} go={go} status={status} />;
+  if (node) return <PreviewInstall node={node} result={result} go={go} status={status} />;
   return <PreviewForm go={go} status={status} />;
 }
 
@@ -267,7 +267,7 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
 //
 // 生产流程中该位置提供带 token 的命令供手动在机器上执行；preview 中脚本已在
 // 容器内前台运行，因此该位置显示日志。上线判定读取同一份 `/nodes/agent-state`。
-function PreviewResult({
+function PreviewInstall({
   node,
   result,
   go,
@@ -281,11 +281,6 @@ function PreviewResult({
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 3_000 });
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   const current = revisions.data?.current_revision;
-  const compile = useQuery({
-    queryKey: ['compile', current],
-    queryFn: () => fetchCompileView(current!),
-    enabled: !!current,
-  });
   const logs = useQuery({
     queryKey: ['preview-node-logs', node],
     queryFn: () => fetchPreviewNodeLogs(node),
@@ -296,8 +291,6 @@ function PreviewResult({
   const nodeLabel = nodeRow?.name || node;
   const tenant = result?.node.tenant_id ?? nodeRow?.tenant_id ?? '';
   const target = result?.revision_id ?? current;
-  const summary = compile.data?.summary;
-
   // 上线判定与纳管流程使用同一个 hook：token 被使用 → agent 启动 → 首次 desired 心跳。
   const probe = useAgentLiveness(nodeRow);
 
@@ -316,16 +309,6 @@ function PreviewResult({
       </div>
 
       <PreviewBanner status={status} />
-
-      <div className="callout blue" style={{ marginBottom: 14 }}>
-        <b>{nodeLabel} 已经进库，容器已启动</b>
-        {result ? (
-          <>
-            ，盖出<b>修订 {result.revision_id}</b>
-          </>
-        ) : null}
-        。等 agent 上线就能发布。
-      </div>
 
       <div className="wz-hops">
         <div className="wz-hop">
@@ -425,48 +408,7 @@ function PreviewResult({
       {verify.error && <ErrorBox error={verify.error} />}
       {verify.data && !verify.data.ok && <pre className="code">{JSON.stringify(verify.data, null, 2)}</pre>}
 
-      <details className="wz-adv">
-        <summary>
-          store 和 preview 替这台补了什么
-          {summary ? `（编译 ${summary.errors} 错 · ${summary.warnings} 警）` : ''}
-        </summary>
-        {result ? (
-          <ul className="wz-ops">
-            <li>
-              <span className="op">underlay v4</span>
-              <span className="arg">{result.preview.ipv4 ?? result.preview.ip}</span>
-            </li>
-            <li>
-              <span className="op">underlay v6</span>
-              <span className="arg">{result.preview.ipv6}</span>
-            </li>
-            <li>
-              <span className="op">overlay</span>
-              <span className="arg">{result.node.overlay_addr}/32</span>
-            </li>
-            <li>
-              <span className="op">容器</span>
-              <span className="arg">{result.preview.container_name}</span>
-            </li>
-            <li>
-              <span className="op">盖出修订</span>
-              <span className="arg">修订 {result.revision_id}</span>
-            </li>
-          </ul>
-        ) : (
-          <p className="note">
-            以上为创建时的回显，只显示一次。当前状态见 <a onClick={() => go({ p: 'node', id: node })}>它的详情页</a>。
-          </p>
-        )}
-        {summary && summary.errors > 0 && (
-          <p className="note warn">编译有 {summary.errors} 条错误，发布会被阻止。诊断见顶栏徽章。</p>
-        )}
-      </details>
-
       <div className="wz-foot">
-        <span className="note">
-          纳管会变更<b>所有机器的对端表</b>。容器已就绪，发布仍走生产 deployment。
-        </span>
         <span className="sp" />
         <button className="btn" onClick={() => go({ p: 'list' })}>
           回机器列表

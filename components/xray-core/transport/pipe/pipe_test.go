@@ -11,6 +11,7 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
 	. "github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -29,6 +30,45 @@ func TestPipeReadWrite(t *testing.T) {
 	common.Must(err)
 	if r := cmp.Diff(rb.String(), "abcdefg"); r != "" {
 		t.Error(r)
+	}
+}
+
+func TestPipePreservesZeroLengthUDPPacket(t *testing.T) {
+	pReader, pWriter := New(WithSizeLimit(0))
+	destination := xnet.UDPDestination(xnet.DomainAddress("example.com"), 53)
+	newPacket := func() *buf.Buffer {
+		packet := buf.FromBytes(nil)
+		packet.UDP = &destination
+		return packet
+	}
+	common.Must(pWriter.WriteMultiBuffer(buf.MultiBuffer{newPacket()}))
+	secondWrite := make(chan error, 1)
+	go func() {
+		secondWrite <- pWriter.WriteMultiBuffer(buf.MultiBuffer{newPacket()})
+	}()
+	select {
+	case err := <-secondWrite:
+		t.Fatalf("second zero-length UDP packet bypassed pipe backpressure: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	mb, err := pReader.ReadMultiBuffer()
+	common.Must(err)
+	if len(mb) != 1 || mb[0].Len() != 0 || mb[0].UDP == nil {
+		t.Fatalf("zero-length UDP packet was not preserved: %+v", mb)
+	}
+	buf.ReleaseMulti(mb)
+	select {
+	case err := <-secondWrite:
+		common.Must(err)
+	case <-time.After(time.Second):
+		t.Fatal("second zero-length UDP packet did not resume after pipe was read")
+	}
+	mb, err = pReader.ReadMultiBuffer()
+	common.Must(err)
+	defer buf.ReleaseMulti(mb)
+	if len(mb) != 1 || mb[0].Len() != 0 || mb[0].UDP == nil {
+		t.Fatalf("second zero-length UDP packet was not preserved: %+v", mb)
 	}
 }
 

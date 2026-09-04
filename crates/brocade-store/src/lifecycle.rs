@@ -188,6 +188,59 @@ pub(crate) async fn advance_intent_tx(
     .fetch_one(&mut **tx)
     .await?;
     let lifecycle_epoch: i64 = row.try_get("lifecycle_epoch")?;
+    // Claims are fenced by lifecycle epoch, but closing the old obligations explicitly keeps the
+    // debt ledger and deployment settlement truthful after a retire/reactivate transition.
+    sqlx::query(
+        "WITH canceled AS (
+             UPDATE node_convergence_obligations
+                SET status = 'canceled',
+                    last_error = '节点生命周期代次已变化',
+                    settled_at = now()
+              WHERE node_id = $1
+                AND lifecycle_epoch < $2
+                AND status IN (
+                    'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+                )
+          RETURNING source_deployment_id, node_id
+         )
+         UPDATE deployment_targets target
+            SET status = 'canceled',
+                error = '节点生命周期代次已变化'
+           FROM canceled
+          WHERE target.deployment_id = canceled.source_deployment_id
+            AND target.node_id = canceled.node_id
+            AND target.status IN ('deferred', 'failed-recovered', 'failed-dirty')",
+    )
+    .bind(node_id)
+    .bind(lifecycle_epoch)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE deployments d
+            SET settlement_status = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM node_convergence_obligations current
+                         WHERE current.source_deployment_id = d.id
+                           AND current.status IN ('failed-recovered', 'failed-dirty')
+                    ) THEN 'uncertain'
+                    WHEN EXISTS (
+                        SELECT 1 FROM node_convergence_obligations current
+                         WHERE current.source_deployment_id = d.id
+                           AND current.status IN ('pending', 'dispatched', 'converging')
+                    ) THEN 'debt'
+                    ELSE 'converged'
+                END
+          WHERE EXISTS (
+              SELECT 1 FROM node_convergence_obligations old
+               WHERE old.source_deployment_id = d.id
+                 AND old.node_id = $1
+                 AND old.lifecycle_epoch < $2
+          )",
+    )
+    .bind(node_id)
+    .bind(lifecycle_epoch)
+    .execute(&mut **tx)
+    .await?;
     let stored_phase = NodeLifecyclePhase::parse(&row.try_get::<String, _>("phase")?)?;
     let event = if retired {
         "retirement-requested"

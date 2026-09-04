@@ -7,10 +7,10 @@ use brocade_core::{
         ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
         ExternalVlessXhttp, ExternalVlessXhttpDownload, HopDial, HopPool, Hysteria2,
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires,
-        ModelSettings, NodeConnection, OverlaySettings, Projection, ProjectionDownloadEndpoint,
-        ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
-        RealityFallbackRateLimit, RealitySite, Rule, Transport, WgTransport, Xhttp, XhttpDownload,
-        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+        ModelSettings, NodeConnection, OverlaySettings, PortSettings, Projection,
+        ProjectionDownloadEndpoint, ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits,
+        RealityFallbackMode, RealityFallbackRateLimit, RealitySite, Rule, Transport, WgTransport,
+        Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
 };
 use brocade_deployment::plan::{
@@ -29,12 +29,12 @@ use brocade_store::{
     CertDomainInput, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest,
     CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
-    HopInRequest, HopWireRequest, LinkProbe, LinkProbeRequest, LinkProbeStatus, ModelOp,
-    NodeDesiredDeployment, PgStore, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
-    PingProbeTarget, ProbeTransport, ProvisionNodeRequest, PutStepRequest,
-    RegisterWarpBindingRequest, RemoveWarpBindingRequest, ReportedNodeState,
-    SetUserAppQuotaRequest, StepAcceptRequest, StoreError, TargetApplyResult,
-    TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
+    HopInRequest, HopWireRequest, IsolateDeploymentTargetRequest, LinkProbe, LinkProbeRequest,
+    LinkProbeStatus, ModelOp, NodeDesiredDeployment, PgStore, PingProbeReportRequest,
+    PingProbeSample, PingProbeSettings, PingProbeTarget, ProbeTransport, ProvisionNodeRequest,
+    PutStepRequest, RegisterWarpBindingRequest, RemoveWarpBindingRequest, ReportedNodeState,
+    RestoreNodeServiceRequest, SetUserAppQuotaRequest, StepAcceptRequest, StoreError,
+    TargetApplyResult, TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
     UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateRealtimeTelemetryPolicyRequest,
     UpdateUserStatusRequest, UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter,
     UsageReportRequest, VerifyDeploymentRequest, WiresRequest, ENROLLMENT_TOKEN_PREFIX,
@@ -388,6 +388,7 @@ async fn migrations_bootstrap_empty_snapshot() {
             "client_snapshot_id",
             "topology_deployment_id",
             "permissions_deployment_id",
+            "isolated_node_ids",
             "generation",
             "updated_at",
         ]
@@ -587,6 +588,10 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
         .execute(db.pool())
         .await
         .unwrap();
+    sqlx::query("ALTER TABLE control_state DROP COLUMN port_anytls_base")
+        .execute(db.pool())
+        .await
+        .unwrap();
     sqlx::raw_sql(
         "ALTER TABLE ingresses ADD COLUMN reality_fingerprint TEXT;
          ALTER TABLE ingresses ADD COLUMN xhttp_host TEXT;
@@ -618,6 +623,7 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     let realtime_policy = db.store.realtime_telemetry_policy().await.unwrap();
     assert!(realtime_policy.enabled);
     assert_eq!(realtime_policy.interval_secs, 1);
+    assert_eq!(db.store.settings().await.unwrap().ports.anytls_base, 16_000);
 
     let app_main = "app-main".to_owned();
     let app_secondary = "app-secondary".to_owned();
@@ -2508,6 +2514,7 @@ async fn global_settings_update_materializes_reality_client_policy() {
         return;
     };
     db.store.migrate().await.unwrap();
+    assert_eq!(db.store.settings().await.unwrap().ports.anytls_base, 16_000);
 
     let result = db
         .store
@@ -2523,7 +2530,10 @@ async fn global_settings_update_materializes_reality_client_policy() {
                 },
                 reality_site: RealitySite::default(),
                 overlay: OverlaySettings::default(),
-                ports: Default::default(),
+                ports: PortSettings {
+                    anytls_base: 16_123,
+                    ..Default::default()
+                },
                 probe: Default::default(),
                 geodata: Default::default(),
             },
@@ -2536,6 +2546,7 @@ async fn global_settings_update_materializes_reality_client_policy() {
         result.settings.reality_client.min_client_ver.as_deref(),
         Some("1.8.0")
     );
+    assert_eq!(result.settings.ports.anytls_base, 16_123);
 
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
     assert_eq!(snapshot.revision, result.revision_id);
@@ -2543,6 +2554,7 @@ async fn global_settings_update_materializes_reality_client_policy() {
         snapshot.settings.reality_client.max_client_ver.as_deref(),
         Some("1.9.9")
     );
+    assert_eq!(snapshot.settings.ports.anytls_base, 16_123);
     assert_eq!(
         snapshot.settings.reality_client.max_time_diff_ms,
         Some(30_000)
@@ -3150,19 +3162,15 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert!(matches!(
-        db.store.clash_subscription_by_uuid(uuid).await,
-        Err(StoreError::Unavailable(_))
-    ));
+    let during_planned = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(during_planned.content.contains("name: \"Renamed Chain\""));
     sqlx::query("UPDATE deployments SET status = 'halted' WHERE id = $1")
         .bind(deployment_id)
         .execute(db.pool())
         .await
         .unwrap();
-    assert!(matches!(
-        db.store.clash_subscription_by_uuid(uuid).await,
-        Err(StoreError::Unavailable(_))
-    ));
+    let during_halt = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(during_halt.content.contains("name: \"Renamed Chain\""));
     sqlx::query(
         "UPDATE deployments
             SET status = 'canceled', active = NULL, finished_at = now()
@@ -3215,13 +3223,12 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .execute(db.pool())
     .await
     .unwrap();
-    assert!(matches!(
-        db.store.clash_subscription_by_uuid(uuid).await,
-        Err(StoreError::Unavailable(_))
-    ));
-    // This row is a synthetic fault fixture. A real partial cancellation is cleared only by a
-    // later fleet-wide success; remove the fixture so the remaining assertions can exercise
-    // independent credential transitions.
+    let after_partial_cancel = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(after_partial_cancel
+        .content
+        .contains("name: \"Renamed Chain\""));
+    // The unfinished release does not move the serving checkpoint. Remove the synthetic fixture
+    // so the remaining assertions can exercise independent credential transitions.
     sqlx::query("DELETE FROM deployments WHERE id = $1")
         .bind(partial_id)
         .execute(db.pool())
@@ -3237,10 +3244,10 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert!(matches!(
-        db.store.clash_subscription_by_uuid(uuid).await,
-        Err(StoreError::Unavailable(_))
-    ));
+    let while_grants_wait = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(while_grants_wait
+        .content
+        .contains("name: \"Renamed Chain\""));
     sqlx::query("UPDATE jobs SET status = 'succeeded' WHERE id = $1")
         .bind(grant_job_id)
         .execute(db.pool())
@@ -6098,6 +6105,16 @@ async fn tenant_scoped_deployment_filters_targets_and_visibility() {
     assert_eq!(other_plan.summary.total_targets, 1);
     assert_eq!(other_plan.targets[0].node_id, "n-other");
 
+    // An out-of-scope node being isolated does not turn a tenant-scoped order into a global
+    // serving proof. It has no target or obligation tying it to this revision.
+    sqlx::query(
+        "INSERT INTO node_operational_isolations (node_id, actor, reason)
+         VALUES ('n-other', 'test', 'outside the scoped deployment')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
     let created = db
         .store
         .create_deployment(&acme, create_deployment_request(1, "deploy-acme-scoped"))
@@ -6577,6 +6594,107 @@ async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses
         .await
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn isolated_node_retirement_tears_down_and_reactivation_creates_new_epoch_debt() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    let initial = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "isolated-lifecycle-initial"),
+        )
+        .await
+        .unwrap();
+    db.store
+        .isolate_deployment_target(
+            &system_admin(),
+            initial.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "pending".to_owned(),
+                reason: "test lifecycle while isolated".to_owned(),
+                acknowledge_uncertain: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let retiring = db
+        .store
+        .update_node_status(
+            &system_admin(),
+            "n1",
+            brocade_store::UpdateNodeStatusRequest {
+                status: "retired".to_owned(),
+                note: Some("retire isolated node".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        target_status(db.pool(), initial.deployment_id, "n1").await,
+        "canceled",
+        "the old epoch debt must close visibly"
+    );
+    let teardown_id = retiring
+        .deployment_id
+        .expect("retirement still creates a teardown while isolated");
+    let teardown = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("retiring target bypasses active-node isolation debt delivery");
+    assert_eq!(teardown.deployment_id, teardown_id);
+    db.store
+        .report_target_result(applied_report(&teardown))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store.node_lifecycle("n1").await.unwrap().phase,
+        brocade_store::NodeLifecyclePhase::Retired
+    );
+
+    let reactivated = db
+        .store
+        .update_node_status(
+            &system_admin(),
+            "n1",
+            brocade_store::UpdateNodeStatusRequest {
+                status: "active".to_owned(),
+                note: Some("reactivate but keep operational isolation".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let reactivation_id = reactivated
+        .deployment_id
+        .expect("reactivation creates a convergence deployment");
+    let detail = db
+        .store
+        .deployment_detail(&system_admin(), reactivation_id, false)
+        .await
+        .unwrap();
+    assert_eq!(detail.status, "succeeded");
+    assert_eq!(detail.activation_status, "activated");
+    assert_eq!(detail.settlement_status, "debt");
+    assert_eq!(detail.active, None);
+    let reactivation = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("reactivated isolated node receives the new lifecycle epoch debt");
+    assert_eq!(reactivation.deployment_id, reactivation_id);
+    assert!(reactivation.claim_generation > 0);
 }
 
 #[tokio::test]
@@ -7764,7 +7882,9 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
         .expect("pending config must not block immediate permissions");
 
     let rebased = sqlx::query(
-        "SELECT desired_grants, desired_structure->>'grants_revision' AS grants_revision
+        "SELECT desired_grants,
+                desired_structure->>'grants_revision' AS grants_revision,
+                usage_generation_id
          FROM deployment_target_state
          WHERE deployment_id = $1 AND node_id = 'n1'",
     )
@@ -7779,6 +7899,16 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
         rebased.try_get::<String, _>("grants_revision").unwrap(),
         revoked.revision_id.to_string(),
         "未来配置单没有记住权限快照来自哪一版"
+    );
+    let usage_bindings: serde_json::Value =
+        sqlx::query_scalar("SELECT bindings FROM usage_generations WHERE id = $1")
+            .bind(rebased.try_get::<i64, _>("usage_generation_id").unwrap())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        usage_bindings.get("alice@platform.acme#i-main").is_none(),
+        "未领取配置单重基权限时也必须重基尚未激活的计费 generation"
     );
 
     let immediate = db
@@ -11599,6 +11729,7 @@ async fn rollback_deployment_restores_target_snapshot_then_force_syncs_when_acti
             conn_handshake_secs = 61,
             stats_user_online = TRUE,
             port_ingress_base = 9443,
+            port_anytls_base = 16123,
             port_hop_base = 31000,
             port_hy2_base = 41000,
             probe_endpoint_url = 'http://changed.example/trace',
@@ -12086,15 +12217,22 @@ async fn base_of(pool: &PgPool, deployment_id: i64) -> Option<i64> {
         .unwrap()
 }
 
-/// Where only the fact that a deployment succeeded is needed, the state is written directly — the
-/// convergence flow has its own tests, and walking the whole flow only buries the semantics being
-/// pinned under a long string of agent reports.
+/// Where only the fact that a deployment became the serving baseline is needed, the state is
+/// written directly. Execution success alone is deliberately insufficient after activation and
+/// settlement became separate dimensions.
 async fn mark_succeeded(pool: &PgPool, deployment_id: i64) {
-    sqlx::query("UPDATE deployments SET status = 'succeeded', active = NULL WHERE id = $1")
-        .bind(deployment_id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'succeeded',
+                active = NULL,
+                activation_status = 'activated',
+                activated_at = now()
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn create_deployment_request(revision_id: u64, idempotency_key: &str) -> CreateDeploymentRequest {
@@ -12262,6 +12400,7 @@ fn grants_observed(grants: &DesiredGrants) -> serde_json::Value {
 
 fn applied_report(desired: &NodeDesiredDeployment) -> TargetConvergenceReport {
     TargetConvergenceReport {
+        claim_generation: desired.claim_generation,
         deployment_id: desired.deployment_id,
         node_id: desired.node_id.clone(),
         result: TargetApplyResult::Applied,
@@ -12275,6 +12414,7 @@ fn applied_report(desired: &NodeDesiredDeployment) -> TargetConvergenceReport {
 fn failed_recovered_report(desired: &NodeDesiredDeployment) -> TargetConvergenceReport {
     let recovered = unknown_reported_state();
     TargetConvergenceReport {
+        claim_generation: desired.claim_generation,
         deployment_id: desired.deployment_id,
         node_id: desired.node_id.clone(),
         result: TargetApplyResult::FailedRecovered,
@@ -14193,6 +14333,797 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
     .execute(db.pool())
     .await;
     assert!(half_download.is_err(), "下载地址和端口必须一起填写");
+}
+
+/// Operational isolation lets the serving revision move forward without pretending the missing
+/// machine converged. A newer release replaces the old debt, and an old claim cannot settle it.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn isolated_target_becomes_supersedable_debt_and_requires_explicit_reentry() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+    let revision = db.store.materialize_snapshot(None).await.unwrap().revision;
+
+    let first = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(revision, "isolation-first"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        target_status(db.pool(), first.deployment_id, "n1").await,
+        "pending"
+    );
+
+    let isolated = db
+        .store
+        .isolate_deployment_target(
+            &system_admin(),
+            first.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "pending".to_owned(),
+                reason: "test node is unreachable".to_owned(),
+                acknowledge_uncertain: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(isolated.isolated);
+    assert_eq!(isolated.debt_count, 1);
+    let serving_generation: i64 =
+        sqlx::query_scalar("SELECT generation FROM subscription_serving_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        isolated.serving_generation,
+        Some(u64::try_from(serving_generation).unwrap()),
+        "isolation result must return the transaction's final serving generation"
+    );
+
+    let first_detail = db
+        .store
+        .deployment_detail(&system_admin(), first.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(first_detail.status, "succeeded");
+    assert_eq!(first_detail.activation_status, "activated");
+    assert_eq!(first_detail.settlement_status, "debt");
+    assert_eq!(first_detail.active, None, "隔离后必须释放同类发布锁");
+    assert_eq!(first_detail.debt_targets, 1);
+
+    let old_claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("isolated node still receives convergence debt");
+    assert!(old_claim.claim_generation > 0);
+
+    let changed = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpdateNode {
+                node_id: "n1".to_owned(),
+                node: UpdateNodeRequest {
+                    name: Some("Node 1 newer".to_owned()),
+                    ..Default::default()
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let second = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(changed.revision_id, "isolation-second"),
+        )
+        .await
+        .unwrap();
+    let second_detail = db
+        .store
+        .deployment_detail(&system_admin(), second.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(second_detail.status, "succeeded");
+    assert_eq!(second_detail.activation_status, "activated");
+    assert_eq!(second_detail.settlement_status, "debt");
+    assert_eq!(
+        target_status(db.pool(), first.deployment_id, "n1").await,
+        "superseded"
+    );
+
+    let stale = db
+        .store
+        .report_target_result(applied_report(&old_claim))
+        .await;
+    assert!(
+        matches!(
+            stale,
+            Err(StoreError::Conflict(_)) | Err(StoreError::Unsupported(_))
+        ),
+        "旧债务 claim 不得覆盖新期望：{stale:?}"
+    );
+
+    let newest = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("newest obligation is claimable");
+    assert_eq!(newest.deployment_id, second.deployment_id);
+    db.store
+        .report_target_result(applied_report(&newest))
+        .await
+        .unwrap();
+    let settled = db
+        .store
+        .deployment_detail(&system_admin(), second.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(settled.settlement_status, "converged");
+
+    db.store.issue_node_token("n1").await.unwrap();
+    db.store
+        .record_node_poll("n1", Some("test-agent"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_reported_at = now(),
+                wireguard_health = '{\"enabled\":true,\"peers\":[]}'::jsonb
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let state = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert!(state.operationally_isolated);
+    assert_eq!(state.convergence_debt_count, 0);
+    assert!(
+        state.service_reentry_ready,
+        "re-entry blockers: {:?}",
+        state.service_reentry_blockers
+    );
+
+    let restored = db
+        .store
+        .restore_node_service(
+            &system_admin(),
+            "n1",
+            RestoreNodeServiceRequest {
+                reason: "test convergence and runtime checks passed".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!restored.isolated);
+    let isolation_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM node_operational_isolations WHERE node_id = 'n1')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!isolation_exists);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn isolating_a_dispatched_target_requires_ack_and_fences_its_report() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    let deployment = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "isolation-dispatched"),
+        )
+        .await
+        .unwrap();
+    let stale_claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("target should be dispatched before isolation");
+    let unacknowledged = db
+        .store
+        .isolate_deployment_target(
+            &system_admin(),
+            deployment.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "dispatched".to_owned(),
+                reason: "agent disappeared after claim".to_owned(),
+                acknowledge_uncertain: false,
+            },
+        )
+        .await;
+    assert!(matches!(unacknowledged, Err(StoreError::Conflict(_))));
+
+    let isolated = db
+        .store
+        .isolate_deployment_target(
+            &system_admin(),
+            deployment.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "dispatched".to_owned(),
+                reason: "agent disappeared after claim".to_owned(),
+                acknowledge_uncertain: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(isolated.debt_count, 1);
+    let applied = sqlx::query(
+        "SELECT wireguard_state, xray_state, grants_state
+           FROM node_applied_state WHERE node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        applied.try_get::<String, _>("wireguard_state").unwrap(),
+        "dirty"
+    );
+    assert_eq!(applied.try_get::<String, _>("xray_state").unwrap(), "dirty");
+    assert_eq!(
+        applied.try_get::<String, _>("grants_state").unwrap(),
+        "dirty"
+    );
+    assert!(matches!(
+        db.store
+            .report_target_result(applied_report(&stale_claim))
+            .await,
+        Err(StoreError::Conflict(_)) | Err(StoreError::Unsupported(_))
+    ));
+    let replacement = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("isolation creates a fresh full-state claim");
+    assert!(replacement.claim_generation > 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn rollback_over_an_isolated_node_activates_with_replacement_debt() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    let base = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "isolated-rollback-base"),
+        )
+        .await
+        .unwrap();
+    let base_claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base_claim))
+        .await
+        .unwrap();
+
+    let changed = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpdateNode {
+                node_id: "n1".to_owned(),
+                node: UpdateNodeRequest {
+                    mtu: Some(1300),
+                    ..Default::default()
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let forward = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(changed.revision_id, "isolated-rollback-forward"),
+        )
+        .await
+        .unwrap();
+    db.store
+        .isolate_deployment_target(
+            &system_admin(),
+            forward.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "pending".to_owned(),
+                reason: "isolate before rollback".to_owned(),
+                acknowledge_uncertain: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let rollback = db
+        .store
+        .create_rollback_deployment(
+            &system_admin(),
+            create_rollback_request(base.deployment_id, "rollback while isolated"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rollback.status, "succeeded");
+    let detail = db
+        .store
+        .deployment_detail(&system_admin(), rollback.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(detail.activation_status, "activated");
+    assert_eq!(detail.settlement_status, "debt");
+    assert_eq!(detail.debt_targets, 1);
+    assert_eq!(detail.active, None);
+    assert_eq!(
+        target_status(db.pool(), forward.deployment_id, "n1").await,
+        "superseded"
+    );
+    assert_eq!(
+        target_status(db.pool(), rollback.deployment_id, "n1").await,
+        "deferred"
+    );
+    let rollback_claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("rollback replaces the isolated node's latest desired state");
+    assert_eq!(rollback_claim.deployment_id, rollback.deployment_id);
+}
+
+/// A debt on one isolated node is local to that node. Healthy nodes must still receive both the
+/// rest of the configuration release and later grant-only releases.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn isolated_config_debt_does_not_block_grants_on_healthy_nodes() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+    let revision = db.store.materialize_snapshot(None).await.unwrap().revision;
+
+    let config = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(revision, "isolation-config-two-nodes"),
+        )
+        .await
+        .unwrap();
+    db.store
+        .isolate_deployment_target(
+            &system_admin(),
+            config.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "pending".to_owned(),
+                reason: "n1 unavailable during release".to_owned(),
+                acknowledge_uncertain: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let healthy_config = db
+        .store
+        .claim_desired_for_node("n-other")
+        .await
+        .unwrap()
+        .expect("healthy node receives configuration");
+    db.store
+        .report_target_result(applied_report(&healthy_config))
+        .await
+        .unwrap();
+    let config_detail = db
+        .store
+        .deployment_detail(&system_admin(), config.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(config_detail.status, "succeeded");
+    assert_eq!(config_detail.settlement_status, "debt");
+    assert!(matches!(
+        db.store
+            .clash_subscription_by_uuid("2d2304da-f114-4574-8d44-625afdb1db5c")
+            .await,
+        Err(StoreError::Unavailable(_))
+    ));
+    db.store
+        .clash_subscription_by_uuid("f98b74ba-58f1-41d0-aaad-8fa5724c6d2d")
+        .await
+        .expect("另一个健康入口的用户不受隔离影响");
+
+    sqlx::query(
+        "INSERT INTO users (tenant_id, id, uuid)
+         VALUES ('platform.other', 'dave', 'd26e89a9-8eb1-4cc2-adb9-8f24cd2f9a77')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let grants_revision = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-other".to_owned(),
+                tenant_id: "platform.other".to_owned(),
+                user_id: "dave".to_owned(),
+                ingress_id: "i-other".to_owned(),
+                enabled: true,
+                note: Some("grant another user on the healthy node".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let automated = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(automated.revision_id, Some(grants_revision.revision_id));
+    assert!(automated.waiting.is_none(), "{:?}", automated.waiting);
+    let grants_id = automated
+        .deployment_id
+        .expect("automatic grants deployment");
+    let healthy_grants = db
+        .store
+        .claim_desired_for_node("n-other")
+        .await
+        .unwrap()
+        .expect("healthy node receives grants despite n1 debt");
+    db.store
+        .report_target_result(applied_report(&healthy_grants))
+        .await
+        .unwrap();
+    let grants_detail = db
+        .store
+        .deployment_detail(&system_admin(), grants_id, false)
+        .await
+        .unwrap();
+    assert_eq!(grants_detail.status, "succeeded");
+    assert_eq!(grants_detail.activation_status, "activated");
+    assert_eq!(grants_detail.settlement_status, "converged");
+    assert_eq!(grants_detail.active, None);
+    assert_eq!(
+        target_status(db.pool(), grants_id, "n-other").await,
+        "succeeded"
+    );
+
+    sqlx::query(
+        "INSERT INTO users (tenant_id, id, uuid)
+         VALUES ('platform.acme', 'erin', '4ed04a92-b0c0-42fa-b751-f1da11c9885b')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let isolated_grant_revision = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "erin".to_owned(),
+                ingress_id: "i-main".to_owned(),
+                enabled: true,
+                note: Some("grant a user on the isolated node".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let isolated_automation = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(
+        isolated_automation.revision_id,
+        Some(isolated_grant_revision.revision_id)
+    );
+    assert!(
+        isolated_automation.waiting.is_none(),
+        "隔离节点的权限债务不得阻塞自动任务：{:?}",
+        isolated_automation.waiting
+    );
+
+    let rebased = sqlx::query(
+        "SELECT desired_grants,
+                desired_structure->>'grants_revision' AS grants_revision,
+                usage_generation_id
+           FROM node_convergence_obligations
+          WHERE node_id = 'n1'
+            AND kind = 'config'
+            AND status IN ('pending', 'dispatched', 'converging')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let rebased_grants: DesiredGrants =
+        serde_json::from_value(rebased.try_get("desired_grants").unwrap()).unwrap();
+    let DesiredGrants::Present { inbounds } = &rebased_grants else {
+        panic!("isolated config debt should retain a complete grant snapshot");
+    };
+    assert!(inbounds
+        .iter()
+        .flat_map(|inbound| &inbound.clients)
+        .any(|client| {
+            client.email == "erin@platform.acme#i-main"
+                && client.uuid == "4ed04a92-b0c0-42fa-b751-f1da11c9885b"
+        }));
+    assert_eq!(
+        rebased.try_get::<String, _>("grants_revision").unwrap(),
+        isolated_grant_revision.revision_id.to_string()
+    );
+    let usage_bindings: serde_json::Value =
+        sqlx::query_scalar("SELECT bindings FROM usage_generations WHERE id = $1")
+            .bind(rebased.try_get::<i64, _>("usage_generation_id").unwrap())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(usage_bindings.get("erin@platform.acme#i-main").is_some());
+
+    let recovered_config = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("isolated node receives its rebased config debt first");
+    assert_eq!(recovered_config.deployment_id, config.deployment_id);
+    assert_eq!(recovered_config.desired.grants, rebased_grants);
+}
+
+/// A permission generation created after config was claimed must wait behind that immutable
+/// config claim. The agent may never receive both writers concurrently for one isolated node.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn isolated_grants_wait_for_an_in_flight_config_obligation() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+    let revision = db.store.materialize_snapshot(None).await.unwrap().revision;
+
+    let config = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(revision, "isolation-config-in-flight"),
+        )
+        .await
+        .unwrap();
+    db.store
+        .isolate_deployment_target(
+            &system_admin(),
+            config.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "pending".to_owned(),
+                reason: "test config claim serialization".to_owned(),
+                acknowledge_uncertain: false,
+            },
+        )
+        .await
+        .unwrap();
+    let config_claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("config obligation should be claimable");
+
+    sqlx::query(
+        "INSERT INTO users (tenant_id, id, uuid)
+         VALUES ('platform.acme', 'frank', 'c57227de-3c39-4767-ab5d-7d4622adc0cb')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let grant_revision = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "frank".to_owned(),
+                ingress_id: "i-main".to_owned(),
+                enabled: true,
+                note: Some("grant while isolated config is in flight".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let automated = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(automated.revision_id, Some(grant_revision.revision_id));
+    assert!(automated.waiting.is_none(), "{:?}", automated.waiting);
+    let grants_id = automated
+        .deployment_id
+        .expect("the newer grants generation must be durable");
+
+    assert!(
+        db.store
+            .claim_desired_for_node("n1")
+            .await
+            .unwrap()
+            .is_none(),
+        "grants must not be handed out while the config claim is in flight"
+    );
+    db.store
+        .report_target_result(applied_report(&config_claim))
+        .await
+        .unwrap();
+
+    let grants_claim = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("grants become claimable after config settles");
+    assert_eq!(grants_claim.deployment_id, grants_id);
+    let DesiredGrants::Present { inbounds } = &grants_claim.desired.grants else {
+        panic!("isolated grants debt should be a complete runtime client list");
+    };
+    assert!(inbounds
+        .iter()
+        .flat_map(|inbound| &inbound.clients)
+        .any(|client| client.email == "frank@platform.acme#i-main"));
+    db.store
+        .report_target_result(applied_report(&grants_claim))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn service_restore_and_new_grant_leave_no_orphaned_isolation_debt() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    let config = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "restore-grant-race-config"),
+        )
+        .await
+        .unwrap();
+    db.store
+        .isolate_deployment_target(
+            &system_admin(),
+            config.deployment_id,
+            "n1",
+            IsolateDeploymentTargetRequest {
+                expected_target_status: "pending".to_owned(),
+                reason: "prepare restore and grant race".to_owned(),
+                acknowledge_uncertain: false,
+            },
+        )
+        .await
+        .unwrap();
+    let debt = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&debt))
+        .await
+        .unwrap();
+    db.store.issue_node_token("n1").await.unwrap();
+    db.store
+        .record_node_poll("n1", Some("test-agent"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_reported_at = now(),
+                wireguard_health = '{\"enabled\":true,\"peers\":[]}'::jsonb
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO users (tenant_id, id, uuid)
+         VALUES ('platform.acme', 'grace', 'd21cd35b-51ab-4e25-82b0-a84a8eab9d7c')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "grace".to_owned(),
+                ingress_id: "i-main".to_owned(),
+                enabled: true,
+                note: Some("race grant with service restore".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let admin = system_admin();
+    let (restore, automation) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            db.store.restore_node_service(
+                &admin,
+                "n1",
+                RestoreNodeServiceRequest {
+                    reason: "race-safe restore".to_owned(),
+                },
+            ),
+            db.store.process_grant_automation(),
+        )
+    })
+    .await
+    .expect("restore/grant race must not deadlock");
+    assert!(restore.is_ok() || automation.is_ok());
+
+    let isolated: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM node_operational_isolations WHERE node_id = 'n1')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let active_debt: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM node_convergence_obligations
+          WHERE node_id = 'n1'
+            AND status IN (
+                'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+            )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        isolated || active_debt == 0,
+        "a restored node must never be left with debt only the isolation path can deliver"
+    );
 }
 
 async fn insert_minimal_fixture(pool: &PgPool) {

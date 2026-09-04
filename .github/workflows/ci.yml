@@ -39,6 +39,38 @@ permissions:
   contents: read
 
 jobs:
+  xray-anytls:
+    name: xray anytls test + race
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: components/xray-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: components/xray-core/go.mod
+          cache-dependency-path: components/xray-core/go.sum
+
+      - name: AnyTLS deterministic and fuzz-seed tests
+        run: go test ./common/buf ./transport/pipe ./proxy/anytls -count=10 -timeout=5m
+
+      - name: AnyTLS settings fuzz
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSSettings$' -fuzztime=10s -timeout=2m
+
+      - name: AnyTLS padding fuzz
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSPaddingScheme$' -fuzztime=10s -timeout=2m
+
+      - name: AnyTLS session-frame fuzz
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSSessionFrames$' -fuzztime=10s -timeout=2m
+
+      - name: AnyTLS UoT-record fuzz
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSUoTRecords$' -fuzztime=10s -timeout=2m
+
+      - name: AnyTLS race tests
+        run: go test -race ./common/buf ./transport/pipe ./proxy/anytls -count=3 -timeout=10m
+
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest

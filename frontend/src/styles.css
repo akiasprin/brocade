@@ -2132,6 +2132,36 @@ input.f::placeholder {
   border-left-color: var(--gold-line);
   background: color-mix(in srgb, var(--gold) 8%, transparent);
 }
+.node-isolation-banner {
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  width: 100%;
+  min-height: 50px;
+  max-width: none;
+  align-items: center;
+  gap: 16px;
+  margin: 0 0 12px;
+  padding: 10px 13px;
+}
+.node-isolation-copy {
+  min-width: 0;
+  line-height: 1.55;
+}
+.node-isolation-banner > .toolbar {
+  align-self: center;
+  margin: 0;
+}
+@media (max-width: 680px) {
+  .node-isolation-banner {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 8px;
+  }
+  .node-isolation-banner > .toolbar {
+    justify-content: flex-start;
+  }
+}
 /* 分区面板：带标题、内含表格或表单。它不是提示，因此使用完整的卡片边框。
    与 .callout 分开定义是因为两者曾被当作同一个类使用，导致表单呈现为批注、
    批注呈现为卡片。 */
@@ -11677,6 +11707,8 @@ h4.sec > .btn {
    状态格内做低对比水印，不再依赖表头；前景只承担状态灯和结果。 */
 .grant-probe {
   --probe-info: color-mix(in srgb, #587fae 72%, var(--ink-2));
+  /* 断点必须看拨测卡本身。它位于用户页右栏，外层双栏即使很宽，卡片仍可能只有五六百像素。 */
+  container-type: inline-size;
 }
 .panel.config-panel.grant-probe > header {
   gap: 8px;
@@ -11781,7 +11813,7 @@ h4.sec > .btn {
   transition: width 180ms ease;
 }
 .grant-probe-list {
-  --grant-probe-columns: minmax(140px, 1.2fr) repeat(4, minmax(82px, 0.8fr)) 64px;
+  --grant-probe-columns: minmax(140px, 1.2fr) minmax(0, 4.8fr) 64px;
   margin: 0 -13px -11px;
   overflow: visible;
   border: 0;
@@ -11821,7 +11853,10 @@ h4.sec > .btn {
   font-weight: 650;
 }
 .grant-probe-matrix {
-  display: contents;
+  display: grid;
+  grid-template-columns: repeat(var(--grant-probe-slot-count), minmax(82px, 1fr));
+  gap: 8px;
+  min-width: 0;
 }
 .grant-probe-gap {
   display: block;
@@ -12019,14 +12054,18 @@ h4.sec > .btn {
 
 @container (max-width: 980px) {
   .grant-probe-list {
-    --grant-probe-columns: minmax(118px, 1fr) repeat(4, minmax(70px, 0.8fr)) 58px;
+    --grant-probe-columns: minmax(118px, 1fr) minmax(0, 4.8fr) 58px;
   }
   .grant-probe-row {
     gap: 6px;
   }
+  .grant-probe-matrix {
+    grid-template-columns: repeat(var(--grant-probe-slot-count), minmax(70px, 1fr));
+    gap: 6px;
+  }
 }
 
-@container (max-width: 640px) {
+@container (max-width: 700px) {
   .panel.config-panel.grant-probe > header {
     flex-wrap: wrap;
     padding: 7px 10px;
@@ -12042,16 +12081,17 @@ h4.sec > .btn {
     padding: 9px 11px;
   }
   .grant-probe-matrix {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(82px, 100px));
     gap: 6px;
     grid-column: 1 / -1;
     grid-row: 2;
+    justify-content: start;
   }
   .grant-probe-gap {
     display: none;
   }
   .grant-probe-result {
+    width: 100%;
     justify-content: flex-start;
     padding-inline: 8px;
   }
@@ -13396,7 +13436,7 @@ input.f.ing-pj-port {
 .load-network-cap > span .mono {
   font-size: inherit;
 }
-/* 量纲。刻度上只剩数字，单位在标题后写一次（`网卡流量 (Mb/s)`）——它不是元信息，不能拿
+/* 量纲。刻度上只剩数字，单位在标题后写一次（`网卡流量 (Mbit/s)`）——它不是元信息，不能拿
    上面那条 9px / --ink-4 的待遇，那是 `eth0 · MTU 1420` 那一级。
    排版跟随它所属的那个标题，不是全站一套：两处标题本来就不同字族、不同字号，单位各自与
    自己的标题同字族、同字号、同字距，只降一档字重与墨色，读起来是标题的后半句。
@@ -13776,6 +13816,15 @@ input.f.ing-pj-port {
   font-weight: 600;
   letter-spacing: 0.02em;
   white-space: nowrap;
+}
+/* 历史图与吞吐图遵守同一单位层级：它是标题的后半句，不是右侧 9px 元信息。负 margin
+   抵掉 cap 的一部分 gap，让「容量 (GiB)」先成组，再与后面的窗口最低值拉开。 */
+.history-chart-cap > .chart-unit {
+  margin-right: 4px;
+  margin-left: -5px;
+  color: var(--ink-3);
+  font: 400 12.5px var(--sans);
+  letter-spacing: 0.02em;
 }
 /* 网卡流量标题原先是 chip，清掉其盒样式；文字排版直接复用上面的历史指标标题规则。 */
 .load-network-cap > b {

@@ -43,10 +43,11 @@ use brocade_store::{
     ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest,
     CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DistributionSettings,
-    E2eProbeRequest, LinkHealthRequest, LinkProbeRequest, LoadReportRequest, ModelOp,
-    NodeLifecyclePhase, PgStore, PhantunBinaries, PingProbeReportRequest, PingProbeSettings,
-    ProvisionNodeRequest, ProvisionNodeResult, ProvisionedNode, RegisterWarpBindingRequest,
-    RemoveWarpBindingRequest, SetUserAppQuotaRequest, StoreError, UpdateAgentLogDefaultRequest,
+    E2eProbeRequest, IsolateDeploymentTargetRequest, LinkHealthRequest, LinkProbeRequest,
+    LoadReportRequest, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
+    PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
+    ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest,
+    RestoreNodeServiceRequest, SetUserAppQuotaRequest, StoreError, UpdateAgentLogDefaultRequest,
     UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateNodeStatusRequest,
     UpdateUserStatusRequest, UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
 };
@@ -826,10 +827,18 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/deployments/{deployment_id}/targets/{node_id}/retry",
             post(retry_target),
         )
+        .route(
+            "/deployments/{deployment_id}/targets/{node_id}/isolate",
+            post(isolate_deployment_target),
+        )
         .route("/nodes/provision", post(provision_node))
         .route("/nodes/{node_id}", put(update_node))
         .route("/nodes/{node_id}/status", put(update_node_status))
         .route("/nodes/{node_id}/lifecycle/abandon", post(abandon_node))
+        .route(
+            "/nodes/{node_id}/restore-service",
+            post(restore_node_service),
+        )
         .route("/nodes/{node_id}/cert-group", put(set_node_cert_group))
         .route("/nodes/{node_id}/agent-token", post(issue_node_token))
         .route("/nodes/{node_id}/agent-token", delete(revoke_node_token))
@@ -2140,6 +2149,7 @@ fn require_complete_settings(value: &serde_json::Value) -> ApiResult<()> {
         &["overlay", "keepalive_secs"],
         &["overlay", "mtu"],
         &["ports", "ingress_base"],
+        &["ports", "anytls_base"],
         &["ports", "hop_base"],
         &["ports", "hy2_base"],
         &["probe", "endpoint_url"],
@@ -2495,6 +2505,34 @@ async fn retry_target(
     let result = state
         .store
         .retry_target(&admin, deployment_id, &node_id)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn isolate_deployment_target(
+    State(state): State<AppState>,
+    Path((deployment_id, node_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+    Json(request): Json<IsolateDeploymentTargetRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let result = state
+        .store
+        .isolate_deployment_target(&admin, deployment_id, &node_id, request)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn restore_node_service(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RestoreNodeServiceRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let result = state
+        .store
+        .restore_node_service(&admin, &node_id, request)
         .await?;
     Ok(Json(result).into_response())
 }
@@ -3656,6 +3694,7 @@ async fn agent_observation(
         .report_target_result(TargetConvergenceReport {
             deployment_id: request.deployment_id,
             node_id: node.node_id.clone(),
+            claim_generation: request.claim_generation,
             result: request.result,
             observed_before: request.observed_before,
             observed_after: request.observed_after,

@@ -148,7 +148,7 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             reality_server_names, \
             reality_fingerprint, \
             reality_flow, \
-            port_ingress_base, port_hop_base, port_hy2_base, \
+            port_ingress_base, port_anytls_base, port_hop_base, port_hy2_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
@@ -193,6 +193,10 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             ingress_base: u16_column(
                 "control_state.port_ingress_base",
                 state.try_get("port_ingress_base")?,
+            )?,
+            anytls_base: u16_column(
+                "control_state.port_anytls_base",
+                state.try_get("port_anytls_base")?,
             )?,
             hop_base: u16_column(
                 "control_state.port_hop_base",
@@ -770,7 +774,7 @@ pub(crate) async fn load_current_snapshot_tx(
             reality_server_names, \
             reality_fingerprint, \
             reality_flow, \
-            port_ingress_base, port_hop_base, port_hy2_base, \
+            port_ingress_base, port_anytls_base, port_hop_base, port_hy2_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
@@ -815,6 +819,10 @@ pub(crate) async fn load_current_snapshot_tx(
             ingress_base: u16_column(
                 "control_state.port_ingress_base",
                 state.try_get("port_ingress_base")?,
+            )?,
+            anytls_base: u16_column(
+                "control_state.port_anytls_base",
+                state.try_get("port_anytls_base")?,
             )?,
             hop_base: u16_column(
                 "control_state.port_hop_base",

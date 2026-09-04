@@ -259,7 +259,7 @@ impl Default for ProbeSettings {
 /// These bases affect only the defaults for newly created objects, never values already
 /// stored. Once a port is recorded in the model it has to stay stable: changing it
 /// alters the xray config, restarts the process, and drops every connection on that
-/// machine (see `HopIn::port`). Editing these two numbers therefore modifies no existing
+/// machine (see `HopIn::port`). Editing these bases therefore modifies no existing
 /// chain; the next chain searches upward from the new base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -271,6 +271,12 @@ pub struct PortSettings {
     /// the only symptom is a failed xray start. Setting this number to 443 selects 443;
     /// that is an operator decision rather than a default.
     pub ingress_base: u16,
+    /// AnyTLS ingresses search upward from this port, on TCP.
+    ///
+    /// Older serialized model revisions predate this setting. They use the factory value when
+    /// read so adding the allocator control does not make those revisions unreadable.
+    #[serde(default = "default_anytls_port_base")]
+    pub anytls_base: u16,
     /// Relay ports search upward from this port. A high range keeps them clear of
     /// ingresses and system services.
     pub hop_base: u16,
@@ -288,9 +294,28 @@ impl Default for PortSettings {
     fn default() -> Self {
         Self {
             ingress_base: 8443,
+            anytls_base: ANYTLS_PORT_BASE,
             hop_base: 20000,
             hy2_base: HYSTERIA2_PORT_BASE,
         }
+    }
+}
+
+#[cfg(test)]
+mod port_settings_tests {
+    use super::{PortSettings, ANYTLS_PORT_BASE};
+
+    #[test]
+    fn revisions_without_anytls_base_use_the_current_factory_value() {
+        let ports: PortSettings = serde_json::from_value(serde_json::json!({
+            "ingress_base": 8443,
+            "hop_base": 20000,
+            "hy2_base": 18000
+        }))
+        .unwrap();
+
+        assert_eq!(ports.anytls_base, ANYTLS_PORT_BASE);
+        assert_eq!(ports.anytls_base, 16_000);
     }
 }
 
@@ -1407,7 +1432,11 @@ impl Default for AnyTls {
 }
 
 /// Base used when the console creates an AnyTLS listener without an explicit port.
-pub const ANYTLS_PORT_BASE: u16 = 19_000;
+pub const ANYTLS_PORT_BASE: u16 = 16_000;
+
+const fn default_anytls_port_base() -> u16 {
+    ANYTLS_PORT_BASE
+}
 
 /// The response body and headers used by Xray's built-in `type: 404` masquerade are owned by
 /// Xray. Brocade stores only optional header overrides for that form; the status and body stay

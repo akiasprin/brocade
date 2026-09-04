@@ -3,6 +3,7 @@ package anytls
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -12,8 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	sessionctx "github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type blockingDeliveryWriter struct {
@@ -30,6 +36,37 @@ type gatedDeliveryWriter struct {
 	mu          sync.Mutex
 	data        []byte
 	closed      bool
+}
+
+type signalingReader struct {
+	buf.Reader
+	started chan struct{}
+	once    sync.Once
+}
+
+type singleConnDialer struct {
+	conn  net.Conn
+	calls atomic.Int32
+}
+
+func (d *singleConnDialer) Dial(context.Context, xnet.Destination) (stat.Connection, error) {
+	if d.calls.Add(1) != 1 {
+		return nil, errors.New("unexpected extra dial")
+	}
+	return d.conn, nil
+}
+
+func (*singleConnDialer) DestIpAddress() xnet.IP { return nil }
+
+func (*singleConnDialer) SetOutboundGateway(context.Context, *sessionctx.Outbound) {}
+
+func (r *signalingReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	r.once.Do(func() { close(r.started) })
+	return r.Reader.ReadMultiBuffer()
+}
+
+func (r *signalingReader) Interrupt() {
+	common.Interrupt(r.Reader)
 }
 
 func (w *gatedDeliveryWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -323,6 +360,98 @@ func TestSessionPSHDeliveryDoesNotBlockOtherStreams(t *testing.T) {
 	s.close(nil)
 }
 
+func TestStreamDeliveryQueueAppliesBackpressure(t *testing.T) {
+	writer := &gatedDeliveryWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	stream := newStream(1, &transport.Link{Writer: writer})
+	stream.startDeliveryWorker(writer.WriteMultiBuffer)
+	defer stream.close(nil)
+
+	if err := stream.enqueueDelivery(buf.MultiBuffer{buf.FromBytes([]byte("in-flight"))}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("delivery writer did not start")
+	}
+	for range streamDeliveryQueueDepth {
+		if err := stream.enqueueDelivery(buf.MultiBuffer{buf.FromBytes([]byte("queued"))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	enqueueDone := make(chan error, 1)
+	go func() {
+		enqueueDone <- stream.enqueueDelivery(buf.MultiBuffer{buf.FromBytes([]byte("backpressured"))})
+	}()
+	select {
+	case err := <-enqueueDone:
+		t.Fatalf("full delivery queue did not apply backpressure: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	writer.unblock()
+	select {
+	case err := <-enqueueDone:
+		if err != nil {
+			t.Fatalf("backpressured delivery failed after space became available: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backpressured delivery did not resume")
+	}
+}
+
+func TestStreamCloseInterruptsDeliveryBackpressure(t *testing.T) {
+	writer := &gatedDeliveryWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	stream := newStream(1, &transport.Link{Writer: writer})
+	stream.startDeliveryWorker(writer.WriteMultiBuffer)
+
+	if err := stream.enqueueDelivery(buf.MultiBuffer{buf.FromBytes([]byte("in-flight"))}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("delivery writer did not start")
+	}
+	for range streamDeliveryQueueDepth {
+		if err := stream.enqueueDelivery(buf.MultiBuffer{buf.FromBytes([]byte("queued"))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	enqueueDone := make(chan error, 1)
+	go func() {
+		enqueueDone <- stream.enqueueDelivery(buf.MultiBuffer{buf.FromBytes([]byte("backpressured"))})
+	}()
+	select {
+	case err := <-enqueueDone:
+		t.Fatalf("full delivery queue did not apply backpressure: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	stream.close(errors.New("stream stopped"))
+	select {
+	case err := <-enqueueDone:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("backpressured delivery error = %v, want closed pipe", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream close did not interrupt delivery backpressure")
+	}
+	select {
+	case <-stream.done:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not finish after closing backpressured delivery")
+	}
+}
+
 func TestSessionTruncatedFramesReturnReadError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -458,6 +587,118 @@ func TestSessionSYNACKSignalsSuccessAndRejection(t *testing.T) {
 	}
 }
 
+func TestSessionDuplicateSYNACKDoesNotBlock(t *testing.T) {
+	tests := []struct {
+		name       string
+		data       []byte
+		wantResult string
+		wantFIN    bool
+	}{
+		{name: "success"},
+		{name: "rejected", data: []byte("destination refused"), wantResult: "destination refused", wantFIN: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, output := newWireSession(marshalTestFrames(
+				testWireFrame{cmd: cmdSYNACK, sid: 7, data: tt.data},
+				testWireFrame{cmd: cmdSYNACK, sid: 7, data: tt.data},
+				testWireFrame{cmd: cmdWaste},
+			), true)
+			s.streams[7] = newStream(7, nil)
+			resultCh := make(chan error, 1)
+			s.synAckCh[7] = resultCh
+
+			readDone := make(chan error, 1)
+			go func() { readDone <- s.readLoop(context.Background()) }()
+			select {
+			case err := <-readDone:
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("readLoop error = %v, want EOF", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("duplicate SYNACK blocked the session reader")
+			}
+
+			result := <-resultCh
+			if tt.wantResult == "" {
+				if result != nil {
+					t.Fatalf("SYNACK result = %v, want nil", result)
+				}
+			} else if result == nil || !strings.Contains(result.Error(), tt.wantResult) {
+				t.Fatalf("SYNACK result = %v, want text %q", result, tt.wantResult)
+			}
+			select {
+			case duplicate := <-resultCh:
+				t.Fatalf("duplicate SYNACK result was delivered: %v", duplicate)
+			default:
+			}
+
+			frames := parseTestFrames(t, output.Bytes())
+			if tt.wantFIN {
+				if len(frames) != 1 || frames[0].cmd != cmdFIN || frames[0].sid != 7 {
+					t.Fatalf("rejected duplicate SYNACK output = %+v, want one FIN", frames)
+				}
+			} else if len(frames) != 0 {
+				t.Fatalf("successful duplicate SYNACK emitted frames: %+v", frames)
+			}
+		})
+	}
+}
+
+func TestPeerFINInterruptsPumpWithoutReply(t *testing.T) {
+	tests := []struct {
+		name     string
+		isClient bool
+	}{
+		{name: "client", isClient: true},
+		{name: "server"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			endpoint := newTestLinkEndpoint()
+			defer endpoint.closeInput()
+			defer endpoint.closeOutput()
+			reader := &signalingReader{Reader: endpoint.link.Reader, started: make(chan struct{})}
+			endpoint.link.Reader = reader
+			stream := newStream(7, endpoint.link)
+			s, output := newWireSession(marshalTestFrames(testWireFrame{cmd: cmdFIN, sid: 7}), tt.isClient)
+			s.streams[7] = stream
+
+			pumpDone := make(chan struct{})
+			go func() {
+				defer close(pumpDone)
+				if tt.isClient {
+					stream.pumpUplink(s)
+				} else {
+					s.pumpDownlink(stream.sid, endpoint.link)
+				}
+			}()
+			select {
+			case <-reader.started:
+			case <-time.After(time.Second):
+				t.Fatal("stream pump did not start")
+			}
+
+			if err := s.readLoop(context.Background()); !errors.Is(err, io.EOF) {
+				t.Fatalf("readLoop error = %v, want EOF", err)
+			}
+			select {
+			case <-pumpDone:
+			case <-time.After(time.Second):
+				t.Fatal("peer FIN did not interrupt stream pump")
+			}
+			if frames := parseTestFrames(t, output.Bytes()); len(frames) != 0 {
+				t.Fatalf("peer FIN emitted reply frames: %+v", frames)
+			}
+			if err := endpoint.input.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("late"))}); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("write after peer FIN error = %v, want closed pipe", err)
+			}
+		})
+	}
+}
+
 func TestSessionFinishStreamIsIdempotent(t *testing.T) {
 	conn, peer := net.Pipe()
 	defer peer.Close()
@@ -536,6 +777,134 @@ func TestClientIdleSessionCleanupHonorsMinimumAndRemovesStale(t *testing.T) {
 	client.cleanupIdleSessionsAt(now)
 	if len(client.idleSessions) != 0 || len(client.sessions) != 0 {
 		t.Fatalf("stale idle session remained: pool=%v sessions=%v", client.idleSessions, client.sessions)
+	}
+}
+
+func TestClientIdleSessionDefaultsMatchSingAnyTLS(t *testing.T) {
+	if defaultIdleSessionCheckInterval != 30*time.Second {
+		t.Fatalf("idle check interval = %v, want 30s", defaultIdleSessionCheckInterval)
+	}
+	if defaultIdleSessionTimeout != 30*time.Second {
+		t.Fatalf("idle timeout = %v, want 30s", defaultIdleSessionTimeout)
+	}
+	if defaultMinIdleSession != 0 {
+		t.Fatalf("minimum idle sessions = %d, want 0", defaultMinIdleSession)
+	}
+}
+
+func TestClientRetriesClosedIdleSessionBeforeOpeningStream(t *testing.T) {
+	idleConn, idlePeer := net.Pipe()
+	defer idlePeer.Close()
+	idle := newSessionForConn(idleConn, true)
+	idle.seq = 41
+	idle.inIdlePool.Store(true)
+
+	client := &Client{
+		server:       protocol.NewServerSpec(xnet.TCPDestination(xnet.DomainAddress("anytls.test"), 443), nil),
+		idleSessions: []uint64{idle.seq},
+		sessions:     map[uint64]*session{idle.seq: idle},
+		cleanupDone:  make(chan struct{}),
+	}
+	idle.setDieHook(func() {
+		client.sessionsMu.Lock()
+		delete(client.sessions, idle.seq)
+		client.sessionsMu.Unlock()
+	})
+	defer client.Close()
+
+	newConn, serverConn := net.Pipe()
+	dialer := &singleConnDialer{conn: newConn}
+	serverDone := make(chan error, 1)
+	serverRelease := make(chan struct{})
+	defer close(serverRelease)
+	go func() {
+		defer serverConn.Close()
+		err := finishFirstClientStream(serverConn)
+		serverDone <- err
+		if err == nil {
+			<-serverRelease
+		}
+	}()
+
+	endpoint := newTestLinkEndpoint()
+	defer endpoint.closeInput()
+	defer endpoint.closeOutput()
+	ctx := sessionctx.ContextWithOutbounds(context.Background(), []*sessionctx.Outbound{{
+		Target: xnet.TCPDestination(xnet.DomainAddress("example.com"), 443),
+	}})
+
+	// Keep openStream between pool selection and its second closed check.
+	idle.openMu.Lock()
+	processDone := make(chan error, 1)
+	go func() {
+		processDone <- client.Process(ctx, endpoint.link, dialer)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for idle.inIdlePool.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if idle.inIdlePool.Load() {
+		idle.openMu.Unlock()
+		t.Fatal("Process did not take the idle session")
+	}
+	idle.close(errors.New("idle session closed during reuse"))
+	idle.openMu.Unlock()
+
+	select {
+	case err := <-processDone:
+		if err != nil {
+			t.Fatalf("Process error = %v, want successful retry", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Process did not finish after retrying the idle session")
+	}
+	if got := dialer.calls.Load(); got != 1 {
+		t.Fatalf("new session dial count = %d, want 1", got)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("replacement session peer error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement session peer did not finish")
+	}
+}
+
+func finishFirstClientStream(conn net.Conn) error {
+	authHeader := make([]byte, 34)
+	if _, err := io.ReadFull(conn, authHeader); err != nil {
+		return err
+	}
+	if paddingLength := int64(binary.BigEndian.Uint16(authHeader[32:34])); paddingLength > 0 {
+		if _, err := io.CopyN(io.Discard, conn, paddingLength); err != nil {
+			return err
+		}
+	}
+
+	var streamID uint32
+	for {
+		header := make([]byte, 7)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return err
+		}
+		cmd := header[0]
+		sid := binary.BigEndian.Uint32(header[1:5])
+		bodyLength := int(binary.BigEndian.Uint16(header[5:7]))
+		if bodyLength > 0 {
+			if _, err := io.CopyN(io.Discard, conn, int64(bodyLength)); err != nil {
+				return err
+			}
+		}
+		if cmd == cmdSYN {
+			streamID = sid
+			continue
+		}
+		if cmd != cmdPSH || streamID == 0 || sid != streamID {
+			continue
+		}
+		_, err := conn.Write(marshalTestFrames(testWireFrame{cmd: cmdFIN, sid: streamID}))
+		return err
 	}
 }
 

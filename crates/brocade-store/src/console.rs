@@ -2649,6 +2649,15 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 l.deployment_id AS lifecycle_deployment_id,
                 l.completed_at::text AS lifecycle_completed_at,
                 l.last_error AS lifecycle_last_error,
+                oi.isolated_at::text AS isolated_at,
+                oi.actor AS isolated_by,
+                oi.reason AS isolation_reason,
+                oi.source_deployment_id AS isolation_source_deployment_id,
+                oi.node_id IS NOT NULL AS operationally_isolated,
+                COALESCE(debt.debt_count, 0) AS convergence_debt_count,
+                COALESCE(debt.debt_failed, FALSE) AS convergence_debt_failed,
+                COALESCE(s.last_poll_at >= now() - interval '90 seconds', FALSE) AS reentry_poll_fresh,
+                COALESCE(s.runtime_reported_at >= now() - interval '2 minutes', FALSE) AS reentry_runtime_fresh,
                 n.wg_transport,
                 s.route_ipv4,
                 s.route_ipv6,
@@ -2684,6 +2693,18 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          LEFT JOIN node_agent_state s ON s.node_id = n.id
          LEFT JOIN node_applied_state a ON a.node_id = n.id
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
+         LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
+         LEFT JOIN LATERAL (
+             SELECT count(*) FILTER (
+                        WHERE o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')
+                    ) AS debt_count,
+                    bool_or(o.status IN ('failed-recovered', 'failed-dirty')) FILTER (
+                        WHERE o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')
+                    ) AS debt_failed
+               FROM node_convergence_obligations o
+              WHERE o.node_id = n.id
+                AND o.lifecycle_epoch = COALESCE(l.lifecycle_epoch, 0)
+         ) debt ON TRUE
          WHERE n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\'
          ORDER BY n.id"
     } else {
@@ -2710,6 +2731,15 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 l.deployment_id AS lifecycle_deployment_id,
                 l.completed_at::text AS lifecycle_completed_at,
                 l.last_error AS lifecycle_last_error,
+                oi.isolated_at::text AS isolated_at,
+                oi.actor AS isolated_by,
+                oi.reason AS isolation_reason,
+                oi.source_deployment_id AS isolation_source_deployment_id,
+                oi.node_id IS NOT NULL AS operationally_isolated,
+                COALESCE(debt.debt_count, 0) AS convergence_debt_count,
+                COALESCE(debt.debt_failed, FALSE) AS convergence_debt_failed,
+                COALESCE(s.last_poll_at >= now() - interval '90 seconds', FALSE) AS reentry_poll_fresh,
+                COALESCE(s.runtime_reported_at >= now() - interval '2 minutes', FALSE) AS reentry_runtime_fresh,
                 n.wg_transport,
                 s.route_ipv4,
                 s.route_ipv6,
@@ -2745,6 +2775,18 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          LEFT JOIN node_agent_state s ON s.node_id = n.id
          LEFT JOIN node_applied_state a ON a.node_id = n.id
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
+         LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
+         LEFT JOIN LATERAL (
+             SELECT count(*) FILTER (
+                        WHERE o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')
+                    ) AS debt_count,
+                    bool_or(o.status IN ('failed-recovered', 'failed-dirty')) FILTER (
+                        WHERE o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')
+                    ) AS debt_failed
+               FROM node_convergence_obligations o
+              WHERE o.node_id = n.id
+                AND o.lifecycle_epoch = COALESCE(l.lifecycle_epoch, 0)
+         ) debt ON TRUE
          ORDER BY n.id"
     }
 }
@@ -2789,6 +2831,60 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
                 "observed_at": row.try_get::<Option<String>, _>("observed_at").ok().flatten()
             })
         });
+
+    let operationally_isolated: bool = row.try_get("operationally_isolated")?;
+    let convergence_debt_count = u64::try_from(row.try_get::<i64, _>("convergence_debt_count")?)
+        .map_err(|_| {
+            StoreError::InvalidData("node convergence debt count is negative".to_owned())
+        })?;
+    let lifecycle_phase: String = row.try_get("lifecycle_phase")?;
+    let mut service_reentry_blockers = Vec::new();
+    if operationally_isolated {
+        if lifecycle_phase != "active" {
+            service_reentry_blockers.push("节点生命周期不是 active".to_owned());
+        }
+        if convergence_debt_count > 0 {
+            service_reentry_blockers.push(format!("仍有 {convergence_debt_count} 项收敛债务"));
+        }
+        if !row.try_get::<bool, _>("reentry_poll_fresh")? {
+            service_reentry_blockers.push("最近 90 秒没有领取期望状态".to_owned());
+        }
+        if !row.try_get::<bool, _>("reentry_runtime_fresh")? {
+            service_reentry_blockers.push("最近 2 分钟没有运行时上报".to_owned());
+        }
+        for (column, label) in [
+            ("phantun_state", "Phantun"),
+            ("wireguard_state", "WireGuard"),
+            ("xray_state", "Xray"),
+            ("hy2_port_hop_state", "HY2 端口跳转"),
+            ("grants_state", "授权名单"),
+        ] {
+            if row
+                .try_get::<Option<String>, _>(column)?
+                .as_deref()
+                .is_none_or(|state| matches!(state, "unknown" | "dirty"))
+            {
+                service_reentry_blockers.push(format!("{label} 尚未确认"));
+            }
+        }
+        if row.try_get::<bool, _>("overlay")? {
+            let wg_ready = row
+                .try_get::<Option<Value>, _>("wireguard_health")?
+                .and_then(|health| {
+                    let enabled = health.get("enabled")?.as_bool()?;
+                    let no_error = health
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty);
+                    Some(enabled && no_error)
+                })
+                .unwrap_or(false);
+            if !wg_ready {
+                service_reentry_blockers.push("WireGuard 运行状态尚未就绪".to_owned());
+            }
+        }
+    }
+    let service_reentry_ready = operationally_isolated && service_reentry_blockers.is_empty();
 
     Ok(NodeAgentStateItem {
         node_id: row.try_get("node_id")?,
@@ -2847,12 +2943,21 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
             StoreError::InvalidData(format!("nodes.domain_strategy 解不开: {error}"))
         })?,
         retired_at: row.try_get("retired_at")?,
-        lifecycle_phase: row.try_get("lifecycle_phase")?,
+        lifecycle_phase,
         lifecycle_epoch: u64::try_from(row.try_get::<i64, _>("lifecycle_epoch")?)
             .map_err(|_| StoreError::InvalidData("node lifecycle epoch is negative".to_owned()))?,
         lifecycle_deployment_id: row.try_get("lifecycle_deployment_id")?,
         lifecycle_completed_at: row.try_get("lifecycle_completed_at")?,
         lifecycle_last_error: row.try_get("lifecycle_last_error")?,
+        operationally_isolated,
+        isolated_at: row.try_get("isolated_at")?,
+        isolated_by: row.try_get("isolated_by")?,
+        isolation_reason: row.try_get("isolation_reason")?,
+        isolation_source_deployment_id: row.try_get("isolation_source_deployment_id")?,
+        convergence_debt_count,
+        convergence_debt_failed: row.try_get("convergence_debt_failed")?,
+        service_reentry_ready,
+        service_reentry_blockers,
         wg_transport_kind: {
             let value = row.try_get::<Value, _>("wg_transport")?;
             value

@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"google.golang.org/protobuf/proto"
 )
@@ -10,6 +11,9 @@ type MemoryAccount struct {
 }
 
 func (a *Account) AsAccount() (protocol.Account, error) {
+	if a == nil || a.Password == "" {
+		return nil, errors.New("anytls: empty password")
+	}
 	return &MemoryAccount{Password: a.Password}, nil
 }
 

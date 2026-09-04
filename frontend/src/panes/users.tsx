@@ -431,6 +431,12 @@ const GRANT_PROBE_SLOTS = [
   { protocol: 'hysteria2', family: 'ipv6', protocolLabel: 'Hysteria2', familyLabel: 'V6' },
 ] as const;
 
+type GrantProbeMatrixStyle = CSSProperties & { '--grant-probe-slot-count': number };
+const GRANT_PROBE_MATRIX_STYLE: GrantProbeMatrixStyle = {
+  // CSS 不再另存一份协议数量：新增协议槽位时，矩阵与数据定义一同扩列。
+  '--grant-probe-slot-count': GRANT_PROBE_SLOTS.length,
+};
+
 const GRANT_PROBE_POLL_MS = 1_000;
 
 const probeBaseName = (item: GrantProbeDisplayItem) => {
@@ -659,7 +665,7 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
               <span className="grant-probe-name">
                 <b>{group.name}</b>
               </span>
-              <span className="grant-probe-matrix">
+              <span className="grant-probe-matrix" style={GRANT_PROBE_MATRIX_STYLE}>
                 {GRANT_PROBE_SLOTS.map(slot => {
                   const item = group.items.find(
                     candidate => candidate.protocol === slot.protocol && candidate.family === slot.family,

@@ -824,6 +824,26 @@ impl PgStore {
         deployment::retry_target(&self.pool, actor, deployment_id, node_id).await
     }
 
+    pub async fn isolate_deployment_target(
+        &self,
+        actor: &AdminContext,
+        deployment_id: i64,
+        node_id: &str,
+        request: brocade_deployment::protocol::IsolateDeploymentTargetRequest,
+    ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
+        deployment::isolate_deployment_target(&self.pool, actor, deployment_id, node_id, request)
+            .await
+    }
+
+    pub async fn restore_node_service(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: brocade_deployment::protocol::RestoreNodeServiceRequest,
+    ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
+        deployment::restore_node_service(&self.pool, actor, node_id, request).await
+    }
+
     pub async fn provision_node(
         &self,
         actor: &AdminContext,

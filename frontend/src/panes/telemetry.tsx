@@ -21,8 +21,12 @@ import {
   observeAxisTick,
   observeBpsReading,
   observeBpsUnit,
+  observeBytesUnit,
   observeColors,
+  observeCountUnit,
+  observeMsUnit,
   observeMinorTick,
+  observeNumberUnit,
   observeSeriesLine,
   observeTimeInterval,
   observeValueAxis,
@@ -51,15 +55,15 @@ const TP_MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
 export const iso = (secs: number) => new Date(secs * 1000).toISOString();
 
 /* ── 格式化 ──────────────────────────────────────────────────
- * 带宽使用 1000 进制（Mb/s 是网络领域的常用单位），字节使用 ui/format 的 1024 进制。
- * 两套单位并存不是疏漏：将 82 Mb/s 显示为 78.2 Mib/s 不符合惯例，
+ * 带宽使用 1000 进制（Mbit/s 是网络领域的常用单位），字节使用 ui/format 的 1024 进制。
+ * 两套单位并存不是疏漏：将 82 Mbit/s 显示为 78.2 Mibit/s 不符合惯例，
  * 将 184 MB 的 RSS 显示为 193 MB 又与 top 的输出不一致。
  */
 
 /* 孤立读数：KPI 芯片、本月合计、机队汇总——身后没有坐标轴，自己定档。图上的读数一律改走
    observeBpsUnit(...).read，跟本卡的轴同一个单位，见那里的说明。
-   精度靠有效数字不靠换单位：原先 ≥1e6 就取整到 Mb/s，3.42 Mb/s 显示成「3 Mb/s」抹掉 13%，
-   1 到 10 Mb/s 之间每个读数都吃这个量级的误差。三位有效数字与 pingLatencyText 同一套规则。 */
+   精度靠有效数字不靠换单位：原先 ≥1e6 就取整到 Mbit/s，3.42 Mbit/s 显示成「3 Mbit/s」抹掉 13%，
+   1 到 10 Mbit/s 之间每个读数都吃这个量级的误差。三位有效数字与 pingLatencyText 同一套规则。 */
 export const bps = (n: number | null): string => (n === null ? '—' : observeBpsReading(n));
 
 /** 微秒转毫秒。RTT 统一显示为毫秒——微秒级精度在跨境链路上没有意义，
@@ -572,7 +576,7 @@ function congestionFindings(r: NodeLoadView): Finding[] {
  * - 缺口（has_gap / null）断开不连接。 */
 
 /** 吞吐值轴的量程与单位。刻度由 ThroughputChart 画，单位由 ThroughputPanel 写在标题栏里
- *  （`网卡流量 (Mb/s)`），两处都走这个函数取值——峰值只算一遍，量纲不可能对不上。 */
+ *  （`网卡流量 (Mbit/s)`），两处都走这个函数取值——峰值只算一遍，量纲不可能对不上。 */
 export function throughputAxis(
   rx: (number | null)[],
   tx: (number | null)[],
@@ -744,8 +748,8 @@ export function ThroughputChart({
           interval: valueAxis.interval,
           axisLine: observeAxisLine(ink3),
           axisTick: observeAxisTick(ink3),
-          // 刻度只写数字，单位由 ThroughputPanel 写在标题栏（`网卡流量 (Mb/s)`）。原先每格
-          // 各调一次 bps()，同一根轴上「1.00 Gb/s」与「500 Mb/s」并存，标签列宽在 3 到 9 字
+          // 刻度只写数字，单位由 ThroughputPanel 写在标题栏（`网卡流量 (Mbit/s)`）。原先每格
+          // 各调一次 bps()，同一根轴上「1.00 Gbit/s」与「500 Mbit/s」并存，标签列宽在 3 到 9 字
           // 之间跳，containLabel 还按最长那条留白。tooltip 与图例仍用 bps()：那是读数不是量程。
           axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: unit.text },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
@@ -790,6 +794,39 @@ const historyLineColorVar = (line: HistoryLine, index: number) => {
 
 type HistoryChartVariant = 'main' | 'secondary' | 'diagnostic';
 
+type HistoryUnit = (axis: ObserveValueAxis) => ObserveAxisUnit;
+type HistoryHeaderReading = ReactNode | ((read: (value: number) => string) => ReactNode);
+type HistoryFormatProps =
+  { formatValue: (value: number) => string; valueUnit?: never } | { formatValue?: never; valueUnit: HistoryUnit };
+
+const historyBytesUnit: HistoryUnit = observeBytesUnit;
+const historyByteRateUnit: HistoryUnit = axis => observeBytesUnit(axis, '/s');
+const historyCountUnit: HistoryUnit = observeCountUnit;
+const historyCountRateUnit: HistoryUnit = axis => observeCountUnit(axis, '/s');
+const historyMsUnit: HistoryUnit = axis => observeMsUnit(axis.interval);
+const historyPerSecondUnit: HistoryUnit = axis => observeNumberUnit(axis, '/s');
+
+function historyObservedPeak(lines: HistoryLine[], threshold?: { value: number }): number {
+  const stackTotals = new Map<string, number[]>();
+  let observedPeak = threshold?.value ?? 0;
+  for (const lineSeries of lines) {
+    if (lineSeries.stack) {
+      const totals = stackTotals.get(lineSeries.stack) ?? Array.from({ length: lineSeries.values.length }, () => 0);
+      lineSeries.values.forEach((value, index) => {
+        if (value !== null) totals[index] += Math.max(0, value);
+      });
+      stackTotals.set(lineSeries.stack, totals);
+      observedPeak = Math.max(observedPeak, ...totals);
+    } else {
+      observedPeak = lineSeries.values.reduce<number>(
+        (valuePeak, value) => (value === null ? valuePeak : Math.max(valuePeak, value)),
+        observedPeak,
+      );
+    }
+  }
+  return observedPeak;
+}
+
 /** 原始时序曲线。这里不放阈值、状态词或自动结论，只负责把服务端保留的窗口逐点画出。
  * null 与 has_gap 都断线，不用 0 填补；tooltip 显示窗口结束的绝对时间和原始数值。 */
 function HistoryChart({
@@ -797,6 +834,7 @@ function HistoryChart({
   samples,
   lines,
   formatValue,
+  valueUnit,
   group,
   variant = 'diagnostic',
   current,
@@ -808,20 +846,27 @@ function HistoryChart({
   title: string;
   samples: LoadSample[];
   lines: HistoryLine[];
-  formatValue: (value: number) => string;
   group?: string;
   variant?: HistoryChartVariant;
-  current?: ReactNode;
-  meta?: ReactNode;
+  current?: HistoryHeaderReading;
+  meta?: HistoryHeaderReading;
   max?: number;
   threshold?: { value: number; label: string };
   wide?: boolean;
-}) {
+} & HistoryFormatProps) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
   const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
   const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
   const lastSig = useRef<string | null>(null);
+  const observedPeak = historyObservedPeak(lines, threshold);
+  const valueAxis = max === undefined ? observeValueAxis(observedPeak) : null;
+  // 显式 max 的容量/连接图仍需要一个完整轴描述来选整卡单位；这只决定显示档位，实际轴上界
+  // 继续服从调用方传入的 max，不额外抬高容量上限。
+  const unitAxis = valueAxis ?? observeValueAxis(max ?? observedPeak);
+  const unit = valueUnit?.(unitAxis);
+  const axisText = unit?.text ?? formatValue!;
+  const readValue = unit?.read ?? formatValue!;
 
   useEffect(() => {
     const el = elRef.current;
@@ -842,7 +887,7 @@ function HistoryChart({
     const chart = chartRef.current;
     if (!chart) return;
     const times = samples.map(sample => sample.window_end_unix_secs);
-    const sig = JSON.stringify([times, lines, title, max, threshold, group, themeName, paletteKey]);
+    const sig = JSON.stringify([times, lines, title, max, threshold, group, unit?.name, themeName, paletteKey]);
     if (sig === lastSig.current) return;
     lastSig.current = sig;
     const css = getComputedStyle(elRef.current ?? document.documentElement);
@@ -868,24 +913,6 @@ function HistoryChart({
       if (hasStack) return undefined;
       return observeAreaStyle(colors[index], themeName, { count: overlapCount });
     };
-    const stackTotals = new Map<string, number[]>();
-    let observedPeak = threshold?.value ?? 0;
-    for (const lineSeries of lines) {
-      if (lineSeries.stack) {
-        const totals = stackTotals.get(lineSeries.stack) ?? Array.from({ length: lineSeries.values.length }, () => 0);
-        lineSeries.values.forEach((value, index) => {
-          if (value !== null) totals[index] += Math.max(0, value);
-        });
-        stackTotals.set(lineSeries.stack, totals);
-        observedPeak = Math.max(observedPeak, ...totals);
-      } else {
-        observedPeak = lineSeries.values.reduce<number>(
-          (valuePeak, value) => (value === null ? valuePeak : Math.max(valuePeak, value)),
-          observedPeak,
-        );
-      }
-    }
-    const valueAxis = max === undefined ? observeValueAxis(observedPeak) : null;
     const lastMs = (times[times.length - 1] ?? 0) * 1000;
     const firstMs = (times[0] ?? 0) * 1000;
     // x 轴显示墙钟时刻（hh:mm），tooltip 到秒；轴起点即首个样本时刻，曲线紧贴 y 轴。
@@ -932,7 +959,7 @@ function HistoryChart({
                   (right.value[1] ?? Number.NEGATIVE_INFINITY) - (left.value[1] ?? Number.NEGATIVE_INFINITY),
               )
               .map(row => {
-                const value = row.value[1] === null ? '—' : formatValue(Number(row.value[1]));
+                const value = row.value[1] === null ? '—' : readValue(Number(row.value[1]));
                 return (
                   `<div style="display:flex;gap:7px;align-items:center;line-height:1.75">` +
                   `<span style="width:8px;height:8px;border-radius:2px;background:${row.color};flex:none"></span>` +
@@ -971,7 +998,7 @@ function HistoryChart({
           scale: true,
           axisLine: observeAxisLine(ink3),
           axisTick: observeAxisTick(ink3),
-          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: (value: number) => formatValue(value) },
+          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: axisText },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
         series: lines.map((lineSeries, index) => ({
@@ -1017,7 +1044,21 @@ function HistoryChart({
       true,
     );
     if (group) echarts.connect(group);
-  }, [formatValue, group, lines, max, paletteKey, samples, themeName, threshold, title, variant]);
+  }, [
+    axisText,
+    group,
+    lines,
+    max,
+    paletteKey,
+    readValue,
+    samples,
+    themeName,
+    threshold,
+    title,
+    unit?.name,
+    valueAxis,
+    variant,
+  ]);
 
   const latest = (values: (number | null)[]) => {
     for (let index = values.length - 1; index >= 0; index -= 1) {
@@ -1025,13 +1066,18 @@ function HistoryChart({
     }
     return null;
   };
+  const renderHeaderReading = (reading: HistoryHeaderReading | undefined) =>
+    typeof reading === 'function' ? reading(readValue) : reading;
+  const renderedMeta = renderHeaderReading(meta);
+  const renderedCurrent = renderHeaderReading(current);
 
   return (
     <section className={`history-chart-card history-chart-card-${variant}${wide ? ' history-chart-card-wide' : ''}`}>
       <header className="history-chart-cap">
         <b>{title}</b>
-        {meta && <small>{meta}</small>}
-        {current && <strong>{current}</strong>}
+        {unit?.name && <span className="chart-unit">({unit.name})</span>}
+        {renderedMeta && <small>{renderedMeta}</small>}
+        {renderedCurrent && <strong>{renderedCurrent}</strong>}
       </header>
       <div ref={elRef} className="history-chart" />
       <footer className="history-chart-legend" aria-label={`${title} 图例`}>
@@ -1041,7 +1087,7 @@ function HistoryChart({
           return (
             <span key={line.name} className={line.area ? 'area' : line.dashed ? 'dashed' : undefined}>
               <i style={{ background: color }} />
-              {line.name} <b>{value === null ? '—' : formatValue(value)}</b>
+              {line.name} <b>{value === null ? '—' : readValue(value)}</b>
             </span>
           );
         })}
@@ -1179,7 +1225,7 @@ const CpuHistory = memo(function CpuHistory({
           title="调度与网络事件速率"
           samples={samples}
           group={group}
-          formatValue={value => `${compact(value)} /s`}
+          valueUnit={historyCountRateUnit}
           lines={[
             {
               name: '上下文切换',
@@ -1199,7 +1245,7 @@ const CpuHistory = memo(function CpuHistory({
           title="Cgroup 限流时间"
           samples={samples}
           group={group}
-          formatValue={value => `${value.toFixed(2)} ms`}
+          valueUnit={historyMsUnit}
           lines={[
             {
               name: '每窗口 throttled',
@@ -1254,10 +1300,12 @@ const MemoryHistory = memo(function MemoryHistory({
           title="容量构成"
           samples={samples}
           group={group}
-          formatValue={bytes}
+          valueUnit={historyBytesUnit}
           variant="main"
-          current={`可用 ${bytes(last.mem_available_bytes)}`}
-          meta={last.memory_detail ? `窗口最低可用 ${bytes(last.memory_detail.available_min_bytes)}` : undefined}
+          current={read => `可用 ${read(last.mem_available_bytes)}`}
+          meta={
+            last.memory_detail ? read => `窗口最低可用 ${read(last.memory_detail!.available_min_bytes)}` : undefined
+          }
           max={memTotal > 0 ? memTotal : undefined}
           threshold={memTotal > 0 ? { value: memTotal * 0.85, label: '可用 15% 阈值' } : undefined}
           lines={[
@@ -1323,7 +1371,7 @@ const MemoryHistory = memo(function MemoryHistory({
           title="内核缓存与固定页"
           samples={samples}
           group={group}
-          formatValue={bytes}
+          valueUnit={historyBytesUnit}
           lines={[
             { name: 'Buffers', values: historyValues(samples, sample => detail(sample, value => value.buffers_bytes)) },
             {
@@ -1349,7 +1397,7 @@ const MemoryHistory = memo(function MemoryHistory({
           title="Swap、脏页与回写"
           samples={samples}
           group={group}
-          formatValue={bytes}
+          valueUnit={historyBytesUnit}
           lines={[
             { name: 'Swap 已用', values: historyValues(samples, sample => sample.swap_used_bytes) },
             {
@@ -1367,7 +1415,7 @@ const MemoryHistory = memo(function MemoryHistory({
           title="Swap I/O"
           samples={samples}
           group={group}
-          formatValue={bytes}
+          valueUnit={historyBytesUnit}
           lines={[
             { name: '换入', values: historyValues(samples, sample => detail(sample, value => value.swap_in_bytes)) },
             { name: '换出', values: historyValues(samples, sample => detail(sample, value => value.swap_out_bytes)) },
@@ -1377,7 +1425,7 @@ const MemoryHistory = memo(function MemoryHistory({
           title="缺页与直接回收"
           samples={samples}
           group={group}
-          formatValue={value => compact(value)}
+          valueUnit={historyCountUnit}
           lines={[
             {
               name: 'Major faults',
@@ -1421,10 +1469,10 @@ const DiskHistory = memo(function DiskHistory({
           title="容量"
           samples={samples}
           group={group}
-          formatValue={bytes}
+          valueUnit={historyBytesUnit}
           variant="main"
           current={diskUsed === null ? '—' : pct((diskUsed / totalNow) * 100, 0)}
-          meta={`可用 ${bytes(last.disk_free_bytes)} · inode ${pct(100 - last.disk_inode_free_pct, 0)}`}
+          meta={read => `可用 ${read(last.disk_free_bytes)} · inode ${pct(100 - last.disk_inode_free_pct, 0)}`}
           max={totalNow > 0 ? totalNow : undefined}
           threshold={totalNow > 0 ? { value: totalNow * 0.9, label: '90% 容量阈值' } : undefined}
           lines={[
@@ -1496,7 +1544,7 @@ const DiskHistory = memo(function DiskHistory({
           title="块设备吞吐"
           samples={samples}
           group={group}
-          formatValue={value => `${bytes(value)}/s`}
+          valueUnit={historyByteRateUnit}
           lines={[
             { name: '读取', values: historyValues(samples, sample => detail(sample, value => value.read_bps)) },
             { name: '写入', values: historyValues(samples, sample => detail(sample, value => value.write_bps)) },
@@ -1506,7 +1554,7 @@ const DiskHistory = memo(function DiskHistory({
           title="块设备 IOPS"
           samples={samples}
           group={group}
-          formatValue={value => `${value.toFixed(2)} /s`}
+          valueUnit={historyPerSecondUnit}
           lines={[
             { name: '读取', values: historyValues(samples, sample => detail(sample, value => value.read_iops)) },
             { name: '写入', values: historyValues(samples, sample => detail(sample, value => value.write_iops)) },
@@ -1516,7 +1564,7 @@ const DiskHistory = memo(function DiskHistory({
           title="完成延迟"
           samples={samples}
           group={group}
-          formatValue={value => `${value.toFixed(2)} ms`}
+          valueUnit={historyMsUnit}
           lines={[
             {
               name: '读取 await',
@@ -1593,19 +1641,19 @@ const NetworkHistory = memo(function NetworkHistory({
           title="连接与套接字"
           samples={samples}
           group={group}
-          formatValue={value => compact(value)}
+          valueUnit={historyCountUnit}
           variant="main"
-          current={
+          current={read =>
             last.conntrack_count === null || conntrackMax === null || conntrackMax <= 0
               ? last.conntrack_count === null
                 ? '—'
-                : compact(last.conntrack_count)
+                : read(last.conntrack_count)
               : pct((last.conntrack_count / conntrackMax) * 100, 0)
           }
           meta={
             last.conntrack_count === null
               ? undefined
-              : `conntrack ${compact(last.conntrack_count)}${conntrackMax ? ` / ${compact(conntrackMax)}` : ''}`
+              : read => `conntrack ${read(last.conntrack_count!)}${conntrackMax ? ` / ${read(conntrackMax)}` : ''}`
           }
           max={conntrackMax && conntrackMax > 0 ? conntrackMax : undefined}
           threshold={
@@ -1691,7 +1739,7 @@ const NetworkHistory = memo(function NetworkHistory({
             title="出站临时端口套接字"
             samples={samples}
             group={group}
-            formatValue={value => compact(value)}
+            valueUnit={historyCountUnit}
             lines={[
               {
                 name: 'IPv4 范围内',
@@ -1716,7 +1764,7 @@ const NetworkHistory = memo(function NetworkHistory({
           title="连接快照"
           samples={samples}
           group={group}
-          formatValue={value => compact(value)}
+          valueUnit={historyCountUnit}
           lines={[
             { name: 'Conntrack', values: historyValues(samples, sample => sample.conntrack_count) },
             { name: 'TCP in-use', values: historyValues(samples, sample => detail(sample, value => value.tcp_inuse)) },
@@ -1728,7 +1776,7 @@ const NetworkHistory = memo(function NetworkHistory({
               title="TCP 连接生命周期"
               samples={samples}
               group={group}
-              formatValue={value => compact(value)}
+              valueUnit={historyCountUnit}
               lines={[
                 {
                   name: '主动建立',
@@ -1752,7 +1800,7 @@ const NetworkHistory = memo(function NetworkHistory({
               title="TCP 重传与异常"
               samples={samples}
               group={group}
-              formatValue={value => compact(value)}
+              valueUnit={historyCountUnit}
               lines={[
                 {
                   name: '重传段',
@@ -1777,7 +1825,7 @@ const NetworkHistory = memo(function NetworkHistory({
               title="监听队列与 UDP 丢弃"
               samples={samples}
               group={group}
-              formatValue={value => compact(value)}
+              valueUnit={historyCountUnit}
               lines={[
                 {
                   name: '监听溢出',
@@ -1809,7 +1857,7 @@ const NetworkHistory = memo(function NetworkHistory({
               title="套接字资源"
               samples={samples}
               group={group}
-              formatValue={bytes}
+              valueUnit={historyBytesUnit}
               lines={[
                 {
                   name: 'TCP 内存',
@@ -1878,12 +1926,6 @@ function uptimeLabel(seconds: number): string {
   if (minutes > 0) return `${minutes} 分钟`;
   return '不足 1 分钟';
 }
-
-const compact = (value: number): string => {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
-  return Math.round(value).toLocaleString();
-};
 
 const LoadDashboard = memo(function LoadDashboard({
   report,
@@ -2081,7 +2123,7 @@ export function hopFindings(view: HopLinkView, sameChain: HopLinkView[]): Findin
     });
   }
 
-  // 瓶颈跳。需要与同链的其他跳比较才有意义——82 Mb/s 本身不表示问题，
+  // 瓶颈跳。需要与同链的其他跳比较才有意义——82 Mbit/s 本身不表示问题，
   // 同链其他跳都在 300 以上而该跳只有 82 才表示问题。
   // 同链的其他跳按 peer 区分——一条链上不会有两跳指向同一台机器。
   const others = sameChain.filter(o => o.sample.peer_node_id !== h.peer_node_id && o.sample.btlbw_p50_bps !== null);
@@ -2091,7 +2133,7 @@ export function hopFindings(view: HopLinkView, sameChain: HopLinkView[]): Findin
       out.push({
         tone: 'warn',
         chip: `瓶颈 ${bps(h.btlbw_p50_bps)}`,
-        // 与同链其他跳的比较结果是该行的唯一信息——单独的 82 Mb/s 不表示任何问题。
+        // 与同链其他跳的比较结果是该行的唯一信息——单独的 82 Mbit/s 不表示任何问题。
         text: (
           <>
             这条链的瓶颈：<b>{bps(h.btlbw_p50_bps)}</b>，次低的一跳 {bps(nextLowest)}。

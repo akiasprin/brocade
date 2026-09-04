@@ -248,10 +248,10 @@ func (mb MultiBuffer) Len() int32 {
 	return size
 }
 
-// IsEmpty returns true if the MultiBuffer has no content.
+// IsEmpty returns true if the MultiBuffer has neither payload nor a UDP packet.
 func (mb MultiBuffer) IsEmpty() bool {
 	for _, b := range mb {
-		if !b.IsEmpty() {
+		if b != nil && (!b.IsEmpty() || b.UDP != nil) {
 			return false
 		}
 	}

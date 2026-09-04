@@ -352,6 +352,15 @@ export interface NodeAgentStateItem {
   lifecycle_deployment_id: number | null;
   lifecycle_completed_at: string | null;
   lifecycle_last_error: string | null;
+  operationally_isolated: boolean;
+  isolated_at: string | null;
+  isolated_by: string | null;
+  isolation_reason: string | null;
+  isolation_source_deployment_id: number | null;
+  convergence_debt_count: number;
+  convergence_debt_failed: boolean;
+  service_reentry_ready: boolean;
+  service_reentry_blockers: string[];
   /* 外部连接该机器 wg 端口的方式。`fake_tcp` 表示入站 UDP 被封禁，使用 phantun 的 TCP 封装。 */
   wg_transport_kind: 'udp' | 'fake_tcp';
   wg_fake_tcp_port: number | null;
@@ -491,12 +500,13 @@ export interface PlanSummary {
   total_targets: number;
   changed_targets: number;
   skipped_targets: number;
+  deferred_targets: number;
   disruptive_targets: number;
   max_wave: number;
 }
 export interface PlannedTarget {
   node_id: string;
-  status: 'pending' | 'skipped';
+  status: 'pending' | 'deferred' | 'skipped';
   wave: number;
   disruptive: boolean;
   actions: PlannedAction[];
@@ -515,6 +525,9 @@ export interface DeploymentListItem {
   id: number;
   revision_id: number;
   status: string;
+  activation_status: 'waiting' | 'activated' | 'rejected';
+  settlement_status: 'converged' | 'debt' | 'uncertain';
+  activated_at: string | null;
   active: boolean | null;
   actor: string | null;
   // 配置单需要写盘并重启；权限单只在运行中的 xray 内增删名单，不断开连接。
@@ -533,6 +546,7 @@ export interface DeploymentListItem {
   changed_targets: number;
   skipped_targets: number;
   failed_targets: number;
+  debt_targets: number;
   disruptive_targets: number;
   max_wave: number;
   // 处于等待人工确认状态而非等待机器上报。含破坏性动作的波需要人工确认后才继续下发——
@@ -557,6 +571,10 @@ export interface DeploymentDetail {
   id: number;
   revision_id: number;
   status: string;
+  activation_status: 'waiting' | 'activated' | 'rejected';
+  settlement_status: 'converged' | 'debt' | 'uncertain';
+  activated_at: string | null;
+  debt_targets: number;
   active: boolean | null;
   actor: string | null;
   note: string | null;
@@ -589,6 +607,26 @@ export const fetchDeployments = (kind?: 'config' | 'grants', token = '') =>
   api<{ deployments: DeploymentListItem[] }>(`/deployments?limit=50${kind ? `&kind=${kind}` : ''}`, token);
 
 export const fetchDeployment = (id: number, token = '') => api<DeploymentDetail>(`/deployments/${id}`, token);
+
+export interface NodeIsolationCommandResult {
+  node_id: string;
+  isolated: boolean;
+  affected_deployments: number[];
+  debt_count: number;
+  serving_generation: number | null;
+}
+
+export const isolateDeploymentTarget = (
+  deploymentId: number,
+  nodeId: string,
+  request: { expected_target_status: string; reason: string; acknowledge_uncertain?: boolean },
+) => post<NodeIsolationCommandResult>(
+  `/deployments/${deploymentId}/targets/${encodeURIComponent(nodeId)}/isolate`,
+  request,
+);
+
+export const restoreNodeService = (nodeId: string, reason: string) =>
+  post<NodeIsolationCommandResult>(`/nodes/${encodeURIComponent(nodeId)}/restore-service`, { reason });
 
 /**
  * 权限变更先进入 durable outbox，之后才会生成自动化授权单。如果规划阶段持续失败，
@@ -1919,8 +1957,6 @@ export interface ModelSettings {
     /* 从全互联中明确排除的无方向节点对；发布后双方都不生成对应 peer。 */
     disabled_links: { a: string; b: string }[];
   };
-  // 自动分配端口的起始值。只影响新建时的默认值——已写入模型的端口不受影响，
-  // 修改已有端口会导致 xray 配置变更、进程重启、该机器上所有连接中断。
   probe: {
     // 端到端探测的目标地址。要求返回纯文本且包含 `ip=` 一行——出口核对依据该行。
     // 使用明文 HTTP 是有意的：测量对象是链路本身，不应包含目标站点的 TLS 握手时间。
@@ -1928,8 +1964,11 @@ export interface ModelSettings {
     timeout_secs: number;
     interval_secs: number;
   };
+  // 自动分配端口的起始值。只影响新建时的默认值——已写入模型的端口不受影响，
+  // 修改已有端口会导致 xray 配置变更、进程重启、该机器上所有连接中断。
   ports: {
     ingress_base: number;
+    anytls_base: number;
     hop_base: number;
     hy2_base: number;
   };

@@ -73,7 +73,7 @@ func readText(br *buf.BufferedReader, length int) (string, error) {
 	if length <= 0 {
 		return "", nil
 	}
-	body := buf.New()
+	body := buf.NewWithSize(int32(length))
 	bodyBytes := body.Extend(int32(length))
 	if _, err := io.ReadFull(br, bodyBytes); err != nil {
 		body.Release()

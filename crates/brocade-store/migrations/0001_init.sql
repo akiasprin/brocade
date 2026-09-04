@@ -414,6 +414,7 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- undirected {"a":"node-a","b":"node-b"} pair, canonicalized by the store.
     overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL,
     port_ingress_base INTEGER DEFAULT 8443 NOT NULL,
+    port_anytls_base INTEGER DEFAULT 16000 NOT NULL,
     port_hop_base INTEGER DEFAULT 20000 NOT NULL,
     -- The same number as model.rs's HYSTERIA2_PORT_BASE, which is where a wire with no
     -- allocation of its own falls back to. Two sources for one factory value, but they are
@@ -534,6 +535,7 @@ CREATE TABLE IF NOT EXISTS control_state (
     CONSTRAINT control_state_overlay_keepalive_range CHECK (((overlay_keepalive_secs >= 1) AND (overlay_keepalive_secs <= 65535))),
     CONSTRAINT control_state_overlay_mtu_range CHECK (((overlay_mtu >= 1000) AND (overlay_mtu <= 9000))),
     CONSTRAINT control_state_overlay_disabled_links_shape CHECK ((jsonb_typeof(overlay_disabled_links) = 'array')),
+    CONSTRAINT control_state_port_anytls_base_range CHECK (((port_anytls_base >= 1) AND (port_anytls_base <= 65535))),
     CONSTRAINT control_state_port_hop_base_range CHECK (((port_hop_base >= 1) AND (port_hop_base <= 65535))),
     CONSTRAINT control_state_port_hy2_base_range CHECK (((port_hy2_base >= 1) AND (port_hy2_base <= 65535))),
     CONSTRAINT control_state_port_ingress_base_range CHECK (((port_ingress_base >= 1) AND (port_ingress_base <= 65535))),
@@ -564,6 +566,8 @@ ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS site_icon_data_url TEXT;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS port_anytls_base INTEGER DEFAULT 16000 NOT NULL;
 -- TCP-only probing was never a durable compatibility contract. Replaying 0001 drops those old
 -- settings before creating the shared TCP/ICMP model; the fleet deliberately starts this history
 -- afresh rather than carrying two names and two wire formats forever.
@@ -592,6 +596,11 @@ ALTER TABLE control_state
 ALTER TABLE control_state
     ADD CONSTRAINT control_state_realtime_interval_known
         CHECK ((realtime_interval_secs = ANY (ARRAY[1, 2, 5])));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_port_anytls_base_range;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_port_anytls_base_range
+        CHECK (((port_anytls_base >= 1) AND (port_anytls_base <= 65535)));
 ALTER TABLE control_state
     DROP CONSTRAINT IF EXISTS control_state_overlay_disabled_links_shape;
 ALTER TABLE control_state
@@ -680,6 +689,14 @@ CREATE TABLE IF NOT EXISTS deployments (
     sync_of_deployment_id BIGINT,
     kind TEXT DEFAULT 'config' NOT NULL,
     base_revision_id BIGINT,
+    -- Execution remains in status/active for compatibility. Activation answers whether this
+    -- revision is serving; settlement answers whether every node has converged or some isolated
+    -- node still owes the latest desired state.
+    activation_status TEXT DEFAULT 'waiting' NOT NULL,
+    settlement_status TEXT DEFAULT 'converged' NOT NULL,
+    activated_at TIMESTAMPTZ,
+    CONSTRAINT deployments_activation_status_check CHECK ((activation_status IN ('waiting', 'activated', 'rejected'))),
+    CONSTRAINT deployments_settlement_status_check CHECK ((settlement_status IN ('converged', 'debt', 'uncertain'))),
     CONSTRAINT deployments_kind_check CHECK ((kind IN ('config', 'grants'))),
     CONSTRAINT deployments_status_check CHECK ((status IN ('planned', 'running', 'halted', 'succeeded', 'failed', 'canceled'))),
     CONSTRAINT deployments_warnings_check CHECK ((jsonb_typeof(warnings) = 'array')),
@@ -690,6 +707,32 @@ CREATE TABLE IF NOT EXISTS deployments (
     CONSTRAINT deployments_rollback_of_deployment_id_fkey FOREIGN KEY (rollback_of_deployment_id) REFERENCES deployments(id),
     CONSTRAINT deployments_sync_of_deployment_id_fkey FOREIGN KEY (sync_of_deployment_id) REFERENCES deployments(id)
 );
+
+ALTER TABLE deployments
+    ADD COLUMN IF NOT EXISTS activation_status TEXT,
+    ADD COLUMN IF NOT EXISTS settlement_status TEXT,
+    ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ;
+UPDATE deployments
+   SET activation_status = CASE
+           WHEN status = 'succeeded' THEN 'activated'
+           WHEN status IN ('failed', 'canceled') THEN 'rejected'
+           ELSE 'waiting'
+       END
+ WHERE activation_status IS NULL;
+UPDATE deployments SET settlement_status = 'converged' WHERE settlement_status IS NULL;
+ALTER TABLE deployments
+    ALTER COLUMN activation_status SET DEFAULT 'waiting',
+    ALTER COLUMN activation_status SET NOT NULL,
+    ALTER COLUMN settlement_status SET DEFAULT 'converged',
+    ALTER COLUMN settlement_status SET NOT NULL;
+ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_activation_status_check;
+ALTER TABLE deployments
+    ADD CONSTRAINT deployments_activation_status_check
+    CHECK (activation_status IN ('waiting', 'activated', 'rejected'));
+ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_settlement_status_check;
+ALTER TABLE deployments
+    ADD CONSTRAINT deployments_settlement_status_check
+    CHECK (settlement_status IN ('converged', 'debt', 'uncertain'));
 
 -- Immutable client-only input for subscriptions. It has its own committed head because a Chain
 -- rename or public projection address changes no machine artifact and must not advance the
@@ -745,10 +788,15 @@ CREATE TABLE IF NOT EXISTS subscription_serving_state (
     client_snapshot_id BIGINT,
     topology_deployment_id BIGINT,
     permissions_deployment_id BIGINT,
+    -- The exact node-isolation overlay represented by generation. It is stored beside the other
+    -- checkpoint pointers so one subscription request cannot mix a new isolation set with an old
+    -- generation.
+    isolated_node_ids JSONB DEFAULT '[]'::jsonb NOT NULL,
     generation BIGINT DEFAULT 1 NOT NULL,
     updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT subscription_serving_state_singleton CHECK (id),
     CONSTRAINT subscription_serving_state_generation_check CHECK (generation > 0),
+    CONSTRAINT subscription_serving_state_isolated_nodes_check CHECK (jsonb_typeof(isolated_node_ids) = 'array'),
     CONSTRAINT subscription_serving_state_pkey PRIMARY KEY (id),
     CONSTRAINT subscription_serving_state_topology_revision_fkey FOREIGN KEY (topology_revision_id) REFERENCES revisions(id),
     CONSTRAINT subscription_serving_state_permissions_revision_fkey FOREIGN KEY (permissions_revision_id) REFERENCES revisions(id),
@@ -760,7 +808,19 @@ CREATE TABLE IF NOT EXISTS subscription_serving_state (
 -- Existing databases have the singleton already. Keep this evolution in 0001: this repository
 -- deliberately carries one replayable canonical migration rather than a stack of delta files.
 ALTER TABLE subscription_serving_state
-    ADD COLUMN IF NOT EXISTS client_snapshot_id BIGINT;
+    ADD COLUMN IF NOT EXISTS client_snapshot_id BIGINT,
+    ADD COLUMN IF NOT EXISTS isolated_node_ids JSONB;
+UPDATE subscription_serving_state
+   SET isolated_node_ids = '[]'::jsonb
+ WHERE isolated_node_ids IS NULL;
+ALTER TABLE subscription_serving_state
+    ALTER COLUMN isolated_node_ids SET DEFAULT '[]'::jsonb,
+    ALTER COLUMN isolated_node_ids SET NOT NULL;
+ALTER TABLE subscription_serving_state
+    DROP CONSTRAINT IF EXISTS subscription_serving_state_isolated_nodes_check;
+ALTER TABLE subscription_serving_state
+    ADD CONSTRAINT subscription_serving_state_isolated_nodes_check
+    CHECK (jsonb_typeof(isolated_node_ids) = 'array');
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -897,11 +957,19 @@ CREATE TABLE IF NOT EXISTS deployment_targets (
     node_id TEXT NOT NULL,
     status TEXT NOT NULL,
     error TEXT,
-    CONSTRAINT deployment_targets_status_check CHECK ((status IN ('pending', 'dispatched', 'converging', 'succeeded', 'failed-recovered', 'failed-dirty', 'skipped', 'canceled'))),
+    CONSTRAINT deployment_targets_status_check CHECK ((status IN ('pending', 'dispatched', 'converging', 'succeeded', 'failed-recovered', 'failed-dirty', 'skipped', 'deferred', 'superseded', 'canceled'))),
     CONSTRAINT deployment_targets_pkey PRIMARY KEY (deployment_id, node_id),
     CONSTRAINT deployment_targets_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id) ON DELETE CASCADE,
     CONSTRAINT deployment_targets_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
 );
+ALTER TABLE deployment_targets DROP CONSTRAINT IF EXISTS deployment_targets_status_check;
+ALTER TABLE deployment_targets
+    ADD CONSTRAINT deployment_targets_status_check CHECK (
+        status IN (
+            'pending', 'dispatched', 'converging', 'succeeded', 'failed-recovered',
+            'failed-dirty', 'skipped', 'deferred', 'superseded', 'canceled'
+        )
+    );
 
 CREATE TABLE IF NOT EXISTS deployment_target_state (
     deployment_id BIGINT NOT NULL,
@@ -928,13 +996,26 @@ CREATE TABLE IF NOT EXISTS deployment_target_state (
     -- activated after a successful convergence report; queued readings taken before that point
     -- therefore retain the previous ownership map.
     usage_generation_id BIGINT,
+    -- Normal targets use zero. An isolation action invalidates it, while node obligations carry
+    -- their own positive claim generation in the agent protocol.
+    claim_generation BIGINT DEFAULT 0 NOT NULL,
     CONSTRAINT deployment_target_state_desired_grants_check CHECK (((desired_grants IS NULL) OR (jsonb_typeof(desired_grants) = 'object'))),
     CONSTRAINT deployment_target_state_dispatched_grants_check CHECK (((dispatched_grants IS NULL) OR (jsonb_typeof(dispatched_grants) = 'object'))),
     CONSTRAINT deployment_target_state_lifecycle_epoch_check CHECK ((lifecycle_epoch >= 0)),
+    CONSTRAINT deployment_target_state_claim_generation_check CHECK ((claim_generation >= 0)),
     CONSTRAINT deployment_target_state_wave_check CHECK ((wave >= 0)),
     CONSTRAINT deployment_target_state_pkey PRIMARY KEY (deployment_id, node_id),
     CONSTRAINT deployment_target_state_deployment_id_node_id_fkey FOREIGN KEY (deployment_id, node_id) REFERENCES deployment_targets(deployment_id, node_id) ON DELETE CASCADE
 );
+ALTER TABLE deployment_target_state ADD COLUMN IF NOT EXISTS claim_generation BIGINT;
+UPDATE deployment_target_state SET claim_generation = 0 WHERE claim_generation IS NULL;
+ALTER TABLE deployment_target_state
+    ALTER COLUMN claim_generation SET DEFAULT 0,
+    ALTER COLUMN claim_generation SET NOT NULL;
+ALTER TABLE deployment_target_state
+    DROP CONSTRAINT IF EXISTS deployment_target_state_claim_generation_check;
+ALTER TABLE deployment_target_state
+    ADD CONSTRAINT deployment_target_state_claim_generation_check CHECK (claim_generation >= 0);
 
 -- Operational progress is deliberately separate from nodes.retired_at. The latter is revisioned
 -- model intent; this row says how far the agent has converged that intent and never enters a model
@@ -983,6 +1064,82 @@ CREATE TABLE IF NOT EXISTS node_lifecycle_events (
     CONSTRAINT node_lifecycle_events_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id),
     CONSTRAINT node_lifecycle_events_once UNIQUE (node_id, lifecycle_epoch, event)
 );
+
+-- Operational isolation is deliberately not model state. The active row is the current fact used
+-- by serving projection; the event table preserves who changed it and why after the active row is
+-- cleared. Removing a row never retires or deletes the node identity.
+CREATE TABLE IF NOT EXISTS node_operational_isolations (
+    node_id TEXT NOT NULL,
+    isolated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source_deployment_id BIGINT,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT node_operational_isolations_pkey PRIMARY KEY (node_id),
+    CONSTRAINT node_operational_isolations_reason_check CHECK (length(btrim(reason)) > 0),
+    CONSTRAINT node_operational_isolations_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT node_operational_isolations_source_deployment_fkey FOREIGN KEY (source_deployment_id) REFERENCES deployments(id)
+);
+
+CREATE TABLE IF NOT EXISTS node_operational_isolation_events (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+    node_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    deployment_id BIGINT,
+    details JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT node_operational_isolation_events_pkey PRIMARY KEY (id),
+    CONSTRAINT node_operational_isolation_events_event_check CHECK (event IN ('isolated', 'restored')),
+    CONSTRAINT node_operational_isolation_events_reason_check CHECK (length(btrim(reason)) > 0),
+    CONSTRAINT node_operational_isolation_events_details_check CHECK (jsonb_typeof(details) = 'object'),
+    CONSTRAINT node_operational_isolation_events_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT node_operational_isolation_events_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id)
+);
+
+-- Latest desired work survives release activation. Rows are append-only per generation: a newer
+-- release supersedes the old row before inserting the next one, so a late report can be rejected
+-- without erasing why the old release was once owed.
+CREATE TABLE IF NOT EXISTS node_convergence_obligations (
+    node_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    lifecycle_epoch BIGINT NOT NULL,
+    generation BIGINT NOT NULL,
+    source_deployment_id BIGINT NOT NULL,
+    source_revision_id BIGINT NOT NULL,
+    desired_structure JSONB NOT NULL,
+    desired_grants JSONB NOT NULL,
+    desired_fingerprint TEXT NOT NULL,
+    usage_generation_id BIGINT,
+    priority INTEGER DEFAULT 0 NOT NULL,
+    status TEXT DEFAULT 'pending' NOT NULL,
+    claim_generation BIGINT DEFAULT 0 NOT NULL,
+    claimed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    superseded_at TIMESTAMPTZ,
+    settled_at TIMESTAMPTZ,
+    last_error TEXT,
+    CONSTRAINT node_convergence_obligations_pkey PRIMARY KEY (node_id, kind, lifecycle_epoch, generation),
+    CONSTRAINT node_convergence_obligations_kind_check CHECK (kind IN ('config', 'grants')),
+    CONSTRAINT node_convergence_obligations_status_check CHECK (status IN ('pending', 'dispatched', 'converging', 'succeeded', 'failed-recovered', 'failed-dirty', 'superseded', 'canceled')),
+    CONSTRAINT node_convergence_obligations_epoch_check CHECK (lifecycle_epoch >= 0),
+    CONSTRAINT node_convergence_obligations_generation_check CHECK (generation > 0),
+    CONSTRAINT node_convergence_obligations_claim_generation_check CHECK (claim_generation >= 0),
+    CONSTRAINT node_convergence_obligations_priority_check CHECK (priority >= 0),
+    CONSTRAINT node_convergence_obligations_structure_check CHECK (jsonb_typeof(desired_structure) = 'object'),
+    CONSTRAINT node_convergence_obligations_grants_check CHECK (jsonb_typeof(desired_grants) = 'object'),
+    CONSTRAINT node_convergence_obligations_fingerprint_check CHECK (desired_fingerprint ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT node_convergence_obligations_source_target_fkey FOREIGN KEY (source_deployment_id, node_id) REFERENCES deployment_targets(deployment_id, node_id) ON DELETE CASCADE,
+    CONSTRAINT node_convergence_obligations_source_revision_fkey FOREIGN KEY (source_revision_id) REFERENCES revisions(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS node_convergence_obligations_one_current
+    ON node_convergence_obligations (node_id, kind, lifecycle_epoch)
+    WHERE status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty');
+CREATE UNIQUE INDEX IF NOT EXISTS node_convergence_obligations_source_target
+    ON node_convergence_obligations (source_deployment_id, node_id)
+    WHERE status <> 'superseded';
 
 CREATE OR REPLACE FUNCTION brocade_initialize_node_lifecycle() RETURNS TRIGGER
     LANGUAGE plpgsql
@@ -1768,7 +1925,7 @@ CREATE TABLE IF NOT EXISTS model_snapshots (
 -- Its own table apart from node_applied_state, because nothing here appears in any artifact.
 -- Artifact reconciliation compares what the control plane sent and is written only when the agent
 -- reports a convergence result; these were never sent by it and are reported through
--- `/agent/v1/runtime` every 30 minutes. Hung off release observations, a machine that does not ship
+-- `/agent/v1/runtime` every 30 seconds. Hung off release observations, a machine that does not ship
 -- for a month leaves all of this unknown for a month — exactly the failure these columns exist to
 -- prevent.
 --
@@ -1949,6 +2106,11 @@ ALTER TABLE node_agent_state
     DROP CONSTRAINT IF EXISTS node_agent_state_usage_generation_id_fkey;
 ALTER TABLE node_agent_state
     ADD CONSTRAINT node_agent_state_usage_generation_id_fkey
+    FOREIGN KEY (usage_generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT;
+ALTER TABLE node_convergence_obligations
+    DROP CONSTRAINT IF EXISTS node_convergence_obligations_usage_generation_fkey;
+ALTER TABLE node_convergence_obligations
+    ADD CONSTRAINT node_convergence_obligations_usage_generation_fkey
     FOREIGN KEY (usage_generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT;
 
 -- A release's observations: what state the four node artifacts are in on the machine.

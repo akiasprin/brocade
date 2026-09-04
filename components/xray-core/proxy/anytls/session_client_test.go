@@ -2,12 +2,16 @@ package anytls
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
 )
 
 func TestWriteWasteFramesKeepsWireLengthAndFrameHeaders(t *testing.T) {
@@ -79,13 +83,13 @@ func TestWritePacketWithPaddingSplitsOversizedRecord(t *testing.T) {
 	s := &session{
 		fw: newFrameWriter(writer),
 	}
-	s.paddingScheme, _ = parsePaddingScheme("stop=1\n0=70000-70000")
+	s.paddingScheme, _ = parsePaddingScheme("stop=2\n1=70000-70000")
 
 	frames, err := (&frame{cmd: cmdHeartRequest, sid: 0}).toMultiBuffer()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writePacketWithPadding(0, frames); err != nil {
+	if err := s.writePacketWithPadding(1, frames); err != nil {
 		t.Fatal(err)
 	}
 	if wire.Len() != 70000 {
@@ -99,5 +103,105 @@ func TestWritePacketWithPaddingSplitsOversizedRecord(t *testing.T) {
 		if frame.cmd != cmdWaste || frame.sid != 0 {
 			t.Fatalf("padding frame = %+v, want waste stream 0", frame)
 		}
+	}
+}
+
+func TestOpenStreamSerializesAssignedIDsOnWire(t *testing.T) {
+	s, output := newWireSession(nil, true)
+	const streamCount = 32
+	endpoints := make([]*testLinkEndpoint, streamCount)
+	results := make(chan *stream, streamCount)
+	errs := make(chan error, streamCount)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range streamCount {
+		endpoint := newTestLinkEndpoint()
+		endpoints[i] = endpoint
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			stream, err := s.openStream(
+				context.Background(),
+				xnet.TCPDestination(xnet.DomainAddress("example.com"), 443),
+				endpoint.link,
+			)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- stream
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(results)
+	for err := range errs {
+		t.Fatalf("openStream error = %v", err)
+	}
+
+	var synIDs []uint32
+	for _, frame := range parseTestFrames(t, output.Bytes()) {
+		if frame.cmd == cmdSYN {
+			synIDs = append(synIDs, frame.sid)
+		}
+	}
+	if len(synIDs) != streamCount {
+		t.Fatalf("SYN count = %d, want %d", len(synIDs), streamCount)
+	}
+	for i, sid := range synIDs {
+		if want := uint32(i + 1); sid != want {
+			t.Fatalf("SYN IDs = %v, want strictly increasing sequence at %d", synIDs, want)
+		}
+	}
+	for stream := range results {
+		s.finishStream(stream.sid, nil)
+	}
+	for _, endpoint := range endpoints {
+		endpoint.closeInput()
+		endpoint.closeOutput()
+	}
+}
+
+func TestOpenStreamRetiresSessionInsteadOfWrappingToZero(t *testing.T) {
+	s, output := newWireSession(nil, true)
+	s.nextSID.Store(math.MaxUint32)
+	endpoint := newTestLinkEndpoint()
+	defer endpoint.closeInput()
+	defer endpoint.closeOutput()
+
+	stream, err := s.openStream(
+		context.Background(),
+		xnet.TCPDestination(xnet.DomainAddress("example.com"), 443),
+		endpoint.link,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.sid != math.MaxUint32 || s.nextSID.Load() != 0 {
+		t.Fatalf("stream ID state = current:%d next:%d", stream.sid, s.nextSID.Load())
+	}
+	s.finishStream(stream.sid, nil)
+
+	if _, err := s.openStream(context.Background(), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443), endpoint.link); err != errStreamIDExhausted {
+		t.Fatalf("open after maximum ID = %v, want %v", err, errStreamIDExhausted)
+	}
+	for _, frame := range parseTestFrames(t, output.Bytes()) {
+		if frame.cmd == cmdSYN && frame.sid == 0 {
+			t.Fatal("client emitted a SYN with stream ID 0")
+		}
+	}
+
+	client := &Client{sessions: map[uint64]*session{1: s}}
+	s.seq = 1
+	s.setDieHook(func() {
+		client.sessionsMu.Lock()
+		delete(client.sessions, s.seq)
+		client.sessionsMu.Unlock()
+	})
+	client.markSessionIdle(s)
+	if !s.isClosed() || len(client.idleSessions) != 0 || len(client.sessions) != 0 {
+		t.Fatalf("exhausted session was retained: closed=%v idle=%v sessions=%v", s.isClosed(), client.idleSessions, client.sessions)
 	}
 }

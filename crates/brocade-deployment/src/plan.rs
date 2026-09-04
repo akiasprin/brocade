@@ -34,6 +34,8 @@ pub struct PlanSummary {
     pub total_targets: usize,
     pub changed_targets: usize,
     pub skipped_targets: usize,
+    #[serde(default)]
+    pub deferred_targets: usize,
     pub disruptive_targets: usize,
     pub max_wave: u32,
 }
@@ -59,6 +61,7 @@ pub struct PlannedTarget {
 #[serde(rename_all = "kebab-case")]
 pub enum PlannedTargetStatus {
     Pending,
+    Deferred,
     Skipped,
 }
 
@@ -1174,6 +1177,10 @@ pub fn summarize_targets(targets: &[PlannedTarget]) -> PlanSummary {
         .iter()
         .filter(|target| target.status == PlannedTargetStatus::Skipped)
         .count();
+    let deferred_targets = targets
+        .iter()
+        .filter(|target| target.status == PlannedTargetStatus::Deferred)
+        .count();
     let changed_targets = total_targets - skipped_targets;
     let disruptive_targets = targets.iter().filter(|target| target.disruptive).count();
     let max_wave = targets.iter().map(|target| target.wave).max().unwrap_or(0);
@@ -1182,6 +1189,7 @@ pub fn summarize_targets(targets: &[PlannedTarget]) -> PlanSummary {
         total_targets,
         changed_targets,
         skipped_targets,
+        deferred_targets,
         disruptive_targets,
         max_wave,
     }

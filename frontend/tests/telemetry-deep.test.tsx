@@ -3,7 +3,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostFacts, LoadSample, NodeLoadView } from '../src/api';
 import type { LoadRange } from '../src/panes/nodes';
-import { observeAreaFill, observeTimeTick, observeValueAxis } from '../src/ui/observe-chart';
+import {
+  observeAreaFill,
+  observeBpsReading,
+  observeBpsUnit,
+  observeBytesUnit,
+  observeCountUnit,
+  observeTimeTick,
+  observeValueAxis,
+} from '../src/ui/observe-chart';
 
 const chartMock = vi.hoisted(() => ({
   setOption: vi.fn(),
@@ -259,6 +267,26 @@ describe('deep host telemetry', () => {
     expect(observeValueAxis(100)).toEqual({ interval: 25, max: 125 });
   });
 
+  it('keeps byte and compact readings on one card-wide unit while leaving ticks bare', () => {
+    const byteUnit = observeBytesUnit(observeValueAxis(8 * 1024 ** 3));
+    expect(byteUnit.name).toBe('GiB');
+    expect(byteUnit.text(2 * 1024 ** 3)).toBe('2');
+    expect(byteUnit.read(128 * 1024 ** 2)).toBe('0.125 GiB');
+
+    const countUnit = observeCountUnit(observeValueAxis(262_144));
+    expect(countUnit.name).toBe('k');
+    expect(countUnit.text(50_000)).toBe('50');
+    expect(countUnit.read(82)).toBe('0.0820 k');
+  });
+
+  it('spells network bit-rate units explicitly', () => {
+    const unit = observeBpsUnit(observeValueAxis(82_000_000));
+    expect(unit.name).toBe('Mbit/s');
+    expect(unit.read(82_000_000)).toBe('82.0 Mbit/s');
+    expect(observeBpsReading(1_000)).toBe('1.00 Kbit/s');
+    expect(observeBpsReading(1_000_000_000)).toBe('1.00 Gbit/s');
+  });
+
   it('fills unstacked traces with a tint of the series color, keeping the hue', () => {
     const stops = (fill: ReturnType<typeof observeAreaFill>) =>
       (fill as Exclude<typeof fill, string>).colorStops.map(stop => stop.color);
@@ -392,6 +420,41 @@ describe('deep host telemetry', () => {
     expect(view.getByText('监听队列与 UDP 丢弃')).toBeTruthy();
     expect(view.getByText('套接字资源')).toBeTruthy();
     expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
+  });
+
+  it('moves history units into titles except for percentages, and keeps units on standalone readings', () => {
+    const view = render(<LoadCard report={report()} />);
+
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+    const percentHeader = view.getByText('CPU 时间占比').closest('header');
+    expect(percentHeader?.querySelector('.chart-unit')).toBeNull();
+    const percentChart = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === '用户态'),
+    )?.[0];
+    expect(percentChart.yAxis.axisLabel.formatter(25)).toBe('25.0%');
+
+    fireEvent.click(view.getByRole('button', { name: /内存/ }));
+    const memoryHeader = view.getByText('容量构成').closest('header');
+    expect(memoryHeader?.querySelector('.chart-unit')?.textContent).toBe('(GiB)');
+    expect(memoryHeader?.textContent).toContain('可用 3.00 GiB');
+    expect(view.getByLabelText('容量构成 图例').textContent).toContain('匿名页 2.40 GiB');
+    const memoryChart = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === '匿名页'),
+    )?.[0];
+    expect(memoryChart.yAxis.axisLabel.formatter(2 * 1024 ** 3)).toBe('2');
+    const memoryTooltip = memoryChart.tooltip.formatter([
+      { seriesName: '共享/tmpfs', color: '#111', value: [130_000, 128 * 1024 ** 2] },
+    ]);
+    expect(memoryTooltip).toContain('0.125 GiB');
+
+    fireEvent.click(view.getByRole('button', { name: /磁盘/ }));
+    expect(view.getByText('块设备吞吐').closest('header')?.querySelector('.chart-unit')?.textContent).toBe('(MiB/s)');
+    expect(view.getByText('块设备 IOPS').closest('header')?.querySelector('.chart-unit')?.textContent).toBe('(/s)');
+    expect(view.getByText('完成延迟').closest('header')?.querySelector('.chart-unit')?.textContent).toBe('(ms)');
+
+    fireEvent.click(view.getByRole('button', { name: /连接表/ }));
+    expect(view.getByText('连接与套接字').closest('header')?.querySelector('.chart-unit')?.textContent).toBe('(k)');
+    expect(view.getByLabelText('连接与套接字 图例').textContent).toContain('TCP 已建立 0.0820 k');
   });
 
   it('keeps the network throughput legend and metadata in the dedicated throughput panel', () => {

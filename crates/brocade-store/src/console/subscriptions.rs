@@ -309,7 +309,14 @@ async fn build_dynamic_clash(
         ))
     })?;
     if plan.entries.is_empty() {
-        return Err(if hide_reason {
+        let authorized = snapshot.apps.iter().any(|app| {
+            app.grants
+                .iter()
+                .any(|grant| grant.tenant == tenant_id && grant.user == user_id)
+        });
+        return Err(if authorized {
+            StoreError::Unavailable(format!("user {tenant_id}/{user_id} 暂时无可用入口"))
+        } else if hide_reason {
             public_not_found()
         } else {
             StoreError::NotFound(format!(

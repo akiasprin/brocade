@@ -359,18 +359,30 @@ pub(crate) async fn create_usage_generation_for_target(
         .bind(deployment_id)
         .fetch_one(&mut **tx)
         .await?;
-    let id: i64 = sqlx::query_scalar(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO usage_generations (node_id, deployment_id, revision_id, bindings)
          VALUES ($1, $2, $3, $4)
-         ON CONFLICT (deployment_id, node_id) DO UPDATE SET node_id = usage_generations.node_id
+         ON CONFLICT (deployment_id, node_id) DO UPDATE SET
+             revision_id = EXCLUDED.revision_id,
+             bindings = EXCLUDED.bindings
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM usage_generation_activations activation
+              WHERE activation.generation_id = usage_generations.id
+         )
          RETURNING id",
     )
     .bind(node_id)
     .bind(deployment_id)
     .bind(revision_id)
     .bind(serde_json::to_value(bindings)?)
-    .fetch_one(&mut **tx)
-    .await?;
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        StoreError::Conflict(format!(
+            "usage generation for deployment {deployment_id}/{node_id} is already active"
+        ))
+    })?;
     Ok(Some(id))
 }
 

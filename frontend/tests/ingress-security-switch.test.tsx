@@ -66,7 +66,7 @@ function Harness({
     queryClient.setQueryData(['nodes'], { nodes: [] });
     queryClient.setQueryData(['revisions'], { current_revision: null });
     queryClient.setQueryData(['settings'], {
-      ports: { hy2_base: 18000 },
+      ports: { anytls_base: 16000, hy2_base: 18000 },
       reality_site: {
         dest: 'www.example.com:443',
         server_names: ['www.example.com'],
@@ -113,7 +113,7 @@ function AnyTlsHarness() {
     queryClient.setQueryData(['nodes'], { nodes: [] });
     queryClient.setQueryData(['revisions'], { current_revision: null });
     queryClient.setQueryData(['settings'], {
-      ports: { hy2_base: 18000 },
+      ports: { anytls_base: 16000, hy2_base: 18000 },
       reality_site: {
         dest: 'www.example.com:443',
         server_names: ['www.example.com'],
@@ -129,6 +129,38 @@ function AnyTlsHarness() {
       <IngressPanel appId="app-1" ingress={value} title="AnyTLS" editable>
         <IngressStreamRow appId="app-1" ingress={value} editable section="protocols" />
         <IngressStreamRow appId="app-1" ingress={value} editable section="anytls" />
+      </IngressPanel>
+    </QueryClientProvider>
+  );
+}
+
+function NewAnyTlsHarness({ anytlsBase }: { anytlsBase: number }) {
+  const [client] = useState(() => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    queryClient.setQueryData(['snapshot'], { snapshot: { apps: [], nodes: [] } });
+    queryClient.setQueryData(['nodes'], { nodes: [] });
+    queryClient.setQueryData(['revisions'], { current_revision: null });
+    queryClient.setQueryData(['settings'], {
+      ports: { anytls_base: anytlsBase, hy2_base: 18000 },
+      reality_site: {
+        dest: 'www.example.com:443',
+        server_names: ['www.example.com'],
+        fingerprint: 'chrome',
+      },
+    });
+    return queryClient;
+  });
+  const value = ingress('vless-reality');
+
+  return (
+    <QueryClientProvider client={client}>
+      <IngressPanel appId="app-1" ingress={value} title="AnyTLS" editable>
+        <IngressStreamRow appId="app-1" ingress={value} editable section="protocols" />
       </IngressPanel>
     </QueryClientProvider>
   );
@@ -398,6 +430,20 @@ describe('VLESS security draft', () => {
 });
 
 describe('AnyTLS ingress draft', () => {
+  it('allocates a newly enabled listener from the global AnyTLS port base', async () => {
+    draft.clear();
+    allowSnapshotRefresh();
+    const view = render(<NewAnyTlsHarness anytlsBase={16123} />);
+
+    fireEvent.click(view.getByRole('checkbox', { name: 'AnyTLS（TCP）' }));
+
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
+    const operation = draft.ops()[0];
+    if (operation?.op !== 'upsert_ingress') throw new Error('expected an ingress draft operation');
+    const saved = operation.ingress as UpsertIngressBody;
+    expect(saved.wires?.anytls?.port).toBe(16123);
+  });
+
   it('exposes the independent TCP port, padding scheme, and full masquerade response', async () => {
     draft.clear();
     const view = render(<AnyTlsHarness />);

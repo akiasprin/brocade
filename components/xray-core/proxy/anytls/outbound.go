@@ -22,7 +22,7 @@ import (
 
 const (
 	defaultIdleSessionCheckInterval = 30 * time.Second
-	defaultIdleSessionTimeout       = 60 * time.Second
+	defaultIdleSessionTimeout       = 30 * time.Second
 	defaultMinIdleSession           = 0
 )
 
@@ -157,10 +157,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.CanSpliceCopy = 3
 	destination := ob.Target
 
-	server := c.server
-	dest := server.Destination
-
 	var sess *session
+	reusedSession := false
 	c.poolMu.Lock()
 	if c.isClosed() {
 		c.poolMu.Unlock()
@@ -180,83 +178,29 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			sess = nil
 			continue
 		}
+		reusedSession = true
 		break
 	}
 	c.sessionsMu.Unlock()
 	c.poolMu.Unlock()
 
 	if sess == nil {
-		if c.isClosed() {
-			return errors.New("anytls: client closed")
-		}
-		seq := c.sessionSeq.Add(1)
-		var conn stat.Connection
-		err := retry.ExponentialBackoff(5, 100).On(func() error {
-			rawConn, err := dialer.Dial(ctx, dest)
-			if err != nil {
-				return err
-			}
-			conn = rawConn
-			return nil
-		})
+		var err error
+		sess, err = c.createSession(ctx, dialer)
 		if err != nil {
-			return errors.New("anytls: failed to establish connection").AtWarning().Base(err)
+			return err
 		}
-
-		paddingScheme, authPadding := c.paddingSnapshot()
-		auth := make([]byte, 34+int(authPadding))
-		copy(auth[:32], c.authHash[:])
-		binary.BigEndian.PutUint16(auth[32:34], authPadding)
-		if err := writeFull(conn, auth); err != nil {
-			conn.Close()
-			return errors.New("anytls: write auth failed").Base(err)
-		}
-		if c.isClosed() {
-			_ = conn.Close()
-			return errors.New("anytls: client closed")
-		}
-
-		sess = &session{
-			client:        c,
-			isClient:      true,
-			conn:          conn,
-			br:            &buf.BufferedReader{Reader: buf.NewReader(conn)},
-			bw:            buf.NewBufferedWriter(buf.NewWriter(conn)),
-			paddingScheme: paddingScheme,
-			streams:       make(map[uint32]*stream),
-			synAckCh:      make(map[uint32]chan error),
-			errCh:         make(chan error, 1),
-			seq:           seq,
-		}
-		sess.fw = newFrameWriter(sess.bw)
-		sess.nextSID.Store(1)
-		sess.pktCounter.Store(1)
-		sess.setPeerVersion(1)
-		sess.setDieHook(func() {
-			c.sessionsMu.Lock()
-			delete(c.sessions, sess.seq)
-			c.sessionsMu.Unlock()
-		})
-		c.poolMu.Lock()
-		if c.isClosed() {
-			c.poolMu.Unlock()
-			_ = conn.Close()
-			return errors.New("anytls: client closed")
-		}
-		c.sessionsMu.Lock()
-		c.sessions[seq] = sess
-		c.sessionsMu.Unlock()
-		c.poolMu.Unlock()
-		errors.LogDebug(ctx, "anytls: new session created, seq=", seq)
-
-		go func() {
-			if err := sess.readLoop(ctx); err != nil && !sess.isClosed() {
-				sess.close(err)
-			}
-		}()
 	}
 
 	stream, err := sess.openStream(ctx, destination, link)
+	if err == errSessionClosed && reusedSession {
+		sess.close(err)
+		sess, err = c.createSession(ctx, dialer)
+		if err != nil {
+			return err
+		}
+		stream, err = sess.openStream(ctx, destination, link)
+	}
 	if err != nil {
 		sess.close(err)
 		return errors.New("anytls: failed to open stream").Base(err)
@@ -277,8 +221,85 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	}
 }
 
+func (c *Client) createSession(ctx context.Context, dialer internet.Dialer) (*session, error) {
+	if c.isClosed() {
+		return nil, errors.New("anytls: client closed")
+	}
+
+	seq := c.sessionSeq.Add(1)
+	var conn stat.Connection
+	err := retry.ExponentialBackoff(5, 100).On(func() error {
+		rawConn, err := dialer.Dial(ctx, c.server.Destination)
+		if err != nil {
+			return err
+		}
+		conn = rawConn
+		return nil
+	})
+	if err != nil {
+		return nil, errors.New("anytls: failed to establish connection").AtWarning().Base(err)
+	}
+
+	paddingScheme, authPadding := c.paddingSnapshot()
+	auth := make([]byte, 34+int(authPadding))
+	copy(auth[:32], c.authHash[:])
+	binary.BigEndian.PutUint16(auth[32:34], authPadding)
+	if err := writeFull(conn, auth); err != nil {
+		_ = conn.Close()
+		return nil, errors.New("anytls: write auth failed").Base(err)
+	}
+	if c.isClosed() {
+		_ = conn.Close()
+		return nil, errors.New("anytls: client closed")
+	}
+
+	sess := &session{
+		client:        c,
+		isClient:      true,
+		conn:          conn,
+		br:            &buf.BufferedReader{Reader: buf.NewReader(conn)},
+		bw:            buf.NewBufferedWriter(buf.NewWriter(conn)),
+		paddingScheme: paddingScheme,
+		streams:       make(map[uint32]*stream),
+		synAckCh:      make(map[uint32]chan error),
+		errCh:         make(chan error, 1),
+		seq:           seq,
+	}
+	sess.fw = newFrameWriter(sess.bw)
+	sess.nextSID.Store(1)
+	sess.pktCounter.Store(1)
+	sess.setPeerVersion(1)
+	sess.setDieHook(func() {
+		c.sessionsMu.Lock()
+		delete(c.sessions, seq)
+		c.sessionsMu.Unlock()
+	})
+	c.poolMu.Lock()
+	if c.isClosed() {
+		c.poolMu.Unlock()
+		_ = conn.Close()
+		return nil, errors.New("anytls: client closed")
+	}
+	c.sessionsMu.Lock()
+	c.sessions[seq] = sess
+	c.sessionsMu.Unlock()
+	c.poolMu.Unlock()
+	errors.LogDebug(ctx, "anytls: new session created, seq=", seq)
+
+	go func() {
+		if err := sess.readLoop(ctx); err != nil && !sess.isClosed() {
+			sess.close(err)
+		}
+	}()
+	return sess, nil
+}
+
 func (c *Client) markSessionIdle(sess *session) {
 	if sess == nil {
+		return
+	}
+	if sess.nextSID.Load() == 0 {
+		sess.close(errStreamIDExhausted)
 		return
 	}
 

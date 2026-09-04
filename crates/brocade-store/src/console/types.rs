@@ -173,6 +173,27 @@ pub struct NodeAgentStateItem {
     pub lifecycle_deployment_id: Option<i64>,
     pub lifecycle_completed_at: Option<String>,
     pub lifecycle_last_error: Option<String>,
+    /// Temporary serving isolation is independent of retirement. The machine remains active and
+    /// keeps polling full convergence obligations, but subscriptions no longer select it until an
+    /// administrator explicitly restores service.
+    #[serde(default)]
+    pub operationally_isolated: bool,
+    #[serde(default)]
+    pub isolated_at: Option<String>,
+    #[serde(default)]
+    pub isolated_by: Option<String>,
+    #[serde(default)]
+    pub isolation_reason: Option<String>,
+    #[serde(default)]
+    pub isolation_source_deployment_id: Option<i64>,
+    #[serde(default)]
+    pub convergence_debt_count: u64,
+    #[serde(default)]
+    pub convergence_debt_failed: bool,
+    #[serde(default)]
+    pub service_reentry_ready: bool,
+    #[serde(default)]
+    pub service_reentry_blockers: Vec<String>,
     pub applied: Option<Value>,
 }
 

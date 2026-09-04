@@ -85,3 +85,20 @@ func TestDiscardBytesAndReadText(t *testing.T) {
 		t.Fatal("readText unexpectedly accepted truncated input")
 	}
 }
+
+func TestReadTextLargerThanDefaultBuffer(t *testing.T) {
+	payload := bytes.Repeat([]byte("a"), 2*buf.Size+17)
+	reader := &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(payload))}
+	text, err := readText(reader, len(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal([]byte(text), payload) {
+		t.Fatal("readText changed large payload")
+	}
+
+	reader = &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(payload[:len(payload)-1]))}
+	if _, err := readText(reader, len(payload)); err == nil {
+		t.Fatal("readText unexpectedly accepted truncated large input")
+	}
+}

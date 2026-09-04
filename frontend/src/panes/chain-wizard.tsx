@@ -140,7 +140,6 @@ export function ChainWizard({
   const [customRealityDest, setCustomRealityDest] = useState('');
   const [customRealityNames, setCustomRealityNames] = useState('');
   const [customRealityFingerprint, setCustomRealityFingerprint] = useState('chrome');
-  const [done, setDone] = useState<string[] | null>(null);
   const [error, setError] = useState<unknown>(null);
 
   const nameMap = new Map((nodes.data?.nodes ?? []).map(n => [n.node_id, n.name]));
@@ -468,10 +467,12 @@ export function ChainWizard({
         });
       }
 
-      setDone(ops.map(o => o.arg));
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['snapshot'] });
       qc.invalidateQueries({ queryKey: ['nodes'] });
+      // 成功后回到进入向导前的上下文。草稿条已经承担待提交状态，不再停留展示一份
+      // 与提交前预览重复的“改了什么”结果页。
+      onDone();
     } catch (e) {
       setError(e);
     }
@@ -493,29 +494,6 @@ export function ChainWizard({
     hopPortIssues.length === 0 &&
     realityTargetReady &&
     (!listeners.some(host => hostSecOf(host) === 'reality') || globalRealityReady);
-
-  if (done) {
-    return (
-      <>
-        <div className="callout blue">
-          <b>加进草稿了。</b> 顶栏的草稿条上按「提交」才写进库——在那之前发布页看不到这条链。
-        </div>
-        <ul className="wz-ops" style={{ marginTop: 10 }}>
-          {done.map((d, i) => (
-            <li key={i}>
-              <span className="arg">{d}</span>
-            </li>
-          ))}
-        </ul>
-        <div className="toolbar">
-          <span className="sp" />
-          <button className="btn primary" onClick={onDone}>
-            完成
-          </button>
-        </div>
-      </>
-    );
-  }
 
   return (
     <form

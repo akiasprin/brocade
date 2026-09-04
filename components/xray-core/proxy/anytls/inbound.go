@@ -2,7 +2,6 @@ package anytls
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"io"
 	"sync"
@@ -55,17 +54,16 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		return nil, errors.New("anytls: invalid masquerade").Base(err)
 	}
 	for _, u := range config.Users {
+		if u == nil {
+			return nil, errors.New("anytls: bad user")
+		}
 		mu, err := u.ToMemoryUser()
 		if err != nil {
 			return nil, errors.New("anytls: bad user").Base(err)
 		}
-		acc, ok := mu.Account.(*MemoryAccount)
-		if !ok {
-			return nil, errors.New("anytls: user account type")
+		if err := s.addUser(mu); err != nil {
+			return nil, errors.New("anytls: bad user").Base(err)
 		}
-		sum := sha256.Sum256([]byte(acc.Password))
-		s.users[sum] = mu
-		s.usersByEmail[mu.Email] = mu
 	}
 	return s, nil
 }

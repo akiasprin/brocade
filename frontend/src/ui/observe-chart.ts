@@ -256,13 +256,13 @@ export function observeValueAxis(peak: number, targetIntervals = 4): ObserveValu
  * One unit for a whole card: named once in the title bar, and used by the ticks, the legend and
  * the tooltip alike.
  *
- * A card that switches unit between its axis and its legend — `(Mb/s)` overhead, `3400 kb/s` in
+ * A card that switches unit between its axis and its legend — `(Mbit/s)` overhead, `3400 Kbit/s` in
  * the strip — makes the reader convert before they can compare, and that happens exactly when a
  * node is idling far below its own peak. So the unit is settled once, from the axis, and precision
- * is bought with significant digits instead: `3.42 Mb/s`, never a rung change.
+ * is bought with significant digits instead: `3.42 Mbit/s`, never a rung change.
  */
 export type ObserveAxisUnit = {
-  /** What the title bar prints, as in `网卡流量 (Mb/s)`. */
+  /** What the title bar prints, as in `网卡流量 (Mbit/s)`. */
   name: string;
   /** One tick, bare — no unit, since the title bar already carries it. */
   text: (value: number) => string;
@@ -274,21 +274,33 @@ export type ObserveAxisUnit = {
  * Three significant digits, which is the precision a reading needs and a tick does not.
  *
  * `ui/ping-probe.ts` has spelled latency this way all along; throughput used to round to whole
- * units above 1 Mb/s, so a 3.42 Mb/s link read `3 Mb/s` — a 13% haircut, taken by every value
- * between 1 and 10 Mb/s. Fixed decimals rather than trimmed ones: a legend is a column, and a
+ * units above 1 Mbit/s, so a 3.42 Mbit/s link read `3 Mbit/s` — a 13% haircut, taken by every value
+ * between 1 and 10 Mbit/s. Fixed decimals rather than trimmed ones: a legend is a column, and a
  * column that keeps its width is easier to scan than one that grows and shrinks per sample.
  */
 function significantText(scaled: number): string {
-  if (scaled < 10) return scaled.toFixed(2);
-  if (scaled < 100) return scaled.toFixed(1);
-  return String(Math.round(scaled));
+  const magnitude = Math.abs(scaled);
+  if (magnitude === 0) return '0.00';
+  // Keep three significant digits even when a reading sits below the card's chosen unit. This is
+  // common on a shared scale: 82 sockets under a k heading must read 0.082 k, not 0.08 k.
+  const decimals = Math.max(0, 2 - Math.floor(Math.log10(magnitude)));
+  return scaled.toFixed(Math.min(decimals, 6));
+}
+
+/** A concise tick whose decimal places follow the axis step rather than the reading precision. */
+function numberTickText(value: number, interval: number): string {
+  if (!Number.isFinite(value)) return String(value);
+  const step = Math.abs(interval);
+  if (step === 0 || !Number.isFinite(step)) return String(value);
+  const decimals = step >= 1 && Number.isInteger(step) ? 0 : Math.max(0, Math.ceil(-Math.log10(step)) + 1);
+  return String(Number(value.toFixed(Math.min(decimals, 6))));
 }
 
 const BPS_UNITS: readonly (readonly [number, string])[] = [
-  [1e9, 'Gb/s'],
-  [1e6, 'Mb/s'],
-  [1e3, 'kb/s'],
-  [1, 'b/s'],
+  [1e9, 'Gbit/s'],
+  [1e6, 'Mbit/s'],
+  [1e3, 'Kbit/s'],
+  [1, 'bit/s'],
 ] as const;
 
 /** The rung a quantity sits on: the largest unit whose quotient is at least 1. */
@@ -312,17 +324,17 @@ export function observeBpsReading(value: number): string {
  * Unit for a throughput card, taken from the tick interval.
  *
  * The interval is the smallest quantity the axis has to spell out, so it — not the peak — decides
- * whether the ticks need decimals. A 250 Mb/s step under a Gb/s heading reads 0 / 0.25 / 0.50 /
- * 0.75 / 1.00; under Mb/s it reads 0 / 250 / 500 / 750 / 1000. Choosing by the peak only bounds the
+ * whether the ticks need decimals. A 250 Mbit/s step under a Gbit/s heading reads 0 / 0.25 / 0.50 /
+ * 0.75 / 1.00; under Mbit/s it reads 0 / 250 / 500 / 750 / 1000. Choosing by the peak only bounds the
  * top label and says nothing about the step, which is where the decimals come from.
  *
- * Ticks stay in that unit however small the numbers get: a peak of 3.4 Mb/s labels 0 / 1 / 2 / 3 / 4
- * rather than moving down to 1000 / 2000 / 3000 / 4000 kb/s. A tick sits on a grid line, so its
+ * Ticks stay in that unit however small the numbers get: a peak of 3.4 Mbit/s labels 0 / 1 / 2 / 3 / 4
+ * rather than moving down to 1000 / 2000 / 3000 / 4000 Kbit/s. A tick sits on a grid line, so its
  * value is exact either way and the smaller unit would buy four zeros, four characters of label
  * column, and no information. The precision a reader is actually missing there is between the grid
  * lines, and that is what `read` supplies.
  *
- * This replaced `bps()` on the axis, which chose per tick and so put `1.00 Gb/s` and `500 Mb/s` on
+ * This replaced `bps()` on the axis, which chose per tick and so put `1.00 Gbit/s` and `500 Mbit/s` on
  * the same axis — a label column jumping between three and nine characters, with `containLabel`
  * reserving room for the longest.
  */
@@ -339,6 +351,66 @@ export function observeBpsUnit(axis: ObserveValueAxis): ObserveAxisUnit {
   };
 }
 
+const BYTE_UNITS: readonly (readonly [number, string])[] = [
+  [1024 ** 4, 'TiB'],
+  [1024 ** 3, 'GiB'],
+  [1024 ** 2, 'MiB'],
+  [1024, 'KiB'],
+  [1, 'B'],
+] as const;
+
+const COUNT_UNITS: readonly (readonly [number, string])[] = [
+  [1_000_000, 'm'],
+  [1_000, 'k'],
+  [1, ''],
+] as const;
+
+function scaleRung(axis: ObserveValueAxis, units: readonly (readonly [number, string])[]): readonly [number, string] {
+  return units.find(([divisor]) => axis.max / divisor >= 1) ?? units[units.length - 1];
+}
+
+/**
+ * One binary byte unit for a whole history card. The largest tick decides the rung, so a byte axis
+ * never crosses from KiB into MiB halfway up. `suffix` carries rates such as MiB/s without making
+ * the formatter choose a second, unrelated unit.
+ */
+export function observeBytesUnit(axis: ObserveValueAxis, suffix = ''): ObserveAxisUnit {
+  const [divisor, base] = scaleRung(axis, BYTE_UNITS);
+  const name = `${base}${suffix}`;
+  return {
+    name,
+    text: value => String(Number((value / divisor).toFixed(2))),
+    read: value => `${significantText(value / divisor)} ${name}`,
+  };
+}
+
+/**
+ * A stable decimal prefix for counts. Below one thousand there is no title suffix; rates still
+ * retain `/s`. Unscaled readings stay integral because these metrics count events or resources.
+ */
+export function observeCountUnit(axis: ObserveValueAxis, suffix = ''): ObserveAxisUnit {
+  const [divisor, prefix] = scaleRung(axis, COUNT_UNITS);
+  const name = `${prefix}${suffix}`;
+  return {
+    name,
+    text: value => String(Number((value / divisor).toFixed(2))),
+    read: value => {
+      if (divisor === 1 && suffix === '') return Math.round(value).toLocaleString();
+      const unit = name ? ` ${name}` : '';
+      return `${divisor === 1 ? Math.round(value).toLocaleString() : significantText(value / divisor)}${unit}`;
+    },
+  };
+}
+
+/** A fixed unit with bare ticks and three-significant-digit readings. */
+export function observeNumberUnit(axis: ObserveValueAxis, name: string): ObserveAxisUnit {
+  return {
+    name,
+    text: value => numberTickText(value, axis.interval),
+    read: value => `${significantText(value)} ${name}`,
+  };
+}
+
 /** Latency axes never change unit — see `observeMsUnit` — so a card can name it without an axis. */
 export const OBSERVE_MS_UNIT = 'ms';
 
@@ -348,12 +420,8 @@ export const OBSERVE_MS_UNIT = 'ms';
  * precision varies with the interval; the name never does.
  */
 export function observeMsUnit(interval: number): ObserveAxisUnit {
-  return {
-    name: OBSERVE_MS_UNIT,
-    text: value => (interval >= 1 ? String(Math.round(value)) : String(Number(value.toFixed(1)))),
-    // Latency readings already satisfy this: `pingLatencyText` is the same three-digit rule, which
-    // is why the ping cards never had the unit drift the throughput cards did. They keep calling
-    // `pingSampleText`, which also has to say 未探测 / 无响应 — states a number cannot carry.
-    read: value => `${significantText(value)} ${OBSERVE_MS_UNIT}`,
-  };
+  // Latency readings already satisfy this: `pingLatencyText` is the same three-digit rule, which
+  // is why the ping cards never had the unit drift the throughput cards did. They keep calling
+  // `pingSampleText`, which also has to say 未探测 / 无响应 — states a number cannot carry.
+  return observeNumberUnit({ max: 0, interval }, OBSERVE_MS_UNIT);
 }

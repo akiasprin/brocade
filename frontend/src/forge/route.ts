@@ -53,9 +53,8 @@ const DRILL: Partial<Record<NavKey, DrillSpec[]>> = {
     { seg: 'node', fields: [{ name: 'id' }] },
     { seg: 'chain', fields: [{ name: 'id' }] },
     { seg: 'provision', rest: { step: 1 } },
-    // 安装相关的几个页面。机器在提交表单时即已入库，因此此处的标识是 node_id：
-    // 切换、刷新、后退都可恢复。恢复后停留在第 4 屏（安装命令）——前两屏是创建时的
-    // 一次性回显，重复显示没有意义，详情页有更完整的内容。
+    // 机器在提交表单时即已入库，因此安装页的标识是 node_id，切换、刷新、后退都可恢复。
+    // 创建响应中的明文 token 不进入地址；恢复安装页时可以重新签发一枚。
     { seg: 'install', fields: [{ name: 'node' }], rest: { step: 4 } },
   ],
   chains: [{ seg: 'chain', fields: [{ name: 'app' }, { name: 'chain' }] }],

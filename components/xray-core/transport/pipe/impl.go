@@ -53,10 +53,20 @@ func (p *pipe) Len() int32 {
 	return data.Len()
 }
 
+func (p *pipe) bufferedSize() int32 {
+	size := p.data.Len()
+	for _, b := range p.data {
+		if b != nil && b.Len() == 0 && b.UDP != nil {
+			size++
+		}
+	}
+	return size
+}
+
 func (p *pipe) getState(forRead bool) error {
 	switch p.state {
 	case open:
-		if !forRead && p.option.isFull(p.data.Len()) {
+		if !forRead && p.option.isFull(p.bufferedSize()) {
 			return errBufferFull
 		}
 		return nil

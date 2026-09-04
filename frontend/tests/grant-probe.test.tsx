@@ -92,7 +92,11 @@ describe('user grant probe', () => {
 
     expect(await view.findByText('伦敦入口')).toBeTruthy();
     const results = view.container.querySelectorAll<HTMLElement>('.grant-probe-result');
+    const matrix = view.container.querySelector<HTMLElement>('.grant-probe-matrix');
     expect(results).toHaveLength(2);
+    // 三种协议各有 V4/V6 两格。CSS 读取同一个槽位数，不会在新增协议后仍按旧的四列排版。
+    expect(matrix?.children).toHaveLength(6);
+    expect(matrix?.style.getPropertyValue('--grant-probe-slot-count')).toBe('6');
     expect(view.container.querySelectorAll('.grant-probe-result.missing')).toHaveLength(0);
     expect(view.container.querySelector('.grant-probe-table-head')).toBeNull();
     expect(results[0].dataset).toMatchObject({ protocol: 'VLESS', stack: 'V4' });

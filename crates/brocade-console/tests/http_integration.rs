@@ -996,7 +996,7 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
     .fetch_one(db.pool())
     .await
     .unwrap();
-    let blocked = agent
+    let during_planned = agent
         .clone()
         .oneshot(
             Request::get(format!("/sub/v1/{uuid}/clash.yaml"))
@@ -1005,17 +1005,20 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
         )
         .await
         .unwrap();
-    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(blocked.headers()["retry-after"], "15");
+    assert_eq!(during_planned.status(), StatusCode::OK);
     assert_eq!(
-        blocked.headers()["cache-control"],
+        during_planned.headers()["cache-control"],
         "no-store, no-cache, max-age=0, must-revalidate"
     );
-    let blocked_body = response_json(blocked).await;
-    assert_eq!(
-        blocked_body["error"],
-        "subscription temporarily unavailable"
-    );
+    assert!(!during_planned.headers().contains_key("retry-after"));
+    let during_planned_body = String::from_utf8(
+        to_bytes(during_planned.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(during_planned_body.contains("name: \"Live Rename\""));
 
     sqlx::query(
         "UPDATE deployments
@@ -2616,12 +2619,16 @@ async fn http_settings_exposes_and_updates_global_reality_client_policy() {
     assert_eq!(body["reality_client"]["min_client_ver"], "1.0.0");
     assert!(body["reality_client"]["max_client_ver"].is_null());
     assert!(body["reality_client"]["max_time_diff_ms"].is_null());
+    assert_eq!(body["ports"]["anytls_base"], 16_000);
 
     let update_body = json!({
         "reality_client": {
             "min_client_ver": "1.8.0",
             "max_client_ver": "1.9.9",
             "max_time_diff_ms": 30000
+        },
+        "ports": {
+            "anytls_base": 16123
         }
     });
     let (status, body) = put_json(&app, &admin_token, "/settings", update_body.clone()).await;
@@ -2635,6 +2642,7 @@ async fn http_settings_exposes_and_updates_global_reality_client_policy() {
         body["settings"]["reality_client"]["max_time_diff_ms"],
         30000
     );
+    assert_eq!(body["settings"]["ports"]["anytls_base"], 16_123);
 
     let stale = app
         .clone()

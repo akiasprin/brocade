@@ -10,6 +10,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/xtls/xray-core/common"
 	. "github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
 )
 
 func TestMultiBufferRead(t *testing.T) {
@@ -37,6 +38,21 @@ func TestMultiBufferAppend(t *testing.T) {
 	mb = append(mb, b)
 	if mb.Len() != 2 {
 		t.Error("expected length 2, but got ", mb.Len())
+	}
+}
+
+func TestZeroLengthUDPPacketIsNotEmpty(t *testing.T) {
+	packet := FromBytes(nil)
+	destination := xnet.UDPDestination(xnet.DomainAddress("example.com"), 53)
+	packet.UDP = &destination
+	mb := MultiBuffer{packet}
+	defer ReleaseMulti(mb)
+
+	if mb.IsEmpty() {
+		t.Fatal("zero-length UDP packet was treated as an empty MultiBuffer")
+	}
+	if mb.Len() != 0 {
+		t.Fatalf("zero-length UDP packet payload length = %d, want 0", mb.Len())
 	}
 }
 

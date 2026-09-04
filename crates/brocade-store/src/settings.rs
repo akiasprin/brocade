@@ -67,6 +67,7 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             overlay_mtu,
             overlay_disabled_links,
             port_ingress_base,
+            port_anytls_base,
             port_hop_base,
             port_hy2_base,
             probe_endpoint_url,
@@ -164,6 +165,7 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
         },
         ports: PortSettings {
             ingress_base: u16_column("port_ingress_base", row.try_get("port_ingress_base")?)?,
+            anytls_base: u16_column("port_anytls_base", row.try_get("port_anytls_base")?)?,
             hop_base: u16_column("port_hop_base", row.try_get("port_hop_base")?)?,
             hy2_base: u16_column("port_hy2_base", row.try_get("port_hy2_base")?)?,
         },
@@ -245,21 +247,22 @@ pub(crate) async fn update_settings_tx(
              overlay_keepalive_secs = $8,
              overlay_mtu = $9,
              port_ingress_base = $10,
-             port_hop_base = $11,
-             port_hy2_base = $12,
-             probe_endpoint_url = $13,
-             probe_timeout_secs = $14,
-             probe_interval_secs = $15,
-             geodata_cron = $16,
-             geodata_geoip_url = $17,
-             geodata_geosite_url = $18,
-             conn_idle_secs = $19,
-             conn_uplink_only_secs = $20,
-             conn_downlink_only_secs = $21,
-             conn_buffer_size_kb = $22,
-             conn_handshake_secs = $23,
-             stats_user_online = $24,
-             overlay_disabled_links = $25
+             port_anytls_base = $11,
+             port_hop_base = $12,
+             port_hy2_base = $13,
+             probe_endpoint_url = $14,
+             probe_timeout_secs = $15,
+             probe_interval_secs = $16,
+             geodata_cron = $17,
+             geodata_geoip_url = $18,
+             geodata_geosite_url = $19,
+             conn_idle_secs = $20,
+             conn_uplink_only_secs = $21,
+             conn_downlink_only_secs = $22,
+             conn_buffer_size_kb = $23,
+             conn_handshake_secs = $24,
+             stats_user_online = $25,
+             overlay_disabled_links = $26
          WHERE id = TRUE",
     )
     .bind(settings.reality_client.min_client_ver.as_deref())
@@ -275,6 +278,7 @@ pub(crate) async fn update_settings_tx(
     .bind(i32::from(settings.overlay.keepalive_secs))
     .bind(i32::from(settings.overlay.mtu))
     .bind(i32::from(settings.ports.ingress_base))
+    .bind(i32::from(settings.ports.anytls_base))
     .bind(i32::from(settings.ports.hop_base))
     .bind(i32::from(settings.ports.hy2_base))
     .bind(settings.probe.endpoint_url.as_str())
@@ -362,6 +366,7 @@ fn validate_backbone(settings: &ModelSettings) -> Result<()> {
     // as a 400 first and says so.
     for (what, port) in [
         ("ports.ingress_base", settings.ports.ingress_base),
+        ("ports.anytls_base", settings.ports.anytls_base),
         ("ports.hop_base", settings.ports.hop_base),
         ("ports.hy2_base", settings.ports.hy2_base),
     ] {
