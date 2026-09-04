@@ -37,10 +37,10 @@ use crate::{
     E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, HopLinkList,
     IssuedAdminToken, IssuedNodeToken, LinkHealthItem, LinkHealthRequest, LinkHealthResult,
     LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult,
-    NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, NodePingProbeList,
-    NodePingProbeView, PingProbeReportRequest, PingProbeReportResult, PingProbeSettings,
-    ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult,
-    QuotaEnforcementOutcome, QuotaEnforcementPlan, RegisterWarpBindingRequest,
+    LoadSeriesQuery, NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView,
+    NodePingProbeList, NodePingProbeView, PingProbeReportRequest, PingProbeReportResult,
+    PingProbeSettings, ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult,
+    PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan, RegisterWarpBindingRequest,
     RegisterWarpBindingResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
     ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
     SetUserAppQuotaRequest, SetUserAppQuotaResult, StoreError, TargetConvergenceReport, TenantList,
@@ -1300,36 +1300,19 @@ impl PgStore {
         &self,
         actor: &AdminContext,
         node_id: &str,
-        range_start_unix_secs: i64,
-        range_end_unix_secs: i64,
+        selection: LoadSeriesQuery,
         max_samples: u32,
     ) -> Result<NodeLoadView> {
-        load::node_load_view(
-            &self.pool,
-            actor,
-            node_id,
-            range_start_unix_secs,
-            range_end_unix_secs,
-            max_samples,
-        )
-        .await
+        load::node_load_view(&self.pool, actor, node_id, selection, max_samples).await
     }
 
     pub async fn list_node_load(
         &self,
         actor: &AdminContext,
-        range_start_unix_secs: i64,
-        range_end_unix_secs: i64,
+        selection: LoadSeriesQuery,
         max_samples_per_node: u32,
     ) -> Result<NodeLoadList> {
-        load::list_node_load(
-            &self.pool,
-            actor,
-            range_start_unix_secs,
-            range_end_unix_secs,
-            max_samples_per_node,
-        )
-        .await
+        load::list_node_load(&self.pool, actor, selection, max_samples_per_node).await
     }
 
     pub async fn ping_probe_settings(&self) -> Result<PingProbeSettings> {

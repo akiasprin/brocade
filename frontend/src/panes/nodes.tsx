@@ -18,6 +18,7 @@ import {
   fetchNodeLoad,
   fetchCerts,
   fetchNodeLoadList,
+  fetchNodeLoadListWindows,
   fetchNodePingProbe,
   fetchNodePingProbeList,
   monthBytes,
@@ -428,8 +429,8 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   // 与上面两个查询一样独立：该端点不可用，或控制面版本尚不支持该端点时，
   // 列表正常显示，状态点回退为只反映活性。
   const load = useQuery({
-    queryKey: ['node-load-list'],
-    queryFn: () => fetchNodeLoadListFor(LIST_NIC_RANGE_SECS),
+    queryKey: ['node-load-list', 'windows', LIST_NIC_WINDOWS],
+    queryFn: () => fetchNodeLoadListWindows(LIST_NIC_WINDOWS),
     refetchInterval: 30_000,
     retry: false,
   });
@@ -1007,10 +1008,10 @@ export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onC
   );
 }
 
-// 列表 NIC 曲线使用 12 分钟绝对区间。样本按真实 window_end 定位，不按返回行数右对齐。
+// 列表保留最近 24 个实际样本，使离线机器仍能显示停机前的最终趋势。返回范围来自这些
+// 样本自己的时间戳，曲线不会被平移到当前时刻；在线/离线由独立的活性状态表达。
 const LIST_NIC_WINDOWS = 24;
 const LIST_NIC_WINDOW_SECS = 30;
-const LIST_NIC_RANGE_SECS = LIST_NIC_WINDOWS * LIST_NIC_WINDOW_SECS;
 // 上一版的最低尺度是 1 Mbit/s。改为每窗口字节数后做等价换算，避免只因换单位就改变曲线高度。
 const LIST_NIC_MIN_CEILING_BYTES = (1_000_000 * LIST_NIC_WINDOW_SECS) / 8;
 // usage 查询仍需要一个近期窗口参数，但列表现在只读其中的本月累计字段。
@@ -1360,26 +1361,27 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
     refetchInterval: 30_000,
   });
   const report = load.data;
-  if (!report || report.series.length === 0) return null;
+  if (!report) return null;
+
+  const series = report.series;
+  const latest = report.latest_sample ?? series[series.length - 1];
+  if (!latest) return null;
 
   const group = linked ? `nd-tp-${nodeId}` : undefined;
   const rangeStart = report.range_start_unix_secs;
   const rangeEnd = report.range_end_unix_secs;
 
   // 网卡：每个点使用上报的真实结束时间。轴保持完整请求区间，因此尾部没有样本时会留白。
-  const series = report.series;
-  const last = series[series.length - 1];
-  const current =
-    !last.has_gap && rangeEnd >= last.window_end_unix_secs && rangeEnd - last.window_end_unix_secs <= 90 ? last : null;
+  const latestNic = latest.has_gap ? null : latest;
   const host = report.host;
   const nicTimes = series.map(sample => sample.window_end_unix_secs);
   const nicRx = series.map(sample => (sample.has_gap ? null : sample.nic_rx_bps));
   const nicTx = series.map(sample => (sample.has_gap ? null : sample.nic_tx_bps));
-  const drops = current ? current.nic_rx_drop + current.nic_tx_drop + current.nic_err : 0;
+  const drops = latestNic ? latestNic.nic_rx_drop + latestNic.nic_tx_drop + latestNic.nic_err : 0;
   const nicMeta = [
-    current && current.nic_rx_drop > 0 ? `接收丢弃 ${current.nic_rx_drop.toLocaleString()}` : null,
-    current && current.nic_tx_drop > 0 ? `发送丢弃 ${current.nic_tx_drop.toLocaleString()}` : null,
-    current && current.nic_err > 0 ? `网卡错误 ${current.nic_err.toLocaleString()}` : null,
+    latestNic && latestNic.nic_rx_drop > 0 ? `接收丢弃 ${latestNic.nic_rx_drop.toLocaleString()}` : null,
+    latestNic && latestNic.nic_tx_drop > 0 ? `发送丢弃 ${latestNic.nic_tx_drop.toLocaleString()}` : null,
+    latestNic && latestNic.nic_err > 0 ? `网卡错误 ${latestNic.nic_err.toLocaleString()}` : null,
     host?.nic ?? null,
     typeof host?.nic_mtu === 'number' ? `MTU ${host.nic_mtu}` : null,
   ].filter((value): value is string => value !== null);
@@ -1391,7 +1393,10 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
 
   /* 每块图一个单位：标题栏写它，图例按它读数，图内的刻度和 tooltip 走同一次 throughputAxis
      的结果。峰值只算一遍，所以标题、刻度、图例三处不可能各说各话。 */
-  const nicUnit = throughputAxis(nicRx, nicTx).unit;
+  const nicUnit = throughputAxis(
+    nicRx.length > 0 ? nicRx : [latestNic?.nic_rx_bps ?? null],
+    nicTx.length > 0 ? nicTx : [latestNic?.nic_tx_bps ?? null],
+  ).unit;
   const xrayUnit = throughputAxis(user, relay).unit;
 
   return (
@@ -1401,14 +1406,17 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
           <b>网卡流量</b>
           <span className="chart-unit">({nicUnit.name})</span>
           {nicMeta.length > 0 && <span className={drops > 0 ? 'hot' : undefined}>{nicMeta.join(' · ')}</span>}
+          <span>
+            最后样本 <Ago at={iso(latest.window_end_unix_secs)} />
+          </span>
           <footer className="load-network-legend" aria-label="网卡流量图例">
             <span className="rx">
               <i />
-              接收 <b>{current ? nicUnit.read(current.nic_rx_bps) : '—'}</b>
+              接收 <b>{latestNic ? nicUnit.read(latestNic.nic_rx_bps) : '—'}</b>
             </span>
             <span className="tx">
               <i />
-              发送 <b>{current ? nicUnit.read(current.nic_tx_bps) : '—'}</b>
+              发送 <b>{latestNic ? nicUnit.read(latestNic.nic_tx_bps) : '—'}</b>
             </span>
           </footer>
         </div>
@@ -2971,9 +2979,7 @@ function LoadCardFor({ nodeId, range, linked }: { nodeId: string; range: LoadRan
   });
   if (!load.data) return null;
   // 吞吐两图（网卡 / XRAY）已移到 ThroughputPanel，与 Ping 面板并列；本卡只留生命体征与历史。
-  return (
-    <LoadCard report={load.data} historyLabel={range.heading} historyWindows={range.seconds / 30} linked={linked} />
-  );
+  return <LoadCard report={load.data} historyLabel={range.heading} linked={linked} />;
 }
 
 const PING_SERIES_CSS = OBSERVE_SERIES_COLOR_VARS;
@@ -3848,7 +3854,9 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   const n = nodes.data?.nodes.find(x => x.node_id === id);
   /* 签发的 node token 同样只显示一次 */
   const [issued, setIssued] = useState<{ token: string; install_command: string } | null>(null);
-  const [lifecycleAction, setLifecycleAction] = useState<'retire' | 'restore' | 'abandon' | 'serviceRestore' | null>(null);
+  const [lifecycleAction, setLifecycleAction] = useState<'retire' | 'restore' | 'abandon' | 'serviceRestore' | null>(
+    null,
+  );
   const [forceReason, setForceReason] = useState('');
   const [serviceRestoreReason, setServiceRestoreReason] = useState('节点已完成补偿并通过运行状态检查');
 
@@ -4013,7 +4021,9 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   // turning WG off removes the backend warning immediately, before the draft is committed and
   // before the agent's next half-hourly runtime report clears its old observation.
   const wireguardEnabled = snapshot.data?.snapshot.nodes?.find(modelNode => modelNode.id === id)?.overlay ?? n.overlay;
-  const isolatedNodeIds = new Set((nodes.data?.nodes ?? []).filter(node => node.operationally_isolated).map(node => node.node_id));
+  const isolatedNodeIds = new Set(
+    (nodes.data?.nodes ?? []).filter(node => node.operationally_isolated).map(node => node.node_id),
+  );
   const wgListenPort =
     snapshot.data?.snapshot.nodes?.find(modelNode => modelNode.id === id)?.wireguard?.listen_port ?? null;
 
@@ -4915,7 +4925,15 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
 // （brocade-store/src/agent.rs），无法再次获取。因此命令区分两种情况——
 // 从创建流程直接进入的显示完整命令；从地址栏返回的提供重签按钮，
 // 签发新 token 后旧 token 立即失效（旧 token 未被获取过）。
-function ProvisionInstall({ node, result, go }: { node: string; result?: ProvisionNodeResult; go: (d: Drill) => void }) {
+function ProvisionInstall({
+  node,
+  result,
+  go,
+}: {
+  node: string;
+  result?: ProvisionNodeResult;
+  go: (d: Drill) => void;
+}) {
   const { who } = useSession();
   const system = can(who.role, 'system');
   const qc = useQueryClient();

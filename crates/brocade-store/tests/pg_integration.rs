@@ -30,15 +30,15 @@ use brocade_store::{
     CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
     HopInRequest, HopWireRequest, IsolateDeploymentTargetRequest, LinkProbe, LinkProbeRequest,
-    LinkProbeStatus, ModelOp, NodeDesiredDeployment, PgStore, PingProbeReportRequest,
-    PingProbeSample, PingProbeSettings, PingProbeTarget, ProbeTransport, ProvisionNodeRequest,
-    PutStepRequest, RegisterWarpBindingRequest, RemoveWarpBindingRequest, ReportedNodeState,
-    RestoreNodeServiceRequest, SetUserAppQuotaRequest, StepAcceptRequest, StoreError,
-    TargetApplyResult, TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
-    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateRealtimeTelemetryPolicyRequest,
-    UpdateUserStatusRequest, UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter,
-    UsageReportRequest, VerifyDeploymentRequest, WiresRequest, ENROLLMENT_TOKEN_PREFIX,
-    NODE_TOKEN_PREFIX,
+    LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment, PgStore,
+    PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeTarget, ProbeTransport,
+    ProvisionNodeRequest, PutStepRequest, RegisterWarpBindingRequest, RemoveWarpBindingRequest,
+    ReportedNodeState, RestoreNodeServiceRequest, SetUserAppQuotaRequest, StepAcceptRequest,
+    StoreError, TargetApplyResult, TargetConvergenceReport, TransportRequest,
+    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    UpdateRealtimeTelemetryPolicyRequest, UpdateUserStatusRequest, UpdateWarpBindingRequest,
+    UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest, VerifyDeploymentRequest,
+    WiresRequest, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -12900,7 +12900,15 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
     assert_eq!(accepted.accepted_samples, 1);
     let view = db
         .store
-        .node_load_view(&system_admin(), "net-observe", now - 60, now + 1, 64)
+        .node_load_view(
+            &system_admin(),
+            "net-observe",
+            LoadSeriesQuery::Absolute {
+                start_unix_secs: now - 60,
+                end_unix_secs: now + 1,
+            },
+            64,
+        )
         .await
         .unwrap();
     assert_eq!(view.range_start_unix_secs, now - 60);
@@ -12909,13 +12917,38 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
     assert_eq!(view.series[0].network_detail.as_ref(), Some(&network));
     assert_eq!(view.series[0].disk_detail.as_ref(), Some(&disk));
     assert_eq!(view.series[0].conntrack_count, Some(1200));
+    assert_eq!(view.latest_sample.as_ref(), view.series.last());
 
     let stale = db
         .store
-        .node_load_view(&system_admin(), "net-observe", now + 60, now + 120, 64)
+        .node_load_view(
+            &system_admin(),
+            "net-observe",
+            LoadSeriesQuery::Absolute {
+                start_unix_secs: now + 60,
+                end_unix_secs: now + 120,
+            },
+            64,
+        )
         .await
         .unwrap();
     assert!(stale.series.is_empty());
+    assert_eq!(stale.latest_sample, view.latest_sample);
+
+    let latest = db
+        .store
+        .node_load_view(
+            &system_admin(),
+            "net-observe",
+            LoadSeriesQuery::LatestWindows { windows: 1 },
+            64,
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.series.len(), 1);
+    assert_eq!(latest.latest_sample.as_ref(), latest.series.last());
+    assert_eq!(latest.range_start_unix_secs, now - 30);
+    assert_eq!(latest.range_end_unix_secs, now);
 }
 
 async fn insert_usage_history_for_main_fixture(pool: &PgPool) {

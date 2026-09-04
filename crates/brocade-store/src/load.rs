@@ -42,6 +42,34 @@ const MAX_SAMPLES_PER_REPORT: usize = 60;
 /// Guard against a single report claiming the whole fleet's hops.
 const MAX_HOPS_PER_REPORT: usize = 512;
 
+/// Which part of a node's load history a reader requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadSeriesQuery {
+    /// Every sample overlapping this half-open wall-clock interval.
+    Absolute {
+        start_unix_secs: i64,
+        end_unix_secs: i64,
+    },
+    /// The newest `windows` samples, regardless of their age.
+    LatestWindows { windows: u32 },
+}
+
+impl LoadSeriesQuery {
+    fn response_range(self, series: &[LoadSample]) -> (i64, i64) {
+        match self {
+            Self::Absolute {
+                start_unix_secs,
+                end_unix_secs,
+            } => (start_unix_secs, end_unix_secs),
+            Self::LatestWindows { .. } => series
+                .first()
+                .zip(series.last())
+                .map(|(first, last)| (first.window_start_unix_secs, last.window_end_unix_secs))
+                .unwrap_or((0, 0)),
+        }
+    }
+}
+
 pub async fn record_load_report(
     pool: &PgPool,
     node_id: &str,
@@ -363,19 +391,19 @@ async fn replace_process_state(
     Ok(())
 }
 
-/// One machine's windows overlapping an absolute interval, oldest first.
+/// One machine's selected load windows, oldest first, plus its newest stored sample.
 pub async fn node_load_view(
     pool: &PgPool,
     actor: &AdminContext,
     node_id: &str,
-    range_start_unix_secs: i64,
-    range_end_unix_secs: i64,
+    selection: LoadSeriesQuery,
     max_samples: u32,
 ) -> Result<NodeLoadView> {
     // Scope check first, and as an early return rather than a filter woven through the three
     // queries below: out of scope means this machine does not exist as far as this operator is
     // concerned, and an empty view says exactly that without leaking whether the id is real.
     if !node_in_scope(pool, actor, node_id).await? {
+        let (range_start_unix_secs, range_end_unix_secs) = selection.response_range(&[]);
         return Ok(NodeLoadView {
             node_id: node_id.to_owned(),
             range_start_unix_secs,
@@ -383,6 +411,7 @@ pub async fn node_load_view(
             reported_at_unix_secs: None,
             clock_skew_secs: None,
             host: None,
+            latest_sample: None,
             series: Vec::new(),
             processes: Vec::new(),
         });
@@ -412,14 +441,13 @@ pub async fn node_load_view(
         None => (None, None, None),
     };
 
-    // The caller owns the wall-clock interval. A sample belongs when its window overlaps the
-    // requested half-open interval; this deliberately includes a partial boundary window. The
-    // row cap is only a cardinality guard for corrupt or unexpectedly fine-grained data, not the
-    // meaning of the requested range.
+    // Absolute selection uses window overlap and deliberately includes partial boundary windows.
+    // Latest-window selection orders descending before LIMIT, then both are reversed below so the
+    // wire representation is always oldest first. The row cap is an independent cardinality guard.
     // Epochs extracted in SQL rather than read as timestamps and converted here: the alternative
     // is a chrono dependency on this crate for one field, and the neighbouring queries
     // (`load_reported_at`, `started_at`) already do it this way.
-    let rows = sqlx::query(
+    let mut samples_query = sqlx::QueryBuilder::<Postgres>::new(
         "SELECT extract(epoch FROM window_start)::bigint AS window_start_secs,
                 extract(epoch FROM window_end)::bigint AS window_end_secs,
                 has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1, cpu_detail,
@@ -428,23 +456,61 @@ pub async fn node_load_view(
                 nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
                 conntrack_count, network_detail, uptime_secs
          FROM node_load_samples
-         WHERE node_id = $1
-           AND window_end > to_timestamp($2)
-           AND window_start < to_timestamp($3)
-         ORDER BY window_start DESC
-         LIMIT $4",
-    )
-    .bind(node_id)
-    .bind(range_start_unix_secs)
-    .bind(range_end_unix_secs)
-    .bind(i64::from(max_samples))
-    .fetch_all(pool)
-    .await?;
+         WHERE node_id = ",
+    );
+    samples_query.push_bind(node_id);
+    match selection {
+        LoadSeriesQuery::Absolute {
+            start_unix_secs,
+            end_unix_secs,
+        } => {
+            samples_query
+                .push(" AND window_end > to_timestamp(")
+                .push_bind(start_unix_secs)
+                .push(") AND window_start < to_timestamp(")
+                .push_bind(end_unix_secs)
+                .push(')');
+        }
+        LoadSeriesQuery::LatestWindows { .. } => {}
+    }
+    let limit = match selection {
+        LoadSeriesQuery::Absolute { .. } => max_samples,
+        LoadSeriesQuery::LatestWindows { windows } => windows.min(max_samples),
+    };
+    samples_query
+        .push(" ORDER BY window_start DESC LIMIT ")
+        .push_bind(i64::from(limit));
+    let rows = samples_query.build().fetch_all(pool).await?;
     let mut series = rows
         .iter()
         .map(load_sample_from_row)
         .collect::<Result<Vec<_>>>()?;
     series.reverse();
+
+    let latest_sample = match selection {
+        LoadSeriesQuery::LatestWindows { .. } => series.last().cloned(),
+        LoadSeriesQuery::Absolute { .. } => {
+            let row = sqlx::query(
+                "SELECT extract(epoch FROM window_start)::bigint AS window_start_secs,
+                        extract(epoch FROM window_end)::bigint AS window_end_secs,
+                        has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1, cpu_detail,
+                        mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
+                        disk_free_bytes, disk_inode_free_pct, disk_detail,
+                        nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
+                        conntrack_count, network_detail, uptime_secs
+                 FROM node_load_samples
+                 WHERE node_id = $1
+                 ORDER BY window_start DESC
+                 LIMIT 1",
+            )
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await?;
+            row.as_ref().map(load_sample_from_row).transpose()?
+        }
+    };
+
+    let (range_start_unix_secs, range_end_unix_secs) = selection.response_range(&series);
 
     let processes = sqlx::query(
         "SELECT proc, rss_bytes, cpu_pct,
@@ -466,17 +532,17 @@ pub async fn node_load_view(
         reported_at_unix_secs: reported_at,
         clock_skew_secs: clock_skew,
         host,
+        latest_sample,
         series,
         processes,
     })
 }
 
-/// Every live machine's windows overlapping one absolute interval, for the list page.
+/// Every live machine's selected load windows, for list and fleet views.
 pub async fn list_node_load(
     pool: &PgPool,
     actor: &AdminContext,
-    range_start_unix_secs: i64,
-    range_end_unix_secs: i64,
+    selection: LoadSeriesQuery,
     max_samples_per_node: u32,
 ) -> Result<NodeLoadList> {
     let filter = tenant_filter(actor);
@@ -493,17 +559,7 @@ pub async fn list_node_load(
     .await?;
     let mut nodes = Vec::with_capacity(ids.len());
     for id in ids {
-        nodes.push(
-            node_load_view(
-                pool,
-                actor,
-                &id,
-                range_start_unix_secs,
-                range_end_unix_secs,
-                max_samples_per_node,
-            )
-            .await?,
-        );
+        nodes.push(node_load_view(pool, actor, &id, selection, max_samples_per_node).await?);
     }
     Ok(NodeLoadList { nodes })
 }

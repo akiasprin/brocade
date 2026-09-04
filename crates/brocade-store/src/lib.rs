@@ -98,6 +98,7 @@ pub use grant_probe::{UserGrantProbePlan, UserGrantProbeTarget};
 pub use lifecycle::{
     AbandonNodeRequest, NodeLifecyclePhase, NodeLifecycleState, NodeLifecycleTransitionResult,
 };
+pub use load::LoadSeriesQuery;
 pub use log_policy::{
     AgentLogPolicyView, NodeLogPolicyItem, UpdateAgentLogDefaultRequest,
     UpdateNodeLogPolicyRequest, DEFAULT_AGENT_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,

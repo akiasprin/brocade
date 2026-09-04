@@ -44,7 +44,7 @@ use brocade_store::{
     CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DistributionSettings,
     E2eProbeRequest, IsolateDeploymentTargetRequest, LinkHealthRequest, LinkProbeRequest,
-    LoadReportRequest, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
+    LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
     PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
     ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest,
     RestoreNodeServiceRequest, SetUserAppQuotaRequest, StoreError, UpdateAgentLogDefaultRequest,
@@ -4054,22 +4054,18 @@ async fn link_health(State(state): State<AppState>, headers: HeaderMap) -> ApiRe
     Ok(Json(json!({ "hops": state.store.link_health(&admin).await? })).into_response())
 }
 
-/// Every machine's load windows overlapping the browser-provided absolute interval.
+/// Every machine's selected load windows. The list normally asks for the latest N windows so an
+/// offline machine retains its final trend; fleet history may instead provide an absolute range.
 async fn load_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<LoadQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    let (range_start, range_end) = load_range(query, LIST_LOAD_MAX_RANGE_SECS)?;
+    let selection = load_selection(query, LIST_LOAD_MAX_RANGE_SECS, LIST_LOAD_MAX_WINDOWS)?;
     let result = state
         .store
-        .list_node_load(
-            &admin,
-            range_start,
-            range_end,
-            LIST_LOAD_MAX_SAMPLES_PER_NODE,
-        )
+        .list_node_load(&admin, selection, LIST_LOAD_MAX_SAMPLES_PER_NODE)
         .await?;
     Ok(Json(result).into_response())
 }
@@ -4081,16 +4077,10 @@ async fn load_node(
     Query(query): Query<LoadQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    let (range_start, range_end) = load_range(query, DETAIL_LOAD_MAX_RANGE_SECS)?;
+    let selection = load_selection(query, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS)?;
     let result = state
         .store
-        .node_load_view(
-            &admin,
-            &node_id,
-            range_start,
-            range_end,
-            DETAIL_LOAD_MAX_SAMPLES,
-        )
+        .node_load_view(&admin, &node_id, selection, DETAIL_LOAD_MAX_SAMPLES)
         .await?;
     Ok(Json(result).into_response())
 }
@@ -4146,8 +4136,9 @@ async fn link_quality(
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct LoadQuery {
-    start_unix_secs: i64,
-    end_unix_secs: i64,
+    start_unix_secs: Option<i64>,
+    end_unix_secs: Option<i64>,
+    windows: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4157,19 +4148,48 @@ struct PingProbeQuery {
 
 const LIST_LOAD_MAX_RANGE_SECS: i64 = 2 * 60 * 60;
 const DETAIL_LOAD_MAX_RANGE_SECS: i64 = 24 * 60 * 60;
+const LIST_LOAD_MAX_WINDOWS: u32 = 240;
+const DETAIL_LOAD_MAX_WINDOWS: u32 = 2_880;
+const DEFAULT_LOAD_WINDOWS: u32 = 24;
 // Normal 30-second telemetry produces at most 241/2,881 overlapping rows. Higher caps leave room
 // for boundary windows while still bounding a malformed high-frequency history.
 const LIST_LOAD_MAX_SAMPLES_PER_NODE: u32 = 512;
 const DETAIL_LOAD_MAX_SAMPLES: u32 = 4_096;
 const MAX_LOAD_UNIX_SECS: i64 = 253_402_300_799;
 
-fn load_range(query: LoadQuery, max_span_secs: i64) -> Result<(i64, i64), StoreError> {
-    if query.start_unix_secs < 0 || query.end_unix_secs > MAX_LOAD_UNIX_SECS {
+fn load_selection(
+    query: LoadQuery,
+    max_span_secs: i64,
+    max_windows: u32,
+) -> Result<LoadSeriesQuery, StoreError> {
+    match (query.start_unix_secs, query.end_unix_secs, query.windows) {
+        (Some(start), Some(end), None) => load_absolute_range(start, end, max_span_secs),
+        (None, None, Some(windows)) if (1..=max_windows).contains(&windows) => {
+            Ok(LoadSeriesQuery::LatestWindows { windows })
+        }
+        (None, None, None) => Ok(LoadSeriesQuery::LatestWindows {
+            windows: DEFAULT_LOAD_WINDOWS,
+        }),
+        (None, None, Some(windows)) => Err(StoreError::InvalidData(format!(
+            "load windows must be between 1 and {max_windows}, got {windows}"
+        ))),
+        _ => Err(StoreError::InvalidData(
+            "provide either windows or both load range boundaries".to_owned(),
+        )),
+    }
+}
+
+fn load_absolute_range(
+    start_unix_secs: i64,
+    end_unix_secs: i64,
+    max_span_secs: i64,
+) -> Result<LoadSeriesQuery, StoreError> {
+    if start_unix_secs < 0 || end_unix_secs > MAX_LOAD_UNIX_SECS {
         return Err(StoreError::InvalidData(
             "load range is outside the supported timestamp interval".to_owned(),
         ));
     }
-    let Some(span) = query.end_unix_secs.checked_sub(query.start_unix_secs) else {
+    let Some(span) = end_unix_secs.checked_sub(start_unix_secs) else {
         return Err(StoreError::InvalidData("invalid load range".to_owned()));
     };
     if span <= 0 {
@@ -4182,7 +4202,10 @@ fn load_range(query: LoadQuery, max_span_secs: i64) -> Result<(i64, i64), StoreE
             "load range spans {span}s, over the {max_span_secs}s limit"
         )));
     }
-    Ok((query.start_unix_secs, query.end_unix_secs))
+    Ok(LoadSeriesQuery::Absolute {
+        start_unix_secs,
+        end_unix_secs,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -4669,37 +4692,78 @@ mod tests {
     use brocade_store::StoreError;
 
     use super::{
-        bearer_token, dist_json, expired_session_cookie, install_command, load_range,
+        bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
         looks_like_uuid, public_may, route_from_headers, safe_filename_slug, session_cookie,
         AgentDistribution, ApiError, ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery,
-        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS, EMBEDDED_AGENTS,
-        EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
+        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
+        DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS, EMBEDDED_XRAYS, INSTALL_SCRIPT,
+        SUBSCRIPTION_CACHE_CONTROL,
     };
+    use brocade_store::LoadSeriesQuery;
 
     #[test]
-    fn machine_load_range_accepts_absolute_day_and_rejects_invalid_intervals() {
+    fn machine_load_query_accepts_absolute_and_window_modes() {
         let day = LoadQuery {
-            start_unix_secs: 1_700_000_000,
-            end_unix_secs: 1_700_086_400,
+            start_unix_secs: Some(1_700_000_000),
+            end_unix_secs: Some(1_700_086_400),
+            windows: None,
         };
         assert_eq!(
-            load_range(day, DETAIL_LOAD_MAX_RANGE_SECS).unwrap(),
-            (day.start_unix_secs, day.end_unix_secs)
+            load_selection(day, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS).unwrap(),
+            LoadSeriesQuery::Absolute {
+                start_unix_secs: day.start_unix_secs.unwrap(),
+                end_unix_secs: day.end_unix_secs.unwrap(),
+            }
         );
-        assert!(load_range(
+        assert_eq!(
+            load_selection(
+                LoadQuery {
+                    start_unix_secs: None,
+                    end_unix_secs: None,
+                    windows: Some(240),
+                },
+                DETAIL_LOAD_MAX_RANGE_SECS,
+                DETAIL_LOAD_MAX_WINDOWS,
+            )
+            .unwrap(),
+            LoadSeriesQuery::LatestWindows { windows: 240 }
+        );
+        assert!(load_selection(
             LoadQuery {
-                end_unix_secs: day.end_unix_secs + 1,
+                end_unix_secs: day.end_unix_secs.map(|end| end + 1),
                 ..day
             },
-            DETAIL_LOAD_MAX_RANGE_SECS
+            DETAIL_LOAD_MAX_RANGE_SECS,
+            DETAIL_LOAD_MAX_WINDOWS,
         )
         .is_err());
-        assert!(load_range(
+        assert!(load_selection(
             LoadQuery {
                 end_unix_secs: day.start_unix_secs,
                 ..day
             },
-            DETAIL_LOAD_MAX_RANGE_SECS
+            DETAIL_LOAD_MAX_RANGE_SECS,
+            DETAIL_LOAD_MAX_WINDOWS,
+        )
+        .is_err());
+        assert!(load_selection(
+            LoadQuery {
+                start_unix_secs: day.start_unix_secs,
+                end_unix_secs: day.end_unix_secs,
+                windows: Some(24),
+            },
+            DETAIL_LOAD_MAX_RANGE_SECS,
+            DETAIL_LOAD_MAX_WINDOWS,
+        )
+        .is_err());
+        assert!(load_selection(
+            LoadQuery {
+                start_unix_secs: None,
+                end_unix_secs: None,
+                windows: Some(0),
+            },
+            DETAIL_LOAD_MAX_RANGE_SECS,
+            DETAIL_LOAD_MAX_WINDOWS,
         )
         .is_err());
     }

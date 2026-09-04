@@ -212,6 +212,7 @@ function sample(deep = true): LoadSample {
 }
 
 function report(deep = true): NodeLoadView {
+  const latest = sample(deep);
   return {
     node_id: 'n1',
     range_start_unix_secs: 0,
@@ -219,7 +220,8 @@ function report(deep = true): NodeLoadView {
     reported_at_unix_secs: 130,
     clock_skew_secs: 0,
     host,
-    series: [sample(deep)],
+    latest_sample: latest,
+    series: [latest],
     processes: [],
   };
 }
@@ -361,12 +363,22 @@ describe('deep host telemetry', () => {
     expect(observeAreaFill('#3e8fb0', 'dark', { stacked: true })).toBe('rgba(62,143,176,0.34)');
   });
 
-  it('never exposes the removed LOAD placeholder title when telemetry has no samples', () => {
+  it('shows the last known state when the selected interval has no samples', () => {
     const value = report();
     value.series = [];
     const view = render(<LoadCard report={value} />);
 
     expect(view.queryByText('LOAD')).toBeNull();
+    expect(view.getByText(/所选时间范围内没有负载读数/)).toBeTruthy();
+    expect(view.getByRole('button', { name: /CPU/ }).textContent).toContain('18');
+  });
+
+  it('shows the empty state only when the machine has never produced a sample', () => {
+    const value = report();
+    value.series = [];
+    value.latest_sample = null;
+    const view = render(<LoadCard report={value} />);
+
     expect(view.getByText('还没有负载读数。')).toBeTruthy();
   });
 
@@ -638,7 +650,7 @@ describe('deep host telemetry', () => {
 
   it('keeps the full 24-hour absolute axis without synthesizing load slots', () => {
     const value = report();
-    const view = render(<LoadCard report={value} historyLabel="24 HOURS" historyWindows={2_880} />);
+    const view = render(<LoadCard report={value} historyLabel="24 HOURS" />);
 
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
     expect(view.getByRole('region', { name: 'CPU 24 HOURS 数值' })).toBeTruthy();
@@ -666,9 +678,19 @@ describe('deep host telemetry', () => {
     expect(network.series[1].data).toEqual([[10_030_000, 200]]);
   });
 
-  it('does not present an old load sample as the current NIC reading', () => {
+  it('keeps the last NIC reading visible when the absolute interval is empty', () => {
     const value = report();
-    value.range_end_unix_secs = value.series[0].window_end_unix_secs + 91;
+    value.series = [];
+    const view = renderThroughput(value);
+
+    expect(view.getByText(/最后样本/)).toBeTruthy();
+    expect(view.getByLabelText('网卡流量图例').textContent).toContain('接收 100');
+    expect(view.getByLabelText('网卡流量图例').textContent).toContain('发送 200');
+  });
+
+  it('does not treat a gap-marked last sample as a valid NIC rate', () => {
+    const value = report();
+    value.latest_sample!.has_gap = true;
     const view = renderThroughput(value);
 
     expect(view.getByLabelText('网卡流量图例').textContent).toContain('接收 —');

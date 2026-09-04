@@ -620,10 +620,11 @@ export const isolateDeploymentTarget = (
   deploymentId: number,
   nodeId: string,
   request: { expected_target_status: string; reason: string; acknowledge_uncertain?: boolean },
-) => post<NodeIsolationCommandResult>(
-  `/deployments/${deploymentId}/targets/${encodeURIComponent(nodeId)}/isolate`,
-  request,
-);
+) =>
+  post<NodeIsolationCommandResult>(
+    `/deployments/${deploymentId}/targets/${encodeURIComponent(nodeId)}/isolate`,
+    request,
+  );
 
 export const restoreNodeService = (nodeId: string, reason: string) =>
   post<NodeIsolationCommandResult>(`/nodes/${encodeURIComponent(nodeId)}/restore-service`, { reason });
@@ -2725,7 +2726,7 @@ export interface ProcessSample {
 
 export interface NodeLoadView {
   node_id: string;
-  /** 服务端实际采用的绝对查询区间；图表必须用它保留尾部缺失时间，不能把末条样本挪到现在。 */
+  /** 绝对查询时是请求区间；最近窗口查询时是返回样本的实际跨度。 */
   range_start_unix_secs: number;
   range_end_unix_secs: number;
   /** null 表示该机器从未上报。与上报值为零是两种状态，界面上必须明确区分 */
@@ -2734,6 +2735,8 @@ export interface NodeLoadView {
       超出 ±600 秒的整轮已被拒收，因此该值必在此区间内 */
   clock_skew_secs: number | null;
   host: HostFacts | null;
+  /** 与查询区间独立的最后一条样本；用于展示离线机器最后已知状态。 */
+  latest_sample: LoadSample | null;
   /** 按时间从旧到新排列，可直接从左向右绘制 */
   series: LoadSample[];
   processes: ProcessSample[];
@@ -2777,6 +2780,13 @@ export const fetchNodeLoad = (nodeId: string, startUnixSecs: number, endUnixSecs
     `/load/nodes/${encodeURIComponent(nodeId)}?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}`,
     token,
   );
+
+/** 最近 N 个已上报窗口，不受样本距当前时刻多久影响。 */
+export const fetchNodeLoadListWindows = (windows = 24, token = '') =>
+  api<{ nodes: NodeLoadView[] }>(`/load/nodes?windows=${windows}`, token);
+
+export const fetchNodeLoadWindows = (nodeId: string, windows = 24, token = '') =>
+  api<NodeLoadView>(`/load/nodes/${encodeURIComponent(nodeId)}?windows=${windows}`, token);
 
 export interface PingProbePoint {
   probed_at_unix_secs: number;

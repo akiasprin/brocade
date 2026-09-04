@@ -1815,9 +1815,10 @@ pub struct LoadReportResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeLoadView {
     pub node_id: String,
-    /// Exact interval requested by the reader. Samples overlap this half-open interval; echoing
-    /// it lets charts keep missing time at its real position instead of moving the last row to
-    /// the right edge and making stale telemetry look current.
+    /// For an absolute query, the exact half-open interval requested by the reader. For a latest
+    /// window query, the extent of the returned samples (or zero when there are none). Charts use
+    /// this to keep missing time at its real position instead of moving an old row to the right
+    /// edge and making stale telemetry look current.
     pub range_start_unix_secs: i64,
     pub range_end_unix_secs: i64,
     /// `None` means this machine has never reported, which is distinct from reporting zeros. The
@@ -1832,6 +1833,11 @@ pub struct NodeLoadView {
     pub clock_skew_secs: Option<i64>,
     #[serde(default)]
     pub host: Option<HostFacts>,
+    /// The newest stored sample, independent of the requested series. This lets the UI retain a
+    /// machine's last known state when an absolute interval contains no samples; its timestamp is
+    /// still authoritative and must not be presented as a reading from the requested interval.
+    #[serde(default)]
+    pub latest_sample: Option<LoadSample>,
     /// Oldest first, so the UI can draw it left to right without sorting.
     pub series: Vec<LoadSample>,
     pub processes: Vec<ProcessSample>,

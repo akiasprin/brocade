@@ -107,12 +107,10 @@ type Finding = {
 };
 
 /* ── LOAD 趋势图 ─────────────────────────────────────────────
- * 60 个窗口直接来自现有 node-load 接口。横轴固定为最近 30 分钟；样本不足时右对齐，
- * `has_gap` 时切断路径，不把机器重启前后的两个值连成一条不存在的趋势。
+ * 横轴使用接口返回的绝对边界；`has_gap` 时切断路径，不把机器重启前后的两个值连成一条
+ * 不存在的趋势。最后状态来自独立的 latest_sample，不会影响曲线上的时间位置。
  */
 
-/** 节点详情保留 60 个 30 秒窗口：完整覆盖最近 30 分钟。 */
-const LOAD_SLOTS = 60;
 const PLOT_W = 100;
 const PLOT_H = 48;
 const PLOT_TOP = 4;
@@ -164,9 +162,14 @@ function trendPaths(
   /* 上报缺口是否断段。计数类指标缺口表示窗口不可信，必须断；uptime 这类读数
      缺口行仍是真实采样（agent 的 has_gap 只标记窗口不完整），断开反而谎报了一次重启。 */
   bridgeGaps = false,
+  rangeStartUnixSecs?: number,
+  rangeEndUnixSecs?: number,
 ): TrendPaths {
-  const tail = series.slice(-LOAD_SLOTS);
-  const offset = LOAD_SLOTS - tail.length;
+  const first = series[0];
+  const last = series[series.length - 1];
+  const rangeStart = rangeStartUnixSecs ?? first?.window_start_unix_secs ?? 0;
+  const rangeEnd = rangeEndUnixSecs ?? last?.window_end_unix_secs ?? rangeStart + 1;
+  const rangeSpan = Math.max(rangeEnd - rangeStart, Number.EPSILON);
   const span = Math.max(domain[1] - domain[0], Number.EPSILON);
   const segments: PlotPoint[][] = [];
   let current: PlotPoint[] = [];
@@ -174,14 +177,14 @@ function trendPaths(
     if (current.length > 0) segments.push(current);
     current = [];
   };
-  tail.forEach((sample, index) => {
+  series.forEach(sample => {
     const value = valueOf(sample);
     if ((!bridgeGaps && sample.has_gap) || value === null || !Number.isFinite(value)) {
       finish();
       return;
     }
     current.push({
-      x: ((offset + index) / (LOAD_SLOTS - 1)) * PLOT_W,
+      x: (Math.max(0, Math.min(rangeSpan, sample.window_end_unix_secs - rangeStart)) / rangeSpan) * PLOT_W,
       y: PLOT_TOP + ((domain[1] - value) / span) * (PLOT_BOTTOM - PLOT_TOP),
     });
   });
@@ -1106,15 +1109,13 @@ const historyValues = (samples: LoadSample[], read: (sample: LoadSample) => numb
 const CpuHistory = memo(function CpuHistory({
   report,
   label,
-  windows,
   linked,
 }: {
   report: NodeLoadView;
   label: string;
-  windows: number;
   linked: boolean;
 }) {
-  const samples = report.series.slice(-windows);
+  const samples = report.series;
   const group = linked ? `nd-cpu-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: CpuDetailSample) => number | null) =>
     sample.cpu_detail ? read(sample.cpu_detail) : null;
@@ -1283,15 +1284,13 @@ const CpuHistory = memo(function CpuHistory({
 const MemoryHistory = memo(function MemoryHistory({
   report,
   label,
-  windows,
   linked,
 }: {
   report: NodeLoadView;
   label: string;
-  windows: number;
   linked: boolean;
 }) {
-  const samples = report.series.slice(-windows);
+  const samples = report.series;
   const group = linked ? `nd-memory-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: MemoryDetailSample) => number | null) =>
     sample.memory_detail ? read(sample.memory_detail) : null;
@@ -1449,15 +1448,13 @@ const MemoryHistory = memo(function MemoryHistory({
 const DiskHistory = memo(function DiskHistory({
   report,
   label,
-  windows,
   linked,
 }: {
   report: NodeLoadView;
   label: string;
-  windows: number;
   linked: boolean;
 }) {
-  const samples = report.series.slice(-windows);
+  const samples = report.series;
   const host = report.host;
   const group = linked ? `nd-disk-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: DiskDetailSample) => number | null) =>
@@ -1604,15 +1601,13 @@ const DiskHistory = memo(function DiskHistory({
 const NetworkHistory = memo(function NetworkHistory({
   report,
   label,
-  windows,
   linked,
 }: {
   report: NodeLoadView;
   label: string;
-  windows: number;
   linked: boolean;
 }) {
-  const samples = report.series.slice(-windows);
+  const samples = report.series;
   const group = linked ? `nd-network-history-${report.node_id}` : undefined;
   const detail = (sample: LoadSample, read: (value: NetworkDetailSample) => number | null | undefined) =>
     sample.network_detail ? (read(sample.network_detail) ?? null) : null;
@@ -1885,12 +1880,16 @@ const NetworkHistory = memo(function NetworkHistory({
 function Spark({
   series,
   valueOf,
+  rangeStartUnixSecs,
+  rangeEndUnixSecs,
   percent = false,
   domain,
   bridgeGaps = false,
 }: {
   series: LoadSample[];
   valueOf: (sample: LoadSample) => number | null;
+  rangeStartUnixSecs: number;
+  rangeEndUnixSecs: number;
   percent?: boolean;
   /* 调用方自定量程：uptime 这类大基数标量不能用 metricDomain 的 |max|·8% 余量，
      那会把窗口内的变化压成平线。 */
@@ -1902,7 +1901,15 @@ function Spark({
     .filter(sample => !sample.has_gap)
     .map(valueOf)
     .filter((n): n is number => n !== null);
-  const paths = trendPaths(series, valueOf, domain ?? metricDomain(values, percent), PLOT_H, bridgeGaps);
+  const paths = trendPaths(
+    series,
+    valueOf,
+    domain ?? metricDomain(values, percent),
+    PLOT_H,
+    bridgeGaps,
+    rangeStartUnixSecs,
+    rangeEndUnixSecs,
+  );
   return (
     <svg className="kpi-spark" viewBox={`0 0 ${PLOT_W} ${PLOT_H}`} preserveAspectRatio="none" aria-hidden="true">
       {paths.areas.map((path, index) => (
@@ -1934,18 +1941,17 @@ function uptimeLabel(seconds: number): string {
 const LoadDashboard = memo(function LoadDashboard({
   report,
   historyLabel,
-  historyWindows,
   linked,
 }: {
   report: NodeLoadView;
   historyLabel: string;
-  historyWindows: number;
   linked: boolean;
 }) {
   const series = report.series;
-  const last = series[series.length - 1];
-  const host = report.host;
+  const last = report.latest_sample ?? series[series.length - 1];
   const [openDetail, setOpenDetail] = useState<'cpu' | 'memory' | 'disk' | 'network' | null>(null);
+  if (!last) return null;
+  const host = report.host;
   const cpu = (sample: LoadSample) => sample.cpu_user_pct + sample.cpu_sys_pct + sample.cpu_softirq_pct;
   const mem = (sample: LoadSample) =>
     host && host.mem_total_bytes > 0 ? (1 - sample.mem_available_bytes / host.mem_total_bytes) * 100 : null;
@@ -1959,7 +1965,14 @@ const LoadDashboard = memo(function LoadDashboard({
   const uptime = uptimeLabel(last.uptime_secs);
   const ctMax = host?.conntrack_max ?? null;
   const ctRatio = last.conntrack_count !== null && ctMax !== null && ctMax > 0 ? last.conntrack_count / ctMax : null;
+  const hasCpuHistory = series.some(sample => sample.cpu_detail);
+  const hasMemoryHistory = series.some(sample => sample.memory_detail);
+  const hasDiskHistory = series.some(sample => sample.disk_detail);
   const hasNetworkHistory = series.some(sample => sample.conntrack_count !== null || sample.network_detail);
+  const sparkRange = {
+    rangeStartUnixSecs: report.range_start_unix_secs,
+    rangeEndUnixSecs: report.range_end_unix_secs,
+  };
 
   return (
     <>
@@ -1970,8 +1983,8 @@ const LoadDashboard = memo(function LoadDashboard({
           type="button"
           className={`kpi kpi-expand ${openDetail === 'cpu' ? 'open' : ''}`}
           aria-expanded={openDetail === 'cpu'}
-          disabled={!last.cpu_detail}
-          title={last.cpu_detail ? `展开 ${historyLabel} CPU 曲线` : '当前 Agent 尚未上报 CPU 深度数据'}
+          disabled={!hasCpuHistory}
+          title={hasCpuHistory ? `展开 ${historyLabel} CPU 曲线` : '所选区间没有 CPU 深度数据'}
           onClick={() => setOpenDetail(value => (value === 'cpu' ? null : 'cpu'))}
         >
           <span className="kpi-l">CPU</span>
@@ -1989,14 +2002,14 @@ const LoadDashboard = memo(function LoadDashboard({
               </span>
             )}
           </span>
-          <Spark series={series} valueOf={cpu} percent />
+          <Spark series={series} valueOf={cpu} percent {...sparkRange} />
         </button>
         <button
           type="button"
           className={`kpi kpi-expand ${openDetail === 'memory' ? 'open' : ''}`}
           aria-expanded={openDetail === 'memory'}
-          disabled={!last.memory_detail}
-          title={last.memory_detail ? `展开 ${historyLabel} 内存曲线` : '当前 Agent 尚未上报内存深度数据'}
+          disabled={!hasMemoryHistory}
+          title={hasMemoryHistory ? `展开 ${historyLabel} 内存曲线` : '所选区间没有内存深度数据'}
           onClick={() => setOpenDetail(value => (value === 'memory' ? null : 'memory'))}
         >
           <span className="kpi-l">内存</span>
@@ -2004,14 +2017,14 @@ const LoadDashboard = memo(function LoadDashboard({
             {memNow === null ? '—' : pct(memNow).replace('%', '')}
             {memNow !== null && <small>%</small>}
           </span>
-          <Spark series={series} valueOf={mem} percent />
+          <Spark series={series} valueOf={mem} percent {...sparkRange} />
         </button>
         <button
           type="button"
           className={`kpi kpi-expand ${openDetail === 'disk' ? 'open' : ''}`}
           aria-expanded={openDetail === 'disk'}
-          disabled={!last.disk_detail}
-          title={last.disk_detail ? `展开 ${historyLabel} 磁盘曲线` : '当前 Agent 尚未上报磁盘深度数据'}
+          disabled={!hasDiskHistory}
+          title={hasDiskHistory ? `展开 ${historyLabel} 磁盘曲线` : '所选区间没有磁盘深度数据'}
           onClick={() => setOpenDetail(value => (value === 'disk' ? null : 'disk'))}
         >
           <span className="kpi-l">磁盘</span>
@@ -2019,7 +2032,7 @@ const LoadDashboard = memo(function LoadDashboard({
             {diskNow === null ? '—' : pct(diskNow).replace('%', '')}
             {diskNow !== null && <small>%</small>}
           </span>
-          <Spark series={series} valueOf={disk} percent />
+          <Spark series={series} valueOf={disk} percent {...sparkRange} />
         </button>
         <button
           type="button"
@@ -2034,12 +2047,12 @@ const LoadDashboard = memo(function LoadDashboard({
             {ctRatio === null ? '—' : pct(ctRatio * 100, 1).replace('%', '')}
             {ctRatio !== null && <small>%</small>}
           </span>
-          <Spark series={series} valueOf={sample => sample.conntrack_count} />
+          <Spark series={series} valueOf={sample => sample.conntrack_count} {...sparkRange} />
         </button>
         <div className="kpi">
           <span className="kpi-l">Load 1m</span>
           <span className="kpi-v">{last.load1.toFixed(2)}</span>
-          <Spark series={series} valueOf={sample => sample.load1} />
+          <Spark series={series} valueOf={sample => sample.load1} {...sparkRange} />
         </div>
         <div className="kpi">
           <span className="kpi-l">已运行</span>
@@ -2053,17 +2066,13 @@ const LoadDashboard = memo(function LoadDashboard({
         </div>
       </div>
 
-      {openDetail === 'cpu' && last.cpu_detail && (
-        <CpuHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
+      {openDetail === 'cpu' && hasCpuHistory && <CpuHistory report={report} label={historyLabel} linked={linked} />}
+      {openDetail === 'memory' && hasMemoryHistory && (
+        <MemoryHistory report={report} label={historyLabel} linked={linked} />
       )}
-      {openDetail === 'memory' && last.memory_detail && (
-        <MemoryHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
-      )}
-      {openDetail === 'disk' && last.disk_detail && (
-        <DiskHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
-      )}
+      {openDetail === 'disk' && hasDiskHistory && <DiskHistory report={report} label={historyLabel} linked={linked} />}
       {openDetail === 'network' && hasNetworkHistory && (
-        <NetworkHistory report={report} label={historyLabel} windows={historyWindows} linked={linked} />
+        <NetworkHistory report={report} label={historyLabel} linked={linked} />
       )}
     </>
   );
@@ -2072,15 +2081,14 @@ const LoadDashboard = memo(function LoadDashboard({
 export function LoadCard({
   report,
   historyLabel = '30 MINUTES',
-  historyWindows = LOAD_SLOTS,
   linked = false,
 }: {
   report: NodeLoadView;
   historyLabel?: string;
-  historyWindows?: number;
   linked?: boolean;
 }) {
-  if (report.series.length === 0) {
+  const latest = report.latest_sample ?? report.series[report.series.length - 1];
+  if (!latest) {
     return (
       <div className="panel" aria-label="观测数据为空">
         <p className="note">还没有负载读数。</p>
@@ -2090,7 +2098,12 @@ export function LoadCard({
 
   return (
     <div className="load-cluster">
-      <LoadDashboard report={report} historyLabel={historyLabel} historyWindows={historyWindows} linked={linked} />
+      {report.series.length === 0 && (
+        <p className="note">
+          所选时间范围内没有负载读数。以下为最后一次状态，采样于 <Ago at={iso(latest.window_end_unix_secs)} />。
+        </p>
+      )}
+      <LoadDashboard report={report} historyLabel={historyLabel} linked={linked} />
     </div>
   );
 }
