@@ -1050,7 +1050,7 @@ export interface AnyTlsSettings {
   padding_scheme?: string[];
   /** Client session pool check interval in seconds. Empty means Xray's default of 30s. */
   idle_session_check_interval_secs?: number | null;
-  /** Client idle session lifetime in seconds. Empty means Xray's default of 60s. */
+  /** Client idle session lifetime in seconds. Empty means the client's default of 30s. */
   idle_session_timeout_secs?: number | null;
   /** Minimum number of idle client sessions to retain. Empty means Xray's default of 0. */
   min_idle_session?: number | null;

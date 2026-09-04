@@ -2348,7 +2348,7 @@ export function IngressStreamRow({
               </div>
             )}
             <div className="note">
-              留空时不下发，由客户端使用自身默认值；Xray 的空闲超时为 60s，Mihomo 为 30s。
+              留空时不下发，由客户端使用自身默认值；当前 Xray 和 Mihomo 的空闲超时默认值均为 30s。
             </div>
           </details>
         </dd>
