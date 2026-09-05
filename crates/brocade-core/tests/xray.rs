@@ -1348,7 +1348,7 @@ fn an_ingress_serving_both_wires_builds_two_inbounds_on_two_ports() {
     // redirect over a run of UDP ports, and the first one written without `-p udp` would take
     // the TCP wire on that same number down with it (`ingress.hy2-port-shared`).
     assert_eq!(tcp["port"], 443);
-    assert_eq!(udp["port"], 18000);
+    assert_eq!(udp["port"], 30000);
 
     // Both listeners have to be fed, or half the subscriptions are turned away as unknown users.
     let tags = plan

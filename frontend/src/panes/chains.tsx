@@ -97,9 +97,9 @@ import { SLUG_MAX, freePortAcross, freeSpanAcross, isValidSlug, occupiedPorts, p
  *
  * 起始值的实际来源是全局设置（`settings.ports.hy2_base`），下面的常量只是设置尚未加载
  * 时的回退值，写法与 rules.tsx 的 HOP_PORT_BASE 一致：直接使用硬编码时，运营者修改设置后
- * 界面仍会填入 18000。 */
-const HY2_PORT_BASE = 18000;
-const ANYTLS_PORT_BASE = 16000;
+ * 界面仍会填入旧值。 */
+const HY2_PORT_BASE = 30000;
+const ANYTLS_PORT_BASE = 18443;
 const DEFAULT_HOP_SPAN = 100;
 const U32_MAX = 4_294_967_295;
 

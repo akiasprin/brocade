@@ -420,13 +420,13 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- undirected {"a":"node-a","b":"node-b"} pair, canonicalized by the store.
     overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL,
     port_ingress_base INTEGER DEFAULT 8443 NOT NULL,
-    port_anytls_base INTEGER DEFAULT 16000 NOT NULL,
+    port_anytls_base INTEGER DEFAULT 18443 NOT NULL,
     port_hop_base INTEGER DEFAULT 20000 NOT NULL,
     -- The same number as model.rs's HYSTERIA2_PORT_BASE, which is where a wire with no
     -- allocation of its own falls back to. Two sources for one factory value, but they are
     -- read on different paths (the console allocating, the model deserializing), and the
     -- alternative is a fresh database whose UDP base disagrees with its own wire default.
-    port_hy2_base INTEGER DEFAULT 18000 NOT NULL,
+    port_hy2_base INTEGER DEFAULT 30000 NOT NULL,
     probe_endpoint_url TEXT DEFAULT 'http://cp.cloudflare.com/cdn-cgi/trace' NOT NULL,
     probe_timeout_secs INTEGER DEFAULT 10 NOT NULL,
     probe_interval_secs INTEGER DEFAULT 60 NOT NULL,
@@ -579,7 +579,17 @@ ALTER TABLE control_state
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL;
 ALTER TABLE control_state
-    ADD COLUMN IF NOT EXISTS port_anytls_base INTEGER DEFAULT 16000 NOT NULL;
+    ADD COLUMN IF NOT EXISTS port_anytls_base INTEGER DEFAULT 18443 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS port_hy2_base INTEGER DEFAULT 30000 NOT NULL;
+ALTER TABLE control_state
+    ALTER COLUMN port_anytls_base SET DEFAULT 18443;
+ALTER TABLE control_state
+    ALTER COLUMN port_hy2_base SET DEFAULT 30000;
+-- Translate the two superseded factory values when replaying this single migration. Values an
+-- operator moved elsewhere remain untouched.
+UPDATE control_state SET port_anytls_base = 18443 WHERE port_anytls_base = 16000;
+UPDATE control_state SET port_hy2_base = 30000 WHERE port_hy2_base = 18000;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS anytls_padding_scheme JSONB DEFAULT '[]'::jsonb NOT NULL;
 -- TCP-only probing was never a durable compatibility contract. Replaying 0001 drops those old

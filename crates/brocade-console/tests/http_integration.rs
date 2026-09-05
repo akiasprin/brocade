@@ -2619,7 +2619,8 @@ async fn http_settings_exposes_and_updates_global_reality_client_policy() {
     assert_eq!(body["reality_client"]["min_client_ver"], "1.0.0");
     assert!(body["reality_client"]["max_client_ver"].is_null());
     assert!(body["reality_client"]["max_time_diff_ms"].is_null());
-    assert_eq!(body["ports"]["anytls_base"], 16_000);
+    assert_eq!(body["ports"]["anytls_base"], 18_443);
+    assert_eq!(body["ports"]["hy2_base"], 30_000);
 
     let update_body = json!({
         "reality_client": {

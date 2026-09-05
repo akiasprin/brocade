@@ -359,7 +359,7 @@ mod port_settings_tests {
         .unwrap();
 
         assert_eq!(ports.anytls_base, ANYTLS_PORT_BASE);
-        assert_eq!(ports.anytls_base, 16_000);
+        assert_eq!(ports.anytls_base, 18_443);
     }
 }
 
@@ -1522,7 +1522,7 @@ impl AnyTls {
 }
 
 /// Base used when the console creates an AnyTLS listener without an explicit port.
-pub const ANYTLS_PORT_BASE: u16 = 16_000;
+pub const ANYTLS_PORT_BASE: u16 = 18_443;
 
 const fn default_anytls_port_base() -> u16 {
     ANYTLS_PORT_BASE
@@ -1584,10 +1584,9 @@ impl Default for Hysteria2 {
 ///
 /// The number carries no protocol meaning. It only has to name a range where a run of free UDP
 /// ports can be found, because a hop range grows upward from whatever the allocator returns. It
-/// sits below the relay range (20000) rather than above it at no cost: occupancy is keyed by
-/// protocol as well as by number (`Proto` in `validate_ports`), so UDP ports allocated here and
-/// TCP relay inbounds there never contend, even where the two ranges overlap.
-pub const HYSTERIA2_PORT_BASE: u16 = 18_000;
+/// starts above the relay range (20000), keeping the factory-assigned UDP hopping block visually
+/// distinct from TCP ingress and relay listeners in operator-facing diagnostics.
+pub const HYSTERIA2_PORT_BASE: u16 = 30_000;
 const DEFAULT_HYSTERIA2_PORT: u16 = HYSTERIA2_PORT_BASE;
 
 fn default_hysteria2_port() -> u16 {

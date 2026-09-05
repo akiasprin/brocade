@@ -49,7 +49,7 @@ const committedSettings = () => ({
     flow: 'xtls-rprx-vision',
   },
   overlay: { keepalive_secs: 25, mtu: 1420, disabled_links: [] },
-  ports: { ingress_base: 8443, anytls_base: 16000, hop_base: 20000, hy2_base: 18000 },
+  ports: { ingress_base: 8443, anytls_base: 18443, hop_base: 20000, hy2_base: 30000 },
   probe: { endpoint_url: 'http://cp.cloudflare.com/cdn-cgi/trace', timeout_secs: 10, interval_secs: 60 },
   geodata: { cron: 'CRON_TZ=Asia/Shanghai 30 6 * * *', geoip_url: 'https://geoip', geosite_url: 'https://geosite' },
   connection: {

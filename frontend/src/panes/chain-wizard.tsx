@@ -76,8 +76,8 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 // 「＋ 新建分组…」在下拉框中的取值。使用不会与 app id 冲突的字符串——app id 的字符集为
 // [a-z0-9._-]（ports.ts 的 isValidSlug），不包含空格和冒号。
 const NEW_APP = ' :new-app:';
-const ANYTLS_PORT_BASE = 16000;
-const HY2_PORT_BASE = 18000;
+const ANYTLS_PORT_BASE = 18443;
+const HY2_PORT_BASE = 30000;
 const HY2_HOP_SPAN = 100;
 
 export const NEW_CHAIN_PROTOCOL_DEFAULTS = {
@@ -731,7 +731,7 @@ export function ChainWizard({
           <input type="checkbox" checked={anyTlsEnabled} onChange={event => setAnyTlsEnabled(event.target.checked)} />
           <span>
             <b>AnyTLS</b>
-            <small>TLS · TCP {anyTlsPort} · idle 30/30/1</small>
+            <small>TLS · TCP {anyTlsPort}</small>
           </span>
         </label>
         <label className={hy2Enabled ? 'on' : ''}>

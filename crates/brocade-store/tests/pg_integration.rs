@@ -664,7 +664,8 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     let realtime_policy = db.store.realtime_telemetry_policy().await.unwrap();
     assert!(realtime_policy.enabled);
     assert_eq!(realtime_policy.interval_secs, 1);
-    assert_eq!(db.store.settings().await.unwrap().ports.anytls_base, 16_000);
+    assert_eq!(db.store.settings().await.unwrap().ports.anytls_base, 18_443);
+    assert_eq!(db.store.settings().await.unwrap().ports.hy2_base, 30_000);
 
     let app_main = "app-main".to_owned();
     let app_secondary = "app-secondary".to_owned();
@@ -2592,7 +2593,8 @@ async fn global_settings_update_materializes_reality_client_policy() {
     };
     db.store.migrate().await.unwrap();
     let initial_settings = db.store.settings().await.unwrap();
-    assert_eq!(initial_settings.ports.anytls_base, 16_000);
+    assert_eq!(initial_settings.ports.anytls_base, 18_443);
+    assert_eq!(initial_settings.ports.hy2_base, 30_000);
     assert_eq!(initial_settings.anytls_padding_scheme.len(), 5);
     assert_eq!(initial_settings.anytls_padding_scheme[0], "stop=4");
     assert_eq!(
