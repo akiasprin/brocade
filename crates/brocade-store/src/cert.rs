@@ -691,7 +691,8 @@ pub async fn certificate_dns_targets(pool: &PgPool) -> Result<Vec<CertificateDns
 pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec<CertGroup>> {
     require_system_admin(actor, "view certificate status")?;
     let groups = sqlx::query(
-        "SELECT l.id, l.label, l.name, l.note, l.status, d.domain
+        "SELECT l.id, l.label, l.name, l.note, l.status, d.domain,
+                d.acme_directory AS configured_directory
            FROM cert_labels l
            JOIN cert_domains d ON d.id = l.domain_id
           ORDER BY l.name",
@@ -728,6 +729,7 @@ pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec
             let id: String = row.try_get("id")?;
             let label: String = row.try_get("label")?;
             let domain: String = row.try_get("domain")?;
+            let configured_directory: String = row.try_get("configured_directory")?;
             Ok(CertGroup {
                 names: names_of(&label, &domain),
                 nodes: members
@@ -743,12 +745,17 @@ pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec
                         cert.try_get::<String, _>("label_id").ok().as_deref() == Some(id.as_str())
                     })
                     .map(|cert| {
-                        let directory: String = cert.try_get("acme_directory")?;
+                        // Pending and failed rows do not have an issuing directory yet. They still
+                        // belong on the settings page, using the group's currently configured
+                        // method until an issued certificate freezes the actual authority here.
+                        let issued_directory: Option<String> = cert.try_get("acme_directory")?;
+                        let directory =
+                            issued_directory.as_deref().unwrap_or(&configured_directory);
                         Ok(GroupCertificate {
                             id: cert.try_get("id")?,
                             status: cert.try_get("status")?,
                             origin: cert.try_get("origin")?,
-                            signing_method: CertificateSigningMethod::from_directory(&directory),
+                            signing_method: CertificateSigningMethod::from_directory(directory),
                             issuer: cert.try_get("issuer")?,
                             issued_at: cert.try_get("issued_at")?,
                             expires_at: cert.try_get("expires_at")?,

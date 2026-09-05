@@ -13627,6 +13627,17 @@ async fn a_self_signed_domain_needs_no_dns_credential() {
     assert_eq!(due[0].label_id, label_id);
     assert_eq!(due[0].acme_directory, brocade_store::SELF_SIGNED_DIRECTORY);
 
+    // A freshly created certificate is still pending and has no issuing directory of its own.
+    // Listing the settings page must use the group's configured method instead of trying to
+    // decode that expected NULL as a string.
+    let groups = db.store.cert_groups(&system_admin()).await.unwrap();
+    let group = groups.iter().find(|group| group.id == label_id).unwrap();
+    assert_eq!(group.certificates.len(), 1);
+    assert_eq!(
+        group.certificates[0].signing_method,
+        brocade_store::CertificateSigningMethod::SelfSigned
+    );
+
     let stale_root_columns: i64 = sqlx::query_scalar(
         "SELECT count(*)
            FROM information_schema.columns
