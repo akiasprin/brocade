@@ -616,12 +616,12 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
   const selfSigned = f.signingMethod === 'self-signed';
   const storedDirectory = d?.signing_method === 'public-ca' ? d.acme_directory : view.letsencrypt;
   const dirty =
-    f.domain.trim() !== (d?.domain ?? '') ||
+    (!selfSigned && f.domain.trim() !== (d?.domain ?? '')) ||
     f.signingMethod !== (d?.signing_method ?? 'public-ca') ||
     f.credential.trim() !== '' ||
     (!selfSigned && f.directory !== storedDirectory) ||
-    f.contact.trim() !== (d?.acme_contact ?? '') ||
-    Number(f.renew) !== (d?.renew_before_days ?? 30);
+    (!selfSigned && f.contact.trim() !== (d?.acme_contact ?? '')) ||
+    (!selfSigned && Number(f.renew) !== (d?.renew_before_days ?? 30));
 
   const staging = f.directory === view.letsencrypt_staging;
   // 折叠标题上的计数：看的是签发失败的证书张数，不是机器台数——一张证书失败会连累整组机器，
@@ -646,7 +646,11 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           {save.isPending ? '保存中…' : '保存这一段'}
         </button>
       </header>
-      <p className="cardsub">按证书组签发通配证书，由控制面生成并随下发包送达节点</p>
+      <p className="cardsub">
+        {selfSigned
+          ? '默认维护 5 张自签证书，在用与待命可随时切换，最多保留 10 张'
+          : '按证书组签发通配证书，由控制面生成并随下发包送达节点'}
+      </p>
       {save.error && <ErrorBox error={save.error} />}
       {scan.error && <ErrorBox error={scan.error} />}
 
@@ -686,24 +690,26 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             </span>
             <span className="hint">
               {selfSigned
-                ? '直接生成自签证书；域名仅作为客户端发送的 SNI，不验证域名所有权。'
+                ? '自动生成随机但逼真的专用 SNI，无需填写或持有域名。'
                 : '由公共 CA 通过 DNS-01 验证域名并签发。'}
             </span>
           </div>
         </div>
 
-        <div className="setfld">
-          <label>证书域名</label>
-          <div className="v">
-            <input
-              className={dirty && f.domain.trim() !== (d?.domain ?? '') ? 'f chg' : 'f'}
-              style={{ width: 280 }}
-              placeholder="example.net"
-              value={f.domain}
-              onChange={e => setForm({ ...f, domain: e.target.value })}
-            />
+        {!selfSigned && (
+          <div className="setfld">
+            <label>证书域名</label>
+            <div className="v">
+              <input
+                className={dirty && f.domain.trim() !== (d?.domain ?? '') ? 'f chg' : 'f'}
+                style={{ width: 280 }}
+                placeholder="example.net"
+                value={f.domain}
+                onChange={e => setForm({ ...f, domain: e.target.value })}
+              />
+            </div>
           </div>
-        </div>
+        )}
 
         {!selfSigned && (
           <>
@@ -764,21 +770,26 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           </>
         )}
 
-        <div className="setfld">
-          <label>提前续期</label>
-          <div className="v">
-            <input
-              className={dirty && Number(f.renew) !== (d?.renew_before_days ?? 30) ? 'f chg' : 'f'}
-              style={{ width: 70 }}
-              value={f.renew}
-              onChange={e => setForm({ ...f, renew: e.target.value })}
-            />
-            <span className="unit">天</span>
+        {!selfSigned && (
+          <div className="setfld">
+            <label>提前续期</label>
+            <div className="v">
+              <input
+                className={dirty && Number(f.renew) !== (d?.renew_before_days ?? 30) ? 'f chg' : 'f'}
+                style={{ width: 70 }}
+                value={f.renew}
+                onChange={e => setForm({ ...f, renew: e.target.value })}
+              />
+              <span className="unit">天</span>
+            </div>
           </div>
-        </div>
+        )}
 
         {selfSigned ? (
-          <div className="guard">每个证书组直接生成一年期自签证书，无需 DNS 验证；私钥加密保存。</div>
+          <div className="guard">
+            默认组首次初始化 5 张、单张有效期 100 年。自动名称使用保留的 <b>.test</b>
+            域名，不存在真实站点，也不再拼接二级域名或通配符；私钥加密保存。
+          </div>
         ) : (
           <>
             <div className="guard">
@@ -838,8 +849,14 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
   const qc = useQueryClient();
   const nameOf = useNodeNames();
   const reload = () => qc.invalidateQueries({ queryKey: ['certs'] });
-  const [creating, setCreating] = useState<{ name: string; note: string } | null>(null);
-  const [editing, setEditing] = useState<{ id: string; name: string; note: string } | null>(null);
+  const selfSigned = view.domain?.signing_method === 'self-signed';
+  const [creating, setCreating] = useState<{ name: string; note: string; certificateName: string } | null>(null);
+  const [editing, setEditing] = useState<{
+    id: string;
+    name: string;
+    note: string;
+    certificateName: string;
+  } | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [pending, setPending] = useState<string | null>(null);
   // Unlike the section saves, these older actions are plain promises rather than useMutation.
@@ -871,13 +888,19 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
         {creating ? (
           <GroupForm
             value={creating}
+            showCertificateName={selfSigned}
             busy={pending !== null}
             onChange={setCreating}
             onCancel={() => setCreating(null)}
             onSave={() => {
               run(
                 'create-group',
-                () => createCertGroup({ name: creating.name, note: creating.note || null }),
+                () =>
+                  createCertGroup({
+                    name: creating.name,
+                    note: creating.note || null,
+                    certificate_name: creating.certificateName.trim() || null,
+                  }),
                 () => setCreating(null),
               );
             }}
@@ -889,7 +912,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               <button
                 className="btn"
                 disabled={!editable || pending !== null}
-                onClick={() => setCreating({ name: '', note: '' })}
+                onClick={() => setCreating({ name: '', note: '', certificateName: '' })}
               >
                 新建证书组
               </button>
@@ -909,7 +932,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
           <button
             className="btn"
             disabled={!editable || !!creating || pending !== null}
-            onClick={() => setCreating({ name: '', note: '' })}
+            onClick={() => setCreating({ name: '', note: '', certificateName: '' })}
           >
             新建证书组
           </button>
@@ -919,13 +942,19 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       {creating && (
         <GroupForm
           value={creating}
+          showCertificateName={selfSigned}
           busy={pending !== null}
           onChange={setCreating}
           onCancel={() => setCreating(null)}
           onSave={() => {
             run(
               'create-group',
-              () => createCertGroup({ name: creating.name, note: creating.note || null }),
+              () =>
+                createCertGroup({
+                  name: creating.name,
+                  note: creating.note || null,
+                  certificate_name: creating.certificateName.trim() || null,
+                }),
               () => setCreating(null),
             );
           }}
@@ -946,26 +975,43 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               <span className="cnames mono">{group.names[1] ?? group.names[0]}</span>
               {group.note && <span className="hint">{group.note}</span>}
               <span className="hint">{members.length} 台机器</span>
+              {selfSigned && <span className="hint">证书池 {group.certificates.length}/10</span>}
               <span className="ctl">
                 <button
                   className="btn sm"
-                  disabled={!editable || pending !== null}
-                  onClick={() => setEditing({ id: group.id, name: group.name, note: group.note ?? '' })}
+                  disabled={!editable || pending !== null || group.is_default}
+                  title={group.is_default ? '默认组名称固定' : '修改证书组名称'}
+                  onClick={() =>
+                    setEditing({
+                      id: group.id,
+                      name: group.name,
+                      note: group.note ?? '',
+                      certificateName: '',
+                    })
+                  }
                 >
                   改名
                 </button>
                 <button
                   className="btn sm"
-                  disabled={!editable || pending !== null}
-                  title="多签一张备用。它待命，由你决定何时启用；自动续期那张不经过这里"
+                  disabled={
+                    !editable || pending !== null || (selfSigned && group.certificates.length >= 10)
+                  }
+                  title={
+                    selfSigned && group.certificates.length >= 10
+                      ? '自签证书池最多 10 张，请先删除一张非在用证书'
+                      : '多签一张待命证书，由你决定何时启用'
+                  }
                   onClick={() => run(`spare:${group.id}`, () => requestSpareCertificate(group.id))}
                 >
                   {pending === `spare:${group.id}` ? '添加中…' : '加一张备用'}
                 </button>
                 <button
                   className="btn sm danger"
-                  disabled={!editable || members.length > 0 || pending !== null}
-                  title={members.length > 0 ? '还有机器在用这个组' : '删除这个组'}
+                  disabled={!editable || members.length > 0 || pending !== null || group.is_default}
+                  title={
+                    group.is_default ? '默认组不能删除' : members.length > 0 ? '还有机器在用这个组' : '删除这个组'
+                  }
                   onClick={() => {
                     if (window.confirm(`删除证书组「${group.name}」？它的证书会一并删除。`)) {
                       run(`delete-group:${group.id}`, () => deleteCertGroup(group.id));
@@ -1010,7 +1056,13 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   return (
                     <div className="certrow cert" key={cert.id}>
                       <span className={`cstate ${state.tone}`}>{state.text}</span>
-                      <span className="hint">{cert.origin === 'spare' ? '手动加的备用' : '自动续期'}</span>
+                      <span className="hint">
+                        {cert.origin === 'bootstrap'
+                          ? '初始化证书池'
+                          : cert.origin === 'spare'
+                            ? '手动添加'
+                            : '自动续期'}
+                      </span>
                       <span className="cissuer">
                         {cert.issuer ? (
                           <span className={/STAGING/i.test(cert.issuer) ? 'cstate warn' : 'hint'}>
@@ -1099,13 +1151,15 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
 function GroupForm({
   value,
   busy,
+  showCertificateName = false,
   onChange,
   onCancel,
   onSave,
 }: {
-  value: { name: string; note: string };
+  value: { name: string; note: string; certificateName: string };
   busy: boolean;
-  onChange: (next: { name: string; note: string }) => void;
+  showCertificateName?: boolean;
+  onChange: (next: { name: string; note: string; certificateName: string }) => void;
   onCancel: () => void;
   onSave: () => void;
 }) {
@@ -1129,6 +1183,17 @@ function GroupForm({
           disabled={busy}
           onChange={e => onChange({ ...value, note: e.target.value })}
         />
+        {showCertificateName && (
+          <input
+            className="f mono"
+            style={{ width: 260 }}
+            placeholder="自定义完整域名（选填）"
+            value={value.certificateName ?? ''}
+            disabled={busy}
+            onChange={e => onChange({ ...value, certificateName: e.target.value })}
+            title="仅手动新建时可指定；留空会生成随机且不会真实存在的 .test 名称"
+          />
+        )}
         <button className="btn" disabled={busy || !value.name.trim()} onClick={onSave}>
           {busy ? '保存中…' : '保存'}
         </button>

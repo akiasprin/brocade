@@ -365,6 +365,7 @@ dependencies = [
  "brocade-store",
  "flate2",
  "futures-util",
+ "getrandom 0.3.4",
  "ipnet",
  "prost",
  "rcgen",

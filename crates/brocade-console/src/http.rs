@@ -2080,6 +2080,8 @@ struct CertGroupInput {
     name: Option<String>,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    certificate_name: Option<String>,
 }
 
 async fn create_cert_group(
@@ -2100,7 +2102,13 @@ async fn create_cert_group(
     let name = input.name.unwrap_or_default();
     let id = state
         .store
-        .create_cert_label(&admin, &domain.id, &name, input.note.as_deref())
+        .create_cert_label_with_certificate_name(
+            &admin,
+            &domain.id,
+            &name,
+            input.note.as_deref(),
+            input.certificate_name.as_deref(),
+        )
         .await?;
     Ok(Json(serde_json::json!({ "id": id })).into_response())
 }
@@ -2145,6 +2153,7 @@ async fn request_spare(
         .store
         .request_spare_certificate(&admin, &label_id)
         .await?;
+    state.cert_wake.notify_one();
     Ok(Json(serde_json::json!({ "id": id })).into_response())
 }
 
@@ -3799,11 +3808,24 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             protocol_version.and_then(|version| i32::try_from(version).ok()),
         )
         .await?;
-    if let Some(route) = route_from_headers(&headers) {
+    let route = route_from_headers(&headers);
+    if let Some(route) = &route {
         state
             .store
-            .record_node_route_ips(&node.node_id, &route)
+            .record_node_route_ips(&node.node_id, route)
             .await?;
+    }
+    if let Some(detected) = public_ip_report_from_headers(&headers, route.as_ref()) {
+        if let Some(revision) = state
+            .store
+            .autofill_node_public_ips(&node.node_id, &detected)
+            .await?
+        {
+            eprintln!(
+                "node {}: 上线自动补全公网 IP（修订 {revision}）",
+                node.node_id
+            );
+        }
     }
 
     if protocol_version.unwrap_or(0) < brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION {
@@ -4725,6 +4747,33 @@ fn route_from_headers(headers: &HeaderMap) -> Option<RouteIpReport> {
     (route.ipv4.is_some() || route.ipv6.is_some()).then_some(route)
 }
 
+fn public_ip_report_from_headers(
+    headers: &HeaderMap,
+    route: Option<&RouteIpReport>,
+) -> Option<RouteIpReport> {
+    let mut report = route.cloned().unwrap_or(RouteIpReport {
+        ipv4: None,
+        ipv6: None,
+    });
+    let source = headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(brocade_store::public_route_ip)
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .and_then(brocade_store::public_route_ip)
+        });
+    match source {
+        Some(IpAddr::V4(ip)) => report.ipv4 = Some(ip.to_string()),
+        Some(IpAddr::V6(ip)) => report.ipv6 = Some(ip.to_string()),
+        None => {}
+    }
+    (report.ipv4.is_some() || report.ipv6.is_some()).then_some(report)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RouteHeaderFamily {
     V4,
@@ -5009,16 +5058,16 @@ mod tests {
     use axum::extract::Path;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    use brocade_store::{AdminContext, AdminRole, AuthenticatedAdmin, StoreError};
+    use brocade_store::{AdminContext, AdminRole, AuthenticatedAdmin, RouteIpReport, StoreError};
 
     use super::{
         bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
-        looks_like_uuid, public_may, require_grant_probe_user_access, resolve_subscription_origin,
-        route_from_headers, safe_filename_slug, session_cookie, user_may, AgentDistribution,
-        ApiError, ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery,
-        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
-        DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS, EMBEDDED_XRAYS, INSTALL_SCRIPT,
-        SUBSCRIPTION_CACHE_CONTROL,
+        looks_like_uuid, public_ip_report_from_headers, public_may,
+        require_grant_probe_user_access, resolve_subscription_origin, route_from_headers,
+        safe_filename_slug, session_cookie, user_may, AgentDistribution, ApiError,
+        ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery, SubscriptionProtocol,
+        BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS,
+        EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
 
@@ -5772,6 +5821,32 @@ mod tests {
         let route = route_from_headers(&headers).unwrap();
         assert_eq!(route.ipv4.as_deref(), Some("198.51.100.10"));
         assert_eq!(route.ipv6.as_deref(), Some("2001:db8::10"));
+    }
+
+    #[test]
+    fn reverse_proxy_source_wins_for_public_ip_autofill_but_private_source_does_not() {
+        let route = RouteIpReport {
+            ipv4: Some("8.8.8.8".to_owned()),
+            ipv6: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", HeaderValue::from_static("172.93.186.36"));
+        assert_eq!(
+            public_ip_report_from_headers(&headers, Some(&route))
+                .unwrap()
+                .ipv4
+                .as_deref(),
+            Some("172.93.186.36")
+        );
+
+        headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.8"));
+        assert_eq!(
+            public_ip_report_from_headers(&headers, Some(&route))
+                .unwrap()
+                .ipv4
+                .as_deref(),
+            Some("8.8.8.8")
+        );
     }
 
     #[test]

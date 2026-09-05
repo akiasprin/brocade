@@ -71,6 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "brocade-console created {default_warps} missing tenant default WARP resource(s)"
         );
     }
+    let default_certificates = store.ensure_default_self_signed_pool().await?;
+    if default_certificates > 0 {
+        eprintln!(
+            "brocade-console created 默认组 with {default_certificates} self-signed certificates"
+        );
+    }
     // Only the policy is durable. The service below is deliberately created once and shared by
     // both listener faces; creating one per router would leave the browser leasing one instance
     // while the Agent connected to another, and no samples would ever start.

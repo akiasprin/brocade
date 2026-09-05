@@ -42,7 +42,7 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(3600);
 /// polite, but the manual "retry now" button and a restarting control plane would not — and the
 /// thing being protected is a weekly quota.
 const RETRY_AFTER_MINUTES: i32 = 30;
-const SELF_SIGNED_DAYS: i64 = 365;
+const SELF_SIGNED_DAYS: i64 = 36_525;
 
 struct SelfSignedCertificate {
     cert_pem: String,
@@ -66,9 +66,36 @@ fn generate_self_signed(names: Vec<String>) -> Result<SelfSignedCertificate, Str
     params.not_before = now - TimeDuration::minutes(5);
     params.not_after = expires;
     params.distinguished_name = DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "Brocade Self-Signed");
+    let mut identity = [0u8; 6];
+    getrandom::fill(&mut identity).map_err(|error| format!("生成自签证书身份失败：{error}"))?;
+    const BRANDS: &[&str] = &[
+        "Arcadia",
+        "Cedar",
+        "Harbor",
+        "Lumen",
+        "Northstar",
+        "Silverline",
+        "Velora",
+    ];
+    const UNITS: &[&str] = &["Edge", "Network", "Relay", "Secure", "Systems"];
+    let brand = BRANDS[usize::from(identity[0]) % BRANDS.len()];
+    let unit = UNITS[usize::from(identity[1]) % UNITS.len()];
+    let serial = identity[2..]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    params.distinguished_name.push(
+        DnType::OrganizationName,
+        format!("{brand} Network Services"),
+    );
+    params.distinguished_name.push(
+        DnType::OrganizationalUnitName,
+        "Private Certificate Authority",
+    );
+    params.distinguished_name.push(
+        DnType::CommonName,
+        format!("{brand} {unit} Root CA {serial}"),
+    );
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let certificate = params
@@ -409,17 +436,14 @@ mod tests {
 
     #[test]
     fn a_directly_self_signed_certificate_carries_an_arbitrary_private_sni_and_pin() {
-        let certificate = generate_self_signed(vec![
-            "*.private.apple.com".to_owned(),
-            "private.apple.com".to_owned(),
-        ])
-        .unwrap();
+        let certificate =
+            generate_self_signed(vec!["northstar-edge-0123abcd.test".to_owned()]).unwrap();
         assert_eq!(certificate.cert_pem.matches("BEGIN CERTIFICATE").count(), 1);
         assert!(KeyPair::from_pem(&certificate.key_pem).is_ok());
-        assert_eq!(
-            crate::acme::leaf_facts(&certificate.cert_pem).unwrap().1,
-            "Brocade Self-Signed"
-        );
+        let (_, issuer) = crate::acme::leaf_facts(&certificate.cert_pem).unwrap();
+        assert!(issuer.contains("Root CA"));
+        let expiry_year: i32 = certificate.not_after[..4].parse().unwrap();
+        assert!(expiry_year >= OffsetDateTime::now_utc().year() + 99);
         assert_eq!(
             crate::acme::leaf_sha256(&certificate.cert_pem).unwrap(),
             certificate.peer_sha256

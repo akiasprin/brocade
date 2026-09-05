@@ -22,7 +22,7 @@ use brocade_deployment::plan::{
 use brocade_deployment::protocol::{
     DiskDetailSample, GeodataFileState, GeodataObservation, HostFacts, LoadReportRequest,
     LoadSample, LocalReconcileReport, NetworkDetailSample, NodeRuntimeReport, NodeVersions,
-    SpoolBacklog, WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus,
+    RouteIpReport, SpoolBacklog, WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus,
 };
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
@@ -15991,6 +15991,182 @@ async fn service_restore_and_new_grant_leave_no_orphaned_isolation_debt() {
         isolated || active_debt == 0,
         "a restored node must never be left with debt only the isolation path can deliver"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn a_fresh_install_bootstraps_one_five_leaf_self_signed_pool() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+
+    assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 5);
+    assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 0);
+    let groups = db.store.cert_groups(&system_admin()).await.unwrap();
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(group.name, "默认组");
+    assert!(group.is_default);
+    assert_eq!(group.names.len(), 1);
+    assert!(group.names[0].ends_with(".test"));
+    assert_eq!(group.names[0].matches('.').count(), 1);
+    assert_eq!(group.certificates.len(), 5);
+    assert!(group
+        .certificates
+        .iter()
+        .all(|certificate| certificate.origin == "bootstrap"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn self_signed_pool_reuses_switched_leaves_and_stops_at_ten() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: String::new(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(domain.domain.ends_with(".test"));
+    let label_id = db
+        .store
+        .create_cert_label_with_certificate_name(&system_admin(), &domain.id, "手动组", None, None)
+        .await
+        .unwrap();
+    let mut issued = Vec::new();
+    for suffix in ['a', 'b'] {
+        let id = db
+            .store
+            .request_spare_certificate(&system_admin(), &label_id)
+            .await
+            .unwrap();
+        let pem = format!("certificate-{suffix}");
+        db.store
+            .record_certificate(IssuedCertificate {
+                certificate_id: &id,
+                acme_directory: brocade_store::SELF_SIGNED_DIRECTORY,
+                cert_pem: &pem,
+                key_pem: "private-key",
+                not_after: "2126-01-01T00:00:00Z",
+                issuer: "Private Root CA",
+                peer_sha256: if suffix == 'a' {
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                } else {
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                },
+            })
+            .await
+            .unwrap();
+        issued.push(id);
+    }
+    assert_eq!(status_of(&db, &issued[0]).await, "serving");
+    assert_eq!(status_of(&db, &issued[1]).await, "ready");
+    db.store
+        .promote_certificate(&system_admin(), &issued[1])
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &issued[0]).await, "ready");
+    assert_eq!(status_of(&db, &issued[1]).await, "serving");
+    db.store
+        .promote_certificate(&system_admin(), &issued[0])
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &issued[0]).await, "serving");
+    assert_eq!(status_of(&db, &issued[1]).await, "ready");
+
+    for _ in 0..8 {
+        db.store
+            .request_spare_certificate(&system_admin(), &label_id)
+            .await
+            .unwrap();
+    }
+    let error = db
+        .store
+        .request_spare_certificate(&system_admin(), &label_id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("最多保留 10 张"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn first_online_report_fills_only_blank_public_ip_and_stamps_a_snapshot() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("UPDATE nodes SET public_ipv4 = NULL, public_ipv6 = NULL WHERE id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let revision = db
+        .store
+        .autofill_node_public_ips(
+            "n1",
+            &RouteIpReport {
+                ipv4: Some("172.93.186.36".to_owned()),
+                ipv6: Some("fd00::1".to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("blank public IPv4 is filled");
+    let row = sqlx::query("SELECT public_ipv4, public_ipv6 FROM nodes WHERE id = 'n1'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        row.try_get::<Option<String>, _>("public_ipv4")
+            .unwrap()
+            .as_deref(),
+        Some("172.93.186.36")
+    );
+    assert!(row
+        .try_get::<Option<String>, _>("public_ipv6")
+        .unwrap()
+        .is_none());
+    let snapshot = db.store.materialize_snapshot(Some(revision)).await.unwrap();
+    let node = snapshot.nodes.iter().find(|node| node.id == "n1").unwrap();
+    assert_eq!(node.public_ipv4.as_deref(), Some("172.93.186.36"));
+
+    assert_eq!(
+        db.store
+            .autofill_node_public_ips(
+                "n1",
+                &RouteIpReport {
+                    ipv4: Some("8.8.8.8".to_owned()),
+                    ipv6: None,
+                },
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT public_ipv4 FROM nodes WHERE id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(current.as_deref(), Some("172.93.186.36"));
 }
 
 async fn insert_minimal_fixture(pool: &PgPool) {

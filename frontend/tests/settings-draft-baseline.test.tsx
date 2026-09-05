@@ -10,6 +10,7 @@ import { useEffect, useState } from 'react';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CertsView } from '../src/api';
 
 /* settings.tsx 经 ui/branding → … 在模块求值期读 matchMedia，jsdom 没有实现。
    import 是提升的，所以装在这里而不是 beforeEach。 */
@@ -77,7 +78,7 @@ const ROUTES: Record<string, () => unknown> = {
   '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),
 };
 
-const certsWithGroup = () => ({
+const certsWithGroup = (): CertsView => ({
   sealing_available: true,
   domain: {
     id: 'private.example',
@@ -96,6 +97,7 @@ const certsWithGroup = () => ({
       domain: 'private.example',
       label: 'a1b2c3d4',
       name: 'CA-1',
+      is_default: false,
       note: null,
       status: 'active',
       names: ['*.a1b2c3d4.private.example', 'a1b2c3d4.private.example'],
@@ -169,9 +171,53 @@ afterEach(() => {
   cleanup();
   draft.clear();
   vi.unstubAllGlobals();
+  ROUTES['/certs'] = () => ({
+    groups: [],
+    nodes: [],
+    letsencrypt: 'https://acme',
+    letsencrypt_staging: 'https://acme-staging',
+  });
 });
 
 describe('设置页分段保存的基准', () => {
+  it('自签模式隐藏全局域名输入并说明百年随机身份', async () => {
+    ROUTES['/certs'] = certsWithGroup;
+    render(<Harness />);
+
+    await screen.findByText(/默认维护 5 张自签证书/);
+    expect(screen.queryByPlaceholderText('example.net')).toBeNull();
+    expect(screen.getByText(/单张有效期 100 年/)).toBeTruthy();
+    expect(screen.getByText(/不再拼接二级域名或通配符/)).toBeTruthy();
+  });
+
+  it('自签证书池到 10 张后禁用继续添加', async () => {
+    const full = certsWithGroup();
+    full.groups[0].name = '默认组';
+    full.groups[0].is_default = true;
+    full.groups[0].names = ['northstar-edge-0123abcd.test'];
+    full.groups[0].certificates = Array.from({ length: 10 }, (_, index) => ({
+      id: `cert-${index}`,
+      status: index === 0 ? 'serving' : 'ready',
+      origin: 'bootstrap',
+      signing_method: 'self-signed',
+      issuer: 'Northstar Edge Root CA',
+      issued_at: '2026-01-01T00:00:00Z',
+      expires_at: '2126-01-01T00:00:00Z',
+      sha256: `${index}`.padStart(64, '0'),
+      attempts: 0,
+      last_error: null,
+      last_attempt_at: null,
+    }));
+    ROUTES['/certs'] = () => full;
+    render(<Harness />);
+
+    const add = await screen.findByRole('button', { name: '加一张备用' });
+    expect((add as HTMLButtonElement).disabled).toBe(true);
+    expect(add.getAttribute('title')).toContain('最多 10 张');
+    expect(screen.getByText('证书池 10/10')).toBeTruthy();
+    expect((screen.getByRole('button', { name: '改名' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('添加备用证书期间锁住证书动作，连续点击只提交一次', async () => {
     let resolveSpare!: (response: Response) => void;
     const spareResponse = new Promise<Response>(resolve => {

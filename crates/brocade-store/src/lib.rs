@@ -35,6 +35,7 @@ pub use admin::{
     IssuedUserLogin, ResetAdminPasswordResult, SetUserPasswordRequest, SetUserPasswordResult,
     ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
 };
+pub use agent::public_route_ip;
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
 pub use agent_release::{AgentBuildInfo, AgentRelease, AgentReleaseScope};
 pub use branding::{BrandingSettings, DEFAULT_SITE_NAME};
@@ -58,7 +59,9 @@ pub use brocade_deployment::protocol::{
 pub use cert::{
     CertDomain, CertDomainInput, CertGroup, CertificateDnsTarget, CertificateOrder,
     CertificateScanLock, CertificateSigningMethod, GroupCertificate, IssuedCertificate,
-    NodeCertificateState, ACME_LETSENCRYPT, ACME_LETSENCRYPT_STAGING, SELF_SIGNED_DIRECTORY,
+    NodeCertificateState, ACME_LETSENCRYPT, ACME_LETSENCRYPT_STAGING,
+    DEFAULT_SELF_SIGNED_GROUP_NAME, SELF_SIGNED_DIRECTORY, SELF_SIGNED_INITIAL_POOL_SIZE,
+    SELF_SIGNED_MAX_POOL_SIZE,
 };
 pub use console::{
     ArtifactContent, ArtifactIndex, ArtifactIndexEntry, ClashHaitunLink, ClashSubscriptionUsage,

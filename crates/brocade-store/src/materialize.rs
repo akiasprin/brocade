@@ -960,7 +960,7 @@ async fn load_nodes(pool: &PgPool) -> Result<Vec<Node>> {
             -- certificate. A group with nothing serving yields NULL here, which is what makes
             -- `ingress.tls-no-certificate` fire instead of publishing an ingress whose every
             -- connection would fail at the TLS handshake.
-            (SELECT l.label || '.' || d.domain \
+            (SELECT COALESCE(l.certificate_name, l.label || '.' || d.domain) \
                FROM node_cert_label m \
                JOIN cert_labels l ON l.id = m.label_id \
                JOIN cert_domains d ON d.id = l.domain_id \
@@ -987,7 +987,7 @@ async fn load_nodes_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<Node>> 
             -- certificate. A group with nothing serving yields NULL here, which is what makes
             -- `ingress.tls-no-certificate` fire instead of publishing an ingress whose every
             -- connection would fail at the TLS handshake.
-            (SELECT l.label || '.' || d.domain \
+            (SELECT COALESCE(l.certificate_name, l.label || '.' || d.domain) \
                FROM node_cert_label m \
                JOIN cert_labels l ON l.id = m.label_id \
                JOIN cert_domains d ON d.id = l.domain_id \

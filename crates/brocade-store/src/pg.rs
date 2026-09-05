@@ -332,6 +332,29 @@ impl PgStore {
         cert::create_cert_label(&self.pool, actor, domain_id, name, note).await
     }
 
+    pub async fn create_cert_label_with_certificate_name(
+        &self,
+        actor: &AdminContext,
+        domain_id: &str,
+        name: &str,
+        note: Option<&str>,
+        certificate_name: Option<&str>,
+    ) -> Result<String> {
+        cert::create_cert_label_with_certificate_name(
+            &self.pool,
+            actor,
+            domain_id,
+            name,
+            note,
+            certificate_name,
+        )
+        .await
+    }
+
+    pub async fn ensure_default_self_signed_pool(&self) -> Result<usize> {
+        cert::ensure_default_self_signed_pool(&self.pool).await
+    }
+
     pub async fn update_cert_label(
         &self,
         actor: &AdminContext,
@@ -782,6 +805,14 @@ impl PgStore {
         route: &brocade_deployment::protocol::RouteIpReport,
     ) -> Result<()> {
         agent::record_node_route_ips(&self.pool, node_id, route).await
+    }
+
+    pub async fn autofill_node_public_ips(
+        &self,
+        node_id: &str,
+        route: &crate::RouteIpReport,
+    ) -> Result<Option<u64>> {
+        agent::autofill_node_public_ips(&self.pool, node_id, route).await
     }
 
     pub async fn halt_deployment(

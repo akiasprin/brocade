@@ -39,6 +39,7 @@ x509-parser = "0.17"
 # x509-parser 的时间类型来自 time；只用它把 notAfter 格式化成 RFC3339。
 time = { version = "0.3", default-features = false, features = ["formatting", "std"] }
 base64 = "0.22"
+getrandom = "0.3"
 
 [dev-dependencies]
 futures-util = "0.3"

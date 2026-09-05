@@ -1,3 +1,5 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
@@ -213,6 +215,96 @@ pub async fn record_node_route_ips(
     Ok(())
 }
 
+fn public_ipv4(value: &str) -> Option<String> {
+    let ip = value.trim().parse::<Ipv4Addr>().ok()?;
+    let [a, b, c, _] = ip.octets();
+    let excluded = a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224;
+    (!excluded).then(|| ip.to_string())
+}
+
+fn public_ipv6(value: &str) -> Option<String> {
+    let ip = value.trim().parse::<Ipv6Addr>().ok()?;
+    let segments = ip.segments();
+    let excluded = ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || ip.to_ipv4_mapped().is_some();
+    (!excluded).then(|| ip.to_string())
+}
+
+/// Fills only address families which the operator left blank. The write is model state: it gets
+/// its own revision and snapshot so subscriptions and future releases see the same address as the
+/// node list. Repeated heartbeats and later route changes are intentionally no-ops.
+pub async fn autofill_node_public_ips(
+    pool: &PgPool,
+    node_id: &str,
+    report: &RouteIpReport,
+) -> Result<Option<u64>> {
+    let ipv4 = report.ipv4.as_deref().and_then(public_ipv4);
+    let ipv6 = report.ipv6.as_deref().and_then(public_ipv6);
+    if ipv4.is_none() && ipv6.is_none() {
+        return Ok(None);
+    }
+
+    let mut tx = pool.begin().await?;
+    let previous = crate::console::lock_control_state(&mut tx).await?;
+    let row = sqlx::query("SELECT public_ipv4, public_ipv6 FROM nodes WHERE id = $1 FOR UPDATE")
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+    let current_ipv4: Option<String> = row.try_get("public_ipv4")?;
+    let current_ipv6: Option<String> = row.try_get("public_ipv6")?;
+    let fill_ipv4 = current_ipv4.is_none().then_some(ipv4).flatten();
+    let fill_ipv6 = current_ipv6.is_none().then_some(ipv6).flatten();
+    if fill_ipv4.is_none() && fill_ipv6.is_none() {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    let revision_id = crate::console::insert_revision(
+        &mut tx,
+        &format!("agent:{node_id}"),
+        &format!("auto-detect public IP for {node_id}"),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE nodes
+            SET public_ipv4 = COALESCE(public_ipv4, $2),
+                public_ipv6 = COALESCE(public_ipv6, $3)
+          WHERE id = $1",
+    )
+    .bind(node_id)
+    .bind(fill_ipv4)
+    .bind(fill_ipv6)
+    .execute(&mut *tx)
+    .await?;
+    let revision_id = crate::console::commit_revision(&mut tx, revision_id, previous, true).await?;
+    tx.commit().await?;
+    Ok(Some(revision_id))
+}
+
+pub fn public_route_ip(value: &str) -> Option<IpAddr> {
+    match value.trim().parse::<IpAddr>().ok()? {
+        IpAddr::V4(ip) => public_ipv4(&ip.to_string()).and(Some(IpAddr::V4(ip))),
+        IpAddr::V6(ip) => public_ipv6(&ip.to_string()).and(Some(IpAddr::V6(ip))),
+    }
+}
+
 /// Record one runtime reconcile.
 ///
 /// Separate from `record_node_poll`: a poll is the 15-second heartbeat and only updates a
@@ -326,4 +418,35 @@ pub async fn record_node_runtime(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_public_route_addresses_are_candidates_for_autofill() {
+        assert_eq!(
+            public_route_ip("172.93.186.36").unwrap().to_string(),
+            "172.93.186.36"
+        );
+        assert_eq!(
+            public_route_ip("2606:4700:4700::1111").unwrap().to_string(),
+            "2606:4700:4700::1111"
+        );
+        for address in [
+            "127.0.0.1",
+            "10.0.0.8",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "203.0.113.10",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "2001:db8::1",
+        ] {
+            assert_eq!(public_route_ip(address), None, "{address}");
+        }
+    }
 }

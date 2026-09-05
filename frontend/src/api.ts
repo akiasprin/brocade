@@ -2240,7 +2240,7 @@ export type CertStatus = 'pending' | 'ready' | 'serving' | 'superseded' | 'faile
 /** 这张证书为什么存在，决定它签好之后是否立即接管。
     `renewal`：扫描发现当前这张快到期而自动排的，签好即接管——留着等人点，就是证书过期而替代品
     躺在库里的那条路径。`spare`：手动加签的备用，停在 `ready` 等人选时机，这正是提前要一张的意义。 */
-export type CertOrigin = 'renewal' | 'spare';
+export type CertOrigin = 'renewal' | 'spare' | 'bootstrap';
 
 export interface GroupCertificate {
   id: string;
@@ -2271,6 +2271,8 @@ export interface CertGroup {
   label: string;
   /** operator 起的名字，给人看，域内唯一。 */
   name: string;
+  /** Fresh-install pool. Its name is fixed and it cannot be deleted. */
+  is_default?: boolean;
   note: string | null;
   status: 'active' | 'draining' | 'retired';
   /** 证书中的两个名称：通配名和裸名。 */
@@ -2318,7 +2320,11 @@ export const saveCertDomain = (body: CertDomainInput) =>
     保持请求等待会使页面依赖一个不确定的时长。页面通过轮询获取进展，具体状态显示在行内。 */
 export const scanCerts = () => api<CertsView>('/certs/scan', '', { method: 'POST' });
 
-export const createCertGroup = (body: { name: string; note?: string | null }) =>
+export const createCertGroup = (body: {
+  name: string;
+  note?: string | null;
+  certificate_name?: string | null;
+}) =>
   api<{ id: string }>('/certs/groups', '', { method: 'POST', body: JSON.stringify(body) });
 export const updateCertGroup = (id: string, body: { name?: string; note?: string | null }) =>
   api<void>(`/certs/groups/${encodeURIComponent(id)}`, '', {

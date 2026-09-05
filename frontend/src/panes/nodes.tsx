@@ -4631,6 +4631,9 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
   const SLUG_RE = /^[a-z0-9._-]{1,32}$/;
   const idInvalid = form.id !== '' && !SLUG_RE.test(form.id);
   const idTaken = form.id.trim() !== '' && (existingNodes.data?.nodes ?? []).some(n => n.node_id === form.id.trim());
+  const defaultCertLabelId = (certs.data?.groups ?? []).find(group => group.is_default)?.id ?? '';
+  const selectedCertLabelId =
+    form.cert_label_id === '__none__' ? '' : form.cert_label_id || defaultCertLabelId;
 
   // 归属租户取默认值：操作者绑定了子树时用该子树，只有一个租户时用该租户，
   // 否则取排序后的第一个。只有需要指定时才修改该项。
@@ -4663,7 +4666,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
         egress_allowed: form.egress_allowed,
         dns,
         domain_strategy: form.domain_strategy,
-        cert_label_id: form.cert_label_id || null,
+        cert_label_id: selectedCertLabelId || null,
       });
     },
     onSuccess: result => {
@@ -4782,7 +4785,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
               />
             </span>
             <span className="attr">
-              <span className="note">留空 = 该机器没有 IPv4 入口。</span>
+              <span className="note">可留空；机器首次上线后自动识别并回填公网 IPv4。</span>
             </span>
           </span>
         </div>
@@ -4823,7 +4826,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
               />
             </span>
             <span className="attr">
-              <span className="note">填写地址本身，不带方括号。</span>
+              <span className="note">可留空并在首次上线后自动回填；手填地址不会被覆盖。</span>
             </span>
           </span>
         </div>
@@ -4867,19 +4870,19 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
           <div>
             <select
               className="f"
-              value={form.cert_label_id}
+              value={selectedCertLabelId || '__none__'}
               onChange={e => setForm({ ...form, cert_label_id: e.target.value })}
             >
-              <option value="">不关联证书</option>
+              <option value="__none__">不关联证书</option>
               {(certs.data?.groups ?? []).map(g => (
                 <option key={g.id} value={g.id}>
-                  {g.name} · {g.names[1] ?? g.names[0]}
+                  {g.name}{g.is_default ? '（默认）' : ''} · {g.names[1] ?? g.names[0]}
                 </option>
               ))}
             </select>
           </div>
           <p className="note">
-            {form.cert_label_id
+            {selectedCertLabelId
               ? '出示这个组的证书，与组内其他机器相同。组内换证书不改 SNI，已发出去的订阅继续可用。'
               : '不关联证书组：这台机器上的 TLS 与 Hysteria 2 接入面会在编译时被拒绝。REALITY 指向外部站点的不受影响。'}
           </p>
