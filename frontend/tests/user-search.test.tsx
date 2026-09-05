@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { UserListItem } from '../src/api';
-import { userMatchesSearch } from '../src/panes/users';
+import { accountTypeBadge, userMatchesSearch } from '../src/panes/users';
 
 const user: UserListItem = {
   tenant_id: 'platform.acme',
@@ -21,5 +21,11 @@ describe('user search', () => {
   it('keeps every user for an empty query and rejects unrelated text', () => {
     expect(userMatchesSearch(user, '   ')).toBe(true);
     expect(userMatchesSearch(user, 'tokyo')).toBe(false);
+  });
+
+  it('labels both formal and test users in the roster', () => {
+    expect(accountTypeBadge('formal')).toBe('正式');
+    expect(accountTypeBadge('test')).toBe('测试');
+    expect(accountTypeBadge(undefined)).toBe('正式');
   });
 });

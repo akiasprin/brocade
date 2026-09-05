@@ -18,6 +18,7 @@ import {
   type NodeAgentStateItem,
   type RealityFallbackMode,
   type Rule,
+  type Wires,
 } from '../api';
 import { can, useSession } from '../session';
 import {
@@ -32,7 +33,16 @@ import {
   forwardAction,
 } from './rules';
 import { ErrorBox, Loading } from '../ui/bits';
-import { freePortAcross, hopListener, hopListeners, isValidSlug, occupiedPorts, portClash } from './ports';
+import {
+  freePortAcross,
+  freeSpanAcross,
+  hopListener,
+  hopListeners,
+  isValidSlug,
+  occupiedPorts,
+  portClash,
+  spanClash,
+} from './ports';
 import { friendlyId } from '../friendly-id';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 
@@ -51,7 +61,7 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 // 与链详情页保持一致（创建时看到的结构与创建后看到的相同）；第二个依据是
 // 明文直连是逐跳的属性，警告需要显示在对应的跳上，修改也在该位置进行。
 //
-// 链和入口的两个内部 id 自动生成并隐藏；App id 是运营者维护的 slug，新建 App 时仍显示。
+// 链和入口的两个内部 id 自动生成并隐藏；分组 id 是运营者维护的 slug，新建分组时仍显示。
 //
 // # 两个入口，同一套界面
 //
@@ -63,9 +73,59 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 // 机器，顺序由规则表表达——向导自动满足该要求：入口挂在本机，每台写入一条
 // `any → 下一台`（末位为出网），顺序显式写入规则。
 
-// 「＋ 新建线路…」在下拉框中的取值。使用不会与 app id 冲突的字符串——app id 的字符集为
+// 「＋ 新建分组…」在下拉框中的取值。使用不会与 app id 冲突的字符串——app id 的字符集为
 // [a-z0-9._-]（ports.ts 的 isValidSlug），不包含空格和冒号。
 const NEW_APP = ' :new-app:';
+const ANYTLS_PORT_BASE = 16000;
+const HY2_PORT_BASE = 18000;
+const HY2_HOP_SPAN = 100;
+
+export const NEW_CHAIN_PROTOCOL_DEFAULTS = {
+  vless: true,
+  anytls: true,
+  hysteria2: true,
+} as const;
+
+export function newChainWires({
+  vless,
+  anytls,
+  hysteria2,
+  anytlsPort,
+  hy2Start,
+  hy2End,
+}: {
+  vless: boolean;
+  anytls: boolean;
+  hysteria2: boolean;
+  anytlsPort: number;
+  hy2Start: number;
+  hy2End: number;
+}): Wires {
+  return {
+    vless: vless ? { kind: 'vless-reality' } : null,
+    anytls: anytls
+      ? {
+          port: anytlsPort,
+          security: 'tls',
+          padding_scheme: [],
+          idle_session_check_interval_secs: 30,
+          idle_session_timeout_secs: 30,
+          min_idle_session: 1,
+          masquerade: { kind: 'not-found' },
+        }
+      : null,
+    hysteria2: hysteria2
+      ? {
+          port: hy2Start,
+          hop: { start: hy2Start, end: hy2End },
+          bandwidth: {},
+          congestion: 'brutal',
+          obfs: { kind: 'salamander', password: 'quick-brown-fox' },
+          masquerade: { kind: 'not-found' },
+        }
+      : null,
+  };
+}
 
 type HopSec = HopWireKind;
 
@@ -118,8 +178,8 @@ export function ChainWizard({
   // 线路的选择：默认为第一个已有线路，没有任何线路时才使用新建。与 id、端口遵循同一规则——
   // state 存储的是是否手动选择过（null 表示未选择），显示值实时计算。不能使用 useState 的
   // 初始值：快照尚未返回时 `apps` 为空，此时计算的默认值始终是新建，且不会再更新。
-  // 创建线路需要 system-admin 而创建链只需 editor，两种权限都不具备时该项无法给出取值：
-  // 「＋ 新建线路…」照常列出但禁用，`targetApp` 为空使 `ready` 拦截提交。
+  // 创建分组需要 system-admin 而创建链只需 editor，两种权限都不具备时该项无法给出取值：
+  // 「＋ 新建分组…」照常列出但禁用，`targetApp` 为空使 `ready` 拦截提交。
   const [appModeRaw, setAppMode] = useState<'new' | 'existing' | null>(null);
   const [appIdRaw, setAppId] = useState<string | null>(null);
   const [appLabelRaw, setAppLabel] = useState<string | null>(null);
@@ -136,7 +196,10 @@ export function ChainWizard({
   /* 键是监听的机器而非跳。见 PortEdit。 */
   const [portEdits, setPortEdits] = useState<Record<string, PortEdit>>({});
   const [showOps, setShowOps] = useState(false);
-  const [realityTarget, setRealityTarget] = useState<RealityFallbackMode | ''>('');
+  const [realityTargetRaw, setRealityTarget] = useState<RealityFallbackMode | '' | null>(null);
+  const [vlessEnabled, setVlessEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.vless);
+  const [anyTlsEnabled, setAnyTlsEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.anytls);
+  const [hy2Enabled, setHy2Enabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.hysteria2);
   const [customRealityDest, setCustomRealityDest] = useState('');
   const [customRealityNames, setCustomRealityNames] = useState('');
   const [customRealityFingerprint, setCustomRealityFingerprint] = useState('chrome');
@@ -150,11 +213,17 @@ export function ChainWizard({
   const headLabel = head ? head.name || head.node_id : '';
   const headCertificate =
     snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === head?.node_id)?.certificate_name ?? null;
+  // The ordinary case requires no extra choice: a managed node already belongs to the default
+  // certificate group, so REALITY borrows that exact local identity. The selector remains visible
+  // for an operator who wants the global/custom target instead.
+  const realityTarget: RealityFallbackMode | '' =
+    realityTargetRaw ?? (headCertificate ? 'node-certificate' : globalRealityReady ? 'global-site' : '');
   const customRealityServerNames = customRealityNames
     .split(/[\s,]+/)
     .map(value => value.trim())
     .filter(Boolean);
   const realityTargetReady =
+    !vlessEnabled ||
     (realityTarget === 'node-certificate' && !!headCertificate) ||
     (realityTarget === 'global-site' && globalRealityReady) ||
     (realityTarget === 'custom-site' &&
@@ -209,6 +278,33 @@ export function ChainWizard({
   // 起始值取自全局设置（settings.ports.ingress_base）：443 端口的用途由运营者决定，
   // 使用硬编码会导致每次建链时都填入该值。
   const port = portRaw ?? freePortAcross(taken, [head?.node_id ?? ''], ingressBase);
+
+  // The wizard exposes which protocols are created but keeps protocol tuning out of the first
+  // decision. Each enabled protocol receives a conflict-free factory port; detailed transport,
+  // hopping and masquerade controls remain on the chain detail page.
+  let anyTlsPort = freePortAcross(taken, [head?.node_id ?? ''], settings.data?.ports?.anytls_base || ANYTLS_PORT_BASE);
+  while (anyTlsPort === port && anyTlsPort < 65536) anyTlsPort += 1;
+  const udpTaken = useMemo(
+    () => occupiedPorts(apps, nodes.data?.nodes ?? [], compile.data?.system, undefined, 'udp'),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [snapshot.data, nodes.data, compile.data],
+  );
+  const hy2Start = freeSpanAcross(
+    udpTaken,
+    [head?.node_id ?? ''],
+    settings.data?.ports?.hy2_base || HY2_PORT_BASE,
+    HY2_HOP_SPAN,
+  );
+  const hy2End = hy2Start + HY2_HOP_SPAN - 1;
+  const enabledProtocolCount = Number(vlessEnabled) + Number(anyTlsEnabled) + Number(hy2Enabled);
+  const wires = newChainWires({
+    vless: vlessEnabled,
+    anytls: anyTlsEnabled,
+    hysteria2: hy2Enabled,
+    anytlsPort: anyTlsPort,
+    hy2Start,
+    hy2End,
+  });
 
   // 该跳的默认连接方式，判定与规则编辑器共用同一实现（`defaultHopDial`）：对端有非 NAT
   // 公网地址时直连，否则回退到 overlay。**默认**不选择反向（`self: null`）：反向是一项
@@ -279,7 +375,7 @@ export function ChainWizard({
     if (clash) return [{ host, msg: clash }];
     // 链头作为反向上游时，其上同时开启接入端口和该反向端口。两者都是本次新建的，
     // `taken` 中尚不包含，上面的校验无法覆盖——只能在此额外校验一次。
-    if (host === head?.node_id && p === port) {
+    if (vlessEnabled && host === head?.node_id && p === port) {
       return [{ host, msg: `与这条链的接入口 ${port} 冲突（同在 ${nameOf(host)} 上）` }];
     }
     return [];
@@ -330,17 +426,24 @@ export function ChainWizard({
       op: 'upsert_chain',
       arg: `${chainId.trim()}「${chainName.trim() || chainId.trim()}」· 租户 ${head?.tenant_id ?? '—'}`,
     });
+    const protocolNames = [vlessEnabled && 'VLESS', anyTlsEnabled && 'AnyTLS', hy2Enabled && 'Hysteria 2'].filter(
+      Boolean,
+    );
     list.push({
       op: 'upsert_ingress',
-      arg: `${ingressId.trim()} → ${headLabel} ${bind.trim()}:${port} · REALITY（${
-        realityTarget === 'node-certificate'
-          ? '本机证书'
-          : realityTarget === 'global-site'
-            ? '全局站点'
-            : realityTarget === 'custom-site'
-              ? '自定义站点'
-              : '未选择目标'
-      }）`,
+      arg: `${ingressId.trim()} → ${headLabel} · ${protocolNames.join(' + ')}${
+        vlessEnabled
+          ? ` · REALITY（${
+              realityTarget === 'node-certificate'
+                ? '本机证书'
+                : realityTarget === 'global-site'
+                  ? '全局站点'
+                  : realityTarget === 'custom-site'
+                    ? '自定义站点'
+                    : '未选择目标'
+            }）`
+          : ''
+      }`,
     });
     if (spine.length > 1) {
       spine.forEach((id, i) => {
@@ -381,6 +484,9 @@ export function ChainWizard({
     users.data,
     ingressTenant,
     realityTarget,
+    vlessEnabled,
+    anyTlsEnabled,
+    hy2Enabled,
   ]);
 
   const submit = async () => {
@@ -408,7 +514,10 @@ export function ChainWizard({
                 server_names: customRealityServerNames,
                 fingerprint: customRealityFingerprint,
               }
-            : { fallback_mode: realityTarget as Exclude<RealityFallbackMode, 'custom-site'> },
+            : {
+                fallback_mode: (realityTarget || 'global-site') as Exclude<RealityFallbackMode, 'custom-site'>,
+              },
+        wires,
       });
 
       // 线性中继：每台转发给下一台，最后一台出网。
@@ -504,7 +613,12 @@ export function ChainWizard({
     port < 65536 &&
     !chainClash &&
     !ingressClash &&
-    !portTaken &&
+    (!vlessEnabled || !portTaken) &&
+    enabledProtocolCount > 0 &&
+    (!anyTlsEnabled ||
+      (anyTlsPort > 0 && anyTlsPort < 65536 && !portClash(taken, [head?.node_id ?? ''], anyTlsPort))) &&
+    (!hy2Enabled || (hy2End <= 65535 && !spanClash(udpTaken, [head?.node_id ?? ''], hy2Start, hy2End))) &&
+    (!(anyTlsEnabled || hy2Enabled) || !!headCertificate) &&
     hopPortIssues.length === 0 &&
     realityTargetReady &&
     (!listeners.some(host => hostSecOf(host) === 'reality') || globalRealityReady);
@@ -520,12 +634,12 @@ export function ChainWizard({
       {/* ── 标识：线路和链名。两个入口的差异集中在该项 ── */}
       <div className="wz-fields">
         <div className="wz-fld">
-          <label>线路</label>
+          <label>分组</label>
           {/* 下拉框与新建的两个输入框在同一行：它们对应同一项输入——选择哪个线路，
-              取值要么是已有线路，要么是新建线路的 id 和名称。
+              取值要么是已有分组，要么是新建分组的 id 和名称。
               分为两行会被理解为两个问题，且第二行需要依靠缩进和竖线表明其从属关系。
 
-              选择新建时下拉框收窄：此时它只显示「＋ 新建线路…」，
+              选择新建时下拉框收窄：此时它只显示「＋ 新建分组…」，
               占用半行宽度没有必要——宽度分配给需要填写的两个输入框。 */}
           <div className="wz-app">
             {/* 始终使用下拉框，即使只有一个选项。从线路页进入时它只包含该线路——
@@ -560,10 +674,10 @@ export function ChainWizard({
                   ))}
                   {/* 新建作为下拉框的最后一项，不再使用独立的单选组：它与其他选项是
                       同一问题的不同取值，使用两种控件相当于重复询问。
-                      建线路要 system-admin，但该项照常列出、只是禁用——按角色隐藏时，
+                      建分组要 system-admin，但该项照常列出、只是禁用——按角色隐藏时，
                       没有任何线路的只读视角会看到一个空下拉框。 */}
                   <option value={NEW_APP} disabled={!system}>
-                    ＋ 新建线路…
+                    ＋ 新建分组…
                   </option>
                 </>
               )}
@@ -574,19 +688,19 @@ export function ChainWizard({
                   className="f mono id"
                   value={appId}
                   onChange={e => setAppId(e.target.value)}
-                  placeholder="线路 ID"
+                  placeholder="分组 ID"
                 />
                 <input
                   className="f"
                   value={appLabel}
                   onChange={e => setAppLabel(e.target.value)}
-                  placeholder="线路名称"
+                  placeholder="分组名称"
                 />
               </>
             )}
           </div>
           {/* 说明该字段的含义——「线路」一词本身不体现它是计费单元。 */}
-          <p className="note">计费单元。填写你提供的服务内容。</p>
+          <p className="note">线路分组，也是计费单元；同类链放在一起。</p>
         </div>
         <div className="wz-fld">
           <label>链名称</label>
@@ -600,6 +714,40 @@ export function ChainWizard({
           <p className="note">列表和面包屑上显示的名字，随时能改</p>
         </div>
       </div>
+
+      <h4 className="sec">
+        接入协议
+        <span className="rule" />
+      </h4>
+      <div className="wz-protocols" aria-label="接入协议">
+        <label className={vlessEnabled ? 'on' : ''}>
+          <input type="checkbox" checked={vlessEnabled} onChange={event => setVlessEnabled(event.target.checked)} />
+          <span>
+            <b>VLESS</b>
+            <small>REALITY · TCP {port}</small>
+          </span>
+        </label>
+        <label className={anyTlsEnabled ? 'on' : ''}>
+          <input type="checkbox" checked={anyTlsEnabled} onChange={event => setAnyTlsEnabled(event.target.checked)} />
+          <span>
+            <b>AnyTLS</b>
+            <small>TLS · TCP {anyTlsPort} · idle 30/30/1</small>
+          </span>
+        </label>
+        <label className={hy2Enabled ? 'on' : ''}>
+          <input type="checkbox" checked={hy2Enabled} onChange={event => setHy2Enabled(event.target.checked)} />
+          <span>
+            <b>Hysteria 2</b>
+            <small>
+              QUIC · UDP {hy2Start}–{hy2End}
+            </small>
+          </span>
+        </label>
+      </div>
+      {enabledProtocolCount === 0 && <p className="note warn">至少开启一个接入协议。</p>}
+      {(anyTlsEnabled || hy2Enabled) && !headCertificate && head && (
+        <p className="note warn">AnyTLS（TLS）和 Hysteria 2 需要本机证书；先为 {headLabel} 分配证书组。</p>
+      )}
 
       {/* ── 路径：一跳一行 ── */}
       <h4 className="sec">
@@ -693,41 +841,45 @@ export function ChainWizard({
               <span className="attrs">
                 {entry ? (
                   <>
-                    <span className="attr">
-                      <span className="k">监听</span>
-                      <input
-                        className="f mono"
-                        style={{ width: 116 }}
-                        value={bind}
-                        onChange={e => setBind(e.target.value)}
-                      />
-                      <input
-                        className="f mono"
-                        style={{ width: 78 }}
-                        value={port}
-                        inputMode="numeric"
-                        onChange={e => setPort(Number(e.target.value))}
-                      />
-                    </span>
-                    <span className="attr">
-                      <span className="k">伪装</span>
-                      <select
-                        className="f"
-                        aria-label="REALITY 目标来源"
-                        value={realityTarget}
-                        onChange={event => setRealityTarget(event.target.value as RealityFallbackMode | '')}
-                      >
-                        <option value="">— 选择 REALITY 目标 —</option>
-                        <option value="node-certificate" disabled={!headCertificate}>
-                          本机证书{headCertificate ? ` · ${headCertificate}` : '（尚未签发）'}
-                        </option>
-                        <option value="global-site" disabled={!globalRealityReady}>
-                          全局站点{globalRealityReady ? ` · ${realitySite.dest}` : '（尚未配置）'}
-                        </option>
-                        <option value="custom-site">自定义站点…</option>
-                      </select>
-                    </span>
-                    {realityTarget === 'custom-site' && (
+                    {vlessEnabled && (
+                      <span className="attr">
+                        <span className="k">VLESS 监听</span>
+                        <input
+                          className="f mono"
+                          style={{ width: 116 }}
+                          value={bind}
+                          onChange={e => setBind(e.target.value)}
+                        />
+                        <input
+                          className="f mono"
+                          style={{ width: 78 }}
+                          value={port}
+                          inputMode="numeric"
+                          onChange={e => setPort(Number(e.target.value))}
+                        />
+                      </span>
+                    )}
+                    {vlessEnabled && (
+                      <span className="attr">
+                        <span className="k">伪装</span>
+                        <select
+                          className="f"
+                          aria-label="REALITY 目标来源"
+                          value={realityTarget}
+                          onChange={event => setRealityTarget(event.target.value as RealityFallbackMode | '')}
+                        >
+                          <option value="">— 选择 REALITY 目标 —</option>
+                          <option value="node-certificate" disabled={!headCertificate}>
+                            本机证书{headCertificate ? ` · ${headCertificate}` : '（尚未签发）'}
+                          </option>
+                          <option value="global-site" disabled={!globalRealityReady}>
+                            全局站点{globalRealityReady ? ` · ${realitySite.dest}` : '（尚未配置）'}
+                          </option>
+                          <option value="custom-site">自定义站点…</option>
+                        </select>
+                      </span>
+                    )}
+                    {vlessEnabled && realityTarget === 'custom-site' && (
                       <span className="attr wz-reality-custom">
                         <span className="k">目标 / SNI</span>
                         <input
@@ -756,7 +908,7 @@ export function ChainWizard({
                         </select>
                       </span>
                     )}
-                    {realityTarget !== '' && !realityTargetReady && (
+                    {vlessEnabled && realityTarget !== '' && !realityTargetReady && (
                       <span className="note warn">该目标尚不完整，补齐后才能创建。</span>
                     )}
                   </>

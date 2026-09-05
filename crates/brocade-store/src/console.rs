@@ -614,6 +614,58 @@ pub async fn upsert_app(
     })
 }
 
+/// Create the one built-in line group on a genuinely fresh installation.
+///
+/// The durable flag matters more than the current row count: an operator may intentionally remove
+/// every group later, and a restart must not silently recreate one. Existing installations which
+/// predate the flag are marked initialized without changing their groups.
+pub(crate) async fn ensure_default_app_group(pool: &PgPool) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+    let initialized: bool = sqlx::query_scalar(
+        "SELECT default_app_group_initialized FROM control_state WHERE id = TRUE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if initialized {
+        tx.commit().await?;
+        return Ok(false);
+    }
+
+    let has_apps: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apps)")
+        .fetch_one(&mut *tx)
+        .await?;
+    if has_apps {
+        sqlx::query(
+            "UPDATE control_state SET default_app_group_initialized = TRUE WHERE id = TRUE",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+
+    let revision_id = insert_revision(&mut tx, "brocade-system", "初始化线路默认分组").await?;
+    let actor = AdminContext::system_admin("brocade-system");
+    let changed = upsert_app_tx(
+        &mut tx,
+        &actor,
+        revision_id,
+        CreateAppRequest {
+            id: "default".to_owned(),
+            label: "默认分组".to_owned(),
+            note: None,
+        },
+    )
+    .await?;
+    sqlx::query("UPDATE control_state SET default_app_group_initialized = TRUE WHERE id = TRUE")
+        .execute(&mut *tx)
+        .await?;
+    commit_revision(&mut tx, revision_id, previous, changed).await?;
+    tx.commit().await?;
+    Ok(changed)
+}
+
 pub(crate) async fn upsert_app_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,

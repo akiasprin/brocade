@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from 'react';
+import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ApiError,
@@ -40,6 +40,7 @@ import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { isValidSlug } from './ports';
 import { SubscriptionViewer, type SubscriptionKind } from './subscription';
+import { draft } from '../draft';
 
 // 用户列表：一行一个用户，点击后就地展开。
 // 此处原为授权矩阵，行是用户、列是接入面。列数随数据增长：每个接入点一列，每个线路再加
@@ -48,11 +49,10 @@ import { SubscriptionViewer, type SubscriptionKind } from './subscription';
 //
 // 一个授权项对应一条 grant。点击只触发 grant-sync 批次，不重启进程，不断开连接。
 //
-// 开户与「机器」面的纳管采用同一结构：列表页只放一个按钮，表单通过下钻显示为独立 sheet。
-// 若把表单放进列表顶部的 toolbar，字段增多后无处容纳；且开户与纳管同属一次性操作，
-// 不应常驻占用列表首屏。
+// 新用户直接作为名册中的一条可编辑行出现。它和已有用户处在同一信息结构里，保存后仍以
+// “待提交”行留在名册中；不会跳转到尚不存在的详情页。
 
-type Drill = { p: 'list' } | { p: 'new' } | { p: 'user'; tenant: string; id: string };
+type Drill = { p: 'list' } | { p: 'user'; tenant: string; id: string };
 
 // 行左侧的状态条。与机器面共用同一组件和同一套判读规则（styles.css 的 .lst-bar），
 // 但表示的状态不同：机器面表示 agent 是否仍在拉取配置，此处表示该用户当前能否连接。
@@ -138,128 +138,18 @@ export const userMatchesSearch = (user: UserListItem, rawQuery: string) => {
     .some(value => value.toLocaleLowerCase().includes(query));
 };
 
+export const accountTypeBadge = (accountType: UserListItem['account_type']) =>
+  accountType === 'test' ? '测试' : '正式';
+
 /* 将当前下钻层级转换为外壳顶部的面包屑。顶层那一段（「用户」）由外壳补全。 */
-const crumbOf = (d: Drill): CrumbSeg[] =>
-  d.p === 'new' ? [{ label: '开户' }] : d.p === 'user' ? [{ label: d.id }] : [];
+const crumbOf = (d: Drill): CrumbSeg[] => (d.p === 'user' ? [{ label: d.id }] : []);
 
 export function UsersPane({ win, bare = false }: { win: Win; bare?: boolean }) {
   const drill = (win.data.drill as Drill | undefined) ?? { p: 'list' };
   const go = (d: Drill) => wm.setData(win.id, { ...win.data, drill: d });
   useCrumb(win, crumbOf(drill));
 
-  if (drill.p === 'new') {
-    const body = <NewUser go={go} />;
-    return bare ? <div className="fg-sheet">{body}</div> : body;
-  }
   return <UserList drill={drill} go={go} sheeted={bare} />;
-}
-
-/* 开户表单。UUID 不在此填写也不显示：它由 store 生成，浏览器不接触凭据。 */
-function NewUser({ go }: { go: (d: Drill) => void }) {
-  const { who } = useSession();
-  const qc = useQueryClient();
-  const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
-  const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
-
-  const [id, setId] = useState('');
-  const [tenant, setTenant] = useState('');
-
-  const options = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
-  /* 归属租户取默认值：操作者绑定了子树时用该子树，否则取排序后的第一个。与纳管向导一致。 */
-  const defaultTenant = options.find(t => t.id === who.tenant_scope)?.id ?? options[0]?.id ?? '';
-  const tenantId = tenant || defaultTenant;
-
-  const create = useMutation({
-    mutationFn: () => createUser({ tenant_id: tenantId, id: id.trim() }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['users'] });
-      qc.invalidateQueries({ queryKey: ['snapshot'] });
-      qc.invalidateQueries({ queryKey: ['revisions'] });
-      go({ p: 'user', tenant: tenantId, id: trimmed });
-    },
-  });
-
-  // 租户决定写入目标，用户列表决定本地查重；任一份尚未就绪时都不能把表单当成可提交。
-  if (tenants.isPending || users.isPending) return <Loading />;
-  if (tenants.error || users.error) return <ErrorBox error={tenants.error ?? users.error} />;
-
-  // 服务端会拒绝（required_slug / ensure_user_missing），但那是一次往返之后返回的错误文本。
-  // 这两项校验用已有数据即可在本地完成，无需先提交一次。
-  // user.dup 只在单个租户内查重：同名不同租户是允许的。
-  const trimmed = id.trim();
-  const badSlug = trimmed && !isValidSlug(trimmed) ? 'id 只能用 [a-z0-9._-]，最长 32。' : null;
-  const dup = (users.data?.users ?? []).some(u => u.tenant_id === tenantId && u.id === trimmed)
-    ? `${tenantId} 里已经有 ${trimmed} 了。`
-    : null;
-  const editable = can(who.role, 'edit');
-  const ready = !!trimmed && !!tenantId && !badSlug && !dup && editable;
-
-  return (
-    <>
-      <header>
-        <h4>开户</h4>
-      </header>
-
-      <form
-        onSubmit={e => {
-          e.preventDefault();
-          if (ready) create.mutate();
-        }}
-      >
-        <dl className="kv form2">
-          <dt>用户 ID</dt>
-          <dd>
-            <input className="f" value={id} placeholder="alice" autoFocus onChange={e => setId(e.target.value)} />
-            {badSlug ? (
-              <div className="note" style={{ color: 'var(--warn)' }}>
-                {badSlug}
-              </div>
-            ) : dup ? (
-              <div className="note" style={{ color: 'var(--warn)' }}>
-                {dup}
-              </div>
-            ) : (
-              <div className="note">
-                将拼入 email（
-                <span className="mono">
-                  {trimmed || 'alice'}@{tenantId || '租户'}#接入面
-                </span>
-                ）。这是 XRAY 用于权限与数据统计的内部对象，创建后不应修改。
-              </div>
-            )}
-          </dd>
-          <dt>归属租户</dt>
-          <dd>
-            {options.length > 1 ? (
-              <select className="f" value={tenantId} onChange={e => setTenant(e.target.value)}>
-                {options.map(t => (
-                  <option key={t.id} value={t.id}>
-                    {t.id}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <span className="mono">{defaultTenant || <span className="dim">（尚无租户）</span>}</span>
-            )}
-            <div className="note">email 使用完整租户路径，不使用叶子名。</div>
-          </dd>
-        </dl>
-
-        {options.length === 0 && <div className="callout warn">尚无租户。请先在「租户」页创建。</div>}
-        {create.error && <ErrorBox error={create.error} />}
-
-        <div className="toolbar">
-          <button className="btn" type="button" onClick={() => go({ p: 'list' })}>
-            取消
-          </button>
-          <span className="sp" />
-          <button className="btn primary" type="submit" disabled={!ready || create.isPending}>
-            {create.isPending ? '开户中…' : '开户'}
-          </button>
-        </div>
-      </form>
-    </>
-  );
 }
 
 // 额度以 GiB 为单位收发：操作者设定额度时使用的单位是 GiB，不是字节数。
@@ -334,11 +224,7 @@ export function QuotaRow({
           <button className="btn" disabled={busy} onClick={() => setDraftValue(null)}>
             取消
           </button>
-          <button
-            className="btn primary"
-            disabled={bad || busy}
-            onClick={() => void submit()}
-          >
+          <button className="btn primary" disabled={bad || busy} onClick={() => void submit()}>
             {busy ? '保存中…' : '保存'}
           </button>
         </span>
@@ -892,7 +778,9 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   const nameOf = useNodeNames();
   const { who } = useSession();
   const qc = useQueryClient();
+  const editable = can(who.role, 'edit');
   const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
+  const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants(), enabled: editable });
   const me = useQuery({ queryKey: ['me-user'], queryFn: fetchMyUser, enabled: who.role === 'user' });
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   /* 自然月汇总单独查询：该请求失败不影响授权操作，数字显示为 — 即可 */
@@ -903,6 +791,10 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
 
   const [busy, setBusy] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  const [newUser, setNewUser] = useState<{ id: string; tenant: string } | null>(null);
+  // A create is a browser draft operation. Subscribe explicitly so the resulting pending user
+  // remains visible as a roster row until the top-bar draft is committed or discarded.
+  const draftEntries = useSyncExternalStore(draft.subscribe, draft.snapshot);
   /* 当前查看的订阅（用户 + 格式）。null 表示未打开。同时只显示一份，与上面的展开策略一致。 */
   const [sub, setSub] = useState<{ user: UserListItem; kind: SubscriptionKind } | null>(null);
   const [detailActionsOpen, setDetailActionsOpen] = useState(false);
@@ -987,11 +879,30 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
     onSuccess: () => qc.invalidateQueries({ queryKey: ['quotas'] }),
   });
 
-  if (users.isPending || snapshot.isPending || quotas.isPending || (who.role === 'user' && me.isPending)) {
+  const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
+  const defaultTenant = tenantOptions.find(tenant => tenant.id === who.tenant_scope)?.id ?? tenantOptions[0]?.id ?? '';
+  const newTenant = newUser?.tenant || defaultTenant;
+  const create = useMutation({
+    mutationFn: () => createUser({ tenant_id: newTenant, id: newUser?.id.trim() ?? '' }),
+    onSuccess: () => {
+      setNewUser(null);
+      void qc.invalidateQueries({ queryKey: ['snapshot'] });
+      void qc.invalidateQueries({ queryKey: ['revisions'] });
+    },
+  });
+
+  if (
+    users.isPending ||
+    snapshot.isPending ||
+    quotas.isPending ||
+    (editable && tenants.isPending) ||
+    (who.role === 'user' && me.isPending)
+  ) {
     return <Loading sheeted={sheeted} />;
   }
   if (users.error) return <ErrorBox error={users.error} />;
   if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  if (tenants.error) return <ErrorBox error={tenants.error} />;
   // 额度缺失不能回退成“不限量”：那会把读取失败显示成一个有效、且风险相反的配置。
   if (quotas.error) return <ErrorBox error={quotas.error} />;
   if (me.error) return <ErrorBox error={me.error} />;
@@ -1001,12 +912,31 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   const granted = new Set(apps.flatMap(a => a.grants.map(g => `${g.tenant}/${g.user}/${g.ingress}`)));
   const selfKey = who.self_user ? `${who.self_user.tenant_id}/${who.self_user.user_id}` : null;
   const listedUsers = users.data.users;
-  const list = me.data
+  const serverUsers = me.data
     ? listedUsers.some(user => `${user.tenant_id}/${user.id}` === selfKey)
       ? listedUsers.map(user => (`${user.tenant_id}/${user.id}` === selfKey ? me.data : user))
       : [me.data, ...listedUsers]
     : listedUsers;
-  const editable = can(who.role, 'edit');
+  type RosterUser = UserListItem & { staged?: boolean };
+  const existingKeys = new Set(serverUsers.map(user => `${user.tenant_id}/${user.id}`));
+  const stagedUsers: RosterUser[] = draftEntries.flatMap(entry => {
+    if (entry.op.op !== 'create_user') return [];
+    const { tenant_id, id } = entry.op.user;
+    if (existingKeys.has(`${tenant_id}/${id}`)) return [];
+    return [
+      {
+        tenant_id,
+        id,
+        status: 'active',
+        account_type: 'formal',
+        login_enabled: false,
+        created_at: '',
+        created_revision: null,
+        staged: true,
+      },
+    ];
+  });
+  const list: RosterUser[] = [...serverUsers, ...stagedUsers];
   const canManageLogin = can(who.role, 'manage-tenants');
   /* 订阅是完整可用的配置，readonly 角色在 API 侧返回 403（见 session.tsx 的 can）。
      入口同步隐藏，避免点击后只得到一个错误。 */
@@ -1098,6 +1028,69 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   // 前者由操作者设置，后者由用量触发。合并统计后必须逐行查看才能判断该做什么。
   const exhaustedCount = allRows.filter(r => r.facts.exhausted.length > 0).length;
   const disabledCount = allRows.filter(r => r.u.status === 'disabled').length;
+  const newUserId = newUser?.id.trim() ?? '';
+  const newUserBadSlug = newUserId && !isValidSlug(newUserId) ? 'ID 只能用 a-z 0-9 . _ -，最长 32' : null;
+  const newUserDuplicate = list.some(user => user.tenant_id === newTenant && user.id === newUserId)
+    ? `${newTenant} 已有 ${newUserId}`
+    : null;
+  const newUserReady = !!newUserId && !!newTenant && !newUserBadSlug && !newUserDuplicate && editable;
+  const newUserEditor = newUser && (
+    <form
+      className="user-row user-new-row"
+      aria-label="新增用户"
+      onSubmit={event => {
+        event.preventDefault();
+        if (newUserReady) create.mutate();
+      }}
+    >
+      <span className="user-avatar user-new-avatar" aria-hidden="true">
+        ＋
+      </span>
+      <span className="rbody">
+        <span className="r1">
+          <input
+            className="f mono"
+            autoFocus
+            aria-label="新用户 ID"
+            value={newUser.id}
+            placeholder="用户 ID，例如 alice"
+            onChange={event => setNewUser({ ...newUser, id: event.target.value })}
+            onKeyDown={event => {
+              if (event.key === 'Escape' && !create.isPending) setNewUser(null);
+            }}
+          />
+          <span className="st st-succeeded">正式</span>
+        </span>
+        <span className={`r2${newUserBadSlug || newUserDuplicate ? ' bad' : ''}`}>
+          {tenantOptions.length > 1 ? (
+            <select
+              className="f mono"
+              aria-label="归属租户"
+              value={newTenant}
+              onChange={event => setNewUser({ ...newUser, tenant: event.target.value })}
+            >
+              {tenantOptions.map(tenant => (
+                <option key={tenant.id} value={tenant.id}>
+                  {tenant.id}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <span className="mono">{newTenant || '尚无租户'}</span>
+          )}
+          {(newUserBadSlug || newUserDuplicate) && <span>{newUserBadSlug || newUserDuplicate}</span>}
+        </span>
+      </span>
+      <span className="rtail user-new-actions">
+        <button className="btn primary" type="submit" disabled={!newUserReady || create.isPending}>
+          {create.isPending ? '添加中…' : '添加'}
+        </button>
+        <button className="btn ghost" type="button" disabled={create.isPending} onClick={() => setNewUser(null)}>
+          取消
+        </button>
+      </span>
+    </form>
+  );
 
   // URL 是显式选择的唯一来源，使刷新、分享链接和浏览器前进/后退落到同一用户。根地址仍
   // 默认预览当前筛选的首行；深链接失效时不回落到别人，避免地址写 alice 却展示 bob。
@@ -1109,6 +1102,18 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   // 并在顶部补一条身份标题条。
   const detailOf = (r: (typeof rows)[number]) => {
     const { u, mine, suspended, use, quotaRows, facts, tone } = r;
+    if (u.staged) {
+      return (
+        <section className="panel user-split-detail">
+          <div className="user-detail-empty">
+            <span>
+              <b className="mono">{u.id}</b> 已加入草稿
+            </span>
+            <small>归属 {u.tenant_id} · 正式用户。提交草稿后即可配置登录、额度与授权。</small>
+          </div>
+        </section>
+      );
+    }
     const disabled = u.status === 'disabled';
     const isMe = r.key === selfKey;
     const selfService = who.role === 'user' && isMe;
@@ -1399,8 +1404,12 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
      避免一条跨栏标题把名册读成详情的附属筛选器。 */
   const body = (
     <>
-      {(grant.error || profile.error || login.error || status.error || rotate.error || quota.error) && (
-        <ErrorBox error={grant.error ?? profile.error ?? login.error ?? status.error ?? rotate.error ?? quota.error} />
+      {(grant.error || profile.error || login.error || status.error || rotate.error || quota.error || create.error) && (
+        <ErrorBox
+          error={
+            grant.error ?? profile.error ?? login.error ?? status.error ?? rotate.error ?? quota.error ?? create.error
+          }
+        />
       )}
       {list.length === 0 ? (
         <section className="panel titled user-list-panel user-empty-panel">
@@ -1411,12 +1420,20 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
               <span className="user-roster-availability">
                 <b>0</b> 可用
               </span>
-              <button className="btn primary" disabled={!editable} onClick={() => go({ p: 'new' })}>
-                ＋ 开户
+              <button
+                className="btn primary"
+                disabled={!editable || tenantOptions.length === 0 || !!newUser}
+                title={tenantOptions.length === 0 ? '请先创建租户' : undefined}
+                onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
+              >
+                ＋ 新增用户
               </button>
             </span>
           </header>
-          <Empty>尚无用户。点击「开户」创建。</Empty>
+          <div className="user-roster-options">
+            {newUserEditor}
+            {!newUser && <Empty>尚无用户。点击「新增用户」后直接在名册中填写。</Empty>}
+          </div>
         </section>
       ) : (
         // 双栏：左名册常驻可扫读，右详情随选中切换。名册项第一行放用户名与接入点数量，
@@ -1433,8 +1450,13 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                 >
                   <b>{okCount}</b> 可用
                 </span>
-                <button className="btn primary" disabled={!editable} onClick={() => go({ p: 'new' })}>
-                  ＋ 开户
+                <button
+                  className="btn primary"
+                  disabled={!editable || tenantOptions.length === 0 || !!newUser}
+                  title={tenantOptions.length === 0 ? '请先创建租户' : undefined}
+                  onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
+                >
+                  ＋ 新增用户
                 </button>
               </span>
             </header>
@@ -1459,6 +1481,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
               )}
             </span>
             <div className="user-roster-options" role="listbox" aria-label="用户列表">
+              {newUserEditor}
               {rows.map(row => {
                 const { u, key, mine, suspended, use, quotaRows, facts, tone } = row;
                 const disabled = u.status === 'disabled';
@@ -1499,7 +1522,10 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                       <span className="r1">
                         <b>{u.id}</b>
                         {key === selfKey && <span className="st st-ok">我</span>}
-                        {u.account_type === 'test' && <span className="st st-warn">测试</span>}
+                        <span className={`st ${u.account_type === 'test' ? 'st-warn' : 'st-succeeded'}`}>
+                          {accountTypeBadge(u.account_type)}
+                        </span>
+                        {u.staged && <span className="st">待提交</span>}
                       </span>
                       <span className="r2">
                         <span className={`rstate${lampCls ? ` ${lampCls}` : ''}`}>{stateLine}</span>

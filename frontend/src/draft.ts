@@ -26,9 +26,11 @@ import type {
   ExternalOutboundWrite,
   HopInRequest,
   IngressProjection,
+  IngressGuard,
   ModelSettings,
   NodeConnection,
   Rule,
+  Wires,
 } from './api';
 
 export type ModelOp =
@@ -71,6 +73,8 @@ export type ModelOp =
         front_id?: string;
         reality: CreateRealityIngress;
         projection?: IngressProjection;
+        wires?: Wires;
+        guard?: IngressGuard;
       };
     }
   | {
@@ -85,6 +89,8 @@ export type ModelOp =
         front_id?: string;
         reality: CreateRealityIngress;
         projection?: IngressProjection;
+        wires?: Wires;
+        guard?: IngressGuard;
       };
     }
   | {

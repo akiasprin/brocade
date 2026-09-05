@@ -7196,7 +7196,9 @@ select.f.words {
   border-radius: 10px;
   background: var(--sunk);
   cursor: pointer;
-  transition: border-color 0.12s, background 0.12s;
+  transition:
+    border-color 0.12s,
+    background 0.12s;
 }
 .sub-insecure-toggle > span {
   position: absolute;
@@ -7206,7 +7208,9 @@ select.f.words {
   height: 10px;
   border-radius: 50%;
   background: var(--ink-4);
-  transition: transform 0.12s, background 0.12s;
+  transition:
+    transform 0.12s,
+    background 0.12s;
 }
 .sub-insecure-toggle[aria-pressed='true'] {
   border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
@@ -10374,6 +10378,46 @@ body.fg-dragging * {
   flex: 0 1 36%;
 }
 
+/* Protocols are a first-class creation choice, but their tuning is not. Three compact switches
+   expose exactly what will be opened while keeping ports informational and automatically assigned. */
+.wz-protocols {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.wz-protocols > label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  cursor: pointer;
+}
+.wz-protocols > label.on {
+  border-color: color-mix(in srgb, var(--action) 48%, var(--line));
+  background: var(--action-wash);
+}
+.wz-protocols > label > span {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+.wz-protocols b {
+  color: var(--ink);
+  font-size: 12px;
+}
+.wz-protocols small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 一跳一行。行使用 grid：左侧序号定宽，中间标识吸收宽度变化，右侧一格放删除操作。
    属性另起一行，跨越中间到右侧——它们是该跳的细节，不应与名称共用同一行的宽度。 */
 .wz-hops {
@@ -10642,6 +10686,9 @@ body.fg-dragging * {
 }
 
 @media (max-width: 820px) {
+  .wz-protocols {
+    grid-template-columns: minmax(0, 1fr);
+  }
   /* 属性在一行放不下时各占一行：压缩后下拉框会只剩箭头可见 */
   .wz-hop {
     grid-template-columns: 22px minmax(0, 1fr) auto;
@@ -11646,6 +11693,41 @@ h4.sec > .btn {
   z-index: 1;
   outline: 2px solid color-mix(in srgb, var(--action) 55%, transparent);
   outline-offset: -2px;
+}
+.user-new-row {
+  cursor: default;
+  background: color-mix(in srgb, var(--action) 5%, var(--sheet));
+  border-color: color-mix(in srgb, var(--action) 30%, var(--line));
+}
+.user-new-row:hover {
+  background: color-mix(in srgb, var(--action) 5%, var(--sheet));
+}
+.user-new-row .r1 > .f {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 27px;
+}
+.user-new-row .r2 > .f {
+  width: 100%;
+  height: 24px;
+  padding-block: 2px;
+  font-size: 10.5px;
+}
+.user-new-row .r2.bad {
+  color: var(--err);
+}
+.user-new-avatar {
+  color: var(--action);
+  border-color: color-mix(in srgb, var(--action) 45%, var(--line));
+}
+.user-new-actions {
+  flex-direction: row !important;
+  gap: 5px !important;
+}
+.user-new-actions .btn {
+  min-height: 27px;
+  padding-inline: 7px;
+  font-size: 10.5px;
 }
 .user-avatar {
   position: relative;
@@ -12873,6 +12955,9 @@ h4.sec > .btn {
     background: color-mix(in srgb, var(--sheet) 42%, transparent);
     box-shadow: none;
     scroll-snap-align: start;
+  }
+  .user-new-row {
+    flex-basis: min(340px, calc(100vw - 58px));
   }
   .user-row:last-child {
     box-shadow: none;

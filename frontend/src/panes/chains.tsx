@@ -62,11 +62,7 @@ import {
   reorderChains,
 } from '../api';
 import { draft } from '../draft';
-import {
-  compatibleXhttpMode,
-  transportKindFor,
-  type IngressSecurity,
-} from '../ingress-transport';
+import { compatibleXhttpMode, transportKindFor, type IngressSecurity } from '../ingress-transport';
 import {
   fallbackLimitDraft,
   fallbackLimitsFromDraft,
@@ -1619,7 +1615,10 @@ function xhttpDownloadDraftOf(endpoint: ProjectionEndpoint, splitReality: boolea
   };
 }
 
-function currentXhttpDownloadDrafts(downloadConfig: Xhttp['download'], draft: XhttpDownloadDrafts | null): XhttpDownloadDrafts {
+function currentXhttpDownloadDrafts(
+  downloadConfig: Xhttp['download'],
+  draft: XhttpDownloadDrafts | null,
+): XhttpDownloadDrafts {
   const current = xhttpDownloadDraftsOf(downloadConfig);
   if (!draft) return current;
   for (const family of PROJECTION_FAMILIES) {
@@ -1846,6 +1845,9 @@ export function IngressStreamRow({
       port,
       security: 'tls',
       padding_scheme: [],
+      idle_session_check_interval_secs: 30,
+      idle_session_timeout_secs: 30,
+      min_idle_session: 1,
       masquerade: { kind: 'not-found' },
     };
   }, [anytlsBase, ingress.node, ingress.port, ingress.wires.anytls, tcpTaken]);
@@ -2045,8 +2047,7 @@ export function IngressStreamRow({
   /* 启用或关闭一条线路。两条都关闭表示该接入面不接收任何连接，服务端的类型定义和库中的
      CHECK 约束都不允许该状态，因此在点击前拦截，而不是点击后返回错误。 */
   const toggleWire = (wire: 'vless' | 'anytls' | 'hy2', enabled: boolean) => {
-    const otherWireOn =
-      wire === 'vless' ? anytlsOn || hy2 : wire === 'anytls' ? vlessOn || hy2 : vlessOn || anytlsOn;
+    const otherWireOn = wire === 'vless' ? anytlsOn || hy2 : wire === 'anytls' ? vlessOn || hy2 : vlessOn || anytlsOn;
     if (!enabled && !otherWireOn) {
       window.alert('至少要保留一条线路：两条都关闭后，这个接入面不再接收任何流量。');
       return;
@@ -2249,7 +2250,7 @@ export function IngressStreamRow({
   const anytlsMasqueradeIsString = anytlsValue.masquerade.kind === 'string';
   const anytlsReality = (anytlsValue.security ?? 'tls') === 'reality';
   const anytlsStoredStatus =
-    anytlsValue.masquerade.kind === 'string' ? anytlsValue.masquerade.status_code ?? 200 : 404;
+    anytlsValue.masquerade.kind === 'string' ? (anytlsValue.masquerade.status_code ?? 200) : 404;
   const anytlsStatusText = draftAnyTlsStatus ?? String(anytlsStoredStatus);
   const parsedAnyTlsHeaders = parseAnyTlsHeaders(anytlsHeadersText);
   const anytlsPortBad =
@@ -2267,19 +2268,15 @@ export function IngressStreamRow({
   const anytlsPaddingBad = anytlsPaddingText.trim() !== '' && !anyTlsPaddingValid(anytlsPaddingText);
   const anytlsIdleCheckText =
     draftAnyTlsIdleCheck ??
-    (anytlsValue.idle_session_check_interval_secs == null
-      ? ''
-      : String(anytlsValue.idle_session_check_interval_secs));
+    (anytlsValue.idle_session_check_interval_secs == null ? '' : String(anytlsValue.idle_session_check_interval_secs));
   const anytlsIdleTimeoutText =
     draftAnyTlsIdleTimeout ??
     (anytlsValue.idle_session_timeout_secs == null ? '' : String(anytlsValue.idle_session_timeout_secs));
   const anytlsMinIdleText =
     draftAnyTlsMinIdle ?? (anytlsValue.min_idle_session == null ? '' : String(anytlsValue.min_idle_session));
   const anytlsPaddingPreset = forceAnyTlsPaddingCustom ? 'custom' : anyTlsPaddingPresetOf(anytlsPaddingText);
-  const anytlsMasqueradePreset: AnyTlsMasqueradePreset =
-    anytlsValue.masquerade.kind === 'not-found' ? '404' : 'custom';
-  const anytlsHeadersBad =
-    !anytlsReality && anytlsMasqueradePreset === 'custom' && parsedAnyTlsHeaders === null;
+  const anytlsMasqueradePreset: AnyTlsMasqueradePreset = anytlsValue.masquerade.kind === 'not-found' ? '404' : 'custom';
+  const anytlsHeadersBad = !anytlsReality && anytlsMasqueradePreset === 'custom' && parsedAnyTlsHeaders === null;
   const optionalUintBad = (text: string, allowZero: boolean) =>
     text.trim() !== '' &&
     (!/^\d+$/.test(text.trim()) ||
@@ -2498,9 +2495,7 @@ export function IngressStreamRow({
             <div className="note bad">本机证书未签发，编译会拒绝这个接入面。前往「机器」页签发。</div>
           )}
         </dd>
-        {anytlsReality && (
-          <IngressRealityRow appId={appId} ingress={ingress} editable={editable} target="anytls" />
-        )}
+        {anytlsReality && <IngressRealityRow appId={appId} ingress={ingress} editable={editable} target="anytls" />}
         <dt>参数</dt>
         <dd>
           {editable && (
@@ -2602,9 +2597,7 @@ export function IngressStreamRow({
                 />
               </label>
             </div>
-            {anytlsSessionBad && (
-              <div className="note bad">数值必须在 0 到 {U32_MAX} 之间；两个时间值须大于 0。</div>
-            )}
+            {anytlsSessionBad && <div className="note bad">数值必须在 0 到 {U32_MAX} 之间；两个时间值须大于 0。</div>}
           </details>
         </dd>
         {!anytlsReality && (
@@ -3275,7 +3268,7 @@ export function IngressStreamRow({
               const node = streamNodes.data?.nodes.find(node => node.node_id === ingress.node);
               const publicHost = family === 'v4' ? node?.public_ipv4 : node?.public_ipv6;
               const publicNat = family === 'v4' ? node?.public_ipv4_nat : node?.public_ipv6_nat;
-              return !!ingress.projection?.[family] || !!publicHost && !publicNat;
+              return !!ingress.projection?.[family] || (!!publicHost && !publicNat);
             }) && <div className="note">节点没有可用的 IPv4 或 IPv6 公网入口，无法生成独立下载订阅。</div>}
             {downloadBad && (
               <div className="note bad">
@@ -3365,12 +3358,7 @@ export function IngressProjectionRow({
     port < 65536;
 
   const desired = useMemo(
-    () =>
-      disabledDraft
-        ? null
-        : draft && valid
-          ? { host: draft.host.trim(), port }
-          : current,
+    () => (disabledDraft ? null : draft && valid ? { host: draft.host.trim(), port } : current),
     [current, disabledDraft, draft, port, valid],
   );
 
@@ -3913,7 +3901,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const create = useMutation({
     mutationFn: async () => {
       const id = (creating?.id ?? '').trim();
-      if (!isValidSlug(id)) throw new Error(`线路 ID 只能用 a-z 0-9 . _ -，最长 ${SLUG_MAX}`);
+      if (!isValidSlug(id)) throw new Error(`分组 ID 只能用 a-z 0-9 . _ -，最长 ${SLUG_MAX}`);
       // id 冲突时不会被拒绝，而是会将该 id 对应项目的链连同主干一并迁移（论证见
       // ports.ts 的 freeId）——因此此处必须先行拦截。
       if (appsNow().some(a => a.id === id)) throw new Error(`线路 ${id} 已经有了`);
@@ -4011,7 +3999,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     <div className="cardpage chain-cardpage">
       <section className="panel titled chain-list-panel">
         {/* 标题栏结构与机器页一致：标题 + 计数 + 右端一组读数 + 一个主按钮。
-          机器页右端是「＋ 纳管节点」，此处是「＋ 新建线路」——两页标题结构相同，
+          机器页右端是「＋ 纳管节点」，此处是「＋ 新建分组」——两页标题结构相同，
           缺少按钮的一页会被理解为不支持新建。
 
           因此按钮不按角色隐藏，只按角色禁用：此前整组包在 `owner &&` 里，readonly 和
@@ -4058,7 +4046,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                 多选
               </button>
               <button className="btn primary" disabled={!!creating || !owner} onClick={beginCreate}>
-                ＋ 新建线路
+                ＋ 新建分组
               </button>
             </>
           )}
@@ -4081,7 +4069,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
             }}
           >
             <div className="row">
-              <span className="k">新线路</span>
+              <span className="k">新分组</span>
               <input
                 className="f mono id"
                 autoFocus
@@ -4094,7 +4082,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                 value={creating.label}
                 // 名称默认留空：名称由用户指定，复制 ID 作为默认值不提供任何信息，
                 // 而留空可直接表明该字段需要填写。提交时留空则回退为 ID（见 create）。
-                placeholder="名称，比如：「三网优化线路接入」"
+                placeholder="分组名称，比如：「三网优化」"
                 onChange={e => setCreating({ ...creating, label: e.target.value })}
                 onKeyDown={e => e.key === 'Escape' && setCreating(null)}
               />
@@ -4108,14 +4096,14 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
             {/* 只说明该字段的含义。字符集由 ID 输入框的校验负责（输入错误时即时提示），
               「改动写入草稿」由顶栏草稿条表示，此处无需重复。 */}
             <p className="note">
-              线路是<b>计费单元</b>：填写对外提供的服务。
+              分组是线路的<b>计费单元</b>：同类链放在一个分组里。
             </p>
             {create.error && <ErrorBox error={create.error} />}
           </form>
         )}
 
         {groups.length === 0 ? (
-          <Empty>还没有线路。用右上角「＋ 新建线路」建一个。</Empty>
+          <Empty>还没有分组。用右上角「＋ 新建分组」建一个。</Empty>
         ) : (
           <div className={`chain-sections${orderDrag?.kind === 'apps' ? ' app-order-dragging' : ''}`} ref={sectionsRef}>
             {groups.map((g, gi) => (

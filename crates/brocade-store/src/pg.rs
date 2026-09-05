@@ -355,6 +355,10 @@ impl PgStore {
         cert::ensure_default_self_signed_pool(&self.pool).await
     }
 
+    pub async fn ensure_default_app_group(&self) -> Result<bool> {
+        console::ensure_default_app_group(&self.pool).await
+    }
+
     pub async fn update_cert_label(
         &self,
         actor: &AdminContext,

@@ -461,6 +461,32 @@ async fn migrations_bootstrap_empty_snapshot() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn first_console_start_creates_default_app_group_exactly_once() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+
+    assert!(db.store.ensure_default_app_group().await.unwrap());
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(snapshot.revision, 2);
+    assert_eq!(snapshot.apps.len(), 1);
+    assert_eq!(snapshot.apps[0].id, "default");
+    assert_eq!(snapshot.apps[0].label, "默认分组");
+
+    assert!(!db.store.ensure_default_app_group().await.unwrap());
+    sqlx::query("DELETE FROM apps WHERE id = 'default'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        !db.store.ensure_default_app_group().await.unwrap(),
+        "deleting every group later must not make a restart look like first initialization"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;

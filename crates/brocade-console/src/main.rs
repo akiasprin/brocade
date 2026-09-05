@@ -71,6 +71,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "brocade-console created {default_warps} missing tenant default WARP resource(s)"
         );
     }
+    if store.ensure_default_app_group().await? {
+        eprintln!("brocade-console created the line group 默认分组");
+    }
     let default_certificates = store.ensure_default_self_signed_pool().await?;
     if default_certificates > 0 {
         eprintln!(
