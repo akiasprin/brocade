@@ -60,6 +60,9 @@ const ADMIN_SESSION_COOKIE: &str = "brocade_session";
 const ROUTE_IPV4_HEADER: &str = "x-brocade-route-ipv4";
 const ROUTE_IPV6_HEADER: &str = "x-brocade-route-ipv6";
 const AGENT_LOG_MAX_MIB_HEADER: &str = "x-brocade-log-max-mib";
+const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
+const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
+const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
 /// Which architecture the asking agent was built for, in `uname -m`'s vocabulary. Only the node
 /// knows this, and the control plane has no other source for it: enrolment records no
 /// architecture, and an incorrect guess would hand a machine a binary that installs, verifies,
@@ -3794,10 +3797,7 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
     // Operational policy rides on the response header so it is present even when the node is
     // otherwise converged and the body is 204. Older agents ignore it; newer agents can change
     // retention without inventing a fake deployment or restarting Xray.
-    let log_max_mib = state
-        .store
-        .effective_node_log_max_mib(&node.node_id)
-        .await?;
+    let log_limits = state.store.effective_node_log_limits(&node.node_id).await?;
     let agent_version = user_agent(&headers).map(str::to_owned);
     let protocol_version = agent_protocol_version(&headers);
     state
@@ -3834,7 +3834,7 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             "x-brocade-agent-upgrade-required",
             HeaderValue::from_static("1"),
         );
-        return Ok(with_agent_log_policy(response, log_max_mib));
+        return Ok(with_agent_log_policy(response, log_limits));
     }
 
     // The certificate check runs before the claim: it is a read, the claim is a take, and a
@@ -3877,14 +3877,36 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             None => StatusCode::NO_CONTENT.into_response(),
         },
     };
-    Ok(with_agent_log_policy(response, log_max_mib))
+    Ok(with_agent_log_policy(response, log_limits))
 }
 
-fn with_agent_log_policy(mut response: Response, max_mib: u32) -> Response {
+fn with_agent_log_policy(
+    mut response: Response,
+    limits: brocade_store::AgentLogLimits,
+) -> Response {
+    // Old agents understand one ceiling only. The smallest value is the safe compatibility
+    // fallback: an old binary may retain less than requested for one class, but it can never let
+    // any class exceed its newly configured disk-safety bound. New agents prefer the three
+    // specific headers below.
+    let legacy_max_mib = limits
+        .agent_journal_mib
+        .min(limits.xray_mib)
+        .min(limits.phantun_mib);
     response.headers_mut().insert(
         AGENT_LOG_MAX_MIB_HEADER,
-        HeaderValue::from_str(&max_mib.to_string()).expect("u32 is a valid HTTP header value"),
+        HeaderValue::from_str(&legacy_max_mib.to_string())
+            .expect("u32 is a valid HTTP header value"),
     );
+    for (name, value) in [
+        (AGENT_JOURNAL_MAX_MIB_HEADER, limits.agent_journal_mib),
+        (XRAY_LOG_MAX_MIB_HEADER, limits.xray_mib),
+        (PHANTUN_LOG_MAX_MIB_HEADER, limits.phantun_mib),
+    ] {
+        response.headers_mut().insert(
+            name,
+            HeaderValue::from_str(&value.to_string()).expect("u32 is a valid HTTP header value"),
+        );
+    }
     response
 }
 
@@ -5058,7 +5080,9 @@ mod tests {
     use axum::extract::Path;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    use brocade_store::{AdminContext, AdminRole, AuthenticatedAdmin, RouteIpReport, StoreError};
+    use brocade_store::{
+        AdminContext, AdminRole, AgentLogLimits, AuthenticatedAdmin, RouteIpReport, StoreError,
+    };
 
     use super::{
         bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
@@ -5070,6 +5094,25 @@ mod tests {
         EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
+
+    #[test]
+    fn agent_log_headers_keep_old_agents_under_every_specific_ceiling() {
+        let response = super::with_agent_log_policy(
+            StatusCode::NO_CONTENT.into_response(),
+            AgentLogLimits {
+                agent_journal_mib: 96,
+                xray_mib: 80,
+                phantun_mib: 64,
+            },
+        );
+        assert_eq!(response.headers()[super::AGENT_LOG_MAX_MIB_HEADER], "64");
+        assert_eq!(
+            response.headers()[super::AGENT_JOURNAL_MAX_MIB_HEADER],
+            "96"
+        );
+        assert_eq!(response.headers()[super::XRAY_LOG_MAX_MIB_HEADER], "80");
+        assert_eq!(response.headers()[super::PHANTUN_LOG_MAX_MIB_HEADER], "64");
+    }
 
     #[test]
     fn subscription_origin_prefers_dedicated_origin() {

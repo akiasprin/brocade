@@ -27,6 +27,8 @@ import {
   type CertsView,
   type BrandingSettings,
   type DistributionView,
+  type AgentLogLimits,
+  type AgentLogLimitOverrides,
   type AgentLogPolicyNode,
   type AgentLogPolicyView,
   type GroupCertificate,
@@ -1540,95 +1542,158 @@ export const validLogMib = (raw: string) => {
   return Number.isSafeInteger(value) && value >= LOG_MIN_MIB && value <= LOG_MAX_MIB ? value : null;
 };
 
-export function NodeLogPolicyRow({ editable, node }: { editable: boolean; node: AgentLogPolicyNode }) {
+type AgentLogKey = keyof AgentLogLimits;
+type AgentLogForm = Record<AgentLogKey, string>;
+
+const AGENT_LOG_CLASSES: ReadonlyArray<{
+  key: AgentLogKey;
+  kind: string;
+  name: string;
+  file: string;
+  suffix: string;
+}> = [
+  {
+    key: 'agent_journal_mib',
+    kind: 'Agent',
+    name: '系统日志',
+    file: '独立 journal 命名空间',
+    suffix: '总计',
+  },
+  { key: 'xray_mib', kind: 'XRAY', name: '运行日志', file: 'xray.log + xray.log.1', suffix: '合计' },
+  {
+    key: 'phantun_mib',
+    kind: 'Phantun',
+    name: '每个运行实例',
+    file: '每个实例的 .log + .log.1',
+    suffix: '每实例',
+  },
+];
+
+const logLimitForm = (limits: AgentLogLimits): AgentLogForm => ({
+  agent_journal_mib: String(limits.agent_journal_mib),
+  xray_mib: String(limits.xray_mib),
+  phantun_mib: String(limits.phantun_mib),
+});
+
+const logOverrideForm = (overrides: AgentLogLimitOverrides): AgentLogForm => ({
+  agent_journal_mib: overrides.agent_journal_mib == null ? '' : String(overrides.agent_journal_mib),
+  xray_mib: overrides.xray_mib == null ? '' : String(overrides.xray_mib),
+  phantun_mib: overrides.phantun_mib == null ? '' : String(overrides.phantun_mib),
+});
+
+const parsedLogLimits = (form: AgentLogForm): AgentLogLimits | null => {
+  const agent = validLogMib(form.agent_journal_mib);
+  const xray = validLogMib(form.xray_mib);
+  const phantun = validLogMib(form.phantun_mib);
+  return agent === null || xray === null || phantun === null
+    ? null
+    : { agent_journal_mib: agent, xray_mib: xray, phantun_mib: phantun };
+};
+
+const parsedLogOverrides = (form: AgentLogForm): AgentLogLimitOverrides | null => {
+  const parse = (raw: string) => (raw.trim() === '' ? null : validLogMib(raw));
+  const agent = parse(form.agent_journal_mib);
+  const xray = parse(form.xray_mib);
+  const phantun = parse(form.phantun_mib);
+  if (
+    (form.agent_journal_mib.trim() !== '' && agent === null) ||
+    (form.xray_mib.trim() !== '' && xray === null) ||
+    (form.phantun_mib.trim() !== '' && phantun === null)
+  ) {
+    return null;
+  }
+  return { agent_journal_mib: agent, xray_mib: xray, phantun_mib: phantun };
+};
+
+export function NodeLogPolicyRow({
+  editable,
+  node,
+  global,
+}: {
+  editable: boolean;
+  node: AgentLogPolicyNode;
+  global: AgentLogLimits;
+}) {
   const qc = useQueryClient();
-  const [form, setForm] = useState(String(node.override_max_mib ?? node.effective_max_mib));
-  const [customizing, setCustomizing] = useState(false);
+  const [form, setForm] = useState<AgentLogForm>(() => logOverrideForm(node.overrides));
   const [syncedFrom, setSyncedFrom] = useState(node);
   if (node !== syncedFrom) {
     setSyncedFrom(node);
-    setForm(String(node.override_max_mib ?? node.effective_max_mib));
-    setCustomizing(false);
+    setForm(logOverrideForm(node.overrides));
   }
   const mutation = useMutation({
-    mutationFn: (maxMib: number | null) => saveNodeLogPolicy(node.node_id, maxMib),
+    mutationFn: (overrides: AgentLogLimitOverrides) => saveNodeLogPolicy(node.node_id, overrides),
     onSuccess: view => {
       qc.setQueryData(['agent-log-policy'], view);
     },
   });
-  const inherited = node.override_max_mib == null && !customizing;
-  const value = validLogMib(form);
-  const dirty = !inherited && (customizing || (value !== null && value !== node.override_max_mib));
+  const baseline = logOverrideForm(node.overrides);
+  const next = parsedLogOverrides(form);
+  const dirty = AGENT_LOG_CLASSES.some(item => form[item.key].trim() !== baseline[item.key]);
+  const overrideCount = AGENT_LOG_CLASSES.filter(item => node.overrides[item.key] !== null).length;
+  const clear: AgentLogLimitOverrides = { agent_journal_mib: null, xray_mib: null, phantun_mib: null };
 
   return (
     <div className="agent-log-node">
-      <div className="agent-log-node-name">
-        <b>{node.name}</b>
-        <span>{node.tenant_id}</span>
+      <div className="agent-log-node-head">
+        <div className="agent-log-node-name">
+          <b>{node.name}</b>
+          <span>{node.tenant_id}</span>
+        </div>
+        <span className={overrideCount === 0 ? 'agent-log-source' : 'agent-log-source overridden'}>
+          {overrideCount === 0 ? '全部继承' : `${overrideCount} 项覆盖`}
+        </span>
       </div>
-      <span className={inherited ? 'agent-log-source' : 'agent-log-source overridden'}>
-        {inherited ? '继承全局' : '机器覆盖'}
-      </span>
-      <label className="agent-log-value">
-        <input
-          className={dirty ? 'f chg' : 'f'}
-          type="number"
-          min={LOG_MIN_MIB}
-          max={LOG_MAX_MIB}
-          step={1}
-          aria-label={`${node.name} 日志上限`}
-          disabled={!editable || inherited || mutation.isPending}
-          value={inherited ? node.effective_max_mib : form}
-          onChange={event => setForm(event.target.value)}
-        />
-        <span>MiB</span>
-      </label>
-      {inherited ? (
-        <button
-          className="btn sm"
-          type="button"
-          disabled={!editable}
-          onClick={() => {
-            setForm(String(node.effective_max_mib));
-            setCustomizing(true);
-          }}
-        >
-          设置覆盖
-        </button>
-      ) : (
-        <>
+      <div className="agent-log-node-limits">
+        {AGENT_LOG_CLASSES.map(item => (
+          <label key={item.key}>
+            <span>{item.kind}</span>
+            <input
+              className={form[item.key].trim() !== baseline[item.key] ? 'f chg' : 'f'}
+              type="number"
+              min={LOG_MIN_MIB}
+              max={LOG_MAX_MIB}
+              step={1}
+              aria-label={`${node.name} ${item.kind} 日志上限`}
+              placeholder={String(global[item.key])}
+              disabled={!editable || mutation.isPending}
+              value={form[item.key]}
+              onChange={event => setForm({ ...form, [item.key]: event.target.value })}
+            />
+            <small>{form[item.key].trim() === '' ? `继承 ${global[item.key]}` : 'MiB'}</small>
+          </label>
+        ))}
+      </div>
+      <div className="agent-log-node-actions">
+        {dirty && (
           <button
-            className={dirty ? 'btn sm primary' : 'btn sm'}
+            className="btn sm primary"
             type="button"
-            disabled={!editable || value === null || !dirty || mutation.isPending}
-            onClick={() => value !== null && mutation.mutate(value)}
+            disabled={!editable || next === null || mutation.isPending}
+            onClick={() => next && mutation.mutate(next)}
           >
-            {mutation.isPending && mutation.variables !== null ? '保存中…' : '保存'}
+            {mutation.isPending ? '保存中…' : '保存覆盖'}
           </button>
+        )}
+        {dirty && (
+          <button className="btn sm" type="button" disabled={mutation.isPending} onClick={() => setForm(baseline)}>
+            还原
+          </button>
+        )}
+        {overrideCount > 0 && !dirty && (
           <button
             className="btn sm"
             type="button"
             disabled={!editable || mutation.isPending}
-            onClick={() => {
-              if (node.override_max_mib == null) {
-                setCustomizing(false);
-                setForm(String(node.effective_max_mib));
-              } else {
-                mutation.mutate(null);
-              }
-            }}
+            onClick={() => mutation.mutate(clear)}
           >
-            {mutation.isPending && mutation.variables === null
-              ? '取消中…'
-              : node.override_max_mib == null
-                ? '取消'
-                : '取消覆盖'}
+            {mutation.isPending ? '清除中…' : '全部继承'}
           </button>
-        </>
-      )}
-      {value === null && !inherited && (
+        )}
+      </div>
+      {next === null && (
         <span className="agent-log-invalid">
-          {LOG_MIN_MIB}–{LOG_MAX_MIB}
+          三项均需留空或填写 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数
         </span>
       )}
       {mutation.error && <ErrorBox error={mutation.error} />}
@@ -1638,16 +1703,16 @@ export function NodeLogPolicyRow({ editable, node }: { editable: boolean; node: 
 
 export function AgentLogPolicySection({ editable, data }: { editable: boolean; data: AgentLogPolicyView }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState(String(data.global_max_mib));
-  const [syncedFrom, setSyncedFrom] = useState(data.global_max_mib);
-  if (data.global_max_mib !== syncedFrom) {
-    setSyncedFrom(data.global_max_mib);
-    setForm(String(data.global_max_mib));
+  const [form, setForm] = useState<AgentLogForm>(() => logLimitForm(data.global));
+  const [syncedFrom, setSyncedFrom] = useState(data.global);
+  if (data.global !== syncedFrom) {
+    setSyncedFrom(data.global);
+    setForm(logLimitForm(data.global));
   }
-  const value = validLogMib(form);
-  const dirty = value !== null && value !== data.global_max_mib;
+  const limits = parsedLogLimits(form);
+  const dirty = limits !== null && AGENT_LOG_CLASSES.some(item => limits[item.key] !== data.global[item.key]);
   const save = useMutation({
-    mutationFn: () => saveAgentLogDefault(value!),
+    mutationFn: () => saveAgentLogDefault(limits!),
     onSuccess: view => qc.setQueryData(['agent-log-policy'], view),
   });
 
@@ -1658,40 +1723,51 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
         <h4>日志保留</h4>
         <ApplyBadge id="set-agent-logs" />
       </header>
-      <p className="cardsub">Agent、XRAY 与每个 Phantun 日志项的磁盘上限；机器覆盖优先于全局</p>
+      <p className="cardsub">Agent、XRAY 与 Phantun 分别设置；机器覆盖优先于对应的全局值</p>
       {save.error && <ErrorBox error={save.error} />}
-      <Group label="全局默认">
-        <Fld label="每个日志项最多">
-          <label className="agent-log-value global">
-            <input
-              className={dirty ? 'f chg' : 'f'}
-              type="number"
-              min={LOG_MIN_MIB}
-              max={LOG_MAX_MIB}
-              step={1}
-              aria-label="全局日志上限"
-              disabled={!editable || save.isPending}
-              value={form}
-              onChange={event => setForm(event.target.value)}
-            />
-            <span>MiB</span>
-          </label>
-          <span className="hint">
-            范围 {LOG_MIN_MIB}–{LOG_MAX_MIB}。修改后，所有未覆盖的机器随下一轮 Agent 轮询更新
+      <Group label="全局默认 · 每类独立">
+        <div className="agent-log-scope" aria-label="日志额度作用范围">
+          {AGENT_LOG_CLASSES.map(item => (
+            <div className="agent-log-scope-row" key={item.key}>
+              <span className="agent-log-scope-kind">{item.kind}</span>
+              <span className="agent-log-scope-name">
+                <b>{item.name}</b>
+                <code>{item.file}</code>
+              </span>
+              <label className="agent-log-scope-limit">
+                <input
+                  className={limits && limits[item.key] !== data.global[item.key] ? 'f chg' : 'f'}
+                  type="number"
+                  min={LOG_MIN_MIB}
+                  max={LOG_MAX_MIB}
+                  step={1}
+                  aria-label={`全局 ${item.kind} 日志上限`}
+                  disabled={!editable || save.isPending}
+                  value={form[item.key]}
+                  onChange={event => setForm({ ...form, [item.key]: event.target.value })}
+                />
+                <span>MiB · {item.suffix}</span>
+              </label>
+            </div>
+          ))}
+        </div>
+        <p className="agent-log-scope-note">
+          三项分别计算，不是整机总额度。每项范围 {LOG_MIN_MIB}–{LOG_MAX_MIB} MiB；降低后会立即截断旧日志。
+        </p>
+        {limits === null && (
+          <span className="agent-log-invalid">
+            三项均需填写 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数
           </span>
-          {value === null && (
-            <span className="agent-log-invalid">
-              请输入 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数
-            </span>
-          )}
-        </Fld>
+        )}
       </Group>
       <Group label="机器覆盖">
         <div className="agent-log-nodes">
           {data.nodes.length === 0 ? (
             <span className="hint">还没有机器</span>
           ) : (
-            data.nodes.map(node => <NodeLogPolicyRow key={node.node_id} editable={editable} node={node} />)
+            data.nodes.map(node => (
+              <NodeLogPolicyRow key={node.node_id} editable={editable} node={node} global={data.global} />
+            ))
           )}
         </div>
         <div className="guard">不产生修订、不需要发布线路。降低上限会立即截断已有日志释放空间，不会中断服务。</div>

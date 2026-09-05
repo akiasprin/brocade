@@ -104,9 +104,9 @@ pub use lifecycle::{
 };
 pub use load::LoadSeriesQuery;
 pub use log_policy::{
-    AgentLogPolicyView, NodeLogPolicyItem, UpdateAgentLogDefaultRequest,
-    UpdateNodeLogPolicyRequest, DEFAULT_AGENT_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
-    MIN_AGENT_LOG_MAX_MIB,
+    AgentLogLimitOverrides, AgentLogLimits, AgentLogPolicyView, NodeLogPolicyItem,
+    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, DEFAULT_AGENT_LOG_MAX_MIB,
+    MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
 };
 pub use pg::PgStore;
 pub use probe::{

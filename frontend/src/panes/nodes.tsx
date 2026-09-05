@@ -32,6 +32,8 @@ import {
   setWireGuardLinkDisabled,
   updateNode,
   verifyDeployment,
+  type AgentLogLimits,
+  type AgentLogLimitOverrides,
   type AgentLogPolicyNode,
   type AgentLogPolicyView,
   type Dns,
@@ -2366,17 +2368,18 @@ function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy, retry: false });
   const mine = logPolicy.data?.nodes.find(row => row.node_id === node.node_id) ?? null;
   if (!mine) return null;
+  const overrideCount = Object.values(mine.overrides).filter(value => value !== null).length;
 
   return (
     <div className="panel config-panel">
       <header>
         <PanelTitle of="artifacts">日志保留</PanelTitle>
-        <span className="hint">{mine.override_max_mib == null ? '与全局一致' : '本机覆盖'}</span>
+        <span className="hint">{overrideCount === 0 ? '全部继承' : `${overrideCount} 项本机覆盖`}</span>
       </header>
       <div className="fgrid one">
         <NodeLogLimitRow
           node={mine}
-          globalMaxMib={logPolicy.data!.global_max_mib}
+          global={logPolicy.data!.global}
           canEdit={canEdit}
           onSaved={view => qc.setQueryData(['agent-log-policy'], view)}
         />
@@ -2399,31 +2402,50 @@ function OverrideTag({ own }: { own: boolean }) {
  * 那一行要在一张机队表里标出是哪台机器，因此带机器名和租户；此处整页都属于这台机器。
  *
  * 不写草稿、不产生修订：保存即落库，未覆盖的机器随下一轮 agent 轮询读到全局值。 */
+type NodeLogKey = keyof AgentLogLimits;
+type NodeLogForm = Record<NodeLogKey, string>;
+
+const NODE_LOG_CLASSES: ReadonlyArray<{ key: NodeLogKey; label: string; note: string }> = [
+  { key: 'agent_journal_mib', label: 'Agent journal（MiB）', note: '独立 journal 命名空间的总量' },
+  { key: 'xray_mib', label: 'XRAY（MiB）', note: 'xray.log 与 xray.log.1 合计' },
+  { key: 'phantun_mib', label: 'Phantun（MiB）', note: '每个 Phantun 实例分别计算' },
+];
+
 function NodeLogLimitRow({
   node,
-  globalMaxMib,
+  global,
   canEdit,
   onSaved,
 }: {
   node: AgentLogPolicyNode;
-  globalMaxMib: number;
+  global: AgentLogLimits;
   canEdit: boolean;
   onSaved: (view: AgentLogPolicyView) => void;
 }) {
-  /* 输入框常驻，改了才出工具条。留空即回退到全局默认值，全局值由占位符给出——
-     与同卡上面四项连接策略的写法一致，因此不需要「设置覆盖 / 取消覆盖」两个模式按钮：
-     填一个数就是覆盖，清空就是继承。`null` 表示本次未改动。 */
-  const [form, setForm] = useState<string | null>(null);
-  const base = node.override_max_mib == null ? '' : String(node.override_max_mib);
+  const toForm = (overrides: AgentLogLimitOverrides): NodeLogForm => ({
+    agent_journal_mib: overrides.agent_journal_mib == null ? '' : String(overrides.agent_journal_mib),
+    xray_mib: overrides.xray_mib == null ? '' : String(overrides.xray_mib),
+    phantun_mib: overrides.phantun_mib == null ? '' : String(overrides.phantun_mib),
+  });
+  const base = toForm(node.overrides);
+  const [form, setForm] = useState<NodeLogForm | null>(null);
+  const [syncedFrom, setSyncedFrom] = useState(node);
+  if (node !== syncedFrom) {
+    setSyncedFrom(node);
+    setForm(null);
+  }
   const shown = form ?? base;
-  const inheritNow = shown.trim() === '';
-  /* 留空提交 null（清除覆盖），有内容则必须落在合法区间，否则不允许保存。 */
-  const value = inheritNow ? null : validLogMib(shown);
-  const invalid = !inheritNow && value === null;
-  const dirty = form !== null && shown.trim() !== base;
+  const parse = (raw: string) => (raw.trim() === '' ? null : validLogMib(raw));
+  const next: AgentLogLimitOverrides = {
+    agent_journal_mib: parse(shown.agent_journal_mib),
+    xray_mib: parse(shown.xray_mib),
+    phantun_mib: parse(shown.phantun_mib),
+  };
+  const invalid = NODE_LOG_CLASSES.some(item => shown[item.key].trim() !== '' && next[item.key] === null);
+  const dirty = form !== null && NODE_LOG_CLASSES.some(item => shown[item.key].trim() !== base[item.key]);
 
   const save = useMutation({
-    mutationFn: (maxMib: number | null) => saveNodeLogPolicy(node.node_id, maxMib),
+    mutationFn: () => saveNodeLogPolicy(node.node_id, next),
     onSuccess: view => {
       setForm(null);
       onSaved(view);
@@ -2431,26 +2453,34 @@ function NodeLogLimitRow({
   });
 
   return (
-    <Row k="日志上限（MiB）">
-      <span className="nd-ctl-line">
-        <input
-          className="f mono"
-          style={{ width: 96 }}
-          inputMode="numeric"
-          aria-label="本机日志上限"
-          placeholder={String(globalMaxMib)}
-          disabled={!canEdit || save.isPending}
-          value={shown}
-          onChange={event => setForm(event.target.value)}
-        />
-        <OverrideTag own={!inheritNow} />
-      </span>
+    <>
+      {NODE_LOG_CLASSES.map(item => {
+        const own = shown[item.key].trim() !== '';
+        return (
+          <Row k={item.label} key={item.key}>
+            <span className="nd-ctl-line">
+              <input
+                className="f mono"
+                style={{ width: 96 }}
+                inputMode="numeric"
+                aria-label={`本机 ${item.label}`}
+                placeholder={String(global[item.key])}
+                disabled={!canEdit || save.isPending}
+                value={shown[item.key]}
+                onChange={event => setForm({ ...shown, [item.key]: event.target.value })}
+              />
+              <OverrideTag own={own} />
+            </span>
+            <span className="sub">{own ? item.note : `留空继承全局 ${global[item.key]}；${item.note}`}</span>
+          </Row>
+        );
+      })}
       {invalid ? (
         <span className="sub" style={{ color: 'var(--err)' }}>
-          取值范围 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数。
+          三项均需留空或填写 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数。
         </span>
       ) : (
-        <span className="sub">降低上限会立即截断已有日志释放空间，不会中断服务。</span>
+        <span className="sub">三类日志分别限制；降低上限会立即截断旧日志，不会中断服务。</span>
       )}
       {dirty && (
         <>
@@ -2459,7 +2489,7 @@ function NodeLogLimitRow({
             <button
               className="btn primary"
               disabled={!canEdit || invalid || save.isPending}
-              onClick={() => save.mutate(value)}
+              onClick={() => save.mutate()}
             >
               {save.isPending ? '保存中…' : '保存'}
             </button>
@@ -2469,7 +2499,7 @@ function NodeLogLimitRow({
           </div>
         </>
       )}
-    </Row>
+    </>
   );
 }
 

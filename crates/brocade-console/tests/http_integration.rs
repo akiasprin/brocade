@@ -1550,6 +1550,24 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
     assert_eq!(
         legacy
             .headers()
+            .get("x-brocade-agent-journal-max-mib")
+            .unwrap(),
+        "100"
+    );
+    assert_eq!(
+        legacy.headers().get("x-brocade-xray-log-max-mib").unwrap(),
+        "100"
+    );
+    assert_eq!(
+        legacy
+            .headers()
+            .get("x-brocade-phantun-log-max-mib")
+            .unwrap(),
+        "100"
+    );
+    assert_eq!(
+        legacy
+            .headers()
             .get("x-brocade-agent-upgrade-required")
             .unwrap(),
         "1"
@@ -1586,6 +1604,24 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
     assert_eq!(desired.status(), StatusCode::NO_CONTENT);
     assert_eq!(
         desired.headers().get("x-brocade-log-max-mib").unwrap(),
+        "100"
+    );
+    assert_eq!(
+        desired
+            .headers()
+            .get("x-brocade-agent-journal-max-mib")
+            .unwrap(),
+        "100"
+    );
+    assert_eq!(
+        desired.headers().get("x-brocade-xray-log-max-mib").unwrap(),
+        "100"
+    );
+    assert_eq!(
+        desired
+            .headers()
+            .get("x-brocade-phantun-log-max-mib")
+            .unwrap(),
         "100"
     );
     let protocol: Option<i32> = sqlx::query_scalar(

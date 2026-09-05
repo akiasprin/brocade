@@ -26,7 +26,7 @@ use brocade_deployment::protocol::{
 };
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
-    AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, ApplyDraftResult,
+    AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentLogLimits, ApplyDraftResult,
     CertDomainInput, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest,
     CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
@@ -2716,57 +2716,100 @@ async fn agent_log_policy_resolves_global_node_override_and_clear_without_a_revi
             .unwrap();
 
     assert_eq!(
-        db.store.effective_node_log_max_mib("n1").await.unwrap(),
-        100
+        db.store.effective_node_log_limits("n1").await.unwrap(),
+        AgentLogLimits {
+            agent_journal_mib: 100,
+            xray_mib: 100,
+            phantun_mib: 100,
+        }
     );
     db.store
         .update_agent_log_default(
             &system_admin(),
-            UpdateAgentLogDefaultRequest { max_mib: 192 },
+            UpdateAgentLogDefaultRequest {
+                agent_journal_mib: 192,
+                xray_mib: 160,
+                phantun_mib: 128,
+            },
         )
         .await
         .unwrap();
     assert_eq!(
-        db.store.effective_node_log_max_mib("n1").await.unwrap(),
-        192
+        db.store.effective_node_log_limits("n1").await.unwrap(),
+        AgentLogLimits {
+            agent_journal_mib: 192,
+            xray_mib: 160,
+            phantun_mib: 128,
+        }
     );
     assert_eq!(
-        db.store.effective_node_log_max_mib("n2").await.unwrap(),
-        192
+        db.store.effective_node_log_limits("n2").await.unwrap(),
+        AgentLogLimits {
+            agent_journal_mib: 192,
+            xray_mib: 160,
+            phantun_mib: 128,
+        }
     );
 
     db.store
         .update_node_log_policy(
             &system_admin(),
             "n1",
-            UpdateNodeLogPolicyRequest { max_mib: Some(64) },
+            UpdateNodeLogPolicyRequest {
+                agent_journal_mib: None,
+                xray_mib: Some(64),
+                phantun_mib: Some(80),
+            },
         )
         .await
         .unwrap();
     db.store
         .update_agent_log_default(
             &system_admin(),
-            UpdateAgentLogDefaultRequest { max_mib: 256 },
+            UpdateAgentLogDefaultRequest {
+                agent_journal_mib: 256,
+                xray_mib: 224,
+                phantun_mib: 192,
+            },
         )
         .await
         .unwrap();
-    assert_eq!(db.store.effective_node_log_max_mib("n1").await.unwrap(), 64);
     assert_eq!(
-        db.store.effective_node_log_max_mib("n2").await.unwrap(),
-        256
+        db.store.effective_node_log_limits("n1").await.unwrap(),
+        AgentLogLimits {
+            agent_journal_mib: 256,
+            xray_mib: 64,
+            phantun_mib: 80,
+        }
+    );
+    assert_eq!(
+        db.store.effective_node_log_limits("n2").await.unwrap(),
+        AgentLogLimits {
+            agent_journal_mib: 256,
+            xray_mib: 224,
+            phantun_mib: 192,
+        }
     );
 
     db.store
         .update_node_log_policy(
             &system_admin(),
             "n1",
-            UpdateNodeLogPolicyRequest { max_mib: None },
+            UpdateNodeLogPolicyRequest {
+                agent_journal_mib: None,
+                xray_mib: None,
+                phantun_mib: None,
+            },
         )
         .await
         .unwrap();
     assert_eq!(
-        db.store.effective_node_log_max_mib("n1").await.unwrap(),
-        256
+        db.store.effective_node_log_limits("n1").await.unwrap(),
+        AgentLogLimits {
+            agent_journal_mib: 256,
+            xray_mib: 224,
+            phantun_mib: 192,
+        }
     );
     let revision_after: i64 =
         sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
@@ -2837,6 +2880,8 @@ async fn deployment_schema_matches_convergence_design() {
     insert_minimal_fixture(db.pool()).await;
 
     assert_column_exists(db.pool(), "control_state", "agent_log_max_mib").await;
+    assert_column_exists(db.pool(), "control_state", "xray_log_max_mib").await;
+    assert_column_exists(db.pool(), "control_state", "phantun_log_max_mib").await;
     assert_column_exists(db.pool(), "control_state", "ping_probe_targets").await;
     assert_column_exists(db.pool(), "control_state", "ping_probe_interval_secs").await;
     assert_column_exists(db.pool(), "control_state", "ping_probe_timeout_ms").await;
@@ -2846,6 +2891,8 @@ async fn deployment_schema_matches_convergence_design() {
     assert_column_exists(db.pool(), "control_state", "realtime_enabled").await;
     assert_column_exists(db.pool(), "control_state", "realtime_interval_secs").await;
     assert_column_exists(db.pool(), "nodes", "agent_log_max_mib").await;
+    assert_column_exists(db.pool(), "nodes", "xray_log_max_mib").await;
+    assert_column_exists(db.pool(), "nodes", "phantun_log_max_mib").await;
     assert_table_exists(db.pool(), "node_ping_probe_samples").await;
     assert_column_exists(db.pool(), "node_ping_probe_samples", "node_id").await;
     assert_column_exists(db.pool(), "node_ping_probe_samples", "target").await;

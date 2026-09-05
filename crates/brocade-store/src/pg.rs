@@ -237,8 +237,8 @@ impl PgStore {
         crate::log_policy::update_node_log_policy(&self.pool, actor, node_id, request).await
     }
 
-    pub async fn effective_node_log_max_mib(&self, node_id: &str) -> Result<u32> {
-        crate::log_policy::effective_node_log_max_mib(&self.pool, node_id).await
+    pub async fn effective_node_log_limits(&self, node_id: &str) -> Result<crate::AgentLogLimits> {
+        crate::log_policy::effective_node_log_limits(&self.pool, node_id).await
     }
 
     /// Operational live-traffic policy. It is durable, but neither reading nor writing it creates

@@ -1,8 +1,10 @@
 //! Live, per-machine log retention policy.
 //!
 //! This is deliberately not part of `ModelSettings`: no generated artifact contains it and a
-//! rollback must never restore an old disk-safety ceiling. The agent receives the resolved value
-//! on every desired-state poll, including an otherwise idle 204 response.
+//! rollback must never restore an old disk-safety ceiling. The three workload classes have
+//! separate bounds: Agent's journal namespace, Xray's rotated pair, and every Phantun instance's
+//! rotated pair. The agent receives the resolved values on every desired-state poll, including an
+//! otherwise idle 204 response.
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -15,8 +17,23 @@ pub use brocade_deployment::protocol::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentLogPolicyView {
-    pub global_max_mib: u32,
+    pub global: AgentLogLimits,
     pub nodes: Vec<NodeLogPolicyItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLogLimits {
+    pub agent_journal_mib: u32,
+    pub xray_mib: u32,
+    pub phantun_mib: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLogLimitOverrides {
+    /// `None` means this class follows the corresponding fleet default continuously.
+    pub agent_journal_mib: Option<u32>,
+    pub xray_mib: Option<u32>,
+    pub phantun_mib: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,20 +41,23 @@ pub struct NodeLogPolicyItem {
     pub node_id: String,
     pub tenant_id: String,
     pub name: String,
-    /// `None` means this machine follows the fleet default continuously.
-    pub override_max_mib: Option<u32>,
-    pub effective_max_mib: u32,
+    pub overrides: AgentLogLimitOverrides,
+    pub effective: AgentLogLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateAgentLogDefaultRequest {
-    pub max_mib: u32,
+    pub agent_journal_mib: u32,
+    pub xray_mib: u32,
+    pub phantun_mib: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateNodeLogPolicyRequest {
-    /// `None` clears the override and resumes inheritance from the fleet default.
-    pub max_mib: Option<u32>,
+    /// `None` clears that class's override and resumes inheritance from the fleet default.
+    pub agent_journal_mib: Option<u32>,
+    pub xray_mib: Option<u32>,
+    pub phantun_mib: Option<u32>,
 }
 
 fn valid(value: u32) -> Result<u32> {
@@ -59,13 +79,30 @@ pub async fn load_agent_log_policy(
     pool: &PgPool,
     actor: &AdminContext,
 ) -> Result<AgentLogPolicyView> {
-    let global =
-        sqlx::query_scalar::<_, i32>("SELECT agent_log_max_mib FROM control_state WHERE id = TRUE")
-            .fetch_one(pool)
-            .await?;
-    let global_max_mib = u32_column("control_state.agent_log_max_mib", global)?;
+    let global_row = sqlx::query(
+        "SELECT agent_log_max_mib, xray_log_max_mib, phantun_log_max_mib
+           FROM control_state
+          WHERE id = TRUE",
+    )
+    .fetch_one(pool)
+    .await?;
+    let global = AgentLogLimits {
+        agent_journal_mib: u32_column(
+            "control_state.agent_log_max_mib",
+            global_row.try_get("agent_log_max_mib")?,
+        )?,
+        xray_mib: u32_column(
+            "control_state.xray_log_max_mib",
+            global_row.try_get("xray_log_max_mib")?,
+        )?,
+        phantun_mib: u32_column(
+            "control_state.phantun_log_max_mib",
+            global_row.try_get("phantun_log_max_mib")?,
+        )?,
+    };
     let rows = sqlx::query(
-        "SELECT id AS node_id, tenant_id, name, agent_log_max_mib
+        "SELECT id AS node_id, tenant_id, name,
+                agent_log_max_mib, xray_log_max_mib, phantun_log_max_mib
            FROM nodes
           WHERE ($1::text IS NULL OR tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\')
           ORDER BY name, id",
@@ -78,24 +115,37 @@ pub async fn load_agent_log_policy(
     let nodes = rows
         .into_iter()
         .map(|row| {
-            let raw = row.try_get::<Option<i32>, _>("agent_log_max_mib")?;
-            let override_max_mib = raw
-                .map(|value| u32_column("nodes.agent_log_max_mib", value))
-                .transpose()?;
+            let overrides = AgentLogLimitOverrides {
+                agent_journal_mib: row
+                    .try_get::<Option<i32>, _>("agent_log_max_mib")?
+                    .map(|value| u32_column("nodes.agent_log_max_mib", value))
+                    .transpose()?,
+                xray_mib: row
+                    .try_get::<Option<i32>, _>("xray_log_max_mib")?
+                    .map(|value| u32_column("nodes.xray_log_max_mib", value))
+                    .transpose()?,
+                phantun_mib: row
+                    .try_get::<Option<i32>, _>("phantun_log_max_mib")?
+                    .map(|value| u32_column("nodes.phantun_log_max_mib", value))
+                    .transpose()?,
+            };
             Ok(NodeLogPolicyItem {
                 node_id: row.try_get("node_id")?,
                 tenant_id: row.try_get("tenant_id")?,
                 name: row.try_get("name")?,
-                effective_max_mib: override_max_mib.unwrap_or(global_max_mib),
-                override_max_mib,
+                effective: AgentLogLimits {
+                    agent_journal_mib: overrides
+                        .agent_journal_mib
+                        .unwrap_or(global.agent_journal_mib),
+                    xray_mib: overrides.xray_mib.unwrap_or(global.xray_mib),
+                    phantun_mib: overrides.phantun_mib.unwrap_or(global.phantun_mib),
+                },
+                overrides,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(AgentLogPolicyView {
-        global_max_mib,
-        nodes,
-    })
+    Ok(AgentLogPolicyView { global, nodes })
 }
 
 pub async fn update_agent_log_default(
@@ -108,11 +158,23 @@ pub async fn update_agent_log_default(
             "only system-admin can update agent log policy".to_owned(),
         ));
     }
-    let max_mib = valid(request.max_mib)?;
-    sqlx::query("UPDATE control_state SET agent_log_max_mib = $1 WHERE id = TRUE")
-        .bind(i32::try_from(max_mib).expect("validated log MiB fits i32"))
-        .execute(pool)
-        .await?;
+    let limits = AgentLogLimits {
+        agent_journal_mib: valid(request.agent_journal_mib)?,
+        xray_mib: valid(request.xray_mib)?,
+        phantun_mib: valid(request.phantun_mib)?,
+    };
+    sqlx::query(
+        "UPDATE control_state
+            SET agent_log_max_mib = $1,
+                xray_log_max_mib = $2,
+                phantun_log_max_mib = $3
+          WHERE id = TRUE",
+    )
+    .bind(i32::try_from(limits.agent_journal_mib).expect("validated log MiB fits i32"))
+    .bind(i32::try_from(limits.xray_mib).expect("validated log MiB fits i32"))
+    .bind(i32::try_from(limits.phantun_mib).expect("validated log MiB fits i32"))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -127,12 +189,36 @@ pub async fn update_node_log_policy(
             "only system-admin can update node log policy".to_owned(),
         ));
     }
-    let max_mib = request.max_mib.map(valid).transpose()?;
-    let changed = sqlx::query("UPDATE nodes SET agent_log_max_mib = $2 WHERE id = $1")
-        .bind(node_id)
-        .bind(max_mib.map(|value| i32::try_from(value).expect("validated log MiB fits i32")))
-        .execute(pool)
-        .await?;
+    let overrides = AgentLogLimitOverrides {
+        agent_journal_mib: request.agent_journal_mib.map(valid).transpose()?,
+        xray_mib: request.xray_mib.map(valid).transpose()?,
+        phantun_mib: request.phantun_mib.map(valid).transpose()?,
+    };
+    let changed = sqlx::query(
+        "UPDATE nodes
+            SET agent_log_max_mib = $2,
+                xray_log_max_mib = $3,
+                phantun_log_max_mib = $4
+          WHERE id = $1",
+    )
+    .bind(node_id)
+    .bind(
+        overrides
+            .agent_journal_mib
+            .map(|value| i32::try_from(value).expect("validated log MiB fits i32")),
+    )
+    .bind(
+        overrides
+            .xray_mib
+            .map(|value| i32::try_from(value).expect("validated log MiB fits i32")),
+    )
+    .bind(
+        overrides
+            .phantun_mib
+            .map(|value| i32::try_from(value).expect("validated log MiB fits i32")),
+    )
+    .execute(pool)
+    .await?;
     if changed.rows_affected() == 0 {
         return Err(StoreError::NotFound(format!("node {node_id}")));
     }
@@ -141,9 +227,11 @@ pub async fn update_node_log_policy(
 
 /// Resolve inheritance for one authenticated node. Read fresh on every poll so neither a global
 /// edit nor clearing a machine override needs a release or a control-plane restart.
-pub async fn effective_node_log_max_mib(pool: &PgPool, node_id: &str) -> Result<u32> {
-    let value = sqlx::query_scalar::<_, i32>(
-        "SELECT COALESCE(node.agent_log_max_mib, control.agent_log_max_mib)
+pub async fn effective_node_log_limits(pool: &PgPool, node_id: &str) -> Result<AgentLogLimits> {
+    let row = sqlx::query(
+        "SELECT COALESCE(node.agent_log_max_mib, control.agent_log_max_mib) AS agent_journal_mib,
+                COALESCE(node.xray_log_max_mib, control.xray_log_max_mib) AS xray_mib,
+                COALESCE(node.phantun_log_max_mib, control.phantun_log_max_mib) AS phantun_mib
            FROM nodes AS node
           CROSS JOIN control_state AS control
           WHERE node.id = $1 AND control.id = TRUE",
@@ -152,7 +240,14 @@ pub async fn effective_node_log_max_mib(pool: &PgPool, node_id: &str) -> Result<
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
-    u32_column("effective agent log max", value)
+    Ok(AgentLogLimits {
+        agent_journal_mib: u32_column(
+            "effective agent journal max",
+            row.try_get("agent_journal_mib")?,
+        )?,
+        xray_mib: u32_column("effective xray log max", row.try_get("xray_mib")?)?,
+        phantun_mib: u32_column("effective phantun log max", row.try_get("phantun_mib")?)?,
+    })
 }
 
 #[cfg(test)]

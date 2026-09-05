@@ -18672,11 +18672,111 @@ input.f.ing-pj-port {
 
 /* 两类重复行都成为可比较的紧凑对象，而不是漂在卡面上的若干输入框。 */
 .cardpage .agent-log-node {
+  display: block;
   min-height: 40px;
   padding: 7px 8px;
   border-color: color-mix(in srgb, var(--ink) 9%, transparent);
   border-radius: 8px;
   background: color-mix(in srgb, var(--block) 72%, var(--sunk));
+}
+.cardpage .agent-log-node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.cardpage .agent-log-node-limits {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  padding-top: 8px;
+}
+.cardpage .agent-log-node-limits > label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 6px;
+  align-items: center;
+  min-width: 0;
+  color: var(--ink-4);
+  font: 9.5px var(--mono);
+}
+.cardpage .agent-log-node-limits > label > input {
+  grid-column: 1;
+  width: 100%;
+  min-width: 0;
+}
+.cardpage .agent-log-node-limits > label > small {
+  grid-column: 2;
+  grid-row: 2;
+  color: var(--ink-4);
+  font-size: 9px;
+  white-space: nowrap;
+}
+.cardpage .agent-log-node-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 5px;
+  margin-top: 7px;
+}
+.cardpage .agent-log-scope {
+  display: grid;
+  gap: 5px;
+  margin: 7px 0 2px;
+}
+.cardpage .agent-log-scope-row {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  min-height: 42px;
+  padding: 6px 9px;
+  border: 1px solid color-mix(in srgb, var(--ink) 8%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--block) 70%, var(--sunk));
+}
+.cardpage .agent-log-scope-kind {
+  color: color-mix(in srgb, var(--hue) 74%, var(--ink-3));
+  font: 600 9.5px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.cardpage .agent-log-scope-name {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.cardpage .agent-log-scope-name b {
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 550;
+}
+.cardpage .agent-log-scope-name code {
+  overflow: hidden;
+  color: var(--ink-4);
+  font: 9.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cardpage .agent-log-scope-limit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  color: var(--ink-4);
+  font: 9.5px var(--mono);
+  white-space: nowrap;
+}
+.cardpage .agent-log-scope-limit > input {
+  width: 72px;
+  font-variant-numeric: tabular-nums;
+}
+.cardpage .agent-log-scope-note {
+  margin: 6px 2px 5px;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  line-height: 1.5;
 }
 .cardpage .ping-probe-target {
   padding: 7px;
@@ -18735,6 +18835,16 @@ input.f.ing-pj-port {
   }
   .cardpage .ping-probe-target {
     grid-template-columns: 54px minmax(0, 1fr) auto;
+  }
+  .cardpage .agent-log-scope-row {
+    grid-template-columns: 54px minmax(0, 1fr);
+  }
+  .cardpage .agent-log-scope-limit {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+  .cardpage .agent-log-node-limits {
+    grid-template-columns: minmax(0, 1fr);
   }
   .cardpage [id^='set-'] > .settings-savebar {
     margin-right: -12px;

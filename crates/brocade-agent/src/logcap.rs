@@ -16,11 +16,27 @@ use brocade_deployment::protocol::{
     DEFAULT_AGENT_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
 };
 
-const LOG_POLICY_FILE: &str = "log-max-mib";
+const LEGACY_LOG_POLICY_FILE: &str = "log-max-mib";
+const AGENT_JOURNAL_POLICY_FILE: &str = "log-agent-journal-max-mib";
+const XRAY_POLICY_FILE: &str = "log-xray-max-mib";
+const PHANTUN_POLICY_FILE: &str = "log-phantun-max-mib";
 const AGENT_JOURNAL_DROPIN: &str =
     "/etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf";
 const AGENT_JOURNAL_CONFIG: &str = "/etc/systemd/journald@brocade-agent.conf.d/limits.conf";
 const AGENT_JOURNAL_DROPIN_CONTENT: &[u8] = b"[Service]\nLogNamespace=brocade-agent\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogPolicy {
+    pub(crate) agent_journal_mib: u32,
+    pub(crate) xray_mib: u32,
+    pub(crate) phantun_mib: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadLog {
+    Xray,
+    Phantun,
+}
 
 fn max_bytes(max_mib: u32) -> u64 {
     u64::from(max_mib) * 1024 * 1024
@@ -35,8 +51,28 @@ fn validate_mib(max_mib: u32) -> Result<u32, String> {
     Ok(max_mib)
 }
 
-fn policy_path(state_dir: &Path) -> PathBuf {
-    state_dir.join(LOG_POLICY_FILE)
+fn legacy_policy_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(LEGACY_LOG_POLICY_FILE)
+}
+
+fn policy_path(state_dir: &Path, file: &str) -> PathBuf {
+    state_dir.join(file)
+}
+
+fn workload_policy_path(state_dir: &Path, workload: WorkloadLog) -> PathBuf {
+    policy_path(
+        state_dir,
+        match workload {
+            WorkloadLog::Xray => XRAY_POLICY_FILE,
+            WorkloadLog::Phantun => PHANTUN_POLICY_FILE,
+        },
+    )
+}
+
+fn read_policy_or_legacy(state_dir: &Path, file: &str) -> u32 {
+    read_policy_mib(&policy_path(state_dir, file))
+        .or_else(|| read_policy_mib(&legacy_policy_path(state_dir)))
+        .unwrap_or(DEFAULT_AGENT_LOG_MAX_MIB)
 }
 
 fn read_policy_mib(path: &Path) -> Option<u32> {
@@ -72,7 +108,7 @@ pub(crate) fn ensure_agent_journal_namespace(state_dir: &Path) -> Result<bool, S
 
     let dropin = Path::new(AGENT_JOURNAL_DROPIN);
     let config = Path::new(AGENT_JOURNAL_CONFIG);
-    let max_mib = read_policy_mib(&policy_path(state_dir)).unwrap_or(DEFAULT_AGENT_LOG_MAX_MIB);
+    let max_mib = read_policy_or_legacy(state_dir, AGENT_JOURNAL_POLICY_FILE);
     let dropin_changed = write_if_changed(dropin, AGENT_JOURNAL_DROPIN_CONTENT)?;
     let config_changed = write_if_changed(config, &journal_policy(max_mib))?;
     if !dropin_changed && !config_changed {
@@ -92,22 +128,48 @@ pub(crate) fn ensure_agent_journal_namespace(state_dir: &Path) -> Result<bool, S
     Ok(dropin_changed)
 }
 
-/// Persist and apply the resolved value from the control plane. Xray and Phantun sinks poll this
-/// file once a second while running, including while their input is quiet, so changing the ceiling
+/// Persist the resolved values from the control plane. Xray and Phantun sinks poll their policy
+/// files once a second while running, including while their input is quiet, so changing a ceiling
 /// neither restarts a workload nor races an external process truncating its open descriptor.
-pub(crate) fn apply_policy(state_dir: &Path, max_mib: u32) -> Result<bool, String> {
-    let max_mib = validate_mib(max_mib)?;
+fn persist_policy_files(state_dir: &Path, policy: LogPolicy) -> Result<bool, String> {
+    let policy = LogPolicy {
+        agent_journal_mib: validate_mib(policy.agent_journal_mib)?,
+        xray_mib: validate_mib(policy.xray_mib)?,
+        phantun_mib: validate_mib(policy.phantun_mib)?,
+    };
     fs::create_dir_all(state_dir)
         .map_err(|error| format!("create state directory {}: {error}", state_dir.display()))?;
-    let path = policy_path(state_dir);
-    let contents = format!("{max_mib}\n");
-    let changed = fs::read(&path).ok().as_deref() != Some(contents.as_bytes());
-    if changed {
-        crate::fsutil::atomic_write_private(&path, contents.as_bytes())?;
+
+    let mut changed = false;
+    for (file, max_mib) in [
+        (AGENT_JOURNAL_POLICY_FILE, policy.agent_journal_mib),
+        (XRAY_POLICY_FILE, policy.xray_mib),
+        (PHANTUN_POLICY_FILE, policy.phantun_mib),
+    ] {
+        changed |= write_if_changed(
+            &policy_path(state_dir, file),
+            format!("{max_mib}\n").as_bytes(),
+        )?;
     }
+    // Version-2 child sinks still watch the old shared file until the marker migration restarts
+    // them. Keep that short window bounded by the smallest of the three requested ceilings.
+    let legacy = policy
+        .agent_journal_mib
+        .min(policy.xray_mib)
+        .min(policy.phantun_mib);
+    changed |= write_if_changed(
+        &legacy_policy_path(state_dir),
+        format!("{legacy}\n").as_bytes(),
+    )?;
+
+    Ok(changed)
+}
+
+pub(crate) fn apply_policy(state_dir: &Path, policy: LogPolicy) -> Result<bool, String> {
+    let changed = persist_policy_files(state_dir, policy)?;
 
     if std::env::var_os("INVOCATION_ID").is_some() && Path::new("/run/systemd/system").exists() {
-        let journal = journal_policy(max_mib);
+        let journal = journal_policy(policy.agent_journal_mib);
         // A previous round may have written the policy file and then failed before updating
         // journald. Compare the cheap local file every round and retry only while it differs;
         // after convergence this path forks no systemctl process on the 15-second poll.
@@ -178,14 +240,22 @@ pub(crate) fn run_args(args: &[String]) -> Result<(), String> {
 /// Shell fragment naming this exact agent binary as a sink. It remains valid across an atomic
 /// self-update: an existing sink keeps its mapped inode, and a newly spawned workload resolves the
 /// replacement at the same path.
-pub(crate) fn command(path: &Path, state_dir: &Path) -> Result<String, String> {
+pub(crate) fn command(
+    path: &Path,
+    state_dir: &Path,
+    workload: WorkloadLog,
+) -> Result<String, String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("cannot locate agent binary for log sink: {error}"))?;
     Ok(format!(
         "{} log-sink {} {}",
         crate::shell_quote(&executable.display().to_string()),
         crate::shell_quote(&path.display().to_string()),
-        crate::shell_quote(&policy_path(state_dir).display().to_string())
+        crate::shell_quote(
+            &workload_policy_path(state_dir, workload)
+                .display()
+                .to_string()
+        )
     ))
 }
 
@@ -364,6 +434,47 @@ mod tests {
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("brocade-logcap-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn policy_is_persisted_per_workload_with_a_safe_legacy_fallback() {
+        let dir = temp("class-policy");
+        let _ = fs::remove_dir_all(&dir);
+        let policy = LogPolicy {
+            agent_journal_mib: 96,
+            xray_mib: 80,
+            phantun_mib: 64,
+        };
+        assert!(persist_policy_files(&dir, policy).unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.join(AGENT_JOURNAL_POLICY_FILE)).unwrap(),
+            "96\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(XRAY_POLICY_FILE)).unwrap(),
+            "80\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(PHANTUN_POLICY_FILE)).unwrap(),
+            "64\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(LEGACY_LOG_POLICY_FILE)).unwrap(),
+            "64\n"
+        );
+
+        let xray = command(&dir.join("logs/xray.log"), &dir, WorkloadLog::Xray).unwrap();
+        let phantun = command(
+            &dir.join("logs/phantun-client-bt0.log"),
+            &dir,
+            WorkloadLog::Phantun,
+        )
+        .unwrap();
+        assert!(xray.contains(XRAY_POLICY_FILE));
+        assert!(!xray.contains(PHANTUN_POLICY_FILE));
+        assert!(phantun.contains(PHANTUN_POLICY_FILE));
+        assert!(!phantun.contains(XRAY_POLICY_FILE));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

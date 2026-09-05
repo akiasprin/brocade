@@ -2111,30 +2111,42 @@ export const saveDistribution = (body: DistributionSettings) =>
   api<DistributionView>('/distribution', '', { method: 'PUT', body: JSON.stringify(body) });
 
 /* ── Agent 日志上限：运行时策略，不进入修订，也不需要发布 ── */
+export interface AgentLogLimits {
+  agent_journal_mib: number;
+  xray_mib: number;
+  phantun_mib: number;
+}
+
+export interface AgentLogLimitOverrides {
+  /* null 持续继承对应的全局值；不是把当时的全局数字复制到机器上。 */
+  agent_journal_mib: number | null;
+  xray_mib: number | null;
+  phantun_mib: number | null;
+}
+
 export interface AgentLogPolicyNode {
   node_id: string;
   tenant_id: string;
   name: string;
-  /* null 持续继承全局值；不是把当时的全局数字复制到机器上。 */
-  override_max_mib: number | null;
-  effective_max_mib: number;
+  overrides: AgentLogLimitOverrides;
+  effective: AgentLogLimits;
 }
 
 export interface AgentLogPolicyView {
-  global_max_mib: number;
+  global: AgentLogLimits;
   nodes: AgentLogPolicyNode[];
 }
 
 export const fetchAgentLogPolicy = () => api<AgentLogPolicyView>('/agent-log-policy');
-export const saveAgentLogDefault = (maxMib: number) =>
+export const saveAgentLogDefault = (limits: AgentLogLimits) =>
   api<AgentLogPolicyView>('/agent-log-policy', '', {
     method: 'PUT',
-    body: JSON.stringify({ max_mib: maxMib }),
+    body: JSON.stringify(limits),
   });
-export const saveNodeLogPolicy = (nodeId: string, maxMib: number | null) =>
+export const saveNodeLogPolicy = (nodeId: string, overrides: AgentLogLimitOverrides) =>
   api<AgentLogPolicyView>(`/agent-log-policy/nodes/${encodeURIComponent(nodeId)}`, '', {
     method: 'PUT',
-    body: JSON.stringify({ max_mib: maxMib }),
+    body: JSON.stringify(overrides),
   });
 
 /* ── agent 发布 ──

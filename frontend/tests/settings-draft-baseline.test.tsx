@@ -72,7 +72,10 @@ const ROUTES: Record<string, () => unknown> = {
     stored: { agent_public_url: 'https://example', xray_version: '26.7.28' },
     effective: { agent_public_url: 'https://example', xray_version: '26.7.28' },
   }),
-  '/agent-log-policy': () => ({ global_max_mib: 100, nodes: [] }),
+  '/agent-log-policy': () => ({
+    global: { agent_journal_mib: 100, xray_mib: 100, phantun_mib: 100 },
+    nodes: [],
+  }),
   '/ping-probe/settings': () => ({ targets: [], interval_secs: 60, timeout_ms: 420 }),
   '/links/mtu': () => ({ default_mtu: 1420, nodes: [], links: [] }),
   '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),

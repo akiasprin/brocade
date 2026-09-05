@@ -83,9 +83,13 @@ const USAGE_CURSOR_FILE: &str = "usage-cursor.json";
 const USAGE_GENERATION_FILE: &str = "usage-generation";
 /// Presence means the running Xray was launched through the bounded sink. It deliberately sits
 /// outside xray.json: logging is agent runtime state, not part of the compiled Xray artifact.
-const XRAY_BOUNDED_LOG_MARKER: &str = "xray.bounded-log-v2";
+const XRAY_BOUNDED_LOG_MARKER: &str = "xray.bounded-log-v3";
+const XRAY_SHARED_POLICY_LOG_MARKER: &str = "xray.bounded-log-v2";
 const XRAY_OLD_BOUNDED_LOG_MARKER: &str = "xray.bounded-log-v1";
 const AGENT_LOG_MAX_MIB_HEADER: &str = "x-brocade-log-max-mib";
+const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
+const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
+const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UsageCursor {
@@ -1542,6 +1546,41 @@ fn apply_once(options: Options) -> Result<(), String> {
     apply_once_inner(options, None, true)
 }
 
+fn log_limit_header(response: &HttpResponse, name: &str) -> Result<Option<u32>, String> {
+    response
+        .header(name)
+        .map(|raw| {
+            raw.parse::<u32>()
+                .map_err(|error| format!("{name}={raw:?}: {error}"))
+        })
+        .transpose()
+}
+
+/// New control planes send one ceiling per workload class. The legacy scalar remains a fallback
+/// in both directions: a new Agent can still poll an old console, and a rolling console update can
+/// serve an Agent binary that has not restarted into the new release yet.
+fn log_policy_from_response(response: &HttpResponse) -> Result<Option<logcap::LogPolicy>, String> {
+    let legacy = log_limit_header(response, AGENT_LOG_MAX_MIB_HEADER)?;
+    let agent = log_limit_header(response, AGENT_JOURNAL_MAX_MIB_HEADER)?;
+    let xray = log_limit_header(response, XRAY_LOG_MAX_MIB_HEADER)?;
+    let phantun = log_limit_header(response, PHANTUN_LOG_MAX_MIB_HEADER)?;
+    if legacy.is_none() && agent.is_none() && xray.is_none() && phantun.is_none() {
+        return Ok(None);
+    }
+    let missing = |name: &str| format!("{name} 缺失且没有旧版统一上限可回退");
+    Ok(Some(logcap::LogPolicy {
+        agent_journal_mib: agent
+            .or(legacy)
+            .ok_or_else(|| missing(AGENT_JOURNAL_MAX_MIB_HEADER))?,
+        xray_mib: xray
+            .or(legacy)
+            .ok_or_else(|| missing(XRAY_LOG_MAX_MIB_HEADER))?,
+        phantun_mib: phantun
+            .or(legacy)
+            .ok_or_else(|| missing(PHANTUN_LOG_MAX_MIB_HEADER))?,
+    }))
+}
+
 fn upgrade_dynamic_log_sinks(
     options: &Options,
     meter: Option<&Arc<Mutex<()>>>,
@@ -1616,15 +1655,17 @@ fn apply_once_inner(
             return Err(error);
         }
     };
-    if let Some(raw) = response.header(AGENT_LOG_MAX_MIB_HEADER) {
-        match raw.parse::<u32>() {
-            Ok(max_mib) => match logcap::apply_policy(&options.state_dir, max_mib) {
-                Ok(true) => println!("日志上限已更新为 {max_mib} MiB"),
-                Ok(false) => {}
-                Err(error) => warn(format!("日志上限未能落地：{error}")),
-            },
-            Err(error) => warn(format!("控制面返回的日志上限 {raw:?} 无效：{error}")),
-        }
+    match log_policy_from_response(&response) {
+        Ok(Some(policy)) => match logcap::apply_policy(&options.state_dir, policy) {
+            Ok(true) => println!(
+                "日志上限已更新：Agent {} MiB，XRAY {} MiB，Phantun 每实例 {} MiB",
+                policy.agent_journal_mib, policy.xray_mib, policy.phantun_mib
+            ),
+            Ok(false) => {}
+            Err(error) => warn(format!("日志上限未能落地：{error}")),
+        },
+        Ok(None) => {}
+        Err(error) => warn(format!("控制面返回的日志上限无效：{error}")),
     }
     if response.status == 204 {
         println!("no desired state");
@@ -1632,10 +1673,10 @@ fn apply_once_inner(
         // control plane, yet it has to distinguish a machine not included in any plan
         // from one that cannot reach the control plane.
         mark_no_desired(&options.state_dir);
-        // Version 2 changes a fixed-size child sink into one following the live policy file. It
-        // needs one workload restart to replace the old pipe, but that restart must sample Xray's
-        // volatile counters first. General local reconcile cannot do that safely because it has
-        // no meter; perform the migration here, where the accounting lock is available.
+        // Version 3 changes the shared policy file into one file per workload class. It needs one
+        // workload restart to replace the old pipe, but that restart must sample Xray's volatile
+        // counters first. General local reconcile cannot do that safely because it has no meter;
+        // perform the migration here, where the accounting lock is available.
         upgrade_dynamic_log_sinks(&options, meter)?;
         // 204 means the control plane judged both dimensions converged: no deployment
         // owed, and the reported certificate sha matches the serving certificate.
@@ -2289,6 +2330,7 @@ fn converge_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> Result<()
             let _ = fs::remove_file("/tmp/brocade-agent-xray.log");
             let _ = fs::remove_file(state_dir.join("xray.json"));
             let _ = fs::remove_file(state_dir.join(XRAY_BOUNDED_LOG_MARKER));
+            let _ = fs::remove_file(state_dir.join(XRAY_SHARED_POLICY_LOG_MARKER));
             let _ = fs::remove_file(state_dir.join(XRAY_OLD_BOUNDED_LOG_MARKER));
             fs::write(state_dir.join("xray.disabled"), reason)
                 .map_err(|error| error.to_string())?;
@@ -2434,7 +2476,7 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     let log_dir = state_dir.join("logs");
     create_private_dir(&log_dir)?;
     let log_path = log_dir.join("xray.log");
-    let sink = logcap::command(&log_path, state_dir)?;
+    let sink = logcap::command(&log_path, state_dir, logcap::WorkloadLog::Xray)?;
     let pipeline = shell_quote(&format!("{launch} 2>&1 | {sink}"));
     let log = shell_quote(&log_path.display().to_string());
     run_command("xray", &["-test", "-config", &path.display().to_string()])?;
@@ -2461,6 +2503,7 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     ))?;
     fs::write(state_dir.join(XRAY_BOUNDED_LOG_MARKER), b"dynamic\n")
         .map_err(|error| format!("failed to record bounded xray logging: {error}"))?;
+    let _ = fs::remove_file(state_dir.join(XRAY_SHARED_POLICY_LOG_MARKER));
     let _ = fs::remove_file(state_dir.join(XRAY_OLD_BOUNDED_LOG_MARKER));
     // The legacy file is no longer held open once the old Xray has exited. Removing it here, not
     // during installation, guarantees its blocks are actually released immediately.
@@ -3545,6 +3588,35 @@ fn unknown_state() -> ReportedNodeState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_policy_prefers_specific_headers_and_falls_back_to_the_legacy_scalar() {
+        let specific = crate::http::parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Log-Max-MiB: 64\r\nX-Brocade-Agent-Journal-Max-MiB: 96\r\nX-Brocade-Xray-Log-Max-MiB: 80\r\nX-Brocade-Phantun-Log-Max-MiB: 72\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::log_policy_from_response(&specific).unwrap(),
+            Some(crate::logcap::LogPolicy {
+                agent_journal_mib: 96,
+                xray_mib: 80,
+                phantun_mib: 72,
+            })
+        );
+
+        let legacy = crate::http::parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Log-Max-MiB: 64\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::log_policy_from_response(&legacy).unwrap(),
+            Some(crate::logcap::LogPolicy {
+                agent_journal_mib: 64,
+                xray_mib: 64,
+                phantun_mib: 64,
+            })
+        );
+    }
+
     // By default a panic on a thread terminates only that thread while the process
     // continues, so the control plane observes a healthy machine. This test verifies
     // that `each_round` catches the panic.

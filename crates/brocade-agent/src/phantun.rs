@@ -16,7 +16,8 @@ use crate::{
     shell_quote, write_private,
 };
 
-pub(crate) const PHANTUN_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log-v2";
+pub(crate) const PHANTUN_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log-v3";
+const PHANTUN_SHARED_POLICY_LOG_MARKER: &str = "phantun.bounded-log-v2";
 const PHANTUN_OLD_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +123,7 @@ pub(crate) fn converge_linux_phantun(
             let _ = fs::remove_file("/tmp/brocade-agent-phantun.log");
             let _ = fs::remove_file(state_dir.join("phantun.json"));
             let _ = fs::remove_file(state_dir.join(PHANTUN_BOUNDED_LOG_MARKER));
+            let _ = fs::remove_file(state_dir.join(PHANTUN_SHARED_POLICY_LOG_MARKER));
             let _ = fs::remove_file(state_dir.join(PHANTUN_OLD_BOUNDED_LOG_MARKER));
             fs::write(state_dir.join("phantun.disabled"), reason)
                 .map_err(|error| error.to_string())?;
@@ -195,6 +197,7 @@ pub(crate) fn apply_phantun(
     }
     fs::write(state_dir.join(PHANTUN_BOUNDED_LOG_MARKER), b"dynamic\n")
         .map_err(|error| format!("failed to record bounded phantun logging: {error}"))?;
+    let _ = fs::remove_file(state_dir.join(PHANTUN_SHARED_POLICY_LOG_MARKER));
     let _ = fs::remove_file(state_dir.join(PHANTUN_OLD_BOUNDED_LOG_MARKER));
     // stop_phantun has closed every legacy descriptor, so this unlink releases the blocks now.
     let _ = fs::remove_file("/tmp/brocade-agent-phantun.log");
@@ -297,7 +300,7 @@ fn spawn_phantun(state_dir: &Path, instance: &PhantunInstance) -> Result<(), Str
         .collect::<Vec<_>>()
         .join(" ");
     let log_path = phantun_log_path(state_dir, instance);
-    let sink = crate::logcap::command(&log_path, state_dir)?;
+    let sink = crate::logcap::command(&log_path, state_dir, crate::logcap::WorkloadLog::Phantun)?;
     let pipeline = shell_quote(&format!("{program} {quoted} 2>&1 | {sink}"));
     run_shell(&format!(
         "set -eu\n\
