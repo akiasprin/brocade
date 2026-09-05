@@ -49,8 +49,6 @@ func newSessionForConn(conn net.Conn, isClient bool) *session {
 		bw:              buf.NewBufferedWriter(buf.NewWriter(conn)),
 		streams:         make(map[uint32]*stream),
 		drainingStreams: make(map[uint32]*stream),
-		errCh:           make(chan error, 1),
-		synAckCh:        make(map[uint32]chan error),
 		peerVersion:     1,
 	}
 	s.fw = newFrameWriter(s.bw)
@@ -373,11 +371,59 @@ func TestClosedSessionRejectsLinkReturnedByDispatcher(t *testing.T) {
 	}
 }
 
+func TestClientTCPStreamDoesNotWaitForOptionalSYNACK(t *testing.T) {
+	clientConn, peerConn := net.Pipe()
+	client := newSessionForConn(clientConn, true)
+	client.nextSID.Store(2)
+	client.peerVersion = 2
+	endpoint := newTestLinkEndpoint()
+
+	wireCh := make(chan []byte, 1)
+	go func() {
+		wire, _ := io.ReadAll(peerConn)
+		wireCh <- wire
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	stream, err := client.openStream(ctx, xnet.TCPDestination(xnet.DomainAddress("example.com"), 443), endpoint.link)
+	if err != nil {
+		client.close(err)
+		_ = peerConn.Close()
+		endpoint.closeInput()
+		endpoint.closeOutput()
+		t.Fatalf("TCP stream open error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 400*time.Millisecond {
+		client.close(nil)
+		_ = peerConn.Close()
+		endpoint.closeInput()
+		endpoint.closeOutput()
+		t.Fatalf("TCP stream waited for optional SYNACK: %v", elapsed)
+	}
+
+	client.close(nil)
+	_ = peerConn.Close()
+	endpoint.closeInput()
+	endpoint.closeOutput()
+	frames := parseTestFrames(t, <-wireCh)
+	var openSeen bool
+	for index := 0; index+1 < len(frames); index++ {
+		if frames[index].cmd == cmdSYN && frames[index].sid == stream.sid && frames[index+1].cmd == cmdPSH && frames[index+1].sid == stream.sid {
+			openSeen = true
+			break
+		}
+	}
+	if !openSeen {
+		t.Fatalf("TCP stream open frames = %+v, want SYN and destination PSH for sid %d", frames, stream.sid)
+	}
+}
+
 func TestClientUDPStreamDoesNotWaitForOptionalSYNACK(t *testing.T) {
 	clientConn, peerConn := net.Pipe()
 	client := newSessionForConn(clientConn, true)
 	client.peerVersion = 2
-	client.synAckSupported.Store(true)
 	endpoint := newTestLinkEndpoint()
 
 	wireCh := make(chan []byte, 1)
@@ -426,13 +472,12 @@ func TestClientUDPStreamDoesNotWaitForOptionalSYNACK(t *testing.T) {
 	}
 }
 
-func TestSessionPairDispatcherFailureSendsSYNACKRejection(t *testing.T) {
+func TestSessionPairDispatcherFailureRejectsStreamAsynchronously(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	client := newSessionForConn(clientConn, true)
 	server := newSessionForConn(serverConn, false)
 	client.nextSID.Store(2)
 	client.peerVersion = 2
-	client.synAckSupported.Store(true)
 	endpoint := newTestLinkEndpoint()
 
 	wantErr := errors.New("destination unavailable")
@@ -447,14 +492,25 @@ func TestSessionPairDispatcherFailureSendsSYNACKRejection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	started := time.Now()
-	_, err := client.openStream(ctx, xnet.TCPDestination(xnet.DomainAddress("unavailable.example"), 443), endpoint.link)
-	if err == nil || !strings.Contains(err.Error(), "destination unavailable") {
+	stream, err := client.openStream(ctx, xnet.TCPDestination(xnet.DomainAddress("unavailable.example"), 443), endpoint.link)
+	if err != nil {
 		closeSessionPair(t, client, server, clientErr, serverErr, endpoint)
-		t.Fatalf("openStream error = %v, want dispatcher rejection", err)
+		t.Fatalf("optimistic openStream error = %v", err)
 	}
-	if strings.Contains(err.Error(), "SYNACK timeout") || time.Since(started) >= time.Second {
+	if time.Since(started) >= time.Second {
 		closeSessionPair(t, client, server, clientErr, serverErr, endpoint)
-		t.Fatalf("dispatcher rejection was not returned promptly: %v", err)
+		t.Fatal("optimistic openStream blocked for SYNACK")
+	}
+	select {
+	case <-stream.done:
+		err = stream.result()
+		if err == nil || !strings.Contains(err.Error(), "destination unavailable") {
+			closeSessionPair(t, client, server, clientErr, serverErr, endpoint)
+			t.Fatalf("asynchronous stream result = %v, want dispatcher rejection", err)
+		}
+	case <-time.After(time.Second):
+		closeSessionPair(t, client, server, clientErr, serverErr, endpoint)
+		t.Fatal("asynchronous SYNACK rejection did not close stream")
 	}
 
 	streamDeadline := time.NewTimer(time.Second)

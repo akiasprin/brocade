@@ -849,8 +849,18 @@ pub async fn record_usage_report(
         }
         let mut update_head = true;
         if let Some(previous) = &previous {
-            if request.read_at_unix_secs <= previous.read_at_unix_secs {
+            if request.read_at_unix_secs < previous.read_at_unix_secs {
                 rejected_counters += 1;
+                update_head = false;
+            } else if request.read_at_unix_secs == previous.read_at_unix_secs {
+                // The agent timestamps reports in whole seconds. A release takes a protected
+                // pre-change sample while the ordinary 30-second sampler runs independently;
+                // the in-process meter orders both reads, but two consecutive reads can still
+                // land in the same wall-clock second. There is no positive-duration window to
+                // book, so leave the earlier head in place and let the next later report include
+                // any same-second counter growth. A strictly older timestamp remains a rejection
+                // above; treating equality as one made a healthy grants hot-swap surface as
+                // "out of order" in the node health UI.
                 update_head = false;
             } else if has_exact_xray_epoch
                 && previous.xray_epoch == xray_epoch

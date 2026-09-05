@@ -58,4 +58,5 @@ describe('Ping probe settings', () => {
     expect(pingLatencyMs({ latency_us: 37_250 })).toBe(37.25);
     expect(pingSampleText({ probed_at_unix_secs: at, attempted: true, latency_us: 850 })).toBe('0.85 ms');
   });
+
 });

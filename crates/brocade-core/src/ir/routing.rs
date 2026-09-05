@@ -115,6 +115,7 @@ pub struct Ingress {
     pub front: Option<String>,
     pub sniff: bool,
     pub identity: IngressIdentity,
+    pub anytls_identity: Option<IngressIdentity>,
     pub wires: IngressWires,
     /// The name on the certificate held by the machine this ingress listens on, resolved here so
     /// that the three readers of it — the artifact, the subscription and the probe — all take it
@@ -319,6 +320,16 @@ pub fn compile_app(
                 .map(|chain| chain.tenant.clone())
                 .unwrap_or_else(|| "platform".to_owned());
 
+            // Empty is the durable model's compact representation of "follow global". Resolve
+            // it before the IR fans out to artifacts, probes and subscriptions so every consumer
+            // sees the same concrete server scheme. An ingress override remains untouched.
+            let mut wires = ingress.wires.clone();
+            if let Some(anytls) = wires.anytls_mut() {
+                if anytls.padding_scheme.is_empty() {
+                    anytls.padding_scheme = doc.settings.anytls_padding_scheme.clone();
+                }
+            }
+
             Ingress {
                 id: ingress.id.clone(),
                 app_id: Some(app.id.clone()),
@@ -330,7 +341,8 @@ pub fn compile_app(
                 front: ingress.front.clone(),
                 sniff: !front_via.contains(&ingress.id),
                 identity: ingress.identity.clone(),
-                wires: ingress.wires.clone(),
+                anytls_identity: ingress.anytls_identity.clone(),
+                wires,
                 certificate_name: node_by_id
                     .get(ingress.node.as_str())
                     .and_then(|node| node.certificate_name.clone()),

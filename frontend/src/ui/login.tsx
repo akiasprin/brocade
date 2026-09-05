@@ -7,6 +7,7 @@ import {
   fetchSessionWhoami,
   initAdmin,
   loginAdmin,
+  setVisitorAccess,
   type BrandingSettings,
 } from '../api';
 import type { Session } from '../app';
@@ -29,7 +30,7 @@ export function Login({ branding, onLogin }: { branding: BrandingSettings; onLog
     <div className="fw active login-fw">
       <div className="fw-head">
         <span className="fw-kind">{initialized ? '登录' : '初始化'}</span>
-        <span className="fw-title">{branding.site_name} console</span>
+        <span className="fw-title">{branding.site_name} | 🛰️ 跨境网络小管家</span>
       </div>
       <div className="fw-body">
         {auth.isPending ? (
@@ -68,7 +69,7 @@ function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Session) =>
         if (operatorId.trim()) login.mutate();
       }}
     >
-      <p className="note">使用操作者用户名和密码登录。公开访客请使用旁边的「访客模式」。</p>
+      <p className="note">用户使用「租户/用户名」登录；系统只有一个租户时可只填用户名。公开访客可使用「访客模式」。</p>
       <label className="fieldline">
         <span>用户名</span>
         <input className="f" autoFocus value={operatorId} onChange={e => setOperatorId(e.target.value)} />
@@ -103,8 +104,7 @@ function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) 
   const [password, setPassword] = useState('');
   const [reveal, setReveal] = useState(false);
   // 显示名默认与用户名相同：初始化页面不应要求重复输入同一内容。两者在模型中仍然独立——
-  // 用户名是主键，会被 revisions.author 和 deployment actor 引用，不可修改；显示名只是
-  // 展示名称，后续可在操作者页面随时修改。根租户也在该步骤创建：节点和用户都必须归属某个
+  // 用户名是主键，会被 revisions.author 和 deployment actor 引用，不可修改。根租户也在该步骤创建：节点和用户都必须归属某个
   // 租户，缺少它无法纳管第一台机器，它与第一个管理员同属初始状态的组成部分。
   const init = useMutation({
     mutationFn: async () => {
@@ -114,13 +114,14 @@ function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) 
         password,
       });
       // 此时 session cookie 已存在，创建租户走正常的鉴权流程。
-      // 创建失败不阻止进入——可在租户页面重新创建。
+      // 创建失败不阻止进入——租户可在租户页补建，访客模式可在设置中重开。
       const tenant = rootTenant.trim();
       if (tenant) {
         try {
           await createTenantNow({ id: tenant, name: tenant });
+          await setVisitorAccess(true);
         } catch {
-          /* 租户创建失败不视为初始化失败：进入后可在租户页面补充创建 */
+          /* 初始租户或访客入口失败不阻止管理员登录，进入后仍可补齐 */
         }
       }
       return { who: result.admin };
@@ -161,7 +162,7 @@ function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) 
       </label>
       {tooShort && <div className="callout err">密码至少 8 位</div>}
       {init.error && <div className="callout err">{errorText(init.error)}</div>}
-      <p className="note dim">用户名创建后不可修改，显示名可以随时修改。</p>
+      <p className="note dim">用户名创建后不可修改；访客模式默认开启，可在设置中关闭。</p>
       <div className="toolbar">
         <span className="sp" />
         <button

@@ -33,8 +33,8 @@ export function PasswordPane() {
   return (
     <>
       <p className="note">
-        修改 <b className="mono">{who.operator_id}</b> 自己的登录密码。为避免旧凭据继续有效，现有 API token
-        会一并撤销，需要时在操作者页重新签发。
+        修改 <b className="mono">{who.operator_id}</b> 自己的登录密码。保存后，其他已登录设备和旧 API token
+        会一并失效。
       </p>
       <form
         onSubmit={e => {

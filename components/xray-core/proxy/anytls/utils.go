@@ -23,27 +23,36 @@ func writeFull(w io.Writer, p []byte) error {
 }
 
 func readMultiBufferExact(br *buf.BufferedReader, length int) (buf.MultiBuffer, error) {
-	var mb buf.MultiBuffer
-	remaining := length
+	if length <= 0 {
+		return nil, nil
+	}
+	mb := make(buf.MultiBuffer, 0, (length+buf.Size-1)/buf.Size)
+	remaining := int32(length)
+	readAny := false
 
 	for remaining > 0 {
-		b := buf.New()
-
-		size := buf.Size
-		if remaining < size {
-			size = remaining
+		part, err := br.ReadAtMost(remaining)
+		partLen := part.Len()
+		if partLen > 0 {
+			mb, _ = buf.MergeMulti(mb, part)
+			remaining -= partLen
+			readAny = true
 		}
-
-		p := b.Extend(int32(size))
-
-		if _, err := io.ReadFull(br, p); err != nil {
-			b.Release()
+		if remaining == 0 {
+			return mb, nil
+		}
+		if err != nil {
+			buf.ReleaseMulti(part)
 			buf.ReleaseMulti(mb)
+			if err == io.EOF && readAny {
+				return nil, io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
-
-		mb = append(mb, b)
-		remaining -= size
+		if partLen == 0 {
+			buf.ReleaseMulti(mb)
+			return nil, io.ErrNoProgress
+		}
 	}
 
 	return mb, nil

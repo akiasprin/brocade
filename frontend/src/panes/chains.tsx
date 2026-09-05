@@ -11,6 +11,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type Ref,
 } from 'react';
 import { hopWireLabel } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -77,7 +78,7 @@ import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { FLAG_SHEET } from '../ui/flags';
 import { RegionFlag } from '../ui/region-flag';
-import { ListIcon } from '../ui/icons';
+import { ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { ProbeBanner, byChain, toneOf, toneTitle } from '../ui/probe';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
@@ -105,6 +106,52 @@ const HY2_PORT_BASE = 18000;
 const ANYTLS_PORT_BASE = 16000;
 const DEFAULT_HOP_SPAN = 100;
 const U32_MAX = 4_294_967_295;
+
+const ANYTLS_PADDING_PRESETS = [
+  { value: 'global', label: '跟随全局（推荐）', scheme: '' },
+  {
+    value: 'two-stage',
+    label: '原生精简 2 段',
+    scheme: ['stop=2', '0=30-30', '1=100-400'].join('\n'),
+  },
+  {
+    value: 'four-stage',
+    label: '原生精简 4 段',
+    scheme: ['stop=4', '0=30-30', '1=100-400', '2=400-500,c,500-1000', '3=9-9,500-1000'].join('\n'),
+  },
+  {
+    value: 'eight-stage',
+    label: '原生完整 8 段',
+    scheme: [
+      'stop=8',
+      '0=30-30',
+      '1=100-400',
+      '2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000',
+      '3=9-9,500-1000',
+      '4=500-1000',
+      '5=500-1000',
+      '6=500-1000',
+      '7=500-1000',
+    ].join('\n'),
+  },
+] as const;
+
+type AnyTlsPaddingPreset = (typeof ANYTLS_PADDING_PRESETS)[number]['value'] | 'custom';
+
+function normalizedAnyTlsPadding(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function anyTlsPaddingPresetOf(text: string): AnyTlsPaddingPreset {
+  const normalized = normalizedAnyTlsPadding(text);
+  return ANYTLS_PADDING_PRESETS.find(preset => preset.scheme === normalized)?.value ?? 'custom';
+}
+
+type AnyTlsMasqueradePreset = '404' | 'custom';
 
 function anyTlsHeadersText(headers: Record<string, string> | undefined): string {
   return Object.entries(headers ?? {})
@@ -172,6 +219,7 @@ function useAnyTlsPortBase(): number {
   const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
   return settings.data?.ports?.anytls_base || ANYTLS_PORT_BASE;
 }
+
 import { ChainWizard } from './chain-wizard';
 
 // 链路页：链在此页首次有独立的位置。
@@ -317,7 +365,9 @@ function chainAccessLabel(ingress: SnapshotIngress | null): string {
     labels.push(transportIsXhttp(vless.kind) ? `${security} · XHTTP` : `VLESS · ${security}`);
   }
   if (ingress.wires.hysteria2) labels.push('HY2');
-  if (ingress.wires.anytls) labels.push('AnyTLS');
+  if (ingress.wires.anytls) {
+    labels.push(ingress.wires.anytls.security === 'reality' ? 'AnyTLS · REALITY' : 'AnyTLS');
+  }
   return labels.join(' + ') || '—';
 }
 
@@ -550,15 +600,48 @@ const PanelSaveCtx = createContext<PanelPut | null>(null);
 
 /** 线路配置与机器详情配置共用的面板骨架。连通性结论仍使用 `.blk tone-*`：它是状态面，
  * 不是配置表单；其余线路配置不再维护第二套 `.blk/.blk-hd/.blk-bd` 材质。 */
-function ConfigPanel({ title, children }: { title: string; children: React.ReactNode }) {
+function ConfigPanel({
+  title,
+  icon,
+  children,
+  panelRef,
+}: {
+  title: string;
+  icon: IconName;
+  children: React.ReactNode;
+  panelRef?: Ref<HTMLElement>;
+}) {
   return (
-    <section className="panel config-panel">
+    <section className="panel config-panel" ref={panelRef}>
       <header>
-        <h4>{title}</h4>
+        <PanelTitle of={icon}>{title}</PanelTitle>
       </header>
       {children}
     </section>
   );
+}
+
+/** 协议开关的保存需要一次往返，但配置卡应在点击当帧出现。该 hook 保留请求期间的
+ * 乐观可见性，并仅在新卡位于视口之外时滚动最短距离。 */
+function useImmediatePanelVisibility(storedVisible: boolean) {
+  const [pendingVisible, setPendingVisible] = useState<boolean | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const reveal = useRef(false);
+  const visible = pendingVisible ?? storedVisible;
+
+  useLayoutEffect(() => {
+    if (!visible || !reveal.current) return;
+    reveal.current = false;
+    panelRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' });
+  }, [visible]);
+
+  const preview = useCallback((enabled: boolean | null) => {
+    if (enabled === true) reveal.current = true;
+    if (enabled === false) reveal.current = false;
+    setPendingVisible(enabled);
+  }, []);
+
+  return { visible, panelRef, preview };
 }
 
 /** 行侧登记。`watch` 里放草稿的当前取值——它变了就要重新登记，否则面板拿到的
@@ -584,12 +667,14 @@ export function IngressPanel({
   title,
   editable,
   children,
+  panelRef,
 }: {
   appId: string;
   ingress: SnapshotIngress;
   title: string;
   editable: boolean;
   children: React.ReactNode;
+  panelRef?: Ref<HTMLElement>;
 }) {
   const qc = useQueryClient();
   const [entries, setEntries] = useState<Record<string, PanelEntry>>({});
@@ -627,7 +712,7 @@ export function IngressPanel({
 
   return (
     <PanelSaveCtx.Provider value={put}>
-      <ConfigPanel title={title}>
+      <ConfigPanel title={title} icon="protocol" panelRef={panelRef}>
         <dl className="kv form2 chain-face fill">{children}</dl>
         {save.error && <ErrorBox error={save.error} />}
         <footer className="config-panel-savebar">
@@ -862,11 +947,13 @@ function IngressRealityRow({
   ingress,
   certificateName,
   editable,
+  target = 'vless',
 }: {
   appId: string;
   ingress: SnapshotIngress;
   certificateName?: string | null;
   editable: boolean;
+  target?: 'vless' | 'anytls';
 }) {
   const qc = useQueryClient();
   const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
@@ -877,14 +964,50 @@ function IngressRealityRow({
     names: string;
     fingerprint: string;
   };
+  const ingressReality =
+    target === 'anytls'
+      ? ingress.wires.anytls?.reality
+      : ingress.wires.vless?.kind.startsWith('vless-reality')
+        ? ingress.wires.vless
+        : null;
+  const initialSource =
+    target === 'anytls' && ingressReality?.fallback_mode === 'node-certificate'
+      ? 'global-site'
+      : (ingressReality?.fallback_mode ?? 'global-site');
   const initial: RealityCertificateForm = {
-    source: ingress.wires.vless?.fallback_mode ?? 'global-site',
-    dest: ingress.wires.vless?.dest ?? global?.dest ?? '',
-    names: (ingress.wires.vless?.server_names ?? global?.server_names ?? []).join(', '),
-    fingerprint: ingress.wires.vless?.fingerprint ?? global?.fingerprint ?? 'chrome',
+    source: initialSource,
+    dest: ingressReality?.dest ?? global?.dest ?? '',
+    names: (ingressReality?.server_names ?? global?.server_names ?? []).join(', '),
+    fingerprint: ingressReality?.fingerprint ?? global?.fingerprint ?? 'chrome',
   };
   const [draft, setDraft] = useState<RealityCertificateForm | null>(null);
   const form = draft ?? initial;
+  const anyTlsReality = (next: RealityCertificateForm) => ({
+    dest: next.source === 'custom-site' ? next.dest.trim() : '',
+    server_names:
+      next.source === 'custom-site'
+        ? next.names
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean)
+        : [],
+    fingerprint: next.source === 'custom-site' ? next.fingerprint.trim() : '',
+    flow: null,
+    fallback_mode: next.source,
+    fallback_limits: ingressReality?.fallback_limits ?? { mode: 'balanced' as const },
+    fallback_guard: ingressReality?.fallback_guard ?? true,
+  });
+  const withAnyTlsReality = (body: UpsertIngressBody, next: RealityCertificateForm): UpsertIngressBody => {
+    const anytls = body.wires?.anytls;
+    if (!anytls) return body;
+    return {
+      ...body,
+      wires: {
+        ...body.wires,
+        anytls: { ...anytls, reality: anyTlsReality(next) },
+      },
+    };
+  };
   const save = useMutation({
     mutationFn: (next: RealityCertificateForm) => {
       const body = ingressUpsertBody(ingress);
@@ -892,6 +1015,9 @@ function IngressRealityRow({
         .split(',')
         .map(value => value.trim())
         .filter(Boolean);
+      if (target === 'anytls') {
+        return upsertIngress(appId, withAnyTlsReality(body, next), body);
+      }
       return upsertIngress(
         appId,
         {
@@ -926,7 +1052,7 @@ function IngressRealityRow({
         names.length > 0 &&
         names.every(realityServerNameIsValid) &&
         realityFingerprintIsValid(form.fingerprint))) &&
-    (form.source !== 'node-certificate' || !!certificateName);
+    (form.source !== 'node-certificate' || (target === 'vless' && !!certificateName));
   const dirty = JSON.stringify(form) !== JSON.stringify(initial);
   /* 贴到面板那份 body 上。取值的整理（拆逗号、custom 之外清空）与下面 save 里的一致。 */
   usePanelEntry(
@@ -935,22 +1061,25 @@ function IngressRealityRow({
     {
       /* valid 为假 = 自定义站点没填全，或选了本机证书而这台机器还没有证书。 */
       blocked: !valid,
-      apply: body => ({
-        ...body,
-        reality: {
-          ...body.reality,
-          fallback_mode: form.source,
-          dest: form.source === 'custom-site' ? form.dest.trim() : '',
-          server_names:
-            form.source === 'custom-site'
-              ? form.names
-                  .split(',')
-                  .map(value => value.trim())
-                  .filter(Boolean)
-              : [],
-          fingerprint: form.source === 'custom-site' ? form.fingerprint.trim() : undefined,
-        },
-      }),
+      apply: body =>
+        target === 'anytls'
+          ? withAnyTlsReality(body, form)
+          : {
+              ...body,
+              reality: {
+                ...body.reality,
+                fallback_mode: form.source,
+                dest: form.source === 'custom-site' ? form.dest.trim() : '',
+                server_names:
+                  form.source === 'custom-site'
+                    ? form.names
+                        .split(',')
+                        .map(value => value.trim())
+                        .filter(Boolean)
+                    : [],
+                fingerprint: form.source === 'custom-site' ? form.fingerprint.trim() : undefined,
+              },
+            },
       reset: () => setDraft(null),
     },
     JSON.stringify(form),
@@ -968,9 +1097,11 @@ function IngressRealityRow({
           disabled={!editable || save.isPending}
           onChange={event => setDraft({ ...form, source: event.target.value as RealityFallbackMode })}
         >
-          <option value="node-certificate" disabled={!certificateName}>
-            {certificateName ? `本机证书 ${certificateName}` : '本机证书（未签发）'}
-          </option>
+          {target === 'vless' && (
+            <option value="node-certificate" disabled={!certificateName}>
+              {certificateName ? `本机证书 ${certificateName}` : '本机证书（未签发）'}
+            </option>
+          )}
           <option value="global-site">{globalSite ? `全局站点 ${globalSite}` : '全局站点（未配置）'}</option>
           <option value="custom-site">自定义站点</option>
         </select>
@@ -1009,7 +1140,7 @@ function IngressRealityRow({
         {form.source === 'global-site' && (
           <div className="note">跟随「设置」中的 REALITY 站点，修改将影响所有跟随的接入面。</div>
         )}
-        {form.source === 'node-certificate' && (
+        {target === 'vless' && form.source === 'node-certificate' && (
           <div className="note">
             客户端 SNI 使用 <span className="mono">{certificateName}</span>。
           </div>
@@ -1142,7 +1273,7 @@ function IngressGuardBlock({
   ];
 
   return (
-    <ConfigPanel title="安全策略">
+    <ConfigPanel title="安全策略" icon="security">
       {/* 标题栏不放读数：启用了哪几项，五个勾选框自己就写着，而「排在链路规则之前」
           是这一块恒定的性质，不是一项随取值变化的状态。 */}
       <div className="guard-switches">
@@ -1541,7 +1672,6 @@ function IngressHy2PortRow({
   onChange: (patch: Partial<Hysteria2Settings>) => void;
   editable: boolean;
 }) {
-  const hy2Base = useHy2PortBase();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
@@ -1574,12 +1704,6 @@ function IngressHy2PortRow({
   const hopBad = editable && hop ? hop.start > hop.end || !(hop.start <= value.port && value.port <= hop.end) : false;
   const hopClash = editable && hop && !hopBad ? spanClash(taken, nodes, hop.start, hop.end) : null;
 
-  const reallocate = () => {
-    const port = freePortAcross(taken, nodes, hy2Base);
-    /* 区间随监听端口变化：区间起点即监听端口，区间长度不变。分别计算时，重新分配后
-       区间可能不再包含监听端口——这正是后端拒绝的情况（ingress.hy2-hop-listener）。 */
-    onChange(hop ? { port, hop: { start: port, end: port + span - 1 } } : { port });
-  };
   const toggleHop = (on: boolean) => {
     if (!on) return onChange({ hop: null });
     const start = freeSpanAcross(taken, nodes, value.port, DEFAULT_HOP_SPAN);
@@ -1601,10 +1725,6 @@ function IngressHy2PortRow({
               onChange(hop ? { port, hop: { start: port, end: port + span - 1 } } : { port });
             }}
           />
-          <span className="dim">UDP</span>
-          <button className="btn" disabled={!editable} onClick={reallocate}>
-            重新分配
-          </button>
         </div>
         {clash && <div className="note bad">{clash}</div>}
       </dd>
@@ -1666,11 +1786,24 @@ export function IngressStreamRow({
   certificateName,
   editable,
   section,
+  vlessEnabled,
+  anytlsEnabled,
+  hy2Enabled,
+  onVlessEnabledChange,
+  onAnyTlsEnabledChange,
+  onHy2EnabledChange,
 }: {
   appId: string;
   ingress: SnapshotIngress;
   certificateName?: string | null;
   editable: boolean;
+  /** 协议开关与配置卡是不同组件实例。外层传入乐观可见性，让刚开启的配置卡立即挂载。 */
+  vlessEnabled?: boolean;
+  anytlsEnabled?: boolean;
+  hy2Enabled?: boolean;
+  onVlessEnabledChange?: (enabled: boolean | null) => void;
+  onAnyTlsEnabledChange?: (enabled: boolean | null) => void;
+  onHy2EnabledChange?: (enabled: boolean | null) => void;
   /** 本次渲染的是哪一段。
    *
    *  三段位于三块面板中，但状态、草稿和保存逻辑只有一份——修改一条线时需要将另一条原样带上
@@ -1714,20 +1847,22 @@ export function IngressStreamRow({
     while (port === ingress.port && port < 65536) port += 1;
     return {
       port,
+      security: 'tls',
       padding_scheme: [],
       masquerade: { kind: 'not-found' },
     };
   }, [anytlsBase, ingress.node, ingress.port, ingress.wires.anytls, tcpTaken]);
   const [pendingTransport, setPendingTransport] = useState<Transport | null>(null);
   const stagedTransport = pendingTransport?.kind === storedKind ? null : pendingTransport;
-  const kind: TransportKind | null = stagedTransport?.kind ?? storedKind;
-  const vlessOn = kind !== null;
+  const kind: TransportKind | null = stagedTransport?.kind ?? storedKind ?? (vlessEnabled ? 'vless-reality' : null);
+  const vlessOn = vlessEnabled ?? kind !== null;
   const [pendingAnyTlsOn, setPendingAnyTlsOn] = useState<boolean | null>(null);
   const stagedAnyTlsOn = pendingAnyTlsOn === !!ingress.wires.anytls ? null : pendingAnyTlsOn;
-  const anytlsOn = stagedAnyTlsOn ?? !!ingress.wires.anytls;
+  const anytlsOn = anytlsEnabled ?? stagedAnyTlsOn ?? !!ingress.wires.anytls;
   const [draftAnyTls, setDraftAnyTls] = useState<AnyTlsSettings | null>(null);
   const anytlsValue = draftAnyTls ?? storedAnyTls;
   const [draftAnyTlsPadding, setDraftAnyTlsPadding] = useState<string | null>(null);
+  const [forceAnyTlsPaddingCustom, setForceAnyTlsPaddingCustom] = useState(false);
   const [draftAnyTlsHeaders, setDraftAnyTlsHeaders] = useState<string | null>(null);
   const [draftAnyTlsStatus, setDraftAnyTlsStatus] = useState<string | null>(null);
   const [draftAnyTlsIdleCheck, setDraftAnyTlsIdleCheck] = useState<string | null>(null);
@@ -1768,7 +1903,7 @@ export function IngressStreamRow({
      必须通过推导得出，不能只依赖 onSuccess 中清除：该清除曾遗漏一次，而 checkbox 的
      disabled 依赖该值，表现为勾选后无法再次点击，尽管保存已成功。 */
   const stagedHy2On = pendingHy2On === !!ingress.wires.hysteria2 ? null : pendingHy2On;
-  const hy2 = stagedHy2On ?? !!ingress.wires.hysteria2;
+  const hy2 = hy2Enabled ?? stagedHy2On ?? !!ingress.wires.hysteria2;
   const activeHy2 = storedHy2;
   const [draftHy2, setDraftHy2] = useState<Hysteria2Settings | null>(null);
   const hy2Value = draftHy2 ?? activeHy2;
@@ -1844,12 +1979,16 @@ export function IngressStreamRow({
       setDraftHy2(null);
       setDraftAnyTls(null);
       setDraftAnyTlsPadding(null);
+      setForceAnyTlsPaddingCustom(false);
       setDraftAnyTlsHeaders(null);
       setDraftAnyTlsStatus(null);
       setDraftAnyTlsIdleCheck(null);
       setDraftAnyTlsIdleTimeout(null);
       setDraftAnyTlsMinIdle(null);
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
+      onVlessEnabledChange?.(null);
+      onAnyTlsEnabledChange?.(null);
+      onHy2EnabledChange?.(null);
       setDraftMode(null);
       setPendingTransport(null);
       setPendingAnyTlsOn(null);
@@ -1864,11 +2003,15 @@ export function IngressStreamRow({
       setPendingHy2On(null);
       setDraftAnyTls(null);
       setDraftAnyTlsPadding(null);
+      setForceAnyTlsPaddingCustom(false);
       setDraftAnyTlsHeaders(null);
       setDraftAnyTlsStatus(null);
       setDraftAnyTlsIdleCheck(null);
       setDraftAnyTlsIdleTimeout(null);
       setDraftAnyTlsMinIdle(null);
+      onVlessEnabledChange?.(null);
+      onAnyTlsEnabledChange?.(null);
+      onHy2EnabledChange?.(null);
     },
   });
 
@@ -1928,6 +2071,7 @@ export function IngressStreamRow({
       }
       const nextVless: Transport | null = enabled ? { kind: 'vless-reality' } : null;
       setPendingTransport(nextVless);
+      onVlessEnabledChange?.(enabled);
       save.mutate({
         vless: nextVless,
         anytls: anytlsOn ? anytlsValue : null,
@@ -1943,6 +2087,7 @@ export function IngressStreamRow({
         return;
       }
       setPendingAnyTlsOn(enabled);
+      onAnyTlsEnabledChange?.(enabled);
       save.mutate({
         vless: vlessOn ? (stagedTransport ?? currentWires(ingress).vless) : null,
         anytls: enabled ? anytlsValue : null,
@@ -1957,6 +2102,7 @@ export function IngressStreamRow({
       return;
     }
     setPendingHy2On(enabled);
+    onHy2EnabledChange?.(enabled);
     saveHy2(enabled ? hy2Value : null);
   };
 
@@ -2112,6 +2258,7 @@ export function IngressStreamRow({
   const anytlsHeaders = anytlsValue.masquerade.headers;
   const anytlsHeadersText = draftAnyTlsHeaders ?? anyTlsHeadersText(anytlsHeaders);
   const anytlsMasqueradeIsString = anytlsValue.masquerade.kind === 'string';
+  const anytlsReality = (anytlsValue.security ?? 'tls') === 'reality';
   const anytlsStoredStatus =
     anytlsValue.masquerade.kind === 'string' ? anytlsValue.masquerade.status_code ?? 200 : 404;
   const anytlsStatusText = draftAnyTlsStatus ?? String(anytlsStoredStatus);
@@ -2125,10 +2272,10 @@ export function IngressStreamRow({
       (vlessOn && anytlsValue.port === ingress.port));
   const anytlsStatus = Number(anytlsStatusText);
   const anytlsStatusBad =
+    !anytlsReality &&
     anytlsMasqueradeIsString &&
     (!/^\d+$/.test(anytlsStatusText) || !Number.isInteger(anytlsStatus) || anytlsStatus < 200 || anytlsStatus > 599);
   const anytlsPaddingBad = anytlsPaddingText.trim() !== '' && !anyTlsPaddingValid(anytlsPaddingText);
-  const anytlsHeadersBad = parsedAnyTlsHeaders === null;
   const anytlsIdleCheckText =
     draftAnyTlsIdleCheck ??
     (anytlsValue.idle_session_check_interval_secs == null
@@ -2139,6 +2286,11 @@ export function IngressStreamRow({
     (anytlsValue.idle_session_timeout_secs == null ? '' : String(anytlsValue.idle_session_timeout_secs));
   const anytlsMinIdleText =
     draftAnyTlsMinIdle ?? (anytlsValue.min_idle_session == null ? '' : String(anytlsValue.min_idle_session));
+  const anytlsPaddingPreset = forceAnyTlsPaddingCustom ? 'custom' : anyTlsPaddingPresetOf(anytlsPaddingText);
+  const anytlsMasqueradePreset: AnyTlsMasqueradePreset =
+    anytlsValue.masquerade.kind === 'not-found' ? '404' : 'custom';
+  const anytlsHeadersBad =
+    !anytlsReality && anytlsMasqueradePreset === 'custom' && parsedAnyTlsHeaders === null;
   const optionalUintBad = (text: string, allowZero: boolean) =>
     text.trim() !== '' &&
     (!/^\d+$/.test(text.trim()) ||
@@ -2190,6 +2342,7 @@ export function IngressStreamRow({
       reset: () => {
         setDraftAnyTls(null);
         setDraftAnyTlsPadding(null);
+        setForceAnyTlsPaddingCustom(false);
         setDraftAnyTlsHeaders(null);
         setDraftAnyTlsStatus(null);
         setDraftAnyTlsIdleCheck(null);
@@ -2209,6 +2362,13 @@ export function IngressStreamRow({
   );
   const updateAnyTls = (patch: Partial<AnyTlsSettings>) => setDraftAnyTls({ ...anytlsValue, ...patch });
   const updateAnyTlsMasquerade = (masquerade: AnyTlsMasquerade) => updateAnyTls({ masquerade });
+  const selectAnyTlsMasqueradePreset = (preset: AnyTlsMasqueradePreset) => {
+    setDraftAnyTlsStatus(null);
+    if (preset !== 'custom') setDraftAnyTlsHeaders(null);
+    const headers = preset === 'custom' ? (parsedAnyTlsHeaders ?? {}) : {};
+    if (preset === '404') return updateAnyTlsMasquerade({ kind: 'not-found', headers });
+    return updateAnyTlsMasquerade({ kind: 'string', content: '', headers, status_code: 200 });
+  };
 
   /* 端口归属协议栈：落点只表示由哪台机器接收，使用哪个端口由各线路自行决定。
      因此此处分四段渲染——协议开关一段，VLESS、AnyTLS、Hysteria 2 各自包含自己的端口和参数。 */
@@ -2275,66 +2435,145 @@ export function IngressStreamRow({
               aria-label="AnyTLS 监听端口"
               onChange={event => updateAnyTls({ port: Number(event.target.value.replace(/\D/g, '')) || 0 })}
             />
-            <span className="dim">TCP</span>
           </div>
-          {anytlsPortBad && <div className="note bad">AnyTLS 端口必须是 1–65535，且不能与同机其他 TCP 监听冲突。</div>}
+          {anytlsPortBad && <div className="note bad">端口必须是 1–65535，且不能与同机其他监听端口冲突。</div>}
         </dd>
-        <dt>Padding Scheme</dt>
+        <dt>安全层</dt>
         <dd>
-          <textarea
-            className="f mono"
-            rows={5}
-            style={{ width: '100%', borderColor: anytlsPaddingBad ? 'var(--err)' : undefined }}
-            value={anytlsPaddingText}
-            disabled={!editable}
-            aria-label="AnyTLS Padding Scheme"
-            placeholder={'留空使用 Xray 默认\n例如：stop=2\n0=30-30'}
-            onChange={event => setDraftAnyTlsPadding(event.target.value)}
-          />
-          <div className="note">每行一条规则；自定义方案必须包含唯一的 `stop=...`，范围支持到 4 MiB。</div>
-          {anytlsPaddingBad && <div className="note bad">Padding Scheme 格式无效：请检查 `=`、重复编号、stop 和字节范围。</div>}
+          <select
+            className="f"
+            value={anytlsReality ? 'reality' : 'tls'}
+            disabled={!editable || save.isPending}
+            aria-label="AnyTLS 安全层"
+            onChange={event => {
+              const security = event.target.value as 'tls' | 'reality';
+              updateAnyTls({
+                security,
+                ...(security === 'reality' && !anytlsValue.reality
+                  ? {
+                      reality: {
+                        dest: '',
+                        server_names: [],
+                        fingerprint: '',
+                        flow: null,
+                        fallback_mode: 'global-site',
+                        fallback_limits: { mode: 'balanced' },
+                        fallback_guard: true,
+                      },
+                    }
+                  : {}),
+              });
+            }}
+          >
+            <option value="reality">REALITY</option>
+            <option value="tls">TLS</option>
+          </select>
+          {!anytlsReality && certificateName && (
+            <div className="note">
+              使用本机证书 <span className="mono">{certificateName}</span>。
+            </div>
+          )}
+          {!anytlsReality && !certificateName && (
+            <div className="note bad">本机证书未签发，编译会拒绝这个接入面。前往「机器」页签发。</div>
+          )}
         </dd>
-        <dt>Session</dt>
+        {anytlsReality && (
+          <IngressRealityRow appId={appId} ingress={ingress} editable={editable} target="anytls" />
+        )}
+        <dt>参数</dt>
         <dd>
-          <details className="form-adv" style={{ width: '100%' }}>
-            <summary>连接复用</summary>
-            <div className="toolbar" style={{ margin: '8px 0 0', gap: 8, flexWrap: 'wrap' }}>
-              <label>
-                <span className="dim">检查间隔（秒）</span>
+          {editable && (
+            <>
+              <div className="toolbar anytls-parameter-row">
+                <span className="dim">Padding Scheme</span>
+                <select
+                  className="f words"
+                  value={anytlsPaddingPreset}
+                  aria-label="AnyTLS Padding Scheme 预设"
+                  onChange={event => {
+                    if (event.target.value === 'custom') {
+                      setForceAnyTlsPaddingCustom(true);
+                      return;
+                    }
+                    const preset = ANYTLS_PADDING_PRESETS.find(item => item.value === event.target.value);
+                    if (preset) {
+                      setForceAnyTlsPaddingCustom(false);
+                      setDraftAnyTlsPadding(preset.scheme);
+                    }
+                  }}
+                >
+                  {ANYTLS_PADDING_PRESETS.map(preset => (
+                    <option key={preset.value} value={preset.value}>
+                      {preset.label}
+                    </option>
+                  ))}
+                  <option value="custom">自定义</option>
+                </select>
+              </div>
+              {anytlsPaddingPreset === 'custom' && (
+                <textarea
+                  className="f mono anytls-padding-custom"
+                  rows={5}
+                  style={{ borderColor: anytlsPaddingBad ? 'var(--err)' : undefined }}
+                  value={anytlsPaddingText}
+                  aria-label="AnyTLS Padding Scheme"
+                  placeholder="每行一条规则"
+                  onChange={event => setDraftAnyTlsPadding(event.target.value)}
+                />
+              )}
+              {anytlsPaddingBad && (
+                <div className="note bad">Padding Scheme 格式无效：请检查 `=`、重复编号、stop 和字节范围。</div>
+              )}
+            </>
+          )}
+          <details className="form-adv anytls-session" style={{ width: '100%' }}>
+            <summary>连接复用（留空 = 使用默认值）</summary>
+            <div className="hy2-quic">
+              <label className="hy2-quic-fld">
+                <span>
+                  检查间隔 <small>秒</small>
+                </span>
                 <input
                   className="f mono"
                   type="number"
                   min={1}
                   max={U32_MAX}
-                  style={{ width: 92, borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  placeholder="30"
+                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
                   value={anytlsIdleCheckText}
                   disabled={!editable}
                   aria-label="AnyTLS Session 检查间隔"
                   onChange={event => setDraftAnyTlsIdleCheck(event.target.value)}
                 />
               </label>
-              <label>
-                <span className="dim">空闲超时（秒）</span>
+              <label className="hy2-quic-fld">
+                <span>
+                  空闲超时 <small>秒</small>
+                </span>
                 <input
                   className="f mono"
                   type="number"
                   min={1}
                   max={U32_MAX}
-                  style={{ width: 92, borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  placeholder="30"
+                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
                   value={anytlsIdleTimeoutText}
                   disabled={!editable}
                   aria-label="AnyTLS Session 空闲超时"
                   onChange={event => setDraftAnyTlsIdleTimeout(event.target.value)}
                 />
               </label>
-              <label>
-                <span className="dim">最少保留（个）</span>
+              <label className="hy2-quic-fld">
+                <span>
+                  最少保留 <small>个</small>
+                </span>
                 <input
                   className="f mono"
                   type="number"
                   min={0}
                   max={U32_MAX}
-                  style={{ width: 92, borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  placeholder="0"
+                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
                   value={anytlsMinIdleText}
                   disabled={!editable}
                   aria-label="AnyTLS Session 最少保留数量"
@@ -2343,75 +2582,74 @@ export function IngressStreamRow({
               </label>
             </div>
             {anytlsSessionBad && (
-              <div className="note bad">
-                Session 参数必须在 0 到 {U32_MAX} 之间；检查间隔和空闲超时必须大于 0。
-              </div>
+              <div className="note bad">数值必须在 0 到 {U32_MAX} 之间；两个时间值须大于 0。</div>
             )}
-            <div className="note">
-              留空时不下发，由客户端使用自身默认值；当前 Xray 和 Mihomo 的空闲超时默认值均为 30s。
-            </div>
           </details>
         </dd>
-        <dt>Masquerade</dt>
-        <dd>
-          <select
-            className="f"
-            value={anytlsMasquerade.kind}
-            disabled={!editable}
-            aria-label="AnyTLS Masquerade 类型"
-            onChange={event =>
-              updateAnyTlsMasquerade(
-                event.target.value === 'string'
-                  ? { kind: 'string', content: '', headers: parsedAnyTlsHeaders ?? {}, status_code: 200 }
-                  : { kind: 'not-found', headers: parsedAnyTlsHeaders ?? {} },
-              )
-            }
-          >
-            <option value="not-found">404 Not Found（默认）</option>
-            <option value="string">自定义响应</option>
-          </select>
-          {anytlsMasquerade.kind === 'string' && (
-            <>
-              <div className="toolbar" style={{ margin: '6px 0 0', gap: 6, flexWrap: 'wrap' }}>
-                <span className="dim">状态码</span>
-                <input
-                  className="f mono"
-                  type="number"
-                  min={200}
-                  max={599}
-                  style={{ width: 86, borderColor: anytlsStatusBad ? 'var(--err)' : undefined }}
-                  value={anytlsStatusText}
-                  disabled={!editable}
-                  aria-label="AnyTLS Masquerade 状态码"
-                  onChange={event => setDraftAnyTlsStatus(event.target.value)}
-                />
-              </div>
-              <textarea
-                className="f"
-                rows={4}
-                style={{ width: '100%', marginTop: 6 }}
-                value={anytlsMasquerade.content}
+        {!anytlsReality && (
+          <>
+            <dt>伪装</dt>
+            <dd>
+              <select
+                className="f words"
+                value={anytlsMasqueradePreset}
                 disabled={!editable}
-                aria-label="AnyTLS Masquerade 正文"
-                placeholder="响应正文"
-                onChange={event => updateAnyTlsMasquerade({ ...anytlsMasquerade, content: event.target.value })}
-              />
-            </>
-          )}
-          <textarea
-            className="f mono"
-            rows={4}
-            style={{ width: '100%', marginTop: 6, borderColor: anytlsHeadersBad ? 'var(--err)' : undefined }}
-            value={anytlsHeadersText}
-            disabled={!editable}
-            aria-label="AnyTLS Masquerade Headers"
-            placeholder={'可选，每行一个 Header\nCache-Control: no-store'}
-            onChange={event => setDraftAnyTlsHeaders(event.target.value)}
-          />
-          {anytlsHeadersBad && <div className="note bad">Headers 必须是一行一个 `名称: 值`，名称不能重复或包含非法字符。</div>}
-          {anytlsStatusBad && <div className="note bad">自定义响应状态码必须是 200–599。</div>}
-          <div className="note">AnyTLS 客户端未完成握手时返回此 HTTP 响应；默认严格返回 404。</div>
-        </dd>
+                aria-label="AnyTLS Masquerade 类型"
+                onChange={event => selectAnyTlsMasqueradePreset(event.target.value as AnyTlsMasqueradePreset)}
+              >
+                <option value="404">404</option>
+                <option value="custom">自定义</option>
+              </select>
+              {anytlsMasqueradePreset === 'custom' && (
+                <>
+                  {anytlsMasquerade.kind === 'string' && (
+                    <>
+                      <div className="toolbar" style={{ margin: '6px 0 0', gap: 6, flexWrap: 'wrap' }}>
+                        <span className="dim">状态码</span>
+                        <input
+                          className="f mono"
+                          type="number"
+                          min={200}
+                          max={599}
+                          style={{ width: 86, borderColor: anytlsStatusBad ? 'var(--err)' : undefined }}
+                          value={anytlsStatusText}
+                          disabled={!editable}
+                          aria-label="AnyTLS Masquerade 状态码"
+                          onChange={event => setDraftAnyTlsStatus(event.target.value)}
+                        />
+                      </div>
+                      <textarea
+                        className="f"
+                        rows={4}
+                        style={{ width: '100%', marginTop: 6 }}
+                        value={anytlsMasquerade.content}
+                        disabled={!editable}
+                        aria-label="AnyTLS Masquerade 正文"
+                        placeholder="响应正文"
+                        onChange={event => updateAnyTlsMasquerade({ ...anytlsMasquerade, content: event.target.value })}
+                      />
+                    </>
+                  )}
+                  <textarea
+                    className="f mono"
+                    rows={4}
+                    style={{ width: '100%', marginTop: 6, borderColor: anytlsHeadersBad ? 'var(--err)' : undefined }}
+                    value={anytlsHeadersText}
+                    disabled={!editable}
+                    aria-label="AnyTLS Masquerade Headers"
+                    placeholder={'可选，每行一个 Header\nCache-Control: no-store'}
+                    onChange={event => setDraftAnyTlsHeaders(event.target.value)}
+                  />
+                </>
+              )}
+              {anytlsHeadersBad && (
+                <div className="note bad">Headers 必须是一行一个 `名称: 值`，名称不能重复或包含非法字符。</div>
+              )}
+              {anytlsStatusBad && <div className="note bad">自定义响应状态码必须是 200–599。</div>}
+              <div className="note">未完成 AnyTLS 握手时返回此响应。</div>
+            </dd>
+          </>
+        )}
       </>
     );
   }
@@ -2544,7 +2782,7 @@ export function IngressStreamRow({
             {/* QUIC 调优收入折叠区。八项留空时均使用 xray 的默认值，修改需要具体依据；
                 展开显示会使一个不常修改的分组占用该区域一半的高度。 */}
             <details className="form-adv" style={{ width: '100%' }}>
-              <summary>QUIC 调优（留空 = 用 xray 默认）</summary>
+              <summary>QUIC 调优（留空 = 使用默认值）</summary>
               <div className="hy2-quic">
                 {(
                   [
@@ -2744,7 +2982,7 @@ export function IngressStreamRow({
               </div>
             )}
             <details className="form-adv" style={{ width: '100%' }}>
-              <summary>Padding 与 XMUX 调优（留空 = 用 Xray 默认）</summary>
+              <summary>Padding 与 XMUX 调优（留空 = 使用默认值）</summary>
               <div className="hy2-quic xhttp-xmux">
                 <label className="hy2-quic-fld xhttp-xmux-range-fld">
                   <span>
@@ -2999,7 +3237,7 @@ export function IngressStreamRow({
                           max={128}
                           inputMode="numeric"
                           style={{ width: 100, borderColor: muxBad ? 'var(--err)' : undefined }}
-                          title="留空使用客户端默认"
+                          title="留空 = 使用默认值"
                           placeholder="两端默认"
                           value={draft.mux}
                           disabled={!editable}
@@ -4351,6 +4589,9 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const ingress = (a?.ingresses ?? []).find(x => x.chain === chain) ?? null;
   const [pendingIngressNode, setPendingIngressNode] = useState<string | null>(null);
   const [pendingBind, setPendingBind] = useState<string | null>(null);
+  const vlessPanel = useImmediatePanelVisibility(!!ingress?.wires.vless);
+  const anyTlsPanel = useImmediatePanelVisibility(!!ingress?.wires.anytls);
+  const hy2Panel = useImmediatePanelVisibility(!!ingress?.wires.hysteria2);
   const { projHandles, projDirty, projBlocked, onV4Handle, onV6Handle } = useProjectionHandles();
 
   // 更换入口即将接入面迁移到另一台机器（链头随之改变，订阅链接也会变化）。
@@ -4472,7 +4713,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
 
             收入 `.kv` 并采用与设置页相同的布局：左列是项名、右列是控件、说明在控件下方。 */}
           {ingress && (
-            <ConfigPanel title="入站">
+            <ConfigPanel title="入站" icon="ingress">
               <dl className="kv form2 chain-face">
                 <dt>入站机器</dt>
                 <dd>
@@ -4535,7 +4776,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             与落点配套：上一块表示由哪台机器接收，本块表示告知客户端连接的地址。
             相邻放置才能体现两者的区别——这也是它们同在左栏的原因。 */}
           {ingress && (
-            <ConfigPanel title="客户端配置">
+            <ConfigPanel title="客户端配置" icon="client">
               <dl className="kv form2 chain-face">
                 <ChainSubscriptionCountryRow appId={app} chain={c} probe={probe} editable={editable} />
                 <IngressProjectionRow
@@ -4600,7 +4841,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             （路径、并发、Host、上行）在 IngressStreamRow 中构成独立的「XHTTP」一行。 */}
           {ingress ? (
             <>
-              <ConfigPanel title="协议">
+              <ConfigPanel title="协议" icon="protocol">
                 {/* 标题右端此前有一枚摘要角标（REALITY · TCP · VISION）。它不含新信息——
                     三层各取一个词，与下方三行下拉框一一对应，而那三行就在同一屏内、
                     永远展开。同一件事说两遍，去掉角标留下拉框。 */}
@@ -4613,11 +4854,20 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     }
                     editable={editable}
                     section="protocols"
+                    onVlessEnabledChange={vlessPanel.preview}
+                    onAnyTlsEnabledChange={anyTlsPanel.preview}
+                    onHy2EnabledChange={hy2Panel.preview}
                   />
                 </dl>
               </ConfigPanel>
-              {!!ingress.wires.vless && (
-                <IngressPanel appId={app} ingress={ingress} title="VLESS" editable={editable}>
+              {vlessPanel.visible && (
+                <IngressPanel
+                  appId={app}
+                  ingress={ingress}
+                  title="VLESS"
+                  editable={editable}
+                  panelRef={vlessPanel.panelRef}
+                >
                   <IngressStreamRow
                     appId={app}
                     ingress={ingress}
@@ -4626,11 +4876,18 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     }
                     editable={editable}
                     section="vless"
+                    vlessEnabled
                   />
                 </IngressPanel>
               )}
-              {!!ingress.wires.anytls && (
-                <IngressPanel appId={app} ingress={ingress} title="AnyTLS" editable={editable}>
+              {anyTlsPanel.visible && (
+                <IngressPanel
+                  appId={app}
+                  ingress={ingress}
+                  title="AnyTLS"
+                  editable={editable}
+                  panelRef={anyTlsPanel.panelRef}
+                >
                   <IngressStreamRow
                     appId={app}
                     ingress={ingress}
@@ -4639,11 +4896,18 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     }
                     editable={editable}
                     section="anytls"
+                    anytlsEnabled
                   />
                 </IngressPanel>
               )}
-              {!!ingress.wires.hysteria2 && (
-                <IngressPanel appId={app} ingress={ingress} title="Hysteria 2" editable={editable}>
+              {hy2Panel.visible && (
+                <IngressPanel
+                  appId={app}
+                  ingress={ingress}
+                  title="Hysteria 2"
+                  editable={editable}
+                  panelRef={hy2Panel.panelRef}
+                >
                   <IngressStreamRow
                     appId={app}
                     ingress={ingress}
@@ -4652,12 +4916,13 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     }
                     editable={editable}
                     section="hy2"
+                    hy2Enabled
                   />
                 </IngressPanel>
               )}
             </>
           ) : (
-            <ConfigPanel title="没有接入面">
+            <ConfigPanel title="没有接入面" icon="warn">
               <div className="callout warn" style={{ margin: 0 }}>
                 编译会报 <span className="mono">chain.no-ingress</span>，发布被挡。
                 没有接入面就没有链头，路径也无从排起。
@@ -4669,10 +4934,10 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
       {moveIngress.error && <ErrorBox error={moveIngress.error} />}
 
       {/* 线路与机器详情使用同一种规则卡：标题、摘要和规则树属于同一块，不再用独立的
-          `h4.sec` 分节线。卡面尺寸与用户页的「授权验证」一致。 */}
+          `h4.sec` 分节线。卡面尺寸与用户页的「网络拨测」一致。 */}
       <section className="panel config-panel rule-sheet-card node-chain-sheet">
         <header>
-          <h4>链路规则</h4>
+          <PanelTitle of="chains">链路规则</PanelTitle>
           <span className="rule-sheet-meta">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳中继`}</span>
         </header>
         {/* 此处不提供「追加一跳」和「改顺序」。这两项操作都在下方的规则表中完成：

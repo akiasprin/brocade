@@ -23,6 +23,7 @@ const MIN_ADMIN_PASSWORD_LEN: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdminRole {
+    User,
     Readonly,
     Editor,
     Publisher,
@@ -33,6 +34,7 @@ pub enum AdminRole {
 impl AdminRole {
     pub fn as_str(self) -> &'static str {
         match self {
+            AdminRole::User => "user",
             AdminRole::Readonly => "readonly",
             AdminRole::Editor => "editor",
             AdminRole::Publisher => "publisher",
@@ -109,18 +111,14 @@ pub struct IssuedAdminSession {
 
 /// The operator whose existence opens the console to anybody who loads the page.
 ///
-/// Not a role and not a flag on the settings: an operator, so that opening the console is done
-/// the same way as granting anyone else access, and closing it again is deleting a row that the
-/// operator list already shows. The id is fixed because the console has to recognise the account
-/// without being told which one it is.
+/// It remains a fixed internal login identity, while the product exposes it as a simple visitor
+/// switch rather than general operator management.
 pub const PUBLIC_OPERATOR_ID: &str = "public";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminAuthState {
     pub initialized: bool,
-    /// Whether the `public` operator exists *and* has no password. Both halves matter: giving
-    /// that account a password is how an administrator closes the door again without deleting
-    /// it, and the console must then stop letting visitors in on their own.
+    /// Whether the fixed passwordless visitor identity exists.
     pub public_open: bool,
 }
 
@@ -142,6 +140,21 @@ pub struct AuthenticatedAdmin {
     pub role: AdminRole,
     pub tenant_scope: Option<String>,
     pub token_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_user: Option<AuthenticatedUser>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedUser {
+    pub tenant_id: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedUserLogin {
+    pub operator_id: String,
+    pub password: String,
+    pub sessions_revoked: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +162,7 @@ pub struct AdminContext {
     operator_id: String,
     role: AdminRole,
     tenant_scope: Option<String>,
+    self_user: Option<AuthenticatedUser>,
 }
 
 impl AdminContext {
@@ -162,6 +176,7 @@ impl AdminContext {
             role,
             tenant_scope: tenant_scope
                 .and_then(|scope| normalize_optional_text(&scope).map(str::to_owned)),
+            self_user: None,
         }
     }
 
@@ -170,15 +185,18 @@ impl AdminContext {
             operator_id: operator_id.into(),
             role: AdminRole::SystemAdmin,
             tenant_scope: None,
+            self_user: None,
         }
     }
 
     pub fn from_authenticated(admin: &AuthenticatedAdmin) -> Self {
-        Self::new(
+        let mut actor = Self::new(
             admin.operator_id.clone(),
             admin.role,
             admin.tenant_scope.clone(),
-        )
+        );
+        actor.self_user = admin.self_user.clone();
+        actor
     }
 
     pub fn operator_id(&self) -> &str {
@@ -191,6 +209,10 @@ impl AdminContext {
 
     pub fn tenant_scope(&self) -> Option<&str> {
         self.tenant_scope.as_deref()
+    }
+
+    pub fn self_user(&self) -> Option<&AuthenticatedUser> {
+        self.self_user.as_ref()
     }
 
     pub fn is_system_admin(&self) -> bool {
@@ -267,6 +289,78 @@ pub async fn admin_auth_state(pool: &PgPool) -> Result<AdminAuthState> {
     })
 }
 
+/// Turn the fixed visitor identity on or off without exposing general operator management.
+///
+/// Disabling deletes the row so its browser sessions disappear through the session foreign key.
+/// Enabling recreates it as a passwordless readonly identity scoped to the installation's root
+/// tenant. User login identities are separate and are not affected.
+pub async fn set_public_access(
+    pool: &PgPool,
+    actor: &AdminContext,
+    enabled: bool,
+) -> Result<AdminAuthState> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can change visitor access".to_owned(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    if enabled {
+        let existing_scope: Option<Option<String>> =
+            sqlx::query_scalar("SELECT tenant_scope FROM admin_operators WHERE id = $1 FOR UPDATE")
+                .bind(PUBLIC_OPERATOR_ID)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let tenant_scope = match existing_scope.flatten() {
+            Some(scope) => scope,
+            None => sqlx::query_scalar::<_, String>(
+                "SELECT id
+                   FROM tenants
+                  ORDER BY array_length(string_to_array(id, '.'), 1), id
+                  LIMIT 1",
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                StoreError::InvalidData(
+                    "create the root tenant before enabling visitor access".to_owned(),
+                )
+            })?,
+        };
+        sqlx::query(
+            "INSERT INTO admin_operators (
+                id, display_name, role, tenant_scope, password_hash,
+                token_hash, token_prefix, token_created_at, token_last_used_at, token_revoked_at,
+                user_tenant_id, user_id
+             ) VALUES ($1, '访客', 'readonly', $2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+             ON CONFLICT (id) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                role = EXCLUDED.role,
+                tenant_scope = EXCLUDED.tenant_scope,
+                password_hash = NULL,
+                token_hash = NULL,
+                token_prefix = NULL,
+                token_created_at = NULL,
+                token_last_used_at = NULL,
+                token_revoked_at = NULL,
+                user_tenant_id = NULL,
+                user_id = NULL",
+        )
+        .bind(PUBLIC_OPERATOR_ID)
+        .bind(tenant_scope)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM admin_operators WHERE id = $1")
+            .bind(PUBLIC_OPERATOR_ID)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    admin_auth_state(pool).await
+}
+
 pub async fn init_admin(pool: &PgPool, request: AdminInitRequest) -> Result<AdminInitResult> {
     let operator_id = required_text(&request.operator_id, "admin operator id")?;
     let display_name = required_text(&request.display_name, "admin operator display_name")?;
@@ -311,13 +405,15 @@ pub async fn init_admin(pool: &PgPool, request: AdminInitRequest) -> Result<Admi
             role: AdminRole::SystemAdmin,
             tenant_scope: None,
             token_prefix: None,
+            self_user: None,
         },
         session,
     })
 }
 
 pub async fn login_admin(pool: &PgPool, request: AdminLoginRequest) -> Result<AdminLoginResult> {
-    let operator_id = required_text(&request.operator_id, "admin operator id")?;
+    let entered_id = required_text(&request.operator_id, "admin operator id")?;
+    let operator_id = resolve_password_login_id(pool, &entered_id).await?;
     let admin = authenticate_admin_password(pool, &operator_id, &request.password)
         .await?
         .ok_or_else(|| StoreError::Unauthorized("invalid admin credentials".to_owned()))?;
@@ -325,11 +421,44 @@ pub async fn login_admin(pool: &PgPool, request: AdminLoginRequest) -> Result<Ad
     Ok(AdminLoginResult { admin, session })
 }
 
+/// Keep the durable identity unambiguous (`tenant/user`) while making a one-tenant installation
+/// pleasant to sign into. An exact operator id always wins, so a short user alias can never
+/// shadow an administrator with the same id.
+async fn resolve_password_login_id(pool: &PgPool, entered_id: &str) -> Result<String> {
+    let exact_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_operators WHERE id = $1)")
+            .bind(entered_id)
+            .fetch_one(pool)
+            .await?;
+    if exact_exists {
+        return Ok(entered_id.to_owned());
+    }
+
+    let alias: Option<String> = sqlx::query_scalar(
+        "SELECT o.id
+         FROM admin_operators o
+         WHERE o.role = 'user'
+           AND o.user_id = $1
+           AND o.user_tenant_id = (SELECT min(id) FROM tenants)
+           AND (SELECT count(*) FROM tenants) = 1
+         LIMIT 1",
+    )
+    .bind(entered_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(alias.unwrap_or_else(|| entered_id.to_owned()))
+}
+
 pub async fn create_admin_operator(
     pool: &PgPool,
     actor: &AdminContext,
     request: CreateAdminOperatorRequest,
 ) -> Result<AdminOperator> {
+    if request.role == AdminRole::User {
+        return Err(StoreError::InvalidData(
+            "user logins must be managed from their user record".to_owned(),
+        ));
+    }
     validate_operator_request(&request)?;
     let id = request.id.trim();
     let display_name = request.display_name.trim();
@@ -430,6 +559,105 @@ pub async fn reset_admin_password(
     })
 }
 
+/// Enable a user's console login, or reset it when it already exists. User logins live in the
+/// same session system as administrators, while the immutable binding below prevents a password
+/// reset from ever turning into access to another user.
+pub async fn issue_user_login(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<IssuedUserLogin> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "user login")?;
+
+    let password = generate_admin_password()?;
+    let password_hash = hash_admin_password(&password)?;
+    let desired_operator_id = format!("{tenant_id}/{user_id}");
+    let mut tx = pool.begin().await?;
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE tenant_id = $1 AND id = $2)",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !exists {
+        return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
+    }
+
+    let existing_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM admin_operators
+         WHERE role = 'user' AND user_tenant_id = $1 AND user_id = $2",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let mut sessions_revoked = 0;
+    let operator_id = if existing_id.as_deref() == Some(desired_operator_id.as_str()) {
+        sqlx::query(
+            "UPDATE admin_operators
+             SET password_hash = $2,
+                 token_hash = NULL,
+                 token_prefix = NULL,
+                 token_created_at = NULL,
+                 token_last_used_at = NULL,
+                 token_revoked_at = NULL
+             WHERE id = $1",
+        )
+        .bind(&desired_operator_id)
+        .bind(&password_hash)
+        .execute(&mut *tx)
+        .await?;
+        desired_operator_id
+    } else {
+        let collision: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_operators WHERE id = $1)")
+                .bind(&desired_operator_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if collision {
+            return Err(StoreError::InvalidData(format!(
+                "login name {desired_operator_id} is already in use"
+            )));
+        }
+        // This also upgrades an identity created by the short-lived bare-user naming scheme.
+        // Its sessions are invalid after a reset anyway, so remove the old identity only after
+        // proving the requested bare login name is available.
+        if let Some(existing_id) = existing_id {
+            sessions_revoked += revoke_operator_sessions(&mut tx, &existing_id, None).await?;
+            sqlx::query("DELETE FROM admin_operators WHERE id = $1")
+                .bind(existing_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO admin_operators (
+                id, display_name, role, tenant_scope, password_hash,
+                user_tenant_id, user_id
+             ) VALUES ($1, $2, 'user', $3, $4, $3, $2)",
+        )
+        .bind(&desired_operator_id)
+        .bind(&user_id)
+        .bind(&tenant_id)
+        .bind(&password_hash)
+        .execute(&mut *tx)
+        .await?;
+        desired_operator_id
+    };
+
+    sessions_revoked += revoke_operator_sessions(&mut tx, &operator_id, None).await?;
+    tx.commit().await?;
+    Ok(IssuedUserLogin {
+        operator_id,
+        password,
+        sessions_revoked,
+    })
+}
+
 /// A self-service password change: verify the old password, install the new one, and drop this
 /// person's sessions elsewhere along the way. `keep_session_token` is the session that made
 /// this request — kept, so that changing a password does not log one out on the spot.
@@ -510,6 +738,7 @@ pub async fn list_admin_operators(
                     token_last_used_at::text AS token_last_used_at,
                     token_revoked_at::text AS token_revoked_at
              FROM admin_operators
+             WHERE role <> 'user'
              ORDER BY id",
         )
         .fetch_all(pool)
@@ -537,7 +766,7 @@ pub async fn list_admin_operators(
                     token_last_used_at::text AS token_last_used_at,
                     token_revoked_at::text AS token_revoked_at
              FROM admin_operators
-             WHERE role <> 'system-admin'
+             WHERE role NOT IN ('system-admin', 'user')
                AND (tenant_scope = $1 OR tenant_scope LIKE $2 ESCAPE '\\')
              ORDER BY id",
         )
@@ -561,6 +790,14 @@ pub async fn issue_admin_token(
         ));
     }
     ensure_admin_operator_access_allowed(pool, actor, operator_id).await?;
+    if load_admin_operator_identity(pool, operator_id)
+        .await?
+        .is_some_and(|operator| operator.role == AdminRole::User)
+    {
+        return Err(StoreError::Forbidden(
+            "user logins cannot hold admin API tokens".to_owned(),
+        ));
+    }
 
     let token = generate_admin_token()?;
     let token_hash = admin_token_hash(&token);
@@ -600,7 +837,7 @@ pub async fn authenticate_admin_token(
 
     let token_hash = admin_token_hash(token);
     let row = sqlx::query(
-        "SELECT id, role, tenant_scope, token_prefix,
+        "SELECT id, role, tenant_scope, token_prefix, user_tenant_id, user_id,
                 (token_last_used_at IS NULL
                  OR token_last_used_at < now() - ($2::int * interval '1 second')) AS touch_last_used
          FROM admin_operators
@@ -638,6 +875,7 @@ pub async fn authenticate_admin_token(
             role: parse_admin_role(row.try_get("role")?)?,
             tenant_scope: row.try_get("tenant_scope")?,
             token_prefix: row.try_get("token_prefix")?,
+            self_user: authenticated_user_from_row(&row)?,
         })
     })
     .transpose()
@@ -654,7 +892,7 @@ pub async fn authenticate_admin_session(
 
     let token_hash = admin_session_token_hash(token);
     let row = sqlx::query(
-        "SELECT o.id, o.role, o.tenant_scope,
+        "SELECT o.id, o.role, o.tenant_scope, o.user_tenant_id, o.user_id,
                 (s.last_used_at IS NULL
                  OR s.last_used_at < now() - ($2::int * interval '1 second')) AS touch_last_used
          FROM admin_sessions s
@@ -696,6 +934,7 @@ pub async fn authenticate_admin_session(
             role: parse_admin_role(row.try_get("role")?)?,
             tenant_scope: row.try_get("tenant_scope")?,
             token_prefix: None,
+            self_user: authenticated_user_from_row(&row)?,
         })
     })
     .transpose()
@@ -749,7 +988,7 @@ async fn authenticate_admin_password(
     password: &str,
 ) -> Result<Option<AuthenticatedAdmin>> {
     let Some(row) = sqlx::query(
-        "SELECT id, role, tenant_scope, password_hash
+        "SELECT id, role, tenant_scope, password_hash, user_tenant_id, user_id
          FROM admin_operators
          WHERE id = $1",
     )
@@ -782,6 +1021,7 @@ async fn authenticate_admin_password(
         role,
         tenant_scope: row.try_get("tenant_scope")?,
         token_prefix: None,
+        self_user: authenticated_user_from_row(&row)?,
     }))
 }
 
@@ -974,6 +1214,11 @@ async fn load_admin_operator_identity(
 }
 
 fn validate_operator_request(request: &CreateAdminOperatorRequest) -> Result<()> {
+    if request.role == AdminRole::User {
+        return Err(StoreError::InvalidData(
+            "user logins must be managed from their user record".to_owned(),
+        ));
+    }
     if request.id.trim().is_empty() {
         return Err(StoreError::InvalidData(
             "admin operator id must not be empty".to_owned(),
@@ -1017,6 +1262,7 @@ fn admin_operator_from_row(row: &sqlx::postgres::PgRow) -> Result<AdminOperator>
 
 fn parse_admin_role(value: String) -> Result<AdminRole> {
     match value.as_str() {
+        "user" => Ok(AdminRole::User),
         "readonly" => Ok(AdminRole::Readonly),
         "editor" => Ok(AdminRole::Editor),
         "publisher" => Ok(AdminRole::Publisher),
@@ -1025,6 +1271,18 @@ fn parse_admin_role(value: String) -> Result<AdminRole> {
         _ => Err(StoreError::InvalidData(format!(
             "unknown admin role {value}"
         ))),
+    }
+}
+
+fn authenticated_user_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<AuthenticatedUser>> {
+    let tenant_id: Option<String> = row.try_get("user_tenant_id")?;
+    let user_id: Option<String> = row.try_get("user_id")?;
+    match (tenant_id, user_id) {
+        (Some(tenant_id), Some(user_id)) => Ok(Some(AuthenticatedUser { tenant_id, user_id })),
+        (None, None) => Ok(None),
+        _ => Err(StoreError::InvalidData(
+            "operator has a partial user binding".to_owned(),
+        )),
     }
 }
 

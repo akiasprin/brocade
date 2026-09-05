@@ -8,6 +8,8 @@ import (
 )
 
 const (
+	frameHeaderSize = 7
+
 	// cmds
 	cmdWaste               = 0  // Paddings
 	cmdSYN                 = 1  // stream open
@@ -37,7 +39,7 @@ func (f *frame) toMultiBuffer() (buf.MultiBuffer, error) {
 		return nil, errors.New("anytls: frame payload too large")
 	}
 	hdr := buf.New()
-	hdrb := hdr.Extend(7)
+	hdrb := hdr.Extend(frameHeaderSize)
 	hdrb[0] = f.cmd
 	binary.BigEndian.PutUint32(hdrb[1:5], f.sid)
 	length := len(f.data)
@@ -63,7 +65,7 @@ func (f *frame) toMultiBufferWithBody(body *buf.Buffer) (buf.MultiBuffer, error)
 		return nil, errors.New("anytls: nil frame")
 	}
 	hdr := buf.New()
-	hdrb := hdr.Extend(7)
+	hdrb := hdr.Extend(frameHeaderSize)
 	hdrb[0] = f.cmd
 	binary.BigEndian.PutUint32(hdrb[1:5], f.sid)
 	if body == nil {
@@ -86,7 +88,7 @@ func (f *frame) toMultiBufferWithBody(body *buf.Buffer) (buf.MultiBuffer, error)
 
 type frameWriter struct {
 	bw     *buf.BufferedWriter
-	header [7]byte
+	header [frameHeaderSize]byte
 }
 
 func newFrameWriter(bw *buf.BufferedWriter) *frameWriter {

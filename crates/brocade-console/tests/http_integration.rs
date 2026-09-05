@@ -2731,6 +2731,165 @@ async fn http_settings_exposes_and_updates_global_reality_client_policy() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    sqlx::query(
+        "UPDATE users
+         SET account_type = 'test'
+         WHERE tenant_id = 'platform.acme' AND id = 'alice'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    seed_subscription_serving(&db).await;
+
+    let (app, admin_token) = admin_app(&db).await;
+    let issued = post_json(
+        &app,
+        &admin_token,
+        "/users/platform.acme/alice/login",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED);
+    assert_eq!(issued.1["operator_id"], "platform.acme/alice");
+    let password = issued.1["password"].as_str().unwrap();
+    let cookie = login_cookie(&app, "alice", password).await;
+
+    let whoami = get_json_with_cookie(&app, "/whoami", &cookie).await;
+    assert_eq!(whoami.0, StatusCode::OK);
+    assert_eq!(whoami.1["role"], "user");
+    assert_eq!(whoami.1["masked_assets"], true);
+    assert_eq!(whoami.1["self_user"]["tenant_id"], "platform.acme");
+    assert_eq!(whoami.1["self_user"]["user_id"], "alice");
+
+    let users = get_json_with_cookie(&app, "/users?include_disabled=true", &cookie).await;
+    assert_eq!(users.0, StatusCode::OK);
+    let general = &users.1["users"][0];
+    assert!(
+        general.get("uuid").is_none(),
+        "general list leaked UUID: {general}"
+    );
+    assert!(general.get("login_enabled").is_none());
+    assert_eq!(general["account_type"], "test");
+
+    let me = get_json_with_cookie(&app, "/me/user", &cookie).await;
+    assert_eq!(me.0, StatusCode::OK);
+    assert_eq!(me.1["uuid"], "2d2304da-f114-4574-8d44-625afdb1db5c");
+    assert_eq!(me.1["login_enabled"], true);
+
+    let artifact = get_json_with_cookie(&app, "/me/artifact", &cookie).await;
+    assert_eq!(artifact.0, StatusCode::OK);
+    assert!(artifact.1["content"]
+        .as_str()
+        .unwrap()
+        .contains("2d2304da-f114-4574-8d44-625afdb1db5c"));
+    let generic_artifact = get_json_with_cookie(
+        &app,
+        "/artifacts/content/user/platform.acme%3Aalice/uri?serving=true",
+        &cookie,
+    )
+    .await;
+    assert_eq!(generic_artifact.0, StatusCode::FORBIDDEN);
+
+    let capability = get_json_with_cookie(&app, "/grant-probes/capability", &cookie).await;
+    assert_eq!(capability.0, StatusCode::OK);
+    let own_probe = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/users/platform.acme/alice/grant-probes")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                // An invalid frozen id stops before any network activity if the local probe
+                // runtime is available; without Xray the capability gate returns unavailable.
+                .body(Body::from(
+                    json!({ "item_ids": ["not-in-plan"] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            own_probe.status(),
+            StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "the user's own probe must pass authorization without starting network work"
+    );
+    let another_users_probe = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/users/platform.acme/bob/grant-probes")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "item_ids": [] }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(another_users_probe.status(), StatusCode::FORBIDDEN);
+
+    let forbidden_rotate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/users/platform.acme/alice/rotate-uuid")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden_rotate.status(), StatusCode::FORBIDDEN);
+
+    let self_rotate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/me/rotate-uuid")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(self_rotate.status(), StatusCode::OK);
+    let rotated = response_json(self_rotate).await;
+    let rotated_uuid = rotated["user"]["uuid"].as_str().unwrap();
+    assert_ne!(rotated_uuid, "2d2304da-f114-4574-8d44-625afdb1db5c");
+    assert_eq!(
+        get_json_with_cookie(&app, "/me/user", &cookie).await.1["uuid"],
+        rotated_uuid
+    );
+
+    let update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/me/user")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::FORBIDDEN);
+}
+
 /// A reviewing role reads the model to check it and must not walk away with the
 /// addresses. What is asserted here is the property the masking layer exists for —
 /// that no raw address reaches such a viewer through *any* read endpoint — rather
@@ -2748,6 +2907,38 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
         "UPDATE control_state
          SET reality_dest = 'borrowed.example.net:443',
              reality_server_names = '[\"borrowed.example.net\"]'::jsonb",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cert_domains (id, domain, acme_directory)
+         VALUES ('readonly-mask-domain', 'huacu.io', 'https://acme.test/directory')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cert_labels (id, domain_id, label, name)
+         VALUES ('readonly-mask-label', 'readonly-mask-domain', 'a2335a6d', '只读脱敏测试')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO certificates (
+            id, label_id, cert_pem, key_pem_sealed, issued_at, expires_at, status
+         ) VALUES (
+            'readonly-mask-cert', 'readonly-mask-label', 'cert', 'sealed',
+            now(), now() + interval '30 days', 'serving'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_cert_label (node_id, label_id)
+         VALUES ('n1', 'readonly-mask-label')",
     )
     .execute(db.pool())
     .await
@@ -2794,6 +2985,10 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     assert_eq!(node["overlay_addr"], "10.66.***.***");
     assert_eq!(node["wireguard"]["listen_port"], "***");
     assert_eq!(node["api_port"], "***");
+    assert_eq!(
+        node["certificate_name"], "***.io",
+        "VLESS、AnyTLS 和 REALITY 共用的本机证书域名必须在服务端脱敏"
+    );
     let user = &snapshot.1["snapshot"]["users"][0];
     assert_eq!(user["id"], "alice");
     assert!(
@@ -2815,7 +3010,14 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     // The whole body, not the fields anybody thought to name: the fixture's
     // addresses must not survive anywhere in it, however deeply nested
     let text = snapshot.1.to_string();
-    for raw in ["10.66.0.1", "n1.example.net", "1.1.1.1", "51820", "10085"] {
+    for raw in [
+        "10.66.0.1",
+        "n1.example.net",
+        "a2335a6d.huacu.io",
+        "1.1.1.1",
+        "51820",
+        "10085",
+    ] {
         assert!(
             !text.contains(raw),
             "{raw} 漏在 /model/snapshot 里了：{text}"
@@ -2851,6 +3053,10 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     // above would prove nothing
     let full = get_json(&app, &admin_token, "/model/snapshot").await;
     assert_eq!(full.1["snapshot"]["nodes"][0]["overlay_addr"], "10.66.0.1");
+    assert_eq!(
+        full.1["snapshot"]["nodes"][0]["certificate_name"], "a2335a6d.huacu.io",
+        "管理员仍应看到完整证书域名"
+    );
     assert!(
         full.1["snapshot"]["users"][0]["uuid"].is_string(),
         "credential masking must apply only to readonly responses"
@@ -4729,7 +4935,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         return;
     };
     db.store.migrate().await.unwrap();
-    insert_node(db.pool()).await;
+    insert_usage_model(db.pool()).await;
     db.store
         .update_ping_probe_settings(
             &AdminContext::system_admin("fixture"),
@@ -4764,20 +4970,63 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         .unwrap();
 
     let (app, admin_token) = admin_app(&db).await;
-    let created = post_json(
+    let enabled = put_json(
         &app,
         &admin_token,
-        "/admin/operators",
-        json!({
-            "id": "public",
-            "display_name": "Public",
-            "role": "readonly",
-            "tenant_scope": "platform.acme"
-        }),
+        "/visitor-access",
+        json!({ "enabled": true }),
     )
     .await;
-    assert_eq!(created.0, StatusCode::CREATED);
+    assert_eq!(enabled.0, StatusCode::OK);
+    assert_eq!(enabled.1["public_open"], true);
     let cookie = login_cookie(&app, "public", "").await;
+
+    // Public access includes the system's masked user and usage views. The same response layer
+    // that masks machine addresses must keep UUID credentials and login state out of both the
+    // dedicated list and the model snapshot.
+    for path in [
+        "/users?include_disabled=true",
+        "/quotas",
+        "/usage/samples",
+        "/usage/monthly-summary",
+    ] {
+        assert_eq!(
+            get_json_with_cookie(&app, path, &cookie).await.0,
+            StatusCode::OK,
+            "public read-only view stayed closed: {path}"
+        );
+    }
+    let probe_plan =
+        get_json_with_cookie(&app, "/users/platform.acme/alice/grant-probes", &cookie).await;
+    assert!(
+        matches!(
+            probe_plan.0,
+            StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "public probe plan was refused by authorization: {}",
+        probe_plan.0
+    );
+    let users = get_json_with_cookie(&app, "/users?include_disabled=true", &cookie).await;
+    let listed_user = &users.1["users"][0];
+    assert_eq!(listed_user["id"], "alice");
+    assert!(listed_user.get("uuid").is_none());
+    assert!(listed_user.get("login_enabled").is_none());
+
+    let snapshot = get_json_with_cookie(&app, "/model/snapshot", &cookie).await;
+    assert_eq!(snapshot.0, StatusCode::OK);
+    assert_eq!(snapshot.1["snapshot"]["users"][0]["id"], "alice");
+    assert!(snapshot.1["snapshot"]["users"][0].get("uuid").is_none());
+    assert_eq!(
+        snapshot.1["snapshot"]["apps"][0]["grants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        snapshot.1["snapshot"]["apps"][0]["chains"][0]["id"],
+        "c-bacemu"
+    );
 
     let list = get_json_with_cookie(&app, "/ping-probe/nodes?window_secs=3600", &cookie).await;
     assert_eq!(list.0, StatusCode::OK);
@@ -4808,6 +5057,21 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
 
     let settings = get_json_with_cookie(&app, "/ping-probe/settings", &cookie).await;
     assert_eq!(settings.0, StatusCode::FORBIDDEN);
+
+    let disabled = put_json(
+        &app,
+        &admin_token,
+        "/visitor-access",
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(disabled.0, StatusCode::OK);
+    assert_eq!(disabled.1["public_open"], false);
+    assert_eq!(
+        get_json_with_cookie(&app, "/whoami", &cookie).await.0,
+        StatusCode::UNAUTHORIZED,
+        "disabling visitor access must close existing visitor sessions"
+    );
 }
 
 /// Sign in once and extract the session cookie for the requests that follow.

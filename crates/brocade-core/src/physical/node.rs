@@ -801,19 +801,41 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                     .is_some_and(RealitySettings::guards_fallback)
                     .then_some(0),
             });
-            let anytls = ingress.wires.anytls().map(|settings| XrayIngressPlan {
-                id: ingress.id.clone(),
-                tag: format!("{base_tag}:anytls"),
-                listen: ingress.bind,
-                port: settings.port,
-                sniff: ingress.sniff,
-                protocol: IngressProtocol::AnyTls(settings.clone()),
-                security: IngressSecurity::Tls,
-                certificate_name: ingress.certificate_name.clone(),
-                xhttp: None,
-                split: None,
-                cover_port: None,
-                guard_port: None,
+            let anytls = ingress.wires.anytls().map(|settings| {
+                let reality = settings.reality();
+                XrayIngressPlan {
+                    id: ingress.id.clone(),
+                    tag: format!("{base_tag}:anytls"),
+                    listen: ingress.bind,
+                    port: settings.port,
+                    sniff: ingress.sniff,
+                    protocol: IngressProtocol::AnyTls(settings.clone()),
+                    security: match reality {
+                        Some(params) => IngressSecurity::Reality {
+                            params: params.clone(),
+                            private_key: ingress
+                                .anytls_identity
+                                .as_ref()
+                                .map(|identity| identity.private_key.clone())
+                                .unwrap_or_default(),
+                            short_ids: ingress
+                                .anytls_identity
+                                .as_ref()
+                                .map(|identity| identity.short_ids.clone())
+                                .unwrap_or_default(),
+                        },
+                        None => IngressSecurity::Tls,
+                    },
+                    certificate_name: ingress.certificate_name.clone(),
+                    xhttp: None,
+                    split: None,
+                    cover_port: reality
+                        .is_some_and(RealitySettings::uses_node_certificate_fallback)
+                        .then_some(0),
+                    guard_port: reality
+                        .is_some_and(RealitySettings::guards_fallback)
+                        .then_some(0),
+                }
             });
             let quic = ingress.wires.hysteria2().map(|settings| XrayIngressPlan {
                 tag: format!("{base_tag}:hy2"),

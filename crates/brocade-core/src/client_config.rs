@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     hash::sha256_hex,
     model::{
-        ExternalOutbound, FrontStrategy, Hysteria2, HysteriaBandwidth, HysteriaCongestion,
-        HysteriaObfs, Ingress, ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint,
-        ProjectionEndpoint, Transport, XhttpMode, XhttpTuning, XhttpXmux,
+        AnyTlsSecurity, ExternalOutbound, FrontStrategy, Hysteria2, HysteriaBandwidth,
+        HysteriaCongestion, HysteriaObfs, Ingress, ModelSnapshot, Node, Projection,
+        ProjectionDownloadEndpoint, ProjectionEndpoint, Transport, XhttpMode, XhttpTuning,
+        XhttpXmux,
     },
 };
 
@@ -165,9 +166,19 @@ struct XhttpTopologyContract<'a> {
 /// AnyTLS values which must match the listener before a new public endpoint can be advertised.
 /// Padding, masquerade and client session pooling are deliberately absent.
 #[derive(Debug, Serialize)]
-struct AnyTlsTopologyContract<'a> {
-    port: u16,
-    certificate_name: Option<&'a str>,
+#[serde(tag = "security", rename_all = "kebab-case")]
+enum AnyTlsTopologyContract<'a> {
+    Tls {
+        port: u16,
+        certificate_name: Option<&'a str>,
+    },
+    Reality {
+        port: u16,
+        public_key: Option<&'a str>,
+        short_id: Option<&'a str>,
+        server_name: Option<&'a str>,
+        fingerprint: Option<&'a str>,
+    },
 }
 
 /// Hysteria 2 values which are either required to reach the listener or emitted by a supported
@@ -576,9 +587,32 @@ pub fn topology_contract_hash(nodes: &[Node], app_id: &str, ingress: &Ingress) -
         .find(|node| node.id == ingress.node)
         .and_then(|node| node.certificate_name.as_deref());
     let vless = vless_topology_contract(ingress, certificate_name);
-    let anytls = ingress.wires.anytls().map(|wire| AnyTlsTopologyContract {
-        port: wire.port,
-        certificate_name,
+    let anytls = ingress.wires.anytls().map(|wire| match wire.security {
+        AnyTlsSecurity::Tls => AnyTlsTopologyContract::Tls {
+            port: wire.port,
+            certificate_name,
+        },
+        AnyTlsSecurity::Reality => AnyTlsTopologyContract::Reality {
+            port: wire.port,
+            public_key: ingress
+                .anytls_identity
+                .as_ref()
+                .map(|identity| identity.public_key.as_str()),
+            short_id: ingress
+                .anytls_identity
+                .as_ref()
+                .and_then(|identity| identity.short_ids.first())
+                .map(String::as_str),
+            server_name: wire
+                .reality
+                .as_ref()
+                .and_then(|reality| reality.server_names.first())
+                .map(String::as_str),
+            fingerprint: wire
+                .reality
+                .as_ref()
+                .map(|reality| reality.fingerprint.as_str()),
+        },
     });
     let hysteria2 = ingress
         .wires

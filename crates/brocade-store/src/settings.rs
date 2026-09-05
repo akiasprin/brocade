@@ -81,7 +81,8 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             conn_downlink_only_secs,
             conn_buffer_size_kb,
             conn_handshake_secs,
-            stats_user_online
+            stats_user_online,
+            anytls_padding_scheme
          FROM control_state
          WHERE id = TRUE";
 
@@ -131,6 +132,10 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
             handshake_secs: secs("conn_handshake_secs")?,
         },
         stats_user_online: row.try_get("stats_user_online")?,
+        anytls_padding_scheme: crate::materialize::json_string_array(
+            "control_state.anytls_padding_scheme",
+            &row.try_get::<serde_json::Value, _>("anytls_padding_scheme")?,
+        )?,
         reality_client: RealityClientPolicy {
             min_client_ver: row.try_get("reality_min_client_ver")?,
             max_client_ver: row.try_get("reality_max_client_ver")?,
@@ -262,7 +267,8 @@ pub(crate) async fn update_settings_tx(
              conn_buffer_size_kb = $23,
              conn_handshake_secs = $24,
              stats_user_online = $25,
-             overlay_disabled_links = $26
+             overlay_disabled_links = $26,
+             anytls_padding_scheme = $27
          WHERE id = TRUE",
     )
     .bind(settings.reality_client.min_client_ver.as_deref())
@@ -302,6 +308,7 @@ pub(crate) async fn update_settings_tx(
     .bind(i32::try_from(settings.connection.handshake_secs).unwrap_or(i32::MAX))
     .bind(settings.stats_user_online)
     .bind(serde_json::to_value(&settings.overlay.disabled_links)?)
+    .bind(serde_json::to_value(&settings.anytls_padding_scheme)?)
     .execute(&mut **tx)
     .await?;
 
@@ -413,6 +420,12 @@ fn normalize_settings(settings: ModelSettings) -> ModelSettings {
         // Numbers, with nothing to trim or case-fold; they pass through untouched.
         connection: settings.connection,
         stats_user_online: settings.stats_user_online,
+        anytls_padding_scheme: settings
+            .anytls_padding_scheme
+            .into_iter()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect(),
         reality_client: RealityClientPolicy {
             min_client_ver: normalize_optional_text(settings.reality_client.min_client_ver),
             max_client_ver: normalize_optional_text(settings.reality_client.max_client_ver),
@@ -550,11 +563,93 @@ fn validate_settings(settings: &ModelSettings) -> Result<()> {
         settings.reality_site.flow.as_deref(),
         "settings.reality_site.flow",
     )?;
+    validate_anytls_padding_scheme(&settings.anytls_padding_scheme)?;
 
     validate_geodata(&settings.geodata)?;
     validate_connection_settings(&settings.connection)?;
 
     Ok(())
+}
+
+/// A global scheme is intentionally narrower than the full AnyTLS grammar accepted by an
+/// ingress override. The UI only generates this four-stage form, and enforcing that shape here
+/// preserves its useful guarantee: it can never spend more padding than the built-in scheme.
+fn validate_anytls_padding_scheme(lines: &[String]) -> Result<()> {
+    if lines.len() != 5 || lines.first().map(String::as_str) != Some("stop=4") {
+        return Err(StoreError::InvalidData(
+            "settings.anytls_padding_scheme 必须是 stop=4 加 0–3 四条精简规则".to_owned(),
+        ));
+    }
+
+    for (expected_key, expected_ranges, total_ceiling, line) in [
+        ("0", &[30][..], 30, &lines[1]),
+        ("1", &[100][..], 100, &lines[2]),
+        ("2", &[140, 260][..], 400, &lines[3]),
+        ("3", &[500][..], 500, &lines[4]),
+    ] {
+        let Some((key, range)) = line.split_once('=') else {
+            return Err(StoreError::InvalidData(format!(
+                "settings.anytls_padding_scheme 规则 {expected_key} 缺少 ="
+            )));
+        };
+        let ranges = range.split(",c,").collect::<Vec<_>>();
+        let parsed = ranges
+            .iter()
+            .zip(expected_ranges)
+            .map(|(range, ceiling)| {
+                let (from, to) = range.split_once('-')?;
+                let from = from.parse::<u32>().ok()?;
+                let to = to.parse::<u32>().ok()?;
+                (from > 0 && from <= to && to <= *ceiling).then_some((from, to))
+            })
+            .collect::<Option<Vec<_>>>();
+        let invalid = key != expected_key
+            || ranges.len() != expected_ranges.len()
+            || parsed
+                .as_ref()
+                .is_none_or(|ranges| ranges.iter().map(|(_, to)| to).sum::<u32>() > total_ceiling);
+        if invalid {
+            return Err(StoreError::InvalidData(format!(
+                "settings.anytls_padding_scheme 规则 {expected_key} 超出精简预算"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Fill the one-row control state once after schema migration. This is initialization rather
+/// than rotation: subsequent starts leave the stored scheme untouched, and operator-triggered
+/// regeneration still travels through the normal settings draft and release path.
+pub(crate) async fn ensure_anytls_padding_scheme(pool: &PgPool) -> Result<()> {
+    let scheme = random_anytls_padding_scheme()?;
+    sqlx::query(
+        "UPDATE control_state
+         SET anytls_padding_scheme = $1
+         WHERE id = TRUE AND anytls_padding_scheme = '[]'::jsonb",
+    )
+    .bind(serde_json::to_value(scheme)?)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn random_anytls_padding_scheme() -> Result<Vec<String>> {
+    let mut random = [0_u8; 10];
+    getrandom::fill(&mut random)?;
+    let pick =
+        |byte: u8, from: u16, to: u16| from + u16::from(byte) % (to.saturating_sub(from) + 1);
+    let zero = (pick(random[0], 20, 25), pick(random[1], 26, 30));
+    let one = (pick(random[2], 48, 72), pick(random[3], 80, 100));
+    let two_a = (pick(random[4], 80, 100), pick(random[5], 110, 140));
+    let two_b = (pick(random[6], 160, 200), pick(random[7], 220, 260));
+    let three = (pick(random[8], 160, 260), pick(random[9], 320, 500));
+    Ok(vec![
+        "stop=4".to_owned(),
+        format!("0={}-{}", zero.0, zero.1),
+        format!("1={}-{}", one.0, one.1),
+        format!("2={}-{},c,{}-{}", two_a.0, two_a.1, two_b.0, two_b.1),
+        format!("3={}-{}", three.0, three.1),
+    ])
 }
 
 /// What the four timeouts and the buffer are allowed to be. `handshake` is here too even
@@ -708,4 +803,41 @@ fn optional_i64(location: &str, value: Option<u64>) -> Result<Option<i64>> {
                 .map_err(|_| StoreError::InvalidData(format!("{location} out of range: {value}")))
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{random_anytls_padding_scheme, validate_anytls_padding_scheme};
+
+    #[test]
+    fn generated_anytls_padding_is_always_within_the_compact_budget() {
+        for _ in 0..256 {
+            let scheme = random_anytls_padding_scheme().unwrap();
+            validate_anytls_padding_scheme(&scheme).unwrap();
+            assert_eq!(scheme[0], "stop=4");
+            assert_eq!(scheme[3].matches(",c,").count(), 1);
+            assert!(!scheme[1].contains(",c,"));
+            assert!(!scheme[2].contains(",c,"));
+            assert!(!scheme[4].contains(",c,"));
+        }
+    }
+
+    #[test]
+    fn global_anytls_padding_rejects_native_or_more_expensive_shapes() {
+        let native = [
+            "stop=8",
+            "0=30-30",
+            "1=100-400",
+            "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+            "3=9-9,500-1000",
+            "4=500-1000",
+            "5=500-1000",
+            "6=500-1000",
+            "7=500-1000",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert!(validate_anytls_padding_scheme(&native).is_err());
+    }
 }

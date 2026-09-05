@@ -22,10 +22,10 @@ use brocade_core::{
     format::{ini, json as json_format, uri, yaml},
     hash::sha256_hex,
     model::{
-        Action, AnyTlsMasquerade, AppView, Chain, Dns, DomainStrategy, ExternalOutboundProtocol,
-        ExternalOutboundSecurity, ExternalWarpBinding, Front, Grant, HopEncryption, HopWire,
-        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressIdentity,
-        IngressWires, IngressWiresWire, ModelSnapshot, NodeConnection, Projection,
+        Action, AnyTlsMasquerade, AnyTlsSecurity, AppView, Chain, Dns, DomainStrategy,
+        ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding, Front, Grant,
+        HopEncryption, HopWire, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
+        IngressIdentity, IngressWires, IngressWiresWire, ModelSnapshot, NodeConnection, Projection,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
         RealityFallbackMode, RealityFallbackRateLimit, RealitySettings, RealityXhttp, Tls,
         TlsXhttp, Transport, User, WgTransport, Xhttp, XhttpTuning, EXTERNAL_WIREGUARD_MAX_WORKERS,
@@ -428,6 +428,51 @@ pub async fn update_user_status(
         revision_id,
         user: load_user_item(pool, tenant_id, user_id).await?,
     })
+}
+
+pub async fn user_profile(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<UserListItem> {
+    actor.require_tenant_access(tenant_id, "user profile")?;
+    load_user_item(pool, &tenant_id, &user_id).await
+}
+
+pub async fn self_user_profile(pool: &PgPool, actor: &AdminContext) -> Result<UserListItem> {
+    let user = actor
+        .self_user()
+        .ok_or_else(|| StoreError::Forbidden("operator is not bound to a user".to_owned()))?;
+    load_user_item(pool, &user.tenant_id, &user.user_id).await
+}
+
+/// Account type is operational identity data, not compiled network state, so it changes no
+/// revision and requires no deployment.
+pub async fn update_user_profile(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+    request: UpdateUserProfileRequest,
+) -> Result<UserListItem> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "user profile")?;
+    let result = sqlx::query(
+        "UPDATE users
+         SET account_type = $3
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .bind(request.account_type.as_str())
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
+    }
+    load_user_item(pool, &tenant_id, &user_id).await
 }
 
 pub(crate) async fn update_user_status_tx(
@@ -1864,6 +1909,8 @@ pub(crate) async fn upsert_ingress_tx(
     // Absent means on. Old callers submit the whole ingress on every edit, so treating absence as
     // off would turn any unrelated change made by one of them into silently removing the guard.
     let fallback_guard = reality.fallback_guard.unwrap_or(true);
+    let (anytls_reality_json, anytls_reality_effective) =
+        normalize_anytls_reality_request(request.wires.anytls.as_ref(), &site)?;
     ensure_app_exists_tx(tx, &app_id).await?;
     let chain_tenant = chain_tenant_tx(tx, &app_id, &chain_id).await?;
     actor.require_tenant_access(&chain_tenant, "ingress")?;
@@ -1967,8 +2014,16 @@ pub(crate) async fn upsert_ingress_tx(
         _ => ("not-found", None),
     };
     let anytls = request.wires.anytls.as_ref();
+    let anytls_security = match anytls.map(|settings| settings.security) {
+        Some(AnyTlsSecurity::Reality) => "reality",
+        _ => "tls",
+    };
     let anytls_padding_scheme = anytls
         .map(|settings| serde_json::to_value(&settings.padding_scheme))
+        .transpose()?;
+    let anytls_keypair = anytls.map(|_| generate_reality_keypair()).transpose()?;
+    let anytls_short_ids = anytls
+        .map(|_| generate_reality_short_id().map(|short_id| json!([short_id])))
         .transpose()?;
     let (
         anytls_masquerade_kind,
@@ -2022,7 +2077,10 @@ pub(crate) async fn upsert_ingress_tx(
             xhttp_download_v4_origin_port, xhttp_download_v6_origin_port,
             anytls_enabled, anytls_port, anytls_padding_scheme,
             anytls_masquerade_kind, anytls_masquerade_content,
-            anytls_masquerade_headers, anytls_masquerade_status_code
+            anytls_masquerade_headers, anytls_masquerade_status_code,
+            anytls_security, anytls_reality,
+            anytls_reality_private_key, anytls_reality_public_key,
+            anytls_reality_short_ids
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
@@ -2040,7 +2098,8 @@ pub(crate) async fn upsert_ingress_tx(
             $51, $52, $53, $54,
             $55, $56, $57, $58,
             $59, $60, $61,
-            $62, $63, $64, $65, $66, $67, $68
+            $62, $63, $64, $65, $66, $67, $68, $69, $70,
+            $71, $72, $73
          )
          ON CONFLICT (id) DO UPDATE SET
             app_id = EXCLUDED.app_id,
@@ -2106,6 +2165,20 @@ pub(crate) async fn upsert_ingress_tx(
             anytls_masquerade_content = EXCLUDED.anytls_masquerade_content,
             anytls_masquerade_headers = EXCLUDED.anytls_masquerade_headers,
             anytls_masquerade_status_code = EXCLUDED.anytls_masquerade_status_code,
+            anytls_security = EXCLUDED.anytls_security,
+            anytls_reality = EXCLUDED.anytls_reality,
+            anytls_reality_private_key = COALESCE(
+                ingresses.anytls_reality_private_key,
+                EXCLUDED.anytls_reality_private_key
+            ),
+            anytls_reality_public_key = COALESCE(
+                ingresses.anytls_reality_public_key,
+                EXCLUDED.anytls_reality_public_key
+            ),
+            anytls_reality_short_ids = COALESCE(
+                ingresses.anytls_reality_short_ids,
+                EXCLUDED.anytls_reality_short_ids
+            ),
             created_revision = COALESCE(ingresses.created_revision, EXCLUDED.created_revision)
          WHERE ROW(ingresses.app_id, ingresses.chain_id, ingresses.node_id, ingresses.bind,
                    ingresses.port, ingresses.front_id, ingresses.reality_dest,
@@ -2138,7 +2211,8 @@ pub(crate) async fn upsert_ingress_tx(
                    ingresses.xhttp_download_v6_origin_port,
                    ingresses.anytls_enabled, ingresses.anytls_port, ingresses.anytls_padding_scheme,
                    ingresses.anytls_masquerade_kind, ingresses.anytls_masquerade_content,
-                   ingresses.anytls_masquerade_headers, ingresses.anytls_masquerade_status_code)
+                   ingresses.anytls_masquerade_headers, ingresses.anytls_masquerade_status_code,
+                   ingresses.anytls_security, ingresses.anytls_reality)
             IS DISTINCT FROM
             ROW(EXCLUDED.app_id, EXCLUDED.chain_id, EXCLUDED.node_id, EXCLUDED.bind,
                 EXCLUDED.port, EXCLUDED.front_id, EXCLUDED.reality_dest,
@@ -2171,10 +2245,15 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.xhttp_download_v6_origin_port,
                 EXCLUDED.anytls_enabled, EXCLUDED.anytls_port, EXCLUDED.anytls_padding_scheme,
                 EXCLUDED.anytls_masquerade_kind, EXCLUDED.anytls_masquerade_content,
-                EXCLUDED.anytls_masquerade_headers, EXCLUDED.anytls_masquerade_status_code)
+                EXCLUDED.anytls_masquerade_headers, EXCLUDED.anytls_masquerade_status_code,
+                EXCLUDED.anytls_security, EXCLUDED.anytls_reality)
+            OR (EXCLUDED.anytls_enabled AND ingresses.anytls_reality_private_key IS NULL)
          RETURNING reality_private_key,
                    reality_public_key,
-                   reality_short_ids",
+                   reality_short_ids,
+                   anytls_reality_private_key,
+                   anytls_reality_public_key,
+                   anytls_reality_short_ids",
     )
     .bind(&id)
     .bind(&app_id)
@@ -2321,6 +2400,11 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(anytls_masquerade_content.unwrap_or_default())
     .bind(anytls_masquerade_headers.unwrap_or_else(|| json!({})))
     .bind(anytls_masquerade_status_code.unwrap_or(200))
+    .bind(anytls_security)
+    .bind(anytls_reality_json)
+    .bind(anytls_keypair.as_ref().map(|keypair| &keypair.private_key))
+    .bind(anytls_keypair.as_ref().map(|keypair| &keypair.public_key))
+    .bind(anytls_short_ids)
     .fetch_optional(&mut **tx)
     .await?;
     let client_changed = sqlx::query(
@@ -2395,7 +2479,9 @@ pub(crate) async fn upsert_ingress_tx(
         Some(row) => row,
         None => {
             sqlx::query(
-                "SELECT reality_private_key, reality_public_key, reality_short_ids
+                "SELECT reality_private_key, reality_public_key, reality_short_ids,
+                        anytls_reality_private_key, anytls_reality_public_key,
+                        anytls_reality_short_ids
              FROM ingresses WHERE id = $1",
             )
             .bind(&id)
@@ -2408,6 +2494,23 @@ pub(crate) async fn upsert_ingress_tx(
         private_key: row.try_get("reality_private_key")?,
         public_key: row.try_get("reality_public_key")?,
         short_ids: json_string_array(&row.try_get::<Value, _>("reality_short_ids")?)?,
+    };
+    let anytls_identity = match (
+        row.try_get::<Option<String>, _>("anytls_reality_private_key")?,
+        row.try_get::<Option<String>, _>("anytls_reality_public_key")?,
+        row.try_get::<Option<Value>, _>("anytls_reality_short_ids")?,
+    ) {
+        (None, None, None) => None,
+        (Some(private_key), Some(public_key), Some(short_ids)) => Some(IngressIdentity {
+            private_key,
+            public_key,
+            short_ids: json_string_array(&short_ids)?,
+        }),
+        _ => {
+            return Err(StoreError::InvalidData(
+                "AnyTLS REALITY identity is only partially populated".to_owned(),
+            ))
+        }
     };
     let effective = RealitySettings {
         // The response echoes the effective value: an unwritten site is filled in from
@@ -2435,6 +2538,10 @@ pub(crate) async fn upsert_ingress_tx(
         fallback_limits,
         fallback_guard,
     };
+    let mut response_anytls = request.wires.anytls.clone();
+    if let Some(anytls) = &mut response_anytls {
+        anytls.reality = anytls_reality_effective;
+    }
     let ingress = Ingress {
         id,
         chain: chain_id,
@@ -2443,6 +2550,7 @@ pub(crate) async fn upsert_ingress_tx(
         port: request.port,
         front: front_id,
         identity,
+        anytls_identity,
         projection,
         guard: request.guard,
         wires: IngressWires::try_from(IngressWiresWire {
@@ -2466,7 +2574,7 @@ pub(crate) async fn upsert_ingress_tx(
                         .expect("XHTTP request has normalized settings"),
                 }),
             }),
-            anytls: request.wires.anytls.clone(),
+            anytls: response_anytls,
             hysteria2: request.wires.hysteria2.clone(),
         })
         .map_err(|error| StoreError::InvalidData(error.to_owned()))?,
@@ -2650,9 +2758,6 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 l.completed_at::text AS lifecycle_completed_at,
                 l.last_error AS lifecycle_last_error,
                 oi.isolated_at::text AS isolated_at,
-                oi.actor AS isolated_by,
-                oi.reason AS isolation_reason,
-                oi.source_deployment_id AS isolation_source_deployment_id,
                 oi.node_id IS NOT NULL AS operationally_isolated,
                 COALESCE(debt.debt_count, 0) AS convergence_debt_count,
                 COALESCE(debt.debt_failed, FALSE) AS convergence_debt_failed,
@@ -2732,9 +2837,6 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 l.completed_at::text AS lifecycle_completed_at,
                 l.last_error AS lifecycle_last_error,
                 oi.isolated_at::text AS isolated_at,
-                oi.actor AS isolated_by,
-                oi.reason AS isolation_reason,
-                oi.source_deployment_id AS isolation_source_deployment_id,
                 oi.node_id IS NOT NULL AS operationally_isolated,
                 COALESCE(debt.debt_count, 0) AS convergence_debt_count,
                 COALESCE(debt.debt_failed, FALSE) AS convergence_debt_failed,
@@ -2951,9 +3053,6 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         lifecycle_last_error: row.try_get("lifecycle_last_error")?,
         operationally_isolated,
         isolated_at: row.try_get("isolated_at")?,
-        isolated_by: row.try_get("isolated_by")?,
-        isolation_reason: row.try_get("isolation_reason")?,
-        isolation_source_deployment_id: row.try_get("isolation_source_deployment_id")?,
         convergence_debt_count,
         convergence_debt_failed: row.try_get("convergence_debt_failed")?,
         service_reentry_ready,
@@ -3024,6 +3123,8 @@ fn user_item_from_row(row: &sqlx::postgres::PgRow) -> Result<UserListItem> {
         id: row.try_get("id")?,
         uuid: row.try_get("uuid")?,
         status: row.try_get("status")?,
+        account_type: parse_user_account_type(row.try_get("account_type")?)?,
+        login_enabled: row.try_get("login_enabled")?,
         created_at: row.try_get("created_at")?,
         created_revision: row
             .try_get::<Option<i64>, _>("created_revision")?
@@ -3034,7 +3135,13 @@ fn user_item_from_row(row: &sqlx::postgres::PgRow) -> Result<UserListItem> {
 
 async fn load_user_item(pool: &PgPool, tenant_id: &str, user_id: &str) -> Result<UserListItem> {
     let row = sqlx::query(
-        "SELECT tenant_id, id, uuid::text AS uuid, status,
+        "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                EXISTS (
+                    SELECT 1 FROM admin_operators o
+                    WHERE o.role = 'user'
+                      AND o.user_tenant_id = users.tenant_id
+                      AND o.user_id = users.id
+                ) AS login_enabled,
                 created_at::text AS created_at, created_revision
          FROM users
          WHERE tenant_id = $1 AND id = $2",
@@ -3055,7 +3162,7 @@ async fn load_tenant(pool: &PgPool, tenant_id: &str) -> Result<TenantListItem> {
                 t.created_revision,
                 (SELECT count(*) FROM nodes n WHERE n.tenant_id = t.id) AS node_count,
                 (SELECT count(*) FROM users u WHERE u.tenant_id = t.id) AS user_count,
-                (SELECT count(*) FROM admin_operators o WHERE o.tenant_scope = t.id) AS operator_count
+                (SELECT count(*) FROM admin_operators o WHERE o.tenant_scope = t.id AND o.role <> 'user') AS operator_count
          FROM tenants t
          WHERE t.id = $1",
     )
@@ -3612,6 +3719,81 @@ fn normalize_reality_request(
     })
 }
 
+/// AnyTLS owns a REALITY target separate from VLESS. Its request is nested in the AnyTLS wire,
+/// while the older top-level `reality` object remains VLESS-only. Only global and custom targets
+/// are accepted: a node certificate is the TLS mode, not an AnyTLS REALITY fallback mode.
+fn normalize_anytls_reality_request(
+    anytls: Option<&brocade_core::model::AnyTls>,
+    site: &brocade_core::model::RealitySite,
+) -> Result<(Option<Value>, Option<RealitySettings>)> {
+    let Some(anytls) = anytls else {
+        return Ok((None, None));
+    };
+    let requested = anytls.reality.clone().unwrap_or(RealitySettings {
+        dest: String::new(),
+        server_names: Vec::new(),
+        fingerprint: String::new(),
+        flow: None,
+        fallback_mode: RealityFallbackMode::GlobalSite,
+        fallback_limits: RealityFallbackLimits::Balanced,
+        fallback_guard: true,
+    });
+    if requested.fallback_mode == RealityFallbackMode::NodeCertificate {
+        return Err(StoreError::InvalidData(
+            "AnyTLS REALITY target must be global-site or custom-site".to_owned(),
+        ));
+    }
+    let mut normalized = normalize_reality_request(CreateRealityIngressRequest {
+        fallback_mode: Some(requested.fallback_mode),
+        fallback_limits: Some(requested.fallback_limits),
+        fallback_guard: Some(requested.fallback_guard),
+        dest: (!requested.dest.trim().is_empty()).then_some(requested.dest),
+        server_names: requested.server_names,
+        fingerprint: (!requested.fingerprint.trim().is_empty()).then_some(requested.fingerprint),
+        // Vision is a VLESS account flow. AnyTLS never stores or emits it.
+        flow: None,
+    })?;
+    let fallback_mode = normalized
+        .fallback_mode
+        .unwrap_or(RealityFallbackMode::GlobalSite);
+    match fallback_mode {
+        RealityFallbackMode::GlobalSite => {
+            normalized.dest = None;
+            normalized.server_names.clear();
+            normalized.fingerprint = None;
+        }
+        RealityFallbackMode::CustomSite => {
+            if normalized.dest.is_none() || normalized.server_names.is_empty() {
+                return Err(StoreError::InvalidData(
+                    "custom AnyTLS REALITY target requires dest and server_names".to_owned(),
+                ));
+            }
+        }
+        RealityFallbackMode::NodeCertificate => unreachable!("rejected above"),
+    }
+    let stored = RealitySettings {
+        dest: normalized.dest.unwrap_or_default(),
+        server_names: normalized.server_names,
+        fingerprint: normalized.fingerprint.unwrap_or_default(),
+        flow: None,
+        fallback_mode,
+        fallback_limits: normalized
+            .fallback_limits
+            .unwrap_or(RealityFallbackLimits::Balanced),
+        fallback_guard: normalized.fallback_guard.unwrap_or(true),
+    };
+    let mut effective = stored.clone();
+    if fallback_mode == RealityFallbackMode::GlobalSite {
+        effective.dest = site.dest.clone().unwrap_or_default();
+        effective.server_names = site.server_names.clone();
+        effective.fingerprint = site
+            .fingerprint
+            .clone()
+            .unwrap_or_else(|| "chrome".to_owned());
+    }
+    Ok((Some(serde_json::to_value(stored)?), Some(effective)))
+}
+
 fn validate_fallback_rate(rate: &RealityFallbackRateLimit, field: &str) -> Result<()> {
     if rate.bytes_per_sec == 0
         || rate.burst_bytes_per_sec == 0
@@ -3660,6 +3842,16 @@ fn normalize_user_status(value: &str) -> Result<&'static str> {
         "disabled" => Ok("disabled"),
         value => Err(StoreError::InvalidData(format!(
             "user status must be active or disabled, got {value}"
+        ))),
+    }
+}
+
+fn parse_user_account_type(value: String) -> Result<UserAccountType> {
+    match value.as_str() {
+        "formal" => Ok(UserAccountType::Formal),
+        "test" => Ok(UserAccountType::Test),
+        _ => Err(StoreError::InvalidData(format!(
+            "unknown user account type {value}"
         ))),
     }
 }

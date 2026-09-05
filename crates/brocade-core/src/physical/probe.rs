@@ -74,6 +74,7 @@ pub enum ProbeSecurity {
 pub struct ProbeAnyTlsParams {
     pub server_name: String,
     pub settings: AnyTls,
+    pub reality: Option<ProbeRealityParams>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,9 +120,29 @@ fn probe_security(ingress: &crate::ir::routing::Ingress) -> ProbeSecurity {
     // a protocol dimension of its own.
     if ingress.wires.vless().is_none() {
         if let Some(settings) = ingress.wires.anytls() {
+            let reality = settings.reality().map(|reality| ProbeRealityParams {
+                public_key: ingress
+                    .anytls_identity
+                    .as_ref()
+                    .map(|identity| identity.public_key.clone())
+                    .unwrap_or_default(),
+                short_id: ingress
+                    .anytls_identity
+                    .as_ref()
+                    .and_then(|identity| identity.short_ids.first())
+                    .cloned()
+                    .unwrap_or_default(),
+                server_name: reality.server_name(ingress.certificate_name.as_deref()),
+                fingerprint: reality.fingerprint.clone(),
+                flow: None,
+            });
             return ProbeSecurity::AnyTls(ProbeAnyTlsParams {
-                server_name: ingress.certificate_name.clone().unwrap_or_default(),
+                server_name: reality
+                    .as_ref()
+                    .map(|reality| reality.server_name.clone())
+                    .unwrap_or_else(|| ingress.certificate_name.clone().unwrap_or_default()),
                 settings: settings.clone(),
+                reality,
             });
         }
     }

@@ -988,8 +988,166 @@ fn an_anytls_ingress_writes_a_distinct_tls_listener_and_server_settings() {
     assert_eq!(anytls["streamSettings"]["network"], "tcp");
     assert_eq!(anytls["streamSettings"]["security"], "tls");
     assert_eq!(
+        anytls["streamSettings"]["sockopt"]["tcpFastOpen"], 256,
+        "AnyTLS listener must enable server-side TFO"
+    );
+    assert_eq!(
         anytls["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"],
         xray::NODE_CERTIFICATE_FILE
+    );
+}
+
+#[test]
+fn an_anytls_only_reality_ingress_uses_its_own_identity_and_custom_site() {
+    let hk = node("hk", [10, 66, 0, 1], true, Dns::System);
+    let doc = doc(vec![hk]);
+    let mut face = ingress("i", "c", "hk");
+    let mut reality = face.wires.reality().unwrap().clone();
+    reality.fallback_mode = RealityFallbackMode::CustomSite;
+    reality.fallback_guard = false;
+    let anytls_identity = brocade_core::model::IngressIdentity {
+        private_key: "anytls-priv-i".to_owned(),
+        public_key: "anytls-pub-i".to_owned(),
+        short_ids: vec!["89abcdef".to_owned()],
+    };
+    face.anytls_identity = Some(anytls_identity.clone());
+    face.wires = IngressWires::AnyTls(AnyTls {
+        port: 19443,
+        security: brocade_core::model::AnyTlsSecurity::Reality,
+        reality: Some(reality),
+        ..AnyTls::default()
+    });
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let anytls = inbound(&value, "in:app/i:anytls");
+    let reality = &anytls["streamSettings"]["realitySettings"];
+    assert_eq!(anytls["streamSettings"]["security"], "reality");
+    assert_eq!(reality["privateKey"], anytls_identity.private_key);
+    assert_ne!(reality["privateKey"], "priv-i");
+    assert_eq!(
+        reality["serverNames"],
+        serde_json::json!(["www.example.com"])
+    );
+    assert_eq!(reality["dest"], "www.example.com:443");
+    assert!(value["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|candidate| candidate["tag"] != "in:app/i:anytls:cover"));
+}
+
+#[test]
+fn vless_and_anytls_reality_keep_separate_sites_and_identities_when_both_are_enabled() {
+    let hk = node("hk", [10, 66, 0, 1], true, Dns::System);
+    let doc = doc(vec![hk]);
+    let mut face = ingress("i", "c", "hk");
+    let mut anytls_reality = face.wires.reality().unwrap().clone();
+    anytls_reality.dest = "cover.example.net:443".to_owned();
+    anytls_reality.server_names = vec!["cover.example.net".to_owned()];
+    anytls_reality.fallback_mode = RealityFallbackMode::CustomSite;
+    anytls_reality.fallback_guard = false;
+    let anytls_identity = brocade_core::model::IngressIdentity {
+        private_key: "anytls-priv-i".to_owned(),
+        public_key: "anytls-pub-i".to_owned(),
+        short_ids: vec!["89abcdef".to_owned()],
+    };
+    face.anytls_identity = Some(anytls_identity.clone());
+    face.wires = IngressWires::VlessAndAnyTls {
+        vless: face.wires.vless().unwrap().clone(),
+        anytls: AnyTls {
+            port: 19443,
+            security: brocade_core::model::AnyTlsSecurity::Reality,
+            reality: Some(anytls_reality),
+            ..AnyTls::default()
+        },
+    };
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let vless = &inbound(&value, "in:app/i")["streamSettings"]["realitySettings"];
+    let anytls = &inbound(&value, "in:app/i:anytls")["streamSettings"]["realitySettings"];
+    assert_eq!(vless["privateKey"], "priv-i");
+    assert_eq!(vless["serverNames"], serde_json::json!(["www.example.com"]));
+    assert_eq!(anytls["privateKey"], anytls_identity.private_key);
+    assert_eq!(
+        anytls["serverNames"],
+        serde_json::json!(["cover.example.net"])
+    );
+    assert_ne!(vless["privateKey"], anytls["privateKey"]);
+}
+
+#[test]
+fn an_anytls_ingress_without_an_override_uses_the_global_padding_scheme() {
+    let mut hk = node("hk", [10, 66, 0, 1], true, Dns::System);
+    hk.certificate_name = Some("hk.example.net".to_owned());
+    let mut doc = doc(vec![hk]);
+    doc.settings.anytls_padding_scheme = vec![
+        "stop=4".to_owned(),
+        "0=21-28".to_owned(),
+        "1=55-91".to_owned(),
+        "2=90-125,c,180-245".to_owned(),
+        "3=180-440".to_owned(),
+    ];
+    let mut face = ingress("i", "c", "hk");
+    face.wires = IngressWires::AnyTls(AnyTls {
+        port: 19443,
+        ..AnyTls::default()
+    });
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    assert_eq!(
+        inbound(&value, "in:app/i:anytls")["settings"]["paddingScheme"],
+        serde_json::json!(doc.settings.anytls_padding_scheme)
     );
 }
 
@@ -1401,6 +1559,7 @@ fn xray_reality_settings_include_global_client_policy() {
             max_time_diff_ms: Some(30_000),
         },
         reality_site: RealitySite::default(),
+        anytls_padding_scheme: brocade_core::model::default_anytls_padding_scheme(),
         overlay: OverlaySettings::default(),
         ports: Default::default(),
         probe: Default::default(),
@@ -3068,6 +3227,7 @@ fn ingress_with_flow(id: &str, chain: &str, node: &str, flow: Option<&str>) -> I
             public_key: format!("pub-{id}"),
             short_ids: vec!["0123abcd".to_owned()],
         },
+        anytls_identity: None,
         wires: IngressWires::Vless(Transport::VlessReality(
             brocade_core::model::RealitySettings {
                 dest: "www.example.com:443".to_owned(),

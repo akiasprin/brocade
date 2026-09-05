@@ -571,6 +571,7 @@ fn ingress(id: &str, chain: &str, node: &str, front: Option<&str>) -> Ingress {
             public_key: format!("pub-{id}"),
             short_ids: vec!["0123abcd".to_owned()],
         },
+        anytls_identity: None,
         wires: IngressWires::Vless(Transport::VlessReality(
             brocade_core::model::RealitySettings {
                 dest: "www.example.com:443".to_owned(),
@@ -1029,6 +1030,7 @@ fn anytls_subscription_carries_the_independent_port_and_tls_name() {
                 masquerade: AnyTlsMasquerade::NotFound {
                     headers: Default::default(),
                 },
+                ..AnyTls::default()
             },
         };
     });
@@ -1049,6 +1051,7 @@ fn anytls_subscription_carries_the_independent_port_and_tls_name() {
     assert!(!uri_text.contains("masquerade"), "{uri_text}");
 
     assert!(clash_text.contains("type: anytls"), "{clash_text}");
+    assert!(clash_text.contains("    tfo: true"), "{clash_text}");
     assert!(clash_text.contains("port: 19443"), "{clash_text}");
     assert!(clash_text.contains("password: uuid-alice"), "{clash_text}");
     assert!(
@@ -1068,6 +1071,42 @@ fn anytls_subscription_carries_the_independent_port_and_tls_name() {
     );
     assert!(!clash_text.contains("padding_scheme"), "{clash_text}");
     assert!(!clash_text.contains("masquerade"), "{clash_text}");
+}
+
+#[test]
+fn anytls_reality_subscription_carries_its_distinct_identity_in_both_formats() {
+    let (uri_text, clash_text) = render(|face| {
+        let reality = face.wires.reality().unwrap().clone();
+        face.anytls_identity = Some(brocade_core::model::IngressIdentity {
+            private_key: "anytls-private".to_owned(),
+            public_key: "anytls-public".to_owned(),
+            short_ids: vec!["89abcdef".to_owned()],
+        });
+        face.wires = IngressWires::AnyTls(AnyTls {
+            port: 19443,
+            security: brocade_core::model::AnyTlsSecurity::Reality,
+            reality: Some(reality),
+            ..AnyTls::default()
+        });
+    });
+
+    assert!(uri_text.contains("security=reality"), "{uri_text}");
+    assert!(uri_text.contains("fp=chrome"), "{uri_text}");
+    assert!(uri_text.contains("pbk="), "{uri_text}");
+    assert!(uri_text.contains("sid="), "{uri_text}");
+    assert!(
+        clash_text.contains("    client-fingerprint: chrome"),
+        "{clash_text}"
+    );
+    assert!(clash_text.contains("    reality-opts:"), "{clash_text}");
+    assert!(clash_text.contains("      public-key:"), "{clash_text}");
+    assert!(clash_text.contains("      short-id:"), "{clash_text}");
+    assert!(
+        clash_text.contains("public-key: anytls-public"),
+        "{clash_text}"
+    );
+    assert!(clash_text.contains("short-id: 89abcdef"), "{clash_text}");
+    assert!(!clash_text.contains("public-key: pub-i-hk"), "{clash_text}");
 }
 
 #[test]
@@ -1314,7 +1353,7 @@ fn an_ingress_serving_both_wires_lists_both_and_keeps_the_names_apart() {
 }
 
 #[test]
-fn dual_stack_dual_wire_names_put_quic_before_the_final_v6_marker() {
+fn dual_stack_subscription_keeps_each_protocols_v4_v6_pair_together() {
     let mut hk = node("hk", "203.0.113.7", [10, 66, 0, 1]);
     hk.public_ipv6 = Some("2001:db8::10".to_owned());
     hk.certificate_name = Some("hk-cert.example.net".to_owned());
@@ -1323,8 +1362,9 @@ fn dual_stack_dual_wire_names_put_quic_before_the_final_v6_marker() {
 
     let mut face = ingress("i-tw", "c-tw", "hk", None);
     let vless = face.wires.vless().unwrap().clone();
-    face.wires = IngressWires::Both {
+    face.wires = IngressWires::VlessAnyTlsAndHysteria2 {
         vless,
+        anytls: AnyTls::default(),
         hysteria2: Hysteria2::default(),
     };
     let mut tw_chain = chain("c-tw", "台湾 02 | CN2 🏡");
@@ -1357,9 +1397,11 @@ fn dual_stack_dual_wire_names_put_quic_before_the_final_v6_marker() {
         names,
         vec![
             "🇹🇼台湾 02 | CN2 🏡",
+            "🇹🇼台湾 02 | CN2 🏡 | v6",
+            "🇹🇼台湾 02 | CN2 🏡 | AnyTLS",
+            "🇹🇼台湾 02 | CN2 🏡 | AnyTLS | v6",
             "🇹🇼台湾 02 | CN2 🏡 | QUIC",
             "🇹🇼台湾 02 | CN2 🏡 | QUIC | v6",
-            "🇹🇼台湾 02 | CN2 🏡 | v6",
         ]
     );
 }

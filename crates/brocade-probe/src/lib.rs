@@ -415,6 +415,25 @@ fn anytls_client_config(
     if let Some(value) = anytls.min_idle_session {
         settings["minIdleSession"] = serde_json::json!(value);
     }
+    let mut stream_settings = if target.reality.public_key.is_empty() {
+        serde_json::json!({
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": anytls.server_name,
+            },
+        })
+    } else {
+        serde_json::json!({
+            "security": "reality",
+            "realitySettings": {
+                "serverName": target.reality.server_name,
+                "fingerprint": target.reality.fingerprint,
+                "publicKey": target.reality.public_key,
+                "shortId": target.reality.short_id,
+            },
+        })
+    };
+    stream_settings["sockopt"] = serde_json::json!({ "tcpFastOpen": true });
     let config = serde_json::json!({
         "log": {
             "loglevel": "info",
@@ -432,12 +451,7 @@ fn anytls_client_config(
             "tag": "probe-out",
             "protocol": "anytls",
             "settings": settings,
-            "streamSettings": {
-                "security": "tls",
-                "tlsSettings": {
-                    "serverName": anytls.server_name,
-                },
-            },
+            "streamSettings": stream_settings,
         }],
     });
     serde_json::to_string(&config).unwrap_or_default()
@@ -1259,6 +1273,13 @@ mod tests {
     #[test]
     fn an_anytls_target_produces_an_anytls_client() {
         let mut t = target(&[]);
+        t.reality = brocade_deployment::protocol::E2eProbeReality {
+            public_key: String::new(),
+            short_id: String::new(),
+            server_name: String::new(),
+            fingerprint: String::new(),
+            flow: None,
+        };
         t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
             server_name: "anytls.example.net".to_owned(),
             idle_session_check_interval_secs: Some(11),
@@ -1280,7 +1301,29 @@ mod tests {
             outbound["streamSettings"]["tlsSettings"]["serverName"],
             "anytls.example.net"
         );
+        assert_eq!(outbound["streamSettings"]["sockopt"]["tcpFastOpen"], true);
         assert!(outbound["streamSettings"].get("network").is_none());
+    }
+
+    #[test]
+    fn an_anytls_reality_target_produces_a_reality_client() {
+        let mut t = target(&[]);
+        t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
+            server_name: "example.com".to_owned(),
+            idle_session_check_interval_secs: None,
+            idle_session_timeout_secs: None,
+            min_idle_session: None,
+        });
+        let out: serde_json::Value =
+            serde_json::from_str(&client_config(&t, 1080, "/tmp/x")).unwrap();
+        let stream = &out["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["security"], "reality");
+        assert_eq!(stream["realitySettings"]["serverName"], "example.com");
+        assert_eq!(stream["realitySettings"]["publicKey"], "pk");
+        assert_eq!(stream["realitySettings"]["shortId"], "sid");
+        assert_eq!(stream["realitySettings"]["fingerprint"], "chrome");
+        assert_eq!(stream["sockopt"]["tcpFastOpen"], true);
+        assert!(stream.get("tlsSettings").is_none());
     }
 
     #[test]

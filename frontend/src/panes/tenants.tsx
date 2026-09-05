@@ -4,17 +4,12 @@ import { createTenant, fetchNodes, fetchOperators, fetchTenants, type AdminOpera
 import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
 
-// 判断某个操作者的范围是否覆盖某个租户。
-// 与服务端 `brocade-store/src/admin.rs` 的 `tenant_in_scope` 一致：路径相等，或
-// scope 之后紧跟一个点。段边界的判定不能省略——纯字符串前缀匹配会使
-// `platformx` 落入 `platform` 的范围，而它属于另一棵树。
-// system-admin 的 scope 为空但可访问全部（`can_access_tenant` 优先判断该角色），
-// 而 scope 为空的非 system-admin 属于全局只读，无法访问任何具体租户。
 const tenantInScope = (tenantId: string, scope: string) =>
   tenantId === scope || (tenantId.startsWith(scope) && tenantId[scope.length] === '.');
 
-const covers = (op: AdminOperator, tenantId: string) =>
-  op.role === 'system-admin' || (op.tenant_scope != null && tenantInScope(tenantId, op.tenant_scope));
+const covers = (admin: AdminOperator, tenantId: string) =>
+  admin.id !== 'public' &&
+  (admin.role === 'system-admin' || (admin.tenant_scope != null && tenantInScope(tenantId, admin.tenant_scope)));
 
 // 租户路径采用 platform.acme.sub 这类前缀形式，可见性即前缀包含关系。
 // 列表按路径排序后，子租户按段数缩进，即呈现为树形结构。
@@ -22,10 +17,9 @@ export function TenantsPane() {
   const { who } = useSession();
   const qc = useQueryClient();
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
-  // 展开一行需要的两份数据。获取失败时少显示一部分内容，不影响整页渲染——
-  // readonly 角色打开本页时 /admin/operators 可能返回 403，这是预期的权限行为而非错误。
+  // 展开一行需要机器与管理员名单。访客读不到管理员名单时只显示聚合数量。
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), retry: false });
-  const operators = useQuery({ queryKey: ['operators'], queryFn: () => fetchOperators(), retry: false });
+  const admins = useQuery({ queryKey: ['operators'], queryFn: () => fetchOperators(), retry: false });
 
   const [id, setId] = useState('');
   const [name, setName] = useState('');
@@ -49,7 +43,7 @@ export function TenantsPane() {
   const list = [...tenants.data.tenants].sort((a, b) => a.id.localeCompare(b.id));
   const editable = can(who.role, 'manage-tenants');
   const allNodes = nodes.data?.nodes ?? [];
-  const allOps = operators.data?.operators ?? [];
+  const allAdmins = admins.data?.operators ?? [];
   /* 示意中的两行使用实际的根租户作为示例，比使用 example.com 更易对应 */
   const root = list[0]?.id ?? 'platform';
 
@@ -118,14 +112,7 @@ export function TenantsPane() {
           <span className="p out">{root}x</span>
           <span className="d">不属于 {root} 的子树：需按段对齐，仅字符串前缀相同不算</span>
         </div>
-        <p className="note">
-          一个操作者的 <span className="mono">scope</span> 覆盖<b>它自身那一段及其下的整棵子树</b>。scope 为{' '}
-          <span className="mono">{root}</span> 时可见 <span className="mono">{root}.acme</span>
-          ，反之不成立。system-admin 不带 scope，可见全部。
-        </p>
-        <p className="note">
-          tenant-admin 管理的是<b>子树内的租户和操作者</b>，不含机器和控制面。
-        </p>
+        <p className="note">租户路径用于归组机器和用户；管理员可管理自身范围及其下的完整子树。</p>
       </div>
 
       {list.length === 0 ? (
@@ -140,7 +127,7 @@ export function TenantsPane() {
               <th>名称</th>
               <th>节点</th>
               <th>用户</th>
-              <th>操作者</th>
+              <th>管理员</th>
             </tr>
           </thead>
           <tbody>
@@ -151,7 +138,7 @@ export function TenantsPane() {
               // 直接归属于该租户的机器。不包含子树中的——那些属于子租户的机器，
               // 在子租户的行中展开时才与其计数对应。
               const mine = allNodes.filter(n => n.tenant_id === t.id);
-              const reach = allOps.filter(o => covers(o, t.id));
+              const reach = allAdmins.filter(admin => covers(admin, t.id));
               return [
                 <tr
                   key={t.id}
@@ -172,7 +159,7 @@ export function TenantsPane() {
                   <td className="mono" data-label="用户">
                     <span className="cnt">{t.user_count}</span>
                   </td>
-                  <td className="mono" data-label="操作者">
+                  <td className="mono" data-label="管理员">
                     <span className="cnt">{t.operator_count}</span>
                   </td>
                 </tr>,
@@ -181,28 +168,21 @@ export function TenantsPane() {
                     <td colSpan={5}>
                       <div className="in">
                         <div className="tnt-blk">
-                          <p className="bh">谁的范围覆盖它</p>
-                          {operators.error ? (
+                          <p className="bh">管理这个租户</p>
+                          {admins.error ? (
                             <p className="note dim" style={{ margin: 0 }}>
-                              取不到操作者名单。
+                              管理员名单仅管理员可见。
                             </p>
                           ) : reach.length === 0 ? (
                             <p className="note dim" style={{ margin: 0 }}>
-                              没有操作者的范围覆盖到这里。
+                              还没有管理员。
                             </p>
                           ) : (
                             <div className="chips">
-                              {reach.map(o => (
-                                <span className="chip" key={o.id}>
-                                  {o.id}
-                                  <span className="r">
-                                    {o.role} ·{' '}
-                                    {o.tenant_scope == null
-                                      ? '全局'
-                                      : o.tenant_scope === t.id
-                                        ? '本租户'
-                                        : `子树 ${o.tenant_scope}`}
-                                  </span>
+                              {reach.map(admin => (
+                                <span className="chip" key={admin.id}>
+                                  {admin.display_name || admin.id}
+                                  <span className="r">{admin.role === 'system-admin' ? '全局管理员' : admin.tenant_scope}</span>
                                 </span>
                               ))}
                             </div>

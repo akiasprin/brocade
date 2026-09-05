@@ -146,7 +146,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inb := sessionctx.InboundFromContext(ctx)
 	inb.Name = protocolName
 	inb.User = user
-	inb.CanSpliceCopy = 3
+	inb.CanSpliceCopy = 3 // Multiplexed AnyTLS frames must be decoded before delivery.
 
 	return sess.readLoop(sessionCtx)
 }

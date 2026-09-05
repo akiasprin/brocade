@@ -25,7 +25,7 @@ use brocade_deployment::protocol::{
 };
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
-    AbandonNodeRequest, AdminContext, AdminLoginRequest, AdminRole, ApplyDraftResult,
+    AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, ApplyDraftResult,
     CertDomainInput, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest,
     CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
@@ -33,12 +33,12 @@ use brocade_store::{
     LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment, PgStore,
     PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeTarget, ProbeTransport,
     ProvisionNodeRequest, PutStepRequest, RegisterWarpBindingRequest, RemoveWarpBindingRequest,
-    ReportedNodeState, RestoreNodeServiceRequest, SetUserAppQuotaRequest, StepAcceptRequest,
-    StoreError, TargetApplyResult, TargetConvergenceReport, TransportRequest,
-    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
-    UpdateRealtimeTelemetryPolicyRequest, UpdateUserStatusRequest, UpdateWarpBindingRequest,
-    UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest, VerifyDeploymentRequest,
-    WiresRequest, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
+    ReportedNodeState, SetUserAppQuotaRequest, StepAcceptRequest, StoreError, TargetApplyResult,
+    TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
+    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateRealtimeTelemetryPolicyRequest,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateWarpBindingRequest,
+    UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest, UserAccountType,
+    VerifyDeploymentRequest, WiresRequest, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -1039,11 +1039,47 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     .execute(db.pool())
     .await
     .unwrap();
+    // Simulate the operation-history and user-contact schema from an older development build.
+    // Replaying the one canonical migration must remove the history and contact data completely.
+    sqlx::raw_sql(
+        "ALTER TABLE users ADD COLUMN email TEXT;
+         ALTER TABLE users ADD COLUMN telegram TEXT;
+         UPDATE users SET email = 'alice@example.com', telegram = '@alice' WHERE id = 'alice';
+         ALTER TABLE node_lifecycle_state ADD COLUMN completed_by TEXT;
+         ALTER TABLE node_lifecycle_state ADD COLUMN reason TEXT;
+         ALTER TABLE node_operational_isolations ADD COLUMN actor TEXT;
+         ALTER TABLE node_operational_isolations ADD COLUMN reason TEXT;
+         ALTER TABLE node_operational_isolations ADD COLUMN source_deployment_id BIGINT;
+         CREATE TABLE audit_log (id BIGINT, payload JSONB);
+         CREATE TABLE node_lifecycle_events (id BIGINT, reason TEXT);
+         CREATE TABLE node_operational_isolation_events (id BIGINT, reason TEXT);
+         INSERT INTO audit_log VALUES (1, '{\"old\":true}'::jsonb);
+         INSERT INTO node_lifecycle_events VALUES (1, 'old lifecycle reason');
+         INSERT INTO node_operational_isolation_events VALUES (1, 'old restore reason');",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 1")
         .execute(db.pool())
         .await
         .unwrap();
     db.store.migrate().await.unwrap();
+    assert_table_missing(db.pool(), "audit_log").await;
+    assert_table_missing(db.pool(), "node_lifecycle_events").await;
+    assert_table_missing(db.pool(), "node_operational_isolation_events").await;
+    assert_column_missing(db.pool(), "users", "email").await;
+    assert_column_missing(db.pool(), "users", "telegram").await;
+    assert_column_missing(db.pool(), "node_lifecycle_state", "completed_by").await;
+    assert_column_missing(db.pool(), "node_lifecycle_state", "reason").await;
+    assert_column_missing(db.pool(), "node_operational_isolations", "actor").await;
+    assert_column_missing(db.pool(), "node_operational_isolations", "reason").await;
+    assert_column_missing(
+        db.pool(),
+        "node_operational_isolations",
+        "source_deployment_id",
+    )
+    .await;
     let replayed_app_order: Vec<String> =
         sqlx::query_scalar("SELECT id FROM apps ORDER BY position")
             .fetch_all(db.pool())
@@ -2514,7 +2550,21 @@ async fn global_settings_update_materializes_reality_client_policy() {
         return;
     };
     db.store.migrate().await.unwrap();
-    assert_eq!(db.store.settings().await.unwrap().ports.anytls_base, 16_000);
+    let initial_settings = db.store.settings().await.unwrap();
+    assert_eq!(initial_settings.ports.anytls_base, 16_000);
+    assert_eq!(initial_settings.anytls_padding_scheme.len(), 5);
+    assert_eq!(initial_settings.anytls_padding_scheme[0], "stop=4");
+    assert_eq!(
+        initial_settings.anytls_padding_scheme[3]
+            .matches(",c,")
+            .count(),
+        1
+    );
+    db.store.migrate().await.unwrap();
+    assert_eq!(
+        db.store.settings().await.unwrap().anytls_padding_scheme,
+        initial_settings.anytls_padding_scheme
+    );
 
     let result = db
         .store
@@ -2529,6 +2579,7 @@ async fn global_settings_update_materializes_reality_client_policy() {
                     max_time_diff_ms: Some(30_000),
                 },
                 reality_site: RealitySite::default(),
+                anytls_padding_scheme: brocade_core::model::default_anytls_padding_scheme(),
                 overlay: OverlaySettings::default(),
                 ports: PortSettings {
                     anytls_base: 16_123,
@@ -2583,6 +2634,7 @@ async fn global_settings_update_materializes_reality_client_policy() {
                     max_time_diff_ms: None,
                 },
                 reality_site: RealitySite::default(),
+                anytls_padding_scheme: brocade_core::model::default_anytls_padding_scheme(),
                 overlay: OverlaySettings::default(),
                 ports: Default::default(),
                 probe: Default::default(),
@@ -2798,7 +2850,11 @@ async fn deployment_schema_matches_convergence_design() {
     assert_table_exists(db.pool(), "node_lifecycle_state").await;
     assert_column_exists(db.pool(), "node_lifecycle_state", "lifecycle_epoch").await;
     assert_column_exists(db.pool(), "node_lifecycle_state", "phase").await;
-    assert_table_exists(db.pool(), "node_lifecycle_events").await;
+    assert_table_missing(db.pool(), "audit_log").await;
+    assert_table_missing(db.pool(), "node_lifecycle_events").await;
+    assert_table_missing(db.pool(), "node_operational_isolation_events").await;
+    assert_column_missing(db.pool(), "node_lifecycle_state", "completed_by").await;
+    assert_column_missing(db.pool(), "node_lifecycle_state", "reason").await;
     assert_table_exists(db.pool(), "deployment_wave_confirmations").await;
     assert_table_exists(db.pool(), "subscription_serving_state").await;
     assert_table_exists(db.pool(), "subscription_client_snapshots").await;
@@ -4365,6 +4421,7 @@ async fn connection_policy_bounds_hold_on_both_the_node_and_the_settings() {
                     conn_idle_secs: 0,
                     ..settings.connection
                 },
+                anytls_padding_scheme: settings.anytls_padding_scheme.clone(),
                 ..settings.clone()
             },
         )
@@ -4382,6 +4439,7 @@ async fn connection_policy_bounds_hold_on_both_the_node_and_the_settings() {
                     handshake_secs: 0,
                     ..settings.connection
                 },
+                anytls_padding_scheme: settings.anytls_padding_scheme.clone(),
                 ..settings
             },
         )
@@ -4769,6 +4827,82 @@ async fn redeem_node_enrollment_rejects_expired_tokens() {
         .redeem_node_enrollment(&result.enrollment.token)
         .await;
     assert!(matches!(expired, Err(StoreError::Unauthorized(_))));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn visitor_access_can_be_enabled_disabled_and_enabled_again() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, name)
+         VALUES ('platform', 'Platform'), ('platform.child', 'Child')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.store
+        .init_admin(AdminInitRequest {
+            operator_id: "admin".to_owned(),
+            display_name: "管理员".to_owned(),
+            password: "admin-password".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let enabled = db
+        .store
+        .set_public_access(&system_admin(), true)
+        .await
+        .unwrap();
+    assert!(enabled.public_open);
+    let scope: String =
+        sqlx::query_scalar("SELECT tenant_scope FROM admin_operators WHERE id = 'public'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(scope, "platform");
+    let tenants = db.store.list_tenants(&system_admin()).await.unwrap();
+    assert!(tenants
+        .tenants
+        .iter()
+        .all(|tenant| tenant.operator_count == 1));
+
+    let login = db
+        .store
+        .login_admin(AdminLoginRequest {
+            operator_id: "public".to_owned(),
+            password: String::new(),
+        })
+        .await
+        .unwrap();
+    let disabled = db
+        .store
+        .set_public_access(&system_admin(), false)
+        .await
+        .unwrap();
+    assert!(!disabled.public_open);
+    assert!(db
+        .store
+        .authenticate_admin_session(&login.session.token)
+        .await
+        .unwrap()
+        .is_none());
+
+    assert!(db
+        .store
+        .set_public_access(&tenant_admin("platform"), true)
+        .await
+        .is_err());
+    assert!(
+        db.store
+            .set_public_access(&system_admin(), true)
+            .await
+            .unwrap()
+            .public_open
+    );
 }
 
 #[tokio::test]
@@ -5274,6 +5408,126 @@ async fn admin_operator_password_set_reset_and_change() {
         .reset_admin_password(&acme_admin, "other-editor")
         .await;
     assert!(matches!(outside, Err(StoreError::Forbidden(_))));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_login_is_bound_to_one_user_and_resets_in_place() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.acme', 'Platform Acme')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (tenant_id, id, uuid) VALUES
+             ('platform.acme', 'alice', gen_random_uuid()),
+             ('platform.acme', 'bob', gen_random_uuid())",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let profile = db
+        .store
+        .update_user_profile(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            UpdateUserProfileRequest {
+                account_type: UserAccountType::Test,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile.account_type, UserAccountType::Test);
+
+    let issued = db
+        .store
+        .issue_user_login(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_eq!(issued.operator_id, "platform.acme/alice");
+    // With one tenant the short alias is accepted, while the authenticated identity remains
+    // the durable tenant-qualified operator id.
+    let session = db
+        .store
+        .login_admin(AdminLoginRequest {
+            operator_id: "alice".to_owned(),
+            password: issued.password.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(session.admin.operator_id, issued.operator_id);
+    assert_eq!(session.admin.role, AdminRole::User);
+    let self_user = session.admin.self_user.as_ref().unwrap();
+    assert_eq!(self_user.tenant_id, "platform.acme");
+    assert_eq!(self_user.user_id, "alice");
+
+    let actor = AdminContext::from_authenticated(&session.admin);
+    let own_profile = db.store.self_user_profile(&actor).await.unwrap();
+    assert_eq!(own_profile.account_type, UserAccountType::Test);
+
+    let operators = db
+        .store
+        .list_admin_operators(&system_admin())
+        .await
+        .unwrap();
+    assert!(operators
+        .iter()
+        .all(|operator| operator.id != issued.operator_id));
+
+    let reset = db
+        .store
+        .issue_user_login(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_eq!(reset.operator_id, issued.operator_id);
+    assert_eq!(reset.sessions_revoked, 1);
+    assert!(db
+        .store
+        .authenticate_admin_session(&session.session.token)
+        .await
+        .unwrap()
+        .is_none());
+    let old_password = db
+        .store
+        .login_admin(AdminLoginRequest {
+            operator_id: issued.operator_id,
+            password: issued.password,
+        })
+        .await;
+    assert!(matches!(old_password, Err(StoreError::Unauthorized(_))));
+    db.store
+        .login_admin(AdminLoginRequest {
+            operator_id: reset.operator_id.clone(),
+            password: reset.password.clone(),
+        })
+        .await
+        .unwrap();
+
+    // The shortcut closes as soon as a second tenant exists; the qualified login is unchanged.
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.other', 'Platform Other')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let ambiguous_short = db
+        .store
+        .login_admin(AdminLoginRequest {
+            operator_id: "alice".to_owned(),
+            password: reset.password.clone(),
+        })
+        .await;
+    assert!(matches!(ambiguous_short, Err(StoreError::Unauthorized(_))));
+    db.store
+        .login_admin(AdminLoginRequest {
+            operator_id: reset.operator_id,
+            password: reset.password,
+        })
+        .await
+        .unwrap();
 }
 
 /// Passwordless login is a named public surface, never a property that can be attached to an
@@ -6108,8 +6362,8 @@ async fn tenant_scoped_deployment_filters_targets_and_visibility() {
     // An out-of-scope node being isolated does not turn a tenant-scoped order into a global
     // serving proof. It has no target or obligation tying it to this revision.
     sqlx::query(
-        "INSERT INTO node_operational_isolations (node_id, actor, reason)
-         VALUES ('n-other', 'test', 'outside the scoped deployment')",
+        "INSERT INTO node_operational_isolations (node_id)
+         VALUES ('n-other')",
     )
     .execute(db.pool())
     .await
@@ -6269,7 +6523,6 @@ async fn retirement_fences_old_target_and_converges_through_teardown_deployment(
             "n1",
             brocade_store::UpdateNodeStatusRequest {
                 status: "retired".to_owned(),
-                note: Some("characterize retirement overlap".to_owned()),
             },
         )
         .await
@@ -6440,7 +6693,7 @@ async fn retirement_fences_old_target_and_converges_through_teardown_deployment(
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses_a_new_epoch() {
+async fn forced_retirement_is_a_fenced_terminal_state_and_restore_uses_a_new_epoch() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -6455,7 +6708,6 @@ async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses
             "n1",
             brocade_store::UpdateNodeStatusRequest {
                 status: "retired".to_owned(),
-                note: Some("force retirement setup".to_owned()),
             },
         )
         .await
@@ -6477,7 +6729,6 @@ async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses
             "n1",
             brocade_store::UpdateNodeStatusRequest {
                 status: "retired".to_owned(),
-                note: Some("repair canceled teardown".to_owned()),
             },
         )
         .await
@@ -6486,18 +6737,7 @@ async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses
     assert_eq!(repaired.lifecycle.lifecycle_epoch, 1);
     assert_ne!(repaired.deployment_id, Some(first_teardown));
 
-    let abandoned = db
-        .store
-        .abandon_node(
-            &system_admin(),
-            "n1",
-            AbandonNodeRequest {
-                reason: "machine is permanently unreachable".to_owned(),
-                unregister_warp: false,
-            },
-        )
-        .await
-        .unwrap();
+    let abandoned = db.store.abandon_node(&system_admin(), "n1").await.unwrap();
     assert_eq!(abandoned.lifecycle.lifecycle_epoch, 2);
     assert_eq!(
         abandoned.lifecycle.phase,
@@ -6547,23 +6787,6 @@ async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses
     assert_eq!(terminal_verify.summary.total_targets, 1);
     assert_eq!(terminal_verify.summary.changed_targets, 1);
 
-    let events = sqlx::query_as::<_, (i64, String)>(
-        "SELECT lifecycle_epoch, event
-           FROM node_lifecycle_events
-          WHERE node_id = 'n1'
-          ORDER BY lifecycle_epoch, id",
-    )
-    .fetch_all(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(
-        events,
-        vec![
-            (1, "retirement-requested".to_owned()),
-            (2, "retirement-abandoned".to_owned()),
-        ]
-    );
-
     let restored = db
         .store
         .update_node_status(
@@ -6571,7 +6794,6 @@ async fn forced_retirement_is_a_fenced_auditable_terminal_state_and_restore_uses
             "n1",
             brocade_store::UpdateNodeStatusRequest {
                 status: "active".to_owned(),
-                note: Some("machine recovered".to_owned()),
             },
         )
         .await
@@ -6620,7 +6842,6 @@ async fn isolated_node_retirement_tears_down_and_reactivation_creates_new_epoch_
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "pending".to_owned(),
-                reason: "test lifecycle while isolated".to_owned(),
                 acknowledge_uncertain: false,
             },
         )
@@ -6634,7 +6855,6 @@ async fn isolated_node_retirement_tears_down_and_reactivation_creates_new_epoch_
             "n1",
             brocade_store::UpdateNodeStatusRequest {
                 status: "retired".to_owned(),
-                note: Some("retire isolated node".to_owned()),
             },
         )
         .await
@@ -6670,7 +6890,6 @@ async fn isolated_node_retirement_tears_down_and_reactivation_creates_new_epoch_
             "n1",
             brocade_store::UpdateNodeStatusRequest {
                 status: "active".to_owned(),
-                note: Some("reactivate but keep operational isolation".to_owned()),
             },
         )
         .await
@@ -6730,7 +6949,6 @@ async fn retirement_and_an_inflight_agent_report_have_one_serializable_winner_wi
                 "n1",
                 brocade_store::UpdateNodeStatusRequest {
                     status: "retired".to_owned(),
-                    note: Some("race an in-flight report".to_owned()),
                 },
             )
         )
@@ -9057,6 +9275,56 @@ async fn exact_xray_epoch_rejects_counter_regression_and_new_epoch_marks_a_gap()
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn later_sequence_in_the_same_second_is_a_benign_usage_noop() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+
+    let first = db
+        .store
+        .record_usage_report("n1", protocol_v3_usage(1, base, "boot-a:100", 100, 200))
+        .await
+        .unwrap();
+    assert_eq!(first.accepted_readings, 1);
+
+    // A release's pre-change sample and the periodic sampler can run serially but still share
+    // one whole-second timestamp. The later sequence is neither an old report nor a counter
+    // regression, and must not raise the node page's rejected-counter warning.
+    let same_second = db
+        .store
+        .record_usage_report("n1", protocol_v3_usage(2, base, "boot-a:100", 130, 240))
+        .await
+        .unwrap();
+    assert_eq!(same_second.accepted_readings, 0);
+    assert_eq!(same_second.inserted_samples, 0);
+    assert_eq!(same_second.rejected_counters, 0);
+
+    let later = db
+        .store
+        .record_usage_report(
+            "n1",
+            protocol_v3_usage(3, base + 30, "boot-a:100", 160, 300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(later.accepted_readings, 1);
+    assert_eq!(later.inserted_samples, 1);
+    assert_eq!(later.rejected_counters, 0);
+
+    let bytes: (i64, i64) = sqlx::query_as(
+        "SELECT uplink_bytes, downlink_bytes FROM usage_samples ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(bytes, (60, 100), "same-second growth is deferred, not lost");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn legacy_report_after_an_exact_epoch_does_not_rebill_climbing_counters() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -10543,6 +10811,7 @@ async fn quota_enforcement_publishes_when_only_grants_change() {
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
 
     // Converge n1 first, after which only grants change in the model
     db.store
@@ -10570,7 +10839,9 @@ async fn quota_enforcement_publishes_when_only_grants_change() {
         "配置已经对齐，名单不该被推迟：{:?}",
         outcome.deferred
     );
-    let deployment_id = outcome.deployment_id.expect("应该自己发了一次");
+    let deployment_id = outcome
+        .deployment_id
+        .unwrap_or_else(|| panic!("应该自己发了一次：{outcome:?}"));
 
     let row = sqlx::query("SELECT actor, revision_id FROM deployments WHERE id = $1")
         .bind(deployment_id)
@@ -10631,8 +10902,34 @@ async fn quota_enforcement_publishes_when_only_grants_change() {
 
     // And it needs no confirmation — grant-only is wave 0 and non-destructive, so the agent claims
     // it on its next round
-    let claimable = db.store.claim_desired_for_node("n1").await.unwrap();
-    assert!(claimable.is_some(), "grant-only 发布不该卡在波次确认上");
+    let claimable = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("grant-only 发布不该卡在波次确认上");
+    db.store
+        .report_target_result(applied_report(&claimable))
+        .await
+        .unwrap();
+
+    let detail = db
+        .store
+        .deployment_detail(&system_admin(), deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(detail.status, "succeeded");
+    assert_eq!(
+        detail.activation_status, "activated",
+        "配额发布属于全局授权队列，执行完成后必须推进 Serving，不能永久待生效"
+    );
+    let serving_revision: i64 = sqlx::query_scalar(
+        "SELECT permissions_revision_id FROM subscription_serving_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(serving_revision as u64, outcome.revision_id);
 }
 
 #[tokio::test]
@@ -13985,6 +14282,57 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
         "client-only tuning must not create a deployment"
     );
 
+    let mut reality_face = face(Some(12), Some(24), None);
+    let anytls = reality_face.wires.anytls.as_mut().unwrap();
+    anytls.security = brocade_core::model::AnyTlsSecurity::Reality;
+    let third = db
+        .store
+        .upsert_ingress(&system_admin(), "app-main", reality_face)
+        .await
+        .unwrap();
+    assert!(third.revision_id > second.revision_id);
+    let stored_security: String =
+        sqlx::query_scalar("SELECT anytls_security FROM ingresses WHERE id = 'i-main'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_security, "reality");
+    let stored_identities: (
+        String,
+        String,
+        serde_json::Value,
+        String,
+        String,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT reality_private_key, reality_public_key, reality_short_ids,
+                    anytls_reality_private_key, anytls_reality_public_key,
+                    anytls_reality_short_ids
+               FROM ingresses
+              WHERE id = 'i-main'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_ne!(stored_identities.0, stored_identities.3);
+    assert_ne!(stored_identities.1, stored_identities.4);
+    assert_ne!(stored_identities.2, stored_identities.5);
+    let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    let ingress = &snapshot.apps[0].ingresses[0];
+    let anytls = ingress.wires.anytls().unwrap();
+    assert_eq!(
+        anytls.security,
+        brocade_core::model::AnyTlsSecurity::Reality
+    );
+    assert_eq!(
+        anytls.reality.as_ref().unwrap().fallback_mode,
+        RealityFallbackMode::GlobalSite
+    );
+    let anytls_identity = ingress.anytls_identity.as_ref().unwrap();
+    assert_ne!(ingress.identity.private_key, anytls_identity.private_key);
+    assert_ne!(ingress.identity.public_key, anytls_identity.public_key);
+    assert_ne!(ingress.identity.short_ids, anytls_identity.short_ids);
+
     let oversized = sqlx::query(
         "UPDATE ingress_client_settings
             SET anytls_idle_session_timeout = 4294967296
@@ -14411,7 +14759,6 @@ async fn isolated_target_becomes_supersedable_debt_and_requires_explicit_reentry
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "pending".to_owned(),
-                reason: "test node is unreachable".to_owned(),
                 acknowledge_uncertain: false,
             },
         )
@@ -14548,13 +14895,7 @@ async fn isolated_target_becomes_supersedable_debt_and_requires_explicit_reentry
 
     let restored = db
         .store
-        .restore_node_service(
-            &system_admin(),
-            "n1",
-            RestoreNodeServiceRequest {
-                reason: "test convergence and runtime checks passed".to_owned(),
-            },
-        )
+        .restore_node_service(&system_admin(), "n1")
         .await
         .unwrap();
     assert!(!restored.isolated);
@@ -14599,7 +14940,6 @@ async fn isolating_a_dispatched_target_requires_ack_and_fences_its_report() {
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "dispatched".to_owned(),
-                reason: "agent disappeared after claim".to_owned(),
                 acknowledge_uncertain: false,
             },
         )
@@ -14614,7 +14954,6 @@ async fn isolating_a_dispatched_target_requires_ack_and_fences_its_report() {
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "dispatched".to_owned(),
-                reason: "agent disappeared after claim".to_owned(),
                 acknowledge_uncertain: true,
             },
         )
@@ -14711,7 +15050,6 @@ async fn rollback_over_an_isolated_node_activates_with_replacement_debt() {
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "pending".to_owned(),
-                reason: "isolate before rollback".to_owned(),
                 acknowledge_uncertain: false,
             },
         )
@@ -14782,7 +15120,6 @@ async fn isolated_config_debt_does_not_block_grants_on_healthy_nodes() {
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "pending".to_owned(),
-                reason: "n1 unavailable during release".to_owned(),
                 acknowledge_uncertain: false,
             },
         )
@@ -14976,7 +15313,6 @@ async fn isolated_grants_wait_for_an_in_flight_config_obligation() {
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "pending".to_owned(),
-                reason: "test config claim serialization".to_owned(),
                 acknowledge_uncertain: false,
             },
         )
@@ -15076,7 +15412,6 @@ async fn service_restore_and_new_grant_leave_no_orphaned_isolation_debt() {
             "n1",
             IsolateDeploymentTargetRequest {
                 expected_target_status: "pending".to_owned(),
-                reason: "prepare restore and grant race".to_owned(),
                 acknowledge_uncertain: false,
             },
         )
@@ -15132,13 +15467,7 @@ async fn service_restore_and_new_grant_leave_no_orphaned_isolation_debt() {
     let admin = system_admin();
     let (restore, automation) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(
-            db.store.restore_node_service(
-                &admin,
-                "n1",
-                RestoreNodeServiceRequest {
-                    reason: "race-safe restore".to_owned(),
-                },
-            ),
+            db.store.restore_node_service(&admin, "n1"),
             db.store.process_grant_automation(),
         )
     })

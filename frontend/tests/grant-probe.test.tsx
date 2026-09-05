@@ -46,7 +46,7 @@ const finishedJob: GrantProbeJob = {
   serving_revision: plan.serving_revision,
   serving_generation: plan.serving_generation,
   status: 'completed',
-  message: '全部授权验证通过',
+  message: '网络拨测全部通过',
   created_at_unix_secs: 1,
   finished_at_unix_secs: 2,
   items: plan.items.map(item => ({ ...item, status: 'passed', ttfb_ms: 42, detail: null })),
@@ -90,6 +90,7 @@ describe('user grant probe', () => {
     vi.stubGlobal('fetch', fetchMock);
     const view = render(<GrantProbePanel user={user} />, { wrapper: wrapper() });
 
+    expect(view.getByText('网络拨测')).toBeTruthy();
     expect(await view.findByText('伦敦入口')).toBeTruthy();
     const results = view.container.querySelectorAll<HTMLElement>('.grant-probe-result');
     const matrix = view.container.querySelector<HTMLElement>('.grant-probe-matrix');
@@ -98,7 +99,11 @@ describe('user grant probe', () => {
     expect(matrix?.children).toHaveLength(6);
     expect(matrix?.style.getPropertyValue('--grant-probe-slot-count')).toBe('6');
     expect(view.container.querySelectorAll('.grant-probe-result.missing')).toHaveLength(0);
-    expect(view.container.querySelector('.grant-probe-table-head')).toBeNull();
+    const tableHead = view.container.querySelector('.grant-probe-table-head');
+    expect(tableHead).toBeTruthy();
+    expect(tableHead?.querySelectorAll('.grant-probe-matrix-head > span')).toHaveLength(6);
+    expect(tableHead?.textContent).toContain('线路 / Route');
+    expect(tableHead?.textContent).toContain('AnyTLS');
     expect(results[0].dataset).toMatchObject({ protocol: 'VLESS', stack: 'V4' });
     expect(results[1].dataset).toMatchObject({ protocol: 'Hysteria2', stack: 'V6' });
     expect((view.getByRole('button', { name: '重试失败项' }) as HTMLButtonElement).disabled).toBe(true);

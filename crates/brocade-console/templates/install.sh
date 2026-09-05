@@ -736,6 +736,41 @@ SYSCTL
 }
 tune_congestion || true
 
+# TCP Fast Open has two independent kernel bits: 1 lets this machine initiate TFO and 2 lets its
+# listeners accept it. Xray still enables the option per socket; this switch merely allows those
+# AnyTLS/VLESS socket settings to take effect. Keep it separate from BBR because a machine without
+# BBR can still support TFO, and failing either optimisation must not prevent installation.
+tune_tcp_fast_open() {
+    conf=/etc/sysctl.d/99-brocade.conf
+    if [ ! -e "$conf" ]; then
+        if ! printf '%s\n' '# 由 brocade 安装脚本写入。' > "$conf"; then
+            echo "写不了 $conf，跳过 TCP Fast Open。不影响安装。" >&2
+            return 0
+        fi
+    fi
+    if ! sed -i '/^[[:space:]]*net\.ipv4\.tcp_fastopen[[:space:]]*=/d' "$conf"; then
+        echo "更新不了 $conf，跳过 TCP Fast Open。不影响安装。" >&2
+        return 0
+    fi
+    if ! printf '%s\n' 'net.ipv4.tcp_fastopen = 3' >> "$conf"; then
+        echo "写不了 TCP Fast Open 配置，跳过。不影响安装。" >&2
+        return 0
+    fi
+
+    sysctl -qw net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
+    now_tfo=$(cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || echo '')
+    case "$now_tfo" in
+        *[!0-9]*|'') now_tfo=0 ;;
+    esac
+    if [ $((now_tfo & 3)) -ne 3 ]; then
+        echo "设了 TCP Fast Open 但当前值仍是「$now_tfo」——多半是容器限制或内核不支持。跳过，不影响安装。" >&2
+        sed -i '/^[[:space:]]*net\.ipv4\.tcp_fastopen[[:space:]]*=/d' "$conf" 2>/dev/null || true
+        return 0
+    fi
+    echo "已开启 TCP Fast Open（客户端 + 服务端）。" >&2
+}
+tune_tcp_fast_open || true
+
 # 连接跟踪表。写进同一个 99-brocade.conf，但单独一个函数——两者的失败条件不一样，而且
 # BBR 设不上的那批机器（OpenVZ/LXC、老内核）恰恰是内存最小、最先撞上连接表上限的那批，
 # 让它们因为没有 BBR 就连这个也拿不到是反的。

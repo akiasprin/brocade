@@ -375,17 +375,18 @@ function PlanButton({
 function DeployStatus({ item }: { item: DeploymentListItem }) {
   // 「等确认」的优先级高于「推送中」：该发布确实处于 running 状态，但停止推进的原因不是
   // 机器响应慢，而是缺少人工确认。显示为「推送中」会导致继续等待，而它不会自动继续。
-  const text = item.activation_status === 'activated' && item.settlement_status !== 'converged'
-    ? `已生效 · ${item.debt_targets} 台待补偿`
-    : item.activation_status === 'activated'
-      ? '已生效'
-      : item.status === 'succeeded' && item.activation_status === 'waiting'
-        ? '执行完成 · 待生效'
-    : item.awaiting_confirmation
-    ? '等确认'
-    : item.status === 'canceled' && item.failed_targets > 0
-      ? '失败后取消'
-      : (STATUS_TEXT[item.status] ?? item.status);
+  const text =
+    item.activation_status === 'activated' && item.settlement_status !== 'converged'
+      ? `已生效 · ${item.debt_targets} 台待补偿`
+      : item.activation_status === 'activated'
+        ? '已生效'
+        : item.status === 'succeeded' && item.activation_status === 'waiting'
+          ? '执行完成 · 待生效'
+          : item.awaiting_confirmation
+            ? '等确认'
+            : item.status === 'canceled' && item.failed_targets > 0
+              ? '失败后取消'
+              : (STATUS_TEXT[item.status] ?? item.status);
   const cls =
     item.activation_status === 'activated' && item.settlement_status !== 'converged'
       ? 'st-gold'
@@ -393,15 +394,15 @@ function DeployStatus({ item }: { item: DeploymentListItem }) {
         ? 'st-succeeded'
         : item.status === 'succeeded' && item.activation_status === 'waiting'
           ? 'st-gold'
-      : item.failed_targets > 0
-      ? 'st-halted'
-      : item.awaiting_confirmation
-        ? 'st-gold'
-        : item.status === 'succeeded'
-          ? 'st-succeeded'
-          : item.status === 'running'
-            ? 'st-gold'
-            : '';
+          : item.failed_targets > 0
+            ? 'st-halted'
+            : item.awaiting_confirmation
+              ? 'st-gold'
+              : item.status === 'succeeded'
+                ? 'st-succeeded'
+                : item.status === 'running'
+                  ? 'st-gold'
+                  : '';
   return (
     <span
       className={`st ${cls}`}
@@ -960,23 +961,15 @@ type Ask =
   | { kind: 'cancel' }
   | { kind: 'cancelRollback' }
   | { kind: 'rollback' }
-  | { kind: 'wave'; wave: number }
-  | { kind: 'isolate'; target: DeploymentTargetDetail };
+  | { kind: 'wave'; wave: number };
 
-const ISOLATABLE_TARGET = new Set([
-  'pending',
-  'dispatched',
-  'converging',
-  'failed-recovered',
-  'failed-dirty',
-]);
+const ISOLATABLE_TARGET = new Set(['pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty']);
 
 function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   const nameOf = useNodeNames();
   const { who } = useSession();
   const qc = useQueryClient();
   const [ask, setAsk] = useState<Ask | null>(null);
-  const [isolationReason, setIsolationReason] = useState('');
   // 已成功确认的波次。confirm 只记录确认状态，不关闭波次
   // （deployment.rs::confirm_deployment_wave），target 需要等 agent 拉取后才离开 live 集合，
   // openWave 不会立即前移——不记录该状态时，按钮在请求成功后到状态更新之间仍可点击，
@@ -1032,15 +1025,12 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   });
   const retry = useMutation({ mutationFn: (node: string) => retryTarget(id, node), onSuccess: refresh });
   const isolate = useMutation({
-    mutationFn: ({ target, reason }: { target: DeploymentTargetDetail; reason: string }) =>
+    mutationFn: (target: DeploymentTargetDetail) =>
       isolateDeploymentTarget(id, target.node_id, {
         expected_target_status: target.status,
-        reason,
         acknowledge_uncertain: target.status !== 'pending',
       }),
     onSuccess: () => {
-      setAsk(null);
-      setIsolationReason('');
       refresh();
       qc.invalidateQueries({ queryKey: ['nodes'] });
     },
@@ -1130,13 +1120,9 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                     key={t.node_id}
                     t={t}
                     publisher={publisher}
-                    system={can(who.role, 'system')}
+                    system={can(who.role, 'system') && !isolate.isPending}
                     onRetry={() => retry.mutate(t.node_id)}
-                    onIsolate={() => {
-                      isolate.reset();
-                      setIsolationReason('节点长期失联');
-                      setAsk({ kind: 'isolate', target: t });
-                    }}
+                    onIsolate={() => isolate.mutate(t)}
                   />
                 ))}
               </tbody>
@@ -1151,9 +1137,23 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
       </div>
       <ArtifactChanges revision={d.revision_id} base={d.base_revision_id} targets={acting} />
 
-      {(confirm.error || halt.error || cancel.error || cancelRollback.error || rollback.error || retry.error) && (
+      {(confirm.error ||
+        halt.error ||
+        cancel.error ||
+        cancelRollback.error ||
+        rollback.error ||
+        retry.error ||
+        isolate.error) && (
         <ErrorBox
-          error={confirm.error ?? halt.error ?? cancel.error ?? cancelRollback.error ?? rollback.error ?? retry.error}
+          error={
+            confirm.error ??
+            halt.error ??
+            cancel.error ??
+            cancelRollback.error ??
+            rollback.error ??
+            retry.error ??
+            isolate.error
+          }
         />
       )}
 
@@ -1273,43 +1273,6 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
             confirm.mutate(ask.wave);
           }}
           onCancel={() => setAsk(null)}
-        />
-      )}
-      {ask?.kind === 'isolate' && (
-        <Confirm
-          title={`隔离 ${nameOf(ask.target.node_id)} 并继续发布？`}
-          confirmLabel={isolate.isPending ? '正在隔离…' : '隔离并继续'}
-          requireWord="隔离"
-          confirmDisabled={isolate.isPending || isolationReason.trim().length === 0}
-          onConfirm={() =>
-            isolate.mutate({ target: ask.target, reason: isolationReason.trim() })
-          }
-          onCancel={() => {
-            setAsk(null);
-            setIsolationReason('');
-          }}
-          body={
-            <div className="node-lifecycle-confirm">
-              <p>
-                当前 target 是 <Status value={ask.target.status} />。该节点会立即从订阅入口和转发拓扑中移除，
-                本发布的其他节点继续推进。
-              </p>
-              {ask.target.status !== 'pending' && (
-                <p className="callout warn">任务已下发或失败状态不确定；旧回报会被代次拒绝，并先把本机现场记为 dirty。</p>
-              )}
-              <label className="field">
-                <span>隔离原因</span>
-                <textarea
-                  className="f"
-                  rows={3}
-                  value={isolationReason}
-                  onChange={event => setIsolationReason(event.target.value)}
-                />
-              </label>
-              <p className="note">节点仍会领取完整补偿任务。补偿完成后必须在节点页显式恢复服务。</p>
-              {isolate.error && <ErrorBox error={isolate.error} />}
-            </div>
-          }
         />
       )}
     </>

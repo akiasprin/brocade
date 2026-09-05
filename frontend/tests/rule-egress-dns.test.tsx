@@ -336,7 +336,7 @@ describe('machine-scoped egress DNS', () => {
 
     expect(Array.from(choice.options).map(option => option.text)).toEqual(['默认 DNS 解析', '自定义 DNS 解析']);
     expect(Array.from(choice.options).find(option => option.value === 'machine')?.disabled).toBe(false);
-    expect(view.getAllByText('机器全局下发')).toHaveLength(2);
+    expect(view.queryByText('机器全局下发')).toBeNull();
     expect(view.container.textContent).not.toContain('引用');
   });
 
@@ -485,7 +485,7 @@ describe('machine-scoped egress DNS', () => {
     );
     expect(view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）')).toBeTruthy();
     expect(view.getByText('media')).toBeTruthy();
-    expect(view.getAllByText('机器全局下发')).toHaveLength(2);
+    expect(view.queryByText('机器全局下发')).toBeNull();
   });
 
   it('does not change policy status when another chain has the same route selector', () => {
@@ -493,7 +493,7 @@ describe('machine-scoped egress DNS', () => {
       { m: { t: 'domain_suffix', v: ['netflix.com'] }, a: { t: 'egress', send_through: null } },
     ]);
 
-    expect(view.getAllByText('机器全局下发')).toHaveLength(2);
+    expect(view.queryByText('机器全局下发')).toBeNull();
     expect(view.container.textContent).not.toContain('其他链路触发');
   });
 
@@ -518,7 +518,7 @@ describe('machine-scoped egress DNS', () => {
     expect(policyChoice.value).toBe('custom');
     expect(Array.from(policyChoice.options).map(option => option.text)).toEqual(['默认 DNS 解析', '自定义 DNS 解析']);
     expect(policyChoice.tagName).toBe('SELECT');
-    expect(view.getAllByText('机器全局下发')).toHaveLength(2);
+    expect(view.queryByText('机器全局下发')).toBeNull();
 
     expect((view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）') as HTMLInputElement).value).toBe(
       '192.0.2.53',
@@ -537,7 +537,8 @@ describe('machine-scoped egress DNS', () => {
     const fallback = view.getByLabelText('失败处理（机器策略：域名后缀 netflix.com）') as HTMLSelectElement;
     expect(fallback.value).toBe('stop');
     expect(Array.from(fallback.options).map(option => option.text)).toEqual(['停止连接', '回退机器 DNS']);
-    expect(view.container.querySelector('.egress-dns-note')?.textContent).toBe('Xray 全局生效 · 香港落地');
+    expect(view.container.querySelector('.egress-dns-note')).toBeNull();
+    expect(view.container.textContent).not.toContain('Xray 全局生效');
     expect(view.container.querySelector('.egress-dns-editor')?.querySelector('header, footer')).toBeNull();
     expect(view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）').closest('tr')).not.toBe(
       view.getByDisplayValue('netflix.com').closest('tr'),

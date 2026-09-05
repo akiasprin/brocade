@@ -9,11 +9,9 @@
 //!   1. Account: how much each (tenant, user, view) with a quota used this month, who went over,
 //!      and who should be restored;
 //!   2. Edit the model: revoke and add grants, composing the whole round into one revision;
-//!   3. Ship a grants deployment: `narrow_to_kind(Grants)` admits only the machines that need
-//!      nothing but a list sync this round, and marks all three artifacts Unmanaged. Such a
-//!      deployment structurally cannot push configuration, so no runtime gate is needed to check
-//!      whether other actions slipped in — and configuration changes others left unreleased are
-//!      unaffected.
+//!   3. Put the revision on the durable grants queue and run it immediately. The shared worker
+//!      admits only machines that need a list sync, rebases pending configuration, and keeps the
+//!      job queued while an in-flight configuration prevents a global serving checkpoint.
 //!
 //! Why this approach works (drop any one of these and it does not):
 //!   - Revoking does not disconnect anyone: xray is Unmanaged in a grants deployment, the
@@ -26,26 +24,21 @@
 //!   - Revoking does not lose usage: adding and removing grants does not affect xray's counters
 //!     at all, the values survive an `rmu`, and adding one back resumes the count. Otherwise one
 //!     revocation would zero the usage and hand the user a whole extra month of quota;
-//!   - Repetition is harmless: `commit_revision` returns the number when nothing really changed,
-//!     `adu`/`rmu` are idempotent themselves, and `create_deployment` honors the idempotency
-//!     key. Several instances running at once cost a few extra log lines at most.
+//!   - Repetition is harmless: model writes, `adu`/`rmu`, and the durable grants worker are all
+//!     idempotent. Several instances are serialized by the worker's advisory lock.
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use brocade_deployment::{
-    plan::{
-        can_sync_grants_now, narrow_to_kind, DeploymentKind, PlannedAction, PlannedTargetStatus,
-    },
-    protocol::CreateDeploymentRequest,
-};
+use brocade_deployment::plan::{can_sync_grants_now, PlannedAction, PlannedTargetStatus};
 
 use crate::{
     console::{
         commit_revision_without_grant_automation, insert_revision, lock_control_state,
         upsert_grant_tx,
     },
-    deployment::{create_deployment, plan_full_deployment},
+    deployment::plan_full_deployment,
+    grant_automation,
     materialize::current_revision,
     AdminContext, CreateGrantRequest, Result, StoreError,
 };
@@ -277,17 +270,12 @@ pub async fn enforce_quotas(pool: &PgPool) -> Result<QuotaEnforcementOutcome> {
         });
     }
 
-    // What ships is a grants deployment: `narrow_to_kind(Grants)` keeps only the machines
-    // needing nothing but a list sync this round, and marks all three artifacts Unmanaged. So it
-    // structurally cannot push configuration and needs no runtime gate checking whether other
-    // actions slipped in. Configuration changes others left in the current revision are
-    // therefore unaffected — their machines' actions carry ApplyXray and the like, and never
-    // enter this deployment at all.
+    // Preserve the round's immediate explanation for machines that need configuration before a
+    // runtime list can exist. The shared worker treats a never-deployed machine as no hot-sync
+    // work (correctly: there is no Xray yet), while the quota result still needs to tell the
+    // caller where this permission will first arrive.
     let full_plan = plan_full_deployment(pool, &actor, revision_id).await?;
-    // A machine whose list must change while it also owes configuration changes cannot enter a
-    // grants deployment. The round after the configuration deployment lands picks it up
-    // naturally — this only records it, so that the log can say what is being waited on.
-    let deferred = full_plan
+    let waiting_for_config = full_plan
         .targets
         .iter()
         .filter(|target| {
@@ -298,40 +286,23 @@ pub async fn enforce_quotas(pool: &PgPool) -> Result<QuotaEnforcementOutcome> {
         .map(|target| target.node_id.clone())
         .collect::<Vec<_>>();
 
-    let deployment_plan = narrow_to_kind(full_plan, DeploymentKind::Grants);
-    if deployment_plan.summary.changed_targets == 0 {
-        return Ok(QuotaEnforcementOutcome {
-            suspended: applied.suspend.len(),
-            restored: applied.restore.len(),
-            revision_id,
-            deployment_id: None,
-            deferred,
-        });
-    }
-
-    let note = enforcement_note(&applied);
-    let created = create_deployment(
-        pool,
-        &actor,
-        CreateDeploymentRequest {
-            revision_id,
-            // One revision ships once. Colliding with another grants deployment still in flight
-            // fails this round outright, and the next retries with the same key rather than
-            // piling up a string of half-finished releases. Configuration deployments are not on
-            // this lock.
-            idempotency_key: format!("quota:{revision_id}"),
-            actor: Some(QUOTA_ACTOR.to_owned()),
-            note: Some(note),
-            kind: DeploymentKind::Grants,
-        },
-    )
-    .await?;
+    // Quota revisions use the same durable worker as every other permission change. Besides
+    // planning against each machine's running topology, that job row is the proof which lets a
+    // completed grants deployment advance the subscription Serving checkpoint. The old direct
+    // create_deployment path had no such row, so successful quota releases stayed `waiting`
+    // forever. Processing immediately preserves the prompt quota response; a busy worker simply
+    // leaves the durable row for its normal retry loop.
+    let released = grant_automation::process_jobs(pool).await?;
+    let mut deferred = waiting_for_config;
+    deferred.extend(released.deferred);
+    deferred.sort();
+    deferred.dedup();
 
     Ok(QuotaEnforcementOutcome {
         suspended: applied.suspend.len(),
         restored: applied.restore.len(),
         revision_id,
-        deployment_id: Some(created.deployment_id),
+        deployment_id: released.deployment_id,
         deferred,
     })
 }
@@ -462,15 +433,22 @@ async fn apply_quota_changes(
         }
     }
 
+    let applied_note = enforcement_note(&applied);
     if changed {
         sqlx::query("UPDATE revisions SET note = $2 WHERE id = $1")
             .bind(i64::try_from(revision_id).unwrap_or(i64::MAX))
-            .bind(enforcement_note(&applied))
+            .bind(&applied_note)
             .execute(&mut *tx)
             .await?;
     }
     let revision_id =
         commit_revision_without_grant_automation(&mut tx, revision_id, previous, changed).await?;
+    if changed {
+        // The outbox row and the permission edit must commit together. A restart after this
+        // transaction may delay enforcement, but can no longer lose the release or its global
+        // activation proof.
+        grant_automation::enqueue_tx(&mut tx, revision_id, QUOTA_ACTOR, &applied_note).await?;
+    }
     tx.commit().await?;
     Ok((revision_id, applied))
 }

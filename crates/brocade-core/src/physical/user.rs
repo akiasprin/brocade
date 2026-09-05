@@ -177,6 +177,7 @@ pub enum UserSecurityPlan {
 pub struct UserAnyTlsPlan {
     pub server_name: String,
     pub settings: AnyTls,
+    pub reality: Option<UserRealityPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,10 +270,31 @@ fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
     }
 
     if let Some(settings) = ingress.wires.anytls() {
+        let reality = settings.reality().map(|reality| UserRealityPlan {
+            public_key: ingress
+                .anytls_identity
+                .as_ref()
+                .map(|identity| identity.public_key.clone())
+                .unwrap_or_default(),
+            short_id: ingress
+                .anytls_identity
+                .as_ref()
+                .and_then(|identity| identity.short_ids.first())
+                .cloned()
+                .unwrap_or_default(),
+            server_name: reality.server_name(ingress.certificate_name.as_deref()),
+            fingerprint: reality.fingerprint.clone(),
+            // Vision is a VLESS flow and does not apply to AnyTLS.
+            flow: None,
+        });
         wires.push((
             UserSecurityPlan::AnyTls(UserAnyTlsPlan {
-                server_name: ingress.certificate_name.clone().unwrap_or_default(),
+                server_name: reality
+                    .as_ref()
+                    .map(|reality| reality.server_name.clone())
+                    .unwrap_or_else(|| ingress.certificate_name.clone().unwrap_or_default()),
                 settings: settings.clone(),
+                reality,
             }),
             " | AnyTLS",
         ));
@@ -390,8 +412,9 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
             }
         }
         // Both levels are semantic: apps arrive in apps.position order and chains in
-        // chains.position order. Sort only within this app, using the entry's parent chain first
-        // and stable entry fields only as deterministic ties inside one chain.
+        // chains.position order. Within one grant, keep each protocol's v4/v6 pair together;
+        // sorting by the rendered name would move the bare VLESS v6 entry behind every named
+        // protocol suffix (`AnyTLS`, `QUIC`, ...).
         entries[app_start..].sort_by(|a, b| {
             ingress_rank
                 .get(a.ingress_id.as_str())
@@ -404,6 +427,13 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                         .unwrap_or(usize::MAX),
                 )
                 .then_with(|| a.grant_id.cmp(&b.grant_id))
+                .then_with(|| {
+                    subscription_protocol_rank(&a.security)
+                        .cmp(&subscription_protocol_rank(&b.security))
+                })
+                .then_with(|| {
+                    subscription_family_rank(a.family).cmp(&subscription_family_rank(b.family))
+                })
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.server.cmp(&b.server))
         });
@@ -419,6 +449,29 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
         entries,
         external_proxies,
         front_groups,
+    }
+}
+
+/// Subscription protocols have a product order independent of their rendered suffixes.
+///
+/// VLESS keeps the bare chain name, AnyTLS follows it, and Hysteria2/QUIC comes last. Keeping
+/// this rank separate from `name` also means changing translated labels cannot silently reorder
+/// a user's subscription.
+fn subscription_protocol_rank(security: &UserSecurityPlan) -> u8 {
+    match security {
+        UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_) => 0,
+        UserSecurityPlan::AnyTls(_) => 1,
+        UserSecurityPlan::Hysteria2(_) => 2,
+    }
+}
+
+/// The direct address precedes its v6 peer inside one protocol pair. `None` is the single
+/// placeholder emitted when neither family has a publishable address, so putting it first is
+/// deterministic without affecting a real dual-stack pair.
+fn subscription_family_rank(family: Option<IpFamily>) -> u8 {
+    match family {
+        None | Some(IpFamily::V4) => 0,
+        Some(IpFamily::V6) => 1,
     }
 }
 

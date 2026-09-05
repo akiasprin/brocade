@@ -765,6 +765,18 @@ fn push_anytls_proxy(
     lines.push(format!("    sni: {}", scalar(&anytls.server_name)));
     lines.push("    tls: true".to_owned());
     lines.push("    udp: true".to_owned());
+    // AnyTLS is TCP-backed, so Mihomo can use its common TFO switch just as it does for VLESS.
+    // A peer or path without TFO support falls back to the ordinary handshake.
+    lines.push("    tfo: true".to_owned());
+    if let Some(reality) = &anytls.reality {
+        lines.push(format!(
+            "    client-fingerprint: {}",
+            scalar(&reality.fingerprint)
+        ));
+        lines.push("    reality-opts:".to_owned());
+        lines.push(format!("      public-key: {}", scalar(&reality.public_key)));
+        lines.push(format!("      short-id: {}", scalar(&reality.short_id)));
+    }
     // Mihomo models both time values as integer seconds rather than duration strings.
     if let Some(value) = anytls.settings.idle_session_check_interval_secs {
         lines.push(format!("    idle-session-check-interval: {value}"));

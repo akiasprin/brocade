@@ -154,7 +154,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		return errors.New("target not specified")
 	}
 	ob.Name = "anytls"
-	ob.CanSpliceCopy = 3
+	ob.CanSpliceCopy = 3 // Multiplexed AnyTLS frames must be encoded before delivery.
 	destination := ob.Target
 
 	var sess *session
@@ -261,8 +261,6 @@ func (c *Client) createSession(ctx context.Context, dialer internet.Dialer) (*se
 		bw:            buf.NewBufferedWriter(buf.NewWriter(conn)),
 		paddingScheme: paddingScheme,
 		streams:       make(map[uint32]*stream),
-		synAckCh:      make(map[uint32]chan error),
-		errCh:         make(chan error, 1),
 		seq:           seq,
 	}
 	sess.fw = newFrameWriter(sess.bw)

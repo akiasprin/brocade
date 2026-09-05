@@ -6,6 +6,7 @@ import { CanvasRenderer } from 'echarts/renderers';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   abandonNode,
+  fetchAgentLogPolicy,
   fetchArtifactContentView,
   fetchCompileView,
   fetchDeployments,
@@ -25,11 +26,14 @@ import {
   issueNodeToken,
   provisionNode,
   restoreNodeService,
+  saveNodeLogPolicy,
   setNodeCertGroup,
   setNodeStatus,
   setWireGuardLinkDisabled,
   updateNode,
   verifyDeployment,
+  type AgentLogPolicyNode,
+  type AgentLogPolicyView,
   type Dns,
   type NodeConnection,
   type DomainStrategy,
@@ -45,9 +49,9 @@ import {
 import { fetchPreviewStatus } from '../preview/api';
 import type { LinkIr } from '../topo/model';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
-import { can, isPublic, useSession } from '../session';
-import { Ago, Confirm, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
-import { Icon, ListIcon, type IconName } from '../ui/icons';
+import { can, isVisitor, useSession } from '../session';
+import { Ago, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
+import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { copyText } from '../ui/platform';
 import { useNarrow } from '../ui/viewport';
@@ -78,6 +82,8 @@ import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import { ChainWizard } from './chain-wizard';
 import { ChainRulesPanel, IngressPortEditor } from './chains';
+/* 日志上限的取值范围与设置页共用一份，见 settings.tsx 中该常量上的说明。 */
+import { LOG_MAX_MIB, LOG_MIN_MIB, validLogMib } from './settings';
 import { MachineEgressDnsRules, RuleDraftScope, isForwardTargetInChain } from './rules';
 import { chainSpine, fetchSnapshot, type SnapshotChain, type SnapshotIngress, type SnapshotStep } from '../api';
 import type { AppIr } from '../topo/model';
@@ -391,14 +397,6 @@ const parseHopSubject = (subject: string) => {
 /** 列表排序用的标签，与卡片上 `<b>` 渲染的是同一个值。 */
 const nodeLabel = (n: NodeAgentStateItem) => n.name || n.node_id;
 
-/** 隔离原因原文留在数据库作为审计记录；横条只显示能放进一句话的业务摘要。 */
-function isolationReasonSummary(reason: string | null | undefined): string {
-  const value = reason?.trim();
-  if (!value) return '节点暂不可用';
-  if (value === '节点长期不可达，隔离并继续发布') return '节点长期失联';
-  return value.replace(/[。！？.!?；;]+$/, '');
-}
-
 /* `numeric` 是必须的：字典序下 `tokyo-iij-10` 会排在 `tokyo-iij-2` 前面，机器名普遍带编号。
    指定 zh 让中文名走拼音序而不是码点序（代价是中日韩字符整体排在拉丁字母之前，
    中英混名的机器会聚到一头）。Collator 建一次复用，不要每次渲染新建。 */
@@ -538,20 +536,12 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
           <button className="btn" onClick={exitSelect}>
             取消
           </button>
-          {/* 退役是直接创建停用发布的操作，不进入浏览器草稿。确认框会明确说明它可能
-              取消并替换当前配置单。 */}
+          {/* 退役直接创建停用发布，不进入浏览器草稿。 */}
           <button
             className="btn danger"
             disabled={pickedLive.length === 0 || retireAll.isPending}
             title={`退役选中的 ${pickedLive.length} 台：保留记录，并为 Agent 创建完整停用发布`}
-            onClick={() => {
-              if (
-                window.confirm(
-                  `确认退役 ${pickedLive.length} 台机器？系统会提交退役修订、取消冲突中的发布，并立即创建完整停用发布。`,
-                )
-              )
-                retireAll.mutate();
-            }}
+            onClick={() => retireAll.mutate()}
           >
             {retireAll.isPending ? '提交中…' : `退役下线${pickedLive.length > 0 ? ` ${pickedLive.length}` : ''}`}
           </button>
@@ -613,7 +603,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
             onToggle={event => setRetiredOpen(event.currentTarget.open)}
           >
             <summary>
-              <h4>退役机器</h4>
+              <PanelTitle of="nodes">退役机器</PanelTitle>
               <span className="hint">{retired.length} 台</span>
             </summary>
             {renderCards(retired)}
@@ -1008,8 +998,8 @@ export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onC
   );
 }
 
-// 列表保留最近 24 个实际样本并按窗口槽位绘制。这里表达的是停机前最后一段趋势，不承担
-// 在线状态或墙上时间定位；在线/离线由机器卡已有的独立活性状态表达。
+// 列表保留最近 24 个实际样本。窗口查询没有固定墙上时间边界，曲线按首尾可绘制样本铺满；
+// 这里表达的是停机前最后一段趋势，在线/离线由机器卡已有的独立活性状态表达。
 const LIST_NIC_WINDOWS = 24;
 const LIST_NIC_WINDOW_SECS = 30;
 // 上一版的最低尺度是 1 Mbit/s。改为每窗口字节数后做等价换算，避免只因换单位就改变曲线高度。
@@ -1113,7 +1103,7 @@ function TcpProbeP95({ view, pending = false }: { view?: NodePingProbeView; pend
   );
 }
 
-function NicWave({ load }: { load?: NodeLoadView }) {
+export function NicWave({ load }: { load?: NodeLoadView }) {
   const samples = (load?.series ?? []).slice(-LIST_NIC_WINDOWS);
   const label = 'NIC · 30 秒 / 窗口';
   const windowBytes = (sample: LoadSample) => {
@@ -1133,9 +1123,12 @@ function NicWave({ load }: { load?: NodeLoadView }) {
 
   const W = 100;
   const H = 36;
-  // 样本不足 24 个时靠右放：右缘是最后一个窗口，新纳管机器不应把两个点拉满整张图。
-  const slotOffset = LIST_NIC_WINDOWS - samples.length;
-  const xOf = (index: number) => ((slotOffset + index) * W) / (LIST_NIC_WINDOWS - 1);
+  // 窗口查询返回的是最近 N 条记录，不是固定时间区间。首尾无效窗口没有可绘制内容，继续
+  // 为它们留槽只会让卡片边缘出现空白；内部 gap 仍按索引占位并断线，保留真实缺口。
+  const firstDrawableIndex = valid[0].index;
+  const lastDrawableIndex = valid[valid.length - 1].index;
+  const drawableSpan = lastDrawableIndex - firstDrawableIndex;
+  const xOf = (index: number) => (drawableSpan === 0 ? W / 2 : ((index - firstDrawableIndex) * W) / drawableSpan);
   const max = valid.reduce((top, point) => (point.value > top ? point.value : top), 0);
   const min = valid.reduce((bottom, point) => (point.value < bottom ? point.value : bottom), valid[0].value);
   const ceiling = Math.max(LIST_NIC_MIN_CEILING_BYTES, max);
@@ -1399,7 +1392,10 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
     <section className="chart-card nd-throughput-panel" aria-label="吞吐">
       <div className="nd-throughput-block">
         <div className="load-network-cap">
-          <b>网卡流量</b>
+          <b>
+            <Icon of="agent" size={13} className="chart-title-icon" />
+            网卡流量
+          </b>
           <span className="chart-unit">({nicUnit.name})</span>
           {nicMeta.length > 0 && <span className={drops > 0 ? 'hot' : undefined}>{nicMeta.join(' · ')}</span>}
           <span>
@@ -1429,7 +1425,10 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
       </div>
       <div className="nd-throughput-block">
         <div className="load-network-cap">
-          <b>XRAY 流量</b>
+          <b>
+            <Icon of="tunnels" size={13} className="chart-title-icon" />
+            XRAY 流量
+          </b>
           <span className="chart-unit">({xrayUnit.name})</span>
           <span>本月 {bytes(monthTotal)}</span>
           <footer className="load-network-legend" aria-label="XRAY 流量图例">
@@ -1465,84 +1464,63 @@ export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; ran
 //
 // 建议值来自探测：agent 按对测量路径 MTU，该机器的建议值等于其所有路径中的最小值减 60。
 function NodeMtuRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit: boolean; onSaved: () => void }) {
-  const probe = useQuery({
-    queryKey: ['link-mtu'],
-    queryFn: () => fetchLinkMtu(),
-    refetchInterval: 60_000,
-  });
+  /* 只取全局默认值当占位符。此处不再显示探测结果——建议值、最小路径通向哪台、
+     几条未探出，是设置页 MTU 探测那一段的内容（它按机队列出全部链路对）；这一行只回答
+     「这台机器的 wg0 用哪个 MTU」。因此也去掉了 60 秒轮询：默认值是全局设置，不是观测量。 */
+  const probe = useQuery({ queryKey: ['link-mtu'], queryFn: () => fetchLinkMtu() });
+  /* null 表示本次未改动，输入框显示模型值。控件常驻、改了才出工具条——与本页其余各行
+     （身份、DNS、出网权限、连接策略）同一形态，不再先点一个「改」把行切进编辑态。
+     留空即回退到全局默认值，全局值由占位符给出，与连接策略那几项的写法一致。 */
   const [value, setValue] = useState<string | null>(null);
-  const mine = probe.data?.nodes.find(n => n.node_id === node.node_id);
-  const effective = node.mtu ?? probe.data?.default_mtu ?? null;
+  /* 当前值取自草稿快照，理由见 useDraftNode。快照尚未返回时回退到直连值，避免该行为空。 */
+  const draftNode = useDraftNode(node.node_id);
+  const modelMtu = draftNode ? (draftNode.mtu ?? null) : node.mtu;
+  const base = modelMtu === null ? '' : String(modelMtu);
+  const shown = value ?? base;
+  const dirty = value !== null && shown.trim() !== base;
+  /* 取值来源随输入框走，不随模型走：清空后这一行应当立刻显示「继承全局」，
+     而不是等保存成功再改口。 */
+  const ownNow = shown.trim() !== '';
 
   const save = useMutation({
-    mutationFn: () => updateNode(node.node_id, { mtu: Number(value) || 0 }),
+    /* 0 表示清空并回退到全局默认值，见 updateNode 中该字段的说明。 */
+    mutationFn: () => updateNode(node.node_id, { mtu: Number(shown.trim()) || 0 }),
     onSuccess: () => {
       setValue(null);
       onSaved();
     },
   });
 
-  if (value !== null) {
-    return (
-      <Row k="MTU">
-        <input
-          className="f"
-          style={{ width: 100 }}
-          value={value}
-          placeholder="留空 = 用默认"
-          onChange={e => setValue(e.target.value)}
-        />
-        <button
-          className="btn primary"
-          style={{ marginLeft: 6 }}
-          disabled={save.isPending}
-          onClick={() => save.mutate()}
-        >
-          保存
-        </button>
-        <button className="btn" style={{ marginLeft: 4 }} onClick={() => setValue(null)}>
-          取消
-        </button>
-        <span className="sub">
-          清空 = 恢复全局默认 {probe.data?.default_mtu ?? '—'}。修改 MTU 会重新生成 wg 配置，触发一次链路重连。
-        </span>
-      </Row>
-    );
-  }
-
   return (
     <Row k="MTU">
-      <span className="mono">{effective ?? '—'}</span>{' '}
-      <span className="dim">{node.mtu === null ? '全局默认' : '本机单独设置'}</span>
-      <button
-        className="btn"
-        style={{ marginLeft: 8 }}
-        disabled={!canEdit}
-        onClick={() => setValue(node.mtu === null ? '' : String(node.mtu))}
-      >
-        改
-      </button>
-      {mine?.suggested_mtu != null && mine.suggested_mtu !== effective && (
-        <button
-          className="btn"
-          style={{ marginLeft: 4 }}
+      <span className="nd-ctl-line">
+        <input
+          className="f mono"
+          style={{ width: 100 }}
+          value={shown}
           disabled={!canEdit}
-          onClick={() => setValue(String(mine.suggested_mtu))}
-        >
-          采纳 {mine.suggested_mtu}
-        </button>
-      )}
-      <span className="sub">
-        {mine?.suggested_mtu != null ? (
-          <>
-            探测建议 {mine.suggested_mtu}
-            {mine.tightest_peer && <>（最小路径通向 {mine.tightest_peer}）</>}
-            {mine.inconclusive > 0 && <>；另有 {mine.inconclusive} 条未探出，该值可能偏大</>}
-          </>
-        ) : (
-          <>还没有探测结果</>
-        )}
+          placeholder={probe.data?.default_mtu == null ? '' : String(probe.data.default_mtu)}
+          aria-label="wg0 MTU"
+          onChange={e => setValue(e.target.value)}
+        />
+        <OverrideTag own={ownNow} />
       </span>
+      {dirty && (
+        <>
+          <span className="sub" style={{ color: 'var(--gold)' }}>
+            修改 MTU 会重新生成 wg 配置，触发一次链路重连。
+          </span>
+          {save.error && <ErrorBox error={save.error} />}
+          <div className="toolbar">
+            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+              {save.isPending ? '保存中…' : '保存到草稿'}
+            </button>
+            <button className="btn" disabled={save.isPending} onClick={() => setValue(null)}>
+              还原
+            </button>
+          </div>
+        </>
+      )}
     </Row>
   );
 }
@@ -1559,11 +1537,15 @@ function WgListenPortRow({
   onSaved: () => void;
 }) {
   const qc = useQueryClient();
+  /* 输入框常驻，改了才出工具条。`null` 表示本次未改动，显示模型值。
+     不在 overlay 中时没有监听端口可设（currentPort 为 null），输入框禁用而不是隐藏——
+     隐藏之后这一行只剩一个「—」，看不出是这台机器没有该项还是接口没返回。 */
   const [value, setValue] = useState<string | null>(null);
-  const parsed = Number(value ?? currentPort);
-  const valid =
-    value !== null && /^\d+$/.test(value.trim()) && Number.isInteger(parsed) && parsed >= 1 && parsed <= 65_535;
-  const dirty = valid && parsed !== currentPort;
+  const base = currentPort === null ? '' : String(currentPort);
+  const shown = value ?? base;
+  const parsed = Number(shown.trim());
+  const valid = /^\d+$/.test(shown.trim()) && Number.isInteger(parsed) && parsed >= 1 && parsed <= 65_535;
+  const dirty = value !== null && shown.trim() !== base;
 
   const save = useMutation({
     mutationFn: () => updateNode(nodeId, { wg_listen_port: parsed }),
@@ -1575,53 +1557,41 @@ function WgListenPortRow({
     },
   });
 
-  if (value === null) {
-    return (
-      <Row k="UDP 监听端口">
-        <span className="mono">{currentPort ?? '—'}</span>
-        <button
-          className="btn"
-          style={{ marginLeft: 8 }}
-          disabled={!canEdit || currentPort === null}
-          onClick={() => setValue(String(currentPort ?? ''))}
-        >
-          改
-        </button>
-      </Row>
-    );
-  }
-
   return (
-    <Row k="UDP 监听端口">
+    <Row k="监听端口">
       <input
         className="f mono"
         style={{ width: 110 }}
-        value={value}
+        value={shown}
+        disabled={!canEdit || currentPort === null}
         inputMode="numeric"
         min={1}
         max={65_535}
+        placeholder={currentPort === null ? '未加入 overlay' : ''}
         aria-label="WireGuard UDP 监听端口"
         onChange={event => setValue(event.target.value)}
       />
-      {!valid && (
+      {dirty && !valid && (
         <span className="sub" style={{ color: 'var(--err)' }}>
           端口必须为 1–65535。
         </span>
       )}
       {dirty && (
-        <span className="sub" style={{ color: 'var(--gold)' }}>
-          所有对端的 wg0.conf 会随之变更，发布后链路将重新握手。
-        </span>
+        <>
+          <span className="sub" style={{ color: 'var(--gold)' }}>
+            所有对端的 wg0.conf 会随之变更，发布后链路将重新握手。
+          </span>
+          {save.error && <ErrorBox error={save.error} />}
+          <div className="toolbar">
+            <button className="btn primary" disabled={!valid || save.isPending} onClick={() => save.mutate()}>
+              {save.isPending ? '保存中…' : '保存到草稿'}
+            </button>
+            <button className="btn" disabled={save.isPending} onClick={() => setValue(null)}>
+              还原
+            </button>
+          </div>
+        </>
       )}
-      {save.error && <ErrorBox error={save.error} />}
-      <div className="toolbar">
-        <button className="btn primary" disabled={!dirty || save.isPending} onClick={() => save.mutate()}>
-          {save.isPending ? '保存中…' : '保存到草稿'}
-        </button>
-        <button className="btn" disabled={save.isPending} onClick={() => setValue(null)}>
-          取消
-        </button>
-      </div>
     </Row>
   );
 }
@@ -1640,7 +1610,6 @@ function WgTransportRow({
   canEdit: boolean;
   onSaved: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   // 默认使用高位、未被常见服务占用的端口。不使用 443：该端口在本机上很可能已被
   // 接入面占用，且在 443 上运行非 TLS 服务会在主动探测下暴露。
   const [staged, setStaged] = useState<{ fake: boolean; port: number } | null>(null);
@@ -1685,54 +1654,48 @@ function WgTransportRow({
     onSuccess: () => {
       // 清除本地暂存：写入草稿后数据源回到编译视图，保留本地值会导致两个值并存。
       setStaged(null);
-      setOpen(false);
       onSaved();
     },
   });
 
-  if (!open) {
-    return (
-      <Row k="入站传输">
-        {currentFake ? '伪 TCP（phantun）' : '直接 UDP'}
-        <button className="btn" style={{ marginLeft: 8 }} disabled={!canEdit} onClick={() => setOpen(true)}>
-          改
-        </button>
-        {currentFake && currentPort !== null && <span className="sub">对端连接 :{currentPort}</span>}
-      </Row>
-    );
-  }
+  /* 两档常驻，改了才出工具条，不再先点「改」把行切进编辑态。
+     端口输入框只在选中 Phantun 时出现——直连 UDP 下它没有对应的配置项。 */
+  const dirty = staged !== null && (staged.fake !== currentFake || (staged.fake && staged.port !== currentPort));
 
   return (
     <Row k="入站传输">
-      <label style={{ marginRight: 14 }}>
-        <input type="radio" checked={!fake} onChange={() => setFake(false)} /> 直接 UDP
-      </label>
-      <label>
-        <input type="radio" checked={fake} onChange={() => setFake(true)} /> 伪 TCP（phantun）
-      </label>
-      {fake && (
-        <div style={{ marginTop: 6 }}>
+      <span className="nd-ctl-line">
+        <SegSwitch checked={fake} disabled={!canEdit} onChange={setFake} off="直连 UDP" on="Phantun" />
+        {fake && (
           <input
-            className="f"
+            className="f mono"
             style={{ width: 110 }}
             value={port}
+            disabled={!canEdit}
+            inputMode="numeric"
+            aria-label="Phantun 伪 TCP 端口"
             onChange={e => setPort(Number(e.target.value) || 0)}
           />
-          <span className="sub">使用高位端口。不要使用 443：容易与接入面冲突，也容易被探测。</span>
-        </div>
-      )}
-      <span className="sub" style={{ color: 'var(--gold)' }}>
-        所有对端的 wg0.conf 会随之变更。属破坏性变更。
+        )}
       </span>
-      {save.error && <ErrorBox error={save.error} />}
-      <div className="toolbar">
-        <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
-          {save.isPending ? '保存中…' : '保存到草稿'}
-        </button>
-        <button className="btn" onClick={() => setOpen(false)}>
-          取消
-        </button>
-      </div>
+      <span className="sub">Phantun 把 WireGuard 的 UDP 伪装成 TCP，用于 UDP 被限速的线路。</span>
+      {fake && <span className="sub">使用高位端口。不要使用 443：容易与接入面冲突，也容易被探测。</span>}
+      {dirty && (
+        <>
+          <span className="sub" style={{ color: 'var(--gold)' }}>
+            所有对端的 wg0.conf 会随之变更。属破坏性变更。
+          </span>
+          {save.error && <ErrorBox error={save.error} />}
+          <div className="toolbar">
+            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+              {save.isPending ? '保存中…' : '保存到草稿'}
+            </button>
+            <button className="btn" disabled={save.isPending} onClick={() => setStaged(null)}>
+              还原
+            </button>
+          </div>
+        </>
+      )}
     </Row>
   );
 }
@@ -1964,6 +1927,25 @@ function formatDns(dns: Dns): string {
   return dns.t === 'servers' ? dns.v.join(', ') : 'system';
 }
 
+/** 这台机器在草稿全部生效后的模型值，未取到时为 null。
+ *
+ * 写草稿的控件必须以它为当前值，不能读 `NodeAgentStateItem`：后者来自 `/nodes/agent-state`，
+ * 是不经过草稿预览的直连接口，草稿提交之前不会变。以它为基准的控件在「保存到草稿」之后
+ * 会回落到改动前的内容——草稿里确实记下了这次修改，界面却显示什么都没发生。
+ * OverlayRow、WgTransportRow、ConnectionCard 三处的注释记录过同一个坑。
+ *
+ * 与其他页面共用 `['snapshot']` 查询键，通常命中缓存；草稿任何变动都会由 shell 集中失效
+ * （见 forge/shell.tsx）。 */
+function useDraftNode(nodeId: string) {
+  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
+  return snapshot.data?.snapshot.nodes?.find(row => row.id === nodeId) ?? null;
+}
+
+/* 配置页上所有下拉框的宽度。`select.f` 是全站唯一不带 width 声明的表单控件，不给宽度就
+   按最长一条 option 撑开——同一栏里几张卡的下拉框会各自宽出不同的距离。取 200px 是因为
+   域名解析那一项的选项最长（`UseIPv6v4`），它决定了这一档的下限。 */
+const SELECT_FIELD = { width: 200 };
+
 /* 这台机器从哪个证书组取证书。
  *
  * 与相邻几张卡不同，改这里不进草稿也不需要发布：证书走 agent 自己的轮询通道（十分钟一轮），
@@ -1999,13 +1981,13 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
   return (
     <div className="panel config-panel">
       <header>
-        <h4>证书组</h4>
+        <PanelTitle of="certificate">证书组</PanelTitle>
       </header>
       <div className="fgrid one">
         <Row k="所属组">
           <select
             className="f"
-            style={{ width: 220 }}
+            style={SELECT_FIELD}
             value={current?.label_id ?? ''}
             disabled={!canEdit || save.isPending || certs.isPending}
             onChange={e => pick(e.target.value)}
@@ -2035,14 +2017,26 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
 // 此前这两个字段只出现在建机器向导中，更新接口一直接收 dns 但没有对应界面，
 // 导致创建后无法修改。形态与 EgressRow 一致：未修改时为灰色说明，修改后显示工具条。
 // 唯一的差异是说明常驻而非被状态提示替换——选项是 UseIPv4v6 这类原值，去掉说明后无法理解。
-function DnsCard({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit: boolean; onSaved: () => void }) {
+/* 导出理由同 WgCard：保存到草稿后是否保持新值，只有连着真实取数路径才测得出。 */
+export function DnsCard({
+  node,
+  canEdit,
+  onSaved,
+}: {
+  node: NodeAgentStateItem;
+  canEdit: boolean;
+  onSaved: () => void;
+}) {
   const [servers, setServers] = useState<string | null>(null);
   const [strategy, setStrategy] = useState<DomainStrategy | null>(null);
 
-  const baseServers = formatDns(node.dns);
+  /* 当前值取自草稿快照，理由见 useDraftNode。快照尚未返回时回退到直连值。 */
+  const draftNode = useDraftNode(node.node_id);
+  const baseStrategy = draftNode?.domain_strategy ?? node.domain_strategy;
+  const baseServers = formatDns(draftNode?.dns ?? node.dns);
   const curServers = servers ?? baseServers;
-  const curStrategy = strategy ?? node.domain_strategy;
-  const dirty = curServers !== baseServers || curStrategy !== node.domain_strategy;
+  const curStrategy = strategy ?? baseStrategy;
+  const dirty = curServers !== baseServers || curStrategy !== baseStrategy;
 
   const save = useMutation({
     mutationFn: () => updateNode(node.node_id, { dns: parseDns(curServers), domain_strategy: curStrategy }),
@@ -2056,7 +2050,7 @@ function DnsCard({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit
   return (
     <div className="panel config-panel">
       <header>
-        <h4>DNS</h4>
+        <PanelTitle of="dns">DNS</PanelTitle>
       </header>
       <div className="fgrid one">
         <Row k="服务器">
@@ -2073,7 +2067,7 @@ function DnsCard({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit
         <Row k="域名解析">
           <select
             className="f"
-            style={{ width: 200 }}
+            style={SELECT_FIELD}
             value={curStrategy}
             disabled={!canEdit}
             onChange={e => setStrategy(e.target.value as DomainStrategy)}
@@ -2120,9 +2114,14 @@ function DnsCard({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit
 
 /* 该机器覆盖的连接策略。共四项，每项留空表示使用全局默认值。
  *
- * 默认折叠，展开后才显示内容——本栏中唯一采用折叠的卡片，因为它也是唯一一张多数机器上
- * 没有内容可看的卡：四项全部跟随机队默认是常态。标题常驻显示，其中的一句说明
- * （跟全局一样 / 该机器修改了 N 项）即是折叠状态下需要表达的全部内容。
+ * 与日志保留（见 LogRetentionCard）各自成卡：两者在设置页各是一段，段内按机器分列，
+ * 逐台调一项要先在机队表里找到这一行，所以都收到这台机器名下；但生效方式相反——
+ * 这一张写草稿、要发布一次，那一张直接落库、下一轮轮询生效，合成一张卡说不清。
+ *
+ * 不再默认折叠。折叠的理由是「四项全部跟随机队默认是常态，多数机器上没有内容可看」，
+ * 那是这张卡只有四行输入框时成立的判断；现在每行都带一枚「继承全局 / 本机覆盖」状态片，
+ * 展开状态本身就是这台机器与机队的对照表，折起来反而要点开才知道有没有差异。
+ * `details` 保留，可以手动折起。
  *
  * 不包含握手超时一项，这是有意的：该值全机队使用同一取值。60 是 xray 为对齐
  * nginx 的 client_header_timeout 选择的，目的是不暴露后端服务类型；各机器分别设置
@@ -2144,10 +2143,14 @@ function DnsCard({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit
 const CONN_FIELDS = [
   // 单位写入标签而非附加在值之后。附加在值之后时，缓冲区未设置的情况会显示为
   // 「跟架构 KB」——非数值的取值加上单位后无法读通，且需要为此单独判断是否显示。
+  //
+  // 「等待」两字从后两项的标签中去掉：标签栏与本页其他卡共用一条竖线（见 styles.css
+  // 的 `.nd-tab-config .fgrid .k`），`DownlinkOnly 等待（秒）` 是全页唯一撑不下的标签，
+  // 为它一项把整页标签栏加宽到 176px，其余各卡的输入框就都跟着右移。
   { key: 'conn_idle_secs', label: '空闲回收（秒）', pick: false },
   { key: 'buffer_size_kb', label: '转发缓冲（KB）', pick: false },
-  { key: 'uplink_only_secs', label: 'UplinkOnly 等待（秒）', pick: true },
-  { key: 'downlink_only_secs', label: 'DownlinkOnly 等待（秒）', pick: true },
+  { key: 'uplink_only_secs', label: 'UplinkOnly（秒）', pick: true },
+  { key: 'downlink_only_secs', label: 'DownlinkOnly（秒）', pick: true },
 ] as const;
 
 type ConnKey = (typeof CONN_FIELDS)[number]['key'];
@@ -2172,7 +2175,7 @@ function ConnectionCard({
   onSaved: () => void;
 }) {
   const qc = useQueryClient();
-  // null 表示本次尚未修改任何字段，当前值直接读取模型。与 DnsCard 一致：控件常驻，
+  // null 表示本次尚未修改任何字段，当前值直接读取模型。与出网与解析一致：控件常驻，
   // 修改后才显示工具条。
   const [form, setForm] = useState<Record<ConnKey, string> | null>(null);
 
@@ -2242,9 +2245,9 @@ function ConnectionCard({
   });
 
   return (
-    <details className="panel config-panel conn-card">
+    <details className="panel config-panel conn-card" open>
       <summary>
-        <h4>连接策略</h4>
+        <PanelTitle of="config">连接策略</PanelTitle>
         <span className="hint">{ownCount === 0 ? '与全局一致' : `本机覆盖 ${ownCount} 项`}</span>
         {/* 折叠状态下内部的改动不可见——`details` 不卸载子树，编辑内容仍然存在，
             但界面上无法看出已有修改。由标题说明该状态。 */}
@@ -2260,7 +2263,7 @@ function ConnectionCard({
             {f.pick ? (
               /* 数字组始终显示当前生效值。点数字即创建/修改本机覆盖；只在覆盖存在时
                  显示独立的「取消覆盖」，将字段恢复为 null。不额外增加模式开关，保留原有单行操作。 */
-              <span className="conn-pick-row">
+              <span className="nd-ctl-line">
                 <span className="segsw" role="group" aria-label={`${f.label}的数值`}>
                   {picks(f.key).map(value => (
                     <button
@@ -2274,6 +2277,7 @@ function ConnectionCard({
                     </button>
                   ))}
                 </span>
+                <OverrideTag own={isOwn(f.key)} />
                 {isOwn(f.key) && (
                   <button type="button" className="btn" disabled={!canEdit} onClick={() => set(f.key, '')}>
                     取消覆盖
@@ -2281,14 +2285,17 @@ function ConnectionCard({
                 )}
               </span>
             ) : (
-              <input
-                className="f mono"
-                style={{ width: 96 }}
-                value={cur(f.key)}
-                disabled={!canEdit}
-                placeholder={globalText(f.key)}
-                onChange={e => set(f.key, e.target.value)}
-              />
+              <span className="nd-ctl-line">
+                <input
+                  className="f mono"
+                  style={{ width: 96 }}
+                  value={cur(f.key)}
+                  disabled={!canEdit}
+                  placeholder={globalText(f.key)}
+                  onChange={e => set(f.key, e.target.value)}
+                />
+                <OverrideTag own={isOwn(f.key)} />
+              </span>
             )}
           </Row>
         ))}
@@ -2315,6 +2322,123 @@ function ConnectionCard({
   );
 }
 
+/* 日志保留。与连接策略分开成卡而不是合成一张「本机覆盖」：两者的生效方式相反——
+   连接策略写草稿、要发布一次；这一项直接落库，未覆盖的机器随下一轮 agent 轮询读到全局值。
+   同卡时这条差别只能靠两条小标题说明，分卡之后由卡本身承担。 */
+function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
+  const qc = useQueryClient();
+  /* 与设置页共用查询键：那一页已经拉过时直接命中缓存，两处显示的是同一份数据。
+     旧控制面没有该接口，失败时不重试也不报错——整张卡不画，页面其余部分照常。 */
+  const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy, retry: false });
+  const mine = logPolicy.data?.nodes.find(row => row.node_id === node.node_id) ?? null;
+  if (!mine) return null;
+
+  return (
+    <div className="panel config-panel">
+      <header>
+        <PanelTitle of="artifacts">日志保留</PanelTitle>
+        <span className="hint">{mine.override_max_mib == null ? '与全局一致' : '本机覆盖'}</span>
+      </header>
+      <div className="fgrid one">
+        <NodeLogLimitRow
+          node={mine}
+          globalMaxMib={logPolicy.data!.global_max_mib}
+          canEdit={canEdit}
+          onSaved={view => qc.setQueryData(['agent-log-policy'], view)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** 该项取自机队默认值还是这台机器自己设置的。样式与设置页机队表里的同名标记共用
+    （`.agent-log-source`）——同一个判断在两页显示为同一枚标记。 */
+function OverrideTag({ own }: { own: boolean }) {
+  return (
+    <span className={own ? 'agent-log-source overridden' : 'agent-log-source'}>{own ? '本机覆盖' : '继承全局'}</span>
+  );
+}
+
+/* Agent、XRAY 与每个 Phantun 日志项的磁盘上限，本机覆盖优先于全局。
+ *
+ * 与设置页机队表里的那一行（`NodeLogPolicyRow`）是同一项配置，形态按本页的表单行重排：
+ * 那一行要在一张机队表里标出是哪台机器，因此带机器名和租户；此处整页都属于这台机器。
+ *
+ * 不写草稿、不产生修订：保存即落库，未覆盖的机器随下一轮 agent 轮询读到全局值。 */
+function NodeLogLimitRow({
+  node,
+  globalMaxMib,
+  canEdit,
+  onSaved,
+}: {
+  node: AgentLogPolicyNode;
+  globalMaxMib: number;
+  canEdit: boolean;
+  onSaved: (view: AgentLogPolicyView) => void;
+}) {
+  /* 输入框常驻，改了才出工具条。留空即回退到全局默认值，全局值由占位符给出——
+     与同卡上面四项连接策略的写法一致，因此不需要「设置覆盖 / 取消覆盖」两个模式按钮：
+     填一个数就是覆盖，清空就是继承。`null` 表示本次未改动。 */
+  const [form, setForm] = useState<string | null>(null);
+  const base = node.override_max_mib == null ? '' : String(node.override_max_mib);
+  const shown = form ?? base;
+  const inheritNow = shown.trim() === '';
+  /* 留空提交 null（清除覆盖），有内容则必须落在合法区间，否则不允许保存。 */
+  const value = inheritNow ? null : validLogMib(shown);
+  const invalid = !inheritNow && value === null;
+  const dirty = form !== null && shown.trim() !== base;
+
+  const save = useMutation({
+    mutationFn: (maxMib: number | null) => saveNodeLogPolicy(node.node_id, maxMib),
+    onSuccess: view => {
+      setForm(null);
+      onSaved(view);
+    },
+  });
+
+  return (
+    <Row k="日志上限（MiB）">
+      <span className="nd-ctl-line">
+        <input
+          className="f mono"
+          style={{ width: 96 }}
+          inputMode="numeric"
+          aria-label="本机日志上限"
+          placeholder={String(globalMaxMib)}
+          disabled={!canEdit || save.isPending}
+          value={shown}
+          onChange={event => setForm(event.target.value)}
+        />
+        <OverrideTag own={!inheritNow} />
+      </span>
+      {invalid ? (
+        <span className="sub" style={{ color: 'var(--err)' }}>
+          取值范围 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数。
+        </span>
+      ) : (
+        <span className="sub">降低上限会立即截断已有日志释放空间，不会中断服务。</span>
+      )}
+      {dirty && (
+        <>
+          {save.error && <ErrorBox error={save.error} />}
+          <div className="toolbar">
+            <button
+              className="btn primary"
+              disabled={!canEdit || invalid || save.isPending}
+              onClick={() => save.mutate(value)}
+            >
+              {save.isPending ? '保存中…' : '保存'}
+            </button>
+            <button className="btn" disabled={save.isPending} onClick={() => setForm(null)}>
+              还原
+            </button>
+          </div>
+        </>
+      )}
+    </Row>
+  );
+}
+
 /** 将输入解析为模型值。空值对应 null，表示使用全局默认；非数值同样按空值处理，
     服务端会拒绝非法输入。 */
 function connValue(raw: string): number | null {
@@ -2324,11 +2448,13 @@ function connValue(raw: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function WgCard({
+/* 导出供测试挂载：草稿丢弃后本卡是否回到已提交状态，只有连着真实取数路径才测得出。 */
+export function WgCard({
   node,
   listenPort,
   peers,
   disabledLinks,
+  enabled,
   canEdit,
   onSaved,
 }: {
@@ -2336,26 +2462,35 @@ function WgCard({
   listenPort: number | null;
   peers: NodeAgentStateItem[];
   disabledLinks: { a: string; b: string }[];
+  enabled: boolean;
   canEdit: boolean;
   onSaved: () => void;
 }) {
   return (
     <div className="panel config-panel">
       <header>
-        <h4>WIREGUARD</h4>
+        <PanelTitle of="tunnels">WIREGUARD</PanelTitle>
       </header>
       <div className="fgrid one">
         <OverlayRow node={node} canEdit={canEdit} onSaved={onSaved} />
-        <NodeMtuRow node={node} canEdit={canEdit} onSaved={onSaved} />
-        <WgListenPortRow nodeId={node.node_id} currentPort={listenPort} canEdit={canEdit} onSaved={onSaved} />
-        <WgDisabledLinksRow
-          node={node}
-          peers={peers}
-          disabledLinks={disabledLinks}
-          canEdit={canEdit}
-          onSaved={onSaved}
-        />
-        <WgTransportRow node={node} canEdit={canEdit} onSaved={onSaved} />
+        {/* 关闭时下面四行不画：不生成 wg 配置，监听端口、MTU、入站封装、禁用组合都不会
+            进入产物，改它们没有任何效果。取值来自草稿快照（与运行时判定同一个数据源，
+            见 NodeDetail 的 wireguardEnabled），因此是「已写入草稿的关闭」才收起——
+            开关刚拨到关闭、尚未保存时四行仍在，那时改动还没生效。 */}
+        {enabled && (
+          <>
+            <WgListenPortRow nodeId={node.node_id} currentPort={listenPort} canEdit={canEdit} onSaved={onSaved} />
+            <NodeMtuRow node={node} canEdit={canEdit} onSaved={onSaved} />
+            <WgTransportRow node={node} canEdit={canEdit} onSaved={onSaved} />
+            <WgDisabledLinksRow
+              node={node}
+              peers={peers}
+              disabledLinks={disabledLinks}
+              canEdit={canEdit}
+              onSaved={onSaved}
+            />
+          </>
+        )}
       </div>
     </div>
   );
@@ -2379,6 +2514,7 @@ function WgDisabledLinksRow({
   const disabledPeers = disabledLinks
     .flatMap(link => (link.a === node.node_id ? [link.b] : link.b === node.node_id ? [link.a] : []))
     .sort();
+  const peerById = new Map(peers.map(peer => [peer.node_id, peer]));
   const candidates = peers
     .filter(
       peer =>
@@ -2401,14 +2537,17 @@ function WgDisabledLinksRow({
   });
 
   return (
-    <Row k="禁用直连" hint="从 WireGuard 全互联中排除的对端">
+    <Row k="禁 Peer 组合">
       {disabledPeers.length === 0 ? (
-        <span className="dim">无</span>
+        <span className="wg-peer-empty">暂无禁用组合</span>
       ) : (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+        <span className="wg-peer-list" role="list" aria-label="已禁用的 Peer 组合">
           {disabledPeers.map(peer => (
-            <span key={peer} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <code>{peer}</code>
+            <span key={peer} className="wg-peer-item" role="listitem">
+              <span className="wg-peer-name">
+                <b>{peerById.get(peer)?.name || peer}</b>
+                {peerById.get(peer)?.name && <code>{peer}</code>}
+              </span>
               <button
                 className="btn"
                 disabled={!canEdit || change.isPending}
@@ -2418,21 +2557,23 @@ function WgDisabledLinksRow({
               </button>
             </span>
           ))}
-        </div>
+        </span>
       )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+      <span className="wg-peer-picker">
         <select
           className="f"
-          style={{ width: 210 }}
           value={selected}
           disabled={!canEdit || !node.overlay || change.isPending || candidates.length === 0}
-          aria-label="选择要禁用直连的 WireGuard 对端"
+          aria-label="选择要加入禁用组合的 WireGuard Peer"
           onChange={event => setSelected(event.target.value)}
         >
-          <option value="">选择对端…</option>
+          <option value="">选择 Peer…</option>
+          {/* 有名字时不再把 id 附在括号里重复一遍：`香港 DMIT AS3 Pro (dmit-hkg-as3-pro-lokmachau)`
+              里 id 占了一半宽度，而上面的已禁用列表本来就是「名字 + 小字 id」两行式，
+              加进去之后那一行仍然会写明是哪台。没有名字的机器仍然显示 id。 */}
           {candidates.map(peer => (
             <option key={peer.node_id} value={peer.node_id}>
-              {peer.name || peer.node_id} ({peer.node_id})
+              {peer.name || peer.node_id}
             </option>
           ))}
         </select>
@@ -2441,9 +2582,9 @@ function WgDisabledLinksRow({
           disabled={!canEdit || change.isPending || selected === ''}
           onClick={() => change.mutate({ peer: selected, disabled: true })}
         >
-          禁用
+          加入禁用
         </button>
-      </div>
+      </span>
       <span className="sub">发布后双方都不再配置该 peer；依赖它的业务跳会阻止发布。</span>
       {change.error && <ErrorBox error={change.error} />}
     </Row>
@@ -2534,7 +2675,7 @@ export function runtimeFindings(
         text: <>agent 无法读取 WireGuard 运行态：{wg.error}</>,
       });
     } else {
-      // 隔离已经是对该节点不可达的业务处置。原始健康数据仍保存在控制面供审计，
+      // 隔离已经是对该节点不可达的业务处置。原始健康数据仍保存在控制面供诊断，
       // 界面不再在每台健康节点上重复展示指向该隔离节点的同一条断链 finding。
       const visiblePeers = wg.peers.filter(peer => !isolatedNodeIds?.has(peer.peer_node_id));
       const down = visiblePeers.filter(peer => peer.status === 'down');
@@ -2913,7 +3054,7 @@ export function FleetNetPanel() {
   const unitName = geo ? observeBpsUnit(observeValueAxis(geo.peak)).name : null;
   const head = (
     <header>
-      <h4>网络吞吐 · 全机队</h4>
+      <PanelTitle of="usage">网络吞吐 · 全机队</PanelTitle>
       {unitName && <span className="chart-unit">({unitName})</span>}
       <span className="sp" />
       <span className="hint">网卡汇总 对 XRAY 承载 · 接收在上 / 发送在下 · 近 2 小时</span>
@@ -3205,7 +3346,10 @@ function PingProbeBlock({
   return (
     <div className="ping-probe-block" aria-label={label}>
       <div className="load-network-cap">
-        <b>{label}</b>
+        <b>
+          <Icon of="diag" size={13} className="chart-title-icon" />
+          {label}
+        </b>
         {/* 量纲跟着图走：没画图时刻度也不存在，标题栏就不该挂一个单位。
             时延轴永远是毫秒（见 observeMsUnit），所以这里不必反算值轴。 */}
         {hasSamples && <span className="chart-unit">({OBSERVE_MS_UNIT})</span>}
@@ -3370,7 +3514,7 @@ function AgentCard({
   // 已运行 = 当前时刻减启动时刻，每秒都在变——与 PollAgo 同理用 useNow 而非 Date.now()。
   const now = useNow();
   return (
-    /* 「上次来拉」移到带名下方的时效位：它表示这条带的数据有多新，与 HOST 的上报时间、
+    /* 「上次来拉」放在带名下方的时效位：它表示这条带的数据有多新，与 HOST 的上报时间、
        CONFIG 的观察时间同一性质，三者在同一列上才能横向比对。 */
     <Band
       name="AGENT"
@@ -3721,7 +3865,7 @@ function NodeChainsSection({
   return (
     <>
       <header>
-        <h4>链路规则</h4>
+        <PanelTitle of="chains">链路规则</PanelTitle>
         <span className="rule-sheet-meta">{inChains.length} 条相关链</span>
         <span className="sp" />
         <button className="btn" disabled={!canCreate} title="以当前节点作为入口" onClick={() => go({ p: 'chain', id })}>
@@ -3850,11 +3994,6 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   const n = nodes.data?.nodes.find(x => x.node_id === id);
   /* 签发的 node token 同样只显示一次 */
   const [issued, setIssued] = useState<{ token: string; install_command: string } | null>(null);
-  const [lifecycleAction, setLifecycleAction] = useState<'retire' | 'restore' | 'abandon' | 'serviceRestore' | null>(
-    null,
-  );
-  const [forceReason, setForceReason] = useState('');
-  const [serviceRestoreReason, setServiceRestoreReason] = useState('节点已完成补偿并通过运行状态检查');
 
   // 身份表单始终可编辑，不再设置「改名称 / 公网 IP」开关。
   // 取消编辑模式不会导致误改：不保存则不生效，且「保存到草稿」只在有修改时出现。
@@ -3865,12 +4004,16 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
     public_ipv4_nat: boolean;
     public_ipv6_nat: boolean;
   } | null>(null);
+  /* 基准取自草稿快照，理由见 useDraftNode：以 `/nodes/agent-state` 为基准时，
+     「保存到草稿」之后 setForm(null) 会让五个输入框一齐回落到改动前的内容。
+     快照里没有这台机器（尚未返回、或较旧的控制面）时回退到直连值。 */
+  const draftNode = useDraftNode(id);
   const base = {
-    name: n?.name ?? '',
-    public_ipv4: n?.public_ipv4 ?? '',
-    public_ipv6: n?.public_ipv6 ?? '',
-    public_ipv4_nat: n?.public_ipv4_nat ?? false,
-    public_ipv6_nat: n?.public_ipv6_nat ?? false,
+    name: draftNode?.name ?? n?.name ?? '',
+    public_ipv4: (draftNode ? draftNode.public_ipv4 : n?.public_ipv4) ?? '',
+    public_ipv6: (draftNode ? draftNode.public_ipv6 : n?.public_ipv6) ?? '',
+    public_ipv4_nat: draftNode?.public_ipv4_nat ?? n?.public_ipv4_nat ?? false,
+    public_ipv6_nat: draftNode?.public_ipv6_nat ?? n?.public_ipv6_nat ?? false,
   };
   const cur = form ?? base;
   const dirty =
@@ -3911,7 +4054,6 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   const retire = useMutation({
     mutationFn: (status: 'active' | 'retired') => setNodeStatus(id, status),
     onSuccess: () => {
-      setLifecycleAction(null);
       qc.invalidateQueries({ queryKey: ['nodes'] });
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
@@ -3920,19 +4062,16 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
     },
   });
   const abandon = useMutation({
-    mutationFn: (reason: string) => abandonNode(id, reason, true),
+    mutationFn: () => abandonNode(id, true),
     onSuccess: () => {
-      setLifecycleAction(null);
-      setForceReason('');
       qc.invalidateQueries({ queryKey: ['nodes'] });
       qc.invalidateQueries({ queryKey: ['deployments'] });
       qc.invalidateQueries({ queryKey: ['snapshot'] });
     },
   });
   const serviceRestore = useMutation({
-    mutationFn: (reason: string) => restoreNodeService(id, reason),
+    mutationFn: () => restoreNodeService(id),
     onSuccess: () => {
-      setLifecycleAction(null);
       refresh();
       qc.invalidateQueries({ queryKey: ['deployments'] });
     },
@@ -3991,7 +4130,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   /* 访客（public）不显示页头操作：这些按钮全部触发写接口，访客没有一个可用。
      隐藏而非禁用与顶栏对访客的处理一致（shell.tsx 同样按 isPublic 移除入口）；
      「禁用而不隐藏」的约定针对登录后的角色，见 session.tsx。 */
-  const pub = isPublic(who);
+  const pub = isVisitor(who);
   const onSaved = () => {
     refresh();
     qc.invalidateQueries({ queryKey: ['revisions'] });
@@ -3999,9 +4138,6 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
   if (!n) return <Loading sheeted={sheeted} />;
 
-  const activeOrders = (deployments.data?.deployments ?? []).filter(
-    deployment => deployment.active && ['planned', 'running', 'halted'].includes(deployment.status),
-  );
   const lifecycleOrder = n.lifecycle_deployment_id
     ? deployments.data?.deployments.find(deployment => deployment.id === n.lifecycle_deployment_id)
     : undefined;
@@ -4121,10 +4257,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
                     <button
                       className={n.lifecycle_phase === 'active' ? 'dg' : undefined}
                       disabled={!system || retire.isPending}
-                      onClick={() => {
-                        retire.reset();
-                        setLifecycleAction(n.lifecycle_phase === 'active' ? 'retire' : 'restore');
-                      }}
+                      onClick={() => retire.mutate(n.lifecycle_phase === 'active' ? 'retired' : 'active')}
                     >
                       {retire.isPending ? '提交中…' : n.lifecycle_phase === 'active' ? '退役机器' : '恢复机器'}
                       <small>
@@ -4136,26 +4269,12 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
                     {n.lifecycle_phase === 'retiring' && (
                       <>
                         {teardownNeedsRepair && (
-                          <button
-                            disabled={!system || retire.isPending}
-                            onClick={() => {
-                              retire.reset();
-                              setLifecycleAction('retire');
-                            }}
-                          >
+                          <button disabled={!system || retire.isPending} onClick={() => retire.mutate('retired')}>
                             重建停用发布
                             <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
                           </button>
                         )}
-                        <button
-                          className="dg"
-                          disabled={!system || abandon.isPending}
-                          onClick={() => {
-                            abandon.reset();
-                            setForceReason('');
-                            setLifecycleAction('abandon');
-                          }}
-                        >
+                        <button className="dg" disabled={!system || abandon.isPending} onClick={() => abandon.mutate()}>
                           {abandon.isPending ? '处理中…' : '强制退役'}
                           <small>仅用于机器永久失联；结果会保留为警告状态</small>
                         </button>
@@ -4179,140 +4298,32 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
   return (
     <NodeDetailLayout sheeted={sheeted} node={n} lamp={lamp} toolbar={detailToolbar}>
-      {lifecycleAction === 'retire' && (
-        <Confirm
-          title={`退役 ${nodeLabel(n)}`}
-          confirmLabel={retire.isPending ? '正在创建…' : '创建停用发布'}
-          confirmDisabled={retire.isPending}
-          onCancel={() => setLifecycleAction(null)}
-          onConfirm={() => retire.mutate('retired')}
-          body={
-            <div className="node-lifecycle-confirm">
-              <p>这不是隐藏机器。系统会先提交退役修订，再让 Agent 确认以下四项都已停用：</p>
-              <div className="node-lifecycle-artifacts">
-                <span>Xray</span>
-                <span>WireGuard</span>
-                <span>Phantun</span>
-                <span>HY2 端口跳转</span>
-              </div>
-              {activeOrders.length > 0 ? (
-                <p className="callout warn">
-                  当前活动发布 {activeOrders.map(order => `#${order.id}`).join('、')}{' '}
-                  会被取消，并按最新修订创建替代发布。
-                </p>
-              ) : (
-                <p className="note">没有冲突中的活动发布；确认后直接创建停用发布。</p>
-              )}
-              <p className="note">Agent Token 会保留到停用回报成功，随后自动撤销；机器记录和发布历史不会删除。</p>
-              {retire.error && <ErrorBox error={retire.error} />}
-            </div>
-          }
-        />
-      )}
-      {lifecycleAction === 'restore' && (
-        <Confirm
-          title={`恢复 ${nodeLabel(n)}`}
-          confirmLabel={retire.isPending ? '正在恢复…' : '恢复并创建发布'}
-          danger={false}
-          confirmDisabled={retire.isPending}
-          onCancel={() => setLifecycleAction(null)}
-          onConfirm={() => retire.mutate('active')}
-          body={
-            <div className="node-lifecycle-confirm">
-              <p>恢复会递增生命周期代次，因此退役前遗留的发布仍然无效；系统将按当前模型创建新的收敛发布。</p>
-              <p className="callout warn">旧 Agent Token 不会复用。恢复后需要重新签发 Token，机器才能领取新发布。</p>
-              {retire.error && <ErrorBox error={retire.error} />}
-            </div>
-          }
-        />
-      )}
-      {lifecycleAction === 'abandon' && (
-        <Confirm
-          title={`强制退役 ${nodeLabel(n)}`}
-          confirmLabel={abandon.isPending ? '正在处理…' : '强制退役'}
-          requireWord="强制退役"
-          confirmDisabled={abandon.isPending || forceReason.trim().length === 0}
-          onCancel={() => {
-            setLifecycleAction(null);
-            setForceReason('');
-          }}
-          onConfirm={() => abandon.mutate(forceReason.trim())}
-          body={
-            <div className="node-lifecycle-confirm">
-              <p className="callout err">
-                控制面将不再等待这台机器，但无法证明远端 Xray、WireGuard 或监听端口已经停止。
-              </p>
-              <label className="field">
-                <span>原因</span>
-                <textarea
-                  className="f"
-                  rows={3}
-                  autoFocus
-                  placeholder="例如：机器已由供应商销毁，无法再连接"
-                  value={forceReason}
-                  onChange={event => setForceReason(event.target.value)}
-                />
-              </label>
-              <p className="note">确认后立即撤销 Agent Token、封住旧发布代次，并尝试注销该机器的托管 WARP 设备。</p>
-              {abandon.error && <ErrorBox error={abandon.error} />}
-            </div>
-          }
-        />
-      )}
-      {lifecycleAction === 'serviceRestore' && (
-        <Confirm
-          title={`恢复 ${nodeLabel(n)} 的服务入口？`}
-          confirmLabel={serviceRestore.isPending ? '正在恢复…' : '恢复服务'}
-          danger={false}
-          confirmDisabled={serviceRestore.isPending || serviceRestoreReason.trim().length === 0}
-          onCancel={() => setLifecycleAction(null)}
-          onConfirm={() => serviceRestore.mutate(serviceRestoreReason.trim())}
-          body={
-            <div className="node-lifecycle-confirm">
-              <p>节点会重新进入订阅入口和转发拓扑。生命周期不会改变，隔离与恢复记录会保留。</p>
-              <label className="field">
-                <span>恢复原因</span>
-                <textarea
-                  className="f"
-                  rows={3}
-                  value={serviceRestoreReason}
-                  onChange={event => setServiceRestoreReason(event.target.value)}
-                />
-              </label>
-              {serviceRestore.error && <ErrorBox error={serviceRestore.error} />}
-            </div>
-          }
-        />
-      )}
       {n.operationally_isolated && (
         <div className="callout warn node-isolation-banner">
-          <div className="node-isolation-copy" title={n.isolation_reason ?? undefined}>
+          <div className="node-isolation-copy">
             <b>
               已隔离
               {n.isolated_at && (
                 <>
-                  {' '}
-                  <Ago at={n.isolated_at} />
+                  {'\u202f'}
+                  <Ago at={n.isolated_at} withPastSuffix={false} />
                 </>
               )}
+              ，
             </b>
-            ：{isolationReasonSummary(n.isolation_reason)}，已停止承载流量；
+            已停止承载流量；
             {n.convergence_debt_count > 0
               ? `${pollTone(n) === 'ok' ? '' : '重新上线并'}同步剩余 ${n.convergence_debt_count} 项配置后`
               : n.service_reentry_ready
                 ? '当前已满足恢复条件'
                 : `${pollTone(n) === 'ok' ? '状态恢复' : '重新上线'}后`}
-            ，可由管理员恢复服务。
+            ，可手动恢复服务。
           </div>
           <div className="toolbar">
             <button
               className="btn primary"
               disabled={!system || !n.service_reentry_ready || serviceRestore.isPending}
-              onClick={() => {
-                serviceRestore.reset();
-                setServiceRestoreReason('节点已完成补偿并通过运行状态检查');
-                setLifecycleAction('serviceRestore');
-              }}
+              onClick={() => serviceRestore.mutate()}
             >
               恢复服务
             </button>
@@ -4386,16 +4397,19 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
         </section>
       )}
 
-      {/* ── 写入控制面模型的配置。修改后先进入草稿。 ──
-            两列而不是铺满：表单行是 72px 标签加 220px 输入，整幅宽度只会让标签和值之间
-            空出一大片。左列是这台机器的对外属性（身份 → 骨干网），右列是它怎么解析、
-            出示什么证书、连接参数。 */}
+      {/* ── 写入控制面模型的配置。 ──
+            两列而不是铺满：表单行是一条标签栏加 220px 输入，整幅宽度只会让标签和值之间
+            空出一大片。分栏依据是「改这一项影响谁」：
+              左栏 —— 只影响这台机器自己（它叫什么、地址是什么、wg0 怎么起）；
+              右栏 —— 影响它与外部的关系，以及它与机队默认值的差异。
+            右栏末尾的「本机覆盖」把设置页里按机器分列的两段（连接策略、日志保留）收在
+            这台机器名下：那两段在设置页是一张机队表，逐台调一项要先在表里找到这一行。 */}
       {tab === 'config' && (
         <section className="nd-tab-config">
           <div>
             <div className="panel config-panel">
               <header>
-                <h4>身份</h4>
+                <PanelTitle of="identity">身份</PanelTitle>
               </header>
               <div className="fgrid one">
                 <Row k="名称">
@@ -4473,6 +4487,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
               listenPort={wgListenPort}
               peers={nodes.data?.nodes ?? []}
               disabledLinks={snapshot.data?.snapshot.settings?.overlay.disabled_links ?? []}
+              enabled={wireguardEnabled}
               canEdit={system}
               onSaved={onSaved}
             />
@@ -4480,12 +4495,11 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
           <div>
             <DnsCard node={n} canEdit={system} onSaved={onSaved} />
-            {/* 位于 DNS 之后：证书组决定这台机器出示的 SNI，和上面几张卡一样是它的对外
-                属性；与它们不同的是改动不经过发布，所以卡里自己就保存了。 */}
+            {/* 证书组决定这台机器出示的 SNI，与上面几行一样是它的对外属性；
+                与它们不同的是改动不经过发布，所以卡里自己就保存了。 */}
             <CertGroupCard node={n} canEdit={system} />
-            {/* 位于最后且默认折叠：多数机器在该卡上的内容是与机队默认一致，
-                而上面几张卡各机器均不相同。标题中的说明已表明是否有差异，需要细节时再展开。 */}
             <ConnectionCard node={n} canEdit={system} onSaved={onSaved} />
+            <LogRetentionCard node={n} canEdit={system} />
           </div>
         </section>
       )}

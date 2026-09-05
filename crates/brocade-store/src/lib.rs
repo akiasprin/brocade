@@ -30,9 +30,9 @@ mod usage;
 
 pub use admin::{
     AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult, AdminLoginRequest,
-    AdminLoginResult, AdminOperator, AdminRole, AuthenticatedAdmin, ChangeAdminPasswordRequest,
-    CreateAdminOperatorRequest, IssuedAdminSession, IssuedAdminToken, ResetAdminPasswordResult,
-    ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
+    AdminLoginResult, AdminOperator, AdminRole, AuthenticatedAdmin, AuthenticatedUser,
+    ChangeAdminPasswordRequest, CreateAdminOperatorRequest, IssuedAdminSession, IssuedAdminToken,
+    IssuedUserLogin, ResetAdminPasswordResult, ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
 };
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
 pub use agent_release::{AgentBuildInfo, AgentRelease, AgentReleaseScope};
@@ -49,8 +49,8 @@ pub use brocade_deployment::protocol::{
     NodePingProbeList, NodePingProbeView, PhantunBinaries, PingProbePoint, PingProbeReportRequest,
     PingProbeReportResult, PingProbeSample, PingProbeSettings, PingProbeTarget,
     PingProbeTargetSeries, ProbeTarget, ProbeTargetList, ProbeTransport, RealtimeTelemetryPolicy,
-    ReportTargetResult, ReportedNodeState, RestoreNodeServiceRequest, RouteIpReport,
-    TargetApplyResult, TargetConvergenceReport, UpdateRealtimeTelemetryPolicyRequest, UsageCounter,
+    ReportTargetResult, ReportedNodeState, RouteIpReport, TargetApplyResult,
+    TargetConvergenceReport, UpdateRealtimeTelemetryPolicyRequest, UsageCounter,
     UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries,
     UsageNodeSeriesList, UsageReportRequest, UsageReportResult, UsageSample, UsageSampleList,
 };
@@ -70,11 +70,11 @@ pub use console::{
     RemoveWarpBindingResult, RevisionList, RevisionListItem, RotateUserUuidResult,
     SetUserAppQuotaRequest, SetUserAppQuotaResult, StepAcceptRequest, TenantList, TenantListItem,
     TransportRequest, UpdateNodeRequest, UpdateNodeResult, UpdateNodeStatusRequest,
-    UpdateUserStatusRequest, UpdateUserStatusResult, UpdateWarpBindingRequest,
-    UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult, UpsertExternalOutboundRequest,
-    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
-    UpsertUserResult, UserAppQuota, UserAppQuotaList, UserList, UserListItem,
-    VerifyDeploymentRequest, WarpBindingRemoval, WiresRequest,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateUserStatusResult,
+    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
+    UpsertExternalOutboundRequest, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
+    UpsertTenantResult, UpsertUserResult, UserAccountType, UserAppQuota, UserAppQuotaList,
+    UserList, UserListItem, VerifyDeploymentRequest, WarpBindingRemoval, WiresRequest,
 };
 pub use credentials::{
     admin_session_token_hash, admin_token_display_prefix, admin_token_hash,

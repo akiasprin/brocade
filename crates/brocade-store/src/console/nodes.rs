@@ -11,8 +11,6 @@ use crate::{AdminContext, Result, StoreError};
 pub struct UpdateNodeStatusRequest {
     /// `active` or `retired`
     pub status: String,
-    #[serde(default)]
-    pub note: Option<String>,
 }
 
 pub(crate) async fn update_node_status_tx(
@@ -21,7 +19,6 @@ pub(crate) async fn update_node_status_tx(
     revision_id: u64,
     node_id: &str,
     request: UpdateNodeStatusRequest,
-    reason: &str,
 ) -> Result<bool> {
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
@@ -56,15 +53,7 @@ pub(crate) async fn update_node_status_tx(
     .rows_affected()
         > 0;
     if changed {
-        crate::lifecycle::advance_intent_tx(
-            tx,
-            &node_id,
-            retired,
-            revision_id,
-            actor.operator_id(),
-            reason,
-        )
-        .await?;
+        crate::lifecycle::advance_intent_tx(tx, &node_id, retired, revision_id).await?;
     }
     Ok(changed)
 }

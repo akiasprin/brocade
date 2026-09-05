@@ -174,6 +174,7 @@ fn model_ingress(ingress: &Value) -> Ingress {
             public_key: str_value(&reality["public_key"]).to_owned(),
             short_ids: string_array(&reality["short_ids"]),
         },
+        anytls_identity: None,
         wires: IngressWires::Vless(Transport::VlessReality(
             brocade_core::model::RealitySettings {
                 dest: str_value(&reality["dest"]).to_owned(),

@@ -547,7 +547,7 @@ func TestSessionControlFrameErrors(t *testing.T) {
 	}
 }
 
-func TestSessionSYNACKSignalsSuccessAndRejection(t *testing.T) {
+func TestSessionSYNACKHandlesSuccessAndRejectionAsynchronously(t *testing.T) {
 	tests := []struct {
 		name       string
 		data       []byte
@@ -560,23 +560,28 @@ func TestSessionSYNACKSignalsSuccessAndRejection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, output := newWireSession(marshalTestFrames(testWireFrame{cmd: cmdSYNACK, sid: 7, data: tt.data}), true)
-			s.streams[7] = newStream(7, nil)
-			resultCh := make(chan error, 1)
-			s.synAckCh[7] = resultCh
+			stream := newStream(7, nil)
+			s.streams[7] = stream
 			if err := s.readLoop(context.Background()); !errors.Is(err, io.EOF) {
 				t.Fatalf("readLoop error = %v, want EOF", err)
 			}
-			result := <-resultCh
 			if tt.wantResult == "" {
-				if result != nil {
-					t.Fatalf("SYNACK result = %v, want nil", result)
+				select {
+				case <-stream.done:
+					t.Fatalf("successful SYNACK closed stream: %v", stream.result())
+				default:
 				}
 				if frames := parseTestFrames(t, output.Bytes()); len(frames) != 0 {
 					t.Fatalf("successful SYNACK emitted frames: %+v", frames)
 				}
 				return
 			}
-			if result == nil || !strings.Contains(result.Error(), tt.wantResult) {
+			select {
+			case <-stream.done:
+			default:
+				t.Fatal("rejected SYNACK did not close stream")
+			}
+			if result := stream.result(); result == nil || !strings.Contains(result.Error(), tt.wantResult) {
 				t.Fatalf("SYNACK result = %v, want text %q", result, tt.wantResult)
 			}
 			frames := parseTestFrames(t, output.Bytes())
@@ -605,9 +610,8 @@ func TestSessionDuplicateSYNACKDoesNotBlock(t *testing.T) {
 				testWireFrame{cmd: cmdSYNACK, sid: 7, data: tt.data},
 				testWireFrame{cmd: cmdWaste},
 			), true)
-			s.streams[7] = newStream(7, nil)
-			resultCh := make(chan error, 1)
-			s.synAckCh[7] = resultCh
+			stream := newStream(7, nil)
+			s.streams[7] = stream
 
 			readDone := make(chan error, 1)
 			go func() { readDone <- s.readLoop(context.Background()) }()
@@ -620,18 +624,21 @@ func TestSessionDuplicateSYNACKDoesNotBlock(t *testing.T) {
 				t.Fatal("duplicate SYNACK blocked the session reader")
 			}
 
-			result := <-resultCh
 			if tt.wantResult == "" {
-				if result != nil {
-					t.Fatalf("SYNACK result = %v, want nil", result)
+				select {
+				case <-stream.done:
+					t.Fatalf("successful duplicate SYNACK closed stream: %v", stream.result())
+				default:
 				}
-			} else if result == nil || !strings.Contains(result.Error(), tt.wantResult) {
-				t.Fatalf("SYNACK result = %v, want text %q", result, tt.wantResult)
-			}
-			select {
-			case duplicate := <-resultCh:
-				t.Fatalf("duplicate SYNACK result was delivered: %v", duplicate)
-			default:
+			} else {
+				select {
+				case <-stream.done:
+				default:
+					t.Fatal("rejected duplicate SYNACK did not close stream")
+				}
+				if result := stream.result(); result == nil || !strings.Contains(result.Error(), tt.wantResult) {
+					t.Fatalf("SYNACK result = %v, want text %q", result, tt.wantResult)
+				}
 			}
 
 			frames := parseTestFrames(t, output.Bytes())

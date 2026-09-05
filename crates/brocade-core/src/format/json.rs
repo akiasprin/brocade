@@ -416,6 +416,8 @@ fn inbound(inbound: &XrayInbound) -> Value {
             } else {
                 json!({ "enabled": false })
             };
+            let mut anytls_stream_settings = stream_settings(&XrayStream::Tcp, security);
+            enable_tcp_fast_open(&mut anytls_stream_settings, json!(TCP_FAST_OPEN_BACKLOG));
             json!({
                 "tag": tag,
                 "listen": listen,
@@ -426,7 +428,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
                     "paddingScheme": settings.padding_scheme,
                     "masquerade": anytls_masquerade(&settings.masquerade),
                 },
-                "streamSettings": stream_settings(&XrayStream::Tcp, security),
+                "streamSettings": anytls_stream_settings,
                 "sniffing": sniffing,
             })
         }

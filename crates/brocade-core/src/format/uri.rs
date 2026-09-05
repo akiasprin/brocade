@@ -165,7 +165,20 @@ fn anytls_uri(
     // There is no upstream Xray share-link parser for AnyTLS. Keep the URI deliberately small
     // and interoperable with clients that use the conventional anytls:// form; the server-side
     // padding scheme is negotiated after the TLS session starts and masquerade is server-only.
-    let query = format!("sni={}", pct_encode(&anytls.server_name));
+    let mut query = vec![("sni", anytls.server_name.clone())];
+    if let Some(reality) = &anytls.reality {
+        query.extend([
+            ("security", "reality".to_owned()),
+            ("fp", reality.fingerprint.clone()),
+            ("pbk", reality.public_key.clone()),
+            ("sid", reality.short_id.clone()),
+        ]);
+    }
+    let query = query
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", pct_encode(&value)))
+        .collect::<Vec<_>>()
+        .join("&");
     format!(
         "anytls://{}@{}:{}?{}#{}",
         pct_encode(&entry.uuid),

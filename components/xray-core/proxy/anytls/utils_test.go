@@ -65,6 +65,39 @@ func TestReadMultiBufferExact(t *testing.T) {
 	}
 }
 
+func TestReadMultiBufferExactReusesCompleteBuffers(t *testing.T) {
+	first := buf.New()
+	firstPayload := first.Extend(101)
+	for i := range firstPayload {
+		firstPayload[i] = byte(i)
+	}
+	second := buf.New()
+	secondPayload := second.Extend(203)
+	for i := range secondPayload {
+		secondPayload[i] = byte(i + len(firstPayload))
+	}
+	trailing := buf.New()
+	trailing.Extend(17)
+
+	reader := &buf.BufferedReader{
+		Reader: buf.NewReader(bytes.NewReader(nil)),
+		Buffer: buf.MultiBuffer{first, second, trailing},
+	}
+	mb, err := readMultiBufferExact(reader, len(firstPayload)+len(secondPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.ReleaseMulti(mb)
+	defer buf.ReleaseMulti(reader.Buffer)
+
+	if len(mb) != 2 || mb[0] != first || mb[1] != second {
+		t.Fatal("complete input buffers were copied instead of transferred")
+	}
+	if len(reader.Buffer) != 1 || reader.Buffer[0] != trailing {
+		t.Fatal("reader did not retain the bytes after the exact body")
+	}
+}
+
 func TestDiscardBytesAndReadText(t *testing.T) {
 	payload := []byte("discard-mehello-world")
 	reader := &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(payload))}

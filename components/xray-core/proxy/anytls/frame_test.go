@@ -4,10 +4,26 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"testing"
 
 	"github.com/xtls/xray-core/common/buf"
 )
+
+type countingConn struct {
+	net.Conn
+	wire       bytes.Buffer
+	writeCalls int
+	maxWrite   int
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+	if len(p) > c.maxWrite {
+		c.maxWrite = len(p)
+	}
+	return c.wire.Write(p)
+}
 
 func TestFrameSerializationBoundaries(t *testing.T) {
 	tests := []struct {
@@ -100,9 +116,10 @@ func TestFrameWriterRejectsOversizedFrames(t *testing.T) {
 }
 
 func TestSendStreamDataSplitsLargePayload(t *testing.T) {
-	var wire bytes.Buffer
+	conn := new(countingConn)
 	s := &session{
-		bw:      buf.NewBufferedWriter(buf.NewWriter(&wire)),
+		conn:    conn,
+		bw:      buf.NewBufferedWriter(buf.NewWriter(conn)),
 		streams: make(map[uint32]*stream),
 	}
 	s.fw = newFrameWriter(s.bw)
@@ -115,7 +132,13 @@ func TestSendStreamDataSplitsLargePayload(t *testing.T) {
 	if err := s.sendStreamData(9, buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
 		t.Fatal(err)
 	}
-	frames := parseTestFrames(t, wire.Bytes())
+	if conn.writeCalls != 2 {
+		t.Fatalf("connection writes = %d, want two bounded batches", conn.writeCalls)
+	}
+	if conn.maxWrite > int(maxPSHBatchWireSize) {
+		t.Fatalf("largest connection write = %d, limit %d", conn.maxWrite, maxPSHBatchWireSize)
+	}
+	frames := parseTestFrames(t, conn.wire.Bytes())
 	if len(frames) != 3 {
 		t.Fatalf("frame count = %d, want 3", len(frames))
 	}
@@ -129,4 +152,122 @@ func TestSendStreamDataSplitsLargePayload(t *testing.T) {
 	if !bytes.Equal(got.Bytes(), payload) {
 		t.Fatal("large payload was not reconstructed exactly")
 	}
+}
+
+func TestSendStreamDataBatchesAdjacentFrames(t *testing.T) {
+	conn := new(countingConn)
+	s := &session{
+		conn:    conn,
+		bw:      buf.NewBufferedWriter(buf.NewWriter(conn)),
+		streams: make(map[uint32]*stream),
+	}
+	s.fw = newFrameWriter(s.bw)
+	s.paddingScheme, _ = parsePaddingScheme("stop=0\n0=30-30")
+
+	payload := make([]byte, 8*buf.Size)
+	data := make(buf.MultiBuffer, 0, 8)
+	for index := range 8 {
+		buffer := buf.New()
+		chunk := buffer.Extend(buf.Size)
+		for offset := range chunk {
+			value := byte(index*17 + offset)
+			chunk[offset] = value
+			payload[index*buf.Size+offset] = value
+		}
+		data = append(data, buffer)
+	}
+
+	if err := s.sendStreamData(13, data); err != nil {
+		t.Fatal(err)
+	}
+	if conn.writeCalls != 1 {
+		t.Fatalf("connection writes = %d, want one batched write", conn.writeCalls)
+	}
+	frames := parseTestFrames(t, conn.wire.Bytes())
+	if len(frames) != 2 {
+		t.Fatalf("frame count = %d, want 2", len(frames))
+	}
+	var got bytes.Buffer
+	for _, frame := range frames {
+		if frame.cmd != cmdPSH || frame.sid != 13 {
+			t.Fatalf("unexpected frame: cmd=%d sid=%d", frame.cmd, frame.sid)
+		}
+		got.Write(frame.data)
+	}
+	if !bytes.Equal(got.Bytes(), payload) {
+		t.Fatal("batched payload was not reconstructed exactly")
+	}
+}
+
+func TestSendStreamDataFlushesControlFrameBeforeDirectWrite(t *testing.T) {
+	conn := new(countingConn)
+	s := &session{
+		conn:    conn,
+		bw:      buf.NewBufferedWriter(buf.NewWriter(conn)),
+		streams: make(map[uint32]*stream),
+	}
+	s.fw = newFrameWriter(s.bw)
+	s.paddingScheme, _ = parsePaddingScheme("stop=0\n0=30-30")
+
+	if err := s.fw.writeFrame(newFrame(cmdSYN, 11)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.sendStreamData(11, buf.MultiBuffer{buf.FromBytes([]byte("payload"))}); err != nil {
+		t.Fatal(err)
+	}
+
+	if conn.writeCalls != 2 {
+		t.Fatalf("connection writes = %d, want control flush plus one data write", conn.writeCalls)
+	}
+	frames := parseTestFrames(t, conn.wire.Bytes())
+	if len(frames) != 2 || frames[0].cmd != cmdSYN || frames[1].cmd != cmdPSH {
+		t.Fatalf("unexpected frame order: %+v", frames)
+	}
+}
+
+func BenchmarkSendStreamData64KiB(b *testing.B) {
+	newPayload := func() buf.MultiBuffer {
+		mb := make(buf.MultiBuffer, 0, 8)
+		for range 8 {
+			buffer := buf.New()
+			payload := buffer.Extend(buf.Size)
+			for i := range payload {
+				payload[i] = byte(i)
+			}
+			mb = append(mb, buffer)
+		}
+		return mb
+	}
+
+	b.Run("coalesced", func(b *testing.B) {
+		conn := new(countingConn)
+		s := &session{conn: conn, bw: buf.NewBufferedWriter(buf.NewWriter(conn))}
+		s.fw = newFrameWriter(s.bw)
+		s.paddingScheme, _ = parsePaddingScheme("stop=0\n0=30-30")
+		b.SetBytes(8 * int64(buf.Size))
+		b.ReportAllocs()
+		for b.Loop() {
+			conn.wire.Reset()
+			if err := s.sendStreamData(1, newPayload()); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.ReportMetric(float64(conn.writeCalls)/float64(b.N), "writes/op")
+	})
+
+	b.Run("buffered-baseline", func(b *testing.B) {
+		conn := new(countingConn)
+		s := &session{bw: buf.NewBufferedWriter(buf.NewWriter(conn))}
+		s.fw = newFrameWriter(s.bw)
+		s.paddingScheme, _ = parsePaddingScheme("stop=0\n0=30-30")
+		b.SetBytes(8 * int64(buf.Size))
+		b.ReportAllocs()
+		for b.Loop() {
+			conn.wire.Reset()
+			if err := s.sendStreamData(1, newPayload()); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.ReportMetric(float64(conn.writeCalls)/float64(b.N), "writes/op")
+	})
 }

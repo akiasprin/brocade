@@ -30,6 +30,11 @@ use serde_json::Value;
 
 const HIDDEN: &str = "***";
 
+/// Host fields whose port must disappear altogether. REALITY's target is shown to reviewers as
+/// a masked site category (`***.com`), not as a masked endpoint (`***.com:***`): even the presence
+/// and shape of the listener port are not part of the review surface.
+const HOST_WITHOUT_PORT_KEYS: &[&str] = &["dest"];
+
 /// Keys whose value is a host — an address or a name. Needed because a domain has
 /// no reliable test by value: `sg-01.example.net` and a tenant path like
 /// `acme.cn.sales` are the same shape, and only the field name says which is which.
@@ -41,12 +46,11 @@ const HIDDEN: &str = "***";
 const HOST_KEYS: &[&str] = &[
     "address",
     "addr",
-    // REALITY's borrowed site, as `host:port`. It needs naming here because the
-    // key-independent pass cannot reach it: that one only treats `host:port` as an
-    // endpoint when the host parses as an address, and this one is a domain
-    // (`borrowed.example.net:443`). Left alone it is the one field on the settings page that
-    // still names a real host to a reviewer.
-    "dest",
+    // The certificate's DNS name is rendered by both VLESS/TLS and AnyTLS/TLS, and is also
+    // offered as REALITY's local-certificate SNI. It is an address even though the column name
+    // does not contain `host` or `server_name`, so it must cross the same server-side masking
+    // boundary as those fields.
+    "certificate_name",
     "dial_host",
     "dns_servers",
     "endpoint",
@@ -96,6 +100,18 @@ const PROSE_KEYS: &[&str] = &[
 /// `Diagnostic` type, and an absent one turns a rendered blank into an `undefined`.
 const PROSE_HIDDEN: &str = "";
 
+/// Configuration material that changes the observable AnyTLS traffic shape. A reviewer can
+/// verify that AnyTLS is enabled without receiving the exact padding recipe used by clients and
+/// servers. Remove these members rather than replacing them: an asterisk-filled array would not
+/// satisfy the wire type and could be mistaken for a real scheme by a future client.
+const SECRET_KEYS: &[&str] = &[
+    "anytls_padding_scheme",
+    "email",
+    "login_enabled",
+    "padding_scheme",
+    "telegram",
+];
+
 /// Keys whose value is a port number. The number becomes the string `"***"`: a port
 /// has no neutral value to stand in for it — 0 reads as "not set", and any other
 /// number is a lie that somebody will eventually dial.
@@ -137,6 +153,9 @@ pub fn mask_json(value: &mut Value) {
             // every object depth so users, compiled clients and observed grant state all follow
             // the same rule.
             map.remove("uuid");
+            for key in SECRET_KEYS {
+                map.remove(*key);
+            }
             for (key, child) in map.iter_mut() {
                 mask_member(key, child);
             }
@@ -153,6 +172,12 @@ fn mask_member(key: &str, value: &mut Value) {
     if PORT_KEYS.contains(&key) && (value.is_number() || value.is_string()) {
         *value = Value::String(HIDDEN.to_owned());
         return;
+    }
+    if HOST_WITHOUT_PORT_KEYS.contains(&key) {
+        if let Value::String(text) = value {
+            *text = mask_host_without_port(text);
+            return;
+        }
     }
     if HOST_KEYS.contains(&key) {
         match value {
@@ -187,6 +212,18 @@ fn mask_host_value(text: &str) -> String {
         mask_url(text)
     } else {
         mask_endpoint(text)
+    }
+}
+
+/// Mask a host-or-endpoint while omitting its port marker. Used for the REALITY target, whose
+/// readonly representation is deliberately only the masked site (`***.com`).
+fn mask_host_without_port(text: &str) -> String {
+    if text.parse::<IpAddr>().is_ok() {
+        return mask_host(text);
+    }
+    match split_host_port(text) {
+        Some((host, _)) => mask_host(host),
+        None => mask_host(text),
     }
 }
 
@@ -388,7 +425,7 @@ mod tests {
             }
         });
         mask_json(&mut settings);
-        assert_eq!(settings["reality_site"]["dest"], "***.net:***");
+        assert_eq!(settings["reality_site"]["dest"], "***.net");
         assert_eq!(settings["reality_site"]["server_names"][0], "***.net");
         // Neither of these names a host, and blanking them would cost the reviewer the
         // very thing they are reviewing.
@@ -403,7 +440,31 @@ mod tests {
             "server_names": ["www.microsoft.com"],
         }}});
         mask_json(&mut ingress);
-        assert_eq!(ingress["transport"]["v"]["dest"], "***.com:***");
+        assert_eq!(ingress["transport"]["v"]["dest"], "***.com");
+    }
+
+    /// A node certificate name appears in three readonly UI locations: VLESS's TLS note,
+    /// AnyTLS's TLS note, and REALITY's local-certificate SNI selector/note. Mask it in the
+    /// completed response rather than relying on every present and future renderer to remember
+    /// to hide it.
+    #[test]
+    fn a_node_certificate_name_is_masked_before_it_reaches_a_readonly_viewer() {
+        let mut snapshot = json!({
+            "snapshot": {
+                "nodes": [{
+                    "id": "n1",
+                    "certificate_name": "a2335a6d.huacu.io",
+                }]
+            }
+        });
+
+        mask_json(&mut snapshot);
+
+        assert_eq!(
+            snapshot["snapshot"]["nodes"][0]["certificate_name"],
+            "***.io"
+        );
+        assert!(!snapshot.to_string().contains("a2335a6d.huacu.io"));
     }
 
     /// A diagnostic's sentence carries whatever the compiler had to say, and what it
@@ -520,7 +581,14 @@ mod tests {
     #[test]
     fn uuid_credentials_are_removed_at_every_depth() {
         let mut value = json!({
-            "users": [{ "id": "alice", "uuid": "user-secret" }],
+            "users": [{
+                "id": "alice",
+                "uuid": "user-secret",
+                "email": "alice@example.com",
+                "telegram": "alice_net",
+                "login_enabled": true,
+                "account_type": "test",
+            }],
             "compiled": {
                 "clients": [{ "email": "alice@example", "uuid": "compiled-secret" }],
                 "observed": { "uuid": "observed-secret", "state": "present" },
@@ -533,8 +601,44 @@ mod tests {
         assert!(!text.contains("compiled-secret"), "{text}");
         assert!(!text.contains("observed-secret"), "{text}");
         assert!(!text.contains("\"uuid\""), "{text}");
+        assert!(!text.contains("alice@example.com"), "{text}");
+        assert!(!text.contains("alice_net"), "{text}");
+        assert!(!text.contains("login_enabled"), "{text}");
         assert_eq!(value["users"][0]["id"], "alice");
+        assert_eq!(value["users"][0]["account_type"], "test");
         assert_eq!(value["compiled"]["observed"]["state"], "present");
+    }
+
+    #[test]
+    fn anytls_padding_schemes_are_removed_at_every_depth() {
+        let mut value = json!({
+            "settings": {
+                "anytls_padding_scheme": ["stop=4", "0=20-30"],
+                "connection": { "conn_idle_secs": 300 },
+            },
+            "ingresses": [{
+                "wires": {
+                    "anytls": {
+                        "port": 443,
+                        "padding_scheme": ["stop=2", "0=30-30", "1=100-400"],
+                        "masquerade": { "kind": "not-found" },
+                    }
+                }
+            }],
+        });
+
+        mask_json(&mut value);
+
+        let encoded = value.to_string();
+        assert!(!encoded.contains("anytls_padding_scheme"), "{encoded}");
+        assert!(!encoded.contains("padding_scheme"), "{encoded}");
+        assert!(!encoded.contains("stop=4"), "{encoded}");
+        assert!(!encoded.contains("stop=2"), "{encoded}");
+        assert_eq!(value["settings"]["connection"]["conn_idle_secs"], 300);
+        assert_eq!(
+            value["ingresses"][0]["wires"]["anytls"]["masquerade"]["kind"],
+            "not-found"
+        );
     }
 
     #[test]

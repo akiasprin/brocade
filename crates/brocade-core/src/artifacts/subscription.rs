@@ -86,6 +86,7 @@ pub enum SubscriptionSecurity {
 pub struct SubscriptionAnyTls {
     pub server_name: String,
     pub settings: AnyTls,
+    pub reality: Option<SubscriptionReality>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +194,7 @@ fn security(security: &UserSecurityPlan) -> SubscriptionSecurity {
         UserSecurityPlan::AnyTls(anytls) => SubscriptionSecurity::AnyTls(SubscriptionAnyTls {
             server_name: anytls.server_name.clone(),
             settings: anytls.settings.clone(),
+            reality: anytls.reality.as_ref().map(reality_params),
         }),
     }
 }

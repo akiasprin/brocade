@@ -580,6 +580,16 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                         fingerprint: reality.fingerprint.clone(),
                         flow: reality.flow.clone(),
                     },
+                    ProbeSecurity::AnyTls(anytls) if anytls.reality.is_some() => {
+                        let reality = anytls.reality.as_ref().unwrap();
+                        E2eProbeReality {
+                            public_key: reality.public_key.clone(),
+                            short_id: reality.short_id.clone(),
+                            server_name: reality.server_name.clone(),
+                            fingerprint: reality.fingerprint.clone(),
+                            flow: None,
+                        }
+                    }
                     // Filler beside a `tls` block that supersedes it. Empty rather than absent
                     // because the field is what an older agent parses, and one that cannot be
                     // parsed costs that agent every other probe on the machine.

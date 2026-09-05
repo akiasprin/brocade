@@ -1,5 +1,5 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   DEFAULT_BRANDING,
   fetchAuthState,
@@ -48,6 +48,7 @@ async function restorePublic() {
 }
 
 export function App() {
+  const queryClient = useQueryClient();
   const brandingQuery = useQuery({ queryKey: ['branding'], queryFn: fetchBranding, retry: false });
   const branding = brandingQuery.data ?? DEFAULT_BRANDING;
   /* 浏览器会话依赖 HttpOnly cookie；内存中只保存 whoami，用于菜单和权限提示。 */
@@ -55,6 +56,15 @@ export function App() {
   // 刷新后先用 cookie 恢复会话：恢复完成前渲染空白占位，避免短暂显示登录页。
   // 401 和网络错误同样进入登录页，只是不会先显示一帧表单。
   const [restoring, setRestoring] = useState(true);
+  // Query keys describe resources rather than identities. Clear them whenever a new identity
+  // enters, otherwise an administrator's cached user list can survive into a public session.
+  const onLogin = useCallback(
+    (next: Session) => {
+      queryClient.clear();
+      setSession(next);
+    },
+    [queryClient],
+  );
 
   useEffect(() => {
     fetchSessionWhoami()
@@ -64,7 +74,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    document.title = `${branding.site_name} · console`;
+    document.title = `${branding.site_name} | 🛰️ 跨境网络小管家`;
   }, [branding.site_name]);
 
   if (restoring) return <div id="stage" />;
@@ -72,7 +82,7 @@ export function App() {
     return (
       <>
         <div id="stage" />
-        <Login branding={branding} onLogin={setSession} />
+        <Login branding={branding} onLogin={onLogin} />
       </>
     );
 
@@ -91,6 +101,7 @@ export function App() {
       /* 撤销请求失败（网络异常等）也继续进入登录页：用户已表达退出意图，cookie 可能已失效 */
     }
     setSession(null);
+    queryClient.clear();
   };
 
   return (
@@ -118,7 +129,7 @@ function Workbench({
 }) {
   useEffect(() => {
     wm.init(session.who.operator_id);
-    const first = visibleTabs(session.who.role)[0];
+    const first = visibleTabs(session.who)[0];
     if (first) openTab(first);
   }, [session]);
 

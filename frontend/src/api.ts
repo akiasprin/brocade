@@ -3,7 +3,7 @@
 
 import { draft, type ModelOp } from './draft';
 
-export type AdminRole = 'readonly' | 'editor' | 'publisher' | 'tenant-admin' | 'system-admin';
+export type AdminRole = 'user' | 'readonly' | 'editor' | 'publisher' | 'tenant-admin' | 'system-admin';
 
 /* GET /whoami = brocade_store::AuthenticatedAdmin */
 export interface Whoami {
@@ -11,6 +11,7 @@ export interface Whoami {
   role: AdminRole;
   tenant_scope: string | null;
   token_prefix: string | null;
+  self_user?: { tenant_id: string; user_id: string };
   /**
    * 该角色看到的 IP、域名和端口均为 `123.123.***.***` 形式的掩码值，也无法获取产物。
    * 掩码在服务端出口处生成，与界面无关；该字段只用于决定是否渲染那些点击后会被拒绝的入口。
@@ -144,6 +145,8 @@ export interface LoginAdminResponse {
 }
 
 export const fetchAuthState = () => api<AuthState>('/auth/state');
+export const setVisitorAccess = (enabled: boolean) =>
+  api<AuthState>('/visitor-access', '', { method: 'PUT', body: JSON.stringify({ enabled }) });
 export const fetchSessionWhoami = () => api<Whoami>('/whoami');
 export const initAdmin = (body: { operator_id: string; display_name: string; password: string }) =>
   api<InitAdminResponse>('/auth/init', '', { method: 'POST', body: JSON.stringify(body) });
@@ -354,9 +357,6 @@ export interface NodeAgentStateItem {
   lifecycle_last_error: string | null;
   operationally_isolated: boolean;
   isolated_at: string | null;
-  isolated_by: string | null;
-  isolation_reason: string | null;
-  isolation_source_deployment_id: number | null;
   convergence_debt_count: number;
   convergence_debt_failed: boolean;
   service_reentry_ready: boolean;
@@ -378,8 +378,6 @@ export interface NodeLifecycleTransitionResult {
     deployment_id: number | null;
     requested_at: string | null;
     completed_at: string | null;
-    completed_by: string | null;
-    reason: string | null;
     last_error: string | null;
   };
   deployment_id: number | null;
@@ -394,9 +392,8 @@ export const setNodeStatus = (id: string, status: 'active' | 'retired') =>
     body: JSON.stringify({ status }),
   });
 
-export const abandonNode = (id: string, reason: string, unregisterWarp = true) =>
+export const abandonNode = (id: string, unregisterWarp = true) =>
   post<NodeLifecycleTransitionResult>(`/nodes/${encodeURIComponent(id)}/lifecycle/abandon`, {
-    reason,
     unregister_warp: unregisterWarp,
   });
 
@@ -619,15 +616,15 @@ export interface NodeIsolationCommandResult {
 export const isolateDeploymentTarget = (
   deploymentId: number,
   nodeId: string,
-  request: { expected_target_status: string; reason: string; acknowledge_uncertain?: boolean },
+  request: { expected_target_status: string; acknowledge_uncertain?: boolean },
 ) =>
   post<NodeIsolationCommandResult>(
     `/deployments/${deploymentId}/targets/${encodeURIComponent(nodeId)}/isolate`,
     request,
   );
 
-export const restoreNodeService = (nodeId: string, reason: string) =>
-  post<NodeIsolationCommandResult>(`/nodes/${encodeURIComponent(nodeId)}/restore-service`, { reason });
+export const restoreNodeService = (nodeId: string) =>
+  post<NodeIsolationCommandResult>(`/nodes/${encodeURIComponent(nodeId)}/restore-service`, {});
 
 /**
  * 权限变更先进入 durable outbox，之后才会生成自动化授权单。如果规划阶段持续失败，
@@ -699,6 +696,8 @@ export interface UserListItem {
   // Readonly responses remove usable credentials at the server boundary.
   uuid?: string;
   status: string;
+  account_type?: 'formal' | 'test';
+  login_enabled?: boolean;
   created_at: string;
   created_revision: number | null;
 }
@@ -721,6 +720,28 @@ export const setUserStatus = (tenant: string, user: string, status: 'active' | '
 
 export const rotateUserUuid = (tenant: string, user: string) =>
   post<{ revision_id: number }>(`/users/${tenant}/${user}/rotate-uuid`, undefined);
+
+export const fetchMyUser = () => api<UserListItem>('/me/user');
+
+export const updateUserProfile = (
+  tenant: string,
+  user: string,
+  body: { account_type: 'formal' | 'test' },
+) =>
+  api<UserListItem>(`/users/${tenant}/${user}/profile`, '', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+
+export interface IssuedUserLogin {
+  operator_id: string;
+  password: string;
+  sessions_revoked: number;
+}
+
+export const issueUserLogin = (tenant: string, user: string) => post<IssuedUserLogin>(`/users/${tenant}/${user}/login`);
+
+export const rotateMyUuid = () => post<{ revision_id: number }>('/me/rotate-uuid');
 
 export interface GrantProbeCapability {
   available: boolean;
@@ -805,15 +826,23 @@ export interface ClashHaitunSubscriptionInfo {
 export const fetchClashSubscription = (tenant: string, user: string) =>
   api<ClashSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription`);
 
+export const fetchMyClashSubscription = () => api<ClashSubscriptionInfo>('/me/clash-subscription');
+
 export const issueClashHaitunSubscription = (tenant: string, user: string) =>
   api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun`, '', {
     method: 'POST',
   });
 
+export const issueMyClashHaitunSubscription = () =>
+  api<ClashHaitunSubscriptionInfo>('/me/clash-subscription/haitun', '', { method: 'POST' });
+
 export const revokeClashHaitunSubscription = (tenant: string, user: string) =>
   api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun`, '', {
     method: 'DELETE',
   });
+
+export const revokeMyClashHaitunSubscription = () =>
+  api<ClashHaitunSubscriptionInfo>('/me/clash-subscription/haitun', '', { method: 'DELETE' });
 
 // ── 流量额度（用户 × 项目）──
 // 额度不修改任何产物——xray.json 中不写入用户——因此它是直接写入的运营参数；
@@ -1047,6 +1076,18 @@ export type AnyTlsMasquerade =
 export interface AnyTlsSettings {
   /** AnyTLS owns its own TCP listener and does not reuse `Ingress.port`. */
   port: number;
+  /** Outer stream security. Older snapshots omit it and therefore remain TLS. */
+  security?: 'tls' | 'reality';
+  /** AnyTLS's own effective REALITY target; it is independent from VLESS on the same ingress. */
+  reality?: {
+    dest: string;
+    server_names: string[];
+    fingerprint: string;
+    flow?: string | null;
+    fallback_mode?: RealityFallbackMode;
+    fallback_limits?: RealityFallbackLimits;
+    fallback_guard?: boolean;
+  } | null;
   /** One padding grammar line per array item. Empty means Xray's built-in scheme. */
   padding_scheme?: string[];
   /** Client session pool check interval in seconds. Empty means Xray's default of 30s. */
@@ -1082,7 +1123,9 @@ export const transportNeedsCertificate = (kind: TransportKind) => kind === 'vles
 
 /* 只要有一条线使用自有证书就需要证书。hy2 必然使用，TLS 两档同样使用。 */
 export const wiresNeedCertificate = (wires: Wires) =>
-  !!wires.anytls || !!wires.hysteria2 || (!!wires.vless && transportNeedsCertificate(wires.vless.kind));
+  (!!wires.anytls && (wires.anytls.security ?? 'tls') === 'tls') ||
+  !!wires.hysteria2 ||
+  (!!wires.vless && transportNeedsCertificate(wires.vless.kind));
 
 export const transportIsXhttp = (kind: TransportKind) => kind === 'vless-reality-xhttp' || kind === 'vless-tls-xhttp';
 
@@ -1557,6 +1600,7 @@ export function ingressUpsertBody(
   const transport: NonNullable<SnapshotIngress['wires']['vless']> = ingress.wires.vless ?? {
     kind: 'vless-reality',
   };
+  const realitySource = transport.kind.startsWith('vless-reality') ? transport : undefined;
   return {
     id: ingress.id,
     chain_id: ingress.chain,
@@ -1567,14 +1611,14 @@ export function ingressUpsertBody(
     reality: {
       // TLS 档没有借用站点，这两个字段为 undefined。回传空表示跟随全局，与其在库中的
       // 状态一致（这两列本身为 NULL）。
-      dest: transport.dest ?? '',
-      server_names: [...(transport.server_names ?? [])],
-      fingerprint: transport.kind.startsWith('vless-reality') ? (transport.fingerprint ?? undefined) : undefined,
-      fallback_mode: transport.fallback_mode ?? 'global-site',
-      fallback_limits: transport.fallback_limits ?? { mode: 'off' },
+      dest: realitySource?.dest ?? '',
+      server_names: [...(realitySource?.server_names ?? [])],
+      fingerprint: realitySource?.fingerprint ?? undefined,
+      fallback_mode: realitySource?.fallback_mode ?? 'global-site',
+      fallback_limits: realitySource?.fallback_limits ?? { mode: 'off' },
       // 需要显式回写，不能依赖「不携带即默认启用」：否则任何一次修改端口或迁移机器，
       // 都会将已关闭回落防护的接入面重新启用，且界面上没有任何提示。
-      fallback_guard: transport.fallback_guard ?? true,
+      fallback_guard: realitySource?.fallback_guard ?? true,
       // 快照中的 flow 是**生效值**，无法区分是该接入面自行设置还是跟随全局。因此此处
       // 一律按生效值显式回写：写 '' 而非 undefined，因为 undefined 表示跟随全局，
       // 而全局默认启用 Vision——这会导致一次端口修改就将已关闭流控的接入面重新启用，
@@ -1726,12 +1770,23 @@ export interface ConsoleSnapshot {
     revision: number;
     apps: SnapshotApp[];
     external_outbounds?: ExternalOutbound[];
-    /* 机器的模型字段。产物相关的字段（overlay / egress / dns 等）各页面有各自的数据来源，
-       此处只声明连接策略：它没有其他支持草稿的读取方式。 */
+    /* 机器的模型字段。服务端返回的是完整的 `model.rs` 中的 `Node`，此处按需声明。
+       凡是有界面可以修改、且修改写入草稿的字段都必须列在这里：写草稿的控件必须从这份
+       快照读回当前值。`/nodes/agent-state`（`['nodes']`）是直连接口，不经过草稿预览，
+       以它为基准的控件在保存后会回落到已提交值——界面表现为改动没有发生。 */
     nodes?: {
       id: string;
+      name?: string;
+      public_ipv4?: string | null;
+      public_ipv6?: string | null;
+      public_ipv4_nat?: boolean;
+      public_ipv6_nat?: boolean;
       overlay?: boolean;
       certificate_name?: string | null;
+      dns?: Dns;
+      domain_strategy?: DomainStrategy;
+      /* 留空表示使用 `settings.overlay.mtu` */
+      mtu?: number | null;
       connection?: NodeConnection;
       wireguard?: { listen_port: number };
     }[];
@@ -1950,6 +2005,9 @@ export interface ModelSettings {
     /* XTLS 流控。新建库的默认值为 'xtls-rprx-vision'；null 表示运营者已显式关闭 */
     flow: string | null;
   };
+  /* 未在单条 AnyTLS 入口覆盖时使用的一组全局 Padding。只有当前值，不保留版本。 */
+  /* readonly 响应会移除这项：它是 AnyTLS 的流量特征配置，不属于游客审阅内容。 */
+  anytls_padding_scheme?: string[];
   /* overlay 链路参数。设为全局配置是因为链路由全互联规则计算得出，不逐条配置 */
   overlay: {
     /* 只在单向连接（一端不可被直接连接）时写入 wg 配置 */
@@ -2510,6 +2568,13 @@ export const fetchArtifactContent = (
     `/artifacts/content/${encodeURIComponent(targetKind)}/${encodeURIComponent(targetId)}/${encodeURIComponent(artifactKind)}` +
       (query.length === 0 ? '' : `?${query.join('&')}`),
   );
+};
+
+export const fetchMyArtifact = (family?: ArtifactFamily, protocol?: ArtifactProtocol) => {
+  const query = [family == null ? null : `family=${family}`, protocol == null ? null : `protocol=${protocol}`].filter(
+    Boolean,
+  );
+  return api<ArtifactContent>(`/me/artifact${query.length === 0 ? '' : `?${query.join('&')}`}`);
 };
 
 // ── 遥测：主机负载 + 逐跳链路质量 ────────────────────────────────

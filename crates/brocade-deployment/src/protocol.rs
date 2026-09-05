@@ -528,14 +528,8 @@ fn converged_settlement() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IsolateDeploymentTargetRequest {
     pub expected_target_status: String,
-    pub reason: String,
     #[serde(default)]
     pub acknowledge_uncertain: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RestoreNodeServiceRequest {
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

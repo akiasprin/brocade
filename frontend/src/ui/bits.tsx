@@ -134,24 +134,27 @@ export function Confirm({
 }
 
 /* 时间戳统一显示为相对时间——在拉取模型下，机器距上次拉取的时长是主要信息。绝对时刻写入 title 备查。 */
-export function Ago({ at }: { at: string | null }) {
+export function Ago({ at, withPastSuffix = true }: { at: string | null; withPastSuffix?: boolean }) {
   // useNow 需要在提前 return 之前调用（hook 不能有条件地跳过）。该值因此每秒自动更新，
   // 不需要依赖其他原因触发重渲染——计时器即用于该场景（ui/clock.ts）。
   const now = useNow();
   if (!at) return <span className="dim">—</span>;
   const t = Date.parse(at.endsWith('Z') || at.includes('+') ? at : `${at}Z`);
-  if (Number.isNaN(t)) return <span className="mono dim">{at}</span>;
+  if (Number.isNaN(t)) return <span className="ago dim">{at}</span>;
   const s = Math.max(0, Math.round((now - t) / 1000));
-  const text =
+  // 数字与中文单位之间保留窄不换行空格，既留出轻微间隔，也不会在此处断行。
+  const unitGap = '\u202f';
+  const age =
     s < 60
-      ? `${s} 秒前`
+      ? `${s}${unitGap}秒`
       : s < 3600
-        ? `${Math.floor(s / 60)} 分钟前`
+        ? `${Math.floor(s / 60)}${unitGap}分钟`
         : s < 86400
-          ? `${Math.floor(s / 3600)} 小时前`
-          : `${Math.floor(s / 86400)} 天前`;
+          ? `${Math.floor(s / 3600)}${unitGap}小时`
+          : `${Math.floor(s / 86400)}${unitGap}天`;
+  const text = withPastSuffix ? `${age}前` : age;
   return (
-    <span className="mono" title={at}>
+    <span className="ago" title={at}>
       {text}
     </span>
   );

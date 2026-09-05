@@ -41,6 +41,7 @@ import {
   type XhttpMode,
 } from '../api';
 import { ErrorBox } from '../ui/bits';
+import { PanelTitle } from '../ui/icons';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
 import { externalImportCanSave, serverNameAfterAddressChange } from '../external-outbound';
 import {
@@ -537,9 +538,6 @@ function MachineEgressDnsControls({
             <option value="stop">停止连接</option>
             <option value="machine">回退机器 DNS</option>
           </select>
-          <span className="egress-dns-note">
-            <b>Xray 全局生效</b> · {nodeName}
-          </span>
         </span>
       )}
     </>
@@ -688,7 +686,7 @@ export function MachineEgressDnsRules({
     <>
       {showHeader && (
         <header>
-          <h4>DNS 解析策略</h4>
+          <PanelTitle of="dns">DNS 解析策略</PanelTitle>
           <span className="rule-sheet-meta" title="Xray 按 D1 起依次选择解析器；DNS 顺序不参与链路规则匹配">
             {activeRows.length} 条
           </span>
@@ -793,11 +791,7 @@ export function MachineEgressDnsRules({
                         nodeName={nodeName}
                         accessibleSuffix={suffix}
                       />
-                      {(row.resolution === null || row.originalSelector) && (
-                        <span className="egress-dns-usage">
-                          {row.resolution === null ? '保存后移除' : '机器全局下发'}
-                        </span>
-                      )}
+                      {row.resolution === null && <span className="egress-dns-usage">保存后移除</span>}
                     </td>
                     <td className="dns-priority-cell">
                       <DnsPriorityControl
@@ -2254,7 +2248,6 @@ export function RuleEditor({
                     nodeName={selfNode?.name || nodeId}
                     accessibleSuffix={`（机器策略：${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`}
                   />
-                  <span className="egress-dns-usage">机器全局下发</span>
                 </td>
                 {!readOnly && (
                   <td className="dns-priority-cell" style={{ width: 120, textAlign: 'right' }}>
@@ -2359,7 +2352,7 @@ export function RuleEditor({
         return (
           <section className="external-outbound-summary" key={`external-${ruleIndex}`}>
             <header>
-              <h4>外部出站</h4>
+              <PanelTitle of="outbound">外部出站</PanelTitle>
               <span className="external-summary-protocol">{externalProtocolLabel(outbound.protocol.t)}</span>
               <b>{outbound.name}</b>
               <span className="sp" />
@@ -2414,7 +2407,7 @@ export function RuleEditor({
       {reverseTargets.length > 0 && (
         <div className="panel" style={{ marginTop: 10 }}>
           <header>
-            <h4>反向接入口</h4>
+            <PanelTitle of="ingress">反向接入口</PanelTitle>
             <span className="hint">
               {reverseTargets.map(to => peerOf(to)?.name || to).join('、')} 从本机的这个端口接入
             </span>
@@ -2489,7 +2482,7 @@ export function RuleEditor({
             {/* 标题由「转发目标的中转入口」改为当前名称：该表配置的一直是该跳的两端，
                 而原名称只涵盖对端一侧。加入出站连接配置后，不修改名称会导致
                 在「入口」标题下配置本机出站。 */}
-            <h4>这一跳</h4>
+            <PanelTitle of="chains">这一跳</PanelTitle>
             <span className="hint">对端在哪个端口接入、本机如何连接过去</span>
           </header>
           <div className="fgrid one">

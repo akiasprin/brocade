@@ -59,7 +59,7 @@ pub struct NodeEgressDnsPolicy {
     pub resolution: EgressDnsResolution,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSettings {
     #[serde(default)]
@@ -70,6 +70,14 @@ pub struct ModelSettings {
     /// site.
     #[serde(default)]
     pub reality_site: RealitySite,
+    /// Fleet-wide AnyTLS padding used by every ingress which does not carry an override.
+    ///
+    /// This is one current scheme, not a version list. A fresh control plane replaces the
+    /// deterministic compatibility fallback with an installation-specific random scheme while
+    /// migrating its database; keeping a serde default is still necessary for historical model
+    /// snapshots written before the field existed.
+    #[serde(default = "default_anytls_padding_scheme")]
+    pub anytls_padding_scheme: Vec<String>,
     #[serde(default)]
     pub overlay: OverlaySettings,
     #[serde(default)]
@@ -97,6 +105,42 @@ pub struct ModelSettings {
     /// this field.
     #[serde(default)]
     pub stats_user_online: bool,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        Self {
+            reality_client: RealityClientPolicy::default(),
+            reality_site: RealitySite::default(),
+            anytls_padding_scheme: default_anytls_padding_scheme(),
+            overlay: OverlaySettings::default(),
+            ports: PortSettings::default(),
+            probe: ProbeSettings::default(),
+            geodata: GeodataSettings::default(),
+            connection: ConnectionSettings::default(),
+            stats_user_online: false,
+        }
+    }
+}
+
+/// Compatibility fallback for old snapshots. Database-backed installations receive a random
+/// scheme with the same four-stage shape instead (see `brocade-store::settings`).
+///
+/// Each range is deliberately cheaper than Xray's built-in AnyTLS scheme: packet zero never
+/// exceeds its fixed 30 bytes, packet one never exceeds its 100-byte minimum, packet two has one
+/// split instead of four, packet three has no split, and padding stops before the built-in packets
+/// four through seven.
+pub fn default_anytls_padding_scheme() -> Vec<String> {
+    [
+        "stop=4",
+        "0=20-30",
+        "1=64-100",
+        "2=90-130,c,180-250",
+        "3=220-480",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// Connection lifetime and per-connection memory.
@@ -1034,6 +1078,10 @@ pub struct Ingress {
     pub front: Option<String>,
     /// Stable credentials owned by the ingress, independent of how its traffic is carried.
     pub identity: IngressIdentity,
+    /// AnyTLS REALITY owns a separately generated identity. It is optional for snapshots created
+    /// before AnyTLS REALITY existed and for ingresses that have never enabled AnyTLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls_identity: Option<IngressIdentity>,
     pub wires: IngressWires,
     /// This ingress's outward address. With neither family projected, the artifacts are
     /// byte for byte what they would be without this field.
@@ -1399,7 +1447,15 @@ pub struct AnyTls {
     /// The TCP port owned by the AnyTLS listener. It is separate from `Ingress::port`, which is
     /// the VLESS side, so one ingress may expose both protocols on distinct ports.
     pub port: u16,
-    /// One line per padding rule. An empty list means use Xray's built-in scheme.
+    /// The outer security layer. TLS presents the node certificate; REALITY uses its own global
+    /// or custom target and an independently generated, persisted protocol identity. The resolved
+    /// REALITY parameters are filled by the store and ignored for TLS.
+    #[serde(default)]
+    pub security: AnyTlsSecurity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality: Option<RealitySettings>,
+    /// One line per padding rule. An empty list inherits the fleet-wide scheme from
+    /// [`ModelSettings::anytls_padding_scheme`]; a non-empty list is an ingress override.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub padding_scheme: Vec<String>,
     /// Client-side session pool check interval. Empty follows the consuming client's default.
@@ -1422,12 +1478,46 @@ impl Default for AnyTls {
     fn default() -> Self {
         Self {
             port: ANYTLS_PORT_BASE,
+            security: AnyTlsSecurity::Tls,
+            reality: None,
             padding_scheme: Vec::new(),
             idle_session_check_interval_secs: None,
             idle_session_timeout_secs: None,
             min_idle_session: None,
             masquerade: AnyTlsMasquerade::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnyTlsSecurity {
+    #[default]
+    Tls,
+    Reality,
+}
+
+impl AnyTlsSecurity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::Reality => "reality",
+        }
+    }
+}
+
+impl AnyTls {
+    pub fn reality(&self) -> Option<&RealitySettings> {
+        (self.security == AnyTlsSecurity::Reality)
+            .then_some(self.reality.as_ref())
+            .flatten()
+    }
+
+    pub fn needs_node_certificate(&self) -> bool {
+        self.security == AnyTlsSecurity::Tls
+            || self
+                .reality()
+                .is_some_and(RealitySettings::uses_node_certificate_fallback)
     }
 }
 
@@ -1868,6 +1958,10 @@ impl IngressWires {
         self.vless().and_then(Transport::reality)
     }
 
+    pub fn anytls_reality(&self) -> Option<&RealitySettings> {
+        self.anytls().and_then(AnyTls::reality)
+    }
+
     pub fn reality_mut(&mut self) -> Option<&mut RealitySettings> {
         self.vless_mut().and_then(Transport::reality_mut)
     }
@@ -1894,7 +1988,7 @@ impl IngressWires {
     /// the TCP half does in two of its four shapes.
     pub fn needs_node_certificate(&self) -> bool {
         self.has_udp()
-            || self.anytls().is_some()
+            || self.anytls().is_some_and(AnyTls::needs_node_certificate)
             || self.vless().is_some_and(Transport::needs_node_certificate)
     }
 

@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCerts,
+  fetchAuthState,
   fetchBranding,
   saveCertDomain,
   saveBranding,
@@ -16,6 +17,7 @@ import {
   saveNodeLogPolicy,
   saveSettings,
   savePingProbeSettings,
+  setVisitorAccess,
   createCertGroup,
   deleteCertGroup,
   requestSpareCertificate,
@@ -32,6 +34,7 @@ import {
   type ModelSettings,
   type PingProbeSettings,
 } from '../api';
+import { draft } from '../draft';
 import { can, useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
 import { BrandIcon } from '../ui/branding';
@@ -69,6 +72,7 @@ type Form = {
   connDownlink: string;
   connBuffer: string;
   connHandshake: string;
+  anyTlsPadding: string;
 };
 
 /* `Number(x) || 默认值` 在该组字段上不适用：0 是合法取值——上下行半关闭等待 0 秒表示
@@ -84,6 +88,27 @@ const PROBE_URL_DEFAULT = 'http://cp.cloudflare.com/cdn-cgi/trace';
 const GEODATA_CRON_DEFAULT = 'CRON_TZ=Asia/Shanghai 30 6 * * *';
 const GEOIP_URL_DEFAULT = 'https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat';
 const GEOSITE_URL_DEFAULT = 'https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat';
+const ANYTLS_PADDING_DEFAULT = ['stop=4', '0=20-30', '1=64-100', '2=90-130,c,180-250', '3=220-480'].join('\n');
+
+/* 四阶段、只在第 2 阶段切一次。各阶段的最大记录预算不超过 AnyTLS 原生默认对应阶段的
+   最小预算，且第 4 个包起完全停止 padding。端点取自 Web Crypto；点击只修改表单，保存并
+   发布后才会影响节点。 */
+function randomAnyTlsPadding(): string {
+  const random = crypto.getRandomValues(new Uint8Array(10));
+  const pick = (byte: number, from: number, to: number) => from + (byte % (to - from + 1));
+  const zero = [pick(random[0], 20, 25), pick(random[1], 26, 30)];
+  const one = [pick(random[2], 48, 72), pick(random[3], 80, 100)];
+  const twoA = [pick(random[4], 80, 100), pick(random[5], 110, 140)];
+  const twoB = [pick(random[6], 160, 200), pick(random[7], 220, 260)];
+  const three = [pick(random[8], 160, 260), pick(random[9], 320, 500)];
+  return [
+    'stop=4',
+    `0=${zero[0]}-${zero[1]}`,
+    `1=${one[0]}-${one[1]}`,
+    `2=${twoA[0]}-${twoA[1]},c,${twoB[0]}-${twoB[1]}`,
+    `3=${three[0]}-${three[1]}`,
+  ].join('\n');
+}
 
 const EMPTY: Form = {
   min: '',
@@ -112,6 +137,7 @@ const EMPTY: Form = {
   connDownlink: '5',
   connBuffer: '',
   connHandshake: '60',
+  anyTlsPadding: ANYTLS_PADDING_DEFAULT,
 };
 
 // 将已保存的设置转换为表单的形态。修改判定基于它：字符串与字符串比较，
@@ -143,6 +169,7 @@ function formOf(s: ModelSettings): Form {
     // null 需转换为空串而非 '0'：该字段的空值表示不写入该键，而 0 表示不缓冲。
     connBuffer: s.connection?.buffer_size_kb == null ? '' : String(s.connection.buffer_size_kb),
     connHandshake: String(s.connection?.handshake_secs ?? 60),
+    anyTlsPadding: (s.anytls_padding_scheme ?? ANYTLS_PADDING_DEFAULT.split('\n')).join('\n'),
   };
 }
 
@@ -151,7 +178,7 @@ function formOf(s: ModelSettings): Form {
 type SectionKey = 'xray' | 'connection' | 'wireguard' | 'ports' | 'probe' | 'geodata';
 
 const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
-  xray: ['dest', 'names', 'fp', 'flow', 'min', 'max', 'diff'],
+  xray: ['dest', 'names', 'fp', 'flow', 'min', 'max', 'diff', 'anyTlsPadding'],
   connection: ['connIdle', 'connUplink', 'connDownlink', 'connBuffer', 'connHandshake'],
   wireguard: ['keepalive', 'mtu'],
   ports: ['ingressBase', 'anytlsBase', 'hopBase', 'hy2Base'],
@@ -173,32 +200,32 @@ const APPLY: Record<Apply, string> = {
 
 /* ── 段目录 ──
  *
- * 九段分两栏排列，目录平铺这九项，不按生效方式分组：那是段自身的属性，每段的标题栏里
- * 已经有一枚徽章写明，目录里再分一次只是把九行拆成三段间隔。
+ * 各段分两栏排列，目录不按生效方式分组：那是段自身的属性，每段的标题栏里
+ * 已经有一枚徽章写明。
  *
- * 编号不是装饰：内容区按该顺序排列（左栏 01–04、右栏 05–09，从上到下、从左到右），
- * 可以直接引用第 5 段这样的位置。
+ * 编号不是装饰：内容区按该顺序排列，可以直接引用某一段的位置。
  */
 type NavItem = { id: string; no: string; label: string; apply: Apply; key?: SectionKey };
 
 const NAV: NavItem[] = [
   { id: 'set-branding', no: '01', label: '站点外观', apply: 'now' },
-  { id: 'set-dist', no: '02', label: '分发', apply: 'now' },
-  { id: 'set-agent-logs', no: '03', label: '日志保留', apply: 'cycle' },
-  { id: 'set-cert', no: '04', label: '证书', apply: 'now' },
-  { id: 'set-xray', no: '05', label: 'XRAY', apply: 'publish', key: 'xray' },
-  { id: 'set-conn', no: '06', label: '连接策略', apply: 'publish', key: 'connection' },
-  { id: 'set-wg', no: '07', label: 'WireGuard', apply: 'publish', key: 'wireguard' },
-  { id: 'set-ports', no: '08', label: '端口分配', apply: 'publish', key: 'ports' },
+  { id: 'set-visitor', no: '02', label: '访客模式', apply: 'now' },
+  { id: 'set-dist', no: '03', label: '分发', apply: 'now' },
+  { id: 'set-agent-logs', no: '04', label: '日志保留', apply: 'cycle' },
+  { id: 'set-cert', no: '05', label: '证书', apply: 'now' },
+  { id: 'set-xray', no: '06', label: 'XRAY', apply: 'publish', key: 'xray' },
+  { id: 'set-conn', no: '07', label: '连接策略', apply: 'publish', key: 'connection' },
+  { id: 'set-wg', no: '08', label: 'WireGuard', apply: 'publish', key: 'wireguard' },
+  { id: 'set-ports', no: '09', label: '端口分配', apply: 'publish', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
-  { id: 'set-probe', no: '09', label: '端到端探测', apply: 'cycle', key: 'probe' },
-  { id: 'set-ping-probe', no: '10', label: 'Ping 链路探测', apply: 'cycle' },
-  { id: 'set-geodata', no: '11', label: '规则库更新', apply: 'publish', key: 'geodata' },
+  { id: 'set-probe', no: '10', label: '端到端探测', apply: 'cycle', key: 'probe' },
+  { id: 'set-ping-probe', no: '11', label: 'Ping 链路探测', apply: 'cycle' },
+  { id: 'set-geodata', no: '12', label: '规则库更新', apply: 'publish', key: 'geodata' },
 ];
 
 const APPLY_OF: Record<string, Apply> = Object.fromEntries(NAV.map(item => [item.id, item.apply]));
 
-/** 段标题里的生效方式。只有「需要发布」着主色：九段里这一档占五段，
+/** 段标题里的生效方式。只有「需要发布」着主色，
     且它是唯一一档「保存完还没完」，另外两档保存即到位。 */
 function ApplyBadge({ id }: { id: string }) {
   const kind = APPLY_OF[id];
@@ -1070,6 +1097,51 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
   );
 }
 
+function VisitorAccessSection({ editable, enabled }: { editable: boolean; enabled: boolean }) {
+  const qc = useQueryClient();
+  const update = useMutation({
+    mutationFn: (next: boolean) => setVisitorAccess(next),
+    onSuccess: state => qc.setQueryData(['auth-state'], state),
+  });
+
+  return (
+    <section className="panel titled" id="set-visitor">
+      <header>
+        <span className="no">{NO_OF['set-visitor']}</span>
+        <h4>访客模式</h4>
+        <ApplyBadge id="set-visitor" />
+        <span className="sp" />
+        <b>{enabled ? '已开启' : '已关闭'}</b>
+      </header>
+      <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客</p>
+      {update.error && <ErrorBox error={update.error} />}
+      <Group>
+        <Fld label="访问状态">
+          <span className="segsw" role="group">
+            <button
+              type="button"
+              aria-pressed={!enabled}
+              disabled={!editable || update.isPending}
+              onClick={() => update.mutate(false)}
+            >
+              关闭
+            </button>
+            <button
+              type="button"
+              aria-pressed={enabled}
+              disabled={!editable || update.isPending}
+              onClick={() => update.mutate(true)}
+            >
+              开启
+            </button>
+          </span>
+          <span className="hint">管理员和用户登录不受影响</span>
+        </Fld>
+      </Group>
+    </section>
+  );
+}
+
 function DistributionSection({ editable, data }: { editable: boolean; data: DistributionView }) {
   const qc = useQueryClient();
   const [form, setForm] = useState<{ url: string; version: string } | null>(null);
@@ -1152,10 +1224,12 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
   );
 }
 
-const LOG_MIN_MIB = 16;
-const LOG_MAX_MIB = 4096;
+/* 机器详情页的「本机覆盖」卡也编辑这一项，取值范围由此处导出而非各自写一份：
+   两处写同一个数字时，改动只会落在其中一处，另一处把服务端会拒绝的值显示为合法。 */
+export const LOG_MIN_MIB = 16;
+export const LOG_MAX_MIB = 4096;
 
-const validLogMib = (raw: string) => {
+export const validLogMib = (raw: string) => {
   if (!/^\d+$/.test(raw.trim())) return null;
   const value = Number(raw);
   return Number.isSafeInteger(value) && value >= LOG_MIN_MIB && value <= LOG_MAX_MIB ? value : null;
@@ -1324,9 +1398,7 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
             data.nodes.map(node => <NodeLogPolicyRow key={node.node_id} editable={editable} node={node} />)
           )}
         </div>
-        <div className="guard">
-          不产生修订、不需要发布线路。降低上限会立即截断已有日志；XRAY 与 Phantun 不会因此重启。
-        </div>
+        <div className="guard">不产生修订、不需要发布线路。降低上限会立即截断已有日志释放空间，不会中断服务。</div>
       </Group>
     </section>
   );
@@ -1593,6 +1665,7 @@ export function SettingsPane() {
   // 证书、分发与站点外观的查询统一放在页面层，一次等齐后再呈现完整页面，
   // 避免各段在不同时间出现而造成布局连续跳动。
   const branding = useQuery({ queryKey: ['branding'], queryFn: () => fetchBranding() });
+  const visitor = useQuery({ queryKey: ['auth-state'], queryFn: () => fetchAuthState() });
   const certs = useQuery({
     queryKey: ['certs'],
     queryFn: () => fetchCerts(),
@@ -1608,16 +1681,31 @@ export function SettingsPane() {
   const [form, setForm] = useState<Form>(EMPTY);
   const [saved, setSaved] = useState<Partial<Record<SectionKey, number>>>({});
 
-  const pristine = settings.data ? formOf(settings.data) : null;
+  /* 分段保存写的是草稿（`saveSettings` → `update_settings`），因此「已保存」的基准是草稿
+     生效后的值，而不是 `GET /settings`——后者是直连接口，草稿提交前不会变。以它为基准有
+     两个后果，都实测复现过（tests/settings-draft-baseline.test.tsx）：
+       一、保存完那一段，标题栏仍显示「有未保存的改动」，保存按钮一直亮着；
+       二、更严重的是保存另一段时，本段未覆盖的字段会从已提交值重新取一遍
+           （见下面 `save` 里的 `v`），把前一段刚写进草稿的改动覆盖回旧值。
+     订阅草稿版本以便其变化时重算基准。 */
+  useSyncExternalStore(draft.subscribe, draft.version);
+  const pendingOp = draft.ops().find(op => op.op === 'update_settings');
+  const pendingSettings = pendingOp?.op === 'update_settings' ? pendingOp.settings : null;
+
+  const pristine = pendingSettings ? formOf(pendingSettings) : settings.data ? formOf(settings.data) : null;
 
   // 服务端数据就绪或变化时重新填充表单。在渲染期执行而非在 effect 中：在 effect 中调用
   // setState 会额外触发一轮渲染，中间一帧会显示空表单。React 对渲染期调用组件自身的
   // setState 有特殊处理——它会丢弃本轮输出并重新渲染，不提交该帧。
   // 使用引用比较：TanStack Query 有结构共享，数据未变化时 data 是同一个对象。
+  //
+  // 触发条件仍是服务端数据本身变化，不跟着草稿走：草稿变化就重填会在保存某一段时，
+  // 把其他段尚未保存的输入一并抹掉（那正是下面 `v` 刻意保留的东西）。首次填充取草稿值——
+  // 打开页面时草稿里已有改动的话，表单应显示它，否则每一段一进来就显示为有未保存的改动。
   const [syncedFrom, setSyncedFrom] = useState<typeof settings.data>(undefined);
   if (settings.data && settings.data !== syncedFrom) {
     setSyncedFrom(settings.data);
-    setForm(formOf(settings.data));
+    setForm(formOf(pendingSettings ?? settings.data));
   }
 
   const save = useMutation({
@@ -1629,6 +1717,10 @@ export function SettingsPane() {
       const base = pristine ?? EMPTY;
       const v = (f: keyof Form) => (own.includes(f) ? form[f] : base[f]);
       const body: ModelSettings = {
+        anytls_padding_scheme: v('anyTlsPadding')
+          .split(/\r?\n/)
+          .map(line => line.trim())
+          .filter(Boolean),
         reality_client: {
           min_client_ver: orNull(v('min')),
           max_client_ver: orNull(v('max')),
@@ -1688,6 +1780,7 @@ export function SettingsPane() {
   if (
     settings.isPending ||
     branding.isPending ||
+    visitor.isPending ||
     certs.isPending ||
     dist.isPending ||
     logPolicy.isPending ||
@@ -1712,7 +1805,7 @@ export function SettingsPane() {
   return (
     <div className="cardpage">
       <div className="duo">
-        {/* 左栏四段、右栏五段：两栏各自成流，不对齐底部。分段位置按高度定——证书段带着
+        {/* 两栏各自成流，不对齐底部。分段位置按高度定——证书段带着
             机队列表，单它一段就抵得上右栏的两段，与它同栏的只能是最短的那两段。
             编号仍从上到下、从左到右连续。 */}
         <div className="col">
@@ -1722,6 +1815,11 @@ export function SettingsPane() {
             <ErrorBox error={branding.error} />
           ) : (
             <BrandingSection editable={editable} data={branding.data!} />
+          )}
+          {visitor.error ? (
+            <ErrorBox error={visitor.error} />
+          ) : (
+            <VisitorAccessSection editable={editable} enabled={visitor.data!.public_open} />
           )}
           {dist.error ? <ErrorBox error={dist.error} /> : <DistributionSection editable={editable} data={dist.data!} />}
           {logPolicy.error ? (
@@ -1804,6 +1902,32 @@ export function SettingsPane() {
               </details>
             </Group>
 
+            {who.role !== 'readonly' && (
+              <Group label="AnyTLS · Padding">
+                <Fld label="全局方案">
+                  <textarea
+                    className={chg('anyTlsPadding')}
+                    rows={5}
+                    style={{ width: 280, resize: 'none' }}
+                    value={form.anyTlsPadding}
+                    readOnly
+                    aria-label="AnyTLS 全局 Padding Scheme"
+                  />
+                  <button
+                    type="button"
+                    className="btn sm"
+                    disabled={!editable}
+                    onClick={() => setForm({ ...form, anyTlsPadding: randomAnyTlsPadding() })}
+                  >
+                    重新生成
+                  </button>
+                  <span className="hint">
+                    所有留空的 AnyTLS 入口跟随这一组。4 阶段，第 2 阶段只切一次；最坏填充量不高于原生默认。
+                  </span>
+                </Fld>
+              </Group>
+            )}
+
             <Group label="REALITY · 客户端闸">
               <Fld label="min_client_ver">
                 <input
@@ -1827,7 +1951,7 @@ export function SettingsPane() {
                 <input
                   className={chg('diff')}
                   style={{ width: 260 }}
-                  placeholder="留空 = 用 XRAY 默认"
+                  placeholder="留空 = 使用默认值"
                   value={form.diff}
                   onChange={e => setForm({ ...form, diff: e.target.value })}
                 />

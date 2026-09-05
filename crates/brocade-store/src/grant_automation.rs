@@ -244,6 +244,7 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
     let rows = sqlx::query(
         "SELECT id,
                 (payload->>'revision_id')::bigint AS revision_id,
+                COALESCE(payload->>'requested_by', '') AS requested_by,
                 COALESCE(payload->>'note', '') AS note
          FROM jobs
          WHERE kind = $1
@@ -273,13 +274,28 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
         ))
     })?;
     let latest_note: String = latest.try_get("note")?;
+    let requested_by = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("requested_by"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let quota_only = requested_by
+        .iter()
+        .all(|actor| actor == crate::quota::QUOTA_ACTOR);
 
-    let note = if job_ids.len() == 1 && !latest_note.trim().is_empty() {
+    let note = if quota_only && job_ids.len() == 1 && !latest_note.trim().is_empty() {
+        latest_note.trim().to_owned()
+    } else if quota_only {
+        format!("配额执行：合并 {} 次额度变化", job_ids.len())
+    } else if job_ids.len() == 1 && !latest_note.trim().is_empty() {
         format!("自动授权：{}", latest_note.trim())
     } else {
         format!("自动授权：合并 {} 次权限变更", job_ids.len())
     };
-    let actor = AdminContext::system_admin(GRANTS_AUTOMATION_ACTOR);
+    let actor = AdminContext::system_admin(if quota_only {
+        crate::quota::QUOTA_ACTOR
+    } else {
+        GRANTS_AUTOMATION_ACTOR
+    });
     let prepared = match deployment::create_automatic_grants_deployment(
         pool,
         &actor,

@@ -511,6 +511,7 @@ fn app(id: &str, chain_id: &str, ingress_id: &str, port: u16, default_rule: Rule
                 public_key: format!("pub-{ingress_id}"),
                 short_ids: vec!["0123abcd".to_owned()],
             },
+            anytls_identity: None,
             wires: IngressWires::Vless(Transport::VlessReality(
                 brocade_core::model::RealitySettings {
                     dest: "www.example.com:443".to_owned(),

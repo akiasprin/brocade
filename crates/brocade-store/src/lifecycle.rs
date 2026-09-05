@@ -5,7 +5,6 @@
 //! which they were created.
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use brocade_deployment::plan::AppliedArtifactState;
@@ -62,8 +61,6 @@ pub struct NodeLifecycleState {
     pub deployment_id: Option<i64>,
     pub requested_at: Option<String>,
     pub completed_at: Option<String>,
-    pub completed_by: Option<String>,
-    pub reason: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -80,7 +77,6 @@ pub struct NodeLifecycleTransitionResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbandonNodeRequest {
-    pub reason: String,
     #[serde(default = "default_true")]
     pub unregister_warp: bool,
 }
@@ -104,8 +100,6 @@ pub async fn load(pool: &PgPool, node_id: &str) -> Result<NodeLifecycleState> {
                 l.deployment_id,
                 l.requested_at::text AS requested_at,
                 l.completed_at::text AS completed_at,
-                l.completed_by,
-                l.reason,
                 l.last_error
            FROM nodes n
            LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
@@ -139,8 +133,6 @@ fn lifecycle_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeLifecycleState>
         deployment_id: row.try_get("deployment_id")?,
         requested_at: row.try_get("requested_at")?,
         completed_at: row.try_get("completed_at")?,
-        completed_by: row.try_get("completed_by")?,
-        reason: row.try_get("reason")?,
         last_error: row.try_get("last_error")?,
     })
 }
@@ -150,8 +142,6 @@ pub(crate) async fn advance_intent_tx(
     node_id: &str,
     retired: bool,
     revision_id: u64,
-    actor: &str,
-    reason: &str,
 ) -> Result<LifecycleAdvance> {
     let revision_id = i64::try_from(revision_id)
         .map_err(|_| StoreError::InvalidData("revision id is out of range".to_owned()))?;
@@ -163,11 +153,11 @@ pub(crate) async fn advance_intent_tx(
     let row = sqlx::query(
         "INSERT INTO node_lifecycle_state (
              node_id, lifecycle_epoch, phase, intent_revision, deployment_id,
-             requested_at, completed_at, completed_by, reason, last_error, updated_at
+             requested_at, completed_at, last_error, updated_at
          )
          VALUES ($1, 1, $2, $3, NULL,
                  CASE WHEN $2 = 'retiring' THEN now() ELSE NULL END,
-                 NULL, NULL, $4, NULL, now())
+                 NULL, NULL, now())
          ON CONFLICT (node_id) DO UPDATE SET
              lifecycle_epoch = node_lifecycle_state.lifecycle_epoch + 1,
              phase = EXCLUDED.phase,
@@ -175,8 +165,6 @@ pub(crate) async fn advance_intent_tx(
              deployment_id = NULL,
              requested_at = EXCLUDED.requested_at,
              completed_at = NULL,
-             completed_by = NULL,
-             reason = EXCLUDED.reason,
              last_error = NULL,
              updated_at = now()
          RETURNING lifecycle_epoch, phase",
@@ -184,7 +172,6 @@ pub(crate) async fn advance_intent_tx(
     .bind(node_id)
     .bind(phase.as_str())
     .bind(revision_id)
-    .bind(reason)
     .fetch_one(&mut **tx)
     .await?;
     let lifecycle_epoch: i64 = row.try_get("lifecycle_epoch")?;
@@ -241,30 +228,9 @@ pub(crate) async fn advance_intent_tx(
     .bind(lifecycle_epoch)
     .execute(&mut **tx)
     .await?;
-    let stored_phase = NodeLifecyclePhase::parse(&row.try_get::<String, _>("phase")?)?;
-    let event = if retired {
-        "retirement-requested"
-    } else {
-        "node-reactivated"
-    };
-    sqlx::query(
-        "INSERT INTO node_lifecycle_events (
-             node_id, lifecycle_epoch, event, revision_id, actor, reason, details
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb)
-         ON CONFLICT (node_id, lifecycle_epoch, event) DO NOTHING",
-    )
-    .bind(node_id)
-    .bind(lifecycle_epoch)
-    .bind(event)
-    .bind(revision_id)
-    .bind(actor)
-    .bind(reason)
-    .execute(&mut **tx)
-    .await?;
     Ok(LifecycleAdvance {
         lifecycle_epoch,
-        phase: stored_phase,
+        phase: NodeLifecyclePhase::parse(&row.try_get::<String, _>("phase")?)?,
     })
 }
 
@@ -321,43 +287,25 @@ pub(crate) async fn complete_retirement_tx(
     node_id: &str,
     lifecycle_epoch: i64,
     deployment_id: Option<i64>,
-    actor: &str,
 ) -> Result<bool> {
-    let row = sqlx::query(
+    let changed = sqlx::query(
         "UPDATE node_lifecycle_state
-            SET phase = 'retired', completed_at = now(), completed_by = $4,
+            SET phase = 'retired', completed_at = now(),
                 last_error = NULL, updated_at = now()
           WHERE node_id = $1
             AND lifecycle_epoch = $2
             AND phase = 'retiring'
-            AND (deployment_id IS NULL OR deployment_id = $3)
-        RETURNING intent_revision",
+            AND (deployment_id IS NULL OR deployment_id = $3)",
     )
     .bind(node_id)
     .bind(lifecycle_epoch)
     .bind(deployment_id)
-    .bind(actor)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some(row) = row else {
-        return Ok(false);
-    };
-    let revision_id: Option<i64> = row.try_get("intent_revision")?;
-    sqlx::query(
-        "INSERT INTO node_lifecycle_events (
-             node_id, lifecycle_epoch, event, revision_id, deployment_id, actor, details
-         )
-         VALUES ($1, $2, 'retirement-converged', $3, $4, $5, $6)
-         ON CONFLICT (node_id, lifecycle_epoch, event) DO NOTHING",
-    )
-    .bind(node_id)
-    .bind(lifecycle_epoch)
-    .bind(revision_id)
-    .bind(deployment_id)
-    .bind(actor)
-    .bind(json!({ "all_artifacts_disabled": true }))
     .execute(&mut **tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Ok(false);
+    }
     sqlx::query(
         "UPDATE node_agent_state
             SET token_revoked_at = COALESCE(token_revoked_at, now())
@@ -369,30 +317,17 @@ pub(crate) async fn complete_retirement_tx(
     Ok(true)
 }
 
-pub(crate) async fn abandon_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: &str,
-    actor: &str,
-    reason: &str,
-) -> Result<i64> {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return Err(StoreError::InvalidData(
-            "force retirement reason must not be empty".to_owned(),
-        ));
-    }
-    let row = sqlx::query(
+pub(crate) async fn abandon_tx(tx: &mut Transaction<'_, Postgres>, node_id: &str) -> Result<i64> {
+    let lifecycle_epoch = sqlx::query_scalar::<_, i64>(
         "UPDATE node_lifecycle_state
             SET lifecycle_epoch = lifecycle_epoch + 1,
                 phase = 'abandoned', deployment_id = NULL,
-                completed_at = now(), completed_by = $2, reason = $3,
+                completed_at = now(),
                 last_error = 'remote teardown was not confirmed', updated_at = now()
           WHERE node_id = $1 AND phase = 'retiring'
-        RETURNING lifecycle_epoch, intent_revision",
+        RETURNING lifecycle_epoch",
     )
     .bind(node_id)
-    .bind(actor)
-    .bind(reason)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| {
@@ -400,24 +335,6 @@ pub(crate) async fn abandon_tx(
             "node {node_id} can only be force-retired while it is retiring"
         ))
     })?;
-    let lifecycle_epoch: i64 = row.try_get("lifecycle_epoch")?;
-    let revision_id: Option<i64> = row.try_get("intent_revision")?;
-    sqlx::query(
-        "INSERT INTO node_lifecycle_events (
-             node_id, lifecycle_epoch, event, revision_id, actor, reason,
-             details
-         )
-         VALUES ($1, $2, 'retirement-abandoned', $3, $4, $5,
-                 '{\"remote_teardown_confirmed\":false}'::jsonb)
-         ON CONFLICT (node_id, lifecycle_epoch, event) DO NOTHING",
-    )
-    .bind(node_id)
-    .bind(lifecycle_epoch)
-    .bind(revision_id)
-    .bind(actor)
-    .bind(reason)
-    .execute(&mut **tx)
-    .await?;
     sqlx::query(
         "UPDATE node_agent_state
             SET token_revoked_at = COALESCE(token_revoked_at, now())

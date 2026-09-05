@@ -435,7 +435,7 @@ impl GrantProbeService {
         job.cancellation.cancel();
         self.update(job, |state| {
             state.status = "superseded";
-            state.message = Some("Serving 状态已变化，本轮结果已作废，请重新验证".to_owned());
+            state.message = Some("Serving 状态已变化，本轮结果已作废，请重新拨测".to_owned());
             state.finished_at_unix_secs = Some(unix_now());
             for item in &mut state.items {
                 if matches!(item.status, "waiting" | "running") {
@@ -459,9 +459,9 @@ impl GrantProbeService {
                 .filter(|item| item.status == "failed")
                 .count();
             state.message = Some(if failed == 0 {
-                "全部授权验证通过".to_owned()
+                "网络拨测全部通过".to_owned()
             } else {
-                format!("{failed} 项授权验证失败")
+                format!("{failed} 项网络拨测失败")
             });
         });
     }

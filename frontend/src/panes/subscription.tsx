@@ -3,9 +3,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchArtifactContent,
   fetchClashSubscription,
+  fetchMyArtifact,
+  fetchMyClashSubscription,
   fetchRevisions,
   issueClashHaitunSubscription,
+  issueMyClashHaitunSubscription,
   revokeClashHaitunSubscription,
+  revokeMyClashHaitunSubscription,
   type ArtifactFamily,
   type ArtifactProtocol,
   type ClashSubscriptionInfo,
@@ -69,17 +73,19 @@ export function SubscriptionViewer({
   tenant,
   user,
   kind,
+  selfService = false,
   onClose,
 }: {
   tenant: string;
   user: string;
   kind: SubscriptionKind;
+  selfService?: boolean;
   onClose: () => void;
 }) {
   return kind === 'clash' ? (
-    <ClashSubscription tenant={tenant} user={user} onClose={onClose} />
+    <ClashSubscription tenant={tenant} user={user} selfService={selfService} onClose={onClose} />
   ) : (
-    <VlessAddresses tenant={tenant} user={user} onClose={onClose} />
+    <VlessAddresses tenant={tenant} user={user} selfService={selfService} onClose={onClose} />
   );
 }
 
@@ -95,7 +101,17 @@ function useEscape(onClose: () => void) {
 
 /* The VLESS entry keeps the existing address-list interaction, while the server narrows both
  * protocol and address family so every tab remains an exact view of the current artifact. */
-function VlessAddresses({ tenant, user, onClose }: { tenant: string; user: string; onClose: () => void }) {
+function VlessAddresses({
+  tenant,
+  user,
+  selfService,
+  onClose,
+}: {
+  tenant: string;
+  user: string;
+  selfService: boolean;
+  onClose: () => void;
+}) {
   const [family, setFamily] = useState<FamilyPick>('both');
   const [protocol, setProtocol] = useState<ProtocolPick>('both');
   useEscape(onClose);
@@ -105,15 +121,17 @@ function VlessAddresses({ tenant, user, onClose }: { tenant: string; user: strin
   const content = useQuery({
     queryKey: ['artifact', revision, 'user', `${tenant}:${user}`, 'uri', family, protocol],
     queryFn: () =>
-      fetchArtifactContent(
-        'user',
-        `${tenant}:${user}`,
-        'uri',
-        undefined,
-        family === 'both' ? undefined : family,
-        protocol === 'both' ? undefined : protocol,
-        true,
-      ),
+      selfService
+        ? fetchMyArtifact(family === 'both' ? undefined : family, protocol === 'both' ? undefined : protocol)
+        : fetchArtifactContent(
+            'user',
+            `${tenant}:${user}`,
+            'uri',
+            undefined,
+            family === 'both' ? undefined : family,
+            protocol === 'both' ? undefined : protocol,
+            true,
+          ),
     enabled: !!revision,
   });
 
@@ -181,7 +199,17 @@ function VlessAddresses({ tenant, user, onClose }: { tenant: string; user: strin
   );
 }
 
-function ClashSubscription({ tenant, user, onClose }: { tenant: string; user: string; onClose: () => void }) {
+function ClashSubscription({
+  tenant,
+  user,
+  selfService,
+  onClose,
+}: {
+  tenant: string;
+  user: string;
+  selfService: boolean;
+  onClose: () => void;
+}) {
   const [family, setFamily] = useState<FamilyPick>('both');
   const [protocol, setProtocol] = useState<ProtocolPick>('both');
   const [template, setTemplate] = useState<ClashTemplatePick>('standard');
@@ -191,18 +219,18 @@ function ClashSubscription({ tenant, user, onClose }: { tenant: string; user: st
   const queryKey = ['clash-subscription', tenant, user] as const;
   const subscription = useQuery({
     queryKey,
-    queryFn: () => fetchClashSubscription(tenant, user),
+    queryFn: () => (selfService ? fetchMyClashSubscription() : fetchClashSubscription(tenant, user)),
     staleTime: 0,
   });
   const updateHaitun = (haitun: ClashSubscriptionInfo['haitun']) => {
     qc.setQueryData<ClashSubscriptionInfo>(queryKey, current => (current ? { ...current, haitun } : current));
   };
   const issueHaitun = useMutation({
-    mutationFn: () => issueClashHaitunSubscription(tenant, user),
+    mutationFn: () => (selfService ? issueMyClashHaitunSubscription() : issueClashHaitunSubscription(tenant, user)),
     onSuccess: updateHaitun,
   });
   const revokeHaitun = useMutation({
-    mutationFn: () => revokeClashHaitunSubscription(tenant, user),
+    mutationFn: () => (selfService ? revokeMyClashHaitunSubscription() : revokeClashHaitunSubscription(tenant, user)),
     onSuccess: data => {
       setRevealed(false);
       updateHaitun(data);

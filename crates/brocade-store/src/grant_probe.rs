@@ -133,7 +133,21 @@ pub async fn user_grant_probe_plan(
                 }),
                 None,
             ),
-            UserSecurityPlan::AnyTls(_value) => ("anytls", empty_reality(), None, None),
+            UserSecurityPlan::AnyTls(value) => (
+                "anytls",
+                value
+                    .reality
+                    .as_ref()
+                    .map_or_else(empty_reality, |reality| E2eProbeReality {
+                        public_key: reality.public_key.clone(),
+                        short_id: reality.short_id.clone(),
+                        server_name: reality.server_name.clone(),
+                        fingerprint: reality.fingerprint.clone(),
+                        flow: None,
+                    }),
+                None,
+                None,
+            ),
             UserSecurityPlan::Hysteria2(value) => (
                 "hysteria2",
                 empty_reality(),

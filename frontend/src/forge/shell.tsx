@@ -45,7 +45,7 @@ import { draft } from '../draft';
 import { DraftBar } from './draft-bar';
 import { ArtifactRail, blastRadius, useChangedArtifacts } from './artifacts';
 import { navigate, startRouting } from './route';
-import { can, isPublic } from '../session';
+import { can, isPublic, isVisitor } from '../session';
 import { forge, useForge, type NavKey } from './state';
 import { theme } from './theme';
 import { palette, PALETTES } from './palette';
@@ -83,7 +83,6 @@ const MORE: Face[] = [
   { key: 'settings', label: '设置', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'tenants', label: '租户' },
   { key: 'topo', label: '拓扑' },
-  { key: 'operators', label: '操作者', roles: ['tenant-admin', 'system-admin'] },
   { key: 'links', label: '链路与 MTU' },
 ];
 
@@ -94,8 +93,8 @@ const LABEL: Record<NavKey, string> = Object.fromEntries(
   [...NAV, ...MORE, ...OFF_NAV].map(f => [f.key, f.label]),
 ) as Record<NavKey, string>;
 
-/* 访客与登录操作者看到同一组导航：都按角色的 roles 字段过滤。 */
-const visible = (faces: Face[], who: Whoami) => faces.filter(f => !f.roles || f.roles.includes(who.role));
+const visible = (faces: Face[], who: Whoami) =>
+  faces.filter(f => !f.roles || f.roles.includes(who.role));
 
 export function ForgeShell({
   branding,
@@ -112,7 +111,8 @@ export function ForgeShell({
   const artifacts = can(session.who.role, 'artifacts');
   /* 公开访客无权访问发布相关的接口。不关闭这些查询时，顶栏会每 5 秒产生一次 403，
      而它们提供的读数（待发布机器数、发布中状态）在该视角下不显示。 */
-  const pub = isPublic(session.who);
+  const pub = isVisitor(session.who);
+  const nav = st.nav;
   const panel = useSyncExternalStore(artifactPanel.subscribe, artifactPanel.snapshot);
   // 草稿版本进入该层的查询键，同时统一失效所有页面的读取缓存。
   // 仅依靠查询键不够：各页面使用 `['snapshot']`，键中不含草稿版本，草稿变化后
@@ -146,7 +146,6 @@ export function ForgeShell({
     startRouting(nav => LABEL[nav]);
     return true;
   });
-
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   const current = revisions.data?.current_revision;
   // 上一个版本：修订列表按 id 倒序排列，取当前记录的下一条。第一个版本没有上一版，
@@ -236,7 +235,7 @@ export function ForgeShell({
           branding={branding}
           who={session.who}
           narrow={narrow}
-          nav={st.nav}
+          nav={nav}
           summary={compile.data?.summary}
           diagnostics={diagnostics}
           diagNames={diagNames}
@@ -251,7 +250,7 @@ export function ForgeShell({
             自己的标题表示，发布状态读数由窄屏「发布」按钮的角标承担。 */}
         {!narrow && (
           <div className="fg-crumb">
-            <ForgeCrumb nav={st.nav} />
+            <ForgeCrumb nav={nav} />
             {/* 公开访客不显示该行右侧的全部读数：发布状态和修订号属于同一类信息，
                 而这两个查询在该身份下无权访问——保留会始终停留在检查中的状态。 */}
             {!pub && (
@@ -264,13 +263,13 @@ export function ForgeShell({
 
         <DraftBar current={current} />
 
-        {st.nav === 'topo' ? (
+        {nav === 'topo' ? (
           <div className="fg-topo">
             <TopoCanvas />
           </div>
         ) : (
           <div className="fg-desk">
-            <Work nav={st.nav} />
+            <Work nav={nav} />
           </div>
         )}
       </div>
@@ -289,7 +288,7 @@ export function ForgeShell({
           一并渲染会在页面上重复显示相同内容。
           拓扑的检视此前也经由此处，现已改为台面右侧的常驻栏：浮窗会遮挡刚点击的图形区域，
           且每点击一个对象就增加一个窗口。 */}
-      {st.nav === 'topo' && <WinLayer filter={w => !w.key.startsWith('tab:')} render={win => <Pane win={win} />} />}
+      {nav === 'topo' && <WinLayer filter={w => !w.key.startsWith('tab:')} render={win => <Pane win={win} />} />}
     </div>
   );
 }
@@ -531,7 +530,7 @@ function TopBar({
           awaitingDeploy={awaitingDeploy}
         />
         {/* 与宽屏的处理一致：诊断属于发布流程的读数，公开访客不显示。 */}
-        {!isPublic(who) && (
+        {!isVisitor(who) && (
           <div className="fg-menuwrap">
             <button
               className="fg-ico"
@@ -580,7 +579,7 @@ function TopBar({
         className="fg-nav"
         faces={NAV}
         who={who}
-        nav={st.nav}
+        nav={nav}
         pendingTargets={pendingTargets}
         activeDeploy={activeDeploy}
         awaitingDeploy={awaitingDeploy}
@@ -605,7 +604,7 @@ function TopBar({
 
       {/* 诊断不对公开访客显示：它表示该版本的编译结果和可发布性，属于编辑到发布流程的
           读数。修订号不在顶栏重复——面包屑行（fg-crumb-right）已承担这项读数。 */}
-      {!isPublic(who) && (
+      {!isVisitor(who) && (
         <div className="fg-menuwrap">
           <button
             className="fg-tgl"

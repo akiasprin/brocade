@@ -36,8 +36,8 @@ use brocade_core::{
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
         IngressWires, IpFamily, ModelSnapshot, Node, NodeEgressDnsPolicy,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
-        RealityFallbackMode, RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport, User,
-        WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
+        RealityFallbackMode, RealitySettings, RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport,
+        User, WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
     },
     physical::{node::project_node, user::project_user},
     Level,
@@ -51,6 +51,8 @@ const HOP_PRIVATE: &str = "iEMzr2SSyraV3pge500qA-3WCTNg0g7qbp4EWqfWQEE";
 const HOP_PUBLIC: &str = "cHXdlQzu_QpzURRgNIenuoMGVsD4x925KAH145J3FSg";
 const INGRESS_PRIVATE: &str = "gM453ZKs-8Ahf4hPV2SVK1yf7XXC4NLV6V424ETpe2g";
 const INGRESS_PUBLIC: &str = "EdUDF5q3f-LSCmqeYUT5AfA3EBJWUAdqzCPHji78pxY";
+const ANYTLS_PRIVATE: &str = "iCS1tIkOifSQg2XIeh16gl1o01FBOd3zTaYy1yRsH08";
+const ANYTLS_PUBLIC: &str = "dHbomJdClhJmOuciALIpV4iOKrDJahm2hyf3Ui2S2yU";
 
 #[test]
 fn machine_egress_dns_without_route_references_loads_in_the_real_binary() {
@@ -734,6 +736,18 @@ fn sing_box_binary() -> Option<PathBuf> {
 /// It covers custom padding (including an oversized record) and the default non-AnyTLS 404 path.
 #[test]
 fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
+    independent_sing_box_client_can_reach_anytls(false);
+}
+
+/// REALITY is a stream security layer, so the AnyTLS protocol adapter should be able to sit
+/// behind it just as VLESS does. Keep this as a real cross-implementation experiment: Xray is
+/// the server while an unmodified sing-box is the client.
+#[test]
+fn an_independent_sing_box_client_can_reach_an_anytls_reality_ingress() {
+    independent_sing_box_client_can_reach_anytls(true);
+}
+
+fn independent_sing_box_client_can_reach_anytls(use_reality: bool) {
     let Some(xray_binary) = xray_binary() else {
         eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
         return;
@@ -746,14 +760,22 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
         eprintln!("跳过：没找到 curl");
         return;
     }
+    if use_reality && Command::new("openssl").arg("version").output().is_err() {
+        eprintln!("跳过：没找到 openssl，无法启动独立 REALITY 目标站");
+        return;
+    }
 
     const PASSWORD: &str = "anytls-e2e-password";
     const SERVER_NAME: &str = "a1b2c3d4.example.net";
-    let ports = free_tcp_ports(3);
+    let ports = free_tcp_ports(4);
     let server_port = ports[0];
     let socks_port = ports[1];
     let echo_port = ports[2];
-    let dir = std::env::temp_dir().join(format!("brocade-anytls-sing-box-{server_port}"));
+    let reality_target_port = ports[3];
+    let security_name = if use_reality { "reality" } else { "tls" };
+    let dir = std::env::temp_dir().join(format!(
+        "brocade-anytls-{security_name}-sing-box-{server_port}"
+    ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let (certificate, key) = self_signed();
@@ -763,8 +785,27 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
     fs::write(&key_path, key).unwrap();
 
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    app.ingresses[0].anytls_identity = Some(brocade_core::model::IngressIdentity {
+        private_key: ANYTLS_PRIVATE.to_owned(),
+        public_key: ANYTLS_PUBLIC.to_owned(),
+        short_ids: vec!["1234567890abcdef".to_owned()],
+    });
     app.ingresses[0].wires = IngressWires::AnyTls(AnyTls {
         port: server_port,
+        security: if use_reality {
+            brocade_core::model::AnyTlsSecurity::Reality
+        } else {
+            brocade_core::model::AnyTlsSecurity::Tls
+        },
+        reality: use_reality.then(|| RealitySettings {
+            dest: format!("127.0.0.1:{reality_target_port}"),
+            server_names: vec![SERVER_NAME.to_owned()],
+            fingerprint: "chrome".to_owned(),
+            flow: None,
+            fallback_mode: RealityFallbackMode::CustomSite,
+            fallback_limits: RealityFallbackLimits::Off,
+            fallback_guard: false,
+        }),
         padding_scheme: vec![
             "stop=2".to_owned(),
             "0=30-30".to_owned(),
@@ -807,13 +848,15 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
         "hk",
     ))))
     .unwrap();
-    let anytls = server_value["inbounds"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|inbound| inbound["tag"] == "in:relay/i-relay:anytls")
-        .expect("AnyTLS inbound");
-    anytls["settings"]["users"] = json!([{"password": PASSWORD, "email": "e2e@example.com"}]);
+    {
+        let anytls = server_value["inbounds"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|inbound| inbound["tag"] == "in:relay/i-relay:anytls")
+            .expect("AnyTLS inbound");
+        anytls["settings"]["users"] = json!([{"password": PASSWORD, "email": "e2e@example.com"}]);
+    }
     // The generated node config normally includes the production geodata downloader. It is
     // unrelated to this protocol E2E and would make the test depend on local geoip/geosite assets.
     server_value
@@ -845,6 +888,20 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
         String::from_utf8_lossy(&checked.stderr)
     );
 
+    let mut reality_target = use_reality.then(|| {
+        Command::new("openssl")
+            .args(["s_server", "-accept"])
+            .arg(format!("127.0.0.1:{reality_target_port}"))
+            .args(["-cert"])
+            .arg(&certificate_path)
+            .args(["-key"])
+            .arg(&key_path)
+            .args(["-www", "-tls1_3", "-quiet"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("跑不起来独立 REALITY 目标站")
+    });
     let mut server = Command::new(&xray_binary)
         .args(["run", "-c"])
         .arg(&server_config_path)
@@ -879,6 +936,27 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
             );
         });
 
+        let client_tls = if use_reality {
+            json!({
+                "enabled": true,
+                "server_name": SERVER_NAME,
+                "utls": {
+                    "enabled": true,
+                    "fingerprint": "chrome",
+                },
+                "reality": {
+                    "enabled": true,
+                    "public_key": ANYTLS_PUBLIC,
+                    "short_id": "1234567890abcdef",
+                },
+            })
+        } else {
+            json!({
+                "enabled": true,
+                "server_name": SERVER_NAME,
+                "insecure": true,
+            })
+        };
         let sing_config = serde_json::json!({
             "log": { "level": "error" },
             "inbounds": [{
@@ -892,11 +970,7 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
                 "server": "127.0.0.1",
                 "server_port": server_port,
                 "password": PASSWORD,
-                "tls": {
-                    "enabled": true,
-                    "server_name": SERVER_NAME,
-                    "insecure": true,
-                },
+                "tls": client_tls,
             }],
         });
         let sing_config_path = dir.join("sing-box.json");
@@ -960,27 +1034,29 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
             return Err(format!("AnyTLS E2E 响应正文不对：{body}"));
         }
 
-        let fallback = Command::new("curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--include",
-                "--http1.1",
-                "--insecure",
-                "--noproxy",
-                "*",
-                "--resolve",
-                &format!("{SERVER_NAME}:{server_port}:127.0.0.1"),
-                &format!("https://{SERVER_NAME}:{server_port}/"),
-            ])
-            .output()
-            .map_err(|error| format!("执行 AnyTLS fallback curl 失败：{error}"))?;
-        let fallback_text = String::from_utf8_lossy(&fallback.stdout);
-        if !fallback.status.success() || !fallback_text.starts_with("HTTP/1.1 404") {
-            return Err(format!(
-                "AnyTLS 默认 fallback 不是 404：\n{fallback_text}\n{}",
-                String::from_utf8_lossy(&fallback.stderr)
-            ));
+        if !use_reality {
+            let fallback = Command::new("curl")
+                .args([
+                    "--silent",
+                    "--show-error",
+                    "--include",
+                    "--http1.1",
+                    "--insecure",
+                    "--noproxy",
+                    "*",
+                    "--resolve",
+                    &format!("{SERVER_NAME}:{server_port}:127.0.0.1"),
+                    &format!("https://{SERVER_NAME}:{server_port}/"),
+                ])
+                .output()
+                .map_err(|error| format!("执行 AnyTLS fallback curl 失败：{error}"))?;
+            let fallback_text = String::from_utf8_lossy(&fallback.stdout);
+            if !fallback.status.success() || !fallback_text.starts_with("HTTP/1.1 404") {
+                return Err(format!(
+                    "AnyTLS 默认 fallback 不是 404：\n{fallback_text}\n{}",
+                    String::from_utf8_lossy(&fallback.stderr)
+                ));
+            }
         }
         Ok(())
     })();
@@ -991,6 +1067,10 @@ fn an_independent_sing_box_client_can_reach_an_anytls_ingress() {
     }
     let _ = server.kill();
     let _ = server.wait();
+    if let Some(mut target) = reality_target.take() {
+        let _ = target.kill();
+        let _ = target.wait();
+    }
     let _ = fs::remove_dir_all(&dir);
     if let Err(error) = outcome {
         panic!("{error}");
@@ -2116,6 +2196,7 @@ fn base_model(dial: HopDial, security: HopWire) -> (ModelSnapshot, AppView) {
                 public_key: INGRESS_PUBLIC.to_owned(),
                 short_ids: vec!["abcdef0123456789".to_owned()],
             },
+            anytls_identity: None,
             wires: IngressWires::Vless(Transport::VlessReality(
                 brocade_core::model::RealitySettings {
                     dest: "apps.apple.com:443".to_owned(),

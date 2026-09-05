@@ -14,7 +14,15 @@ pub(crate) async fn list_tenants(pool: &PgPool, actor: &AdminContext) -> Result<
                     t.created_revision,
                     (SELECT count(*) FROM nodes n WHERE n.tenant_id = t.id) AS node_count,
                     (SELECT count(*) FROM users u WHERE u.tenant_id = t.id) AS user_count,
-                    (SELECT count(*) FROM admin_operators o WHERE o.tenant_scope = t.id) AS operator_count
+                    (SELECT count(*)
+                       FROM admin_operators o
+                      WHERE o.role <> 'user'
+                        AND o.id <> 'public'
+                        AND (
+                            o.role = 'system-admin'
+                            OR o.tenant_scope = t.id
+                            OR substring(t.id FROM 1 FOR char_length(o.tenant_scope) + 1) = o.tenant_scope || '.'
+                        )) AS operator_count
              FROM tenants t
              ORDER BY t.id",
         )
@@ -32,7 +40,15 @@ pub(crate) async fn list_tenants(pool: &PgPool, actor: &AdminContext) -> Result<
                     t.created_revision,
                     (SELECT count(*) FROM nodes n WHERE n.tenant_id = t.id) AS node_count,
                     (SELECT count(*) FROM users u WHERE u.tenant_id = t.id) AS user_count,
-                    (SELECT count(*) FROM admin_operators o WHERE o.tenant_scope = t.id) AS operator_count
+                    (SELECT count(*)
+                       FROM admin_operators o
+                      WHERE o.role <> 'user'
+                        AND o.id <> 'public'
+                        AND (
+                            o.role = 'system-admin'
+                            OR o.tenant_scope = t.id
+                            OR substring(t.id FROM 1 FOR char_length(o.tenant_scope) + 1) = o.tenant_scope || '.'
+                        )) AS operator_count
              FROM tenants t
              WHERE t.id = $1 OR t.id LIKE $2 ESCAPE '\\'
              ORDER BY t.id",
@@ -121,7 +137,13 @@ pub async fn list_users(
     let tenant_id = tenant_id.and_then(optional_text);
     let rows = if actor.is_system_admin() {
         sqlx::query(
-            "SELECT tenant_id, id, uuid::text AS uuid, status,
+            "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                    EXISTS (
+                        SELECT 1 FROM admin_operators o
+                        WHERE o.role = 'user'
+                          AND o.user_tenant_id = users.tenant_id
+                          AND o.user_id = users.id
+                    ) AS login_enabled,
                     created_at::text AS created_at, created_revision
              FROM users
              WHERE ($1::text IS NULL OR tenant_id = $1)
@@ -135,7 +157,13 @@ pub async fn list_users(
     } else if let Some(tenant_id) = tenant_id {
         actor.require_tenant_access(tenant_id, "user")?;
         sqlx::query(
-            "SELECT tenant_id, id, uuid::text AS uuid, status,
+            "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                    EXISTS (
+                        SELECT 1 FROM admin_operators o
+                        WHERE o.role = 'user'
+                          AND o.user_tenant_id = users.tenant_id
+                          AND o.user_id = users.id
+                    ) AS login_enabled,
                     created_at::text AS created_at, created_revision
              FROM users
              WHERE tenant_id = $1
@@ -152,7 +180,13 @@ pub async fn list_users(
             .tenant_scope_like_pattern()
             .ok_or_else(|| StoreError::Forbidden("admin context has no tenant_scope".to_owned()))?;
         sqlx::query(
-            "SELECT tenant_id, id, uuid::text AS uuid, status,
+            "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                    EXISTS (
+                        SELECT 1 FROM admin_operators o
+                        WHERE o.role = 'user'
+                          AND o.user_tenant_id = users.tenant_id
+                          AND o.user_id = users.id
+                    ) AS login_enabled,
                     created_at::text AS created_at, created_revision
              FROM users
              WHERE (tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\')

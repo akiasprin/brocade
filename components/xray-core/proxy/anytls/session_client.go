@@ -3,7 +3,6 @@ package anytls
 import (
 	"context"
 	"encoding/binary"
-	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/uot"
@@ -182,29 +181,16 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 		targetCopy := target
 		st.udpTarget = &targetCopy
 	}
-	// SYNACK success is optional in AnyTLS v2. Only wait after the peer has
-	// demonstrated support by returning a zero-length SYNACK; this keeps
-	// stream creation compatible with sing-box/sing-anytls servers that do
-	// not send success confirmations.
-	waitForSynAck := sid >= 2 && s.peerVersionValue() >= 2 && s.synAckSupported.Load() && target.Network != net.Network_UDP
+	// Stream opening is deliberately optimistic. A successful SYNACK is only
+	// advisory: the server dispatcher returns before the target dial completes,
+	// so waiting for it would delay the first uplink payload by a full session
+	// RTT without proving that the destination is reachable. Rejections remain
+	// asynchronous and close only this stream in the session read loop.
 	s.streamsMu.Lock()
 	s.streams[st.sid] = st
 	s.streamsMu.Unlock()
 	s.activeStreams.Add(1)
 	s.inIdlePool.Store(false)
-
-	var ch chan error
-	if waitForSynAck {
-		ch = make(chan error, 1)
-		s.synAckMu.Lock()
-		s.synAckCh[sid] = ch
-		s.synAckMu.Unlock()
-		defer func() {
-			s.synAckMu.Lock()
-			delete(s.synAckCh, sid)
-			s.synAckMu.Unlock()
-		}()
-	}
 
 	var frames buf.MultiBuffer
 	addrBuf := buf.New()
@@ -252,26 +238,6 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	}
 	openLocked = false
 	s.openMu.Unlock()
-
-	if waitForSynAck {
-		select {
-		case serr := <-ch:
-			if serr != nil {
-				s.finishStream(sid, serr)
-				return nil, errors.New("anytls: SYN rejected").Base(serr)
-			}
-		case sessErr := <-s.errCh:
-			s.finishStream(sid, sessErr)
-			return nil, sessErr
-		case <-time.After(3 * time.Second):
-			timeoutErr := errors.New("anytls: SYNACK timeout")
-			s.close(timeoutErr)
-			return nil, timeoutErr
-		case <-ctx.Done():
-			s.finishStream(sid, ctx.Err())
-			return nil, ctx.Err()
-		}
-	}
 
 	if target.Network == net.Network_UDP {
 		reqBuf := buf.New()

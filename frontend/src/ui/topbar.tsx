@@ -21,18 +21,17 @@ export const TABS: Tab[] = [
   { key: 'tenants', label: '租户' },
   { key: 'deploy', label: '发布' },
   { key: 'usage', label: '用量' },
-  { key: 'operators', label: '操作者', roles: ['tenant-admin', 'system-admin'] },
   { key: 'settings', label: '设置' },
 ];
 
 // 底部 tab bar 只有四格——移动端从第五格开始标签会被压缩到不可读。
-// 未进入的项（租户、操作者、设置）收入抽屉，不是移除。
+// 未进入的项（租户、设置）收入抽屉，不是移除。
 const BOTTOM_KEYS = ['nodes', 'users', 'deploy', 'usage'];
 /* 底部四格使用短标签：完整名称在 25% 屏宽下无法容纳 */
 const SHORT_LABEL: Record<string, string> = { users: '用户' };
 
-export function visibleTabs(role: AdminRole): Tab[] {
-  return TABS.filter(t => !t.roles || t.roles.includes(role));
+export function visibleTabs(who: Whoami): Tab[] {
+  return TABS.filter(t => !t.roles || t.roles.includes(who.role));
 }
 
 /* 功能窗属于管理台面：在拓扑台面点击菜单时先切回管理台面，再执行置顶 */
@@ -116,7 +115,7 @@ export function Topbar({ branding, who, onLogout }: { branding: BrandingSettings
       <header id="bar">
         <div className="brand">
           <BrandIcon branding={branding} className="brand-logo" />
-          <b>{branding.site_name}</b> <span>/ console</span>
+          <b>{branding.site_name}</b> <span>| 🛰️ 跨境网络小管家</span>
         </div>
         <div className="seg">
           <button aria-pressed={snap.floor === 'desk'} onClick={() => wm.setFloor('desk')}>
@@ -127,7 +126,7 @@ export function Topbar({ branding, who, onLogout }: { branding: BrandingSettings
           </button>
         </div>
         <nav id="menu" aria-label="功能菜单">
-          {visibleTabs(who.role).map(t => {
+          {visibleTabs(who).map(t => {
             const key = `tab:${t.key}`;
             const pressed = active?.key === key && !active.min && active.home === snap.floor;
             return (
@@ -173,14 +172,14 @@ export function Topbar({ branding, who, onLogout }: { branding: BrandingSettings
       </header>
 
       {narrow && sheet && <MoreSheet who={who} onClose={() => setSheet(false)} />}
-      {narrow && <BottomTabs role={who.role} activeKey={active?.key} floor={snap.floor} />}
+      {narrow && <BottomTabs who={who} activeKey={active?.key} floor={snap.floor} />}
     </>
   );
 }
 
 /* 底部 tab bar：窄屏下由它承担窗口切换，因此功能窗的标题栏不再提供关闭按钮。 */
-function BottomTabs({ role, activeKey, floor }: { role: AdminRole; activeKey: string | undefined; floor: string }) {
-  const tabs = BOTTOM_KEYS.map(k => visibleTabs(role).find(t => t.key === k)).filter((t): t is Tab => !!t);
+function BottomTabs({ who, activeKey, floor }: { who: Whoami; activeKey: string | undefined; floor: string }) {
+  const tabs = BOTTOM_KEYS.map(k => visibleTabs(who).find(t => t.key === k)).filter((t): t is Tab => !!t);
   return (
     <nav id="tabbar" aria-label="主导航">
       {tabs.map(t => (
@@ -195,7 +194,7 @@ function BottomTabs({ role, activeKey, floor }: { role: AdminRole; activeKey: st
 // ☰ 抽屉：底部四格无法容纳的内容都在此——台面切换、其余功能页面、产物面板、身份。
 // 退出不放在此处：顶栏已有一个入口，同一不可撤销操作提供两个入口会增加决策成本。
 function MoreSheet({ who, onClose }: { who: Whoami; onClose: () => void }) {
-  const rest = visibleTabs(who.role).filter(t => !BOTTOM_KEYS.includes(t.key));
+  const rest = visibleTabs(who).filter(t => !BOTTOM_KEYS.includes(t.key));
   const go = (fn: () => void) => () => {
     fn();
     onClose();

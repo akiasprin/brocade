@@ -46,10 +46,10 @@ use brocade_store::{
     E2eProbeRequest, IsolateDeploymentTargetRequest, LinkHealthRequest, LinkProbeRequest,
     LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
     PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
-    ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest,
-    RestoreNodeServiceRequest, SetUserAppQuotaRequest, StoreError, UpdateAgentLogDefaultRequest,
-    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateNodeStatusRequest,
-    UpdateUserStatusRequest, UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
+    ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest, SetUserAppQuotaRequest,
+    StoreError, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -533,7 +533,7 @@ const MASK_BODY_LIMIT: usize = 32 * 1024 * 1024;
 /// Whether this role reads the console as a reviewer, which means the model for review rather
 /// than the addresses for use.
 fn role_masks_assets(role: AdminRole) -> bool {
-    role == AdminRole::Readonly
+    matches!(role, AdminRole::User | AdminRole::Readonly)
 }
 
 /// Replace every asset identifier on the way out, for viewers who may not keep them.
@@ -551,15 +551,30 @@ fn role_masks_assets(role: AdminRole) -> bool {
 /// what it serves is the desired state a machine converges to, and an agent handed
 /// `123.123.***.***` would write it into wg0 and take the backbone down.
 async fn mask_assets(request: Request, next: Next) -> Response {
+    let self_response = request_admin().is_some_and(|admin| admin.role == AdminRole::User)
+        && self_route_may_hold_secrets(request.method(), request.uri().path());
     let response = next.run(request).await;
     if !response_is_json(&response) {
         return response;
     }
-    let masked = request_admin().is_some_and(|admin| role_masks_assets(admin.role));
+    let masked =
+        request_admin().is_some_and(|admin| role_masks_assets(admin.role)) && !self_response;
     if !masked {
         return response;
     }
     mask_response_body(response).await
+}
+
+fn self_route_may_hold_secrets(method: &axum::http::Method, path: &str) -> bool {
+    matches!(
+        (method, path),
+        (&axum::http::Method::GET, "/me/user")
+            | (&axum::http::Method::POST, "/me/rotate-uuid")
+            | (&axum::http::Method::GET, "/me/artifact")
+            | (&axum::http::Method::GET, "/me/clash-subscription")
+            | (&axum::http::Method::POST, "/me/clash-subscription/haitun")
+            | (&axum::http::Method::DELETE, "/me/clash-subscription/haitun")
+    )
 }
 
 /// What a visitor signed in as `public` may ask for: the read side of the console.
@@ -572,7 +587,8 @@ async fn mask_assets(request: Request, next: Next) -> Response {
 ///
 /// The list covers what the visitor-facing pages read: the model, the machines' agent state
 /// and load, the per-machine traffic series, hop quality, the current revision's compile
-/// output, and the read side of the users, tenants, quotas and usage pages.
+/// output, and the read side of users, tenants, quotas and usage. Sensitive fields are removed
+/// centrally by the response masking layer.
 /// Write methods never match: the method check above closes every non-GET to the public
 /// account, and the deployments, settings, operator and artifact routes are excluded
 /// entirely.
@@ -619,6 +635,17 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         || is_user_grant_probe_plan_path(path)
 }
 
+fn user_may(method: &axum::http::Method, path: &str) -> bool {
+    public_may(method, path)
+        || self_route_may_hold_secrets(method, path)
+        || (method == axum::http::Method::POST && path == "/admin/password")
+        || (method == axum::http::Method::GET && path == "/grant-probes/capability")
+        || (method == axum::http::Method::POST && is_user_grant_probe_plan_path(path))
+        || ((method == axum::http::Method::GET || method == axum::http::Method::DELETE)
+            && is_grant_probe_job_path(path))
+        || (method == axum::http::Method::GET && is_grant_probe_events_path(path))
+}
+
 fn is_user_grant_probe_plan_path(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/users/") else {
         return false;
@@ -627,6 +654,25 @@ fn is_user_grant_probe_plan_path(path: &str) -> bool {
     matches!(
         (parts.next(), parts.next(), parts.next(), parts.next()),
         (Some(tenant), Some(user), Some("grant-probes"), None) if !tenant.is_empty() && !user.is_empty()
+    )
+}
+
+fn is_grant_probe_job_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/grant-probes/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!((parts.next(), parts.next()), (Some(id), None) if !id.is_empty() && id != "capability")
+}
+
+fn is_grant_probe_events_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/grant-probes/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(id), Some("events"), None) if !id.is_empty()
     )
 }
 
@@ -641,9 +687,15 @@ fn is_user_grant_probe_plan_path(path: &str) -> bool {
 /// a handler, so writes are refused twice, but the role cannot carry this rule: other
 /// authenticated operators also hold `readonly`.
 async fn public_scope(request: Request, next: Next) -> Response {
-    let is_public = request_admin().is_some_and(|admin| admin.operator_id == PUBLIC_OPERATOR_ID);
-    if is_public && !public_may(request.method(), request.uri().path()) {
-        return ApiError::Forbidden.into_response();
+    if let Some(admin) = request_admin() {
+        if admin.operator_id == PUBLIC_OPERATOR_ID
+            && !public_may(request.method(), request.uri().path())
+        {
+            return ApiError::Forbidden.into_response();
+        }
+        if admin.role == AdminRole::User && !user_may(request.method(), request.uri().path()) {
+            return ApiError::Forbidden.into_response();
+        }
     }
     next.run(request).await
 }
@@ -721,6 +773,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/auth/init", post(auth_init))
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
+        .route("/visitor-access", put(set_visitor_access))
         .route("/whoami", get(whoami))
         // Public read: the login page must know its name and mark before a session exists. Writes
         // still require a system administrator in the handler below.
@@ -848,6 +901,11 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(rotate_user_uuid),
         )
         .route(
+            "/users/{tenant_id}/{user_id}/profile",
+            put(update_user_profile),
+        )
+        .route("/users/{tenant_id}/{user_id}/login", post(issue_user_login))
+        .route(
             "/users/{tenant_id}/{user_id}/clash-subscription",
             get(clash_subscription_info),
         )
@@ -906,6 +964,15 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(reset_admin_password),
         )
         .route("/admin/password", post(change_admin_password))
+        .route("/me/user", get(self_user_profile))
+        .route("/me/rotate-uuid", post(rotate_self_user_uuid))
+        .route("/me/artifact", get(self_user_artifact))
+        .route("/me/clash-subscription", get(self_clash_subscription_info))
+        .route(
+            "/me/clash-subscription/haitun",
+            post(issue_self_clash_haitun_subscription)
+                .delete(revoke_self_clash_haitun_subscription),
+        )
         .route("/usage/samples", get(list_usage_samples))
         .route("/usage/node-series", get(list_usage_node_series))
         .route("/usage/monthly-summary", get(usage_monthly_summary))
@@ -1281,6 +1348,24 @@ fn safe_filename_slug(value: &str) -> String {
 
 async fn auth_state(State(state): State<AppState>) -> ApiResult<Response> {
     let result = state.store.admin_auth_state().await?;
+    Ok(Json(result).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct VisitorAccessRequest {
+    enabled: bool,
+}
+
+async fn set_visitor_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<VisitorAccessRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let result = state
+        .store
+        .set_public_access(&admin, request.enabled)
+        .await?;
     Ok(Json(result).into_response())
 }
 
@@ -2146,6 +2231,7 @@ fn require_complete_settings(value: &serde_json::Value) -> ApiResult<()> {
         &["reality_site", "server_names"],
         &["reality_site", "fingerprint"],
         &["reality_site", "flow"],
+        &["anytls_padding_scheme"],
         &["overlay", "keepalive_secs"],
         &["overlay", "mtu"],
         &["ports", "ingress_base"],
@@ -2527,13 +2613,9 @@ async fn restore_node_service(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<RestoreNodeServiceRequest>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    let result = state
-        .store
-        .restore_node_service(&admin, &node_id, request)
-        .await?;
+    let result = state.store.restore_node_service(&admin, &node_id).await?;
     Ok(Json(result).into_response())
 }
 
@@ -2701,6 +2783,97 @@ async fn rotate_user_uuid(
     Ok(Json(result).into_response())
 }
 
+async fn update_user_profile(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateUserProfileRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let result = state
+        .store
+        .update_user_profile(&admin, &tenant_id, &user_id, request)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn issue_user_login(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ManageOperators).await?;
+    let result = state
+        .store
+        .issue_user_login(&admin, &tenant_id, &user_id)
+        .await?;
+    Ok((StatusCode::CREATED, Json(result)).into_response())
+}
+
+async fn self_user_context(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<(AdminContext, String, String)> {
+    let authenticated = require_admin(state, headers, AdminPermission::Read).await?;
+    if authenticated.role != AdminRole::User {
+        return Err(ApiError::Forbidden);
+    }
+    let user = authenticated.self_user.clone().ok_or(ApiError::Forbidden)?;
+    Ok((
+        AdminContext::from_authenticated(&authenticated),
+        user.tenant_id,
+        user.user_id,
+    ))
+}
+
+async fn self_user_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (admin, _, _) = self_user_context(&state, &headers).await?;
+    Ok(Json(state.store.self_user_profile(&admin).await?).into_response())
+}
+
+async fn rotate_self_user_uuid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (admin, tenant_id, user_id) = self_user_context(&state, &headers).await?;
+    let result = state
+        .store
+        .rotate_user_uuid(&admin, &tenant_id, &user_id)
+        .await?;
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct SelfArtifactQuery {
+    family: Option<IpFamily>,
+    protocol: Option<SubscriptionProtocol>,
+}
+
+async fn self_user_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SelfArtifactQuery>,
+) -> ApiResult<Response> {
+    let (admin, tenant_id, user_id) = self_user_context(&state, &headers).await?;
+    let result = state
+        .store
+        .serving_user_artifact_content(
+            &admin,
+            &format!("{tenant_id}:{user_id}"),
+            "uri",
+            SubscriptionFilter {
+                family: query.family,
+                protocol: query.protocol,
+            },
+        )
+        .await?;
+    Ok(Json(result).into_response())
+}
+
 #[derive(Debug, Serialize)]
 struct ClashSubscriptionInfoResponse {
     url: String,
@@ -2734,6 +2907,23 @@ async fn clash_subscription_info(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    clash_subscription_info_response(&state, &admin, &tenant_id, &user_id).await
+}
+
+async fn self_clash_subscription_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (admin, tenant_id, user_id) = self_user_context(&state, &headers).await?;
+    clash_subscription_info_response(&state, &admin, &tenant_id, &user_id).await
+}
+
+async fn clash_subscription_info_response(
+    state: &AppState,
+    admin: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> ApiResult<Response> {
     let origin = state
         .subscription_public_url
         .as_deref()
@@ -2742,11 +2932,11 @@ async fn clash_subscription_info(
         ))?;
     let subscription = state
         .store
-        .clash_subscription_for_user(&admin, &tenant_id, &user_id)
+        .clash_subscription_for_user(admin, tenant_id, user_id)
         .await?;
     let haitun = state
         .store
-        .clash_haitun_link_for_user(&admin, &tenant_id, &user_id)
+        .clash_haitun_link_for_user(admin, tenant_id, user_id)
         .await?;
     let url = format!("{origin}/sub/v1/{}/clash.yaml", subscription.uuid);
     Ok(Json(ClashSubscriptionInfoResponse {
@@ -2761,12 +2951,29 @@ async fn clash_subscription_info(
     .into_response())
 }
 
+async fn issue_self_clash_haitun_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (admin, tenant_id, user_id) = self_user_context(&state, &headers).await?;
+    issue_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
+}
+
 async fn issue_clash_haitun_subscription(
     State(state): State<AppState>,
     Path((tenant_id, user_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    issue_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
+}
+
+async fn issue_clash_haitun_subscription_response(
+    state: &AppState,
+    admin: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> ApiResult<Response> {
     let origin = state
         .subscription_public_url
         .as_deref()
@@ -2777,13 +2984,21 @@ async fn issue_clash_haitun_subscription(
     // effective-entry checks as opening the normal Clash subscription.
     state
         .store
-        .clash_subscription_for_user(&admin, &tenant_id, &user_id)
+        .clash_subscription_for_user(admin, tenant_id, user_id)
         .await?;
     let link = state
         .store
-        .issue_clash_haitun_link(&admin, &tenant_id, &user_id)
+        .issue_clash_haitun_link(admin, tenant_id, user_id)
         .await?;
     Ok(Json(clash_haitun_subscription_info(origin, Some(&link))).into_response())
+}
+
+async fn revoke_self_clash_haitun_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (admin, tenant_id, user_id) = self_user_context(&state, &headers).await?;
+    revoke_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
 }
 
 async fn revoke_clash_haitun_subscription(
@@ -2792,9 +3007,18 @@ async fn revoke_clash_haitun_subscription(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    revoke_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
+}
+
+async fn revoke_clash_haitun_subscription_response(
+    state: &AppState,
+    admin: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> ApiResult<Response> {
     let link = state
         .store
-        .revoke_clash_haitun_link(&admin, &tenant_id, &user_id)
+        .revoke_clash_haitun_link(admin, tenant_id, user_id)
         .await?;
     // A revoked response has no URL, so this operation remains available even when the public
     // subscription origin was removed from a broken deployment.
@@ -2877,7 +3101,7 @@ async fn abandon_node(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     let unregister_warp = request.unregister_warp;
-    let result = state.store.abandon_node(&admin, &node_id, request).await?;
+    let result = state.store.abandon_node(&admin, &node_id).await?;
     if unregister_warp {
         cleanup_retired_warp_bindings(&state, &node_id).await;
     }
@@ -2941,7 +3165,7 @@ async fn user_grant_probe_plan(
 ) -> ApiResult<Response> {
     // This projection deliberately contains no endpoint, port or credential (the executable
     // target remains server-side), so readonly reviewers may inspect the effective Serving
-    // matrix. POST below still requires ViewArtifacts because it actually uses those secrets.
+    // matrix. POST below requires ViewArtifacts, except that a user may execute their own plan.
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     let plan = state
         .store
@@ -2972,8 +3196,37 @@ async fn grant_probe_capability(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    require_admin(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    require_grant_probe_context(&state, &headers).await?;
     Ok(Json(state.grant_probes.capability()).into_response())
+}
+
+async fn require_grant_probe_context(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<AdminContext> {
+    let authenticated = require_admin(state, headers, AdminPermission::Read).await?;
+    if authenticated.role != AdminRole::User
+        && !admin_has_permission(authenticated.role, AdminPermission::ViewArtifacts)
+    {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(AdminContext::from_authenticated(&authenticated))
+}
+
+fn require_grant_probe_user_access(
+    admin: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> ApiResult<()> {
+    if admin.role() == AdminRole::User {
+        return admin
+            .self_user()
+            .is_some_and(|user| user.tenant_id == tenant_id && user.user_id == user_id)
+            .then_some(())
+            .ok_or(ApiError::Forbidden);
+    }
+    admin.require_tenant_access(tenant_id, "grant probe")?;
+    Ok(())
 }
 
 async fn start_user_grant_probe(
@@ -2982,7 +3235,8 @@ async fn start_user_grant_probe(
     headers: HeaderMap,
     Json(request): Json<StartGrantProbeRequest>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    let admin = require_grant_probe_context(&state, &headers).await?;
+    require_grant_probe_user_access(&admin, &tenant_id, &user_id)?;
     // This call is the server-side publication gate. It reads the same frozen Serving projection
     // as subscriptions and refuses open releases, queued grant sync, dirty runtime, and partial
     // settlement. The browser's disabled button is only presentation and is never trusted.
@@ -3016,12 +3270,12 @@ async fn grant_probe_status(
     Path(probe_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    let admin = require_grant_probe_context(&state, &headers).await?;
     let job = state
         .grant_probes
         .snapshot_for(&probe_id)
         .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
-    admin.require_tenant_access(&job.tenant_id, "grant probe")?;
+    require_grant_probe_user_access(&admin, &job.tenant_id, &job.user_id)?;
     Ok(Json(job).into_response())
 }
 
@@ -3030,12 +3284,12 @@ async fn cancel_grant_probe(
     Path(probe_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    let admin = require_grant_probe_context(&state, &headers).await?;
     let current = state
         .grant_probes
         .snapshot_for(&probe_id)
         .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
-    admin.require_tenant_access(&current.tenant_id, "grant probe")?;
+    require_grant_probe_user_access(&admin, &current.tenant_id, &current.user_id)?;
     let job = state
         .grant_probes
         .cancel(&probe_id)
@@ -3048,12 +3302,12 @@ async fn grant_probe_events(
     Path(probe_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::ViewArtifacts).await?;
+    let admin = require_grant_probe_context(&state, &headers).await?;
     let (initial, receiver) = state
         .grant_probes
         .subscribe(&probe_id)
         .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
-    admin.require_tenant_access(&initial.tenant_id, "grant probe")?;
+    require_grant_probe_user_access(&admin, &initial.tenant_id, &initial.user_id)?;
     let first = tokio_stream::once(Ok::<Event, Infallible>(probe_sse_event(&initial)));
     let updates = BroadcastStream::new(receiver).filter_map(|message| match message {
         Ok(snapshot) => Some(Ok::<Event, Infallible>(probe_sse_event(&snapshot))),
@@ -4365,7 +4619,8 @@ fn admin_has_permission(role: AdminRole, permission: AdminPermission) -> bool {
     match permission {
         AdminPermission::Read => matches!(
             role,
-            AdminRole::Readonly
+            AdminRole::User
+                | AdminRole::Readonly
                 | AdminRole::Editor
                 | AdminRole::Publisher
                 | AdminRole::TenantAdmin
@@ -4689,15 +4944,15 @@ mod tests {
     use axum::extract::Path;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    use brocade_store::StoreError;
+    use brocade_store::{AdminContext, AdminRole, AuthenticatedAdmin, StoreError};
 
     use super::{
         bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
-        looks_like_uuid, public_may, route_from_headers, safe_filename_slug, session_cookie,
-        AgentDistribution, ApiError, ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery,
-        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
-        DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS, EMBEDDED_XRAYS, INSTALL_SCRIPT,
-        SUBSCRIPTION_CACHE_CONTROL,
+        looks_like_uuid, public_may, require_grant_probe_user_access, route_from_headers,
+        safe_filename_slug, session_cookie, user_may, AgentDistribution, ApiError,
+        ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery, SubscriptionProtocol,
+        BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS,
+        EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
 
@@ -4855,8 +5110,8 @@ mod tests {
     /// to stay closed. Both directions are asserted here because the failure modes are opposite
     /// and neither is reported: too narrow renders empty boxes on the machines page that are not
     /// traced back to authorization, and too wide exposes the users table to an anonymous
-    /// visitor. The visitor gets the read-only machine, link, user and usage pages; deployments
-    /// and settings stay closed because every write path sits behind them.
+    /// visitor. The visitor gets the read-only system description, including masked users and
+    /// usage. Deployments, settings, credentials and writes remain closed.
     #[test]
     fn the_public_account_reaches_the_pages_it_is_opened_for_and_nothing_else() {
         use axum::http::Method;
@@ -4875,14 +5130,14 @@ mod tests {
             "/links/quality",
             "/links/health",
             "/probes/e2e",
-            "/users",
             "/tenants",
+            "/users",
             "/quotas",
             "/usage/samples",
             "/usage/monthly-summary",
+            "/users/platform.acme/alice/grant-probes",
             "/realtime/nodes/events",
             "/realtime/nodes/hk-01/events",
-            "/users/platform.acme/alice/grant-probes",
         ] {
             assert!(public_may(&Method::GET, path), "should allow GET {path}");
         }
@@ -4917,6 +5172,63 @@ mod tests {
         assert!(!public_may(&Method::GET, "/users//alice/grant-probes"));
     }
 
+    #[test]
+    fn a_user_gets_the_public_console_plus_self_service_and_network_probe_routes() {
+        use axum::http::Method;
+
+        assert!(user_may(&Method::GET, "/model/snapshot"));
+        assert!(user_may(&Method::GET, "/users"));
+        assert!(user_may(&Method::GET, "/quotas"));
+        assert!(user_may(&Method::GET, "/usage/samples"));
+        assert!(user_may(&Method::GET, "/usage/monthly-summary"));
+        assert!(user_may(&Method::GET, "/me/user"));
+        assert!(!user_may(&Method::PUT, "/me/user"));
+        assert!(user_may(&Method::POST, "/me/rotate-uuid"));
+        assert!(user_may(&Method::GET, "/me/artifact"));
+        assert!(user_may(&Method::GET, "/me/clash-subscription"));
+        assert!(user_may(&Method::POST, "/admin/password"));
+        assert!(user_may(&Method::GET, "/grant-probes/capability"));
+        assert!(user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/grant-probes"
+        ));
+        assert!(user_may(
+            &Method::POST,
+            "/users/platform.acme/alice/grant-probes"
+        ));
+        assert!(user_may(&Method::GET, "/grant-probes/p1"));
+        assert!(user_may(&Method::DELETE, "/grant-probes/p1"));
+        assert!(user_may(&Method::GET, "/grant-probes/p1/events"));
+
+        assert!(!user_may(
+            &Method::POST,
+            "/users/platform.acme/bob/rotate-uuid"
+        ));
+        assert!(!user_may(
+            &Method::GET,
+            "/users/platform.acme/bob/clash-subscription"
+        ));
+        assert!(!user_may(&Method::GET, "/admin/operators"));
+        assert!(!user_may(&Method::GET, "/artifacts/index"));
+        assert!(!user_may(&Method::POST, "/grant-probes/capability"));
+        assert!(!user_may(&Method::DELETE, "/grant-probes/p1/events"));
+        assert!(!user_may(&Method::GET, "/grant-probes/p1/extra"));
+
+        let actor = AdminContext::from_authenticated(&AuthenticatedAdmin {
+            operator_id: "platform.acme/alice".to_owned(),
+            role: AdminRole::User,
+            tenant_scope: Some("platform.acme".to_owned()),
+            token_prefix: None,
+            self_user: Some(brocade_store::AuthenticatedUser {
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+            }),
+        });
+        assert!(require_grant_probe_user_access(&actor, "platform.acme", "alice").is_ok());
+        assert!(require_grant_probe_user_access(&actor, "platform.acme", "bob").is_err());
+        assert!(require_grant_probe_user_access(&actor, "another", "alice").is_err());
+    }
+
     #[tokio::test]
     async fn unexpected_store_errors_return_only_a_reference() {
         let response = ApiError::Store(StoreError::Sqlx(sqlx::Error::Protocol(
@@ -4944,6 +5256,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("mv -f \"$stage\" \"$dest\""));
         assert!(INSTALL_SCRIPT.contains("-H \"@$auth_header\""));
         assert!(!INSTALL_SCRIPT.contains("-H \"Authorization: Bearer $ENROLL_TOKEN\""));
+        assert!(INSTALL_SCRIPT.contains("net.ipv4.tcp_fastopen = 3"));
     }
 
     #[test]

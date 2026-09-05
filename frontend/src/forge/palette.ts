@@ -45,8 +45,8 @@ export const PALETTES: PaletteOption[] = [
   {
     key: 'xuanmo',
     name: '玄墨',
-    description: '墨色操作 · 矿物色数据',
-    action: '#eef0f3',
+    description: '灰白操作 · 矿物色数据',
+    action: '#d1d1cd',
   },
 ];
 

@@ -1724,6 +1724,13 @@ fn validate_anytls(
     ingress: &Ingress,
     settings: &crate::model::AnyTls,
 ) {
+    if settings.security == crate::model::AnyTlsSecurity::Reality && settings.reality.is_none() {
+        diagnostics.push(Diagnostic::error(
+            "ingress.anytls-reality",
+            &ingress.id,
+            format!("接入面 {} 的 AnyTLS REALITY 参数没有解析完成", ingress.id),
+        ));
+    }
     if settings.port == 0 {
         diagnostics.push(Diagnostic::error(
             "ingress.anytls-port",
@@ -3006,65 +3013,91 @@ fn has_downstream(app: &AppIr, front_id: &str) -> bool {
 
 fn validate_reality(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
     for ingress in &app.ingresses {
-        // A shape presenting its own certificate has none of these to get wrong. Its own check —
-        // that the machine actually holds a certificate — is `validate_ingress_certificate`.
-        let Some(reality) = ingress.wires.reality() else {
-            continue;
-        };
+        let realities = [
+            ingress
+                .wires
+                .reality()
+                .map(|reality| (reality, Some(&ingress.identity), false)),
+            ingress
+                .wires
+                .anytls_reality()
+                .map(|reality| (reality, ingress.anytls_identity.as_ref(), true)),
+        ];
+        for (reality, identity, is_anytls) in realities.into_iter().flatten() {
+            let Some(identity) = identity else {
+                diagnostics.push(Diagnostic::error(
+                    "anytls.reality-identity",
+                    &ingress.id,
+                    "AnyTLS REALITY 缺少独立密钥",
+                ));
+                continue;
+            };
+            if is_anytls && reality.uses_node_certificate_fallback() {
+                diagnostics.push(Diagnostic::error(
+                    "anytls.reality-target",
+                    &ingress.id,
+                    "AnyTLS REALITY 目标站点只能使用全局站点或自定义站点",
+                ));
+                continue;
+            }
 
-        if !reality.uses_node_certificate_fallback() {
-            if reality.server_names.is_empty() {
-                diagnostics.push(Diagnostic::error(
-                    "reality.no-sni",
-                    &ingress.id,
-                    "server_names 不能为空",
-                ));
-            }
-            if !is_nonzero_host_port(&reality.dest) {
-                diagnostics.push(Diagnostic::error(
-                    "reality.dest",
-                    &ingress.id,
-                    format!(
-                        "dest「{}」必须使用 host:port，且端口为 1–65535",
-                        reality.dest
-                    ),
-                ));
-            }
-            for server_name in &reality.server_names {
-                if !is_reality_server_name(server_name) {
+            // A VLESS shape presenting its own certificate has none of these to get wrong. Its
+            // own check — that the machine holds a certificate — is elsewhere. AnyTLS rejects
+            // that fallback above, so its site always takes this branch.
+            if !reality.uses_node_certificate_fallback() {
+                if reality.server_names.is_empty() {
                     diagnostics.push(Diagnostic::error(
-                        "reality.server-name",
+                        "reality.no-sni",
                         &ingress.id,
-                        format!("server_name「{server_name}」不能包含端口、空白或通配符"),
+                        "server_names 不能为空",
+                    ));
+                }
+                if !is_nonzero_host_port(&reality.dest) {
+                    diagnostics.push(Diagnostic::error(
+                        "reality.dest",
+                        &ingress.id,
+                        format!(
+                            "dest「{}」必须使用 host:port，且端口为 1–65535",
+                            reality.dest
+                        ),
+                    ));
+                }
+                for server_name in &reality.server_names {
+                    if !is_reality_server_name(server_name) {
+                        diagnostics.push(Diagnostic::error(
+                            "reality.server-name",
+                            &ingress.id,
+                            format!("server_name「{server_name}」不能包含端口、空白或通配符"),
+                        ));
+                    }
+                }
+                if !is_reality_fingerprint(&reality.fingerprint) {
+                    diagnostics.push(Diagnostic::error(
+                        "reality.fingerprint-unsupported",
+                        &ingress.id,
+                        "REALITY 指纹不受当前 Xray 版本支持，且不能使用 unsafe 或 hellogolang",
                     ));
                 }
             }
-            if !is_reality_fingerprint(&reality.fingerprint) {
-                diagnostics.push(Diagnostic::error(
-                    "reality.fingerprint-unsupported",
-                    &ingress.id,
-                    "REALITY 指纹不受当前 Xray 版本支持，且不能使用 unsafe 或 hellogolang",
-                ));
+            if let RealityFallbackLimits::Custom { upload, download } = &reality.fallback_limits {
+                validate_fallback_rate(ingress, "upload", upload, diagnostics);
+                validate_fallback_rate(ingress, "download", download, diagnostics);
             }
-        }
-        if let RealityFallbackLimits::Custom { upload, download } = &reality.fallback_limits {
-            validate_fallback_rate(ingress, "upload", upload, diagnostics);
-            validate_fallback_rate(ingress, "download", download, diagnostics);
-        }
-        if ingress.identity.short_ids.is_empty() {
-            diagnostics.push(Diagnostic::error(
-                "reality.short-id",
-                &ingress.id,
-                "short_ids 不能为空",
-            ));
-        }
-        for short_id in &ingress.identity.short_ids {
-            if !is_reality_short_id(short_id) {
+            if identity.short_ids.is_empty() {
                 diagnostics.push(Diagnostic::error(
                     "reality.short-id",
                     &ingress.id,
-                    format!("short_id「{short_id}」必须是 2–16 位、偶数长度的十六进制字符串"),
+                    "short_ids 不能为空",
                 ));
+            }
+            for short_id in &identity.short_ids {
+                if !is_reality_short_id(short_id) {
+                    diagnostics.push(Diagnostic::error(
+                        "reality.short-id",
+                        &ingress.id,
+                        format!("short_id「{short_id}」必须是 2–16 位、偶数长度的十六进制字符串"),
+                    ));
+                }
             }
         }
     }

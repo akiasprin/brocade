@@ -4,9 +4,11 @@ use brocade_core::{
     client_config::SubscriptionClientConfig,
     compile::compile,
     model::{
-        Action, AnyTls, ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        ExternalWarpBinding, Hysteria2, HysteriaMasquerade, HysteriaObfs, IngressWires,
-        ModelSnapshot, Projection, ProjectionEndpoint, RealityXhttp, Transport, Xhttp, XhttpXmux,
+        Action, AnyTls, AnyTlsSecurity, ExternalOutbound, ExternalOutboundProtocol,
+        ExternalOutboundSecurity, ExternalWarpBinding, Hysteria2, HysteriaMasquerade, HysteriaObfs,
+        IngressIdentity, IngressWires, ModelSnapshot, Projection, ProjectionEndpoint,
+        RealityFallbackLimits, RealityFallbackMode, RealitySettings, RealityXhttp, Transport,
+        Xhttp, XhttpXmux,
     },
 };
 use fixture::demo_snapshot;
@@ -113,6 +115,28 @@ fn anytls_topology() -> ModelSnapshot {
         idle_session_timeout_secs: Some(10),
         min_idle_session: Some(1),
         ..AnyTls::default()
+    });
+    topology
+}
+
+fn anytls_reality_topology() -> ModelSnapshot {
+    let mut topology = anytls_topology();
+    let ingress = &mut topology.apps[0].ingresses[0];
+    ingress.anytls_identity = Some(IngressIdentity {
+        private_key: "anytls-private".to_owned(),
+        public_key: "anytls-public".to_owned(),
+        short_ids: vec!["1234567890abcdef".to_owned()],
+    });
+    let anytls = ingress.wires.anytls_mut().unwrap();
+    anytls.security = AnyTlsSecurity::Reality;
+    anytls.reality = Some(RealitySettings {
+        dest: "cover.example:443".to_owned(),
+        server_names: vec!["cover.example".to_owned()],
+        fingerprint: "chrome".to_owned(),
+        flow: None,
+        fallback_mode: RealityFallbackMode::CustomSite,
+        fallback_limits: RealityFallbackLimits::Off,
+        fallback_guard: false,
     });
     topology
 }
@@ -359,6 +383,75 @@ fn anytls_handshake_change_holds_projection_until_topology_matches() {
             .port += 1;
     });
     assert_topology_change_gates_projection(anytls_topology(), |desired| {
+        let node_id = desired.apps[0].ingresses[0].node.clone();
+        desired
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .unwrap()
+            .certificate_name = Some("new-cert.example".to_owned());
+    });
+    assert_topology_change_gates_projection(anytls_topology(), |desired| {
+        let ingress = &mut desired.apps[0].ingresses[0];
+        ingress.anytls_identity = Some(IngressIdentity {
+            private_key: "anytls-private".to_owned(),
+            public_key: "anytls-public".to_owned(),
+            short_ids: vec!["1234567890abcdef".to_owned()],
+        });
+        let anytls = ingress.wires.anytls_mut().unwrap();
+        anytls.security = AnyTlsSecurity::Reality;
+        anytls.reality = Some(RealitySettings {
+            dest: "cover.example:443".to_owned(),
+            server_names: vec!["cover.example".to_owned()],
+            fingerprint: "chrome".to_owned(),
+            flow: None,
+            fallback_mode: RealityFallbackMode::CustomSite,
+            fallback_limits: RealityFallbackLimits::Off,
+            fallback_guard: false,
+        });
+    });
+    assert_topology_change_gates_projection(anytls_reality_topology(), |desired| {
+        desired.apps[0].ingresses[0]
+            .anytls_identity
+            .as_mut()
+            .unwrap()
+            .public_key = "rotated-anytls-public".to_owned();
+    });
+    assert_topology_change_gates_projection(anytls_reality_topology(), |desired| {
+        desired.apps[0].ingresses[0]
+            .anytls_identity
+            .as_mut()
+            .unwrap()
+            .short_ids[0] = "fedcba0987654321".to_owned();
+    });
+    assert_topology_change_gates_projection(anytls_reality_topology(), |desired| {
+        desired.apps[0].ingresses[0]
+            .wires
+            .anytls_mut()
+            .unwrap()
+            .reality
+            .as_mut()
+            .unwrap()
+            .server_names[0] = "new-cover.example".to_owned();
+    });
+    assert_topology_change_gates_projection(anytls_reality_topology(), |desired| {
+        desired.apps[0].ingresses[0]
+            .wires
+            .anytls_mut()
+            .unwrap()
+            .reality
+            .as_mut()
+            .unwrap()
+            .fingerprint = "firefox".to_owned();
+    });
+}
+
+#[test]
+fn anytls_reality_does_not_depend_on_vless_identity_or_the_node_certificate() {
+    assert_topology_change_allows_projection(anytls_reality_topology(), |desired| {
+        desired.apps[0].ingresses[0].identity.public_key = "rotated-vless-public".to_owned();
+    });
+    assert_topology_change_allows_projection(anytls_reality_topology(), |desired| {
         let node_id = desired.apps[0].ingresses[0].node.clone();
         desired
             .nodes

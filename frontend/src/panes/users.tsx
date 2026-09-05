@@ -6,6 +6,7 @@ import {
   cancelGrantProbe,
   fetchGrantProbeCapability,
   fetchGrantProbeJob,
+  fetchMyUser,
   fetchQuotas,
   fetchSnapshot,
   fetchTenants,
@@ -13,10 +14,13 @@ import {
   fetchUsers,
   fetchUserGrantProbePlan,
   grantProbeEventsUrl,
+  issueUserLogin,
+  rotateMyUuid,
   rotateUserUuid,
   setQuota,
   setUserStatus,
   startUserGrantProbe,
+  updateUserProfile,
   upsertGrant,
   type SnapshotApp,
   type GrantProbeJob,
@@ -27,7 +31,7 @@ import {
 } from '../api';
 import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
-import { Icon, ListIcon } from '../ui/icons';
+import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
@@ -35,9 +39,6 @@ import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { isValidSlug } from './ports';
 import { SubscriptionViewer, type SubscriptionKind } from './subscription';
-
-/* 服务端返回的月界是 `2026-08-01 00:00:00` 形式的 +08 本地时间，此处转换为面板标题用的年月 */
-const monthLabel = (s: string) => `${s.slice(0, 4)} 年 ${parseInt(s.slice(5, 7), 10)} 月`;
 
 // 用户列表：一行一个用户，点击后就地展开。
 // 此处原为授权矩阵，行是用户、列是接入面。列数随数据增长：每个接入点一列，每个线路再加
@@ -420,6 +421,101 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
+function UserProfileCard({
+  user,
+  editable,
+  canManageLogin,
+}: {
+  user: UserListItem;
+  editable: boolean;
+  canManageLogin: boolean;
+}) {
+  const qc = useQueryClient();
+  const [accountType, setAccountType] = useState<'formal' | 'test'>(user.account_type ?? 'formal');
+  const [issued, setIssued] = useState<{ operator_id: string; password: string } | null>(null);
+
+  const save = useMutation({
+    mutationFn: () => updateUserProfile(user.tenant_id, user.id, { account_type: accountType }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['users'] });
+    },
+  });
+  const login = useMutation({
+    mutationFn: () => issueUserLogin(user.tenant_id, user.id),
+    onSuccess: value => {
+      setIssued(value);
+      void qc.invalidateQueries({ queryKey: ['users'] });
+    },
+  });
+  return (
+    <section className="panel config-panel user-dcard user-profile-card">
+      <header>
+        <PanelTitle of="users">用户资料</PanelTitle>
+        <span className={`st ${accountType === 'test' ? 'st-warn' : 'st-ok'}`}>
+          {accountType === 'test' ? '测试账号' : '正式账号'}
+        </span>
+      </header>
+      <div className="user-dcard-body">
+        <dl className="kv form2 user-profile-form">
+          <dt>账号类型</dt>
+          <dd>
+            <select
+              className="f"
+              value={accountType}
+              disabled={!editable}
+              onChange={event => setAccountType(event.target.value as 'formal' | 'test')}
+            >
+              <option value="formal">正式</option>
+              <option value="test">测试</option>
+            </select>
+          </dd>
+          <dt>登录</dt>
+          <dd className="user-login-control">
+            <span>
+              {user.login_enabled === undefined ? '仅本人或管理员可见' : user.login_enabled ? '已开通' : '未开通'}
+            </span>
+            {canManageLogin && (
+              <button
+                className="btn"
+                type="button"
+                disabled={login.isPending}
+                onClick={() => {
+                  if (user.login_enabled && !window.confirm(`确定重置 ${user.id} 的登录密码？现有登录会话将失效。`)) {
+                    return;
+                  }
+                  login.mutate();
+                }}
+              >
+                {login.isPending ? '处理中…' : user.login_enabled ? '重置登录密码' : '开通登录'}
+              </button>
+            )}
+          </dd>
+        </dl>
+        {editable && (
+          <div className="toolbar user-profile-actions">
+            <span className="sp" />
+            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+              {save.isPending ? '保存中…' : '保存资料'}
+            </button>
+          </div>
+        )}
+        {(save.error || login.error) && <ErrorBox error={save.error ?? login.error} />}
+        {issued && (
+          <div className="callout warn user-login-issued">
+            <b>登录密码只显示这一次</b>
+            <span>
+              登录名 <code>{issued.operator_id}</code> <CopyButton text={issued.operator_id} />
+            </span>
+            <span>
+              密码 <code>{issued.password}</code> <CopyButton text={issued.password} />
+            </span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 type GrantProbeDisplayItem = GrantProbePlanItem & Partial<Pick<GrantProbeJobItem, 'status' | 'ttfb_ms' | 'detail'>>;
 
 const GRANT_PROBE_SLOTS = [
@@ -469,7 +565,7 @@ const probeVisibleStatusText = (item: GrantProbeDisplayItem) => {
 };
 
 /**
- * 人工授权验证。它与周期 E2E 有意分开：此处用真实用户凭据，回答“alice 现在能不能
+ * 人工网络拨测。它与周期 E2E 有意分开：此处用真实用户凭据，回答“alice 现在能不能
  * 从这个授权入口走通”；周期 E2E 用专用 probe 身份，回答线路总体是否健康。
  */
 export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem; readOnly?: boolean }) {
@@ -595,7 +691,7 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
   return (
     <section className="panel config-panel user-dcard grant-probe">
       <header>
-        <h4>授权验证</h4>
+        <PanelTitle of="diag">网络拨测</PanelTitle>
         {plan.data && <span className="grant-probe-serving">Serving R{plan.data.serving_revision}</span>}
         <span className="grant-probe-actions">
           <button
@@ -624,20 +720,6 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
           </button>
         </span>
       </header>
-      <div
-        className="grant-probe-note"
-        title="结果只验证本次授权是否可用，不代替周期健康观测；每项会产生极小真实流量。"
-      >
-        {readOnly ? (
-          <>
-            只读查看 <b>{user.id} 当前生效的 Serving 授权</b>；登录具备操作权限的账号后可发起验证。
-          </>
-        ) : (
-          <>
-            使用 <b>{user.id} 当前生效的真实用户凭据</b> 从公网验证；流量计入该用户用量。
-          </>
-        )}
-      </div>
       {unavailable && <div className="grant-probe-banner bad">{unavailable}</div>}
       {loadError && !unavailable && (
         <div className="grant-probe-banner warn">
@@ -658,6 +740,19 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
         </div>
       )}
       <div className="grant-probe-list">
+        {[...groups.values()].length > 0 && (
+          <div className="grant-probe-table-head" aria-hidden="true">
+            <span>线路 / Route</span>
+            <span className="grant-probe-matrix grant-probe-matrix-head" style={GRANT_PROBE_MATRIX_STYLE}>
+              {GRANT_PROBE_SLOTS.map(slot => (
+                <span key={`${slot.protocol}/${slot.family}`}>
+                  {slot.protocolLabel} <i>○</i> {slot.familyLabel}
+                </span>
+              ))}
+            </span>
+            <span>探测</span>
+          </div>
+        )}
         {[...groups.entries()].map(([key, group]) => {
           const ids = group.items.map(item => item.id);
           return (
@@ -707,9 +802,18 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
           );
         })}
         {!loadError && !unavailable && source.length === 0 && (
-          <div className="grant-probe-empty">{plan.isPending ? '正在读取 Serving 授权…' : '没有可验证的生效授权'}</div>
+          <div className="grant-probe-empty">{plan.isPending ? '正在读取 Serving 授权…' : '没有可拨测的生效授权'}</div>
         )}
       </div>
+      <footer
+        className="grant-probe-foot"
+        title="拨测只检查本次授权是否可用，不代替周期健康观测；每项会产生极小真实流量。"
+      >
+        <Icon of="diag" size={13} className="grant-probe-foot-icon" />
+        {readOnly
+          ? `只读查看 ${user.id} 当前生效的 Serving 授权；登录具备操作权限的账号后可发起拨测。`
+          : `使用 ${user.id} 当前生效的真实用户凭据从公网验证；流量计入该用户用量。`}
+      </footer>
     </section>
   );
 }
@@ -719,6 +823,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   const { who } = useSession();
   const qc = useQueryClient();
   const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
+  const me = useQuery({ queryKey: ['me-user'], queryFn: fetchMyUser, enabled: who.role === 'user' });
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   /* 自然月汇总单独查询：该请求失败不影响授权操作，数字显示为 — 即可 */
   const monthly = useQuery({ queryKey: ['usage-monthly'], queryFn: () => fetchUsageMonthly() });
@@ -730,6 +835,23 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   const [search, setSearch] = useState('');
   /* 当前查看的订阅（用户 + 格式）。null 表示未打开。同时只显示一份，与上面的展开策略一致。 */
   const [sub, setSub] = useState<{ user: UserListItem; kind: SubscriptionKind } | null>(null);
+  const [detailActionsOpen, setDetailActionsOpen] = useState(false);
+
+  /* 低频且有破坏性的用户操作收入「更多」菜单。点击外部或按 Escape 都关闭，
+     与机器详情和顶栏已有菜单保持同一套交互。 */
+  useEffect(() => {
+    if (!detailActionsOpen) return;
+    const close = () => setDetailActionsOpen(false);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    document.addEventListener('click', close);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [detailActionsOpen]);
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ['users'] });
@@ -758,8 +880,12 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
     onSuccess: refresh,
   });
   const rotate = useMutation({
-    mutationFn: (u: UserListItem) => rotateUserUuid(u.tenant_id, u.id),
-    onSuccess: refresh,
+    mutationFn: (value: { user: UserListItem; selfService: boolean }) =>
+      value.selfService ? rotateMyUuid() : rotateUserUuid(value.user.tenant_id, value.user.id),
+    onSuccess: () => {
+      refresh();
+      void qc.invalidateQueries({ queryKey: ['me-user'] });
+    },
   });
   // 额度直写，不进草稿：保存后立即生效，无需再到发布页操作。
   // 因此只失效 quotas 查询，不涉及 revisions。
@@ -774,14 +900,23 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
     onSuccess: () => qc.invalidateQueries({ queryKey: ['quotas'] }),
   });
 
-  if (users.isPending || snapshot.isPending) return <Loading sheeted={sheeted} />;
+  if (users.isPending || snapshot.isPending || (who.role === 'user' && me.isPending)) {
+    return <Loading sheeted={sheeted} />;
+  }
   if (users.error) return <ErrorBox error={users.error} />;
   if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  if (me.error) return <ErrorBox error={me.error} />;
 
   const apps: SnapshotApp[] = snapshot.data.snapshot.apps ?? [];
   const columns = apps.flatMap(a => a.ingresses.map(i => ({ app: a, ingress: i })));
   const granted = new Set(apps.flatMap(a => a.grants.map(g => `${g.tenant}/${g.user}/${g.ingress}`)));
-  const list = users.data.users;
+  const selfKey = who.self_user ? `${who.self_user.tenant_id}/${who.self_user.user_id}` : null;
+  const listedUsers = users.data.users;
+  const list = me.data
+    ? listedUsers.some(user => `${user.tenant_id}/${user.id}` === selfKey)
+      ? listedUsers.map(user => (`${user.tenant_id}/${user.id}` === selfKey ? me.data : user))
+      : [me.data, ...listedUsers]
+    : listedUsers;
   const editable = can(who.role, 'edit');
   /* 订阅是完整可用的配置，readonly 角色在 API 侧返回 403（见 session.tsx 的 can）。
      入口同步隐藏，避免点击后只得到一个错误。 */
@@ -838,7 +973,12 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   // 已停用的排到末尾，同档内保持服务端给出的顺序（sort 是稳定的）。排序只依据操作者
   // 设置的状态：流量用尽同样显示红色，但那是随用量变化并会自行恢复的状态，
   // 用它排序会导致列表顺序随用量变动。
-  const ordered = [...list].sort((a, b) => Number(a.status === 'disabled') - Number(b.status === 'disabled'));
+  const ordered = [...list].sort((a, b) => {
+    const aSelf = `${a.tenant_id}/${a.id}` === selfKey;
+    const bSelf = `${b.tenant_id}/${b.id}` === selfKey;
+    if (aSelf !== bSelf) return aSelf ? -1 : 1;
+    return Number(a.status === 'disabled') - Number(b.status === 'disabled');
+  });
   const allRows = ordered.map(u => {
     const mine = columns.filter(c => granted.has(`${u.tenant_id}/${u.id}/${c.ingress.id}`));
     const quotaRows = quotaRowsOf(u, mine);
@@ -879,92 +1019,145 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   const detailOf = (r: (typeof rows)[number]) => {
     const { u, mine, suspended, use, quotaRows, facts, tone } = r;
     const disabled = u.status === 'disabled';
+    const isMe = r.key === selfKey;
+    const selfService = who.role === 'user' && isMe;
+    const canOpenSubscription = canReadArtifacts || selfService;
     const headCls = disabled ? 'off' : tone === 'idle' ? 'idle' : '';
     const lampCls = tone === 'ok' ? '' : tone; // '' | 'bad' | 'idle'
     return (
-      <div className="user-split-detail">
+      <section className="panel user-split-detail">
         <div className={`user-dhead${headCls ? ` ${headCls}` : ''}`}>
-          <GeneratedUserAvatar id={u.id} detail lampClass={lampCls} lampTitle={userLampTitle(facts)} />
-          <div className="dtitle">
-            <div className="dname">
-              <b className="mono">{u.id}</b>
-              <span className="dsub">
-                <span
-                  className="dstat"
-                  title={
-                    mine.length > 0
-                      ? `${mine.length} 个接入点`
-                      : suspended.size > 0
-                        ? `${suspended.size} 个接入点已停用`
-                        : '尚未授权接入点'
-                  }
-                  aria-label={
-                    mine.length > 0
-                      ? `${mine.length} 个接入点`
-                      : suspended.size > 0
-                        ? `${suspended.size} 个接入点已停用`
-                        : '尚未授权接入点'
-                  }
-                >
-                  <Icon of="chains" size={12} className="dstat-ic" />
-                  <b>{mine.length || suspended.size}</b>
+          <div className="user-dhead-main">
+            <GeneratedUserAvatar id={u.id} detail lampClass={lampCls} lampTitle={userLampTitle(facts)} />
+            <div className="dtitle">
+              <div className="dname">
+                <b className="mono">{u.id}</b>
+                {isMe && <span className="st st-ok">我</span>}
+                <span className={`st ${u.account_type === 'test' ? 'st-warn' : ''}`}>
+                  {u.account_type === 'test' ? '测试' : '正式'}
                 </span>
-                <span
-                  className="dstat"
-                  title={`本月合计 ${use.rows.length > 0 ? bytes(use.total) : '—'}`}
-                  aria-label={`本月合计 ${use.rows.length > 0 ? bytes(use.total) : '—'}`}
-                >
-                  <Icon of="usage" size={12} className="dstat-ic" />
-                  <b>{use.rows.length > 0 ? bytes(use.total) : '—'}</b>
+                <span className="dsub">
+                  <span
+                    className="dstat"
+                    title={
+                      mine.length > 0
+                        ? `${mine.length} 个接入点`
+                        : suspended.size > 0
+                          ? `${suspended.size} 个接入点已停用`
+                          : '尚未授权接入点'
+                    }
+                    aria-label={
+                      mine.length > 0
+                        ? `${mine.length} 个接入点`
+                        : suspended.size > 0
+                          ? `${suspended.size} 个接入点已停用`
+                          : '尚未授权接入点'
+                    }
+                  >
+                    <Icon of="chains" size={12} className="dstat-ic" />
+                    <b>{mine.length || suspended.size}</b>
+                  </span>
+                  <span
+                    className="dstat"
+                    title={`本月合计 ${use.rows.length > 0 ? bytes(use.total) : '—'}`}
+                    aria-label={`本月合计 ${use.rows.length > 0 ? bytes(use.total) : '—'}`}
+                  >
+                    <Icon of="usage" size={12} className="dstat-ic" />
+                    <b>{use.rows.length > 0 ? bytes(use.total) : '—'}</b>
+                  </span>
                 </span>
-              </span>
-            </div>
-            {u.uuid && (
-              <div className="user-duuid">
-                <span>UUID</span>
-                <code>{u.uuid}</code>
-                <CopyButton text={u.uuid} />
               </div>
-            )}
-          </div>
-          <div className="user-dacts">
-            <button
-              className="btn"
-              disabled={!editable || status.isPending}
-              onClick={() => status.mutate({ user: u, next: disabled ? 'active' : 'disabled' })}
-            >
-              {disabled ? '启用' : '停用'}
-            </button>
-            <button
-              className="btn"
-              disabled={!canReadArtifacts}
-              title="打开该用户的 vless:// 链接，可选择地址族"
-              onClick={() => setSub({ user: u, kind: 'uri' })}
-            >
-              VLESS
-            </button>
-            <button
-              className="btn"
-              disabled={!canReadArtifacts}
-              title="Clash 格式的订阅，可选择地址族"
-              onClick={() => setSub({ user: u, kind: 'clash' })}
-            >
-              Clash
-            </button>
-            <button
-              className="btn danger"
-              disabled={!editable || rotate.isPending}
-              title="当前连接将断开，订阅需要重新导入"
-              onClick={() => rotate.mutate(u)}
-            >
-              换 UUID
-            </button>
+              {u.uuid && (
+                <div className="user-duuid">
+                  <span>UUID</span>
+                  <code>{u.uuid}</code>
+                  <CopyButton text={u.uuid} />
+                </div>
+              )}
+            </div>
+            <div className="user-dhead-actions">
+              <div className="user-dacts">
+                {!editable && <span className="user-readonly">{selfService ? '自助访问' : '只读访问'}</span>}
+                <button
+                  className="btn user-dact"
+                  disabled={!canOpenSubscription}
+                  title="打开该用户的 vless:// 节点链接，可选择地址族"
+                  onClick={() => setSub({ user: u, kind: 'uri' })}
+                >
+                  <Icon of="link" size={13} className="user-dact-icon" />
+                  节点链接
+                </button>
+                <button
+                  className="btn user-dact"
+                  disabled={!canOpenSubscription}
+                  title="打开 Clash 订阅地址，可选择地址族"
+                  onClick={() => setSub({ user: u, kind: 'clash' })}
+                >
+                  <Icon of="subscription" size={13} className="user-dact-icon" />
+                  订阅地址
+                </button>
+                <div className="fg-menuwrap user-action-menuwrap">
+                  <button
+                    className="btn user-dact"
+                    disabled={!editable && !selfService}
+                    aria-haspopup="menu"
+                    aria-expanded={detailActionsOpen}
+                    onClick={event => {
+                      event.stopPropagation();
+                      setDetailActionsOpen(open => !open);
+                    }}
+                  >
+                    <Icon of="more" size={13} className="user-dact-icon" />
+                    更多
+                  </button>
+                  {detailActionsOpen && (editable || selfService) && (
+                    <div className="fg-menu user-action-menu" role="menu" onClick={() => setDetailActionsOpen(false)}>
+                      {editable && (
+                        <button
+                          role="menuitem"
+                          className={disabled ? undefined : 'dg'}
+                          disabled={status.isPending}
+                          onClick={() => status.mutate({ user: u, next: disabled ? 'active' : 'disabled' })}
+                        >
+                          <Icon of={disabled ? 'check' : 'dash'} size={14} className="user-action-menu-icon" />
+                          <span>
+                            {disabled ? '启用用户' : '停用用户'}
+                            <small>{disabled ? '恢复该用户的连接权限' : '旧凭据将立即失效'}</small>
+                          </span>
+                        </button>
+                      )}
+                      <button
+                        role="menuitem"
+                        className="dg"
+                        disabled={rotate.isPending}
+                        onClick={() => {
+                          if (!window.confirm(`确定更换 ${u.id} 的 UUID？旧订阅和现有连接会立即失效。`)) return;
+                          rotate.mutate({ user: u, selfService });
+                        }}
+                      >
+                        <Icon of="settings" size={14} className="user-action-menu-icon" />
+                        <span>
+                          更换 UUID
+                          <small>当前连接将断开，订阅需要重新导入</small>
+                        </span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
         </div>
         <div className="user-dbody">
+          <UserProfileCard
+            key={`profile/${r.key}/${u.account_type ?? ''}`}
+            user={u}
+            editable={editable}
+            canManageLogin={can(who.role, 'manage-tenants')}
+          />
           <section className="panel config-panel user-dcard">
             <header>
-              <h4>用量与额度</h4>
+              <PanelTitle of="usage">用量与额度</PanelTitle>
               <span className="rt">
                 本月合计 <b>{use.rows.length > 0 ? bytes(use.total) : '—'}</b> · {quotaRows.length} 条线路
               </span>
@@ -1000,7 +1193,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
               只补一层与用量卡一致的标题条。 */}
           <section className="panel config-panel user-dcard">
             <header>
-              <h4>接入授权</h4>
+              <PanelTitle of="access">接入授权</PanelTitle>
               <span className="rt">
                 <b>{mine.length}</b> / {columns.length} 已授权
               </span>
@@ -1054,64 +1247,62 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
               )}
             </div>
           </section>
-          <GrantProbePanel key={r.key} user={u} readOnly={!canReadArtifacts} />
+          <GrantProbePanel key={r.key} user={u} readOnly={!canReadArtifacts && !selfService} />
         </div>
-      </div>
+      </section>
     );
   };
 
-  /* 标题栏到页脚说明的整块，两种外壳共用一份。
-     铺纸时套 `.cardpage > .panel.titled`，与机器页、线路页同一层结构（见下方 return）；
-     窗口模式仍是一张 `.panel`。此前铺纸时用的是裸 `.fg-sheet > header`：同一个台面上
-     切到用户页，标题会从 13px 无衬线的色带标题变成 15px 等宽大写的浮动标题。 */
+  /* 名册与详情是两张同级面板：名册承担搜索和开户入口，详情只承担当前用户。
+     避免一条跨栏标题把名册读成详情的附属筛选器。 */
   const body = (
     <>
-      {/* 标题栏与机器面结构相同：标题 + 计数 + 一组读数 + 一个按钮。
-          读数在正常状态下全部为灰色，只有「已停用」显示红色。 */}
-      <header>
-        <ListIcon of="users" />
-        <h4>用户</h4>
-        <span className="hint">
-          {search.trim() ? `${rows.length} / ${list.length}` : list.length} 个
-          {monthly.data ? ` · ${monthLabel(monthly.data.month_start)}` : ''}
-        </span>
-        <span className="rd">
-          <b>{okCount}</b> 可用
-          {disabledCount > 0 && (
-            <>
-              {' '}
-              · <i>{disabledCount}</i> 已停用
-            </>
-          )}
-          {exhaustedCount > 0 && (
-            <>
-              {' '}
-              · <i>{exhaustedCount}</i> 流量已用尽
-            </>
-          )}
-          {idleCount > 0 && ` · ${idleCount} 未授权`}
-        </span>
-        <button className="btn primary" disabled={!editable} onClick={() => go({ p: 'new' })}>
-          ＋ 开户
-        </button>
-      </header>
       {(grant.error || status.error || rotate.error) && (
         <ErrorBox error={grant.error ?? status.error ?? rotate.error} />
       )}
       {list.length === 0 ? (
-        <Empty>尚无用户。点击「开户」创建。</Empty>
+        <section className="panel titled user-list-panel user-empty-panel">
+          <header>
+            <ListIcon of="users" />
+            <h4>用户</h4>
+            <span className="user-roster-head-actions">
+              <span className="user-roster-availability">
+                <b>0</b> 可用
+              </span>
+              <button className="btn primary" disabled={!editable} onClick={() => go({ p: 'new' })}>
+                ＋ 开户
+              </button>
+            </span>
+          </header>
+          <Empty>尚无用户。点击「开户」创建。</Empty>
+        </section>
       ) : (
         // 双栏：左名册常驻可扫读，右详情随选中切换。名册项第一行放用户名与接入点数量，
         // 第二行写明状态；身份徽标的悬停提示提供完整原因。
         <div className="user-split">
-          <div className="user-split-roster">
+          <section className="panel titled user-list-panel user-split-roster">
+            <header>
+              <ListIcon of="users" />
+              <h4>用户</h4>
+              <span className="user-roster-head-actions">
+                <span
+                  className="user-roster-availability"
+                  title={`${list.length} 个用户${disabledCount ? ` · ${disabledCount} 已停用` : ''}${exhaustedCount ? ` · ${exhaustedCount} 流量已用尽` : ''}${idleCount ? ` · ${idleCount} 未授权` : ''}`}
+                >
+                  <b>{okCount}</b> 可用
+                </span>
+                <button className="btn primary" disabled={!editable} onClick={() => go({ p: 'new' })}>
+                  ＋ 开户
+                </button>
+              </span>
+            </header>
             <span className="user-list-search">
               <Icon of="search" size={13} className="user-list-search-icon" />
               <input
                 type="search"
                 value={search}
                 aria-label="搜索用户"
-                placeholder="搜索用户"
+                placeholder="搜索用户名或 UUID"
                 autoComplete="off"
                 spellCheck={false}
                 onChange={event => setSearch(event.target.value)}
@@ -1165,6 +1356,8 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                     <span className="rbody">
                       <span className="r1">
                         <b>{u.id}</b>
+                        {key === selfKey && <span className="st st-ok">我</span>}
+                        {u.account_type === 'test' && <span className="st st-warn">测试</span>}
                       </span>
                       <span className="r2">
                         <span className={`rstate${lampCls ? ` ${lampCls}` : ''}`}>{stateLine}</span>
@@ -1192,11 +1385,11 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
               })}
               {rows.length === 0 && <div className="user-search-empty">没有匹配的用户</div>}
             </div>
-          </div>
+          </section>
           {selected ? (
             detailOf(selected)
           ) : (
-            <div className="user-split-detail">
+            <section className="panel user-split-detail">
               <div className="user-detail-empty">
                 {routedKey
                   ? '链接指向的用户不存在，或当前账号无权查看'
@@ -1204,7 +1397,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                     ? '没有匹配的用户'
                     : '从左侧选择一个用户查看详情'}
               </div>
-            </div>
+            </section>
           )}
         </div>
       )}
@@ -1213,27 +1406,19 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
           尚无接入面，没有可授权的对象。
         </p>
       )}
-      <p className="note" style={{ marginTop: 10 }}>
-        权限保存后<b>自动推送</b>，无需另建变更单。同步名单不断开连接、不重启进程。停用或更换 UUID 后旧凭据立即失效。
-      </p>
     </>
   );
 
   return (
     <>
-      {sheeted ? (
-        <div className="cardpage user-cardpage">
-          <section className="panel titled user-list-panel">{body}</section>
-        </div>
-      ) : (
-        <div className="panel">{body}</div>
-      )}
+      <div className="cardpage user-cardpage">{body}</div>
       {sub && (
         <SubscriptionViewer
           key={`${sub.user.tenant_id}/${sub.user.id}/${sub.kind}`}
           tenant={sub.user.tenant_id}
           user={sub.user.id}
           kind={sub.kind}
+          selfService={who.role === 'user' && `${sub.user.tenant_id}/${sub.user.id}` === selfKey}
           onClose={() => setSub(null)}
         />
       )}

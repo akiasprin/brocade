@@ -181,12 +181,6 @@ pub struct NodeAgentStateItem {
     #[serde(default)]
     pub isolated_at: Option<String>,
     #[serde(default)]
-    pub isolated_by: Option<String>,
-    #[serde(default)]
-    pub isolation_reason: Option<String>,
-    #[serde(default)]
-    pub isolation_source_deployment_id: Option<i64>,
-    #[serde(default)]
     pub convergence_debt_count: u64,
     #[serde(default)]
     pub convergence_debt_failed: bool,
@@ -254,8 +248,26 @@ pub struct UserListItem {
     pub id: String,
     pub uuid: String,
     pub status: String,
+    pub account_type: UserAccountType,
+    pub login_enabled: bool,
     pub created_at: String,
     pub created_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UserAccountType {
+    Formal,
+    Test,
+}
+
+impl UserAccountType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Formal => "formal",
+            Self::Test => "test",
+        }
+    }
 }
 
 /// A Clash subscription compiled from the current model for one active user. It is deliberately
@@ -392,6 +404,12 @@ pub struct UpdateUserStatusRequest {
     pub status: String,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateUserProfileRequest {
+    pub account_type: UserAccountType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

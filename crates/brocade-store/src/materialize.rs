@@ -6,8 +6,8 @@ use std::{
 use brocade_core::client_config::ClientProjectionDownloadEndpoint;
 use brocade_core::hash::hex_lower;
 use brocade_core::model::{
-    Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, ConnectionSettings, DestMatch,
-    DisabledWireGuardLink, Dns, ExternalOutbound, ExternalOutboundProtocol,
+    Accept, Action, AnyTls, AnyTlsMasquerade, AnyTlsSecurity, AppView, Chain, ConnectionSettings,
+    DestMatch, DisabledWireGuardLink, Dns, ExternalOutbound, ExternalOutboundProtocol,
     ExternalOutboundSecurity, ExternalWarpBinding, Front, FrontStrategy, GeodataSettings, Grant,
     HopDial, HopIn, HopPool, Hysteria2, HysteriaBandwidth, HysteriaBbrProfile, HysteriaCongestion,
     HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, HysteriaQuic, Ingress, IngressGuard,
@@ -148,6 +148,7 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             reality_server_names, \
             reality_fingerprint, \
             reality_flow, \
+            anytls_padding_scheme, \
             port_ingress_base, port_anytls_base, port_hop_base, port_hy2_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
@@ -178,6 +179,10 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             fingerprint: state.try_get("reality_fingerprint")?,
             flow: state.try_get("reality_flow")?,
         },
+        anytls_padding_scheme: json_string_array(
+            "control_state.anytls_padding_scheme",
+            &state.try_get::<Value, _>("anytls_padding_scheme")?,
+        )?,
         overlay: OverlaySettings {
             keepalive_secs: u16_column(
                 "control_state.overlay_keepalive_secs",
@@ -774,6 +779,7 @@ pub(crate) async fn load_current_snapshot_tx(
             reality_server_names, \
             reality_fingerprint, \
             reality_flow, \
+            anytls_padding_scheme, \
             port_ingress_base, port_anytls_base, port_hop_base, port_hy2_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
@@ -804,6 +810,10 @@ pub(crate) async fn load_current_snapshot_tx(
             fingerprint: state.try_get("reality_fingerprint")?,
             flow: state.try_get("reality_flow")?,
         },
+        anytls_padding_scheme: json_string_array(
+            "control_state.anytls_padding_scheme",
+            &state.try_get::<Value, _>("anytls_padding_scheme")?,
+        )?,
         overlay: OverlaySettings {
             keepalive_secs: u16_column(
                 "control_state.overlay_keepalive_secs",
@@ -1622,7 +1632,9 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
-            transport_kind, anytls_enabled, anytls_port, anytls_padding_scheme, \
+            transport_kind, anytls_enabled, anytls_security, anytls_reality, \
+            anytls_reality_private_key, anytls_reality_public_key, anytls_reality_short_ids, \
+            anytls_port, anytls_padding_scheme, \
             client.anytls_idle_session_check_interval, client.anytls_idle_session_timeout, \
             client.anytls_min_idle_session, \
             anytls_masquerade_kind, anytls_masquerade_content, anytls_masquerade_headers, anytls_masquerade_status_code, \
@@ -1672,7 +1684,9 @@ async fn load_ingresses_tx(
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
-            transport_kind, anytls_enabled, anytls_port, anytls_padding_scheme, \
+            transport_kind, anytls_enabled, anytls_security, anytls_reality, \
+            anytls_reality_private_key, anytls_reality_public_key, anytls_reality_short_ids, \
+            anytls_port, anytls_padding_scheme, \
             client.anytls_idle_session_check_interval, client.anytls_idle_session_timeout, \
             client.anytls_min_idle_session, \
             anytls_masquerade_kind, anytls_masquerade_content, anytls_masquerade_headers, anytls_masquerade_status_code, \
@@ -1834,11 +1848,19 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             },
             _ => AnyTlsMasquerade::NotFound { headers },
         };
+        let security = match text(row, "anytls_security")?.as_str() {
+            "reality" => AnyTlsSecurity::Reality,
+            _ => AnyTlsSecurity::Tls,
+        };
         Some(AnyTls {
             port: row
                 .try_get::<Option<i32>, _>("anytls_port")?
                 .and_then(|port| u16::try_from(port).ok())
                 .unwrap_or(brocade_core::model::ANYTLS_PORT_BASE),
+            security,
+            // Keep the protocol's own target while TLS is selected so switching back to REALITY
+            // neither borrows VLESS state nor silently resets an AnyTLS custom target.
+            reality: Some(anytls_reality_from_row(row, site)?),
             padding_scheme,
             idle_session_check_interval_secs: optional_u32_bigint(
                 row,
@@ -1942,6 +1964,7 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
         port: port(row.try_get::<i32, _>("port")?)?,
         front: row.try_get("front_id")?,
         identity,
+        anytls_identity: anytls_identity_from_row(row)?,
         wires,
         projection: Projection {
             v4: projection_endpoint(row, "v4")?,
@@ -1955,6 +1978,63 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             tcp_and_quic_only: row.try_get("guard_tcp_and_quic_only")?,
         },
     })
+}
+
+fn anytls_identity_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<IngressIdentity>> {
+    let private_key = row.try_get::<Option<String>, _>("anytls_reality_private_key")?;
+    let public_key = row.try_get::<Option<String>, _>("anytls_reality_public_key")?;
+    let short_ids = row.try_get::<Option<Value>, _>("anytls_reality_short_ids")?;
+    match (private_key, public_key, short_ids) {
+        (None, None, None) => Ok(None),
+        (Some(private_key), Some(public_key), Some(short_ids)) => Ok(Some(IngressIdentity {
+            private_key,
+            public_key,
+            short_ids: json_string_array("ingresses.anytls_reality_short_ids", &short_ids)?,
+        })),
+        _ => Err(StoreError::InvalidData(
+            "ingresses AnyTLS REALITY identity is only partially populated".to_owned(),
+        )),
+    }
+}
+
+/// Resolve AnyTLS's own REALITY target. Older experimental rows have no value in the new column;
+/// they move to the global site instead of silently inheriting VLESS's per-ingress override.
+fn anytls_reality_from_row(
+    row: &sqlx::postgres::PgRow,
+    site: &RealitySite,
+) -> Result<RealitySettings> {
+    let stored = row
+        .try_get::<Option<Value>, _>("anytls_reality")?
+        .map(serde_json::from_value::<RealitySettings>)
+        .transpose()
+        .map_err(|error| {
+            StoreError::InvalidData(format!("ingresses.anytls_reality is invalid: {error}"))
+        })?;
+    let mut reality = stored.unwrap_or(RealitySettings {
+        dest: String::new(),
+        server_names: Vec::new(),
+        fingerprint: String::new(),
+        flow: None,
+        fallback_mode: RealityFallbackMode::GlobalSite,
+        fallback_limits: RealityFallbackLimits::Balanced,
+        fallback_guard: true,
+    });
+    if reality.fallback_mode == RealityFallbackMode::NodeCertificate {
+        return Err(StoreError::InvalidData(
+            "AnyTLS REALITY target must be global-site or custom-site".to_owned(),
+        ));
+    }
+    if reality.fallback_mode == RealityFallbackMode::GlobalSite {
+        reality.dest = site.dest.clone().unwrap_or_default();
+        reality.server_names = site.server_names.clone();
+        reality.fingerprint = site
+            .fingerprint
+            .clone()
+            .unwrap_or_else(|| "chrome".to_owned());
+    }
+    // Flow is a VLESS account setting, not an AnyTLS stream setting.
+    reality.flow = None;
+    Ok(reality)
 }
 
 fn xhttp_download_from_row(

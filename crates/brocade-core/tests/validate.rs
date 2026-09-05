@@ -2958,6 +2958,7 @@ fn validate_model_snapshot_reports_reality_client_policy_errors() {
             max_time_diff_ms: Some(86_400_001),
         },
         reality_site: RealitySite::default(),
+        anytls_padding_scheme: brocade_core::model::default_anytls_padding_scheme(),
         overlay: OverlaySettings::default(),
         ports: Default::default(),
         probe: Default::default(),
@@ -2979,6 +2980,7 @@ fn validate_model_snapshot_reports_reality_client_policy_errors() {
             max_time_diff_ms: None,
         },
         reality_site: RealitySite::default(),
+        anytls_padding_scheme: brocade_core::model::default_anytls_padding_scheme(),
         overlay: OverlaySettings::default(),
         ports: Default::default(),
         probe: Default::default(),
@@ -3591,6 +3593,7 @@ fn ingress(id: &str, chain: &str, node: &str, front: Option<&str>) -> Ingress {
             public_key: format!("pub-{id}"),
             short_ids: vec!["0123abcd".to_owned()],
         },
+        anytls_identity: None,
         wires: IngressWires::Vless(Transport::VlessReality(
             brocade_core::model::RealitySettings {
                 dest: "www.example.com:443".to_owned(),

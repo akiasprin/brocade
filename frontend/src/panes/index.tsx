@@ -15,7 +15,6 @@ import { NodesPane } from './nodes';
 import { DeployPane } from './deploy';
 import { TenantsPane } from './tenants';
 import { UsersPane } from './users';
-import { OperatorsPane } from './operators';
 import { PasswordPane } from './password';
 import { UsagePane } from './usage';
 import { SettingsPane } from './settings';
@@ -34,8 +33,6 @@ export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
       return <TenantsPane />;
     case 'tab:users':
       return <UsersPane win={win} bare={bare} />;
-    case 'tab:operators':
-      return <OperatorsPane />;
     case 'tab:usage':
       return <UsagePane />;
     case 'tab:settings':

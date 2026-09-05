@@ -1239,7 +1239,7 @@
   --ground: #f4f3f6;
   --sheet: #fefefe;
   --surface: #ebe9ef;
-  --block: #f9f8fb;
+  --block: #fbfafc;
   --band: #f1f0f4;
   --sunk: #f6f5f8;
   --line: #dedce4;
@@ -1287,7 +1287,7 @@
   --ground: #f2f4f7;
   --sheet: #fefefe;
   --surface: #e8ebf1;
-  --block: #f8f9fb;
+  --block: #fafafb;
   --band: #eef0f5;
   --sunk: #f5f6f9;
   --line: #d9dde6;
@@ -1336,7 +1336,7 @@
   --ground: #f3f4f1;
   --sheet: #fefefe;
   --surface: #e9eae5;
-  --block: #f9f9f6;
+  --block: #fbfbf8;
   --band: #f0f1ed;
   --sunk: #f6f6f3;
   --line: #dcded6;
@@ -1385,7 +1385,7 @@
   --ground: #f5f3f4;
   --sheet: #fffefe;
   --surface: #ede9eb;
-  --block: #faf8f9;
+  --block: #fcfafb;
   --band: #f2eff1;
   --sunk: #f7f5f6;
   --line: #e2dce0;
@@ -1397,12 +1397,12 @@
   --code-n: #4a62a0;
 }
 
-/* 玄墨：纯灰阶界面与墨色操作。低彩矿物绿与灰紫只用于数据区分。 */
+/* 玄墨：冷黑界面与低亮灰白操作。矿物绿与灰紫只用于数据区分。 */
 :root[data-palette='xuanmo'] {
-  --action: #eef0f3;
-  --action-hover: #ffffff;
-  --action-active: #c6c9ce;
-  --action-wash: rgba(238, 240, 243, 0.13);
+  --action: #d1d1cd;
+  --action-hover: #dddcd7;
+  --action-active: #b4b4b1;
+  --action-wash: rgba(209, 209, 205, 0.13);
   --action-on: #131416;
   --data: #98b8ae;
   --data-secondary: #a993aa;
@@ -1415,10 +1415,10 @@
   --sunk: #101112;
   --line: #2c2e31;
   --line-soft: rgba(235, 236, 240, 0.075);
-  --ink: #e2e4e7;
-  --ink-2: #c2c5c9;
-  --ink-3: #8d9196;
-  --ink-4: #676b71;
+  --ink: #cdcdca;
+  --ink-2: #b2b2af;
+  --ink-3: #858583;
+  --ink-4: #646462;
   --hue-1: #969e9b;
   --hue-2: #899f99;
   --hue-3: #9b8fa0;
@@ -1436,7 +1436,7 @@
   --ground: #f2f2f1;
   --sheet: #ffffff;
   --surface: #e9e9e8;
-  --block: #f8f8f7;
+  --block: #fafaf9;
   --band: #f0f0ef;
   --sunk: #f5f5f4;
   --line: #dbdcda;
@@ -1918,12 +1918,29 @@ input.f {
   box-sizing: border-box;
   font-family: var(--mono);
 }
+textarea.f {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  resize: vertical;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  color: var(--ink);
+  font: 12.5px/1.5 var(--sans);
+}
+textarea.f.mono {
+  font-family: var(--mono);
+}
 /* 聚焦使用内描边，不使用外扩光圈。原实现为 `0 0 0 3px var(--action-wash)`：框外一圈 3px
    半透明主色，是全屏出现频率最高的光晕，每次聚焦输入框都会出现。
    内描边不占用框外空间，相邻控件不会被推开或遮挡。
    内圈使用半透明：满色内圈加满色边框合计 2px，聚焦状态不应比周围元素重这么多——
    它表示的是光标位置，不是警告。 */
 input.f:focus,
+textarea.f:focus,
 select.f:focus {
   outline: none;
   border-color: var(--action);
@@ -1933,71 +1950,90 @@ input.f::placeholder {
   color: var(--ink-3);
   font-family: var(--sans);
 }
-/* 二选一开关：两格，选中的一格反白。直角外框，与按钮同高同边框，两个状态都有文字标签。
+textarea.f::placeholder {
+  color: var(--ink-3);
+}
+/* 几选一：每一档一格，各格都有文字标签，当前档由一块浮起的滑块标出。两种用法——
+   二选一（直连/经 NAT、关闭/启用、禁止出网/可出网、正式/测试）与多格数值
+   （连接策略的 1–5，取值落在预设外时会多出一格），同一套规则要同时成立。
    被替换的圆角开关（`.switch`，仍保留供其他位置使用）有两个问题：圆角胶囊加圆形滑块
    是移动端系统控件的样式，在本页的直角和分隔线中是唯一的圆角元素；且关闭状态下只能
    依据滑块位置推断其含义，而本页的开关关闭后多为破坏性操作（移除 wg0、断开出网），
-   两个状态都应有文字说明。
-   尺寸按 .btn 的规则计算（padding + 字号），使其与同一行的按钮对齐。 */
+   两个状态都应有文字说明。此处的滑块与它不同：滑块之外两档都写着文字，位置只是强调。
+   外框高度取 --ctl-h，与同一行的按钮、输入框、下拉框对齐。 */
+/* 形态：凹槽加滑块。外框沉到 --sunk（与输入框同一档），选中的那一格换成一块浮起的
+   卡面加薄投影，格间不再画分隔线。
+   与 .btn / input.f / select.f 同高。缺少 min-height 时会矮 1.5px；此前不明显，
+   因为使用它的行旁边只有说明文字，而接入面投影那一行把它与输入框排在了一起。
+   内部各格依靠 inline-flex 默认的 align-items:stretch 撑满高度。
+   2px 内距是滑块与凹槽之间的缝：没有它，滑块贴住外框边线，读不出「浮在槽里」。 */
 .segsw {
   display: inline-flex;
   vertical-align: middle;
   border: 1px solid var(--line);
   border-radius: var(--r-ctl);
-  overflow: hidden;
-  background: var(--btn);
-  /* 与 .btn / input.f / select.f 同高。缺少此声明时会矮 1.5px；此前不明显，
-     因为使用它的行旁边只有说明文字，而接入面投影那一行把它与输入框排在了一起。
-     内部两个按钮依靠 inline-flex 默认的 align-items:stretch 撑满高度，
-     因此选中格的实心底色不会低于外框。 */
+  /* 不裁切。此前的 overflow:hidden 是为了把选中格的实心底色裁进外框圆角；现在各格
+     由 2px 内距与外框隔开，够不到圆角，而裁切反而会切掉滑块投影落在内距里的那一圈。 */
+  padding: 2px;
+  background: var(--sunk);
   min-height: var(--ctl-h);
   box-sizing: border-box;
 }
 .segsw button {
   border: 0;
-  border-left: 1px solid var(--line);
+  border-radius: 4px;
   background: none;
   color: var(--ink-3);
-  padding: 5px 13px;
+  padding: 0 12px;
   font-size: 12.5px;
   line-height: 1.4;
   cursor: pointer;
   white-space: nowrap;
 }
-.segsw button:first-child {
-  border-left: 0;
-}
 @media (hover: hover) {
   .segsw button:hover:not(:disabled) {
-    background: var(--btn-h);
-    color: var(--ink);
+    background: color-mix(in srgb, var(--ink) 6%, transparent);
+    color: var(--ink-2);
   }
   /* 选中格需要单独声明。`:hover:not()` 比 `[aria-pressed="true"]` 多一级伪类权重，
-     不重新声明时鼠标悬停会使实心底色被灰底覆盖，两格样式相同，无法分辨当前选中项。
-     这是 hover 状态下最不应丢失的信息。 */
+     不重新声明时鼠标悬停会使滑块被上一条的墨洗覆盖，两格样式相同，无法分辨当前选中项。
+     这是 hover 状态下最不应丢失的信息。滑块本身不给 hover 反馈：它已经是选中项，
+     再点一次不产生任何变化。 */
   .segsw button[aria-pressed='true']:hover:not(:disabled) {
-    background: var(--action-hover);
-    color: var(--action-on);
+    background: var(--card);
+    color: var(--ink);
   }
 }
-/* 选中格填充 selection 纯色，不加边线和阴影。
-   两种更轻的方案都不适用：压深底色（--hover-2）在亮色主题下方向相反——白比灰亮，
-   未选中格反而成为整行最亮的一块；底部边线在这套直角分隔线中是唯一的装饰元素。
-   实色填充是表示选中状态最直接的方式。 */
+/* 选中格不着主色。它表示的是「当前是哪一档」，而 --action 在全站表示可点击与待办——
+   机器配置页一屏有五处（两条 IP 的 NAT、出网权限、WireGuard、连接策略数值格），
+   五块实心主色读起来是五个待办操作。改由材质表示：滑块取 --card（比凹槽亮一档）
+   加一层薄投影，字色抬到 --ink 并加重，与未选中的 --ink-3 拉开两档。
+   此前记录的两种更轻的方案仍然不适用，理由未变：压深底色（--hover-2）在亮色主题下
+   方向相反——白比灰亮，未选中格反而成为整行最亮的一块；底部边线在这套直角分隔线中
+   是唯一的装饰元素。 */
 .segsw button[aria-pressed='true'] {
-  background: var(--action);
-  color: var(--action-on);
+  background: var(--card);
+  color: var(--ink);
   font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
 }
 .segsw button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
-/* 触屏最小尺寸，与 .btn 中的处理方式一致 */
+/* 触屏最小尺寸，与 .btn 中的处理方式一致。
+   凹槽的 2px 内距在这里去掉：留着的话外框高度是 44 + 4 + 2 = 50px，而同屏的输入框和
+   按钮都是 44px，分段控件会比相邻控件高出 6px。缝是为了让滑块读出「浮在槽里」，
+   触屏上这一点让位给点按目标——44px 是下限，不能为了 2px 的缝把它压到 40px。
+   各格圆角随之收到 5px，贴住外框的 6px 圆角内缘。 */
 @media (max-width: 820px) {
+  .segsw {
+    padding: 0;
+  }
   .segsw button {
     min-height: 44px;
     padding: 0 15px;
+    border-radius: 5px;
     font-size: 13.5px;
   }
 }
@@ -2206,9 +2242,8 @@ input.f::placeholder {
   font-size: 11px;
   color: var(--ink-3);
 }
-/* `.mono` 自带 `font-size:12px`，置于 11px 的 hint 内会恢复为 12px，导致
-   「28 分钟前 上报」由 12px 等宽和 11px 无衬线两段拼成，基线也不对齐。
-   保留字体（时间是读数，需要等宽以对齐列），字号交回 hint 控制。 */
+/* `.mono` 自带 `font-size:12px`，置于 11px 的 hint 内会恢复为 12px。
+   代号仍保留等宽字体，但字号交回 hint 控制，避免同一句话出现两种字号。 */
 .panel > :is(header, summary) .hint .mono,
 .fg-sheet > header .hint .mono,
 .panel > :is(header, summary) .hint.mono,
@@ -2370,18 +2405,122 @@ input.f::placeholder {
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
-/* 连接策略卡片的标签栏比其他位置宽：半关闭的两项直接使用 xray 的键名
-   （UplinkOnly / DownlinkOnly），以便与配置文件中的字段完全一致，单位也写在标签内。
-   代价是 72px 宽度不足，不加宽会导致每个标签折成两行。 */
-.conn-card .fgrid .k {
-  width: 176px;
+/* 机器配置页各行以控件为首项，后面常有另起一行的说明。整行按基线对齐时，不同控件的
+   行盒会让上下缘错开；直接居中又会让标签相对「控件 + 说明」整块下沉。改为盒顶对齐，
+   标签自身在统一控件高度内居中。纯文本 fgrid 仍沿用上面的基线对齐。
+
+   此前这三条挂在 `.wg-card` 上，而那个类名只落在证书组卡片上——WIREGUARD 卡自己没有它，
+   五行控件按基线排，各行的控件上下缘参差。改挂到页签容器：配置页的几张卡是同一张表的
+   几段，对齐方式不该逐卡不同。
+
+   标签栏改为 124px 定宽、左对齐、等宽字，与设置页的字段行（`.setfld > label`）同一形态。
+   此前是 72px 右对齐，而连接策略那张卡单独加宽到 176px——同一页里两条标签栏，右侧的
+   输入框也就落在两条竖线上。左对齐而非右对齐：`DownlinkOnly（秒）` 与 `名称` 相差
+   一百余像素，右对齐时标签起点参差；左对齐后标签与卡片内容同起一条竖线。
+   124px 是最长的 `DownlinkOnly（秒）` 排得下的宽度。 */
+.nd-tab-config .fgrid .row {
+  align-items: flex-start;
+  gap: 14px;
+  padding: 8px 0;
 }
-/* 数值组与「取消覆盖」并排。只有后者在存在覆盖时出现；容器允许换行，
-   避免五个档位加按钮在窄屏上溢出卡片。 */
-.conn-pick-row {
-  display: inline-flex;
+.nd-tab-config .fgrid .k {
+  display: flex;
+  width: 124px;
+  min-height: var(--ctl-h);
   align-items: center;
+  justify-content: flex-start;
+  color: var(--ink-3);
+  font-family: var(--mono);
+  letter-spacing: 0.03em;
+  text-align: left;
+}
+.nd-tab-config .fgrid .v > :is(.segsw, input.f, select.f, .btn) {
+  vertical-align: middle;
+}
+.wg-peer-empty {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.wg-peer-list {
+  display: grid;
+  margin-bottom: 8px;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+}
+.wg-peer-item {
+  display: flex;
+  min-width: 0;
+  min-height: 38px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 2px;
+}
+.wg-peer-item + .wg-peer-item {
+  border-top: 1px solid var(--line-soft);
+}
+.wg-peer-name {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+}
+.wg-peer-name b {
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wg-peer-name code {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wg-peer-item > .btn {
+  flex: none;
+  margin-left: auto;
+  min-height: 26px;
+  padding-inline: 9px;
+  font-size: 11.5px;
+}
+.wg-peer-picker {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+/* 定宽 200px，与同页 DNS、证书组两张卡的下拉框（`SELECT_FIELD`）取同一个数：三者分属
+   三张卡但同在一栏，各自按内容撑开时右缘参差。
+   `min-width: 0` 不能省。flex 子项的 min-width 默认为 auto，解析为内容最小尺寸——
+   对 `<select>` 就是最长那条 option 的宽度；而 min-width 在约束求解中优先于 width 与
+   max-width，不解除它，选择框一步都不缩，会把「加入禁用」顶出卡片。`select.f` 是全站
+   唯一不带 width 声明的表单控件（input.f 是 width:100%），按内容撑开是它的默认行为，
+   凡是把它放进 flex 行的地方都要显式解除这条最小宽度。 */
+.wg-peer-picker > select.f {
+  flex: none;
+  min-width: 0;
+  width: 200px;
+}
+.wg-peer-picker > .btn {
+  flex: none;
+}
+/* 连接策略卡片此前把标签栏单独加宽到 176px（`UplinkOnly 等待（秒）` 在 72px 下折成两行）。
+   标签已去掉「等待」二字，页面统一的 124px 栏排得下，这条覆盖随之撤销——留着它会让这张卡
+   的输入框比同栏其他卡右移 52px。 */
+/* 字段行里的一条控件线：输入框、开关、状态片、行内按钮排成一行，间距只由这里的 gap 给。
+   此前每个按钮各自写 `style={{ marginLeft: 4 | 6 | 8 }}`——同一张 WIREGUARD 卡里三种间距，
+   「改」和「采纳 1420」之间 4px、「1420 全局默认」和「改」之间 8px，按钮组读不成一组。
+   允许换行：窄栏下五个档位加两个按钮会溢出卡片。 */
+.nd-ctl-line {
+  display: inline-flex;
+  min-width: 0;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
 }
 
@@ -2781,8 +2920,8 @@ input.f::placeholder {
   /* 底色统一交给 --card：撤掉此前区分观测卡的 1.8% 墨色微染，全站白卡一致。 */
 }
 
-/* 配置页不铺满：一行是 72px 标签加 220px 输入，整幅宽度只会在标签和值之间空出一片。
-   左列是这台机器的对外属性（身份 → 骨干网），右列是它怎么解析、出示什么证书、连接参数。 */
+/* 配置页不铺满：一行是 124px 标签加 220px 输入，整幅宽度只会在标签和值之间空出一片。
+   左列只影响这台机器自己（身份 → 骨干网），右列是它与外部的关系，以及它与机队默认值的差异。 */
 .nd-tab-config {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -2796,6 +2935,12 @@ input.f::placeholder {
   gap: 12px;
   min-width: 0;
 }
+/* 控件线上的元素间距一律由 `.nd-ctl-line` 的 gap 给，元素自带的外边距在这里清零，
+   否则两者叠加：出口读数（`.fgrid .v .egress`）自带 10px 左外边距，那是它紧跟输入框时
+   的间距，落在控件线上会让开关与读数之间空出 18px。 */
+.nd-ctl-line > .egress {
+  margin-left: 0;
+}
 /* 卡面取块档，与设置页的段卡（`.cardpage .panel.titled`）同一档面，而不是 `.panel`
    基线的纸档。亮色下 --card 被解耦成纯白（#fff），而纸（--sheet）也是 #fefefe：卡面与
    它所落的纸只差 1，卡片自身读不出边界，一张卡里唯一读得出来的面反而是标题条那条更深的
@@ -2805,15 +2950,18 @@ input.f::placeholder {
   margin: 0;
   background: var(--block);
 }
-/* 落在纸里的配置面板不投影。投影表达的是「浮在台面上」，而这两页的卡片落在纸里，纸自己
-   已经交代了边界；卡面与纸之间那一档明暗差是第一次说明边界，再挂一层投影是第二次说同一
-   件事，一栏四五张卡各挂一份还会把纸压暗。
-   `.nd-sheet` 是机器与隧道详情的连续纸，`.fg-sheet:has(> .chain-detailpage)` 是线路详情。
-   用户页的详情子卡不在此列：那一页脱了纸，卡片落在名册卡里，需要投影浮起，见 `.user-dcard`。 */
-.nd-sheet .panel.config-panel,
-.fg-sheet:has(> .chain-detailpage) .panel.config-panel {
-  box-shadow: none;
-}
+/* 落在纸里的配置面板保留 `.panel` 基线的 --sheet-shadow，不再剥掉。
+ *
+ * 这里曾写 `box-shadow: none`，理由是「卡面与纸之间那一档明暗差已经交代了边界，再挂投影
+ * 是第二次说同一件事」。那个理由成立的前提是那一档差足够大——亮色下纸取台面档时，纸与
+ * 块档卡差 3.8 L*。现在纸抬到了台面与块档卡之间（见文件末尾亮色一节），这一档只剩 1.7 L*，
+ * 明暗差不再单独说得清边界，投影就从「第二次重复」变成了唯一一次。
+ *
+ * 「一栏四五张卡各挂一份会把纸压暗」这条代价仍然存在，但 --sheet-shadow 本身是为一列卡片
+ * 设计的柔投影（不是给浮层用的 --shadow），设置页同样是一列九张 `.panel.titled` 各挂一份。
+ *
+ * `.nd-sheet` 是机器与隧道详情的连续纸，`.fg-sheet:has(> .chain-detailpage)` 是线路详情。
+ * 用户页的详情子卡另有一套，见 `.user-dcard`。 */
 /* VLESS / Hysteria 的统一提交属于表单，不属于标题。操作条固定在内容末尾并始终占位：
    切换协议展开多行时按钮不会消失，标题色带也保持和其他配置面板相同的纯标题结构。 */
 .config-panel-savebar {
@@ -3062,7 +3210,6 @@ input.f::placeholder {
   vertical-align: -1.5px;
   margin-right: 3px;
 }
-
 @container (min-width: 640px) {
   .nd-rt-band {
     grid-template-columns: 74px minmax(0, 1fr);
@@ -3240,6 +3387,20 @@ input.f::placeholder {
   color: var(--ink-2);
 }
 .list-ico svg {
+  display: block;
+}
+/* 详情页面板标题统一使用 12px 线稿图标。图标与文字组成一个不可拆的标题项，标题右侧的
+   状态、说明和操作按钮仍由 header 自身排列。 */
+.panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.panel-title-icon {
+  display: inline-flex;
+  flex: none;
+}
+.panel-title-icon svg {
   display: block;
 }
 .sh h4 {
@@ -4117,6 +4278,10 @@ details.more b {
   font-family: var(--mono);
   font-size: 12px;
 }
+.ago {
+  font-family: var(--sans);
+  font-size: inherit;
+}
 .dim {
   color: var(--ink-3);
 }
@@ -4655,7 +4820,7 @@ input.f {
 .egress-dns-editor {
   min-width: 0;
   display: inline-grid;
-  grid-template-columns: minmax(205px, 240px) 82px 126px 138px minmax(145px, 1fr);
+  grid-template-columns: minmax(205px, 240px) 82px 126px 138px;
   align-items: center;
   gap: 8px;
   margin-left: 8px;
@@ -4687,18 +4852,6 @@ input.f {
   font: 11px var(--mono);
   font-style: normal;
   text-align: center;
-}
-.egress-dns-note {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink-4);
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.egress-dns-note b {
-  color: var(--ink-3);
-  font-weight: 550;
 }
 .egress-dns-usage {
   margin-left: 8px;
@@ -4735,7 +4888,8 @@ input.f {
 }
 @container rules (max-width: 1800px) {
   .egress-dns-editor {
-    grid-template-columns: minmax(195px, 220px) 78px 118px 132px minmax(140px, 1fr);
+    grid-template-columns: minmax(185px, 220px) 74px 112px 124px;
+    gap: 6px;
   }
 }
 .chain-rule-tree .rule-editor > .toolbar:first-child {
@@ -4841,11 +4995,10 @@ input.f {
 
 /* ═══ 规则表的窄屏适配 ═══
    桌面是一张表：序号 | 匹配 | 动作 | 重排，一行铺开。窄下来单行放不下——动作格里还
-   串着转发目标、走法、推导地址，DNS 策略的参数栅格更有七百余像素。分三档，且
+   串着转发目标、走法、推导地址，DNS 策略还有多个并排参数。分三档，且
    **表结构保持不变**（tests 依赖 tbody/tr/td、兜底 `*`、每行四格）：
    · ≤1440px：动作格改 flex 换行，目标 / 走法落到动作选择器下方，不再横向溢出；
-     DNS 参数栅格减列。断点取自五列栅格的实测最小内容宽（约 1412px）：1050–1412 之间
-     若仍用五列，整表比卡片宽，被卡的 overflow:hidden 裁掉右侧按钮。
+     DNS 参数缩短但仍维持一行，优先利用移除说明标签后腾出的空间。
    · ≤1050px：匹配格放开定宽（上方独立的 1050px 断点块）。
    · ≤640px：整行折成卡片——序号做抬头、重排做卡脚，匹配 / 动作各补一枚小标签，
      控件占满整宽，DNS 参数落成一列、这一跳逐项一行。
@@ -4862,12 +5015,16 @@ input.f {
   .rule-table .rule-action-cell > :is(.egress-dns-reference, .egress-dns-editor, .egress-dns-usage) {
     margin-left: 0;
   }
-  .egress-dns-editor {
-    grid-template-columns: minmax(0, 1fr) 116px 130px;
+  .egress-dns-choice {
+    width: 136px;
   }
-  .egress-dns-endpoint,
-  .egress-dns-note {
-    grid-column: 1 / -1;
+  .egress-dns-editor {
+    grid-template-columns: minmax(170px, 1fr) 68px 104px 112px;
+    gap: 5px;
+  }
+  .egress-dns-endpoint {
+    grid-template-columns: minmax(90px, 1fr) 4px 52px;
+    gap: 3px;
   }
 }
 
@@ -5767,6 +5924,11 @@ details.raw .tbl {
   border-color: color-mix(in srgb, var(--warn) 50%, var(--line));
   color: var(--warn);
   background: color-mix(in srgb, var(--warn) 7%, transparent);
+}
+.st-ok {
+  border-color: color-mix(in srgb, var(--ok) 48%, var(--line));
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 7%, transparent);
 }
 .st-gold {
   border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
@@ -10692,6 +10854,30 @@ body.fg-dragging * {
 .chain-face dd > select.f {
   min-width: 150px;
 }
+.anytls-parameter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  margin: 0;
+}
+.anytls-parameter-row > span {
+  flex: none;
+  white-space: nowrap;
+}
+.anytls-parameter-row > select.f {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+.anytls-padding-custom {
+  width: 100%;
+  margin-top: 6px;
+}
+.anytls-session {
+  margin-top: 6px;
+}
 /* 协议栈块：六个控件均为下拉框，宽度各自取决于其最长选项，右边缘位于六个不同位置，
    形成参差的一列。撑满对齐为同一条边后，该列呈现为表格结构（其本身即是表格）。
    带保存按钮的两行让下拉框占用剩余宽度，右边缘仍在同一位置。
@@ -11240,9 +11426,13 @@ h4.sec > .btn {
   container-type: inline-size;
   align-items: start;
 }
+.user-split > .panel {
+  margin: 0;
+}
 .user-split-roster {
   min-width: 0;
   min-height: 0;
+  box-sizing: border-box;
   padding: 0;
   overflow: hidden;
   border: 1px solid var(--line-soft);
@@ -11250,22 +11440,82 @@ h4.sec > .btn {
   background: color-mix(in srgb, var(--sunk) 46%, transparent);
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 3%, transparent);
 }
+.user-split-roster > header {
+  gap: 6px;
+}
+.user-split-roster > header h4 {
+  flex: none;
+  white-space: nowrap;
+}
 .user-split-roster > .user-list-search {
-  width: 100%;
-  height: 38px;
-  margin: 0;
-  padding: 0 11px;
-  border: 0;
-  border-bottom: 1px solid var(--line-soft);
-  border-radius: 0;
-  background: transparent;
+  width: auto;
+  max-width: 100%;
+  height: 34px;
+  box-sizing: border-box;
+  margin: 0 0 7px;
+  padding: 0 8px 0 9px;
+  gap: 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  color: color-mix(in srgb, var(--ink-4) 82%, var(--action));
+  background: color-mix(in srgb, var(--block) 82%, var(--sunk));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 3%, transparent);
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+.user-split-roster > .user-list-search:hover {
+  border-color: color-mix(in srgb, var(--ink-4) 34%, var(--line-soft));
+  background: color-mix(in srgb, var(--block) 91%, var(--sunk));
 }
 .user-split-roster > .user-list-search:focus-within {
-  border-bottom-color: color-mix(in srgb, var(--action) 42%, var(--line));
-  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--action) 18%, transparent);
+  border-color: color-mix(in srgb, var(--action) 48%, var(--line));
+  color: var(--action);
+  background: color-mix(in srgb, var(--action) 3%, var(--block));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--action) 10%, transparent);
+}
+.user-split-roster > .user-list-search input {
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+.user-split-roster > .user-list-search input::placeholder {
+  color: color-mix(in srgb, var(--ink-4) 90%, transparent);
+}
+.user-split-roster > .user-list-search > button {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  line-height: 20px;
+}
+.user-split-roster > .user-list-search > button:hover {
+  color: var(--ink-2);
+  background: var(--hover-2);
+}
+.user-roster-head-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+}
+.user-roster-availability {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.user-roster-availability b {
+  color: var(--ink-2);
+  font-weight: 650;
+}
+.user-roster-head-actions .btn {
+  min-height: 27px;
+  padding-inline: 6px;
+  font-size: 10.5px;
 }
 .user-roster-options {
-  padding: 8px 4px 4px;
+  padding: 0;
 }
 .user-search-empty {
   display: grid;
@@ -11429,26 +11679,32 @@ h4.sec > .btn {
 .user-row .rmeter i.over {
   background: var(--err);
 }
-/* 右栏详情不再套一张总卡：身份条直接落在页面上，下面的用量、授权与拨测各自成为独立
-   面板，层级与线路详情一致。整栏仍按内容自然增长，由 .fg-desk 统一滚动。 */
+/* 右栏与左侧名册是两张同级面板。内容仍按自然高度增长，由 .fg-desk 统一滚动。 */
 .user-split-detail {
   display: flex;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  overflow: visible;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
+  margin: 0;
+  padding: 0 13px 14px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--block);
+  box-shadow: var(--sheet-shadow);
 }
 .user-dhead {
-  display: flex;
   flex: none;
-  align-items: center;
-  gap: 12px;
-  padding: 3px 3px 13px;
+  margin: 0 -13px;
+  padding: 11px 13px 0;
   border-bottom: 1px solid var(--line-soft);
-  background: transparent;
+  background: var(--band);
+}
+.user-dhead-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 3px 3px 10px;
 }
 .user-dhead .plate {
   position: relative;
@@ -11571,7 +11827,7 @@ h4.sec > .btn {
   padding: 0;
   background: transparent;
 }
-/* 标题栏右侧操作：与两行身份信息并排，并在标题栏中垂直居中。 */
+/* 高频读取操作留在身份栏右上角；停用与换 UUID 收进「更多」，避免危险操作常驻。 */
 .user-dacts {
   display: flex;
   flex: none;
@@ -11583,8 +11839,56 @@ h4.sec > .btn {
 }
 .user-dacts .btn {
   min-height: 32px;
-  padding: 0 13px;
-  font-size: 12.5px;
+  padding: 0 11px;
+  font-size: 12px;
+}
+.user-dhead-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0;
+}
+.user-dact {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.user-dact-icon,
+.user-dact-icon svg,
+.user-action-menu-icon,
+.user-action-menu-icon svg {
+  display: block;
+  flex: none;
+}
+.user-action-menu {
+  top: 36px;
+  min-width: 244px;
+}
+.user-action-menu button {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 8px;
+}
+.user-action-menu-icon {
+  margin-top: 2px;
+}
+.user-action-menu button > span:last-child {
+  min-width: 0;
+}
+.user-readonly {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  padding: 0 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-ctl);
+  color: var(--ink-4);
+  background: color-mix(in srgb, var(--action) 5%, transparent);
+  font-size: 11.5px;
+  white-space: nowrap;
 }
 
 /* 身份事实条：租户暂不展示，仅保留 UUID 并铺满整行。 */
@@ -11680,6 +11984,38 @@ h4.sec > .btn {
 .user-dcard-body {
   padding: 0;
 }
+.user-profile-form {
+  margin: 0;
+}
+.user-profile-form dt,
+.user-profile-form dd {
+  align-self: center;
+}
+.user-login-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+.user-login-control > span {
+  color: var(--ink-3);
+}
+.user-profile-actions {
+  margin-top: 10px;
+}
+.user-login-issued {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+.user-login-issued > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.user-login-issued code {
+  overflow-wrap: anywhere;
+}
 /* .qta / .grant-cards 自带 margin-top:4px（原先跟在 .fgrid 标签后）；落在卡壳里由内距
    接管顶距，去掉这 4px 免得叠出多余空白。 */
 .user-dcard-body > .qta,
@@ -11703,8 +12039,8 @@ h4.sec > .btn {
   font-weight: 600;
 }
 
-/* 授权验证：说明带和进度属于面板状态，拨测项则是普通分隔行。协议与 IP 栈直接落在每个
-   状态格内做低对比水印，不再依赖表头；前景只承担状态灯和结果。 */
+/* 网络拨测：宽容器使用固定列头，方便纵向比较同一协议；窄容器隐藏列头，并把协议与 IP 栈
+   放回每个状态格，避免六列表格在手机上横向溢出。 */
 .grant-probe {
   --probe-info: color-mix(in srgb, #587fae 72%, var(--ink-2));
   /* 断点必须看拨测卡本身。它位于用户页右栏，外层双栏即使很宽，卡片仍可能只有五六百像素。 */
@@ -11736,19 +12072,6 @@ h4.sec > .btn {
   min-height: 27px;
   padding-inline: 10px;
   font-size: 11.5px;
-}
-.grant-probe-note {
-  margin: 0 -13px;
-  padding: 9px 13px;
-  border-bottom: 1px solid var(--line-soft);
-  color: var(--ink-3);
-  background: color-mix(in srgb, var(--probe-info) 6%, var(--block));
-  font-size: 10.5px;
-  line-height: 1.4;
-}
-.grant-probe-note b {
-  color: var(--ink-2);
-  font-weight: 600;
 }
 .grant-probe-banner {
   margin: 0 -13px;
@@ -11820,6 +12143,32 @@ h4.sec > .btn {
   border-radius: 0;
   background: transparent;
 }
+.grant-probe-table-head {
+  display: grid;
+  grid-template-columns: var(--grant-probe-columns);
+  gap: 8px;
+  align-items: center;
+  min-height: 30px;
+  box-sizing: border-box;
+  padding: 5px 13px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  background: var(--band);
+  font: 10.5px/1.25 var(--sans);
+}
+.grant-probe-table-head > span:last-child {
+  text-align: right;
+}
+.grant-probe-matrix-head > span {
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.grant-probe-matrix-head i {
+  color: var(--ink-4);
+  font-style: normal;
+}
 .grant-probe-row {
   display: grid;
   grid-template-columns: var(--grant-probe-columns);
@@ -11882,6 +12231,7 @@ h4.sec > .btn {
 }
 .grant-probe-result::before,
 .grant-probe-result::after {
+  display: none;
   position: static;
   z-index: auto;
   color: var(--ink-3);
@@ -11957,8 +12307,7 @@ h4.sec > .btn {
 .grant-probe-result.passed > .grant-probe-dot {
   background: var(--ok);
 }
-.grant-probe-result.passed > b,
-.grant-probe-foot b {
+.grant-probe-result.passed > b {
   color: var(--ok);
 }
 .grant-probe-result.failed {
@@ -12017,13 +12366,10 @@ h4.sec > .btn {
   background: var(--band);
   font-size: 10.5px;
 }
-.grant-probe-foot > svg {
-  width: 13px;
-  height: 13px;
+.grant-probe-foot-icon,
+.grant-probe-foot-icon svg {
+  display: block;
   flex: none;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.5;
 }
 .grant-probe-legend {
   display: flex;
@@ -12075,6 +12421,9 @@ h4.sec > .btn {
     margin-left: 0;
     justify-content: flex-end;
   }
+  .grant-probe-table-head {
+    display: none;
+  }
   .grant-probe-row {
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
@@ -12094,6 +12443,10 @@ h4.sec > .btn {
     width: 100%;
     justify-content: flex-start;
     padding-inline: 8px;
+  }
+  .grant-probe-result::before,
+  .grant-probe-result::after {
+    display: block;
   }
   .grant-probe-one {
     grid-column: 2;
@@ -12313,10 +12666,13 @@ h4.sec > .btn {
   .user-facts {
     grid-template-columns: minmax(0, 1fr);
   }
-  .user-dhead {
+  .user-dhead-main {
     flex-wrap: wrap;
   }
-  .user-dhead > .user-dacts {
+  .user-dhead-actions {
+    width: 100%;
+  }
+  .user-dhead-actions > .user-dacts {
     width: 100%;
     justify-content: flex-start;
     padding-left: 0;
@@ -12361,13 +12717,13 @@ h4.sec > .btn {
   .user-row.picked {
     border-color: color-mix(in srgb, var(--action) 38%, var(--line));
   }
-  .user-dhead {
+  .user-dhead-main {
     gap: 10px;
     padding: 3px 2px 11px;
   }
-  .user-dhead > .user-dacts {
+  .user-dhead-actions > .user-dacts {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
     gap: 6px;
   }
   .user-dacts .btn {
@@ -13423,18 +13779,23 @@ input.f.ing-pj-port {
   /* 分隔改由卡面投影承担，撤掉标题下分隔线（与 .panel 标题条一致）。 */
 }
 .load-network-cap > b {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   white-space: nowrap;
+}
+.load-network-cap > b .chart-title-icon,
+.load-network-cap > b .chart-title-icon svg {
+  display: block;
+  flex: none;
+}
+.load-network-cap > b .chart-title-icon {
+  color: var(--ink-3);
 }
 .load-network-cap > span {
   color: var(--ink-4);
   font: 9px var(--mono);
   white-space: nowrap;
-}
-/* `<Ago>` 返回的是 `<span class="mono">`，而 `.mono` 自带 `font-size: 12px`，会把上面这行
-   继承下来的 9px 顶掉——「21 秒前」比紧跟其后的「上报 · 30 秒 / 窗口」大了三分之一，
-   一句话里两个字号。同一个碰撞在标题栏的 `.hint` 上已经补过一次（见上文 `font-size: inherit`）。 */
-.load-network-cap > span .mono {
-  font-size: inherit;
 }
 /* 量纲。刻度上只剩数字，单位在标题后写一次（`网卡流量 (Mbit/s)`）——它不是元信息，不能拿
    上面那条 9px / --ink-4 的待遇，那是 `eth0 · MTU 1420` 那一级。

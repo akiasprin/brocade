@@ -18,7 +18,7 @@ use brocade_deployment::protocol::{
     DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
     DeploymentTargetDetail, DeploymentWaveConfirmationResult, IsolateDeploymentTargetRequest,
     NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState,
-    RestoreNodeServiceRequest, TargetApplyResult, TargetConvergenceReport,
+    TargetApplyResult, TargetConvergenceReport,
 };
 use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
@@ -360,13 +360,11 @@ pub async fn transition_node_status(
             )))
         }
     };
-    let note = console::note_or(request.note.as_deref(), || {
-        if retiring {
-            format!("retire node {node_id} and create teardown deployment")
-        } else {
-            format!("reactivate node {node_id} and create convergence deployment")
-        }
-    });
+    let note = if retiring {
+        format!("retire node {node_id} and create teardown deployment")
+    } else {
+        format!("reactivate node {node_id} and create convergence deployment")
+    };
 
     let mut tx = pool.begin().await?;
     // Report, retry, cancel and rollback all lock the deployment row before any target or
@@ -394,8 +392,7 @@ pub async fn transition_node_status(
     let previous = console::lock_control_state(&mut tx).await?;
     let proposed_revision = console::insert_revision(&mut tx, actor.operator_id(), &note).await?;
     let changed =
-        console::update_node_status_tx(&mut tx, actor, proposed_revision, node_id, request, &note)
-            .await?;
+        console::update_node_status_tx(&mut tx, actor, proposed_revision, node_id, request).await?;
     let revision_id =
         console::commit_revision(&mut tx, proposed_revision, previous, changed).await?;
 
@@ -531,14 +528,8 @@ pub async fn transition_node_status(
         Some(deployment_id)
     } else {
         if lifecycle_phase == NodeLifecyclePhase::Retiring.as_str() {
-            crate::lifecycle::complete_retirement_tx(
-                &mut tx,
-                node_id,
-                lifecycle_epoch,
-                None,
-                actor.operator_id(),
-            )
-            .await?;
+            crate::lifecycle::complete_retirement_tx(&mut tx, node_id, lifecycle_epoch, None)
+                .await?;
         }
         None
     };
@@ -557,7 +548,6 @@ pub async fn abandon_node(
     pool: &PgPool,
     actor: &AdminContext,
     node_id: &str,
-    request: crate::AbandonNodeRequest,
 ) -> Result<NodeLifecycleTransitionResult> {
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
@@ -575,9 +565,7 @@ pub async fn abandon_node(
     )
     .fetch_all(&mut *tx)
     .await?;
-    let lifecycle_epoch =
-        crate::lifecycle::abandon_tx(&mut tx, node_id, actor.operator_id(), &request.reason)
-            .await?;
+    let lifecycle_epoch = crate::lifecycle::abandon_tx(&mut tx, node_id).await?;
     let mut canceled_deployment_ids = Vec::new();
     for deployment_id in active_ids {
         cancel_deployment_tx(&mut tx, deployment_id).await?;
@@ -2642,7 +2630,6 @@ pub async fn report_target_result(
             &report.node_id,
             current_lifecycle_epoch,
             Some(report.deployment_id),
-            "agent",
         )
         .await?;
     } else if lifecycle_phase == "retiring" && final_status != "succeeded" {
@@ -2687,13 +2674,6 @@ pub async fn isolate_deployment_target(
             "only system-admin can isolate deployment targets".to_owned(),
         ));
     }
-    let reason = request.reason.trim();
-    if reason.is_empty() {
-        return Err(StoreError::InvalidData(
-            "isolation reason must not be empty".to_owned(),
-        ));
-    }
-
     let mut tx = pool.begin().await?;
     let rows = sqlx::query(
         "SELECT d.id AS deployment_id,
@@ -2770,47 +2750,14 @@ pub async fn isolate_deployment_target(
         )));
     }
 
-    let already_isolated = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-             SELECT 1 FROM node_operational_isolations WHERE node_id = $1
-         )",
-    )
-    .bind(node_id)
-    .fetch_one(&mut *tx)
-    .await?;
     sqlx::query(
-        "INSERT INTO node_operational_isolations (
-             node_id, actor, reason, source_deployment_id
-         ) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (node_id) DO UPDATE SET
-             actor = EXCLUDED.actor,
-             reason = EXCLUDED.reason,
-             source_deployment_id = EXCLUDED.source_deployment_id,
-             updated_at = now()",
+        "INSERT INTO node_operational_isolations (node_id)
+         VALUES ($1)
+         ON CONFLICT (node_id) DO UPDATE SET updated_at = now()",
     )
     .bind(node_id)
-    .bind(actor.operator_id())
-    .bind(reason)
-    .bind(deployment_id)
     .execute(&mut *tx)
     .await?;
-    if !already_isolated {
-        sqlx::query(
-            "INSERT INTO node_operational_isolation_events (
-                 node_id, event, actor, reason, deployment_id, details
-             ) VALUES ($1, 'isolated', $2, $3, $4, $5)",
-        )
-        .bind(node_id)
-        .bind(actor.operator_id())
-        .bind(reason)
-        .bind(deployment_id)
-        .bind(json!({
-            "selected_target_status": selected_status,
-            "uncertain": uncertain,
-        }))
-        .execute(&mut *tx)
-        .await?;
-    }
 
     let mut affected = BTreeSet::new();
     for row in rows {
@@ -2967,17 +2914,10 @@ pub async fn restore_node_service(
     pool: &PgPool,
     actor: &AdminContext,
     node_id: &str,
-    request: RestoreNodeServiceRequest,
 ) -> Result<NodeIsolationCommandResult> {
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
             "only system-admin can restore an isolated node to service".to_owned(),
-        ));
-    }
-    let reason = request.reason.trim();
-    if reason.is_empty() {
-        return Err(StoreError::InvalidData(
-            "restore reason must not be empty".to_owned(),
         ));
     }
     let mut tx = pool.begin().await?;
@@ -3097,17 +3037,6 @@ pub async fn restore_node_service(
         .bind(node_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query(
-        "INSERT INTO node_operational_isolation_events (
-             node_id, event, actor, reason, details
-         ) VALUES ($1, 'restored', $2, $3, $4)",
-    )
-    .bind(node_id)
-    .bind(actor.operator_id())
-    .bind(reason)
-    .bind(json!({ "lifecycle_epoch": lifecycle_epoch }))
-    .execute(&mut *tx)
-    .await?;
     let serving_generation = crate::serving::refresh_isolation_snapshot_tx(&mut tx).await?;
     tx.commit().await?;
     Ok(NodeIsolationCommandResult {
@@ -3921,15 +3850,7 @@ async fn restore_nodes_tx(
             phase != "active"
         };
         if intent_changed {
-            crate::lifecycle::advance_intent_tx(
-                tx,
-                &node_id,
-                retired,
-                lifecycle_revision,
-                "system:rollback",
-                "restore node lifecycle from rollback snapshot",
-            )
-            .await?;
+            crate::lifecycle::advance_intent_tx(tx, &node_id, retired, lifecycle_revision).await?;
         }
     }
     Ok(())
@@ -4299,6 +4220,7 @@ async fn restore_app_tx(
             _ => ("not-found", None),
         };
         let anytls = ingress.wires.anytls();
+        let anytls_reality = anytls_reality_override_json(anytls)?;
         let anytls_padding_scheme = anytls
             .map(|settings| serde_json::to_value(&settings.padding_scheme))
             .transpose()?;
@@ -4354,7 +4276,10 @@ async fn restore_app_tx(
                 xhttp_download_v4_origin_port, xhttp_download_v6_origin_port,
                 anytls_enabled, anytls_port, anytls_padding_scheme,
                 anytls_masquerade_kind, anytls_masquerade_content,
-                anytls_masquerade_headers, anytls_masquerade_status_code
+                anytls_masquerade_headers, anytls_masquerade_status_code,
+                anytls_security, anytls_reality,
+                anytls_reality_private_key, anytls_reality_public_key,
+                anytls_reality_short_ids
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
@@ -4373,7 +4298,8 @@ async fn restore_app_tx(
                 $51, $52, $53, $54,
                 $55, $56, $57, $58,
                 $59, $60, $61,
-                $62, $63, $64, $65, $66, $67, $68
+                $62, $63, $64, $65, $66, $67, $68, $69, $70,
+                $71, $72, $73
              )",
         )
         .bind(&ingress.id)
@@ -4461,6 +4387,27 @@ async fn restore_app_tx(
         .bind(anytls_masquerade_content.unwrap_or_default())
         .bind(anytls_masquerade_headers.unwrap_or_else(|| json!({})))
         .bind(anytls_masquerade_status_code.unwrap_or(200))
+        .bind(anytls.map_or("tls", |settings| settings.security.as_str()))
+        .bind(anytls_reality)
+        .bind(
+            ingress
+                .anytls_identity
+                .as_ref()
+                .map(|identity| &identity.private_key),
+        )
+        .bind(
+            ingress
+                .anytls_identity
+                .as_ref()
+                .map(|identity| &identity.public_key),
+        )
+        .bind(
+            ingress
+                .anytls_identity
+                .as_ref()
+                .map(|identity| serde_json::to_value(&identity.short_ids))
+                .transpose()?,
+        )
         .execute(&mut **tx)
         .await?;
 
@@ -4756,6 +4703,33 @@ fn ingress_reality_override_columns(
         fallback_limits: reality.fallback_limits.clone(),
         fallback_guard: reality.fallback_guard,
     }
+}
+
+fn anytls_reality_override_json(
+    anytls: Option<&brocade_core::model::AnyTls>,
+) -> Result<Option<Value>> {
+    let Some(anytls) = anytls else {
+        return Ok(None);
+    };
+    let Some(reality) = anytls.reality.as_ref() else {
+        return Ok(None);
+    };
+    let mut stored = reality.clone();
+    stored.flow = None;
+    match stored.fallback_mode {
+        RealityFallbackMode::GlobalSite | RealityFallbackMode::NodeCertificate => {
+            // Node-certificate existed only in the first experimental snapshot shape. Restoring
+            // one moves AnyTLS to the supported global target rather than reviving that mode.
+            stored.fallback_mode = RealityFallbackMode::GlobalSite;
+            stored.dest.clear();
+            stored.server_names.clear();
+            stored.fingerprint.clear();
+        }
+        // Preserve explicit custom provenance even if its current values happen to equal the
+        // global site. A later global edit must not change this AnyTLS target.
+        RealityFallbackMode::CustomSite => {}
+    }
+    Ok(Some(serde_json::to_value(stored)?))
 }
 
 async fn insert_rollback_deployment_tx(

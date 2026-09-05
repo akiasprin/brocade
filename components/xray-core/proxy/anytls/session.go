@@ -45,11 +45,9 @@ type session struct {
 	// inbound payloads have been delivered or the session is force-closed.
 	drainingStreams map[uint32]*stream
 
-	peerVersion     byte
-	errCh           chan error
-	closed          atomic.Bool
-	synAckSupported atomic.Bool
-	seq             uint64
+	peerVersion byte
+	closed      atomic.Bool
+	seq         uint64
 
 	server                 *Server
 	dispatcher             routing.Dispatcher
@@ -64,9 +62,6 @@ type session struct {
 
 	schemeMu      sync.RWMutex
 	paddingScheme *paddingScheme
-
-	synAckMu sync.Mutex
-	synAckCh map[uint32]chan error
 
 	activeStreams atomic.Int32
 	idleSinceNano atomic.Int64
@@ -446,12 +441,6 @@ func (s *session) close(err error) {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
-	if err != nil {
-		select {
-		case s.errCh <- err:
-		default:
-		}
-	}
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -502,19 +491,6 @@ func closeTransportLink(link *transport.Link) {
 	}
 	common.Interrupt(link.Reader)
 	common.Close(link.Writer)
-}
-
-func (s *session) signalSYNACK(sid uint32, result error) {
-	s.synAckMu.Lock()
-	ch := s.synAckCh[sid]
-	s.synAckMu.Unlock()
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- result:
-	default:
-	}
 }
 
 func (s *session) reservePeerStreamID(sid uint32) error {
@@ -625,12 +601,23 @@ func (s *session) writePacket(frames buf.MultiBuffer) error {
 }
 
 func (s *session) writeFramesLocked(sid uint32, data buf.MultiBuffer, packetIndex uint32, paddingEnabled bool) error {
+	// Steady-state PSH frames bypass BufferedWriter. Feeding a large payload
+	// through its 8 KiB staging buffer turns one AnyTLS frame into many small
+	// TLS writes. Flush pending control data first, then batch complete frames
+	// into bounded contiguous buffers while preserving their wire boundaries.
+	if !paddingEnabled && s.conn != nil {
+		if err := s.fw.flush(); err != nil {
+			return err
+		}
+		return writePSHBatch(s.conn, sid, data)
+	}
+
 	for !data.IsEmpty() {
 		var chunk buf.MultiBuffer
 		data, chunk = buf.SplitSize(data, maxFramePayload)
 		if paddingEnabled {
 			b := buf.New()
-			p := b.Extend(7)
+			p := b.Extend(frameHeaderSize)
 			p[0] = cmdPSH
 			binary.BigEndian.PutUint32(p[1:5], sid)
 			binary.BigEndian.PutUint16(p[5:7], uint16(chunk.Len()))
@@ -648,6 +635,66 @@ func (s *session) writeFramesLocked(sid uint32, data buf.MultiBuffer, packetInde
 		}
 	}
 	return nil
+}
+
+const maxPSHBatchWireSize int32 = 128 * 1024
+
+// writePSHBatch takes ownership of data. It preserves the 16-bit AnyTLS frame
+// limit while grouping adjacent PSH frames into bounded connection writes.
+func writePSHBatch(conn io.Writer, sid uint32, data buf.MultiBuffer) error {
+	defer buf.ReleaseMulti(data)
+
+	totalLength := data.Len()
+	if totalLength <= 0 {
+		return nil
+	}
+
+	// Sum of per-buffer ceilings is an upper bound on the number of frames
+	// SplitSize can produce. It lets small writes use a small bytespool bucket
+	// while the hard cap keeps large upstream batches bounded.
+	frameCapacity := int32(0)
+	for _, buffer := range data {
+		if buffer != nil && !buffer.IsEmpty() {
+			frameCapacity += (buffer.Len() + maxFramePayload - 1) / maxFramePayload
+		}
+	}
+	wireCapacity := totalLength + frameCapacity*frameHeaderSize
+	if wireCapacity > maxPSHBatchWireSize {
+		wireCapacity = maxPSHBatchWireSize
+	}
+	wire := buf.NewWithSize(wireCapacity)
+	defer wire.Release()
+
+	for !data.IsEmpty() {
+		var chunk buf.MultiBuffer
+		data, chunk = buf.SplitSize(data, maxFramePayload)
+		length := chunk.Len()
+		if length <= 0 || length > maxFramePayload {
+			buf.ReleaseMulti(chunk)
+			return fmt.Errorf("anytls: invalid PSH frame payload length: %d", length)
+		}
+
+		frameLength := frameHeaderSize + length
+		if !wire.IsEmpty() && wire.Len()+frameLength > wireCapacity {
+			if err := writeFull(conn, wire.Bytes()); err != nil {
+				buf.ReleaseMulti(chunk)
+				return err
+			}
+			wire.Clear()
+		}
+
+		header := wire.Extend(frameHeaderSize)
+		header[0] = cmdPSH
+		binary.BigEndian.PutUint32(header[1:5], sid)
+		binary.BigEndian.PutUint16(header[5:7], uint16(length))
+		chunk.Copy(wire.Extend(length))
+		buf.ReleaseMulti(chunk)
+	}
+
+	if wire.IsEmpty() {
+		return nil
+	}
+	return writeFull(conn, wire.Bytes())
 }
 
 func (s *session) sendStreamData(sid uint32, data buf.MultiBuffer) error {
@@ -932,13 +979,7 @@ func (s *session) readLoop(ctx context.Context) error {
 			if st == nil || !st.synAckReceived.CompareAndSwap(false, true) {
 				continue
 			}
-			if rejected == nil {
-				// A zero-length SYNACK is an optional success confirmation. Record
-				// it so later streams can wait for prompt dispatcher rejections,
-				// while remaining compatible with clients such as sing-box that do
-				// not send success confirmations at all.
-				s.synAckSupported.Store(true)
-			} else {
+			if rejected != nil {
 				errors.LogWarning(ctx, "anytls: stream handshake rejected, streamId=", sid, " err=", rejected)
 				if s.finishStream(sid, rejected) && !s.isClosed() {
 					if err := s.sendFrame(newFrame(cmdFIN, sid)); err != nil {
@@ -946,7 +987,6 @@ func (s *session) readLoop(ctx context.Context) error {
 					}
 				}
 			}
-			s.signalSYNACK(sid, rejected)
 		case cmdServerSettings:
 			if !s.isClient {
 				if length > 0 {

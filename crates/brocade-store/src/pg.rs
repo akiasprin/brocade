@@ -35,21 +35,22 @@ use crate::{
     DeleteStepResult, DeploymentCommandResult, DeploymentDetail, DeploymentList,
     DeploymentVerification, DeploymentWaveConfirmationResult, DynamicClashSubscription,
     E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, HopLinkList,
-    IssuedAdminToken, IssuedNodeToken, LinkHealthItem, LinkHealthRequest, LinkHealthResult,
-    LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult,
-    LoadSeriesQuery, NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView,
-    NodePingProbeList, NodePingProbeView, PingProbeReportRequest, PingProbeReportResult,
-    PingProbeSettings, ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult,
-    PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan, RegisterWarpBindingRequest,
-    RegisterWarpBindingResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
-    ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
-    SetUserAppQuotaRequest, SetUserAppQuotaResult, StoreError, TargetConvergenceReport, TenantList,
-    UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult, UpdateUserStatusRequest,
-    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
-    UpsertChainResult, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
-    UpsertTenantResult, UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList,
-    UsageReportRequest, UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan,
-    UserList, VerifyDeploymentRequest, WarpBindingRemoval,
+    IssuedAdminToken, IssuedNodeToken, IssuedUserLogin, LinkHealthItem, LinkHealthRequest,
+    LinkHealthResult, LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest,
+    LoadReportResult, LoadSeriesQuery, NodeAgentStateList, NodeDesiredDeployment, NodeLoadList,
+    NodeLoadView, NodePingProbeList, NodePingProbeView, PingProbeReportRequest,
+    PingProbeReportResult, PingProbeSettings, ProbeTargetList, ProvisionNodeRequest,
+    ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan,
+    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveWarpBindingRequest,
+    RemoveWarpBindingResult, ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList,
+    RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult, StoreError,
+    TargetConvergenceReport, TenantList, UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateUserStatusResult,
+    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
+    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
+    UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest,
+    UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan, UserList,
+    VerifyDeploymentRequest, WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -183,6 +184,7 @@ impl PgStore {
         // Keep migrations embedded in the store crate; cargo only refreshes this
         // list when the crate is rebuilt.
         sqlx::migrate!("./migrations").run(&self.pool).await?;
+        settings::ensure_anytls_padding_scheme(&self.pool).await?;
         let default_warps = console::ensure_default_warp_outbounds(&self.pool).await?;
         materialize::ensure_current_snapshot(&self.pool).await?;
         crate::subscription_client::ensure_checkpoint(&self.pool).await?;
@@ -839,9 +841,8 @@ impl PgStore {
         &self,
         actor: &AdminContext,
         node_id: &str,
-        request: brocade_deployment::protocol::RestoreNodeServiceRequest,
     ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
-        deployment::restore_node_service(&self.pool, actor, node_id, request).await
+        deployment::restore_node_service(&self.pool, actor, node_id).await
     }
 
     pub async fn provision_node(
@@ -877,9 +878,8 @@ impl PgStore {
         &self,
         actor: &AdminContext,
         node_id: &str,
-        request: crate::AbandonNodeRequest,
     ) -> Result<crate::NodeLifecycleTransitionResult> {
-        crate::deployment::abandon_node(&self.pool, actor, node_id, request).await
+        crate::deployment::abandon_node(&self.pool, actor, node_id).await
     }
 
     pub async fn retired_node_warp_bindings(&self, node_id: &str) -> Result<Vec<(String, String)>> {
@@ -927,6 +927,29 @@ impl PgStore {
         user_id: &str,
     ) -> Result<RotateUserUuidResult> {
         console::rotate_user_uuid(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn user_profile(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<crate::UserListItem> {
+        console::user_profile(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn self_user_profile(&self, actor: &AdminContext) -> Result<crate::UserListItem> {
+        console::self_user_profile(&self.pool, actor).await
+    }
+
+    pub async fn update_user_profile(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        request: UpdateUserProfileRequest,
+    ) -> Result<crate::UserListItem> {
+        console::update_user_profile(&self.pool, actor, tenant_id, user_id, request).await
     }
 
     pub async fn update_user_status(
@@ -1123,6 +1146,14 @@ impl PgStore {
         admin::admin_auth_state(&self.pool).await
     }
 
+    pub async fn set_public_access(
+        &self,
+        actor: &AdminContext,
+        enabled: bool,
+    ) -> Result<AdminAuthState> {
+        admin::set_public_access(&self.pool, actor, enabled).await
+    }
+
     pub async fn init_admin(&self, request: AdminInitRequest) -> Result<AdminInitResult> {
         admin::init_admin(&self.pool, request).await
     }
@@ -1133,6 +1164,15 @@ impl PgStore {
 
     pub async fn list_admin_operators(&self, actor: &AdminContext) -> Result<Vec<AdminOperator>> {
         admin::list_admin_operators(&self.pool, actor).await
+    }
+
+    pub async fn issue_user_login(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<IssuedUserLogin> {
+        admin::issue_user_login(&self.pool, actor, tenant_id, user_id).await
     }
 
     pub async fn issue_admin_token(
