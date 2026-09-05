@@ -489,7 +489,8 @@ export function TopoCanvas() {
 
         <div className="topo-legend">
           {chains.map(c => (
-            <span
+            <button
+              type="button"
               key={c.id}
               className="chip"
               aria-pressed={litChain === c.id}
@@ -498,7 +499,7 @@ export function TopoCanvas() {
             >
               <span className="bar" />
               {c.name}
-            </span>
+            </button>
           ))}
           <span className="sp" />
           <span className="note">

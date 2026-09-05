@@ -63,8 +63,11 @@ export function ArtifactPanel() {
     </aside>
   );
 
-  if (!revision || index.isPending) return shell(<Loading />);
+  if (revisions.isPending || (!!revision && index.isPending)) return shell(<Loading />);
+  if (revisions.error) return shell(<ErrorBox error={revisions.error} />);
+  if (revision == null) return shell(<Empty>还没有可查看的修订。</Empty>);
   if (index.error) return shell(<ErrorBox error={index.error} />);
+  if (!index.data) return shell(<ErrorBox error={new Error('产物索引没有返回结果')} />);
 
   const all = index.data.artifacts;
   if (all.length === 0) return shell(<Empty>当前修订还没有产物。先纳管一台机器。</Empty>);

@@ -70,8 +70,10 @@ export function DiagPane() {
     return { node: id => nodes.get(id), chain: id => chains.get(id) };
   }, [nodeList.data, snapshot.data]);
 
-  if (compile.isPending) return <Loading />;
-  if (compile.error) return <ErrorBox error={compile.error} />;
+  if (revisions.isPending || (current != null && compile.isPending)) return <Loading />;
+  if (revisions.error || compile.error) return <ErrorBox error={revisions.error ?? compile.error} />;
+  if (!current) return <Empty>还没有可诊断的修订。</Empty>;
+  if (!compile.data) return <ErrorBox error={new Error('编译结果没有返回内容')} />;
 
   const { summary, revision } = compile.data;
   const diagnostics = visibleDiagnostics(compile.data.diagnostics);
@@ -87,6 +89,7 @@ export function DiagPane() {
         <span className="dim mono">修订 {revision}</span>
       </div>
       <div className="dg-box">
+        {(nodeList.error || snapshot.error) && <ErrorBox error={nodeList.error ?? snapshot.error} />}
         <DiagTable diagnostics={diagnostics} names={names} />
       </div>
     </div>

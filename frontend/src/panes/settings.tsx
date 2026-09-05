@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore } from 'react';
+import { useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCerts,
@@ -313,9 +313,22 @@ function MtuProbe() {
           ——不调也通，调了快一点
         </span>
       )}
-      <button className="btn sm" onClick={() => setOpen(!open)}>
+      {/* SettingsPane 的只读态由 fieldset 保证；查看探测结果不修改配置，仍应可展开。
+          使用非表单控件避免被 fieldset 一并禁用，并补齐键盘语义。 */}
+      <span
+        className="btn sm"
+        role="button"
+        tabIndex={0}
+        onClick={() => setOpen(!open)}
+        onKeyDown={event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setOpen(!open);
+          }
+        }}
+      >
         {open ? '收起探测结果' : '看探测结果'}
-      </button>
+      </span>
       {open && (
         <div className="panel" style={{ marginTop: 8, width: '100%' }}>
           <table className="t">
@@ -635,6 +648,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
       </header>
       <p className="cardsub">按证书组签发通配证书，由控制面生成并随下发包送达节点</p>
       {save.error && <ErrorBox error={save.error} />}
+      {scan.error && <ErrorBox error={scan.error} />}
 
       <div className="setgrp">
         <p className="eyebrow">签发</p>
@@ -827,10 +841,28 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
   const [creating, setCreating] = useState<{ name: string; note: string } | null>(null);
   const [editing, setEditing] = useState<{ id: string; name: string; note: string } | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  const [pending, setPending] = useState<string | null>(null);
+  // Unlike the section saves, these older actions are plain promises rather than useMutation.
+  // Keep a synchronous lock as well as disabled buttons: two click events can be delivered before
+  // React commits the pending render, and asking for one spare must never create two rows.
+  const pendingRef = useRef(false);
 
-  const run = (what: Promise<unknown>) => {
+  const run = (key: string, what: () => Promise<unknown>, onSuccess?: () => void) => {
+    if (pendingRef.current) return;
+    pendingRef.current = true;
+    setPending(key);
     setFailed(null);
-    what.then(reload).catch((error: unknown) => setFailed(String(error)));
+    Promise.resolve()
+      .then(what)
+      .then(() => {
+        onSuccess?.();
+        return reload();
+      })
+      .catch((error: unknown) => setFailed(String(error)))
+      .finally(() => {
+        pendingRef.current = false;
+        setPending(null);
+      });
   };
 
   if (view.groups.length === 0) {
@@ -839,18 +871,26 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
         {creating ? (
           <GroupForm
             value={creating}
+            busy={pending !== null}
             onChange={setCreating}
             onCancel={() => setCreating(null)}
             onSave={() => {
-              run(createCertGroup({ name: creating.name, note: creating.note || null }));
-              setCreating(null);
+              run(
+                'create-group',
+                () => createCertGroup({ name: creating.name, note: creating.note || null }),
+                () => setCreating(null),
+              );
             }}
           />
         ) : (
           <div className="guard">
             还没有证书组。同组机器共享 SNI 和证书，签发额度按组计算。同组机器会被识别为同一批。
             <div style={{ marginTop: 8 }}>
-              <button className="btn" disabled={!editable} onClick={() => setCreating({ name: '', note: '' })}>
+              <button
+                className="btn"
+                disabled={!editable || pending !== null}
+                onClick={() => setCreating({ name: '', note: '' })}
+              >
                 新建证书组
               </button>
             </div>
@@ -868,7 +908,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
         <div className="v">
           <button
             className="btn"
-            disabled={!editable || !!creating}
+            disabled={!editable || !!creating || pending !== null}
             onClick={() => setCreating({ name: '', note: '' })}
           >
             新建证书组
@@ -879,11 +919,15 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       {creating && (
         <GroupForm
           value={creating}
+          busy={pending !== null}
           onChange={setCreating}
           onCancel={() => setCreating(null)}
           onSave={() => {
-            run(createCertGroup({ name: creating.name, note: creating.note || null }));
-            setCreating(null);
+            run(
+              'create-group',
+              () => createCertGroup({ name: creating.name, note: creating.note || null }),
+              () => setCreating(null),
+            );
           }}
         />
       )}
@@ -905,26 +949,26 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               <span className="ctl">
                 <button
                   className="btn sm"
-                  disabled={!editable}
+                  disabled={!editable || pending !== null}
                   onClick={() => setEditing({ id: group.id, name: group.name, note: group.note ?? '' })}
                 >
                   改名
                 </button>
                 <button
                   className="btn sm"
-                  disabled={!editable}
+                  disabled={!editable || pending !== null}
                   title="多签一张备用。它待命，由你决定何时启用；自动续期那张不经过这里"
-                  onClick={() => run(requestSpareCertificate(group.id))}
+                  onClick={() => run(`spare:${group.id}`, () => requestSpareCertificate(group.id))}
                 >
-                  加一张备用
+                  {pending === `spare:${group.id}` ? '添加中…' : '加一张备用'}
                 </button>
                 <button
                   className="btn sm danger"
-                  disabled={!editable || members.length > 0}
+                  disabled={!editable || members.length > 0 || pending !== null}
                   title={members.length > 0 ? '还有机器在用这个组' : '删除这个组'}
                   onClick={() => {
                     if (window.confirm(`删除证书组「${group.name}」？它的证书会一并删除。`)) {
-                      run(deleteCertGroup(group.id));
+                      run(`delete-group:${group.id}`, () => deleteCertGroup(group.id));
                     }
                   }}
                 >
@@ -936,11 +980,15 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
             {editing?.id === group.id && (
               <GroupForm
                 value={editing}
+                busy={pending !== null}
                 onChange={next => setEditing({ ...next, id: group.id })}
                 onCancel={() => setEditing(null)}
                 onSave={() => {
-                  run(updateCertGroup(group.id, { name: editing.name, note: editing.note || null }));
-                  setEditing(null);
+                  run(
+                    `update-group:${group.id}`,
+                    () => updateCertGroup(group.id, { name: editing.name, note: editing.note || null }),
+                    () => setEditing(null),
+                  );
                 }}
               />
             )}
@@ -990,23 +1038,25 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                       {cert.status === 'ready' && (
                         <button
                           className="btn sm"
-                          disabled={!editable}
+                          disabled={!editable || pending !== null}
                           title="让这个组的机器改用这张。SNI 不变，不需要发布"
-                          onClick={() => run(serveCertificate(cert.id))}
+                          onClick={() => run(`serve:${cert.id}`, () => serveCertificate(cert.id))}
                         >
-                          启用
+                          {pending === `serve:${cert.id}` ? '启用中…' : '启用'}
                         </button>
                       )}
                       {cert.status !== 'serving' && (
                         <button
                           className="btn sm danger"
-                          disabled={!editable}
+                          disabled={!editable || pending !== null}
                           title={trustedByXray ? '删除后，Xray 将不再信任这张证书' : '删除这条证书记录'}
                           onClick={() => {
                             const impact = trustedByXray
                               ? '删除后，Xray 将不再信任这张证书。已缓存旧配置的客户端需要刷新。'
                               : '删除这条证书记录？';
-                            if (window.confirm(impact)) run(deleteCertificate(cert.id));
+                            if (window.confirm(impact)) {
+                              run(`delete-certificate:${cert.id}`, () => deleteCertificate(cert.id));
+                            }
                           }}
                         >
                           删除
@@ -1048,11 +1098,13 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
 /** 建组和改组用同一个表单：两者要填的东西相同，分开写会让它们慢慢长得不一样。 */
 function GroupForm({
   value,
+  busy,
   onChange,
   onCancel,
   onSave,
 }: {
   value: { name: string; note: string };
+  busy: boolean;
   onChange: (next: { name: string; note: string }) => void;
   onCancel: () => void;
   onSave: () => void;
@@ -1066,6 +1118,7 @@ function GroupForm({
           style={{ width: 160 }}
           placeholder="香港前置"
           value={value.name}
+          disabled={busy}
           onChange={e => onChange({ ...value, name: e.target.value })}
         />
         <input
@@ -1073,12 +1126,13 @@ function GroupForm({
           style={{ width: 280 }}
           placeholder="备注（可选）：这组是干什么的"
           value={value.note}
+          disabled={busy}
           onChange={e => onChange({ ...value, note: e.target.value })}
         />
-        <button className="btn" disabled={!value.name.trim()} onClick={onSave}>
-          保存
+        <button className="btn" disabled={busy || !value.name.trim()} onClick={onSave}>
+          {busy ? '保存中…' : '保存'}
         </button>
-        <button className="btn" onClick={onCancel}>
+        <button className="btn" disabled={busy} onClick={onCancel}>
           取消
         </button>
       </div>
@@ -1906,7 +1960,10 @@ export function SettingsPane() {
 
   return (
     <div className="cardpage">
-      <div className="duo">
+      {/* 非 system-admin 仍可查看实际配置，但整页必须是真正的只读控件。此前只禁用了
+          保存按钮，输入框和分段开关仍能改出一份永远无法保存的“脏”表单。 */}
+      <fieldset disabled={!editable} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+        <div className="duo">
         {/* 两栏各自成流，不对齐底部。分段位置按高度定——证书段带着
             机队列表，单它一段就抵得上右栏的两段，与它同栏的只能是最短的那两段。
             编号仍从上到下、从左到右连续。 */}
@@ -2336,8 +2393,9 @@ export function SettingsPane() {
               </div>
             </Group>
           </Section>
+          </div>
         </div>
-      </div>
+      </fieldset>
     </div>
   );
 }

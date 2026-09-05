@@ -40,7 +40,7 @@ import {
   type StepAccept,
   type XhttpMode,
 } from '../api';
-import { ErrorBox } from '../ui/bits';
+import { ErrorBox, Loading } from '../ui/bits';
 import { PanelTitle } from '../ui/icons';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
 import { externalImportCanSave, serverNameAfterAddressChange } from '../external-outbound';
@@ -101,19 +101,19 @@ const EMPTY_REALITY_SITE = { dest: '', names: '' };
 const HOP_PORT_BASE = 20000;
 
 /** 中转端口的起始值，取自全局设置；设置尚未加载时使用回退值。 */
-function useHopPortBase(): number {
-  const settings = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings() });
+function useHopPortBase(enabled = true): number {
+  const settings = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings(), enabled });
   return settings.data?.ports?.hop_base || HOP_PORT_BASE;
 }
 
 /** 各机器的 overlay 地址。只存在于编译结果中——它由系统层分配，不在模型中。 */
-function useOverlayAddrs(): (nodeId: string) => string {
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
+function useOverlayAddrs(enabled = true): (nodeId: string) => string {
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled });
   const current = revisions.data?.current_revision;
   const compiled = useQuery({
     queryKey: ['compile', current],
     queryFn: () => fetchCompileView(current!),
-    enabled: !!current,
+    enabled: enabled && !!current,
   });
   const byId = useMemo(() => {
     const nodes =
@@ -130,15 +130,15 @@ function useOverlayAddrs(): (nodeId: string) => string {
 // 导出该函数是因为端口选择不止规则编辑器一处使用：链路页的「追加一跳」、画布上的
 // 「接入主干」同样需要，且这两处选出的值必须与此处显示的一致。分别实现判定会导致
 // 界面显示 20001 而库中存储 20000，需要排查一个实际不存在的端口冲突。
-export function usePortPool(): Map<string, PortOwners> {
-  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
-  const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
+export function usePortPool(enabled = true): Map<string, PortOwners> {
+  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot(), enabled });
+  const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), enabled });
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled });
   const current = revisions.data?.current_revision;
   const compiled = useQuery({
     queryKey: ['compile', current],
     queryFn: () => fetchCompileView(current!),
-    enabled: !!current,
+    enabled: enabled && !!current,
   });
   return useMemo(
     () => occupiedPorts(snapshot.data?.snapshot.apps ?? [], nodeList.data?.nodes ?? [], compiled.data?.system),
@@ -1299,23 +1299,7 @@ export function seedHopIn(
   };
 }
 
-export function RuleEditor({
-  appId,
-  chainId,
-  nodeId,
-  initial,
-  accept,
-  peers,
-  isForwardTarget,
-  steps,
-  root,
-  hopIn: selfHopIn = null,
-  fallback,
-  onClose,
-  shared,
-  saves = true,
-  readOnly = false,
-}: {
+type RuleEditorProps = {
   appId: string;
   chainId: string;
   nodeId: string;
@@ -1359,7 +1343,62 @@ export function RuleEditor({
   // 禁用通过 `<fieldset disabled>` 实现：逐个控件添加 disabled 时，遗漏某个不会报错，
   // 表现为 readonly 角色可以修改，点击保存后才返回 403。
   readOnly?: boolean;
-}) {
+};
+
+// 将依赖门放在持有表单 state 的组件之外：只有端口起点、占用表和编译结果都就绪后才挂载
+// 真正的编辑器。若在同一组件中先用 fallback 初始化 useState、随后才显示 Loading，错误默认值
+// 仍会被永久冻结在 state 里。
+export function RuleEditor(props: RuleEditorProps) {
+  const readOnly = props.readOnly ?? false;
+  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
+  const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const settings = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings(), enabled: !readOnly });
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled: !readOnly });
+  const current = revisions.data?.current_revision;
+  const compiled = useQuery({
+    queryKey: ['compile', current],
+    queryFn: () => fetchCompileView(current!),
+    enabled: !readOnly && !!current,
+  });
+  const pending =
+    snapshot.isPending ||
+    nodes.isPending ||
+    (!readOnly && (settings.isPending || revisions.isPending || (current != null && compiled.isPending)));
+  const error = snapshot.error ?? nodes.error ?? (!readOnly ? settings.error ?? revisions.error ?? compiled.error : null);
+  if (pending) return <Loading />;
+  const blockingError =
+    (!snapshot.data && snapshot.error) ||
+    (!nodes.data && nodes.error) ||
+    (!readOnly && ((!settings.data && settings.error) || (!revisions.data && revisions.error))) ||
+    (!readOnly && current != null && !compiled.data && compiled.error);
+  if (blockingError) return <ErrorBox error={blockingError} />;
+  // 后台刷新失败但仍有完整缓存时保留内容供核对，同时禁用整棵表单；不能把旧数据当成
+  // 最新结果继续写，也不应把正在查看的规则整页替换掉。
+  return (
+    <fieldset disabled={!!error} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+      {error && <ErrorBox error={error} />}
+      <RuleEditorReady {...props} />
+    </fieldset>
+  );
+}
+
+function RuleEditorReady({
+  appId,
+  chainId,
+  nodeId,
+  initial,
+  accept,
+  peers,
+  isForwardTarget,
+  steps,
+  root,
+  hopIn: selfHopIn = null,
+  fallback,
+  onClose,
+  shared,
+  saves = true,
+  readOnly = false,
+}: RuleEditorProps) {
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const app = snapshot.data?.snapshot.apps.find(candidate => candidate.id === appId);
@@ -1539,9 +1578,9 @@ export function RuleEditor({
   // 每个目标对应一份中转端口表单状态。初始值取自对端 step 上已有的配置。
   // 将 `seedHops` 提取并导出，是因为同一台机器可能在树中出现两次（分叉后汇合），
   // 此时草稿由上层持有并共享，初始值需要由上层计算（见 ChainRulesPanel）。
-  const portPool = usePortPool();
-  const hopBase = useHopPortBase();
-  const overlayOf = useOverlayAddrs();
+  const portPool = usePortPool(!readOnly);
+  const hopBase = useHopPortBase(!readOnly);
+  const overlayOf = useOverlayAddrs(!readOnly);
   // 反向两档显示的是本机的对外地址（由编译器推导，此处只是同步显示）。
   // 查询键与其他位置一致，通常命中缓存。标记为 NAT 的不计入——该类地址无法接受反向接入，
   // 编译器的 `dialable_public_host` 判定相同，两处判定需保持一致。

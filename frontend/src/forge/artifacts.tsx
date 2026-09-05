@@ -56,9 +56,23 @@ export function useRevisionDiff(revision: number | undefined, base: number | nul
   return useMemo(() => {
     const list = here.data?.artifacts ?? [];
     /* 没有基线时不判定为已变更：将全部产物标为变更不提供信息。 */
-    if (base == null || !there.data) return { list, changed: new Set<string>(), known: false };
-    return { list, changed: changedBetween(list, there.data.artifacts), known: true };
-  }, [here.data, there.data, base]);
+    if (base == null || !there.data) {
+      return {
+        list,
+        changed: new Set<string>(),
+        known: false,
+        pending: (revision != null && here.isPending) || (base != null && there.isPending),
+        error: here.error ?? there.error,
+      };
+    }
+    return {
+      list,
+      changed: changedBetween(list, there.data.artifacts),
+      known: true,
+      pending: (revision != null && here.isPending) || there.isPending,
+      error: here.error ?? there.error,
+    };
+  }, [here.data, here.isPending, here.error, there.data, there.isPending, there.error, revision, base]);
 }
 
 /** 当前版本相对基线发生变化的产物，返回产物 id 的集合。
@@ -89,9 +103,25 @@ export function useChangedArtifacts(
   return useMemo(() => {
     const list = here.data?.artifacts ?? [];
     // 没有基线（首次编译）时不判定为已变更——那会将全部产物标为变更，不提供信息。
-    if (base == null || !there.data) return { list, changed: new Set<string>(), known: false, dirty };
-    return { list, changed: changedBetween(list, there.data.artifacts), known: true, dirty };
-  }, [here.data, there.data, base, dirty]);
+    if (base == null || !there.data) {
+      return {
+        list,
+        changed: new Set<string>(),
+        known: false,
+        dirty,
+        pending: (revision != null && here.isPending) || (base != null && there.isPending),
+        error: here.error ?? there.error,
+      };
+    }
+    return {
+      list,
+      changed: changedBetween(list, there.data.artifacts),
+      known: true,
+      dirty,
+      pending: (revision != null && here.isPending) || there.isPending,
+      error: here.error ?? there.error,
+    };
+  }, [here.data, here.isPending, here.error, there.data, there.isPending, there.error, revision, base, dirty]);
 }
 
 /** 影响范围：发生变化的 node 类产物涉及的机器数量。 */
@@ -139,7 +169,7 @@ export function ArtifactRail({
   onClose: () => void;
 }) {
   const panel = useSyncExternalStore(artifactPanel.subscribe, artifactPanel.snapshot);
-  const { list, changed, dirty } = useChangedArtifacts(revision, prev, { compareClean });
+  const { list, changed, dirty, pending, error } = useChangedArtifacts(revision, prev, { compareClean });
   const baseRevision = dirty ? revision : compareClean ? prev : undefined;
   const rail = useRef<HTMLElement>(null);
 
@@ -190,7 +220,8 @@ export function ArtifactRail({
       <div className="fg-rsh">
         产物 · {dirty ? '草稿预览' : '当前修订'}
         <span className="n">
-          {list.length} 份{baseRevision != null && changed.size ? ` · 比修订 ${baseRevision} ${changed.size} 变` : ''}
+          {pending ? '读取中…' : `${list.length} 份`}
+          {!pending && baseRevision != null && changed.size ? ` · 比修订 ${baseRevision} ${changed.size} 变` : ''}
         </span>
         <button className="x" title="关闭产物栏" aria-label="关闭产物栏" onClick={onClose}>
           ×
@@ -199,6 +230,8 @@ export function ArtifactRail({
 
       <div className="fg-artbody">
         <div className="fg-arttree">
+          {error && <ErrorBox error={error} />}
+          {!error && pending && <Loading />}
           {GROUPS.map(g => {
             const mine = list.filter(a => a.target_kind === g.kind);
             if (!mine.length) return null;
@@ -259,7 +292,9 @@ export function ArtifactRail({
               或编译因错误而中止（产物只在 can_publish 为真时产生）。
               后一种更常见，此前的「该版本没有产物」会引导向前一种理解，
               而实际需要查看的是诊断。因此两种原因都说明。 */}
-          {list.length === 0 && <Empty>当前无产物或编译检测出无法解决的问题。</Empty>}
+          {!error && !pending && list.length === 0 && (
+            <Empty>当前无产物或编译检测出无法解决的问题。</Empty>
+          )}
         </div>
 
         <div className="fg-artpane">

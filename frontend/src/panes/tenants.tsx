@@ -143,7 +143,15 @@ export function TenantsPane() {
                 <tr
                   key={t.id}
                   className={isOpen ? 'tnt-row on' : 'tnt-row'}
+                  tabIndex={0}
+                  aria-expanded={isOpen}
                   onClick={() => setOpen(isOpen ? null : t.id)}
+                  onKeyDown={event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      setOpen(isOpen ? null : t.id);
+                    }
+                  }}
                 >
                   <td className="mono" style={{ paddingLeft: 10 + depth * 18 }}>
                     {depth > 0 && <span className="dim">└ </span>}
@@ -171,7 +179,7 @@ export function TenantsPane() {
                           <p className="bh">管理这个租户</p>
                           {admins.error ? (
                             <p className="note dim" style={{ margin: 0 }}>
-                              管理员名单仅管理员可见。
+                              管理员名单读取失败或当前角色不可见。
                             </p>
                           ) : reach.length === 0 ? (
                             <p className="note dim" style={{ margin: 0 }}>
@@ -190,7 +198,11 @@ export function TenantsPane() {
                         </div>
                         <div className="tnt-blk">
                           <p className="bh">挂在这个租户名下的机器</p>
-                          {mine.length === 0 ? (
+                          {nodes.error ? (
+                            <p className="note bad" style={{ margin: 0 }}>
+                              机器名单读取失败，不能据此判断这一层是否为空。
+                            </p>
+                          ) : mine.length === 0 ? (
                             <p className="note dim" style={{ margin: 0 }}>
                               没有机器直接归属于这一层{t.node_count > 0 && '（另有 ' + t.node_count + ' 台在子树中）'}。
                             </p>

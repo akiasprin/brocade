@@ -588,6 +588,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       <div className="cardpage node-cardpage">
         <section className="panel titled node-list-panel">
           {renderHeader(live.length, false)}
+          {retireAll.error && <ErrorBox error={retireAll.error} />}
           {list.length === 0 ? (
             <Empty>还没有节点。点「纳管节点」加一台。</Empty>
           ) : live.length === 0 ? (
@@ -616,6 +617,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   return (
     <div className={section}>
       {renderHeader(list.length, true)}
+      {retireAll.error && <ErrorBox error={retireAll.error} />}
       {list.length === 0 ? <Empty>还没有节点。点「纳管节点」加一台。</Empty> : renderCards(list)}
     </div>
   );
@@ -1614,12 +1616,12 @@ function WgTransportRow({
   // 接入面占用，且在 443 上运行非 TLS 服务会在主动探测下暴露。
   const [staged, setStaged] = useState<{ fake: boolean; port: number } | null>(null);
 
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled: canEdit });
   const current = revisions.data?.current_revision;
   const compile = useQuery({
     queryKey: ['compile', current],
     queryFn: () => fetchCompileView(current!),
-    enabled: !!current,
+    enabled: canEdit && !!current,
   });
 
   // 当前值取自编译结果而非 `node.wg_transport_kind`，原因与 OverlayRow 一致：
@@ -1658,6 +1660,10 @@ function WgTransportRow({
     },
   });
 
+  const dependencyPending = revisions.isPending || (current != null && compile.isPending);
+  const dependencyError = revisions.error ?? compile.error;
+  const editingReady = canEdit && !dependencyPending && !dependencyError;
+
   /* 两档常驻，改了才出工具条，不再先点「改」把行切进编辑态。
      端口输入框只在选中 Phantun 时出现——直连 UDP 下它没有对应的配置项。 */
   const dirty = staged !== null && (staged.fake !== currentFake || (staged.fake && staged.port !== currentPort));
@@ -1665,13 +1671,13 @@ function WgTransportRow({
   return (
     <Row k="入站传输">
       <span className="nd-ctl-line">
-        <SegSwitch checked={fake} disabled={!canEdit} onChange={setFake} off="直连 UDP" on="Phantun" />
+        <SegSwitch checked={fake} disabled={!editingReady} onChange={setFake} off="直连 UDP" on="Phantun" />
         {fake && (
           <input
             className="f mono"
             style={{ width: 110 }}
             value={port}
-            disabled={!canEdit}
+            disabled={!editingReady}
             inputMode="numeric"
             aria-label="Phantun 伪 TCP 端口"
             onChange={e => setPort(Number(e.target.value) || 0)}
@@ -1680,6 +1686,7 @@ function WgTransportRow({
       </span>
       <span className="sub">Phantun 把 WireGuard 的 UDP 伪装成 TCP，用于 UDP 被限速的线路。</span>
       {fake && <span className="sub">使用高位端口。不要使用 443：容易与接入面冲突，也容易被探测。</span>}
+      {dependencyError && <ErrorBox error={dependencyError} />}
       {dirty && (
         <>
           <span className="sub" style={{ color: 'var(--gold)' }}>
@@ -1687,7 +1694,7 @@ function WgTransportRow({
           </span>
           {save.error && <ErrorBox error={save.error} />}
           <div className="toolbar">
-            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+            <button className="btn primary" disabled={!editingReady || save.isPending} onClick={() => save.mutate()}>
               {save.isPending ? '保存中…' : '保存到草稿'}
             </button>
             <button className="btn" disabled={save.isPending} onClick={() => setStaged(null)}>
@@ -1715,12 +1722,12 @@ function OverlayRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
   const qc = useQueryClient();
   const [staged, setStaged] = useState<boolean | null>(null);
 
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled: canEdit });
   const current = revisions.data?.current_revision;
   const compile = useQuery({
     queryKey: ['compile', current],
     queryFn: () => fetchCompileView(current!),
-    enabled: !!current,
+    enabled: canEdit && !!current,
   });
 
   // 当前值取自编译结果而非 `node.overlay`：`/nodes/agent-state` 是直连接口，不经过
@@ -1753,9 +1760,14 @@ function OverlayRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
     },
   });
 
+  const dependencyPending = revisions.isPending || (current != null && compile.isPending);
+  const dependencyError = revisions.error ?? compile.error;
+  const editingReady = canEdit && !dependencyPending && !dependencyError;
+
   return (
     <Row k="WireGuard">
-      <SegSwitch checked={value} disabled={!canEdit} onChange={checked => setStaged(checked)} off="关闭" on="启用" />
+      <SegSwitch checked={value} disabled={!editingReady} onChange={checked => setStaged(checked)} off="关闭" on="启用" />
+      {dependencyError && <ErrorBox error={dependencyError} />}
       {!dirty && (
         <span className="sub">
           {value
@@ -1779,7 +1791,7 @@ function OverlayRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
           )}
           {save.error && <ErrorBox error={save.error} />}
           <div className="toolbar">
-            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+            <button className="btn primary" disabled={!editingReady || save.isPending} onClick={() => save.mutate()}>
               {save.isPending ? '保存中…' : '保存到草稿'}
             </button>
             <button className="btn" disabled={save.isPending} onClick={() => setStaged(null)}>
@@ -1807,12 +1819,12 @@ function EgressRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEd
   const qc = useQueryClient();
   const [staged, setStaged] = useState<boolean | null>(null);
 
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled: canEdit });
   const current = revisions.data?.current_revision;
   const compile = useQuery({
     queryKey: ['compile', current],
     queryFn: () => fetchCompileView(current!),
-    enabled: !!current,
+    enabled: canEdit && !!current,
   });
 
   // 每个 app 的 nodes 都是全量节点表（ir/routing.rs 中的 filter 只过滤退役节点），
@@ -1835,15 +1847,20 @@ function EgressRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEd
     },
   });
 
+  const dependencyPending = revisions.isPending || (current != null && compile.isPending);
+  const dependencyError = revisions.error ?? compile.error;
+  const editingReady = canEdit && !dependencyPending && !dependencyError;
+
   return (
     <Row k="出网权限">
       <SegSwitch
         checked={value}
-        disabled={!canEdit}
+        disabled={!editingReady}
         onChange={checked => setStaged(checked)}
         off="禁止出网"
         on="可出网"
       />
+      {dependencyError && <ErrorBox error={dependencyError} />}
       {!dirty && (
         <span className="sub">
           {value
@@ -1860,7 +1877,7 @@ function EgressRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEd
           </span>
           {save.error && <ErrorBox error={save.error} />}
           <div className="toolbar">
-            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+            <button className="btn primary" disabled={!editingReady || save.isPending} onClick={() => save.mutate()}>
               {save.isPending ? '保存中…' : '保存到草稿'}
             </button>
             <button className="btn" disabled={save.isPending} onClick={() => setStaged(null)}>
@@ -1967,6 +1984,9 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
     mutationFn: (labelId: string) => setNodeCertGroup(node.node_id, labelId || null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['certs'] }),
   });
+
+  if (certs.isPending) return <Loading />;
+  if (certs.error) return <ErrorBox error={certs.error} />;
 
   const pick = (next: string) => {
     if (next === (current?.label_id ?? '')) return;
@@ -4003,7 +4023,12 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   // 详情页的状态灯同样依赖 last_poll_at。列表卸载后不再有它的 10 秒轮询；若这里仅命中
   // 缓存，负载查询触发重绘时会拿旧时间与当前时间比较，停留 60 秒后误报「失联」。
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 10_000 });
-  const deployments = useQuery({ queryKey: ['deployments'], queryFn: () => fetchDeployments() });
+  // 访客看不到发布记录，且详情页只在判断退役工单时需要它；不要发一个必然 403 的请求。
+  const deployments = useQuery({
+    queryKey: ['deployments'],
+    queryFn: () => fetchDeployments(),
+    enabled: !isVisitor(who),
+  });
   const revisionOf = (d: number) => deployments.data?.deployments.find(x => x.id === d)?.revision_id;
   const n = nodes.data?.nodes.find(x => x.node_id === id);
   /* 签发的 node token 同样只显示一次 */
@@ -4150,7 +4175,11 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
     qc.invalidateQueries({ queryKey: ['revisions'] });
   };
 
-  if (!n) return <Loading sheeted={sheeted} />;
+  if (nodes.isPending || (!pub && deployments.isPending) || snapshot.isPending) return <Loading sheeted={sheeted} />;
+  if (nodes.error || (!pub && deployments.error) || snapshot.error) {
+    return <ErrorBox error={nodes.error ?? deployments.error ?? snapshot.error} />;
+  }
+  if (!n) return <ErrorBox error={new Error(`没有这台机器：${id}`)} />;
 
   const lifecycleOrder = n.lifecycle_deployment_id
     ? deployments.data?.deployments.find(deployment => deployment.id === n.lifecycle_deployment_id)
@@ -4577,7 +4606,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
   const options = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
   /* 已有的机器：用于判断 id 是否被占用。 */
   const existingNodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  /* 证书组的下拉选项。取不到就只剩「不关联证书」一项，与没有权限读证书配置时的表现一致。 */
+  /* 证书组的下拉选项。纳管是 system-admin 操作，其有权读取；失败不能伪装成“没有证书组”。 */
   const certs = useQuery({ queryKey: ['certs'], queryFn: () => fetchCerts(), retry: false });
 
   const [form, setForm] = useState({
@@ -4645,6 +4674,13 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
       go({ p: 'install', node: result.node.id, step: 2, result });
     },
   });
+
+  // 租户决定写入归属，机器列表用于防止覆盖既有 ID，证书列表决定新机器的证书关联。
+  // 任一依赖未知时都不展示一张看似完整、实际采用危险默认值的表单。
+  if (tenants.isPending || existingNodes.isPending || certs.isPending) return <Loading />;
+  if (tenants.error || existingNodes.error || certs.error) {
+    return <ErrorBox error={tenants.error ?? existingNodes.error ?? certs.error} />;
+  }
 
   const ready = !!form.id.trim() && !idInvalid && !idTaken && !!tenantId;
 
@@ -4992,8 +5028,8 @@ function ProvisionInstall({
   const certs = useQuery({
     queryKey: ['certs'],
     queryFn: () => fetchCerts(),
-    // 创建机器需要 system-admin 权限，因此此处通常可以获取；获取失败时整段不显示，
-    // 而不是显示错误提示。
+    // 创建机器需要 system-admin 权限，因此此处通常可以获取。读取失败时安装步骤仍可继续，
+    // 但证书状态必须明确标为未知，不能伪装成“没有证书域”。
     enabled: system,
     // 通过 CA 签发一轮约半分钟。轮询到该机器所属的组签出证书后停止；机器没有选组时不必轮询，
     // 那不是等得到的状态，要人去选。
@@ -5014,6 +5050,8 @@ function ProvisionInstall({
   const certFailed = certGroup?.certificates.find(c => c.status === 'failed');
 
   const target = result?.revision_id ?? current;
+  if (nodes.isPending || revisions.isPending) return <Loading />;
+  if (nodes.error || revisions.error) return <ErrorBox error={nodes.error ?? revisions.error} />;
   return (
     <>
       <div className="chain-hd">
@@ -5103,7 +5141,9 @@ function ProvisionInstall({
             <span className="idx">03</span>
             <span className="who">
               <b>拿到证书</b>
-              {!certDomain ? (
+              {certs.error ? (
+                <span className="st st-warn">证书状态读取失败</span>
+              ) : !certDomain ? (
                 <span className="st st-warn">没有证书域</span>
               ) : !certRow ? (
                 <span className="st st-warn">未选证书组</span>
@@ -5118,7 +5158,9 @@ function ProvisionInstall({
             <span className="ctl" />
             <span className="attrs">
               <span className="note">
-                {!certDomain ? (
+                {certs.error ? (
+                  <ErrorBox error={certs.error} />
+                ) : !certDomain ? (
                   <>
                     尚未配置证书域，这台机器不会有证书，其上的 TLS 和 Hysteria 2 接入面会在<b>编译时被拒绝</b>，
                     直到建链那一步才暴露。前往<b>设置 → 证书</b>填写域名与 Cloudflare token。 REALITY

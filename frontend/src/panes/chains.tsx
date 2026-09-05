@@ -208,18 +208,6 @@ function anyTlsPaddingValid(text: string): boolean {
   return stopSeen;
 }
 
-/** Hysteria 2 的起始端口，取自全局设置；设置尚未加载时使用回退值。 */
-function useHy2PortBase(): number {
-  const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
-  return settings.data?.ports?.hy2_base || HY2_PORT_BASE;
-}
-
-/** AnyTLS 的起始端口，取自全局设置；设置尚未加载时使用回退值。 */
-function useAnyTlsPortBase(): number {
-  const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
-  return settings.data?.ports?.anytls_base || ANYTLS_PORT_BASE;
-}
-
 import { ChainWizard } from './chain-wizard';
 
 // 链路页：链在此页首次有独立的位置。
@@ -265,8 +253,8 @@ function NewChain({ app, go }: { app: string; go: (d: Drill) => void }) {
   const a = snapshot.data?.snapshot.apps.find(x => x.id === app);
   const usable = (nodeList.data?.nodes ?? []).filter(n => !n.retired_at);
 
-  if (snapshot.isPending) return <Loading />;
-  if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  if (snapshot.isPending || nodeList.isPending) return <Loading />;
+  if (snapshot.error || nodeList.error) return <ErrorBox error={snapshot.error ?? nodeList.error} />;
   if (!a) return <ErrorBox error={new Error(`没有这条线路：${app}`)} />;
 
   return (
@@ -818,6 +806,14 @@ export function IngressPortEditor({
       onSaved?.();
     },
   });
+
+  if (
+    editable &&
+    (snapshot.isPending || nodeList.isPending || revisions.isPending || (current != null && compiled.isPending))
+  )
+    return <Loading />;
+  const dependencyError = snapshot.error ?? nodeList.error ?? revisions.error ?? compiled.error;
+  if (editable && dependencyError) return <ErrorBox error={dependencyError} />;
 
   return (
     <div className="toolbar" style={{ margin: 0, gap: 6 }}>
@@ -1812,8 +1808,9 @@ export function IngressStreamRow({
   section: 'protocols' | 'vless' | 'anytls' | 'hy2';
 }) {
   const qc = useQueryClient();
-  const hy2Base = useHy2PortBase();
-  const anytlsBase = useAnyTlsPortBase();
+  const portSettings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
+  const hy2Base = portSettings.data?.ports?.hy2_base || HY2_PORT_BASE;
+  const anytlsBase = portSettings.data?.ports?.anytls_base || ANYTLS_PORT_BASE;
   const streamSnapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const streamNodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const streamRevisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
@@ -1996,19 +1993,11 @@ export function IngressStreamRow({
       qc.invalidateQueries({ queryKey: ['compile'] });
     },
     onError: () => {
-      setDraftHy2(null);
-      setDraftMode(null);
+      // 协议开关是立即提交的乐观状态，失败后必须回到快照；其他字段属于面板草稿，
+      // 保存失败时应保留，不能把用户刚填写的端口、伪装和调优参数全部清空。
       setPendingTransport(null);
       setPendingAnyTlsOn(null);
       setPendingHy2On(null);
-      setDraftAnyTls(null);
-      setDraftAnyTlsPadding(null);
-      setForceAnyTlsPaddingCustom(false);
-      setDraftAnyTlsHeaders(null);
-      setDraftAnyTlsStatus(null);
-      setDraftAnyTlsIdleCheck(null);
-      setDraftAnyTlsIdleTimeout(null);
-      setDraftAnyTlsMinIdle(null);
       onVlessEnabledChange?.(null);
       onAnyTlsEnabledChange?.(null);
       onHy2EnabledChange?.(null);
@@ -2370,6 +2359,37 @@ export function IngressStreamRow({
     return updateAnyTlsMasquerade({ kind: 'string', content: '', headers, status_code: 200 });
   };
 
+  // 自动端口要同时看全局起点、快照、机器和编译后的系统监听。可编辑视角下缺一项都不能
+  // 继续给出“空闲端口”；只读视角不做端口分配，仍可查看快照中的实际值。
+  const dependencyPending =
+    portSettings.isPending ||
+    streamSnapshot.isPending ||
+    streamNodes.isPending ||
+    streamRevisions.isPending ||
+    (streamRevisions.data?.current_revision != null && streamCompiled.isPending);
+  const dependencyError =
+    portSettings.error ?? streamSnapshot.error ?? streamNodes.error ?? streamRevisions.error ?? streamCompiled.error;
+  if (editable && dependencyPending) {
+    return section === 'protocols' ? (
+      <>
+        <dt>协议</dt>
+        <dd>
+          <Loading />
+        </dd>
+      </>
+    ) : null;
+  }
+  if (editable && dependencyError) {
+    return section === 'protocols' ? (
+      <>
+        <dt>协议</dt>
+        <dd>
+          <ErrorBox error={dependencyError} />
+        </dd>
+      </>
+    ) : null;
+  }
+
   /* 端口归属协议栈：落点只表示由哪台机器接收，使用哪个端口由各线路自行决定。
      因此此处分四段渲染——协议开关一段，VLESS、AnyTLS、Hysteria 2 各自包含自己的端口和参数。 */
   if (section === 'protocols') {
@@ -2413,6 +2433,7 @@ export function IngressStreamRow({
               共用一份凭据和一条授权，订阅中分别输出，由客户端自行选择。
             </div>
           )}
+          {save.error && <ErrorBox error={save.error} />}
         </dd>
       </>
     );
@@ -3927,8 +3948,8 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     setCreating({ id, label: '' });
   };
 
-  if (snapshot.isPending) return <Loading />;
-  if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  if (snapshot.isPending || nodeList.isPending) return <Loading />;
+  if (snapshot.error || nodeList.error) return <ErrorBox error={snapshot.error ?? nodeList.error} />;
 
   // 含退役节点即视为停用（与编译器判定一致）。列表不依赖编译结果——草稿或未发布时
   // 编译视图中还没有该链，而停用状态是模型事实，从节点侧计算。判定依据是成员而非主干：
@@ -4042,6 +4063,8 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
             </>
           )}
         </header>
+
+        {probes.error && <ErrorBox error={probes.error} />}
 
         {/* 新建项目表现为列表最前面增加一条待创建的行，而不是插入一块面板。
           两个输入框不需要独立的下沉底色区域——此前的版本高 130px（ID 的说明折为两行，
@@ -4625,7 +4648,6 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
     },
-    onError: () => setPendingBind(null),
   });
 
   const saveProjections = useMutation({
@@ -4645,8 +4667,8 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     },
   });
 
-  if (snapshot.isPending) return <Loading />;
-  if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  if (snapshot.isPending || nodes.isPending) return <Loading />;
+  if (snapshot.error || nodes.error) return <ErrorBox error={snapshot.error ?? nodes.error} />;
   if (!a || !c) return <ErrorBox error={new Error(`没有这条链：${app}/${chain}`)} />;
 
   const spine = chainSpine(a, c.id);
@@ -4702,6 +4724,8 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                 </div>
               </div>
             </div>
+          ) : probes.error ? (
+            <ErrorBox error={probes.error} />
           ) : (
             <ProbeBanner item={probe} />
           )}
@@ -4768,6 +4792,11 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     <span className="mono">{ingress.bind}</span>
                   )}
                 </dd>
+                {saveBind.error && (
+                  <dd style={{ gridColumn: '1 / -1' }}>
+                    <ErrorBox error={saveBind.error} />
+                  </dd>
+                )}
               </dl>
             </ConfigPanel>
           )}
@@ -5124,6 +5153,7 @@ export function ChainRulesPanel({
   /* 中转端口的默认值需要选择未占用的端口。与接入面处共用同一份判定（ports.ts）。 */
   const snapshotForPorts = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodesForPorts = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const settingsForPorts = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings(), enabled: !readOnly });
   const revisionsForPorts = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   const currentForPorts = revisionsForPorts.data?.current_revision;
   const compiledForPorts = useQuery({
@@ -5140,6 +5170,20 @@ export function ChainRulesPanel({
       ),
     [snapshotForPorts.data, nodesForPorts.data, compiledForPorts.data],
   );
+  const hopBase = settingsForPorts.data?.ports?.hop_base || 20000;
+  const portDependenciesPending =
+    !readOnly &&
+    (snapshotForPorts.isPending ||
+      nodesForPorts.isPending ||
+      settingsForPorts.isPending ||
+      revisionsForPorts.isPending ||
+      (currentForPorts != null && compiledForPorts.isPending));
+  const portDependenciesError =
+    snapshotForPorts.error ??
+    nodesForPorts.error ??
+    settingsForPorts.error ??
+    revisionsForPorts.error ??
+    compiledForPorts.error;
   const rowOf = new Map(rows.map(row => [row.node, row]));
   const stepOf = (node: string) => steps.find(s => s.node === node) ?? null;
   /* 树中显示机器名称，id 写入 title——名称是日常识别依据 */
@@ -5184,18 +5228,11 @@ export function ChainRulesPanel({
   // 编译器补全在规则表末尾的规则。读取编译视图，不在此处推算：
   // 在浏览器中重新计算相当于实现第二个编译器，最终会与 Rust 的实现产生差异。
   // `fetchCompileView` 在存在草稿时读取草稿的编译结果，未保存的改动同样计算正确。
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
-  const currentRevision = revisions.data?.current_revision;
-  const compiled = useQuery({
-    queryKey: ['compile', currentRevision],
-    queryFn: () => fetchCompileView(currentRevision!),
-    enabled: !!currentRevision,
-  });
   const compiledRules = useMemo(() => {
-    const apps = (compiled.data?.apps as CompiledApp[] | undefined) ?? [];
+    const apps = (compiledForPorts.data?.apps as CompiledApp[] | undefined) ?? [];
     const app = apps.find(a => (a.app_id ?? '') === appId);
     return new Map((app?.steps ?? []).filter(s => s.chain === chain.id).map(s => [s.node, s.rules ?? []]));
-  }, [compiled.data, appId, chain.id]);
+  }, [compiledForPorts.data, appId, chain.id]);
 
   const fallbackOf = (node: string) => {
     const written = draftRules[node] ?? stepOf(node)?.rules ?? [];
@@ -5341,7 +5378,7 @@ export function ChainRulesPanel({
                 shared={{
                   rules: draftRules[node] ?? step?.rules ?? [],
                   setRules: next => setDraftRules(prev => ({ ...prev, [node]: next })),
-                  hops: draftHops[node] ?? seedHops(peersOf(node), portPool),
+                  hops: draftHops[node] ?? seedHops(peersOf(node), portPool, hopBase),
                   setHops: next => setDraftHops(prev => ({ ...prev, [node]: next })),
                   dns: draftDns[node] ?? {},
                   setDns: next => setDraftDns(prev => ({ ...prev, [node]: next })),
@@ -5360,7 +5397,10 @@ export function ChainRulesPanel({
                 // 两处都注册时同一内容会被写入两次（结果幂等，但产生一次多余的请求）。
                 saves={!repeated}
                 readOnly={readOnly}
-                fallback={{ rules: fallbackOf(node), pending: compiled.isLoading }}
+                fallback={{
+                  rules: fallbackOf(node),
+                  pending: revisionsForPorts.isPending || compiledForPorts.isLoading,
+                }}
               />
             </div>
             {children.length > 0 && (
@@ -5374,11 +5414,17 @@ export function ChainRulesPanel({
     );
   };
 
+  // 可编辑态必须等端口起点和占用表完整后再构造 RuleEditor 的共享草稿。否则这里先用
+  // 20000/空占用表 seed，子组件随后即使拿到真实设置也只会收到已经冻结的默认值。
+  if (portDependenciesPending) return <Loading />;
+  if (!readOnly && portDependenciesError) return <ErrorBox error={portDependenciesError} />;
+
   const tree = rootNodes.map(root => renderNode(root, ['入口'], new Set()));
   const orphanTree = rows.flatMap(row => (rendered.has(row.node) ? [] : [renderNode(row.node, ['孤立'], new Set())]));
 
   return (
     <>
+      {readOnly && portDependenciesError && <ErrorBox error={portDependenciesError} />}
       {showHeader && (
         <div className="toolbar" style={{ marginTop: 14 }}>
           <b>整条链规则</b>

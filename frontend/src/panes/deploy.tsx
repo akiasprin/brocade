@@ -163,6 +163,17 @@ const DP_NO = { config: '01', agent: '02' } as const;
 // 自动化授权单由权限操作或配额执行自动发起，只增删运行时的名单。
 const KIND_LABEL = { all: '全部', config: '变更单', grants: '自动化授权单' } as const;
 
+// 发布列表通常由服务端按 id 倒序返回，但基线判定不能依赖调用方排序。回滚也会产生更大的
+// 修订号，因此比较的是 deployment id（实际发生顺序），返回该次发布引用的修订。
+export function latestSuccessfulRevision(items: DeploymentListItem[]): number | null {
+  const latest = items.reduce<DeploymentListItem | null>(
+    (best, item) =>
+      item.status === 'succeeded' && (best === null || item.id > best.id) ? item : best,
+    null,
+  );
+  return latest?.revision_id ?? null;
+}
+
 function ConfigSection({ go }: { go: (d: Drill) => void }) {
   const [kind, setKind] = useState<'all' | 'config' | 'grants'>('all');
 
@@ -189,8 +200,12 @@ function ConfigSection({ go }: { go: (d: Drill) => void }) {
     enabled: current != null,
   });
 
-  if (list.isPending) return <Loading />;
-  if (list.error) return <ErrorBox error={list.error} />;
+  // 历史、当前活动单和当前修订共同决定本段按钮是否可用。缺一项时继续渲染会把“未知”
+  // 误当成“没有活动发布”或“已收敛”。
+  if (list.isPending || all.isPending || revisions.isPending) return <Loading />;
+  if (list.error || all.error || revisions.error) {
+    return <ErrorBox error={list.error ?? all.error ?? revisions.error} />;
+  }
 
   const items = list.data.deployments;
   const activeOf = (k: 'config' | 'grants') => (all.data?.deployments ?? []).find(d => d.active && d.kind === k);
@@ -203,7 +218,11 @@ function ConfigSection({ go }: { go: (d: Drill) => void }) {
             两类发布的忙闲状态排在其后——它们已有更显著的表达方式（进行中的发布会
             置顶为一张卡），此处只在确实有进行中的发布时才显示。 */}
         <span className="hint">
-          {verify.data?.summary.changed_targets ? (
+          {current == null ? (
+            '还没有可发布修订'
+          ) : verify.error ? (
+            '待发布状态读取失败'
+          ) : verify.data?.summary.changed_targets ? (
             <>
               <b>{verify.data.summary.changed_targets} 台</b> 待发布
               {current != null && ` · 修订 ${current}`}
@@ -241,11 +260,12 @@ function ConfigSection({ go }: { go: (d: Drill) => void }) {
           ))}
         </select>
         <PlanButton
-          pending={verify.isPending}
+          pending={current == null || verify.isPending || !!verify.error}
           changed={verify.data?.summary.changed_targets}
           onClick={() => go({ p: 'plan', key: randomKey() })}
         />
       </header>
+      {verify.error && <ErrorBox error={verify.error} />}
       {/* 进行中的发布置顶：本页的三项内容中只有它有时效性。
           它同时保留在下方的历史记录中——历史记录按时间排列，此处表示当前状态。 */}
       {items
@@ -525,9 +545,7 @@ function PlanPreview({
   });
   // 基线为最近一次成功发布对应的修订。按发布 id 排序（即时间顺序），不按修订号排序：
   // 回滚发布的修订号高于它回滚的那些，按修订号排序会将基线定位到更早的模型。
-  const publishedBase = (deployments.data?.deployments ?? [])
-    .filter(d => d.status === 'succeeded')
-    .reduce<number | null>((best, d) => (best === null ? d.revision_id : best), null);
+  const publishedBase = latestSuccessfulRevision(deployments.data?.deployments ?? []);
   /* 该区间内存在仍然有效的发布时不能丢弃——服务端使用同一判定。 */
   const blockedByDeployment =
     publishedBase != null &&
@@ -559,7 +577,10 @@ function PlanPreview({
     },
   });
 
-  if (!target || plan.isPending) return <Loading />;
+  if (revisions.isPending || deployments.isPending || !target || plan.isPending) return <Loading />;
+  if (revisions.error || deployments.error) {
+    return <ErrorBox error={revisions.error ?? deployments.error} />;
+  }
 
   return (
     <>
@@ -677,7 +698,7 @@ function PlanPreview({
               onCancel={() => setAskAbort(false)}
             />
           )}
-          {create.error && <ErrorBox error={create.error} />}
+          {(create.error || abort.error) && <ErrorBox error={create.error ?? abort.error} />}
         </>
       )}
     </>
@@ -743,12 +764,13 @@ function ArtifactChanges({
   targets: { node_id: string }[];
 }) {
   const nameOf = useNodeNames();
-  const { list, changed, known } = useRevisionDiff(revision, base);
+  const { list, changed, known, pending, error } = useRevisionDiff(revision, base);
 
   if (base == null) {
     return <div className="callout">第一次发布，没有可比的上一版。完整内容见右侧产物栏。</div>;
   }
-  if (!known) return <Loading />;
+  if (error) return <ErrorBox error={error} />;
+  if (pending || !known) return <Loading />;
 
   // 按机器筛选而非按产物类型筛选：这些机器上与基线不同的全部列出，包括 grants.json-rpc。
   // 它是运行时的名单，两类发布都可能包含——重启 xray 后需要重新加载该名单。
@@ -1121,6 +1143,8 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                     t={t}
                     publisher={publisher}
                     system={can(who.role, 'system') && !isolate.isPending}
+                    retryPending={retry.isPending}
+                    retrying={retry.isPending && retry.variables === t.node_id}
                     onRetry={() => retry.mutate(t.node_id)}
                     onIsolate={() => isolate.mutate(t)}
                   />
@@ -1344,12 +1368,16 @@ function TargetRow({
   t,
   publisher,
   system,
+  retryPending,
+  retrying,
   onRetry,
   onIsolate,
 }: {
   t: DeploymentTargetDetail;
   publisher: boolean;
   system: boolean;
+  retryPending: boolean;
+  retrying: boolean;
   onRetry: () => void;
   onIsolate: () => void;
 }) {
@@ -1375,8 +1403,8 @@ function TargetRow({
         </td>
         <td>
           {t.status.startsWith('failed') && (
-            <button className="btn" disabled={!publisher} onClick={onRetry}>
-              retry
+            <button className="btn" disabled={!publisher || retryPending} onClick={onRetry}>
+              {retrying ? 'retrying…' : 'retry'}
             </button>
           )}
           {ISOLATABLE_TARGET.has(t.status) && (

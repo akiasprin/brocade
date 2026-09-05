@@ -390,6 +390,9 @@ function RawSamples() {
         <span className="src">最近 100 条 · 含中继跳</span>
       </summary>
       <div className="raw-bd">
+        {(tenants.error || users.error || nodes.error) && (
+          <ErrorBox error={tenants.error ?? users.error ?? nodes.error} />
+        )}
         <div className="toolbar">
           <select
             className="f"

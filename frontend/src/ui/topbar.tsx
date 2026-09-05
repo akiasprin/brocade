@@ -66,10 +66,32 @@ function RevisionBadge() {
     wm.open('diag', '诊断', { w: 560, h: 320 });
   };
 
-  if (current === undefined) {
+  if (revisions.error) {
+    return (
+      <button id="revbadge" onClick={open} title="点开查看错误">
+        <span className="err">修订读取失败</span>
+      </button>
+    );
+  }
+  if (revisions.isPending) {
     return (
       <button id="revbadge" onClick={open}>
         <span className="dim">修订 …</span>
+      </button>
+    );
+  }
+  if (current === undefined) {
+    return (
+      <button id="revbadge" onClick={open}>
+        <span className="dim">暂无修订</span>
+      </button>
+    );
+  }
+  if (compile.error) {
+    return (
+      <button id="revbadge" onClick={open} title="点开查看错误">
+        <span>R{current}</span>
+        <span className="err">编译读取失败</span>
       </button>
     );
   }

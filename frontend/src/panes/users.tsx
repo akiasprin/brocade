@@ -179,6 +179,10 @@ function NewUser({ go }: { go: (d: Drill) => void }) {
     },
   });
 
+  // 租户决定写入目标，用户列表决定本地查重；任一份尚未就绪时都不能把表单当成可提交。
+  if (tenants.isPending || users.isPending) return <Loading />;
+  if (tenants.error || users.error) return <ErrorBox error={tenants.error ?? users.error} />;
+
   // 服务端会拒绝（required_slug / ensure_user_missing），但那是一次往返之后返回的错误文本。
   // 这两项校验用已有数据即可在本地完成，无需先提交一次。
   // user.dup 只在单个租户内查重：同名不同租户是允许的。
@@ -267,7 +271,7 @@ const toGiB = (n: number) => Number((n / GiB).toFixed(3));
 // 一个线路一个指标列，显示已用量、额度和剩余量。
 // 进度条仅在设置了额度时显示：未设额度时不存在用尽的概念，显示一条空槽会被误读为
 // 用量为零，而实际含义是不限量。
-function QuotaRow({
+export function QuotaRow({
   app,
   used,
   limit,
@@ -277,20 +281,30 @@ function QuotaRow({
   onSave,
 }: {
   app: SnapshotApp;
-  used: number;
+  used: number | null;
   limit: number | null;
   over: boolean;
   editable: boolean;
   busy: boolean;
-  onSave: (limit: number | null) => void;
+  onSave: (limit: number | null) => Promise<unknown>;
 }) {
   const [draftValue, setDraftValue] = useState<string | null>(null);
   const editing = draftValue !== null;
-  const pct = limit ? Math.min(100, (used / limit) * 100) : 0;
+  const pct = limit && used !== null ? Math.min(100, (used / limit) * 100) : null;
 
   if (editing) {
     const n = Number(draftValue.trim());
     const bad = draftValue.trim() !== '' && (!Number.isFinite(n) || n <= 0);
+    const submit = async () => {
+      if (bad || busy) return;
+      try {
+        await onSave(draftValue.trim() === '' ? null : Math.round(n * GiB));
+        // 只有服务端确认保存后才退出编辑。失败时保留输入，方便修正或重试。
+        setDraftValue(null);
+      } catch {
+        // mutation.error 由父组件显示；这里仅阻止 rejected promise 变成未处理异常。
+      }
+    };
     return (
       <div className="qta-r">
         <span className="qta-head">
@@ -302,32 +316,30 @@ function QuotaRow({
         <input
           className="f qta-in"
           autoFocus
+          disabled={busy}
           value={draftValue}
           placeholder="留空 = 不限"
           onChange={e => setDraftValue(e.target.value)}
           onKeyDown={e => {
-            if (e.key === 'Escape') setDraftValue(null);
-            if (e.key === 'Enter' && !bad) {
-              onSave(draftValue.trim() === '' ? null : Math.round(n * GiB));
-              setDraftValue(null);
+            if (e.key === 'Escape' && !busy) setDraftValue(null);
+            if (e.key === 'Enter' && !bad && !busy) {
+              e.preventDefault();
+              void submit();
             }
           }}
         />
         <span className="qta-acts">
           <span className="qta-u">GiB</span>
           <span className="sp" />
-          <button className="btn" onClick={() => setDraftValue(null)}>
+          <button className="btn" disabled={busy} onClick={() => setDraftValue(null)}>
             取消
           </button>
           <button
             className="btn primary"
             disabled={bad || busy}
-            onClick={() => {
-              onSave(draftValue.trim() === '' ? null : Math.round(n * GiB));
-              setDraftValue(null);
-            }}
+            onClick={() => void submit()}
           >
-            保存
+            {busy ? '保存中…' : '保存'}
           </button>
         </span>
       </div>
@@ -344,10 +356,10 @@ function QuotaRow({
       </span>
       <span className="qta-measures">
         <small>本月已用</small>
-        <strong>{bytes(used)}</strong>
+        <strong>{used === null ? '—' : bytes(used)}</strong>
         <span className="qta-cap">{limit === null ? '不限额度' : `/ ${bytes(limit)}`}</span>
       </span>
-      {limit !== null && (
+      {limit !== null && pct !== null && used !== null && (
         <span className="qta-t" title={`${pct.toFixed(0)}%`}>
           <i style={{ width: `${used > 0 ? Math.max(1, pct) : 0}%` }} />
         </span>
@@ -355,6 +367,11 @@ function QuotaRow({
       <span className={`qta-meta${over ? ' over' : ''}${limit === null ? ' unlimited' : ''}`}>
         {limit === null ? (
           '未设置月度额度'
+        ) : used === null ? (
+          <>
+            <span>本月用量未知</span>
+            <span>额度 {bytes(limit)}</span>
+          </>
         ) : over ? (
           <>
             <span>额度已用尽</span>
@@ -362,7 +379,7 @@ function QuotaRow({
           </>
         ) : (
           <>
-            <span>{pct.toFixed(0)}%</span>
+            <span>{pct?.toFixed(0)}%</span>
             <span>剩余 {bytes(limit - used)}</span>
           </>
         )}
@@ -970,11 +987,13 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
     onSuccess: () => qc.invalidateQueries({ queryKey: ['quotas'] }),
   });
 
-  if (users.isPending || snapshot.isPending || (who.role === 'user' && me.isPending)) {
+  if (users.isPending || snapshot.isPending || quotas.isPending || (who.role === 'user' && me.isPending)) {
     return <Loading sheeted={sheeted} />;
   }
   if (users.error) return <ErrorBox error={users.error} />;
   if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  // 额度缺失不能回退成“不限量”：那会把读取失败显示成一个有效、且风险相反的配置。
+  if (quotas.error) return <ErrorBox error={quotas.error} />;
   if (me.error) return <ErrorBox error={me.error} />;
 
   const apps: SnapshotApp[] = snapshot.data.snapshot.apps ?? [];
@@ -1033,9 +1052,10 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
       .map(a => {
         const key = `${u.tenant_id}/${u.id}/${a.id}`;
         const row = usageByView.get(key);
-        const used = row ? row.uplink_bytes + row.downlink_bytes : 0;
+        // 月用量是可选观测；读取失败时显示未知，绝不能把未知当成 0 后再算出“额度充足”。
+        const used = monthly.isPending || monthly.error ? null : row ? row.uplink_bytes + row.downlink_bytes : 0;
         const limit = quotaByView.get(key) ?? null;
-        return { app: a, used, limit, over: limit !== null && used >= limit };
+        return { app: a, used, limit, over: limit !== null && used !== null && used >= limit };
       });
   };
 
@@ -1300,7 +1320,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                       over={q.over}
                       editable={editable}
                       busy={quota.isPending}
-                      onSave={limit => quota.mutate({ user: u, app: q.app.id, limit })}
+                      onSave={limit => quota.mutateAsync({ user: u, app: q.app.id, limit })}
                     />
                   ))}
                 </div>
@@ -1379,8 +1399,8 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
      避免一条跨栏标题把名册读成详情的附属筛选器。 */
   const body = (
     <>
-      {(grant.error || profile.error || login.error || status.error || rotate.error) && (
-        <ErrorBox error={grant.error ?? profile.error ?? login.error ?? status.error ?? rotate.error} />
+      {(grant.error || profile.error || login.error || status.error || rotate.error || quota.error) && (
+        <ErrorBox error={grant.error ?? profile.error ?? login.error ?? status.error ?? rotate.error ?? quota.error} />
       )}
       {list.length === 0 ? (
         <section className="panel titled user-list-panel user-empty-panel">
@@ -1461,9 +1481,9 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                         ? '可用'
                         : '未授权';
                 // 细条取各线路中最接近额度的一条；未设置额度时不显示。
-                const limited = quotaRows.filter(q => q.limit !== null);
+                const limited = quotaRows.filter(q => q.limit !== null && q.used !== null);
                 const maxPct = limited.length
-                  ? Math.min(100, Math.max(...limited.map(q => (q.used / (q.limit as number)) * 100)))
+                  ? Math.min(100, Math.max(...limited.map(q => ((q.used as number) / (q.limit as number)) * 100)))
                   : null;
                 return (
                   <button

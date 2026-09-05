@@ -6727,6 +6727,7 @@ select.f.words {
 }
 /* 链路开关：选中一条时其余降低对比度 */
 .topo-legend .chip {
+  appearance: none;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -6734,6 +6735,7 @@ select.f.words {
   padding: 3px 10px;
   border-radius: 6px;
   border: 1px solid transparent;
+  background: transparent;
   transition:
     border-color 0.2s,
     color 0.2s,

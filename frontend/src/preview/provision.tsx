@@ -100,6 +100,9 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
     },
   });
 
+  if (tenants.isPending || existingNodes.isPending) return <Loading />;
+  if (tenants.error || existingNodes.error) return <ErrorBox error={tenants.error ?? existingNodes.error} />;
+
   const ready = !!form.id.trim() && !idInvalid && !idTaken && !!tenantId;
 
   return (
@@ -298,6 +301,9 @@ function PreviewInstall({
   const verify = useMutation({
     mutationFn: () => previewVerifySubscription({ tenant_id: tenant, user_id: userId }),
   });
+
+  if (nodes.isPending || revisions.isPending) return <Loading />;
+  if (nodes.error || revisions.error) return <ErrorBox error={nodes.error ?? revisions.error} />;
 
   return (
     <>

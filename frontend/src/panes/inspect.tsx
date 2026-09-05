@@ -18,8 +18,10 @@ export function InspectPane({ kind, id }: { kind: string; id: string }) {
     enabled: !!current,
   });
 
-  if (!current || compile.isPending) return <Loading />;
-  if (compile.error) return <ErrorBox error={compile.error} />;
+  if (revisions.isPending || (current != null && compile.isPending)) return <Loading />;
+  if (revisions.error || compile.error) return <ErrorBox error={revisions.error ?? compile.error} />;
+  if (!current) return <Empty>还没有可检视的修订。</Empty>;
+  if (!compile.data) return <ErrorBox error={new Error('编译结果没有返回内容')} />;
 
   const system = compile.data.system as SystemIr;
   const apps = (compile.data.apps as AppIr[]) ?? [];

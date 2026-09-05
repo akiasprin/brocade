@@ -85,8 +85,10 @@ export function OperatorsPane() {
     onSuccess: refresh,
   });
 
-  if (operators.isPending) return <Loading />;
-  if (operators.error) return <ErrorBox error={operators.error} />;
+  // 新操作者的 scope 来自租户列表。租户尚未读到或读取失败时不能用空列表继续渲染，
+  // 否则界面会显示一张可提交、但必然把 scope 提交为空的表单。
+  if (operators.isPending || tenants.isPending) return <Loading />;
+  if (operators.error || tenants.error) return <ErrorBox error={operators.error ?? tenants.error} />;
 
   const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
   const defaultScope = tenantOptions.find(t => t.id === who.tenant_scope)?.id ?? tenantOptions[0]?.id ?? '';

@@ -35,7 +35,7 @@ import {
 import { Pane } from '../panes';
 import { LinksPane } from '../panes/links';
 import { TopoCanvas } from '../topo/canvas';
-import { Loading } from '../ui/bits';
+import { ErrorBox, Loading } from '../ui/bits';
 import { useNarrow } from '../ui/viewport';
 import { artifactPanel } from '../ui/artifact-panel';
 import { DiagTable } from '../ui/diag-table';
@@ -192,7 +192,13 @@ export function ForgeShell({
     refetchInterval: 5_000,
   });
 
-  const { list, changed, dirty } = useChangedArtifacts(current, prev);
+  const {
+    list,
+    changed,
+    dirty,
+    pending: artifactsPending,
+    error: artifactsError,
+  } = useChangedArtifacts(current, prev);
   const draftBlast = useMemo(() => blastRadius(list, changed), [list, changed]);
   const pendingTargets = dirty ? undefined : verify.data?.summary.changed_targets;
   const diagnostics = visibleDiagnostics(compile.data?.diagnostics);
@@ -210,13 +216,20 @@ export function ForgeShell({
   const grantRuntime = compactGrantAutomation(grantAutomation.data, grantAutomation.isPending, !!grantAutomation.error);
   // 面包屑只留一段短状态：需要人工介入和失败优先，安静时才显示队列健康。
   // 修订号由相邻的 Rn 只显示一次，避免“已收敛到修订 n · 修订 n”。
-  const crumbRuntime: RuntimeCrumbState = dirty
-    ? {
-        text: draftBlast.size ? `草稿 · ${draftBlast.size} 台` : '草稿 · 无产物变更',
-        tone: draftBlast.size ? 'hot' : 'normal',
-        title: draftBlast.size ? [...draftBlast].join(', ') : undefined,
-      }
-    : verify.isPending
+  const runtimeReadError = revisions.error ?? compile.error;
+  const crumbRuntime: RuntimeCrumbState = runtimeReadError
+    ? { text: revisions.error ? '修订状态未知' : '编译状态未知', tone: 'bad' }
+    : dirty
+      ? artifactsError
+        ? { text: '草稿 · 影响范围未知', tone: 'bad' }
+        : artifactsPending
+          ? { text: '草稿 · 计算影响中', tone: 'normal' }
+          : {
+              text: draftBlast.size ? `草稿 · ${draftBlast.size} 台` : '草稿 · 无产物变更',
+              tone: draftBlast.size ? 'hot' : 'normal',
+              title: draftBlast.size ? [...draftBlast].join(', ') : undefined,
+            }
+      : verify.isPending
       ? { text: '检查中', tone: 'normal' }
       : verify.error
         ? { text: '发布状态未知', tone: 'bad' }
@@ -239,6 +252,8 @@ export function ForgeShell({
           summary={compile.data?.summary}
           diagnostics={diagnostics}
           diagNames={diagNames}
+          diagnosticsPending={revisions.isPending || (current != null && compile.isPending)}
+          diagnosticsError={runtimeReadError}
           pendingTargets={pendingTargets}
           activeDeploy={activeDeploy}
           awaitingDeploy={awaitingDeploy}
@@ -385,6 +400,8 @@ function TopBar({
   summary,
   diagnostics,
   diagNames,
+  diagnosticsPending,
+  diagnosticsError,
   pendingTargets,
   activeDeploy,
   awaitingDeploy,
@@ -400,6 +417,8 @@ function TopBar({
   diagnostics: Diagnostic[];
   /* 用于将 location 中的 id 转换为名称。查找不到时回退到 id，见 formatLocation。 */
   diagNames: DiagNames;
+  diagnosticsPending: boolean;
+  diagnosticsError: unknown;
   pendingTargets: number | undefined;
   /* 存在 active 的发布（限流锁被占用，含 halted 未收尾）时显示红色状态 */
   activeDeploy: { id: number } | undefined;
@@ -451,7 +470,13 @@ function TopBar({
 
   const diagPop = st.diag && (
     <div className="fg-pop" onClick={e => e.stopPropagation()}>
-      <DiagTable diagnostics={diagnostics} names={diagNames} />
+      {diagnosticsError ? (
+        <ErrorBox error={diagnosticsError} />
+      ) : diagnosticsPending ? (
+        <Loading />
+      ) : (
+        <DiagTable diagnostics={diagnostics} names={diagNames} />
+      )}
     </div>
   );
 
@@ -544,7 +569,9 @@ function TopBar({
               }}
             >
               <Icon of="diag" size={13} className="fg-tgl-ic" />
-              {(errors > 0 || warnings > 0) && <i className={`fg-dot${errors ? ' err' : ''}`} />}
+              {(diagnosticsError || errors > 0 || warnings > 0) && (
+                <i className={`fg-dot${diagnosticsError || errors ? ' err' : ''}`} />
+              )}
             </button>
             {diagPop}
           </div>
@@ -618,8 +645,10 @@ function TopBar({
           >
             <Icon of="diag" size={13} className="fg-tgl-ic" />
             诊断
-            {(errors > 0 || warnings > 0) && (
-              <span className={`fg-badge${errors ? ' err' : ''}`}>{errors || warnings}</span>
+            {(diagnosticsError || errors > 0 || warnings > 0) && (
+              <span className={`fg-badge${diagnosticsError || errors ? ' err' : ''}`}>
+                {diagnosticsError ? '!' : errors || warnings}
+              </span>
             )}
           </button>
           {diagPop}

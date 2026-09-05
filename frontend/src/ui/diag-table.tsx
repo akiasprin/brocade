@@ -110,7 +110,19 @@ export function DiagTable({ diagnostics, names }: { diagnostics: Diagnostic[]; n
                         </td>
                       </tr>
                     )}
-                    <tr className={`dg-r ${d.level}`} onClick={() => setOpen(open === i ? null : i)}>
+                    <tr
+                      className={`dg-r ${d.level}`}
+                      role="button"
+                      tabIndex={0}
+                      aria-expanded={open === i}
+                      onClick={() => setOpen(open === i ? null : i)}
+                      onKeyDown={event => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          setOpen(open === i ? null : i);
+                        }
+                      }}
+                    >
                       <td className="c-lv">
                         <span className="dot" />
                       </td>

@@ -70,7 +70,9 @@ export function AgentReleaseSection({ editable, no }: { editable: boolean; no: s
   });
 
   if (rel.isPending || nodes.isPending) return <Loading />;
-  if (rel.error) return <ErrorBox error={rel.error} />;
+  // 机器列表决定批准范围和“全选”的含义；读取失败时不能把空列表当成空机队，
+  // 否则一次保存会把原有范围误算成 off。
+  if (rel.error || nodes.error) return <ErrorBox error={rel.error ?? nodes.error} />;
   const view = rel.data!;
   const rows = nodes.data?.nodes ?? [];
   const allIds = rows.map(n => n.node_id);

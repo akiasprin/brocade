@@ -77,6 +77,37 @@ const ROUTES: Record<string, () => unknown> = {
   '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),
 };
 
+const certsWithGroup = () => ({
+  sealing_available: true,
+  domain: {
+    id: 'private.example',
+    domain: 'private.example',
+    dns_provider: 'cloudflare',
+    acme_directory: 'self-signed',
+    signing_method: 'self-signed',
+    acme_contact: null,
+    renew_before_days: 30,
+    has_credential: false,
+    has_account: false,
+  },
+  groups: [
+    {
+      id: 'group-1',
+      domain: 'private.example',
+      label: 'a1b2c3d4',
+      name: 'CA-1',
+      note: null,
+      status: 'active',
+      names: ['*.a1b2c3d4.private.example', 'a1b2c3d4.private.example'],
+      nodes: [],
+      certificates: [],
+    },
+  ],
+  nodes: [],
+  letsencrypt: 'https://acme',
+  letsencrypt_staging: 'https://acme-staging',
+});
+
 function stubFetch() {
   vi.stubGlobal(
     'fetch',
@@ -105,13 +136,13 @@ function ShellDraftInvalidation() {
   return null;
 }
 
-function Harness() {
+function Harness({ role = 'system-admin' }: { role?: 'system-admin' | 'editor' }) {
   const [client] = useState(
     () => new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } }),
   );
   return (
     <QueryClientProvider client={client}>
-      <SessionProvider value={SESSION}>
+      <SessionProvider value={{ who: { ...SESSION.who, role } }}>
         <ShellDraftInvalidation />
         <SettingsPane />
       </SessionProvider>
@@ -141,6 +172,82 @@ afterEach(() => {
 });
 
 describe('设置页分段保存的基准', () => {
+  it('添加备用证书期间锁住证书动作，连续点击只提交一次', async () => {
+    let resolveSpare!: (response: Response) => void;
+    const spareResponse = new Promise<Response>(resolve => {
+      resolveSpare = resolve;
+    });
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/certs/groups/group-1/spare' && init?.method === 'POST') return spareResponse;
+      const body = path === '/certs' ? certsWithGroup : ROUTES[path];
+      if (!body) throw new Error(`未预期的请求：${path}`);
+      return new Response(JSON.stringify(body()), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<Harness />);
+    const add = await screen.findByRole('button', { name: '加一张备用' });
+    fireEvent.click(add);
+    fireEvent.click(add);
+
+    await waitFor(() => {
+      const posts = fetchMock.mock.calls.filter(
+        ([path, init]) => path === '/certs/groups/group-1/spare' && init?.method === 'POST',
+      );
+      expect(posts).toHaveLength(1);
+    });
+    expect((screen.getByRole('button', { name: '添加中…' }) as HTMLButtonElement).disabled).toBe(true);
+
+    resolveSpare(
+      new Response(JSON.stringify({ id: 'spare-1' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: '加一张备用' }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it('证书组创建失败时保留表单和输入，不把失败表现成已完成', async () => {
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/certs/groups' && init?.method === 'POST') {
+        return new Response(JSON.stringify({ error: '证书组写入失败' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      const body = path === '/certs' ? certsWithGroup : ROUTES[path];
+      if (!body) throw new Error(`未预期的请求：${path}`);
+      return new Response(JSON.stringify(body()), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<Harness />);
+    fireEvent.click(await screen.findByRole('button', { name: '新建证书组' }));
+    const name = screen.getByPlaceholderText('香港前置') as HTMLInputElement;
+    fireEvent.change(name, { target: { value: '新加坡备用' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await screen.findByText(/证书组写入失败/);
+    expect(screen.getByPlaceholderText('香港前置')).toBe(name);
+    expect(name.value).toBe('新加坡备用');
+  });
+
+  it('非系统管理员看到的设置控件是真只读，不会产生无法保存的脏表单', async () => {
+    render(<Harness role="editor" />);
+
+    const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
+    expect(dest.matches(':disabled')).toBe(true);
+    expect(header('set-xray').getByRole('button', { name: '保存这一段' }).matches(':disabled')).toBe(true);
+  });
+
   it('保存一段之后该段不再显示「有未保存的改动」', async () => {
     render(<Harness />);
 

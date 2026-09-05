@@ -478,7 +478,21 @@ export function ChainWizard({
     }
   };
 
-  if (snapshot.isPending) return <Loading />;
+  // 向导的默认端口、可选机器、线路冲突、授权对象和 REALITY 站点分别来自这些查询。
+  // 任何一项失败都不能以空数组/工厂默认值继续，否则“创建成功”的结果可能少授权、撞端口
+  // 或写入错误的站点。
+  if (
+    snapshot.isPending ||
+    settings.isPending ||
+    nodes.isPending ||
+    revisions.isPending ||
+    users.isPending ||
+    (current != null && compile.isPending)
+  )
+    return <Loading />;
+  const dependencyError =
+    snapshot.error ?? settings.error ?? nodes.error ?? revisions.error ?? users.error ?? compile.error;
+  if (dependencyError) return <ErrorBox error={dependencyError} />;
 
   const ready =
     !!head &&
