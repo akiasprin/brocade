@@ -209,7 +209,9 @@ pub struct AppState {
     store: PgStore,
     geoip: crate::geoip::GeoIpLookup,
     dist: AgentDistribution,
-    subscription_public_url: Option<String>,
+    // Optional dedicated subscription origin. When absent, subscriptions follow the effective
+    // Agent public URL, including a value changed live from the settings page.
+    subscription_public_url_override: Option<String>,
     subscription_rate: Arc<Mutex<HashMap<String, SubscriptionRateWindow>>>,
     // A quota change wakes the enforcement loop immediately rather than waiting for its next
     // tick. Lowering a quota has to revoke immediately and raising one has to restore
@@ -277,6 +279,20 @@ impl AppState {
         Ok(dist)
     }
 
+    /// The subscription face normally shares the site's public origin with the Agent face. A
+    /// dedicated origin remains available for split deployments, but is an override rather than
+    /// a second mandatory setting.
+    async fn subscription_origin(&self) -> ApiResult<String> {
+        let agent_public_url = self.distribution().await?.agent_public_url;
+        resolve_subscription_origin(
+            self.subscription_public_url_override.clone(),
+            agent_public_url,
+        )
+        .ok_or(ApiError::Unavailable(
+            "BROCADE_SUBSCRIPTION_PUBLIC_URL is not configured and the Agent public URL is not a valid subscription origin",
+        ))
+    }
+
     /// Attaches the issuing worker's handle. Chained rather than passed in, because every
     /// constructor above already carries one argument that only some callers care about.
     pub fn and_cert_wake(mut self, cert_wake: Arc<Notify>) -> Self {
@@ -310,17 +326,21 @@ impl AppState {
             .ok()
             .and_then(normalize_url)
             .unwrap_or(agent_origin);
-        let subscription_public_url = env::var("BROCADE_SUBSCRIPTION_PUBLIC_URL")
+        let subscription_public_url_override = env::var("BROCADE_SUBSCRIPTION_PUBLIC_URL")
             .ok()
-            .and_then(normalize_subscription_origin)
-            // Debug/test builds keep the one-listener zero-config experience. Production must
-            // state the HTTPS public origin explicitly; otherwise the admin endpoint answers 503
-            // instead of handing out a loopback or internal URL.
-            .or_else(|| cfg!(debug_assertions).then(|| agent_public_url.clone()));
+            .and_then(|url| {
+                let origin = normalize_subscription_origin(url);
+                if origin.is_none() {
+                    eprintln!(
+                        "忽略 BROCADE_SUBSCRIPTION_PUBLIC_URL：生产订阅入口必须使用 HTTPS（本地 debug 仅允许 localhost）"
+                    );
+                }
+                origin
+            });
         Self {
             store,
             geoip: crate::geoip::GeoIpLookup::default(),
-            subscription_public_url,
+            subscription_public_url_override,
             subscription_rate: Arc::new(Mutex::new(HashMap::new())),
             quota_wake,
             grants_wake: Arc::new(Notify::new()),
@@ -2973,12 +2993,7 @@ async fn clash_subscription_info_response(
     tenant_id: &str,
     user_id: &str,
 ) -> ApiResult<Response> {
-    let origin = state
-        .subscription_public_url
-        .as_deref()
-        .ok_or(ApiError::Unavailable(
-            "BROCADE_SUBSCRIPTION_PUBLIC_URL is not configured",
-        ))?;
+    let origin = state.subscription_origin().await?;
     let subscription = state
         .store
         .clash_subscription_for_user(admin, tenant_id, user_id)
@@ -2992,7 +3007,7 @@ async fn clash_subscription_info_response(
         url: url.clone(),
         urls: clash_subscription_urls(url),
         template: "SubBoost 标准版",
-        haitun: clash_haitun_subscription_info(origin, haitun.as_ref()),
+        haitun: clash_haitun_subscription_info(&origin, haitun.as_ref()),
         remaining_bytes: subscription.usage.remaining_bytes,
         reset_at: subscription.usage.reset_at,
         usage_has_gap: subscription.usage.has_gap,
@@ -3023,12 +3038,7 @@ async fn issue_clash_haitun_subscription_response(
     tenant_id: &str,
     user_id: &str,
 ) -> ApiResult<Response> {
-    let origin = state
-        .subscription_public_url
-        .as_deref()
-        .ok_or(ApiError::Unavailable(
-            "BROCADE_SUBSCRIPTION_PUBLIC_URL is not configured",
-        ))?;
+    let origin = state.subscription_origin().await?;
     // Do not mint a bearer that can only return 404. This performs the same serving-model and
     // effective-entry checks as opening the normal Clash subscription.
     state
@@ -3039,7 +3049,7 @@ async fn issue_clash_haitun_subscription_response(
         .store
         .issue_clash_haitun_link(admin, tenant_id, user_id)
         .await?;
-    Ok(Json(clash_haitun_subscription_info(origin, Some(&link))).into_response())
+    Ok(Json(clash_haitun_subscription_info(&origin, Some(&link))).into_response())
 }
 
 async fn revoke_self_clash_haitun_subscription(
@@ -4815,11 +4825,17 @@ fn normalize_subscription_origin(url: String) -> Option<String> {
     {
         Some(url)
     } else {
-        eprintln!(
-            "忽略 BROCADE_SUBSCRIPTION_PUBLIC_URL：生产订阅入口必须使用 HTTPS（本地 debug 仅允许 localhost）"
-        );
         None
     }
+}
+
+fn resolve_subscription_origin(
+    dedicated_origin: Option<String>,
+    agent_public_url: String,
+) -> Option<String> {
+    dedicated_origin
+        .and_then(normalize_subscription_origin)
+        .or_else(|| normalize_subscription_origin(agent_public_url))
 }
 
 /// Which credential the install command carries: a one-time enrollment token for a first
@@ -4997,13 +5013,42 @@ mod tests {
 
     use super::{
         bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
-        looks_like_uuid, public_may, require_grant_probe_user_access, route_from_headers,
-        safe_filename_slug, session_cookie, user_may, AgentDistribution, ApiError,
-        ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery, SubscriptionProtocol,
-        BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS,
-        EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
+        looks_like_uuid, public_may, require_grant_probe_user_access, resolve_subscription_origin,
+        route_from_headers, safe_filename_slug, session_cookie, user_may, AgentDistribution,
+        ApiError, ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery,
+        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
+        DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS, EMBEDDED_XRAYS, INSTALL_SCRIPT,
+        SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
+
+    #[test]
+    fn subscription_origin_prefers_dedicated_origin() {
+        assert_eq!(
+            resolve_subscription_origin(
+                Some("https://subscriptions.example".to_owned()),
+                "https://console.example".to_owned(),
+            )
+            .as_deref(),
+            Some("https://subscriptions.example")
+        );
+    }
+
+    #[test]
+    fn subscription_origin_falls_back_to_agent_public_url() {
+        assert_eq!(
+            resolve_subscription_origin(None, "https://console.example/".to_owned()).as_deref(),
+            Some("https://console.example")
+        );
+    }
+
+    #[test]
+    fn subscription_origin_rejects_non_local_plain_http() {
+        assert_eq!(
+            resolve_subscription_origin(None, "http://console.example".to_owned()),
+            None
+        );
+    }
 
     #[test]
     fn machine_load_query_accepts_absolute_and_window_modes() {
