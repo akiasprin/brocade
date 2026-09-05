@@ -69,7 +69,7 @@ async fn fallback_guard_round_trips() {
             anytls: None,
             hysteria2: None,
         },
-        id: "i-main".to_owned(),
+        id: "i-bacemu".to_owned(),
         chain_id: "c-main".to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
