@@ -212,12 +212,12 @@ const NAV: NavItem[] = [
   { id: 'set-branding', no: '01', label: '站点外观', apply: 'now' },
   { id: 'set-visitor', no: '02', label: '访客模式', apply: 'now' },
   { id: 'set-dist', no: '03', label: '分发', apply: 'now' },
-  { id: 'set-cert', no: '04', label: '证书', apply: 'now' },
-  { id: 'set-xray', no: '05', label: 'XRAY', apply: 'publish', key: 'xray' },
-  { id: 'set-conn', no: '06', label: '连接策略', apply: 'publish', key: 'connection' },
-  { id: 'set-wg', no: '07', label: 'WireGuard', apply: 'publish', key: 'wireguard' },
-  { id: 'set-ports', no: '08', label: '端口分配', apply: 'publish', key: 'ports' },
-  { id: 'set-agent-logs', no: '09', label: '日志保留', apply: 'cycle' },
+  { id: 'set-agent-logs', no: '04', label: '日志保留', apply: 'cycle' },
+  { id: 'set-cert', no: '05', label: '证书', apply: 'now' },
+  { id: 'set-xray', no: '06', label: 'XRAY', apply: 'publish', key: 'xray' },
+  { id: 'set-conn', no: '07', label: '连接策略', apply: 'publish', key: 'connection' },
+  { id: 'set-wg', no: '08', label: 'WireGuard', apply: 'publish', key: 'wireguard' },
+  { id: 'set-ports', no: '09', label: '端口分配', apply: 'publish', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
   { id: 'set-probe', no: '10', label: '端到端探测', apply: 'cycle', key: 'probe' },
   { id: 'set-ping-probe', no: '11', label: 'Ping 链路探测', apply: 'cycle' },
@@ -252,6 +252,8 @@ function SettingsSaveBar({
   label?: string;
   onSave: () => void;
 }) {
+  if (!dirty) return null;
+
   return (
     <footer className="settings-savebar">
       <span
@@ -1444,9 +1446,6 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
           <span className="hint">管理员和用户登录不受影响</span>
         </Fld>
       </Group>
-      <footer className="settings-savebar passive">
-        <span className="settings-save-state">切换后立即生效，无需另存</span>
-      </footer>
     </section>
   );
 }
@@ -2107,62 +2106,14 @@ export function SettingsPane() {
   });
 
   return (
-    <div className="cardpage settings-page">
-      <header className="settings-hero">
-        <div>
-          <p className="eyebrow">SYSTEM</p>
-          <h2>系统设置</h2>
-          <p>按影响范围分区管理。每张卡片独立保存，保存后的生效方式写在标题旁。</p>
-        </div>
-        <nav aria-label="设置分区">
-          {[
-            ['set-branding', '控制台与访问'],
-            ['set-cert', '证书与节点'],
-            ['set-xray', '网络默认值'],
-            ['set-agent-logs', '观测与维护'],
-          ].map(([id, label]) => (
-            <button
-              type="button"
-              key={id}
-              onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
-      </header>
+    <div className="cardpage">
       {/* 非 system-admin 仍可查看实际配置，但整页必须是真正的只读控件。此前只禁用了
           保存按钮，输入框和分段开关仍能改出一份永远无法保存的“脏”表单。 */}
       <fieldset disabled={!editable} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
-        <div className="settings-grid">
-          <div className="settings-chapter control">
-            <span>01</span>
-            <div>
-              <h3>控制台与访问</h3>
-              <p>站点身份、访客权限，以及节点如何找到控制面</p>
-            </div>
-          </div>
-          <div className="settings-chapter certificates">
-            <span>02</span>
-            <div>
-              <h3>证书与节点</h3>
-              <p>签发策略、证书组、轮换队列与机器同步状态</p>
-            </div>
-          </div>
-          <div className="settings-chapter network">
-            <span>03</span>
-            <div>
-              <h3>网络默认值</h3>
-              <p>接入协议、连接行为、Overlay 与新建端口的默认配置</p>
-            </div>
-          </div>
-          <div className="settings-chapter operations">
-            <span>04</span>
-            <div>
-              <h3>观测与维护</h3>
-              <p>日志、链路探测，以及规则库的更新计划</p>
-            </div>
-          </div>
+        <div className="duo">
+          {/* 两栏各自成流，不对齐底部。分段位置按高度定——证书段带着
+            机队列表，单它一段就抵得上右栏的两段，与它同栏的只能是最短的那两段。
+            编号仍从上到下、从左到右连续。 */}
           <div className="col">
             {save.error && <ErrorBox error={save.error} />}
 

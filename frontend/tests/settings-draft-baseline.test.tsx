@@ -180,22 +180,16 @@ afterEach(() => {
 });
 
 describe('设置页分段保存的基准', () => {
-  it('分区导航只滚动页面且保存动作位于卡片底部', async () => {
-    const scrollIntoView = vi.fn();
-    const previous = Element.prototype.scrollIntoView;
-    Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView });
-    window.location.hash = '#/settings';
+  it('保存动作默认隐藏，有改动后才出现在卡片底部', async () => {
+    render(<Harness />);
+    const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
+    const xray = document.getElementById('set-xray')!;
 
-    try {
-      render(<Harness />);
-      fireEvent.click(await screen.findByRole('button', { name: '网络默认值' }));
+    expect(section('set-xray').queryByRole('button', { name: '保存这一段' })).toBeNull();
+    fireEvent.change(dest, { target: { value: 'www.edited.example:443' } });
 
-      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
-      expect(window.location.hash).toBe('#/settings');
-      expect(document.getElementById('set-xray')?.lastElementChild?.classList.contains('settings-savebar')).toBe(true);
-    } finally {
-      Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: previous });
-    }
+    expect(section('set-xray').getByRole('button', { name: '保存这一段' })).toBeTruthy();
+    expect(xray.lastElementChild?.classList.contains('settings-savebar')).toBe(true);
   });
 
   it('自签模式隐藏全局域名输入并说明百年随机身份', async () => {
@@ -309,7 +303,7 @@ describe('设置页分段保存的基准', () => {
 
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
     expect(dest.matches(':disabled')).toBe(true);
-    expect(section('set-xray').getByRole('button', { name: '保存这一段' }).matches(':disabled')).toBe(true);
+    expect(section('set-xray').queryByRole('button', { name: '保存这一段' })).toBeNull();
   });
 
   it('保存一段之后该段不再显示「有未保存的改动」', async () => {
