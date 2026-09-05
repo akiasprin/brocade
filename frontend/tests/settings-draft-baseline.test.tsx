@@ -152,11 +152,11 @@ function Harness({ role = 'system-admin' }: { role?: 'system-admin' | 'editor' }
   );
 }
 
-/** 段标题栏。段内的「保存这一段」「有未保存的改动」都在它里面。 */
-const header = (id: string) => {
+/** 设置段。状态与保存动作位于段尾，查询范围应覆盖整张卡片。 */
+const section = (id: string) => {
   const section = document.getElementById(id);
   if (!section) throw new Error(`没有找到设置段 ${id}`);
-  return within(section.querySelector('header') as HTMLElement);
+  return within(section);
 };
 
 const settingsOp = () => draft.ops().find(op => op.op === 'update_settings');
@@ -180,6 +180,24 @@ afterEach(() => {
 });
 
 describe('设置页分段保存的基准', () => {
+  it('分区导航只滚动页面且保存动作位于卡片底部', async () => {
+    const scrollIntoView = vi.fn();
+    const previous = Element.prototype.scrollIntoView;
+    Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView });
+    window.location.hash = '#/settings';
+
+    try {
+      render(<Harness />);
+      fireEvent.click(await screen.findByRole('button', { name: '网络默认值' }));
+
+      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+      expect(window.location.hash).toBe('#/settings');
+      expect(document.getElementById('set-xray')?.lastElementChild?.classList.contains('settings-savebar')).toBe(true);
+    } finally {
+      Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: previous });
+    }
+  });
+
   it('自签模式隐藏全局域名输入并说明百年随机身份', async () => {
     ROUTES['/certs'] = certsWithGroup;
     render(<Harness />);
@@ -214,7 +232,7 @@ describe('设置页分段保存的基准', () => {
     const add = await screen.findByRole('button', { name: '加一张备用' });
     expect((add as HTMLButtonElement).disabled).toBe(true);
     expect(add.getAttribute('title')).toContain('最多 10 张');
-    expect(screen.getByText('证书池 10/10')).toBeTruthy();
+    expect(screen.getByLabelText('证书组概况').textContent).toContain('10/10证书池');
     expect((screen.getByRole('button', { name: '改名' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
@@ -291,7 +309,7 @@ describe('设置页分段保存的基准', () => {
 
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
     expect(dest.matches(':disabled')).toBe(true);
-    expect(header('set-xray').getByRole('button', { name: '保存这一段' }).matches(':disabled')).toBe(true);
+    expect(section('set-xray').getByRole('button', { name: '保存这一段' }).matches(':disabled')).toBe(true);
   });
 
   it('保存一段之后该段不再显示「有未保存的改动」', async () => {
@@ -301,9 +319,9 @@ describe('设置页分段保存的基准', () => {
     expect(dest.value).toBe('www.committed.example:443');
 
     fireEvent.change(dest, { target: { value: 'www.edited.example:443' } });
-    expect(header('set-xray').getByText('有未保存的改动')).toBeTruthy();
+    expect(section('set-xray').getByText('有未保存的改动')).toBeTruthy();
 
-    fireEvent.click(header('set-xray').getByText('保存这一段'));
+    fireEvent.click(section('set-xray').getByText('保存这一段'));
 
     /* 改动确实进了草稿 */
     await waitFor(() =>
@@ -311,7 +329,7 @@ describe('设置页分段保存的基准', () => {
     );
 
     /* 但基准仍是 GET /settings 的已提交值，该段会一直自认为有未保存的改动 */
-    await waitFor(() => expect(header('set-xray').queryByText('有未保存的改动')).toBeNull());
+    await waitFor(() => expect(section('set-xray').queryByText('有未保存的改动')).toBeNull());
   });
 
   it('保存另一段不会把前一段已入草稿的改动写回旧值', async () => {
@@ -319,7 +337,7 @@ describe('设置页分段保存的基准', () => {
 
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
     fireEvent.change(dest, { target: { value: 'www.edited.example:443' } });
-    fireEvent.click(header('set-xray').getByText('保存这一段'));
+    fireEvent.click(section('set-xray').getByText('保存这一段'));
     await waitFor(() =>
       expect(settingsOp()).toMatchObject({ settings: { reality_site: { dest: 'www.edited.example:443' } } }),
     );
@@ -327,7 +345,7 @@ describe('设置页分段保存的基准', () => {
     /* 再改另一段并保存。两段互不相干，前一段已经在草稿里，不应被这次保存覆盖回去。 */
     const hopBase = (await screen.findByDisplayValue('20000')) as HTMLInputElement;
     fireEvent.change(hopBase, { target: { value: '20100' } });
-    fireEvent.click(header('set-ports').getByText('保存这一段'));
+    fireEvent.click(section('set-ports').getByText('保存这一段'));
 
     await waitFor(() => expect(settingsOp()).toMatchObject({ settings: { ports: { hop_base: 20100 } } }));
     expect(settingsOp()).toMatchObject({ settings: { reality_site: { dest: 'www.edited.example:443' } } });
@@ -344,7 +362,7 @@ describe('设置页分段保存的基准', () => {
     fireEvent.change(dest, { target: { value: 'www.edited.example:443' } });
     fireEvent.change(hopBase, { target: { value: '20100' } });
 
-    fireEvent.click(header('set-xray').getByText('保存这一段'));
+    fireEvent.click(section('set-xray').getByText('保存这一段'));
 
     await waitFor(() =>
       expect(settingsOp()).toMatchObject({ settings: { reality_site: { dest: 'www.edited.example:443' } } }),
@@ -353,6 +371,6 @@ describe('设置页分段保存的基准', () => {
     expect(settingsOp()).toMatchObject({ settings: { ports: { hop_base: 20000 } } });
     /* 但输入框里的值要留着，并且该段仍标为有未保存的改动 */
     expect(hopBase.value).toBe('20100');
-    expect(header('set-ports').getByText('有未保存的改动')).toBeTruthy();
+    expect(section('set-ports').getByText('有未保存的改动')).toBeTruthy();
   });
 });
