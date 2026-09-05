@@ -187,10 +187,17 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	// RTT without proving that the destination is reachable. Rejections remain
 	// asynchronous and close only this stream in the session read loop.
 	s.streamsMu.Lock()
+	// close marks the session before it takes streamsMu. Registering and incrementing under the
+	// same lock lets close either reject this stream or clear both pieces of state afterwards;
+	// neither the map entry nor activeStreams can reappear after close has reset them.
+	if s.isClosed() {
+		s.streamsMu.Unlock()
+		return nil, errSessionClosed
+	}
 	s.streams[st.sid] = st
-	s.streamsMu.Unlock()
 	s.activeStreams.Add(1)
 	s.inIdlePool.Store(false)
+	s.streamsMu.Unlock()
 
 	var frames buf.MultiBuffer
 	addrBuf := buf.New()

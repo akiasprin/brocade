@@ -733,6 +733,18 @@ func TestSessionFinishStreamIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestClosedSessionCannotAcceptANewPeerStream(t *testing.T) {
+	s, _ := newWireSession(nil, false)
+	s.closed.Store(true)
+
+	if err := s.reservePeerStreamID(1, true); err != errSessionClosed {
+		t.Fatalf("reserve after close = %v, want %v", err, errSessionClosed)
+	}
+	if len(s.streams) != 0 || s.lastPeerSID != 0 {
+		t.Fatalf("closed session accepted peer state: last=%d streams=%v", s.lastPeerSID, s.streams)
+	}
+}
+
 func TestClientIdleSessionCleanupHonorsMinimumAndRemovesStale(t *testing.T) {
 	now := time.Now()
 	client := &Client{

@@ -493,9 +493,14 @@ func closeTransportLink(link *transport.Link) {
 	common.Close(link.Writer)
 }
 
-func (s *session) reservePeerStreamID(sid uint32) error {
+func (s *session) reservePeerStreamID(sid uint32, createStream bool) error {
 	s.streamsMu.Lock()
 	defer s.streamsMu.Unlock()
+	// close marks the session before taking streamsMu. Rechecking under this lock prevents the
+	// read loop from inserting a newly parsed SYN after close has already emptied both maps.
+	if s.isClosed() {
+		return errSessionClosed
+	}
 	if sid == 0 {
 		return errors.New("anytls: SYN stream ID must not be zero")
 	}
@@ -503,6 +508,11 @@ func (s *session) reservePeerStreamID(sid uint32) error {
 		return errors.New("anytls: SYN stream ID must increase, got ", sid, " after ", s.lastPeerSID)
 	}
 	s.lastPeerSID = sid
+	if createStream {
+		if _, ok := s.streams[sid]; !ok {
+			s.streams[sid] = newStream(sid, nil)
+		}
+	}
 	return nil
 }
 
@@ -893,7 +903,7 @@ func (s *session) readLoop(ctx context.Context) error {
 					_ = s.sendFrame(alert)
 					return errors.New("anytls: client did not send its settings")
 				}
-				if idErr := s.reservePeerStreamID(sid); idErr != nil {
+				if idErr := s.reservePeerStreamID(sid, length == 0); idErr != nil {
 					if length > 0 {
 						if err := discardBytes(s.br, length); err != nil {
 							return err
@@ -911,11 +921,6 @@ func (s *session) readLoop(ctx context.Context) error {
 					}
 					continue
 				}
-				s.streamsMu.Lock()
-				if _, ok := s.streams[sid]; !ok {
-					s.streams[sid] = newStream(sid, nil)
-				}
-				s.streamsMu.Unlock()
 			}
 		case cmdPSH:
 			if length <= 0 {
