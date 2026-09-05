@@ -18419,3 +18419,325 @@ input.f.ing-pj-port {
 :root[data-theme='light'] .nd-sheet :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel) > :is(header, summary) {
   background: transparent;
 }
+
+/* ═══ 设置页卡片精修 ═══
+ *
+ * 页面仍是原有的两栏卡片流，这一层只补足卡片内部的信息层级：标题负责定位，说明负责
+ * 交代影响，小组与字段负责编辑。证书组已经有自己的三层卡片结构，字段与小组的通用精修
+ * 因此主动排除它，避免在证书卡里再套一层视觉容器。 */
+.cardpage .duo {
+  gap: 14px;
+}
+.cardpage .duo > .col {
+  gap: 14px;
+}
+
+/* 为十二张卡轮换极低饱和的段色。颜色只落在编号、顶部细线和小组标签上，不承担状态含义。 */
+#set-branding,
+#set-cert,
+#set-ports {
+  --hue: var(--hue-1);
+}
+#set-visitor,
+#set-xray,
+#set-probe {
+  --hue: var(--hue-2);
+}
+#set-dist,
+#set-conn,
+#set-ping-probe {
+  --hue: var(--hue-3);
+}
+#set-agent-logs,
+#set-wg,
+#set-geodata {
+  --hue: var(--hue-4);
+}
+
+.cardpage [id^='set-'].panel.titled {
+  position: relative;
+  padding: 15px 14px 17px;
+  border-color: color-mix(in srgb, var(--ink) 11%, transparent);
+  border-radius: 11px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--hue) 2.6%, var(--block)) 0, var(--block) 150px), var(--block);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.16),
+    0 7px 22px rgba(0, 0, 0, 0.13);
+}
+.cardpage [id^='set-'].panel.titled::before {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  right: 11px;
+  left: 11px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--hue) 58%, transparent), transparent);
+  content: '';
+  pointer-events: none;
+}
+.cardpage [id^='set-'].panel.titled > header {
+  gap: 8px;
+  min-height: 47px;
+  margin: -15px -14px 0;
+  padding: 0 14px;
+  border-bottom-color: color-mix(in srgb, var(--hue) 17%, var(--line-soft));
+  background: linear-gradient(90deg, color-mix(in srgb, var(--hue) 7%, var(--band)), var(--band) 56%);
+}
+.cardpage [id^='set-'].panel.titled > header .no {
+  display: inline-grid;
+  width: 25px;
+  height: 21px;
+  box-sizing: border-box;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--hue) 34%, var(--line));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--hue) 8%, var(--block));
+  color: color-mix(in srgb, var(--hue) 82%, var(--ink));
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+.cardpage [id^='set-'].panel.titled > header h4 {
+  color: var(--ink-2);
+  font: 600 12.5px var(--sans);
+  letter-spacing: 0.015em;
+  text-transform: none;
+}
+.cardpage [id^='set-'].panel.titled > header .applyb {
+  margin-left: auto;
+}
+.cardpage [id^='set-'].panel.titled > header .sp + .settings-live-state + .applyb {
+  margin-left: 0;
+}
+
+/* 生效方式与访客状态是辅助信息，用有边界的小徽章收拢，避免散落成一串灰字。 */
+.cardpage [id^='set-'] .applyb {
+  padding: 2px 8px;
+  border-color: color-mix(in srgb, var(--ink) 11%, var(--line));
+  background: color-mix(in srgb, var(--ink) 3.5%, transparent);
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.cardpage [id^='set-'] .applyb.pub {
+  border-color: color-mix(in srgb, var(--action) 31%, var(--line));
+  background: color-mix(in srgb, var(--action) 7%, transparent);
+  color: var(--action-hover);
+}
+.settings-live-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-3);
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.settings-live-state::before {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ink-4);
+  content: '';
+}
+.settings-live-state.on {
+  color: var(--ok);
+}
+.settings-live-state.on::before {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 11%, transparent);
+}
+
+/* 说明紧接标题，却不再占据一整块无层次的灰面；底线把“这张卡做什么”和编辑区分开。 */
+.cardpage [id^='set-'] > .cardsub {
+  margin: 0 -2px 9px;
+  padding: 10px 2px 9px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+/* 有名字的小组使用一层很浅的内嵌面，长卡片不再是一列没有停顿的字段。无名小组维持平面，
+ * 站点外观、访客模式这类只有一两项的卡不会平白多套一个框。 */
+.cardpage [id^='set-']:not(#set-cert) .setgrp:has(> .eyebrow) {
+  margin: 0 0 11px;
+  padding: 10px 10px 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--sunk) 31%, transparent);
+}
+.cardpage [id^='set-']:not(#set-cert) .setgrp:has(> .eyebrow):last-child {
+  margin-bottom: 0;
+}
+.cardpage [id^='set-']:not(#set-cert) .setgrp > .eyebrow {
+  gap: 8px;
+  margin: 0 0 4px;
+  color: color-mix(in srgb, var(--hue) 72%, var(--ink-3));
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+}
+.cardpage [id^='set-']:not(#set-cert) .setgrp > .eyebrow::after {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--hue) 24%, var(--line-soft)), transparent);
+}
+
+/* 字段行在静止时保持克制，指针经过或输入框获得焦点时整行才浮出，长说明也更容易归属到
+ * 对应字段。技术字段仍由输入框自身的等宽字体表达，中文标签改用界面字体。 */
+.cardpage [id^='set-']:not(#set-cert) .setfld {
+  gap: 6px 13px;
+  margin: 0 -7px;
+  padding: 8px 7px;
+  border-radius: 7px;
+  transition:
+    background 0.12s ease,
+    box-shadow 0.12s ease;
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld + .setfld {
+  border-top-color: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+@media (hover: hover) {
+  .cardpage [id^='set-']:not(#set-cert) .setfld:hover {
+    background: color-mix(in srgb, var(--ink) 2.2%, transparent);
+  }
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld:focus-within {
+  background: color-mix(in srgb, var(--action) 4.5%, transparent);
+  box-shadow: inset 2px 0 color-mix(in srgb, var(--action) 58%, transparent);
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld > label {
+  color: var(--ink-3);
+  font: 500 11.5px/30px var(--sans);
+  letter-spacing: 0;
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld .v {
+  min-width: 0;
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld .hint {
+  margin-top: 2px;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld .hint b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld :is(input.f, textarea.f, select.f) {
+  max-width: 100%;
+  border-color: color-mix(in srgb, var(--ink) 13%, transparent);
+  background: color-mix(in srgb, var(--sunk) 88%, var(--block));
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.13);
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld :is(input.f, textarea.f, select.f):focus {
+  border-color: color-mix(in srgb, var(--action) 72%, var(--line));
+  background: var(--sunk);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--action) 34%, transparent);
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld .segsw {
+  border-color: color-mix(in srgb, var(--ink) 13%, transparent);
+  background: color-mix(in srgb, var(--sunk) 88%, var(--block));
+}
+.cardpage [id^='set-']:not(#set-cert) .setfld .segsw button[aria-pressed='true'] {
+  background: color-mix(in srgb, var(--action) 8%, var(--card));
+  color: var(--action-hover);
+}
+
+/* 折叠说明看起来像一项可操作内容，展开后正文接在同一块面里。 */
+.cardpage [id^='set-']:not(#set-cert) details.more {
+  margin: 7px 0 4px;
+}
+.cardpage [id^='set-']:not(#set-cert) details.more > summary {
+  width: 100%;
+  min-height: 30px;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--ink) 2.5%, transparent);
+  color: var(--ink-3);
+}
+.cardpage [id^='set-']:not(#set-cert) details.more[open] > summary {
+  border-radius: 7px 7px 0 0;
+  color: var(--ink-2);
+}
+.cardpage [id^='set-']:not(#set-cert) details.more > .body {
+  margin-top: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-top: 0;
+  border-left-width: 1px;
+  border-radius: 0 0 7px 7px;
+  background: color-mix(in srgb, var(--sunk) 25%, transparent);
+}
+
+/* 两类重复行都成为可比较的紧凑对象，而不是漂在卡面上的若干输入框。 */
+.cardpage .agent-log-node {
+  min-height: 40px;
+  padding: 7px 8px;
+  border-color: color-mix(in srgb, var(--ink) 9%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--block) 72%, var(--sunk));
+}
+.cardpage .ping-probe-target {
+  padding: 7px;
+  border: 1px solid color-mix(in srgb, var(--ink) 9%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--block) 72%, var(--sunk));
+}
+.cardpage .ping-probe-kind {
+  justify-content: center;
+}
+.cardpage .branding-preview {
+  width: 40px;
+  height: 40px;
+  border-color: color-mix(in srgb, var(--hue) 28%, var(--line));
+  border-radius: 9px;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--hue) 9%, var(--field)), var(--field));
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.05),
+    0 2px 6px rgba(0, 0, 0, 0.14);
+}
+
+/* 只有脏状态才渲染保存栏；出现时用暖色左缘标出待办，动作仍固定在卡片底部。 */
+.cardpage [id^='set-'] > .settings-savebar {
+  min-height: 48px;
+  margin: auto -14px -17px;
+  padding: 8px 14px;
+  border-top-color: color-mix(in srgb, var(--gold) 24%, var(--line-soft));
+  border-radius: 0 0 11px 11px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--gold) 7%, var(--sunk)), var(--sunk) 62%);
+  box-shadow: inset 3px 0 color-mix(in srgb, var(--gold) 58%, transparent);
+}
+.cardpage [id^='set-'] > .settings-savebar .settings-save-state.dirty {
+  color: color-mix(in srgb, var(--gold) 82%, var(--ink));
+}
+
+@media (max-width: 620px) {
+  .cardpage .duo,
+  .cardpage .duo > .col {
+    gap: 10px;
+  }
+  .cardpage [id^='set-'].panel.titled {
+    padding-right: 12px;
+    padding-left: 12px;
+    border-radius: 9px;
+  }
+  .cardpage [id^='set-'].panel.titled > header {
+    margin-right: -12px;
+    margin-left: -12px;
+    padding: 0 12px;
+  }
+  .cardpage [id^='set-']:not(#set-cert) .setfld {
+    margin-right: -5px;
+    margin-left: -5px;
+    padding-right: 5px;
+    padding-left: 5px;
+  }
+  .cardpage .ping-probe-target {
+    grid-template-columns: 54px minmax(0, 1fr) auto;
+  }
+  .cardpage [id^='set-'] > .settings-savebar {
+    margin-right: -12px;
+    margin-left: -12px;
+  }
+}

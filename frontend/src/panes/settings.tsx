@@ -1417,9 +1417,9 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
       <header>
         <span className="no">{NO_OF['set-visitor']}</span>
         <h4>访客模式</h4>
-        <ApplyBadge id="set-visitor" />
         <span className="sp" />
-        <b>{enabled ? '已开启' : '已关闭'}</b>
+        <b className={enabled ? 'settings-live-state on' : 'settings-live-state'}>{enabled ? '已开启' : '已关闭'}</b>
+        <ApplyBadge id="set-visitor" />
       </header>
       <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客</p>
       {update.error && <ErrorBox error={update.error} />}
