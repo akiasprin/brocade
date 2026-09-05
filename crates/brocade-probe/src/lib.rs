@@ -416,11 +416,15 @@ fn anytls_client_config(
         settings["minIdleSession"] = serde_json::json!(value);
     }
     let mut stream_settings = if target.reality.public_key.is_empty() {
+        let mut tls_settings = serde_json::json!({
+            "serverName": anytls.server_name,
+        });
+        if let Some(pin) = &anytls.pinned_peer_cert_sha256 {
+            tls_settings["pinnedPeerCertSha256"] = serde_json::json!(pin);
+        }
         serde_json::json!({
             "security": "tls",
-            "tlsSettings": {
-                "serverName": anytls.server_name,
-            },
+            "tlsSettings": tls_settings,
         })
     } else {
         serde_json::json!({
@@ -523,6 +527,12 @@ fn hysteria_client_config(
             }]),
         );
     }
+    let mut tls_settings = serde_json::json!({
+        "serverName": hysteria.server_name,
+    });
+    if let Some(pin) = &hysteria.pinned_peer_cert_sha256 {
+        tls_settings["pinnedPeerCertSha256"] = serde_json::json!(pin);
+    }
     let config = serde_json::json!({
         "log": {
             "loglevel": "info",
@@ -547,9 +557,7 @@ fn hysteria_client_config(
             "streamSettings": {
                 "network": "hysteria",
                 "security": "tls",
-                "tlsSettings": {
-                    "serverName": hysteria.server_name,
-                },
+                "tlsSettings": tls_settings,
                 "hysteriaSettings": {
                     "version": 2,
                     "auth": target.uuid,
@@ -573,13 +581,17 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
         // weaken the probe, it stops the probe process from starting at all. A machine whose
         // certificate does not verify therefore fails here — correctly, because a subscriber's
         // client fails in the same place. Pinning the certificate (`pinnedPeerCertSha256`) is the
-        // replacement, and it needs the digest, which this target does not carry.
+        // replacement. Self-signed certificates carry that digest in the frozen probe target.
         Some(tls) => {
+            let mut tls_settings = serde_json::json!({
+                "serverName": tls.server_name,
+            });
+            if let Some(pin) = &tls.pinned_peer_cert_sha256 {
+                tls_settings["pinnedPeerCertSha256"] = serde_json::json!(pin);
+            }
             serde_json::json!({
                 "security": "tls",
-                "tlsSettings": {
-                    "serverName": tls.server_name,
-                },
+                "tlsSettings": tls_settings,
             })
         }
         None => serde_json::json!({
@@ -1252,6 +1264,9 @@ mod tests {
         let mut t = target(&[]);
         t.tls = Some(brocade_deployment::protocol::E2eProbeTls {
             server_name: "a1b2.example.net".to_owned(),
+            pinned_peer_cert_sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
             flow: None,
         });
         let out: serde_json::Value =
@@ -1259,6 +1274,10 @@ mod tests {
         let stream = &out["outbounds"][0]["streamSettings"];
         assert_eq!(stream["security"], "tls");
         assert_eq!(stream["tlsSettings"]["serverName"], "a1b2.example.net");
+        assert_eq!(
+            stream["tlsSettings"]["pinnedPeerCertSha256"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert!(stream["tlsSettings"].get("fingerprint").is_none());
         // xray rejects a config carrying `allowInsecure` outright (removed in v26.2.6, fatal
         // from v26.6.1). Writing it does not loosen verification, it prevents the probe process
@@ -1282,6 +1301,9 @@ mod tests {
         };
         t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
             server_name: "anytls.example.net".to_owned(),
+            pinned_peer_cert_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
             idle_session_check_interval_secs: Some(11),
             idle_session_timeout_secs: Some(22),
             min_idle_session: Some(3),
@@ -1301,8 +1323,64 @@ mod tests {
             outbound["streamSettings"]["tlsSettings"]["serverName"],
             "anytls.example.net"
         );
+        assert_eq!(
+            outbound["streamSettings"]["tlsSettings"]["pinnedPeerCertSha256"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
         assert_eq!(outbound["streamSettings"]["sockopt"]["tcpFastOpen"], true);
         assert!(outbound["streamSettings"].get("network").is_none());
+    }
+
+    #[test]
+    fn xray_accepts_the_retained_self_signed_anytls_probe_pins() {
+        let binary = std::env::var_os("BROCADE_XRAY_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tools/xray"));
+        if !binary.is_file() {
+            eprintln!("skipping: place xray at .tools/xray");
+            return;
+        }
+        let mut t = target(&[]);
+        t.reality = brocade_deployment::protocol::E2eProbeReality {
+            public_key: String::new(),
+            short_id: String::new(),
+            server_name: String::new(),
+            fingerprint: String::new(),
+            flow: None,
+        };
+        t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
+            server_name: "private.apple.com".to_owned(),
+            pinned_peer_cert_sha256: Some(
+                concat!(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                )
+                .to_owned(),
+            ),
+            idle_session_check_interval_secs: None,
+            idle_session_timeout_secs: None,
+            min_idle_session: None,
+        });
+        let config = client_config(&t, 1080, "/tmp/brocade-probe-test.log");
+        let file = TempFile::write(&std::env::temp_dir(), &config, ".json").unwrap();
+        let checked = Command::new(binary)
+            .args(["-test", "-c", &file.path])
+            .output()
+            .expect("run xray -test");
+        let stdout = String::from_utf8_lossy(&checked.stdout);
+        let stderr = String::from_utf8_lossy(&checked.stderr);
+        if stdout.contains("unknown config id: anytls")
+            || stderr.contains("unknown config id: anytls")
+        {
+            eprintln!("skipping: installed xray predates AnyTLS");
+            return;
+        }
+        assert!(
+            checked.status.success(),
+            "xray rejected self-signed AnyTLS probe:\n{}\n{}\n{config}",
+            stdout,
+            stderr
+        );
     }
 
     #[test]
@@ -1310,6 +1388,7 @@ mod tests {
         let mut t = target(&[]);
         t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
             server_name: "example.com".to_owned(),
+            pinned_peer_cert_sha256: None,
             idle_session_check_interval_secs: None,
             idle_session_timeout_secs: None,
             min_idle_session: None,
@@ -1331,6 +1410,9 @@ mod tests {
         let mut t = target(&[]);
         t.hysteria2 = Some(brocade_deployment::protocol::E2eProbeHysteria2 {
             server_name: "hy2.example.net".to_owned(),
+            pinned_peer_cert_sha256: Some(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            ),
             congestion: "force-brutal".to_owned(),
             up: Some("20 mbps".to_owned()),
             down: Some("100 mbps".to_owned()),
@@ -1353,6 +1435,10 @@ mod tests {
         assert_eq!(
             outbound["streamSettings"]["tlsSettings"]["serverName"],
             "hy2.example.net"
+        );
+        assert_eq!(
+            outbound["streamSettings"]["tlsSettings"]["pinnedPeerCertSha256"],
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
         assert_eq!(outbound["streamSettings"]["hysteriaSettings"]["auth"], "u");
         assert_eq!(

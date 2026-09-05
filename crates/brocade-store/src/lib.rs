@@ -32,7 +32,8 @@ pub use admin::{
     AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult, AdminLoginRequest,
     AdminLoginResult, AdminOperator, AdminRole, AuthenticatedAdmin, AuthenticatedUser,
     ChangeAdminPasswordRequest, CreateAdminOperatorRequest, IssuedAdminSession, IssuedAdminToken,
-    IssuedUserLogin, ResetAdminPasswordResult, ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
+    IssuedUserLogin, ResetAdminPasswordResult, SetUserPasswordRequest, SetUserPasswordResult,
+    ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
 };
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
 pub use agent_release::{AgentBuildInfo, AgentRelease, AgentReleaseScope};
@@ -56,8 +57,8 @@ pub use brocade_deployment::protocol::{
 };
 pub use cert::{
     CertDomain, CertDomainInput, CertGroup, CertificateDnsTarget, CertificateOrder,
-    CertificateScanLock, GroupCertificate, NodeCertificateState, ACME_LETSENCRYPT,
-    ACME_LETSENCRYPT_STAGING,
+    CertificateScanLock, CertificateSigningMethod, GroupCertificate, IssuedCertificate,
+    NodeCertificateState, ACME_LETSENCRYPT, ACME_LETSENCRYPT_STAGING, SELF_SIGNED_DIRECTORY,
 };
 pub use console::{
     ArtifactContent, ArtifactIndex, ArtifactIndexEntry, ClashHaitunLink, ClashSubscriptionUsage,

@@ -159,4 +159,43 @@ describe('Clash subscription templates', () => {
       ).toBe(true),
     );
   });
+
+  it('requests self-signed URI entries only after an explicit one-time insecure choice', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === '/revisions?limit=50') {
+        return jsonResponse({ current_revision: 9, revisions: [] });
+      }
+      return jsonResponse({
+        revision: 9,
+        target_kind: 'user',
+        target_id: 'platform.acme:alice',
+        artifact_kind: 'uri',
+        state: 'present',
+        sha256: 'abc',
+        byte_len: 16,
+        content: path.includes('insecure=true')
+          ? 'anytls://secret@203.0.113.7:19443?sni=private.example&insecure=1'
+          : '# 自签证书地址默认隐藏',
+        redacted: false,
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <SubscriptionViewer tenant="platform.acme" user="alice" kind="uri" onClose={() => undefined} />
+      </QueryClientProvider>,
+    );
+
+    await view.findByText('# 自签证书地址默认隐藏');
+    expect(view.queryByText(/anytls:\/\//)).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '允许 insecure' }));
+    await view.findByText(/anytls:\/\/secret/);
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).endsWith('/artifacts/content/user/platform.acme%3Aalice/uri?serving=true&insecure=true'),
+      ),
+    ).toBe(true);
+  });
 });

@@ -288,8 +288,8 @@ CREATE TABLE IF NOT EXISTS cert_domains (
     -- accounts could not coordinate.
     acme_account_key_sealed TEXT,
     acme_account_url TEXT,
-    -- Certificates last 90 days. Renewing with 30 left means 30 days may fail before anything
-    -- breaks — the window is the whole point, not a countdown.
+    -- Public certificates normally last 90 days; self-signed certificates last a year. The advance window
+    -- is retry time before either kind breaks, not merely a countdown for display.
     renew_before_days INTEGER DEFAULT 30 NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT cert_domains_pkey PRIMARY KEY (id),
@@ -299,7 +299,7 @@ CREATE TABLE IF NOT EXISTS cert_domains (
     -- An https URL, or the one name that means nobody signs it but us. Spelled out rather than
     -- loosened to "any non-empty string": a typo in this column points the fleet at a CA that does
     -- not exist, and the failure surfaces one node at a time, half an hour apart.
-    CONSTRAINT cert_domains_directory_shape CHECK ((acme_directory ~ '^https://')),
+    CONSTRAINT cert_domains_directory_shape CHECK ((acme_directory ~ '^https://' OR acme_directory = 'self-signed')),
     CONSTRAINT cert_domains_renew_before_range CHECK (((renew_before_days >= 1) AND (renew_before_days <= 89)))
 );
 
@@ -2297,6 +2297,10 @@ CREATE TABLE IF NOT EXISTS certificates (
     -- left pointing at a staging directory shows every group ready while nothing trusts a single
     -- certificate, and this column is where that says itself out loud.
     issuer TEXT,
+    -- SHA-256 of the leaf certificate's DER bytes. This is deliberately distinct from the digest
+    -- of cert_pem used to reconcile the file on a node: Xray's pinnedPeerCertSha256 verifies the
+    -- X.509 certificate, not the PEM file containing it and the rest of its chain.
+    peer_sha256 TEXT,
     -- Which ACME directory issued this. Recorded so that changing the domain's directory makes
     -- everything under it due again: an operator moving from staging to production has said the
     -- certificates they hold are not the ones they want, and nothing else here can tell.
@@ -2943,6 +2947,14 @@ ALTER TABLE control_state
 -- whose CREATE TABLE branch cannot affect an already existing table therefore has a matching
 -- ALTER here. This block is deliberately safe to execute repeatedly: it is also used when a
 -- development database clears `_sqlx_migrations` and replays 0001 without discarding its data.
+ALTER TABLE cert_domains DROP CONSTRAINT IF EXISTS cert_domains_directory_shape;
+ALTER TABLE cert_domains ADD CONSTRAINT cert_domains_directory_shape
+    CHECK (acme_directory ~ '^https://' OR acme_directory = 'self-signed');
+ALTER TABLE certificates ADD COLUMN IF NOT EXISTS peer_sha256 TEXT;
+ALTER TABLE certificates DROP CONSTRAINT IF EXISTS certificates_peer_sha256_shape;
+ALTER TABLE certificates ADD CONSTRAINT certificates_peer_sha256_shape
+    CHECK (peer_sha256 IS NULL OR peer_sha256 ~ '^[0-9a-f]{64}$');
+
 ALTER TABLE apps
     ADD COLUMN IF NOT EXISTS position INTEGER;
 WITH ordered_apps AS (

@@ -19,6 +19,7 @@ import {
   savePingProbeSettings,
   setVisitorAccess,
   createCertGroup,
+  deleteCertificate,
   deleteCertGroup,
   requestSpareCertificate,
   serveCertificate,
@@ -522,6 +523,7 @@ function certState(cert: GroupCertificate): { tone: string; text: string } {
   switch (cert.status) {
     case 'serving':
       // 到期在即才提醒：续期是自动的，但自动也会失败，而失败只有靠剩余天数才看得出来。
+      if (left !== null && left < 0) return { tone: 'err', text: '在用 · 已过期' };
       if (left !== null && left <= 7) return { tone: 'err', text: `在用 · 只剩 ${left} 天` };
       if (left !== null && left <= 20) return { tone: 'warn', text: `在用 · 还剩 ${left} 天` };
       return { tone: 'ok', text: '在用' };
@@ -536,10 +538,15 @@ function certState(cert: GroupCertificate): { tone: string; text: string } {
   }
 }
 
+function retainedCertificate(cert: GroupCertificate): boolean {
+  return cert.sha256 !== null && ['ready', 'serving', 'superseded'].includes(cert.status);
+}
+
 function CertSection({ editable, view }: { editable: boolean; view: CertsView }) {
   const qc = useQueryClient();
   const [form, setForm] = useState<{
     domain: string;
+    signingMethod: 'public-ca' | 'self-signed';
     credential: string;
     directory: string;
     contact: string;
@@ -553,9 +560,10 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
     const d = view.domain;
     setForm({
       domain: d?.domain ?? '',
+      signingMethod: d?.signing_method ?? 'public-ca',
       // 凭据不回读，因此表单中始终为空；已存储时通过下方的 placeholder 说明。
       credential: '',
-      directory: d?.acme_directory ?? view.letsencrypt,
+      directory: d?.signing_method === 'public-ca' ? d.acme_directory : view.letsencrypt,
       contact: d?.acme_contact ?? '',
       renew: String(d?.renew_before_days ?? 30),
     });
@@ -565,6 +573,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
     mutationFn: () =>
       saveCertDomain({
         domain: form!.domain.trim(),
+        signing_method: form!.signingMethod,
         dns_credential: form!.credential.trim() ? form!.credential.trim() : null,
         acme_directory: form!.directory,
         acme_contact: form!.contact.trim() ? form!.contact.trim() : null,
@@ -583,11 +592,21 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
   });
 
   const d = view.domain;
-  const f = form ?? { domain: '', credential: '', directory: view.letsencrypt, contact: '', renew: '30' };
+  const f = form ?? {
+    domain: '',
+    signingMethod: 'public-ca' as const,
+    credential: '',
+    directory: view.letsencrypt,
+    contact: '',
+    renew: '30',
+  };
+  const selfSigned = f.signingMethod === 'self-signed';
+  const storedDirectory = d?.signing_method === 'public-ca' ? d.acme_directory : view.letsencrypt;
   const dirty =
     f.domain.trim() !== (d?.domain ?? '') ||
+    f.signingMethod !== (d?.signing_method ?? 'public-ca') ||
     f.credential.trim() !== '' ||
-    f.directory !== (d?.acme_directory ?? view.letsencrypt) ||
+    (!selfSigned && f.directory !== storedDirectory) ||
     f.contact.trim() !== (d?.acme_contact ?? '') ||
     Number(f.renew) !== (d?.renew_before_days ?? 30);
 
@@ -614,11 +633,50 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           {save.isPending ? '保存中…' : '保存这一段'}
         </button>
       </header>
-      <p className="cardsub">每台一张独立的通配证书，由控制面签发，随下发包送达节点</p>
+      <p className="cardsub">按证书组签发通配证书，由控制面生成并随下发包送达节点</p>
       {save.error && <ErrorBox error={save.error} />}
 
       <div className="setgrp">
         <p className="eyebrow">签发</p>
+
+        <div className="setfld">
+          <label>签发方式</label>
+          <div className="v">
+            <span
+              className={
+                dirty && f.signingMethod !== (d?.signing_method ?? 'public-ca') ? 'segsw chg' : 'segsw'
+              }
+              role="group"
+              aria-label="证书签发方式"
+            >
+              <button
+                type="button"
+                aria-pressed={!selfSigned}
+                onClick={() =>
+                  setForm({
+                    ...f,
+                    signingMethod: 'public-ca',
+                    directory: f.directory === 'self-signed' ? view.letsencrypt : f.directory,
+                  })
+                }
+              >
+                公共 CA
+              </button>
+              <button
+                type="button"
+                aria-pressed={selfSigned}
+                onClick={() => setForm({ ...f, signingMethod: 'self-signed', credential: '' })}
+              >
+                自签
+              </button>
+            </span>
+            <span className="hint">
+              {selfSigned
+                ? '直接生成自签证书；域名仅作为客户端发送的 SNI，不验证域名所有权。'
+                : '由公共 CA 通过 DNS-01 验证域名并签发。'}
+            </span>
+          </div>
+        </div>
 
         <div className="setfld">
           <label>证书域名</label>
@@ -633,58 +691,64 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           </div>
         </div>
 
-        <div className="setfld">
-          <label>Cloudflare Token</label>
-          <div className="v">
-            <input
-              className={f.credential ? 'f chg' : 'f'}
-              style={{ width: 430 }}
-              type="password"
-              placeholder={d?.has_credential ? '已配置（重填才会覆盖）' : 'Zone:Read + DNS:Edit'}
-              value={f.credential}
-              onChange={e => setForm({ ...f, credential: e.target.value })}
-            />
-            {d?.has_credential && !f.credential && <span className="hint">已配置，不可读出</span>}
-          </div>
-        </div>
+        {!selfSigned && (
+          <>
+            <div className="setfld">
+              <label>Cloudflare Token</label>
+              <div className="v">
+                <input
+                  className={f.credential ? 'f chg' : 'f'}
+                  style={{ width: 430 }}
+                  type="password"
+                  placeholder={d?.has_credential ? '已配置（重填才会覆盖）' : 'Zone:Read + DNS:Edit'}
+                  value={f.credential}
+                  onChange={e => setForm({ ...f, credential: e.target.value })}
+                />
+                {d?.has_credential && !f.credential && <span className="hint">已配置，不可读出</span>}
+              </div>
+            </div>
 
-        <div className="setfld">
-          <label>ACME 目录</label>
-          <div className="v">
-            <span
-              className={dirty && f.directory !== (d?.acme_directory ?? view.letsencrypt) ? 'segsw chg' : 'segsw'}
-              role="group"
-            >
-              <button
-                type="button"
-                aria-pressed={!staging}
-                onClick={() => setForm({ ...f, directory: view.letsencrypt })}
-              >
-                正式
-              </button>
-              <button
-                type="button"
-                aria-pressed={staging}
-                onClick={() => setForm({ ...f, directory: view.letsencrypt_staging })}
-              >
-                staging
-              </button>
-            </span>
-          </div>
-        </div>
+            <div className="setfld">
+              <label>ACME 目录</label>
+              <div className="v">
+                <span
+                  className={
+                    dirty && f.directory !== (d?.acme_directory ?? view.letsencrypt) ? 'segsw chg' : 'segsw'
+                  }
+                  role="group"
+                >
+                  <button
+                    type="button"
+                    aria-pressed={!staging}
+                    onClick={() => setForm({ ...f, directory: view.letsencrypt })}
+                  >
+                    正式
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={staging}
+                    onClick={() => setForm({ ...f, directory: view.letsencrypt_staging })}
+                  >
+                    staging
+                  </button>
+                </span>
+              </div>
+            </div>
 
-        <div className="setfld">
-          <label>联系邮箱</label>
-          <div className="v">
-            <input
-              className={dirty && f.contact.trim() !== (d?.acme_contact ?? '') ? 'f chg' : 'f'}
-              style={{ width: 280 }}
-              placeholder="选填"
-              value={f.contact}
-              onChange={e => setForm({ ...f, contact: e.target.value })}
-            />
-          </div>
-        </div>
+            <div className="setfld">
+              <label>联系邮箱</label>
+              <div className="v">
+                <input
+                  className={dirty && f.contact.trim() !== (d?.acme_contact ?? '') ? 'f chg' : 'f'}
+                  style={{ width: 280 }}
+                  placeholder="选填"
+                  value={f.contact}
+                  onChange={e => setForm({ ...f, contact: e.target.value })}
+                />
+              </div>
+            </div>
+          </>
+        )}
 
         <div className="setfld">
           <label>提前续期</label>
@@ -699,18 +763,22 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           </div>
         </div>
 
-        <div className="guard">
-          使用<b>单独的域名</b>。Cloudflare token 按 zone 授权，无法限制到子域，域名分开可防止凭据泄露波及控制面。
-        </div>
-
-        <div className="guard">
-          每台一张<b>独立</b>证书。Let&apos;s Encrypt <b>同一组名字每 7 天最多签发 5 张</b>
-          ，随机标签使每台名字唯一，不受此限制。
-        </div>
-
-        <div className="guard">
-          证书会进入 CT 公开日志，随机标签防猜测但不防枚举。DNS-01 <b>不需要 A 记录</b>，名字与 IP 的对应关系不公开。
-        </div>
+        {selfSigned ? (
+          <div className="guard">每个证书组直接生成一年期自签证书，无需 DNS 验证；私钥加密保存。</div>
+        ) : (
+          <>
+            <div className="guard">
+              使用<b>单独的域名</b>。Cloudflare token 按 zone 授权，无法限制到子域，域名分开可防止凭据泄露波及控制面。
+            </div>
+            <div className="guard">
+              每台一张<b>独立</b>证书。Let&apos;s Encrypt <b>同一组名字每 7 天最多签发 5 张</b>
+              ，随机标签使每台名字唯一，不受此限制。
+            </div>
+            <div className="guard">
+              证书会进入 CT 公开日志，随机标签防猜测但不防枚举。DNS-01 <b>不需要 A 记录</b>，名字与 IP 的对应关系不公开。
+            </div>
+          </>
+        )}
       </div>
 
       {d && (
@@ -725,7 +793,11 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
               <button className="btn" disabled={!editable || scan.isPending} onClick={() => scan.mutate()}>
                 {scan.isPending ? '已排上…' : '现在检查一轮'}
               </button>
-              <span className="hint">每台约半分钟，串行执行。并发会触发 CA 的速率限制</span>
+              <span className="hint">
+                {d.signing_method === 'self-signed'
+                  ? '自签证书在本机生成，完成后随节点轮询热更新'
+                  : '每台约半分钟，串行执行。并发会触发 CA 的速率限制'}
+              </span>
             </div>
           </div>
 
@@ -820,6 +892,9 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       {view.groups.map(group => {
         const serving = group.certificates.find(c => c.status === 'serving');
         const members = view.nodes.filter(row => row.label_id === group.id);
+        const xrayPinsActive = group.certificates.some(
+          cert => retainedCertificate(cert) && cert.signing_method === 'self-signed',
+        );
         return (
           <div className="certgrp" key={group.id}>
             <div className="certgrp-hd">
@@ -870,6 +945,12 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               />
             )}
 
+            {xrayPinsActive && (
+              <div className="certtrust-note">
+                这个组仍保留自签证书，Xray 会同时信任下列所有已签发证书，包括已换下或过期的证书。要撤销信任，请手动删除对应证书。
+              </div>
+            )}
+
             <div className="certtbl">
               {group.certificates.length === 0 ? (
                 <div className="hint">还没有证书。签发每小时一轮，也可以点上方「现在检查一轮」。</div>
@@ -877,6 +958,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                 group.certificates.map(cert => {
                   const state = certState(cert);
                   const left = daysLeft(cert.expires_at);
+                  const trustedByXray = xrayPinsActive && retainedCertificate(cert);
                   return (
                     <div className="certrow cert" key={cert.id}>
                       <span className={`cstate ${state.tone}`}>{state.text}</span>
@@ -890,6 +972,11 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                           <span className="hint">—</span>
                         )}
                       </span>
+                      {trustedByXray && (
+                        <span className={left !== null && left < 0 ? 'ctrust warn' : 'ctrust'}>
+                          {left !== null && left < 0 ? '已过期 · Xray 仍信任' : 'Xray 仍信任'}
+                        </span>
+                      )}
                       <span className="cwhen">
                         {cert.expires_at ? (
                           <>
@@ -908,6 +995,21 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                           onClick={() => run(serveCertificate(cert.id))}
                         >
                           启用
+                        </button>
+                      )}
+                      {cert.status !== 'serving' && (
+                        <button
+                          className="btn sm danger"
+                          disabled={!editable}
+                          title={trustedByXray ? '删除后，Xray 将不再信任这张证书' : '删除这条证书记录'}
+                          onClick={() => {
+                            const impact = trustedByXray
+                              ? '删除后，Xray 将不再信任这张证书。已缓存旧配置的客户端需要刷新。'
+                              : '删除这条证书记录？';
+                            if (window.confirm(impact)) run(deleteCertificate(cert.id));
+                          }}
+                        >
+                          删除
                         </button>
                       )}
                       {cert.last_error && <span className="cerr">{cert.last_error}</span>}

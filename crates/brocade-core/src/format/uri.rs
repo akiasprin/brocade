@@ -3,16 +3,47 @@ use crate::artifacts::subscription::{
 };
 use crate::model::{XhttpTuning, XhttpXmux, XhttpXmuxRange};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UriRenderOptions {
+    /// Explicit, one-request opt-in from the connection-address dialog. It is never used by a
+    /// public subscription URL and never persisted.
+    pub allow_insecure: bool,
+}
+
 pub fn subscription(subscription: &Subscription) -> String {
+    subscription_with_options(subscription, UriRenderOptions::default())
+}
+
+pub fn subscription_with_options(subscription: &Subscription, options: UriRenderOptions) -> String {
     let mut lines = Vec::new();
     let mut skipped = Vec::new();
+    let mut hidden_self_signed = Vec::new();
+    let mut unsupported_self_signed = Vec::new();
 
     for entry in &subscription.entries {
         if entry.front_name.is_some() {
             skipped.push(entry.name.clone());
             continue;
         }
-        lines.push(entry_uri(entry));
+        let self_signed = match &entry.security {
+            SubscriptionSecurity::Tls(tls) => tls.self_signed,
+            SubscriptionSecurity::AnyTls(anytls) => anytls.self_signed,
+            SubscriptionSecurity::Hysteria2(hysteria) => hysteria.self_signed,
+            SubscriptionSecurity::Reality(_) => false,
+        };
+        if self_signed {
+            // VLESS has no interoperable URI field for a self-signed certificate pin, and current Xray
+            // rejects allowInsecure. Never emit a link that imports successfully and cannot dial.
+            if matches!(&entry.security, SubscriptionSecurity::Tls(_)) {
+                unsupported_self_signed.push(entry.name.clone());
+                continue;
+            }
+            if !options.allow_insecure {
+                hidden_self_signed.push(entry.name.clone());
+                continue;
+            }
+        }
+        lines.push(entry_uri(entry, options));
     }
 
     if lines.is_empty() {
@@ -24,16 +55,31 @@ pub fn subscription(subscription: &Subscription) -> String {
         lines.push(format!("# {}", skipped.join("、")));
         lines.push("# 换 Clash 目标即可。".to_owned());
     }
+    if !hidden_self_signed.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "# 以下自签证书地址默认隐藏；在连接地址窗口明确允许 insecure 后才会显示：".to_owned(),
+        );
+        lines.push(format!("# {}", hidden_self_signed.join("、")));
+    }
+    if !unsupported_self_signed.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "# 以下 VLESS 自签入口没有可靠的跨客户端 URI 表达，已跳过；请使用 Clash 订阅："
+                .to_owned(),
+        );
+        lines.push(format!("# {}", unsupported_self_signed.join("、")));
+    }
 
     format!("{}\n", lines.join("\n"))
 }
 
-fn entry_uri(entry: &SubscriptionEntry) -> String {
+fn entry_uri(entry: &SubscriptionEntry, options: UriRenderOptions) -> String {
     if let SubscriptionSecurity::AnyTls(anytls) = &entry.security {
-        return anytls_uri(entry, anytls);
+        return anytls_uri(entry, anytls, options);
     }
     if let SubscriptionSecurity::Hysteria2(hysteria) = &entry.security {
-        return hysteria2_uri(entry, hysteria);
+        return hysteria2_uri(entry, hysteria, options);
     }
     // `type` names the network layer, and it is the field a client uses to decide how to dial.
     // XHTTP additionally needs the path: the server matches it and refuses anything else, so a
@@ -161,6 +207,7 @@ fn entry_uri(entry: &SubscriptionEntry) -> String {
 fn anytls_uri(
     entry: &SubscriptionEntry,
     anytls: &crate::artifacts::subscription::SubscriptionAnyTls,
+    options: UriRenderOptions,
 ) -> String {
     // There is no upstream Xray share-link parser for AnyTLS. Keep the URI deliberately small
     // and interoperable with clients that use the conventional anytls:// form; the server-side
@@ -173,6 +220,8 @@ fn anytls_uri(
             ("pbk", reality.public_key.clone()),
             ("sid", reality.short_id.clone()),
         ]);
+    } else if anytls.self_signed && options.allow_insecure {
+        query.push(("insecure", "1".to_owned()));
     }
     let query = query
         .into_iter()
@@ -230,11 +279,14 @@ fn xray_range(range: &XhttpXmuxRange) -> serde_json::Value {
 fn hysteria2_uri(
     entry: &SubscriptionEntry,
     hysteria: &crate::artifacts::subscription::SubscriptionHysteria2,
+    options: UriRenderOptions,
 ) -> String {
-    // No `insecure`: the fleet's own core rejects a config carrying the equivalent field, so a
-    // subscription offering it would describe a client this deployment cannot run. A certificate
-    // that does not verify is a fault to fix on the machine.
+    // `insecure` is emitted only by the explicit one-request escape hatch. The durable model and
+    // ordinary subscription output never weaken certificate verification.
     let mut query = vec![("sni", hysteria.server_name.clone())];
+    if hysteria.self_signed && options.allow_insecure {
+        query.push(("insecure", "1".to_owned()));
+    }
     if let Some(crate::model::HysteriaObfs::Salamander { password }) = &hysteria.settings.obfs {
         query.push(("obfs", "salamander".to_owned()));
         query.push(("obfs-password", password.clone()));

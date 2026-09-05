@@ -559,6 +559,7 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
     let snapshot = crate::materialize::load_current_immutable_snapshot(pool).await?;
     let probe_settings = snapshot.settings.probe.clone();
     let plan = e2e_probe_plan(&snapshot, node_id)?;
+    let pinned_peer_cert_sha256 = self_signed_certificate_pin(pool, node_id).await?;
 
     Ok(E2eProbeTargetList {
         targets: plan
@@ -606,6 +607,7 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                 hysteria2: match &target.security {
                     ProbeSecurity::Hysteria2(hysteria) => Some(E2eProbeHysteria2 {
                         server_name: hysteria.server_name.clone(),
+                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                         congestion: hysteria.settings.congestion.as_str().to_owned(),
                         up: hysteria.settings.bandwidth.up.clone(),
                         down: hysteria.settings.bandwidth.down.clone(),
@@ -644,6 +646,7 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                 anytls: match &target.security {
                     ProbeSecurity::AnyTls(anytls) => Some(E2eProbeAnyTls {
                         server_name: anytls.server_name.clone(),
+                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                         idle_session_check_interval_secs: anytls
                             .settings
                             .idle_session_check_interval_secs,
@@ -658,6 +661,7 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     | ProbeSecurity::Hysteria2(_) => None,
                     ProbeSecurity::Tls(tls) => Some(E2eProbeTls {
                         server_name: tls.server_name.clone(),
+                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                         flow: tls.flow.clone(),
                     }),
                 },
@@ -695,6 +699,24 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
         timeout_secs: u64::from(probe_settings.timeout_secs),
         interval_secs: u64::from(probe_settings.interval_secs),
     })
+}
+
+async fn self_signed_certificate_pin(pool: &PgPool, node_id: &str) -> Result<Option<String>> {
+    let Some(profile) = crate::cert::serving_certificate_profile_for_node(pool, node_id).await?
+    else {
+        return Ok(None);
+    };
+    if !profile.requires_pinning {
+        return Ok(None);
+    }
+    if profile.trusted_peer_sha256.is_empty() {
+        Err(StoreError::InvalidData(format!(
+            "self-signed certificate trust set {} on node {node_id} has no peer fingerprint",
+            profile.name
+        )))
+    } else {
+        Ok(Some(profile.trusted_peer_sha256.join(",")))
+    }
 }
 
 /// Keep the publish gate on the store boundary. A compile failure is not an empty work list:

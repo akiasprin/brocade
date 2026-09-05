@@ -28,6 +28,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// How long to wait for an authorization or order to leave `pending`. The measured end-to-end time
 /// was 28 seconds; this is the ceiling for one order, not an expected duration.
@@ -184,6 +185,9 @@ pub struct IssuedCertificate {
     /// says itself out loud — Let's Encrypt's staging names are deliberately absurd
     /// (`(STAGING) Pretend Pear X1` at the root) for exactly this purpose.
     pub issuer: String,
+    /// SHA-256 of the leaf certificate's DER bytes, used by the local Xray probe when the chain is
+    /// private and therefore absent from system trust stores.
+    pub peer_sha256: String,
 }
 
 /// One DNS record the caller has to publish, and later remove.
@@ -529,11 +533,13 @@ impl Session {
             .to_owned();
 
         let (not_after, issuer) = leaf_facts(&chain_pem)?;
+        let peer_sha256 = leaf_sha256(&chain_pem)?;
         Ok(IssuedCertificate {
             not_after,
             issuer,
             chain_pem,
             key_pem: key.serialize_pem(),
+            peer_sha256,
         })
     }
 }
@@ -572,6 +578,12 @@ pub(crate) fn leaf_facts(chain_pem: &str) -> Result<(String, String)> {
         .map(str::to_owned)
         .unwrap_or_else(|| certificate.issuer().to_string());
     Ok((not_after, issuer))
+}
+
+pub(crate) fn leaf_sha256(chain_pem: &str) -> Result<String> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(chain_pem.as_bytes())
+        .map_err(|error| Error::Protocol(format!("证书 PEM 解不开：{error}")))?;
+    Ok(format!("{:x}", Sha256::digest(&pem.contents)))
 }
 
 /// Turns an ACME problem document into one line worth putting on a page.

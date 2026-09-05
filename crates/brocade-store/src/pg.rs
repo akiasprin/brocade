@@ -43,14 +43,14 @@ use crate::{
     ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan,
     RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveWarpBindingRequest,
     RemoveWarpBindingResult, ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList,
-    RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult, StoreError,
-    TargetConvergenceReport, TenantList, UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult,
-    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateUserStatusResult,
-    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
-    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
-    UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest,
-    UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan, UserList,
-    VerifyDeploymentRequest, WarpBindingRemoval,
+    RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult, SetUserPasswordRequest,
+    SetUserPasswordResult, StoreError, TargetConvergenceReport, TenantList, UpdateNodeRequest,
+    UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
+    UpsertChainResult, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
+    UpsertTenantResult, UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList,
+    UsageReportRequest, UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan,
+    UserList, VerifyDeploymentRequest, WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -373,6 +373,14 @@ impl PgStore {
         cert::promote_certificate(&self.pool, actor, certificate_id).await
     }
 
+    pub async fn delete_certificate(
+        &self,
+        actor: &AdminContext,
+        certificate_id: &str,
+    ) -> Result<()> {
+        cert::delete_certificate(&self.pool, actor, certificate_id).await
+    }
+
     pub async fn certificate_dns_targets(&self) -> Result<Vec<crate::CertificateDnsTarget>> {
         cert::certificate_dns_targets(&self.pool).await
     }
@@ -392,23 +400,8 @@ impl PgStore {
         cert::record_certificate_attempt(&self.pool, certificate_id).await
     }
 
-    pub async fn record_certificate(
-        &self,
-        certificate_id: &str,
-        cert_pem: &str,
-        key_pem: &str,
-        not_after: &str,
-        issuer: &str,
-    ) -> Result<()> {
-        cert::record_certificate(
-            &self.pool,
-            certificate_id,
-            cert_pem,
-            key_pem,
-            not_after,
-            issuer,
-        )
-        .await
+    pub async fn record_certificate(&self, issued: crate::IssuedCertificate<'_>) -> Result<bool> {
+        cert::record_certificate(&self.pool, issued).await
     }
 
     pub async fn record_certificate_observation(
@@ -587,9 +580,17 @@ impl PgStore {
         target_id: &str,
         artifact_kind: &str,
         filter: SubscriptionFilter,
+        allow_insecure: bool,
     ) -> Result<ArtifactContent> {
-        console::serving_user_artifact_content(&self.pool, actor, target_id, artifact_kind, filter)
-            .await
+        console::serving_user_artifact_content(
+            &self.pool,
+            actor,
+            target_id,
+            artifact_kind,
+            filter,
+            allow_insecure,
+        )
+        .await
     }
 
     pub async fn clash_subscription_by_uuid(&self, uuid: &str) -> Result<DynamicClashSubscription> {
@@ -1173,6 +1174,16 @@ impl PgStore {
         user_id: &str,
     ) -> Result<IssuedUserLogin> {
         admin::issue_user_login(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn set_user_password(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        request: SetUserPasswordRequest,
+    ) -> Result<SetUserPasswordResult> {
+        admin::set_user_password(&self.pool, actor, tenant_id, user_id, request).await
     }
 
     pub async fn issue_admin_token(

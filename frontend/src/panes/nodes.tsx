@@ -1960,6 +1960,8 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
   const current = certs.data?.nodes.find(row => row.node_id === node.node_id);
   const group = groups.find(g => g.id === current?.label_id);
   const serving = group?.certificates.find(c => c.status === 'serving');
+  const selfSigned = serving?.issuer === 'Brocade Self-Signed';
+  const expiry = serving?.expires_at ? new Date(serving.expires_at) : null;
 
   const save = useMutation({
     mutationFn: (labelId: string) => setNodeCertGroup(node.node_id, labelId || null),
@@ -2005,6 +2007,18 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
               : '没有本机证书：这台机器上的 TLS 与 Hysteria 2 接入面会在编译时被拒绝。'}
           </span>
         </Row>
+        {current && serving && (
+          <>
+            <Row k="签发">
+              <span className={selfSigned ? 'st st-warn' : 'st st-ok'}>
+                {selfSigned ? '自签' : '公共 CA'}
+              </span>
+              <span className="sub">
+                {expiry && !Number.isNaN(expiry.valueOf()) ? `叶证书有效至 ${expiry.toLocaleDateString('zh-CN')}` : ''}
+              </span>
+            </Row>
+          </>
+        )}
         {save.error && <ErrorBox error={save.error} />}
       </div>
     </div>

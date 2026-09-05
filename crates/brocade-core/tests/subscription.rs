@@ -1074,6 +1074,56 @@ fn anytls_subscription_carries_the_independent_port_and_tls_name() {
 }
 
 #[test]
+fn self_signed_anytls_is_hidden_by_default_and_only_insecure_on_explicit_render() {
+    let mut artifact = subscription::build(&plan(|face| {
+        face.wires = IngressWires::AnyTls(AnyTls {
+            port: 19443,
+            ..AnyTls::default()
+        });
+    }));
+    artifact.mark_self_signed(&["hk-cert.example.net".to_owned()].into_iter().collect());
+
+    let safe_uri = uri::subscription(&artifact);
+    assert!(!safe_uri.contains("anytls://"), "{safe_uri}");
+    assert!(safe_uri.contains("自签证书地址默认隐藏"), "{safe_uri}");
+    assert!(!safe_uri.contains("insecure=1"), "{safe_uri}");
+
+    let explicit_uri = uri::subscription_with_options(
+        &artifact,
+        uri::UriRenderOptions {
+            allow_insecure: true,
+        },
+    );
+    assert!(explicit_uri.contains("anytls://"), "{explicit_uri}");
+    assert!(explicit_uri.contains("insecure=1"), "{explicit_uri}");
+
+    let clash = yaml::clash_subscription(&artifact);
+    assert!(clash.contains("type: anytls"), "{clash}");
+    assert!(clash.contains("skip-cert-verify: true"), "{clash}");
+}
+
+#[test]
+fn self_signed_vless_uri_is_never_rendered_without_a_portable_trust_field() {
+    let mut artifact = subscription::build(&plan(|face| {
+        face.wires = IngressWires::Vless(Transport::VlessTls(Tls::default()));
+    }));
+    artifact.mark_self_signed(&["hk-cert.example.net".to_owned()].into_iter().collect());
+
+    let explicit_uri = uri::subscription_with_options(
+        &artifact,
+        uri::UriRenderOptions {
+            allow_insecure: true,
+        },
+    );
+    assert!(!explicit_uri.contains("vless://"), "{explicit_uri}");
+    assert!(explicit_uri.contains("请使用 Clash 订阅"), "{explicit_uri}");
+
+    let clash = yaml::clash_subscription(&artifact);
+    assert!(clash.contains("type: vless"), "{clash}");
+    assert!(clash.contains("skip-cert-verify: true"), "{clash}");
+}
+
+#[test]
 fn anytls_reality_subscription_carries_its_distinct_identity_in_both_formats() {
     let (uri_text, clash_text) = render(|face| {
         let reality = face.wires.reality().unwrap().clone();

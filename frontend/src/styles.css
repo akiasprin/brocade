@@ -7139,6 +7139,85 @@ select.f.words {
 .sub-filter-with-action .sub-filter-row {
   flex: 1;
 }
+.sub-insecure {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  margin: 3px 0 2px;
+  padding: 5px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface) 42%, transparent);
+}
+.sub-insecure.on {
+  border-color: color-mix(in srgb, var(--gold) 38%, var(--line));
+  background: color-mix(in srgb, var(--gold) 6%, var(--surface));
+}
+.sub-insecure-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  color: var(--ink-3);
+}
+.sub-insecure.on .sub-insecure-icon {
+  color: var(--gold);
+}
+.sub-insecure-icon svg {
+  width: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.45;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.sub-insecure-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+.sub-insecure-copy small {
+  color: var(--ink-4);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.sub-insecure-toggle {
+  position: relative;
+  width: 31px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--sunk);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.sub-insecure-toggle > span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ink-4);
+  transition: transform 0.12s, background 0.12s;
+}
+.sub-insecure-toggle[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
+  background: color-mix(in srgb, var(--gold) 14%, var(--sunk));
+}
+.sub-insecure-toggle[aria-pressed='true'] > span {
+  transform: translateX(13px);
+  background: var(--gold);
+}
+.sub-insecure-toggle:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
 .sub-tabs {
   display: flex;
   align-items: center;
@@ -11855,6 +11934,17 @@ h4.sec > .btn {
   gap: 6px;
   white-space: nowrap;
 }
+.user-account-type {
+  display: inline-flex;
+  align-items: stretch;
+}
+.user-account-type .segsw {
+  min-height: 32px;
+}
+.user-account-type .segsw button {
+  padding-inline: 9px;
+  font-size: 12px;
+}
 .user-dact-icon,
 .user-dact-icon svg,
 .user-action-menu-icon,
@@ -11984,29 +12074,97 @@ h4.sec > .btn {
 .user-dcard-body {
   padding: 0;
 }
-.user-profile-form {
-  margin: 0;
+.user-password-card {
+  width: min(430px, calc(100vw - 28px));
+  max-height: min(620px, calc(100vh - 28px));
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: var(--shadow);
 }
-.user-profile-form dt,
-.user-profile-form dd {
-  align-self: center;
-}
-.user-login-control {
+.user-password-card > header {
   display: flex;
-  flex-wrap: wrap;
+  min-height: 48px;
   align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 13px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.user-password-card > header > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.user-password-card > header b {
+  color: var(--ink);
+  font-size: 13.5px;
+}
+.user-password-card > header small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-password-card > header > button {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--ink-3);
+  background: transparent;
+  font-size: 20px;
+  cursor: pointer;
+}
+.user-password-card > header > button:hover {
+  color: var(--ink);
+  background: var(--hover-2);
+}
+.user-password-card > form {
+  display: grid;
+  gap: 10px;
+  padding: 13px;
+}
+.user-password-card > form > .note {
+  margin: 0 0 2px;
+}
+.user-password-card > form > label {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.user-password-card > form > footer,
+.user-password-card > footer,
+.user-password-done {
+  display: flex;
+  justify-content: flex-end;
   gap: 7px;
 }
-.user-login-control > span {
-  color: var(--ink-3);
+.user-password-card > form > footer {
+  margin-top: 3px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
 }
-.user-profile-actions {
-  margin-top: 10px;
+.user-password-done {
+  display: grid;
+  justify-items: end;
+  padding: 13px;
 }
 .user-login-issued {
   display: grid;
   gap: 7px;
-  margin-top: 10px;
+  margin: 13px;
+  padding: 11px;
+  border: 1px solid color-mix(in srgb, var(--gold) 35%, var(--line));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--gold) 6%, var(--card));
 }
 .user-login-issued > span {
   display: flex;
@@ -12015,6 +12173,9 @@ h4.sec > .btn {
 }
 .user-login-issued code {
   overflow-wrap: anywhere;
+}
+.user-login-issued-card > footer {
+  padding: 0 13px 13px;
 }
 /* .qta / .grant-cards 自带 margin-top:4px（原先跟在 .fgrid 标签后）；落在卡壳里由内距
    接管顶距，去掉这 4px 免得叠出多余空白。 */
@@ -12725,6 +12886,14 @@ h4.sec > .btn {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
     gap: 6px;
+  }
+  .user-account-type .segsw {
+    width: 100%;
+  }
+  .user-account-type .segsw button {
+    min-width: 0;
+    flex: 1;
+    padding-inline: 5px;
   }
   .user-dacts .btn {
     width: 100%;
@@ -15564,6 +15733,14 @@ input.f.ing-pj-port {
   gap: 6px;
 }
 
+.certtrust-note {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  color: var(--ink-2);
+  font: 11.5px/1.55 var(--sans);
+}
+
 /* 机器行比证书行低一档：它们是同一张证书的多个持有者，不是并列的另一张证书。 */
 .certrow.member {
   background: color-mix(in srgb, var(--ink) 2.5%, transparent);
@@ -15640,6 +15817,16 @@ input.f.ing-pj-port {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11.5px;
+}
+
+.certrow .ctrust {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.certrow .ctrust.warn {
+  color: var(--warn);
 }
 
 /* 机器上的实际状态，占满整行显示在下方：它并非每行都有（正常时不显示），

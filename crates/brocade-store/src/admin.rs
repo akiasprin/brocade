@@ -104,6 +104,17 @@ pub struct ChangeAdminPasswordRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetUserPasswordRequest {
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetUserPasswordResult {
+    pub operator_id: String,
+    pub sessions_revoked: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedAdminSession {
     pub token: String,
     pub expires_at: String,
@@ -654,6 +665,56 @@ pub async fn issue_user_login(
     Ok(IssuedUserLogin {
         operator_id,
         password,
+        sessions_revoked,
+    })
+}
+
+/// Set a chosen password for an existing user login. This is deliberately separate from
+/// `issue_user_login`: reset/enable returns a generated one-time password, while this path accepts
+/// the value the operator explicitly entered. Both revoke every existing session and API token.
+pub async fn set_user_password(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+    request: SetUserPasswordRequest,
+) -> Result<SetUserPasswordResult> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "user login")?;
+    let password_hash = hash_admin_password(&request.new_password)?;
+
+    let mut tx = pool.begin().await?;
+    let operator_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM admin_operators
+         WHERE role = 'user' AND user_tenant_id = $1 AND user_id = $2
+         FOR UPDATE",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let operator_id = operator_id
+        .ok_or_else(|| StoreError::NotFound(format!("user login {tenant_id}/{user_id}")))?;
+
+    sqlx::query(
+        "UPDATE admin_operators
+         SET password_hash = $2,
+             token_revoked_at = CASE
+                 WHEN token_hash IS NOT NULL THEN COALESCE(token_revoked_at, now())
+                 ELSE token_revoked_at
+             END
+         WHERE id = $1",
+    )
+    .bind(&operator_id)
+    .bind(&password_hash)
+    .execute(&mut *tx)
+    .await?;
+    let sessions_revoked = revoke_operator_sessions(&mut tx, &operator_id, None).await?;
+    tx.commit().await?;
+
+    Ok(SetUserPasswordResult {
+        operator_id,
         sessions_revoked,
     })
 }

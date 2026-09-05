@@ -19,7 +19,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brocade_store::{CertificateOrder, PgStore};
+use brocade_store::{
+    CertificateOrder, CertificateSigningMethod, IssuedCertificate, PgStore, SELF_SIGNED_DIRECTORY,
+};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose,
+};
+use sha2::{Digest, Sha256};
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 use crate::acme::{self, AccountKey};
 use crate::dns::Cloudflare;
@@ -35,6 +42,74 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(3600);
 /// polite, but the manual "retry now" button and a restarting control plane would not — and the
 /// thing being protected is a weekly quota.
 const RETRY_AFTER_MINUTES: i32 = 30;
+const SELF_SIGNED_DAYS: i64 = 365;
+
+struct SelfSignedCertificate {
+    cert_pem: String,
+    key_pem: String,
+    not_after: String,
+    issuer: String,
+    peer_sha256: String,
+}
+
+enum IssueOutcome {
+    Stored(f64),
+    Obsolete,
+}
+
+fn generate_self_signed(names: Vec<String>) -> Result<SelfSignedCertificate, String> {
+    let now = OffsetDateTime::now_utc();
+    let expires = now + TimeDuration::days(SELF_SIGNED_DAYS);
+    let key = KeyPair::generate().map_err(|error| format!("生成自签证书密钥失败：{error}"))?;
+    let mut params =
+        CertificateParams::new(names).map_err(|error| format!("自签证书名称不合法：{error}"))?;
+    params.not_before = now - TimeDuration::minutes(5);
+    params.not_after = expires;
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "Brocade Self-Signed");
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let certificate = params
+        .self_signed(&key)
+        .map_err(|error| format!("生成自签证书失败：{error}"))?;
+    let cert_pem = certificate.pem();
+    let (not_after, issuer) =
+        acme::leaf_facts(&cert_pem).map_err(|error| format!("读不回自签证书：{error}"))?;
+    Ok(SelfSignedCertificate {
+        cert_pem,
+        key_pem: key.serialize_pem(),
+        not_after,
+        issuer,
+        peer_sha256: format!("{:x}", Sha256::digest(certificate.der())),
+    })
+}
+
+async fn issue_self_signed(
+    store: &PgStore,
+    order: &CertificateOrder,
+) -> Result<IssueOutcome, String> {
+    let started = std::time::Instant::now();
+    let certificate = generate_self_signed(order.names())?;
+    let stored = store
+        .record_certificate(IssuedCertificate {
+            certificate_id: &order.certificate_id,
+            acme_directory: &order.acme_directory,
+            cert_pem: &certificate.cert_pem,
+            key_pem: &certificate.key_pem,
+            not_after: &certificate.not_after,
+            issuer: &certificate.issuer,
+            peer_sha256: &certificate.peer_sha256,
+        })
+        .await
+        .map_err(|error| format!("签发成功但存不下来：{error}"))?;
+    if stored {
+        Ok(IssueOutcome::Stored(started.elapsed().as_secs_f64()))
+    } else {
+        Ok(IssueOutcome::Obsolete)
+    }
+}
 
 /// Runs one pass over everything that is due. Returns how many succeeded and how many failed.
 pub async fn scan_once(store: &PgStore) -> (usize, usize) {
@@ -95,9 +170,12 @@ pub async fn scan_once(store: &PgStore) -> (usize, usize) {
             continue;
         }
         match issue(store, &order).await {
-            Ok(seconds) => {
+            Ok(IssueOutcome::Stored(seconds)) => {
                 issued += 1;
                 eprintln!("证书：{what} 已签发，用时 {seconds:.0}s");
+            }
+            Ok(IssueOutcome::Obsolete) => {
+                eprintln!("证书：{what} 签发期间设置已变化，丢弃结果并按新设置重新排队");
             }
             Err(error) => {
                 failed += 1;
@@ -132,7 +210,9 @@ async fn reconcile_dns(store: &PgStore, domains: &[brocade_store::CertDomain]) {
         }
     };
 
-    for domain in domains.iter().filter(|domain| domain.has_credential) {
+    for domain in domains.iter().filter(|domain| {
+        domain.signing_method == CertificateSigningMethod::PublicCa && domain.has_credential
+    }) {
         let credential = match store.cert_domain_secrets(&domain.id).await {
             Ok((Some(credential), _, _)) => credential,
             Ok(_) => continue,
@@ -164,7 +244,10 @@ async fn reconcile_dns(store: &PgStore, domains: &[brocade_store::CertDomain]) {
 
 /// One order, start to finish. The error is a sentence meant for the console, not a type — every
 /// caller does the same thing with it, which is show it to a person.
-async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<f64, String> {
+async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<IssueOutcome, String> {
+    if order.acme_directory == SELF_SIGNED_DIRECTORY {
+        return issue_self_signed(store, order).await;
+    }
     let started = std::time::Instant::now();
 
     let (credential, account_key, account_url) = store
@@ -253,18 +336,24 @@ async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<f64, String>
     retract(&dns, &published).await;
     let issued = result.map_err(|error| error.to_string())?;
 
-    store
-        .record_certificate(
-            &order.certificate_id,
-            &issued.chain_pem,
-            &issued.key_pem,
-            &issued.not_after,
-            &issued.issuer,
-        )
+    let stored = store
+        .record_certificate(IssuedCertificate {
+            certificate_id: &order.certificate_id,
+            acme_directory: &order.acme_directory,
+            cert_pem: &issued.chain_pem,
+            key_pem: &issued.key_pem,
+            not_after: &issued.not_after,
+            issuer: &issued.issuer,
+            peer_sha256: &issued.peer_sha256,
+        })
         .await
         .map_err(|error| format!("签发成功但存不下来：{error}"))?;
 
-    Ok(started.elapsed().as_secs_f64())
+    if stored {
+        Ok(IssueOutcome::Stored(started.elapsed().as_secs_f64()))
+    } else {
+        Ok(IssueOutcome::Obsolete)
+    }
 }
 
 /// Best-effort cleanup. A failure here is logged and not propagated: the order's own outcome is
@@ -312,4 +401,29 @@ pub fn spawn(store: PgStore) -> Arc<tokio::sync::Notify> {
         }
     });
     wake
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_directly_self_signed_certificate_carries_an_arbitrary_private_sni_and_pin() {
+        let certificate = generate_self_signed(vec![
+            "*.private.apple.com".to_owned(),
+            "private.apple.com".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(certificate.cert_pem.matches("BEGIN CERTIFICATE").count(), 1);
+        assert!(KeyPair::from_pem(&certificate.key_pem).is_ok());
+        assert_eq!(
+            crate::acme::leaf_facts(&certificate.cert_pem).unwrap().1,
+            "Brocade Self-Signed"
+        );
+        assert_eq!(
+            crate::acme::leaf_sha256(&certificate.cert_pem).unwrap(),
+            certificate.peer_sha256
+        );
+        assert_eq!(certificate.peer_sha256.len(), 64);
+    }
 }

@@ -4,6 +4,8 @@
 //! projected from the same fully converged Serving snapshot used by subscriptions; otherwise this
 //! endpoint would be both an SSRF primitive and a test of a path subscribers were never given.
 
+use std::collections::BTreeMap;
+
 use brocade_core::{
     compile::compile,
     model::{HysteriaBbrProfile, HysteriaObfs, IpFamily},
@@ -71,6 +73,7 @@ pub async fn user_grant_probe_plan(
     }
 
     let mut items = Vec::with_capacity(user.entries.len());
+    let mut self_signed_pins = BTreeMap::<String, Option<String>>::new();
     for entry in user.entries {
         let (app, ingress) = serving
             .snapshot
@@ -88,6 +91,14 @@ pub async fn user_grant_probe_plan(
                     entry.grant_id, entry.ingress_id
                 ))
             })?;
+        let pinned_peer_cert_sha256 = match self_signed_pins.get(&ingress.node) {
+            Some(value) => value.clone(),
+            None => {
+                let value = self_signed_certificate_pin(pool, &ingress.node).await?;
+                self_signed_pins.insert(ingress.node.clone(), value.clone());
+                value
+            }
+        };
         let chain = app
             .chains
             .iter()
@@ -129,6 +140,7 @@ pub async fn user_grant_probe_plan(
                 empty_reality(),
                 Some(E2eProbeTls {
                     server_name: value.server_name.clone(),
+                    pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                     flow: value.flow.clone(),
                 }),
                 None,
@@ -154,6 +166,7 @@ pub async fn user_grant_probe_plan(
                 None,
                 Some(E2eProbeHysteria2 {
                     server_name: value.server_name.clone(),
+                    pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                     congestion: value.settings.congestion.as_str().to_owned(),
                     up: value.settings.bandwidth.up.clone(),
                     down: value.settings.bandwidth.down.clone(),
@@ -205,6 +218,7 @@ pub async fn user_grant_probe_plan(
                 anytls: match &entry.security {
                     UserSecurityPlan::AnyTls(value) => Some(E2eProbeAnyTls {
                         server_name: value.server_name.clone(),
+                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                         idle_session_check_interval_secs: value
                             .settings
                             .idle_session_check_interval_secs,
@@ -253,6 +267,24 @@ pub async fn user_grant_probe_plan(
         timeout_secs: u64::from(serving.snapshot.settings.probe.timeout_secs),
         items,
     })
+}
+
+async fn self_signed_certificate_pin(pool: &PgPool, node_id: &str) -> Result<Option<String>> {
+    let Some(profile) = crate::cert::serving_certificate_profile_for_node(pool, node_id).await?
+    else {
+        return Ok(None);
+    };
+    if !profile.requires_pinning {
+        return Ok(None);
+    }
+    if profile.trusted_peer_sha256.is_empty() {
+        Err(StoreError::InvalidData(format!(
+            "self-signed certificate trust set {} on node {node_id} has no peer fingerprint",
+            profile.name
+        )))
+    } else {
+        Ok(Some(profile.trusted_peer_sha256.join(",")))
+    }
 }
 
 pub async fn user_grant_probe_generation_matches(pool: &PgPool, expected: u64) -> Result<bool> {

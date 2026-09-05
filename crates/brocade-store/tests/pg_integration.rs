@@ -12,6 +12,7 @@ use brocade_core::{
         RealityFallbackMode, RealityFallbackRateLimit, RealitySite, Rule, Transport, WgTransport,
         Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
+    physical::user::SubscriptionFilter,
 };
 use brocade_deployment::plan::{
     AppliedArtifactState, AppliedGrantsState, DeploymentKind, DeploymentPlan, DesiredArtifact,
@@ -29,16 +30,17 @@ use brocade_store::{
     CertDomainInput, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest,
     CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest, CreateIngressRequest,
     CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
-    HopInRequest, HopWireRequest, IsolateDeploymentTargetRequest, LinkProbe, LinkProbeRequest,
-    LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment, PgStore,
+    HopInRequest, HopWireRequest, IsolateDeploymentTargetRequest, IssuedCertificate, LinkProbe,
+    LinkProbeRequest, LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment, PgStore,
     PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeTarget, ProbeTransport,
     ProvisionNodeRequest, PutStepRequest, RegisterWarpBindingRequest, RemoveWarpBindingRequest,
-    ReportedNodeState, SetUserAppQuotaRequest, StepAcceptRequest, StoreError, TargetApplyResult,
-    TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
-    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateRealtimeTelemetryPolicyRequest,
-    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateWarpBindingRequest,
-    UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest, UserAccountType,
-    VerifyDeploymentRequest, WiresRequest, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
+    ReportedNodeState, SetUserAppQuotaRequest, SetUserPasswordRequest, StepAcceptRequest,
+    StoreError, TargetApplyResult, TargetConvergenceReport, TransportRequest,
+    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest,
+    UserAccountType, VerifyDeploymentRequest, WiresRequest, ENROLLMENT_TOKEN_PREFIX,
+    NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -241,14 +243,27 @@ async fn issue_certificate_for(db: &TestPg, node_id: &str, issuer: &str) -> Stri
         .request_spare_certificate(&system_admin(), &label_of_node(db, node_id).await)
         .await
         .unwrap();
+    let issued_directory: String = sqlx::query_scalar(
+        "SELECT d.acme_directory
+           FROM certificates c
+           JOIN cert_labels l ON l.id = c.label_id
+           JOIN cert_domains d ON d.id = l.domain_id
+          WHERE c.id = $1",
+    )
+    .bind(&cert_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     db.store
-        .record_certificate(
-            &cert_id,
-            "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n",
-            "-----BEGIN PRIVATE KEY-----\ny\n-----END PRIVATE KEY-----\n",
-            "2099-01-01T00:00:00Z",
+        .record_certificate(IssuedCertificate {
+            certificate_id: &cert_id,
+            acme_directory: &issued_directory,
+            cert_pem: "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n",
+            key_pem: "-----BEGIN PRIVATE KEY-----\ny\n-----END PRIVATE KEY-----\n",
+            not_after: "2099-01-01T00:00:00Z",
             issuer,
-        )
+            peer_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        })
         .await
         .unwrap();
     cert_id
@@ -5521,13 +5536,63 @@ async fn user_login_is_bound_to_one_user_and_resets_in_place() {
         })
         .await;
     assert!(matches!(ambiguous_short, Err(StoreError::Unauthorized(_))));
-    db.store
+    let qualified_session = db
+        .store
         .login_admin(AdminLoginRequest {
-            operator_id: reset.operator_id,
-            password: reset.password,
+            operator_id: reset.operator_id.clone(),
+            password: reset.password.clone(),
         })
         .await
         .unwrap();
+
+    let changed = db
+        .store
+        .set_user_password(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SetUserPasswordRequest {
+                new_password: "chosen-user-password".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.operator_id, reset.operator_id);
+    assert_eq!(changed.sessions_revoked, 2);
+    assert!(db
+        .store
+        .authenticate_admin_session(&qualified_session.session.token)
+        .await
+        .unwrap()
+        .is_none());
+    let reset_password = db
+        .store
+        .login_admin(AdminLoginRequest {
+            operator_id: reset.operator_id.clone(),
+            password: reset.password,
+        })
+        .await;
+    assert!(matches!(reset_password, Err(StoreError::Unauthorized(_))));
+    db.store
+        .login_admin(AdminLoginRequest {
+            operator_id: reset.operator_id,
+            password: "chosen-user-password".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let short = db
+        .store
+        .set_user_password(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SetUserPasswordRequest {
+                new_password: "short".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(short, Err(StoreError::InvalidData(_))));
 }
 
 /// Passwordless login is a named public surface, never a property that can be attached to an
@@ -11853,6 +11918,7 @@ async fn cancel_deployment_and_rollback_restores_latest_succeeded_snapshot_and_f
             &system_admin(),
             CertDomainInput {
                 domain: "rollback.example.test".to_owned(),
+                signing_method: Default::default(),
                 dns_credential: Some("token".to_owned()),
                 acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
                 acme_contact: Some("ops@example.test".to_owned()),
@@ -13324,6 +13390,7 @@ async fn changing_the_ca_makes_the_certificates_it_issued_due_again() {
 
     let domain = |directory: &str| CertDomainInput {
         domain: "example.test".to_owned(),
+        signing_method: Default::default(),
         dns_credential: Some("token".to_owned()),
         acme_directory: Some(directory.to_owned()),
         acme_contact: Some("ops@example.test".to_owned()),
@@ -13461,8 +13528,8 @@ async fn an_entrance_is_guarded_by_default_and_changing_it_stamps_a_revision() {
 ///
 /// Guarded in the store rather than left to the CHECK constraint, because the message matters: a
 /// typo here points the fleet at a CA that does not exist, and the failure surfaces one node at a
-/// time, half an hour apart. There is no sentinel any more — self-signing was removed, so an
-/// empty directory is a refusal rather than a fallback.
+/// time, half an hour apart. Self-signing is selected explicitly; its internal marker is not a
+/// public-CA directory value, so an empty or sentinel directory is a refusal rather than fallback.
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn the_directory_takes_an_https_url_and_nothing_else() {
@@ -13477,6 +13544,7 @@ async fn the_directory_takes_an_https_url_and_nothing_else() {
 
     let with_directory = |directory: &str| CertDomainInput {
         domain: "lab.test".to_owned(),
+        signing_method: Default::default(),
         dns_credential: None,
         acme_directory: Some(directory.to_owned()),
         acme_contact: None,
@@ -13501,6 +13569,7 @@ async fn the_directory_takes_an_https_url_and_nothing_else() {
             &system_admin(),
             CertDomainInput {
                 domain: "lab.test".to_owned(),
+                signing_method: Default::default(),
                 dns_credential: None,
                 acme_directory: None,
                 acme_contact: None,
@@ -13521,6 +13590,405 @@ async fn the_directory_takes_an_https_url_and_nothing_else() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn a_self_signed_domain_needs_no_dns_credential() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "private.apple.com".to_owned(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(domain.acme_directory, brocade_store::SELF_SIGNED_DIRECTORY);
+    assert!(!domain.has_credential);
+    let label_id = db
+        .store
+        .create_cert_label(&system_admin(), &domain.id, "Self-signed", None)
+        .await
+        .unwrap();
+    let due = db.store.certificates_due(0).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].label_id, label_id);
+    assert_eq!(due[0].acme_directory, brocade_store::SELF_SIGNED_DIRECTORY);
+
+    let stale_root_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'cert_domains'
+            AND column_name LIKE 'self_signed_root_%'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stale_root_columns, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn an_inflight_certificate_cannot_adopt_a_changed_signing_method() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "switch.test".to_owned(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    db.store
+        .create_cert_label(&system_admin(), &domain.id, "Switch", None)
+        .await
+        .unwrap();
+    let old_order = db.store.certificates_due(0).await.unwrap().remove(0);
+    db.store
+        .record_certificate_attempt(&old_order.certificate_id)
+        .await
+        .unwrap();
+
+    db.store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: domain.domain,
+                signing_method: brocade_store::CertificateSigningMethod::PublicCa,
+                dns_credential: Some("token".to_owned()),
+                acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+
+    let stored = db
+        .store
+        .record_certificate(IssuedCertificate {
+            certificate_id: &old_order.certificate_id,
+            acme_directory: &old_order.acme_directory,
+            cert_pem: "old-mode certificate",
+            key_pem: "old-mode private key",
+            not_after: "2099-01-01T00:00:00Z",
+            issuer: "Brocade Self-Signed",
+            peer_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        })
+        .await
+        .unwrap();
+    assert!(!stored, "旧签发方式的结果不能接管");
+    let discarded = sqlx::query(
+        "SELECT status, cert_pem, last_attempt_at IS NULL AS requeued
+           FROM certificates WHERE id = $1",
+    )
+    .bind(&old_order.certificate_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(discarded.try_get::<String, _>("status").unwrap(), "pending");
+    assert!(discarded
+        .try_get::<Option<String>, _>("cert_pem")
+        .unwrap()
+        .is_none());
+    assert!(discarded.try_get::<bool, _>("requeued").unwrap());
+
+    let new_order = db.store.certificates_due(0).await.unwrap().remove(0);
+    assert_eq!(new_order.certificate_id, old_order.certificate_id);
+    assert_eq!(new_order.acme_directory, brocade_store::ACME_LETSENCRYPT);
+    assert!(db
+        .store
+        .record_certificate(IssuedCertificate {
+            certificate_id: &new_order.certificate_id,
+            acme_directory: &new_order.acme_directory,
+            cert_pem: "public certificate",
+            key_pem: "public private key",
+            not_after: "2099-01-01T00:00:00Z",
+            issuer: "Public CA",
+            peer_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        })
+        .await
+        .unwrap());
+    let actual_directory: String =
+        sqlx::query_scalar("SELECT acme_directory FROM certificates WHERE id = $1")
+            .bind(&new_order.certificate_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(actual_directory, brocade_store::ACME_LETSENCRYPT);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn retained_certificate_trust_survives_expiry_and_ca_switch_until_manual_deletion() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+
+    // Make the fixture's only user entry use TLS-backed AnyTLS so both subscription rendering and
+    // probe pinning have an observable trust decision.
+    sqlx::query(
+        "UPDATE ingresses
+            SET transport_kind = NULL,
+                anytls_enabled = TRUE,
+                anytls_security = 'tls',
+                anytls_port = 8443
+          WHERE id = 'i-main'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "expired.test".to_owned(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    let label_id = db
+        .store
+        .create_cert_label(&system_admin(), &domain.id, "Expired", None)
+        .await
+        .unwrap();
+    db.store
+        .set_node_cert_label(&system_admin(), "n1", Some(&label_id))
+        .await
+        .unwrap();
+    let certificate_id = db
+        .store
+        .request_spare_certificate(&system_admin(), &label_id)
+        .await
+        .unwrap();
+    let pin = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    assert!(db
+        .store
+        .record_certificate(IssuedCertificate {
+            certificate_id: &certificate_id,
+            acme_directory: brocade_store::SELF_SIGNED_DIRECTORY,
+            cert_pem: "self-signed certificate",
+            key_pem: "self-signed private key",
+            not_after: "2099-01-01T00:00:00Z",
+            issuer: "Brocade Self-Signed",
+            peer_sha256: pin,
+        })
+        .await
+        .unwrap());
+
+    // The general artifact inspector and draft preview must not become alternate download paths.
+    // Only the dedicated serving address dialog accepts an explicit allow_insecure choice.
+    for rendered in [
+        db.store
+            .artifact_content(
+                &system_admin(),
+                None,
+                "user",
+                "platform.acme:alice",
+                "uri",
+                SubscriptionFilter::default(),
+            )
+            .await
+            .unwrap(),
+        db.store
+            .preview_draft_artifact(
+                &system_admin(),
+                Vec::new(),
+                "user",
+                "platform.acme:alice",
+                "uri",
+            )
+            .await
+            .unwrap(),
+    ] {
+        let rendered = rendered.content.unwrap();
+        assert!(!rendered.contains("anytls://"));
+        assert!(rendered.contains("自签证书地址默认隐藏"));
+    }
+
+    // The deployed Serving projection was compiled while the certificate was valid. Expiry is an
+    // operational fact that can change underneath that immutable projection; it must not silently
+    // change how the same certificate is classified for trust.
+    seed_subscription_serving(&db).await;
+    sqlx::query("UPDATE certificates SET expires_at = '2000-01-01T00:00:00Z' WHERE id = $1")
+        .bind(&certificate_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let uri = db
+        .store
+        .serving_user_artifact_content(
+            &system_admin(),
+            "platform.acme:alice",
+            "uri",
+            SubscriptionFilter::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let uri = uri.content.unwrap();
+    assert!(!uri.contains("anytls://"));
+    assert!(uri.contains("自签证书地址默认隐藏"));
+
+    let probe = db
+        .store
+        .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    let anytls = probe.items[0].target.anytls.as_ref().unwrap();
+    assert_eq!(anytls.pinned_peer_cert_sha256.as_deref(), Some(pin));
+
+    // Switching authority creates a distinct renewal row. The public leaf becomes the one served,
+    // while the old self-signed leaf stays in the trust set until an operator removes it.
+    db.store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: domain.domain,
+                signing_method: brocade_store::CertificateSigningMethod::PublicCa,
+                dns_credential: Some("token".to_owned()),
+                acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    let public_order = db.store.certificates_due(0).await.unwrap().remove(0);
+    assert_ne!(public_order.certificate_id, certificate_id);
+    assert_eq!(public_order.acme_directory, brocade_store::ACME_LETSENCRYPT);
+    let public_pin = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    assert!(db
+        .store
+        .record_certificate(IssuedCertificate {
+            certificate_id: &public_order.certificate_id,
+            acme_directory: &public_order.acme_directory,
+            cert_pem: "public certificate",
+            key_pem: "public private key",
+            not_after: "2099-01-01T00:00:00Z",
+            issuer: "Public CA",
+            peer_sha256: public_pin,
+        })
+        .await
+        .unwrap());
+    assert_eq!(status_of(&db, &certificate_id).await, "superseded");
+    assert_eq!(
+        status_of(&db, &public_order.certificate_id).await,
+        "serving"
+    );
+
+    let probe = db
+        .store
+        .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    let pins = probe.items[0]
+        .target
+        .anytls
+        .as_ref()
+        .unwrap()
+        .pinned_peer_cert_sha256
+        .as_deref()
+        .unwrap();
+    let mut pins = pins.split(',').collect::<Vec<_>>();
+    pins.sort_unstable();
+    assert_eq!(pins, vec![pin, public_pin]);
+    let uri = db
+        .store
+        .serving_user_artifact_content(
+            &system_admin(),
+            "platform.acme:alice",
+            "uri",
+            SubscriptionFilter::default(),
+            false,
+        )
+        .await
+        .unwrap()
+        .content
+        .unwrap();
+    assert!(uri.contains("自签证书地址默认隐藏"));
+
+    db.store
+        .delete_certificate(&system_admin(), &certificate_id)
+        .await
+        .unwrap();
+    let probe = db
+        .store
+        .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert!(probe.items[0]
+        .target
+        .anytls
+        .as_ref()
+        .unwrap()
+        .pinned_peer_cert_sha256
+        .is_none());
+    let uri = db
+        .store
+        .serving_user_artifact_content(
+            &system_admin(),
+            "platform.acme:alice",
+            "uri",
+            SubscriptionFilter::default(),
+            false,
+        )
+        .await
+        .unwrap()
+        .content
+        .unwrap();
+    assert!(uri.contains("anytls://"));
+    assert!(db
+        .store
+        .delete_certificate(&system_admin(), &public_order.certificate_id)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn renewal_failure_does_not_withdraw_an_unexpired_certificate() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -13537,6 +14005,7 @@ async fn renewal_failure_does_not_withdraw_an_unexpired_certificate() {
             &system_admin(),
             CertDomainInput {
                 domain: "example.test".to_owned(),
+                signing_method: Default::default(),
                 dns_credential: Some("token".to_owned()),
                 acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
                 acme_contact: Some("ops@example.test".to_owned()),
@@ -13595,6 +14064,7 @@ async fn cert_delta_is_some_until_the_node_reports_the_serving_certificate() {
             &system_admin(),
             CertDomainInput {
                 domain: "example.test".to_owned(),
+                signing_method: Default::default(),
                 dns_credential: Some("token".to_owned()),
                 acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
                 acme_contact: Some("ops@example.test".to_owned()),
@@ -13658,6 +14128,7 @@ async fn a_renewal_takes_over_while_a_spare_waits() {
             &system_admin(),
             CertDomainInput {
                 domain: "example.test".to_owned(),
+                signing_method: Default::default(),
                 dns_credential: Some("token".to_owned()),
                 acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
                 acme_contact: None,
@@ -13715,14 +14186,27 @@ async fn status_of(db: &TestPg, certificate_id: &str) -> String {
 }
 
 async fn record_test_certificate(db: &TestPg, certificate_id: &str) {
+    let issued_directory: String = sqlx::query_scalar(
+        "SELECT d.acme_directory
+           FROM certificates c
+           JOIN cert_labels l ON l.id = c.label_id
+           JOIN cert_domains d ON d.id = l.domain_id
+          WHERE c.id = $1",
+    )
+    .bind(certificate_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     db.store
-        .record_certificate(
+        .record_certificate(IssuedCertificate {
             certificate_id,
-            "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n",
-            "-----BEGIN PRIVATE KEY-----\ny\n-----END PRIVATE KEY-----\n",
-            "2099-01-01T00:00:00Z",
-            "Test CA",
-        )
+            acme_directory: &issued_directory,
+            cert_pem: "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n",
+            key_pem: "-----BEGIN PRIVATE KEY-----\ny\n-----END PRIVATE KEY-----\n",
+            not_after: "2099-01-01T00:00:00Z",
+            issuer: "Test CA",
+            peer_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        })
         .await
         .unwrap();
 }
@@ -14162,6 +14646,7 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
             &system_admin(),
             CertDomainInput {
                 domain: "example.test".to_owned(),
+                signing_method: Default::default(),
                 dns_credential: Some("token".to_owned()),
                 acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
                 acme_contact: Some("ops@example.test".to_owned()),

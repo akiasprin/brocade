@@ -988,6 +988,11 @@ pub struct E2eProbeTarget {
 pub struct E2eProbeAnyTls {
     /// The name on the machine's certificate. The client verifies it as ordinary TLS.
     pub server_name: String,
+    /// Comma-separated DER SHA-256 values for every retained leaf in the certificate group.
+    /// Present while the group still trusts any self-signed leaf; Xray verifies one of these
+    /// instead of disabling TLS verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_peer_cert_sha256: Option<String>,
     /// Optional client session-pool settings. Omitted values use the pinned Xray defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_session_check_interval_secs: Option<u32>,
@@ -1000,6 +1005,8 @@ pub struct E2eProbeAnyTls {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2eProbeHysteria2 {
     pub server_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_peer_cert_sha256: Option<String>,
     pub congestion: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up: Option<String>,
@@ -1062,6 +1069,8 @@ pub struct E2eProbeTls {
     /// The name on the machine's certificate. The client verifies it, so unlike REALITY's
     /// impersonated name, an incorrect value fails the probe at the client end.
     pub server_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_peer_cert_sha256: Option<String>,
     pub flow: Option<String>,
 }
 

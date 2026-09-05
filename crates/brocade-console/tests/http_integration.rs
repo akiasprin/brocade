@@ -2888,6 +2888,45 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
         .await
         .unwrap();
     assert_eq!(update.status(), StatusCode::FORBIDDEN);
+
+    let forbidden_password = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/users/platform.acme/alice/login")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "new_password": "user-chosen-password" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden_password.status(), StatusCode::FORBIDDEN);
+
+    let changed_password = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/users/platform.acme/alice/login")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "new_password": "user-chosen-password" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed_password.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(changed_password).await["operator_id"],
+        "platform.acme/alice"
+    );
+    login_cookie(&app, "platform.acme/alice", "user-chosen-password").await;
 }
 
 /// A reviewing role reads the model to check it and must not walk away with the
@@ -4595,6 +4634,91 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         securities.contains(&"none") && securities.contains(&"reality"),
         "两条链各用各的传输层：{securities:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn certificate_settings_issue_a_direct_self_signed_certificate() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+
+    let response = app
+        .oneshot(
+            Request::put("/certs/domain")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "domain": "private.apple.com",
+                        "signing_method": "self-signed",
+                        "renew_before_days": 30
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["domain"]["signing_method"], "self-signed");
+    assert_eq!(body["domain"]["acme_directory"], "self-signed");
+    assert_eq!(body["domain"]["has_credential"], false);
+    let text = body.to_string();
+    assert!(!text.contains("BEGIN PRIVATE KEY"));
+    assert!(!text.contains("BEGIN CERTIFICATE"));
+
+    let domain_id = body["domain"]["id"].as_str().unwrap();
+    let label_id = db
+        .store
+        .create_cert_label(
+            &AdminContext::system_admin("test-admin"),
+            domain_id,
+            "Self-signed SNI",
+            None,
+        )
+        .await
+        .unwrap();
+    db.store
+        .set_node_cert_label(
+            &AdminContext::system_admin("test-admin"),
+            "n1",
+            Some(&label_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(brocade_console::certs::scan_once(&db.store).await, (1, 0));
+    let groups = db
+        .store
+        .cert_groups(&AdminContext::system_admin("test-admin"))
+        .await
+        .unwrap();
+    let serving = groups[0]
+        .certificates
+        .iter()
+        .find(|certificate| certificate.status == "serving")
+        .unwrap();
+    assert_eq!(serving.issuer.as_deref(), Some("Brocade Self-Signed"));
+    let row = sqlx::query("SELECT key_pem_sealed, peer_sha256 FROM certificates WHERE id = $1")
+        .bind(&serving.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let sealed_key: String = row.try_get("key_pem_sealed").unwrap();
+    let peer_sha256: String = row.try_get("peer_sha256").unwrap();
+    assert!(!sealed_key.contains("BEGIN PRIVATE KEY"));
+    assert_eq!(peer_sha256.len(), 64);
+    let material = db.store.cert_delta_for_node("n1").await.unwrap().unwrap();
+    assert_eq!(material.cert_pem.matches("BEGIN CERTIFICATE").count(), 1);
+    assert!(material.key_pem.contains("BEGIN PRIVATE KEY"));
 }
 
 async fn apply_step_json(

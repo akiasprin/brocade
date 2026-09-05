@@ -437,7 +437,7 @@ pub async fn user_profile(
     user_id: &str,
 ) -> Result<UserListItem> {
     actor.require_tenant_access(tenant_id, "user profile")?;
-    load_user_item(pool, &tenant_id, &user_id).await
+    load_user_item(pool, tenant_id, user_id).await
 }
 
 pub async fn self_user_profile(pool: &PgPool, actor: &AdminContext) -> Result<UserListItem> {

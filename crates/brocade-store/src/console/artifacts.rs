@@ -1,6 +1,9 @@
 //! Artifact index and contents. Artifacts are a pure function of the snapshot — computed on
 //! demand rather than looked up, which is how a draft can have artifacts too.
+use std::collections::BTreeSet;
+
 use brocade_core::artifacts::hy2_port_hop::Hy2PortHopArtifact;
+use brocade_core::format::uri::UriRenderOptions;
 use brocade_core::{model::ModelSnapshot, physical::user::SubscriptionFilter};
 use sqlx::PgPool;
 
@@ -150,6 +153,7 @@ pub async fn artifact_content(
     filter: SubscriptionFilter,
 ) -> Result<ArtifactContent> {
     let snapshot = load_scoped_snapshot(pool, actor, revision).await?;
+    let self_signed_names = crate::cert::self_signed_certificate_names(pool).await?;
     artifact_content_of(
         &snapshot,
         target_kind,
@@ -157,6 +161,7 @@ pub async fn artifact_content(
         artifact_kind,
         !actor.is_system_admin(),
         filter,
+        &self_signed_names,
     )
 }
 
@@ -171,6 +176,7 @@ pub async fn serving_user_artifact_content(
     target_id: &str,
     artifact_kind: &str,
     filter: SubscriptionFilter,
+    allow_insecure: bool,
 ) -> Result<ArtifactContent> {
     let target_id = required_text(target_id, "target_id")?;
     let artifact_kind = required_text(artifact_kind, "artifact_kind")?;
@@ -179,19 +185,29 @@ pub async fn serving_user_artifact_content(
             "serving user artifact {target_id}/{artifact_kind}"
         )));
     }
+    if allow_insecure && artifact_kind != "uri" {
+        return Err(StoreError::InvalidData(
+            "insecure rendering is available only for URI artifacts".to_owned(),
+        ));
+    }
     let (tenant_id, user_id) = split_user_target(&target_id)?;
     actor.require_tenant_access(tenant_id, "serving user artifact")?;
 
     let serving = crate::serving::load_subscription_serving_projection(pool).await?;
     ensure_user_visible(&serving.snapshot, tenant_id, user_id)?;
     serving.ensure_available()?;
-    artifact_content_of(
+    let self_signed_names = crate::cert::self_signed_certificate_names(pool).await?;
+    artifact_content_of_with_policy(
         &serving.snapshot,
         "user",
         &target_id,
         &artifact_kind,
-        false,
-        filter,
+        ArtifactRenderPolicy {
+            redact: false,
+            filter,
+            self_signed_names: &self_signed_names,
+            allow_insecure,
+        },
     )
 }
 
@@ -209,6 +225,35 @@ pub(crate) fn artifact_content_of(
     artifact_kind: &str,
     redact: bool,
     filter: SubscriptionFilter,
+    self_signed_names: &BTreeSet<String>,
+) -> Result<ArtifactContent> {
+    artifact_content_of_with_policy(
+        snapshot,
+        target_kind,
+        target_id,
+        artifact_kind,
+        ArtifactRenderPolicy {
+            redact,
+            filter,
+            self_signed_names,
+            allow_insecure: false,
+        },
+    )
+}
+
+struct ArtifactRenderPolicy<'a> {
+    redact: bool,
+    filter: SubscriptionFilter,
+    self_signed_names: &'a BTreeSet<String>,
+    allow_insecure: bool,
+}
+
+fn artifact_content_of_with_policy(
+    snapshot: &ModelSnapshot,
+    target_kind: &str,
+    target_id: &str,
+    artifact_kind: &str,
+    policy: ArtifactRenderPolicy<'_>,
 ) -> Result<ArtifactContent> {
     let target_kind = required_text(target_kind, "target_kind")?;
     let target_id = required_text(target_id, "target_id")?;
@@ -233,7 +278,7 @@ pub(crate) fn artifact_content_of(
                         &target_id,
                         &artifact_kind,
                         json_format::phantun(&artifact),
-                        redact,
+                        policy.redact,
                     )
                 }
                 brocade_core::artifacts::phantun::PhantunArtifact::Disabled { .. } => {
@@ -260,7 +305,7 @@ pub(crate) fn artifact_content_of(
                         &target_id,
                         &artifact_kind,
                         ini::wireguard(&artifact),
-                        redact,
+                        policy.redact,
                     )
                 }
                 brocade_core::artifacts::wireguard::WireGuardArtifact::Disabled { .. } => {
@@ -286,7 +331,7 @@ pub(crate) fn artifact_content_of(
                     &target_id,
                     &artifact_kind,
                     json_format::hy2_port_hop(&artifact),
-                    redact,
+                    policy.redact,
                 ),
                 Hy2PortHopArtifact::Disabled { .. } => Ok(disabled_artifact_content(
                     snapshot.revision,
@@ -310,7 +355,7 @@ pub(crate) fn artifact_content_of(
                         &target_id,
                         &artifact_kind,
                         json_format::xray(&artifact),
-                        redact,
+                        policy.redact,
                     )
                 }
                 brocade_core::artifacts::xray::XrayArtifact::Disabled { .. } => {
@@ -355,10 +400,16 @@ pub(crate) fn artifact_content_of(
                     "cannot project user {tenant_id}/{user_id}: {blocked:?}"
                 ))
             })?;
-            plan.retain_filter(filter);
-            let subscription = subscription::build(&plan);
+            plan.retain_filter(policy.filter);
+            let mut subscription = subscription::build(&plan);
+            subscription.mark_self_signed(policy.self_signed_names);
             let content = if artifact_kind == "uri" {
-                uri::subscription(&subscription)
+                uri::subscription_with_options(
+                    &subscription,
+                    UriRenderOptions {
+                        allow_insecure: policy.allow_insecure,
+                    },
+                )
             } else {
                 yaml::clash_subscription(&subscription)
             };

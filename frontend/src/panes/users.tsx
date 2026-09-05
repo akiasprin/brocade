@@ -18,6 +18,7 @@ import {
   rotateMyUuid,
   rotateUserUuid,
   setQuota,
+  setUserPassword,
   setUserStatus,
   startUserGrantProbe,
   updateUserProfile,
@@ -30,7 +31,7 @@ import {
   type UserListItem,
 } from '../api';
 import { can, useSession } from '../session';
-import { Empty, ErrorBox, Loading } from '../ui/bits';
+import { Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
@@ -421,98 +422,150 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function UserProfileCard({
-  user,
-  editable,
-  canManageLogin,
-}: {
-  user: UserListItem;
-  editable: boolean;
-  canManageLogin: boolean;
-}) {
-  const qc = useQueryClient();
-  const [accountType, setAccountType] = useState<'formal' | 'test'>(user.account_type ?? 'formal');
-  const [issued, setIssued] = useState<{ operator_id: string; password: string } | null>(null);
+const USER_PASSWORD_MIN_LEN = 8;
 
-  const save = useMutation({
-    mutationFn: () => updateUserProfile(user.tenant_id, user.id, { account_type: accountType }),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: ['users'] });
-    },
+function UserPasswordDialog({ user, onClose }: { user: UserListItem; onClose: () => void }) {
+  const [next, setNext] = useState('');
+  const [again, setAgain] = useState('');
+  const change = useMutation({
+    mutationFn: () => setUserPassword(user.tenant_id, user.id, next),
   });
-  const login = useMutation({
-    mutationFn: () => issueUserLogin(user.tenant_id, user.id),
-    onSuccess: value => {
-      setIssued(value);
-      void qc.invalidateQueries({ queryKey: ['users'] });
-    },
-  });
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  const tooShort = next.length > 0 && next.length < USER_PASSWORD_MIN_LEN;
+  const mismatch = again.length > 0 && next !== again;
+  const ready = next.length >= USER_PASSWORD_MIN_LEN && next === again;
+
   return (
-    <section className="panel config-panel user-dcard user-profile-card">
-      <header>
-        <PanelTitle of="users">用户资料</PanelTitle>
-        <span className={`st ${accountType === 'test' ? 'st-warn' : 'st-ok'}`}>
-          {accountType === 'test' ? '测试账号' : '正式账号'}
-        </span>
-      </header>
-      <div className="user-dcard-body">
-        <dl className="kv form2 user-profile-form">
-          <dt>账号类型</dt>
-          <dd>
-            <select
-              className="f"
-              value={accountType}
-              disabled={!editable}
-              onChange={event => setAccountType(event.target.value as 'formal' | 'test')}
-            >
-              <option value="formal">正式</option>
-              <option value="test">测试</option>
-            </select>
-          </dd>
-          <dt>登录</dt>
-          <dd className="user-login-control">
-            <span>
-              {user.login_enabled === undefined ? '仅本人或管理员可见' : user.login_enabled ? '已开通' : '未开通'}
-            </span>
-            {canManageLogin && (
-              <button
-                className="btn"
-                type="button"
-                disabled={login.isPending}
-                onClick={() => {
-                  if (user.login_enabled && !window.confirm(`确定重置 ${user.id} 的登录密码？现有登录会话将失效。`)) {
-                    return;
-                  }
-                  login.mutate();
-                }}
-              >
-                {login.isPending ? '处理中…' : user.login_enabled ? '重置登录密码' : '开通登录'}
-              </button>
-            )}
-          </dd>
-        </dl>
-        {editable && (
-          <div className="toolbar user-profile-actions">
-            <span className="sp" />
-            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
-              {save.isPending ? '保存中…' : '保存资料'}
+    <div className="confirm-mask" onClick={onClose}>
+      <section
+        className="user-password-card"
+        onClick={event => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`修改 ${user.id} 的登录密码`}
+      >
+        <header>
+          <span>
+            <b>修改密码</b>
+            <small className="mono">
+              {user.tenant_id}/{user.id}
+            </small>
+          </span>
+          <button type="button" aria-label="关闭" onClick={onClose}>
+            ×
+          </button>
+        </header>
+        {change.data ? (
+          <div className="user-password-done">
+            <div className="callout">
+              密码已修改。
+              {change.data.sessions_revoked > 0
+                ? `已注销 ${change.data.sessions_revoked} 条旧会话。`
+                : '没有需要注销的旧会话。'}
+            </div>
+            <button className="btn primary" type="button" onClick={onClose}>
+              完成
             </button>
           </div>
+        ) : (
+          <form
+            onSubmit={event => {
+              event.preventDefault();
+              if (ready) change.mutate();
+            }}
+          >
+            <p className="note">直接设置该用户的新登录密码；保存后，其他设备上的登录会话立即失效。</p>
+            <label>
+              <span>新密码</span>
+              <input
+                className="f"
+                type="password"
+                autoComplete="new-password"
+                autoFocus
+                value={next}
+                placeholder={`至少 ${USER_PASSWORD_MIN_LEN} 位`}
+                onChange={event => setNext(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>确认密码</span>
+              <input
+                className="f"
+                type="password"
+                autoComplete="new-password"
+                value={again}
+                placeholder="再输入一遍"
+                onChange={event => setAgain(event.target.value)}
+              />
+            </label>
+            {tooShort && <p className="note err">新密码至少 {USER_PASSWORD_MIN_LEN} 位。</p>}
+            {mismatch && <p className="note err">两次输入不一致。</p>}
+            {change.error && <ErrorBox error={change.error} />}
+            <footer>
+              <button className="btn" type="button" onClick={onClose}>
+                取消
+              </button>
+              <button className="btn primary" type="submit" disabled={!ready || change.isPending}>
+                {change.isPending ? '保存中…' : '保存密码'}
+              </button>
+            </footer>
+          </form>
         )}
-        {(save.error || login.error) && <ErrorBox error={save.error ?? login.error} />}
-        {issued && (
-          <div className="callout warn user-login-issued">
-            <b>登录密码只显示这一次</b>
-            <span>
-              登录名 <code>{issued.operator_id}</code> <CopyButton text={issued.operator_id} />
-            </span>
-            <span>
-              密码 <code>{issued.password}</code> <CopyButton text={issued.password} />
-            </span>
-          </div>
-        )}
-      </div>
-    </section>
+      </section>
+    </div>
+  );
+}
+
+function UserLoginIssuedDialog({
+  user,
+  issued,
+  onClose,
+}: {
+  user: UserListItem;
+  issued: { operator_id: string; password: string };
+  onClose: () => void;
+}) {
+  return (
+    <div className="confirm-mask" onClick={onClose}>
+      <section
+        className="user-password-card user-login-issued-card"
+        onClick={event => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${user.id} 的新登录密码`}
+      >
+        <header>
+          <span>
+            <b>{user.login_enabled ? '密码已重置' : '登录已开通'}</b>
+            <small>密码只显示这一次</small>
+          </span>
+          <button type="button" aria-label="关闭" onClick={onClose}>
+            ×
+          </button>
+        </header>
+        <div className="user-login-issued">
+          <span>
+            登录名 <code>{issued.operator_id}</code> <CopyButton text={issued.operator_id} />
+          </span>
+          <span>
+            密码 <code>{issued.password}</code> <CopyButton text={issued.password} />
+          </span>
+        </div>
+        <footer>
+          <button className="btn primary" type="button" onClick={onClose}>
+            我已保存
+          </button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
@@ -836,6 +889,11 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   /* 当前查看的订阅（用户 + 格式）。null 表示未打开。同时只显示一份，与上面的展开策略一致。 */
   const [sub, setSub] = useState<{ user: UserListItem; kind: SubscriptionKind } | null>(null);
   const [detailActionsOpen, setDetailActionsOpen] = useState(false);
+  const [passwordUser, setPasswordUser] = useState<UserListItem | null>(null);
+  const [issuedLogin, setIssuedLogin] = useState<{
+    user: UserListItem;
+    value: { operator_id: string; password: string };
+  } | null>(null);
 
   /* 低频且有破坏性的用户操作收入「更多」菜单。点击外部或按 Escape 都关闭，
      与机器详情和顶栏已有菜单保持同一套交互。 */
@@ -871,6 +929,18 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
       }),
     onSettled: () => {
       setBusy(null);
+      refresh();
+    },
+  });
+  const profile = useMutation({
+    mutationFn: (value: { user: UserListItem; accountType: 'formal' | 'test' }) =>
+      updateUserProfile(value.user.tenant_id, value.user.id, { account_type: value.accountType }),
+    onSuccess: refresh,
+  });
+  const login = useMutation({
+    mutationFn: (user: UserListItem) => issueUserLogin(user.tenant_id, user.id),
+    onSuccess: (value, user) => {
+      setIssuedLogin({ user, value });
       refresh();
     },
   });
@@ -918,6 +988,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
       : [me.data, ...listedUsers]
     : listedUsers;
   const editable = can(who.role, 'edit');
+  const canManageLogin = can(who.role, 'manage-tenants');
   /* 订阅是完整可用的配置，readonly 角色在 API 侧返回 403（见 session.tsx 的 can）。
      入口同步隐藏，避免点击后只得到一个错误。 */
   const canReadArtifacts = can(who.role, 'artifacts');
@@ -1033,9 +1104,6 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
               <div className="dname">
                 <b className="mono">{u.id}</b>
                 {isMe && <span className="st st-ok">我</span>}
-                <span className={`st ${u.account_type === 'test' ? 'st-warn' : ''}`}>
-                  {u.account_type === 'test' ? '测试' : '正式'}
-                </span>
                 <span className="dsub">
                   <span
                     className="dstat"
@@ -1078,13 +1146,49 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
             <div className="user-dhead-actions">
               <div className="user-dacts">
                 {!editable && <span className="user-readonly">{selfService ? '自助访问' : '只读访问'}</span>}
+                <span className="user-account-type" title="用户资料 · 账号类型">
+                  <SegSwitch
+                    checked={u.account_type === 'test'}
+                    disabled={!editable || profile.isPending}
+                    off="正式"
+                    on="测试"
+                    onChange={test =>
+                      profile.mutate({
+                        user: u,
+                        accountType: test ? 'test' : 'formal',
+                      })
+                    }
+                  />
+                </span>
+                <button
+                  className="btn user-dact"
+                  disabled={!selfService && (!canManageLogin || !u.login_enabled)}
+                  title={
+                    selfService
+                      ? '修改自己的登录密码'
+                      : u.login_enabled
+                        ? '为该用户设置新的登录密码'
+                        : '请先在“更多”中开通登录'
+                  }
+                  onClick={() => {
+                    if (selfService) {
+                      wm.setFloor('desk');
+                      wm.open('tab:password', '改密码', { w: 460, h: 300 });
+                    } else {
+                      setPasswordUser(u);
+                    }
+                  }}
+                >
+                  <Icon of="security" size={13} className="user-dact-icon" />
+                  修改密码
+                </button>
                 <button
                   className="btn user-dact"
                   disabled={!canOpenSubscription}
                   title="打开该用户的 vless:// 节点链接，可选择地址族"
                   onClick={() => setSub({ user: u, kind: 'uri' })}
                 >
-                  <Icon of="link" size={13} className="user-dact-icon" />
+                  <Icon of="client" size={13} className="user-dact-icon" />
                   节点链接
                 </button>
                 <button
@@ -1112,6 +1216,30 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                   </button>
                   {detailActionsOpen && (editable || selfService) && (
                     <div className="fg-menu user-action-menu" role="menu" onClick={() => setDetailActionsOpen(false)}>
+                      {canManageLogin && (
+                        <button
+                          role="menuitem"
+                          className={u.login_enabled ? 'dg' : undefined}
+                          disabled={login.isPending}
+                          onClick={() => {
+                            if (
+                              u.login_enabled &&
+                              !window.confirm(`确定重置 ${u.id} 的登录密码？现有登录会话将失效。`)
+                            ) {
+                              return;
+                            }
+                            login.mutate(u);
+                          }}
+                        >
+                          <Icon of="access" size={14} className="user-action-menu-icon" />
+                          <span>
+                            {u.login_enabled ? '重置登录密码' : '开通登录'}
+                            <small>
+                              {u.login_enabled ? '生成一次性密码并注销现有会话' : '生成该用户的首次登录密码'}
+                            </small>
+                          </span>
+                        </button>
+                      )}
                       {editable && (
                         <button
                           role="menuitem"
@@ -1149,12 +1277,6 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
           </div>
         </div>
         <div className="user-dbody">
-          <UserProfileCard
-            key={`profile/${r.key}/${u.account_type ?? ''}`}
-            user={u}
-            editable={editable}
-            canManageLogin={can(who.role, 'manage-tenants')}
-          />
           <section className="panel config-panel user-dcard">
             <header>
               <PanelTitle of="usage">用量与额度</PanelTitle>
@@ -1257,8 +1379,8 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
      避免一条跨栏标题把名册读成详情的附属筛选器。 */
   const body = (
     <>
-      {(grant.error || status.error || rotate.error) && (
-        <ErrorBox error={grant.error ?? status.error ?? rotate.error} />
+      {(grant.error || profile.error || login.error || status.error || rotate.error) && (
+        <ErrorBox error={grant.error ?? profile.error ?? login.error ?? status.error ?? rotate.error} />
       )}
       {list.length === 0 ? (
         <section className="panel titled user-list-panel user-empty-panel">
@@ -1420,6 +1542,21 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
           kind={sub.kind}
           selfService={who.role === 'user' && `${sub.user.tenant_id}/${sub.user.id}` === selfKey}
           onClose={() => setSub(null)}
+        />
+      )}
+      {passwordUser && (
+        <UserPasswordDialog
+          key={`${passwordUser.tenant_id}/${passwordUser.id}`}
+          user={passwordUser}
+          onClose={() => setPasswordUser(null)}
+        />
+      )}
+      {issuedLogin && (
+        <UserLoginIssuedDialog
+          key={`${issuedLogin.user.tenant_id}/${issuedLogin.user.id}/${issuedLogin.value.password}`}
+          user={issuedLogin.user}
+          issued={issuedLogin.value}
+          onClose={() => setIssuedLogin(null)}
         />
       )}
     </>

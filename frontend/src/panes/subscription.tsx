@@ -114,15 +114,20 @@ function VlessAddresses({
 }) {
   const [family, setFamily] = useState<FamilyPick>('both');
   const [protocol, setProtocol] = useState<ProtocolPick>('both');
+  const [allowInsecure, setAllowInsecure] = useState(false);
   useEscape(onClose);
 
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), refetchInterval: 10_000 });
   const revision = revisions.data?.current_revision;
   const content = useQuery({
-    queryKey: ['artifact', revision, 'user', `${tenant}:${user}`, 'uri', family, protocol],
+    queryKey: ['artifact', revision, 'user', `${tenant}:${user}`, 'uri', family, protocol, allowInsecure],
     queryFn: () =>
       selfService
-        ? fetchMyArtifact(family === 'both' ? undefined : family, protocol === 'both' ? undefined : protocol)
+        ? fetchMyArtifact(
+            family === 'both' ? undefined : family,
+            protocol === 'both' ? undefined : protocol,
+            allowInsecure,
+          )
         : fetchArtifactContent(
             'user',
             `${tenant}:${user}`,
@@ -131,6 +136,7 @@ function VlessAddresses({
             family === 'both' ? undefined : family,
             protocol === 'both' ? undefined : protocol,
             true,
+            allowInsecure,
           ),
     enabled: !!revision,
   });
@@ -153,7 +159,10 @@ function VlessAddresses({
               ariaLabel="订阅协议"
               picks={PROTOCOL_PICKS}
               value={protocol}
-              onChange={setProtocol}
+              onChange={value => {
+                setProtocol(value);
+                if (value === 'vless') setAllowInsecure(false);
+              }}
             />
             <div className="sub-filter-with-action">
               <SubscriptionTabs
@@ -169,6 +178,29 @@ function VlessAddresses({
                 </button>
               )}
             </div>
+            {protocol !== 'vless' && (
+              <div className={allowInsecure ? 'sub-insecure on' : 'sub-insecure'}>
+                <span className="sub-insecure-icon" aria-hidden="true">
+                  <svg viewBox="0 0 20 20">
+                    <path d="M10 2.5 16 4.8v5c0 3.9-2.4 6.8-6 8.3-3.6-1.5-6-4.4-6-8.3v-5L10 2.5Z" />
+                    <path d="M7.7 10.3h4.6M10 8v4.6" />
+                  </svg>
+                </span>
+                <span className="sub-insecure-copy">
+                  <span>允许 insecure</span>
+                  <small>仅本次显示自签连接地址；客户端不会验证证书</small>
+                </span>
+                <button
+                  type="button"
+                  className="sub-insecure-toggle"
+                  aria-pressed={allowInsecure}
+                  aria-label="允许 insecure"
+                  onClick={() => setAllowInsecure(value => !value)}
+                >
+                  <span aria-hidden="true" />
+                </button>
+              </div>
+            )}
           </div>
           {!revision || content.isPending ? (
             <Loading />

@@ -47,8 +47,8 @@ use brocade_store::{
     LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
     PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
     ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest, SetUserAppQuotaRequest,
-    StoreError, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
-    UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    SetUserPasswordRequest, StoreError, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest,
+    UpdateNodeRequest, UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
     UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
@@ -835,6 +835,7 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/certs/certificates/{cert_id}/serve",
             post(serve_certificate),
         )
+        .route("/certs/certificates/{cert_id}", delete(delete_certificate))
         .route("/revisions", get(list_revisions))
         .route(
             "/revisions/{revision_id}/discard-pending",
@@ -904,7 +905,10 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/users/{tenant_id}/{user_id}/profile",
             put(update_user_profile),
         )
-        .route("/users/{tenant_id}/{user_id}/login", post(issue_user_login))
+        .route(
+            "/users/{tenant_id}/{user_id}/login",
+            post(issue_user_login).put(set_user_password),
+        )
         .route(
             "/users/{tenant_id}/{user_id}/clash-subscription",
             get(clash_subscription_info),
@@ -1462,6 +1466,10 @@ struct ArtifactContentQuery {
     protocol: Option<SubscriptionProtocol>,
     #[serde(default)]
     serving: bool,
+    /// Explicit, one-time acknowledgement for URI formats that cannot carry a certificate pin.
+    /// Ignored for Clash, whose structured format carries its own verification policy.
+    #[serde(default)]
+    insecure: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1741,6 +1749,12 @@ async fn artifact_content(
         family: query.family,
         protocol: query.protocol,
     };
+    if query.insecure && (!query.serving || target_kind != "user" || artifact_kind != "uri") {
+        return Err(StoreError::InvalidData(
+            "insecure is allowed only for a current serving user URI".to_owned(),
+        )
+        .into());
+    }
     let result = if query.serving {
         if target_kind != "user" || query.revision.is_some() {
             return Err(StoreError::InvalidData(
@@ -1750,7 +1764,13 @@ async fn artifact_content(
         }
         state
             .store
-            .serving_user_artifact_content(&admin, &target_id, &artifact_kind, filter)
+            .serving_user_artifact_content(
+                &admin,
+                &target_id,
+                &artifact_kind,
+                filter,
+                query.insecure,
+            )
             .await?
     } else {
         state
@@ -2116,6 +2136,18 @@ async fn serve_certificate(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     state.store.promote_certificate(&admin, &cert_id).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Explicitly drops one retained leaf from the clients' trust set. Superseded certificates remain
+/// trusted until this route is called; serving certificates are rejected by the store.
+async fn delete_certificate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(cert_id): Path<String>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state.store.delete_certificate(&admin, &cert_id).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -2810,6 +2842,20 @@ async fn issue_user_login(
     Ok((StatusCode::CREATED, Json(result)).into_response())
 }
 
+async fn set_user_password(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<SetUserPasswordRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ManageOperators).await?;
+    let result = state
+        .store
+        .set_user_password(&admin, &tenant_id, &user_id, request)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
 async fn self_user_context(
     state: &AppState,
     headers: &HeaderMap,
@@ -2851,6 +2897,8 @@ async fn rotate_self_user_uuid(
 struct SelfArtifactQuery {
     family: Option<IpFamily>,
     protocol: Option<SubscriptionProtocol>,
+    #[serde(default)]
+    insecure: bool,
 }
 
 async fn self_user_artifact(
@@ -2869,6 +2917,7 @@ async fn self_user_artifact(
                 family: query.family,
                 protocol: query.protocol,
             },
+            query.insecure,
         )
         .await?;
     Ok(Json(result).into_response())

@@ -2005,11 +2005,9 @@ impl IngressWires {
 /// presents that certificate. The remaining ingress-local setting is whether to run flow control;
 /// the client uses its native TLS stack and the model carries no ClientHello preset.
 ///
-/// Skipping certificate verification is deliberately absent, on this wire and on Hysteria 2
-/// alike: xray removed `allowInsecure` in v26.2.6 and rejects the whole config from v26.6.1 on,
-/// and a subscription that still carried it would hand out a configuration the fleet's own core
-/// refuses to load. A certificate that does not verify is now a fault to fix, not a switch to
-/// turn off.
+/// Skipping certificate verification is deliberately absent from the model: Xray removed
+/// `allowInsecure`, probes pin self-signed certificates, and the one lossy URI escape hatch is a transient
+/// render choice rather than durable ingress configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {

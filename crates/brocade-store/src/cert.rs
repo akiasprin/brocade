@@ -23,6 +23,8 @@
 //! topology in that public log; a random one still shows that a node exists but not what it is.
 //! Nothing here pretends the label is a secret — it is only prevented from being a description.
 
+use std::collections::BTreeSet;
+
 use brocade_core::hash::{hex_lower, sha256_hex};
 use brocade_deployment::protocol::NodeCertificateMaterial;
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,9 @@ use crate::{AdminContext, Result, StoreError};
 pub const ACME_LETSENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// Its staging directory. Different account, far looser limits, certificates that nothing trusts.
 pub const ACME_LETSENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+/// Stored in the existing directory column so a certificate's requested authority remains one
+/// comparable value. It is not a URL and is admitted explicitly by the database constraint.
+pub const SELF_SIGNED_DIRECTORY: &str = "self-signed";
 /// Bytes of randomness in a label. Eight hex characters — enough that labels do not collide within
 /// a fleet, short enough to read out over a call.
 const LABEL_BYTES: usize = 4;
@@ -77,6 +82,25 @@ pub struct CertDomain {
     /// Whether an ACME account has been registered against this directory yet. Absent is normal
     /// before the first issuance; the worker registers one and records it.
     pub has_account: bool,
+    pub signing_method: CertificateSigningMethod,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateSigningMethod {
+    #[default]
+    PublicCa,
+    SelfSigned,
+}
+
+impl CertificateSigningMethod {
+    pub fn from_directory(directory: &str) -> Self {
+        if directory == SELF_SIGNED_DIRECTORY {
+            Self::SelfSigned
+        } else {
+            Self::PublicCa
+        }
+    }
 }
 
 /// What a caller may set. Separate from [`CertDomain`] because the credential is write-only:
@@ -85,6 +109,8 @@ pub struct CertDomain {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertDomainInput {
     pub domain: String,
+    #[serde(default)]
+    pub signing_method: CertificateSigningMethod,
     #[serde(default)]
     pub dns_credential: Option<String>,
     #[serde(default)]
@@ -126,6 +152,9 @@ pub struct GroupCertificate {
     /// `renewal` (the scan asked for it, and it takes over on arrival) or `spare` (an operator
     /// asked for it in advance, and it waits to be activated).
     pub origin: String,
+    /// The authority that actually issued this row, frozen when it was stored. It can differ from
+    /// the domain's current setting while old leaves remain in the client trust set.
+    pub signing_method: CertificateSigningMethod,
     /// Whose signature it carries, as the certificate itself states it. `None` before the first
     /// issuance. This is the one field that tells a staging certificate from a real one, and it
     /// cannot be derived from the configured directory — that says what was asked for.
@@ -166,6 +195,16 @@ pub struct NodeCertificateState {
     pub observed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServingCertificateProfile {
+    pub name: String,
+    /// Pinning remains active while any retained, issued certificate in the group is self-signed.
+    /// A later public certificate therefore overlaps the old self-signed leaf until an operator
+    /// explicitly deletes the latter.
+    pub requires_pinning: bool,
+    pub trusted_peer_sha256: Vec<String>,
+}
+
 /// A unit of work for the issuing worker: one group that needs a certificate now.
 ///
 /// Keyed on the group rather than the machine, which is the entire point of grouping — Let's
@@ -185,6 +224,18 @@ pub struct CertificateOrder {
     /// for wording — the work is identical either way, which is deliberate: a renewal that behaves
     /// differently from a first issuance is a path exercised eight times less often.
     pub renewal: bool,
+}
+
+/// The immutable facts produced by one certificate order. Keeping the directory beside the bytes
+/// makes it impossible for the write path to relabel an in-flight result with a newer setting.
+pub struct IssuedCertificate<'a> {
+    pub certificate_id: &'a str,
+    pub acme_directory: &'a str,
+    pub cert_pem: &'a str,
+    pub key_pem: &'a str,
+    pub not_after: &'a str,
+    pub issuer: &'a str,
+    pub peer_sha256: &'a str,
 }
 
 impl CertificateOrder {
@@ -240,11 +291,13 @@ pub async fn list_cert_domains(pool: &PgPool) -> Result<Vec<CertDomain>> {
     .await?;
     rows.iter()
         .map(|row| {
+            let directory: String = row.try_get("acme_directory")?;
             Ok(CertDomain {
                 id: row.try_get("id")?,
                 domain: row.try_get("domain")?,
                 dns_provider: row.try_get("dns_provider")?,
-                acme_directory: row.try_get("acme_directory")?,
+                signing_method: CertificateSigningMethod::from_directory(&directory),
+                acme_directory: directory,
                 acme_contact: row.try_get("acme_contact")?,
                 renew_before_days: row.try_get("renew_before_days")?,
                 has_credential: row.try_get("has_credential")?,
@@ -263,23 +316,20 @@ pub async fn upsert_cert_domain(
 ) -> Result<CertDomain> {
     require_system_admin(actor, "manage certificate domains")?;
 
-    let directory = input
-        .acme_directory
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        // No fallback. Self-signing used to be the default, on the grounds that it is the only
-        // setting needing nothing else supplied, and it is gone: xray no longer accepts a client
-        // told to skip verification, so a self-signed certificate produces listeners no client
-        // can use. Defaulting to a CA instead would fail per node, half an hour apart, with the
-        // console showing pending and no explanation. Refusing the save says the same thing once,
-        // in a sentence, at the moment the operator is looking.
-        .ok_or_else(|| {
-            StoreError::InvalidData(
-                "certificate directory is required — this fleet issues through a CA".to_owned(),
-            )
-        })?
-        .to_owned();
+    let directory = match input.signing_method {
+        CertificateSigningMethod::SelfSigned => SELF_SIGNED_DIRECTORY.to_owned(),
+        CertificateSigningMethod::PublicCa => input
+            .acme_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                StoreError::InvalidData(
+                    "certificate directory is required for public CA issuance".to_owned(),
+                )
+            })?
+            .to_owned(),
+    };
     let domain = normalize_domain(&input.domain);
     if domain.is_empty() {
         return Err(StoreError::InvalidData(
@@ -293,7 +343,9 @@ pub async fn upsert_cert_domain(
             "{domain} is not a domain the fleet can issue under — it needs at least one dot"
         )));
     }
-    if !directory.starts_with("https://") {
+    if input.signing_method == CertificateSigningMethod::PublicCa
+        && !directory.starts_with("https://")
+    {
         return Err(StoreError::InvalidData(
             "the ACME directory must be an https URL".to_owned(),
         ));
@@ -301,7 +353,7 @@ pub async fn upsert_cert_domain(
     let renew_before = input.renew_before_days.unwrap_or(30);
     if !(1..=89).contains(&renew_before) {
         return Err(StoreError::InvalidData(
-            "renew_before_days must be between 1 and 89 — certificates last 90".to_owned(),
+            "renew_before_days must be between 1 and 89".to_owned(),
         ));
     }
 
@@ -353,11 +405,13 @@ pub async fn upsert_cert_domain(
     let domain_id: String = row.try_get("id")?;
     tx.commit().await?;
 
+    let directory: String = row.try_get("acme_directory")?;
     Ok(CertDomain {
         id: domain_id,
         domain: row.try_get("domain")?,
         dns_provider: row.try_get("dns_provider")?,
-        acme_directory: row.try_get("acme_directory")?,
+        signing_method: CertificateSigningMethod::from_directory(&directory),
+        acme_directory: directory,
         acme_contact: row.try_get("acme_contact")?,
         renew_before_days: row.try_get("renew_before_days")?,
         has_credential: row.try_get("has_credential")?,
@@ -654,7 +708,7 @@ pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec
     let certs = sqlx::query(
         // The digest is recomputed from `cert_pem` on every read: storing it would be a second
         // copy of a fact already in the row, and the two would eventually disagree.
-        "SELECT id, label_id, status, origin, issuer, attempts, last_error,
+        "SELECT id, label_id, status, origin, issuer, attempts, last_error, acme_directory,
                 issued_at::text AS issued_at, expires_at::text AS expires_at,
                 last_attempt_at::text AS last_attempt_at,
                 CASE WHEN cert_pem IS NULL THEN NULL
@@ -689,10 +743,12 @@ pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec
                         cert.try_get::<String, _>("label_id").ok().as_deref() == Some(id.as_str())
                     })
                     .map(|cert| {
+                        let directory: String = cert.try_get("acme_directory")?;
                         Ok(GroupCertificate {
                             id: cert.try_get("id")?,
                             status: cert.try_get("status")?,
                             origin: cert.try_get("origin")?,
+                            signing_method: CertificateSigningMethod::from_directory(&directory),
                             issuer: cert.try_get("issuer")?,
                             issued_at: cert.try_get("issued_at")?,
                             expires_at: cert.try_get("expires_at")?,
@@ -756,6 +812,80 @@ pub async fn list_node_certificate_state(
             })
         })
         .collect()
+}
+
+/// Names whose retained trust set still contains a self-signed certificate. This deliberately
+/// outlives the serving row: changing the node to a public certificate does not silently tighten
+/// clients before the operator removes the old leaf from the database.
+pub(crate) async fn self_signed_certificate_names(pool: &PgPool) -> Result<BTreeSet<String>> {
+    let rows = sqlx::query(
+        "SELECT l.label, d.domain
+           FROM cert_labels l
+           JOIN cert_domains d ON d.id = l.domain_id
+           JOIN certificates c ON c.label_id = l.id AND c.status = 'serving'
+          WHERE EXISTS (
+                SELECT 1 FROM certificates trusted
+                 WHERE trusted.label_id = l.id
+                   AND trusted.status IN ('ready', 'serving', 'superseded')
+                   AND trusted.acme_directory = 'self-signed'
+                   AND trusted.peer_sha256 IS NOT NULL
+          )",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(format!(
+                "{}.{}",
+                row.try_get::<String, _>("label")?,
+                row.try_get::<String, _>("domain")?
+            ))
+        })
+        .collect()
+}
+
+pub(crate) async fn serving_certificate_profile_for_node(
+    pool: &PgPool,
+    node_id: &str,
+) -> Result<Option<ServingCertificateProfile>> {
+    let row = sqlx::query(
+        "SELECT l.label, d.domain,
+                EXISTS (
+                    SELECT 1 FROM certificates trusted
+                     WHERE trusted.label_id = l.id
+                       AND trusted.status IN ('ready', 'serving', 'superseded')
+                       AND trusted.acme_directory = 'self-signed'
+                       AND trusted.peer_sha256 IS NOT NULL
+                ) AS requires_pinning,
+                ARRAY(
+                    SELECT trusted.peer_sha256
+                      FROM certificates trusted
+                     WHERE trusted.label_id = l.id
+                       AND trusted.status IN ('ready', 'serving', 'superseded')
+                       AND trusted.peer_sha256 IS NOT NULL
+                     ORDER BY trusted.issued_at, trusted.id
+                ) AS trusted_peer_sha256
+           FROM node_cert_label m
+           JOIN cert_labels l ON l.id = m.label_id
+           JOIN cert_domains d ON d.id = l.domain_id
+           JOIN certificates c ON c.label_id = l.id AND c.status = 'serving'
+          WHERE m.node_id = $1",
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok(ServingCertificateProfile {
+            name: format!(
+                "{}.{}",
+                row.try_get::<String, _>("label")?,
+                row.try_get::<String, _>("domain")?
+            ),
+            requires_pinning: row.try_get("requires_pinning")?,
+            trusted_peer_sha256: row.try_get("trusted_peer_sha256")?,
+        })
+    })
+    .transpose()
 }
 
 /// Asks for one more certificate in a group, to be held as a spare.
@@ -840,6 +970,35 @@ pub async fn promote_certificate(
     Ok(())
 }
 
+/// Removes one certificate from the retained client trust set. The certificate currently served
+/// by the group cannot be deleted: switch the group first, then remove the old row once every
+/// client that still needs it has refreshed.
+pub async fn delete_certificate(
+    pool: &PgPool,
+    actor: &AdminContext,
+    certificate_id: &str,
+) -> Result<()> {
+    require_system_admin(actor, "delete a certificate")?;
+    let mut tx = pool.begin().await?;
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM certificates WHERE id = $1 FOR UPDATE")
+            .bind(certificate_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::InvalidData(format!("没有这张证书：{certificate_id}")))?;
+    if status == "serving" {
+        return Err(StoreError::InvalidData(
+            "正在由节点使用的证书不能删除；请先启用另一张证书".to_owned(),
+        ));
+    }
+    sqlx::query("DELETE FROM certificates WHERE id = $1")
+        .bind(certificate_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// What needs issuing or renewing now, one row per group.
 ///
 /// `retry_after_minutes` keeps a failing group from being retried every scan: a wrong credential
@@ -875,6 +1034,40 @@ pub async fn certificates_due(
             .await?;
     }
 
+    // A renewal is a new certificate, not new bytes written over the serving row. Keeping both
+    // rows is what lets clients trust the old and new leaves at the same time while machines pick
+    // up the replacement on their own schedules. Failed renewal rows retry in place; creating a
+    // fresh row for every scan would spend the CA's quota while evading the retry backoff.
+    let renewals: Vec<String> = sqlx::query(
+        "SELECT l.id
+           FROM cert_labels l
+           JOIN cert_domains d ON d.id = l.domain_id
+           JOIN certificates serving
+             ON serving.label_id = l.id AND serving.status = 'serving'
+          WHERE l.status = 'active'
+            AND (d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
+            AND (serving.expires_at < now() + make_interval(days => d.renew_before_days)
+                 OR serving.acme_directory IS DISTINCT FROM d.acme_directory)
+            AND NOT EXISTS (
+                SELECT 1 FROM certificates pending
+                 WHERE pending.label_id = l.id
+                   AND pending.origin = 'renewal'
+                   AND pending.status IN ('pending', 'ready', 'failed')
+            )",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|row| row.try_get("id"))
+    .collect::<std::result::Result<_, _>>()?;
+    for label_id in renewals {
+        sqlx::query("INSERT INTO certificates (id, label_id, origin) VALUES ($1, $2, 'renewal')")
+            .bind(generate_id()?)
+            .bind(&label_id)
+            .execute(pool)
+            .await?;
+    }
+
     let rows = sqlx::query(
         "SELECT c.id AS certificate_id, c.label_id, l.domain_id, l.label,
                 d.domain, d.acme_directory, d.acme_contact,
@@ -883,29 +1076,12 @@ pub async fn certificates_due(
            FROM certificates c
            JOIN cert_labels l ON l.id = c.label_id
            JOIN cert_domains d ON d.id = l.domain_id
-          -- A DNS credential is what proves the name to a CA, so a domain without one has nothing
-          -- to issue with.
-          WHERE d.dns_credential_sealed IS NOT NULL
+          -- Public issuance needs a DNS credential to prove the name. Direct self-signing does not.
+          WHERE (d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
             AND l.status = 'active'
-            AND (
-                 -- Never filled in: a fresh row, or a spare somebody asked for.
-                 c.status IN ('pending', 'failed')
-                 -- Serving and running out, or issued by a CA the operator has since changed away
-                 -- from. The latter is due regardless of how long it has left: a certificate from
-                 -- the wrong CA is not a certificate that works, and expiry has nothing to say
-                 -- about that. Renewal creates a new row rather than overwriting this one, so
-                 -- that the group keeps serving the old certificate until the new one is in hand.
-                 -- A renewal already in flight holds off a second one; a spare does not. Letting
-                 -- a spare count here is how renewal stops happening altogether: the spare sits
-                 -- in `ready` forever and every later scan sees it and skips.
-                 OR (c.status = 'serving'
-                     AND NOT EXISTS (SELECT 1 FROM certificates n
-                                      WHERE n.label_id = c.label_id
-                                        AND n.origin = 'renewal'
-                                        AND n.status IN ('pending', 'ready'))
-                     AND (c.expires_at < now() + make_interval(days => d.renew_before_days)
-                          OR c.acme_directory IS DISTINCT FROM d.acme_directory))
-            )
+            -- Fresh, manually requested and renewal rows all use one issuance path. A serving row
+            -- is never selected here: the block above creates a separate renewal row for it.
+            AND c.status IN ('pending', 'failed')
             AND (c.last_attempt_at IS NULL
                  OR c.last_attempt_at < now() - make_interval(mins => $1))
           ORDER BY c.expires_at NULLS FIRST",
@@ -931,7 +1107,9 @@ pub async fn certificates_due(
 }
 
 /// Stores a freshly issued certificate. `not_after` is RFC3339 as the CA stated it, not a value
-/// computed here — the expiry that matters is the one in the certificate.
+/// computed here — the expiry that matters is the one in the certificate. Returns `false` without
+/// storing or promoting when the domain changed signing method while this order was in flight; the
+/// row is made immediately due again so the next scan uses the new setting.
 ///
 /// What happens next is decided by the row's `origin`, in one transaction with the write:
 ///
@@ -947,24 +1125,38 @@ pub async fn certificates_due(
 /// The takeover does not interrupt anything. Both certificates are valid, both carry the same
 /// names, and the machines pick up the new bytes on their own schedule — the agent within ten
 /// minutes, xray within an hour of that. Nothing is republished, because the SNI has not changed.
-pub async fn record_certificate(
-    pool: &PgPool,
-    certificate_id: &str,
-    cert_pem: &str,
-    key_pem: &str,
-    not_after: &str,
-    issuer: &str,
-) -> Result<()> {
-    let sealed = secrets::seal(CTX_CERT_KEY, key_pem)?;
+pub async fn record_certificate(pool: &PgPool, issued: IssuedCertificate<'_>) -> Result<bool> {
     let mut tx = pool.begin().await?;
 
-    let row = sqlx::query("SELECT label_id, origin FROM certificates WHERE id = $1 FOR UPDATE")
-        .bind(certificate_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| StoreError::InvalidData(format!("没有这张证书：{certificate_id}")))?;
+    // Lock both the order and its domain so this comparison and the promotion have one
+    // linearization point with `upsert_cert_domain`. An ACME order can take long enough for an
+    // operator to change CA (or switch to self-signing) while it is in flight; the certificate
+    // proves which directory actually issued it, not whichever value happens to be current now.
+    let row = sqlx::query(
+        "SELECT c.label_id, c.origin, d.acme_directory AS current_directory
+           FROM certificates c
+           JOIN cert_labels l ON l.id = c.label_id
+           JOIN cert_domains d ON d.id = l.domain_id
+          WHERE c.id = $1
+          FOR UPDATE OF c, d",
+    )
+    .bind(issued.certificate_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::InvalidData(format!("没有这张证书：{}", issued.certificate_id)))?;
     let label_id: String = row.try_get("label_id")?;
     let origin: String = row.try_get("origin")?;
+    let current_directory: String = row.try_get("current_directory")?;
+    if current_directory != issued.acme_directory {
+        sqlx::query("UPDATE certificates SET last_attempt_at = NULL WHERE id = $1")
+            .bind(issued.certificate_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+
+    let sealed = secrets::seal(CTX_CERT_KEY, issued.key_pem)?;
 
     let serving: Option<String> = sqlx::query(
         "SELECT id FROM certificates
@@ -972,7 +1164,7 @@ pub async fn record_certificate(
           FOR UPDATE",
     )
     .bind(&label_id)
-    .bind(certificate_id)
+    .bind(issued.certificate_id)
     .fetch_optional(&mut *tx)
     .await?
     .map(|row| row.try_get("id"))
@@ -991,25 +1183,25 @@ pub async fn record_certificate(
     sqlx::query(
         "UPDATE certificates
             SET cert_pem = $2, key_pem_sealed = $3, expires_at = $4::timestamptz, issuer = $5,
-                acme_directory = (SELECT d.acme_directory
-                                    FROM cert_labels l
-                                    JOIN cert_domains d ON d.id = l.domain_id
-                                   WHERE l.id = certificates.label_id),
+                peer_sha256 = $6,
+                acme_directory = $7,
                 issued_at = now(), attempts = 0, last_error = NULL, last_attempt_at = now(),
-                status = $6
+                status = $8
           WHERE id = $1",
     )
-    .bind(certificate_id)
-    .bind(cert_pem)
+    .bind(issued.certificate_id)
+    .bind(issued.cert_pem)
     .bind(sealed)
-    .bind(not_after)
-    .bind(issuer)
+    .bind(issued.not_after)
+    .bind(issued.issuer)
+    .bind(issued.peer_sha256)
+    .bind(issued.acme_directory)
     .bind(if takes_over { "serving" } else { "ready" })
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Records what a node says it is holding.

@@ -741,6 +741,12 @@ export interface IssuedUserLogin {
 
 export const issueUserLogin = (tenant: string, user: string) => post<IssuedUserLogin>(`/users/${tenant}/${user}/login`);
 
+export const setUserPassword = (tenant: string, user: string, newPassword: string) =>
+  api<{ operator_id: string; sessions_revoked: number }>(`/users/${tenant}/${user}/login`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ new_password: newPassword }),
+  });
+
 export const rotateMyUuid = () => post<{ revision_id: number }>('/me/rotate-uuid');
 
 export interface GrantProbeCapability {
@@ -2205,8 +2211,9 @@ export interface CertDomain {
   domain: string;
   dns_provider: string;
   acme_directory: string;
+  signing_method: 'public-ca' | 'self-signed';
   acme_contact: string | null;
-  /** 提前多少天续期。证书有效期 90 天，预留 30 天意味着有 30 天的重试窗口。 */
+  /** 提前多少天续期；公共 CA 通常为 90 天，自签叶证书为一年。 */
   renew_before_days: number;
   /** 是否已存储 DNS 凭据——**不包含凭据本身**。页面需要能显示「已配置」但无法读取其内容。 */
   has_credential: boolean;
@@ -2217,13 +2224,15 @@ export interface CertDomain {
 /** 可写入的部分。凭据是只写的：不填写表示保持原值，使表单可以在无法读取机密的情况下保存。 */
 export interface CertDomainInput {
   domain: string;
+  signing_method: 'public-ca' | 'self-signed';
   dns_credential?: string | null;
   acme_directory?: string | null;
   acme_contact?: string | null;
   renew_before_days?: number | null;
 }
 
-/** 一张证书在组内的位置。
+/** 一张证书在组内的位置。`superseded` 只表示节点已换下；只要记录仍保留，Xray 的多 pin
+    信任集合仍会接受它，管理员需要显式删除才会撤销这份信任。
     `pending` 尚未签发；`ready` 已签好、待命；`serving` 该组机器当前出示的这张；
     `superseded` 曾经出示、已被换下；`failed` 签发失败，该行留着记录原因。 */
 export type CertStatus = 'pending' | 'ready' | 'serving' | 'superseded' | 'failed';
@@ -2237,6 +2246,7 @@ export interface GroupCertificate {
   id: string;
   status: CertStatus;
   origin: CertOrigin;
+  signing_method: 'public-ca' | 'self-signed';
   /** 签发者的 CN，从证书**字节中**解析得出，不是根据设置推导。两者可能不一致，而只有前者
       反映实际情况——若机队几个月前设为 staging 且未改回，每张都显示已签发但没有任何客户端
       信任它，该字段是唯一能反映该问题的位置。Let's Encrypt 的 staging 名称刻意使用明显的
@@ -2323,6 +2333,9 @@ export const requestSpareCertificate = (id: string) =>
 /** 把一张待命的证书变成该组机器出示的那张。SNI 不变，只换字节，因此不需要发布。 */
 export const serveCertificate = (certId: string) =>
   api<void>(`/certs/certificates/${encodeURIComponent(certId)}/serve`, '', { method: 'POST' });
+/** 删除一张非 serving 证书，同时从该组下发给 Xray 的多 pin 信任集合中移除它。 */
+export const deleteCertificate = (certId: string) =>
+  api<void>(`/certs/certificates/${encodeURIComponent(certId)}`, '', { method: 'DELETE' });
 /** 改一台机器所属的证书组，`null` 表示不属于任何组。
     这会改变该机器的 SNI：已发出去的订阅里写的是旧组的名字，改完就连不上，需要重新拉取。 */
 export const setNodeCertGroup = (nodeId: string, labelId: string | null) =>
@@ -2557,12 +2570,14 @@ export const fetchArtifactContent = (
   family?: ArtifactFamily,
   protocol?: ArtifactProtocol,
   serving = false,
+  insecure = false,
 ) => {
   const query = [
     revision == null ? null : `revision=${revision}`,
     family == null ? null : `family=${family}`,
     protocol == null ? null : `protocol=${protocol}`,
     serving ? 'serving=true' : null,
+    insecure ? 'insecure=true' : null,
   ].filter(Boolean);
   return api<ArtifactContent>(
     `/artifacts/content/${encodeURIComponent(targetKind)}/${encodeURIComponent(targetId)}/${encodeURIComponent(artifactKind)}` +
@@ -2570,10 +2585,12 @@ export const fetchArtifactContent = (
   );
 };
 
-export const fetchMyArtifact = (family?: ArtifactFamily, protocol?: ArtifactProtocol) => {
-  const query = [family == null ? null : `family=${family}`, protocol == null ? null : `protocol=${protocol}`].filter(
-    Boolean,
-  );
+export const fetchMyArtifact = (family?: ArtifactFamily, protocol?: ArtifactProtocol, insecure = false) => {
+  const query = [
+    family == null ? null : `family=${family}`,
+    protocol == null ? null : `protocol=${protocol}`,
+    insecure ? 'insecure=true' : null,
+  ].filter(Boolean);
   return api<ArtifactContent>(`/me/artifact${query.length === 0 ? '' : `?${query.join('&')}`}`);
 };
 

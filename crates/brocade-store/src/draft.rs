@@ -497,6 +497,7 @@ pub async fn preview_artifact(
     artifact_kind: &str,
 ) -> Result<ArtifactContent> {
     let snapshot = draft_snapshot(pool, actor, ops).await?;
+    let self_signed_names = crate::cert::self_signed_certificate_names(pool).await?;
     // Always every family: a preview exists to be diffed against the committed revision, and a
     // narrowed side would report the entries it dropped as removals.
     crate::console::artifact_content_of(
@@ -506,6 +507,7 @@ pub async fn preview_artifact(
         artifact_kind,
         !actor.is_system_admin(),
         Default::default(),
+        &self_signed_names,
     )
 }
 
