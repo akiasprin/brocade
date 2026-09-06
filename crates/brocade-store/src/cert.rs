@@ -1993,6 +1993,14 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_group_without_a_private_name_keeps_its_original_sni() {
+        assert_eq!(
+            certificate_name_of("a1b2c3d4", "example.com", None),
+            "a1b2c3d4.example.com"
+        );
+    }
+
+    #[test]
     fn generated_self_signed_names_are_plausible_and_random() {
         let first = generate_synthetic_certificate_name().unwrap();
         assert!(first.ends_with(".com"));

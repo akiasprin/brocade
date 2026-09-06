@@ -4399,7 +4399,11 @@ UPDATE certificates AS c SET status = 'superseded', runtime_slot = NULL
   FROM cert_labels AS l, cert_domains AS d
  WHERE c.label_id = l.id AND l.domain_id = d.id
    AND d.acme_directory = 'self-signed' AND c.status = 'ready';
-UPDATE certificates AS c SET certificate_name = l.certificate_name
+-- Older self-signed groups predate certificate_name. Their issued identity was the same
+-- label.domain value returned by certificate_name_of(), so preserve that exact SNI rather than
+-- inventing a replacement which would not match the certificate already held by clients.
+UPDATE certificates AS c
+   SET certificate_name = COALESCE(l.certificate_name, l.label || '.' || d.domain)
   FROM cert_labels AS l, cert_domains AS d
  WHERE c.label_id = l.id AND l.domain_id = d.id
    AND c.acme_directory = 'self-signed' AND c.status IN ('serving', 'compatible')
