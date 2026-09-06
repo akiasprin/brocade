@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchAgentRelease, fetchNodes, saveAgentRelease, type AgentReleaseScope, type AgentReleaseView } from '../api';
 import { Ago, ErrorBox, Loading } from '../ui/bits';
+import { PanelTitle } from '../ui/icons';
 
 const bareBuild = (raw: string | null) => raw?.replace(/^brocade-agent\//, '') ?? null;
 
@@ -21,7 +22,7 @@ export function useAgentDrift(): { pending: number; loading: boolean } {
   return { pending: inScope.filter(n => !onThisBuild(view, n.agent_version)).length, loading: false };
 }
 
-export function AgentReleaseSection({ editable, no }: { editable: boolean; no: string }) {
+export function AgentReleaseSection({ editable }: { editable: boolean }) {
   const qc = useQueryClient();
   const rel = useQuery({ queryKey: ['agent-release'], queryFn: () => fetchAgentRelease() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
@@ -92,8 +93,7 @@ export function AgentReleaseSection({ editable, no }: { editable: boolean; no: s
   return (
     <section className="panel titled" id="dp-agent">
       <header>
-        <span className="no">{no}</span>
-        <h4>Agent 版本</h4>
+        <PanelTitle of="agent">Agent 版本</PanelTitle>
         <span className="sp" />
       </header>
 

@@ -32,6 +32,7 @@ import {
 } from '../api';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
 import { bytes } from '../ui/format';
+import { PanelTitle } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 
 // 柱状图覆盖的时间范围：与机器列表右端使用同一刻度（24 格 × 30s 上报窗口 = 12 分钟）。
@@ -95,7 +96,7 @@ export function UsagePane() {
       <div className="duo">
         <section className="panel titled">
           <header>
-            <h4>本月流量</h4>
+            <PanelTitle of="usage">本月流量</PanelTitle>
             <span className="sp" />
             <span className="st">{monthLabel(monthly.data.month_start)}</span>
           </header>
@@ -138,7 +139,7 @@ export function UsagePane() {
         {gaps.length > 0 && (
           <section className="panel titled">
             <header>
-              <h4>有缺口</h4>
+              <PanelTitle of="warn">有缺口</PanelTitle>
               <span className="sp" />
               <span className="st">has_gap</span>
             </header>
@@ -169,8 +170,7 @@ export function UsagePane() {
         <div className="col">
           <section className="panel titled" id="us-who">
             <header>
-              <span className="no">01</span>
-              <h4>谁在用</h4>
+              <PanelTitle of="users">谁在用</PanelTitle>
               <span className="hint">用户 × 线路</span>
               <span className="sp" />
               {ranked.length > RANK_LIMIT && (
@@ -223,8 +223,7 @@ export function UsagePane() {
         <div className="col">
           <section className="panel titled" id="us-load">
             <header>
-              <span className="no">02</span>
-              <h4>哪台机器扛得多</h4>
+              <PanelTitle of="nodes">哪台机器扛得多</PanelTitle>
               <span className="hint">最近 {SERIES_WINDOW_SECS / 60} 分钟 · 一格 30 秒</span>
             </header>
             <p className="cardsub">柱图是最近这一段，右边两列是本月</p>

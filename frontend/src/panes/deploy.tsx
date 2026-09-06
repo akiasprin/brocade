@@ -28,6 +28,7 @@ import { entryId, useRevisionDiff } from '../forge/artifacts';
 import { artifactFile, artifactFmt, countChanges, diffLines, highlight } from '../forge/diff';
 import { can, useSession } from '../session';
 import { Ago, Confirm, Empty, ErrorBox, Loading, STATUS_TEXT, Status } from '../ui/bits';
+import { PanelTitle } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { randomKey } from '../ui/platform';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
@@ -147,17 +148,12 @@ export function DeployPane({ win }: { win: Win }) {
           <ConfigSection go={go} />
         </div>
         <div className="col">
-          <AgentReleaseSection editable={can(who.role, 'system')} no={DP_NO.agent} />
+          <AgentReleaseSection editable={can(who.role, 'system')} />
         </div>
       </div>
     </div>
   );
 }
-
-/* 两段的编号，按版面顺序：左栏的配置发布是 01，右栏的 agent 更新是 02。
-   `agent` 的号由 DeployPane 传给 AgentReleaseSection：那一段渲染在另一个文件里，
-   由它反过来 import 本文件会形成循环依赖。 */
-const DP_NO = { config: '01', agent: '02' } as const;
 
 // 协议中的取值是 config / grants，界面按发起方式表述：变更单由人工发起，需要关注分波和确认；
 // 自动化授权单由权限操作或配额执行自动发起，只增删运行时的名单。
@@ -167,8 +163,7 @@ const KIND_LABEL = { all: '全部', config: '变更单', grants: '自动化授�
 // 修订号，因此比较的是 deployment id（实际发生顺序），返回该次发布引用的修订。
 export function latestSuccessfulRevision(items: DeploymentListItem[]): number | null {
   const latest = items.reduce<DeploymentListItem | null>(
-    (best, item) =>
-      item.status === 'succeeded' && (best === null || item.id > best.id) ? item : best,
+    (best, item) => (item.status === 'succeeded' && (best === null || item.id > best.id) ? item : best),
     null,
   );
   return latest?.revision_id ?? null;
@@ -212,8 +207,7 @@ function ConfigSection({ go }: { go: (d: Drill) => void }) {
   return (
     <section className="panel titled" id="dp-config">
       <header>
-        <span className="no">{DP_NO.config}</span>
-        <h4>配置发布</h4>
+        <PanelTitle of="deploy">配置发布</PanelTitle>
         {/* 段抬头的读数：进入本段首先需要了解的是待发布的机器数量。
             两类发布的忙闲状态排在其后——它们已有更显著的表达方式（进行中的发布会
             置顶为一张卡），此处只在确实有进行中的发布时才显示。 */}

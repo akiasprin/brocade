@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ExternalOutbound } from '../src/api';
 import { draft } from '../src/draft';
 import {
   WarpBindingCard,
+  WarpCreate,
   WarpEdit,
   WarpRuleManager,
   warpIpRouting,
@@ -25,6 +26,12 @@ const protocol = (overrides: Partial<WarpProtocol['v']> = {}): WarpProtocol => (
     workers: 0,
     ...overrides,
   },
+});
+
+afterEach(() => {
+  cleanup();
+  draft.clear();
+  vi.unstubAllGlobals();
 });
 
 describe('WARP exit stack settings', () => {
@@ -66,6 +73,18 @@ describe('WARP exit stack settings', () => {
     expect(warpIpStackOf(protocol({ allowed_ips: ['::/0'] }))).toBe('ipv6');
   });
 
+  it('keeps the create endpoint fields independently addressable', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <WarpCreate tenantId="platform" existingIds={new Set()} onClose={() => undefined} onCreated={() => undefined} />
+      </QueryClientProvider>,
+    );
+
+    expect(view.getByRole('textbox', { name: 'Endpoint 地址' })).toBeTruthy();
+    expect(view.getByRole('spinbutton', { name: 'Endpoint 端口' })).toBeTruthy();
+  });
+
   it('makes the stack and Keepalive editable after the tunnel is created', async () => {
     draft.clear();
     const tunnel: ExternalOutbound = {
@@ -86,10 +105,18 @@ describe('WARP exit stack settings', () => {
       </QueryClientProvider>,
     );
 
+    const save = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(save.title).toBe('没有修改');
+    expect(draft.ops()).toHaveLength(0);
+    expect(view.getByRole('textbox', { name: '默认 Endpoint 地址' })).toBeTruthy();
+    expect(view.getByRole('spinbutton', { name: '默认 Endpoint 端口' })).toBeTruthy();
+
     const keepAlive = view.getByRole('spinbutton', { name: 'Keepalive' });
     expect((keepAlive as HTMLInputElement).value).toBe('25');
     fireEvent.change(keepAlive, { target: { value: '40' } });
     expect((keepAlive as HTMLInputElement).value).toBe('40');
+    expect(save.disabled).toBe(false);
 
     const stack = view.getByRole('combobox', { name: 'WARP 出口协议栈' });
     fireEvent.change(stack, { target: { value: 'ipv4' } });
@@ -100,7 +127,7 @@ describe('WARP exit stack settings', () => {
     const workers = view.getByRole('spinbutton', { name: 'Workers' });
     fireEvent.change(workers, { target: { value: '4' } });
 
-    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    fireEvent.click(save);
     await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
     const operation = draft.ops()[0];
     expect(operation?.op).toBe('upsert_external_outbound');
@@ -148,13 +175,18 @@ describe('WARP exit stack settings', () => {
     const card = within(view.container);
 
     fireEvent.click(card.getByRole('button', { name: '设置' }));
+    const save = card.getByRole('button', { name: '保存' }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(save.title).toBe('没有修改');
+    expect(fetchMock).not.toHaveBeenCalled();
     fireEvent.change(card.getByLabelText('Keepalive（秒）'), { target: { value: '35' } });
     fireEvent.change(card.getByRole('combobox', { name: 'WARP 出口协议栈' }), {
       target: { value: 'prefer_ipv6' },
     });
     fireEvent.change(card.getByLabelText('TUN 实现'), { target: { value: 'userspace' } });
     fireEvent.change(card.getByLabelText('Workers'), { target: { value: '8' } });
-    fireEvent.click(card.getByRole('button', { name: '保存' }));
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];

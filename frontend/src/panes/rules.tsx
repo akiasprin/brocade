@@ -1397,7 +1397,8 @@ export function RuleEditor(props: RuleEditorProps) {
     snapshot.isPending ||
     nodes.isPending ||
     (!readOnly && (settings.isPending || revisions.isPending || (current != null && compiled.isPending)));
-  const error = snapshot.error ?? nodes.error ?? (!readOnly ? settings.error ?? revisions.error ?? compiled.error : null);
+  const error =
+    snapshot.error ?? nodes.error ?? (!readOnly ? (settings.error ?? revisions.error ?? compiled.error) : null);
   if (pending) return <Loading />;
   const blockingError =
     (!snapshot.data && snapshot.error) ||
@@ -1884,9 +1885,7 @@ function RuleEditorReady({
     defaultHopDial({ peer: peerOf(to), self: selfAddrs, port: Number(hopOf(to).port) || hopBase });
 
   const defaultRuleAction = (): RuleAction =>
-    defaultTarget
-      ? forwardAction(defaultTarget, defaultDial(defaultTarget))
-      : { t: 'egress', send_through: null };
+    defaultTarget ? forwardAction(defaultTarget, defaultDial(defaultTarget)) : { t: 'egress', send_through: null };
 
   // 切换档位时重新计算地址。连接方式按目标统一：同一个 from -> to 只对应一个
   // outbound/tag，各规则不能使用不同的地址。
@@ -3105,6 +3104,17 @@ function externalReserved(value: string): number[] | null {
   return bytes.length === 3 && bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255) ? bytes : null;
 }
 
+function stableJson(value: unknown): string {
+  return (
+    JSON.stringify(value, (_key, current) => {
+      if (!current || typeof current !== 'object' || Array.isArray(current)) return current;
+      return Object.fromEntries(
+        Object.entries(current as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)),
+      );
+    }) ?? 'undefined'
+  );
+}
+
 type ExternalXhttpDraft = {
   path: string;
   host: string;
@@ -3367,94 +3377,116 @@ export function ExternalOutboundEditor({
     (securityKind === 'none' || !!serverName.trim()) &&
     primaryRealityValid;
 
+  const downloadSecurity: ExternalOutboundSecurity =
+    xhttp.downloadSecurityKind === 'tls'
+      ? {
+          t: 'tls',
+          v: {
+            server_name: xhttp.downloadServerName.trim(),
+            fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
+          },
+        }
+      : {
+          t: 'reality',
+          v: {
+            server_name: xhttp.downloadServerName.trim(),
+            public_key: xhttp.downloadPublicKey.trim(),
+            short_id: xhttp.downloadShortId.trim(),
+            fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
+          },
+        };
+  const transport: ExternalVlessTransport =
+    vlessTransport === 'raw'
+      ? { t: 'raw' }
+      : {
+          t: 'xhttp',
+          v: {
+            path: xhttp.path.trim(),
+            host: xhttp.host.trim() || null,
+            mux: xhttp.mux.trim() ? Number(xhttp.mux) : null,
+            mode: xhttp.mode,
+            download: xhttp.downloadEnabled
+              ? {
+                  address: xhttp.downloadAddress.trim(),
+                  port: Number(xhttp.downloadPort),
+                  security: downloadSecurity,
+                  path: xhttp.downloadPath.trim(),
+                  host: xhttp.downloadHost.trim() || null,
+                  mux: xhttp.downloadMux.trim() ? Number(xhttp.downloadMux) : null,
+                  mode: xhttp.downloadMode,
+                }
+              : null,
+          },
+        };
+  const protocol: ExternalOutboundProtocol =
+    protocolKind === 'vless'
+      ? { t: 'vless', v: { credential, encryption: encryption || 'none', flow: flow || null, transport } }
+      : protocolKind === 'shadowsocks2022'
+        ? { t: 'shadowsocks2022', v: { credential, method } }
+        : protocolKind === 'socks5'
+          ? { t: 'socks5', v: { username: username.trim() || null, credential } }
+          : protocolKind === 'http_connect'
+            ? { t: 'http_connect', v: { username: username.trim() || null, credential } }
+            : {
+                t: 'wireguard',
+                v: {
+                  credential,
+                  peer_public_key: peerPublicKey.trim(),
+                  local_addresses: externalList(localAddresses),
+                  mtu: Number(wireguardMtu),
+                  reserved: reservedBytes ?? [],
+                  keep_alive: Number(keepAlive),
+                  allowed_ips: externalList(allowedIps),
+                  no_kernel_tun: noKernelTun,
+                  domain_strategy: wireguardDomainStrategy,
+                },
+              };
+  const security: ExternalOutboundSecurity =
+    securityKind === 'none'
+      ? { t: 'none' }
+      : securityKind === 'tls'
+        ? {
+            t: 'tls',
+            v: { server_name: serverName.trim(), fingerprint: fingerprint.trim() || 'chrome' },
+          }
+        : {
+            t: 'reality',
+            v: {
+              server_name: serverName.trim(),
+              public_key: publicKey.trim(),
+              short_id: shortId.trim(),
+              fingerprint: fingerprint.trim() || 'chrome',
+            },
+          };
+  const outbound: ExternalOutbound = {
+    id,
+    tenant: tenantId,
+    name: name.trim(),
+    address: address.trim(),
+    port: Number(port),
+    protocol,
+    security,
+    bindings: existing?.bindings ?? [],
+  };
+  const dirty =
+    existing === null ||
+    stableJson(outbound) !==
+      stableJson({
+        id: existing.id,
+        tenant: existing.tenant,
+        name: existing.name,
+        address: existing.address,
+        port: existing.port,
+        protocol: existing.protocol,
+        security: existing.security,
+        bindings: existing.bindings,
+      });
+
   const save = async () => {
-    if (!valid) return;
+    if (!valid || !dirty) return;
     setSaving(true);
     setError(null);
     try {
-      const downloadSecurity: ExternalOutboundSecurity =
-        xhttp.downloadSecurityKind === 'tls'
-          ? {
-              t: 'tls',
-              v: {
-                server_name: xhttp.downloadServerName.trim(),
-                fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
-              },
-            }
-          : {
-              t: 'reality',
-              v: {
-                server_name: xhttp.downloadServerName.trim(),
-                public_key: xhttp.downloadPublicKey.trim(),
-                short_id: xhttp.downloadShortId.trim(),
-                fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
-              },
-            };
-      const transport: ExternalVlessTransport =
-        vlessTransport === 'raw'
-          ? { t: 'raw' }
-          : {
-              t: 'xhttp',
-              v: {
-                path: xhttp.path.trim(),
-                host: xhttp.host.trim() || null,
-                mux: xhttp.mux.trim() ? Number(xhttp.mux) : null,
-                mode: xhttp.mode,
-                download: xhttp.downloadEnabled
-                  ? {
-                      address: xhttp.downloadAddress.trim(),
-                      port: Number(xhttp.downloadPort),
-                      security: downloadSecurity,
-                      path: xhttp.downloadPath.trim(),
-                      host: xhttp.downloadHost.trim() || null,
-                      mux: xhttp.downloadMux.trim() ? Number(xhttp.downloadMux) : null,
-                      mode: xhttp.downloadMode,
-                    }
-                  : null,
-              },
-            };
-      const protocol: ExternalOutboundProtocol =
-        protocolKind === 'vless'
-          ? { t: 'vless', v: { credential, encryption: encryption || 'none', flow: flow || null, transport } }
-          : protocolKind === 'shadowsocks2022'
-            ? { t: 'shadowsocks2022', v: { credential, method } }
-            : protocolKind === 'socks5'
-              ? { t: 'socks5', v: { username: username.trim() || null, credential } }
-              : protocolKind === 'http_connect'
-                ? { t: 'http_connect', v: { username: username.trim() || null, credential } }
-                : {
-                    t: 'wireguard',
-                    v: {
-                      credential,
-                      peer_public_key: peerPublicKey.trim(),
-                      local_addresses: externalList(localAddresses),
-                      mtu: Number(wireguardMtu),
-                      reserved: reservedBytes ?? [],
-                      keep_alive: Number(keepAlive),
-                      allowed_ips: externalList(allowedIps),
-                      no_kernel_tun: noKernelTun,
-                      domain_strategy: wireguardDomainStrategy,
-                    },
-                  };
-      const security: ExternalOutboundSecurity =
-        securityKind === 'none'
-          ? { t: 'none' }
-          : securityKind === 'tls'
-            ? { t: 'tls', v: { server_name: serverName, fingerprint } }
-            : {
-                t: 'reality',
-                v: { server_name: serverName, public_key: publicKey, short_id: shortId, fingerprint },
-              };
-      const outbound: ExternalOutbound = {
-        id,
-        tenant: tenantId,
-        name: name.trim(),
-        address: address.trim(),
-        port: Number(port),
-        protocol,
-        security,
-        bindings: existing?.bindings ?? [],
-      };
       await upsertExternalOutbound({
         id,
         tenant_id: tenantId,
@@ -3630,11 +3662,12 @@ export function ExternalOutboundEditor({
                     <span className="sub">全局唯一；创建后不变。</span>
                   </span>
                 </label>
-                <label className="row">
+                <div className="row">
                   <span className="k">服务器</span>
                   <span className="v external-outbound-host">
                     <input
                       className="f mono"
+                      aria-label="服务器地址"
                       placeholder="edge.example.com"
                       value={address}
                       onChange={event => {
@@ -3648,11 +3681,12 @@ export function ExternalOutboundEditor({
                       type="number"
                       min={1}
                       max={65535}
+                      aria-label="服务器端口"
                       value={port}
                       onChange={event => setPort(event.target.value)}
                     />
                   </span>
-                </label>
+                </div>
                 {authenticatedProxy && (
                   <label className="row">
                     <span className="k">用户名（可选）</span>
@@ -3712,12 +3746,13 @@ export function ExternalOutboundEditor({
                         />
                       </span>
                     </label>
-                    <label className="row">
+                    <div className="row">
                       <span className="k">传输层</span>
                       <span className="v">
                         <span className="external-transport-options">
                           <button
                             type="button"
+                            aria-label="RAW / TCP"
                             className={vlessTransport === 'raw' ? 'on' : ''}
                             aria-pressed={vlessTransport === 'raw'}
                             onClick={() => chooseVlessTransport('raw')}
@@ -3727,6 +3762,7 @@ export function ExternalOutboundEditor({
                           </button>
                           <button
                             type="button"
+                            aria-label="XHTTP"
                             className={vlessTransport === 'xhttp' ? 'on' : ''}
                             aria-pressed={vlessTransport === 'xhttp'}
                             onClick={() => chooseVlessTransport('xhttp')}
@@ -3736,7 +3772,7 @@ export function ExternalOutboundEditor({
                           </button>
                         </span>
                       </span>
-                    </label>
+                    </div>
                     <label className="row">
                       <span className="k">Flow</span>
                       <span className="v">
@@ -3785,11 +3821,12 @@ export function ExternalOutboundEditor({
                             />
                           </span>
                         </label>
-                        <label className="row">
+                        <div className="row">
                           <span className="k">模式 / XMUX</span>
                           <span className="v external-xhttp-pair">
                             <select
                               className="f mono"
+                              aria-label="XHTTP 上传模式"
                               value={xhttp.mode}
                               onChange={event => patchXhttp({ mode: event.target.value as XhttpMode })}
                             >
@@ -3803,12 +3840,13 @@ export function ExternalOutboundEditor({
                               type="number"
                               min={1}
                               max={128}
+                              aria-label="XHTTP 上传 XMUX"
                               placeholder="并发 1–128"
                               value={xhttp.mux}
                               onChange={event => patchXhttp({ mux: event.target.value })}
                             />
                           </span>
-                        </label>
+                        </div>
                         <label className="row external-xhttp-download-switch">
                           <span className="k">独立下载链路</span>
                           <span className="v">
@@ -3836,11 +3874,12 @@ export function ExternalOutboundEditor({
                               <b>下载链路</b>
                               <small>对应 Xray downloadSettings，不沿用上传端安全参数</small>
                             </header>
-                            <label className="row">
+                            <div className="row">
                               <span className="k">服务器</span>
                               <span className="v external-outbound-host">
                                 <input
                                   className="f mono"
+                                  aria-label="下载服务器地址"
                                   placeholder="download.example.com"
                                   value={xhttp.downloadAddress}
                                   onChange={event => {
@@ -3861,11 +3900,12 @@ export function ExternalOutboundEditor({
                                   type="number"
                                   min={1}
                                   max={65535}
+                                  aria-label="下载服务器端口"
                                   value={xhttp.downloadPort}
                                   onChange={event => patchXhttp({ downloadPort: event.target.value })}
                                 />
                               </span>
-                            </label>
+                            </div>
                             <label className="row">
                               <span className="k">Path</span>
                               <span className="v">
@@ -3887,11 +3927,12 @@ export function ExternalOutboundEditor({
                                 />
                               </span>
                             </label>
-                            <label className="row">
+                            <div className="row">
                               <span className="k">模式 / XMUX</span>
                               <span className="v external-xhttp-pair">
                                 <select
                                   className="f mono"
+                                  aria-label="XHTTP 下载模式"
                                   value={xhttp.downloadMode}
                                   onChange={event => patchXhttp({ downloadMode: event.target.value as XhttpMode })}
                                 >
@@ -3905,12 +3946,13 @@ export function ExternalOutboundEditor({
                                   type="number"
                                   min={1}
                                   max={128}
+                                  aria-label="XHTTP 下载 XMUX"
                                   placeholder="并发 1–128"
                                   value={xhttp.downloadMux}
                                   onChange={event => patchXhttp({ downloadMux: event.target.value })}
                                 />
                               </span>
-                            </label>
+                            </div>
                             <label className="row">
                               <span className="k">安全层</span>
                               <span className="v">
@@ -3926,11 +3968,12 @@ export function ExternalOutboundEditor({
                                 </select>
                               </span>
                             </label>
-                            <label className="row">
+                            <div className="row">
                               <span className="k">SNI / 指纹</span>
                               <span className="v external-xhttp-pair">
                                 <input
                                   className="f mono"
+                                  aria-label="下载 SNI"
                                   placeholder="download.example.com"
                                   value={xhttp.downloadServerName}
                                   aria-invalid={
@@ -3955,6 +3998,7 @@ export function ExternalOutboundEditor({
                                 ) : (
                                   <input
                                     className="f mono"
+                                    aria-label="下载 TLS 指纹"
                                     placeholder="chrome"
                                     value={xhttp.downloadFingerprint}
                                     onChange={event => patchXhttp({ downloadFingerprint: event.target.value })}
@@ -3967,7 +4011,7 @@ export function ExternalOutboundEditor({
                                     当前 Xray 不支持该 REALITY 指纹；unsafe / hellogolang 不可用。
                                   </span>
                                 )}
-                            </label>
+                            </div>
                             {xhttp.downloadSecurityKind === 'reality' && (
                               <>
                                 <label className="row">
@@ -4053,7 +4097,7 @@ export function ExternalOutboundEditor({
                         />
                       </span>
                     </label>
-                    <label className="row">
+                    <div className="row">
                       <span className="k">MTU / Keepalive</span>
                       <span className="v external-outbound-host">
                         <input
@@ -4061,6 +4105,7 @@ export function ExternalOutboundEditor({
                           type="number"
                           min={576}
                           max={9000}
+                          aria-label="WireGuard MTU"
                           value={wireguardMtu}
                           onChange={event => setWireguardMtu(event.target.value)}
                         />
@@ -4069,11 +4114,12 @@ export function ExternalOutboundEditor({
                           type="number"
                           min={0}
                           max={65535}
+                          aria-label="WireGuard Keepalive"
                           value={keepAlive}
                           onChange={event => setKeepAlive(event.target.value)}
                         />
                       </span>
-                    </label>
+                    </div>
                     <label className="row">
                       <span className="k">Reserved</span>
                       <span className="v">
@@ -4246,7 +4292,12 @@ export function ExternalOutboundEditor({
           <button className="btn" onClick={onClose}>
             取消
           </button>
-          <button className="btn primary" disabled={!valid || saving} onClick={() => void save()}>
+          <button
+            className="btn primary"
+            disabled={!valid || saving || !dirty}
+            title={!dirty ? '没有修改' : undefined}
+            onClick={() => void save()}
+          >
             {saving
               ? '保存中…'
               : purpose === 'rule'

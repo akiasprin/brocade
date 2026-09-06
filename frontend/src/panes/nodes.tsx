@@ -1768,7 +1768,13 @@ function OverlayRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
 
   return (
     <Row k="WireGuard">
-      <SegSwitch checked={value} disabled={!editingReady} onChange={checked => setStaged(checked)} off="关闭" on="启用" />
+      <SegSwitch
+        checked={value}
+        disabled={!editingReady}
+        onChange={checked => setStaged(checked)}
+        off="关闭"
+        on="启用"
+      />
       {dependencyError && <ErrorBox error={dependencyError} />}
       {!dirty && (
         <span className="sub">
@@ -2032,9 +2038,7 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
         {current && serving && (
           <>
             <Row k="签发">
-              <span className={selfSigned ? 'st st-warn' : 'st st-ok'}>
-                {selfSigned ? '自签' : '公共 CA'}
-              </span>
+              <span className={selfSigned ? 'st st-warn' : 'st st-ok'}>{selfSigned ? '自签' : '公共 CA'}</span>
               <span className="sub">
                 {expiry && !Number.isNaN(expiry.valueOf()) ? `叶证书有效至 ${expiry.toLocaleDateString('zh-CN')}` : ''}
               </span>
@@ -3754,10 +3758,7 @@ function RuntimeCard({
   return (
     <div className="panel nd-runtime">
       <header>
-        <h4>
-          <Icon of="observe" size={13} className="nd-rt-head-ic" />
-          运行状态
-        </h4>
+        <PanelTitle of="observe">运行状态</PanelTitle>
       </header>
       <AgentCard node={node} agentStartedAt={agentStartedAt} />
       {/* HOST 的数据来自负载上报（host facts 是其中的低频段），与节点状态是两个通道。 */}
@@ -4662,8 +4663,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
   const idInvalid = form.id !== '' && !SLUG_RE.test(form.id);
   const idTaken = form.id.trim() !== '' && (existingNodes.data?.nodes ?? []).some(n => n.node_id === form.id.trim());
   const defaultCertLabelId = (certs.data?.groups ?? []).find(group => group.is_default)?.id ?? '';
-  const selectedCertLabelId =
-    form.cert_label_id === '__none__' ? '' : form.cert_label_id || defaultCertLabelId;
+  const selectedCertLabelId = form.cert_label_id === '__none__' ? '' : form.cert_label_id || defaultCertLabelId;
 
   // 归属租户取默认值：操作者绑定了子树时用该子树，只有一个租户时用该租户，
   // 否则取排序后的第一个。只有需要指定时才修改该项。
@@ -4906,7 +4906,8 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
               <option value="__none__">不关联证书</option>
               {(certs.data?.groups ?? []).map(g => (
                 <option key={g.id} value={g.id}>
-                  {g.name}{g.is_default ? '（默认）' : ''} · {g.names[1] ?? g.names[0]}
+                  {g.name}
+                  {g.is_default ? '（默认）' : ''} · {g.names[1] ?? g.names[0]}
                 </option>
               ))}
             </select>

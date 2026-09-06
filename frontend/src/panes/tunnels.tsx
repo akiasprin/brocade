@@ -16,7 +16,7 @@ import {
 import { draft } from '../draft';
 import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
-import { Icon, ListIcon } from '../ui/icons';
+import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { useCrumb } from '../wm/crumb';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { ExternalOutboundEditor } from './rules';
@@ -381,7 +381,7 @@ function TunnelList({ go }: { go: (drill: Drill) => void }) {
   );
 }
 
-function WarpCreate({
+export function WarpCreate({
   tenantId,
   existingIds,
   onClose,
@@ -427,6 +427,7 @@ function WarpCreate({
     Number(workers) <= 256;
 
   const save = async () => {
+    if (!valid) return;
     setSaving(true);
     setError(null);
     const tunnel: ExternalOutbound = {
@@ -505,13 +506,24 @@ function WarpCreate({
                 {existingIds.has(id) && <span className="sub err">这个 ID 已存在。</span>}
               </span>
             </label>
-            <label className="row">
+            <div className="row">
               <span className="k">Endpoint</span>
               <span className="v tunnel-endpoint-fields">
-                <input className="f mono" value={address} onChange={event => setAddress(event.target.value)} />
-                <input className="f mono" type="number" value={port} onChange={event => setPort(event.target.value)} />
+                <input
+                  className="f mono"
+                  aria-label="Endpoint 地址"
+                  value={address}
+                  onChange={event => setAddress(event.target.value)}
+                />
+                <input
+                  className="f mono"
+                  type="number"
+                  aria-label="Endpoint 端口"
+                  value={port}
+                  onChange={event => setPort(event.target.value)}
+                />
               </span>
-            </label>
+            </div>
             <div className="row">
               <span className="k">出口协议栈</span>
               <span className="v">
@@ -771,7 +783,7 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
           {isWarp ? (
             <section className="panel config-panel tunnel-panel">
               <header>
-                <h4>机器注册</h4>
+                <PanelTitle of="nodes">机器注册</PanelTitle>
                 <span className="hint">{tunnel.bindings.length} 已注册</span>
               </header>
               <div className="warp-bindings">
@@ -848,7 +860,7 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
           ) : (
             <section className="panel config-panel tunnel-panel">
               <header>
-                <h4>订阅前置</h4>
+                <PanelTitle of="client">订阅前置</PanelTitle>
                 <span className="hint">Clash dialer-proxy</span>
               </header>
               <div className="tunnel-fronts">
@@ -883,7 +895,7 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
           {/* 规则引用：每项跳转到对应线路 */}
           <section className="panel config-panel tunnel-panel">
             <header>
-              <h4>规则引用</h4>
+              <PanelTitle of="chains">规则引用</PanelTitle>
               <span className="hint">{new Set(references.map(reference => reference.node)).size} 台机器</span>
             </header>
             <div className="tunnel-ref-list">
@@ -979,6 +991,14 @@ export function WarpBindingCard({
   const [workers, setWorkers] = useState(String(effectiveWorkers));
   const [formError, setFormError] = useState<unknown>(null);
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
+  const dirty =
+    address.trim() !== effectiveAddress ||
+    Number(port) !== effectivePort ||
+    Number(mtu) !== effectiveMtu ||
+    Number(keepAlive) !== effectiveKeepAlive ||
+    ipStack !== effectiveIpStack ||
+    noKernelTun !== effectiveNoKernelTun ||
+    Number(workers) !== effectiveWorkers;
 
   const update = useMutation({
     mutationFn: (overrides: WarpBindingOverrides) => updateWarpBinding(tenantId, outboundId, binding.node, overrides),
@@ -1021,6 +1041,7 @@ export function WarpBindingCard({
     setEditing(true);
   };
   const save = () => {
+    if (!dirty) return;
     const nextAddress = address.trim();
     const nextPort = Number(port);
     const nextMtu = Number(mtu);
@@ -1224,7 +1245,12 @@ export function WarpBindingCard({
                 <button className="btn" disabled={update.isPending} onClick={() => setEditing(false)}>
                   取消
                 </button>
-                <button className="btn primary" disabled={update.isPending} onClick={save}>
+                <button
+                  className="btn primary"
+                  disabled={update.isPending || !dirty}
+                  title={dirty ? undefined : '没有修改'}
+                  onClick={save}
+                >
                   {update.isPending ? '保存中…' : '保存'}
                 </button>
               </div>
@@ -1266,8 +1292,17 @@ export function WarpEdit({ tunnel, onClose }: { tunnel: ExternalOutbound; onClos
     Number.isInteger(Number(workers)) &&
     Number(workers) >= 0 &&
     Number(workers) <= 256;
+  const dirty =
+    name.trim() !== tunnel.name ||
+    address.trim() !== tunnel.address ||
+    Number(port) !== tunnel.port ||
+    Number(mtu) !== protocol.v.mtu ||
+    Number(keepAlive) !== protocol.v.keep_alive ||
+    ipStack !== warpIpStackOf(protocol) ||
+    noKernelTun !== protocol.v.no_kernel_tun ||
+    Number(workers) !== protocol.v.workers;
   const save = async () => {
-    if (!valid) return;
+    if (!valid || !dirty) return;
     setSaving(true);
     setError(null);
     try {
@@ -1320,20 +1355,26 @@ export function WarpEdit({ tunnel, onClose }: { tunnel: ExternalOutbound; onClos
                 <input className="f" value={name} onChange={event => setName(event.target.value)} />
               </span>
             </label>
-            <label className="row">
+            <div className="row">
               <span className="k">默认 Endpoint</span>
               <span className="v tunnel-endpoint-fields">
-                <input className="f mono" value={address} onChange={event => setAddress(event.target.value)} />
+                <input
+                  className="f mono"
+                  aria-label="默认 Endpoint 地址"
+                  value={address}
+                  onChange={event => setAddress(event.target.value)}
+                />
                 <input
                   className="f mono"
                   type="number"
                   min={1}
                   max={65535}
+                  aria-label="默认 Endpoint 端口"
                   value={port}
                   onChange={event => setPort(event.target.value)}
                 />
               </span>
-            </label>
+            </div>
             <div className="row">
               <span className="k">出口协议栈</span>
               <span className="v">
@@ -1410,7 +1451,12 @@ export function WarpEdit({ tunnel, onClose }: { tunnel: ExternalOutbound; onClos
           <button className="btn" onClick={onClose}>
             取消
           </button>
-          <button className="btn primary" disabled={saving || !valid} onClick={() => void save()}>
+          <button
+            className="btn primary"
+            disabled={saving || !valid || !dirty}
+            title={dirty ? undefined : '没有修改'}
+            onClick={() => void save()}
+          >
             {saving ? '保存中…' : '保存到草稿'}
           </button>
         </footer>
@@ -1510,7 +1556,7 @@ export function WarpRuleManager({
 
           <section className="panel config-panel tunnel-panel warp-rule-machine">
             <header>
-              <h4>机器身份</h4>
+              <PanelTitle of="identity">机器身份</PanelTitle>
               <span className={`st ${binding ? '' : 'st-warn'}`}>{binding ? '已注册' : '待注册'}</span>
             </header>
             {binding ? (

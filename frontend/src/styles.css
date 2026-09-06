@@ -3310,8 +3310,9 @@ textarea.f::placeholder {
    一条实线比增加空白的成本更低。
    用负 margin 抵消卡片内距，使标题条延伸到边缘；用 overflow 裁剪底色的圆角。
 
-   三处在使用：机器详情的观测页、机器与线路详情共用的配置面板（.config-panel），以及设置页
-   的段（.panel.titled）。配置面板显式使用同一类，不再由页面容器暗中改变普通 .panel 的材质。
+   全站只保留机器、线路和用户页已有的三种骨架：普通 .panel、配置卡
+   .panel.config-panel，以及列表/段卡 .panel.titled。其他页面也只能复用它们。
+   配置面板显式使用同一类，不再由页面容器暗中改变普通 .panel 的材质。
 
    `.b-col` 是双栏时期的容器，改成页签后已无处引用，这三条里留着它是为了不在这一次改动里
    顺手删掉别的东西——要清的话三条一起清，见文件末尾的说明。 */
@@ -3361,18 +3362,6 @@ textarea.f::placeholder {
   letter-spacing: 0.11em;
   color: var(--ink-3);
 }
-/* 段编号。与左栏目录里的编号是同一个号——目录说「第 5 段是 WireGuard」，段自己也要
-   报出这个号，否则点过去之后无从确认落在了哪一段。
-   尺寸跟着标题走（10.5px 等宽），着色使用段色而非 --ink-4：段色在这一页只出现在编号和
-   小组标签两处，都是尺寸很小的元素，落在大面积的底色或边框上会变成装饰。 */
-.panel.titled > :is(header, summary) .no {
-  flex: none;
-  font: 600 10.5px var(--mono);
-  letter-spacing: 0.08em;
-  font-variant-numeric: tabular-nums;
-  color: var(--hue, var(--ink-4));
-}
-
 /* 列表页的标题行是页面标题，不是面板标题：机器/线路/用户/租户/操作者这些行回答
    「这是哪一页」，监控卡片和设置段的标题回答「这一块是什么」。标题条尺寸统一继承
    `.cardpage .panel.titled > header`，这里只放大页面级标题文字。 */
@@ -3413,11 +3402,6 @@ textarea.f::placeholder {
   margin: 0 0 16px;
 }
 
-/* 发布页保留自己的段色；设置页统一走配置面板的中性色，不按段另造皮肤。 */
-#dp-agent,
-#dp-config {
-  --hue: var(--hue-2);
-}
 [id^='set-'] > .guard:not(:has(.btn)),
 [id^='set-'] .setgrp > .guard:not(:has(.btn)) {
   display: none;

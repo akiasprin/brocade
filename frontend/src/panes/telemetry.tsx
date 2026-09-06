@@ -14,6 +14,7 @@ import { GridComponent, MarkLineComponent, TooltipComponent } from 'echarts/comp
 import { CanvasRenderer } from 'echarts/renderers';
 import { bytes } from '../ui/format';
 import { Ago } from '../ui/bits';
+import { PanelTitle } from '../ui/icons';
 import {
   OBSERVE_SERIES_COLOR_VARS,
   observeAreaStyle,
@@ -2228,7 +2229,7 @@ export function HopLinkTable({ hops, nodeName }: { hops: HopLinkView[]; nodeName
   return (
     <div className="panel">
       <header>
-        <h4>LINK QUALITY</h4>
+        <PanelTitle of="chains">LINK QUALITY</PanelTitle>
         <span className="sp" />
         <span className="hint">来自真实转发流量，不额外发起探测</span>
       </header>

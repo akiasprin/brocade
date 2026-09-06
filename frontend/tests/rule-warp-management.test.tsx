@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ConsoleSnapshot, ExternalOutbound, NodeAgentStateItem, Rule } from '../src/api';
 import { draft } from '../src/draft';
-import { RuleEditor } from '../src/panes/rules';
+import { ExternalOutboundEditor, RuleEditor } from '../src/panes/rules';
 
 const warp: ExternalOutbound = {
   id: 'warp',
@@ -122,5 +122,65 @@ describe('WARP management inside forwarding rules', () => {
     await waitFor(() => expect(view.getByRole('dialog', { name: '管理当前机器的 WARP 出口' })).toBeTruthy());
     expect(view.queryByRole('dialog', { name: '配置外部出站' })).toBeNull();
     expect(view.getByText('默认参数属于租户 WARP 资源；当前机器有覆盖时，以机器参数为准。')).toBeTruthy();
+  });
+});
+
+describe('external outbound editor controls', () => {
+  it('gives grouped tunnel controls independent accessible names', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <ExternalOutboundEditor
+          tenantId="platform"
+          existing={null}
+          onClose={() => undefined}
+          onSaved={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+    expect(view.getByRole('button', { name: 'RAW / TCP' })).toBeTruthy();
+    expect(view.getByRole('button', { name: 'XHTTP' })).toBeTruthy();
+    expect(view.getByRole('textbox', { name: '服务器地址' })).toBeTruthy();
+    expect(view.getByRole('spinbutton', { name: '服务器端口' })).toBeTruthy();
+
+    fireEvent.click(view.getByRole('button', { name: 'XHTTP' }));
+    expect(view.getByRole('combobox', { name: 'XHTTP 上传模式' })).toBeTruthy();
+    expect(view.getByRole('spinbutton', { name: 'XHTTP 上传 XMUX' })).toBeTruthy();
+    fireEvent.click(view.getByRole('checkbox', { name: /下载使用另一组服务器/ }));
+    expect(view.getByRole('textbox', { name: '下载服务器地址' })).toBeTruthy();
+    expect(view.getByRole('spinbutton', { name: '下载服务器端口' })).toBeTruthy();
+    expect(view.getByRole('combobox', { name: 'XHTTP 下载模式' })).toBeTruthy();
+    expect(view.getByRole('spinbutton', { name: 'XHTTP 下载 XMUX' })).toBeTruthy();
+    expect(view.getByRole('textbox', { name: '下载 SNI' })).toBeTruthy();
+    expect(view.getByRole('textbox', { name: '下载 TLS 指纹' })).toBeTruthy();
+
+    fireEvent.click(view.getByRole('button', { name: 'WireGuard' }));
+    expect(view.getByRole('spinbutton', { name: 'WireGuard MTU' })).toBeTruthy();
+    expect(view.getByRole('spinbutton', { name: 'WireGuard Keepalive' })).toBeTruthy();
+  });
+
+  it('does not create a draft operation when an existing outbound has no changes', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <ExternalOutboundEditor
+          tenantId="platform"
+          existing={vendor}
+          onClose={() => undefined}
+          onSaved={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const save = view.getByRole('button', { name: '保存并选中' }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(save.title).toBe('没有修改');
+    fireEvent.click(save);
+    expect(draft.ops()).toHaveLength(0);
+
+    fireEvent.change(view.getByRole('textbox', { name: '名称' }), { target: { value: '供应商出口 2' } });
+    expect(save.disabled).toBe(false);
   });
 });
