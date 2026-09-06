@@ -300,6 +300,7 @@ mod tests {
             id: "sg-01".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "sg-01".to_owned(),
+            certificate_track: None,
             public_ipv4: ipv4.map(str::to_owned),
             public_ipv6: ipv6.map(str::to_owned),
             public_ipv4_nat: ipv4_nat,

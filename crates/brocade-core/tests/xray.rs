@@ -9,22 +9,71 @@ use brocade_core::{
         system::compile_system,
     },
     model::{
-        Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, DestMatch, Dns, DomainStrategy,
-        EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
-        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
+        Accept, Action, AnyTls, AnyTlsMasquerade, AppView, CertificateTrack, Chain, DestMatch, Dns,
+        DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution,
+        EgressDnsTransport, ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
         ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn, HopPool, HopWire, Hysteria2,
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
         IngressWires, IpFamily, ModelSettings, ModelSnapshot, Network, Node, NodeEgressDnsPolicy,
         OverlaySettings, Reality, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
-        RealitySite, RealityXhttp, Rule, Step, Transport, User, WireGuardKeys, Xhttp, XhttpMode,
-        XhttpTuning, XhttpXmuxRange,
+        RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp,
+        XhttpMode, XhttpTuning, XhttpXmuxRange,
     },
     physical::node::{project_node, reality_fallback_limits},
     Level,
 };
+
 use ipnet::Ipv4Net;
 use serde_json::Value;
+
+#[test]
+fn a_pure_ingress_node_uses_its_assigned_self_signed_track() {
+    let mut hk = node("hk", [10, 66, 0, 1], true, Dns::System);
+    hk.overlay = false;
+    hk.certificate_name = Some("private-edge.example.com".to_owned());
+    hk.certificate_track = Some(CertificateTrack::SelfSigned);
+    let doc = doc(vec![hk]);
+    let mut face = ingress("i", "c", "hk");
+    face.wires = IngressWires::Vless(Transport::VlessTls(Tls::default()));
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    assert!(
+        sys.nodes.iter().all(|node| node.id != "hk"),
+        "pure ingress node must exercise the AppIr-only path"
+    );
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let certificates = inbound(&value, "in:app/i")["streamSettings"]["tlsSettings"]["certificates"]
+        .as_array()
+        .unwrap();
+    assert_eq!(certificates.len(), 2);
+    assert_eq!(
+        certificates[0]["certificateFile"],
+        xray::NODE_SELF_SIGNED_CERTIFICATE_FILES[0]
+    );
+    assert_eq!(
+        certificates[1]["certificateFile"],
+        xray::NODE_SELF_SIGNED_CERTIFICATE_FILES[1]
+    );
+    assert_eq!(certificates[0]["reloadInterval"], 5);
+    assert_eq!(certificates[1]["reloadInterval"], 5);
+}
 
 #[test]
 fn managed_xhttp_listener_tuning_reaches_the_server_artifact() {

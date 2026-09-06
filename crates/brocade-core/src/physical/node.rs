@@ -679,7 +679,10 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
 
     let mut plan = XrayPlan {
         node_id: node_id.to_owned(),
-        certificate_track: system_node.and_then(|node| node.certificate_track),
+        // AppIr contains every live application node, including pure ingress/egress machines
+        // intentionally absent from SystemIr. Taking this from SystemIr made those nodes silently
+        // fall back to the public-CA directory even when their assigned group was self-signed.
+        certificate_track: app_node.certificate_track,
         api_port: app_node.api_port,
         reality_client: sys.settings.reality_client.clone(),
         dns: app_node.dns.clone(),

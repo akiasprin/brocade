@@ -63,6 +63,11 @@ pub struct AppNode {
     pub id: String,
     pub tenant: String,
     pub name: String,
+    /// Which Agent certificate directory this node's TLS listeners use. This belongs in the
+    /// application projection as well as SystemIr: a pure ingress/egress node is intentionally
+    /// absent from the overlay system layer but still owns Xray listeners.
+    #[serde(default)]
+    pub certificate_track: Option<crate::model::CertificateTrack>,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
     pub public_ipv4_nat: bool,
@@ -227,6 +232,7 @@ pub fn compile_app(
                 id: node.id.clone(),
                 tenant: node.tenant.clone(),
                 name: node.name.clone(),
+                certificate_track: node.certificate_track,
                 public_ipv4: node.public_ipv4.clone(),
                 public_ipv6: node.public_ipv6.clone(),
                 public_ipv4_nat: node.public_ipv4_nat,
