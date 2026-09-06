@@ -3902,8 +3902,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     mutationFn: async () => {
       const id = (creating?.id ?? '').trim();
       if (!isValidSlug(id)) throw new Error(`分组 ID 只能用 a-z 0-9 . _ -，最长 ${SLUG_MAX}`);
-      // id 冲突时不会被拒绝，而是会将该 id 对应项目的链连同主干一并迁移（论证见
-      // ports.ts 的 freeId）——因此此处必须先行拦截。
+      // 创建表单不能借 upsert 语义悄悄改名已有分组，因此在客户端先明确拦截重复 ID。
       if (appsNow().some(a => a.id === id)) throw new Error(`线路 ${id} 已经有了`);
       await upsertApp({ id, label: (creating?.label ?? '').trim() || id });
     },

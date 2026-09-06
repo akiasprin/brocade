@@ -9,8 +9,9 @@
     "preview": "vite preview",
     "lint": "eslint src",
     "lint:strict": "eslint src --max-warnings 0",
-    "test": "npm run test:unit && npm run test:react",
+    "test": "npm run test:unit && npm run test:ports && npm run test:react",
     "test:unit": "node --test tests/*.test.mjs",
+    "test:ports": "node scripts/ports-check.mjs",
     "test:react": "tsc --noEmit -p tsconfig.test.json && vitest run --config vitest.config.ts",
     "format": "prettier --write src",
     "format:check": "prettier --check src"
