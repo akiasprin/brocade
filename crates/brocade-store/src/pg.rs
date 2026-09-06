@@ -184,10 +184,13 @@ impl PgStore {
         // Keep migrations embedded in the store crate; cargo only refreshes this
         // list when the crate is rebuilt.
         sqlx::migrate!("./migrations").run(&self.pool).await?;
-        settings::ensure_anytls_padding_scheme(&self.pool).await?;
-        let default_warps = console::ensure_default_warp_outbounds(&self.pool).await?;
+        // Repair durable subscription pointers immediately after schema/data migrations. Later
+        // initializers may commit a model revision and must never advance from a checkpoint whose
+        // resource IDs no longer match the migrated model.
         materialize::ensure_current_snapshot(&self.pool).await?;
         crate::subscription_client::ensure_checkpoint(&self.pool).await?;
+        settings::ensure_anytls_padding_scheme(&self.pool).await?;
+        let default_warps = console::ensure_default_warp_outbounds(&self.pool).await?;
         Ok(default_warps)
     }
 

@@ -19,6 +19,7 @@ use crate::{Result, StoreError};
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedClientSnapshot {
     pub(crate) id: u64,
+    pub(crate) source_revision_id: u64,
     pub(crate) content_sha256: String,
     pub(crate) config: SubscriptionClientConfig,
     stored_document: Value,
@@ -133,8 +134,200 @@ pub(crate) async fn ensure_checkpoint(pool: &PgPool) -> Result<()> {
         }
     }
 
+    migrate_grouped_model_id_checkpoints_tx(&mut tx).await?;
+
     tx.commit().await?;
     Ok(())
+}
+
+/// Rebuild client checkpoints after the canonical SQL migration replaces legacy chain and
+/// ingress IDs. Contract hashes include both IDs, so renaming only the JSON object keys would
+/// leave every public projection detached from its serving topology.
+///
+/// Replaying all immutable model snapshots through a checkpoint's source revision preserves the
+/// accumulated rollback candidates. Pointer changes and removal of legacy documents share this
+/// transaction, so subscriptions can observe either the complete old state or the complete new
+/// state, never a mixture.
+async fn migrate_grouped_model_id_checkpoints_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, document
+           FROM subscription_client_snapshots
+          ORDER BY id
+          FOR UPDATE",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut legacy_ids = Vec::new();
+    for row in rows {
+        let id = to_u64("client snapshot id", row.try_get::<i64, _>("id")?)?;
+        let document: Value = row.try_get("document")?;
+        if client_document_has_legacy_model_ids(&document) {
+            legacy_ids.push(id);
+        }
+    }
+    if legacy_ids.is_empty() {
+        return Ok(());
+    }
+
+    let head_id = lock_head_id_tx(tx).await?;
+    let serving = lock_serving_tx(tx).await?;
+    let serving_id = serving.and_then(|(_, _, client)| client);
+    let mut replacements = Vec::new();
+    for old_id in [head_id, serving_id].into_iter().flatten() {
+        if !legacy_ids.contains(&old_id)
+            || replacements
+                .iter()
+                .any(|(replaced, _): &(u64, LoadedClientSnapshot)| *replaced == old_id)
+        {
+            continue;
+        }
+        let old = load_client_snapshot_tx(tx, old_id).await?;
+        let config = rebuild_client_config_tx(tx, old.source_revision_id).await?;
+        if client_config_has_legacy_model_ids(&config) {
+            return Err(StoreError::InvalidData(format!(
+                "subscription client snapshot {old_id} still has legacy model IDs after rebuild"
+            )));
+        }
+        let replacement = insert_snapshot_tx(
+            tx,
+            old.source_revision_id,
+            &config,
+            "grouped-model-id-migration",
+        )
+        .await?;
+        replacements.push((old_id, replacement));
+    }
+
+    let replacement_for = |old_id: u64| {
+        replacements
+            .iter()
+            .find_map(|(old, replacement)| (*old == old_id).then_some(replacement))
+    };
+    if let Some(old_head) = head_id {
+        if let Some(replacement) = replacement_for(old_head) {
+            update_head_tx(tx, replacement.id).await?;
+        }
+    }
+    if let Some(old_serving) = serving_id {
+        if let Some(replacement) = replacement_for(old_serving) {
+            sqlx::query(
+                "UPDATE subscription_serving_state
+                    SET client_snapshot_id = $1,
+                        generation = generation + 1,
+                        updated_at = now()
+                  WHERE id = TRUE",
+            )
+            .bind(to_i64("client_snapshot_id", replacement.id)?)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    for legacy_id in legacy_ids {
+        sqlx::query("DELETE FROM subscription_client_snapshots WHERE id = $1")
+            .bind(to_i64("client snapshot id", legacy_id)?)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn rebuild_client_config_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    source_revision: u64,
+) -> Result<SubscriptionClientConfig> {
+    let source_revision_i64 = to_i64("source_revision_id", source_revision)?;
+    let revisions = sqlx::query_scalar::<_, i64>(
+        "SELECT revision_id
+           FROM model_snapshots
+          WHERE revision_id <= $1
+          ORDER BY revision_id",
+    )
+    .bind(source_revision_i64)
+    .fetch_all(&mut **tx)
+    .await?;
+    if revisions
+        .last()
+        .is_none_or(|revision| *revision != source_revision_i64)
+    {
+        return Err(StoreError::InvalidData(format!(
+            "subscription client source revision {source_revision} has no immutable model snapshot"
+        )));
+    }
+
+    let mut config = None;
+    for revision in revisions {
+        let snapshot = crate::materialize::load_immutable_snapshot_tx(
+            tx,
+            to_u64("model snapshot revision_id", revision)?,
+        )
+        .await?;
+        config = Some(SubscriptionClientConfig::advance(
+            config.as_ref(),
+            &snapshot,
+        ));
+    }
+    config.ok_or_else(|| {
+        StoreError::InvalidData(format!(
+            "subscription client source revision {source_revision} has no model history"
+        ))
+    })
+}
+
+fn client_document_has_legacy_model_ids(document: &Value) -> bool {
+    let invalid_chain = document
+        .get("chains")
+        .and_then(Value::as_object)
+        .is_some_and(|chains| chains.keys().any(|id| !is_grouped_chain_id(id)));
+    let invalid_order = document
+        .get("chain_order")
+        .and_then(Value::as_object)
+        .is_some_and(|orders| {
+            orders.values().any(|order| {
+                order.as_array().is_some_and(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .any(|id| !is_grouped_chain_id(id))
+                })
+            })
+        });
+    let invalid_ingress = document
+        .get("ingresses")
+        .and_then(Value::as_object)
+        .is_some_and(|ingresses| ingresses.keys().any(|id| !is_grouped_ingress_id(id)));
+    invalid_chain || invalid_order || invalid_ingress
+}
+
+fn client_config_has_legacy_model_ids(config: &SubscriptionClientConfig) -> bool {
+    config.chains.keys().any(|id| !is_grouped_chain_id(id))
+        || config
+            .chain_order
+            .values()
+            .flatten()
+            .any(|id| !is_grouped_chain_id(id))
+        || config.ingresses.keys().any(|id| !is_grouped_ingress_id(id))
+}
+
+fn is_grouped_ingress_id(id: &str) -> bool {
+    id.strip_prefix("ing-")
+        .is_some_and(|token| is_model_id_token(token.as_bytes()))
+}
+
+fn is_grouped_chain_id(id: &str) -> bool {
+    let Some(tokens) = id.strip_prefix("chn-") else {
+        return false;
+    };
+    let Some((ingress, chain)) = tokens.split_once('-') else {
+        return false;
+    };
+    is_model_id_token(ingress.as_bytes()) && is_model_id_token(chain.as_bytes())
+}
+
+fn is_model_id_token(token: &[u8]) -> bool {
+    token.len() == 4
+        && token
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Advance the committed client head and, where topology already serves, its active pointer.
@@ -504,6 +697,7 @@ async fn insert_encoded_snapshot_tx(
     };
     Ok(LoadedClientSnapshot {
         id: to_u64("client snapshot id", id)?,
+        source_revision_id: source_revision,
         content_sha256,
         config,
         stored_document: document,
@@ -512,7 +706,7 @@ async fn insert_encoded_snapshot_tx(
 
 fn decode_snapshot_row(row: &sqlx::postgres::PgRow) -> Result<LoadedClientSnapshot> {
     let id = to_u64("client snapshot id", row.try_get::<i64, _>("id")?)?;
-    let _source_revision = to_u64(
+    let source_revision_id = to_u64(
         "source_revision_id",
         row.try_get::<i64, _>("source_revision_id")?,
     )?;
@@ -542,6 +736,7 @@ fn decode_snapshot_row(row: &sqlx::postgres::PgRow) -> Result<LoadedClientSnapsh
     }
     Ok(LoadedClientSnapshot {
         id,
+        source_revision_id,
         content_sha256: expected,
         config,
         stored_document,
@@ -652,6 +847,8 @@ fn to_i64(field: &str, value: u64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use brocade_core::client_config::SubscriptionClientConfig;
+
     #[test]
     fn obsolete_projection_controls_are_folded_before_decoding() {
         let mut document = serde_json::json!({
@@ -674,5 +871,45 @@ mod tests {
         assert!(projection.get("xhttp_alpn").is_none());
         assert!(projection.get("tls_fingerprint").is_none());
         assert_eq!(projection["v4"]["host"], "edge.example");
+    }
+
+    #[test]
+    fn grouped_model_id_detection_rejects_every_legacy_location() {
+        let valid = serde_json::json!({
+            "chains": { "chn-8f3a-2d71": {} },
+            "chain_order": { "app": ["chn-8f3a-2d71"] },
+            "ingresses": { "ing-8f3a": {} }
+        });
+        assert!(!super::client_document_has_legacy_model_ids(&valid));
+
+        for legacy in [
+            serde_json::json!({ "chains": { "c-main": {} } }),
+            serde_json::json!({ "chain_order": { "app": ["c-main"] } }),
+            serde_json::json!({ "ingresses": { "i-main": {} } }),
+        ] {
+            assert!(super::client_document_has_legacy_model_ids(&legacy));
+        }
+    }
+
+    #[test]
+    fn grouped_model_id_shapes_are_exact() {
+        assert!(super::is_grouped_ingress_id("ing-8f3a"));
+        assert!(!super::is_grouped_ingress_id("ing-8F3A"));
+        assert!(!super::is_grouped_ingress_id("ing-8f3aa"));
+        assert!(super::is_grouped_chain_id("chn-8f3a-2d71"));
+        assert!(!super::is_grouped_chain_id("chn-8f3a"));
+        assert!(!super::is_grouped_chain_id("chn-8f3a-2D71"));
+
+        let config: SubscriptionClientConfig = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "app_order": ["app"],
+            "chain_order": { "app": ["chn-8f3a-2d71"] },
+            "chains": { "chn-8f3a-2d71": { "name": "Main" } },
+            "fronts": {},
+            "ingresses": {},
+            "external_outbounds": []
+        }))
+        .unwrap();
+        assert!(!super::client_config_has_legacy_model_ids(&config));
     }
 }

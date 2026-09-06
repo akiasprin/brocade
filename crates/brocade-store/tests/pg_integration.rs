@@ -574,7 +574,40 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     .await
     .unwrap();
 
+    // Keep startup reconciliation out of this migration fixture. This test deliberately carries
+    // topology states which are not publishable; the grouped-ID checkpoint migration itself must
+    // preserve them, while the independent default-WARP initializer must remain a no-op.
+    sqlx::query(
+        "INSERT INTO external_outbounds
+            (id, tenant_id, name, address, port, protocol, credential_sealed,
+             protocol_options, security)
+         VALUES
+            ('warp.platform.acme', 'platform.acme', 'WARP',
+             'engage.cloudflareclient.com', 2408, 'warp', '', $1, $2)",
+    )
+    .bind(json!({
+        "mtu": 1280,
+        "keep_alive": 25,
+        "allowed_ips": ["0.0.0.0/0", "::/0"],
+        "no_kernel_tun": false,
+        "domain_strategy": "ForceIP",
+        "workers": 0,
+    }))
+    .bind(json!({ "t": "none" }))
+    .execute(db.pool())
+    .await
+    .unwrap();
+
     store_current_model_snapshot(db.pool(), &db.store).await;
+    seed_subscription_serving(&db).await;
+    let legacy_client_snapshot_id: i64 = sqlx::query_scalar(
+        "SELECT client_snapshot_id
+           FROM subscription_serving_state
+          WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
 
     // Simulate the development schema which introduced machine DNS before its independent
     // priority column. Replaying 0001 must retain both policies and assign deterministic slots.
@@ -830,6 +863,64 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
         historical_old_ids, 0,
         "rollback snapshots retain legacy ids"
     );
+
+    let (
+        head_client_id,
+        serving_client_id,
+        serving_generation,
+        client_document,
+        client_sha,
+        reason,
+    ): (i64, i64, i64, serde_json::Value, String, String) = sqlx::query_as(
+        "SELECT client.head_snapshot_id,
+                serving.client_snapshot_id,
+                serving.generation,
+                snapshot.document,
+                snapshot.content_sha256,
+                snapshot.reason
+           FROM subscription_client_state client
+           JOIN subscription_serving_state serving ON serving.id = TRUE
+           JOIN subscription_client_snapshots snapshot
+             ON snapshot.id = serving.client_snapshot_id
+          WHERE client.id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(head_client_id, serving_client_id);
+    assert_ne!(serving_client_id, legacy_client_snapshot_id);
+    assert_eq!(serving_generation, 2);
+    assert_eq!(reason, "grouped-model-id-migration");
+    assert!(client_document["chains"].get(&chain_main).is_some());
+    assert!(client_document["ingresses"].get(&ingress_main).is_some());
+    assert!(client_document["chain_order"]["app-main"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_str() == Some(&chain_main)));
+    assert!(!client_document.to_string().contains("c-main"));
+    assert!(!client_document.to_string().contains("i-main"));
+    assert_eq!(
+        client_sha,
+        brocade_core::hash::sha256_hex(&serde_json::to_vec(&client_document).unwrap())
+    );
+    let legacy_client_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM subscription_client_snapshots
+          WHERE document::text LIKE '%\"c-main\"%'
+             OR document::text LIKE '%\"i-main\"%'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(legacy_client_rows, 0);
+    let deleted_legacy_client: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM subscription_client_snapshots WHERE id = $1")
+            .bind(legacy_client_snapshot_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(deleted_legacy_client, 0);
 
     let user_usage: (String, String, String) =
         sqlx::query_as("SELECT app_id, ingress_id, grant_label FROM usage_samples LIMIT 1")
