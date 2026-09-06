@@ -204,9 +204,9 @@ pub struct NodeCertificateState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServingCertificateProfile {
     pub name: String,
-    /// Pinning remains active while any retained, issued certificate in the group is self-signed.
-    /// A later public certificate therefore overlaps the old self-signed leaf until an operator
-    /// explicitly deletes the latter.
+    /// Pinning remains active while any retained certificate in a group this node has used is
+    /// self-signed. A later certificate/group therefore overlaps the preceding leaf until an
+    /// operator explicitly deletes that certificate or unused group.
     pub requires_pinning: bool,
     pub trusted_peer_sha256: Vec<String>,
 }
@@ -820,6 +820,14 @@ pub async fn assign_node_label(
         }
         error => error.into(),
     })?;
+    sqlx::query(
+        "INSERT INTO node_cert_trusted_labels (node_id, label_id) VALUES ($1, $2)
+         ON CONFLICT (node_id, label_id) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(label_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -1040,13 +1048,16 @@ pub async fn list_node_certificate_state(
 /// clients before the operator removes the old leaf from the database.
 pub(crate) async fn self_signed_certificate_names(pool: &PgPool) -> Result<BTreeSet<String>> {
     let rows = sqlx::query(
-        "SELECT l.label, l.certificate_name, d.domain
-           FROM cert_labels l
+        "SELECT DISTINCT l.label, l.certificate_name, d.domain
+           FROM node_cert_label m
+           JOIN cert_labels l ON l.id = m.label_id
            JOIN cert_domains d ON d.id = l.domain_id
            JOIN certificates c ON c.label_id = l.id AND c.status = 'serving'
           WHERE EXISTS (
-                SELECT 1 FROM certificates trusted
-                 WHERE trusted.label_id = l.id
+                SELECT 1
+                  FROM node_cert_trusted_labels history
+                  JOIN certificates trusted ON trusted.label_id = history.label_id
+                 WHERE history.node_id = m.node_id
                    AND trusted.status IN ('ready', 'serving', 'superseded')
                    AND trusted.acme_directory = 'self-signed'
                    AND trusted.peer_sha256 IS NOT NULL
@@ -1075,16 +1086,19 @@ pub(crate) async fn serving_certificate_profile_for_node(
     let row = sqlx::query(
         "SELECT l.label, l.certificate_name, d.domain,
                 EXISTS (
-                    SELECT 1 FROM certificates trusted
-                     WHERE trusted.label_id = l.id
+                    SELECT 1
+                      FROM node_cert_trusted_labels history
+                      JOIN certificates trusted ON trusted.label_id = history.label_id
+                     WHERE history.node_id = m.node_id
                        AND trusted.status IN ('ready', 'serving', 'superseded')
                        AND trusted.acme_directory = 'self-signed'
                        AND trusted.peer_sha256 IS NOT NULL
                 ) AS requires_pinning,
                 ARRAY(
                     SELECT trusted.peer_sha256
-                      FROM certificates trusted
-                     WHERE trusted.label_id = l.id
+                      FROM node_cert_trusted_labels history
+                      JOIN certificates trusted ON trusted.label_id = history.label_id
+                     WHERE history.node_id = m.node_id
                        AND trusted.status IN ('ready', 'serving', 'superseded')
                        AND trusted.peer_sha256 IS NOT NULL
                      ORDER BY trusted.issued_at, trusted.id

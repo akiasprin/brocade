@@ -1,4 +1,4 @@
-export type ModelIdKind = 'chain' | 'ingress';
+export type ModelIdKind = 'app' | 'chain' | 'ingress';
 
 export interface ModelIdPair {
   ingressId: string;
@@ -6,6 +6,8 @@ export interface ModelIdPair {
 }
 
 const RANDOM_BYTES = 4;
+const APP_RANDOM_BYTES = 2;
+const APP_ID = /^app-([0-9a-f]{4})$/;
 const INGRESS_ID = /^ing-([0-9a-f]{4})$/;
 const CHAIN_ID = /^chn-([0-9a-f]{4})-([0-9a-f]{4})$/;
 
@@ -21,8 +23,13 @@ export const modelIdPairFromBytes = (bytes: Uint8Array): ModelIdPair => {
   };
 };
 
+export const appIdFromBytes = (bytes: Uint8Array): string => {
+  if (bytes.length < APP_RANDOM_BYTES) throw new Error(`app id needs ${APP_RANDOM_BYTES} random bytes`);
+  return `app-${hex(bytes, 0)}`;
+};
+
 export const isModelId = (kind: ModelIdKind, value: string): boolean =>
-  (kind === 'ingress' ? INGRESS_ID : CHAIN_ID).test(value);
+  (kind === 'app' ? APP_ID : kind === 'ingress' ? INGRESS_ID : CHAIN_ID).test(value);
 
 export const modelIdsArePaired = ({ ingressId, chainId }: ModelIdPair): boolean => {
   const ingressToken = INGRESS_ID.exec(ingressId)?.[1];
@@ -44,4 +51,15 @@ export function modelIdPair(used: ReadonlySet<string> = new Set()): ModelIdPair 
     if (token !== null && !usedIngressTokens.has(token) && !used.has(pair.chainId)) return pair;
   }
   throw new Error('无法生成不重复的 ID，请重试');
+}
+
+/** Generate an opaque line-group id; names remain the operator-facing identity. */
+export function appId(used: ReadonlySet<string> = new Set()): string {
+  const crypto = globalThis.crypto;
+  if (!crypto?.getRandomValues) throw new Error('浏览器不支持安全随机数，无法生成 ID');
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const id = appIdFromBytes(crypto.getRandomValues(new Uint8Array(APP_RANDOM_BYTES)));
+    if (!used.has(id)) return id;
+  }
+  throw new Error('无法生成不重复的分组 ID，请重试');
 }

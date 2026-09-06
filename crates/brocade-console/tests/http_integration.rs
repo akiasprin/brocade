@@ -945,7 +945,7 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
                     json!({
                         "ops": [{
                             "op": "upsert_chain",
-                            "app_id": "app-main",
+                            "app_id": "app-a1b2",
                             "chain": CreateChainRequest {
                                 id: "chn-b2c3-d4e5".to_owned(),
                                 tenant_id: "platform.acme".to_owned(),
@@ -2182,7 +2182,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     let body = json!({
         "probed_at_unix_secs": probe_base,
         "chains": [{
-            "app_id": "app-main",
+            "app_id": "app-a1b2",
             "chain_id": "chn-b2c3-d4e5",
             "status": "ok",
             "ttfb_ms": 86,
@@ -2258,7 +2258,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     let broken = json!({
         "probed_at_unix_secs": probe_base + 60,
         "chains": [{
-            "app_id": "app-main",
+            "app_id": "app-a1b2",
             "chain_id": "chn-b2c3-d4e5",
             "status": "timeout",
             "ttfb_ms": 10000,
@@ -2312,7 +2312,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     let stale = json!({
         "probed_at_unix_secs": probe_base + 120,
         "chains": [{
-            "app_id": "app-main", "chain_id": "c-gone", "status": "ok", "ttfb_ms": 10,
+            "app_id": "app-a1b2", "chain_id": "c-gone", "status": "ok", "ttfb_ms": 10,
             "exit_ip": null, "exit_loc": null, "exit_verdict": "unknown", "detail": null
         }]
     });
@@ -2516,7 +2516,7 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         &app,
         &admin_token,
         "/apps",
-        json!({ "id": "app-main", "label": "Main App" }),
+        json!({ "id": "app-a1b2", "label": "Main App" }),
     )
     .await;
     post_json(
@@ -2529,7 +2529,7 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
     post_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains",
+        "/apps/app-a1b2/chains",
         json!({ "id": "chn-b2c3-d4e5", "tenant_id": "platform.acme", "name": "Main Chain" }),
     )
     .await;
@@ -2538,7 +2538,7 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
     let inherited = post_json(
         &app,
         &admin_token,
-        "/apps/app-main/ingresses",
+        "/apps/app-a1b2/ingresses",
         json!({
             "id": "ing-b2c3",
             "chain_id": "chn-b2c3-d4e5",
@@ -3408,7 +3408,7 @@ async fn http_console_read_surface_returns_redacted_snapshot_compile_state_and_a
         serde_json::from_slice(&to_bytes(grants.into_body(), 1024 * 1024).await.unwrap()).unwrap();
     assert_eq!(body["state"], "present");
     let grants: Value = serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-    assert_eq!(grants["inbounds"][0]["tag"], "in:app-main/ing-b2c3");
+    assert_eq!(grants["inbounds"][0]["tag"], "in:app-a1b2/ing-b2c3");
     assert_eq!(
         grants["inbounds"][0]["clients"][0]["id"],
         "2d2304da-f114-4574-8d44-625afdb1db5c"
@@ -3452,7 +3452,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         &app,
         &admin_token,
         "/apps",
-        json!({ "id": "app-main", "label": "Main App" }),
+        json!({ "id": "app-a1b2", "label": "Main App" }),
     )
     .await;
     assert_eq!(app_result.0, StatusCode::OK);
@@ -3485,7 +3485,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
     let chain = post_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains",
+        "/apps/app-a1b2/chains",
         json!({
             "id": "chn-b2c3-d4e5",
             "tenant_id": "platform.acme",
@@ -3499,7 +3499,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
     let ingress = post_json(
         &app,
         &admin_token,
-        "/apps/app-main/ingresses",
+        "/apps/app-a1b2/ingresses",
         json!({
             "id": "ing-b2c3",
             "chain_id": "chn-b2c3-d4e5",
@@ -3538,7 +3538,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
     let legacy_step = put_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/chn-b2c3-d4e5/steps/n-api",
+        "/apps/app-a1b2/chains/chn-b2c3-d4e5/steps/n-api",
         json!({ "rules": [] }),
     )
     .await;
@@ -3547,7 +3547,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
     let step = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-b2c3-d4e5",
         "n-api",
         json!({
@@ -3566,7 +3566,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         &admin_token,
         "/grants",
         json!({
-            "app_id": "app-main",
+            "app_id": "app-a1b2",
             "tenant_id": "platform.acme",
             "user_id": "alice",
             "ingress_id": "ing-b2c3",
@@ -4134,7 +4134,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         "退掉的号要能被下一次真改动接着用"
     );
 
-    let app_body = json!({ "id": "app-main", "label": "Main App" });
+    let app_body = json!({ "id": "app-a1b2", "label": "Main App" });
     let created = post_json(&app, &admin_token, "/apps", app_body.clone()).await;
     assert_eq!(created.1["revision_id"], 4);
     let created_again = post_json(&app, &admin_token, "/apps", app_body).await;
@@ -4182,12 +4182,12 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     let chain = post_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains",
+        "/apps/app-a1b2/chains",
         chain_body.clone(),
     )
     .await;
     assert_eq!(chain.1["revision_id"], 7);
-    let chain_again = post_json(&app, &admin_token, "/apps/app-main/chains", chain_body).await;
+    let chain_again = post_json(&app, &admin_token, "/apps/app-a1b2/chains", chain_body).await;
     assert_eq!(chain_again.1["revision_id"], 7, "链和主干都原样");
 
     let ingress_body = json!({
@@ -4206,7 +4206,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     let ingress = post_json(
         &app,
         &admin_token,
-        "/apps/app-main/ingresses",
+        "/apps/app-a1b2/ingresses",
         ingress_body.clone(),
     )
     .await;
@@ -4217,7 +4217,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         .to_owned();
 
     let ingress_again =
-        post_json(&app, &admin_token, "/apps/app-main/ingresses", ingress_body).await;
+        post_json(&app, &admin_token, "/apps/app-a1b2/ingresses", ingress_body).await;
     assert_eq!(ingress_again.0, StatusCode::OK);
     assert_eq!(ingress_again.1["revision_id"], 8, "接入面原样再存一遍");
     // The empty-commit path no longer goes through RETURNING and reads the keys from the database —
@@ -4233,7 +4233,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     let step = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-b2c3-d4e5",
         "n-api",
         step_body.clone(),
@@ -4243,7 +4243,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     let step_again = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-b2c3-d4e5",
         "n-api",
         step_body,
@@ -4252,7 +4252,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     assert_eq!(step_again.1["revision_id"], 9, "同一张规则表再存一遍");
 
     let grant_body = json!({
-        "app_id": "app-main",
+        "app_id": "app-a1b2",
         "tenant_id": "platform.acme",
         "user_id": "alice",
         "ingress_id": "ing-b2c3",
@@ -4269,7 +4269,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         &admin_token,
         "/grants",
         json!({
-            "app_id": "app-main",
+            "app_id": "app-a1b2",
             "tenant_id": "platform.acme",
             "user_id": "alice",
             "ingress_id": "ing-b2c3",
@@ -4373,7 +4373,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
         &app,
         &admin_token,
         "/apps",
-        json!({ "id": "app-main", "label": "Main App" }),
+        json!({ "id": "app-a1b2", "label": "Main App" }),
     )
     .await;
     for id in ["n-edge", "n-hop"] {
@@ -4383,7 +4383,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
     post_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains",
+        "/apps/app-a1b2/chains",
         json!({
             "id": "chn-b2c3-d4e5",
             "tenant_id": "platform.acme",
@@ -4406,7 +4406,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
     let step = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-b2c3-d4e5",
         "n-hop",
         json!({
@@ -4427,7 +4427,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
     let step = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-b2c3-d4e5",
         "n-hop",
         json!({
@@ -4461,7 +4461,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
     let step = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-b2c3-d4e5",
         "n-hop",
         json!({
@@ -4480,7 +4480,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
     apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-b2c3-d4e5",
         "n-hop",
         json!({
@@ -4520,7 +4520,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         &app,
         &admin_token,
         "/apps",
-        json!({ "id": "app-main", "label": "Main App" }),
+        json!({ "id": "app-a1b2", "label": "Main App" }),
     )
     .await;
     for id in ["n-lan", "n-wan", "n-relay"] {
@@ -4535,7 +4535,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         post_json(
             &app,
             &admin_token,
-            "/apps/app-main/chains",
+            "/apps/app-a1b2/chains",
             json!({
                 "id": chain,
                 "tenant_id": "platform.acme",
@@ -4548,7 +4548,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         post_json(
             &app,
             &admin_token,
-            "/apps/app-main/ingresses",
+            "/apps/app-a1b2/ingresses",
             json!({
                 "id": ingress,
                 "chain_id": chain,
@@ -4570,7 +4570,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
     apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-c3d4-e5f6",
         "n-lan",
         json!({
@@ -4584,7 +4584,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
     let lan = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-c3d4-e5f6",
         "n-relay",
         json!({
@@ -4601,7 +4601,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
     apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-d4e5-f607",
         "n-wan",
         json!({
@@ -4619,7 +4619,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
     let wan = apply_step_json(
         &app,
         &admin_token,
-        "app-main",
+        "app-a1b2",
         "chn-d4e5-f607",
         "n-relay",
         json!({
@@ -5710,13 +5710,13 @@ async fn insert_usage_model(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-main', 'Main App', 0)")
+    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-a1b2', 'Main App', 0)")
         .execute(pool)
         .await
         .unwrap();
     sqlx::query(
         "INSERT INTO chains (id, app_id, tenant_id, name, position)
-         VALUES ('chn-b2c3-d4e5', 'app-main', 'platform.acme', 'Main Chain', 0)",
+         VALUES ('chn-b2c3-d4e5', 'app-a1b2', 'platform.acme', 'Main Chain', 0)",
     )
     .execute(pool)
     .await
@@ -5731,7 +5731,7 @@ async fn insert_usage_model(pool: &PgPool) {
             reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            'ing-b2c3', 'app-main', 'chn-b2c3-d4e5', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
+            'ing-b2c3', 'app-a1b2', 'chn-b2c3-d4e5', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision',
             'custom-site'
@@ -5756,7 +5756,7 @@ async fn insert_usage_model(pool: &PgPool) {
     .unwrap();
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
-         VALUES ('app-main', 'platform.acme', 'alice', 'ing-b2c3')",
+         VALUES ('app-a1b2', 'platform.acme', 'alice', 'ing-b2c3')",
     )
     .execute(pool)
     .await

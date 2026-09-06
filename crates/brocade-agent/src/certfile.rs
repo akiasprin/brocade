@@ -60,17 +60,18 @@ const KEY_FILE: &str = "key.pem";
 pub(crate) fn apply_material(
     options: &Options,
     material: &NodeCertificateMaterial,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if !write_certificate(Path::new(&options.state_dir), material)? {
-        return Ok(());
+        return Ok(false);
     }
 
-    // Say so at once rather than waiting for the next runtime round.
-    //
-    // What this machine holds is reported on the half-hourly cycle with versions and backlog,
-    // which suited those: they change on nobody's schedule and mean nothing at finer resolution.
-    // This one changes exactly here, and until it is reported the control plane keeps judging
-    // the node as stale and repeats the material on every desired poll — fifteen seconds apart.
+    Ok(true)
+}
+
+/// Report only after the caller has made every running TLS consumer use the new files. Reporting
+/// from the write itself made the control plane stop offering the certificate even when Xray's
+/// reload failed, leaving the node permanently "current" on disk while serving the old leaf.
+pub(crate) fn report_applied(options: &Options) {
     let report_options = options.clone();
     if let Err(error) = std::thread::Builder::new()
         .name("certificate-report".to_owned())
@@ -86,7 +87,6 @@ pub(crate) fn apply_material(
             "certificate: 换好了，但启动即时上报线程失败（{error}）；下一轮会补"
         ));
     }
-    Ok(())
 }
 
 /// Writes the pair, or leaves the disk alone when it already matches.

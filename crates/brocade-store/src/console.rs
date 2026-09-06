@@ -647,12 +647,13 @@ pub(crate) async fn ensure_default_app_group(pool: &PgPool) -> Result<bool> {
 
     let revision_id = insert_revision(&mut tx, "brocade-system", "初始化线路默认分组").await?;
     let actor = AdminContext::system_admin("brocade-system");
+    let default_app_id = random_app_model_id_tx(&mut tx).await?;
     let changed = upsert_app_tx(
         &mut tx,
         &actor,
         revision_id,
         CreateAppRequest {
-            id: "default".to_owned(),
+            id: default_app_id,
             label: "默认分组".to_owned(),
             note: None,
         },
@@ -678,6 +679,7 @@ pub(crate) async fn upsert_app_tx(
         ));
     }
     let id = required_text(request.id, "app id")?;
+    validate_model_id("app", &id)?;
     let label = required_text(request.label, "app label")?;
     let revision_id = u64_to_i64(revision_id, "revision_id")?;
 
@@ -2708,6 +2710,11 @@ fn ingress_model_id_token(id: &str) -> Option<&str> {
     is_lower_hex4(token).then_some(token)
 }
 
+fn app_model_id_token(id: &str) -> Option<&str> {
+    let token = id.strip_prefix("app-")?;
+    is_lower_hex4(token).then_some(token)
+}
+
 fn chain_model_id_parts(id: &str) -> Option<(&str, &str)> {
     let (ingress_token, chain_token) = id.strip_prefix("chn-")?.split_once('-')?;
     (is_lower_hex4(ingress_token) && is_lower_hex4(chain_token))
@@ -2716,6 +2723,7 @@ fn chain_model_id_parts(id: &str) -> Option<(&str, &str)> {
 
 fn validate_model_id(kind: &str, id: &str) -> Result<()> {
     let valid = match kind {
+        "app" => app_model_id_token(id).is_some(),
         "chain" => chain_model_id_parts(id).is_some(),
         "ingress" => ingress_model_id_token(id).is_some(),
         _ => {
@@ -2728,6 +2736,7 @@ fn validate_model_id(kind: &str, id: &str) -> Result<()> {
         return Ok(());
     }
     let shape = match kind {
+        "app" => "app-<4 lowercase hex>",
         "chain" => "chn-<4 lowercase hex>-<4 lowercase hex>",
         "ingress" => "ing-<4 lowercase hex>",
         _ => unreachable!(),
@@ -2735,6 +2744,24 @@ fn validate_model_id(kind: &str, id: &str) -> Result<()> {
     Err(StoreError::InvalidData(format!(
         "{kind} id must use {shape}"
     )))
+}
+
+async fn random_app_model_id_tx(tx: &mut Transaction<'_, Postgres>) -> Result<String> {
+    for _ in 0..256 {
+        let mut random = [0_u8; 2];
+        getrandom::fill(&mut random)?;
+        let id = format!("app-{:02x}{:02x}", random[0], random[1]);
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apps WHERE id = $1)")
+            .bind(&id)
+            .fetch_one(&mut **tx)
+            .await?;
+        if !exists {
+            return Ok(id);
+        }
+    }
+    Err(StoreError::Conflict(
+        "could not allocate a unique app id after 256 attempts".to_owned(),
+    ))
 }
 
 fn validate_model_id_pair(ingress_id: &str, chain_id: &str) -> Result<()> {
@@ -3985,12 +4012,14 @@ mod model_id_tests {
     use super::*;
 
     #[test]
-    fn accepts_only_the_grouped_three_letter_id_shapes() {
+    fn accepts_only_the_random_model_id_shapes() {
+        assert!(validate_model_id("app", "app-8f3a").is_ok());
         assert!(validate_model_id("ingress", "ing-8f3a").is_ok());
         assert!(validate_model_id("chain", "chn-8f3a-2d71").is_ok());
         assert!(validate_model_id("ingress", "i-bacemu").is_err());
         assert!(validate_model_id("chain", "c-lumira").is_err());
         assert!(validate_model_id("chain", "chn-8F3A-2d71").is_err());
+        assert!(validate_model_id("app", "app-main").is_err());
     }
 
     #[test]

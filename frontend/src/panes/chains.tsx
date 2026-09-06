@@ -58,6 +58,7 @@ import {
   type RealityFallbackMode,
   type Wires,
   currentWires,
+  createApp,
   reorderApps,
   reorderChains,
 } from '../api';
@@ -77,6 +78,7 @@ import { RegionFlag } from '../ui/region-flag';
 import { ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { ProbeBanner, byChain, toneOf, toneTitle } from '../ui/probe';
+import { appId as randomAppId } from '../model-id';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import {
@@ -89,7 +91,7 @@ import {
   type EgressDnsOrderDraft,
   type HopsDraft,
 } from './rules';
-import { SLUG_MAX, freePortAcross, freeSpanAcross, isValidSlug, occupiedPorts, portClash, spanClash } from './ports';
+import { freePortAcross, freeSpanAcross, occupiedPorts, portClash, spanClash } from './ports';
 
 /* Hysteria 2 的端口从此值起分配，跳转区间的默认长度同此。与 model.rs 的
  * HYSTERIA2_PORT_BASE / DEFAULT_HYSTERIA2_HOP_SPAN 保持一致——两处不一致不会报错，
@@ -3901,10 +3903,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const create = useMutation({
     mutationFn: async () => {
       const id = (creating?.id ?? '').trim();
-      if (!isValidSlug(id)) throw new Error(`分组 ID 只能用 a-z 0-9 . _ -，最长 ${SLUG_MAX}`);
-      // 创建表单不能借 upsert 语义悄悄改名已有分组，因此在客户端先明确拦截重复 ID。
-      if (appsNow().some(a => a.id === id)) throw new Error(`线路 ${id} 已经有了`);
-      await upsertApp({ id, label: (creating?.label ?? '').trim() || id });
+      await createApp({ id, label: (creating?.label ?? '').trim() || id });
     },
     onSuccess: () => {
       setCreating(null);
@@ -3926,13 +3925,9 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     },
   });
 
-  /* 默认 id 与拓扑图处使用同一规则（app-1、app-2…），使两个入口生成的名称一致。 */
   const beginCreate = () => {
-    const used = new Set(appsNow().map(a => a.id));
-    let id = '';
-    for (let i = appsNow().length + 1; !id; i += 1) if (!used.has(`app-${i}`)) id = `app-${i}`;
     create.reset();
-    setCreating({ id, label: '' });
+    setCreating({ id: randomAppId(new Set(appsNow().map(app => app.id))), label: '' });
   };
 
   if (snapshot.isPending || nodeList.isPending) return <Loading />;
@@ -4053,12 +4048,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
 
         {probes.error && <ErrorBox error={probes.error} />}
 
-        {/* 新建项目表现为列表最前面增加一条待创建的行，而不是插入一块面板。
-          两个输入框不需要独立的下沉底色区域——此前的版本高 130px（ID 的说明折为两行，
-          将按钮推到第三行），会把第一个项目挤出视野，而其内容只有 ID 和名称两项。
-
-          说明收入 placeholder 和下方的一行注脚：「创建后不可修改」需要提示的时机是
-          提交前（草稿条会列出「项目 app-4」），而非填写时。 */}
+        {/* 技术 ID 自动生成；创建时只要求用户填写真正用于辨识的分组名称。 */}
         {creating && (
           <form
             className="prj-newbar"
@@ -4070,14 +4060,8 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
             <div className="row">
               <span className="k">新分组</span>
               <input
-                className="f mono id"
-                autoFocus
-                value={creating.id}
-                placeholder="ID"
-                onChange={e => setCreating({ ...creating, id: e.target.value })}
-              />
-              <input
                 className="f nm"
+                autoFocus
                 value={creating.label}
                 // 名称默认留空：名称由用户指定，复制 ID 作为默认值不提供任何信息，
                 // 而留空可直接表明该字段需要填写。提交时留空则回退为 ID（见 create）。
@@ -4092,8 +4076,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                 取消
               </button>
             </div>
-            {/* 只说明该字段的含义。字符集由 ID 输入框的校验负责（输入错误时即时提示），
-              「改动写入草稿」由顶栏草稿条表示，此处无需重复。 */}
+            {/* 只说明该字段的含义；技术 ID 和草稿机制都不需要用户在这里处理。 */}
             <p className="note">
               分组是线路的<b>计费单元</b>：同类链放在一个分组里。
             </p>

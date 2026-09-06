@@ -471,11 +471,12 @@ async fn first_console_start_creates_default_app_group_exactly_once() {
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
     assert_eq!(snapshot.revision, 2);
     assert_eq!(snapshot.apps.len(), 1);
-    assert_eq!(snapshot.apps[0].id, "default");
+    assert!(snapshot.apps[0].id.starts_with("app-") && snapshot.apps[0].id.len() == 8);
     assert_eq!(snapshot.apps[0].label, "默认分组");
 
     assert!(!db.store.ensure_default_app_group().await.unwrap());
-    sqlx::query("DELETE FROM apps WHERE id = 'default'")
+    sqlx::query("DELETE FROM apps WHERE id = $1")
+        .bind(&snapshot.apps[0].id)
         .execute(db.pool())
         .await
         .unwrap();
@@ -695,9 +696,7 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     .await
     .unwrap();
 
-    // Development deployments deliberately keep schema evolution in 0001. Clearing its sqlx
-    // record makes the migrator execute the complete file again against an existing schema,
-    // which is the same compatibility path used by those deployments.
+    // Replay the canonical migration against the simulated legacy database.
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 1")
         .execute(db.pool())
         .await
@@ -710,8 +709,15 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     assert_eq!(db.store.settings().await.unwrap().ports.anytls_base, 18_443);
     assert_eq!(db.store.settings().await.unwrap().ports.hy2_base, 30_000);
 
-    let app_main = "app-main".to_owned();
-    let app_secondary = "app-secondary".to_owned();
+    let app_main: String = sqlx::query_scalar("SELECT id FROM apps WHERE label = 'Main App'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let app_secondary: String =
+        sqlx::query_scalar("SELECT id FROM apps WHERE label = 'Secondary App'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
     let chain_alpha: String =
         sqlx::query_scalar("SELECT id FROM chains WHERE name = 'Alpha Chain'")
             .fetch_one(db.pool())
@@ -733,6 +739,9 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
             .unwrap();
     assert!(chain_main.starts_with("chn-") && chain_main.len() == 13);
     assert!(ingress_main.starts_with("ing-") && ingress_main.len() == 8);
+    assert!(app_main.starts_with("app-") && app_main.len() == 8);
+    assert!(app_secondary.starts_with("app-") && app_secondary.len() == 8);
+    assert_ne!(app_main, app_secondary);
     assert_eq!(
         &chain_main[4..8],
         &ingress_main[4..],
@@ -853,7 +862,9 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     let historical_old_ids: i64 = sqlx::query_scalar(
         "SELECT count(*)
            FROM model_snapshots
-          WHERE snapshot::text LIKE '%\"c-main\"%'
+          WHERE snapshot::text LIKE '%\"app-main\"%'
+             OR snapshot::text LIKE '%\"app-secondary\"%'
+             OR snapshot::text LIKE '%\"c-main\"%'
              OR snapshot::text LIKE '%\"i-main\"%'",
     )
     .fetch_one(db.pool())
@@ -893,13 +904,20 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     assert_eq!(reason, "grouped-model-id-migration");
     assert!(client_document["chains"].get(&chain_main).is_some());
     assert!(client_document["ingresses"].get(&ingress_main).is_some());
-    assert!(client_document["chain_order"]["app-main"]
+    assert!(client_document["app_order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_str() == Some(&app_main)));
+    assert!(client_document["chain_order"][&app_main]
         .as_array()
         .unwrap()
         .iter()
         .any(|id| id.as_str() == Some(&chain_main)));
     assert!(!client_document.to_string().contains("c-main"));
     assert!(!client_document.to_string().contains("i-main"));
+    assert!(!client_document.to_string().contains("app-main"));
+    assert!(!client_document.to_string().contains("app-secondary"));
     assert_eq!(
         client_sha,
         brocade_core::hash::sha256_hex(&serde_json::to_vec(&client_document).unwrap())
@@ -907,7 +925,9 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     let legacy_client_rows: i64 = sqlx::query_scalar(
         "SELECT count(*)
            FROM subscription_client_snapshots
-          WHERE document::text LIKE '%\"c-main\"%'
+          WHERE document::text LIKE '%\"app-main\"%'
+             OR document::text LIKE '%\"app-secondary\"%'
+             OR document::text LIKE '%\"c-main\"%'
              OR document::text LIKE '%\"i-main\"%'",
     )
     .fetch_one(db.pool())
@@ -1340,7 +1360,7 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
         .upsert_app(
             &system_admin(),
             CreateAppRequest {
-                id: "app-new".to_owned(),
+                id: "app-c0de".to_owned(),
                 label: "New App".to_owned(),
                 note: None,
             },
@@ -1352,7 +1372,10 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
             .fetch_all(db.pool())
             .await
             .unwrap();
-    assert_eq!(order_after_create, ["app-secondary", "app-main", "app-new"]);
+    assert_eq!(
+        order_after_create,
+        ["app-secondary", "app-main", "app-c0de"]
+    );
 }
 
 #[tokio::test]
@@ -1670,7 +1693,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
         .upsert_app(
             &system_admin(),
             CreateAppRequest {
-                id: "app-alpha".to_owned(),
+                id: "app-a1fa".to_owned(),
                 label: "Alpha App".to_owned(),
                 note: None,
             },
@@ -1682,11 +1705,11 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
             .fetch_all(db.pool())
             .await
             .unwrap();
-    assert_eq!(default_order, ["app-alpha", "app-main"]);
+    assert_eq!(default_order, ["app-a1fa", "app-main"]);
 
     sqlx::query(
         "INSERT INTO chains (id, app_id, tenant_id, name, position)
-         VALUES ('c-alpha', 'app-alpha', 'platform.acme', 'Alpha Chain', 0)",
+         VALUES ('c-alpha', 'app-a1fa', 'platform.acme', 'Alpha Chain', 0)",
     )
     .execute(db.pool())
     .await
@@ -1695,13 +1718,13 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
         "INSERT INTO e2e_probes (
             chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at
          ) VALUES
-            ('c-alpha', 'app-alpha', 'n1', 'ok', 20, 'match', now()),
+            ('c-alpha', 'app-a1fa', 'n1', 'ok', 20, 'match', now()),
             ('chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 30, 'match', now())",
     )
     .execute(db.pool())
     .await
     .unwrap();
-    for app_id in ["app-alpha", "app-main"] {
+    for app_id in ["app-a1fa", "app-main"] {
         db.store
             .set_user_app_quota(
                 &system_admin(),
@@ -1722,7 +1745,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
          ) VALUES
             (now() - interval '60 seconds', now() - interval '30 seconds',
              'n1', 'platform.acme', 'alice', 'ing-a1b2',
-             'app-alpha', 'test-user#alpha', 10, 20),
+             'app-a1fa', 'test-user#alpha', 10, 20),
             (now() - interval '60 seconds', now() - interval '30 seconds',
              'n1', 'platform.acme', 'alice', 'ing-a1b2',
              'app-main', 'test-user#main', 30, 40)",
@@ -1737,7 +1760,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
         .apply_draft(
             &system_admin(),
             vec![ModelOp::ReorderApps {
-                ids: vec!["app-main".to_owned(), "app-alpha".to_owned()],
+                ids: vec!["app-main".to_owned(), "app-a1fa".to_owned()],
             }],
             None,
         )
@@ -1751,7 +1774,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
             .iter()
             .map(|app| app.id.as_str())
             .collect::<Vec<_>>(),
-        ["app-main", "app-alpha"]
+        ["app-main", "app-a1fa"]
     );
     assert_eq!(
         db.store
@@ -1761,7 +1784,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
             .iter()
             .map(|probe| probe.app_id.as_str())
             .collect::<Vec<_>>(),
-        ["app-main", "app-alpha"]
+        ["app-main", "app-a1fa"]
     );
     assert_eq!(
         db.store
@@ -1772,7 +1795,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
             .iter()
             .map(|quota| quota.app_id.as_str())
             .collect::<Vec<_>>(),
-        ["app-main", "app-alpha"]
+        ["app-main", "app-a1fa"]
     );
     assert_eq!(
         db.store
@@ -1783,7 +1806,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
             .iter()
             .map(|view| view.app_id.as_str())
             .collect::<Vec<_>>(),
-        ["app-main", "app-alpha"]
+        ["app-main", "app-a1fa"]
     );
 }
 
@@ -14163,6 +14186,109 @@ async fn retained_certificate_trust_survives_expiry_and_ca_switch_until_manual_d
         .delete_certificate(&system_admin(), &public_order.certificate_id)
         .await
         .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn changing_a_nodes_certificate_group_keeps_the_previous_groups_pins() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    sqlx::query(
+        "UPDATE ingresses
+            SET transport_kind = NULL,
+                anytls_enabled = TRUE,
+                anytls_security = 'tls',
+                anytls_port = 8443
+          WHERE id = 'ing-a1b2'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "pin-overlap.example.com".to_owned(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    let old_label = db
+        .store
+        .create_cert_label(&system_admin(), &domain.id, "Old", None)
+        .await
+        .unwrap();
+    db.store
+        .set_node_cert_label(&system_admin(), "n1", Some(&old_label))
+        .await
+        .unwrap();
+    let old_certificate = issue_certificate_for(&db, "n1", "Old Self-Signed").await;
+    let old_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    sqlx::query("UPDATE certificates SET peer_sha256 = $2 WHERE id = $1")
+        .bind(&old_certificate)
+        .bind(old_pin)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let new_label = db
+        .store
+        .create_cert_label(&system_admin(), &domain.id, "New", None)
+        .await
+        .unwrap();
+    db.store
+        .set_node_cert_label(&system_admin(), "n1", Some(&new_label))
+        .await
+        .unwrap();
+    let new_certificate = issue_certificate_for(&db, "n1", "New Self-Signed").await;
+    let new_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    sqlx::query("UPDATE certificates SET peer_sha256 = $2 WHERE id = $1")
+        .bind(&new_certificate)
+        .bind(new_pin)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    let targets = db.store.e2e_probe_targets("n1").await.unwrap();
+    let pins = targets.targets[0]
+        .anytls
+        .as_ref()
+        .unwrap()
+        .pinned_peer_cert_sha256
+        .as_deref()
+        .unwrap();
+    let mut pins = pins.split(',').collect::<Vec<_>>();
+    pins.sort_unstable();
+    assert_eq!(pins, [old_pin, new_pin]);
+
+    db.store
+        .delete_cert_label(&system_admin(), &old_label)
+        .await
+        .unwrap();
+    let targets = db.store.e2e_probe_targets("n1").await.unwrap();
+    assert_eq!(
+        targets.targets[0]
+            .anytls
+            .as_ref()
+            .unwrap()
+            .pinned_peer_cert_sha256
+            .as_deref(),
+        Some(new_pin)
+    );
 }
 
 #[tokio::test]

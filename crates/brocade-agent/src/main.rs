@@ -1706,14 +1706,25 @@ fn apply_once_inner(
         } => (deployment, certificate),
         DesiredStateResponse::Certificate(material) => {
             crate::certfile::apply_material(&options, &material)?;
+            // This variant means the control plane still sees the certificate dimension as stale.
+            // Reload even when the files match: a previous reload may have failed after the write.
+            reload_xray_after_certificate(&options, meter)?;
+            crate::certfile::report_applied(&options);
             return Ok(());
         }
     };
-    // Before the deployment itself: applying it restarts xray, which tests the config, and a
-    // TLS ingress tests against the certificate file. A failed write propagates and fails the
-    // round — the machine will ask again and receive both, the deployment not yet applied.
+    // Put the pair on disk before convergence. A failed write fails the round; a Present xray is
+    // forced through its restart path below, while an Unmanaged xray is reloaded explicitly.
+    let certificate_received = certificate.is_some();
     if let Some(material) = &certificate {
         crate::certfile::apply_material(&options, material)?;
+    }
+    // A grants-only deployment carries xray as Unmanaged, so its ordinary convergence cannot
+    // reload the certificate files. Do that first; grant convergence below then restores the new
+    // complete user set into the restarted process. A Present xray is forced through the restart
+    // path inside converge_linux_xray instead of taking a hot swap which may not reread TLS files.
+    if certificate_received && matches!(&desired.desired.xray, DesiredArtifact::Unmanaged { .. }) {
+        reload_xray_after_certificate(&options, meter)?;
     }
     let before = observe_state(&options.state_dir, &desired, options.apply_mode)?;
     // Hold this lock across the whole restart: a sampling thread running between the
@@ -1743,8 +1754,13 @@ fn apply_once_inner(
         };
         match options.apply_mode {
             ApplyMode::StateDir => converge_to_state_dir(&options.state_dir, &desired),
-            ApplyMode::Linux => converge_linux(&options.state_dir, &desired, &mut collect)
-                .map(|_| observe_linux_state(&options.state_dir, &desired)),
+            ApplyMode::Linux => converge_linux(
+                &options.state_dir,
+                &desired,
+                certificate_received,
+                &mut collect,
+            )
+            .map(|_| observe_linux_state(&options.state_dir, &desired)),
         }
     };
     let (result, after, error) = match applied {
@@ -1791,6 +1807,43 @@ fn apply_once_inner(
     if let Some(error) = error {
         return Err(error);
     }
+    if certificate_received {
+        crate::certfile::report_applied(&options);
+    }
+    Ok(())
+}
+
+/// A certificate-only desired response used to stop after replacing the two files. Xray checks the
+/// paths only on its hourly watcher, while the agent immediately reported the files as current; the
+/// control plane then had no reason to send either the certificate or a deployment again. Reload the
+/// one consumer immediately, preserving the last usage counters and restoring its in-memory grants.
+fn reload_xray_after_certificate(
+    options: &Options,
+    meter: Option<&Arc<Mutex<()>>>,
+) -> Result<(), String> {
+    if options.apply_mode == ApplyMode::StateDir {
+        return Ok(());
+    }
+    let path = options.state_dir.join("xray.json");
+    if !path.exists() || options.state_dir.join("xray.disabled").exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("读取待换证的 xray 配置失败：{error}"))?;
+    let api_port = xray_api_port(&content).unwrap_or(10085);
+    let _guard = meter.map(|meter| {
+        meter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    });
+    if let Err(error) = collect_usage_report(options) {
+        eprintln!("usage: 换证重启 xray 前的采集没成功：{error}");
+    }
+    apply_xray(&path, api_port)?;
+    if let Some(want) = desired_grants_on_disk(&options.state_dir)? {
+        sync_grants(&options.state_dir, &content, api_port, &want)?;
+    }
+    println!("xray 已载入新证书");
     Ok(())
 }
 
@@ -2166,6 +2219,7 @@ fn converge_to_state_dir(
 fn converge_linux(
     state_dir: &Path,
     desired: &NodeDesiredDeployment,
+    force_xray_restart: bool,
     // The hook for step 4. A parameter rather than a direct call, because state-dir
     // mode and a lone apply-once have no reporting channel and must skip this step.
     before_xray_restart: &mut dyn FnMut(),
@@ -2204,7 +2258,7 @@ fn converge_linux(
     if desired.usage_generation_id.is_some() {
         before_xray_restart();
     }
-    converge_linux_xray(state_dir, &desired.desired.xray)?;
+    converge_linux_xray(state_dir, &desired.desired.xray, force_xray_restart)?;
     // After xray, because the ports come out of its config: applying first would exempt the
     // previous release's ports and leave the new ones tracked until the next convergence.
     conntrack::apply(&desired.desired.xray)?;
@@ -2283,7 +2337,11 @@ fn apply_wireguard(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn converge_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> Result<(), String> {
+fn converge_linux_xray(
+    state_dir: &Path,
+    desired: &DesiredArtifact,
+    force_restart: bool,
+) -> Result<(), String> {
     match desired {
         DesiredArtifact::Present { content, .. } => {
             let path = state_dir.join("xray.json");
@@ -2306,7 +2364,7 @@ fn converge_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> Result<()
             // branch runs. That is what makes the swap an optimization rather than a
             // second source of truth: it removes a restart, and a failed swap costs only
             // the restart it was avoiding.
-            if xray_running() && !splice_mode_changed && bounded_log {
+            if !force_restart && xray_running() && !splice_mode_changed && bounded_log {
                 if let Some(swap) = previous
                     .as_deref()
                     .and_then(|previous| hot_swap(previous, content))

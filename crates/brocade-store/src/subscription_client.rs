@@ -140,8 +140,8 @@ pub(crate) async fn ensure_checkpoint(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Rebuild client checkpoints after the canonical SQL migration replaces legacy chain and
-/// ingress IDs. Contract hashes include both IDs, so renaming only the JSON object keys would
+/// Rebuild client checkpoints after canonical SQL migrations replace legacy app, chain and
+/// ingress IDs. Contract hashes include all three IDs, so renaming only the JSON object keys would
 /// leave every public projection detached from its serving topology.
 ///
 /// Replaying all immutable model snapshots through a checkpoint's source revision preserves the
@@ -275,6 +275,14 @@ async fn rebuild_client_config_tx(
 }
 
 fn client_document_has_legacy_model_ids(document: &Value) -> bool {
+    let invalid_apps = document
+        .get("app_order")
+        .and_then(Value::as_array)
+        .is_some_and(|apps| {
+            apps.iter()
+                .filter_map(Value::as_str)
+                .any(|id| !is_random_app_id(id))
+        });
     let invalid_chain = document
         .get("chains")
         .and_then(Value::as_object)
@@ -283,29 +291,37 @@ fn client_document_has_legacy_model_ids(document: &Value) -> bool {
         .get("chain_order")
         .and_then(Value::as_object)
         .is_some_and(|orders| {
-            orders.values().any(|order| {
-                order.as_array().is_some_and(|ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
-                        .any(|id| !is_grouped_chain_id(id))
+            orders.keys().any(|id| !is_random_app_id(id))
+                || orders.values().any(|order| {
+                    order.as_array().is_some_and(|ids| {
+                        ids.iter()
+                            .filter_map(Value::as_str)
+                            .any(|id| !is_grouped_chain_id(id))
+                    })
                 })
-            })
         });
     let invalid_ingress = document
         .get("ingresses")
         .and_then(Value::as_object)
         .is_some_and(|ingresses| ingresses.keys().any(|id| !is_grouped_ingress_id(id)));
-    invalid_chain || invalid_order || invalid_ingress
+    invalid_apps || invalid_chain || invalid_order || invalid_ingress
 }
 
 fn client_config_has_legacy_model_ids(config: &SubscriptionClientConfig) -> bool {
-    config.chains.keys().any(|id| !is_grouped_chain_id(id))
+    config.app_order.iter().any(|id| !is_random_app_id(id))
+        || config.chain_order.keys().any(|id| !is_random_app_id(id))
+        || config.chains.keys().any(|id| !is_grouped_chain_id(id))
         || config
             .chain_order
             .values()
             .flatten()
             .any(|id| !is_grouped_chain_id(id))
         || config.ingresses.keys().any(|id| !is_grouped_ingress_id(id))
+}
+
+fn is_random_app_id(id: &str) -> bool {
+    id.strip_prefix("app-")
+        .is_some_and(|token| is_model_id_token(token.as_bytes()))
 }
 
 fn is_grouped_ingress_id(id: &str) -> bool {
@@ -876,15 +892,18 @@ mod tests {
     #[test]
     fn grouped_model_id_detection_rejects_every_legacy_location() {
         let valid = serde_json::json!({
+            "app_order": ["app-a1b2"],
             "chains": { "chn-8f3a-2d71": {} },
-            "chain_order": { "app": ["chn-8f3a-2d71"] },
+            "chain_order": { "app-a1b2": ["chn-8f3a-2d71"] },
             "ingresses": { "ing-8f3a": {} }
         });
         assert!(!super::client_document_has_legacy_model_ids(&valid));
 
         for legacy in [
+            serde_json::json!({ "app_order": ["app-main"] }),
+            serde_json::json!({ "chain_order": { "app-main": ["chn-8f3a-2d71"] } }),
             serde_json::json!({ "chains": { "c-main": {} } }),
-            serde_json::json!({ "chain_order": { "app": ["c-main"] } }),
+            serde_json::json!({ "chain_order": { "app-a1b2": ["c-main"] } }),
             serde_json::json!({ "ingresses": { "i-main": {} } }),
         ] {
             assert!(super::client_document_has_legacy_model_ids(&legacy));
@@ -893,6 +912,9 @@ mod tests {
 
     #[test]
     fn grouped_model_id_shapes_are_exact() {
+        assert!(super::is_random_app_id("app-a1b2"));
+        assert!(!super::is_random_app_id("app-main"));
+        assert!(!super::is_random_app_id("app-A1b2"));
         assert!(super::is_grouped_ingress_id("ing-8f3a"));
         assert!(!super::is_grouped_ingress_id("ing-8F3A"));
         assert!(!super::is_grouped_ingress_id("ing-8f3aa"));
@@ -902,8 +924,8 @@ mod tests {
 
         let config: SubscriptionClientConfig = serde_json::from_value(serde_json::json!({
             "schema": 1,
-            "app_order": ["app"],
-            "chain_order": { "app": ["chn-8f3a-2d71"] },
+            "app_order": ["app-a1b2"],
+            "chain_order": { "app-a1b2": ["chn-8f3a-2d71"] },
             "chains": { "chn-8f3a-2d71": { "name": "Main" } },
             "fronts": {},
             "ingresses": {},

@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { isModelId, modelIdPair, modelIdPairFromBytes, modelIdsArePaired } from '../src/model-id';
+import { appId, appIdFromBytes, isModelId, modelIdPair, modelIdPairFromBytes, modelIdsArePaired } from '../src/model-id';
 
 describe('关联模型 ID', () => {
+  it('分组使用 app 加四位十六进制随机值', () => {
+    expect(appIdFromBytes(new Uint8Array([0x8f, 0x3a]))).toBe('app-8f3a');
+    expect(isModelId('app', 'app-8f3a')).toBe(true);
+    expect(isModelId('app', 'app-main')).toBe(false);
+    expect(appId(new Set(['app-0000']))).toMatch(/^app-[0-9a-f]{4}$/);
+  });
+
   it('使用三字母类型前缀和两段四位十六进制随机值', () => {
     const pair = modelIdPairFromBytes(new Uint8Array([0x8f, 0x3a, 0x2d, 0x71]));
 

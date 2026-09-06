@@ -2380,6 +2380,27 @@ CREATE TABLE IF NOT EXISTS node_cert_label (
 
 CREATE INDEX IF NOT EXISTS node_cert_label_label_id_idx ON node_cert_label (label_id);
 
+-- Every certificate group this node has been assigned to remains part of its explicit pin set.
+-- Xray reads certificate files asynchronously, so immediately after moving a node the process may
+-- still present the preceding group's leaf even though the new bytes are already on disk. Retaining
+-- the old group here makes that short overlap safe. Deleting a certificate (or an unused group) is
+-- the operator's explicit act that removes it from future client/probe configurations.
+CREATE TABLE IF NOT EXISTS node_cert_trusted_labels (
+    node_id TEXT NOT NULL,
+    label_id TEXT NOT NULL,
+    first_assigned_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT node_cert_trusted_labels_pkey PRIMARY KEY (node_id, label_id),
+    CONSTRAINT node_cert_trusted_labels_node_id_fkey FOREIGN KEY (node_id)
+        REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT node_cert_trusted_labels_label_id_fkey FOREIGN KEY (label_id)
+        REFERENCES cert_labels(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS node_cert_trusted_labels_label_id_idx
+    ON node_cert_trusted_labels (label_id);
+INSERT INTO node_cert_trusted_labels (node_id, label_id)
+SELECT node_id, label_id FROM node_cert_label
+ON CONFLICT (node_id, label_id) DO NOTHING;
+
 -- What a machine reports it is actually holding, as opposed to what was issued for its group.
 -- Without this the console shows the control plane's own intent and calls it status — and a failed
 -- write, a replaced file, and an agent too old to manage certificates all look like success.
@@ -3615,27 +3636,26 @@ ALTER TABLE external_outbounds
         protocol IN ('vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard', 'warp')
     );
 
--- Chain and ingress ids are renamed as a unit. App ids are operator-owned slugs and deliberately
--- stay unchanged. ON UPDATE CASCADE is intentional for the two migrated kinds even after the
--- one-time conversion: a repair must not leave half the live model behind.
+-- App, chain and ingress ids are internal random references. ON UPDATE CASCADE is intentional even
+-- after the one-time conversion: a repair must not leave half the live model behind.
 ALTER TABLE chains DROP CONSTRAINT IF EXISTS chains_app_id_fkey;
 ALTER TABLE chains ADD CONSTRAINT chains_app_id_fkey FOREIGN KEY (app_id)
-    REFERENCES apps(id) ON DELETE CASCADE;
+    REFERENCES apps(id) ON UPDATE CASCADE ON DELETE CASCADE;
 ALTER TABLE e2e_probe_samples DROP CONSTRAINT IF EXISTS e2e_probe_samples_chain_id_fkey;
 ALTER TABLE e2e_probe_samples ADD CONSTRAINT e2e_probe_samples_chain_id_fkey FOREIGN KEY (chain_id)
     REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
 ALTER TABLE e2e_probes DROP CONSTRAINT IF EXISTS e2e_probes_app_id_fkey;
 ALTER TABLE e2e_probes ADD CONSTRAINT e2e_probes_app_id_fkey FOREIGN KEY (app_id)
-    REFERENCES apps(id) ON DELETE CASCADE;
+    REFERENCES apps(id) ON UPDATE CASCADE ON DELETE CASCADE;
 ALTER TABLE e2e_probes DROP CONSTRAINT IF EXISTS e2e_probes_chain_id_fkey;
 ALTER TABLE e2e_probes ADD CONSTRAINT e2e_probes_chain_id_fkey FOREIGN KEY (chain_id)
     REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
 ALTER TABLE fronts DROP CONSTRAINT IF EXISTS fronts_app_id_fkey;
 ALTER TABLE fronts ADD CONSTRAINT fronts_app_id_fkey FOREIGN KEY (app_id)
-    REFERENCES apps(id) ON DELETE CASCADE;
+    REFERENCES apps(id) ON UPDATE CASCADE ON DELETE CASCADE;
 ALTER TABLE ingresses DROP CONSTRAINT IF EXISTS ingresses_app_id_fkey;
 ALTER TABLE ingresses ADD CONSTRAINT ingresses_app_id_fkey FOREIGN KEY (app_id)
-    REFERENCES apps(id) ON DELETE CASCADE;
+    REFERENCES apps(id) ON UPDATE CASCADE ON DELETE CASCADE;
 ALTER TABLE ingresses DROP CONSTRAINT IF EXISTS ingresses_chain_id_fkey;
 ALTER TABLE ingresses ADD CONSTRAINT ingresses_chain_id_fkey FOREIGN KEY (chain_id)
     REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
@@ -3644,7 +3664,7 @@ ALTER TABLE front_vias ADD CONSTRAINT front_vias_ingress_id_fkey FOREIGN KEY (in
     REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE RESTRICT;
 ALTER TABLE grants DROP CONSTRAINT IF EXISTS grants_app_id_fkey;
 ALTER TABLE grants ADD CONSTRAINT grants_app_id_fkey FOREIGN KEY (app_id)
-    REFERENCES apps(id) ON DELETE CASCADE;
+    REFERENCES apps(id) ON UPDATE CASCADE ON DELETE CASCADE;
 ALTER TABLE grants DROP CONSTRAINT IF EXISTS grants_ingress_id_fkey;
 ALTER TABLE grants ADD CONSTRAINT grants_ingress_id_fkey FOREIGN KEY (ingress_id)
     REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE CASCADE;
@@ -3656,6 +3676,7 @@ CREATE OR REPLACE FUNCTION brocade_is_grouped_model_id(kind TEXT, value TEXT) RE
     LANGUAGE sql IMMUTABLE STRICT
     AS $_$
     SELECT CASE kind
+        WHEN 'app' THEN value ~ '^app-[0-9a-f]{4}$'
         WHEN 'chain' THEN value ~ '^chn-[0-9a-f]{4}-[0-9a-f]{4}$'
         WHEN 'ingress' THEN value ~ '^ing-[0-9a-f]{4}$'
         ELSE FALSE
@@ -3668,10 +3689,10 @@ CREATE OR REPLACE FUNCTION brocade_random_model_id_token() RETURNS TEXT
     SELECT substr(md5(random()::TEXT || clock_timestamp()::TEXT), 1, 4)
 $_$;
 
--- Convert every active and historical association together. An ingress owns the first four
--- hexadecimal characters and its chain carries the same token plus an independent suffix. The
--- temporary source tables include deleted objects still present in rollback snapshots, so no old
--- identifier can return through a later rollback.
+-- Convert every active and historical association together. Apps receive an independent random
+-- token. An ingress owns the first four hexadecimal characters and its chain carries the same token
+-- plus an independent suffix. The temporary source tables include deleted objects still present in
+-- rollback snapshots, so no old identifier can return through a later rollback.
 CREATE OR REPLACE FUNCTION brocade_migrate_grouped_model_ids() RETURNS INTEGER
     LANGUAGE plpgsql
     AS $_$
@@ -3690,6 +3711,8 @@ DECLARE
     fronts_doc JSONB;
     steps_doc JSONB;
     grants_doc JSONB;
+    old_app TEXT;
+    new_app TEXT;
     old_chain TEXT;
     new_chain TEXT;
     old_ingress TEXT;
@@ -3702,6 +3725,9 @@ DECLARE
     previous_snapshot JSONB;
     changed INTEGER;
 BEGIN
+    CREATE TEMP TABLE _brocade_app_id_sources (
+        old_id TEXT PRIMARY KEY
+    ) ON COMMIT DROP;
     CREATE TEMP TABLE _brocade_chain_id_sources (
         old_id TEXT PRIMARY KEY
     ) ON COMMIT DROP;
@@ -3718,6 +3744,10 @@ BEGIN
         old_id TEXT PRIMARY KEY,
         new_id TEXT NOT NULL UNIQUE
     ) ON COMMIT DROP;
+    CREATE TEMP TABLE _brocade_app_id_map (
+        old_id TEXT PRIMARY KEY,
+        new_id TEXT NOT NULL UNIQUE
+    ) ON COMMIT DROP;
     CREATE TEMP TABLE _brocade_ingress_id_map (
         old_id TEXT PRIMARY KEY,
         new_id TEXT NOT NULL UNIQUE,
@@ -3728,10 +3758,32 @@ BEGIN
         new_id TEXT NOT NULL UNIQUE
     ) ON COMMIT DROP;
 
+    INSERT INTO _brocade_app_id_sources SELECT id FROM apps;
     INSERT INTO _brocade_chain_id_sources SELECT id FROM chains;
     INSERT INTO _brocade_ingress_id_sources SELECT id FROM ingresses;
     INSERT INTO _brocade_chain_ingress_sources
     SELECT chain_id, id, 9223372036854775807 FROM ingresses;
+
+    INSERT INTO _brocade_app_id_sources (old_id)
+    SELECT DISTINCT app_value->>'id'
+      FROM model_snapshots AS snapshot_row
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snapshot_row.snapshot->'apps', '[]'::jsonb)) AS app_item(app_value)
+     WHERE app_value->>'id' IS NOT NULL
+    ON CONFLICT (old_id) DO NOTHING;
+
+    INSERT INTO _brocade_app_id_sources (old_id)
+    SELECT app_id FROM quota_suspensions
+    UNION
+    SELECT app_id FROM usage_chain_samples
+    UNION
+    SELECT app_id FROM usage_samples WHERE app_id IS NOT NULL
+    UNION
+    SELECT app_id FROM user_app_quotas
+    UNION
+    SELECT split_part(chain_id, '/', 1) FROM link_health WHERE strpos(chain_id, '/') > 0
+    UNION
+    SELECT split_part(chain_id, '/', 1) FROM node_hop_link_samples WHERE strpos(chain_id, '/') > 0
+    ON CONFLICT (old_id) DO NOTHING;
 
     INSERT INTO _brocade_chain_id_sources (old_id)
     SELECT DISTINCT chain_value->>'id'
@@ -3762,6 +3814,29 @@ BEGIN
             _brocade_chain_ingress_sources.observed_revision,
             EXCLUDED.observed_revision
         );
+
+    FOR source IN
+        SELECT old_id
+          FROM _brocade_app_id_sources
+         WHERE NOT brocade_is_grouped_model_id('app', old_id)
+         ORDER BY old_id
+    LOOP
+        attempts := 0;
+        LOOP
+            attempts := attempts + 1;
+            IF attempts > 65536 THEN
+                RAISE EXCEPTION 'exhausted four-character app id space';
+            END IF;
+            candidate := 'app-' || brocade_random_model_id_token();
+            EXIT WHEN NOT EXISTS (
+                              SELECT 1 FROM _brocade_app_id_sources WHERE old_id = candidate
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM _brocade_app_id_map WHERE new_id = candidate
+                          );
+        END LOOP;
+        INSERT INTO _brocade_app_id_map VALUES (source.old_id, candidate);
+    END LOOP;
 
     -- Allocate ingress tokens first. If its chain already has the new format, retain that chain's
     -- token; this makes an interrupted or partially repaired conversion converge to the same pair.
@@ -3880,12 +3955,25 @@ BEGIN
 
     INSERT INTO _brocade_hop_id_map (old_id, new_id)
     SELECT chain.app_id || '/' || chain.id,
-           chain.app_id || '/' || COALESCE(chain_map.new_id, chain.id)
+           COALESCE(app_map.new_id, chain.app_id) || '/' || COALESCE(chain_map.new_id, chain.id)
       FROM chains AS chain
       LEFT JOIN _brocade_chain_id_map AS chain_map ON chain_map.old_id = chain.id
-     WHERE chain_map.new_id IS NOT NULL;
+      LEFT JOIN _brocade_app_id_map AS app_map ON app_map.old_id = chain.app_id
+     WHERE chain_map.new_id IS NOT NULL OR app_map.new_id IS NOT NULL;
+    INSERT INTO _brocade_hop_id_map (old_id, new_id)
+    SELECT historical.old_id,
+           app_map.new_id || substr(historical.old_id, length(app_map.old_id) + 1)
+      FROM (
+          SELECT chain_id AS old_id FROM link_health WHERE strpos(chain_id, '/') > 0
+          UNION
+          SELECT chain_id AS old_id FROM node_hop_link_samples WHERE strpos(chain_id, '/') > 0
+      ) AS historical
+      JOIN _brocade_app_id_map AS app_map
+        ON app_map.old_id = split_part(historical.old_id, '/', 1)
+    ON CONFLICT (old_id) DO NOTHING;
 
-    SELECT (SELECT count(*) FROM _brocade_chain_id_map)
+    SELECT (SELECT count(*) FROM _brocade_app_id_map)
+         + (SELECT count(*) FROM _brocade_chain_id_map)
          + (SELECT count(*) FROM _brocade_ingress_id_map)
       INTO changed;
     IF changed = 0 THEN
@@ -3897,6 +3985,9 @@ BEGIN
     FOR stored IN SELECT revision_id, snapshot FROM model_snapshots ORDER BY revision_id LOOP
         apps_doc := '[]'::jsonb;
         FOR app_doc IN SELECT value FROM jsonb_array_elements(COALESCE(stored.snapshot->'apps', '[]'::jsonb)) LOOP
+            old_app := app_doc->>'id';
+            SELECT new_id INTO new_app FROM _brocade_app_id_map WHERE old_id = old_app;
+            new_app := COALESCE(new_app, old_app);
             chains_doc := '[]'::jsonb;
             FOR chain_doc IN SELECT value FROM jsonb_array_elements(COALESCE(app_doc->'chains', '[]'::jsonb)) LOOP
                 old_chain := chain_doc->>'id';
@@ -3957,6 +4048,10 @@ BEGIN
                 grants_doc := grants_doc || jsonb_build_array(grant_doc);
             END LOOP;
             app_doc := jsonb_set(app_doc, '{grants}', grants_doc, false);
+            app_doc := jsonb_set(app_doc, '{id}', to_jsonb(new_app), false);
+            IF app_doc->>'label' = old_app THEN
+                app_doc := jsonb_set(app_doc, '{label}', to_jsonb(new_app), false);
+            END IF;
             apps_doc := apps_doc || jsonb_build_array(app_doc);
         END LOOP;
         UPDATE model_snapshots
@@ -3964,6 +4059,9 @@ BEGIN
          WHERE revision_id = stored.revision_id;
     END LOOP;
 
+    UPDATE apps AS live SET id = mapped.new_id,
+        label = CASE WHEN live.label = mapped.old_id THEN mapped.new_id ELSE live.label END
+      FROM _brocade_app_id_map AS mapped WHERE live.id = mapped.old_id;
     UPDATE chains AS live SET id = mapped.new_id,
         name = CASE WHEN live.name = mapped.old_id THEN mapped.new_id ELSE live.name END
       FROM _brocade_chain_id_map AS mapped WHERE live.id = mapped.old_id;
@@ -4002,13 +4100,21 @@ BEGIN
       FROM _brocade_ingress_id_map AS mapped WHERE live.label LIKE '%#' || mapped.old_id;
     UPDATE quota_suspensions AS live SET ingress_id = mapped.new_id
       FROM _brocade_ingress_id_map AS mapped WHERE live.ingress_id = mapped.old_id;
+    UPDATE quota_suspensions AS live SET app_id = mapped.new_id
+      FROM _brocade_app_id_map AS mapped WHERE live.app_id = mapped.old_id;
+    UPDATE usage_chain_samples AS live SET app_id = mapped.new_id
+      FROM _brocade_app_id_map AS mapped WHERE live.app_id = mapped.old_id;
+    UPDATE usage_samples AS live SET app_id = mapped.new_id
+      FROM _brocade_app_id_map AS mapped WHERE live.app_id = mapped.old_id;
+    UPDATE user_app_quotas AS live SET app_id = mapped.new_id
+      FROM _brocade_app_id_map AS mapped WHERE live.app_id = mapped.old_id;
 
     SELECT current_revision INTO previous_revision FROM control_state WHERE id = TRUE FOR UPDATE;
     SELECT snapshot INTO previous_snapshot FROM model_snapshots WHERE revision_id = previous_revision;
     IF previous_snapshot IS NULL THEN
         RAISE EXCEPTION 'cannot migrate model ids: current revision % has no snapshot', previous_revision;
     END IF;
-    INSERT INTO revisions (author, note) VALUES ('system:id-migration', 'convert chain and ingress ids to grouped random ids')
+    INSERT INTO revisions (author, note) VALUES ('system:id-migration', 'convert app, chain and ingress ids to short random ids')
         RETURNING id INTO migration_revision;
     previous_snapshot := jsonb_set(previous_snapshot, '{revision}', to_jsonb(migration_revision), false);
     INSERT INTO model_snapshots (revision_id, snapshot) VALUES (migration_revision, previous_snapshot);

@@ -43,7 +43,7 @@ import {
   portClash,
   spanClash,
 } from './ports';
-import { modelIdPair } from '../model-id';
+import { appId as randomAppId, modelIdPair } from '../model-id';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 
 // 使一台机器运行 xray 的方式：为其创建一条链和一个接入面。
@@ -61,7 +61,7 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 // 与链详情页保持一致（创建时看到的结构与创建后看到的相同）；第二个依据是
 // 明文直连是逐跳的属性，警告需要显示在对应的跳上，修改也在该位置进行。
 //
-// 链和入口的两个内部 id 自动生成并隐藏；分组 id 是运营者维护的 slug，新建分组时仍显示。
+// 分组、链和入口的内部 id 都自动生成并隐藏；用户只维护可读名称。
 //
 // # 两个入口，同一套界面
 //
@@ -73,8 +73,7 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 // 机器，顺序由规则表表达——向导自动满足该要求：入口挂在本机，每台写入一条
 // `any → 下一台`（末位为出网），顺序显式写入规则。
 
-// 「＋ 新建分组…」在下拉框中的取值。使用不会与 app id 冲突的字符串——app id 的字符集为
-// [a-z0-9._-]（ports.ts 的 isValidSlug），不包含空格和冒号。
+// 「＋ 新建分组…」在下拉框中的取值。前后空格与冒号不会出现在 app-xxxx 中。
 const NEW_APP = ' :new-app:';
 const ANYTLS_PORT_BASE = 18443;
 const HY2_PORT_BASE = 30000;
@@ -181,7 +180,6 @@ export function ChainWizard({
   // 创建分组需要 system-admin 而创建链只需 editor，两种权限都不具备时该项无法给出取值：
   // 「＋ 新建分组…」照常列出但禁用，`targetApp` 为空使 `ready` 拦截提交。
   const [appModeRaw, setAppMode] = useState<'new' | 'existing' | null>(null);
-  const [appIdRaw, setAppId] = useState<string | null>(null);
   const [appLabelRaw, setAppLabel] = useState<string | null>(null);
   const [pickedAppRaw, setPickedApp] = useState<string | null>(null);
   const appMode: 'new' | 'existing' = fixedApp ? 'existing' : (appModeRaw ?? (apps.length > 0 ? 'existing' : 'new'));
@@ -232,13 +230,7 @@ export function ChainWizard({
       customRealityServerNames.length > 0 &&
       customRealityServerNames.every(realityServerNameIsValid) &&
       realityFingerprintIsValid(customRealityFingerprint));
-  // App 是运营侧长期稳定的 slug，不参与随机 ID 迁移。新建时仍从入口机器给出一个可编辑
-  // 的 slug 默认值；链和接入面的内部 ID 才使用短友好随机值。
-  const slug = (head?.node_id ?? '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '');
-  const appId = appIdRaw ?? (slug ? `app-${slug}` : '');
+  const [appId] = useState(() => randomAppId());
   const appLabel = appLabelRaw ?? headLabel;
   const chainName = chainNameRaw ?? (headLabel ? `${headLabel} 直出` : '');
   /* 选择连接方式需要读取对端的公网地址，因此此处需要完整的节点数据而非只有名称。 */
@@ -644,11 +636,11 @@ export function ChainWizard({
         <div className="wz-fld">
           <label>分组</label>
           {/* 下拉框与新建的两个输入框在同一行：它们对应同一项输入——选择哪个线路，
-              取值要么是已有分组，要么是新建分组的 id 和名称。
+              取值要么是已有分组，要么是新建分组的名称；技术 ID 自动生成。
               分为两行会被理解为两个问题，且第二行需要依靠缩进和竖线表明其从属关系。
 
               选择新建时下拉框收窄：此时它只显示「＋ 新建分组…」，
-              占用半行宽度没有必要——宽度分配给需要填写的两个输入框。 */}
+              占用半行宽度没有必要——宽度分配给需要填写的名称。 */}
           <div className="wz-app">
             {/* 始终使用下拉框，即使只有一个选项。从线路页进入时它只包含该线路——
                 改为只读文本时，同一字段在两个入口下是两种控件，需要先判断当前是否可修改。
@@ -691,20 +683,12 @@ export function ChainWizard({
               )}
             </select>
             {appMode === 'new' && !fixedApp && (
-              <>
-                <input
-                  className="f mono id"
-                  value={appId}
-                  onChange={e => setAppId(e.target.value)}
-                  placeholder="分组 ID"
-                />
-                <input
-                  className="f"
-                  value={appLabel}
-                  onChange={e => setAppLabel(e.target.value)}
-                  placeholder="分组名称"
-                />
-              </>
+              <input
+                className="f"
+                value={appLabel}
+                onChange={e => setAppLabel(e.target.value)}
+                placeholder="分组名称"
+              />
             )}
           </div>
           {/* 说明该字段的含义——「线路」一词本身不体现它是计费单元。 */}

@@ -10236,9 +10236,7 @@ body.fg-dragging * {
   color: var(--ink-4);
   font-size: 12.5px;
 }
-/* 新建项目：在列表最前面增加一条待创建的行，而不是插入一块面板。
-   原实现是带下沉底色的方框加两个纵向排列的输入格，高 130px，会把第一个项目挤出视野，
-   而其内容只有 ID 和名称两项。现改为一行，与列表同宽同内距，下方一行说明。 */
+/* 新建项目：技术 ID 自动生成；名称与动作保持一行并与列表同宽。 */
 .prj-newbar {
   margin: 0 0 6px;
   border-bottom: 1px solid var(--line-soft);
@@ -10257,11 +10255,6 @@ body.fg-dragging * {
   font: 10px var(--mono);
   letter-spacing: 0.1em;
   color: var(--ink-4);
-}
-/* ID 列窄一档：字符集限于 a-z 0-9 . _ -，内容较短；名称占用剩余宽度 */
-.prj-newbar > .row > .f.id {
-  flex: 0 1 190px;
-  min-width: 0;
 }
 .prj-newbar > .row > .f.nm {
   flex: 1 1 240px;
@@ -10324,8 +10317,7 @@ body.fg-dragging * {
 .wz-ro b {
   font-weight: 600;
 }
-/* 项目一格：下拉框加上（选择「新建」后才出现的）id 和名称，排布在同一行。
-   三者属于同一项输入，换行会被理解为三个独立的问题。 */
+/* 项目一格：下拉框加上选择「新建」后才出现的名称。 */
 .wz-app {
   display: flex;
   gap: 7px;
@@ -10336,18 +10328,12 @@ body.fg-dragging * {
   flex: 1 1 auto;
   min-width: 0;
 }
-/* 选择「新建」后下拉框只显示「＋ 新建项目…」，收缩到内容宽度——
-   剩余宽度分配给需要填写的两个输入格。 */
+/* 选择「新建」后下拉框只显示「＋ 新建项目…」，剩余宽度交给名称。 */
 .wz-app > select.f.narrow {
   flex: 0 0 auto;
   width: auto;
   max-width: 140px;
 }
-/* id 有字符集限制（a-z 0-9 . _ -），内容较短，宽度比名称窄一档 */
-.wz-app > .f.id {
-  flex: 0 1 36%;
-}
-
 /* Protocols are a first-class creation choice, but their tuning is not. Three compact switches
    expose exactly what will be opened while keeping ports informational and automatically assigned. */
 .wz-protocols {
@@ -13519,12 +13505,11 @@ h4.sec > .btn {
   .prj-none {
     padding: 2px 12px 12px;
   }
-  /* 390 宽度下两个输入框各占一行，按钮跟在其后——同行排列时名称框只剩数十像素 */
+  /* 390 宽度下名称占满可用宽度，按钮跟在其后。 */
   .prj-newbar > .row {
     padding: 10px 0 0;
     gap: 7px;
   }
-  .prj-newbar > .row > .f.id,
   .prj-newbar > .row > .f.nm {
     flex: 1 1 100%;
   }
