@@ -58,6 +58,18 @@ const SLOT_A_FILE: &str = "slot-a.pem";
 const SLOT_B_FILE: &str = "slot-b.pem";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Establish both trust-track directories even when this node currently receives material for
+/// only one of them. An empty track is still an explicit, inspectable state; creating it lazily
+/// made a self-signed-only node look as though the public-CA half of the layout did not exist.
+pub(crate) fn ensure_layout(state_dir: &Path) -> Result<(), String> {
+    let tls_dir = state_dir.join(CERT_DIR);
+    create_private_dir(&tls_dir)?;
+    for track in [CertificateTrack::PublicCa, CertificateTrack::SelfSigned] {
+        create_private_dir(&track_dir(state_dir, track))?;
+    }
+    Ok(())
+}
+
 /// Apply certificate material received in the desired response.
 ///
 /// Called from the apply path, for the `Certificate` variant and for the `certificate` field of
@@ -328,6 +340,27 @@ mod tests {
                 .unwrap(),
             "SELF\nSELF-KEY\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_layout_always_contains_two_private_trust_tracks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("brocade-cert-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        ensure_layout(&dir).unwrap();
+        for track in [PUBLIC_CA_DIR, SELF_SIGNED_DIR] {
+            let path = dir.join(CERT_DIR).join(track);
+            assert!(path.is_dir());
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1114,6 +1114,7 @@ fn spawn_spool_reporter(
 /// across the xray restart, so that the sampling thread does not read a freshly
 /// started, empty process and mistake the reset for users sending no traffic.
 fn run_forever(options: Options) -> Result<(), String> {
+    certfile::ensure_layout(&options.state_dir)?;
     match logcap::ensure_agent_journal_namespace(&options.state_dir) {
         Ok(true) => {
             println!("agent 日志已切到独立 journal，重启一次使配置生效");
