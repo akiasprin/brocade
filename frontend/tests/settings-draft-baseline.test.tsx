@@ -183,6 +183,32 @@ afterEach(() => {
 });
 
 describe('设置页分段保存的基准', () => {
+  it('所有设置段与机器配置、链路设置共用 config-panel 和图标标题', async () => {
+    render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+
+    for (const id of [
+      'set-branding',
+      'set-visitor',
+      'set-dist',
+      'set-agent-logs',
+      'set-cert',
+      'set-xray',
+      'set-conn',
+      'set-wg',
+      'set-ports',
+      'set-probe',
+      'set-ping-probe',
+      'set-geodata',
+    ]) {
+      const panel = document.getElementById(id)!;
+      expect(panel.classList.contains('config-panel')).toBe(true);
+      expect(panel.querySelector(':scope > header .panel-title')).toBeTruthy();
+      expect(panel.querySelector(':scope > header .panel-title-icon')).toBeTruthy();
+      expect(panel.querySelector(':scope > header .no')).toBeNull();
+    }
+  });
+
   it('保存动作默认隐藏，有改动后才出现在卡片底部', async () => {
     render(<Harness />);
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;

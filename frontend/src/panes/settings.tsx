@@ -41,6 +41,7 @@ import { draft } from '../draft';
 import { can, useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
 import { BrandIcon } from '../ui/branding';
+import { PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { REALITY_FINGERPRINT_OPTIONS } from '../reality';
 
@@ -201,32 +202,32 @@ const APPLY: Record<Apply, string> = {
   cycle: '下一轮生效',
 };
 
-/* ── 段目录 ──
- *
- * 各段分两栏排列，目录不按生效方式分组：那是段自身的属性，每段的标题栏里
- * 已经有一枚徽章写明。
- *
- * 编号不是装饰：内容区按该顺序排列，可以直接引用某一段的位置。
- */
-type NavItem = { id: string; no: string; label: string; apply: Apply; key?: SectionKey };
+/* 标题图标与机器配置、链路设置共用同一套线稿图标。设置项仍按两栏顺序排列；
+ * 生效方式是段自身的属性，由标题右侧的徽章说明。 */
+type NavItem = { id: string; label: string; icon: IconName; apply: Apply; key?: SectionKey };
 
 const NAV: NavItem[] = [
-  { id: 'set-branding', no: '01', label: '站点外观', apply: 'now' },
-  { id: 'set-visitor', no: '02', label: '访客模式', apply: 'now' },
-  { id: 'set-dist', no: '03', label: '分发', apply: 'now' },
-  { id: 'set-agent-logs', no: '04', label: '日志保留', apply: 'cycle' },
-  { id: 'set-cert', no: '05', label: '证书', apply: 'now' },
-  { id: 'set-xray', no: '06', label: 'XRAY', apply: 'publish', key: 'xray' },
-  { id: 'set-conn', no: '07', label: '连接策略', apply: 'publish', key: 'connection' },
-  { id: 'set-wg', no: '08', label: 'WireGuard', apply: 'publish', key: 'wireguard' },
-  { id: 'set-ports', no: '09', label: '端口分配', apply: 'publish', key: 'ports' },
+  { id: 'set-branding', label: '站点外观', icon: 'settings', apply: 'now' },
+  { id: 'set-visitor', label: '访客模式', icon: 'access', apply: 'now' },
+  { id: 'set-dist', label: '分发', icon: 'deploy', apply: 'now' },
+  { id: 'set-agent-logs', label: '日志保留', icon: 'artifacts', apply: 'cycle' },
+  { id: 'set-cert', label: '证书', icon: 'certificate', apply: 'now' },
+  { id: 'set-xray', label: 'XRAY', icon: 'protocol', apply: 'publish', key: 'xray' },
+  { id: 'set-conn', label: '连接策略', icon: 'config', apply: 'publish', key: 'connection' },
+  { id: 'set-wg', label: 'WireGuard', icon: 'tunnels', apply: 'publish', key: 'wireguard' },
+  { id: 'set-ports', label: '端口分配', icon: 'ingress', apply: 'publish', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
-  { id: 'set-probe', no: '10', label: '端到端探测', apply: 'cycle', key: 'probe' },
-  { id: 'set-ping-probe', no: '11', label: 'Ping 链路探测', apply: 'cycle' },
-  { id: 'set-geodata', no: '12', label: '规则库更新', apply: 'publish', key: 'geodata' },
+  { id: 'set-probe', label: '端到端探测', icon: 'observe', apply: 'cycle', key: 'probe' },
+  { id: 'set-ping-probe', label: 'Ping 链路探测', icon: 'diag', apply: 'cycle' },
+  { id: 'set-geodata', label: '规则库更新', icon: 'dns', apply: 'publish', key: 'geodata' },
 ];
 
 const APPLY_OF: Record<string, Apply> = Object.fromEntries(NAV.map(item => [item.id, item.apply]));
+const ICON_OF: Record<string, IconName> = Object.fromEntries(NAV.map(item => [item.id, item.icon]));
+
+function SettingsTitle({ id, children }: { id: string; children: React.ReactNode }) {
+  return <PanelTitle of={ICON_OF[id]}>{children}</PanelTitle>;
+}
 
 /** 段标题里的生效方式。只有「需要发布」着主色，
     且它是唯一一档「保存完还没完」，另外两档保存即到位。 */
@@ -457,10 +458,6 @@ function MtuProbe() {
   );
 }
 
-/* 段编号取自目录，段上不另写一份：两处各写一份时，插入一段就会出现目录说 05、段自己
-   说 04 的情况，而这个号的用处正是让「目录里点的那一项」和「滚到的这一段」能对上。 */
-const NO_OF: Record<string, string> = Object.fromEntries(NAV.map(item => [item.id, item.no]));
-
 function Section({
   id,
   name,
@@ -483,12 +480,9 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="panel titled" id={id}>
-      {/* 说明不进标题栏：一栏宽 470px，「编号 + 段名 + 徽章 + 状态 + 保存」已经占满，
-          再塞一句说明会把色带顶成两行。它落在色带下方，与段内的字段同起一条竖线。 */}
+    <section className="panel config-panel" id={id}>
       <header>
-        <span className="no">{NO_OF[id]}</span>
-        <h4>{name}</h4>
+        <SettingsTitle id={id}>{name}</SettingsTitle>
         <ApplyBadge id={id} />
       </header>
       <p className="cardsub">{sub}</p>
@@ -669,10 +663,9 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
   const bad = view.groups.flatMap(group => group.certificates.filter(cert => cert.status === 'failed'));
 
   return (
-    <section className="panel titled" id="set-cert">
+    <section className="panel config-panel" id="set-cert">
       <header>
-        <span className="no">{NO_OF['set-cert']}</span>
-        <h4>证书</h4>
+        <SettingsTitle id="set-cert">证书</SettingsTitle>
         <ApplyBadge id="set-cert" />
       </header>
       <p className="cardsub">
@@ -1347,10 +1340,9 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
   };
 
   return (
-    <section className="panel titled" id="set-branding">
+    <section className="panel config-panel" id="set-branding">
       <header>
-        <span className="no">{NO_OF['set-branding']}</span>
-        <h4>站点外观</h4>
+        <SettingsTitle id="set-branding">站点外观</SettingsTitle>
         <ApplyBadge id="set-branding" />
       </header>
       <p className="cardsub">控制台左上角使用这里的名称和图标；名称也同步到登录页和浏览器标题</p>
@@ -1415,13 +1407,12 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
   });
 
   return (
-    <section className="panel titled" id="set-visitor">
+    <section className="panel config-panel" id="set-visitor">
       <header>
-        <span className="no">{NO_OF['set-visitor']}</span>
-        <h4>访客模式</h4>
-        <span className="sp" />
-        <b className={enabled ? 'settings-live-state on' : 'settings-live-state'}>{enabled ? '已开启' : '已关闭'}</b>
+        <SettingsTitle id="set-visitor">访客模式</SettingsTitle>
         <ApplyBadge id="set-visitor" />
+        <span className="sp" />
+        <b>{enabled ? '已开启' : '已关闭'}</b>
       </header>
       <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客</p>
       {update.error && <ErrorBox error={update.error} />}
@@ -1486,10 +1477,9 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
     !own && live ? <span className="hint">当前生效：{live}（来自环境变量）</span> : null;
 
   return (
-    <section className="panel titled" id="set-dist">
+    <section className="panel config-panel" id="set-dist">
       <header>
-        <span className="no">{NO_OF['set-dist']}</span>
-        <h4>分发</h4>
+        <SettingsTitle id="set-dist">分发</SettingsTitle>
         <ApplyBadge id="set-dist" />
       </header>
       <p className="cardsub">节点从哪里访问这台控制面、安装哪个 XRAY</p>
@@ -1717,10 +1707,9 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
   });
 
   return (
-    <section className="panel titled agent-log-policy" id="set-agent-logs">
+    <section className="panel config-panel agent-log-policy" id="set-agent-logs">
       <header>
-        <span className="no">{NO_OF['set-agent-logs']}</span>
-        <h4>日志保留</h4>
+        <SettingsTitle id="set-agent-logs">日志保留</SettingsTitle>
         <ApplyBadge id="set-agent-logs" />
       </header>
       <p className="cardsub">Agent、XRAY 与 Phantun 分别设置；机器覆盖优先于对应的全局值</p>
@@ -1880,10 +1869,9 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
     }));
 
   return (
-    <section className="panel titled ping-probe-settings" id="set-ping-probe">
+    <section className="panel config-panel ping-probe-settings" id="set-ping-probe">
       <header>
-        <span className="no">{NO_OF['set-ping-probe']}</span>
-        <h4>Ping 链路探测</h4>
+        <SettingsTitle id="set-ping-probe">Ping 链路探测</SettingsTitle>
         <ApplyBadge id="set-ping-probe" />
       </header>
       <p className="cardsub">每台机器按目标协议执行 TCP Connect 或 ICMP Echo，用于描述机器到目标的链路状态</p>
