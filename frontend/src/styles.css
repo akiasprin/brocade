@@ -119,6 +119,9 @@
   --del-ink: #e2687a;
   --r-card: 10px;
   --r-ctl: 6px;
+  /* 配置字段中“控件 / 选项 → 解释文案”的统一垂直间距。6px 足以分开两个层级，
+     又小于同一字段的 8px 内部节奏，不会把说明误读成下一项。 */
+  --field-note-gap: 6px;
   --mono: ui-monospace, SFMono-Regular, 'SF Mono', 'JetBrains Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
   --sans:
     -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB',
@@ -2529,7 +2532,7 @@ textarea.f::placeholder {
   display: block;
   font-size: 11px;
   color: var(--ink-3);
-  margin-top: 2px;
+  margin-top: var(--field-note-gap);
 }
 /* 对照值：位于输入框右侧，不换行。它不是该字段的说明（说明使用 .sub 并另起一行），
    而是同一项的另一个取值，置于同一行才能表明是与左侧值比较。 */
@@ -3735,7 +3738,8 @@ table.t tbody tr:last-child td {
 .setfld .v {
   display: flex;
   align-items: center;
-  gap: 8px;
+  column-gap: 8px;
+  row-gap: var(--field-note-gap);
   flex-wrap: wrap;
 }
 /* 说明独占一行，排在控件下方。此前它与控件同行换行，一句四十字的说明会把它旁边的
@@ -3747,7 +3751,7 @@ table.t tbody tr:last-child td {
   font-size: 11.5px;
   color: var(--ink-3);
   flex: 1 1 100%;
-  margin-top: 1px;
+  margin-top: 0;
   line-height: 1.6;
 }
 /* 单位和格式提示留在控件右边：它们是控件的一部分（「天」「站点:端口」），
@@ -10901,7 +10905,7 @@ body.fg-dragging * {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 3px;
+  gap: 0;
 }
 .chain-face dd > .toolbar {
   margin: 0;
@@ -10917,6 +10921,12 @@ body.fg-dragging * {
 .chain-face dd > .note {
   margin: 0;
   line-height: 1.55;
+}
+/* 线路配置此前只有 3px、机器配置 2px、设置表单约 9px；说明与它解释的菜单/按钮因页面
+   而忽近忽远。只在说明前已有内容时加入公共间距，空状态中作为首项出现的说明仍然顶格。 */
+.chain-face dd > :not(.note) + .note,
+.chain-face dd > .note + .note {
+  margin-top: var(--field-note-gap);
 }
 /* 线路详情的配置字段与机器配置的 `.fgrid.one` 共用同一视觉规格。
    JSX 仍使用语义正确的 dl/dt/dd，但标签宽度、对齐、行距、分隔线和文字层级保持一致。 */

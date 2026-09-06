@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn a_directly_self_signed_certificate_carries_an_arbitrary_private_sni_and_pin() {
         let certificate =
-            generate_self_signed(vec!["northstar-edge-0123abcd.test".to_owned()]).unwrap();
+            generate_self_signed(vec!["northstar-edge-0123abcd.com".to_owned()]).unwrap();
         assert_eq!(certificate.cert_pem.matches("BEGIN CERTIFICATE").count(), 1);
         assert!(KeyPair::from_pem(&certificate.key_pem).is_ok());
         let (_, issuer) = crate::acme::leaf_facts(&certificate.cert_pem).unwrap();

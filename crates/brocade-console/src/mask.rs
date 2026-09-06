@@ -52,6 +52,7 @@ const HOST_KEYS: &[&str] = &[
     // boundary as those fields.
     "certificate_name",
     "dial_host",
+    "domain",
     "dns_servers",
     "endpoint",
     "endpoint_host",
@@ -60,6 +61,7 @@ const HOST_KEYS: &[&str] = &[
     "host",
     "ipv4",
     "ipv6",
+    "names",
     "overlay_addr",
     "peer_endpoint",
     "public_ipv4",
@@ -86,7 +88,16 @@ const HOST_KEYS: &[&str] = &[
 /// which check failed, how severe it is, and on which asset — enough to review by and
 /// enough to ask about — while the summary counts are untouched.
 const PROSE_KEYS: &[&str] = &[
-    "detail", "details", "error", "message", "note", "notes", "reason", "warning", "warnings",
+    "detail",
+    "details",
+    "error",
+    "last_error",
+    "message",
+    "note",
+    "notes",
+    "reason",
+    "warning",
+    "warnings",
 ];
 
 /// What replaces prose: nothing at all.
@@ -105,6 +116,7 @@ const PROSE_HIDDEN: &str = "";
 /// servers. Remove these members rather than replacing them: an asterisk-filled array would not
 /// satisfy the wire type and could be mistaken for a real scheme by a future client.
 const SECRET_KEYS: &[&str] = &[
+    "acme_contact",
     "anytls_padding_scheme",
     "email",
     "login_enabled",
@@ -147,6 +159,17 @@ pub fn mask_json(value: &mut Value) {
         }
         Value::Array(items) => items.iter_mut().for_each(mask_json),
         Value::Object(map) => {
+            // A certificate group's `label` and `domain` are deliberately separate fields, but
+            // keeping the former while masking only the latter lets a viewer reconstruct the
+            // exact SNI. Match the certificate-group shape rather than the generic key name:
+            // labels elsewhere are ordinary UI text and must remain readable.
+            if map.contains_key("certificates")
+                && map.contains_key("names")
+                && map.contains_key("label")
+                && map.contains_key("domain")
+            {
+                map.insert("label".to_owned(), Value::String(HIDDEN.to_owned()));
+            }
             // A UUID is a usable VLESS credential, not review material. Remove the member rather
             // than replacing its value: `***` still suggests a field callers may rely on, while
             // the readonly wire contract deliberately does not carry it at all. This is done at
@@ -638,6 +661,61 @@ mod tests {
         assert_eq!(
             value["ingresses"][0]["wires"]["anytls"]["masquerade"]["kind"],
             "not-found"
+        );
+    }
+
+    #[test]
+    fn certificate_status_keeps_health_but_cannot_reconstruct_the_sni() {
+        let mut value = json!({
+            "domain": {
+                "domain": "huacu.io",
+                "acme_contact": "ops@huacu.io",
+                "signing_method": "self-signed"
+            },
+            "groups": [{
+                "id": "group-1",
+                "domain": "huacu.io",
+                "label": "a2335a6d",
+                "name": "默认组",
+                "names": ["*.a2335a6d.huacu.io", "a2335a6d.huacu.io"],
+                "status": "active",
+                "certificates": [{
+                    "status": "serving",
+                    "signing_method": "self-signed",
+                    "issuer": "Harbor Edge Root CA 1234",
+                    "expires_at": "2126-09-06T00:00:00Z",
+                    "last_error": "failed to issue a2335a6d.huacu.io"
+                }]
+            }],
+            "nodes": [{
+                "node_id": "n1",
+                "certificate_name": "a2335a6d.huacu.io",
+                "on_disk": "current"
+            }]
+        });
+
+        mask_json(&mut value);
+
+        assert_eq!(value["domain"]["domain"], "***.io");
+        assert!(value["domain"].get("acme_contact").is_none());
+        assert_eq!(value["groups"][0]["domain"], "***.io");
+        assert_eq!(value["groups"][0]["label"], "***");
+        assert_eq!(value["groups"][0]["names"][0], "***.io");
+        assert_eq!(value["groups"][0]["certificates"][0]["last_error"], "");
+        assert_eq!(value["nodes"][0]["certificate_name"], "***.io");
+        assert_eq!(value["nodes"][0]["on_disk"], "current");
+        assert_eq!(
+            value["groups"][0]["certificates"][0]["signing_method"],
+            "self-signed"
+        );
+        let encoded = value.to_string();
+        assert!(
+            !encoded.contains("a2335a6d"),
+            "SNI label leaked in {encoded}"
+        );
+        assert!(
+            !encoded.contains("ops@huacu.io"),
+            "contact leaked in {encoded}"
         );
     }
 

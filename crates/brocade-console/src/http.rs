@@ -628,6 +628,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/healthz",
         "/auth/state",
         "/branding",
+        "/certs",
         "/whoami",
         "/model/snapshot",
         "/nodes/agent-state",
@@ -2073,7 +2074,9 @@ async fn certs_response(
 }
 
 async fn get_certs(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    // Certificate health belongs on the machine read surface. User/readonly responses pass
+    // through the asset masker, while every mutation below remains SystemAdmin-only.
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(Json(certs_response(&state, &admin).await?).into_response())
 }
 
@@ -5303,6 +5306,7 @@ mod tests {
         use axum::http::Method;
         for path in [
             "/branding",
+            "/certs",
             "/whoami",
             "/model/snapshot",
             "/nodes/agent-state",

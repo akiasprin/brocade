@@ -805,8 +805,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
 
         {selfSigned ? (
           <div className="guard">
-            默认组首次初始化 5 张、单张有效期 100 年。自动名称使用保留的 <b>.test</b>
-            域名，不存在真实站点，也不再拼接二级域名或通配符；私钥加密保存。
+            默认组首次初始化 5 张、单张有效期 100 年。自动名称使用随机生成的 <b>.com</b>
+            域名，不再拼接二级域名或通配符；私钥加密保存。
           </div>
         ) : (
           <>
@@ -1272,7 +1272,7 @@ function GroupForm({
               value={value.certificateName ?? ''}
               disabled={busy}
               onChange={e => onChange({ ...value, certificateName: e.target.value })}
-              title="仅手动新建时可指定；留空会生成随机且不会真实存在的 .test 名称"
+              title="仅手动新建时可指定；留空会生成随机的 .com 名称"
             />
           </label>
         )}

@@ -3083,6 +3083,25 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
         "readonly user list carried a usable UUID: {listed_user}"
     );
 
+    // Certificate health is visible on the machine page for a reviewer. The status and trust
+    // source survive, while the three pieces that could reconstruct its SNI (`domain`, `label`,
+    // and `names`) cross the same masking boundary as the machine snapshot.
+    let certs = get_json_with_token(&app, "/certs", &reviewer_token).await;
+    assert_eq!(certs.0, StatusCode::OK);
+    let cert_group = &certs.1["groups"][0];
+    assert_eq!(cert_group["domain"], "***.io");
+    assert_eq!(cert_group["label"], "***");
+    assert_eq!(cert_group["names"][0], "***.io");
+    assert_eq!(cert_group["certificates"][0]["status"], "serving");
+    assert_eq!(cert_group["certificates"][0]["signing_method"], "public-ca");
+    assert_eq!(certs.1["nodes"][0]["certificate_name"], "***.io");
+    assert_eq!(certs.1["nodes"][0]["on_disk"], "unknown");
+    assert!(
+        !certs.1.to_string().contains("a2335a6d.huacu.io"),
+        "readonly certificate view carried the real SNI: {}",
+        certs.1
+    );
+
     // The whole body, not the fields anybody thought to name: the fixture's
     // addresses must not survive anywhere in it, however deeply nested
     let text = snapshot.1.to_string();
@@ -3136,6 +3155,14 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     assert!(
         full.1["snapshot"]["users"][0]["uuid"].is_string(),
         "credential masking must apply only to readonly responses"
+    );
+    let full_certs = get_json(&app, &admin_token, "/certs").await;
+    assert_eq!(full_certs.0, StatusCode::OK);
+    assert_eq!(full_certs.1["groups"][0]["domain"], "huacu.io");
+    assert_eq!(full_certs.1["groups"][0]["label"], "a2335a6d");
+    assert_eq!(
+        full_certs.1["nodes"][0]["certificate_name"],
+        "a2335a6d.huacu.io"
     );
 
     // The compile view stays readable — it is the review surface: topology, chains,
@@ -5150,6 +5177,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "/quotas",
         "/usage/samples",
         "/usage/monthly-summary",
+        "/certs",
     ] {
         assert_eq!(
             get_json_with_cookie(&app, path, &cookie).await.0,

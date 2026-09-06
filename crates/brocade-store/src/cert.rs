@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::secrets::{self, CTX_ACME_ACCOUNT, CTX_CERT_KEY, CTX_DNS_CREDENTIAL};
-use crate::{AdminContext, Result, StoreError};
+use crate::{AdminContext, AdminRole, Result, StoreError};
 
 /// Let's Encrypt's production directory. Named here so the console's default and the operator's
 /// choice are the same string.
@@ -276,6 +276,19 @@ fn require_system_admin(actor: &AdminContext, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Certificate status is part of the machine review surface, but its raw names are still asset
+/// identifiers. The console's response boundary masks them for `user` and `readonly`; roles that
+/// would receive this structure unmasked continue to need system-admin.
+fn require_certificate_status_reader(actor: &AdminContext) -> Result<()> {
+    if actor.is_system_admin() || matches!(actor.role(), AdminRole::User | AdminRole::Readonly) {
+        Ok(())
+    } else {
+        Err(StoreError::Forbidden(
+            "only system-admin or a masked viewer can view certificate status".to_owned(),
+        ))
+    }
+}
+
 fn normalize_domain(raw: &str) -> String {
     raw.trim().trim_end_matches('.').to_ascii_lowercase()
 }
@@ -296,10 +309,11 @@ fn generate_id() -> Result<String> {
     Ok(hex_lower(&bytes))
 }
 
-/// A plausible private hostname which can never collide with a real public site. RFC 2606
-/// reserves `.test`; the two words make the value readable while the random suffix makes each
-/// installation and manually-created self-signed group distinct.
-fn generate_reserved_certificate_name() -> Result<String> {
+/// A plausible hostname for a self-signed certificate. The two words keep it readable while the
+/// random suffix makes each installation and manually-created group distinct. It deliberately
+/// ends in `.com`: this identity is trusted only through the certificate pin, never through DNS
+/// ownership or a public CA.
+fn generate_synthetic_certificate_name() -> Result<String> {
     const FIRST: &[&str] = &[
         "amber",
         "arcadia",
@@ -320,7 +334,7 @@ fn generate_reserved_certificate_name() -> Result<String> {
     let mut bytes = [0u8; 6];
     getrandom::fill(&mut bytes)?;
     Ok(format!(
-        "{}-{}-{}.test",
+        "{}-{}-{}.com",
         FIRST[usize::from(bytes[0]) % FIRST.len()],
         SECOND[usize::from(bytes[1]) % SECOND.len()],
         hex_lower(&bytes[2..])
@@ -365,7 +379,7 @@ pub async fn ensure_default_self_signed_pool(pool: &PgPool) -> Result<usize> {
         return Ok(0);
     }
 
-    let certificate_name = generate_reserved_certificate_name()?;
+    let certificate_name = generate_synthetic_certificate_name()?;
     let group_id = generate_id()?;
     let label = generate_label()?;
     sqlx::query(
@@ -454,7 +468,7 @@ pub async fn upsert_cert_domain(
     };
     let domain = match (input.signing_method, normalize_domain(&input.domain)) {
         (CertificateSigningMethod::SelfSigned, domain) if domain.is_empty() => {
-            generate_reserved_certificate_name()?
+            generate_synthetic_certificate_name()?
         }
         (_, domain) if domain.is_empty() => {
             return Err(StoreError::InvalidData(
@@ -648,7 +662,7 @@ async fn create_cert_label_inner(
                 .filter(|value| !value.is_empty())
             {
                 Some(value) => normalize_certificate_name(value)?,
-                None => generate_reserved_certificate_name()?,
+                None => generate_synthetic_certificate_name()?,
             },
         )
     } else if certificate_name.is_some_and(|value| !value.trim().is_empty()) {
@@ -884,7 +898,7 @@ pub async fn certificate_dns_targets(pool: &PgPool) -> Result<Vec<CertificateDns
 
 /// Every group with its certificates and members. What the console's certificate page shows.
 pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec<CertGroup>> {
-    require_system_admin(actor, "view certificate status")?;
+    require_certificate_status_reader(actor)?;
     let groups = sqlx::query(
         "SELECT l.id, l.label, l.name, l.note, l.status, l.certificate_name, l.is_default,
                 d.domain,
@@ -980,7 +994,7 @@ pub async fn list_node_certificate_state(
     pool: &PgPool,
     actor: &AdminContext,
 ) -> Result<Vec<NodeCertificateState>> {
-    require_system_admin(actor, "view certificate status")?;
+    require_certificate_status_reader(actor)?;
     let rows = sqlx::query(
         // `on_disk` is decided here rather than in the console, so that the comparison and the
         // bytes being compared never travel apart.
@@ -1656,23 +1670,46 @@ mod tests {
         let order = CertificateOrder {
             certificate_id: "c1".to_owned(),
             label_id: "l1".to_owned(),
-            domain_id: "internal.test".to_owned(),
-            domain: "internal.test".to_owned(),
+            domain_id: "internal.com".to_owned(),
+            domain: "internal.com".to_owned(),
             label: "a1b2c3d4".to_owned(),
-            certificate_name: Some("northstar-edge-0123abcd.test".to_owned()),
+            certificate_name: Some("northstar-edge-0123abcd.com".to_owned()),
             acme_directory: SELF_SIGNED_DIRECTORY.to_owned(),
             acme_contact: None,
             renewal: false,
         };
-        assert_eq!(order.names(), vec!["northstar-edge-0123abcd.test"]);
+        assert_eq!(order.names(), vec!["northstar-edge-0123abcd.com"]);
     }
 
     #[test]
-    fn generated_self_signed_names_are_reserved_and_random() {
-        let first = generate_reserved_certificate_name().unwrap();
-        assert!(first.ends_with(".test"));
+    fn generated_self_signed_names_are_plausible_and_random() {
+        let first = generate_synthetic_certificate_name().unwrap();
+        assert!(first.ends_with(".com"));
         assert_eq!(first.matches('.').count(), 1);
-        assert_ne!(first, generate_reserved_certificate_name().unwrap());
+        assert_ne!(first, generate_synthetic_certificate_name().unwrap());
+    }
+
+    #[test]
+    fn certificate_status_is_readable_only_by_admin_or_masked_roles() {
+        assert!(require_certificate_status_reader(&AdminContext::system_admin("root")).is_ok());
+        assert!(require_certificate_status_reader(&AdminContext::new(
+            "reviewer",
+            AdminRole::Readonly,
+            Some("platform".to_owned()),
+        ))
+        .is_ok());
+        assert!(require_certificate_status_reader(&AdminContext::new(
+            "alice",
+            AdminRole::User,
+            Some("platform".to_owned()),
+        ))
+        .is_ok());
+        assert!(require_certificate_status_reader(&AdminContext::new(
+            "editor",
+            AdminRole::Editor,
+            Some("platform".to_owned()),
+        ))
+        .is_err());
     }
 
     #[test]

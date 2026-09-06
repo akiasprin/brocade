@@ -16084,7 +16084,7 @@ async fn a_fresh_install_bootstraps_one_five_leaf_self_signed_pool() {
     assert_eq!(group.name, "默认组");
     assert!(group.is_default);
     assert_eq!(group.names.len(), 1);
-    assert!(group.names[0].ends_with(".test"));
+    assert!(group.names[0].ends_with(".com"));
     assert_eq!(group.names[0].matches('.').count(), 1);
     assert_eq!(group.certificates.len(), 5);
     assert!(group
@@ -16119,7 +16119,7 @@ async fn self_signed_pool_reuses_switched_leaves_and_stops_at_ten() {
         )
         .await
         .unwrap();
-    assert!(domain.domain.ends_with(".test"));
+    assert!(domain.domain.ends_with(".com"));
     let label_id = db
         .store
         .create_cert_label_with_certificate_name(&system_admin(), &domain.id, "手动组", None, None)

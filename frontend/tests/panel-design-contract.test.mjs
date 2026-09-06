@@ -83,6 +83,16 @@ test('所有面板标题固定使用 PanelTitle，列表页只使用 ListIcon �
   assert.match(settings, /function SettingsTitle[\s\S]*?<PanelTitle of=\{ICON_OF\[id\]\}>/);
 });
 
+test('配置控件与说明文字共用 6px 垂直间距', () => {
+  assert.match(styles, /--field-note-gap:\s*6px;/);
+  assert.match(styles, /\.setfld \.v\s*\{[^}]*row-gap:\s*var\(--field-note-gap\)/s);
+  assert.match(styles, /\.fgrid \.v \.sub\s*\{[^}]*margin-top:\s*var\(--field-note-gap\)/s);
+  assert.match(
+    styles,
+    /\.chain-face dd > :not\(\.note\) \+ \.note,[\s\S]*?margin-top:\s*var\(--field-note-gap\)/,
+  );
+});
+
 const splitSelectors = selectorList => {
   const selectors = [];
   let depth = 0;
