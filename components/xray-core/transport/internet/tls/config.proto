@@ -35,6 +35,10 @@ message Certificate {
   bool One_time_loading = 7;
 
   bool build_chain = 8;
+
+  // Experimental interval, in seconds, for re-reading an already configured
+  // certificate file. Zero keeps the default one-hour interval.
+  uint64 reload_interval = 9;
 }
 
 message Config {

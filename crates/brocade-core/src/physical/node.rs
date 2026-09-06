@@ -177,6 +177,7 @@ pub struct ResolvedConnection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayPlan {
     pub node_id: String,
+    pub certificate_track: Option<crate::model::CertificateTrack>,
     pub api_port: Option<u16>,
     pub reality_client: RealityClientPolicy,
     pub dns: Dns,
@@ -678,6 +679,7 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
 
     let mut plan = XrayPlan {
         node_id: node_id.to_owned(),
+        certificate_track: system_node.and_then(|node| node.certificate_track),
         api_port: app_node.api_port,
         reality_client: sys.settings.reality_client.clone(),
         dns: app_node.dns.clone(),

@@ -680,10 +680,13 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
         lines.push(format!("    flow: {}", scalar(flow)));
     }
     lines.push(format!("    servername: {}", scalar(server_name)));
-    if matches!(&entry.security, SubscriptionSecurity::Tls(tls) if tls.self_signed) {
-        // Public Clash URLs may carry self-signed entries because this choice is explicit at the
-        // subscription level. URI lists stay closed by default; see format/uri.rs.
-        lines.push("    skip-cert-verify: true".to_owned());
+    if let SubscriptionSecurity::Tls(tls) = &entry.security {
+        if let Some(fingerprint) = &tls.certificate_fingerprint {
+            lines.push(format!(
+                "    fingerprint: {}",
+                scalar(&fingerprint.to_uppercase())
+            ));
+        }
     }
     if let Some(reality) = reality {
         lines.push(format!(
@@ -773,8 +776,11 @@ fn push_anytls_proxy(
     // AnyTLS is TCP-backed, so Mihomo can use its common TFO switch just as it does for VLESS.
     // A peer or path without TFO support falls back to the ordinary handshake.
     lines.push("    tfo: true".to_owned());
-    if anytls.self_signed {
-        lines.push("    skip-cert-verify: true".to_owned());
+    if let Some(fingerprint) = &anytls.certificate_fingerprint {
+        lines.push(format!(
+            "    fingerprint: {}",
+            scalar(&fingerprint.to_uppercase())
+        ));
     }
     if let Some(reality) = &anytls.reality {
         lines.push(format!(
@@ -1028,8 +1034,11 @@ fn push_hysteria2_proxy(
     lines.push(format!("    password: {}", scalar(&entry.uuid)));
     lines.push(format!("    sni: {}", scalar(&hysteria.server_name)));
     lines.push("    udp: true".to_owned());
-    if hysteria.self_signed {
-        lines.push("    skip-cert-verify: true".to_owned());
+    if let Some(fingerprint) = &hysteria.certificate_fingerprint {
+        lines.push(format!(
+            "    fingerprint: {}",
+            scalar(&fingerprint.to_uppercase())
+        ));
     }
     if let Some(crate::model::HysteriaObfs::Salamander { password }) = &hysteria.settings.obfs {
         lines.push("    obfs: salamander".to_owned());

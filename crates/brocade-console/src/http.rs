@@ -3844,19 +3844,19 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
     // failure after the take would 500 a node that has just been handed a deployment. A failure
     // here degrades to "no certificate owed" rather than erroring the whole response — one
     // malformed cert row must not block a deployment.
-    let certificate = if node.lifecycle_phase == NodeLifecyclePhase::Active {
+    let certificates = if node.lifecycle_phase == NodeLifecyclePhase::Active {
         match state.store.cert_delta_for_node(&node.node_id).await {
-            Ok(certificate) => certificate,
+            Ok(certificates) => certificates,
             Err(error) => {
                 eprintln!(
                     "证书：{node} 的证书差异判定失败（{error}），这一轮不带证书",
                     node = node.node_id
                 );
-                None
+                Vec::new()
             }
         }
     } else {
-        None
+        Vec::new()
     };
 
     let response = match state.store.claim_desired_for_node(&node.node_id).await? {
@@ -3867,17 +3867,17 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             Json(
                 brocade_deployment::protocol::DesiredStateResponse::Deployment {
                     deployment: desired,
-                    certificate,
+                    certificates,
                 },
             )
             .into_response()
         }
-        None => match certificate {
-            Some(material) => {
-                Json(brocade_deployment::protocol::DesiredStateResponse::Certificate(material))
+        None => match certificates.is_empty() {
+            false => {
+                Json(brocade_deployment::protocol::DesiredStateResponse::Certificates(certificates))
                     .into_response()
             }
-            None => StatusCode::NO_CONTENT.into_response(),
+            true => StatusCode::NO_CONTENT.into_response(),
         },
     };
     Ok(with_agent_log_policy(response, log_limits))
@@ -4011,24 +4011,16 @@ async fn agent_runtime(
     // report its runtime normally and update nothing here.
     match &request.certificate {
         brocade_deployment::protocol::CertificateObservation::Unmanaged => {}
-        brocade_deployment::protocol::CertificateObservation::Absent => {
+        brocade_deployment::protocol::CertificateObservation::Managed {
+            public_ca,
+            self_signed,
+        } => {
             state
                 .store
                 .record_certificate_observation_at(
                     &node.node_id,
-                    "absent",
-                    None,
-                    request.observed_at_unix_secs,
-                )
-                .await?;
-        }
-        brocade_deployment::protocol::CertificateObservation::Present { sha256 } => {
-            state
-                .store
-                .record_certificate_observation_at(
-                    &node.node_id,
-                    "present",
-                    Some(sha256),
+                    public_ca,
+                    self_signed,
                     request.observed_at_unix_secs,
                 )
                 .await?;

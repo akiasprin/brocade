@@ -30,7 +30,7 @@ export function Login({ branding, onLogin }: { branding: BrandingSettings; onLog
     <div className="fw active login-fw">
       <div className="fw-head">
         <span className="fw-kind">{initialized ? '登录' : '初始化'}</span>
-        <span className="fw-title">{branding.site_name} | 🛰️ 跨境网络小管家</span>
+        <span className="fw-title">{branding.site_name} | 跨境网络小管家</span>
       </div>
       <div className="fw-body">
         {auth.isPending ? (

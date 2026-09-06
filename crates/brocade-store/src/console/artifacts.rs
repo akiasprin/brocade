@@ -1,6 +1,6 @@
 //! Artifact index and contents. Artifacts are a pure function of the snapshot — computed on
 //! demand rather than looked up, which is how a draft can have artifacts too.
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use brocade_core::artifacts::hy2_port_hop::Hy2PortHopArtifact;
 use brocade_core::format::uri::UriRenderOptions;
@@ -153,7 +153,7 @@ pub async fn artifact_content(
     filter: SubscriptionFilter,
 ) -> Result<ArtifactContent> {
     let snapshot = load_scoped_snapshot(pool, actor, revision).await?;
-    let self_signed_names = crate::cert::self_signed_certificate_names(pool).await?;
+    let self_signed_names = crate::cert::self_signed_certificate_pins(pool).await?;
     artifact_content_of(
         &snapshot,
         target_kind,
@@ -196,7 +196,7 @@ pub async fn serving_user_artifact_content(
     let serving = crate::serving::load_subscription_serving_projection(pool).await?;
     ensure_user_visible(&serving.snapshot, tenant_id, user_id)?;
     serving.ensure_available()?;
-    let self_signed_names = crate::cert::self_signed_certificate_names(pool).await?;
+    let self_signed_names = crate::cert::self_signed_certificate_pins(pool).await?;
     artifact_content_of_with_policy(
         &serving.snapshot,
         "user",
@@ -225,7 +225,7 @@ pub(crate) fn artifact_content_of(
     artifact_kind: &str,
     redact: bool,
     filter: SubscriptionFilter,
-    self_signed_names: &BTreeSet<String>,
+    self_signed_names: &BTreeMap<String, String>,
 ) -> Result<ArtifactContent> {
     artifact_content_of_with_policy(
         snapshot,
@@ -244,7 +244,7 @@ pub(crate) fn artifact_content_of(
 struct ArtifactRenderPolicy<'a> {
     redact: bool,
     filter: SubscriptionFilter,
-    self_signed_names: &'a BTreeSet<String>,
+    self_signed_names: &'a BTreeMap<String, String>,
     allow_insecure: bool,
 }
 

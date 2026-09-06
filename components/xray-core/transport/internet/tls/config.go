@@ -45,9 +45,14 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 	return root, nil
 }
 
-// BuildCertificates builds a list of TLS certificates from proto definition.
-func (c *Config) BuildCertificates() []*tls.Certificate {
-	certs := make([]*tls.Certificate, 0, len(c.Certificate))
+type certificateStore struct {
+	access sync.RWMutex
+	certs  []*tls.Certificate
+}
+
+func (c *Config) buildCertificateStore() *certificateStore {
+	store := &certificateStore{certs: make([]*tls.Certificate, 0, len(c.Certificate))}
+	entries := make([]*Certificate, 0, len(c.Certificate))
 	for _, entry := range c.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
@@ -66,14 +71,33 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 			return &keyPair
 		}
 		if keyPair := getX509KeyPair(); keyPair != nil {
-			certs = append(certs, keyPair)
+			store.certs = append(store.certs, keyPair)
+			entries = append(entries, entry)
 		} else {
 			continue
 		}
-		index := len(certs) - 1
-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
-			cert := certs[index]
+	}
+
+	for index, entry := range entries {
+		entry := entry
+		setupCertificateWatchers(entry, func(isReloaded, isOcspstapling bool) {
+			store.access.Lock()
+			defer store.access.Unlock()
+			cert := store.certs[index]
 			if isReloaded {
+				getX509KeyPair := func() *tls.Certificate {
+					keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
+					if err != nil {
+						errors.LogWarningInner(context.Background(), err, "ignoring invalid X509 key pair")
+						return nil
+					}
+					keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
+					if err != nil {
+						errors.LogWarningInner(context.Background(), err, "ignoring invalid certificate")
+						return nil
+					}
+					return &keyPair
+				}
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
 					cert = newKeyPair
 				} else {
@@ -87,47 +111,68 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 					cert.OCSPStaple = newOCSPData
 				}
 			}
-			certs[index] = cert
+			store.certs[index] = cert
 		})
 	}
-	return certs
+	return store
 }
 
-func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
-	go func() {
-		if entry.OneTimeLoading {
-			return
+// BuildCertificates builds a list of TLS certificates from proto definition.
+func (c *Config) BuildCertificates() []*tls.Certificate {
+	return c.buildCertificateStore().certs
+}
+
+func setupCertificateWatchers(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
+	if entry.OneTimeLoading {
+		return
+	}
+
+	if entry.CertificatePath != "" && entry.KeyPath != "" {
+		reloadInterval := entry.ReloadInterval
+		if reloadInterval == 0 {
+			reloadInterval = entry.OcspStapling
+			if reloadInterval == 0 {
+				reloadInterval = 3600
+			}
 		}
-		var isOcspstapling bool
-		hotReloadCertInterval := uint64(3600)
-		if entry.OcspStapling != 0 {
-			hotReloadCertInterval = entry.OcspStapling
-			isOcspstapling = true
-		}
-		t := time.NewTicker(time.Duration(hotReloadCertInterval) * time.Second)
-		for {
-			var isReloaded bool
-			if entry.CertificatePath != "" && entry.KeyPath != "" {
+		go func() {
+			t := time.NewTicker(time.Duration(reloadInterval) * time.Second)
+			defer t.Stop()
+			for {
+				var isReloaded bool
 				newCert, err := filesystem.ReadCert(entry.CertificatePath)
 				if err != nil {
 					errors.LogErrorInner(context.Background(), err, "failed to parse certificate")
-					return
+					<-t.C
+					continue
 				}
 				newKey, err := filesystem.ReadCert(entry.KeyPath)
 				if err != nil {
 					errors.LogErrorInner(context.Background(), err, "failed to parse key")
-					return
+					<-t.C
+					continue
 				}
 				if string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key) {
 					entry.Certificate = newCert
 					entry.Key = newKey
 					isReloaded = true
 				}
+				callback(isReloaded, false)
+				<-t.C
 			}
-			callback(isReloaded, isOcspstapling)
-			<-t.C
-		}
-	}()
+		}()
+	}
+
+	if entry.OcspStapling != 0 {
+		go func() {
+			t := time.NewTicker(time.Duration(entry.OcspStapling) * time.Second)
+			defer t.Stop()
+			for {
+				callback(false, true)
+				<-t.C
+			}
+		}()
+	}
 }
 
 func isCertificateExpired(c *tls.Certificate) bool {
@@ -163,7 +208,7 @@ func (c *Config) getCustomCA() []*Certificate {
 	for _, certificate := range c.Certificate {
 		if certificate.Usage == Certificate_AUTHORITY_ISSUE {
 			certs = append(certs, certificate)
-			setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {})
+			setupCertificateWatchers(certificate, func(isReloaded, isOcspstapling bool) {})
 		}
 	}
 	return certs
@@ -243,20 +288,22 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(store *certificateStore, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		if len(certs) == 0 {
+		store.access.RLock()
+		defer store.access.RUnlock()
+		if len(store.certs) == 0 {
 			return nil, errNoCertificates
 		}
 		sni := strings.ToLower(hello.ServerName)
-		if !rejectUnknownSNI && (len(certs) == 1 || sni == "") {
-			return certs[0], nil
+		if !rejectUnknownSNI && (len(store.certs) == 1 || sni == "") {
+			return store.certs[0], nil
 		}
 		gsni := "*"
 		if index := strings.IndexByte(sni, '.'); index != -1 {
 			gsni += sni[index:]
 		}
-		for _, keyPair := range certs {
+		for _, keyPair := range store.certs {
 			if keyPair.Leaf.Subject.CommonName == sni || keyPair.Leaf.Subject.CommonName == gsni {
 				return keyPair, nil
 			}
@@ -269,7 +316,7 @@ func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) f
 		if rejectUnknownSNI {
 			return nil, errNoCertificates
 		}
-		return certs[0], nil
+		return store.certs[0], nil
 	}
 }
 
@@ -409,7 +456,8 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	if len(caCerts) > 0 {
 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
+		store := c.buildCertificateStore()
+		config.GetCertificate = getNewGetCertificateFunc(store, c.RejectUnknownSni)
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {

@@ -525,6 +525,7 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4]) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),
             public_key: format!("pub-{id}"),
@@ -1081,7 +1082,11 @@ fn self_signed_anytls_is_hidden_by_default_and_only_insecure_on_explicit_render(
             ..AnyTls::default()
         });
     }));
-    artifact.mark_self_signed(&["hk-cert.example.net".to_owned()].into_iter().collect());
+    artifact.mark_self_signed(
+        &[("hk-cert.example.net".to_owned(), "aa".repeat(32))]
+            .into_iter()
+            .collect(),
+    );
 
     let safe_uri = uri::subscription(&artifact);
     assert!(!safe_uri.contains("anytls://"), "{safe_uri}");
@@ -1099,7 +1104,11 @@ fn self_signed_anytls_is_hidden_by_default_and_only_insecure_on_explicit_render(
 
     let clash = yaml::clash_subscription(&artifact);
     assert!(clash.contains("type: anytls"), "{clash}");
-    assert!(clash.contains("skip-cert-verify: true"), "{clash}");
+    assert!(
+        clash.contains(&format!("fingerprint: {}", "AA".repeat(32))),
+        "{clash}"
+    );
+    assert!(!clash.contains("skip-cert-verify"), "{clash}");
 }
 
 #[test]
@@ -1107,7 +1116,11 @@ fn self_signed_vless_uri_is_never_rendered_without_a_portable_trust_field() {
     let mut artifact = subscription::build(&plan(|face| {
         face.wires = IngressWires::Vless(Transport::VlessTls(Tls::default()));
     }));
-    artifact.mark_self_signed(&["hk-cert.example.net".to_owned()].into_iter().collect());
+    artifact.mark_self_signed(
+        &[("hk-cert.example.net".to_owned(), "bb".repeat(32))]
+            .into_iter()
+            .collect(),
+    );
 
     let explicit_uri = uri::subscription_with_options(
         &artifact,
@@ -1120,7 +1133,11 @@ fn self_signed_vless_uri_is_never_rendered_without_a_portable_trust_field() {
 
     let clash = yaml::clash_subscription(&artifact);
     assert!(clash.contains("type: vless"), "{clash}");
-    assert!(clash.contains("skip-cert-verify: true"), "{clash}");
+    assert!(
+        clash.contains(&format!("fingerprint: {}", "BB".repeat(32))),
+        "{clash}"
+    );
+    assert!(!clash.contains("skip-cert-verify"), "{clash}");
 }
 
 #[test]

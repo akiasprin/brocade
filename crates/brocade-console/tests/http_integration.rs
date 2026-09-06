@@ -4702,6 +4702,56 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn first_start_issues_the_default_self_signed_primary_and_standby_pair() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 2);
+    assert_eq!(brocade_console::certs::scan_once(&db.store).await, (2, 0));
+
+    let groups = db
+        .store
+        .cert_groups(&AdminContext::system_admin("test-admin"))
+        .await
+        .unwrap();
+    assert_eq!(groups.len(), 1);
+    let certificates = &groups[0].certificates;
+    assert_eq!(certificates.len(), 2);
+    assert_eq!(
+        certificates
+            .iter()
+            .map(|certificate| certificate.status.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["ready", "serving"])
+    );
+    assert_eq!(
+        certificates
+            .iter()
+            .filter_map(|certificate| certificate.runtime_slot.as_deref())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["a", "b"])
+    );
+    assert_ne!(
+        certificates[0].certificate_name,
+        certificates[1].certificate_name
+    );
+    let issued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM certificates
+          WHERE cert_pem IS NOT NULL AND key_pem_sealed IS NOT NULL AND peer_sha256 IS NOT NULL",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(issued, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     std::env::set_var(
         brocade_store::secrets::SECRET_KEY_ENV,
@@ -4786,9 +4836,19 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     let peer_sha256: String = row.try_get("peer_sha256").unwrap();
     assert!(!sealed_key.contains("BEGIN PRIVATE KEY"));
     assert_eq!(peer_sha256.len(), 64);
-    let material = db.store.cert_delta_for_node("n1").await.unwrap().unwrap();
-    assert_eq!(material.cert_pem.matches("BEGIN CERTIFICATE").count(), 1);
-    assert!(material.key_pem.contains("BEGIN PRIVATE KEY"));
+    let material = db.store.cert_delta_for_node("n1").await.unwrap().remove(0);
+    assert_eq!(
+        material.slots[0]
+            .cert_pem
+            .matches("BEGIN CERTIFICATE")
+            .count(),
+        1
+    );
+    assert!(material.slots[0].key_pem.contains("BEGIN PRIVATE KEY"));
+    assert_eq!(
+        material.track,
+        brocade_deployment::protocol::CertificateTrack::SelfSigned
+    );
 }
 
 async fn apply_step_json(

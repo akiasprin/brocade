@@ -225,22 +225,24 @@ describe('设置页分段保存的基准', () => {
     ROUTES['/certs'] = certsWithGroup;
     render(<Harness />);
 
-    await screen.findByText(/默认维护 5 张自签证书/);
+    await screen.findByText(/默认维护一对主备自签证书/);
     expect(screen.queryByPlaceholderText('example.net')).toBeNull();
     expect(screen.getByText(/单张有效期 100 年/)).toBeTruthy();
     expect(screen.getByText(/不再拼接二级域名或通配符/)).toBeTruthy();
   });
 
-  it('自签证书池到 10 张后禁用继续添加', async () => {
+  it('自签证书主备槽占满后禁用继续添加', async () => {
     const full = certsWithGroup();
     full.groups[0].name = '默认组';
     full.groups[0].is_default = true;
     full.groups[0].names = ['northstar-edge-0123abcd.com'];
-    full.groups[0].certificates = Array.from({ length: 10 }, (_, index) => ({
+    full.groups[0].certificates = Array.from({ length: 2 }, (_, index) => ({
       id: `cert-${index}`,
       status: index === 0 ? 'serving' : 'ready',
       origin: 'bootstrap',
       signing_method: 'self-signed',
+      certificate_name: `private-${index}.com`,
+      runtime_slot: index === 0 ? 'a' : 'b',
       issuer: 'Northstar Edge Root CA',
       issued_at: '2026-01-01T00:00:00Z',
       expires_at: '2126-01-01T00:00:00Z',
@@ -254,8 +256,8 @@ describe('设置页分段保存的基准', () => {
 
     const add = await screen.findByRole('button', { name: '加一张备用' });
     expect((add as HTMLButtonElement).disabled).toBe(true);
-    expect(add.getAttribute('title')).toContain('最多 10 张');
-    expect(screen.getByLabelText('证书组概况').textContent).toContain('10/10证书池');
+    expect(add.getAttribute('title')).toContain('主备槽已经占满');
+    expect(screen.getByLabelText('证书组概况').textContent).toContain('2/2运行槽');
     expect((screen.getByRole('button', { name: '改名' }) as HTMLButtonElement).disabled).toBe(true);
   });
 

@@ -723,11 +723,7 @@ export const rotateUserUuid = (tenant: string, user: string) =>
 
 export const fetchMyUser = () => api<UserListItem>('/me/user');
 
-export const updateUserProfile = (
-  tenant: string,
-  user: string,
-  body: { account_type: 'formal' | 'test' },
-) =>
+export const updateUserProfile = (tenant: string, user: string, body: { account_type: 'formal' | 'test' }) =>
   api<UserListItem>(`/users/${tenant}/${user}/profile`, '', {
     method: 'PUT',
     body: JSON.stringify(body),
@@ -2248,7 +2244,7 @@ export interface CertDomainInput {
     信任集合仍会接受它，管理员需要显式删除才会撤销这份信任。
     `pending` 尚未签发；`ready` 已签好、待命；`serving` 该组机器当前出示的这张；
     `superseded` 曾经出示、已被换下；`failed` 签发失败，该行留着记录原因。 */
-export type CertStatus = 'pending' | 'ready' | 'serving' | 'superseded' | 'failed';
+export type CertStatus = 'pending' | 'ready' | 'serving' | 'compatible' | 'superseded' | 'failed';
 
 /** 这张证书为什么存在，决定它签好之后是否立即接管。
     `renewal`：扫描发现当前这张快到期而自动排的，签好即接管——留着等人点，就是证书过期而替代品
@@ -2260,6 +2256,8 @@ export interface GroupCertificate {
   status: CertStatus;
   origin: CertOrigin;
   signing_method: 'public-ca' | 'self-signed';
+  certificate_name: string | null;
+  runtime_slot: 'a' | 'b' | null;
   /** 签发者的 CN，从证书**字节中**解析得出，不是根据设置推导。两者可能不一致，而只有前者
       反映实际情况——若机队几个月前设为 staging 且未改回，每张都显示已签发但没有任何客户端
       信任它，该字段是唯一能反映该问题的位置。Let's Encrypt 的 staging 名称刻意使用明显的
@@ -2333,11 +2331,7 @@ export const saveCertDomain = (body: CertDomainInput) =>
     保持请求等待会使页面依赖一个不确定的时长。页面通过轮询获取进展，具体状态显示在行内。 */
 export const scanCerts = () => api<CertsView>('/certs/scan', '', { method: 'POST' });
 
-export const createCertGroup = (body: {
-  name: string;
-  note?: string | null;
-  certificate_name?: string | null;
-}) =>
+export const createCertGroup = (body: { name: string; note?: string | null; certificate_name?: string | null }) =>
   api<{ id: string }>('/certs/groups', '', { method: 'POST', body: JSON.stringify(body) });
 export const updateCertGroup = (id: string, body: { name?: string; note?: string | null }) =>
   api<void>(`/certs/groups/${encodeURIComponent(id)}`, '', {

@@ -86,6 +86,9 @@ type Certificate struct {
 	// If true, one-Time Loading
 	OneTimeLoading bool `protobuf:"varint,7,opt,name=One_time_loading,json=OneTimeLoading,proto3" json:"One_time_loading,omitempty"`
 	BuildChain     bool `protobuf:"varint,8,opt,name=build_chain,json=buildChain,proto3" json:"build_chain,omitempty"`
+	// Experimental interval, in seconds, for re-reading an already configured
+	// certificate file. Zero keeps the default one-hour interval.
+	ReloadInterval uint64 `protobuf:"varint,9,opt,name=reload_interval,json=reloadInterval,proto3" json:"reload_interval,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -174,6 +177,13 @@ func (x *Certificate) GetBuildChain() bool {
 		return x.BuildChain
 	}
 	return false
+}
+
+func (x *Certificate) GetReloadInterval() uint64 {
+	if x != nil {
+		return x.ReloadInterval
+	}
+	return 0
 }
 
 type Config struct {
@@ -379,7 +389,7 @@ var File_transport_internet_tls_config_proto protoreflect.FileDescriptor
 
 const file_transport_internet_tls_config_proto_rawDesc = "" +
 	"\n" +
-	"#transport/internet/tls/config.proto\x12\x1bxray.transport.internet.tls\x1a\x1ftransport/internet/config.proto\"\x83\x03\n" +
+	"#transport/internet/tls/config.proto\x12\x1bxray.transport.internet.tls\x1a\x1ftransport/internet/config.proto\"\xac\x03\n" +
 	"\vCertificate\x12 \n" +
 	"\vcertificate\x18\x01 \x01(\fR\vcertificate\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12D\n" +
@@ -389,7 +399,8 @@ const file_transport_internet_tls_config_proto_rawDesc = "" +
 	"\bkey_path\x18\x06 \x01(\tR\akeyPath\x12(\n" +
 	"\x10One_time_loading\x18\a \x01(\bR\x0eOneTimeLoading\x12\x1f\n" +
 	"\vbuild_chain\x18\b \x01(\bR\n" +
-	"buildChain\"D\n" +
+	"buildChain\x12'\n" +
+	"\x0freload_interval\x18\t \x01(\x04R\x0ereloadInterval\"D\n" +
 	"\x05Usage\x12\x10\n" +
 	"\fENCIPHERMENT\x10\x00\x12\x14\n" +
 	"\x10AUTHORITY_VERIFY\x10\x01\x12\x13\n" +

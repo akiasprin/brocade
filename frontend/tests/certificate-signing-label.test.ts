@@ -7,6 +7,8 @@ const certificate = (signingMethod: GroupCertificate['signing_method'], issuer: 
   status: 'serving',
   origin: 'spare',
   signing_method: signingMethod,
+  certificate_name: signingMethod === 'self-signed' ? 'private.example.com' : null,
+  runtime_slot: 'a',
   issuer,
   issued_at: '2026-09-06T00:00:00Z',
   expires_at: '2126-09-06T00:00:00Z',

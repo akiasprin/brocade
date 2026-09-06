@@ -13,8 +13,8 @@ use crate::plan::{
 /// response body as a `NodeDesiredDeployment`, and an enum-shaped body fails that outright —
 /// which is deliberate. An agent that silently ignored the `certificate` field would read as
 /// converged while never writing the file.
-pub const AGENT_PROTOCOL_VERSION: u32 = 4;
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 4;
+pub const AGENT_PROTOCOL_VERSION: u32 = 5;
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 5;
 
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
@@ -175,14 +175,14 @@ pub struct NodeDesiredDeployment {
 pub enum DesiredStateResponse {
     /// Nothing to converge, certificate included. Sent as HTTP 204 rather than serialized.
     Converged,
-    /// A deployment is owed. `certificate` is set when the cert check found drift, so the
+    /// A deployment is owed. `certificates` contains every drifted trust track, so the
     /// deploy path always carries the dependency confirmation with it.
     Deployment {
         deployment: NodeDesiredDeployment,
-        certificate: Option<NodeCertificateMaterial>,
+        certificates: Vec<NodeCertificateMaterial>,
     },
-    /// No deployment is owed but the certificate is missing or stale.
-    Certificate(NodeCertificateMaterial),
+    /// No deployment is owed but one or both independent certificate tracks are missing or stale.
+    Certificates(Vec<NodeCertificateMaterial>),
 }
 
 /// What a node reports about the certificate it actually holds.
@@ -207,11 +207,30 @@ pub enum CertificateObservation {
     /// Not reported. An agent from before this existed, and nothing to conclude from it.
     #[default]
     Unmanaged,
-    /// Looked, and there is no certificate on disk. Normal before the first one arrives; a fault
-    /// afterwards, and the one this whole report exists to make visible.
-    Absent,
-    /// The sha256 of `cert.pem` as it is on disk, lowercase hex.
-    Present { sha256: String },
+    /// Both independent certificate tracks were inspected. A missing digest means that physical
+    /// slot is absent or unreadable; the other track and slot remain independently observable.
+    Managed {
+        public_ca: CertificatePairObservation,
+        self_signed: CertificatePairObservation,
+    },
+}
+
+/// What is present in one track's two fixed runtime slots.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CertificatePairObservation {
+    #[serde(default)]
+    pub slot_a_sha256: Option<String>,
+    #[serde(default)]
+    pub slot_b_sha256: Option<String>,
+}
+
+/// The trust track a certificate belongs to. It is frozen on the issued certificate and is never
+/// inferred from the control plane's current global signing setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateTrack {
+    PublicCa,
+    SelfSigned,
 }
 
 /// A certificate and its key, on their way to one node.
@@ -244,9 +263,18 @@ pub enum CertificateObservation {
 /// route.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCertificateMaterial {
-    /// Both names the certificate covers: the wildcard and the bare label. Sent so the agent can
-    /// record what it holds without parsing the certificate, and so a person reading the desired
-    /// state can see which names are in play.
+    /// Publicly trusted and self-signed materials live under different directories and are never
+    /// loaded into the same Xray certificate set.
+    pub track: CertificateTrack,
+    /// The two files Xray knows from process start. A track with only one live identity repeats it
+    /// in both slots, so every configured path always contains a valid certificate and key.
+    pub slots: [NodeCertificateSlotMaterial; 2],
+}
+
+/// One complete certificate identity assigned to a fixed physical slot.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCertificateSlotMaterial {
+    pub certificate_id: String,
     pub names: Vec<String>,
     /// The full chain, leaf first, which is what a TLS server presents. Not the leaf alone: a
     /// missing intermediate works in a browser with a cached intermediate and fails everywhere
@@ -261,6 +289,16 @@ pub struct NodeCertificateMaterial {
 impl std::fmt::Debug for NodeCertificateMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeCertificateMaterial")
+            .field("track", &self.track)
+            .field("slots", &self.slots)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NodeCertificateSlotMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCertificateSlotMaterial")
+            .field("certificate_id", &self.certificate_id)
             .field("names", &self.names)
             .field("cert_pem", &"<redacted>")
             .field("key_pem", &"<redacted>")
@@ -1977,20 +2015,26 @@ mod tests {
     /// certificate — which is exactly what the protocol version gate exists to prevent. This
     /// test pins the tag so a rename cannot slip in as a serde detail.
     #[test]
-    fn the_certificate_variant_serializes_as_a_tagged_enum() {
-        let material = NodeCertificateMaterial {
-            names: vec!["*.a.example.net".to_owned(), "a.example.net".to_owned()],
+    fn the_certificates_variant_serializes_as_a_tagged_enum() {
+        let slot = NodeCertificateSlotMaterial {
+            certificate_id: "cert-a".to_owned(),
+            names: vec!["a.example.net".to_owned()],
             cert_pem: "CERT".to_owned(),
             key_pem: "KEY".to_owned(),
         };
+        let material = NodeCertificateMaterial {
+            track: CertificateTrack::SelfSigned,
+            slots: [slot.clone(), slot],
+        };
         let wire =
-            serde_json::to_string(&DesiredStateResponse::Certificate(material.clone())).unwrap();
+            serde_json::to_string(&DesiredStateResponse::Certificates(vec![material.clone()]))
+                .unwrap();
         assert_eq!(
             wire,
-            r#"{"t":"certificate","v":{"names":["*.a.example.net","a.example.net"],"cert_pem":"CERT","key_pem":"KEY"}}"#
+            r#"{"t":"certificates","v":[{"track":"self-signed","slots":[{"certificate_id":"cert-a","names":["a.example.net"],"cert_pem":"CERT","key_pem":"KEY"},{"certificate_id":"cert-a","names":["a.example.net"],"cert_pem":"CERT","key_pem":"KEY"}]}]}"#
         );
         let parsed: DesiredStateResponse = serde_json::from_str(&wire).unwrap();
-        assert_eq!(parsed, DesiredStateResponse::Certificate(material));
+        assert_eq!(parsed, DesiredStateResponse::Certificates(vec![material]));
     }
 
     #[test]

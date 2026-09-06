@@ -432,14 +432,15 @@ async fn migrations_bootstrap_empty_snapshot() {
     assert_eq!(
         reality_defaults
             .try_get::<Option<String>, _>("reality_dest")
-            .unwrap(),
-        None
+            .unwrap()
+            .as_deref(),
+        Some("addons.mozilla.org:443")
     );
     assert_eq!(
         reality_defaults
             .try_get::<serde_json::Value, _>("reality_server_names")
             .unwrap(),
-        json!([])
+        json!(["addons.mozilla.org"])
     );
 
     let branding =
@@ -14190,7 +14191,7 @@ async fn retained_certificate_trust_survives_expiry_and_ca_switch_until_manual_d
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn changing_a_nodes_certificate_group_keeps_the_previous_groups_pins() {
+async fn changing_a_nodes_certificate_group_publishes_only_the_current_pin() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -14271,9 +14272,7 @@ async fn changing_a_nodes_certificate_group_keeps_the_previous_groups_pins() {
         .pinned_peer_cert_sha256
         .as_deref()
         .unwrap();
-    let mut pins = pins.split(',').collect::<Vec<_>>();
-    pins.sort_unstable();
-    assert_eq!(pins, [old_pin, new_pin]);
+    assert_eq!(pins, new_pin);
 
     db.store
         .delete_cert_label(&system_admin(), &old_label)
@@ -14333,7 +14332,7 @@ async fn renewal_failure_does_not_withdraw_an_unexpired_certificate() {
         .await
         .unwrap();
 
-    assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_some());
+    assert!(!db.store.cert_delta_for_node("n1").await.unwrap().is_empty());
     let dns_targets = db.store.certificate_dns_targets().await.unwrap();
     assert_eq!(dns_targets.len(), 1);
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
@@ -14361,7 +14360,7 @@ async fn cert_delta_is_some_until_the_node_reports_the_serving_certificate() {
     );
 
     // No group bound, nothing issued: nothing is expected of this dimension.
-    assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_none());
+    assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_empty());
 
     db.store
         .upsert_cert_domain(
@@ -14380,33 +14379,148 @@ async fn cert_delta_is_some_until_the_node_reports_the_serving_certificate() {
     issue_certificate_for(&db, "n1", "Test CA").await;
 
     // Serving now exists and the node has never reported: owed.
-    let material = db.store.cert_delta_for_node("n1").await.unwrap().unwrap();
+    let material = db.store.cert_delta_for_node("n1").await.unwrap().remove(0);
+    let empty = brocade_deployment::protocol::CertificatePairObservation::default();
 
     // Reported absent: still owed.
     db.store
-        .record_certificate_observation("n1", "absent", None)
+        .record_certificate_observation("n1", &empty, &empty)
         .await
         .unwrap();
-    assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_some());
+    assert!(!db.store.cert_delta_for_node("n1").await.unwrap().is_empty());
 
     // Reported with a wrong sha: still owed.
     db.store
         .record_certificate_observation(
             "n1",
-            "present",
-            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            &brocade_deployment::protocol::CertificatePairObservation {
+                slot_a_sha256: Some(
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+                ),
+                slot_b_sha256: Some(
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+                ),
+            },
+            &empty,
         )
         .await
         .unwrap();
-    assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_some());
+    assert!(!db.store.cert_delta_for_node("n1").await.unwrap().is_empty());
 
     // Reported with the serving sha: converged on this dimension.
-    let serving_sha = brocade_core::hash::sha256_hex(material.cert_pem.as_bytes());
+    let digest = |slot: &brocade_deployment::protocol::NodeCertificateSlotMaterial| {
+        brocade_core::hash::sha256_hex(
+            format!(
+                "{}\n{}\n",
+                slot.cert_pem.trim_end(),
+                slot.key_pem.trim_end()
+            )
+            .as_bytes(),
+        )
+    };
+    let current = brocade_deployment::protocol::CertificatePairObservation {
+        slot_a_sha256: Some(digest(&material.slots[0])),
+        slot_b_sha256: Some(digest(&material.slots[1])),
+    };
     db.store
-        .record_certificate_observation("n1", "present", Some(&serving_sha))
+        .record_certificate_observation("n1", &current, &empty)
         .await
         .unwrap();
-    assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_none());
+    assert!(db.store.cert_delta_for_node("n1").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn certificate_delta_carries_public_and_self_signed_tracks_independently() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "example.test".to_owned(),
+                signing_method: brocade_store::CertificateSigningMethod::PublicCa,
+                dns_credential: Some("token".to_owned()),
+                acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
+                acme_contact: Some("ops@example.test".to_owned()),
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    let label_id = db
+        .store
+        .create_cert_label(&system_admin(), &domain.id, "双轨", None)
+        .await
+        .unwrap();
+    db.store
+        .set_node_cert_label(&system_admin(), "n1", Some(&label_id))
+        .await
+        .unwrap();
+    issue_certificate_for(&db, "n1", "Test CA").await;
+
+    db.store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "example.test".to_owned(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    let self_signed = db
+        .store
+        .request_spare_certificate(&system_admin(), &label_id)
+        .await
+        .unwrap();
+    db.store
+        .record_certificate(IssuedCertificate {
+            certificate_id: &self_signed,
+            acme_directory: brocade_store::SELF_SIGNED_DIRECTORY,
+            cert_pem: "self-signed-certificate",
+            key_pem: "self-signed-private-key",
+            not_after: "2126-01-01T00:00:00Z",
+            issuer: "Private Root CA",
+            peer_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        })
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &self_signed).await, "ready");
+
+    let materials = db.store.cert_delta_for_node("n1").await.unwrap();
+    assert_eq!(materials.len(), 2);
+    assert_eq!(
+        materials
+            .iter()
+            .map(|material| material.track)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            brocade_deployment::protocol::CertificateTrack::PublicCa,
+            brocade_deployment::protocol::CertificateTrack::SelfSigned,
+        ])
+    );
+    assert!(materials
+        .iter()
+        .all(|material| { material.slots[0].certificate_id == material.slots[1].certificate_id }));
+    let switch = db
+        .store
+        .promote_certificate(&system_admin(), &self_signed)
+        .await
+        .unwrap_err();
+    assert!(matches!(switch, StoreError::Unsupported(_)), "{switch:?}");
 }
 
 /// A renewal takes over on arrival; a spare waits to be chosen.
@@ -16326,13 +16440,13 @@ async fn service_restore_and_new_grant_leave_no_orphaned_isolation_debt() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn a_fresh_install_bootstraps_one_five_leaf_self_signed_pool() {
+async fn a_fresh_install_bootstraps_a_self_signed_primary_and_standby() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
     db.store.migrate().await.unwrap();
 
-    assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 5);
+    assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 2);
     assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 0);
     let groups = db.store.cert_groups(&system_admin()).await.unwrap();
     assert_eq!(groups.len(), 1);
@@ -16342,16 +16456,74 @@ async fn a_fresh_install_bootstraps_one_five_leaf_self_signed_pool() {
     assert_eq!(group.names.len(), 1);
     assert!(group.names[0].ends_with(".com"));
     assert_eq!(group.names[0].matches('.').count(), 1);
-    assert_eq!(group.certificates.len(), 5);
+    assert_eq!(group.certificates.len(), 2);
     assert!(group
         .certificates
         .iter()
         .all(|certificate| certificate.origin == "bootstrap"));
+    assert_eq!(
+        group
+            .certificates
+            .iter()
+            .filter_map(|certificate| certificate.runtime_slot.as_deref())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["a", "b"])
+    );
+    assert_ne!(
+        group.certificates[0].certificate_name,
+        group.certificates[1].certificate_name
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn self_signed_pool_reuses_switched_leaves_and_stops_at_ten() {
+async fn an_older_install_with_custom_groups_still_receives_exactly_one_default_pair() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: String::new(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    db.store
+        .create_cert_label_with_certificate_name(
+            &system_admin(),
+            &domain.id,
+            "已有自定义组",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 2);
+    assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 0);
+    let groups = db.store.cert_groups(&system_admin()).await.unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups.iter().filter(|group| group.is_default).count(), 1);
+    let default = groups.iter().find(|group| group.is_default).unwrap();
+    assert_eq!(default.certificates.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn self_signed_rotation_keeps_one_compatible_identity_in_stable_slots() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -16409,31 +16581,192 @@ async fn self_signed_pool_reuses_switched_leaves_and_stops_at_ten() {
     }
     assert_eq!(status_of(&db, &issued[0]).await, "serving");
     assert_eq!(status_of(&db, &issued[1]).await, "ready");
+    let before = db.store.cert_groups(&system_admin()).await.unwrap();
+    let before = &before[0].certificates;
+    let first_slot = before
+        .iter()
+        .find(|cert| cert.id == issued[0])
+        .unwrap()
+        .runtime_slot
+        .as_deref();
+    let second_slot = before
+        .iter()
+        .find(|cert| cert.id == issued[1])
+        .unwrap()
+        .runtime_slot
+        .as_deref();
+    assert_eq!((first_slot, second_slot), (Some("a"), Some("b")));
+    assert_ne!(
+        before
+            .iter()
+            .find(|cert| cert.id == issued[0])
+            .unwrap()
+            .certificate_name,
+        before
+            .iter()
+            .find(|cert| cert.id == issued[1])
+            .unwrap()
+            .certificate_name,
+    );
     db.store
         .promote_certificate(&system_admin(), &issued[1])
         .await
         .unwrap();
-    assert_eq!(status_of(&db, &issued[0]).await, "ready");
+    assert_eq!(status_of(&db, &issued[0]).await, "compatible");
     assert_eq!(status_of(&db, &issued[1]).await, "serving");
-    db.store
-        .promote_certificate(&system_admin(), &issued[0])
-        .await
-        .unwrap();
-    assert_eq!(status_of(&db, &issued[0]).await, "serving");
-    assert_eq!(status_of(&db, &issued[1]).await, "ready");
-
-    for _ in 0..8 {
-        db.store
-            .request_spare_certificate(&system_admin(), &label_id)
-            .await
-            .unwrap();
-    }
     let error = db
         .store
         .request_spare_certificate(&system_admin(), &label_id)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("最多保留 10 张"));
+    assert!(error.to_string().contains("主备槽已经占满"));
+
+    db.store
+        .delete_certificate(&system_admin(), &issued[0])
+        .await
+        .unwrap();
+    let third = db
+        .store
+        .request_spare_certificate(&system_admin(), &label_id)
+        .await
+        .unwrap();
+    let after = db.store.cert_groups(&system_admin()).await.unwrap();
+    assert_eq!(
+        after[0]
+            .certificates
+            .iter()
+            .find(|cert| cert.id == third)
+            .unwrap()
+            .runtime_slot
+            .as_deref(),
+        Some("a")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn self_signed_publication_waits_for_every_assigned_node_to_preload_both_slots() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: String::new(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    let label_id = db
+        .store
+        .create_cert_label_with_certificate_name(
+            &system_admin(),
+            &domain.id,
+            "轮换门禁",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.store
+        .set_node_cert_label(&system_admin(), "n1", Some(&label_id))
+        .await
+        .unwrap();
+
+    let mut certificates = Vec::new();
+    for (suffix, pin) in [
+        (
+            'a',
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            'b',
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ] {
+        let id = db
+            .store
+            .request_spare_certificate(&system_admin(), &label_id)
+            .await
+            .unwrap();
+        let cert_pem = format!("certificate-{suffix}");
+        let key_pem = format!("private-key-{suffix}");
+        db.store
+            .record_certificate(IssuedCertificate {
+                certificate_id: &id,
+                acme_directory: brocade_store::SELF_SIGNED_DIRECTORY,
+                cert_pem: &cert_pem,
+                key_pem: &key_pem,
+                not_after: "2126-01-01T00:00:00Z",
+                issuer: "Private Root CA",
+                peer_sha256: pin,
+            })
+            .await
+            .unwrap();
+        certificates.push(id);
+    }
+
+    let blocked = db
+        .store
+        .promote_certificate(&system_admin(), &certificates[1])
+        .await
+        .unwrap_err();
+    assert!(matches!(blocked, StoreError::Conflict(_)), "{blocked:?}");
+    assert!(blocked.to_string().contains("n1"));
+    assert_eq!(status_of(&db, &certificates[0]).await, "serving");
+    assert_eq!(status_of(&db, &certificates[1]).await, "ready");
+
+    let material = db
+        .store
+        .cert_delta_for_node("n1")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|material| {
+            material.track == brocade_deployment::protocol::CertificateTrack::SelfSigned
+        })
+        .unwrap();
+    let digest = |slot: &brocade_deployment::protocol::NodeCertificateSlotMaterial| {
+        brocade_core::hash::sha256_hex(
+            format!(
+                "{}\n{}\n",
+                slot.cert_pem.trim_end(),
+                slot.key_pem.trim_end()
+            )
+            .as_bytes(),
+        )
+    };
+    let observed = brocade_deployment::protocol::CertificatePairObservation {
+        slot_a_sha256: Some(digest(&material.slots[0])),
+        slot_b_sha256: Some(digest(&material.slots[1])),
+    };
+    db.store
+        .record_certificate_observation(
+            "n1",
+            &brocade_deployment::protocol::CertificatePairObservation::default(),
+            &observed,
+        )
+        .await
+        .unwrap();
+    db.store
+        .promote_certificate(&system_admin(), &certificates[1])
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &certificates[0]).await, "compatible");
+    assert_eq!(status_of(&db, &certificates[1]).await, "serving");
 }
 
 #[tokio::test]

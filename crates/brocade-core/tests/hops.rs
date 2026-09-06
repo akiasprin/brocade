@@ -894,6 +894,7 @@ fn node(id: &str, overlay_addr: [u8; 4], on_overlay: bool) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay_addr),
         certificate_name: None,
+        certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),
             public_key: format!("pub-{id}"),

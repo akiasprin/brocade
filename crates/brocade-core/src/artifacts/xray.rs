@@ -6,9 +6,9 @@ use crate::{
     hash::hex_lower,
     ir::{hops::HopDialWire, routing::DestMatch},
     model::{
-        AnyTls, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsTransport,
-        ExternalOutboundProtocol, ExternalOutboundSecurity, GeodataSettings, HopPool, HopWire,
-        Hysteria2, Network, RealityClientPolicy, XhttpTuning,
+        AnyTls, CertificateTrack, Dns, DomainStrategy, EgressDnsAddressStrategy,
+        EgressDnsTransport, ExternalOutboundProtocol, ExternalOutboundSecurity, GeodataSettings,
+        HopPool, HopWire, Hysteria2, Network, RealityClientPolicy, XhttpTuning,
     },
     physical::node::{
         IngressProtocol, IngressSecurity, NodePlan, XrayClientPlan, XrayEgressDnsPlan,
@@ -30,8 +30,18 @@ use crate::{
 /// time holds its certificate elsewhere, and a TLS ingress on it fails at `xray -test` naming the
 /// path it could not open. That failure appears in the agent's report rather than leaving the
 /// ingress serving nothing.
-pub const NODE_CERTIFICATE_FILE: &str = "/var/lib/brocade-agent/tls/cert.pem";
-pub const NODE_CERTIFICATE_KEY_FILE: &str = "/var/lib/brocade-agent/tls/key.pem";
+pub const NODE_PUBLIC_CA_CERTIFICATE_FILES: [&str; 2] = [
+    "/var/lib/brocade-agent/tls/public-ca/slot-a.pem",
+    "/var/lib/brocade-agent/tls/public-ca/slot-b.pem",
+];
+pub const NODE_SELF_SIGNED_CERTIFICATE_FILES: [&str; 2] = [
+    "/var/lib/brocade-agent/tls/self-signed/slot-a.pem",
+    "/var/lib/brocade-agent/tls/self-signed/slot-b.pem",
+];
+// Compatibility names for callers that only inspect the first public-CA slot. New code must use
+// the pair constants above; certificate and key intentionally share one combined PEM path.
+pub const NODE_CERTIFICATE_FILE: &str = NODE_PUBLIC_CA_CERTIFICATE_FILES[0];
+pub const NODE_CERTIFICATE_KEY_FILE: &str = NODE_PUBLIC_CA_CERTIFICATE_FILES[0];
 
 pub const API_TAG: &str = "api";
 pub const DNS_TAG: &str = "dns-out";
@@ -231,8 +241,9 @@ pub enum XrayIngressSecurity {
     /// machine keeps its state is that machine's business, set at install time, and a compiler
     /// that had to know it would stop being a function of the model alone.
     Tls {
-        certificate_file: String,
-        key_file: String,
+        /// Two fixed paths configured from process start. Each path is one combined PEM containing
+        /// its certificate chain and private key, so an atomic rename cannot expose a mixed pair.
+        certificate_files: [String; 2],
         /// `None` keeps xray's normal negotiation. The local HTTP-403 cover pins HTTP/1.1 because
         /// blackhole's built-in response is an HTTP/1.1 byte string, not an HTTP/2 frame.
         alpn: Option<Vec<String>>,
@@ -689,11 +700,13 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             address: "127.0.0.1".to_owned(),
         });
     }
-    inbounds.extend(
-        xray.inbounds
-            .iter()
-            .flat_map(|ingress| ingress_inbounds(ingress, &xray.reality_client)),
-    );
+    inbounds.extend(xray.inbounds.iter().flat_map(|ingress| {
+        ingress_inbounds(
+            ingress,
+            &xray.reality_client,
+            xray.certificate_track.unwrap_or(CertificateTrack::PublicCa),
+        )
+    }));
     // Which downstream credential on which relay port is a portal end. The reverse tag
     // lives on the credential now, so it has to be joined onto the inbound's client
     // list rather than written as a block of its own.
@@ -1004,6 +1017,7 @@ fn geodata_config(settings: &GeodataSettings) -> XrayGeodata {
 fn ingress_security(
     ingress: &XrayIngressPlan,
     policy: &RealityClientPolicy,
+    certificate_track: CertificateTrack,
 ) -> XrayIngressSecurity {
     match &ingress.security {
         IngressSecurity::Reality {
@@ -1036,8 +1050,7 @@ fn ingress_security(
             ),
         },
         IngressSecurity::Tls => XrayIngressSecurity::Tls {
-            certificate_file: NODE_CERTIFICATE_FILE.to_owned(),
-            key_file: NODE_CERTIFICATE_KEY_FILE.to_owned(),
+            certificate_files: certificate_files(certificate_track),
             // v26.4.25 does not add h3 on the server side. Without this the client offers only
             // h3 while the server offers h2/http1 and every handshake fails with no server log.
             alpn: matches!(ingress.protocol, IngressProtocol::Hysteria2(_))
@@ -1046,10 +1059,22 @@ fn ingress_security(
     }
 }
 
-fn ingress_inbounds(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> Vec<XrayInbound> {
+fn certificate_files(track: CertificateTrack) -> [String; 2] {
+    let files = match track {
+        CertificateTrack::PublicCa => NODE_PUBLIC_CA_CERTIFICATE_FILES,
+        CertificateTrack::SelfSigned => NODE_SELF_SIGNED_CERTIFICATE_FILES,
+    };
+    files.map(str::to_owned)
+}
+
+fn ingress_inbounds(
+    ingress: &XrayIngressPlan,
+    policy: &RealityClientPolicy,
+    certificate_track: CertificateTrack,
+) -> Vec<XrayInbound> {
     let mut inbounds =
         match &ingress.split {
-            None => vec![ingress_inbound(ingress, policy)],
+            None => vec![ingress_inbound(ingress, policy, certificate_track)],
             Some(split) => {
                 let xhttp = ingress
                     .xhttp
@@ -1062,7 +1087,7 @@ fn ingress_inbounds(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> 
                         listen: ingress.listen.to_string(),
                         port: ingress.port,
                         target_port: split.core_port,
-                        security: ingress_security(ingress, policy),
+                        security: ingress_security(ingress, policy, certificate_track),
                     },
                     XrayInbound::Vless {
                         tag: ingress.tag.clone(),
@@ -1084,8 +1109,7 @@ fn ingress_inbounds(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> 
                         port: *port,
                         target_port: split.core_port,
                         security: XrayIngressSecurity::Tls {
-                            certificate_file: NODE_CERTIFICATE_FILE.to_owned(),
-                            key_file: NODE_CERTIFICATE_KEY_FILE.to_owned(),
+                            certificate_files: certificate_files(certificate_track),
                             alpn: None,
                         },
                     }
@@ -1117,8 +1141,7 @@ fn ingress_inbounds(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> 
             // placeholder target. No external address is present anywhere in the cover path.
             target_port: 1,
             security: XrayIngressSecurity::Tls {
-                certificate_file: NODE_CERTIFICATE_FILE.to_owned(),
-                key_file: NODE_CERTIFICATE_KEY_FILE.to_owned(),
+                certificate_files: certificate_files(certificate_track),
                 alpn: Some(vec!["http/1.1".to_owned()]),
             },
         });
@@ -1126,13 +1149,17 @@ fn ingress_inbounds(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> 
     inbounds
 }
 
-fn ingress_inbound(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> XrayInbound {
+fn ingress_inbound(
+    ingress: &XrayIngressPlan,
+    policy: &RealityClientPolicy,
+    certificate_track: CertificateTrack,
+) -> XrayInbound {
     match &ingress.protocol {
         IngressProtocol::Vless => XrayInbound::Vless {
             tag: ingress.tag.clone(),
             listen: ingress.listen.to_string(),
             port: ingress.port,
-            security: ingress_security(ingress, policy),
+            security: ingress_security(ingress, policy, certificate_track),
             sniff: ingress.sniff,
             stream: match &ingress.xhttp {
                 None => XrayStream::Tcp,
@@ -1147,7 +1174,7 @@ fn ingress_inbound(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> X
             tag: ingress.tag.clone(),
             listen: ingress.listen.to_string(),
             port: ingress.port,
-            security: ingress_security(ingress, policy),
+            security: ingress_security(ingress, policy, certificate_track),
             sniff: ingress.sniff,
             settings: settings.clone(),
         },
@@ -1155,7 +1182,7 @@ fn ingress_inbound(ingress: &XrayIngressPlan, policy: &RealityClientPolicy) -> X
             tag: ingress.tag.clone(),
             listen: ingress.listen.to_string(),
             port: ingress.port,
-            security: ingress_security(ingress, policy),
+            security: ingress_security(ingress, policy, certificate_track),
             sniff: ingress.sniff,
             settings: settings.clone(),
         },

@@ -61,7 +61,6 @@ pub use cert::{
     CertificateScanLock, CertificateSigningMethod, GroupCertificate, IssuedCertificate,
     NodeCertificateState, ACME_LETSENCRYPT, ACME_LETSENCRYPT_STAGING,
     DEFAULT_SELF_SIGNED_GROUP_NAME, SELF_SIGNED_DIRECTORY, SELF_SIGNED_INITIAL_POOL_SIZE,
-    SELF_SIGNED_MAX_POOL_SIZE,
 };
 pub use console::{
     ArtifactContent, ArtifactIndex, ArtifactIndexEntry, ClashHaitunLink, ClashSubscriptionUsage,

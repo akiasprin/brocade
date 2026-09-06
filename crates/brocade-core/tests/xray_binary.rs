@@ -14,7 +14,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::Duration,
@@ -780,9 +780,8 @@ fn independent_sing_box_client_can_reach_anytls(use_reality: bool) {
     fs::create_dir_all(&dir).unwrap();
     let (certificate, key) = self_signed();
     let certificate_path = dir.join("cert.pem");
-    let key_path = dir.join("key.pem");
-    fs::write(&certificate_path, certificate).unwrap();
-    fs::write(&key_path, key).unwrap();
+    write_certificate_bundle(&certificate_path, &certificate, &key);
+    let key_path = certificate_path.clone();
 
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
     app.ingresses[0].anytls_identity = Some(brocade_core::model::IngressIdentity {
@@ -863,16 +862,10 @@ fn independent_sing_box_client_can_reach_anytls(use_reality: bool) {
         .as_object_mut()
         .expect("Xray config object")
         .remove("geodata");
-    let server_config = serde_json::to_string_pretty(&server_value)
-        .unwrap()
-        .replace(
-            xray::NODE_CERTIFICATE_FILE,
-            &certificate_path.display().to_string(),
-        )
-        .replace(
-            xray::NODE_CERTIFICATE_KEY_FILE,
-            &key_path.display().to_string(),
-        );
+    let server_config = replace_node_certificate_paths(
+        &serde_json::to_string_pretty(&server_value).unwrap(),
+        &certificate_path,
+    );
     let server_config_path = dir.join("xray.json");
     fs::write(&server_config_path, &server_config).unwrap();
 
@@ -1016,6 +1009,8 @@ fn independent_sing_box_client_can_reach_anytls(use_reality: bool) {
             .args([
                 "--silent",
                 "--show-error",
+                "--noproxy",
+                "",
                 "--socks5-hostname",
                 &format!("127.0.0.1:{socks_port}"),
                 &format!("http://127.0.0.1:{echo_port}/"),
@@ -1265,22 +1260,10 @@ fn split_reality_upload_and_tls_download_load_in_the_real_binary() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let (certificate, key) = self_signed();
-    fs::write(dir.join("cert.pem"), certificate).unwrap();
-    fs::write(dir.join("key.pem"), key).unwrap();
+    let bundle = dir.join("cert.pem");
+    write_certificate_bundle(&bundle, &certificate, &key);
     let path = dir.join("split.json");
-    fs::write(
-        &path,
-        config
-            .replace(
-                xray::NODE_CERTIFICATE_FILE,
-                &dir.join("cert.pem").display().to_string(),
-            )
-            .replace(
-                xray::NODE_CERTIFICATE_KEY_FILE,
-                &dir.join("key.pem").display().to_string(),
-            ),
-    )
-    .unwrap();
+    fs::write(&path, replace_node_certificate_paths(&config, &bundle)).unwrap();
     let output = Command::new(&binary)
         .args(["-test", "-c"])
         .arg(&path)
@@ -1351,19 +1334,11 @@ fn ordinary_https_to_reality_reaches_only_the_local_403_cover() {
     fs::create_dir_all(&dir).unwrap();
     let (certificate, key) = self_signed();
     let certificate_path = dir.join("cert.pem");
-    let key_path = dir.join("key.pem");
-    fs::write(&certificate_path, certificate).unwrap();
-    fs::write(&key_path, key).unwrap();
-    let config = serde_json::to_string_pretty(&value)
-        .unwrap()
-        .replace(
-            xray::NODE_CERTIFICATE_FILE,
-            &certificate_path.display().to_string(),
-        )
-        .replace(
-            xray::NODE_CERTIFICATE_KEY_FILE,
-            &key_path.display().to_string(),
-        );
+    write_certificate_bundle(&certificate_path, &certificate, &key);
+    let config = replace_node_certificate_paths(
+        &serde_json::to_string_pretty(&value).unwrap(),
+        &certificate_path,
+    );
     assert!(!config.contains("apps.apple.com"), "{config}");
     let config_path = dir.join("xray.json");
     fs::write(&config_path, &config).unwrap();
@@ -1510,9 +1485,7 @@ fn valid_reality_traffic_still_passes_with_the_local_cover_enabled() {
     fs::create_dir_all(&dir).unwrap();
     let (certificate, key) = self_signed();
     let certificate_path = dir.join("cert.pem");
-    let key_path = dir.join("key.pem");
-    fs::write(&certificate_path, certificate).unwrap();
-    fs::write(&key_path, key).unwrap();
+    write_certificate_bundle(&certificate_path, &certificate, &key);
     let server_log = dir.join("server.log");
     let client_log = dir.join("client.log");
     server["log"] = json!({
@@ -1520,16 +1493,10 @@ fn valid_reality_traffic_still_passes_with_the_local_cover_enabled() {
         "access": "none",
         "error": server_log,
     });
-    let server_config = serde_json::to_string_pretty(&server)
-        .unwrap()
-        .replace(
-            xray::NODE_CERTIFICATE_FILE,
-            &certificate_path.display().to_string(),
-        )
-        .replace(
-            xray::NODE_CERTIFICATE_KEY_FILE,
-            &key_path.display().to_string(),
-        );
+    let server_config = replace_node_certificate_paths(
+        &serde_json::to_string_pretty(&server).unwrap(),
+        &certificate_path,
+    );
     let server_path = dir.join("server.json");
     fs::write(&server_path, server_config).unwrap();
     let client_path = dir.join("client.json");
@@ -1914,8 +1881,7 @@ fn a_tls_ingress_loads_in_the_real_binary() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let (certificate, key) = self_signed();
-    fs::write(dir.join("cert.pem"), certificate).unwrap();
-    fs::write(dir.join("key.pem"), key).unwrap();
+    write_certificate_bundle(&dir.join("cert.pem"), &certificate, &key);
 
     for (name, xhttp) in [
         ("tls-tcp", None),
@@ -1978,15 +1944,7 @@ fn a_tls_ingress_loads_in_the_real_binary() {
         let path = dir.join(format!("{name}.json"));
         fs::write(
             &path,
-            config
-                .replace(
-                    xray::NODE_CERTIFICATE_FILE,
-                    &dir.join("cert.pem").display().to_string(),
-                )
-                .replace(
-                    xray::NODE_CERTIFICATE_KEY_FILE,
-                    &dir.join("key.pem").display().to_string(),
-                ),
+            replace_node_certificate_paths(&config, &dir.join("cert.pem")),
         )
         .unwrap();
         let output = Command::new(&binary)
@@ -2016,8 +1974,7 @@ fn a_hysteria2_ingress_loads_in_the_real_binary() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let (certificate, key) = self_signed();
-    fs::write(dir.join("cert.pem"), certificate).unwrap();
-    fs::write(dir.join("key.pem"), key).unwrap();
+    write_certificate_bundle(&dir.join("cert.pem"), &certificate, &key);
 
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
     app.ingresses[0].wires = IngressWires::Hysteria2(Hysteria2 {
@@ -2087,15 +2044,7 @@ fn a_hysteria2_ingress_loads_in_the_real_binary() {
     let path = dir.join("hysteria2.json");
     fs::write(
         &path,
-        config
-            .replace(
-                xray::NODE_CERTIFICATE_FILE,
-                &dir.join("cert.pem").display().to_string(),
-            )
-            .replace(
-                xray::NODE_CERTIFICATE_KEY_FILE,
-                &dir.join("key.pem").display().to_string(),
-            ),
+        replace_node_certificate_paths(&config, &dir.join("cert.pem")),
     )
     .unwrap();
     let output = Command::new(&binary)
@@ -2121,6 +2070,23 @@ fn self_signed() -> (String, String) {
     params.distinguished_name = rcgen::DistinguishedName::new();
     let certificate = params.self_signed(&key).unwrap();
     (certificate.pem(), key.serialize_pem())
+}
+
+fn write_certificate_bundle(path: &Path, certificate: &str, key: &str) {
+    fs::write(
+        path,
+        format!("{}\n{}\n", certificate.trim_end(), key.trim_end()),
+    )
+    .unwrap();
+}
+
+fn replace_node_certificate_paths(config: &str, bundle: &Path) -> String {
+    xray::NODE_PUBLIC_CA_CERTIFICATE_FILES
+        .into_iter()
+        .chain(xray::NODE_SELF_SIGNED_CERTIFICATE_FILES)
+        .fold(config.to_owned(), |config, path| {
+            config.replace(path, &bundle.display().to_string())
+        })
 }
 
 fn free_tcp_ports(count: usize) -> Vec<u16> {
@@ -2261,6 +2227,7 @@ fn node(id: &str, overlay: [u8; 4]) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: "QG4l1cVXHNVPQxL0FKBTaFAsuGSKLFB39JYFhTOEXFo=".to_owned(),
             public_key: "T3JqRDF3ZmFrZXB1YmtleWZha2VwdWJrZXlmYWtlcHViaz0=".to_owned(),

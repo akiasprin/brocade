@@ -402,11 +402,10 @@ CREATE TABLE IF NOT EXISTS control_state (
     reality_min_client_ver TEXT DEFAULT '1.0.0',
     reality_max_client_ver TEXT,
     reality_max_time_diff_ms BIGINT,
-    -- No external site is a safe universal REALITY target. A fresh control plane starts
-    -- unconfigured and the creation flow requires an explicit choice: the node certificate, this
-    -- global site after an operator configures it, or a per-ingress custom site.
-    reality_dest TEXT DEFAULT NULL,
-    reality_server_names JSONB DEFAULT '[]'::jsonb NOT NULL,
+    -- Factory REALITY target. Ingresses that follow the global site inherit this pair; an
+    -- operator can still replace it or choose a per-ingress custom target.
+    reality_dest TEXT DEFAULT 'addons.mozilla.org:443',
+    reality_server_names JSONB DEFAULT '["addons.mozilla.org"]'::jsonb NOT NULL,
     -- One current AnyTLS padding scheme. The store replaces this empty bootstrap marker with an
     -- installation-specific compact four-stage scheme immediately after migration; later
     -- regeneration goes through the ordinary settings revision and release path.
@@ -2343,13 +2342,20 @@ CREATE TABLE IF NOT EXISTS certificates (
     -- everything under it due again: an operator moving from staging to production has said the
     -- certificates they hold are not the ones they want, and nothing else here can tell.
     acme_directory TEXT,
+    -- Self-signed generations have independent SNI identities. Public-CA rows keep this NULL and
+    -- use the group's wildcard/bare-name pair for same-name renewal.
+    certificate_name TEXT,
+    -- A physical slot is stable across promotion, so promoting B never rewrites both files and
+    -- never creates a window where the old identity disappears. Historical rows have no slot.
+    runtime_slot TEXT,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT certificates_pkey PRIMARY KEY (id),
-    CONSTRAINT certificates_status_known CHECK ((status IN ('pending', 'ready', 'serving', 'superseded', 'failed'))),
+    CONSTRAINT certificates_status_known CHECK ((status IN ('pending', 'ready', 'serving', 'compatible', 'superseded', 'failed'))),
     CONSTRAINT certificates_origin_known CHECK ((origin IN ('renewal', 'spare'))),
     -- ready or serving without a certificate would be a lie the rest of the code would have to
     -- keep checking for; refused here so nothing downstream has to.
-    CONSTRAINT certificates_held_has_cert CHECK (((status NOT IN ('ready', 'serving')) OR ((cert_pem IS NOT NULL) AND (key_pem_sealed IS NOT NULL) AND (expires_at IS NOT NULL)))),
+    CONSTRAINT certificates_held_has_cert CHECK (((status NOT IN ('ready', 'serving', 'compatible')) OR ((cert_pem IS NOT NULL) AND (key_pem_sealed IS NOT NULL) AND (expires_at IS NOT NULL)))),
+    CONSTRAINT certificates_runtime_slot_known CHECK (runtime_slot IS NULL OR runtime_slot IN ('a', 'b')),
     CONSTRAINT certificates_label_id_fkey FOREIGN KEY (label_id) REFERENCES cert_labels(id) ON DELETE CASCADE
 );
 
@@ -2358,6 +2364,12 @@ CREATE TABLE IF NOT EXISTS certificates (
 -- certificates that both claim to be the one to present.
 CREATE UNIQUE INDEX IF NOT EXISTS certificates_one_serving_per_label
     ON certificates (label_id) WHERE (status = 'serving');
+CREATE UNIQUE INDEX IF NOT EXISTS certificates_one_runtime_slot_per_label
+    ON certificates (
+        label_id,
+        (CASE WHEN certificate_name IS NULL THEN 'public-ca' ELSE 'self-signed' END),
+        runtime_slot
+    ) WHERE runtime_slot IS NOT NULL;
 
 -- Renewal scans ask "what expires soonest", never "what belongs to this group".
 CREATE INDEX IF NOT EXISTS certificates_expires_at_idx ON certificates (expires_at);
@@ -2414,11 +2426,19 @@ ON CONFLICT (node_id, label_id) DO NOTHING;
 CREATE TABLE IF NOT EXISTS node_cert_state (
     node_id TEXT NOT NULL,
     observed_state TEXT NOT NULL,
-    observed_sha256 TEXT,
+    public_slot_a_sha256 TEXT,
+    public_slot_b_sha256 TEXT,
+    self_signed_slot_a_sha256 TEXT,
+    self_signed_slot_b_sha256 TEXT,
     observed_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT node_cert_state_pkey PRIMARY KEY (node_id),
-    CONSTRAINT node_cert_state_known CHECK ((observed_state IN ('absent', 'present'))),
-    CONSTRAINT node_cert_state_shape CHECK (((observed_state <> 'present') OR (observed_sha256 ~ '^[0-9a-f]{64}$'))),
+    CONSTRAINT node_cert_state_known CHECK ((observed_state = 'managed')),
+    CONSTRAINT node_cert_state_shape CHECK (
+        (public_slot_a_sha256 IS NULL OR public_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
+        (public_slot_b_sha256 IS NULL OR public_slot_b_sha256 ~ '^[0-9a-f]{64}$') AND
+        (self_signed_slot_a_sha256 IS NULL OR self_signed_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
+        (self_signed_slot_b_sha256 IS NULL OR self_signed_slot_b_sha256 ~ '^[0-9a-f]{64}$')
+    ),
     CONSTRAINT node_cert_state_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
@@ -2998,9 +3018,15 @@ ON CONFLICT (id) DO NOTHING;
 -- Replaying 0001 changes only the factory default. The active row is operator data and must never
 -- be rewritten here: a configured REALITY site can already be in use by every inherited ingress.
 ALTER TABLE control_state
-    ALTER COLUMN reality_dest SET DEFAULT NULL;
+    ALTER COLUMN reality_dest SET DEFAULT 'addons.mozilla.org:443';
 ALTER TABLE control_state
-    ALTER COLUMN reality_server_names SET DEFAULT '[]'::jsonb;
+    ALTER COLUMN reality_server_names SET DEFAULT '["addons.mozilla.org"]'::jsonb;
+-- An installation created before this factory target existed has the exact empty pair below.
+-- Upgrade that untouched state, while leaving every configured custom site byte-for-byte alone.
+UPDATE control_state
+   SET reality_dest = 'addons.mozilla.org:443',
+       reality_server_names = '["addons.mozilla.org"]'::jsonb
+ WHERE reality_dest IS NULL AND reality_server_names = '[]'::jsonb;
 
 -- Development uses this one migration as both bootstrap and schema reconciliation. Every change
 -- whose CREATE TABLE branch cannot affect an already existing table therefore has a matching
@@ -4335,34 +4361,65 @@ ALTER TABLE certificates
     ADD CONSTRAINT certificates_origin_known
         CHECK (origin IN ('renewal', 'spare', 'bootstrap'));
 
--- Serialize every insertion into one self-signed group and enforce the limit below the API layer.
--- This also covers the renewal scanner racing a manual click, or a future writer which forgets
--- the application-side preflight.
-CREATE OR REPLACE FUNCTION brocade_enforce_self_signed_pool_limit() RETURNS TRIGGER
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    self_signed BOOLEAN;
-    held BIGINT;
-BEGIN
-    SELECT d.acme_directory = 'self-signed'
-      INTO self_signed
-      FROM cert_labels l
-      JOIN cert_domains d ON d.id = l.domain_id
-     WHERE l.id = NEW.label_id
-     FOR UPDATE OF l;
-    IF self_signed THEN
-        SELECT count(*) INTO held FROM certificates WHERE label_id = NEW.label_id;
-        IF held >= 10 THEN
-            RAISE EXCEPTION 'self-signed certificate pool may contain at most 10 rows'
-                USING ERRCODE = 'check_violation';
-        END IF;
-    END IF;
-    RETURN NEW;
-END
-$$;
-
+-- Certificate history may contain more than two rows, but only two rows in one group may own a
+-- runtime slot. Self-signed and public-CA material remain separate tracks on the Agent; a group's
+-- issued row freezes both its trust track and, for self-signed generations, its exact SNI.
 DROP TRIGGER IF EXISTS certificates_enforce_self_signed_pool_limit ON certificates;
-CREATE TRIGGER certificates_enforce_self_signed_pool_limit
-    BEFORE INSERT ON certificates
-    FOR EACH ROW EXECUTE FUNCTION brocade_enforce_self_signed_pool_limit();
+DROP FUNCTION IF EXISTS brocade_enforce_self_signed_pool_limit();
+
+ALTER TABLE certificates
+    ADD COLUMN IF NOT EXISTS certificate_name TEXT,
+    ADD COLUMN IF NOT EXISTS runtime_slot TEXT;
+
+ALTER TABLE certificates DROP CONSTRAINT IF EXISTS certificates_status_known;
+ALTER TABLE certificates ADD CONSTRAINT certificates_status_known
+    CHECK (status IN ('pending', 'ready', 'serving', 'compatible', 'superseded', 'failed'));
+ALTER TABLE certificates DROP CONSTRAINT IF EXISTS certificates_held_has_cert;
+ALTER TABLE certificates ADD CONSTRAINT certificates_held_has_cert CHECK (
+    status NOT IN ('ready', 'serving', 'compatible') OR
+    (cert_pem IS NOT NULL AND key_pem_sealed IS NOT NULL AND expires_at IS NOT NULL)
+);
+ALTER TABLE certificates DROP CONSTRAINT IF EXISTS certificates_runtime_slot_known;
+ALTER TABLE certificates ADD CONSTRAINT certificates_runtime_slot_known
+    CHECK (runtime_slot IS NULL OR runtime_slot IN ('a', 'b'));
+DROP INDEX IF EXISTS certificates_one_runtime_slot_per_label;
+CREATE UNIQUE INDEX certificates_one_runtime_slot_per_label
+    ON certificates (
+        label_id,
+        (CASE WHEN certificate_name IS NULL THEN 'public-ca' ELSE 'self-signed' END),
+        runtime_slot
+    ) WHERE runtime_slot IS NOT NULL;
+
+-- Existing serving material becomes slot A. Existing ready self-signed leaves all share the old
+-- group SNI and cannot safely coexist under leaf pinning, so retain them as history without a
+-- runtime slot. No certificate bytes or private keys are deleted.
+UPDATE certificates SET runtime_slot = 'a'
+ WHERE status = 'serving' AND runtime_slot IS NULL;
+UPDATE certificates AS c SET status = 'superseded', runtime_slot = NULL
+  FROM cert_labels AS l, cert_domains AS d
+ WHERE c.label_id = l.id AND l.domain_id = d.id
+   AND d.acme_directory = 'self-signed' AND c.status = 'ready';
+UPDATE certificates AS c SET certificate_name = l.certificate_name
+  FROM cert_labels AS l, cert_domains AS d
+ WHERE c.label_id = l.id AND l.domain_id = d.id
+   AND c.acme_directory = 'self-signed' AND c.status IN ('serving', 'compatible')
+   AND c.certificate_name IS NULL;
+
+ALTER TABLE node_cert_state
+    ADD COLUMN IF NOT EXISTS public_slot_a_sha256 TEXT,
+    ADD COLUMN IF NOT EXISTS public_slot_b_sha256 TEXT,
+    ADD COLUMN IF NOT EXISTS self_signed_slot_a_sha256 TEXT,
+    ADD COLUMN IF NOT EXISTS self_signed_slot_b_sha256 TEXT;
+ALTER TABLE node_cert_state DROP CONSTRAINT IF EXISTS node_cert_state_known;
+-- The legacy digest covered cert.pem only and is not comparable with the new combined PEM slots.
+-- Mark it unknown so protocol v5 sends both files once and establishes an honest baseline.
+UPDATE node_cert_state SET observed_state = 'managed';
+ALTER TABLE node_cert_state ADD CONSTRAINT node_cert_state_known CHECK (observed_state = 'managed');
+ALTER TABLE node_cert_state DROP CONSTRAINT IF EXISTS node_cert_state_shape;
+ALTER TABLE node_cert_state ADD CONSTRAINT node_cert_state_shape CHECK (
+    (public_slot_a_sha256 IS NULL OR public_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
+    (public_slot_b_sha256 IS NULL OR public_slot_b_sha256 ~ '^[0-9a-f]{64}$') AND
+    (self_signed_slot_a_sha256 IS NULL OR self_signed_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
+    (self_signed_slot_b_sha256 IS NULL OR self_signed_slot_b_sha256 ~ '^[0-9a-f]{64}$')
+);
+ALTER TABLE node_cert_state DROP COLUMN IF EXISTS observed_sha256;

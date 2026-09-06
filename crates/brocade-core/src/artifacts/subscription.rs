@@ -88,6 +88,7 @@ pub struct SubscriptionAnyTls {
     pub settings: AnyTls,
     pub reality: Option<SubscriptionReality>,
     pub self_signed: bool,
+    pub certificate_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,7 @@ pub struct SubscriptionHysteria2 {
     pub server_name: String,
     pub settings: Hysteria2,
     pub self_signed: bool,
+    pub certificate_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +104,7 @@ pub struct SubscriptionTls {
     pub server_name: String,
     pub flow: Option<String>,
     pub self_signed: bool,
+    pub certificate_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,17 +186,20 @@ impl Subscription {
     /// Certificate issuance is operational state rather than revision state. Mark it immediately
     /// before rendering so links stay hidden while the group retains self-signed trust, while the
     /// pure compiler remains independent from the database.
-    pub fn mark_self_signed(&mut self, names: &std::collections::BTreeSet<String>) {
+    pub fn mark_self_signed(&mut self, pins: &std::collections::BTreeMap<String, String>) {
         for entry in &mut self.entries {
             match &mut entry.security {
                 SubscriptionSecurity::Tls(tls) => {
-                    tls.self_signed = names.contains(&tls.server_name);
+                    tls.certificate_fingerprint = pins.get(&tls.server_name).cloned();
+                    tls.self_signed = tls.certificate_fingerprint.is_some();
                 }
                 SubscriptionSecurity::AnyTls(anytls) if anytls.reality.is_none() => {
-                    anytls.self_signed = names.contains(&anytls.server_name);
+                    anytls.certificate_fingerprint = pins.get(&anytls.server_name).cloned();
+                    anytls.self_signed = anytls.certificate_fingerprint.is_some();
                 }
                 SubscriptionSecurity::Hysteria2(hysteria) => {
-                    hysteria.self_signed = names.contains(&hysteria.server_name);
+                    hysteria.certificate_fingerprint = pins.get(&hysteria.server_name).cloned();
+                    hysteria.self_signed = hysteria.certificate_fingerprint.is_some();
                 }
                 SubscriptionSecurity::Reality(_) | SubscriptionSecurity::AnyTls(_) => {}
             }
@@ -210,12 +216,14 @@ fn security(security: &UserSecurityPlan) -> SubscriptionSecurity {
             server_name: tls.server_name.clone(),
             flow: tls.flow.clone(),
             self_signed: false,
+            certificate_fingerprint: None,
         }),
         UserSecurityPlan::Hysteria2(hysteria) => {
             SubscriptionSecurity::Hysteria2(SubscriptionHysteria2 {
                 server_name: hysteria.server_name.clone(),
                 settings: hysteria.settings.clone(),
                 self_signed: false,
+                certificate_fingerprint: None,
             })
         }
         UserSecurityPlan::AnyTls(anytls) => SubscriptionSecurity::AnyTls(SubscriptionAnyTls {
@@ -223,6 +231,7 @@ fn security(security: &UserSecurityPlan) -> SubscriptionSecurity {
             settings: anytls.settings.clone(),
             reality: anytls.reality.as_ref().map(reality_params),
             self_signed: false,
+            certificate_fingerprint: None,
         }),
     }
 }

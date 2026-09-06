@@ -437,20 +437,27 @@ impl PgStore {
     pub async fn record_certificate_observation(
         &self,
         node_id: &str,
-        state: &str,
-        sha256: Option<&str>,
+        public_ca: &brocade_deployment::protocol::CertificatePairObservation,
+        self_signed: &brocade_deployment::protocol::CertificatePairObservation,
     ) -> Result<()> {
-        cert::record_observation(&self.pool, node_id, state, sha256).await
+        cert::record_observation(&self.pool, node_id, public_ca, self_signed).await
     }
 
     pub async fn record_certificate_observation_at(
         &self,
         node_id: &str,
-        state: &str,
-        sha256: Option<&str>,
+        public_ca: &brocade_deployment::protocol::CertificatePairObservation,
+        self_signed: &brocade_deployment::protocol::CertificatePairObservation,
         observed_at_unix_secs: Option<i64>,
     ) -> Result<()> {
-        cert::record_observation_at(&self.pool, node_id, state, sha256, observed_at_unix_secs).await
+        cert::record_observation_at(
+            &self.pool,
+            node_id,
+            public_ca,
+            self_signed,
+            observed_at_unix_secs,
+        )
+        .await
     }
 
     pub async fn record_certificate_failure(
@@ -468,7 +475,7 @@ impl PgStore {
     pub async fn cert_delta_for_node(
         &self,
         node_id: &str,
-    ) -> Result<Option<brocade_deployment::protocol::NodeCertificateMaterial>> {
+    ) -> Result<Vec<brocade_deployment::protocol::NodeCertificateMaterial>> {
         cert::cert_delta_for_node(&self.pool, node_id).await
     }
 

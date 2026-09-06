@@ -960,13 +960,17 @@ async fn load_nodes(pool: &PgPool) -> Result<Vec<Node>> {
             -- certificate. A group with nothing serving yields NULL here, which is what makes
             -- `ingress.tls-no-certificate` fire instead of publishing an ingress whose every
             -- connection would fail at the TLS handshake.
-            (SELECT COALESCE(l.certificate_name, l.label || '.' || d.domain) \
+            (SELECT COALESCE(c.certificate_name, l.certificate_name, l.label || '.' || d.domain) \
                FROM node_cert_label m \
                JOIN cert_labels l ON l.id = m.label_id \
                JOIN cert_domains d ON d.id = l.domain_id \
                JOIN certificates c ON c.label_id = l.id AND c.status = 'serving' \
               WHERE m.node_id = nodes.id
-                AND c.expires_at > now()) AS certificate_name \
+                AND c.expires_at > now()) AS certificate_name, \
+            (SELECT CASE WHEN c.acme_directory = 'self-signed' THEN 'self-signed' ELSE 'public-ca' END \
+               FROM node_cert_label m \
+               JOIN certificates c ON c.label_id = m.label_id AND c.status = 'serving' \
+              WHERE m.node_id = nodes.id AND c.expires_at > now()) AS certificate_track \
          FROM nodes \
          ORDER BY id",
     )
@@ -987,13 +991,17 @@ async fn load_nodes_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<Node>> 
             -- certificate. A group with nothing serving yields NULL here, which is what makes
             -- `ingress.tls-no-certificate` fire instead of publishing an ingress whose every
             -- connection would fail at the TLS handshake.
-            (SELECT COALESCE(l.certificate_name, l.label || '.' || d.domain) \
+            (SELECT COALESCE(c.certificate_name, l.certificate_name, l.label || '.' || d.domain) \
                FROM node_cert_label m \
                JOIN cert_labels l ON l.id = m.label_id \
                JOIN cert_domains d ON d.id = l.domain_id \
                JOIN certificates c ON c.label_id = l.id AND c.status = 'serving' \
               WHERE m.node_id = nodes.id
-                AND c.expires_at > now()) AS certificate_name \
+                AND c.expires_at > now()) AS certificate_name, \
+            (SELECT CASE WHEN c.acme_directory = 'self-signed' THEN 'self-signed' ELSE 'public-ca' END \
+               FROM node_cert_label m \
+               JOIN certificates c ON c.label_id = m.label_id AND c.status = 'serving' \
+              WHERE m.node_id = nodes.id AND c.expires_at > now()) AS certificate_track \
          FROM nodes \
          ORDER BY id",
     )
@@ -1024,6 +1032,15 @@ fn node_from_row(row: &sqlx::postgres::PgRow) -> Result<Node> {
         // attempt failed, is a name nothing answers to yet — and an ingress compiled against it
         // would hand out subscriptions naming a certificate that does not exist.
         certificate_name: row.try_get("certificate_name")?,
+        certificate_track: match row
+            .try_get::<Option<String>, _>("certificate_track")?
+            .as_deref()
+        {
+            Some("public-ca") => Some(brocade_core::model::CertificateTrack::PublicCa),
+            Some("self-signed") => Some(brocade_core::model::CertificateTrack::SelfSigned),
+            Some(value) => return invalid(format!("unknown certificate track {value}")),
+            None => None,
+        },
         id: text(row, "id")?,
         tenant: text(row, "tenant_id")?,
         name: text(row, "name")?,

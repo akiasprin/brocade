@@ -35,6 +35,7 @@ pub struct SystemIr {
 pub struct SystemNode {
     pub id: String,
     pub tenant: String,
+    pub certificate_track: Option<crate::model::CertificateTrack>,
     /// Backbone address. `None` means this machine is not on the overlay: no wg
     /// config is generated and it enters no `Link`.
     pub overlay_addr: Option<Ipv4Addr>,
@@ -147,6 +148,7 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
             SystemNode {
                 id: node.id.clone(),
                 tenant: node.tenant.clone(),
+                certificate_track: node.certificate_track,
                 overlay_addr: node.overlay.then_some(node.overlay_addr),
                 wireguard: node.overlay.then(|| WireGuard {
                     private_key: node.wireguard.private_key.clone(),

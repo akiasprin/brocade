@@ -74,7 +74,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    document.title = `${branding.site_name} | 🛰️ 跨境网络小管家`;
+    document.title = `${branding.site_name} | 跨境网络小管家`;
   }, [branding.site_name]);
 
   if (restoring) return <div id="stage" />;

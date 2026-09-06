@@ -530,7 +530,7 @@ function daysLeft(expiresAt: string | null): number | null {
 /* 机器上是旧证书与控制面尚未收到上报是两种状态，但显示形式相同。
  *
  * 节点上报当前持有的证书与签发不在同一条路径：签发在控制面执行，上报由节点按轮次执行。
- * 因此签发后的数分钟内，上报内容仍是上一张证书——不是机器未更新，而是上报数据晚于签发。
+ * 因此签发后的短暂窗口内，上报内容仍是上一张证书——不是机器未更新，而是上报数据晚于签发。
  *
  * 判定依据是时间先后而非经过的分钟数：上报时间早于签发时间即表示尚未上报新状态。 */
 function notYetHeard(issuedAt: string | null, observedAt: string | null): boolean {
@@ -541,9 +541,8 @@ function notYetHeard(issuedAt: string | null, observedAt: string | null): boolea
   return !Number.isNaN(issued) && !Number.isNaN(observed) && observed < issued;
 }
 
-/** 一台机器持有的是不是本组正在出示的那张。
-    换证书后最长一小时才生效：agent 十分钟一轮取到新字节，xray 再按自己的周期热重载。
-    这段时间里「旧的」是预期状态，不是故障。 */
+/** 一台机器是否持有本组当前需要的全部主备槽。
+    agent 每 15 秒拉取，写入后等待 xray 的 5 秒热重载；短暂的「旧」是收敛过程。 */
 function diskState(
   row: NodeCertificateState,
   serving: GroupCertificate | undefined,
@@ -575,7 +574,9 @@ function certState(cert: GroupCertificate): { tone: string; text: string } {
       if (left !== null && left <= 20) return { tone: 'warn', text: `在用 · 还剩 ${left} 天` };
       return { tone: 'ok', text: '在用' };
     case 'ready':
-      return { tone: 'idle', text: '待命' };
+      return { tone: 'idle', text: '备用槽待发布' };
+    case 'compatible':
+      return { tone: 'ok', text: '保留兼容' };
     case 'pending':
       return { tone: 'idle', text: '排队签发中' };
     case 'failed':
@@ -586,7 +587,7 @@ function certState(cert: GroupCertificate): { tone: string; text: string } {
 }
 
 function retainedCertificate(cert: GroupCertificate): boolean {
-  return cert.sha256 !== null && ['ready', 'serving', 'superseded'].includes(cert.status);
+  return cert.sha256 !== null && ['ready', 'serving', 'compatible'].includes(cert.status);
 }
 
 function CertSection({ editable, view }: { editable: boolean; view: CertsView }) {
@@ -670,8 +671,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
       </header>
       <p className="cardsub">
         {selfSigned
-          ? '默认维护 5 张自签证书，在用与待命可随时切换，最多保留 10 张'
-          : '按证书组签发通配证书，由控制面生成并随下发包送达节点'}
+          ? '默认维护一对主备自签证书，备用就绪后才允许切换'
+          : '按证书组维护一对主备通配证书，由控制面签发并送达节点'}
       </p>
       {save.error && <ErrorBox error={save.error} />}
       {scan.error && <ErrorBox error={scan.error} />}
@@ -805,7 +806,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
 
         {selfSigned ? (
           <div className="guard">
-            默认组首次初始化 5 张、单张有效期 100 年。自动名称使用随机生成的 <b>.com</b>
+            默认组首次初始化一对主备证书，单张有效期 100 年。自动名称使用随机生成的 <b>.com</b>
             域名，不再拼接二级域名或通配符；私钥加密保存。
           </div>
         ) : (
@@ -814,8 +815,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
               使用<b>单独的域名</b>。Cloudflare token 按 zone 授权，无法限制到子域，域名分开可防止凭据泄露波及控制面。
             </div>
             <div className="guard">
-              每台一张<b>独立</b>证书。Let&apos;s Encrypt <b>同一组名字每 7 天最多签发 5 张</b>
-              ，随机标签使每台名字唯一，不受此限制。
+              每组一对主备证书，组内机器共享。Let&apos;s Encrypt <b>同一组名字每 7 天最多签发 5 张</b>
+              ，备用槽只保留一张，避免无意义消耗额度。
             </div>
             <div className="guard">
               证书会进入 CT 公开日志，随机标签防猜测但不防枚举。DNS-01 <b>不需要 A 记录</b>，名字与 IP
@@ -851,7 +852,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             续期失败<b>不等于没有证书</b>，在用的到期前仍可用。风险是长期未处理导致过期后整组停服。
           </div>
           <div className="guard">
-            组内换证书<b>不改 SNI、不需要发布</b>，约一小时生效。<b>换组才会改 SNI</b>，已发出的订阅会断连。
+            公有证书组内续期不改 SNI；自签证书会先装入备用槽，所有机器确认后才允许启用新的 SNI 与校验值。
           </div>
         </div>
       )}
@@ -871,9 +872,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
 
 /** 证书组的列表：一个组、组里的证书、用这个组的机器。
  *
- * 三层而不是一张平表：证书属于组，机器也属于组，但证书和机器之间没有直接关系——同组十台机器
- * 共用一张证书，各自独立地报告自己拿到没有。平表会把那一张证书重复十遍，也就看不出轮换过程中
- * 「已经换过的」和「还没换到的」是同一张证书的两侧。 */
+ * 三层而不是一张平表：证书属于组，机器也属于组，但证书和机器之间没有直接关系——同组机器
+ * 共用主备证书，各自独立报告两个信任轨的槽位。平表会把同一对证书重复很多遍。 */
 function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) {
   const qc = useQueryClient();
   const nameOf = useNodeNames();
@@ -958,7 +958,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       <div className="certgroups-toolbar">
         <div>
           <b>证书组</b>
-          <span className="hint">每个组一个 SNI，一张证书供组内所有机器使用</span>
+          <span className="hint">每个组一对主备证书，组内机器共享</span>
         </div>
         <div className="v">
           <button
@@ -1001,7 +1001,14 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
         const xrayPinsActive = group.certificates.some(
           cert => retainedCertificate(cert) && cert.signing_method === 'self-signed',
         );
+        const configuredMethod = view.domain?.signing_method;
+        const standbyBusy = group.certificates.some(
+          cert =>
+            cert.signing_method === configuredMethod &&
+            ['pending', 'ready', 'compatible', 'failed'].includes(cert.status),
+        );
         const usableCertificates = group.certificates.filter(cert => retainedCertificate(cert)).length;
+        const preloadPending = members.some(row => row.on_disk !== 'current');
         return (
           <article className="certgrp" key={group.id}>
             <header className="certgrp-hd">
@@ -1014,7 +1021,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                     <b>{group.name}</b>
                     {group.is_default && <span className="certgrp-default">默认组</span>}
                   </div>
-                  <code className="certgrp-sni">{group.names[1] ?? group.names[0]}</code>
+                  <code className="certgrp-sni">{serving?.certificate_name ?? group.names[1] ?? group.names[0]}</code>
                   {group.note && <span className="certgrp-note">{group.note}</span>}
                 </div>
               </div>
@@ -1027,15 +1034,17 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   <b>{usableCertificates}</b>
                   <small>可用证书</small>
                 </span>
-                {selfSigned && (
-                  <span>
-                    <b>
-                      {group.certificates.length}
-                      <i>/10</i>
-                    </b>
-                    <small>证书池</small>
-                  </span>
-                )}
+                <span>
+                  <b>
+                    {
+                      group.certificates.filter(
+                        cert => cert.signing_method === configuredMethod && cert.runtime_slot !== null,
+                      ).length
+                    }
+                    /2
+                  </b>
+                  <small>运行槽</small>
+                </span>
               </div>
               <span className="ctl">
                 <button
@@ -1057,11 +1066,9 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                 <button
                   type="button"
                   className="btn sm"
-                  disabled={!editable || pending !== null || (selfSigned && group.certificates.length >= 10)}
+                  disabled={!editable || pending !== null || standbyBusy}
                   title={
-                    selfSigned && group.certificates.length >= 10
-                      ? '自签证书池最多 10 张，请先删除一张非在用证书'
-                      : '多签一张待命证书，由你决定何时启用'
+                    standbyBusy ? '主备槽已经占满，请先停止并清理旧兼容证书' : '多签一张待命证书，由你决定何时启用'
                   }
                   onClick={() => run(`spare:${group.id}`, () => requestSpareCertificate(group.id))}
                 >
@@ -1101,8 +1108,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
 
             {xrayPinsActive && (
               <div className="certtrust-note">
-                这个组仍保留自签证书，Xray
-                会同时信任下列所有已签发证书，包括已换下或过期的证书。要撤销信任，请手动删除对应证书。
+                自签证书使用独立的主备双槽。新订阅只下发当前证书；保留兼容的旧证书仅用于已保存的旧配置。
               </div>
             )}
 
@@ -1118,7 +1124,8 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   group.certificates.map(cert => {
                     const state = certState(cert);
                     const left = daysLeft(cert.expires_at);
-                    const trustedByXray = xrayPinsActive && retainedCertificate(cert);
+                    const trustedByXray =
+                      cert.signing_method === 'self-signed' && ['ready', 'serving', 'compatible'].includes(cert.status);
                     return (
                       <div className={`certrow cert ${state.tone}`} key={cert.id}>
                         <div className="certrow-status">
@@ -1139,7 +1146,11 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                           </span>
                           {trustedByXray && (
                             <span className={left !== null && left < 0 ? 'ctrust warn' : 'ctrust'}>
-                              {left !== null && left < 0 ? '已过期 · Xray 仍信任' : 'Xray 已信任'}
+                              {left !== null && left < 0
+                                ? '已过期 · 仍在运行槽'
+                                : cert.status === 'ready'
+                                  ? '已装入备用槽'
+                                  : 'Xray 正在提供'}
                             </span>
                           )}
                         </div>
@@ -1158,8 +1169,18 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                             <button
                               type="button"
                               className="btn sm"
-                              disabled={!editable || pending !== null}
-                              title="让这个组的机器改用这张。SNI 不变，不需要发布"
+                              disabled={
+                                !editable ||
+                                pending !== null ||
+                                (cert.signing_method === 'self-signed' && preloadPending)
+                              }
+                              title={
+                                cert.signing_method === 'self-signed'
+                                  ? preloadPending
+                                    ? '等待所有机器确认主备槽后才能启用'
+                                    : '发布这张证书的新 SNI 与证书校验'
+                                  : '让这个组的机器改用这张同名公有证书'
+                              }
                               onClick={() => run(`serve:${cert.id}`, () => serveCertificate(cert.id))}
                             >
                               {pending === `serve:${cert.id}` ? '启用中…' : '启用'}
@@ -1170,11 +1191,16 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                               type="button"
                               className="btn sm danger"
                               disabled={!editable || pending !== null}
-                              title={trustedByXray ? '删除后，Xray 将不再信任这张证书' : '删除这条证书记录'}
+                              title={
+                                cert.status === 'compatible'
+                                  ? '停止兼容；仍使用旧配置的客户端将无法重新连接'
+                                  : '删除这条证书记录'
+                              }
                               onClick={() => {
-                                const impact = trustedByXray
-                                  ? '删除后，Xray 将不再信任这张证书。已缓存旧配置的客户端需要刷新。'
-                                  : '删除这条证书记录？';
+                                const impact =
+                                  cert.status === 'compatible'
+                                    ? '停止兼容后，仍使用这份旧 SNI 和证书校验的客户端将无法重新连接。继续？'
+                                    : '删除这条证书记录？';
                                 if (window.confirm(impact)) {
                                   run(`delete-certificate:${cert.id}`, () => deleteCertificate(cert.id));
                                 }

@@ -137,7 +137,7 @@ export function Topbar({ branding, who, onLogout }: { branding: BrandingSettings
       <header id="bar">
         <div className="brand">
           <BrandIcon branding={branding} className="brand-logo" />
-          <b>{branding.site_name}</b> <span>| 🛰️ 跨境网络小管家</span>
+          <b>{branding.site_name}</b> <span>| 跨境网络小管家</span>
         </div>
         <div className="seg">
           <button aria-pressed={snap.floor === 'desk'} onClick={() => wm.setFloor('desk')}>

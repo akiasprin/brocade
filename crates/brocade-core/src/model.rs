@@ -406,9 +406,8 @@ impl Default for OverlaySettings {
     }
 }
 
-/// The globally defaulted REALITY site. Blank means never set, in which case an
-/// ingress must write its own.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// The globally defaulted REALITY site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealitySite {
     #[serde(default)]
@@ -421,6 +420,17 @@ pub struct RealitySite {
     /// A fresh database defaults to [`DEFAULT_REALITY_FLOW`], which enables Vision.
     #[serde(default)]
     pub flow: Option<String>,
+}
+
+impl Default for RealitySite {
+    fn default() -> Self {
+        Self {
+            dest: Some("addons.mozilla.org:443".to_owned()),
+            server_names: vec!["addons.mozilla.org".to_owned()],
+            fingerprint: Some("chrome".to_owned()),
+            flow: Some(DEFAULT_REALITY_FLOW.to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -472,6 +482,10 @@ pub struct Node {
     /// that presents no certificate.
     #[serde(default)]
     pub certificate_name: Option<String>,
+    /// Which independent Agent certificate directory Xray must use. Frozen from the serving
+    /// certificate rather than inferred from the mutable global issuance setting.
+    #[serde(default)]
+    pub certificate_track: Option<CertificateTrack>,
     pub wireguard: WireGuardKeys,
     #[serde(default)]
     pub api_port: Option<u16>,
@@ -504,6 +518,13 @@ pub struct Node {
     /// `settings.connection`.
     #[serde(default)]
     pub connection: NodeConnection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateTrack {
+    PublicCa,
+    SelfSigned,
 }
 
 /// A relay port's wire format: which protocol it uses and, where the protocol allows a

@@ -806,15 +806,16 @@ fn ingress_security(security: &XrayIngressSecurity) -> (&'static str, &'static s
         // stays absent for normal TLS inbounds and is present only on the local 403 cover, whose
         // built-in response is HTTP/1.1 rather than HTTP/2 frames.
         XrayIngressSecurity::Tls {
-            certificate_file,
-            key_file,
+            certificate_files,
             alpn,
         } => {
             let mut settings = json!({
-                "certificates": [{
-                    "certificateFile": certificate_file,
-                    "keyFile": key_file,
-                }],
+                "certificates": certificate_files.iter().map(|file| json!({
+                    "certificateFile": file,
+                    "keyFile": file,
+                    "reloadInterval": 5,
+                })).collect::<Vec<_>>(),
+                "rejectUnknownSni": true,
             });
             if let Some(alpn) = alpn {
                 settings

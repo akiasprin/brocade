@@ -1694,7 +1694,7 @@ fn apply_once_inner(
 
     let response: DesiredStateResponse =
         serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
-    let (desired, certificate) = match response {
+    let (desired, certificates) = match response {
         DesiredStateResponse::Converged => {
             // The control plane sends this state as HTTP 204, which the branch above already
             // handled. A serialized one means the two sides disagree about the protocol.
@@ -1702,29 +1702,26 @@ fn apply_once_inner(
         }
         DesiredStateResponse::Deployment {
             deployment,
-            certificate,
-        } => (deployment, certificate),
-        DesiredStateResponse::Certificate(material) => {
-            crate::certfile::apply_material(&options, &material)?;
+            certificates,
+        } => (deployment, certificates),
+        DesiredStateResponse::Certificates(materials) => {
+            for material in &materials {
+                crate::certfile::apply_material(&options, material)?;
+            }
             // This variant means the control plane still sees the certificate dimension as stale.
             // Reload even when the files match: a previous reload may have failed after the write.
-            reload_xray_after_certificate(&options, meter)?;
+            if !materials.is_empty() {
+                wait_for_xray_certificate_reload(&options)?;
+            }
             crate::certfile::report_applied(&options);
             return Ok(());
         }
     };
     // Put the pair on disk before convergence. A failed write fails the round; a Present xray is
     // forced through its restart path below, while an Unmanaged xray is reloaded explicitly.
-    let certificate_received = certificate.is_some();
-    if let Some(material) = &certificate {
+    let certificate_received = !certificates.is_empty();
+    for material in &certificates {
         crate::certfile::apply_material(&options, material)?;
-    }
-    // A grants-only deployment carries xray as Unmanaged, so its ordinary convergence cannot
-    // reload the certificate files. Do that first; grant convergence below then restores the new
-    // complete user set into the restarted process. A Present xray is forced through the restart
-    // path inside converge_linux_xray instead of taking a hot swap which may not reread TLS files.
-    if certificate_received && matches!(&desired.desired.xray, DesiredArtifact::Unmanaged { .. }) {
-        reload_xray_after_certificate(&options, meter)?;
     }
     let before = observe_state(&options.state_dir, &desired, options.apply_mode)?;
     // Hold this lock across the whole restart: a sampling thread running between the
@@ -1754,13 +1751,8 @@ fn apply_once_inner(
         };
         match options.apply_mode {
             ApplyMode::StateDir => converge_to_state_dir(&options.state_dir, &desired),
-            ApplyMode::Linux => converge_linux(
-                &options.state_dir,
-                &desired,
-                certificate_received,
-                &mut collect,
-            )
-            .map(|_| observe_linux_state(&options.state_dir, &desired)),
+            ApplyMode::Linux => converge_linux(&options.state_dir, &desired, &mut collect)
+                .map(|_| observe_linux_state(&options.state_dir, &desired)),
         }
     };
     let (result, after, error) = match applied {
@@ -1808,19 +1800,16 @@ fn apply_once_inner(
         return Err(error);
     }
     if certificate_received {
+        wait_for_xray_certificate_reload(&options)?;
         crate::certfile::report_applied(&options);
     }
     Ok(())
 }
 
-/// A certificate-only desired response used to stop after replacing the two files. Xray checks the
-/// paths only on its hourly watcher, while the agent immediately reported the files as current; the
-/// control plane then had no reason to send either the certificate or a deployment again. Reload the
-/// one consumer immediately, preserving the last usage counters and restoring its in-memory grants.
-fn reload_xray_after_certificate(
-    options: &Options,
-    meter: Option<&Arc<Mutex<()>>>,
-) -> Result<(), String> {
+/// Validate the complete slot pair and give the already-running Xray watcher one bounded interval
+/// to ingest an atomic replacement. Ordinary rotation must not restart Xray: doing so discards the
+/// very sessions the fixed dual slots are designed to preserve.
+fn wait_for_xray_certificate_reload(options: &Options) -> Result<(), String> {
     if options.apply_mode == ApplyMode::StateDir {
         return Ok(());
     }
@@ -1828,22 +1817,15 @@ fn reload_xray_after_certificate(
     if !path.exists() || options.state_dir.join("xray.disabled").exists() {
         return Ok(());
     }
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("读取待换证的 xray 配置失败：{error}"))?;
-    let api_port = xray_api_port(&content).unwrap_or(10085);
-    let _guard = meter.map(|meter| {
-        meter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    });
-    if let Err(error) = collect_usage_report(options) {
-        eprintln!("usage: 换证重启 xray 前的采集没成功：{error}");
+    run_command("xray", &["-test", "-config", &path.display().to_string()])?;
+    if !xray_running() {
+        return Err("证书文件已写入，但 xray 当前没有运行；拒绝把磁盘状态报告成已加载".to_owned());
     }
-    apply_xray(&path, api_port)?;
-    if let Some(want) = desired_grants_on_disk(&options.state_dir)? {
-        sync_grants(&options.state_dir, &content, api_port, &want)?;
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    if !xray_running() {
+        return Err("等待证书热更新时 xray 退出了".to_owned());
     }
-    println!("xray 已载入新证书");
+    println!("xray 证书槽已通过预检并完成热更新等待");
     Ok(())
 }
 
@@ -2219,7 +2201,6 @@ fn converge_to_state_dir(
 fn converge_linux(
     state_dir: &Path,
     desired: &NodeDesiredDeployment,
-    force_xray_restart: bool,
     // The hook for step 4. A parameter rather than a direct call, because state-dir
     // mode and a lone apply-once have no reporting channel and must skip this step.
     before_xray_restart: &mut dyn FnMut(),
@@ -2258,7 +2239,7 @@ fn converge_linux(
     if desired.usage_generation_id.is_some() {
         before_xray_restart();
     }
-    converge_linux_xray(state_dir, &desired.desired.xray, force_xray_restart)?;
+    converge_linux_xray(state_dir, &desired.desired.xray, false)?;
     // After xray, because the ports come out of its config: applying first would exempt the
     // previous release's ports and leave the new ones tracked until the next convergence.
     conntrack::apply(&desired.desired.xray)?;

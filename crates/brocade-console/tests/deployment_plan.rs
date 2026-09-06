@@ -658,6 +658,7 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4], dns: Dns) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),
             public_key: format!("pub-{id}"),
@@ -678,6 +679,7 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4], dns: Dns) -> Node {
 fn tls_node(id: &str, public_ipv4: &str, overlay: [u8; 4]) -> Node {
     Node {
         certificate_name: Some(format!("{id}.example.net")),
+        certificate_track: Some(brocade_core::model::CertificateTrack::PublicCa),
         ..node(id, public_ipv4, overlay, Dns::System)
     }
 }

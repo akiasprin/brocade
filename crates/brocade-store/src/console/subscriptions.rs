@@ -355,7 +355,7 @@ async fn build_dynamic_clash(
 
     let uuid = plan.uuid.clone();
     let mut artifact = subscription::build(&plan);
-    artifact.mark_self_signed(&crate::cert::self_signed_certificate_names(pool).await?);
+    artifact.mark_self_signed(&crate::cert::self_signed_certificate_pins(pool).await?);
     let content = match template {
         DynamicClashTemplate::Standard => yaml::clash_subscription(&artifact),
         DynamicClashTemplate::Haitun => yaml::clash_haitun_subscription(&artifact),
