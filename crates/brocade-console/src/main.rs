@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_certificates = store.ensure_default_self_signed_pool().await?;
     if default_certificates > 0 {
         eprintln!(
-            "brocade-console created 默认组 with {default_certificates} self-signed certificates"
+            "brocade-console created 默认自签证书组 with {default_certificates} self-signed certificates"
         );
     }
     // Only the policy is durable. The service below is deliberately created once and shared by

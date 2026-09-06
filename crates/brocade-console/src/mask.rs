@@ -676,7 +676,7 @@ mod tests {
                 "id": "group-1",
                 "domain": "huacu.io",
                 "label": "a2335a6d",
-                "name": "默认组",
+                "name": "默认自签证书组",
                 "names": ["*.a2335a6d.huacu.io", "a2335a6d.huacu.io"],
                 "status": "active",
                 "certificates": [{

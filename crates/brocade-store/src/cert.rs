@@ -48,7 +48,7 @@ pub const SELF_SIGNED_DIRECTORY: &str = "self-signed";
 /// a fleet, short enough to read out over a call.
 const LABEL_BYTES: usize = 4;
 const CERTIFICATE_SCAN_ADVISORY_KEY: i64 = 0x4252_4f43_4345_5254;
-pub const DEFAULT_SELF_SIGNED_GROUP_NAME: &str = "默认组";
+pub const DEFAULT_SELF_SIGNED_GROUP_NAME: &str = "默认自签证书组";
 pub const SELF_SIGNED_INITIAL_POOL_SIZE: usize = 2;
 
 /// A transaction whose only job is to hold the fleet-wide issuance lock. Dropping it rolls the
@@ -384,6 +384,10 @@ pub async fn ensure_default_self_signed_pool(pool: &PgPool) -> Result<usize> {
             .fetch_one(&mut *tx)
             .await?;
     if default_exists {
+        sqlx::query("UPDATE cert_labels SET name = $1 WHERE is_default AND name <> $1")
+            .bind(DEFAULT_SELF_SIGNED_GROUP_NAME)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         return Ok(0);
     }
@@ -748,7 +752,7 @@ pub async fn update_cert_label(
                 .await?
                 .ok_or_else(|| StoreError::InvalidData(format!("没有这个证书组：{id}")))?;
         if is_default && name != DEFAULT_SELF_SIGNED_GROUP_NAME {
-            return Err(StoreError::InvalidData("默认组不能改名".to_owned()));
+            return Err(StoreError::InvalidData("默认自签证书组不能改名".to_owned()));
         }
         sqlx::query("UPDATE cert_labels SET name = $2 WHERE id = $1")
             .bind(id)
@@ -783,7 +787,7 @@ pub async fn delete_cert_label(pool: &PgPool, actor: &AdminContext, id: &str) ->
         .await?
         .ok_or_else(|| StoreError::InvalidData(format!("没有这个证书组：{id}")))?;
     if is_default {
-        return Err(StoreError::InvalidData("默认组不能删除".to_owned()));
+        return Err(StoreError::InvalidData("默认自签证书组不能删除".to_owned()));
     }
     let using: i64 = sqlx::query("SELECT count(*) AS n FROM node_cert_label WHERE label_id = $1")
         .bind(id)

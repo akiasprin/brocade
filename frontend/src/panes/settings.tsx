@@ -806,7 +806,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
 
         {selfSigned ? (
           <div className="guard">
-            默认组首次初始化一对主备证书，单张有效期 100 年。自动名称使用随机生成的 <b>.com</b>
+            默认自签证书组首次初始化一对主备证书，单张有效期 100 年。自动名称使用随机生成的 <b>.com</b>
             域名，不再拼接二级域名或通配符；私钥加密保存。
           </div>
         ) : (
@@ -1019,7 +1019,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                 <div>
                   <div className="certgrp-title">
                     <b>{group.name}</b>
-                    {group.is_default && <span className="certgrp-default">默认组</span>}
+                    {group.is_default && <span className="certgrp-default">默认</span>}
                   </div>
                   <code className="certgrp-sni">{serving?.certificate_name ?? group.names[1] ?? group.names[0]}</code>
                   {group.note && <span className="certgrp-note">{group.note}</span>}
@@ -1051,7 +1051,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   type="button"
                   className="btn sm"
                   disabled={!editable || pending !== null || group.is_default}
-                  title={group.is_default ? '默认组名称固定' : '修改证书组名称'}
+                  title={group.is_default ? '默认自签证书组名称固定' : '修改证书组名称'}
                   onClick={() =>
                     setEditing({
                       id: group.id,
@@ -1078,7 +1078,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   type="button"
                   className="btn sm danger"
                   disabled={!editable || members.length > 0 || pending !== null || group.is_default}
-                  title={group.is_default ? '默认组不能删除' : members.length > 0 ? '还有机器在用这个组' : '删除这个组'}
+                  title={group.is_default ? '默认自签证书组不能删除' : members.length > 0 ? '还有机器在用这个组' : '删除这个组'}
                   onClick={() => {
                     if (window.confirm(`删除证书组「${group.name}」？它的证书会一并删除。`)) {
                       run(`delete-group:${group.id}`, () => deleteCertGroup(group.id));

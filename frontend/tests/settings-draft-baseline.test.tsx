@@ -233,7 +233,7 @@ describe('设置页分段保存的基准', () => {
 
   it('自签证书主备槽占满后禁用继续添加', async () => {
     const full = certsWithGroup();
-    full.groups[0].name = '默认组';
+    full.groups[0].name = '默认自签证书组';
     full.groups[0].is_default = true;
     full.groups[0].names = ['northstar-edge-0123abcd.com'];
     full.groups[0].certificates = Array.from({ length: 2 }, (_, index) => ({

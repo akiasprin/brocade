@@ -16447,11 +16447,15 @@ async fn a_fresh_install_bootstraps_a_self_signed_primary_and_standby() {
     db.store.migrate().await.unwrap();
 
     assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 2);
+    sqlx::query("UPDATE cert_labels SET name = '默认组' WHERE is_default")
+        .execute(db.pool())
+        .await
+        .unwrap();
     assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 0);
     let groups = db.store.cert_groups(&system_admin()).await.unwrap();
     assert_eq!(groups.len(), 1);
     let group = &groups[0];
-    assert_eq!(group.name, "默认组");
+    assert_eq!(group.name, "默认自签证书组");
     assert!(group.is_default);
     assert_eq!(group.names.len(), 1);
     assert!(group.names[0].ends_with(".com"));
