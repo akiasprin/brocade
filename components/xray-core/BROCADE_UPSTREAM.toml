@@ -7,7 +7,9 @@ commit = "b4f08981becb71eaa995fa98ed2098ade92566bb"
 imported_at = "2026-09-03"
 license = "MPL-2.0"
 
-# AnyTLS is carried as a Brocade-maintained patch on top of this upstream baseline.
-# The fork is the only Xray runtime supported by Brocade; the unpatched community
-# binary is not a compatible deployment target.
+# Brocade-maintained capabilities carried on top of this upstream baseline. The fork is the only
+# Xray runtime supported by Brocade; the unpatched community binary is not a compatible deployment
+# target. `sniffing_failure_routing` marks IP destinations whose bounded sniffing attempt did not
+# recover a domain, allowing an explicit safe route instead of falling through to the default.
 anytls = true
+sniffing_failure_routing = true

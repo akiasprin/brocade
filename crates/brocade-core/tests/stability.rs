@@ -157,7 +157,8 @@ fn subscription_artifacts(snapshot: &ModelSnapshot) -> SubscriptionArtifacts {
 fn artifact_texts(snapshot: ModelSnapshot) -> (String, String, String, String) {
     let output = compile(&snapshot);
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
-    assert_eq!(output.summary.warnings, 0, "{:#?}", output.diagnostics);
+    assert_eq!(output.summary.warnings, 1, "{:#?}", output.diagnostics);
+    assert_eq!(output.diagnostics[0].code, "rule.sniffing-fallback-missing");
 
     let node_plan = output.project_node("hk").unwrap();
     let xray_text = json::xray(&xray::build(&node_plan));

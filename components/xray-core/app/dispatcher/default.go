@@ -26,6 +26,27 @@ import (
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
 
+// sniffingStateAttribute is intentionally an internal routing attribute rather than a
+// protocol field. The JSON router already knows how to match content attributes, so a
+// caller can choose a fail-safe outbound when an IP destination did not yield a domain
+// without changing Xray's public configuration schema.
+const sniffingStateAttribute = "xray.sniffing"
+
+const sniffingStateFailed = "failed"
+
+func setSniffingState(content *session.Content, originalDestinationWasIP, domainRecovered bool) {
+	if originalDestinationWasIP && !domainRecovered {
+		content.SetAttribute(sniffingStateAttribute, sniffingStateFailed)
+		return
+	}
+	// HTTP headers also live in Attributes. Remove a client-supplied or stale value so it
+	// cannot select the fail-safe route. The nil check also keeps the successful TLS/QUIC
+	// fast path allocation-free; only an actual failure needs to create the map.
+	if content.Attributes != nil {
+		delete(content.Attributes, sniffingStateAttribute)
+	}
+}
+
 type cachedReader struct {
 	sync.Mutex
 	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
@@ -285,9 +306,11 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	sniffingRequest := content.SniffingRequest
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled {
+		setSniffingState(content, false, false)
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
 		go func() {
+			originalDestinationWasIP := destination.Address.Family().IsIP()
 			cReader := &cachedReader{
 				reader: outbound.Reader.(*pipe.Reader),
 			}
@@ -296,7 +319,8 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 			if err == nil {
 				content.Protocol = result.Protocol()
 			}
-			if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+			domainRecovered := err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination)
+			if domainRecovered {
 				domain := result.Domain()
 				errors.LogInfo(ctx, "sniffed domain: ", domain)
 				destination.Address = net.ParseAddress(domain)
@@ -314,6 +338,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 					ob.Target = destination
 				}
 			}
+			setSniffingState(content, originalDestinationWasIP, domainRecovered)
 			d.routedDispatch(ctx, outbound, destination)
 		}()
 	}
@@ -341,8 +366,10 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
+		setSniffingState(content, false, false)
 		d.routedDispatch(ctx, outbound, destination)
 	} else {
+		originalDestinationWasIP := destination.Address.Family().IsIP()
 		cReader := &cachedReader{
 			reader: outbound.Reader.(buf.TimeoutReader),
 		}
@@ -351,7 +378,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		if err == nil {
 			content.Protocol = result.Protocol()
 		}
-		if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+		domainRecovered := err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination)
+		if domainRecovered {
 			domain := result.Domain()
 			errors.LogInfo(ctx, "sniffed domain: ", domain)
 			destination.Address = net.ParseAddress(domain)
@@ -369,6 +397,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 				ob.Target = destination
 			}
 		}
+		setSniffingState(content, originalDestinationWasIP, domainRecovered)
 		d.routedDispatch(ctx, outbound, destination)
 	}
 

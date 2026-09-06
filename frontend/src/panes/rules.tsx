@@ -393,6 +393,12 @@ export function RuleDraftScope({ children, hint }: { children: ReactNode; hint?:
 
 const MATCH_KINDS: { t: DestMatch['t']; label: string; hint: string; list: boolean }[] = [
   { t: 'any', label: '任意', hint: '兜底用，放最后一条', list: false },
+  {
+    t: 'sniffing_failed',
+    label: '嗅探失败兜底',
+    hint: '原目标为 IP 且 200ms 内未取得域名；放在域名规则之后、任意规则之前',
+    list: false,
+  },
   { t: 'geosite', label: 'geosite', hint: '如 cn、netflix（要节点上有 geosite.dat）', list: true },
   { t: 'geoip', label: 'geoip', hint: '如 cn、private', list: true },
   { t: 'domain_suffix', label: '域名后缀', hint: '如 example.com', list: true },
@@ -546,7 +552,32 @@ function MachineEgressDnsControls({
 
 const matchValues = (m: DestMatch): string => ('v' in m ? (Array.isArray(m.v) ? m.v.join(', ') : String(m.v)) : '');
 
-const isAnyRule = (rule: Rule): boolean => rule.m.t === 'any';
+const isAnyRule = (rule: Rule | undefined): boolean => rule?.m.t === 'any';
+const isSniffingFallbackRule = (rule: Rule | undefined): boolean => rule?.m.t === 'sniffing_failed';
+const isPinnedTerminalRule = (rule: Rule | undefined): boolean => isSniffingFallbackRule(rule) || isAnyRule(rule);
+
+// The failure selector is a second terminal. Keep every ordinary selector ahead of it so IP,
+// port and explicit domain rules still get first refusal, while Any remains the absolute last
+// resort. The same invariant is checked by brocade-core for writes that bypass this editor.
+const pinTerminalRules = (rules: Rule[]): Rule[] => [
+  ...rules.filter(rule => !isPinnedTerminalRule(rule)),
+  ...rules.filter(isSniffingFallbackRule),
+  ...rules.filter(isAnyRule),
+];
+
+const matchDependsOnSniffing = (match: DestMatch): boolean => {
+  switch (match.t) {
+    case 'domain_suffix':
+    case 'domain_keyword':
+    case 'domain_regex':
+    case 'geosite':
+      return true;
+    case 'all':
+      return match.v.some(matchDependsOnSniffing);
+    default:
+      return false;
+  }
+};
 
 type MachineDnsDraftRow = {
   id: string;
@@ -843,6 +874,8 @@ function buildMatch(t: DestMatch['t'], raw: string): DestMatch {
   switch (t) {
     case 'any':
       return { t: 'any' };
+    case 'sniffing_failed':
+      return { t: 'sniffing_failed' };
     case 'front_downstream':
       return { t: 'front_downstream' };
     case 'network':
@@ -1478,7 +1511,7 @@ function RuleEditorReady({
   // 两份草稿（规则表、各转发目标的中转端口）默认由本组件持有；`shared` 非空时交由上层持有，
   // 因为同一台机器在树中出现两次时，两处编辑的必须是同一份——它们对应库中的同一条记录
   // （steps 主键为 chain_id + node_id）。
-  const ownRules = useState<Rule[]>(initial);
+  const ownRules = useState<Rule[]>(() => pinTerminalRules(initial));
   const [rules, setRules] = shared ? [shared.rules, shared.setRules] : ownRules;
   const warpReferencedOnCurrentNode = (outboundId: string) =>
     rules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === outboundId) ||
@@ -1797,13 +1830,7 @@ function RuleEditorReady({
 
   const patch = (i: number, next: Rule) => {
     const updated = rules.map((rule, index) => (index === i ? next : rule));
-    // Any 是整张表的兜底，不论动作是落地、转发还是拒绝，都不能让后续规则失效。
-    // 在下拉框中把某行改成 Any 时，立即把该行移到末尾。
-    if (isAnyRule(next) && i < updated.length - 1) {
-      updated.splice(i, 1);
-      updated.push(next);
-    }
-    setRules(updated);
+    setRules(pinTerminalRules(updated));
   };
   const patchMatch = (i: number, rule: Rule, match: DestMatch) =>
     patch(i, {
@@ -1813,8 +1840,9 @@ function RuleEditorReady({
   const move = (i: number, delta: number) => {
     const j = i + delta;
     if (j < 0 || j >= rules.length) return;
-    // Any 可以向下归位，但不能向上；普通规则也不能越过已经位于末尾的 Any。
-    if ((isAnyRule(rules[i]) && delta < 0) || (delta > 0 && isAnyRule(rules[j]))) return;
+    // Both terminals are compiler invariants, not user-sortable rows. Ordinary rules cannot move
+    // below the failure fallback or Any.
+    if (isPinnedTerminalRule(rules[i]) || (delta > 0 && isPinnedTerminalRule(rules[j]))) return;
     const next = [...rules];
     [next[i], next[j]] = [next[j], next[i]];
     setRules(next);
@@ -1854,6 +1882,11 @@ function RuleEditorReady({
   /* 判定实现在模块层的 `defaultHopDial` 中，与建链向导共用同一份。 */
   const defaultDial = (to: string): HopDial =>
     defaultHopDial({ peer: peerOf(to), self: selfAddrs, port: Number(hopOf(to).port) || hopBase });
+
+  const defaultRuleAction = (): RuleAction =>
+    defaultTarget
+      ? forwardAction(defaultTarget, defaultDial(defaultTarget))
+      : { t: 'egress', send_through: null };
 
   // 切换档位时重新计算地址。连接方式按目标统一：同一个 from -> to 只对应一个
   // outbound/tag，各规则不能使用不同的地址。
@@ -1895,16 +1928,22 @@ function RuleEditorReady({
   }, [flushing]);
 
   const addRule = () => {
-    const anyIndex = rules.findIndex(isAnyRule);
+    const terminalIndex = rules.findIndex(isPinnedTerminalRule);
+    const hasAny = rules.some(isAnyRule);
     const next: Rule = {
-      // 已有兜底时，新行必须插在它之前；再创建一个 Any 会让原兜底之后的内容永远不可达。
-      m: anyIndex >= 0 ? { t: 'domain_suffix', v: [] } : { t: 'any' },
-      a: defaultTarget ? forwardAction(defaultTarget, defaultDial(defaultTarget)) : { t: 'egress', send_through: null },
+      // 已有终结规则时，新行必须插在它之前；再创建一个 Any 会让原兜底之后的内容永远不可达。
+      m: hasAny ? { t: 'domain_suffix', v: [] } : { t: 'any' },
+      a: defaultRuleAction(),
     };
     const updated = [...rules];
-    updated.splice(anyIndex >= 0 ? anyIndex : updated.length, 0, next);
-    setRules(updated);
+    updated.splice(terminalIndex >= 0 ? terminalIndex : updated.length, 0, next);
+    setRules(pinTerminalRules(updated));
   };
+
+  const hasSniffingDependentRule = rules.some(rule => matchDependsOnSniffing(rule.m));
+  const hasSniffingFallback = rules.some(isSniffingFallbackRule);
+  const addSniffingFallback = () =>
+    setRules(pinTerminalRules([...rules, { m: { t: 'sniffing_failed' }, a: defaultRuleAction() }]));
 
   return (
     // 使用 `fieldset` 仅为其 disabled 属性（它是 HTML 中唯一能一次禁用整棵子树
@@ -1965,7 +2004,12 @@ function RuleEditorReady({
                         <option
                           key={k.t}
                           value={k.t}
-                          disabled={k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)}
+                          disabled={
+                            (k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)) ||
+                            (k.t === 'sniffing_failed' &&
+                              r.m.t !== 'sniffing_failed' &&
+                              rules.some(isSniffingFallbackRule))
+                          }
                         >
                           {k.label}
                         </option>
@@ -2236,17 +2280,31 @@ function RuleEditorReady({
                     <td style={{ width: 120, textAlign: 'right' }}>
                       <button
                         className="btn"
-                        disabled={i === 0 || isAnyRule(r)}
+                        disabled={i === 0 || isPinnedTerminalRule(r)}
                         onClick={() => move(i, -1)}
-                        title={isAnyRule(r) ? '任意是兜底规则，固定在末尾' : '上移'}
+                        title={
+                          isAnyRule(r)
+                            ? '任意固定在末尾'
+                            : isSniffingFallbackRule(r)
+                              ? '嗅探失败兜底固定在任意之前'
+                              : '上移'
+                        }
                       >
                         ↑
                       </button>
                       <button
                         className="btn"
-                        disabled={i === rules.length - 1 || rules[i + 1]?.m.t === 'any'}
+                        disabled={
+                          i === rules.length - 1 || isPinnedTerminalRule(r) || isPinnedTerminalRule(rules[i + 1])
+                        }
                         onClick={() => move(i, 1)}
-                        title={rules[i + 1]?.m.t === 'any' ? '不能移动到任意兜底之后' : '下移'}
+                        title={
+                          isPinnedTerminalRule(r)
+                            ? '终结规则位置固定'
+                            : isPinnedTerminalRule(rules[i + 1])
+                              ? '不能移动到终结规则之后'
+                              : '下移'
+                        }
                       >
                         ↓
                       </button>
@@ -2671,6 +2729,14 @@ function RuleEditorReady({
         <button className="btn" onClick={addRule}>
           ＋ 加一条
         </button>
+        {hasSniffingDependentRule && !hasSniffingFallback && (
+          <>
+            <button className="btn" onClick={addSniffingFallback}>
+              ＋ 嗅探失败兜底
+            </button>
+            <span className="note">域名/Geosite 规则依赖嗅探；匹配条件与转发、落地或拒绝动作独立配置。</span>
+          </>
+        )}
         <span className="sp" />
         {/* 位于规则树中时按钮统一收敛到末尾，此处只保留该表已修改的标记 */}
         {bus ? (

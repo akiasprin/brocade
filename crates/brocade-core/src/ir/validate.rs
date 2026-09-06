@@ -2199,6 +2199,8 @@ fn validate_steps(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnostic>
             ));
         }
 
+        validate_sniffing_fallback(step, diagnostics);
+
         // Reverse access's downstream is not bound by this check. Its `accept` is its
         // own identity, not a key others dial it with (see the credential passage in
         // `ir/hops.rs`) — it does not listen at all and dials the upstream itself.
@@ -2255,6 +2257,58 @@ fn validate_steps(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnostic>
                 ));
             }
         }
+    }
+}
+
+/// Domain and protocol rules can receive an IP-only destination. Xray gives sniffing a bounded
+/// window; without an explicit failure rule, an unrecognized connection simply continues down
+/// the table and can reach the terminal Any action. The failure rule is therefore a second
+/// terminal: all ordinary selectors get first refusal, then sniffing failure, then Any.
+fn validate_sniffing_fallback(step: &super::routing::Step, diagnostics: &mut Vec<Diagnostic>) {
+    let at = format!("{}/{}", step.chain, step.node);
+    let positions = step
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| {
+            matches!(rule.dest_match, DestMatch::SniffingFailed).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    if positions.is_empty()
+        && step
+            .rules
+            .iter()
+            .any(|rule| rule.dest_match.depends_on_sniffing())
+    {
+        diagnostics.push(Diagnostic::warn(
+            "rule.sniffing-fallback-missing",
+            &at,
+            "存在依赖嗅探的域名、Geosite 或协议规则，但没有嗅探失败兜底；IP 目标在 200ms 内未取得域名时可能继续命中 Any",
+        ));
+    }
+
+    if positions.len() > 1 {
+        diagnostics.push(Diagnostic::error(
+            "rule.sniffing-fallback-duplicate",
+            &at,
+            "嗅探失败兜底只能有一条",
+        ));
+    }
+
+    let Some(&position) = positions.first() else {
+        return;
+    };
+    if matches!(
+        step.rules.last().map(|rule| &rule.dest_match),
+        Some(DestMatch::Any)
+    ) && position + 2 != step.rules.len()
+    {
+        diagnostics.push(Diagnostic::error(
+            "rule.sniffing-fallback-position",
+            &at,
+            "嗅探失败兜底必须固定在所有普通规则之后、末条 Any 之前",
+        ));
     }
 }
 
@@ -3226,7 +3280,7 @@ where
 
 fn has_empty_match(rule: &Rule) -> bool {
     match &rule.dest_match {
-        DestMatch::Any | DestMatch::FrontDownstream => false,
+        DestMatch::Any | DestMatch::SniffingFailed | DestMatch::FrontDownstream => false,
         DestMatch::DomainSuffix(values)
         | DestMatch::DomainKeyword(values)
         | DestMatch::Geosite(values)
@@ -3265,6 +3319,7 @@ fn has_unrepresentable_all_match(dest_match: &DestMatch) -> bool {
 fn collect_match_slots(dest_match: &DestMatch, slots: &mut MatchSlots) -> bool {
     match dest_match {
         DestMatch::Any => true,
+        DestMatch::SniffingFailed => slots.put(MatchSlot::Attribute),
         DestMatch::DomainSuffix(_)
         | DestMatch::DomainKeyword(_)
         | DestMatch::DomainRegex(_)
@@ -3288,6 +3343,7 @@ struct MatchSlots {
     port: bool,
     network: bool,
     protocol: bool,
+    attribute: bool,
 }
 
 impl MatchSlots {
@@ -3298,6 +3354,7 @@ impl MatchSlots {
             MatchSlot::Port => &mut self.port,
             MatchSlot::Network => &mut self.network,
             MatchSlot::Protocol => &mut self.protocol,
+            MatchSlot::Attribute => &mut self.attribute,
         };
         if *occupied {
             return false;
@@ -3314,6 +3371,7 @@ enum MatchSlot {
     Port,
     Network,
     Protocol,
+    Attribute,
 }
 
 fn under(child: &str, parent: &str) -> bool {
@@ -3498,6 +3556,7 @@ fn match_host(dest_match: &DestMatch, host: &str) -> MatchVerdict {
         | DestMatch::Port(_)
         | DestMatch::PortExcept(_)
         | DestMatch::Protocol(_)
+        | DestMatch::SniffingFailed
         | DestMatch::Network(_) => MatchVerdict::Maybe,
     }
 }

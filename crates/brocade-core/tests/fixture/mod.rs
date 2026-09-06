@@ -250,6 +250,7 @@ fn model_rule(rule: &Value) -> Rule {
 fn model_match(value: &Value) -> DestMatch {
     match str_value(&value["t"]) {
         "any" => DestMatch::Any,
+        "sniffing_failed" => DestMatch::SniffingFailed,
         "domain_suffix" => DestMatch::DomainSuffix(csv(&value["v"])),
         "domain_keyword" => DestMatch::DomainKeyword(csv(&value["v"])),
         "domain_regex" => DestMatch::DomainRegex(str_value(&value["v"]).to_owned()),

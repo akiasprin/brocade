@@ -2292,6 +2292,7 @@ fn parse_dest_match(value: &Value) -> Result<DestMatch> {
     let tag = tagged_kind(value)?;
     match tag {
         "any" => Ok(DestMatch::Any),
+        "sniffing_failed" => Ok(DestMatch::SniffingFailed),
         "domain_suffix" => Ok(DestMatch::DomainSuffix(tagged_string_array(value)?)),
         "domain_keyword" => Ok(DestMatch::DomainKeyword(tagged_string_array(value)?)),
         "domain_regex" => Ok(DestMatch::DomainRegex(tagged_string(value)?)),
@@ -2561,6 +2562,10 @@ mod tests {
                 "action": { "t": "block" }
             },
             {
+                "match": { "t": "sniffing_failed" },
+                "action": { "t": "block" }
+            },
+            {
                 "match": { "t": "geosite", "v": ["netflix"] },
                 "action": {
                     "t": "egress",
@@ -2603,6 +2608,10 @@ mod tests {
                 },
                 Rule {
                     dest_match: DestMatch::FrontDownstream,
+                    action: Action::Block,
+                },
+                Rule {
+                    dest_match: DestMatch::SniffingFailed,
                     action: Action::Block,
                 },
                 Rule {

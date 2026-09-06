@@ -2197,6 +2197,7 @@ fn project_node_adds_hop_inbound_and_dns_route() {
     assert_eq!(overlay["listen"], "10.66.0.2");
     assert_eq!(overlay["settings"]["clients"][0]["id"], "uuid-sg");
     assert_eq!(overlay["settings"]["clients"][0]["email"], "c-relay@sg");
+    assert!(overlay.get("sniffing").is_none());
 
     assert_eq!(value["dns"]["tag"], "dns-out");
     assert_eq!(value["dns"]["servers"], serde_json::json!(["8.8.8.8"]));
@@ -2205,6 +2206,83 @@ fn project_node_adds_hop_inbound_and_dns_route() {
         serde_json::json!(["dns-out"])
     );
     assert_eq!(value["routing"]["rules"][1]["outboundTag"], "out:egress");
+}
+
+#[test]
+fn sniffing_failure_rule_opts_relay_into_sniffing_and_can_route_to_local_egress() {
+    let doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true, Dns::System),
+        node("sg", [10, 66, 0, 2], true, Dns::System),
+    ]);
+    let mut relay = AppView {
+        id: "relay".to_owned(),
+        label: "中转".to_owned(),
+        chains: vec![chain("c-relay")],
+        ingresses: vec![ingress("i-relay", "c-relay", "hk")],
+        fronts: Vec::new(),
+        steps: vec![
+            step("c-relay", "hk", vec![forward("sg")], None),
+            step(
+                "c-relay",
+                "sg",
+                vec![
+                    Rule {
+                        dest_match: DestMatch::Geosite(vec!["netflix".to_owned()]),
+                        action: Action::Block,
+                    },
+                    Rule {
+                        dest_match: DestMatch::Any,
+                        action: Action::Block,
+                    },
+                ],
+                Some(accept("uuid-sg", "c-relay@sg")),
+            ),
+        ],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let relay_ir = compile_hops(
+        compile_app(&doc, &relay, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[relay_ir], "sg")));
+    assert!(
+        inbound(&value, "in:hop:relay/c-relay")
+            .get("sniffing")
+            .is_none(),
+        "a legacy domain rule must not silently add another 200ms relay sniff window"
+    );
+
+    relay.steps[1].rules.insert(
+        1,
+        Rule {
+            dest_match: DestMatch::SniffingFailed,
+            action: Action::Egress { send_through: None },
+        },
+    );
+    let mut fallback_diagnostics = Vec::new();
+    let fallback_ir = compile_hops(
+        compile_app(&doc, &relay, &mut fallback_diagnostics),
+        &sys,
+        &mut fallback_diagnostics,
+    );
+    assert!(fallback_diagnostics.is_empty(), "{fallback_diagnostics:#?}");
+    let with_fallback = parse_xray(&xray::build(&project_node(&sys, &[fallback_ir], "sg")));
+    assert_eq!(
+        inbound(&with_fallback, "in:hop:relay/c-relay")["sniffing"],
+        serde_json::json!({
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
+        })
+    );
+    assert_eq!(
+        rule_to(&with_fallback, "out:egress")["attrs"],
+        serde_json::json!({ "xray.sniffing": "^failed$" })
+    );
 }
 
 #[test]

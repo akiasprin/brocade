@@ -5455,6 +5455,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains(&script_default));
         assert!(upstream.contains(&format!("tag = \"{BROCADE_XRAY_VERSION}\"")));
         assert!(upstream.contains("anytls = true"));
+        assert!(upstream.contains("sniffing_failure_routing = true"));
         assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"b4f0898\""));
         assert!(build_script.contains("core.build={build_id}"));
         assert!(build_script.contains("fn repository_build_id"));

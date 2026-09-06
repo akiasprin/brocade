@@ -15,11 +15,26 @@ fn demo_raw_configs_match_core_compiler() {
     let output = compile(&snapshot);
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
     // The demo deliberately carries one Pool hop so the concurrency-one artifact path keeps a
-    // golden baseline. It is also the one warning the compiler should produce: Pool remains
-    // compatible, but new console rules no longer select it because idle Mux.cool workers are not
-    // health-checked before reuse.
-    assert_eq!(output.summary.warnings, 1, "{:#?}", output.diagnostics);
-    assert_eq!(output.diagnostics[0].code, "rule.pool-concurrency-one");
+    // golden baseline. Its seven older domain/Geosite rule tables do not yet carry the explicit
+    // sniffing-failure fallback, so the compiler also identifies each migration point without
+    // blocking publication.
+    assert_eq!(output.summary.warnings, 8, "{:#?}", output.diagnostics);
+    assert_eq!(
+        output
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "rule.pool-concurrency-one")
+            .count(),
+        1
+    );
+    assert_eq!(
+        output
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "rule.sniffing-fallback-missing")
+            .count(),
+        7
+    );
     let dump_dir = env::var_os("BROCADE_DEMO_DUMP_DIR").map(PathBuf::from);
     if let Some(dir) = &dump_dir {
         fs::create_dir_all(dir).unwrap();

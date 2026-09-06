@@ -164,6 +164,47 @@ function renderMachineRules(
 }
 
 describe('machine-scoped egress DNS', () => {
+  it('offers a safe sniffing fallback and pins it immediately before Any', () => {
+    const view = renderEditor(
+      false,
+      [
+        { m: { t: 'geosite', v: ['netflix'] }, a: { t: 'egress', send_through: null } },
+        { m: { t: 'any' }, a: { t: 'egress', send_through: null } },
+      ],
+      false,
+      [],
+      true,
+      true,
+      [],
+    );
+    const matchSelects = () =>
+      Array.from(view.container.querySelectorAll<HTMLSelectElement>('td.rule-match-cell > select'));
+
+    expect(matchSelects().map(select => select.value)).toEqual(['geosite', 'any']);
+    fireEvent.click(view.getByRole('button', { name: '＋ 嗅探失败兜底' }));
+
+    expect(matchSelects().map(select => select.value)).toEqual(['geosite', 'sniffing_failed', 'any']);
+    const fallbackSelect = matchSelects().find(select => select.value === 'sniffing_failed')!;
+    const fallbackRow = fallbackSelect.closest('tr')!;
+    const action = fallbackRow.querySelector<HTMLSelectElement>('select.rule-action-select')!;
+    const egress = action.querySelector<HTMLOptionElement>('option[value="egress"]')!;
+    const moveButtons = fallbackRow.querySelectorAll<HTMLButtonElement>('button.btn:not(.danger)');
+    expect(action.value).toBe('egress');
+    expect(egress.disabled).toBe(false);
+    expect(moveButtons[0].disabled).toBe(true);
+    expect(moveButtons[1].disabled).toBe(true);
+    fireEvent.change(action, { target: { value: 'block' } });
+    expect(action.value).toBe('block');
+
+    const geositeFallbackOption = matchSelects()[0].querySelector<HTMLOptionElement>(
+      'option[value="sniffing_failed"]',
+    )!;
+    expect(geositeFallbackOption.disabled).toBe(true);
+
+    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    expect(matchSelects().map(select => select.value)).toEqual(['geosite', 'domain_suffix', 'sniffing_failed', 'any']);
+  });
+
   it('adds a new machine DNS policy from the machine-detail panel header', async () => {
     draft.init('machine-detail-dns-create-test');
     draft.clear();

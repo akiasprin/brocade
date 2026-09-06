@@ -333,6 +333,7 @@ pub enum XrayInbound {
         port: u16,
         security: XrayHopInboundWire,
         clients: Vec<XrayClient>,
+        sniff: bool,
     },
     /// A relay inbound speaking Shadowsocks 2022. Its own variant rather than a wire format
     /// inside `Backbone`, because none of the VLESS shape applies: the settings object is a
@@ -348,6 +349,7 @@ pub enum XrayInbound {
         /// gives arriving traffic an identity: without it the routing rules select nothing
         /// and the usage counters have no name to hang off.
         users: Vec<XrayShadowsocksUser>,
+        sniff: bool,
     },
 }
 
@@ -640,6 +642,10 @@ fn stamp_rule_tags(rules: &mut [XrayRoutingRule]) {
             &mut hasher,
             rule.condition.network.as_deref().unwrap_or("").as_bytes(),
         );
+        if rule.condition.sniffing_failed {
+            field(&mut hasher, b"xray.sniffing");
+            field(&mut hasher, b"^failed$");
+        }
         field(&mut hasher, rule.outbound_tag.as_bytes());
         field(
             &mut hasher,
@@ -662,6 +668,9 @@ pub struct XrayMatchCondition {
     pub network: Option<String>,
     /// What the sniffer decided the connection speaks. Empty on every rule that does not ask.
     pub protocol: Vec<String>,
+    /// The Brocade Xray fork marks this after a bounded sniffing attempt could not recover a
+    /// routable domain from an IP destination.
+    pub sniffing_failed: bool,
 }
 
 pub fn build(plan: &NodePlan) -> XrayArtifact {
@@ -1180,6 +1189,7 @@ fn hop_inbound(
         port: hop.port,
         security,
         clients: clients(),
+        sniff: hop.sniff,
     };
 
     match &hop.security {
@@ -1220,6 +1230,7 @@ fn hop_inbound(
                     password: user_psk.clone(),
                 })
                 .collect(),
+            sniff: hop.sniff,
         },
     }
 }
@@ -1409,6 +1420,7 @@ fn match_condition(dest_match: &DestMatch) -> XrayMatchCondition {
 fn put_match(dest_match: &DestMatch, condition: &mut XrayMatchCondition) {
     match dest_match {
         DestMatch::Any => {}
+        DestMatch::SniffingFailed => condition.sniffing_failed = true,
         DestMatch::DomainSuffix(values) => put_domains(
             values.iter().map(|value| format!("domain:{value}")),
             condition,
@@ -1490,6 +1502,7 @@ fn is_representable_match(dest_match: &DestMatch) -> bool {
 fn collect_match_slots(dest_match: &DestMatch, slots: &mut MatchSlots) -> bool {
     match dest_match {
         DestMatch::Any => true,
+        DestMatch::SniffingFailed => slots.put(MatchSlot::Attribute),
         DestMatch::DomainSuffix(_)
         | DestMatch::DomainKeyword(_)
         | DestMatch::DomainRegex(_)
@@ -1513,6 +1526,7 @@ struct MatchSlots {
     port: bool,
     network: bool,
     protocol: bool,
+    attribute: bool,
 }
 
 impl MatchSlots {
@@ -1523,6 +1537,7 @@ impl MatchSlots {
             MatchSlot::Port => &mut self.port,
             MatchSlot::Network => &mut self.network,
             MatchSlot::Protocol => &mut self.protocol,
+            MatchSlot::Attribute => &mut self.attribute,
         };
         if *occupied {
             return false;
@@ -1539,6 +1554,7 @@ enum MatchSlot {
     Port,
     Network,
     Protocol,
+    Attribute,
 }
 
 fn put_domains<I>(values: I, condition: &mut XrayMatchCondition)

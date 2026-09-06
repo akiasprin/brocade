@@ -270,40 +270,45 @@ fn inbound(inbound: &XrayInbound) -> Value {
             method,
             password,
             users,
-        } => json!({
-            "tag": tag,
-            "listen": listen,
-            "port": port,
-            "protocol": "shadowsocks",
-            "settings": {
-                "method": method,
-                "password": password,
-                // Both, and stated rather than left out. xray reads an absent `network` as TCP
-                // alone (`NetworkList::Build` returns TCP for nil), so silence here would drop
-                // every UDP packet the chain carries — DNS and QUIC among them — while the
-                // relay looked healthy and TCP kept working. VLESS needs no equivalent because
-                // it tunnels UDP inside its own connection; shadowsocks dials the relay over
-                // UDP for UDP, so the port has to be listening on it.
-                "network": "tcp,udp",
-                // `clients` rather than `users`, which xray accepts as the same thing
-                // (`ShadowsocksServerConfig::Build` copies one onto the other). It is spelled
-                // the way the VLESS inbounds above spell it, so somebody comparing two relay
-                // ports in one file is not made to notice a difference that is not there.
-                //
-                // The accounts carry no method of their own. xray refuses one outright
-                // ("users must have empty method") because the port already declared it, and
-                // a second answer could only ever disagree.
-                "clients": users.iter().map(|user| json!({
-                    "email": user.email,
-                    "password": user.password,
-                })).collect::<Vec<_>>(),
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "none",
-                "sockopt": { "tcpFastOpen": TCP_FAST_OPEN_BACKLOG },
-            },
-        }),
+            sniff,
+        } => {
+            let mut value = json!({
+                "tag": tag,
+                "listen": listen,
+                "port": port,
+                "protocol": "shadowsocks",
+                "settings": {
+                    "method": method,
+                    "password": password,
+                    // Both, and stated rather than left out. xray reads an absent `network` as TCP
+                    // alone (`NetworkList::Build` returns TCP for nil), so silence here would drop
+                    // every UDP packet the chain carries — DNS and QUIC among them — while the
+                    // relay looked healthy and TCP kept working. VLESS needs no equivalent because
+                    // it tunnels UDP inside its own connection; shadowsocks dials the relay over
+                    // UDP for UDP, so the port has to be listening on it.
+                    "network": "tcp,udp",
+                    // `clients` rather than `users`, which xray accepts as the same thing
+                    // (`ShadowsocksServerConfig::Build` copies one onto the other). It is spelled
+                    // the way the VLESS inbounds above spell it, so somebody comparing two relay
+                    // ports in one file is not made to notice a difference that is not there.
+                    //
+                    // The accounts carry no method of their own. xray refuses one outright
+                    // ("users must have empty method") because the port already declared it, and
+                    // a second answer could only ever disagree.
+                    "clients": users.iter().map(|user| json!({
+                        "email": user.email,
+                        "password": user.password,
+                    })).collect::<Vec<_>>(),
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none",
+                    "sockopt": { "tcpFastOpen": TCP_FAST_OPEN_BACKLOG },
+                },
+            });
+            enable_sniffing(&mut value, *sniff);
+            value
+        }
         XrayInbound::Api {
             tag,
             listen,
@@ -485,6 +490,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
             port,
             security,
             clients,
+            sniff,
         } => {
             // Each position states one thing: `decryption` is the protocol layer
             // (where VLESS Encryption lands) and `streamSettings.security` the
@@ -520,7 +526,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
             };
             enable_tcp_fast_open(&mut stream_settings, json!(TCP_FAST_OPEN_BACKLOG));
 
-            json!({
+            let mut value = json!({
                 "tag": tag,
                 "listen": listen,
                 "port": port,
@@ -542,9 +548,27 @@ fn inbound(inbound: &XrayInbound) -> Value {
                     "decryption": decryption,
                 },
                 "streamSettings": stream_settings,
-            })
+            });
+            enable_sniffing(&mut value, *sniff);
+            value
         }
     }
+}
+
+fn enable_sniffing(value: &mut Value, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    value
+        .as_object_mut()
+        .expect("xray inbound is an object")
+        .insert(
+            "sniffing".to_owned(),
+            json!({
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+            }),
+        );
 }
 
 fn hysteria_stream_settings(
@@ -1327,6 +1351,9 @@ fn put_condition(object: &mut Map<String, Value>, condition: &XrayMatchCondition
     }
     if !condition.protocol.is_empty() {
         object.insert("protocol".to_owned(), json!(condition.protocol));
+    }
+    if condition.sniffing_failed {
+        object.insert("attrs".to_owned(), json!({ "xray.sniffing": "^failed$" }));
     }
 }
 

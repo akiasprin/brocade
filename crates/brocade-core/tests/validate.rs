@@ -1525,6 +1525,77 @@ fn validate_app_reports_duplicate_ids_no_ingress_and_empty_match() {
 }
 
 #[test]
+fn sniffing_failure_fallback_is_explicit_and_pinned_before_any() {
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![
+                Rule {
+                    dest_match: DestMatch::Geosite(vec!["netflix".to_owned()]),
+                    action: Action::Block,
+                },
+                any_egress(),
+            ],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    let doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    let mut compile_diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut compile_diagnostics);
+    let base = compile_app(&doc, &app, &mut compile_diagnostics);
+
+    let mut missing = Vec::new();
+    validate_app(&sys, &base, &mut missing);
+    assert_has(&missing, Level::Warn, "rule.sniffing-fallback-missing");
+
+    let mut fallback = base.steps[0].rules[0].clone();
+    fallback.dest_match = DestMatch::SniffingFailed;
+    // A failure only says that no domain was recovered; local egress remains a valid,
+    // explicitly selected action.
+    fallback.action = Action::Egress { send_through: None };
+    let mut misplaced_app = base.clone();
+    misplaced_app.steps[0].rules.insert(0, fallback.clone());
+    let mut misplaced = Vec::new();
+    validate_app(&sys, &misplaced_app, &mut misplaced);
+    assert_has(&misplaced, Level::Error, "rule.sniffing-fallback-position");
+
+    let mut valid_app = base.clone();
+    let valid_position = valid_app.steps[0].rules.len() - 1;
+    valid_app.steps[0]
+        .rules
+        .insert(valid_position, fallback.clone());
+    let mut valid = Vec::new();
+    validate_app(&sys, &valid_app, &mut valid);
+    assert!(
+        valid
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with("rule.sniffing-fallback")),
+        "{valid:#?}"
+    );
+
+    let duplicate_position = valid_app.steps[0].rules.len() - 1;
+    valid_app.steps[0]
+        .rules
+        .insert(duplicate_position, fallback);
+    let mut duplicate = Vec::new();
+    validate_app(&sys, &valid_app, &mut duplicate);
+    assert_has(&duplicate, Level::Error, "rule.sniffing-fallback-duplicate");
+}
+
+#[test]
 fn validate_app_reports_unrepresentable_all_match() {
     let app = AppView {
         id: "app".to_owned(),

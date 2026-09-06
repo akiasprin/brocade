@@ -2526,6 +2526,9 @@ pub struct Rule {
 #[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum DestMatch {
     Any,
+    /// Content sniffing was enabled for an IP destination, but no domain was recovered for
+    /// routing. This is the explicit fail-safe hook for Xray's bounded sniffing window.
+    SniffingFailed,
     DomainSuffix(Vec<String>),
     DomainKeyword(Vec<String>),
     DomainRegex(String),
@@ -2546,6 +2549,32 @@ pub enum DestMatch {
 }
 
 impl DestMatch {
+    /// Whether this selector may need Xray to inspect application bytes when the original
+    /// destination is an IP address. A hostname supplied by the client can satisfy the domain
+    /// selectors without sniffing, but an IP-only request cannot.
+    pub fn depends_on_sniffing(&self) -> bool {
+        match self {
+            Self::DomainSuffix(_)
+            | Self::DomainKeyword(_)
+            | Self::DomainRegex(_)
+            | Self::Geosite(_)
+            | Self::Protocol(_) => true,
+            Self::All(values) => values.iter().any(Self::depends_on_sniffing),
+            _ => false,
+        }
+    }
+
+    /// Whether this selector asks the Brocade Xray fork to expose the bounded sniffing-failure
+    /// marker. Ordinary domain selectors do not opt a relay into another sniff attempt by
+    /// themselves: doing that to an existing multi-hop rule table could add 200ms at every hop.
+    pub fn requests_sniffing_failure_state(&self) -> bool {
+        match self {
+            Self::SniffingFailed => true,
+            Self::All(values) => values.iter().any(Self::requests_sniffing_failure_state),
+            _ => false,
+        }
+    }
+
     /// Canonical identity for a machine-owned DNS policy selector.
     ///
     /// Routing lists are sets, so their input order cannot create a second DNS policy. Keeping

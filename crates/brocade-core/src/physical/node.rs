@@ -348,6 +348,9 @@ pub struct XrayHopInboundPlan {
     /// This machine's relay-port material for this chain, including the private key.
     pub security: HopWire,
     pub clients: Vec<XrayClientPlan>,
+    /// Enabled only after this step explicitly adds a bounded sniffing-failure selector. Merely
+    /// having a domain rule does not add a second 200ms sniff window to an existing relay.
+    pub sniff: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1097,6 +1100,10 @@ fn xray_hop_inbounds(
                 port: hop_in.port,
                 security: hop_in.security.clone(),
                 clients,
+                sniff: step
+                    .rules
+                    .iter()
+                    .any(|rule| rule.dest_match.requests_sniffing_failure_state()),
             });
         }
     }

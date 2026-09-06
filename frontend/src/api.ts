@@ -1231,6 +1231,7 @@ export const stageGrant = (grant: GrantWrite) => {
 // Rule 的键是 m 和 a（服务端通过 #[serde(rename)] 指定）。
 export type DestMatch =
   | { t: 'any' }
+  | { t: 'sniffing_failed' }
   | { t: 'domain_suffix'; v: string[] }
   | { t: 'domain_keyword'; v: string[] }
   | { t: 'domain_regex'; v: string }
