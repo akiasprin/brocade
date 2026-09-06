@@ -1165,7 +1165,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                           )}
                         </span>
                         <div className="certrow-actions">
-                          {cert.status === 'ready' && (
+                          {(cert.status === 'ready' || cert.status === 'compatible') && (
                             <button
                               type="button"
                               className="btn sm"
@@ -1175,7 +1175,9 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                                 (cert.signing_method === 'self-signed' && preloadPending)
                               }
                               title={
-                                cert.signing_method === 'self-signed'
+                                cert.status === 'compatible'
+                                  ? '切回这张旧证书；当前证书会继续保留兼容'
+                                  : cert.signing_method === 'self-signed'
                                   ? preloadPending
                                     ? '等待所有机器确认主备槽后才能启用'
                                     : '发布这张证书的新 SNI 与证书校验'
@@ -1183,7 +1185,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                               }
                               onClick={() => run(`serve:${cert.id}`, () => serveCertificate(cert.id))}
                             >
-                              {pending === `serve:${cert.id}` ? '启用中…' : '启用'}
+                              {pending === `serve:${cert.id}` ? '切换中…' : cert.status === 'compatible' ? '切回' : '启用'}
                             </button>
                           )}
                           {cert.status !== 'serving' && (

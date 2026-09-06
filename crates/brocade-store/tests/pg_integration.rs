@@ -16618,6 +16618,42 @@ async fn self_signed_rotation_keeps_one_compatible_identity_in_stable_slots() {
         .unwrap();
     assert_eq!(status_of(&db, &issued[0]).await, "compatible");
     assert_eq!(status_of(&db, &issued[1]).await, "serving");
+
+    // Switching is reversible. The old identity keeps its physical slot while compatible and can
+    // become serving again; the certificate it replaces remains available to clients in turn.
+    db.store
+        .promote_certificate(&system_admin(), &issued[0])
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &issued[0]).await, "serving");
+    assert_eq!(status_of(&db, &issued[1]).await, "compatible");
+    let switched_back = db.store.cert_groups(&system_admin()).await.unwrap();
+    let switched_back = &switched_back[0].certificates;
+    assert_eq!(
+        switched_back
+            .iter()
+            .find(|cert| cert.id == issued[0])
+            .unwrap()
+            .runtime_slot
+            .as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        switched_back
+            .iter()
+            .find(|cert| cert.id == issued[1])
+            .unwrap()
+            .runtime_slot
+            .as_deref(),
+        Some("b")
+    );
+    db.store
+        .promote_certificate(&system_admin(), &issued[1])
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &issued[0]).await, "compatible");
+    assert_eq!(status_of(&db, &issued[1]).await, "serving");
+
     let error = db
         .store
         .request_spare_certificate(&system_admin(), &label_id)

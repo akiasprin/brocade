@@ -1286,9 +1286,9 @@ pub async fn promote_certificate(
     if status == "serving" {
         return Ok(());
     }
-    if status != "ready" {
+    if status != "ready" && status != "compatible" {
         return Err(StoreError::InvalidData(format!(
-            "这张证书是 {status}，还不能启用——只有已签发待命的（ready）可以"
+            "这张证书是 {status}，还不能启用——只有备用或保留兼容的证书可以"
         )));
     }
     let previous_directory: Option<String> = sqlx::query_scalar(
