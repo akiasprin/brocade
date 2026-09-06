@@ -493,6 +493,16 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    // The ordinary fixture already uses the current grouped IDs. Rename it back to the oldest
+    // supported on-disk shape so this test exercises the real upgrade path on replay.
+    sqlx::query("UPDATE chains SET id = 'c-main' WHERE id = 'chn-a1b2-c3d4'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ingresses SET id = 'i-main' WHERE id = 'ing-a1b2'")
+        .execute(db.pool())
+        .await
+        .unwrap();
 
     sqlx::query(
         "INSERT INTO apps (id, label, position)
@@ -688,12 +698,12 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert!(chain_main.starts_with("c-") && chain_main.len() == 8);
-    assert!(ingress_main.starts_with("i-") && ingress_main.len() == 8);
-    assert_ne!(
-        &chain_main[2..],
-        &ingress_main[2..],
-        "Chain and Ingress must share one six-letter namespace"
+    assert!(chain_main.starts_with("chn-") && chain_main.len() == 13);
+    assert!(ingress_main.starts_with("ing-") && ingress_main.len() == 8);
+    assert_eq!(
+        &chain_main[4..8],
+        &ingress_main[4..],
+        "A chain must carry its ingress's four-character token"
     );
     let migrated_xmux: serde_json::Value =
         sqlx::query_scalar("SELECT xhttp_xmux FROM ingress_client_settings WHERE ingress_id = $1")
@@ -731,12 +741,15 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
     .await
     .unwrap();
     assert_eq!(removed_client_columns, 0);
-    let reserved_bodies: (i64, i64) =
-        sqlx::query_as("SELECT count(*), count(DISTINCT body) FROM friendly_model_id_bodies")
+    let legacy_registry: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('friendly_model_id_bodies')::text")
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(reserved_bodies, (4, 4));
+    assert_eq!(
+        legacy_registry, None,
+        "the pronounceable-ID registry remains"
+    );
     let alias_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('model_id_aliases')::text")
             .fetch_one(db.pool())
@@ -970,43 +983,6 @@ async fn migration_0001_replays_after_its_checksum_row_is_cleared() {
         "a stale draft resurrected a migrated chain id"
     );
 
-    let cross_kind_id = format!("c-{}", &ingress_main[2..]);
-    let cross_kind = db
-        .store
-        .apply_draft(
-            &system_admin(),
-            vec![ModelOp::UpsertChain {
-                app_id: app_main.clone(),
-                chain: CreateChainRequest {
-                    id: cross_kind_id,
-                    tenant_id: "platform.acme".to_owned(),
-                    name: "must not share an ingress body".to_owned(),
-                    subscription_country: None,
-                    note: None,
-                },
-            }],
-            None,
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(cross_kind, StoreError::Conflict(_)));
-
-    // The trigger is the final backstop for maintenance SQL and concurrent writers which bypass
-    // the Store helper. A prefix change must not make the same six-letter body legal.
-    let duplicate_ingress_id = format!("i-{}", &chain_main[2..]);
-    let direct_collision = sqlx::query("UPDATE ingresses SET id = $1 WHERE id = $2")
-        .bind(&duplicate_ingress_id)
-        .bind(&ingress_main)
-        .execute(db.pool())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        direct_collision
-            .as_database_error()
-            .and_then(|error| error.code()),
-        Some(std::borrow::Cow::Borrowed("23505"))
-    );
-
     let app_positions: Vec<(String, i32)> =
         sqlx::query_as("SELECT id, position FROM apps ORDER BY position")
             .fetch_all(db.pool())
@@ -1204,7 +1180,7 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
             chain_id, app_id, node_id, status, ttfb_ms, exit_ip,
             exit_loc, exit_verdict, probed_at
          ) VALUES (
-            'c-main', 'app-main', 'n1', 'ok', 25, '192.0.2.10',
+            'chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 25, '192.0.2.10',
             'test-region', 'match', now()
          )",
     )
@@ -1215,9 +1191,9 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
     let identity_references = || async {
         sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
             "SELECT
-                (SELECT app_id FROM chains WHERE id = 'c-main'),
-                (SELECT app_id FROM grants WHERE ingress_id = 'i-main'),
-                (SELECT app_id FROM e2e_probes WHERE chain_id = 'c-main'),
+                (SELECT app_id FROM chains WHERE id = 'chn-a1b2-c3d4'),
+                (SELECT app_id FROM grants WHERE ingress_id = 'ing-a1b2'),
+                (SELECT app_id FROM e2e_probes WHERE chain_id = 'chn-a1b2-c3d4'),
                 (SELECT app_id FROM usage_samples LIMIT 1),
                 (SELECT app_id FROM usage_chain_samples LIMIT 1),
                 (SELECT chain_id FROM usage_chain_samples LIMIT 1),
@@ -1260,7 +1236,7 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
             "app-main".to_owned(),
             "app-main".to_owned(),
             "app-main".to_owned(),
-            "c-main".to_owned(),
+            "chn-a1b2-c3d4".to_owned(),
             "app-main".to_owned(),
         )
     );
@@ -1300,7 +1276,10 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
 
     // The untouched/default sequence follows stable IDs even when creation happens in another
     // order. Both chains belong to app-main; positions are deliberately not global.
-    for (id, name) in [("c-zovuru", "Zulu Chain"), ("c-bacemu", "Alpha Chain")] {
+    for (id, name) in [
+        ("chn-c3d4-e5f6", "Zulu Chain"),
+        ("chn-b2c3-d4e5", "Alpha Chain"),
+    ] {
         db.store
             .upsert_chain(
                 &system_admin(),
@@ -1321,16 +1300,19 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             .fetch_all(db.pool())
             .await
             .unwrap();
-    assert_eq!(default_order, ["c-bacemu", "c-main", "c-zovuru"]);
+    assert_eq!(
+        default_order,
+        ["chn-a1b2-c3d4", "chn-b2c3-d4e5", "chn-c3d4-e5f6"]
+    );
 
     // A complete ordering document is also the stale-page guard. Missing or duplicated IDs must
     // abort the whole draft rather than assigning a partial set of positions.
     for ids in [
-        vec!["c-main".to_owned(), "c-zovuru".to_owned()],
+        vec!["chn-a1b2-c3d4".to_owned(), "chn-c3d4-e5f6".to_owned()],
         vec![
-            "c-bacemu".to_owned(),
-            "c-bacemu".to_owned(),
-            "c-zovuru".to_owned(),
+            "chn-b2c3-d4e5".to_owned(),
+            "chn-b2c3-d4e5".to_owned(),
+            "chn-c3d4-e5f6".to_owned(),
         ],
     ] {
         let error = db
@@ -1361,8 +1343,8 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
     // as well as the chain declarations themselves. These are fixture rows, not the write path
     // under test, so cloning the known-good ingress keeps this test about ordering.
     for (chain_id, ingress_id, port) in [
-        ("c-bacemu", "i-dafino", 444_i32),
-        ("c-zovuru", "i-gurelo", 445_i32),
+        ("chn-b2c3-d4e5", "ing-b2c3", 444_i32),
+        ("chn-c3d4-e5f6", "ing-c3d4", 445_i32),
     ] {
         sqlx::query(
             "INSERT INTO ingresses (
@@ -1378,7 +1360,7 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
                     reality_dest, reality_server_names, reality_flow,
                     reality_fallback_mode
              FROM ingresses
-             WHERE id = 'i-main'",
+             WHERE id = 'ing-a1b2'",
         )
         .bind(ingress_id)
         .bind(chain_id)
@@ -1399,9 +1381,9 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
         "INSERT INTO e2e_probes (
             chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at
          ) VALUES
-            ('c-bacemu', 'app-main', 'n1', 'ok', 21, 'match', now()),
-            ('c-main', 'app-main', 'n1', 'ok', 22, 'match', now()),
-            ('c-zovuru', 'app-main', 'n1', 'ok', 23, 'match', now())",
+            ('chn-b2c3-d4e5', 'app-main', 'n1', 'ok', 21, 'match', now()),
+            ('chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 22, 'match', now()),
+            ('chn-c3d4-e5f6', 'app-main', 'n1', 'ok', 23, 'match', now())",
     )
     .execute(db.pool())
     .await
@@ -1413,7 +1395,7 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             (SELECT count(*) FROM e2e_probes WHERE app_id = 'app-main'),
             (SELECT count(*) FROM usage_chain_samples WHERE app_id = 'app-main'),
             (SELECT chain_id FROM usage_chain_samples WHERE app_id = 'app-main' LIMIT 1),
-            (SELECT app_id FROM chains WHERE id = 'c-main')",
+            (SELECT app_id FROM chains WHERE id = 'chn-a1b2-c3d4')",
     )
     .fetch_one(db.pool())
     .await
@@ -1426,9 +1408,9 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             vec![ModelOp::ReorderChains {
                 app_id: "app-main".to_owned(),
                 ids: vec![
-                    "c-zovuru".to_owned(),
-                    "c-main".to_owned(),
-                    "c-bacemu".to_owned(),
+                    "chn-c3d4-e5f6".to_owned(),
+                    "chn-a1b2-c3d4".to_owned(),
+                    "chn-b2c3-d4e5".to_owned(),
                 ],
             }],
             None,
@@ -1448,14 +1430,14 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             .iter()
             .map(|chain| chain.id.as_str())
             .collect::<Vec<_>>(),
-        ["c-zovuru", "c-main", "c-bacemu"]
+        ["chn-c3d4-e5f6", "chn-a1b2-c3d4", "chn-b2c3-d4e5"]
     );
     assert_eq!(
         app.ingresses
             .iter()
             .map(|ingress| ingress.chain.as_str())
             .collect::<Vec<_>>(),
-        ["c-zovuru", "c-main", "c-bacemu"]
+        ["chn-c3d4-e5f6", "chn-a1b2-c3d4", "chn-b2c3-d4e5"]
     );
     assert_eq!(
         db.store
@@ -1465,7 +1447,7 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             .iter()
             .map(|probe| probe.chain_id.as_str())
             .collect::<Vec<_>>(),
-        ["c-zovuru", "c-main", "c-bacemu"]
+        ["chn-c3d4-e5f6", "chn-a1b2-c3d4", "chn-b2c3-d4e5"]
     );
     let references_after: (i64, i64, i64, String, String) = sqlx::query_as(
         "SELECT
@@ -1473,13 +1455,13 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             (SELECT count(*) FROM e2e_probes WHERE app_id = 'app-main'),
             (SELECT count(*) FROM usage_chain_samples WHERE app_id = 'app-main'),
             (SELECT chain_id FROM usage_chain_samples WHERE app_id = 'app-main' LIMIT 1),
-            (SELECT app_id FROM chains WHERE id = 'c-main')",
+            (SELECT app_id FROM chains WHERE id = 'chn-a1b2-c3d4')",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
     assert_eq!(references_after, references_before);
-    assert_eq!(references_after.3, "c-main");
+    assert_eq!(references_after.3, "chn-a1b2-c3d4");
     assert_eq!(references_after.4, "app-main");
 
     // Once an operator has established a custom order, a new chain appends even if its ID would
@@ -1489,7 +1471,7 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             &system_admin(),
             "app-main",
             CreateChainRequest {
-                id: "c-betalo".to_owned(),
+                id: "chn-d4e5-f607".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Beta Chain".to_owned(),
                 subscription_country: None,
@@ -1505,7 +1487,12 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
             .unwrap();
     assert_eq!(
         order_after_create,
-        ["c-zovuru", "c-main", "c-bacemu", "c-betalo"]
+        [
+            "chn-c3d4-e5f6",
+            "chn-a1b2-c3d4",
+            "chn-b2c3-d4e5",
+            "chn-d4e5-f607"
+        ]
     );
 }
 
@@ -1524,7 +1511,7 @@ async fn chain_subscription_country_is_normalized_persisted_and_clearable() {
             &system_admin(),
             "app-main",
             CreateChainRequest {
-                id: "c-main".to_owned(),
+                id: "chn-a1b2-c3d4".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Main".to_owned(),
                 subscription_country: Some(" tw ".to_owned()),
@@ -1546,7 +1533,7 @@ async fn chain_subscription_country_is_normalized_persisted_and_clearable() {
             &system_admin(),
             "app-main",
             CreateChainRequest {
-                id: "c-main".to_owned(),
+                id: "chn-a1b2-c3d4".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Main".to_owned(),
                 subscription_country: Some("TWN".to_owned()),
@@ -1563,7 +1550,7 @@ async fn chain_subscription_country_is_normalized_persisted_and_clearable() {
             &system_admin(),
             "app-main",
             CreateChainRequest {
-                id: "c-main".to_owned(),
+                id: "chn-a1b2-c3d4".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Main".to_owned(),
                 subscription_country: None,
@@ -1618,7 +1605,7 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
             chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at
          ) VALUES
             ('c-alpha', 'app-alpha', 'n1', 'ok', 20, 'match', now()),
-            ('c-main', 'app-main', 'n1', 'ok', 30, 'match', now())",
+            ('chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 30, 'match', now())",
     )
     .execute(db.pool())
     .await
@@ -1643,10 +1630,10 @@ async fn line_order_drives_every_operator_facing_projection_with_id_as_the_defau
             app_id, grant_label, uplink_bytes, downlink_bytes
          ) VALUES
             (now() - interval '60 seconds', now() - interval '30 seconds',
-             'n1', 'platform.acme', 'alice', 'i-main',
+             'n1', 'platform.acme', 'alice', 'ing-a1b2',
              'app-alpha', 'test-user#alpha', 10, 20),
             (now() - interval '60 seconds', now() - interval '30 seconds',
-             'n1', 'platform.acme', 'alice', 'i-main',
+             'n1', 'platform.acme', 'alice', 'ing-a1b2',
              'app-main', 'test-user#main', 30, 40)",
     )
     .execute(db.pool())
@@ -2360,7 +2347,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
     let proxy = put_step_draft(
         &db,
         "app-main",
-        "c-main",
+        "chn-a1b2-c3d4",
         "n1",
         PutStepRequest {
             accept: None,
@@ -2398,7 +2385,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
     let direct = put_step_draft(
         &db,
         "app-main",
-        "c-main",
+        "chn-a1b2-c3d4",
         "n1",
         PutStepRequest {
             accept: None,
@@ -3209,7 +3196,7 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     set_quota(&db, Some(10_000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 1_200, 800).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 1_200, 800).await;
     let initial_revision = seed_subscription_serving(&db).await;
 
     let uuid = "2d2304da-f114-4574-8d44-625afdb1db5c";
@@ -3240,7 +3227,7 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
             vec![ModelOp::UpsertChain {
                 app_id: "app-main".to_owned(),
                 chain: CreateChainRequest {
-                    id: "c-main".to_owned(),
+                    id: "chn-a1b2-c3d4".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Renamed Chain".to_owned(),
                     subscription_country: None,
@@ -4006,7 +3993,7 @@ async fn hop_security_keeps_its_keys_until_the_kind_changes() {
             &system_admin(),
             "app-main",
             CreateChainRequest {
-                id: "c-main".to_owned(),
+                id: "chn-a1b2-c3d4".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Main".to_owned(),
                 subscription_country: None,
@@ -4020,7 +4007,7 @@ async fn hop_security_keeps_its_keys_until_the_kind_changes() {
         put_step_draft(
             db,
             "app-main",
-            "c-main",
+            "chn-a1b2-c3d4",
             "n1",
             PutStepRequest {
                 accept: Some(StepAcceptRequest {
@@ -4622,7 +4609,7 @@ async fn probe_targets_use_public_ipv4_and_the_peers_transport() {
 }
 
 async fn stored_hop_security(pool: &PgPool) -> serde_json::Value {
-    sqlx::query("SELECT hop_in_wire FROM steps WHERE chain_id = 'c-main' AND node_id = 'n1'")
+    sqlx::query("SELECT hop_in_wire FROM steps WHERE chain_id = 'chn-a1b2-c3d4' AND node_id = 'n1'")
         .fetch_one(pool)
         .await
         .unwrap()
@@ -5876,13 +5863,13 @@ async fn materialize_minimal_fixture_and_compile() {
     assert_eq!(user.uuid, "2d2304da-f114-4574-8d44-625afdb1db5c");
 
     let app = &snapshot.apps[0];
-    assert_eq!(app.chains[0].id, "c-main");
+    assert_eq!(app.chains[0].id, "chn-a1b2-c3d4");
     assert_eq!(app.chains[0].name, "Main Chain");
     assert_eq!(app.grants.len(), 1);
-    assert_eq!(app.grants[0].ingress, "i-main");
+    assert_eq!(app.grants[0].ingress, "ing-a1b2");
 
     let ingress = &app.ingresses[0];
-    assert_eq!(ingress.id, "i-main");
+    assert_eq!(ingress.id, "ing-a1b2");
     assert_eq!(ingress.port, 443);
     ingress.wires.reality().expect("REALITY 形状");
     assert_eq!(ingress.identity.short_ids, vec!["8337a0bf".to_owned()]);
@@ -5898,7 +5885,7 @@ async fn materialize_minimal_fixture_and_compile() {
     assert_eq!(node_plan.grant_sync.updates.len(), 1);
     assert_eq!(
         node_plan.grant_sync.updates[0].inbound_tag,
-        "in:app-main/i-main"
+        "in:app-main/ing-a1b2"
     );
     // Two clients: one real user and one derived credential for end-to-end probing. The latter
     // ships down the same channel as a real user — the only way it can reach the ingress (argued
@@ -5956,7 +5943,7 @@ async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
     put_step_draft(
         &db,
         "app-main",
-        "c-main",
+        "chn-a1b2-c3d4",
         "n1",
         PutStepRequest {
             accept: None,
@@ -6262,7 +6249,7 @@ async fn create_deployment_writes_structure_blobs_and_a_separate_frozen_grants_s
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(bindings["alice@platform.acme#i-main"]["kind"], "user");
+    assert_eq!(bindings["alice@platform.acme#ing-a1b2"]["kind"], "user");
     assert!(desired.get("grants").is_none());
     assert!(desired["actions"]
         .as_array()
@@ -7270,7 +7257,7 @@ async fn create_deployment_writes_compile_warnings() {
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
-    sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = 'c-main' AND node_id = 'n1'")
+    sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = 'chn-a1b2-c3d4' AND node_id = 'n1'")
         .bind(json!([
             {
                 "match": { "t": "any" },
@@ -7334,7 +7321,7 @@ async fn create_deployment_blocks_compile_errors_and_empty_target_sets() {
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE ingresses SET chain_id = 'c-gone' WHERE id = 'i-main'")
+    sqlx::query("UPDATE ingresses SET chain_id = 'c-gone' WHERE id = 'ing-a1b2'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -7435,13 +7422,13 @@ async fn load_desired_for_node_keeps_the_grants_snapshot_from_deployment_creatio
         .map(|client| (client.email.as_str(), client.uuid.as_str()))
         .collect::<Vec<_>>();
     assert!(clients.contains(&(
-        "alice@platform.acme#i-main",
+        "alice@platform.acme#ing-a1b2",
         "2d2304da-f114-4574-8d44-625afdb1db5c",
     )));
     assert!(
         !clients
             .iter()
-            .any(|(email, _)| *email == "bob@platform.acme#i-main"),
+            .any(|(email, _)| *email == "bob@platform.acme#ing-a1b2"),
         "a permission added after work-order creation must not be folded into that order"
     );
 }
@@ -7509,7 +7496,7 @@ async fn permission_change_is_automatically_released_from_the_durable_queue() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: Some("撤掉 Alice".to_owned()),
             },
@@ -7584,7 +7571,7 @@ async fn permission_change_is_automatically_released_from_the_durable_queue() {
         inbounds
             .iter()
             .flat_map(|inbound| &inbound.clients)
-            .all(|client| client.email != "alice@platform.acme#i-main"),
+            .all(|client| client.email != "alice@platform.acme#ing-a1b2"),
         "the automatic order must contain the revoked state (probe identities may remain)"
     );
     assert!(
@@ -7642,7 +7629,7 @@ async fn automatic_grants_fold_legacy_xhttp_mux_in_the_running_revision() {
              reality_flow = '',
              xhttp_path = '/legacy',
              xhttp_mode = NULL
-         WHERE id = 'i-main'",
+         WHERE id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await
@@ -7650,7 +7637,7 @@ async fn automatic_grants_fold_legacy_xhttp_mux_in_the_running_revision() {
     sqlx::query(
         "UPDATE ingress_client_settings
             SET xhttp_host = NULL, xhttp_xmux = NULL
-          WHERE ingress_id = 'i-main'",
+          WHERE ingress_id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await
@@ -7701,7 +7688,7 @@ async fn automatic_grants_fold_legacy_xhttp_mux_in_the_running_revision() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: Some("legacy XHTTP snapshot regression".to_owned()),
             },
@@ -7775,7 +7762,7 @@ async fn an_indirect_flow_change_requires_a_disruptive_config_deployment() {
              reality_server_names = '[]'::jsonb,
              reality_flow = NULL,
              reality_fallback_mode = 'global-site'
-         WHERE id = 'i-main'",
+         WHERE id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await
@@ -7783,7 +7770,7 @@ async fn an_indirect_flow_change_requires_a_disruptive_config_deployment() {
     sqlx::query(
         "UPDATE ingress_client_settings
             SET reality_fingerprint = NULL
-          WHERE ingress_id = 'i-main'",
+          WHERE ingress_id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await
@@ -8010,7 +7997,7 @@ async fn discarding_an_unreleased_permission_revision_cancels_its_automatic_job(
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: None,
             },
@@ -8065,7 +8052,7 @@ async fn automatic_grants_rebase_an_unclaimed_first_config_order() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: None,
             },
@@ -8096,7 +8083,7 @@ async fn automatic_grants_rebase_an_unclaimed_first_config_order() {
         inbounds
             .iter()
             .flat_map(|inbound| &inbound.clients)
-            .all(|client| client.email != "alice@platform.acme#i-main"),
+            .all(|client| client.email != "alice@platform.acme#ing-a1b2"),
         "尚未下发的配置单仍带着撤销前的 Alice"
     );
 }
@@ -8176,8 +8163,8 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
             &system_admin(),
             "app-main",
             CreateIngressRequest {
-                id: "i-main".to_owned(),
-                chain_id: "c-main".to_owned(),
+                id: "ing-a1b2".to_owned(),
+                chain_id: "chn-a1b2-c3d4".to_owned(),
                 node_id: "n1".to_owned(),
                 bind: "0.0.0.0".parse().unwrap(),
                 port: 443,
@@ -8224,7 +8211,7 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: None,
             },
@@ -8265,7 +8252,7 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
             .await
             .unwrap();
     assert!(
-        usage_bindings.get("alice@platform.acme#i-main").is_none(),
+        usage_bindings.get("alice@platform.acme#ing-a1b2").is_none(),
         "未领取配置单重基权限时也必须重基尚未激活的计费 generation"
     );
 
@@ -8285,7 +8272,7 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
             .iter()
             .map(|inbound| inbound.tag.as_str())
             .collect::<Vec<_>>(),
-        vec!["in:app-main/i-main"],
+        vec!["in:app-main/ing-a1b2"],
         "立即权限单必须针对机器当前还在跑的 VLESS 入站"
     );
     db.store
@@ -8309,7 +8296,7 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
             .iter()
             .map(|inbound| inbound.tag.as_str())
             .collect::<Vec<_>>(),
-        vec!["in:app-main/i-main:hy2"],
+        vec!["in:app-main/ing-a1b2:hy2"],
         "未来配置单必须带它自己 Hysteria 入站对应的最新权限"
     );
 }
@@ -8385,7 +8372,7 @@ async fn dispatched_xray_config_is_a_permission_conflict_until_it_reports() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: None,
             },
@@ -8597,7 +8584,7 @@ async fn enable_hy2_port_hopping(pool: &PgPool) {
     sqlx::query(
         "UPDATE ingresses
             SET hy2_enabled = TRUE, hy2_port = 50001, hy2_hop_start = 50001, hy2_hop_end = 50010
-          WHERE id = 'i-main'",
+          WHERE id = 'ing-a1b2'",
     )
     .execute(pool)
     .await
@@ -9182,7 +9169,7 @@ fn protocol_v3_usage(
         xray_epoch: Some(epoch.to_owned()),
         route: None,
         counters: vec![UsageCounter {
-            label: "alice@platform.acme#i-main".to_owned(),
+            label: "alice@platform.acme#ing-a1b2".to_owned(),
             uplink_bytes,
             downlink_bytes,
         }],
@@ -9202,7 +9189,7 @@ async fn unknown_counter_growth_is_ephemeral_and_not_persisted() {
     let mut first = protocol_v3_usage(1, base, "boot-a:100", 10, 20);
     first.counters[0].label = "removed-user".to_owned();
     first.counters.push(UsageCounter {
-        label: "probe#i-main".to_owned(),
+        label: "probe#ing-a1b2".to_owned(),
         uplink_bytes: 100,
         downlink_bytes: 200,
     });
@@ -9232,7 +9219,7 @@ async fn unknown_counter_growth_is_ephemeral_and_not_persisted() {
     let mut second = protocol_v3_usage(2, base + 30, "boot-a:100", 11, 20);
     second.counters[0].label = "removed-user".to_owned();
     second.counters.push(UsageCounter {
-        label: "probe#i-main".to_owned(),
+        label: "probe#ing-a1b2".to_owned(),
         uplink_bytes: 150,
         downlink_bytes: 280,
     });
@@ -9257,7 +9244,7 @@ async fn unknown_counter_growth_is_ephemeral_and_not_persisted() {
     let mut probe_only_growth = protocol_v3_usage(3, base + 60, "boot-a:100", 11, 20);
     probe_only_growth.counters[0].label = "removed-user".to_owned();
     probe_only_growth.counters.push(UsageCounter {
-        label: "probe#i-main".to_owned(),
+        label: "probe#ing-a1b2".to_owned(),
         uplink_bytes: 200,
         downlink_bytes: 360,
     });
@@ -9493,7 +9480,7 @@ async fn legacy_report_after_an_exact_epoch_does_not_rebill_climbing_counters() 
                 xray_started_at_unix_secs: base + 20,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "alice@platform.acme#i-main".to_owned(),
+                    label: "alice@platform.acme#ing-a1b2".to_owned(),
                     uplink_bytes: 140,
                     downlink_bytes: 260,
                 }],
@@ -9531,7 +9518,7 @@ async fn frozen_usage_generation_survives_model_removal_and_raw_retention() {
 
     // The model no longer owns this label, but a delayed report from the already-running
     // generation still has an immutable, auditable owner.
-    sqlx::query("DELETE FROM grants WHERE user_id = 'alice' AND ingress_id = 'i-main'")
+    sqlx::query("DELETE FROM grants WHERE user_id = 'alice' AND ingress_id = 'ing-a1b2'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -9616,7 +9603,7 @@ async fn first_report_after_new_authorization_counts_the_complete_counter() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "bob".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: true,
                 note: None,
             },
@@ -9641,7 +9628,7 @@ async fn first_report_after_new_authorization_counts_the_complete_counter() {
             .await
             .unwrap();
     assert_eq!(
-        bindings["bob@platform.acme#i-main"]["first_reading"],
+        bindings["bob@platform.acme#ing-a1b2"]["first_reading"],
         "count-from-zero"
     );
 
@@ -9663,7 +9650,7 @@ async fn first_report_after_new_authorization_counts_the_complete_counter() {
                 xray_started_at_unix_secs: activated_at - 300,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "bob@platform.acme#i-main".to_owned(),
+                    label: "bob@platform.acme#ing-a1b2".to_owned(),
                     uplink_bytes: 100,
                     downlink_bytes: 200,
                 }],
@@ -9711,12 +9698,12 @@ async fn usage_report_records_delta_samples_and_restart_gaps() {
                 route: None,
                 counters: vec![
                     UsageCounter {
-                        label: "alice@platform.acme#i-main".to_owned(),
+                        label: "alice@platform.acme#ing-a1b2".to_owned(),
                         uplink_bytes: 100,
                         downlink_bytes: 200,
                     },
                     UsageCounter {
-                        label: "unknown@platform.acme#i-main".to_owned(),
+                        label: "unknown@platform.acme#ing-a1b2".to_owned(),
                         uplink_bytes: 1,
                         downlink_bytes: 1,
                     },
@@ -9742,7 +9729,7 @@ async fn usage_report_records_delta_samples_and_restart_gaps() {
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "alice@platform.acme#i-main".to_owned(),
+                    label: "alice@platform.acme#ing-a1b2".to_owned(),
                     uplink_bytes: 150,
                     downlink_bytes: 280,
                 }],
@@ -9767,7 +9754,7 @@ async fn usage_report_records_delta_samples_and_restart_gaps() {
                 xray_started_at_unix_secs: base + 90,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "alice@platform.acme#i-main".to_owned(),
+                    label: "alice@platform.acme#ing-a1b2".to_owned(),
                     uplink_bytes: 20,
                     downlink_bytes: 30,
                 }],
@@ -9838,7 +9825,7 @@ async fn usage_report_takes_a_delta_when_the_start_time_jumps_but_counters_climb
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "alice@platform.acme#i-main".to_owned(),
+                    label: "alice@platform.acme#ing-a1b2".to_owned(),
                     uplink_bytes: 100,
                     downlink_bytes: 200,
                 }],
@@ -9861,7 +9848,7 @@ async fn usage_report_takes_a_delta_when_the_start_time_jumps_but_counters_climb
                 xray_started_at_unix_secs: base + 58,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "alice@platform.acme#i-main".to_owned(),
+                    label: "alice@platform.acme#ing-a1b2".to_owned(),
                     uplink_bytes: 150,
                     downlink_bytes: 280,
                 }],
@@ -9903,7 +9890,7 @@ async fn usage_report_rejects_labels_for_another_nodes_ingress() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
 
-    // n2 exists, but i-main sits on n1 and it receives no client entry for alice.
+    // n2 exists, but ing-a1b2 sits on n1 and it receives no client entry for alice.
     sqlx::query(
         "INSERT INTO nodes (
             id, tenant_id, name, public_ipv4, overlay_addr,
@@ -9937,7 +9924,7 @@ async fn usage_report_rejects_labels_for_another_nodes_ingress() {
                     xray_started_at_unix_secs: base - 1000,
                     route: None,
                     counters: vec![UsageCounter {
-                        label: "alice@platform.acme#i-main".to_owned(),
+                        label: "alice@platform.acme#ing-a1b2".to_owned(),
                         uplink_bytes: uplink,
                         downlink_bytes: downlink,
                     }],
@@ -9967,7 +9954,7 @@ async fn usage_report_rejects_labels_for_another_nodes_ingress() {
         .unwrap();
     assert_eq!(samples, 0);
 
-    // The same label reported by n1, which really carries i-main, still books normally.
+    // The same label reported by n1, which really carries ing-a1b2, still books normally.
     let owned = db
         .store
         .record_usage_report(
@@ -9981,7 +9968,7 @@ async fn usage_report_rejects_labels_for_another_nodes_ingress() {
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "alice@platform.acme#i-main".to_owned(),
+                    label: "alice@platform.acme#ing-a1b2".to_owned(),
                     uplink_bytes: 10,
                     downlink_bytes: 20,
                 }],
@@ -10031,8 +10018,8 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
     // n2 is the next hop on the chain, and the credential is in its own name.
     sqlx::query(
         "INSERT INTO steps (chain_id, node_id, rules, accept_uuid, accept_label, hop_in_port, hop_in_wire)
-         VALUES ('c-main', 'n2', '[]'::jsonb,
-                 '3f7b1f5e-9a2c-4c1d-8b3a-6d5e4f2c1b0a', 'c-main@n2',
+         VALUES ('chn-a1b2-c3d4', 'n2', '[]'::jsonb,
+                 '3f7b1f5e-9a2c-4c1d-8b3a-6d5e4f2c1b0a', 'chn-a1b2-c3d4@n2',
                  20001, '{\"t\": \"none\"}'::jsonb)",
     )
     .execute(db.pool())
@@ -10046,7 +10033,7 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
             "a": { "t": "forward", "to": "n2", "dial": { "t": "reverse", "v": "v4" } }
         }
     ]);
-    sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = 'c-main' AND node_id = 'n1'")
+    sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = 'chn-a1b2-c3d4' AND node_id = 'n1'")
         .bind(&reverse_rules)
         .execute(db.pool())
         .await
@@ -10067,7 +10054,7 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
                     xray_started_at_unix_secs: base - 1000,
                     route: None,
                     counters: vec![UsageCounter {
-                        label: "c-main@n2".to_owned(),
+                        label: "chn-a1b2-c3d4@n2".to_owned(),
                         uplink_bytes: uplink,
                         downlink_bytes: downlink,
                     }],
@@ -10083,7 +10070,7 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
     let row = sqlx::query(
         "SELECT node_id, uplink_bytes, downlink_bytes
          FROM usage_chain_samples
-         WHERE hop_label = 'c-main@n2'",
+         WHERE hop_label = 'chn-a1b2-c3d4@n2'",
     )
     .fetch_one(db.pool())
     .await
@@ -10093,7 +10080,7 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
     assert_eq!(row.try_get::<i64, _>("downlink_bytes").unwrap(), 200);
 
     let frozen_binding: serde_json::Value = sqlx::query_scalar(
-        "SELECT g.bindings -> 'c-main@n2'
+        "SELECT g.bindings -> 'chn-a1b2-c3d4@n2'
            FROM node_agent_state s
            JOIN usage_generations g ON g.id = s.usage_generation_id
           WHERE s.node_id = 'n1'",
@@ -10107,7 +10094,7 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
     // The raw reading is still recorded against whoever read it — differences must be taken
     // against one source.
     let readings: i64 = sqlx::query(
-        "SELECT count(*) AS n FROM usage_readings WHERE node_id = 'n1' AND label = 'c-main@n2'",
+        "SELECT count(*) AS n FROM usage_readings WHERE node_id = 'n1' AND label = 'chn-a1b2-c3d4@n2'",
     )
     .fetch_one(db.pool())
     .await
@@ -10125,7 +10112,7 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
             "a": { "t": "forward", "to": "n2", "dial": { "t": "overlay" } }
         }
     ]);
-    sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = 'c-main' AND node_id = 'n1'")
+    sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = 'chn-a1b2-c3d4' AND node_id = 'n1'")
         .bind(&overlay_rules)
         .execute(db.pool())
         .await
@@ -10144,7 +10131,7 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
                 xray_started_at_unix_secs: base - 1000,
                 route: None,
                 counters: vec![UsageCounter {
-                    label: "c-main@n2".to_owned(),
+                    label: "chn-a1b2-c3d4@n2".to_owned(),
                     uplink_bytes: 999,
                     downlink_bytes: 999,
                 }],
@@ -10174,8 +10161,8 @@ async fn tenant_scoped_usage_samples_do_not_cross_subtrees() {
          VALUES
             (
                 to_timestamp(1800000000), to_timestamp(1800000060),
-                'n1', 'platform.acme', 'alice', 'i-main',
-                'alice@platform.acme#i-main', 10, 20
+                'n1', 'platform.acme', 'alice', 'ing-a1b2',
+                'alice@platform.acme#ing-a1b2', 10, 20
             ),
             (
                 to_timestamp(1800000000), to_timestamp(1800000060),
@@ -10306,7 +10293,7 @@ async fn insert_second_ingress(pool: &PgPool) {
             reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            'i-alt', 'app-main', 'c-main', 'n1', '0.0.0.0', 8443, NULL, 'vless-reality',
+            'i-alt', 'app-main', 'chn-a1b2-c3d4', 'n1', '0.0.0.0', 8443, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision',
             'custom-site'
@@ -10342,7 +10329,7 @@ async fn quota_enforcement_suspends_every_ingress_in_one_revision() {
     insert_second_ingress(db.pool()).await;
 
     set_quota(&db, Some(1000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 600, 600).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 600, 600).await;
     assert_eq!(live_grants(db.pool()).await, 2);
 
     let before = revision_count(db.pool()).await;
@@ -10385,7 +10372,7 @@ async fn quota_enforcement_is_idempotent_across_rounds() {
     insert_minimal_fixture(db.pool()).await;
 
     set_quota(&db, Some(1000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 600, 600).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 600, 600).await;
 
     db.store.enforce_quotas().await.unwrap();
     let after_first = revision_count(db.pool()).await;
@@ -10408,7 +10395,7 @@ async fn quota_enforcement_restores_when_the_limit_is_raised_or_dropped() {
     insert_minimal_fixture(db.pool()).await;
 
     set_quota(&db, Some(1000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 600, 600).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 600, 600).await;
     db.store.enforce_quotas().await.unwrap();
     assert_eq!(live_grants(db.pool()).await, 0);
 
@@ -10444,7 +10431,7 @@ async fn quota_enforcement_never_restores_a_manually_revoked_grant() {
     insert_minimal_fixture(db.pool()).await;
 
     set_quota(&db, Some(1000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 600, 600).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 600, 600).await;
     db.store.enforce_quotas().await.unwrap();
     assert_eq!(live_grants(db.pool()).await, 0);
     assert_eq!(suspensions(db.pool()).await, 1);
@@ -10459,7 +10446,7 @@ async fn quota_enforcement_never_restores_a_manually_revoked_grant() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: Some("keep manually disabled".to_owned()),
             },
@@ -10488,7 +10475,7 @@ async fn quota_enforcement_rejects_operator_reenable_while_still_over_limit() {
     insert_minimal_fixture(db.pool()).await;
 
     set_quota(&db, Some(1000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 600, 600).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 600, 600).await;
     db.store.enforce_quotas().await.unwrap();
 
     let error = db
@@ -10499,7 +10486,7 @@ async fn quota_enforcement_rejects_operator_reenable_while_still_over_limit() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: true,
                 note: None,
             },
@@ -10522,14 +10509,14 @@ async fn quota_enforcement_leaves_users_under_the_limit_alone() {
     insert_minimal_fixture(db.pool()).await;
 
     set_quota(&db, Some(1000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 400, 500).await; // 900 < 1000
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 400, 500).await; // 900 < 1000
 
     let outcome = db.store.enforce_quotas().await.unwrap();
     assert_eq!(outcome.suspended, 0);
     assert_eq!(live_grants(db.pool()).await, 1);
 
     // One more pushes it over the line
-    insert_month_sample(db.pool(), "i-main", "app-main", 3, 100, 0).await; // 合计 1000 = 额度
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 3, 100, 0).await; // 合计 1000 = 额度
     let outcome = db.store.enforce_quotas().await.unwrap();
     assert_eq!(outcome.suspended, 1);
     assert_eq!(live_grants(db.pool()).await, 0);
@@ -10577,7 +10564,7 @@ async fn a_grants_deployment_carries_no_config_for_the_agent_to_apply() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: None,
             },
@@ -10734,7 +10721,7 @@ async fn grants_do_not_wait_on_an_unrelated_wireguard_change() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "alice".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: false,
                 note: None,
             },
@@ -10931,7 +10918,7 @@ async fn quota_enforcement_never_publishes_someone_elses_pending_work() {
     // Setting a generous quota must likewise trigger no release — nothing is over, so there is
     // nothing to push
     set_quota(&db, Some(1_000_000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 10, 10).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 10, 10).await;
     db.store.enforce_quotas().await.unwrap();
     let deployments: i64 = sqlx::query_scalar("SELECT count(*) FROM deployments")
         .fetch_one(db.pool())
@@ -10970,7 +10957,7 @@ async fn quota_enforcement_publishes_when_only_grants_change() {
         .unwrap();
 
     set_quota(&db, Some(1000)).await;
-    insert_month_sample(db.pool(), "i-main", "app-main", 1, 600, 600).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 600, 600).await;
 
     let outcome = db.store.enforce_quotas().await.unwrap();
     assert_eq!(outcome.suspended, 1);
@@ -11243,8 +11230,8 @@ async fn monthly_usage_keeps_the_app_frozen_on_the_sample() {
                 + INTERVAL '1 minute') AT TIME ZONE 'Asia/Hong_Kong',
             (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
                 + INTERVAL '2 minutes') AT TIME ZONE 'Asia/Hong_Kong',
-            'n1', 'platform.acme', 'alice', 'i-main',
-            'app-main', 'alice@platform.acme#i-main', 10, 20, FALSE
+            'n1', 'platform.acme', 'alice', 'ing-a1b2',
+            'app-main', 'alice@platform.acme#ing-a1b2', 10, 20, FALSE
          )",
     )
     .execute(db.pool())
@@ -11252,7 +11239,7 @@ async fn monthly_usage_keeps_the_app_frozen_on_the_sample() {
     .unwrap();
 
     // The ingress is moved to another view
-    sqlx::query("UPDATE ingresses SET app_id = 'app-other' WHERE id = 'i-main'")
+    sqlx::query("UPDATE ingresses SET app_id = 'app-other' WHERE id = 'ing-a1b2'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -11271,11 +11258,11 @@ async fn monthly_usage_keeps_the_app_frozen_on_the_sample() {
     // an INNER JOIN discards them as a batch, presenting as consumption inexplicably losing a
     // chunk. The frozen column plus a LEFT JOIN is what carries that principle to the query
     // side.
-    sqlx::query("DELETE FROM grants WHERE ingress_id = 'i-main'")
+    sqlx::query("DELETE FROM grants WHERE ingress_id = 'ing-a1b2'")
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("DELETE FROM ingresses WHERE id = 'i-main'")
+    sqlx::query("DELETE FROM ingresses WHERE id = 'ing-a1b2'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -11321,16 +11308,16 @@ async fn monthly_usage_summary_aggregates_current_month_per_user() {
                     + INTERVAL '1 minute') AT TIME ZONE 'Asia/Hong_Kong',
                 (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
                     + INTERVAL '2 minutes') AT TIME ZONE 'Asia/Hong_Kong',
-                'n1', 'platform.acme', 'alice', 'i-main',
-                'alice@platform.acme#i-main', 10, 20, FALSE
+                'n1', 'platform.acme', 'alice', 'ing-a1b2',
+                'alice@platform.acme#ing-a1b2', 10, 20, FALSE
             ),
             (
                 (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
                     + INTERVAL '3 minutes') AT TIME ZONE 'Asia/Hong_Kong',
                 (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
                     + INTERVAL '4 minutes') AT TIME ZONE 'Asia/Hong_Kong',
-                'n1', 'platform.acme', 'alice', 'i-main',
-                'alice@platform.acme#i-main', 30, 40, TRUE
+                'n1', 'platform.acme', 'alice', 'ing-a1b2',
+                'alice@platform.acme#ing-a1b2', 30, 40, TRUE
             ),
             -- bob：一行，无缺口
             (
@@ -11338,8 +11325,8 @@ async fn monthly_usage_summary_aggregates_current_month_per_user() {
                     + INTERVAL '5 minutes') AT TIME ZONE 'Asia/Hong_Kong',
                 (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
                     + INTERVAL '6 minutes') AT TIME ZONE 'Asia/Hong_Kong',
-                'n1', 'platform.acme', 'bob', 'i-main',
-                'bob@platform.acme#i-main', 5, 7, FALSE
+                'n1', 'platform.acme', 'bob', 'ing-a1b2',
+                'bob@platform.acme#ing-a1b2', 5, 7, FALSE
             ),
             -- charlie 在别的租户：子树裁剪后看不见
             (
@@ -11356,8 +11343,8 @@ async fn monthly_usage_summary_aggregates_current_month_per_user() {
                     - INTERVAL '1 month' + INTERVAL '1 minute') AT TIME ZONE 'Asia/Hong_Kong',
                 (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
                     - INTERVAL '1 month' + INTERVAL '2 minutes') AT TIME ZONE 'Asia/Hong_Kong',
-                'n1', 'platform.acme', 'alice', 'i-main',
-                'alice@platform.acme#i-main', 999, 999, FALSE
+                'n1', 'platform.acme', 'alice', 'ing-a1b2',
+                'alice@platform.acme#ing-a1b2', 999, 999, FALSE
             )",
     )
     .execute(db.pool())
@@ -12013,7 +12000,7 @@ async fn cancel_deployment_and_rollback_restores_latest_succeeded_snapshot_and_f
                 reality_public_key = 'changed-public',
                 reality_short_ids = '[\"deadbeef\"]'::jsonb,
                 created_revision = $1
-          WHERE id = 'i-main'",
+          WHERE id = 'ing-a1b2'",
     )
     .bind(second_revision)
     .execute(db.pool())
@@ -12146,7 +12133,7 @@ async fn rollback_deployment_restores_target_snapshot_then_force_syncs_when_acti
         .unwrap();
 
     let second_revision = insert_revision(db.pool(), "rollback test edit").await;
-    sqlx::query("UPDATE ingresses SET port = 8443, created_revision = $1 WHERE id = 'i-main'")
+    sqlx::query("UPDATE ingresses SET port = 8443, created_revision = $1 WHERE id = 'ing-a1b2'")
         .bind(second_revision)
         .execute(db.pool())
         .await
@@ -12329,14 +12316,14 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
                 reality_dest, reality_server_names, reality_flow,
                 reality_fallback_mode
          FROM ingresses
-         WHERE id = 'i-main'",
+         WHERE id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO steps (chain_id, node_id, rules)
-         SELECT 'c-secondary', node_id, rules FROM steps WHERE chain_id = 'c-main'",
+         SELECT 'c-secondary', node_id, rules FROM steps WHERE chain_id = 'chn-a1b2-c3d4'",
     )
     .execute(db.pool())
     .await
@@ -12384,7 +12371,7 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
                 },
                 ModelOp::ReorderChains {
                     app_id: "app-main".to_owned(),
-                    ids: vec!["c-secondary".to_owned(), "c-main".to_owned()],
+                    ids: vec!["c-secondary".to_owned(), "chn-a1b2-c3d4".to_owned()],
                 },
             ],
             None,
@@ -12402,7 +12389,7 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
             .fetch_all(db.pool())
             .await
             .unwrap();
-    assert_eq!(pending_chain_order, ["c-secondary", "c-main"]);
+    assert_eq!(pending_chain_order, ["c-secondary", "chn-a1b2-c3d4"]);
 
     let mut changed_settings = target_snapshot.settings.clone();
     changed_settings.geodata.cron = "CRON_TZ=UTC 15 3 * * *".to_owned();
@@ -12451,7 +12438,7 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
         .iter()
         .map(|chain| chain.id.as_str())
         .collect();
-    assert_eq!(restored_chain_order, ["c-main", "c-secondary"]);
+    assert_eq!(restored_chain_order, ["chn-a1b2-c3d4", "c-secondary"]);
 }
 
 #[tokio::test]
@@ -12485,7 +12472,7 @@ async fn rollback_deployment_preserves_usage_history_referencing_restored_model_
     insert_usage_history_for_main_fixture(db.pool()).await;
 
     let second_revision = insert_revision(db.pool(), "rollback usage edit").await;
-    sqlx::query("UPDATE ingresses SET port = 8443, created_revision = $1 WHERE id = 'i-main'")
+    sqlx::query("UPDATE ingresses SET port = 8443, created_revision = $1 WHERE id = 'ing-a1b2'")
         .bind(second_revision)
         .execute(db.pool())
         .await
@@ -12531,7 +12518,7 @@ async fn rollback_deployment_preserves_usage_history_referencing_restored_model_
     assert_eq!(usage_sample_count(db.pool()).await, 1);
     assert_eq!(usage_chain_sample_count(db.pool()).await, 1);
     let restored = db.store.materialize_snapshot(None).await.unwrap();
-    assert_eq!(restored.apps[0].ingresses[0].id, "i-main");
+    assert_eq!(restored.apps[0].ingresses[0].id, "ing-a1b2");
     assert_eq!(restored.apps[0].ingresses[0].port, 443);
 }
 
@@ -12703,7 +12690,7 @@ fn assert_no_alice(grants: &DesiredGrants) {
         inbounds
             .iter()
             .flat_map(|inbound| &inbound.clients)
-            .all(|client| client.email != "alice@platform.acme#i-main"),
+            .all(|client| client.email != "alice@platform.acme#ing-a1b2"),
         "权限目标仍带着已撤销的 Alice"
     );
 }
@@ -13397,8 +13384,8 @@ async fn insert_usage_history_for_main_fixture(pool: &PgPool) {
          )
          VALUES (
             now() - interval '60 seconds', now() - interval '30 seconds',
-            'n1', 'platform.acme', 'alice', 'i-main',
-            'alice@platform.acme#i-main', 10, 20
+            'n1', 'platform.acme', 'alice', 'ing-a1b2',
+            'alice@platform.acme#ing-a1b2', 10, 20
          )",
     )
     .execute(pool)
@@ -13412,8 +13399,8 @@ async fn insert_usage_history_for_main_fixture(pool: &PgPool) {
          )
          VALUES (
             now() - interval '60 seconds', now() - interval '30 seconds',
-            'n1', 'platform.acme', 'app-main', 'c-main',
-            'c-main@n1', 30, 40
+            'n1', 'platform.acme', 'app-main', 'chn-a1b2-c3d4',
+            'chn-a1b2-c3d4@n1', 30, 40
          )",
     )
     .execute(pool)
@@ -13432,7 +13419,7 @@ async fn insert_extra_user_grant(pool: &PgPool) {
 
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
-         VALUES ('app-main', 'platform.acme', 'bob', 'i-main')",
+         VALUES ('app-main', 'platform.acme', 'bob', 'ing-a1b2')",
     )
     .execute(pool)
     .await
@@ -13514,11 +13501,25 @@ async fn an_entrance_is_guarded_by_default_and_changing_it_stamps_a_revision() {
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    db.store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: "chn-b2c3-d4e5".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Guard Defaults".to_owned(),
+                subscription_country: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
 
     // Written the way a caller that predates the field writes it: the JSON simply has no `guard`.
     let request: CreateIngressRequest = serde_json::from_value(serde_json::json!({
-        "id": "i-garude",
-        "chain_id": "c-main",
+        "id": "ing-b2c3",
+        "chain_id": "chn-b2c3-d4e5",
         "node_id": "n1",
         "bind": "0.0.0.0",
         "port": 8443,
@@ -13550,7 +13551,7 @@ async fn an_entrance_is_guarded_by_default_and_changing_it_stamps_a_revision() {
     let stored: (bool, bool, bool, bool, bool) = sqlx::query_as(
         "SELECT guard_no_private, guard_no_bittorrent, guard_no_mail,
                 guard_no_udp_amplification, guard_tcp_and_quic_only
-           FROM ingresses WHERE id = 'i-garude'",
+           FROM ingresses WHERE id = 'ing-b2c3'",
     )
     .fetch_one(db.pool())
     .await
@@ -13593,8 +13594,8 @@ async fn an_entrance_is_guarded_by_default_and_changing_it_stamps_a_revision() {
         .apps
         .iter()
         .flat_map(|app| app.ingresses.iter())
-        .find(|ingress| ingress.id == "i-garude")
-        .expect("i-garude 在快照里");
+        .find(|ingress| ingress.id == "ing-b2c3")
+        .expect("ing-b2c3 在快照里");
     assert!(!ingress.guard.no_bittorrent);
     assert!(ingress.guard.no_private, "没动的那几条要原样留着");
 }
@@ -13854,7 +13855,7 @@ async fn retained_certificate_trust_survives_expiry_and_ca_switch_until_manual_d
                 anytls_enabled = TRUE,
                 anytls_security = 'tls',
                 anytls_port = 8443
-          WHERE id = 'i-main'",
+          WHERE id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await
@@ -14311,14 +14312,33 @@ async fn an_ingress_can_turn_flow_off_without_the_fleet_losing_it() {
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    db.store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: "chn-b2c3-d4e5".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Flow Off".to_owned(),
+                subscription_country: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
 
     let face = |id: &str, flow: Option<String>| CreateIngressRequest {
         wires: Default::default(),
         id: id.to_owned(),
-        chain_id: "c-main".to_owned(),
+        chain_id: if id == "ing-a1b2" {
+            "chn-a1b2-c3d4"
+        } else {
+            "chn-b2c3-d4e5"
+        }
+        .to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
-        port: if id == "i-main" { 443 } else { 8443 },
+        port: if id == "ing-a1b2" { 443 } else { 8443 },
         front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
@@ -14336,14 +14356,14 @@ async fn an_ingress_can_turn_flow_off_without_the_fleet_losing_it() {
 
     // One left alone, one turned off explicitly.
     db.store
-        .upsert_ingress(&system_admin(), "app-main", face("i-main", None))
+        .upsert_ingress(&system_admin(), "app-main", face("ing-a1b2", None))
         .await
         .unwrap();
     db.store
         .upsert_ingress(
             &system_admin(),
             "app-main",
-            face("i-bacemu", Some(String::new())),
+            face("ing-b2c3", Some(String::new())),
         )
         .await
         .unwrap();
@@ -14363,10 +14383,10 @@ async fn an_ingress_can_turn_flow_off_without_the_fleet_losing_it() {
     };
 
     // The untouched one still follows the global default, which a fresh database sets to Vision.
-    assert_eq!(flow_of("i-main").as_deref(), Some("xtls-rprx-vision"));
+    assert_eq!(flow_of("ing-a1b2").as_deref(), Some("xtls-rprx-vision"));
     // The other one is off, and being off is `None` at the model layer — that is what "ship no
     // flow" is, and it is what lets an XHTTP ingress compile.
-    assert_eq!(flow_of("i-bacemu"), None);
+    assert_eq!(flow_of("ing-b2c3"), None);
 }
 
 #[tokio::test]
@@ -14386,8 +14406,8 @@ async fn an_ingress_equal_to_the_global_reality_site_keeps_following_it() {
             "app-main",
             CreateIngressRequest {
                 wires: Default::default(),
-                id: "i-main".to_owned(),
-                chain_id: "c-main".to_owned(),
+                id: "ing-a1b2".to_owned(),
+                chain_id: "chn-a1b2-c3d4".to_owned(),
                 node_id: "n1".to_owned(),
                 bind: "0.0.0.0".parse().unwrap(),
                 port: 443,
@@ -14416,7 +14436,7 @@ async fn an_ingress_equal_to_the_global_reality_site_keeps_following_it() {
            FROM ingresses AS ingress
            LEFT JOIN ingress_client_settings AS client
              ON client.ingress_id = ingress.id
-          WHERE ingress.app_id = 'app-main' AND ingress.id = 'i-main'",
+          WHERE ingress.app_id = 'app-main' AND ingress.id = 'ing-a1b2'",
     )
     .fetch_one(db.pool())
     .await
@@ -14483,8 +14503,8 @@ async fn reality_fallback_mode_and_limits_round_trip_without_an_external_target(
             "app-main",
             CreateIngressRequest {
                 wires: Default::default(),
-                id: "i-main".to_owned(),
-                chain_id: "c-main".to_owned(),
+                id: "ing-a1b2".to_owned(),
+                chain_id: "chn-a1b2-c3d4".to_owned(),
                 node_id: "n1".to_owned(),
                 bind: "0.0.0.0".parse().unwrap(),
                 port: 443,
@@ -14508,7 +14528,7 @@ async fn reality_fallback_mode_and_limits_round_trip_without_an_external_target(
 
     let row = sqlx::query(
         "SELECT reality_dest, reality_server_names, reality_fallback_mode, reality_fallback_limits
-         FROM ingresses WHERE id = 'i-main'",
+         FROM ingresses WHERE id = 'ing-a1b2'",
     )
     .fetch_one(db.pool())
     .await
@@ -14557,8 +14577,8 @@ async fn an_ingress_keeps_its_stream_across_writes() {
 
     let face = |wires: WiresRequest, port: u16| CreateIngressRequest {
         wires,
-        id: "i-main".to_owned(),
-        chain_id: "c-main".to_owned(),
+        id: "ing-a1b2".to_owned(),
+        chain_id: "chn-a1b2-c3d4".to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port,
@@ -14647,14 +14667,14 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         .apps
         .iter()
         .flat_map(|app| &app.ingresses)
-        .find(|ingress| ingress.id == "i-main")
+        .find(|ingress| ingress.id == "ing-a1b2")
         .expect("接入面还在");
     assert_eq!(stored.wires.xhttp(), Some(&xhttp));
 
     let incomplete_xmux = sqlx::query(
         "UPDATE ingress_client_settings
          SET xhttp_xmux = '{\"max_concurrency\": 16}'::jsonb
-         WHERE ingress_id = 'i-main'",
+         WHERE ingress_id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await;
@@ -14695,7 +14715,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
     assert_column_missing(db.pool(), "ingresses", "xhttp_alpn").await;
     assert_column_missing(db.pool(), "ingresses", "tls_fingerprint").await;
     let stored_tuning: serde_json::Value =
-        sqlx::query_scalar("SELECT xhttp_tuning FROM ingresses WHERE id = 'i-main'")
+        sqlx::query_scalar("SELECT xhttp_tuning FROM ingresses WHERE id = 'ing-a1b2'")
             .fetch_one(db.pool())
             .await
             .unwrap();
@@ -14708,7 +14728,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         .apps
         .iter()
         .flat_map(|app| &app.ingresses)
-        .find(|ingress| ingress.id == "i-main")
+        .find(|ingress| ingress.id == "ing-a1b2")
         .unwrap();
     let Some(Transport::VlessTlsXhttp(_)) = stored.wires.vless() else {
         panic!("expected TLS + XHTTP");
@@ -14744,8 +14764,8 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
     issue_certificate_for(&db, "n1", "Test CA").await;
 
     let face = |check, timeout, minimum| CreateIngressRequest {
-        id: "i-main".to_owned(),
-        chain_id: "c-main".to_owned(),
+        id: "ing-a1b2".to_owned(),
+        chain_id: "chn-a1b2-c3d4".to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: 443,
@@ -14804,7 +14824,7 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
         "SELECT anytls_idle_session_check_interval, anytls_idle_session_timeout,
                 anytls_min_idle_session
            FROM ingress_client_settings
-          WHERE ingress_id = 'i-main'",
+          WHERE ingress_id = 'ing-a1b2'",
     )
     .fetch_one(db.pool())
     .await
@@ -14863,7 +14883,7 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
         .unwrap();
     assert!(third.revision_id > second.revision_id);
     let stored_security: String =
-        sqlx::query_scalar("SELECT anytls_security FROM ingresses WHERE id = 'i-main'")
+        sqlx::query_scalar("SELECT anytls_security FROM ingresses WHERE id = 'ing-a1b2'")
             .fetch_one(db.pool())
             .await
             .unwrap();
@@ -14880,7 +14900,7 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
                     anytls_reality_private_key, anytls_reality_public_key,
                     anytls_reality_short_ids
                FROM ingresses
-              WHERE id = 'i-main'",
+              WHERE id = 'ing-a1b2'",
     )
     .fetch_one(db.pool())
     .await
@@ -14907,7 +14927,7 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
     let oversized = sqlx::query(
         "UPDATE ingress_client_settings
             SET anytls_idle_session_timeout = 4294967296
-          WHERE ingress_id = 'i-main'",
+          WHERE ingress_id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await;
@@ -14926,7 +14946,7 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
     sqlx::query(
         "UPDATE ingress_client_settings
             SET anytls_idle_session_timeout = 4294967296
-          WHERE ingress_id = 'i-main'",
+          WHERE ingress_id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await
@@ -14946,6 +14966,20 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
     };
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    db.store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: "chn-b2c3-d4e5".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "TCP Peer".to_owned(),
+                subscription_country: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
 
     let hysteria = |password: &str| Hysteria2 {
         bbr_profile: brocade_core::model::HysteriaBbrProfile::default(),
@@ -14967,7 +15001,12 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
     let face = |id: &str, port: u16, wires: WiresRequest| CreateIngressRequest {
         wires,
         id: id.to_owned(),
-        chain_id: "c-main".to_owned(),
+        chain_id: if id == "ing-a1b2" {
+            "chn-a1b2-c3d4"
+        } else {
+            "chn-b2c3-d4e5"
+        }
+        .to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port,
@@ -14992,7 +15031,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
             &system_admin(),
             "app-main",
             face(
-                "i-main",
+                "ing-a1b2",
                 443,
                 WiresRequest {
                     vless: None,
@@ -15014,7 +15053,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
     let stored = snapshot.apps[0]
         .ingresses
         .iter()
-        .find(|ingress| ingress.id == "i-main")
+        .find(|ingress| ingress.id == "ing-a1b2")
         .expect("Hysteria 2 ingress");
     assert_eq!(
         stored.wires,
@@ -15028,7 +15067,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
             &system_admin(),
             "app-main",
             face(
-                "i-main",
+                "ing-a1b2",
                 8443,
                 WiresRequest {
                     vless: None,
@@ -15043,7 +15082,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
     let stored = snapshot.apps[0]
         .ingresses
         .iter()
-        .find(|ingress| ingress.id == "i-main")
+        .find(|ingress| ingress.id == "ing-a1b2")
         .unwrap();
     assert_eq!(
         stored.wires,
@@ -15056,7 +15095,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
         .upsert_ingress(
             &system_admin(),
             "app-main",
-            face("i-velesu", 8443, WiresRequest::default()),
+            face("ing-b2c3", 8443, WiresRequest::default()),
         )
         .await
         .expect("TCP and UDP should be allowed to share one numeric port");
@@ -15113,8 +15152,8 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                     },
                 }),
             },
-            id: "i-main".to_owned(),
-            chain_id: "c-main".to_owned(),
+            id: "ing-a1b2".to_owned(),
+            chain_id: "chn-a1b2-c3d4".to_owned(),
             node_id: "n1".to_owned(),
             bind: "0.0.0.0".parse().unwrap(),
             port: 443,
@@ -15278,7 +15317,7 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
     // write path.
     let raw = sqlx::query(
         "UPDATE ingresses SET projection_v4_host = '', projection_v4_port = 20443 \
-         WHERE id = 'i-main'",
+         WHERE id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await;
@@ -15289,7 +15328,7 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
             projection_v4_host = 'cu.acc.example.net', projection_v4_port = 20443, \
             projection_v4_download_host = 'down.acc.example.net', \
             projection_v4_download_port = NULL \
-         WHERE id = 'i-main'",
+         WHERE id = 'ing-a1b2'",
     )
     .execute(db.pool())
     .await;
@@ -15792,7 +15831,7 @@ async fn isolated_config_debt_does_not_block_grants_on_healthy_nodes() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "erin".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: true,
                 note: Some("grant a user on the isolated node".to_owned()),
             },
@@ -15831,7 +15870,7 @@ async fn isolated_config_debt_does_not_block_grants_on_healthy_nodes() {
         .iter()
         .flat_map(|inbound| &inbound.clients)
         .any(|client| {
-            client.email == "erin@platform.acme#i-main"
+            client.email == "erin@platform.acme#ing-a1b2"
                 && client.uuid == "4ed04a92-b0c0-42fa-b751-f1da11c9885b"
         }));
     assert_eq!(
@@ -15844,7 +15883,7 @@ async fn isolated_config_debt_does_not_block_grants_on_healthy_nodes() {
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert!(usage_bindings.get("erin@platform.acme#i-main").is_some());
+    assert!(usage_bindings.get("erin@platform.acme#ing-a1b2").is_some());
 
     let recovered_config = db
         .store
@@ -15911,7 +15950,7 @@ async fn isolated_grants_wait_for_an_in_flight_config_obligation() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "frank".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: true,
                 note: Some("grant while isolated config is in flight".to_owned()),
             },
@@ -15951,7 +15990,7 @@ async fn isolated_grants_wait_for_an_in_flight_config_obligation() {
     assert!(inbounds
         .iter()
         .flat_map(|inbound| &inbound.clients)
-        .any(|client| client.email == "frank@platform.acme#i-main"));
+        .any(|client| client.email == "frank@platform.acme#ing-a1b2"));
     db.store
         .report_target_result(applied_report(&grants_claim))
         .await
@@ -16027,7 +16066,7 @@ async fn service_restore_and_new_grant_leave_no_orphaned_isolation_debt() {
                 app_id: "app-main".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 user_id: "grace".to_owned(),
-                ingress_id: "i-main".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
                 enabled: true,
                 note: Some("race grant with service restore".to_owned()),
             },
@@ -16282,7 +16321,7 @@ async fn insert_minimal_fixture(pool: &PgPool) {
 
     sqlx::query(
         "INSERT INTO chains (id, app_id, tenant_id, name, position)
-         VALUES ('c-main', 'app-main', 'platform.acme', 'Main Chain', 0)",
+         VALUES ('chn-a1b2-c3d4', 'app-main', 'platform.acme', 'Main Chain', 0)",
     )
     .execute(pool)
     .await
@@ -16298,7 +16337,7 @@ async fn insert_minimal_fixture(pool: &PgPool) {
             reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            'i-main', 'app-main', 'c-main', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
+            'ing-a1b2', 'app-main', 'chn-a1b2-c3d4', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision',
             'custom-site'
@@ -16309,7 +16348,7 @@ async fn insert_minimal_fixture(pool: &PgPool) {
     .unwrap();
     sqlx::query(
         "INSERT INTO ingress_client_settings (ingress_id, reality_fingerprint)
-         VALUES ('i-main', 'chrome')",
+         VALUES ('ing-a1b2', 'chrome')",
     )
     .execute(pool)
     .await
@@ -16323,7 +16362,7 @@ async fn insert_minimal_fixture(pool: &PgPool) {
     ]);
     sqlx::query(
         "INSERT INTO steps (chain_id, node_id, rules)
-         VALUES ('c-main', 'n1', $1)",
+         VALUES ('chn-a1b2-c3d4', 'n1', $1)",
     )
     .bind(rules)
     .execute(pool)
@@ -16332,7 +16371,7 @@ async fn insert_minimal_fixture(pool: &PgPool) {
 
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
-         VALUES ('app-main', 'platform.acme', 'alice', 'i-main')",
+         VALUES ('app-main', 'platform.acme', 'alice', 'ing-a1b2')",
     )
     .execute(pool)
     .await
@@ -16457,7 +16496,7 @@ async fn insert_ingress_short_ids(
             reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            $1, 'app-main', 'c-main', 'n1', '0.0.0.0', $2, NULL, 'vless-reality',
+            $1, 'app-main', 'chn-a1b2-c3d4', 'n1', '0.0.0.0', $2, NULL, 'vless-reality',
             'reality-private', 'reality-public', $3,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision',
             'custom-site'
@@ -16511,7 +16550,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             &system_admin(),
             "app-main",
             CreateChainRequest {
-                id: "c-sobacu".to_owned(),
+                id: "chn-e5f6-0718".to_owned(),
                 tenant_id: "platform.acme".to_owned(),
                 name: "Sub".to_owned(),
                 subscription_country: None,
@@ -16530,7 +16569,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            'i-toremi', 'app-main', 'c-sobacu', 'n1', '0.0.0.0', 8444, NULL, 'vless-reality',
+            'ing-e5f6', 'app-main', 'chn-e5f6-0718', 'n1', '0.0.0.0', 8444, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision',
             'custom-site'
@@ -16614,26 +16653,26 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     // ── (1) Deleting a middle hop: the whole subtree is removed and references cleared ──
     // n1 → n2 → n3, with n2 also forking to n4. Deleting n2 removes the n2/n3/n4 rows and clears
     // the Forward → n2 entry from n1's rule table.
-    put(&db, "c-sobacu", "n1", &["n2"]).await;
-    put(&db, "c-sobacu", "n2", &["n3", "n4"]).await;
-    put(&db, "c-sobacu", "n3", &[]).await;
-    put(&db, "c-sobacu", "n4", &[]).await;
+    put(&db, "chn-e5f6-0718", "n1", &["n2"]).await;
+    put(&db, "chn-e5f6-0718", "n2", &["n3", "n4"]).await;
+    put(&db, "chn-e5f6-0718", "n3", &[]).await;
+    put(&db, "chn-e5f6-0718", "n4", &[]).await;
 
     let removed = db
         .store
-        .delete_step(&system_admin(), "app-main", "c-sobacu", "n2")
+        .delete_step(&system_admin(), "app-main", "chn-e5f6-0718", "n2")
         .await
         .unwrap();
     assert!(removed.deleted, "删中间跳必须真删掉东西");
     assert!(!removed.chain_removed);
     assert_eq!(removed.removed_steps, vec!["n2", "n3", "n4"]);
     assert_eq!(
-        steps_of(&db, "c-sobacu").await,
+        steps_of(&db, "chn-e5f6-0718").await,
         vec!["n1"],
         "子树之外只剩 n1"
     );
     assert!(
-        forward_targets(&db, "c-sobacu", "n1").await.is_empty(),
+        forward_targets(&db, "chn-e5f6-0718", "n1").await.is_empty(),
         "n1 规则表里指向 n2 的 Forward 必须被清掉"
     );
 
@@ -16646,14 +16685,14 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     // Idempotent: deleting again is a no-op and the revision number falls back.
     let again = db
         .store
-        .delete_step(&system_admin(), "app-main", "c-sobacu", "n2")
+        .delete_step(&system_admin(), "app-main", "chn-e5f6-0718", "n2")
         .await
         .unwrap();
     assert!(!again.deleted);
 
     // ── (2) Deleting the head: the whole chain goes (declaration, ingress, grants) ──
-    // c-main's ingress i-main sits on n1, which makes n1 the head.
-    // A historical usage row referencing i-main is inserted first: since 0001's section 0026,
+    // chn-a1b2-c3d4's ingress ing-a1b2 sits on n1, which makes n1 the head.
+    // A historical usage row referencing ing-a1b2 is inserted first: since 0001's section 0026,
     // usage_samples has no foreign key to ingresses, and a record of historical fact does not
     // block deleting the model.
     sqlx::query(
@@ -16661,7 +16700,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             sampled_at, window_start, window_end, node_id, tenant_id, user_id,
             ingress_id, grant_label, uplink_bytes, downlink_bytes
          ) VALUES (now(), now() - interval '1 hour', now(), 'n1',
-                   'platform.acme', 'alice', 'i-main', 'alice@i-main', 100, 200)",
+                   'platform.acme', 'alice', 'ing-a1b2', 'alice@ing-a1b2', 100, 200)",
     )
     .execute(db.pool())
     .await
@@ -16669,28 +16708,28 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
 
     let head = db
         .store
-        .delete_step(&system_admin(), "app-main", "c-main", "n1")
+        .delete_step(&system_admin(), "app-main", "chn-a1b2-c3d4", "n1")
         .await
         .unwrap();
     assert!(head.deleted);
     assert!(head.chain_removed, "删链头 = 整条链删除");
-    assert_eq!(head.removed_steps, vec!["n1"], "c-main 链的成员清单");
+    assert_eq!(head.removed_steps, vec!["n1"], "chn-a1b2-c3d4 链的成员清单");
 
-    let chains_left: i64 = sqlx::query("SELECT count(*) FROM chains WHERE id = 'c-main'")
+    let chains_left: i64 = sqlx::query("SELECT count(*) FROM chains WHERE id = 'chn-a1b2-c3d4'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
     assert_eq!(chains_left, 0, "链声明随链头删除一起消失");
-    let ingresses_left: i64 = sqlx::query("SELECT count(*) FROM ingresses WHERE id = 'i-main'")
+    let ingresses_left: i64 = sqlx::query("SELECT count(*) FROM ingresses WHERE id = 'ing-a1b2'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
     assert_eq!(ingresses_left, 0, "接入面随链删除");
-    let grants_left: i64 = sqlx::query("SELECT count(*) FROM grants WHERE ingress_id = 'i-main'")
+    let grants_left: i64 = sqlx::query("SELECT count(*) FROM grants WHERE ingress_id = 'ing-a1b2'")
         .fetch_one(db.pool())
         .await
         .unwrap()
@@ -16706,20 +16745,20 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             .unwrap();
     assert_eq!(
         usage.as_deref(),
-        Some("i-main"),
+        Some("ing-a1b2"),
         "历史用量样本保留，ingress_id 原值不动（0026 段起就无外键，是事实记录）"
     );
 
     // ── (3) The draft-commit path: the same DeleteStep op, the same cascade ──
-    put(&db, "c-sobacu", "n1", &["n2"]).await;
-    put(&db, "c-sobacu", "n2", &[]).await;
+    put(&db, "chn-e5f6-0718", "n1", &["n2"]).await;
+    put(&db, "chn-e5f6-0718", "n2", &[]).await;
     let applied = db
         .store
         .apply_draft(
             &system_admin(),
             vec![brocade_store::ModelOp::DeleteStep {
                 app_id: "app-main".to_owned(),
-                chain_id: "c-sobacu".to_owned(),
+                chain_id: "chn-e5f6-0718".to_owned(),
                 node_id: "n2".to_owned(),
             }],
             None,
@@ -16727,7 +16766,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
         .await
         .unwrap();
     assert_eq!(applied.changed, 1);
-    assert_eq!(steps_of(&db, "c-sobacu").await, vec!["n1"]);
+    assert_eq!(steps_of(&db, "chn-e5f6-0718").await, vec!["n1"]);
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
     let output = compile(&snapshot);
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
@@ -16768,7 +16807,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     // its convenience entrance.
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
-         VALUES ('app-main', 'platform.acme', 'alice', 'i-toremi')",
+         VALUES ('app-main', 'platform.acme', 'alice', 'ing-e5f6')",
     )
     .execute(db.pool())
     .await
@@ -16779,32 +16818,32 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
             &system_admin(),
             vec![brocade_store::ModelOp::DeleteChain {
                 app_id: "app-main".to_owned(),
-                chain_id: "c-sobacu".to_owned(),
+                chain_id: "chn-e5f6-0718".to_owned(),
             }],
             None,
         )
         .await
         .unwrap();
     assert_eq!(applied.changed, 1);
-    let c: i64 = sqlx::query("SELECT count(*) FROM chains WHERE id = 'c-sobacu'")
+    let c: i64 = sqlx::query("SELECT count(*) FROM chains WHERE id = 'chn-e5f6-0718'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
-    let i: i64 = sqlx::query("SELECT count(*) FROM ingresses WHERE id = 'i-toremi'")
+    let i: i64 = sqlx::query("SELECT count(*) FROM ingresses WHERE id = 'ing-e5f6'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
-    let g: i64 = sqlx::query("SELECT count(*) FROM grants WHERE ingress_id = 'i-toremi'")
+    let g: i64 = sqlx::query("SELECT count(*) FROM grants WHERE ingress_id = 'ing-e5f6'")
         .fetch_one(db.pool())
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
-    let s: i64 = sqlx::query("SELECT count(*) FROM steps WHERE chain_id = 'c-sobacu'")
+    let s: i64 = sqlx::query("SELECT count(*) FROM steps WHERE chain_id = 'chn-e5f6-0718'")
         .fetch_one(db.pool())
         .await
         .unwrap()
@@ -16882,7 +16921,7 @@ async fn prune_chain_drops_stranded_steps_after_whole_tree_lands() {
         }
         brocade_store::ModelOp::PutStep {
             app_id: "app-main".to_owned(),
-            chain_id: "c-main".to_owned(),
+            chain_id: "chn-a1b2-c3d4".to_owned(),
             node_id: node.to_owned(),
             step: PutStepRequest {
                 accept: Some(StepAcceptRequest {
@@ -16900,10 +16939,10 @@ async fn prune_chain_drops_stranded_steps_after_whole_tree_lands() {
     }
     let prune = || brocade_store::ModelOp::PruneChain {
         app_id: "app-main".to_owned(),
-        chain_id: "c-main".to_owned(),
+        chain_id: "chn-a1b2-c3d4".to_owned(),
     };
     async fn steps_of(db: &TestPg) -> Vec<String> {
-        sqlx::query("SELECT node_id FROM steps WHERE chain_id = 'c-main' ORDER BY node_id")
+        sqlx::query("SELECT node_id FROM steps WHERE chain_id = 'chn-a1b2-c3d4' ORDER BY node_id")
             .fetch_all(db.pool())
             .await
             .unwrap()
@@ -17011,7 +17050,7 @@ async fn prune_chain_drops_stranded_steps_after_whole_tree_lands() {
         .unwrap();
     let pruned = db
         .store
-        .prune_chain(&system_admin(), "app-main", "c-main")
+        .prune_chain(&system_admin(), "app-main", "chn-a1b2-c3d4")
         .await
         .unwrap();
     assert_eq!(pruned.removed_steps, ["n4"], "n1 不指 n4 了，它就落单了");
@@ -17222,8 +17261,8 @@ async fn hysteria2_quic_tuning_round_trips_field_by_field() {
                 masquerade: HysteriaMasquerade::NotFound,
             }),
         },
-        id: "i-pucivo".to_owned(),
-        chain_id: "c-main".to_owned(),
+        id: "ing-a1b2".to_owned(),
+        chain_id: "chn-a1b2-c3d4".to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: 8443,
@@ -17259,7 +17298,7 @@ async fn hysteria2_quic_tuning_round_trips_field_by_field() {
             .apps
             .iter()
             .flat_map(|app| &app.ingresses)
-            .find(|ingress| ingress.id == "i-pucivo")
+            .find(|ingress| ingress.id == "ing-a1b2")
             .and_then(|ingress| ingress.wires.hysteria2().cloned())
             .expect("接入面还在")
     };

@@ -420,7 +420,7 @@ pub async fn record_link_health(
         }
 
         // Chain IDs are model identities, not free-form telemetry dimensions. After the
-        // friendly-ID rollout there is deliberately no alias fallback: a stale tag is unknown and
+        // grouped model-ID rollout there is deliberately no alias fallback: a stale tag is unknown and
         // must not recreate the retired namespace in an operational table.
         let known_chain = match hop.chain_id.split_once('/') {
             Some((app_id, chain_id)) => {

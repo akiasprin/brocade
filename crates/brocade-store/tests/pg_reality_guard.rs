@@ -57,7 +57,7 @@ async fn fallback_guard_round_trips() {
         .unwrap();
     sqlx::query(
         "INSERT INTO chains (id, app_id, tenant_id, name, position)
-         VALUES ('c-main', 'app-main', 'platform.acme', 'Main Chain', 0)",
+         VALUES ('chn-a1b2-c3d4', 'app-main', 'platform.acme', 'Main Chain', 0)",
     )
     .execute(&pool)
     .await
@@ -69,8 +69,8 @@ async fn fallback_guard_round_trips() {
             anytls: None,
             hysteria2: None,
         },
-        id: "i-bacemu".to_owned(),
-        chain_id: "c-main".to_owned(),
+        id: "ing-a1b2".to_owned(),
+        chain_id: "chn-a1b2-c3d4".to_owned(),
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: 443,

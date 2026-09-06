@@ -372,7 +372,7 @@ class DraftStore {
   /* 按操作者分键恢复。切换用户时重新开始——草稿表示该用户未提交的内容，随用户区分。 */
   init(operator: string) {
     // v2 is an intentional hard boundary: v1 drafts can contain chain/ingress IDs replaced by the
-    // friendly-ID migration. Replaying one after that migration could target a different object
+    // grouped model-ID migration. Replaying one after that migration could target a different object
     // graph, so it is safer to start a clean draft than to guess an old-to-new mapping in the
     // browser. App slugs stay unchanged; server-side tombstones protect the two migrated kinds.
     const key = `brocade-console:draft:v2:${operator}`;

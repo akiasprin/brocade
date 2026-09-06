@@ -63,9 +63,9 @@ describe('线路与链顺序草稿', () => {
     expect(draft.ops()).toEqual([{ op: 'upsert_app', app: { id: 'line-c', label: 'Line C' } }]);
   });
 
-  it('友好 ID 上线后不回放仍引用旧 ID 的 v1 草稿', () => {
+  it('模型 ID 上线后不回放仍引用旧 ID 的 v1 草稿', () => {
     localStorage.setItem(
-      'brocade-console:draft:v1:pre-friendly-id-test',
+      'brocade-console:draft:v1:pre-model-id-test',
       JSON.stringify([
         {
           key: 'chain:app-1/c-1',
@@ -79,7 +79,7 @@ describe('线路与链顺序草稿', () => {
       ]),
     );
 
-    draft.init('pre-friendly-id-test');
+    draft.init('pre-model-id-test');
     expect(draft.ops()).toEqual([]);
   });
 });

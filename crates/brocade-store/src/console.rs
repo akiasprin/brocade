@@ -1548,8 +1548,7 @@ pub(crate) async fn upsert_chain_tx(
     let name = required_text(request.name, "chain name")?;
     let subscription_country = normalize_subscription_country(request.subscription_country)?;
     actor.require_tenant_access(&tenant_id, "chain")?;
-    reject_non_friendly_new_model_id_tx(tx, "chain", &id).await?;
-    reject_friendly_body_conflict_tx(tx, "chain", &id).await?;
+    validate_model_id("chain", &id)?;
     ensure_app_exists_tx(tx, &app_id).await?;
     ensure_tenant_exists_tx(tx, &tenant_id).await?;
     let revision_id = u64_to_i64(revision_id, "revision_id")?;
@@ -1966,8 +1965,8 @@ pub(crate) async fn upsert_ingress_tx(
     ensure_app_exists_tx(tx, &app_id).await?;
     let chain_tenant = chain_tenant_tx(tx, &app_id, &chain_id).await?;
     actor.require_tenant_access(&chain_tenant, "ingress")?;
-    reject_non_friendly_new_model_id_tx(tx, "ingress", &id).await?;
-    reject_friendly_body_conflict_tx(tx, "ingress", &id).await?;
+    validate_model_id("ingress", &id)?;
+    validate_model_id_pair(&id, &chain_id)?;
     ensure_node_exists_tx(tx, &node_id).await?;
     if let Some(front_id) = &front_id {
         ensure_front_in_app_tx(tx, &app_id, front_id).await?;
@@ -2697,89 +2696,60 @@ fn client_download_json(download: &ProjectionDownloadEndpoint) -> Result<Value> 
     })?)
 }
 
-/// Existing non-friendly IDs may still be updated while an old development fixture is being
-/// migrated, but no write path may create another one. Production has no such rows after the
-/// one-time conversion, so this closes the door previously held shut by persistent tombstones.
-async fn reject_non_friendly_new_model_id_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    kind: &str,
-    id: &str,
-) -> Result<()> {
-    if friendly_model_id_body(kind, id).is_some() {
-        return Ok(());
-    }
-    let exists = match kind {
-        "chain" => {
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM chains WHERE id = $1)")
-        }
-        "ingress" => {
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ingresses WHERE id = $1)")
-        }
+fn is_lower_hex4(value: &str) -> bool {
+    value.len() == 4
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn ingress_model_id_token(id: &str) -> Option<&str> {
+    let token = id.strip_prefix("ing-")?;
+    is_lower_hex4(token).then_some(token)
+}
+
+fn chain_model_id_parts(id: &str) -> Option<(&str, &str)> {
+    let (ingress_token, chain_token) = id.strip_prefix("chn-")?.split_once('-')?;
+    (is_lower_hex4(ingress_token) && is_lower_hex4(chain_token))
+        .then_some((ingress_token, chain_token))
+}
+
+fn validate_model_id(kind: &str, id: &str) -> Result<()> {
+    let valid = match kind {
+        "chain" => chain_model_id_parts(id).is_some(),
+        "ingress" => ingress_model_id_token(id).is_some(),
         _ => {
             return Err(StoreError::InvalidData(format!(
-                "unknown friendly model id kind {kind}"
+                "unknown model id kind {kind}"
             )));
         }
-    }
-    .bind(id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if !exists {
-        let prefix = if kind == "chain" { "c-" } else { "i-" };
-        return Err(StoreError::InvalidData(format!(
-            "new {kind} id must use {prefix} plus six alternating consonant/vowel letters"
-        )));
-    }
-    Ok(())
-}
-
-fn friendly_model_id_body<'a>(kind: &str, id: &'a str) -> Option<&'a str> {
-    let prefix = match kind {
-        "chain" => "c-",
-        "ingress" => "i-",
-        _ => return None,
     };
-    let body = id.strip_prefix(prefix)?;
-    let consonants = b"bcdfghjklmnprstvwz";
-    let vowels = b"aeiou";
-    (body.len() == 6
-        && body.bytes().enumerate().all(|(index, byte)| {
-            if index % 2 == 0 {
-                consonants.contains(&byte)
-            } else {
-                vowels.contains(&byte)
-            }
-        }))
-    .then_some(body)
-}
-
-/// Give a model write a clean 409 before the database trigger's final concurrency backstop. The
-/// six-letter body is one namespace shared by chains and ingresses, even though their full IDs have
-/// different prefixes.
-async fn reject_friendly_body_conflict_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    kind: &str,
-    id: &str,
-) -> Result<()> {
-    let Some(body) = friendly_model_id_body(kind, id) else {
+    if valid {
         return Ok(());
+    }
+    let shape = match kind {
+        "chain" => "chn-<4 lowercase hex>-<4 lowercase hex>",
+        "ingress" => "ing-<4 lowercase hex>",
+        _ => unreachable!(),
     };
-    let owner = sqlx::query(
-        "SELECT kind, model_id
-           FROM friendly_model_id_bodies
-          WHERE body = $1",
-    )
-    .bind(body)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(owner) = owner {
-        let owner_kind: String = owner.try_get("kind")?;
-        let owner_id: String = owner.try_get("model_id")?;
-        if owner_kind != kind || owner_id != id {
-            return Err(StoreError::Conflict(format!(
-                "friendly id body {body} is already used"
-            )));
-        }
+    Err(StoreError::InvalidData(format!(
+        "{kind} id must use {shape}"
+    )))
+}
+
+fn validate_model_id_pair(ingress_id: &str, chain_id: &str) -> Result<()> {
+    let ingress_token = ingress_model_id_token(ingress_id).ok_or_else(|| {
+        StoreError::InvalidData("ingress id must use ing-<4 lowercase hex>".to_owned())
+    })?;
+    let (chain_ingress_token, _) = chain_model_id_parts(chain_id).ok_or_else(|| {
+        StoreError::InvalidData(
+            "chain id must use chn-<4 lowercase hex>-<4 lowercase hex>".to_owned(),
+        )
+    })?;
+    if ingress_token != chain_ingress_token {
+        return Err(StoreError::InvalidData(format!(
+            "ingress {ingress_id} and chain {chain_id} must share the same four-character token"
+        )));
     }
     Ok(())
 }
@@ -4008,4 +3978,24 @@ fn i64_to_u64(value: i64, field: &str) -> Result<u64> {
 
 pub(crate) fn u64_to_i64(value: u64, field: &str) -> Result<i64> {
     i64::try_from(value).map_err(|_| StoreError::InvalidData(format!("{field} out of range")))
+}
+
+#[cfg(test)]
+mod model_id_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_the_grouped_three_letter_id_shapes() {
+        assert!(validate_model_id("ingress", "ing-8f3a").is_ok());
+        assert!(validate_model_id("chain", "chn-8f3a-2d71").is_ok());
+        assert!(validate_model_id("ingress", "i-bacemu").is_err());
+        assert!(validate_model_id("chain", "c-lumira").is_err());
+        assert!(validate_model_id("chain", "chn-8F3A-2d71").is_err());
+    }
+
+    #[test]
+    fn requires_the_chain_to_carry_its_ingress_token() {
+        assert!(validate_model_id_pair("ing-8f3a", "chn-8f3a-2d71").is_ok());
+        assert!(validate_model_id_pair("ing-8f3a", "chn-a410-2d71").is_err());
+    }
 }

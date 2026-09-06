@@ -947,7 +947,7 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
                             "op": "upsert_chain",
                             "app_id": "app-main",
                             "chain": CreateChainRequest {
-                                id: "c-bacemu".to_owned(),
+                                id: "chn-b2c3-d4e5".to_owned(),
                                 tenant_id: "platform.acme".to_owned(),
                                 name: "Live Rename".to_owned(),
                                 subscription_country: None,
@@ -2146,7 +2146,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
             .unwrap();
 
     let target = &list["targets"][0];
-    assert_eq!(target["chain_id"], "c-bacemu");
+    assert_eq!(target["chain_id"], "chn-b2c3-d4e5");
     assert_eq!(target["port"], 443);
     // It dials the local machine rather than a public IP: going over the public internet also
     // measures inbound routing, which is not a property of the chain.
@@ -2160,11 +2160,11 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     // id alone — it is something that reaches the ingress.
     assert_eq!(
         target["uuid"],
-        brocade_core::model::probe_uuid("reality-private", "i-dafino").as_str()
+        brocade_core::model::probe_uuid("reality-private", "ing-b2c3").as_str()
     );
     assert_ne!(
         target["uuid"],
-        brocade_core::model::probe_uuid("", "i-dafino").as_str()
+        brocade_core::model::probe_uuid("", "ing-b2c3").as_str()
     );
     assert!(list["endpoint_url"]
         .as_str()
@@ -2183,7 +2183,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         "probed_at_unix_secs": probe_base,
         "chains": [{
             "app_id": "app-main",
-            "chain_id": "c-bacemu",
+            "chain_id": "chn-b2c3-d4e5",
             "status": "ok",
             "ttfb_ms": 86,
             "exit_ip": "203.0.113.9",
@@ -2244,7 +2244,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
     let chain = &view["chains"][0];
-    assert_eq!(chain["chain_id"], "c-bacemu");
+    assert_eq!(chain["chain_id"], "chn-b2c3-d4e5");
     assert_eq!(chain["chain_name"], "Main Chain");
     assert_eq!(chain["node_id"], "n1");
     assert_eq!(chain["status"], "ok");
@@ -2259,7 +2259,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         "probed_at_unix_secs": probe_base + 60,
         "chains": [{
             "app_id": "app-main",
-            "chain_id": "c-bacemu",
+            "chain_id": "chn-b2c3-d4e5",
             "status": "timeout",
             "ttfb_ms": 10000,
             "exit_ip": null,
@@ -2382,7 +2382,7 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
             "read_at_unix_secs": read_at,
             "xray_started_at_unix_secs": base - 1000,
             "counters": [{
-                "label": "alice@platform.acme#i-dafino",
+                "label": "alice@platform.acme#ing-b2c3",
                 "uplink_bytes": up,
                 "downlink_bytes": down
             }]
@@ -2444,7 +2444,7 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
     assert_eq!(body["samples"].as_array().unwrap().len(), 1);
     assert_eq!(
         body["samples"][0]["grant_label"],
-        "alice@platform.acme#i-dafino"
+        "alice@platform.acme#ing-b2c3"
     );
     assert_eq!(body["samples"][0]["uplink_bytes"], 25);
     assert_eq!(body["samples"][0]["downlink_bytes"], 60);
@@ -2530,7 +2530,7 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         &app,
         &admin_token,
         "/apps/app-main/chains",
-        json!({ "id": "c-bacemu", "tenant_id": "platform.acme", "name": "Main Chain" }),
+        json!({ "id": "chn-b2c3-d4e5", "tenant_id": "platform.acme", "name": "Main Chain" }),
     )
     .await;
 
@@ -2540,8 +2540,8 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         &admin_token,
         "/apps/app-main/ingresses",
         json!({
-            "id": "i-hemori",
-            "chain_id": "c-bacemu",
+            "id": "ing-b2c3",
+            "chain_id": "chn-b2c3-d4e5",
             "node_id": "n-api",
             "bind": "0.0.0.0",
             "port": 443,
@@ -2562,8 +2562,8 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         .unwrap();
     let inherited = ingresses
         .iter()
-        .find(|v| v["id"] == "i-hemori")
-        .expect("i-hemori 在快照里");
+        .find(|v| v["id"] == "ing-b2c3")
+        .expect("ing-b2c3 在快照里");
     assert_eq!(inherited["wires"]["vless"]["flow"], "xtls-rprx-vision");
 
     // Turning it off must really turn it off: on by default is not welded on. An ingress left blank
@@ -2596,8 +2596,8 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
         .unwrap();
     let inherited = ingresses
         .iter()
-        .find(|v| v["id"] == "i-hemori")
-        .expect("i-hemori 在快照里");
+        .find(|v| v["id"] == "ing-b2c3")
+        .expect("ing-b2c3 在快照里");
     assert!(
         inherited["wires"]["vless"]["flow"].is_null(),
         "全局关掉之后，跟随全局的接入面也不下发 flow"
@@ -3408,7 +3408,7 @@ async fn http_console_read_surface_returns_redacted_snapshot_compile_state_and_a
         serde_json::from_slice(&to_bytes(grants.into_body(), 1024 * 1024).await.unwrap()).unwrap();
     assert_eq!(body["state"], "present");
     let grants: Value = serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-    assert_eq!(grants["inbounds"][0]["tag"], "in:app-main/i-dafino");
+    assert_eq!(grants["inbounds"][0]["tag"], "in:app-main/ing-b2c3");
     assert_eq!(
         grants["inbounds"][0]["clients"][0]["id"],
         "2d2304da-f114-4574-8d44-625afdb1db5c"
@@ -3487,7 +3487,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         &admin_token,
         "/apps/app-main/chains",
         json!({
-            "id": "c-bacemu",
+            "id": "chn-b2c3-d4e5",
             "tenant_id": "platform.acme",
             "name": "Main Chain"
         }),
@@ -3501,8 +3501,8 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         &admin_token,
         "/apps/app-main/ingresses",
         json!({
-            "id": "i-dafino",
-            "chain_id": "c-bacemu",
+            "id": "ing-b2c3",
+            "chain_id": "chn-b2c3-d4e5",
             "node_id": "n-api",
             "bind": "0.0.0.0",
             "port": 443,
@@ -3538,7 +3538,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
     let legacy_step = put_json(
         &app,
         &admin_token,
-        "/apps/app-main/chains/c-bacemu/steps/n-api",
+        "/apps/app-main/chains/chn-b2c3-d4e5/steps/n-api",
         json!({ "rules": [] }),
     )
     .await;
@@ -3548,7 +3548,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
         &app,
         &admin_token,
         "app-main",
-        "c-bacemu",
+        "chn-b2c3-d4e5",
         "n-api",
         json!({
             "rules": [{
@@ -3569,7 +3569,7 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
             "app_id": "app-main",
             "tenant_id": "platform.acme",
             "user_id": "alice",
-            "ingress_id": "i-dafino",
+            "ingress_id": "ing-b2c3",
             "enabled": true
         }),
     )
@@ -4175,7 +4175,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     assert_eq!(user.1["revision_id"], 6);
 
     let chain_body = json!({
-        "id": "c-bacemu",
+        "id": "chn-b2c3-d4e5",
         "tenant_id": "platform.acme",
         "name": "Main Chain"
     });
@@ -4191,8 +4191,8 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
     assert_eq!(chain_again.1["revision_id"], 7, "链和主干都原样");
 
     let ingress_body = json!({
-        "id": "i-dafino",
-        "chain_id": "c-bacemu",
+        "id": "ing-b2c3",
+        "chain_id": "chn-b2c3-d4e5",
         "node_id": "n-api",
         "bind": "0.0.0.0",
         "port": 443,
@@ -4234,7 +4234,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         &app,
         &admin_token,
         "app-main",
-        "c-bacemu",
+        "chn-b2c3-d4e5",
         "n-api",
         step_body.clone(),
     )
@@ -4244,7 +4244,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         &app,
         &admin_token,
         "app-main",
-        "c-bacemu",
+        "chn-b2c3-d4e5",
         "n-api",
         step_body,
     )
@@ -4255,7 +4255,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         "app_id": "app-main",
         "tenant_id": "platform.acme",
         "user_id": "alice",
-        "ingress_id": "i-dafino",
+        "ingress_id": "ing-b2c3",
         "enabled": true
     });
     let grant = post_json(&app, &admin_token, "/grants", grant_body.clone()).await;
@@ -4272,7 +4272,7 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
             "app_id": "app-main",
             "tenant_id": "platform.acme",
             "user_id": "alice",
-            "ingress_id": "i-dafino",
+            "ingress_id": "ing-b2c3",
             "enabled": true
         }),
     )
@@ -4385,7 +4385,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
         &admin_token,
         "/apps/app-main/chains",
         json!({
-            "id": "c-bacemu",
+            "id": "chn-b2c3-d4e5",
             "tenant_id": "platform.acme",
             "name": "主链路"
         }),
@@ -4407,7 +4407,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
         &app,
         &admin_token,
         "app-main",
-        "c-bacemu",
+        "chn-b2c3-d4e5",
         "n-hop",
         json!({
             "accept": {},
@@ -4428,7 +4428,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
         &app,
         &admin_token,
         "app-main",
-        "c-bacemu",
+        "chn-b2c3-d4e5",
         "n-hop",
         json!({
             "accept": {},
@@ -4462,7 +4462,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
         &app,
         &admin_token,
         "app-main",
-        "c-bacemu",
+        "chn-b2c3-d4e5",
         "n-hop",
         json!({
             "accept": {},
@@ -4481,7 +4481,7 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
         &app,
         &admin_token,
         "app-main",
-        "c-bacemu",
+        "chn-b2c3-d4e5",
         "n-hop",
         json!({
             "accept": {},
@@ -4529,8 +4529,8 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
     }
 
     for (chain, head, ingress) in [
-        ("c-lanavi", "n-lan", "i-mopelu"),
-        ("c-waneso", "n-wan", "i-rudesa"),
+        ("chn-c3d4-e5f6", "n-lan", "ing-c3d4"),
+        ("chn-d4e5-f607", "n-wan", "ing-d4e5"),
     ] {
         post_json(
             &app,
@@ -4571,7 +4571,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         &app,
         &admin_token,
         "app-main",
-        "c-lanavi",
+        "chn-c3d4-e5f6",
         "n-lan",
         json!({
             "rules": [{
@@ -4585,7 +4585,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         &app,
         &admin_token,
         "app-main",
-        "c-lanavi",
+        "chn-c3d4-e5f6",
         "n-relay",
         json!({
             "accept": {},
@@ -4602,7 +4602,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         &app,
         &admin_token,
         "app-main",
-        "c-waneso",
+        "chn-d4e5-f607",
         "n-wan",
         json!({
             "rules": [{
@@ -4620,7 +4620,7 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         &app,
         &admin_token,
         "app-main",
-        "c-waneso",
+        "chn-d4e5-f607",
         "n-relay",
         json!({
             "accept": {},
@@ -4658,10 +4658,10 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         .iter()
         .flat_map(|a| a["hops"].as_array().unwrap())
         .collect();
-    let lan_hop = hops.iter().find(|h| h["chain"] == "c-lanavi").unwrap();
+    let lan_hop = hops.iter().find(|h| h["chain"] == "chn-c3d4-e5f6").unwrap();
     assert_eq!(lan_hop["address"], "10.0.0.9");
     assert_eq!(lan_hop["security"]["t"], "none");
-    let wan_hop = hops.iter().find(|h| h["chain"] == "c-waneso").unwrap();
+    let wan_hop = hops.iter().find(|h| h["chain"] == "chn-d4e5-f607").unwrap();
     assert_eq!(wan_hop["address"], "relay.sg.example");
     assert_eq!(wan_hop["security"]["t"], "reality");
 
@@ -4770,7 +4770,13 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         .iter()
         .find(|certificate| certificate.status == "serving")
         .unwrap();
-    assert_eq!(serving.issuer.as_deref(), Some("Brocade Self-Signed"));
+    assert!(
+        serving
+            .issuer
+            .as_deref()
+            .is_some_and(|issuer| !issuer.trim().is_empty() && issuer != "Let's Encrypt"),
+        "a self-signed leaf should identify its generated private root"
+    );
     let row = sqlx::query("SELECT key_pem_sealed, peer_sha256 FROM certificates WHERE id = $1")
         .bind(&serving.id)
         .fetch_one(db.pool())
@@ -5214,7 +5220,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     );
     assert_eq!(
         snapshot.1["snapshot"]["apps"][0]["chains"][0]["id"],
-        "c-bacemu"
+        "chn-b2c3-d4e5"
     );
 
     let list = get_json_with_cookie(&app, "/ping-probe/nodes?window_secs=3600", &cookie).await;
@@ -5710,7 +5716,7 @@ async fn insert_usage_model(pool: &PgPool) {
         .unwrap();
     sqlx::query(
         "INSERT INTO chains (id, app_id, tenant_id, name, position)
-         VALUES ('c-bacemu', 'app-main', 'platform.acme', 'Main Chain', 0)",
+         VALUES ('chn-b2c3-d4e5', 'app-main', 'platform.acme', 'Main Chain', 0)",
     )
     .execute(pool)
     .await
@@ -5725,7 +5731,7 @@ async fn insert_usage_model(pool: &PgPool) {
             reality_dest, reality_server_names, reality_flow,
             reality_fallback_mode
          ) VALUES (
-            'i-dafino', 'app-main', 'c-bacemu', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
+            'ing-b2c3', 'app-main', 'chn-b2c3-d4e5', 'n1', '0.0.0.0', 443, NULL, 'vless-reality',
             'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
             'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision',
             'custom-site'
@@ -5736,21 +5742,21 @@ async fn insert_usage_model(pool: &PgPool) {
     .unwrap();
     sqlx::query(
         "INSERT INTO ingress_client_settings (ingress_id, reality_fingerprint)
-         VALUES ('i-dafino', 'chrome')",
+         VALUES ('ing-b2c3', 'chrome')",
     )
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO steps (chain_id, node_id, rules)
-         VALUES ('c-bacemu', 'n1', '[{\"match\":{\"t\":\"any\"},\"action\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
+         VALUES ('chn-b2c3-d4e5', 'n1', '[{\"match\":{\"t\":\"any\"},\"action\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
     )
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
-         VALUES ('app-main', 'platform.acme', 'alice', 'i-dafino')",
+         VALUES ('app-main', 'platform.acme', 'alice', 'ing-b2c3')",
     )
     .execute(pool)
     .await

@@ -132,24 +132,24 @@ CREATE TABLE IF NOT EXISTS apps (
     CONSTRAINT apps_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id)
 );
 
--- Chain and ingress prefixes describe the resource kind; the six-letter body is the human-sized
--- identity. Reserve that body once across both tables so `c-lumira` and `i-lumira` can never coexist
--- and be confused in logs, URLs or support conversations. Triggers below maintain this registry.
-CREATE TABLE IF NOT EXISTS friendly_model_id_bodies (
-    body TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    model_id TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
-    CONSTRAINT friendly_model_id_bodies_pkey PRIMARY KEY (body),
-    CONSTRAINT friendly_model_id_bodies_kind_check CHECK (kind IN ('chain', 'ingress')),
-    CONSTRAINT friendly_model_id_bodies_body_check CHECK (
-        body ~ '^[bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou]$'
-    ),
-    CONSTRAINT friendly_model_id_bodies_model_id_key UNIQUE (model_id),
-    CONSTRAINT friendly_model_id_bodies_shape_check CHECK (
-        model_id = CASE kind WHEN 'chain' THEN 'c-' ELSE 'i-' END || body
-    )
-);
+-- Remove the superseded pronounceable-ID registry before any replay can update a chain or ingress
+-- through its old trigger. The current IDs encode their relationship directly and use the tables'
+-- ordinary primary keys for collision protection.
+DO $_$
+BEGIN
+    IF to_regclass('chains') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS chains_friendly_id_body ON chains;
+    END IF;
+    IF to_regclass('ingresses') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS ingresses_friendly_id_body ON ingresses;
+    END IF;
+END
+$_$;
+DROP FUNCTION IF EXISTS brocade_reserve_friendly_model_id_body();
+DROP FUNCTION IF EXISTS brocade_migrate_friendly_model_ids();
+DROP FUNCTION IF EXISTS brocade_random_friendly_model_id(TEXT);
+DROP FUNCTION IF EXISTS brocade_is_friendly_model_id(TEXT, TEXT);
+DROP TABLE IF EXISTS friendly_model_id_bodies;
 
 -- Reusable tenant-level proxy targets. Credentials are sealed independently from the JSON
 -- protocol options: this keeps a query or dump of the ordinary configuration columns from
@@ -3652,43 +3652,27 @@ ALTER TABLE steps DROP CONSTRAINT IF EXISTS steps_chain_id_fkey;
 ALTER TABLE steps ADD CONSTRAINT steps_chain_id_fkey FOREIGN KEY (chain_id)
     REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE;
 
-CREATE OR REPLACE FUNCTION brocade_is_friendly_model_id(kind TEXT, value TEXT) RETURNS BOOLEAN
+CREATE OR REPLACE FUNCTION brocade_is_grouped_model_id(kind TEXT, value TEXT) RETURNS BOOLEAN
     LANGUAGE sql IMMUTABLE STRICT
     AS $_$
     SELECT CASE kind
-        WHEN 'chain' THEN value ~ '^c-[bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou]$'
-        WHEN 'ingress' THEN value ~ '^i-[bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou][bcdfghjklmnprstvwz][aeiou]$'
+        WHEN 'chain' THEN value ~ '^chn-[0-9a-f]{4}-[0-9a-f]{4}$'
+        WHEN 'ingress' THEN value ~ '^ing-[0-9a-f]{4}$'
         ELSE FALSE
     END
 $_$;
 
-CREATE OR REPLACE FUNCTION brocade_random_friendly_model_id(kind TEXT) RETURNS TEXT
-    LANGUAGE plpgsql VOLATILE STRICT
+CREATE OR REPLACE FUNCTION brocade_random_model_id_token() RETURNS TEXT
+    LANGUAGE sql VOLATILE
     AS $_$
-DECLARE
-    prefix TEXT;
-    consonants CONSTANT TEXT := 'bcdfghjklmnprstvwz';
-    vowels CONSTANT TEXT := 'aeiou';
-    alphabet TEXT;
-    body TEXT := '';
-    letter_index INTEGER;
-BEGIN
-    prefix := CASE kind WHEN 'chain' THEN 'c-' WHEN 'ingress' THEN 'i-' END;
-    IF prefix IS NULL THEN
-        RAISE EXCEPTION 'unknown friendly model id kind: %', kind;
-    END IF;
-    FOR letter_index IN 0..5 LOOP
-        alphabet := CASE WHEN letter_index % 2 = 0 THEN consonants ELSE vowels END;
-        body := body || substr(alphabet, 1 + floor(random() * length(alphabet))::integer, 1);
-    END LOOP;
-    RETURN prefix || body;
-END
+    SELECT substr(md5(random()::TEXT || clock_timestamp()::TEXT), 1, 4)
 $_$;
 
--- Convert every active and historical association together. It is callable because production
--- development databases replay 0001 manually after clearing its sqlx checksum; the function gives
--- that procedure one atomic statement and gives PostgreSQL integration tests the exact same path.
-CREATE OR REPLACE FUNCTION brocade_migrate_friendly_model_ids() RETURNS INTEGER
+-- Convert every active and historical association together. An ingress owns the first four
+-- hexadecimal characters and its chain carries the same token plus an independent suffix. The
+-- temporary source tables include deleted objects still present in rollback snapshots, so no old
+-- identifier can return through a later rollback.
+CREATE OR REPLACE FUNCTION brocade_migrate_grouped_model_ids() RETURNS INTEGER
     LANGUAGE plpgsql
     AS $_$
 DECLARE
@@ -3710,62 +3694,188 @@ DECLARE
     new_chain TEXT;
     old_ingress TEXT;
     new_ingress TEXT;
+    candidate_token TEXT;
     candidate TEXT;
+    attempts INTEGER;
     previous_revision BIGINT;
     migration_revision BIGINT;
     previous_snapshot JSONB;
     changed INTEGER;
 BEGIN
+    CREATE TEMP TABLE _brocade_chain_id_sources (
+        old_id TEXT PRIMARY KEY
+    ) ON COMMIT DROP;
+    CREATE TEMP TABLE _brocade_ingress_id_sources (
+        old_id TEXT PRIMARY KEY
+    ) ON COMMIT DROP;
+    CREATE TEMP TABLE _brocade_chain_ingress_sources (
+        old_chain_id TEXT NOT NULL,
+        old_ingress_id TEXT NOT NULL,
+        observed_revision BIGINT NOT NULL,
+        PRIMARY KEY (old_chain_id, old_ingress_id)
+    ) ON COMMIT DROP;
     CREATE TEMP TABLE _brocade_chain_id_map (
         old_id TEXT PRIMARY KEY,
         new_id TEXT NOT NULL UNIQUE
     ) ON COMMIT DROP;
     CREATE TEMP TABLE _brocade_ingress_id_map (
         old_id TEXT PRIMARY KEY,
-        new_id TEXT NOT NULL UNIQUE
+        new_id TEXT NOT NULL UNIQUE,
+        token TEXT NOT NULL UNIQUE
     ) ON COMMIT DROP;
     CREATE TEMP TABLE _brocade_hop_id_map (
         old_id TEXT PRIMARY KEY,
         new_id TEXT NOT NULL UNIQUE
     ) ON COMMIT DROP;
 
-    FOR source IN SELECT id FROM chains WHERE NOT brocade_is_friendly_model_id('chain', id) ORDER BY id LOOP
-        LOOP
-            candidate := brocade_random_friendly_model_id('chain');
-            EXIT WHEN NOT EXISTS (SELECT 1 FROM chains WHERE id = candidate)
-                      AND NOT EXISTS (SELECT 1 FROM _brocade_chain_id_map WHERE new_id = candidate)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM ingresses WHERE id = 'i-' || substr(candidate, 3)
-                      );
-        END LOOP;
-        INSERT INTO _brocade_chain_id_map VALUES (source.id, candidate);
-    END LOOP;
+    INSERT INTO _brocade_chain_id_sources SELECT id FROM chains;
+    INSERT INTO _brocade_ingress_id_sources SELECT id FROM ingresses;
+    INSERT INTO _brocade_chain_ingress_sources
+    SELECT chain_id, id, 9223372036854775807 FROM ingresses;
+
+    INSERT INTO _brocade_chain_id_sources (old_id)
+    SELECT DISTINCT chain_value->>'id'
+      FROM model_snapshots AS snapshot_row
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snapshot_row.snapshot->'apps', '[]'::jsonb)) AS app_item(app_value)
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(app_value->'chains', '[]'::jsonb)) AS chain_item(chain_value)
+     WHERE chain_value->>'id' IS NOT NULL
+    ON CONFLICT (old_id) DO NOTHING;
+
+    INSERT INTO _brocade_ingress_id_sources (old_id)
+    SELECT DISTINCT ingress_value->>'id'
+      FROM model_snapshots AS snapshot_row
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snapshot_row.snapshot->'apps', '[]'::jsonb)) AS app_item(app_value)
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(app_value->'ingresses', '[]'::jsonb)) AS ingress_item(ingress_value)
+     WHERE ingress_value->>'id' IS NOT NULL
+    ON CONFLICT (old_id) DO NOTHING;
+
+    INSERT INTO _brocade_chain_ingress_sources (old_chain_id, old_ingress_id, observed_revision)
+    SELECT ingress_value->>'chain', ingress_value->>'id', max(snapshot_row.revision_id)
+      FROM model_snapshots AS snapshot_row
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snapshot_row.snapshot->'apps', '[]'::jsonb)) AS app_item(app_value)
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(app_value->'ingresses', '[]'::jsonb)) AS ingress_item(ingress_value)
+     WHERE ingress_value->>'id' IS NOT NULL
+       AND ingress_value->>'chain' IS NOT NULL
+     GROUP BY ingress_value->>'chain', ingress_value->>'id'
+    ON CONFLICT (old_chain_id, old_ingress_id) DO UPDATE
+        SET observed_revision = GREATEST(
+            _brocade_chain_ingress_sources.observed_revision,
+            EXCLUDED.observed_revision
+        );
+
+    -- Allocate ingress tokens first. If its chain already has the new format, retain that chain's
+    -- token; this makes an interrupted or partially repaired conversion converge to the same pair.
     FOR source IN
-        SELECT ingress.id
-          FROM ingresses AS ingress
-         WHERE NOT brocade_is_friendly_model_id('ingress', ingress.id)
-            OR EXISTS (
-                SELECT 1
-                  FROM chains AS chain
-                 WHERE chain.id = 'c-' || substr(ingress.id, 3)
-                   AND brocade_is_friendly_model_id('ingress', ingress.id)
-            )
-         ORDER BY ingress.id
+        SELECT ingress.old_id,
+               (
+                   SELECT substr(relation.old_chain_id, 5, 4)
+                     FROM _brocade_chain_ingress_sources AS relation
+                    WHERE relation.old_ingress_id = ingress.old_id
+                      AND brocade_is_grouped_model_id('chain', relation.old_chain_id)
+                    ORDER BY relation.observed_revision DESC, relation.old_chain_id
+                    LIMIT 1
+               ) AS preferred_token
+          FROM _brocade_ingress_id_sources AS ingress
+         WHERE NOT brocade_is_grouped_model_id('ingress', ingress.old_id)
+         ORDER BY ingress.old_id
     LOOP
+        candidate_token := source.preferred_token;
+        attempts := 0;
         LOOP
-            candidate := brocade_random_friendly_model_id('ingress');
-            EXIT WHEN NOT EXISTS (SELECT 1 FROM ingresses WHERE id = candidate)
-                      AND NOT EXISTS (SELECT 1 FROM _brocade_ingress_id_map WHERE new_id = candidate)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM chains WHERE id = 'c-' || substr(candidate, 3)
+            attempts := attempts + 1;
+            IF attempts > 65536 THEN
+                RAISE EXCEPTION 'exhausted four-character ingress id space';
+            END IF;
+            IF candidate_token IS NULL THEN
+                candidate_token := brocade_random_model_id_token();
+            END IF;
+            candidate := 'ing-' || candidate_token;
+            EXIT WHEN NOT EXISTS (
+                          SELECT 1 FROM _brocade_ingress_id_sources WHERE old_id = candidate
                       )
-                      AND NOT EXISTS (
-                          SELECT 1
-                            FROM _brocade_chain_id_map
-                           WHERE substr(new_id, 3) = substr(candidate, 3)
+                      AND NOT EXISTS (SELECT 1 FROM _brocade_ingress_id_map WHERE new_id = candidate)
+                      AND (
+                          source.preferred_token IS NOT NULL
+                          OR NOT EXISTS (
+                              SELECT 1
+                                FROM _brocade_chain_id_sources
+                               WHERE brocade_is_grouped_model_id('chain', old_id)
+                                 AND substr(old_id, 5, 4) = candidate_token
+                          )
                       );
+            IF source.preferred_token IS NOT NULL THEN
+                RAISE EXCEPTION 'chain token % is already owned by another ingress', candidate_token;
+            END IF;
+            candidate_token := NULL;
         END LOOP;
-        INSERT INTO _brocade_ingress_id_map VALUES (source.id, candidate);
+        INSERT INTO _brocade_ingress_id_map VALUES (source.old_id, candidate, candidate_token);
+    END LOOP;
+
+    -- A chain takes the token of its first ingress. Orphan chains receive an unused token so a
+    -- later repair can create the matching ingress without renaming the chain again.
+    FOR source IN
+        SELECT chain.old_id,
+               (
+                   SELECT COALESCE(mapped.token, substr(ingress.old_id, 5, 4))
+                     FROM _brocade_chain_ingress_sources AS relation
+                     JOIN _brocade_ingress_id_sources AS ingress
+                       ON ingress.old_id = relation.old_ingress_id
+                     LEFT JOIN _brocade_ingress_id_map AS mapped ON mapped.old_id = ingress.old_id
+                    WHERE relation.old_chain_id = chain.old_id
+                      AND (mapped.token IS NOT NULL OR brocade_is_grouped_model_id('ingress', ingress.old_id))
+                    ORDER BY relation.observed_revision DESC, ingress.old_id
+                    LIMIT 1
+               ) AS ingress_token
+          FROM _brocade_chain_id_sources AS chain
+         WHERE NOT brocade_is_grouped_model_id('chain', chain.old_id)
+         ORDER BY chain.old_id
+    LOOP
+        candidate_token := source.ingress_token;
+        IF candidate_token IS NULL THEN
+            attempts := 0;
+            LOOP
+                attempts := attempts + 1;
+                IF attempts > 65536 THEN
+                    RAISE EXCEPTION 'exhausted four-character ingress-group token space';
+                END IF;
+                candidate_token := brocade_random_model_id_token();
+                EXIT WHEN NOT EXISTS (
+                                  SELECT 1
+                                    FROM _brocade_ingress_id_sources
+                                   WHERE brocade_is_grouped_model_id('ingress', old_id)
+                                     AND substr(old_id, 5, 4) = candidate_token
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM _brocade_ingress_id_map WHERE token = candidate_token
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM _brocade_chain_id_sources
+                                   WHERE brocade_is_grouped_model_id('chain', old_id)
+                                     AND substr(old_id, 5, 4) = candidate_token
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM _brocade_chain_id_map
+                                   WHERE substr(new_id, 5, 4) = candidate_token
+                              );
+            END LOOP;
+        END IF;
+        attempts := 0;
+        LOOP
+            attempts := attempts + 1;
+            IF attempts > 65536 THEN
+                RAISE EXCEPTION 'exhausted four-character chain id space for ingress token %', candidate_token;
+            END IF;
+            candidate := 'chn-' || candidate_token || '-' || brocade_random_model_id_token();
+            EXIT WHEN NOT EXISTS (
+                              SELECT 1 FROM _brocade_chain_id_sources WHERE old_id = candidate
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM _brocade_chain_id_map WHERE new_id = candidate
+                          );
+        END LOOP;
+        INSERT INTO _brocade_chain_id_map VALUES (source.old_id, candidate);
     END LOOP;
 
     INSERT INTO _brocade_hop_id_map (old_id, new_id)
@@ -3898,7 +4008,7 @@ BEGIN
     IF previous_snapshot IS NULL THEN
         RAISE EXCEPTION 'cannot migrate model ids: current revision % has no snapshot', previous_revision;
     END IF;
-    INSERT INTO revisions (author, note) VALUES ('system:id-migration', 'convert chain and ingress ids to friendly random ids')
+    INSERT INTO revisions (author, note) VALUES ('system:id-migration', 'convert chain and ingress ids to grouped random ids')
         RETURNING id INTO migration_revision;
     previous_snapshot := jsonb_set(previous_snapshot, '{revision}', to_jsonb(migration_revision), false);
     INSERT INTO model_snapshots (revision_id, snapshot) VALUES (migration_revision, previous_snapshot);
@@ -3907,77 +4017,7 @@ BEGIN
 END
 $_$;
 
--- Rebuild the global body registry from canonical model rows on every 0001 replay. Existing
--- triggers are removed first so an earlier development replay cannot repopulate it halfway through
--- the atomic ID migration.
-DROP TRIGGER IF EXISTS chains_friendly_id_body ON chains;
-DROP TRIGGER IF EXISTS ingresses_friendly_id_body ON ingresses;
-TRUNCATE friendly_model_id_bodies;
-SELECT brocade_migrate_friendly_model_ids();
-
-INSERT INTO friendly_model_id_bodies (body, kind, model_id)
-SELECT substr(id, 3), 'chain', id
-  FROM chains
- WHERE brocade_is_friendly_model_id('chain', id)
-UNION ALL
-SELECT substr(id, 3), 'ingress', id
-  FROM ingresses
- WHERE brocade_is_friendly_model_id('ingress', id);
-
-CREATE OR REPLACE FUNCTION brocade_reserve_friendly_model_id_body() RETURNS TRIGGER
-    LANGUAGE plpgsql
-    AS $_$
-DECLARE
-    resource_kind TEXT := TG_ARGV[0];
-    old_body TEXT;
-    new_body TEXT;
-    owner_kind TEXT;
-    owner_id TEXT;
-BEGIN
-    IF TG_OP = 'DELETE' THEN
-        IF brocade_is_friendly_model_id(resource_kind, OLD.id) THEN
-            DELETE FROM friendly_model_id_bodies
-             WHERE body = substr(OLD.id, 3)
-               AND friendly_model_id_bodies.kind = resource_kind
-               AND model_id = OLD.id;
-        END IF;
-        RETURN OLD;
-    END IF;
-
-    IF brocade_is_friendly_model_id(resource_kind, NEW.id) THEN
-        new_body := substr(NEW.id, 3);
-        INSERT INTO friendly_model_id_bodies (body, kind, model_id)
-        VALUES (new_body, resource_kind, NEW.id)
-        ON CONFLICT (body) DO NOTHING;
-        SELECT reserved.kind, reserved.model_id
-          INTO owner_kind, owner_id
-          FROM friendly_model_id_bodies AS reserved
-         WHERE reserved.body = new_body;
-        IF owner_kind IS DISTINCT FROM resource_kind OR owner_id IS DISTINCT FROM NEW.id THEN
-            RAISE EXCEPTION 'friendly id body % is already used by % %', new_body, owner_kind, owner_id
-                USING ERRCODE = '23505', CONSTRAINT = 'friendly_model_id_bodies_pkey';
-        END IF;
-    END IF;
-
-    IF TG_OP = 'UPDATE' AND brocade_is_friendly_model_id(resource_kind, OLD.id) THEN
-        old_body := substr(OLD.id, 3);
-        IF new_body IS DISTINCT FROM old_body THEN
-            DELETE FROM friendly_model_id_bodies
-             WHERE body = old_body
-               AND friendly_model_id_bodies.kind = resource_kind
-               AND model_id = OLD.id;
-        END IF;
-    END IF;
-    RETURN NEW;
-END
-$_$;
-
-CREATE TRIGGER chains_friendly_id_body
-    BEFORE INSERT OR UPDATE OF id OR DELETE ON chains
-    FOR EACH ROW EXECUTE FUNCTION brocade_reserve_friendly_model_id_body('chain');
-CREATE TRIGGER ingresses_friendly_id_body
-    BEFORE INSERT OR UPDATE OF id OR DELETE ON ingresses
-    FOR EACH ROW EXECUTE FUNCTION brocade_reserve_friendly_model_id_body('ingress');
+SELECT brocade_migrate_grouped_model_ids();
 
 -- A development database may already contain rows marked retired by the former one-bit flow.
 -- Only an explicit all-disabled observation is proof of completed teardown; absent, dirty,
@@ -4017,7 +4057,7 @@ UPDATE node_agent_state AS agent
    AND agent.token_hash IS NOT NULL;
 
 -- The rolling-release compatibility table existed only while agents could still report labels
--- from the pre-friendly-id configuration. Once the fleet has converged, retaining it would make
+-- from the pre-grouped-ID configuration. Once the fleet has converged, retaining it would make
 -- old IDs a permanent second namespace. Replaying 0001 removes both the table and its data.
 DROP TABLE IF EXISTS model_id_aliases;
 

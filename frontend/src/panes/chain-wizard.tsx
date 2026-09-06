@@ -43,7 +43,7 @@ import {
   portClash,
   spanClash,
 } from './ports';
-import { friendlyId } from '../friendly-id';
+import { modelIdPair } from '../model-id';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 
 // 使一台机器运行 xray 的方式：为其创建一条链和一个接入面。
@@ -259,8 +259,16 @@ export function ChainWizard({
 
   // 技术 ID 在向导的整个生命周期中保持不变：后续的链、接入面、授权与规则操作都引用
   // 同一组值。端口则随已占用端口计算，只有用户明确修改后才固定。
-  const [chainId] = useState(() => friendlyId('chain'));
-  const [ingressId] = useState(() => friendlyId('ingress', new Set([chainId])));
+  const [{ chainId, ingressId }] = useState(() =>
+    modelIdPair(
+      new Set(
+        apps.flatMap(app => [
+          ...(app.chains ?? []).map(chain => chain.id),
+          ...(app.ingresses ?? []).map(ingress => ingress.id),
+        ]),
+      ),
+    ),
+  );
   const [portRaw, setPort] = useState<number | null>(null);
 
   const targetApp = appMode === 'new' ? appId.trim() : pickedApp;
