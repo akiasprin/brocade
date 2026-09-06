@@ -39,6 +39,7 @@ import {
   type Dns,
   type NodeConnection,
   type DomainStrategy,
+  type GroupCertificate,
   type LinkHealthItem,
   type NodeAgentStateItem,
   type NodeLoadView,
@@ -1978,6 +1979,10 @@ const SELECT_FIELD = { width: 200 };
  *
  * 换组会改 SNI，已经发出去的订阅写的是旧名字，改完就连不上。确认框把这句话说清楚，而不是
  * 问一句「确定要修改吗」——后者没有告诉人代价是什么。 */
+export function certificateSigningLabel(certificate: Pick<GroupCertificate, 'signing_method'>): string {
+  return certificate.signing_method === 'self-signed' ? '自签证书' : "Let's Encrypt";
+}
+
 function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
   const qc = useQueryClient();
   const certs = useQuery({ queryKey: ['certs'], queryFn: () => fetchCerts(), retry: false });
@@ -1985,7 +1990,9 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
   const current = certs.data?.nodes.find(row => row.node_id === node.node_id);
   const group = groups.find(g => g.id === current?.label_id);
   const serving = group?.certificates.find(c => c.status === 'serving');
-  const selfSigned = serving?.issuer === 'Brocade Self-Signed';
+  // issuer 是证书里的自由文本，新的自签证书会随机生成一个逼真的名称，不能拿它判断
+  // 信任来源。签发方式在证书落库时已经冻结，切换设置后也不会被改写。
+  const selfSigned = serving?.signing_method === 'self-signed';
   const expiry = serving?.expires_at ? new Date(serving.expires_at) : null;
 
   const save = useMutation({
@@ -2038,7 +2045,7 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
         {current && serving && (
           <>
             <Row k="签发">
-              <span className={selfSigned ? 'st st-warn' : 'st st-ok'}>{selfSigned ? '自签' : '公共 CA'}</span>
+              <span className={selfSigned ? 'st st-warn' : 'st st-ok'}>{certificateSigningLabel(serving)}</span>
               <span className="sub">
                 {expiry && !Number.isNaN(expiry.valueOf()) ? `叶证书有效至 ${expiry.toLocaleDateString('zh-CN')}` : ''}
               </span>
@@ -2409,8 +2416,8 @@ function OverrideTag({ own }: { own: boolean }) {
 type NodeLogKey = keyof AgentLogLimits;
 type NodeLogForm = Record<NodeLogKey, string>;
 
-const NODE_LOG_CLASSES: ReadonlyArray<{ key: NodeLogKey; label: string; note: string }> = [
-  { key: 'agent_journal_mib', label: 'Agent journal（MiB）', note: '独立 journal 命名空间的总量' },
+const NODE_LOG_CLASSES: ReadonlyArray<{ key: NodeLogKey; label: string; note: string | null }> = [
+  { key: 'agent_journal_mib', label: 'Agent 日志', note: null },
   { key: 'xray_mib', label: 'XRAY（MiB）', note: 'xray.log 与 xray.log.1 合计' },
   { key: 'phantun_mib', label: 'Phantun（MiB）', note: '每个 Phantun 实例分别计算' },
 ];
@@ -2475,7 +2482,9 @@ function NodeLogLimitRow({
               />
               <OverrideTag own={own} />
             </span>
-            <span className="sub">{own ? item.note : `留空继承全局 ${global[item.key]}；${item.note}`}</span>
+            {item.note && (
+              <span className="sub">{own ? item.note : `留空继承全局 ${global[item.key]}；${item.note}`}</span>
+            )}
           </Row>
         );
       })}
@@ -2484,7 +2493,7 @@ function NodeLogLimitRow({
           三项均需留空或填写 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数。
         </span>
       ) : (
-        <span className="sub">三类日志分别限制；降低上限会立即截断旧日志，不会中断服务。</span>
+        <span className="sub">降低上限会立即截断旧日志，不会中断服务。</span>
       )}
       {dirty && (
         <>

@@ -698,20 +698,20 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
                   })
                 }
               >
-                公共 CA
+                Let&apos;s Encrypt
               </button>
               <button
                 type="button"
                 aria-pressed={selfSigned}
                 onClick={() => setForm({ ...f, signingMethod: 'self-signed', credential: '' })}
               >
-                自签
+                自签证书
               </button>
             </span>
             <span className="hint">
               {selfSigned
                 ? '自动生成随机但逼真的专用 SNI，无需填写或持有域名。'
-                : '由公共 CA 通过 DNS-01 验证域名并签发。'}
+                : "由 Let's Encrypt 验证域名并签发，客户端默认信任。"}
             </span>
           </div>
         </div>
@@ -749,7 +749,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             </div>
 
             <div className="setfld">
-              <label>ACME 目录</label>
+              <label>签发环境</label>
               <div className="v">
                 <span
                   className={dirty && f.directory !== (d?.acme_directory ?? view.letsencrypt) ? 'segsw chg' : 'segsw'}

@@ -2226,7 +2226,7 @@ export interface CertDomain {
   acme_directory: string;
   signing_method: 'public-ca' | 'self-signed';
   acme_contact: string | null;
-  /** 提前多少天续期；公共 CA 通常为 90 天，自签叶证书为一年。 */
+  /** 提前多少天续期；Let's Encrypt 证书通常为 90 天，自签叶证书按本地策略生成。 */
   renew_before_days: number;
   /** 是否已存储 DNS 凭据——**不包含凭据本身**。页面需要能显示「已配置」但无法读取其内容。 */
   has_credential: boolean;

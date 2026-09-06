@@ -447,7 +447,7 @@ pub async fn upsert_cert_domain(
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 StoreError::InvalidData(
-                    "certificate directory is required for public CA issuance".to_owned(),
+                    "certificate directory is required for ACME issuance".to_owned(),
                 )
             })?
             .to_owned(),
@@ -1141,7 +1141,7 @@ pub async fn request_spare_certificate(
             "自签证书池最多保留 {SELF_SIGNED_MAX_POOL_SIZE} 张，请先删除一张待命或失败的证书"
         )));
     }
-    // Public CA groups retain their quota-aware two-spare limit.
+    // ACME groups retain their quota-aware two-spare limit.
     if directory != SELF_SIGNED_DIRECTORY && count >= 2 {
         return Err(StoreError::InvalidData(
             "这个组已经有两张备用了，再多也用不上，而每张都占掉每周五张的额度".to_owned(),
