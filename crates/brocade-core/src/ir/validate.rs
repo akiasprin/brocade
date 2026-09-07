@@ -32,6 +32,16 @@ const MAX_REALITY_TIME_DIFF_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) {
     validate_settings(snapshot, diagnostics);
+    for policy in &snapshot.settings.reverse_health_overrides {
+        let matches=snapshot.apps.iter().flat_map(|app| &app.steps).filter(|step|step.chain==policy.chain && step.node==policy.from).any(|step|step.rules.iter().any(|rule|matches!(&rule.action, Action::Forward {to,dial:HopDial::Reverse(_),..} if to==&policy.to)));
+        if !matches {
+            diagnostics.push(Diagnostic::error(
+                "reverse.health-link-missing",
+                format!("{}/{}/{}", policy.chain, policy.from, policy.to),
+                "健康策略覆盖未匹配到定向反向链路",
+            ));
+        }
+    }
 
     unique_by(
         snapshot.nodes.iter().map(|node| node.id.as_str()),
@@ -137,6 +147,14 @@ pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<D
 }
 
 fn validate_settings(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) {
+    if let Err(message) = snapshot.settings.validate_reverse_health() {
+        diagnostics.push(Diagnostic::error(
+            "reverse.health-invalid",
+            "settings.reverse_health",
+            message,
+        ));
+    }
+
     validate_hop_mux(
         &snapshot.settings.relay_mux,
         "settings.relay_mux",

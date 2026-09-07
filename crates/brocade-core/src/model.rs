@@ -95,6 +95,10 @@ pub struct ModelSettings {
     /// complete value or replace it with one complete override; individual fields never inherit.
     #[serde(default)]
     pub relay_mux: HopMux,
+    #[serde(default)]
+    pub reverse_health: ReverseHealth,
+    #[serde(default)]
+    pub reverse_health_overrides: Vec<ReverseHealthOverride>,
     /// Count, per account, how many distinct source addresses are using it at a given
     /// time.
     ///
@@ -123,6 +127,8 @@ impl Default for ModelSettings {
             geodata: GeodataSettings::default(),
             connection: ConnectionSettings::default(),
             relay_mux: HopMux::default(),
+            reverse_health: ReverseHealth::default(),
+            reverse_health_overrides: Vec::new(),
             stats_user_online: false,
         }
     }
@@ -3500,5 +3506,90 @@ mod hop_mux_tests {
             serde_json::from_value::<HopPool>(override_value).unwrap(),
             HopPool::Mux(Some(value))
         );
+    }
+}
+
+/// Same-tunnel, bidirectional reverse liveness; independent from ordinary Mux pooling.
+/// Present policies are complete values, never partial field inheritance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseHealth {
+    pub probe_interval_ms: u32,
+    pub probe_timeout_ms: u32,
+    pub confirm_timeout_ms: u32,
+    pub health_lease_ms: u32,
+    pub min_healthy_workers: u32,
+    pub max_idle_ready_workers: u32,
+    pub max_parallel_dials_per_pair: u32,
+    pub dial_ready_timeout_ms: u32,
+    pub reconnect_backoff_cap_ms: u32,
+}
+impl Default for ReverseHealth {
+    fn default() -> Self {
+        Self {
+            probe_interval_ms: 1000,
+            probe_timeout_ms: 750,
+            confirm_timeout_ms: 750,
+            health_lease_ms: 3000,
+            min_healthy_workers: 2,
+            max_idle_ready_workers: 2,
+            max_parallel_dials_per_pair: 2,
+            dial_ready_timeout_ms: 2000,
+            reconnect_backoff_cap_ms: 2000,
+        }
+    }
+}
+impl ReverseHealth {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(100..=60000).contains(&self.probe_interval_ms)
+            || !(50..=10000).contains(&self.probe_timeout_ms)
+            || self.probe_timeout_ms >= self.probe_interval_ms
+            || !(50..=10000).contains(&self.confirm_timeout_ms)
+            || self.health_lease_ms
+                < self.probe_interval_ms.saturating_mul(11) / 10 + self.probe_timeout_ms
+            || self.health_lease_ms > 120000
+            || !(1..=8).contains(&self.min_healthy_workers)
+            || self.max_idle_ready_workers < self.min_healthy_workers
+            || self.max_idle_ready_workers > 16
+            || !(1..=8).contains(&self.max_parallel_dials_per_pair)
+            || !(200..=30000).contains(&self.dial_ready_timeout_ms)
+            || !(250..=30000).contains(&self.reconnect_backoff_cap_ms)
+        {
+            return Err("reverse health 参数超出范围，或探活超时/健康租约/备用连接数量不一致");
+        };
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseHealthOverride {
+    pub chain: String,
+    pub from: String,
+    pub to: String,
+    pub health: ReverseHealth,
+}
+impl ModelSettings {
+    pub fn reverse_health_for(&self, chain: &str, from: &str, to: &str) -> ReverseHealth {
+        self.reverse_health_overrides
+            .iter()
+            .find(|r| r.chain == chain && r.from == from && r.to == to)
+            .map(|r| r.health)
+            .unwrap_or(self.reverse_health)
+    }
+    pub fn validate_reverse_health(&self) -> Result<(), String> {
+        self.reverse_health.validate().map_err(str::to_owned)?;
+        let mut keys = std::collections::BTreeSet::new();
+        for r in &self.reverse_health_overrides {
+            r.health.validate().map_err(str::to_owned)?;
+            if r.chain.is_empty()
+                || r.from.is_empty()
+                || r.to.is_empty()
+                || r.from == r.to
+                || !keys.insert((&r.chain, &r.from, &r.to))
+            {
+                return Err("reverse health 覆盖必须指定唯一的 chain/from/to".to_owned());
+            }
+        }
+        Ok(())
     }
 }

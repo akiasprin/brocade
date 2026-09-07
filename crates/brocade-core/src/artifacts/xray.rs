@@ -96,6 +96,8 @@ pub enum XrayArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayConfig {
+    pub reverse_canary_urls: BTreeMap<String, String>,
+    pub reverse_health: BTreeMap<String, crate::model::ReverseHealth>,
     pub certificate_group_id: Option<String>,
     pub log_level: String,
     pub api: XrayApi,
@@ -965,6 +967,21 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
     stamp_rule_tags(&mut rules);
 
     XrayArtifact::Config(XrayConfig {
+        reverse_canary_urls: xray
+            .reverse_portals
+            .iter()
+            .map(|p| (p.tag.clone(), p.canary_url.clone()))
+            .collect(),
+        reverse_health: xray
+            .reverse_portals
+            .iter()
+            .map(|p| (p.tag.clone(), p.health))
+            .chain(
+                xray.reverse_bridges
+                    .iter()
+                    .map(|p| (p.tag.clone(), p.health)),
+            )
+            .collect(),
         certificate_group_id: xray.certificate_group_id.clone(),
         log_level: "warning".to_owned(),
         api: XrayApi {

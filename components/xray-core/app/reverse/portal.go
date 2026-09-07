@@ -3,6 +3,7 @@ package reverse
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -140,6 +141,7 @@ type StaticMuxPicker struct {
 	access  sync.Mutex
 	workers []*PortalWorker
 	cTask   *task.Periodic
+	closed  bool
 }
 
 func NewStaticMuxPicker() (*StaticMuxPicker, error) {
@@ -161,7 +163,9 @@ func (p *StaticMuxPicker) cleanup() error {
 		if !w.Closed() {
 			activeWorkers = append(activeWorkers, w)
 		} else {
-			w.timer.SetTimeout(0)
+			if w.timer != nil {
+				w.timer.SetTimeout(0)
+			}
 		}
 	}
 
@@ -176,34 +180,23 @@ func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
 	p.access.Lock()
 	defer p.access.Unlock()
 
-	if len(p.workers) == 0 {
+	if p.closed || len(p.workers) == 0 {
 		return nil, errors.New("empty worker list")
 	}
 
 	var minIdx int = -1
 	var minConn uint32 = 9999
 	for i, w := range p.workers {
-		if w.draining {
+		if w.draining.Load() {
 			continue
 		}
 		if w.IsFull() {
 			continue
 		}
-		if w.client.ActiveConnections() < minConn {
+		conn := w.client.ActiveConnections()
+		if (conn > 0 && (minConn == 0 || conn < minConn)) || minIdx == -1 {
 			minConn = w.client.ActiveConnections()
 			minIdx = i
-		}
-	}
-
-	if minIdx == -1 {
-		for i, w := range p.workers {
-			if w.IsFull() {
-				continue
-			}
-			if w.client.ActiveConnections() < minConn {
-				minConn = w.client.ActiveConnections()
-				minIdx = i
-			}
 		}
 	}
 
@@ -218,6 +211,10 @@ func (p *StaticMuxPicker) AddWorker(worker *PortalWorker) {
 	p.access.Lock()
 	defer p.access.Unlock()
 
+	if p.closed {
+		worker.client.Close()
+		return
+	}
 	p.workers = append(p.workers, worker)
 }
 
@@ -226,12 +223,15 @@ type PortalWorker struct {
 	control  *task.Periodic
 	writer   buf.Writer
 	reader   buf.Reader
-	draining bool
+	draining atomic.Bool
 	counter  uint32
 	timer    *signal.ActivityTimer
 }
 
 func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
+	if client.ReverseHealth() != nil {
+		return &PortalWorker{client: client}, nil
+	}
 	opt := []pipe.Option{pipe.WithSizeLimit(16 * 1024)}
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
@@ -270,7 +270,7 @@ func (w *PortalWorker) heartbeat() error {
 		return errors.New("client worker stopped")
 	}
 
-	if w.draining || w.writer == nil {
+	if w.draining.Load() || w.writer == nil {
 		return errors.New("already disposed")
 	}
 
@@ -278,7 +278,7 @@ func (w *PortalWorker) heartbeat() error {
 	msg.FillInRandom()
 
 	if w.client.TotalConnections() > 256 {
-		w.draining = true
+		w.draining.Store(true)
 		msg.State = Control_DRAIN
 
 		defer func() {
@@ -289,7 +289,7 @@ func (w *PortalWorker) heartbeat() error {
 	}
 
 	w.counter = (w.counter + 1) % 5
-	if w.draining || w.counter == 1 {
+	if w.draining.Load() || w.counter == 1 {
 		b, err := proto.Marshal(msg)
 		common.Must(err)
 		mb := buf.MergeBytes(nil, b)
@@ -300,9 +300,28 @@ func (w *PortalWorker) heartbeat() error {
 }
 
 func (w *PortalWorker) IsFull() bool {
-	return w.client.IsFull()
+	return w.client.IsFull() || (w.client.ReverseHealth() != nil && !w.client.ReverseHealth().Usable())
 }
 
 func (w *PortalWorker) Closed() bool {
 	return w.client.Closed()
+}
+
+func (p *StaticMuxPicker) Close() error {
+	p.access.Lock()
+	p.closed = true
+	workers := p.workers
+	p.workers = nil
+	p.access.Unlock()
+	p.cTask.Close()
+	for _, w := range workers {
+		w.client.Close()
+		if w.control != nil {
+			w.control.Close()
+		}
+		if w.timer != nil {
+			w.timer.SetTimeout(0)
+		}
+	}
+	return nil
 }

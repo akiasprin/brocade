@@ -66,6 +66,8 @@ pub enum AgentRealtimeCommand {
 /// `has_gap` rather than guessed across.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRealtimeSample {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_health: Option<ReverseHealthReport>,
     pub sequence: u64,
     pub sampled_at_unix_millis: i64,
     pub elapsed_millis: u32,
@@ -2195,4 +2197,63 @@ mod tests {
         assert_eq!(parsed.io_pressure_some_pct, None);
         assert_eq!(parsed.io_pressure_full_pct, None);
     }
+}
+
+/// A current data-plane snapshot, with bounded recent transitions. Health is not a business canary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseHealthWorker {
+    #[serde(default)]
+    pub active_sessions: u32,
+    #[serde(default)]
+    pub affected_sessions: u32,
+    #[serde(default)]
+    pub control_queue_depth: u32,
+    #[serde(default)]
+    pub queue_delay_ms: i64,
+    #[serde(default)]
+    pub scheduler_lag_ms: i64,
+    pub worker_id: String,
+    pub pair: String,
+    pub role: String,
+    pub state: String,
+    pub reason: String,
+    pub ack_age_ms: i64,
+    pub rtt_ms: i64,
+    pub probes: u64,
+    pub acks: u64,
+    pub timeouts: u64,
+    pub rejected_dispatches: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseHealthEvent {
+    pub sequence: u64,
+    pub at_unix_ms: i64,
+    pub from: String,
+    #[serde(flatten)]
+    pub worker: ReverseHealthWorker,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseHealthReport {
+    #[serde(default)]
+    pub canaries: Vec<ReverseCanaryReport>,
+    pub boot_id: String,
+    pub sequence: u64,
+    pub sampled_at_unix_ms: i64,
+    pub workers: Vec<ReverseHealthWorker>,
+    pub events: Vec<ReverseHealthEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseCanaryReport {
+    pub pair: String,
+    pub state: String,
+    pub reason: String,
+    pub sampled_at_unix_ms: i64,
+    pub latency_ms: i64,
+    pub consecutive_successes: u64,
+    pub first_ok_unix_ms: i64,
+    pub stable_since_unix_ms: i64,
+    pub last_failure_unix_ms: i64,
+    pub attempts: u64,
+    pub failures: u64,
 }

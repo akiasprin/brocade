@@ -85,6 +85,7 @@ func (s *Server) Close() error {
 }
 
 type ServerWorker struct {
+	health         *ReverseHealth
 	dispatcher     routing.Dispatcher
 	link           *transport.Link
 	sessionManager *SessionManager
@@ -93,6 +94,14 @@ type ServerWorker struct {
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
+	return newServerWorker(ctx, d, link, nil)
+}
+
+func NewReverseServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link, config ReverseHealthConfig) (*ServerWorker, error) {
+	return newServerWorker(ctx, d, link, &config)
+}
+
+func newServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link, config *ReverseHealthConfig) (*ServerWorker, error) {
 	worker := &ServerWorker{
 		dispatcher:     d,
 		link:           link,
@@ -100,8 +109,18 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 		done:           done.New(),
 		timer:          time.NewTicker(60 * time.Second),
 	}
+	if config != nil {
+		copyLink := *link
+		copyLink.Writer = newHealthWriter(link.Writer, worker.done)
+		worker.link = &copyLink
+		hc := *config
+		hc.ActiveSessions = worker.ActiveConnections
+		worker.health = newReverseHealth(hc, copyLink.Writer.(*healthWriter), worker.done)
+	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
-		inbound.CanSpliceCopy = 3
+		copyInbound := *inbound
+		copyInbound.CanSpliceCopy = 3
+		ctx = session.ContextWithInbound(ctx, &copyInbound)
 	}
 	go worker.run(ctx)
 	go worker.monitor()
@@ -127,6 +146,9 @@ func (w *ServerWorker) monitor() {
 		checkCount := w.sessionManager.Count()
 		select {
 		case <-w.done.Wait():
+			if w.health != nil {
+				w.health.stop("transport_closed")
+			}
 			w.sessionManager.Close()
 			common.Interrupt(w.link.Writer)
 			common.Interrupt(w.link.Reader)
@@ -152,11 +174,17 @@ func (w *ServerWorker) WaitClosed() <-chan struct{} {
 }
 
 func (w *ServerWorker) Close() error {
+	if w.health != nil {
+		w.health.stop("closed")
+	}
 	return w.done.Close()
 }
 
 func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if meta.Option.Has(OptionProbe) {
+		if w.health != nil {
+			return w.health.receive(meta)
+		}
 		if meta.Option.Has(OptionAck) {
 			return nil
 		}
@@ -169,6 +197,15 @@ func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.Bu
 }
 
 func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata, reader *buf.BufferedReader) error {
+	if w.health != nil {
+		w.health.mu.Lock()
+		w.health.checkLocked(time.Now())
+		state := w.health.snapshot.State
+		w.health.mu.Unlock()
+		if state != "READY" && state != "DRAINING" {
+			return errors.New("reverse worker not dispatchable")
+		}
+	}
 	ctx = session.SubContextFromMuxInbound(ctx)
 	if meta.Inbound != nil && meta.Inbound.Source.IsValid() && meta.Inbound.Local.IsValid() {
 		if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -198,6 +235,11 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		}
 	}
 
+	// Reverse UDP associations belong to this worker generation. Never transfer
+	// a backend reader (and queued old replies) from a failed reverse worker.
+	if w.health != nil {
+		meta.GlobalID = [8]byte{}
+	}
 	if meta.GlobalID != [8]byte{} { // MUST ignore empty Global ID
 		mb, err := NewPacketReader(reader, &meta.Target).ReadMultiBuffer()
 		if err != nil {

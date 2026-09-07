@@ -3021,6 +3021,8 @@ fn dial_direction_and_keepalive_follow_public_ip_nat() {
 fn validate_model_snapshot_reports_reality_client_policy_errors() {
     let mut invalid_shape = doc(Vec::new());
     invalid_shape.settings = ModelSettings {
+        reverse_health: Default::default(),
+        reverse_health_overrides: Vec::new(),
         connection: Default::default(),
         relay_mux: Default::default(),
         stats_user_online: false,
@@ -3044,6 +3046,8 @@ fn validate_model_snapshot_reports_reality_client_policy_errors() {
 
     let mut invalid_range = doc(Vec::new());
     invalid_range.settings = ModelSettings {
+        reverse_health: Default::default(),
+        reverse_health_overrides: Vec::new(),
         connection: Default::default(),
         relay_mux: Default::default(),
         stats_user_online: false,

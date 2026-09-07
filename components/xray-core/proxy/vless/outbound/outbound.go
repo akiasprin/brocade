@@ -97,6 +97,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		}
 	}
 
+	handler.testpre = a.Testpre
 	if a.Reverse != nil {
 		rvsCtx := session.ContextWithInbound(ctx, &session.Inbound{
 			Tag:  a.Reverse.Tag,
@@ -112,23 +113,21 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 				SniffingRequest: request,
 			})
 		}
-		handler.reverse = &Reverse{
+		hc, err := a.Reverse.HealthConfig("bridge")
+		if err != nil {
+			return nil, err
+		}
+		handler.reverse = &Reverse{health: hc,
 			tag:        a.Reverse.Tag,
 			dispatcher: v.GetFeature(routing.DispatcherType()).(routing.Dispatcher),
 			ctx:        rvsCtx,
 			handler:    handler,
 		}
-		handler.reverse.monitorTask = &task.Periodic{
-			Execute:  handler.reverse.monitor,
-			Interval: time.Second * 2,
-		}
-		go func() {
-			time.Sleep(2 * time.Second)
-			handler.reverse.Start()
-		}()
+		handler.reverse.ctx, handler.reverse.cancel = context.WithCancel(rvsCtx)
+		handler.reverse.wake = make(chan struct{}, 1)
+		handler.reverse.reportDialDemand(0, 0, false)
+		go handler.reverse.Start()
 	}
-
-	handler.testpre = a.Testpre
 
 	return handler, nil
 }
@@ -425,65 +424,180 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 }
 
 type Reverse struct {
-	tag         string
-	dispatcher  routing.Dispatcher
-	ctx         context.Context
-	handler     *Handler
-	workers     []*reverse.BridgeWorker
-	monitorTask *task.Periodic
+	health                   mux.ReverseHealthConfig
+	tag                      string
+	dispatcher               routing.Dispatcher
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	handler                  *Handler
+	mu                       sync.Mutex
+	workers                  []*reverse.BridgeWorker
+	wake                     chan struct{}
+	started, closed          bool
+	nextAttempt, stableSince time.Time
+	failures                 uint
 }
 
 func (r *Reverse) monitor() error {
-	var activeWorkers []*reverse.BridgeWorker
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	now := time.Now()
+	kept := r.workers[:0]
+	ready, pending, busy := 0, 0, 0
 	for _, w := range r.workers {
-		if w.IsActive() {
-			activeWorkers = append(activeWorkers, w)
+		if w.Closed() {
+			continue
+		}
+		kept = append(kept, w)
+		state := w.Worker.ReverseHealth().Snapshot().State
+		if state == "READY" {
+			ready++
+			if w.Connections() > 0 {
+				busy++
+			}
+		} else if state == "VALIDATING" {
+			pending++
 		}
 	}
-	if len(activeWorkers) != len(r.workers) {
-		r.workers = activeWorkers
-	}
-
-	var numConnections uint32
-	var numWorker uint32
-	for _, w := range r.workers {
-		if w.IsActive() {
-			numConnections += w.Connections()
-			numWorker++
+	r.workers = kept
+	idle := ready - busy
+	for i := len(r.workers) - 1; i >= 0 && idle > r.health.MaxIdleReadyWorkers; i-- {
+		w := r.workers[i]
+		if w.Connections() == 0 && w.Worker.ReverseHealth().Snapshot().State == "READY" {
+			w.Worker.ReverseHealth().Drain()
+			idle--
+			ready--
 		}
 	}
-	if numWorker == 0 || numConnections/numWorker > 16 {
+	r.reportDialDemand(ready, pending, !now.Before(r.nextAttempt))
+	if ready >= r.health.MinHealthyWorkers {
+		if r.stableSince.IsZero() {
+			r.stableSince = now
+		}
+		if now.Sub(r.stableSince) >= 10*time.Second {
+			r.failures = 0
+		}
+	} else {
+		r.stableSince = time.Time{}
+	}
+	// MinHealthyWorkers is a total healthy floor. Keep one spare under load;
+	// adding the full floor to each transient canary would churn an extra dial
+	// every second against MaxIdleReadyWorkers.
+	desired := max(r.health.MinHealthyWorkers, busy+1)
+	if desired > 32 {
+		desired = 32
+	}
+	if ready+pending >= desired || pending >= r.health.MaxParallelDials || now.Before(r.nextAttempt) {
+		return nil
+	}
+	for ready+pending < desired && pending < r.health.MaxParallelDials {
+		if !r.acquireDial() {
+			return nil
+		}
 		reader1, writer1 := pipe.New(pipe.WithSizeLimit(2 * buf.Size))
 		reader2, writer2 := pipe.New(pipe.WithSizeLimit(2 * buf.Size))
 		link1 := &transport.Link{Reader: reader1, Writer: writer2}
 		link2 := &transport.Link{Reader: reader2, Writer: writer1}
-		w := &reverse.BridgeWorker{
-			Tag:        r.tag,
-			Dispatcher: r.dispatcher,
-		}
-		worker, err := mux.NewServerWorker(session.ContextWithIsReverseMux(r.ctx, true), w, link1)
+		w := &reverse.BridgeWorker{Tag: r.tag, Dispatcher: r.dispatcher}
+		config := r.health
+		config.Wake = r.wake
+		worker, err := mux.NewReverseServerWorker(session.ContextWithIsReverseMux(r.ctx, true), w, link1, config)
 		if err != nil {
-			errors.LogWarningInner(r.ctx, err, "failed to create mux server worker")
-			return nil
+			releaseReverseDial()
+			common.Interrupt(reader1)
+			common.Interrupt(reader2)
+			return err
 		}
 		w.Worker = worker
 		r.workers = append(r.workers, w)
+		pending++
 		go func() {
-			ctx := session.ContextWithOutbounds(r.ctx, []*session.Outbound{{
-				Target: net.Destination{Address: net.DomainAddress("v1.rvs.cool")},
-			}})
-			r.handler.Process(ctx, link2, session.FullHandlerFromContext(ctx).(*proxyman.Handler))
-			common.Interrupt(reader1)
-			common.Interrupt(reader2)
+			defer releaseReverseDial()
+			timer := time.NewTicker(25 * time.Millisecond)
+			defer timer.Stop()
+			for {
+				state := worker.ReverseHealth().Snapshot().State
+				if state != "VALIDATING" {
+					return
+				}
+				select {
+				case <-worker.WaitClosed():
+					return
+				case <-timer.C:
+				}
+			}
+		}()
+		ctx, cancel := context.WithCancel(session.ContextWithOutbounds(r.ctx, []*session.Outbound{{Target: net.Destination{Address: net.DomainAddress("v1.rvs.cool")}}}))
+		go func() {
+			select {
+			case <-worker.WaitClosed():
+				cancel()
+			case <-ctx.Done():
+				worker.Close()
+			}
+		}()
+		go func() {
+			defer cancel()
+			defer worker.Close()
+			defer common.Interrupt(reader1)
+			defer common.Interrupt(reader2)
+			if err := r.handler.Process(ctx, link2, session.FullHandlerFromContext(ctx).(*proxyman.Handler)); err != nil {
+				errors.LogInfoInner(ctx, err, "reverse transport ended")
+			}
 		}()
 	}
+	base := min(250*time.Millisecond<<min(r.failures, 7), r.health.BackoffCap)
+	r.failures++
+	r.nextAttempt = now.Add(base/2 + time.Duration(now.UnixNano()%int64(base/2)))
 	return nil
 }
-
 func (r *Reverse) Start() error {
-	return r.monitorTask.Start()
+	r.mu.Lock()
+	if r.closed || r.started {
+		r.mu.Unlock()
+		return nil
+	}
+	r.started = true
+	r.mu.Unlock()
+	// Handler construction precedes core Start. Cancellation must win over delayed initialization.
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-r.ctx.Done():
+		return nil
+	case <-timer.C:
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		r.monitor()
+		select {
+		case <-r.ctx.Done():
+			return nil
+		case <-r.wake:
+		case <-ticker.C:
+		}
+	}
 }
-
 func (r *Reverse) Close() error {
-	return r.monitorTask.Close()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	workers := r.workers
+	r.workers = nil
+	r.mu.Unlock()
+	r.forgetDialDemand()
+	if r.cancel != nil {
+		r.cancel()
+	}
+	for _, w := range workers {
+		w.Worker.Close()
+	}
+	return nil
 }

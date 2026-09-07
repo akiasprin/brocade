@@ -1,4 +1,5 @@
 import { useServerForm } from '../ui/server-form';
+import { ReverseHealthSettings } from '../reverse-health-settings';
 import { useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -2272,6 +2273,8 @@ export function SettingsPane() {
           buffer_size_kb: v('connBuffer').trim() === '' ? null : numOr(v('connBuffer'), 0),
           handshake_secs: numOr(v('connHandshake'), 60),
         },
+        reverse_health: settings.data?.reverse_health,
+        reverse_health_overrides: settings.data?.reverse_health_overrides,
         relay_mux: {
           concurrency: numOr(v('muxConcurrency'), 1),
           min_idle_workers: numOr(v('muxMinIdle'), 0),
@@ -2669,6 +2672,8 @@ export function SettingsPane() {
                 )}
               </Group>
             </Section>
+
+            <ReverseHealthSettings />
 
             <Section id="set-wg" name="WIREGUARD" sub="overlay 链路，全互联算出来的" {...secProps('wireguard')}>
               <Group label="Overlay 默认值">

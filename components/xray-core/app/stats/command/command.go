@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/core"
 	feature_stats "github.com/xtls/xray-core/features/stats"
 	grpc "google.golang.org/grpc"
@@ -163,6 +164,11 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 
 func (s *statsServer) QueryStats(ctx context.Context, request *QueryStatsRequest) (*QueryStatsResponse, error) {
 	response := &QueryStatsResponse{}
+	for name, value := range mux.GetReverseHealthMetrics() {
+		if strings.Contains(name, request.Pattern) {
+			response.Stat = append(response.Stat, &Stat{Name: name, Value: value})
+		}
+	}
 
 	s.stats.VisitCounters(func(name string, c feature_stats.Counter) bool {
 		if strings.Contains(name, request.Pattern) {

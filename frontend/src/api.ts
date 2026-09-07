@@ -2192,6 +2192,8 @@ export interface ModelSettings {
   connection: ConnectionSettings;
   /* 节点间 Mux 的全局完整默认值；规则只会整组跟随或整组覆盖。 */
   relay_mux: HopMux;
+  reverse_health?: ReverseHealthPolicy;
+  reverse_health_overrides?: ReverseHealthOverride[];
   /* 使 xray 统计每个账号当前有多少个不同的来源地址在使用。
      设为全局而非逐机器配置：是否统计共享账号是机队级的决定，而上面一组是各机器
      各自的容量参数。它只做统计，xray 不会因统计值高而拒绝连接。 */
@@ -3074,3 +3076,29 @@ export const fetchNodePingProbeRange = (nodeId: string, startUnixSecs: number, e
 
 export const fetchLinkQuality = (chainId?: string, token = '') =>
   api<{ hops: HopLinkView[] }>(`/links/quality${chainId ? `?chain_id=${encodeURIComponent(chainId)}` : ''}`, token);
+
+export interface ReverseHealthPolicy {
+  probe_interval_ms: number;
+  probe_timeout_ms: number;
+  confirm_timeout_ms: number;
+  health_lease_ms: number;
+  min_healthy_workers: number;
+  max_idle_ready_workers: number;
+  max_parallel_dials_per_pair: number;
+  dial_ready_timeout_ms: number;
+  reconnect_backoff_cap_ms: number;
+}
+export interface ReverseHealthOverride {
+  chain: string; from: string; to: string; health: ReverseHealthPolicy;
+}
+export const DEFAULT_REVERSE_HEALTH: ReverseHealthPolicy = {
+  probe_interval_ms: 1000, probe_timeout_ms: 750, confirm_timeout_ms: 750,
+  health_lease_ms: 3000, min_healthy_workers: 2, max_idle_ready_workers: 2,
+  max_parallel_dials_per_pair: 2, dial_ready_timeout_ms: 2000, reconnect_backoff_cap_ms: 2000,
+};
+export function reverseHealthError(p: ReverseHealthPolicy): string | null {
+  if (Object.values(p).some(v => !Number.isInteger(v))) return '所有参数必须填写整数';
+  if (p.probe_interval_ms < 100 || p.probe_interval_ms > 60000 || p.probe_timeout_ms < 50 || p.probe_timeout_ms > 10000 || p.probe_timeout_ms >= p.probe_interval_ms || p.confirm_timeout_ms < 50 || p.confirm_timeout_ms > 10000 || p.health_lease_ms < Math.floor(p.probe_interval_ms * 1.1) + p.probe_timeout_ms || p.health_lease_ms > 120000 || p.min_healthy_workers < 1 || p.min_healthy_workers > 8 || p.max_idle_ready_workers < p.min_healthy_workers || p.max_idle_ready_workers > 16 || p.max_parallel_dials_per_pair < 1 || p.max_parallel_dials_per_pair > 8 || p.dial_ready_timeout_ms < 200 || p.dial_ready_timeout_ms > 30000 || p.reconnect_backoff_cap_ms < 250 || p.reconnect_backoff_cap_ms > 30000)
+    return '参数超出范围，或超时、健康租约、备用连接数量不一致';
+  return null;
+}

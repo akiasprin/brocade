@@ -85,6 +85,7 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             conn_handshake_secs,
             stats_user_online,
             anytls_padding_scheme,
+            reverse_health, reverse_health_overrides,
             relay_mux_concurrency,
             relay_mux_min_idle_workers,
             relay_mux_max_idle_workers,
@@ -141,6 +142,8 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
                 .transpose()?,
             handshake_secs: secs("conn_handshake_secs")?,
         },
+        reverse_health: serde_json::from_value(row.try_get("reverse_health")?)?,
+        reverse_health_overrides: serde_json::from_value(row.try_get("reverse_health_overrides")?)?,
         relay_mux: HopMux {
             concurrency: u16_column(
                 "relay_mux_concurrency",
@@ -325,7 +328,7 @@ pub(crate) async fn update_settings_tx(
              relay_mux_probe_timeout_ms = $33,
              relay_mux_idle_ttl_secs = $34,
              relay_mux_max_requests_per_worker = $35,
-             port_vless_encryption_base = $36
+             port_vless_encryption_base = $36, reverse_health = $37, reverse_health_overrides = $38
          WHERE id = TRUE",
     )
     .bind(settings.reality_client.min_client_ver.as_deref())
@@ -375,6 +378,8 @@ pub(crate) async fn update_settings_tx(
     .bind(i64::from(settings.relay_mux.idle_ttl_secs))
     .bind(i32::from(settings.relay_mux.max_requests_per_worker))
     .bind(i32::from(settings.ports.vless_encryption_base))
+    .bind(serde_json::to_value(settings.reverse_health)?)
+    .bind(serde_json::to_value(&settings.reverse_health_overrides)?)
     .execute(&mut **tx)
     .await?;
 
@@ -495,6 +500,8 @@ fn normalize_settings(settings: ModelSettings) -> ModelSettings {
         // Numbers, with nothing to trim or case-fold; they pass through untouched.
         connection: settings.connection,
         relay_mux: settings.relay_mux,
+        reverse_health: settings.reverse_health,
+        reverse_health_overrides: settings.reverse_health_overrides,
         stats_user_online: settings.stats_user_online,
         anytls_padding_scheme: settings
             .anytls_padding_scheme
@@ -553,6 +560,9 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 }
 
 fn validate_settings(settings: &ModelSettings) -> Result<()> {
+    settings
+        .validate_reverse_health()
+        .map_err(StoreError::InvalidData)?;
     validate_relay_mux(&settings.relay_mux)?;
     if let Some(link) = settings
         .overlay

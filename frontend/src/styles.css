@@ -19219,3 +19219,12 @@ input.f.ing-pj-port {
 .cert-issuance-settings[open] > summary {
   margin-bottom: 12px;
 }
+
+.reverse-health-card { margin: 16px 0; padding: 16px; border: 1px solid var(--line, #8885); border-radius: 8px; overflow-x: auto; }
+.reverse-health-card h3 { margin-top: 0; }
+.reverse-health-card h3 small { font-size: 12px; font-weight: normal; }
+.reverse-health-card table { width: 100%; text-align: left; border-collapse: collapse; }
+.reverse-health-card th, .reverse-health-card td { padding: 6px 12px 6px 0; }
+.reverse-health-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 12px 0; }
+.reverse-health-fields label { display: flex; flex-direction: column; gap: 5px; }
+.reverse-health-fields input { max-width: 180px; }

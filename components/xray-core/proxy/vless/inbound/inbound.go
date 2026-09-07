@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -74,6 +75,8 @@ func init() {
 
 // Handler is an inbound connection handler that handles messages in VLess protocol.
 type Handler struct {
+	reverseAccess          sync.Mutex
+	reverseClosed          bool
 	inboundHandlerManager  feature_inbound.Manager
 	policyManager          policy.Manager
 	stats                  stats.Manager
@@ -191,6 +194,11 @@ func isMuxAndNotXUDP(request *protocol.RequestHeader, first *buf.Buffer) bool {
 }
 
 func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
+	h.reverseAccess.Lock()
+	defer h.reverseAccess.Unlock()
+	if h.reverseClosed {
+		return nil, errors.New("reverse inbound closed")
+	}
 	u := h.validator.Get(a.ID.UUID())
 	if u == nil {
 		return nil, errors.New("reverse: user " + a.ID.String() + " doesn't exist anymore")
@@ -201,12 +209,19 @@ func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
 	}
 	r := h.outboundHandlerManager.GetHandler(a.Reverse.Tag)
 	if r == nil {
-		picker, _ := reverse.NewStaticMuxPicker()
-		r = &Reverse{tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
-		for len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
-			time.Sleep(time.Second) // prevents this outbound from becoming the default outbound
+		hc, err := a.Reverse.HealthConfig("portal")
+		if err != nil {
+			return nil, err
 		}
+		picker, _ := reverse.NewStaticMuxPicker()
+		r = &Reverse{canaryURL: a.Reverse.CanaryUrl, ctx: h.ctx, dispatcher: h.defaultDispatcher, health: hc, tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
+		if len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
+			r.Close()
+			return nil, errors.New("reverse awaits default outbound initialization")
+		}
+
 		if err := h.outboundHandlerManager.AddHandler(h.ctx, r); err != nil {
+			r.Close()
 			return nil, err
 		}
 	}
@@ -227,6 +242,9 @@ func (h *Handler) RemoveReverse(u *protocol.MemoryUser) {
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
+	h.reverseAccess.Lock()
+	h.reverseClosed = true
+	h.reverseAccess.Unlock()
 	if h.decryption != nil {
 		h.decryption.Close()
 	}
@@ -243,8 +261,12 @@ func (h *Handler) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
 
 // RemoveUser implements proxy.UserManager.RemoveUser().
 func (h *Handler) RemoveUser(ctx context.Context, e string) error {
-	h.RemoveReverse(h.validator.GetByEmail(e))
-	return h.validator.Del(e)
+	h.reverseAccess.Lock()
+	defer h.reverseAccess.Unlock()
+	user := h.validator.GetByEmail(e)
+	err := h.validator.Del(e)
+	h.RemoveReverse(user)
+	return err
 }
 
 // GetUser implements proxy.UserManager.GetUser().
@@ -640,9 +662,16 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 }
 
 type Reverse struct {
-	tag    string
-	picker *reverse.StaticMuxPicker
-	client *mux.ClientManager
+	lifecycle    sync.Mutex
+	closed       bool
+	ctx          context.Context
+	canaryURL    string
+	dispatcher   routing.Dispatcher
+	canaryCancel context.CancelFunc
+	health       mux.ReverseHealthConfig
+	tag          string
+	picker       *reverse.StaticMuxPicker
+	client       *mux.ClientManager
 }
 
 func (r *Reverse) Tag() string {
@@ -650,10 +679,11 @@ func (r *Reverse) Tag() string {
 }
 
 func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer features.Feature) error {
-	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
+	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{ReverseHealth: &r.health, MaxConcurrency: 16, MaxConnection: 4096})
 	if err != nil {
 		return errors.New("failed to create mux client worker").Base(err).AtWarning()
 	}
+	defer muxClient.Close()
 	worker, err := reverse.NewPortalWorker(muxClient)
 	if err != nil {
 		return errors.New("failed to create portal worker").Base(err).AtWarning()
@@ -671,22 +701,48 @@ func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer fea
 
 func (r *Reverse) Dispatch(ctx context.Context, link *transport.Link) {
 	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 {
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		return
+	}
 	ob := outbounds[len(outbounds)-1]
 	if ob != nil {
 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil && ob.OriginalTarget.Address != ob.Target.Address {
 			link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
 			link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
 		}
-		r.client.Dispatch(session.ContextWithIsReverseMux(ctx, true), link)
+		if err := r.client.Dispatch(session.ContextWithIsReverseMux(ctx, true), link); err == nil {
+			return
+		} else {
+			errors.LogInfoInner(ctx, err, "reverse dispatch failed")
+		}
 	}
+	common.Interrupt(link.Reader)
+	common.Interrupt(link.Writer)
 }
 
 func (r *Reverse) Start() error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	if r.closed || r.canaryURL == "" || r.canaryCancel != nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(r.ctx)
+	r.canaryCancel = cancel
+	go r.runCanary(ctx)
 	return nil
 }
 
 func (r *Reverse) Close() error {
-	return nil
+	r.lifecycle.Lock()
+	r.closed = true
+	cancel := r.canaryCancel
+	r.lifecycle.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return r.client.Close()
 }
 
 func (r *Reverse) SenderSettings() *serial.TypedMessage {

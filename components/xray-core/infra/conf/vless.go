@@ -79,6 +79,9 @@ func (c *VLessInboundConfig) Build() (proto.Message, error) {
 		}
 
 		if account.Reverse != nil {
+			if _, err := account.Reverse.HealthConfig("portal"); err != nil {
+				return nil, err
+			}
 			if account.Reverse.Tag == "" {
 				return nil, errors.New(`VLESS clients: "tag" can't be empty for "reverse"`)
 			}
@@ -203,8 +206,9 @@ func (c *VLessInboundConfig) Build() (proto.Message, error) {
 }
 
 type VLessReverseConfig struct {
-	Tag      string          `json:"tag"`
-	Sniffing *SniffingConfig `json:"sniffing"`
+	Health   *vless.ReverseHealth `json:"health"`
+	Tag      string               `json:"tag"`
+	Sniffing *SniffingConfig      `json:"sniffing"`
 }
 
 func (c *VLessReverseConfig) Build() (*vless.Reverse, error) {
@@ -212,7 +216,7 @@ func (c *VLessReverseConfig) Build() (*vless.Reverse, error) {
 		return nil, errors.New(`VLESS reverse: "tag" can't be empty`)
 	}
 	r := &vless.Reverse{
-		Tag: c.Tag,
+		Tag: c.Tag, Health: c.Health,
 	}
 	if c.Sniffing != nil {
 		sc, err := c.Sniffing.Build()
@@ -220,6 +224,9 @@ func (c *VLessReverseConfig) Build() (*vless.Reverse, error) {
 			return nil, errors.New(`VLESS reverse: invalid "sniffing" config`).Base(err)
 		}
 		r.Sniffing = sc
+	}
+	if _, err := r.HealthConfig("bridge"); err != nil {
+		return nil, err
 	}
 	return r, nil
 }

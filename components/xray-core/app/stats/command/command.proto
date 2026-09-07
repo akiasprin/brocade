@@ -82,7 +82,13 @@ message GetUsersStatsResponse {
   repeated UserStat users = 1;
 }
 
+// JSON schema is shared with the Brocade Agent; sequence gaps require a fresh snapshot.
+message ReverseHealthRequest {}
+message ReverseHealthResponse { bytes json = 1; }
+
 service StatsService {
+ rpc GetReverseHealthSnapshot(ReverseHealthRequest) returns (ReverseHealthResponse) {}
+ rpc WatchReverseHealth(ReverseHealthRequest) returns (stream ReverseHealthResponse) {}
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
   rpc GetStatsOnline(GetStatsRequest) returns (GetStatsResponse) {}
   rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse) {}

@@ -1,0 +1,39 @@
+package inbound
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/mux"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/pipe"
+)
+
+type emptyReviewPicker struct{}
+
+func (emptyReviewPicker) PickAvailable() (*mux.ClientWorker, error) {
+	return nil, errors.New("empty worker list")
+}
+
+func TestReviewReverseEmptyPickerClosesLink(t *testing.T) {
+	r := &Reverse{client: &mux.ClientManager{Picker: emptyReviewPicker{}}}
+	input, inputWriter := pipe.New()
+	output, outputWriter := pipe.New()
+	defer input.Interrupt()
+	defer output.Interrupt()
+	defer inputWriter.Close()
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
+		Target: net.TCPDestination(net.LocalHostIP, 80),
+	}})
+	r.Dispatch(ctx, &transport.Link{Reader: input, Writer: outputWriter})
+	mb, err := output.ReadMultiBufferTimeout(100 * time.Millisecond)
+	buf.ReleaseMulti(mb)
+	if err == buf.ErrReadTimeout {
+		t.Fatal("reverse discarded the picker error and left caller's response pipe open")
+	}
+}

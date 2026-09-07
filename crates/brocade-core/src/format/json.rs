@@ -152,6 +152,19 @@ fn xray_config(config: &XrayConfig) -> Value {
                 .collect::<Vec<_>>(),
         },
     });
+    for inbound in value["inbounds"].as_array_mut().unwrap() {
+        if let Some(clients) = inbound
+            .pointer_mut("/settings/clients")
+            .and_then(Value::as_array_mut)
+        {
+            for client in clients {
+                attach_reverse_health(client.get_mut("reverse"), config);
+            }
+        }
+    }
+    for outbound in value["outbounds"].as_array_mut().unwrap() {
+        attach_reverse_health(outbound.pointer_mut("/settings/reverse"), config);
+    }
     // No top-level `reverse` block: xray removed it (`infra/conf/xray.go` returns
     // "The feature legacy reverse has been removed" the moment the key is present, so
     // writing it does not degrade — it stops the node's xray from starting at all).
@@ -1394,5 +1407,24 @@ mod tests {
                 worker_pool: None,
             }),
         );
+    }
+}
+
+fn attach_reverse_health(reverse: Option<&mut Value>, config: &XrayConfig) {
+    if let Some(reverse) = reverse {
+        if let Some(url) = reverse
+            .get("tag")
+            .and_then(Value::as_str)
+            .and_then(|tag| config.reverse_canary_urls.get(tag))
+        {
+            reverse["canary_url"] = json!(url);
+        }
+        if let Some(policy) = reverse
+            .get("tag")
+            .and_then(Value::as_str)
+            .and_then(|tag| config.reverse_health.get(tag))
+        {
+            reverse["health"] = json!(policy);
+        }
     }
 }

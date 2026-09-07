@@ -22,17 +22,127 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type ReverseHealth struct {
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	ProbeIntervalMs         uint32                 `protobuf:"varint,1,opt,name=probe_interval_ms,json=probeIntervalMs,proto3" json:"probe_interval_ms,omitempty"`
+	ProbeTimeoutMs          uint32                 `protobuf:"varint,2,opt,name=probe_timeout_ms,json=probeTimeoutMs,proto3" json:"probe_timeout_ms,omitempty"`
+	ConfirmTimeoutMs        uint32                 `protobuf:"varint,3,opt,name=confirm_timeout_ms,json=confirmTimeoutMs,proto3" json:"confirm_timeout_ms,omitempty"`
+	HealthLeaseMs           uint32                 `protobuf:"varint,4,opt,name=health_lease_ms,json=healthLeaseMs,proto3" json:"health_lease_ms,omitempty"`
+	MinHealthyWorkers       uint32                 `protobuf:"varint,5,opt,name=min_healthy_workers,json=minHealthyWorkers,proto3" json:"min_healthy_workers,omitempty"`
+	MaxIdleReadyWorkers     uint32                 `protobuf:"varint,6,opt,name=max_idle_ready_workers,json=maxIdleReadyWorkers,proto3" json:"max_idle_ready_workers,omitempty"`
+	MaxParallelDialsPerPair uint32                 `protobuf:"varint,7,opt,name=max_parallel_dials_per_pair,json=maxParallelDialsPerPair,proto3" json:"max_parallel_dials_per_pair,omitempty"`
+	DialReadyTimeoutMs      uint32                 `protobuf:"varint,8,opt,name=dial_ready_timeout_ms,json=dialReadyTimeoutMs,proto3" json:"dial_ready_timeout_ms,omitempty"`
+	ReconnectBackoffCapMs   uint32                 `protobuf:"varint,9,opt,name=reconnect_backoff_cap_ms,json=reconnectBackoffCapMs,proto3" json:"reconnect_backoff_cap_ms,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *ReverseHealth) Reset() {
+	*x = ReverseHealth{}
+	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReverseHealth) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReverseHealth) ProtoMessage() {}
+
+func (x *ReverseHealth) ProtoReflect() protoreflect.Message {
+	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReverseHealth.ProtoReflect.Descriptor instead.
+func (*ReverseHealth) Descriptor() ([]byte, []int) {
+	return file_proxy_vless_account_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *ReverseHealth) GetProbeIntervalMs() uint32 {
+	if x != nil {
+		return x.ProbeIntervalMs
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetProbeTimeoutMs() uint32 {
+	if x != nil {
+		return x.ProbeTimeoutMs
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetConfirmTimeoutMs() uint32 {
+	if x != nil {
+		return x.ConfirmTimeoutMs
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetHealthLeaseMs() uint32 {
+	if x != nil {
+		return x.HealthLeaseMs
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetMinHealthyWorkers() uint32 {
+	if x != nil {
+		return x.MinHealthyWorkers
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetMaxIdleReadyWorkers() uint32 {
+	if x != nil {
+		return x.MaxIdleReadyWorkers
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetMaxParallelDialsPerPair() uint32 {
+	if x != nil {
+		return x.MaxParallelDialsPerPair
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetDialReadyTimeoutMs() uint32 {
+	if x != nil {
+		return x.DialReadyTimeoutMs
+	}
+	return 0
+}
+
+func (x *ReverseHealth) GetReconnectBackoffCapMs() uint32 {
+	if x != nil {
+		return x.ReconnectBackoffCapMs
+	}
+	return 0
+}
+
 type Reverse struct {
 	state         protoimpl.MessageState   `protogen:"open.v1"`
 	Tag           string                   `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
 	Sniffing      *proxyman.SniffingConfig `protobuf:"bytes,2,opt,name=sniffing,proto3" json:"sniffing,omitempty"`
+	Health        *ReverseHealth           `protobuf:"bytes,3,opt,name=health,proto3" json:"health,omitempty"`
+	CanaryUrl     string                   `protobuf:"bytes,4,opt,name=canary_url,json=canaryUrl,proto3" json:"canary_url,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Reverse) Reset() {
 	*x = Reverse{}
-	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	mi := &file_proxy_vless_account_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -44,7 +154,7 @@ func (x *Reverse) String() string {
 func (*Reverse) ProtoMessage() {}
 
 func (x *Reverse) ProtoReflect() protoreflect.Message {
-	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	mi := &file_proxy_vless_account_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -57,7 +167,7 @@ func (x *Reverse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Reverse.ProtoReflect.Descriptor instead.
 func (*Reverse) Descriptor() ([]byte, []int) {
-	return file_proxy_vless_account_proto_rawDescGZIP(), []int{0}
+	return file_proxy_vless_account_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *Reverse) GetTag() string {
@@ -72,6 +182,20 @@ func (x *Reverse) GetSniffing() *proxyman.SniffingConfig {
 		return x.Sniffing
 	}
 	return nil
+}
+
+func (x *Reverse) GetHealth() *ReverseHealth {
+	if x != nil {
+		return x.Health
+	}
+	return nil
+}
+
+func (x *Reverse) GetCanaryUrl() string {
+	if x != nil {
+		return x.CanaryUrl
+	}
+	return ""
 }
 
 type Account struct {
@@ -93,7 +217,7 @@ type Account struct {
 
 func (x *Account) Reset() {
 	*x = Account{}
-	mi := &file_proxy_vless_account_proto_msgTypes[1]
+	mi := &file_proxy_vless_account_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -105,7 +229,7 @@ func (x *Account) String() string {
 func (*Account) ProtoMessage() {}
 
 func (x *Account) ProtoReflect() protoreflect.Message {
-	mi := &file_proxy_vless_account_proto_msgTypes[1]
+	mi := &file_proxy_vless_account_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -118,7 +242,7 @@ func (x *Account) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Account.ProtoReflect.Descriptor instead.
 func (*Account) Descriptor() ([]byte, []int) {
-	return file_proxy_vless_account_proto_rawDescGZIP(), []int{1}
+	return file_proxy_vless_account_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Account) GetId() string {
@@ -188,10 +312,23 @@ var File_proxy_vless_account_proto protoreflect.FileDescriptor
 
 const file_proxy_vless_account_proto_rawDesc = "" +
 	"\n" +
-	"\x19proxy/vless/account.proto\x12\x10xray.proxy.vless\x1a\x19app/proxyman/config.proto\"Z\n" +
+	"\x19proxy/vless/account.proto\x12\x10xray.proxy.vless\x1a\x19app/proxyman/config.proto\"\xca\x03\n" +
+	"\rReverseHealth\x12*\n" +
+	"\x11probe_interval_ms\x18\x01 \x01(\rR\x0fprobeIntervalMs\x12(\n" +
+	"\x10probe_timeout_ms\x18\x02 \x01(\rR\x0eprobeTimeoutMs\x12,\n" +
+	"\x12confirm_timeout_ms\x18\x03 \x01(\rR\x10confirmTimeoutMs\x12&\n" +
+	"\x0fhealth_lease_ms\x18\x04 \x01(\rR\rhealthLeaseMs\x12.\n" +
+	"\x13min_healthy_workers\x18\x05 \x01(\rR\x11minHealthyWorkers\x123\n" +
+	"\x16max_idle_ready_workers\x18\x06 \x01(\rR\x13maxIdleReadyWorkers\x12<\n" +
+	"\x1bmax_parallel_dials_per_pair\x18\a \x01(\rR\x17maxParallelDialsPerPair\x121\n" +
+	"\x15dial_ready_timeout_ms\x18\b \x01(\rR\x12dialReadyTimeoutMs\x127\n" +
+	"\x18reconnect_backoff_cap_ms\x18\t \x01(\rR\x15reconnectBackoffCapMs\"\xb2\x01\n" +
 	"\aReverse\x12\x10\n" +
 	"\x03tag\x18\x01 \x01(\tR\x03tag\x12=\n" +
-	"\bsniffing\x18\x02 \x01(\v2!.xray.app.proxyman.SniffingConfigR\bsniffing\"\x86\x02\n" +
+	"\bsniffing\x18\x02 \x01(\v2!.xray.app.proxyman.SniffingConfigR\bsniffing\x127\n" +
+	"\x06health\x18\x03 \x01(\v2\x1f.xray.proxy.vless.ReverseHealthR\x06health\x12\x1d\n" +
+	"\n" +
+	"canary_url\x18\x04 \x01(\tR\tcanaryUrl\"\x86\x02\n" +
 	"\aAccount\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04flow\x18\x02 \x01(\tR\x04flow\x12\x1e\n" +
@@ -218,20 +355,22 @@ func file_proxy_vless_account_proto_rawDescGZIP() []byte {
 	return file_proxy_vless_account_proto_rawDescData
 }
 
-var file_proxy_vless_account_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_proxy_vless_account_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_proxy_vless_account_proto_goTypes = []any{
-	(*Reverse)(nil),                 // 0: xray.proxy.vless.Reverse
-	(*Account)(nil),                 // 1: xray.proxy.vless.Account
-	(*proxyman.SniffingConfig)(nil), // 2: xray.app.proxyman.SniffingConfig
+	(*ReverseHealth)(nil),           // 0: xray.proxy.vless.ReverseHealth
+	(*Reverse)(nil),                 // 1: xray.proxy.vless.Reverse
+	(*Account)(nil),                 // 2: xray.proxy.vless.Account
+	(*proxyman.SniffingConfig)(nil), // 3: xray.app.proxyman.SniffingConfig
 }
 var file_proxy_vless_account_proto_depIdxs = []int32{
-	2, // 0: xray.proxy.vless.Reverse.sniffing:type_name -> xray.app.proxyman.SniffingConfig
-	0, // 1: xray.proxy.vless.Account.reverse:type_name -> xray.proxy.vless.Reverse
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	3, // 0: xray.proxy.vless.Reverse.sniffing:type_name -> xray.app.proxyman.SniffingConfig
+	0, // 1: xray.proxy.vless.Reverse.health:type_name -> xray.proxy.vless.ReverseHealth
+	1, // 2: xray.proxy.vless.Account.reverse:type_name -> xray.proxy.vless.Reverse
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_proxy_vless_account_proto_init() }
@@ -245,7 +384,7 @@ func file_proxy_vless_account_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_vless_account_proto_rawDesc), len(file_proxy_vless_account_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
