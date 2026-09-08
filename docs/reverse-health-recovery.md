@@ -16,7 +16,7 @@ TCP 故障后关闭旧连接，由应用重新连接，不重放字节或承诺�
 
 ## 配置与可观测性
 
-完整策略从 ModelSettings 全局默认或 `(chain, from, to)` 定向覆盖，经过编译器生成到 reverse 两端。覆盖采用完整策略，不逐字段继承；发布验证拒绝无对应 reverse 边的覆盖。数据库增量迁移为 `0002_reverse_health.sql`。控制台设置页可编辑策略。
+完整策略从 ModelSettings 全局默认或 `(chain, from, to)` 定向覆盖，经过编译器生成到 reverse 两端。覆盖采用完整策略，不逐字段继承；发布验证拒绝无对应 reverse 边的覆盖。数据库增量迁移为 `0003_reverse_health.sql`。控制台设置页可编辑策略。
 
 StatsService 新增 GetReverseHealthSnapshot 和 WatchReverseHealth，CLI：
 
@@ -120,3 +120,18 @@ python3 scripts/reverse-review/run.py --case change_ip_silent \
 | downstream_silent-tls-0 | 2.179 s | 3.346 s |
 
 每场景仅 1 次，不能视为分位数或上界。测试输出 `target/reverse-tuning-verified` 保留实际两端策略、故障注入记录和源码哈希，生产 Go 源码与该次测试逐文件一致。
+
+
+## 合入 main 的兼容处理
+
+功能提交已重放到 main 的更新基线上，保留原有 Mux 修复和设置页草稿同步改进。反向隧道迁移改为 `0003_reverse_health.sql`，接在 main 的 `0002_mux_worker_limits.sql` 之后，避免 SQLx 迁移版本重复。历史实验对应的原提交保留在 `work/reverse-health-before-main-20260908`。合入动作本身不启动服务、不执行生产数据库迁移。
+
+合入基线验证：Go 相关包 `-race` 通过，Core 单元/编译/校验 157 项通过，Frontend 42 文件 290 项通过、生产构建通过，真实 PostgreSQL 迁移及策略往返通过。与 main 新 Mux 实现组合后，默认策略、RTT 150 ms、NAT 换 IP 双向静默、固定 UDP socket，三种真实 Xray 进程 `-race` 实验均通过：
+
+| 传输 | TCP 稳定恢复 | UDP 稳定恢复 |
+| --- | ---: | ---: |
+| raw | 2.145 s | 2.556 s |
+| reality | 1.619 s | 2.425 s |
+| tls | 2.141 s | 2.548 s |
+
+原始证据位于 `target/reverse-merge-verified`。每种 1 次，保持有限样本解释，不构成恢复时间上界。
