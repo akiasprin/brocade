@@ -12,7 +12,7 @@ use brocade_core::{
         EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
         ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
-        ExternalWarpBinding, Front, FrontStrategy, Grant, HopDial, HopIn, HopPool, HopWire,
+        ExternalWarpBinding, Front, FrontStrategy, Grant, HopDial, HopIn, HopMux, HopPool, HopWire,
         Hysteria2, HysteriaBandwidth, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, Ingress,
         IngressWires, IpFamily, ModelSettings, ModelSnapshot, Node, NodeEgressDnsPolicy,
         OverlaySettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
@@ -3022,6 +3022,7 @@ fn validate_model_snapshot_reports_reality_client_policy_errors() {
     let mut invalid_shape = doc(Vec::new());
     invalid_shape.settings = ModelSettings {
         connection: Default::default(),
+        relay_mux: Default::default(),
         stats_user_online: false,
         reality_client: RealityClientPolicy {
             min_client_ver: Some("1.x.0".to_owned()),
@@ -3044,6 +3045,7 @@ fn validate_model_snapshot_reports_reality_client_policy_errors() {
     let mut invalid_range = doc(Vec::new());
     invalid_range.settings = ModelSettings {
         connection: Default::default(),
+        relay_mux: Default::default(),
         stats_user_online: false,
         reality_client: RealityClientPolicy {
             min_client_ver: Some("1.10.0".to_owned()),
@@ -3596,6 +3598,8 @@ fn node(
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_names: Vec::new(),
+        certificate_group_id: None,
         certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),
@@ -3761,6 +3765,109 @@ fn a_connection_setting_on_a_reverse_hop_is_refused() {
     );
 }
 
+#[test]
+fn relay_mux_global_boundaries_and_cross_constraints_are_validated() {
+    for mux in [
+        HopMux {
+            concurrency: 1,
+            min_idle_workers: 0,
+            max_idle_workers: 1,
+            max_probing_workers: 1,
+            probe_interval_secs: 2,
+            probe_timeout_ms: 200,
+            idle_ttl_secs: 5,
+            max_requests_per_worker: 1,
+        },
+        HopMux {
+            concurrency: 128,
+            min_idle_workers: u32::MAX,
+            max_idle_workers: u32::MAX,
+            max_probing_workers: u32::MAX,
+            probe_interval_secs: 60,
+            probe_timeout_ms: 10_000,
+            idle_ttl_secs: u32::MAX,
+            max_requests_per_worker: u16::MAX,
+        },
+    ] {
+        let mut snapshot = doc(Vec::new());
+        snapshot.settings.relay_mux = mux;
+        let mut diagnostics = Vec::new();
+        validate_model_snapshot(&snapshot, &mut diagnostics);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|item| item.code == "mux.worker-pool"),
+            "{mux:?}: {diagnostics:#?}"
+        );
+    }
+
+    for invalid in [
+        HopMux {
+            concurrency: 0,
+            ..Default::default()
+        },
+        HopMux {
+            min_idle_workers: 9,
+            ..Default::default()
+        },
+        HopMux {
+            max_idle_workers: 0,
+            ..Default::default()
+        },
+        HopMux {
+            min_idle_workers: 3,
+            max_idle_workers: 2,
+            ..Default::default()
+        },
+        HopMux {
+            max_probing_workers: 3,
+            max_idle_workers: 2,
+            ..Default::default()
+        },
+        HopMux {
+            probe_interval_secs: 1,
+            ..Default::default()
+        },
+        HopMux {
+            probe_timeout_ms: 5_000,
+            probe_interval_secs: 5,
+            ..Default::default()
+        },
+        HopMux {
+            idle_ttl_secs: 6,
+            probe_interval_secs: 5,
+            probe_timeout_ms: 2_000,
+            ..Default::default()
+        },
+        HopMux {
+            max_requests_per_worker: 0,
+            ..Default::default()
+        },
+    ] {
+        let mut snapshot = doc(Vec::new());
+        snapshot.settings.relay_mux = invalid;
+        let mut diagnostics = Vec::new();
+        validate_model_snapshot(&snapshot, &mut diagnostics);
+        assert_has(&diagnostics, Level::Error, "mux.worker-pool");
+    }
+}
+
+#[test]
+fn relay_mux_rule_override_uses_the_same_validation() {
+    let mut diagnostics = Vec::new();
+    let (sys, app_ir) = pool_ir(
+        HopDial::Overlay,
+        HopPool::Mux(Some(HopMux {
+            max_probing_workers: 3,
+            max_idle_workers: 2,
+            ..Default::default()
+        })),
+        &mut diagnostics,
+    );
+    validate_app(&sys, &app_ir, &mut diagnostics);
+    assert_has(&diagnostics, Level::Error, "mux.worker-pool");
+}
+
 /// The concurrency-one pool remains valid for existing authored models, but it must not look as
 /// safe as a normal connection pool. Xray selects an idle Mux.cool worker without probing the
 /// underlying TCP connection first, which is the observed source of long stalls after idle reuse.
@@ -3918,4 +4025,95 @@ fn pool_ir_rules(
     let app_ir = compile_app(&doc, &app, diagnostics);
     let app_ir = brocade_core::ir::hops::compile_hops(app_ir, &sys, diagnostics);
     (sys, app_ir)
+}
+
+#[test]
+fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption() {
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "App".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![],
+        fronts: vec![],
+        grants: vec![],
+        steps: vec![],
+    };
+    doc.external_outbounds = vec![ExternalOutbound {
+        id: "proxy".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "Proxy".to_owned(),
+        address: "edge.example.com".to_owned(),
+        port: 443,
+        protocol: ExternalOutboundProtocol::Anytls {
+            credential: "password".to_owned(),
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: vec![],
+    }];
+    let codes = |doc: &ModelSnapshot| {
+        let mut diagnostics = vec![];
+        let sys = compile_system(doc, &mut diagnostics);
+        let ir = compile_app(doc, &app, &mut diagnostics);
+        validate_app(&sys, &ir, &mut diagnostics);
+        diagnostics.into_iter().map(|d| d.code).collect::<Vec<_>>()
+    };
+    assert!(codes(&doc)
+        .iter()
+        .any(|code| *code == "external-outbound.anytls-security"));
+    for (value, valid) in [
+        ("none".to_owned(), true),
+        (
+            format!("mlkem768x25519plus.native.1rtt.{}", "A".repeat(43)),
+            true,
+        ),
+        ("garbage".to_owned(), false),
+        ("mlkem768x25519plus.native.1rtt.".to_owned(), false),
+    ] {
+        doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Vless {
+            credential: "uuid".to_owned(),
+            encryption: value.clone(),
+            flow: None,
+            transport: ExternalVlessTransport::Raw,
+        };
+        let codes = codes(&doc);
+        assert_eq!(
+            !codes
+                .iter()
+                .any(|code| *code == "external-outbound.vless-encryption"),
+            valid,
+            "{value}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .any(|code| *code == "external-outbound.security-required"),
+            value == "none"
+        );
+    }
+}
+
+#[test]
+fn native_vless_encryption_claims_its_tcp_port_and_validates_keys() {
+    let mut diagnostics = Vec::new();
+    let (sys, mut app) = two_hop_ir(HopDial::Overlay, HopWire::None, &mut diagnostics);
+    let ingress = &mut app.ingresses[0];
+    ingress.wires = IngressWires::WithVlessEncryption {
+        other: Some(Box::new(ingress.wires.clone())),
+        encryption: brocade_core::model::VlessEncryption {
+            options: Default::default(),
+            port: ingress.port,
+            private_key: "invalid".to_owned(),
+            public_key: "invalid".to_owned(),
+        },
+    };
+    validate_app(&sys, &app, &mut diagnostics);
+    assert_has(&diagnostics, Level::Error, "node.port-clash");
+    assert_has(&diagnostics, Level::Error, "ingress.vless-encryption-key");
 }

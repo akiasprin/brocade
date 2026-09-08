@@ -79,8 +79,11 @@ describe('chain subscription country', () => {
       </QueryClientProvider>,
     );
 
+    expect(view.getByRole('img', { name: 'TW 地区旗' })).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '台北直连' }));
     const input = view.getByRole('textbox', { name: '链名' });
+    expect((input as HTMLInputElement).value).toBe('台北直连');
+    expect(view.getByRole('img', { name: 'TW 地区旗' })).toBeTruthy();
     fireEvent.change(input, { target: { value: '台湾高速' } });
     fireEvent.keyDown(input, { key: 'Enter' });
 

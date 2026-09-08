@@ -188,7 +188,7 @@ export function ProbeBanner({ item }: { item: E2eProbeItem | null | undefined })
             </span>
             <span className="probe-say">
               <span className="l1">还没探过这条链。</span>
-              <span className="l2">链头的 agent 每轮会自己探一次，刚建好的链要等一会儿。</span>
+              <span className="l2">入口节点的 agent 每轮会自己探一次，刚建好的链要等一会儿。</span>
             </span>
           </div>
         </div>
@@ -215,14 +215,14 @@ export function ProbeBanner({ item }: { item: E2eProbeItem | null | undefined })
         ? /* 只陈述事实，不推测原因。此处此前还有一句「检查链头的规则表是否遗漏转发，
              流量可能在该处直接出网」——那只是**一种**可能，流量可能在任意一跳出网。
              将推测表述为建议会导致优先排查一个未必相关的位置。 */
-          '这不是这条链的出口机器。'
+          '这不是这条链的出口节点。'
         : item.exit_verdict === 'unknown'
           ? /* 三种情况都无法核对：出口位于 NAT 之后（v4 或 v6 任一在 NAT 后即无法核对，
                因为从哪一族出网由落点和路由决定，探测不去猜）；模型中没有公网地址；
                地址会变化（PPPoE 拨号、动态分配），模型中的值已过期。
                最后一种更难发现——该字段有取值，但取值不正确。 */
-            '核对不了这个 IP 是不是这条链的出口：出口机器在 NAT 后面、没有公网地址，或地址会变。'
-          : '跟这条链的出口机器对得上。';
+            '核对不了这个 IP 是不是这条链的出口：出口节点在 NAT 后面、没有公网地址，或地址会变。'
+          : '跟这条链的出口节点对得上。';
 
   return (
     <div className={`blk ${toneCls}`}>

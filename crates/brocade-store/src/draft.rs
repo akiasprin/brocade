@@ -70,6 +70,10 @@ pub enum ModelOp {
         app_id: String,
         ids: Vec<String>,
     },
+    DeleteExternalOutbound {
+        tenant_id: String,
+        id: String,
+    },
     UpsertExternalOutbound {
         outbound: UpsertExternalOutboundRequest,
     },
@@ -151,6 +155,10 @@ pub enum ModelOp {
         node_id: String,
         node: UpdateNodeRequest,
     },
+    SetNodeCertGroup {
+        node_id: String,
+        label_id: Option<String>,
+    },
     UpdateNodeStatus {
         node_id: String,
         status: UpdateNodeStatusRequest,
@@ -176,8 +184,11 @@ impl ModelOp {
             }
             ModelOp::ReorderApps { .. } => "调整线路顺序".to_owned(),
             ModelOp::ReorderChains { app_id, .. } => format!("调整链顺序 {app_id}"),
+            ModelOp::DeleteExternalOutbound { tenant_id, id } => {
+                format!("删除代理出站 {tenant_id}/{id}")
+            }
             ModelOp::UpsertExternalOutbound { outbound } => {
-                format!("隧道 {}/{}", outbound.tenant_id, outbound.id)
+                format!("代理出站 {}/{}", outbound.tenant_id, outbound.id)
             }
             ModelOp::CreateChain { app_id, chain } | ModelOp::UpsertChain { app_id, chain } => {
                 format!("链 {app_id}/{}", chain.id)
@@ -223,6 +234,7 @@ impl ModelOp {
                 status,
             } => format!("用户 {tenant_id}/{user_id} 置为 {}", status.status),
             ModelOp::UpdateNode { node_id, .. } => format!("机器 {node_id}"),
+            ModelOp::SetNodeCertGroup { node_id, .. } => format!("机器证书组 {node_id}"),
             ModelOp::UpdateNodeStatus { node_id, status } => {
                 format!("机器 {node_id} 置为 {}", status.status)
             }
@@ -281,6 +293,9 @@ async fn apply_op(
         ModelOp::ReorderApps { ids } => c::reorder_apps_tx(tx, actor, ids).await?,
         ModelOp::ReorderChains { app_id, ids } => {
             c::reorder_chains_tx(tx, actor, app_id, ids).await?
+        }
+        ModelOp::DeleteExternalOutbound { tenant_id, id } => {
+            c::delete_external_outbound_tx(tx, actor, &tenant_id, &id).await?
         }
         ModelOp::UpsertExternalOutbound { outbound } => {
             c::upsert_external_outbound_tx(tx, actor, revision_id, outbound).await?
@@ -365,6 +380,9 @@ async fn apply_op(
         } => c::update_user_status_tx(tx, actor, &tenant_id, &user_id, status).await?,
         ModelOp::UpdateNode { node_id, node } => {
             c::update_node_tx(tx, actor, revision_id, &node_id, node).await?
+        }
+        ModelOp::SetNodeCertGroup { node_id, label_id } => {
+            crate::cert::set_node_label_tx(tx, actor, &node_id, label_id.as_deref()).await?
         }
         ModelOp::UpdateNodeStatus { node_id, status } => {
             let _ = (node_id, status);

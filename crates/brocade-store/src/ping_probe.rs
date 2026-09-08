@@ -191,6 +191,37 @@ pub async fn node_view(
         &settings.targets,
         settings.timeout_ms,
         bounded_window(window_secs),
+        None,
+    )
+    .await
+}
+
+pub async fn node_view_range(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    start_unix_secs: i64,
+    end_unix_secs: i64,
+) -> Result<NodePingProbeView> {
+    let span = end_unix_secs
+        .checked_sub(start_unix_secs)
+        .ok_or_else(|| StoreError::InvalidData("invalid PING timestamp range".to_owned()))?;
+    if start_unix_secs < 0 || !(1..=7 * 86_400).contains(&span) {
+        return Err(StoreError::InvalidData(
+            "PING range must be positive and no longer than 7 days".to_owned(),
+        ));
+    }
+    let settings = load_settings(pool).await?;
+    if !node_in_scope(pool, actor, node_id).await? {
+        return Ok(empty_view(node_id, &settings.targets));
+    }
+    read_node(
+        pool,
+        node_id,
+        &settings.targets,
+        settings.timeout_ms,
+        60,
+        Some((start_unix_secs, end_unix_secs)),
     )
     .await
 }
@@ -222,6 +253,7 @@ pub async fn list_nodes(
                 &settings.targets,
                 settings.timeout_ms,
                 bounded_window(window_secs),
+                None,
             )
             .await?,
         );
@@ -235,16 +267,26 @@ async fn read_node(
     targets: &[PingProbeTarget],
     timeout_ms: u32,
     window_secs: u32,
+    absolute: Option<(i64, i64)>,
 ) -> Result<NodePingProbeView> {
     let rows = sqlx::query(
         "SELECT target, extract(epoch FROM probed_at)::bigint AS probed_at, attempted, latency_us
            FROM node_ping_probe_samples
           WHERE node_id = $1
-            AND probed_at >= now() - make_interval(secs => $2::double precision)
+            AND (
+                ($3::bigint IS NULL
+                 AND probed_at >= now() - make_interval(secs => $2::double precision))
+                OR
+                ($3::bigint IS NOT NULL
+                 AND probed_at >= to_timestamp($3)
+                 AND probed_at <= to_timestamp($4))
+            )
           ORDER BY probed_at ASC",
     )
     .bind(node_id)
     .bind(i32::try_from(window_secs).expect("bounded window fits i32"))
+    .bind(absolute.map(|range| range.0))
+    .bind(absolute.map(|range| range.1))
     .fetch_all(pool)
     .await?;
     let mut points = BTreeMap::<String, Vec<PingProbePoint>>::new();

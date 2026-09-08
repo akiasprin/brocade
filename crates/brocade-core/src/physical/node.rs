@@ -177,6 +177,7 @@ pub struct ResolvedConnection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayPlan {
     pub node_id: String,
+    pub certificate_group_id: Option<String>,
     pub certificate_track: Option<crate::model::CertificateTrack>,
     pub api_port: Option<u16>,
     pub reality_client: RealityClientPolicy,
@@ -189,6 +190,8 @@ pub struct XrayPlan {
     /// here rather than in the artifact keeps the precedence rule in one place and out of
     /// the renderer, which then only writes values.
     pub connection: ResolvedConnection,
+    /// Fleet default used to resolve a rule that follows the global relay Mux settings.
+    pub relay_mux: crate::model::HopMux,
     pub dns_route: Option<String>,
     /// Machine-owned domain-scoped resolvers. They are independent of the machine default above:
     /// each query is tagged and routed through a dedicated direct Freedom outbound. They do not
@@ -262,6 +265,9 @@ pub struct XrayIngressPlan {
     /// Certificate name managed for this node. REALITY reads it only when its fallback mode is
     /// local; TLS needs only the files, because the name is already inside the certificate.
     pub certificate_name: Option<String>,
+    /// All names present in the fixed certificate slots. Used only by REALITY's local cover;
+    /// ordinary TLS selects the matching certificate from the two configured files itself.
+    pub certificate_names: Vec<String>,
     /// The HTTP layer this ingress is carried inside, or `None` for one carried over plain TCP.
     /// Flattened out of the model's [`Transport`](crate::model::Transport) here because from the
     /// artifact layer down, the shapes differ only by whether this is present.
@@ -291,6 +297,10 @@ pub struct XrayIngressPlan {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngressProtocol {
+    VlessEncryption {
+        private_key: String,
+        options: crate::model::VlessEncryptionOptions,
+    },
     Vless,
     AnyTls(AnyTls),
     Hysteria2(crate::model::Hysteria2),
@@ -327,6 +337,7 @@ pub struct XrayFallbackLimitsPlan {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngressSecurity {
+    None,
     Reality {
         params: RealitySettings,
         /// The ingress's own secret, used as REALITY's private key.
@@ -682,6 +693,7 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
         // AppIr contains every live application node, including pure ingress/egress machines
         // intentionally absent from SystemIr. Taking this from SystemIr made those nodes silently
         // fall back to the public-CA directory even when their assigned group was self-signed.
+        certificate_group_id: app_node.certificate_group_id.clone(),
         certificate_track: app_node.certificate_track,
         api_port: app_node.api_port,
         reality_client: sys.settings.reality_client.clone(),
@@ -704,6 +716,7 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
                 stats_user_online: sys.settings.stats_user_online,
             }
         },
+        relay_mux: sys.settings.relay_mux,
         dns_route: None,
         egress_dns: xray_egress_dns(&app_node.egress_dns),
         inbounds: xray_ingresses(apps, node_id, app_node.api_port),
@@ -793,6 +806,7 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                     None => IngressSecurity::Tls,
                 },
                 certificate_name: ingress.certificate_name.clone(),
+                certificate_names: ingress.certificate_names.clone(),
                 xhttp: ingress.wires.xhttp().cloned(),
                 split: split.then_some(XraySplitIngressPlan {
                     core_port: 0,
@@ -835,6 +849,7 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                         None => IngressSecurity::Tls,
                     },
                     certificate_name: ingress.certificate_name.clone(),
+                    certificate_names: ingress.certificate_names.clone(),
                     xhttp: None,
                     split: None,
                     cover_port: reality
@@ -862,8 +877,34 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                 listen: ingress.bind,
                 sniff: ingress.sniff,
                 certificate_name: ingress.certificate_name.clone(),
+                certificate_names: ingress.certificate_names.clone(),
             });
-            vless.into_iter().chain(anytls).chain(quic)
+            let encryption = ingress
+                .wires
+                .vless_encryption()
+                .map(|settings| XrayIngressPlan {
+                    id: ingress.id.clone(),
+                    tag: format!("{base_tag}:vless-encryption"),
+                    listen: ingress.bind,
+                    port: settings.port,
+                    sniff: ingress.sniff,
+                    protocol: IngressProtocol::VlessEncryption {
+                        private_key: settings.private_key.clone(),
+                        options: settings.options.clone(),
+                    },
+                    security: IngressSecurity::None,
+                    certificate_name: None,
+                    certificate_names: vec![],
+                    xhttp: None,
+                    split: None,
+                    cover_port: None,
+                    guard_port: None,
+                });
+            vless
+                .into_iter()
+                .chain(anytls)
+                .chain(quic)
+                .chain(encryption)
         })
         .collect::<Vec<_>>();
     inbounds.sort_by(|a, b| a.tag.cmp(&b.tag));
@@ -872,6 +913,12 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
     // always yields the same artifact, and they skip every port this xray process already binds.
     let mut used = BTreeSet::new();
     used.extend(api_port);
+    used.extend(
+        apps.iter()
+            .flat_map(|app| &app.ingresses)
+            .filter(|ingress| ingress.node == node_id)
+            .filter_map(|ingress| ingress.wires.vless_encryption().map(|wire| wire.port)),
+    );
     for app in apps {
         used.extend(
             app.ingresses
@@ -1652,6 +1699,19 @@ fn grant_sync_plan(apps: &[AppIr], node_id: &str) -> GrantSyncPlan {
                     clients: clients.clone(),
                 });
             }
+            if ingress.wires.vless_encryption().is_some() {
+                updates.push(GrantInboundUpdatePlan {
+                    inbound_tag: format!("{tag}:vless-encryption"),
+                    clients: clients
+                        .iter()
+                        .cloned()
+                        .map(|client| GrantClientPlan {
+                            flow: None,
+                            ..client
+                        })
+                        .collect(),
+                });
+            }
             if ingress.wires.anytls().is_some() {
                 updates.push(GrantInboundUpdatePlan {
                     inbound_tag: format!("{tag}:anytls"),
@@ -1825,6 +1885,9 @@ fn ingress_inbound_tags(app: &AppIr, ingress: &Ingress) -> Vec<String> {
     if ingress.wires.has_tcp() {
         if ingress.wires.vless().is_some() {
             tags.push(base.clone());
+        }
+        if ingress.wires.vless_encryption().is_some() {
+            tags.push(format!("{base}:vless-encryption"));
         }
         if ingress.wires.anytls().is_some() {
             tags.push(format!("{base}:anytls"));

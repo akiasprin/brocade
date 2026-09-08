@@ -33,7 +33,7 @@ pub use admin::{
     AdminLoginResult, AdminOperator, AdminRole, AuthenticatedAdmin, AuthenticatedUser,
     ChangeAdminPasswordRequest, CreateAdminOperatorRequest, IssuedAdminSession, IssuedAdminToken,
     IssuedUserLogin, ResetAdminPasswordResult, SetUserPasswordRequest, SetUserPasswordResult,
-    ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
+    SystemInitRequest, SystemInitResult, ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
 };
 pub use agent::public_route_ip;
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
@@ -69,15 +69,16 @@ pub use console::{
     CreateTenantRequest, CreateUserRequest, DeleteStepResult, DeploymentVerification,
     DynamicClashSubscription, HopInRequest, HopWireRequest, ModelWriteResult, NodeAgentStateItem,
     NodeAgentStateList, PruneChainResult, PutStepRequest, RedactedModelSnapshot, RedactedSecret,
-    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveWarpBindingRequest,
-    RemoveWarpBindingResult, RevisionList, RevisionListItem, RotateUserUuidResult,
-    SetUserAppQuotaRequest, SetUserAppQuotaResult, StepAcceptRequest, TenantList, TenantListItem,
-    TransportRequest, UpdateNodeRequest, UpdateNodeResult, UpdateNodeStatusRequest,
-    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateUserStatusResult,
-    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
-    UpsertExternalOutboundRequest, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
-    UpsertTenantResult, UpsertUserResult, UserAccountType, UserAppQuota, UserAppQuotaList,
-    UserList, UserListItem, VerifyDeploymentRequest, WarpBindingRemoval, WiresRequest,
+    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
+    RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult, RevisionList,
+    RevisionListItem, RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult,
+    StepAcceptRequest, TenantList, TenantListItem, TransportRequest, UpdateNodeRequest,
+    UpdateNodeResult, UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
+    UpsertChainResult, UpsertExternalOutboundRequest, UpsertFrontResult, UpsertGrantResult,
+    UpsertIngressResult, UpsertTenantResult, UpsertUserResult, UserAccountType, UserAppQuota,
+    UserAppQuotaList, UserList, UserListItem, VerifyDeploymentRequest, WarpBindingRemoval,
+    WiresRequest,
 };
 pub use credentials::{
     admin_session_token_hash, admin_token_display_prefix, admin_token_hash,
@@ -105,7 +106,7 @@ pub use load::LoadSeriesQuery;
 pub use log_policy::{
     AgentLogLimitOverrides, AgentLogLimits, AgentLogPolicyView, NodeLogPolicyItem,
     UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, DEFAULT_AGENT_LOG_MAX_MIB,
-    MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
+    DEFAULT_PHANTUN_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
 };
 pub use pg::PgStore;
 pub use probe::{

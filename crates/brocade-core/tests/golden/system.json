@@ -65,7 +65,7 @@
       "a": "au-01",
       "b": "hk-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -73,7 +73,7 @@
       "a": "au-01",
       "b": "jp-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -81,7 +81,7 @@
       "a": "au-01",
       "b": "sg-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -89,7 +89,7 @@
       "a": "au-01",
       "b": "us-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -97,7 +97,7 @@
       "a": "hk-01",
       "b": "jp-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -105,7 +105,7 @@
       "a": "hk-01",
       "b": "sg-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -113,7 +113,7 @@
       "a": "hk-01",
       "b": "us-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -121,7 +121,7 @@
       "a": "jp-01",
       "b": "sg-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -129,7 +129,7 @@
       "a": "jp-01",
       "b": "us-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     },
     {
@@ -137,7 +137,7 @@
       "a": "sg-01",
       "b": "us-01",
       "dial": "Both",
-      "keepalive_secs": 25,
+      "keepalive_secs": 10,
       "mtu": 1420
     }
   ]

@@ -2,7 +2,6 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchNodes, fetchRevisions, fetchTenants } from '../api';
 import { useAgentLiveness } from '../ui/agent-alive';
-import { useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
 import { openTabByKey } from '../ui/topbar';
 import { navigate } from '../forge/route';
@@ -62,20 +61,18 @@ function PreviewBanner({ status }: { status: PreviewStatus }) {
 /* 第一种状态：机器尚未入库。 */
 function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewStatus }) {
   const qc = useQueryClient();
-  const { who } = useSession();
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
   const options = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
   const existingNodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const defaultTenant = options.find(t => t.id === who.tenant_scope)?.id ?? (options.length ? options[0].id : '');
+  const defaultTenant = options.length === 1 ? options[0].id : '';
   const [form, setForm] = useState({
     id: '',
     name: '',
-    tenant_id: '',
     public_ipv4_nat: false,
     public_ipv6_nat: false,
     egress_allowed: true,
   });
-  const tenantId = form.tenant_id || defaultTenant;
+  const tenantId = defaultTenant;
 
   /* id 是 slug，与服务端 brocade_core::model::is_valid_slug 使用同一规则。 */
   const SLUG_RE = /^[a-z0-9._-]{1,32}$/;
@@ -146,19 +143,6 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
             onChange={e => setForm({ ...form, name: e.target.value })}
           />
           <p className="note">列表和拓扑图上显示的名称，可随时修改</p>
-        </div>
-        <div className="wz-fld">
-          <label>归属租户</label>
-          {/* 始终使用下拉框，只有一个选项时同样如此（与生产流程和建链向导的规则一致） */}
-          <select className="f" value={tenantId} onChange={e => setForm({ ...form, tenant_id: e.target.value })}>
-            {options.length === 0 && <option value="">还没有租户</option>}
-            {options.map(t => (
-              <option key={t.id} value={t.id}>
-                {t.name && t.name !== t.id ? `${t.name}（${t.id}）` : t.id}
-              </option>
-            ))}
-          </select>
-          <p className="note">创建后不可修改。</p>
         </div>
       </div>
 
@@ -238,22 +222,18 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
               on="允许"
             />
           </div>
-          <p className="note">禁止时它只能作为中转，指向它的落地规则会在编译时被拒绝。</p>
+          <p className="note">禁止时它只能作为中转节点，指向它的本机出网规则会在编译时被拒绝。</p>
         </div>
       </div>
 
-      {tenants.data && tenants.data.tenants.length === 0 && (
+      {tenants.data && tenants.data.tenants.length !== 1 && (
         <div className="callout warn" style={{ marginTop: 12 }}>
-          还没有租户。机器必须归属一个租户，先去「租户」面建一个。
+          系统归属配置异常：当前必须恰好有一条，实际为 {tenants.data.tenants.length} 条。
         </div>
       )}
       {provision.error && <ErrorBox error={provision.error} />}
 
       <div className="wz-foot">
-        {/* 与生产流程的说明一致：该步骤不进入草稿。preview 中还会额外创建一个容器。 */}
-        <span className="note warn">
-          <b>这一步没有草稿</b>：提交后立即写入库、盖出一版新修订，并启动一个容器。
-        </span>
         <span className="sp" />
         <button type="button" className="btn" onClick={() => go({ p: 'list' })}>
           取消
@@ -402,10 +382,7 @@ function PreviewInstall({
               />
             </span>
             <span className="attr">
-              <span className="note">
-                在租户 <span className="mono">{tenant || '…'}</span> 下查找该用户的订阅。HTTP 探测与 Xray 用户 stats
-                全部通过才算通过。
-              </span>
+              <span className="note">使用该用户当前生效的订阅验证。HTTP 拨测与 Xray 用户 stats 全部通过才算通过。</span>
             </span>
           </span>
         </div>

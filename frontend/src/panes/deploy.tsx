@@ -44,12 +44,12 @@ type Drill =
 /* 动作决定是否具有破坏性，破坏性决定波次划分 */
 const ACTION_NOTE: Record<PlannedAction, string> = {
   'apply-phantun': '同步 phantun · fake TCP 封装进程变更',
-  'apply-hy2-port-hop': '装端口跳转 · 只改 nft，进程不动，没人掉线',
+  'apply-hy2-port-hop': '装端口跳跃 · 只改 nft，进程不动，没人掉线',
   'sync-grants': '同步授权 · 进程不动，没人掉线',
   'apply-wire-guard': '同步 WireGuard · 已有链路不断',
   'apply-xray': '重写 xray · 重启，断这台上所有连接',
   'disable-phantun': '停用 phantun · 依赖 fake TCP 的链路会断',
-  'disable-hy2-port-hop': '撤端口跳转 · 客户端只剩落点那一个口能连',
+  'disable-hy2-port-hop': '撤端口跳跃 · 客户端只剩落点那一个口能连',
   'disable-wire-guard': '停用 WireGuard · 经过它的链路全断',
   'disable-xray': '停用 xray · 这台上所有连接断',
 };
@@ -602,25 +602,25 @@ function PlanPreview({
             </div>
           ))}
           <PlanTargets targets={plan.data.targets} />
-          {plan.data.base_revision_id != null ? (
-            <>
-              <div className="wavehead" style={{ marginTop: 14 }}>
-                <span>变更内容 · 跟修订 {plan.data.base_revision_id} 比</span>
-                <span className="rule" />
-              </div>
-              <ArtifactChanges
-                revision={target}
-                base={plan.data.base_revision_id}
-                targets={plan.data.targets.filter(t => t.status !== 'skipped')}
-              />
-            </>
-          ) : (
-            <div className="callout">第一次发布，没有可比的上一版。</div>
-          )}
+          <div className="wavehead" style={{ marginTop: 14 }}>
+            <span>
+              {plan.data.base_revision_id == null
+                ? '变更内容 · 第一次发布（全部新建）'
+                : plan.data.base_revision_id === target
+                  ? '运行状态更新'
+                  : `变更内容 · 跟修订 ${plan.data.base_revision_id} 比`}
+            </span>
+            <span className="rule" />
+          </div>
+          <ArtifactChanges
+            revision={target}
+            base={plan.data.base_revision_id}
+            targets={plan.data.targets.filter(t => t.status !== 'skipped')}
+          />
           {stale ? (
             <div className="callout warn">
-              当前修订已经是 <b className="mono">{revisions.data?.current_revision}</b>，预览的是{' '}
-              <b className="mono">{target}</b>——期间模型又动过，现在创建会被拒。
+              配置已更新到修订 <b className="mono">{revisions.data?.current_revision}</b>，这份预览仍是修订{' '}
+              <b className="mono">{target}</b>，不能再创建发布。
               <div className="toolbar">
                 <span className="sp" />
                 <button className="btn" onClick={() => setPicked(revisions.data?.current_revision)}>
@@ -630,7 +630,7 @@ function PlanPreview({
             </div>
           ) : (
             <div className="callout">
-              创建会带上 <b className="mono">revision_id = {target}</b>；期间模型又动过就拒绝。
+              创建前会再次确认配置仍是修订 {target}；如果期间有新的修改，本次创建会自动停止。
             </div>
           )}
           <div className="toolbar">
@@ -712,7 +712,7 @@ function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
           <div key={w}>
             <div className="wavehead">
               <span>
-                wave {w} · {disruptive ? '破坏性 —— 要人确认，一台一波' : '不掉线，一波推完'}
+                wave {w} · {disruptive ? '破坏性 · 灰度发布，一台一波' : '不掉线，一波推完'}
               </span>
               <span className="rule" />
             </div>
@@ -746,7 +746,7 @@ function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
 // 产物是模型快照的纯函数，分别编译两个 revision 即可逐行比较，服务端无需额外计算。
 // 基线是 base_revision_id——同类上一次成功推送的版本，而非上一个修订：
 // 期间提交但未发布的修订不属于本次发布。
-function ArtifactChanges({
+export function ArtifactChanges({
   revision,
   base,
   targets,
@@ -760,26 +760,31 @@ function ArtifactChanges({
   const nameOf = useNodeNames();
   const { list, changed, known, pending, error } = useRevisionDiff(revision, base);
 
-  if (base == null) {
-    return <div className="callout">第一次发布，没有可比的上一版。完整内容见右侧产物栏。</div>;
-  }
   if (error) return <ErrorBox error={error} />;
-  if (pending || !known) return <Loading />;
+  if (pending || (base != null && !known)) return <Loading />;
 
   // 按机器筛选而非按产物类型筛选：这些机器上与基线不同的全部列出，包括 grants.json-rpc。
   // 它是运行时的名单，两类发布都可能包含——重启 xray 后需要重新加载该名单。
   const mine = new Set(targets.map(t => t.node_id));
-  const nodeChanges = list.filter(a => a.target_kind === 'node' && mine.has(a.target_id) && changed.has(entryId(a)));
+  const nodeChanges = list.filter(
+    a => a.target_kind === 'node' && mine.has(a.target_id) && (base == null || changed.has(entryId(a))),
+  );
   // 订阅不通过发布下发，但发生变化时需要提示。按用户数统计而非文件数：
   // 一个用户对应 clash 和 uri 两份，显示为「2 份变更」会被理解为涉及两个用户。
   const subs = [
-    ...new Set(list.filter(a => a.target_kind === 'user' && changed.has(entryId(a))).map(a => a.target_id)),
+    ...new Set(
+      list.filter(a => a.target_kind === 'user' && (base == null || changed.has(entryId(a)))).map(a => a.target_id),
+    ),
   ];
 
   if (nodeChanges.length === 0) {
     return (
       <div className="callout">
-        跟修订 {base} 比，这几台的产物没变
+        {base === revision && targets.length > 0
+          ? '证书等运行状态已经变化，需要重新下发；创建后可在发布详情中查看实际文件记录'
+          : base == null
+            ? '第一次发布没有可新建的机器产物'
+            : `跟修订 ${base} 比，这几台的产物没变`}
         {subs.length > 0 ? `（另有 ${subs.length} 人的订阅变了）` : ''}。
       </div>
     );
@@ -807,7 +812,118 @@ function ArtifactChanges({
   );
 }
 
-/* 每台一个折叠块，内容按需拉取：每份产物需要获取两个版本，十台全部展开即产生四十个请求。 */
+type RecordedArtifact = { state?: string; sha256?: string; content?: string };
+
+function artifactRecord(value: unknown, key: string): RecordedArtifact | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const artifact = (value as Record<string, unknown>)[key];
+  return artifact && typeof artifact === 'object' ? (artifact as RecordedArtifact) : undefined;
+}
+
+/** 同修订也可能因证书等运行状态产生不同产物，历史详情必须使用发布时保存的内容。 */
+export function RecordedArtifactChanges({ targets }: { targets: DeploymentTargetDetail[] }) {
+  const nameOf = useNodeNames();
+  return (
+    <>
+      {targets.map(target => {
+        const files = ['phantun', 'wireguard', 'xray', 'hy2_port_hop'].flatMap(kind => {
+          const after = artifactRecord(target.desired_structure, kind);
+          const before = artifactRecord(target.observed_before, kind);
+          if (!after || after.state === 'unmanaged') return [];
+          if (before && after.state === 'present' && before.state === 'present' && after.sha256 === before.sha256)
+            return [];
+          if (before?.state === 'absent' && after.state === 'disabled') return [];
+          return [{ kind, before, after }];
+        });
+        return (
+          <div className="dp-node" key={target.node_id}>
+            <div className="dp-nodehead">
+              <span className="nm">{nameOf(target.node_id)}</span>
+            </div>
+            {files.length === 0 ? (
+              <div className="note">没有文件内容变化；本次执行的同步或重应用操作见上方动作记录。</div>
+            ) : (
+              files.map(({ kind, before, after }) => (
+                <details className="dp-file" key={kind} open={before?.state === 'absent'}>
+                  <summary className="cfg-bar">
+                    <span className="cfg-file">{artifactFile(kind)}</span>
+                  </summary>
+                  <RecordedFileDiff kind={kind} before={before} after={after} />
+                </details>
+              ))
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function RecordedFileDiff({
+  kind,
+  before,
+  after,
+}: {
+  kind: string;
+  before: RecordedArtifact | undefined;
+  after: RecordedArtifact;
+}) {
+  const beforeText = before?.state === 'absent' ? '' : before?.content;
+  const afterText = after.state === 'disabled' ? '' : after.content;
+  if (beforeText === undefined || afterText === undefined) {
+    return (
+      <div className="note">
+        {before === undefined
+          ? '执行前状态尚未记录，暂不能比较。'
+          : '记录中的原文不可用或当前账号无权查看，暂不能显示逐行差异。'}
+        <div>
+          执行前：<code>{before?.sha256 ?? before?.state ?? '未知'}</code>
+        </div>
+        <div>
+          本次目标：<code>{after.sha256 ?? after.state}</code>
+        </div>
+      </div>
+    );
+  }
+  const ops =
+    before?.state === 'absent'
+      ? afterText.split('\n').map((s, i) => ({ t: '+' as const, n: i + 1, s }))
+      : after.state === 'disabled'
+        ? beforeText.split('\n').map(s => ({ t: '-' as const, n: null, s }))
+        : diffLines(beforeText, afterText);
+  const counts = countChanges(ops);
+  return (
+    <>
+      <div className="fg-delta">
+        <span className="add">+{counts.add}</span> <span className="del">−{counts.del}</span>
+      </div>
+      <div className="fg-code dp-diff">
+        <table>
+          <tbody>
+            {collapseContext(ops, 3).map((row, i) =>
+              row === null ? (
+                <tr key={i} className="gap">
+                  <td className="ln">⋯</td>
+                  <td className="src" />
+                </tr>
+              ) : (
+                <tr key={i} className={row.t === '+' ? 'add' : row.t === '-' ? 'del' : undefined}>
+                  <td className="ln">{row.n ?? ''}</td>
+                  <td
+                    className="src"
+                    dangerouslySetInnerHTML={{ __html: highlight(row.s, artifactFmt(kind)) || '&nbsp;' }}
+                  />
+                </tr>
+              ),
+            )}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+/* 每台一个折叠块，内容按需拉取。 */
 function NodeDiff({
   name,
   nodeId,
@@ -819,9 +935,10 @@ function NodeDiff({
   nodeId: string;
   entries: ArtifactIndexEntry[];
   revision: number;
-  base: number;
+  base: number | null;
 }) {
-  const [open, setOpen] = useState(false);
+  // 首次发布没有旧内容可对照，完整的新建内容就是 diff 本身，因此默认展开。
+  const [open, setOpen] = useState(() => base == null);
   return (
     <div className="dp-node">
       <button className="dp-nodehead" onClick={() => setOpen(!open)} aria-expanded={open}>
@@ -837,7 +954,9 @@ function NodeDiff({
           ))}
         </span>
         <span className="sp" />
-        <span className="note">{entries.length} 份变更</span>
+        <span className="note">
+          {entries.length} 份{base == null ? '新建' : '变更'}
+        </span>
       </button>
       {open && (
         <div className="dp-nodebody">
@@ -850,7 +969,7 @@ function NodeDiff({
   );
 }
 
-function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revision: number; base: number }) {
+function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revision: number; base: number | null }) {
   const key = [entry.target_kind, entry.target_id, entry.artifact_kind] as const;
   const here = useQuery({
     queryKey: ['artifact', revision, ...key],
@@ -858,7 +977,8 @@ function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revisi
   });
   const there = useQuery({
     queryKey: ['artifact', base, ...key],
-    queryFn: () => fetchArtifactContent(...key, base),
+    queryFn: () => fetchArtifactContent(...key, base ?? undefined),
+    enabled: base != null,
   });
 
   const fmt = artifactFmt(entry.artifact_kind);
@@ -871,14 +991,14 @@ function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revisi
     </div>
   );
 
-  if (here.isPending || there.isPending)
+  if (here.isPending || (base != null && there.isPending))
     return (
       <div className="dp-file">
         {head()}
         <Loading />
       </div>
     );
-  if (here.error || there.error)
+  if (here.error || (base != null && there.error))
     return (
       <div className="dp-file">
         {head()}
@@ -887,11 +1007,13 @@ function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revisi
     );
 
   const text = here.data.content ?? '';
-  const before = there.data.content ?? '';
-  const ops = diffLines(before, text);
+  const before = there.data?.content ?? '';
+  // `diffLines('', text)` 会把空串当成一行删除；首次发布应只有真正的新建行。
+  const ops =
+    base == null ? text.split('\n').map((s, i) => ({ t: '+' as const, n: i + 1, s })) : diffLines(before, text);
   const counts = countChanges(ops);
   /* 产物有数百行，全部展开会使改动内容难以定位。 */
-  const shown = collapseContext(ops, 3);
+  const shown = base == null ? ops : collapseContext(ops, 3);
 
   return (
     <div className="dp-file">
@@ -992,8 +1114,8 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   // 同一个波会被确认两次。
   const [confirmedWave, setConfirmedWave] = useState<number | null>(null);
   const detail = useQuery({
-    queryKey: ['deployment', id],
-    queryFn: () => fetchDeployment(id),
+    queryKey: ['deployment', id, who.role === 'system-admin'],
+    queryFn: () => fetchDeployment(id, '', who.role === 'system-admin'),
     /* agent 采用拉取模型并异步回报，前端通过轮询获取进度 */
     refetchInterval: q =>
       OPEN_STATES.has((q.state.data?.status ?? '') as string) || q.state.data?.settlement_status === 'debt'
@@ -1114,7 +1236,7 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
           <div key={w}>
             <div className="wavehead">
               <span>
-                wave {w} · {disruptive ? '破坏性 · 金丝雀，一台一波' : '不掉线，一波推完'}
+                wave {w} · {disruptive ? '破坏性 · 灰度发布，一台一波' : '不掉线，一波推完'}
               </span>
               <span className="rule" />
               {canConfirm && (
@@ -1150,10 +1272,10 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
       })}
 
       <div className="wavehead" style={{ marginTop: 14 }}>
-        <span>产物变更 · 跟修订 {d.base_revision_id ?? '—'} 比</span>
+        <span>产物变更 · 本次目标与执行前配置</span>
         <span className="rule" />
       </div>
-      <ArtifactChanges revision={d.revision_id} base={d.base_revision_id} targets={acting} />
+      <RecordedArtifactChanges targets={acting} />
 
       {(confirm.error ||
         halt.error ||

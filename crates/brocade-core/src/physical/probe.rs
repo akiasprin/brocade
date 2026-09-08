@@ -64,6 +64,11 @@ pub struct ProbeChainTarget {
 /// so this mirrors what the subscription hands out rather than describing it separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeSecurity {
+    VlessEncryption {
+        port: u16,
+        public_key: String,
+        options: crate::model::VlessEncryptionOptions,
+    },
     Reality(ProbeRealityParams),
     Tls(ProbeTlsParams),
     AnyTls(ProbeAnyTlsParams),
@@ -119,6 +124,13 @@ fn probe_security(ingress: &crate::ir::routing::Ingress) -> ProbeSecurity {
     // mixed VLESS+AnyTLS ingress keeps the established VLESS target until the result model grows
     // a protocol dimension of its own.
     if ingress.wires.vless().is_none() {
+        if let Some(settings) = ingress.wires.vless_encryption() {
+            return ProbeSecurity::VlessEncryption {
+                port: settings.port,
+                public_key: settings.public_key.clone(),
+                options: settings.options.clone(),
+            };
+        }
         if let Some(settings) = ingress.wires.anytls() {
             let reality = settings.reality().map(|reality| ProbeRealityParams {
                 public_key: ingress
@@ -188,6 +200,7 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
             let security = probe_security(ingress);
             let port = match &security {
                 ProbeSecurity::AnyTls(anytls) => anytls.settings.port,
+                ProbeSecurity::VlessEncryption { port, .. } => *port,
                 _ => ingress.port,
             };
 
@@ -300,6 +313,7 @@ mod tests {
             id: "sg-01".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "sg-01".to_owned(),
+            certificate_group_id: None,
             certificate_track: None,
             public_ipv4: ipv4.map(str::to_owned),
             public_ipv6: ipv6.map(str::to_owned),

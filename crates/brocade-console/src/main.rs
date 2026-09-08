@@ -3,7 +3,8 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use axum::Router;
 use brocade_console::http::{
     admin_router_with_wakes_and_realtime, agent_router_with_origin_and_realtime,
-    merged_router_with_wakes_and_realtime, with_console_static, with_console_static_dir,
+    merged_router_with_wakes_and_realtime, with_console_branding, with_console_static,
+    with_console_static_dir,
 };
 use brocade_store::PgStore;
 use tokio::sync::Notify;
@@ -258,9 +259,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Which of the two sources the front end comes from is the same decision on both listener
     // layouts, so it is made once here rather than at each of the two call sites — where the two
     // could drift into disagreeing.
-    let with_console = |router: Router| match &console_dist {
-        Some(dir) => with_console_static_dir(router, dir),
-        None => with_console_static(router),
+    let branding_store = store.clone();
+    let with_console = |router: Router| {
+        with_console_branding(
+            match &console_dist {
+                Some(dir) => with_console_static_dir(router, dir),
+                None => with_console_static(router),
+            },
+            branding_store.clone(),
+        )
     };
 
     match agent_listener {

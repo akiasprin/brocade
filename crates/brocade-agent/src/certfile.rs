@@ -37,11 +37,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use brocade_deployment::protocol::{
-    CertificateObservation, CertificatePairObservation, CertificateTrack, NodeCertificateMaterial,
+    CertificateObservation, CertificatePairObservation, NodeCertificateMaterial,
     NodeCertificateSlotMaterial,
 };
 
@@ -54,19 +54,18 @@ use crate::{create_private_dir, warn};
 const CERT_DIR: &str = "tls";
 const PUBLIC_CA_DIR: &str = "public-ca";
 const SELF_SIGNED_DIR: &str = "self-signed";
+const CURRENT_FILE: &str = "current.pem";
 const SLOT_A_FILE: &str = "slot-a.pem";
 const SLOT_B_FILE: &str = "slot-b.pem";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Establish both trust-track directories even when this node currently receives material for
-/// only one of them. An empty track is still an explicit, inspectable state; creating it lazily
-/// made a self-signed-only node look as though the public-CA half of the layout did not exist.
+/// only one of them. Public CA owns one current file; only self-signed needs two overlap slots.
 pub(crate) fn ensure_layout(state_dir: &Path) -> Result<(), String> {
     let tls_dir = state_dir.join(CERT_DIR);
     create_private_dir(&tls_dir)?;
-    for track in [CertificateTrack::PublicCa, CertificateTrack::SelfSigned] {
-        create_private_dir(&track_dir(state_dir, track))?;
-    }
+    create_private_dir(&tls_dir.join(PUBLIC_CA_DIR))?;
+    create_private_dir(&tls_dir.join(SELF_SIGNED_DIR))?;
     Ok(())
 }
 
@@ -111,7 +110,7 @@ pub(crate) fn report_applied(options: &Options) {
     }
 }
 
-/// Writes the pair, or leaves the disk alone when it already matches.
+/// Writes the current public-CA certificate or the self-signed pair, leaving matching files alone.
 ///
 /// Comparing first is not an optimization: these files hold a private key, and a write that
 /// changes nothing is still a window where the file is truncated. It also keeps the mtime honest,
@@ -120,42 +119,42 @@ pub(crate) fn write_certificate(
     state_dir: &Path,
     material: &NodeCertificateMaterial,
 ) -> Result<bool, String> {
-    let dir = track_dir(state_dir, material.track);
-    create_private_dir(&dir)?;
-    let mut changed = false;
-    for (file, slot) in [SLOT_A_FILE, SLOT_B_FILE].into_iter().zip(&material.slots) {
-        let path = dir.join(file);
-        let bundle = certificate_bundle(slot);
-        if std::fs::read(&path).is_ok_and(|on_disk| on_disk == bundle) {
-            continue;
+    match material {
+        NodeCertificateMaterial::PublicCa { certificate } => {
+            let dir = state_dir.join(CERT_DIR).join(PUBLIC_CA_DIR);
+            create_private_dir(&dir)?;
+            let changed = write_identity(&dir.join(CURRENT_FILE), certificate)?;
+            if changed {
+                eprintln!("本机 CA 证书已更新：{}", certificate.certificate_id);
+            }
+            Ok(changed)
         }
-        atomic_write_private(&path, &bundle)?;
-        changed = true;
-    }
-    if changed {
-        // Names and ids, never contents: this line goes to a journal other people can read.
-        eprintln!(
-            "证书槽已更新（{}）：{} / {}",
-            track_name(material.track),
-            material.slots[0].certificate_id,
-            material.slots[1].certificate_id
-        );
-    }
-    Ok(changed)
-}
-
-fn track_name(track: CertificateTrack) -> &'static str {
-    match track {
-        CertificateTrack::PublicCa => "公有证书",
-        CertificateTrack::SelfSigned => "自签证书",
+        NodeCertificateMaterial::SelfSigned { slots } => {
+            let dir = state_dir.join(CERT_DIR).join(SELF_SIGNED_DIR);
+            create_private_dir(&dir)?;
+            let mut changed = false;
+            for (file, slot) in [SLOT_A_FILE, SLOT_B_FILE].into_iter().zip(slots) {
+                changed |= write_identity(&dir.join(file), slot)?;
+            }
+            if changed {
+                // Names and ids, never contents: this line goes to a journal other people can read.
+                eprintln!(
+                    "本机自签证书槽已更新：{} / {}",
+                    slots[0].certificate_id, slots[1].certificate_id
+                );
+            }
+            Ok(changed)
+        }
     }
 }
 
-fn track_dir(state_dir: &Path, track: CertificateTrack) -> PathBuf {
-    state_dir.join(CERT_DIR).join(match track {
-        CertificateTrack::PublicCa => PUBLIC_CA_DIR,
-        CertificateTrack::SelfSigned => SELF_SIGNED_DIR,
-    })
+fn write_identity(path: &Path, identity: &NodeCertificateSlotMaterial) -> Result<bool, String> {
+    let bundle = certificate_bundle(identity);
+    if std::fs::read(path).is_ok_and(|on_disk| on_disk == bundle) {
+        return Ok(false);
+    }
+    atomic_write_private(path, &bundle)?;
+    Ok(true)
 }
 
 fn certificate_bundle(slot: &NodeCertificateSlotMaterial) -> Vec<u8> {
@@ -216,21 +215,23 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Only a digest: the control plane holds the same bytes and can compare. Anything richer would
 /// need an X.509 parser here, for facts the other side already knows.
 pub(crate) fn observe(state_dir: &Path) -> CertificateObservation {
+    let tls_dir = state_dir.join(CERT_DIR);
     CertificateObservation::Managed {
-        public_ca: observe_track(&track_dir(state_dir, CertificateTrack::PublicCa)),
-        self_signed: observe_track(&track_dir(state_dir, CertificateTrack::SelfSigned)),
+        public_ca_sha256: digest_file(&tls_dir.join(PUBLIC_CA_DIR).join(CURRENT_FILE)),
+        self_signed: observe_self_signed(&tls_dir.join(SELF_SIGNED_DIR)),
     }
 }
 
-fn observe_track(dir: &Path) -> CertificatePairObservation {
-    let digest = |file| {
-        std::fs::read(dir.join(file))
-            .ok()
-            .map(|bytes| crate::sha256_hex(&bytes))
-    };
+fn digest_file(path: &Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| crate::sha256_hex(&bytes))
+}
+
+fn observe_self_signed(dir: &Path) -> CertificatePairObservation {
     CertificatePairObservation {
-        slot_a_sha256: digest(SLOT_A_FILE),
-        slot_b_sha256: digest(SLOT_B_FILE),
+        slot_a_sha256: digest_file(&dir.join(SLOT_A_FILE)),
+        slot_b_sha256: digest_file(&dir.join(SLOT_B_FILE)),
     }
 }
 
@@ -247,10 +248,15 @@ mod tests {
         }
     }
 
-    fn material(cert: &str, key: &str) -> NodeCertificateMaterial {
-        NodeCertificateMaterial {
-            track: CertificateTrack::SelfSigned,
+    fn self_signed_material(cert: &str, key: &str) -> NodeCertificateMaterial {
+        NodeCertificateMaterial::SelfSigned {
             slots: [slot("a", cert, key), slot("b", cert, key)],
+        }
+    }
+
+    fn public_ca_material(cert: &str, key: &str) -> NodeCertificateMaterial {
+        NodeCertificateMaterial::PublicCa {
+            certificate: slot("current", cert, key),
         }
     }
 
@@ -262,7 +268,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        write_certificate(&dir, &material("CERT", "KEY")).unwrap();
+        write_certificate(&dir, &self_signed_material("CERT", "KEY")).unwrap();
         let tls = dir.join(CERT_DIR).join(SELF_SIGNED_DIR);
         assert_eq!(
             std::fs::read_to_string(tls.join(SLOT_A_FILE)).unwrap(),
@@ -290,11 +296,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        write_certificate(&dir, &material("CERT", "KEY")).unwrap();
+        write_certificate(&dir, &self_signed_material("CERT", "KEY")).unwrap();
         let path = dir.join(CERT_DIR).join(SELF_SIGNED_DIR).join(SLOT_A_FILE);
         let first = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write_certificate(&dir, &material("CERT", "KEY")).unwrap();
+        write_certificate(&dir, &self_signed_material("CERT", "KEY")).unwrap();
         let second = std::fs::metadata(&path).unwrap().modified().unwrap();
         // Equal mtimes mean the second call decided there was nothing to do. Rewriting identical
         // bytes every ten minutes would make the timestamp meaningless to anything watching it.
@@ -309,8 +315,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        write_certificate(&dir, &material("OLD", "OLDKEY")).unwrap();
-        write_certificate(&dir, &material("NEW", "NEWKEY")).unwrap();
+        write_certificate(&dir, &self_signed_material("OLD", "OLDKEY")).unwrap();
+        write_certificate(&dir, &self_signed_material("NEW", "NEWKEY")).unwrap();
         let tls = dir.join(CERT_DIR).join(SELF_SIGNED_DIR);
         assert_eq!(
             std::fs::read_to_string(tls.join(SLOT_A_FILE)).unwrap(),
@@ -325,13 +331,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("brocade-cert-tracks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut public = material("PUBLIC", "PUBLIC-KEY");
-        public.track = CertificateTrack::PublicCa;
-        write_certificate(&dir, &public).unwrap();
-        write_certificate(&dir, &material("SELF", "SELF-KEY")).unwrap();
+        write_certificate(&dir, &public_ca_material("PUBLIC", "PUBLIC-KEY")).unwrap();
+        write_certificate(&dir, &self_signed_material("SELF", "SELF-KEY")).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(dir.join(CERT_DIR).join(PUBLIC_CA_DIR).join(SLOT_A_FILE))
+            std::fs::read_to_string(dir.join(CERT_DIR).join(PUBLIC_CA_DIR).join(CURRENT_FILE))
                 .unwrap(),
             "PUBLIC\nPUBLIC-KEY\n"
         );
@@ -340,6 +344,25 @@ mod tests {
                 .unwrap(),
             "SELF\nSELF-KEY\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn public_ca_uses_one_current_file() {
+        let dir = std::env::temp_dir().join(format!("brocade-cert-public-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_certificate(&dir, &public_ca_material("OLD", "OLDKEY")).unwrap();
+        write_certificate(&dir, &public_ca_material("NEW", "NEWKEY")).unwrap();
+        let public = dir.join(CERT_DIR).join(PUBLIC_CA_DIR);
+        assert_eq!(
+            std::fs::read_to_string(public.join(CURRENT_FILE)).unwrap(),
+            "NEW\nNEWKEY\n"
+        );
+        assert!(!public.join(SLOT_A_FILE).exists());
+        assert!(!public.join(SLOT_B_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

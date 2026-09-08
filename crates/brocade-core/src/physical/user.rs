@@ -81,7 +81,9 @@ impl UserPlan {
                 (protocol, &entry.security),
                 (
                     SubscriptionProtocol::Vless,
-                    UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_)
+                    UserSecurityPlan::Reality(_)
+                        | UserSecurityPlan::Tls(_)
+                        | UserSecurityPlan::VlessEncryption { .. }
                 ) | (SubscriptionProtocol::AnyTls, UserSecurityPlan::AnyTls(_))
                     | (
                         SubscriptionProtocol::Hysteria2,
@@ -167,6 +169,11 @@ pub struct UserDownloadPlan {
 /// are handed the same parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserSecurityPlan {
+    VlessEncryption {
+        port: u16,
+        public_key: String,
+        options: crate::model::VlessEncryptionOptions,
+    },
     Reality(UserRealityPlan),
     Tls(UserTlsPlan),
     AnyTls(UserAnyTlsPlan),
@@ -234,6 +241,16 @@ pub struct UserExternalProxyPlan {
 /// name in every subscription.
 fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
     let mut wires = Vec::new();
+    if let Some(settings) = ingress.wires.vless_encryption() {
+        wires.push((
+            UserSecurityPlan::VlessEncryption {
+                port: settings.port,
+                public_key: settings.public_key.clone(),
+                options: settings.options.clone(),
+            },
+            " | VLESS Encryption",
+        ));
+    }
 
     if ingress.wires.vless().is_some() {
         let vless = match ingress.wires.reality() {
@@ -363,7 +380,10 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
             let wires = securities(ingress);
             for server in subscription_servers(node, ingress) {
                 for (security, wire_suffix) in &wires {
-                    let quic = matches!(security, UserSecurityPlan::Hysteria2(_));
+                    let independent_transport = !matches!(
+                        security,
+                        UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_)
+                    );
                     entries.push(UserSubscriptionEntryPlan {
                         grant_id: grant.id.clone(),
                         ingress_id: ingress.id.clone(),
@@ -382,25 +402,33 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                         port: match security {
                             UserSecurityPlan::Hysteria2(plan) => plan.settings.port,
                             UserSecurityPlan::AnyTls(plan) => plan.settings.port,
+                            UserSecurityPlan::VlessEncryption { port, .. } => *port,
                             _ => server.port,
                         },
                         // The independent download belongs to the XHTTP half and to nothing else;
                         // QUIC carries its own streams and has no second connection to project.
-                        download: server.download.clone().filter(|_| !quic).map(|download| {
-                            UserDownloadPlan {
-                                server: download.host,
-                                port: download.port,
-                                // A split REALITY ingress terminates the downlink with this
-                                // machine's certificate. Validation prevents the empty case from
-                                // being published.
-                                server_name: ingress.certificate_name.clone().unwrap_or_default(),
-                                http_host: download.http_host,
-                                mux: download.mux,
-                            }
-                        }),
+                        download: server
+                            .download
+                            .clone()
+                            .filter(|_| !independent_transport)
+                            .map(|download| {
+                                UserDownloadPlan {
+                                    server: download.host,
+                                    port: download.port,
+                                    // A split REALITY ingress terminates the downlink with this
+                                    // machine's certificate. Validation prevents the empty case from
+                                    // being published.
+                                    server_name: ingress
+                                        .certificate_name
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    http_host: download.http_host,
+                                    mux: download.mux,
+                                }
+                            }),
                         uuid: uuid.clone(),
                         security: security.clone(),
-                        xhttp: if quic {
+                        xhttp: if independent_transport {
                             None
                         } else {
                             ingress.wires.xhttp().cloned()
@@ -459,7 +487,9 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
 /// a user's subscription.
 fn subscription_protocol_rank(security: &UserSecurityPlan) -> u8 {
     match security {
-        UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_) => 0,
+        UserSecurityPlan::Reality(_)
+        | UserSecurityPlan::Tls(_)
+        | UserSecurityPlan::VlessEncryption { .. } => 0,
         UserSecurityPlan::AnyTls(_) => 1,
         UserSecurityPlan::Hysteria2(_) => 2,
     }

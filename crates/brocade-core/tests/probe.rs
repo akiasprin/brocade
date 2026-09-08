@@ -242,6 +242,18 @@ fn probe_params(
     security: &ProbeSecurity,
 ) -> (&'static str, String, String, String, String, Option<String>) {
     match security {
+        ProbeSecurity::VlessEncryption {
+            public_key,
+            options,
+            ..
+        } => (
+            "vless-encryption",
+            options.encryption(public_key),
+            String::new(),
+            String::new(),
+            String::new(),
+            None,
+        ),
         ProbeSecurity::Reality(reality) => (
             "reality",
             reality.public_key.clone(),
@@ -281,6 +293,18 @@ fn user_params(
     security: &UserSecurityPlan,
 ) -> (&'static str, String, String, String, String, Option<String>) {
     match security {
+        UserSecurityPlan::VlessEncryption {
+            public_key,
+            options,
+            ..
+        } => (
+            "vless-encryption",
+            options.encryption(public_key),
+            String::new(),
+            String::new(),
+            String::new(),
+            None,
+        ),
         UserSecurityPlan::Reality(reality) => (
             "reality",
             reality.public_key.clone(),

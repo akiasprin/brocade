@@ -128,6 +128,8 @@ struct SubscriptionTopologyContract<'a> {
     vless: Option<VlessTopologyContract<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anytls: Option<AnyTlsTopologyContract<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vless_encryption: Option<(u16, String)>,
     hysteria2: Option<Hysteria2TopologyContract<'a>>,
     split_download_ports: [Option<u16>; 2],
     split_download_certificate_name: Option<&'a str>,
@@ -651,6 +653,10 @@ pub fn topology_contract_hash(nodes: &[Node], app_id: &str, ingress: &Ingress) -
         ingress_port: ingress.port,
         vless,
         anytls,
+        vless_encryption: ingress
+            .wires
+            .vless_encryption()
+            .map(|wire| (wire.port, wire.options.encryption(&wire.public_key))),
         hysteria2,
         split_download_ports,
         split_download_certificate_name,

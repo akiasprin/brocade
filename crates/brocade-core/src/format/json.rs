@@ -173,6 +173,10 @@ fn xray_config(config: &XrayConfig) -> Value {
             }),
         );
     }
+    // Agent-only metadata: a group change changes the artifact and is not hot-swappable.
+    if let Some(group) = &config.certificate_group_id {
+        value["brocadeCertificateGroup"] = json!(group);
+    }
     value
 }
 
@@ -322,6 +326,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
             "settings": { "address": address },
         }),
         XrayInbound::Vless {
+            decryption,
             tag,
             listen,
             port,
@@ -367,7 +372,7 @@ fn inbound(inbound: &XrayInbound) -> Value {
                 "protocol": "vless",
                 "settings": {
                     "clients": [],
-                    "decryption": "none",
+                    "decryption": decryption.as_deref().unwrap_or("none"),
                 },
                 "streamSettings": stream_settings,
                 "sniffing": sniffing,
@@ -835,10 +840,22 @@ fn insert_mux(value: &mut Value, mux: Option<&XrayMux>) {
     let object = value
         .as_object_mut()
         .expect("xray outbound must be an object before inserting mux");
-    object.insert(
-        "mux".to_owned(),
-        json!({ "enabled": true, "concurrency": mux.concurrency }),
-    );
+    let mut config = json!({ "enabled": true, "concurrency": mux.concurrency });
+    if let Some(pool) = mux.worker_pool {
+        config.as_object_mut().unwrap().insert(
+            "workerPool".to_owned(),
+            json!({
+                "minIdleWorkers": pool.min_idle_workers,
+                "maxIdleWorkers": pool.max_idle_workers,
+                "maxProbingWorkers": pool.max_probing_workers,
+                "probeIntervalSecs": pool.probe_interval_secs,
+                "probeTimeoutMs": pool.probe_timeout_ms,
+                "idleTtlSecs": pool.idle_ttl_secs,
+                "maxRequestsPerWorker": pool.max_requests_per_worker,
+            }),
+        );
+    }
+    object.insert("mux".to_owned(), config);
 }
 
 fn outbound(outbound: &XrayOutbound) -> Value {
@@ -958,6 +975,10 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             );
             let mut vless_transport = None;
             let (protocol_name, settings) = match protocol {
+                ExternalOutboundProtocol::Anytls { credential } => (
+                    "anytls",
+                    json!({ "address": address, "port": port, "password": credential }),
+                ),
                 ExternalOutboundProtocol::Vless {
                     credential,
                     encryption,
@@ -1366,6 +1387,12 @@ mod tests {
     #[should_panic(expected = "xray outbound must be an object before inserting mux")]
     fn mux_insertion_fails_loudly_for_a_non_object() {
         let mut value = json!([]);
-        insert_mux(&mut value, Some(&XrayMux { concurrency: 2 }));
+        insert_mux(
+            &mut value,
+            Some(&XrayMux {
+                concurrency: 2,
+                worker_pool: None,
+            }),
+        );
     }
 }

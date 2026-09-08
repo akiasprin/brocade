@@ -66,6 +66,8 @@ pub struct AppNode {
     /// Which Agent certificate directory this node's TLS listeners use. This belongs in the
     /// application projection as well as SystemIr: a pure ingress/egress node is intentionally
     /// absent from the overlay system layer but still owns Xray listeners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_group_id: Option<String>,
     #[serde(default)]
     pub certificate_track: Option<crate::model::CertificateTrack>,
     pub public_ipv4: Option<String>,
@@ -127,6 +129,9 @@ pub struct Ingress {
     /// from one place. `None` for a machine with none issued, which only a shape that presents
     /// its own certificate has any reason to care about.
     pub certificate_name: Option<String>,
+    /// Both runtime-slot names. `certificate_name` selects new client projections; listeners use
+    /// this set so changing that selection never makes the other slot's saved SNI invalid.
+    pub certificate_names: Vec<String>,
     /// What this entrance refuses to carry. Copied from the model unchanged — the compiler decides
     /// what each flag becomes, not whether it applies.
     pub guard: crate::model::IngressGuard,
@@ -232,6 +237,7 @@ pub fn compile_app(
                 id: node.id.clone(),
                 tenant: node.tenant.clone(),
                 name: node.name.clone(),
+                certificate_group_id: node.certificate_group_id.clone(),
                 certificate_track: node.certificate_track,
                 public_ipv4: node.public_ipv4.clone(),
                 public_ipv6: node.public_ipv6.clone(),
@@ -352,6 +358,10 @@ pub fn compile_app(
                 certificate_name: node_by_id
                     .get(ingress.node.as_str())
                     .and_then(|node| node.certificate_name.clone()),
+                certificate_names: node_by_id
+                    .get(ingress.node.as_str())
+                    .map(|node| node.certificate_names.clone())
+                    .unwrap_or_default(),
                 projection: ingress.projection.clone(),
                 guard: ingress.guard,
             }
@@ -747,7 +757,9 @@ fn compile_chain_steps(
         diagnostics.push(Diagnostic::warn(
             "step.unreachable",
             format!("{}/{}", chain.id, node),
-            format!("{node} 从链头不可达（没有规则 Forward 指向它），{rule_count} 条规则不会产出"),
+            format!(
+                "{node} 从入口节点不可达（没有规则 Forward 指向它），{rule_count} 条规则不会产出"
+            ),
         ));
     }
 

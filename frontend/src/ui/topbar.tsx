@@ -18,14 +18,13 @@ export const TABS: Tab[] = [
   { key: 'nodes', label: '节点' },
   { key: 'chains', label: '链路' },
   { key: 'users', label: '用户与授权' },
-  { key: 'tenants', label: '租户' },
   { key: 'deploy', label: '发布' },
   { key: 'usage', label: '用量' },
   { key: 'settings', label: '设置' },
 ];
 
 // 底部 tab bar 只有四格——移动端从第五格开始标签会被压缩到不可读。
-// 未进入的项（租户、设置）收入抽屉，不是移除。
+// 未进入的项收入抽屉；租户管理在单租户阶段不提供入口。
 const BOTTOM_KEYS = ['nodes', 'users', 'deploy', 'usage'];
 /* 底部四格使用短标签：完整名称在 25% 屏宽下无法容纳 */
 const SHORT_LABEL: Record<string, string> = { users: '用户' };
@@ -176,9 +175,7 @@ export function Topbar({ branding, who, onLogout }: { branding: BrandingSettings
           ))}
         </div>
         <div className="who">
-          <b>{who.operator_id}</b> · {who.role}
-          <br />
-          scope {who.tenant_scope ?? '—（全局）'}
+          <b>{who.self_user?.user_id ?? who.operator_id}</b> · {who.role}
         </div>
         <button className="btn" title="改自己的登录密码" onClick={openPassword}>
           改密码
@@ -257,9 +254,7 @@ function MoreSheet({ who, onClose }: { who: Whoami; onClose: () => void }) {
 
         <p className="eyebrow">身份</p>
         <div className="sheet-who mono">
-          <b>{who.operator_id}</b> · {who.role}
-          <br />
-          scope {who.tenant_scope ?? '—（全局）'}
+          <b>{who.self_user?.user_id ?? who.operator_id}</b> · {who.role}
         </div>
         <div className="sheet-row">
           <button className="btn" onClick={go(openPassword)}>

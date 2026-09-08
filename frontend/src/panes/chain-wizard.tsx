@@ -20,6 +20,7 @@ import {
   type Rule,
   type Wires,
 } from '../api';
+import { nodeCertificateLabel } from '../certificate';
 import { can, useSession } from '../session';
 import {
   DIAL_LABEL,
@@ -75,7 +76,8 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 
 // 「＋ 新建分组…」在下拉框中的取值。前后空格与冒号不会出现在 app-xxxx 中。
 const NEW_APP = ' :new-app:';
-const ANYTLS_PORT_BASE = 18443;
+const VLESS_PORT_BASE = 13443;
+const ANYTLS_PORT_BASE = 14443;
 const HY2_PORT_BASE = 30000;
 const HY2_HOP_SPAN = 100;
 
@@ -86,6 +88,8 @@ export const NEW_CHAIN_PROTOCOL_DEFAULTS = {
 } as const;
 
 export function newChainWires({
+  vlessEncryption = false,
+  vlessEncryptionPort = 48000,
   vless,
   anytls,
   hysteria2,
@@ -93,6 +97,8 @@ export function newChainWires({
   hy2Start,
   hy2End,
 }: {
+  vlessEncryption?: boolean;
+  vlessEncryptionPort?: number;
   vless: boolean;
   anytls: boolean;
   hysteria2: boolean;
@@ -101,6 +107,7 @@ export function newChainWires({
   hy2End: number;
 }): Wires {
   return {
+    ...(vlessEncryption ? { vless_encryption: { port: vlessEncryptionPort } } : {}),
     vless: vless ? { kind: 'vless-reality' } : null,
     anytls: anytls
       ? {
@@ -162,9 +169,9 @@ export function ChainWizard({
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const settings = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const ingressBase = settings.data?.ports?.ingress_base || 8443;
+  const ingressBase = settings.data?.ports?.ingress_base || VLESS_PORT_BASE;
   const hopBase = settings.data?.ports?.hop_base || 20000;
-  // 中转端口选择 REALITY 时请求中需要填写的站点。它没有接入面的“本机证书”模式，必须
+  // 中转端口选择 REALITY 时请求中需要填写的站点。它没有接入面的本机 TLS 证书模式，必须
   // 使用已经明确配置的全局站点；没有站点时该选择会被拦截，而不是静默塞入工厂域名。
   const realitySite = {
     dest: settings.data?.reality_site?.dest ?? '',
@@ -195,6 +202,7 @@ export function ChainWizard({
   const [portEdits, setPortEdits] = useState<Record<string, PortEdit>>({});
   const [showOps, setShowOps] = useState(false);
   const [realityTargetRaw, setRealityTarget] = useState<RealityFallbackMode | '' | null>(null);
+  const [encryptionEnabled, setEncryptionEnabled] = useState(false);
   const [vlessEnabled, setVlessEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.vless);
   const [anyTlsEnabled, setAnyTlsEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.anytls);
   const [hy2Enabled, setHy2Enabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.hysteria2);
@@ -209,8 +217,9 @@ export function ChainWizard({
   // 因此在未选择之前本页无法给出任何默认值——`ready` 会拦截提交。
   const head = (nodes.data?.nodes ?? []).find(n => n.node_id === spine[0]) ?? node ?? null;
   const headLabel = head ? head.name || head.node_id : '';
-  const headCertificate =
-    snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === head?.node_id)?.certificate_name ?? null;
+  const headCertificateNode = snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === head?.node_id);
+  const headCertificate = headCertificateNode?.certificate_name ?? null;
+  const headCertificateLabel = nodeCertificateLabel(headCertificateNode?.certificate_track);
   // The ordinary case requires no extra choice: a managed node already belongs to the default
   // certificate group, so REALITY borrows that exact local identity. The selector remains visible
   // for an operator who wants the global/custom target instead.
@@ -275,8 +284,8 @@ export function ChainWizard({
     [snapshot.data, nodes.data, compile.data],
   );
 
-  // 起始值取自全局设置（settings.ports.ingress_base）：443 端口的用途由运营者决定，
-  // 使用硬编码会导致每次建链时都填入该值。
+  // VLESS 起始值取自全局设置（settings.ports.ingress_base）。常量只用于设置尚未加载时的
+  // 短暂回退；始终硬编码会让运营者修改基线后，建链向导仍填入旧值。
   const port = portRaw ?? freePortAcross(taken, [head?.node_id ?? ''], ingressBase);
 
   // The wizard exposes which protocols are created but keeps protocol tuning out of the first
@@ -296,8 +305,23 @@ export function ChainWizard({
     HY2_HOP_SPAN,
   );
   const hy2End = hy2Start + HY2_HOP_SPAN - 1;
-  const enabledProtocolCount = Number(vlessEnabled) + Number(anyTlsEnabled) + Number(hy2Enabled);
+  let encryptionPort = freePortAcross(
+    taken,
+    [head?.node_id ?? ''],
+    settings.data?.ports?.vless_encryption_base || 48000,
+  );
+  while (
+    encryptionPort < 65536 &&
+    ((vlessEnabled && encryptionPort === port) ||
+      (anyTlsEnabled && encryptionPort === anyTlsPort) ||
+      taken.get(head?.node_id ?? '')?.has(encryptionPort))
+  )
+    encryptionPort += 1;
+  const enabledProtocolCount =
+    Number(vlessEnabled) + Number(anyTlsEnabled) + Number(hy2Enabled) + Number(encryptionEnabled);
   const wires = newChainWires({
+    vlessEncryption: encryptionEnabled,
+    vlessEncryptionPort: encryptionPort,
     vless: vlessEnabled,
     anytls: anyTlsEnabled,
     hysteria2: hy2Enabled,
@@ -399,7 +423,7 @@ export function ChainWizard({
     key: `${u.tenant_id}/${u.id}`,
     // 不可选的保留在列表中并说明原因，判定和处理方式与规则编辑器的下拉框一致：
     // 直接隐藏会导致该用户从列表中消失，需要到其他位置查找。
-    blocked: under(u.tenant_id, ingressTenant) ? null : `归 ${u.tenant_id}，这条链（${ingressTenant}）看不见它`,
+    blocked: under(u.tenant_id, ingressTenant) ? null : '该用户不在当前入口的可授权范围内',
   }));
 
   // 实际会写入的授权。更换入口后重新计算，不清空 `pickedUsers`：更换机器可能使某个用户
@@ -424,18 +448,21 @@ export function ChainWizard({
     if (appMode === 'new') list.push({ op: 'upsert_app', arg: `${targetApp}「${appLabel.trim() || targetApp}」` });
     list.push({
       op: 'upsert_chain',
-      arg: `${chainId.trim()}「${chainName.trim() || chainId.trim()}」· 租户 ${head?.tenant_id ?? '—'}`,
+      arg: `${chainId.trim()}「${chainName.trim() || chainId.trim()}」`,
     });
-    const protocolNames = [vlessEnabled && 'VLESS', anyTlsEnabled && 'AnyTLS', hy2Enabled && 'Hysteria 2'].filter(
-      Boolean,
-    );
+    const protocolNames = [
+      vlessEnabled && 'VLESS · REALITY',
+      encryptionEnabled && 'VLESS · Encryption',
+      anyTlsEnabled && 'AnyTLS',
+      hy2Enabled && 'Hysteria 2',
+    ].filter(Boolean);
     list.push({
       op: 'upsert_ingress',
       arg: `${ingressId.trim()} → ${headLabel} · ${protocolNames.join(' + ')}${
         vlessEnabled
           ? ` · REALITY（${
               realityTarget === 'node-certificate'
-                ? '本机证书'
+                ? headCertificateLabel
                 : realityTarget === 'global-site'
                   ? '全局站点'
                   : realityTarget === 'custom-site'
@@ -453,7 +480,7 @@ export function ChainWizard({
           const how = dial.t === 'overlay' ? 'WireGuard' : dial.t === 'reverse' ? `反向 ${dial.v}` : dial.v;
           list.push({ op: 'put_step', arg: `${nameOf(id)}：任意 → 转发 ${nameOf(to)}（${how}）` });
         } else {
-          list.push({ op: 'put_step', arg: `${nameOf(id)}：任意 → 落地` });
+          list.push({ op: 'put_step', arg: `${nameOf(id)}：任意 → 从本机出网` });
         }
       });
     }
@@ -461,7 +488,7 @@ export function ChainWizard({
     for (const u of grantedUsers) {
       list.push({
         op: 'upsert_grant',
-        arg: `${u.tenant_id}/${u.id} → ${ingressId.trim()}`,
+        arg: `${u.id} → ${ingressId.trim()}`,
       });
     }
     return list;
@@ -484,7 +511,10 @@ export function ChainWizard({
     users.data,
     ingressTenant,
     realityTarget,
+    headCertificateLabel,
     vlessEnabled,
+    encryptionEnabled,
+    encryptionPort,
     anyTlsEnabled,
     hy2Enabled,
   ]);
@@ -615,6 +645,7 @@ export function ChainWizard({
     !ingressClash &&
     (!vlessEnabled || !portTaken) &&
     enabledProtocolCount > 0 &&
+    (!encryptionEnabled || (encryptionPort > 0 && encryptionPort < 65536)) &&
     (!anyTlsEnabled ||
       (anyTlsPort > 0 && anyTlsPort < 65536 && !portClash(taken, [head?.node_id ?? ''], anyTlsPort))) &&
     (!hy2Enabled || (hy2End <= 65535 && !spanClash(udpTaken, [head?.node_id ?? ''], hy2Start, hy2End))) &&
@@ -715,8 +746,19 @@ export function ChainWizard({
         <label className={vlessEnabled ? 'on' : ''}>
           <input type="checkbox" checked={vlessEnabled} onChange={event => setVlessEnabled(event.target.checked)} />
           <span>
-            <b>VLESS</b>
-            <small>REALITY · TCP {port}</small>
+            <b>VLESS · REALITY</b>
+            <small>传输层加密 · TCP {port}</small>
+          </span>
+        </label>
+        <label className={encryptionEnabled ? 'on' : ''}>
+          <input
+            type="checkbox"
+            checked={encryptionEnabled}
+            onChange={event => setEncryptionEnabled(event.target.checked)}
+          />
+          <span>
+            <b>VLESS · Encryption</b>
+            <small>协议层加密 · TCP {encryptionPort}</small>
           </span>
         </label>
         <label className={anyTlsEnabled ? 'on' : ''}>
@@ -738,7 +780,9 @@ export function ChainWizard({
       </div>
       {enabledProtocolCount === 0 && <p className="note warn">至少开启一个接入协议。</p>}
       {(anyTlsEnabled || hy2Enabled) && !headCertificate && head && (
-        <p className="note warn">AnyTLS（TLS）和 Hysteria 2 需要本机证书；先为 {headLabel} 分配证书组。</p>
+        <p className="note warn">
+          AnyTLS（TLS）和 Hysteria 2 需要{headCertificateLabel}；先为 {headLabel} 分配证书组。
+        </p>
       )}
 
       {/* ── 路径：一跳一行 ── */}
@@ -758,7 +802,7 @@ export function ChainWizard({
                   if (e.target.value) setSpine([e.target.value]);
                 }}
               >
-                <option value="">— 选一台当入口 —</option>
+                <option value="">— 选择入口节点 —</option>
                 {addable.map(n => (
                   <option key={n} value={n}>
                     {nameOf(n)}（{n}）
@@ -790,9 +834,9 @@ export function ChainWizard({
               <span className="idx">{String(i + 1).padStart(2, '0')}</span>
               <span className="who">
                 <b title={id}>{nameOf(id)}</b>
-                {entry && <span className="st b-role">入口</span>}
-                {last && !entry && <span className="st st-succeeded">落地</span>}
-                {!entry && !last && <span className="st">中转</span>}
+                {entry && <span className="st b-role">入口节点</span>}
+                {last && !entry && <span className="st st-succeeded">出口节点</span>}
+                {!entry && !last && <span className="st">中转节点</span>}
                 <span className="mono dim">{id}</span>
               </span>
               <span className="ctl">
@@ -862,7 +906,8 @@ export function ChainWizard({
                         >
                           <option value="">— 选择 REALITY 目标 —</option>
                           <option value="node-certificate" disabled={!headCertificate}>
-                            本机证书{headCertificate ? ` · ${headCertificate}` : '（尚未签发）'}
+                            {headCertificateLabel}
+                            {headCertificate ? ` · ${headCertificate}` : '（尚未签发）'}
                           </option>
                           <option value="global-site" disabled={!globalRealityReady}>
                             全局站点{globalRealityReady ? ` · ${realitySite.dest}` : '（尚未配置）'}
@@ -1023,7 +1068,7 @@ export function ChainWizard({
               </select>
             </span>
             <span className="ctl">
-              <span className="note">{spine.length === 1 ? '现在是直出：入口自己落地' : '末位自动落地'}</span>
+              <span className="note">{spine.length === 1 ? '当前为直出：入口节点直接出网' : '末位作为出口节点'}</span>
             </span>
           </div>
         )}
@@ -1044,7 +1089,7 @@ export function ChainWizard({
       {!head ? (
         // 链头未选择时无法计算：接入面的租户随其确定，而租户决定可授权的用户范围。
         // 此时列出全部用户供选择，会导致所选用户在后续被过滤掉且无提示。
-        <p className="note">先在上面选一台当入口——接入面归它的租户，那决定了哪些用户能连。</p>
+        <p className="note">先在上面选一台当入口——入口决定哪些用户可以授权。</p>
       ) : users.isPending ? (
         <Loading />
       ) : userRows.length === 0 ? (
@@ -1090,7 +1135,6 @@ export function ChainWizard({
                   ✓
                 </span>
                 {u.id}
-                <span className="t">{u.tenant_id}</span>
               </button>
             ))}
           </div>
@@ -1099,8 +1143,7 @@ export function ChainWizard({
             // 少于预期且无法解释，而这些用户仍显示为已勾选。勾选状态保留——
             // 切换回原机器时它们会重新生效。
             <p className="note warn">
-              换了入口之后 {droppedUsers.map(u => u.id).join('、')} 不在 <span className="mono">{ingressTenant}</span>{' '}
-              之下，本次不会为其授权。
+              换了入口之后 {droppedUsers.map(u => u.id).join('、')} 不在可授权范围，本次不会为其授权。
             </p>
           )}
         </>

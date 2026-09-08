@@ -76,6 +76,10 @@ pub struct SubscriptionDownload {
 /// on the client's own certificate check before a byte reaches us.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionSecurity {
+    VlessEncryption {
+        public_key: String,
+        options: crate::model::VlessEncryptionOptions,
+    },
     Reality(SubscriptionReality),
     Tls(SubscriptionTls),
     AnyTls(SubscriptionAnyTls),
@@ -201,7 +205,9 @@ impl Subscription {
                     hysteria.certificate_fingerprint = pins.get(&hysteria.server_name).cloned();
                     hysteria.self_signed = hysteria.certificate_fingerprint.is_some();
                 }
-                SubscriptionSecurity::Reality(_) | SubscriptionSecurity::AnyTls(_) => {}
+                SubscriptionSecurity::Reality(_)
+                | SubscriptionSecurity::AnyTls(_)
+                | SubscriptionSecurity::VlessEncryption { .. } => {}
             }
         }
     }
@@ -212,6 +218,14 @@ fn security(security: &UserSecurityPlan) -> SubscriptionSecurity {
         UserSecurityPlan::Reality(reality) => {
             SubscriptionSecurity::Reality(reality_params(reality))
         }
+        UserSecurityPlan::VlessEncryption {
+            public_key,
+            options,
+            ..
+        } => SubscriptionSecurity::VlessEncryption {
+            public_key: public_key.clone(),
+            options: options.clone(),
+        },
         UserSecurityPlan::Tls(tls) => SubscriptionSecurity::Tls(SubscriptionTls {
             server_name: tls.server_name.clone(),
             flow: tls.flow.clone(),

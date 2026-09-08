@@ -94,6 +94,7 @@ pub struct ProbeOptions {
     xray_binary: PathBuf,
     runtime_dir: PathBuf,
     cancellation: ProbeCancellation,
+    warm_up: bool,
 }
 
 impl Default for ProbeOptions {
@@ -102,6 +103,7 @@ impl Default for ProbeOptions {
             xray_binary: PathBuf::from("xray"),
             runtime_dir: std::env::temp_dir(),
             cancellation: ProbeCancellation::default(),
+            warm_up: true,
         }
     }
 }
@@ -112,6 +114,7 @@ impl ProbeOptions {
             xray_binary: xray_binary.into(),
             runtime_dir: std::env::temp_dir(),
             cancellation,
+            warm_up: true,
         }
     }
 
@@ -119,6 +122,14 @@ impl ProbeOptions {
     /// systemd RuntimeDirectory; Agents retain the established system temporary directory.
     pub fn with_runtime_dir(mut self, runtime_dir: impl Into<PathBuf>) -> Self {
         self.runtime_dir = runtime_dir.into();
+        self
+    }
+
+    /// Measure the first real request instead of sending an unmeasured warm-up first.
+    /// Callers can opt into cold-request timing. User grant checks and periodic telemetry
+    /// keep warm-up enabled by default.
+    pub fn without_warm_up(mut self) -> Self {
+        self.warm_up = false;
         self
     }
 
@@ -245,19 +256,14 @@ fn probe_once(
                 format!("探测进程没起来：{}", process.take_output()),
             ));
         }
-        // Send one warm-up request and measure the second: the first pays for
-        // xray's cold start (process init, loading geoip/geosite), which is the
-        // probe's own overhead and would add a constant to every chain. The
-        // handshake neither can nor should be skipped — xray does not reuse
-        // outbound connections by default, and a user waits for it on every new
-        // connection too. A failed warm-up fails outright without a second
-        // request: a broken chain breaks again and only costs another timeout.
         if options.cancellation.is_cancelled() {
             return Err((E2eProbeStatus::Unsupported, "拨测已取消".to_owned()));
         }
-        run_probe(socks_port, &endpoint, timeout, &options.cancellation)?;
-        if options.cancellation.is_cancelled() {
-            return Err((E2eProbeStatus::Unsupported, "拨测已取消".to_owned()));
+        if options.warm_up {
+            run_probe(socks_port, &endpoint, timeout, &options.cancellation)?;
+            if options.cancellation.is_cancelled() {
+                return Err((E2eProbeStatus::Unsupported, "拨测已取消".to_owned()));
+            }
         }
         run_probe(socks_port, &endpoint, timeout, &options.cancellation)
     })();
@@ -318,11 +324,11 @@ fn judge_exit(target: &E2eProbeTarget, exit_ip: Option<&str>) -> E2eExitVerdict 
 fn mismatch_detail(target: &E2eProbeTarget, verdict: E2eExitVerdict) -> Option<String> {
     match verdict {
         E2eExitVerdict::Mismatch => Some(format!(
-            "通了，但出口 IP 不在这条链的出口机器上（期望 {}）",
+            "通了，但出口 IP 不在这条链的出口节点上（期望 {}）",
             target.expected_exit_ips.join("、")
         )),
         E2eExitVerdict::Unknown if target.expected_exit_ips.is_empty() => {
-            Some("出口机器在 NAT 后面或没有公网地址，核对不了从哪儿出去的".to_owned())
+            Some("出口节点在 NAT 后面或没有公网地址，核对不了从哪儿出去的".to_owned())
         }
         _ => None,
     }
@@ -352,7 +358,7 @@ fn client_config(target: &E2eProbeTarget, socks_port: u16, log_path: &str) -> St
             "port": target.port,
             "users": [{
                 "id": target.uuid,
-                "encryption": "none",
+                "encryption": target.vless_encryption.as_deref().unwrap_or("none"),
             }],
         }],
     });
@@ -572,6 +578,9 @@ fn hysteria_client_config(
 /// The client half of what the ingress's own artifact says, assembled from the two axes the
 /// target names: which certificate to expect, and whether the stream is carried inside HTTP.
 fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
+    if target.vless_encryption.is_some() {
+        return serde_json::json!({ "network": "tcp", "security": "none" });
+    }
     let mut settings = match &target.tls {
         // A certificate of the machine's own: nothing to configure but the name, which the
         // client checks the certificate against — so a wrong one fails here rather than at the
@@ -1098,8 +1107,15 @@ fn read_exact_until(
 mod tests {
     use super::*;
 
+    #[test]
+    fn warm_up_is_default_but_can_be_disabled_for_interactive_checks() {
+        assert!(ProbeOptions::default().warm_up);
+        assert!(!ProbeOptions::default().without_warm_up().warm_up);
+    }
+
     fn target(expected: &[&str]) -> E2eProbeTarget {
         E2eProbeTarget {
+            vless_encryption: None,
             app_id: Some("app".to_owned()),
             chain_id: "c1".to_owned(),
             chain_name: "链".to_owned(),
@@ -1471,6 +1487,26 @@ mod tests {
         );
         assert!(outbound["settings"].get("vnext").is_none());
         assert!(outbound["streamSettings"].get("realitySettings").is_none());
+    }
+
+    #[test]
+    fn native_encryption_probe_uses_its_key_and_plain_tcp_transport() {
+        let mut t = target(&[]);
+        t.vless_encryption = Some("mlkem768x25519plus.native.0rtt.public-key".to_owned());
+        t.reality.flow = None;
+        let value: serde_json::Value =
+            serde_json::from_str(&client_config(&t, 10800, "/tmp/probe-test.log")).unwrap();
+        let outbound = &value["outbounds"][0];
+        assert_eq!(
+            outbound["settings"]["vnext"][0]["users"][0]["encryption"],
+            t.vless_encryption.unwrap()
+        );
+        assert_eq!(outbound["streamSettings"]["network"], "tcp");
+        assert_eq!(outbound["streamSettings"]["security"], "none");
+        assert!(outbound["streamSettings"].get("realitySettings").is_none());
+        assert!(outbound["settings"]["vnext"][0]["users"][0]
+            .get("flow")
+            .is_none());
     }
 
     #[test]

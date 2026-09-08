@@ -291,6 +291,8 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4]) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_names: Vec::new(),
+        certificate_group_id: None,
         certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),

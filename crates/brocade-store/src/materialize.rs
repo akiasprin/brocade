@@ -9,10 +9,10 @@ use brocade_core::model::{
     Accept, Action, AnyTls, AnyTlsMasquerade, AnyTlsSecurity, AppView, Chain, ConnectionSettings,
     DestMatch, DisabledWireGuardLink, Dns, ExternalOutbound, ExternalOutboundProtocol,
     ExternalOutboundSecurity, ExternalWarpBinding, Front, FrontStrategy, GeodataSettings, Grant,
-    HopDial, HopIn, HopPool, Hysteria2, HysteriaBandwidth, HysteriaBbrProfile, HysteriaCongestion,
-    HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, HysteriaQuic, Ingress, IngressGuard,
-    IngressIdentity, IngressWires, IngressWiresWire, ModelSettings, ModelSnapshot, Network, Node,
-    NodeConnection, OverlaySettings, PortSettings, ProbeSettings, Projection,
+    HopDial, HopIn, HopMux, HopPool, Hysteria2, HysteriaBandwidth, HysteriaBbrProfile,
+    HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, HysteriaQuic, Ingress,
+    IngressGuard, IngressIdentity, IngressWires, IngressWiresWire, ModelSettings, ModelSnapshot,
+    Network, Node, NodeConnection, OverlaySettings, PortSettings, ProbeSettings, Projection,
     ProjectionDownloadEndpoint, ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits,
     RealityFallbackMode, RealitySettings, RealitySite, RealityXhttp, Rule, Step, Tls, TlsXhttp,
     Transport, User, WireGuardKeys, Xhttp, XhttpMode,
@@ -149,11 +149,14 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             reality_fingerprint, \
             reality_flow, \
             anytls_padding_scheme, \
-            port_ingress_base, port_anytls_base, port_hop_base, port_hy2_base, \
+            port_ingress_base, port_anytls_base, port_vless_encryption_base, port_hop_base, port_hy2_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
-            conn_buffer_size_kb, conn_handshake_secs, stats_user_online \
+            conn_buffer_size_kb, conn_handshake_secs, stats_user_online, \
+            relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
+            relay_mux_max_probing_workers, relay_mux_probe_interval_secs, \
+            relay_mux_probe_timeout_ms, relay_mux_idle_ttl_secs, relay_mux_max_requests_per_worker \
          FROM control_state WHERE id = TRUE",
     )
     .fetch_one(pool)
@@ -195,6 +198,10 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             )?,
         },
         ports: PortSettings {
+            vless_encryption_base: u16_column(
+                "control_state.port_vless_encryption_base",
+                state.try_get("port_vless_encryption_base")?,
+            )?,
             ingress_base: u16_column(
                 "control_state.port_ingress_base",
                 state.try_get("port_ingress_base")?,
@@ -243,6 +250,7 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
                 state.try_get("conn_handshake_secs")?,
             )?,
         },
+        relay_mux: hop_mux_from_row(&state)?,
         stats_user_online: state.try_get("stats_user_online")?,
         geodata: GeodataSettings {
             cron: state.try_get("geodata_cron")?,
@@ -780,11 +788,14 @@ pub(crate) async fn load_current_snapshot_tx(
             reality_fingerprint, \
             reality_flow, \
             anytls_padding_scheme, \
-            port_ingress_base, port_anytls_base, port_hop_base, port_hy2_base, \
+            port_ingress_base, port_anytls_base, port_vless_encryption_base, port_hop_base, port_hy2_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
-            conn_buffer_size_kb, conn_handshake_secs, stats_user_online \
+            conn_buffer_size_kb, conn_handshake_secs, stats_user_online, \
+            relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
+            relay_mux_max_probing_workers, relay_mux_probe_interval_secs, \
+            relay_mux_probe_timeout_ms, relay_mux_idle_ttl_secs, relay_mux_max_requests_per_worker \
          FROM control_state WHERE id = TRUE",
     )
     .fetch_one(&mut **tx)
@@ -826,6 +837,10 @@ pub(crate) async fn load_current_snapshot_tx(
             )?,
         },
         ports: PortSettings {
+            vless_encryption_base: u16_column(
+                "control_state.port_vless_encryption_base",
+                state.try_get("port_vless_encryption_base")?,
+            )?,
             ingress_base: u16_column(
                 "control_state.port_ingress_base",
                 state.try_get("port_ingress_base")?,
@@ -874,6 +889,7 @@ pub(crate) async fn load_current_snapshot_tx(
                 state.try_get("conn_handshake_secs")?,
             )?,
         },
+        relay_mux: hop_mux_from_row(&state)?,
         stats_user_online: state.try_get("stats_user_online")?,
         geodata: GeodataSettings {
             cron: state.try_get("geodata_cron")?,
@@ -960,6 +976,7 @@ async fn load_nodes(pool: &PgPool) -> Result<Vec<Node>> {
             -- certificate. A group with nothing serving yields NULL here, which is what makes
             -- `ingress.tls-no-certificate` fire instead of publishing an ingress whose every
             -- connection would fail at the TLS handshake.
+            (SELECT label_id FROM node_cert_label WHERE node_id = nodes.id) AS certificate_group_id, \
             (SELECT COALESCE(c.certificate_name, l.certificate_name, l.label || '.' || d.domain) \
                FROM node_cert_label m \
                JOIN cert_labels l ON l.id = m.label_id \
@@ -967,6 +984,22 @@ async fn load_nodes(pool: &PgPool) -> Result<Vec<Node>> {
                JOIN certificates c ON c.label_id = l.id AND c.status = 'serving' \
               WHERE m.node_id = nodes.id
                 AND c.expires_at > now()) AS certificate_name, \
+            ARRAY(SELECT COALESCE(slot.certificate_name, l.certificate_name, l.label || '.' || d.domain) \
+               FROM node_cert_label m \
+               JOIN cert_labels l ON l.id = m.label_id \
+               JOIN cert_domains d ON d.id = l.domain_id \
+               JOIN certificates slot ON slot.label_id = l.id \
+              WHERE m.node_id = nodes.id \
+                AND slot.status IN ('ready', 'serving', 'compatible') \
+                AND slot.expires_at > now() \
+                AND (slot.acme_directory = 'self-signed') = ( \
+                    SELECT serving.acme_directory = 'self-signed' \
+                      FROM certificates serving \
+                     WHERE serving.label_id = l.id AND serving.status = 'serving' \
+                       AND serving.expires_at > now() \
+                ) \
+              ORDER BY CASE slot.status WHEN 'serving' THEN 0 WHEN 'compatible' THEN 1 ELSE 2 END, \
+                       slot.runtime_slot, slot.id) AS certificate_names, \
             (SELECT CASE WHEN c.acme_directory = 'self-signed' THEN 'self-signed' ELSE 'public-ca' END \
                FROM node_cert_label m \
                JOIN certificates c ON c.label_id = m.label_id AND c.status = 'serving' \
@@ -991,6 +1024,7 @@ async fn load_nodes_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<Node>> 
             -- certificate. A group with nothing serving yields NULL here, which is what makes
             -- `ingress.tls-no-certificate` fire instead of publishing an ingress whose every
             -- connection would fail at the TLS handshake.
+            (SELECT label_id FROM node_cert_label WHERE node_id = nodes.id) AS certificate_group_id, \
             (SELECT COALESCE(c.certificate_name, l.certificate_name, l.label || '.' || d.domain) \
                FROM node_cert_label m \
                JOIN cert_labels l ON l.id = m.label_id \
@@ -998,6 +1032,22 @@ async fn load_nodes_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<Node>> 
                JOIN certificates c ON c.label_id = l.id AND c.status = 'serving' \
               WHERE m.node_id = nodes.id
                 AND c.expires_at > now()) AS certificate_name, \
+            ARRAY(SELECT COALESCE(slot.certificate_name, l.certificate_name, l.label || '.' || d.domain) \
+               FROM node_cert_label m \
+               JOIN cert_labels l ON l.id = m.label_id \
+               JOIN cert_domains d ON d.id = l.domain_id \
+               JOIN certificates slot ON slot.label_id = l.id \
+              WHERE m.node_id = nodes.id \
+                AND slot.status IN ('ready', 'serving', 'compatible') \
+                AND slot.expires_at > now() \
+                AND (slot.acme_directory = 'self-signed') = ( \
+                    SELECT serving.acme_directory = 'self-signed' \
+                      FROM certificates serving \
+                     WHERE serving.label_id = l.id AND serving.status = 'serving' \
+                       AND serving.expires_at > now() \
+                ) \
+              ORDER BY CASE slot.status WHEN 'serving' THEN 0 WHEN 'compatible' THEN 1 ELSE 2 END, \
+                       slot.runtime_slot, slot.id) AS certificate_names, \
             (SELECT CASE WHEN c.acme_directory = 'self-signed' THEN 'self-signed' ELSE 'public-ca' END \
                FROM node_cert_label m \
                JOIN certificates c ON c.label_id = m.label_id AND c.status = 'serving' \
@@ -1027,11 +1077,16 @@ fn node_from_row(row: &sqlx::postgres::PgRow) -> Result<Node> {
             .map(|value| u32_column(column, value))
             .transpose()
     };
+    let mut certificate_names = row.try_get::<Vec<String>, _>("certificate_names")?;
+    let mut seen_certificate_names = std::collections::BTreeSet::new();
+    certificate_names.retain(|name| seen_certificate_names.insert(name.clone()));
     Ok(Node {
         // Only a certificate that reached 'ready' counts. One still being issued, or whose last
         // attempt failed, is a name nothing answers to yet — and an ingress compiled against it
         // would hand out subscriptions naming a certificate that does not exist.
         certificate_name: row.try_get("certificate_name")?,
+        certificate_names,
+        certificate_group_id: row.try_get("certificate_group_id")?,
         certificate_track: match row
             .try_get::<Option<String>, _>("certificate_track")?
             .as_deref()
@@ -1179,6 +1234,7 @@ fn external_outbound_from_row(
     };
     let options = row.try_get::<Value, _>("protocol_options")?;
     let protocol = match stored_protocol.as_str() {
+        "anytls" => ExternalOutboundProtocol::Anytls { credential },
         "vless" => ExternalOutboundProtocol::Vless {
             credential,
             encryption: options
@@ -1649,6 +1705,7 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
+            vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options, \
             transport_kind, anytls_enabled, anytls_security, anytls_reality, \
             anytls_reality_private_key, anytls_reality_public_key, anytls_reality_short_ids, \
             anytls_port, anytls_padding_scheme, \
@@ -1701,6 +1758,7 @@ async fn load_ingresses_tx(
             reality_server_names, reality_fingerprint, reality_flow, \
             reality_fallback_mode, reality_fallback_limits, reality_fallback_guard, \
             hy2_port, hy2_hop_start, hy2_hop_end, \
+            vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options, \
             transport_kind, anytls_enabled, anytls_security, anytls_reality, \
             anytls_reality_private_key, anytls_reality_public_key, anytls_reality_short_ids, \
             anytls_port, anytls_padding_scheme, \
@@ -1967,6 +2025,19 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
         });
     let quic = row.try_get::<bool, _>("hy2_enabled")?.then_some(hysteria2);
     let wires = IngressWires::try_from(IngressWiresWire {
+        vless_encryption: row
+            .try_get::<Option<i32>, _>("vless_encryption_port")?
+            .map(|port| -> Result<_> {
+                Ok(brocade_core::model::VlessEncryption {
+                    port: u16::try_from(port).map_err(|_| {
+                        StoreError::InvalidData("invalid VLESS Encryption port".to_owned())
+                    })?,
+                    private_key: text(row, "vless_encryption_private_key")?,
+                    public_key: text(row, "vless_encryption_public_key")?,
+                    options: serde_json::from_value(row.try_get("vless_encryption_options")?)?,
+                })
+            })
+            .transpose()?,
         vless,
         anytls,
         hysteria2: quic,
@@ -2541,9 +2612,51 @@ impl From<ipnet::AddrParseError> for StoreError {
     }
 }
 
+fn u32_bigint_column(location: &str, value: i64) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| StoreError::InvalidData(format!("{location} out of range: {value}")))
+}
+
 fn u32_column(location: &str, value: i32) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| StoreError::InvalidData(format!("{location} out of range: {value}")))
+}
+
+fn hop_mux_from_row(row: &sqlx::postgres::PgRow) -> Result<HopMux> {
+    Ok(HopMux {
+        concurrency: u16_column(
+            "control_state.relay_mux_concurrency",
+            row.try_get("relay_mux_concurrency")?,
+        )?,
+        min_idle_workers: u32_bigint_column(
+            "control_state.relay_mux_min_idle_workers",
+            row.try_get("relay_mux_min_idle_workers")?,
+        )?,
+        max_idle_workers: u32_bigint_column(
+            "control_state.relay_mux_max_idle_workers",
+            row.try_get("relay_mux_max_idle_workers")?,
+        )?,
+        max_probing_workers: u32_bigint_column(
+            "control_state.relay_mux_max_probing_workers",
+            row.try_get("relay_mux_max_probing_workers")?,
+        )?,
+        probe_interval_secs: u16_column(
+            "control_state.relay_mux_probe_interval_secs",
+            row.try_get("relay_mux_probe_interval_secs")?,
+        )?,
+        probe_timeout_ms: u32_column(
+            "control_state.relay_mux_probe_timeout_ms",
+            row.try_get("relay_mux_probe_timeout_ms")?,
+        )?,
+        idle_ttl_secs: u32_bigint_column(
+            "control_state.relay_mux_idle_ttl_secs",
+            row.try_get("relay_mux_idle_ttl_secs")?,
+        )?,
+        max_requests_per_worker: u16_column(
+            "control_state.relay_mux_max_requests_per_worker",
+            row.try_get("relay_mux_max_requests_per_worker")?,
+        )?,
+    })
 }
 
 fn u16_column(location: &str, value: i32) -> Result<u16> {

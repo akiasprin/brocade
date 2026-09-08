@@ -13,7 +13,6 @@ import { DiagTable } from '../ui/diag-table';
 import type { Win } from '../wm/store';
 import { NodesPane } from './nodes';
 import { DeployPane } from './deploy';
-import { TenantsPane } from './tenants';
 import { UsersPane } from './users';
 import { PasswordPane } from './password';
 import { UsagePane } from './usage';
@@ -29,8 +28,6 @@ export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
       return <ChainsPane win={win} />;
     case 'tab:deploy':
       return <DeployPane win={win} />;
-    case 'tab:tenants':
-      return <TenantsPane />;
     case 'tab:users':
       return <UsersPane win={win} bare={bare} />;
     case 'tab:usage':

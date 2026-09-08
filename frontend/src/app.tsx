@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  DEFAULT_BRANDING,
   fetchAuthState,
   fetchBranding,
+  initialBranding,
   fetchSessionWhoami,
   logoutAdmin,
   type BrandingSettings,
@@ -49,8 +49,15 @@ async function restorePublic() {
 
 export function App() {
   const queryClient = useQueryClient();
-  const brandingQuery = useQuery({ queryKey: ['branding'], queryFn: fetchBranding, retry: false });
-  const branding = brandingQuery.data ?? DEFAULT_BRANDING;
+  const brandingQuery = useQuery({
+    queryKey: ['branding'],
+    queryFn: fetchBranding,
+    retry: false,
+    initialData: initialBranding,
+    initialDataUpdatedAt: 0,
+  });
+  // A failed request is not evidence that the operator chose the product defaults.
+  const branding = brandingQuery.data ?? { site_name: '控制台', icon_data_url: null };
   /* 浏览器会话依赖 HttpOnly cookie；内存中只保存 whoami，用于菜单和权限提示。 */
   const [session, setSession] = useState<Session | null>(null);
   // 刷新后先用 cookie 恢复会话：恢复完成前渲染空白占位，避免短暂显示登录页。
@@ -60,7 +67,9 @@ export function App() {
   // enters, otherwise an administrator's cached user list can survive into a public session.
   const onLogin = useCallback(
     (next: Session) => {
+      const branding = queryClient.getQueryData<BrandingSettings>(['branding']);
       queryClient.clear();
+      if (branding) queryClient.setQueryData(['branding'], branding);
       setSession(next);
     },
     [queryClient],
@@ -74,10 +83,10 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    document.title = `${branding.site_name} | 跨境网络小管家`;
-  }, [branding.site_name]);
+    if (brandingQuery.data) document.title = `${brandingQuery.data.site_name} | 跨境网络小管家`;
+  }, [brandingQuery.data]);
 
-  if (restoring) return <div id="stage" />;
+  if (restoring || brandingQuery.isPending) return <div id="stage" />;
   if (!session)
     return (
       <>
@@ -101,7 +110,9 @@ export function App() {
       /* 撤销请求失败（网络异常等）也继续进入登录页：用户已表达退出意图，cookie 可能已失效 */
     }
     setSession(null);
+    const currentBranding = queryClient.getQueryData<BrandingSettings>(['branding']);
     queryClient.clear();
+    if (currentBranding) queryClient.setQueryData(['branding'], currentBranding);
   };
 
   return (

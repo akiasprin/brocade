@@ -566,6 +566,14 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
             .targets
             .into_iter()
             .map(|target| E2eProbeTarget {
+                vless_encryption: match &target.security {
+                    ProbeSecurity::VlessEncryption {
+                        public_key,
+                        options,
+                        ..
+                    } => Some(options.encryption(public_key)),
+                    _ => None,
+                },
                 app_id: target.app_id,
                 chain_id: target.chain_id,
                 chain_name: target.chain_name,
@@ -594,7 +602,8 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     // Filler beside a `tls` block that supersedes it. Empty rather than absent
                     // because the field is what an older agent parses, and one that cannot be
                     // parsed costs that agent every other probe on the machine.
-                    ProbeSecurity::Tls(_)
+                    ProbeSecurity::VlessEncryption { .. }
+                    | ProbeSecurity::Tls(_)
                     | ProbeSecurity::AnyTls(_)
                     | ProbeSecurity::Hysteria2(_) => E2eProbeReality {
                         public_key: String::new(),
@@ -656,7 +665,8 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     _ => None,
                 },
                 tls: match &target.security {
-                    ProbeSecurity::Reality(_)
+                    ProbeSecurity::VlessEncryption { .. }
+                    | ProbeSecurity::Reality(_)
                     | ProbeSecurity::AnyTls(_)
                     | ProbeSecurity::Hysteria2(_) => None,
                     ProbeSecurity::Tls(tls) => Some(E2eProbeTls {

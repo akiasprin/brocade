@@ -29,7 +29,9 @@ pub fn subscription_with_options(subscription: &Subscription, options: UriRender
             SubscriptionSecurity::Tls(tls) => tls.self_signed,
             SubscriptionSecurity::AnyTls(anytls) => anytls.self_signed,
             SubscriptionSecurity::Hysteria2(hysteria) => hysteria.self_signed,
-            SubscriptionSecurity::Reality(_) => false,
+            SubscriptionSecurity::Reality(_) | SubscriptionSecurity::VlessEncryption { .. } => {
+                false
+            }
         };
         if self_signed {
             // VLESS has no interoperable URI field for a self-signed certificate pin, and current Xray
@@ -116,6 +118,14 @@ fn entry_uri(entry: &SubscriptionEntry, options: UriRenderOptions) -> String {
             query.push(("pbk", reality.public_key.clone()));
             query.push(("sid", reality.short_id.clone()));
             reality.flow.clone()
+        }
+        SubscriptionSecurity::VlessEncryption {
+            public_key,
+            options,
+        } => {
+            query[0].1 = options.encryption(public_key);
+            query.push(("security", "none".to_owned()));
+            None
         }
         SubscriptionSecurity::Tls(tls) => {
             query.push(("security", "tls".to_owned()));

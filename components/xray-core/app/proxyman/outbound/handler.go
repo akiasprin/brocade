@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"time"
 
 	"github.com/xtls/xray-core/common/dice"
 
@@ -120,7 +121,30 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 	}
 
 	if h.senderSettings != nil && h.senderSettings.MultiplexSettings != nil {
-		if config := h.senderSettings.MultiplexSettings; config.Enabled {
+		config := h.senderSettings.MultiplexSettings
+		if config.WorkerPool != nil && !config.Enabled {
+			return nil, errors.New("mux worker pool requires enabled mux")
+		}
+		if config.Enabled {
+			var workerPool *mux.WorkerPoolConfig
+			maxRequests := uint32(128)
+			if pool := config.WorkerPool; pool != nil {
+				if config.Concurrency < 1 || config.Concurrency > 128 || config.XudpConcurrency > 128 {
+					return nil, errors.New("mux worker pool requires concurrency between 1 and 128")
+				}
+				workerPool = &mux.WorkerPoolConfig{
+					MinIdleWorkers:    pool.MinIdleWorkers,
+					MaxIdleWorkers:    pool.MaxIdleWorkers,
+					MaxProbingWorkers: pool.MaxProbingWorkers,
+					ProbeInterval:     time.Duration(pool.ProbeIntervalSecs) * time.Second,
+					ProbeTimeout:      time.Duration(pool.ProbeTimeoutMs) * time.Millisecond,
+					IdleTTL:           time.Duration(pool.IdleTtlSecs) * time.Second,
+				}
+				maxRequests = pool.MaxRequestsPerWorker
+				if err := workerPool.Validate(maxRequests); err != nil {
+					return nil, errors.New("invalid mux worker pool").Base(err)
+				}
+			}
 			if config.Concurrency < 0 {
 				h.mux = &mux.ClientManager{Enabled: false}
 			}
@@ -131,12 +155,15 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				h.mux = &mux.ClientManager{
 					Enabled: true,
 					Picker: &mux.IncrementalWorkerPicker{
+						Pool: workerPool,
+						Tag:  h.tag,
 						Factory: &mux.DialingWorkerFactory{
 							Proxy:  proxyHandler,
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.Concurrency),
-								MaxConnection:  128,
+								MaxConnection:  maxRequests,
+								WorkerPool:     workerPool,
 							},
 						},
 					},
@@ -152,12 +179,15 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				h.xudp = &mux.ClientManager{
 					Enabled: true,
 					Picker: &mux.IncrementalWorkerPicker{
+						Pool: workerPool,
+						Tag:  h.tag,
 						Factory: &mux.DialingWorkerFactory{
 							Proxy:  proxyHandler,
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.XudpConcurrency),
-								MaxConnection:  128,
+								MaxConnection:  maxRequests,
+								WorkerPool:     workerPool,
 							},
 						},
 					},
@@ -381,8 +411,20 @@ func (h *Handler) Start() error {
 // Close implements common.Closable.
 func (h *Handler) Close() error {
 	common.Close(h.mux)
+	common.Close(h.xudp)
 	common.Close(h.proxy)
 	return nil
+}
+
+// Drain stops background Mux probes and replenishment after a live outbound
+// removal while allowing sessions already using the handler to finish.
+func (h *Handler) Drain() {
+	if h.mux != nil {
+		h.mux.Drain()
+	}
+	if h.xudp != nil {
+		h.xudp.Drain()
+	}
 }
 
 // SenderSettings implements outbound.Handler.

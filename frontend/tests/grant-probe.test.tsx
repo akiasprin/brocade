@@ -95,20 +95,21 @@ describe('user grant probe', () => {
     const results = view.container.querySelectorAll<HTMLElement>('.grant-probe-result');
     const matrix = view.container.querySelector<HTMLElement>('.grant-probe-matrix');
     expect(results).toHaveLength(2);
-    // 三种协议各有 V4/V6 两格。CSS 读取同一个槽位数，不会在新增协议后仍按旧的四列排版。
-    expect(matrix?.children).toHaveLength(6);
-    expect(matrix?.style.getPropertyValue('--grant-probe-slot-count')).toBe('6');
+    // 四种协议各有 V4/V6 两格。CSS 读取同一个槽位数，不会在新增协议后仍按旧的四列排版。
+    expect(matrix?.children).toHaveLength(8);
+    expect(matrix?.style.getPropertyValue('--grant-probe-slot-count')).toBe('8');
     expect(view.container.querySelectorAll('.grant-probe-result.missing')).toHaveLength(0);
     const tableHead = view.container.querySelector('.grant-probe-table-head');
     expect(tableHead).toBeTruthy();
-    expect(tableHead?.querySelectorAll('.grant-probe-matrix-head > span')).toHaveLength(6);
+    expect(tableHead?.querySelectorAll('.grant-probe-matrix-head > span')).toHaveLength(8);
     expect(tableHead?.textContent).toContain('线路 / Route');
     expect(tableHead?.textContent).toContain('AnyTLS');
     expect(results[0].dataset).toMatchObject({ protocol: 'VLESS', stack: 'V4' });
     expect(results[1].dataset).toMatchObject({ protocol: 'Hysteria2', stack: 'V6' });
     expect((view.getByRole('button', { name: '重试失败项' }) as HTMLButtonElement).disabled).toBe(true);
-    expect(view.getByText(/真实用户凭据/)).toBeTruthy();
-    expect(view.getByText(/计入该用户用量/)).toBeTruthy();
+    const foot = view.getByText(/真实用户凭据/);
+    expect(foot.classList.contains('user-dcard-foot')).toBe(true);
+    expect(foot.textContent).toMatch(/计入该用户用量/);
     fireEvent.click(view.getByRole('button', { name: '拨测' }));
 
     await view.findAllByText('42ms');
@@ -149,7 +150,7 @@ describe('user grant probe', () => {
     const view = render(<GrantProbePanel user={user} readOnly />, { wrapper: wrapper() });
 
     expect(await view.findByText('伦敦入口')).toBeTruthy();
-    expect(view.getByText(/只读查看/)).toBeTruthy();
+    expect(view.queryByText(/只读查看/)).toBeNull();
     expect((view.getByRole('button', { name: '拨测全部' }) as HTMLButtonElement).disabled).toBe(true);
     expect((view.getByRole('button', { name: '拨测' }) as HTMLButtonElement).disabled).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -252,4 +253,21 @@ describe('user grant probe', () => {
     expect(await view.findAllByText('44ms', {}, { timeout: 3_000 })).toHaveLength(2);
     expect(fetchMock.mock.calls.some(([input]) => String(input) === '/grant-probes/p-live')).toBe(true);
   });
+});
+
+it('单独的 VLESS Encryption 入站也显示在拨测矩阵中', async () => {
+  const nativePlan = {
+    ...plan,
+    items: [{ ...plan.items[0], id: 'native', name: '加密入口 | VLESS Encryption', protocol: 'vless-encryption' }],
+  };
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === '/grant-probes/capability') return jsonResponse({ available: true });
+      return jsonResponse(nativePlan);
+    }),
+  );
+  const view = render(<GrantProbePanel user={user} />, { wrapper: wrapper() });
+  expect(await view.findByText('加密入口')).toBeTruthy();
+  expect(view.getByLabelText('VLESS · Encryption · V4：尚未验证')).toBeTruthy();
 });

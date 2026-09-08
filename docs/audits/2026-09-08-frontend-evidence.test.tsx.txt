@@ -1,0 +1,340 @@
+// Audit evidence: assertions describe observed defects, not desired behavior.
+import { useEffect } from 'react';
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+window.matchMedia = ((media: string) => ({
+  matches: false,
+  media,
+  addEventListener() {},
+  removeEventListener() {},
+})) as unknown as typeof window.matchMedia;
+const { draft } = await import('../src/draft');
+const { DraftBar } = await import('../src/forge/draft-bar');
+const { SessionProvider } = await import('../src/session');
+const { parse } = await import('../src/forge/route');
+const { Login } = await import('../src/ui/login');
+const { fetchSnapshot } = await import('../src/api');
+const who = {
+  operator_id: 'audit',
+  role: 'system-admin' as const,
+  tenant_scope: null,
+  token_prefix: null,
+  masked_assets: false,
+};
+const clients: QueryClient[] = [];
+function client() {
+  const qc = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: 5000, refetchOnWindowFocus: false, refetchOnReconnect: false },
+      mutations: { retry: false },
+    },
+  });
+  clients.push(qc);
+  return qc;
+}
+function json(body: unknown) {
+  return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => (resolve = r));
+  return { promise, resolve };
+}
+afterEach(() => {
+  cleanup();
+  clients.forEach(qc => qc.clear());
+  clients.length = 0;
+  draft.clear();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+it('F01: successful submission clears edits added after request was sent', async () => {
+  draft.init('audit-submit');
+  draft.clear();
+  draft.push({ op: 'update_node', node_id: 'A', node: { name: 'submitted' } });
+  const response = deferred<Response>();
+  let sent: unknown;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((_path, init) => {
+      sent = JSON.parse(init.body);
+      return response.promise;
+    }),
+  );
+  render(
+    <QueryClientProvider client={client()}>
+      <SessionProvider value={{ who }}>
+        <DraftBar current={1} />
+      </SessionProvider>
+    </QueryClientProvider>,
+  );
+  fireEvent.click(screen.getByRole('button', { name: '提交' }));
+  await waitFor(() => expect(sent).toBeDefined());
+  act(() => draft.push({ op: 'update_node', node_id: 'B', node: { name: 'never submitted' } }));
+  expect(draft.ops()).toHaveLength(2);
+  await act(async () => response.resolve(json({ revision_id: 2 })));
+  await waitFor(() => expect(draft.ops()).toHaveLength(0));
+  expect(JSON.stringify(sent)).not.toContain('never submitted');
+});
+it('F02: foreign tab storage update is ignored and overwritten by the next local edit', () => {
+  draft.init('audit-tabs');
+  draft.clear();
+  const key = 'brocade-console:draft:v2:audit-tabs';
+  const remote = JSON.stringify([
+    { key: 'node:A', label: 'remote', op: { op: 'update_node', node_id: 'A', node: { name: 'remote edit' } } },
+  ]);
+  localStorage.setItem(key, remote);
+  window.dispatchEvent(new StorageEvent('storage', { key, newValue: remote, storageArea: localStorage }));
+  expect(draft.ops()).toHaveLength(0);
+  draft.push({ op: 'update_node', node_id: 'B', node: { name: 'local edit' } });
+  expect(localStorage.getItem(key)).not.toContain('remote edit');
+});
+it('F03: malformed percent encoded route throws before the shell can render', () => {
+  expect(() => parse('#/nodes/node/%')).toThrow(URIError);
+});
+it('F04: malformed stored entries survive restore and crash ops consumers', () => {
+  localStorage.setItem('brocade-console:draft:v2:audit-corrupt', '[{}]');
+  draft.init('audit-corrupt');
+  expect(draft.ops()).toEqual([undefined]);
+  expect(() => draft.ops().find(op => op.op === 'update_settings')).toThrow(TypeError);
+});
+it('F05: login screen automatically restores a still-valid session after failed logout', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async path => json(path === '/auth/state' ? { initialized: true, public_open: false } : who)),
+  );
+  const onLogin = vi.fn();
+  render(
+    <QueryClientProvider client={client()}>
+      <Login branding={{ site_name: 'Audit', icon_data_url: null }} onLogin={onLogin} />
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(onLogin).toHaveBeenCalledWith({ who }));
+});
+function SnapshotReader() {
+  const qc = useQueryClient();
+  useEffect(
+    () =>
+      draft.subscribe(() => {
+        void qc.invalidateQueries({ queryKey: ['snapshot'] });
+      }),
+    [qc],
+  );
+  const q = useQuery({ queryKey: ['snapshot'], queryFn: fetchSnapshot });
+  return <div>{q.data ? JSON.stringify(q.data) : 'waiting'}</div>;
+}
+it('F06: draft invalidation during initial fetch accepts old committed response', async () => {
+  draft.init('audit-inflight');
+  draft.clear();
+  const response = deferred<Response>();
+  const fetch = vi.fn((path: string) =>
+    path === '/model/snapshot' ? response.promise : Promise.resolve(json({ snapshot: { tag: 'draft' } })),
+  );
+  vi.stubGlobal('fetch', fetch);
+  const qc = client();
+  render(
+    <QueryClientProvider client={qc}>
+      <SnapshotReader />
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  act(() => draft.push({ op: 'update_node', node_id: 'A', node: { name: 'new draft' } }));
+  await act(async () => response.resolve(json({ tag: 'old committed' })));
+  await waitFor(() => expect(screen.getByText(/old committed/)).toBeDefined());
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(draft.ops()).toHaveLength(1);
+});
+
+const committedSettings = () => ({
+  reality_client: { min_client_ver: null, max_client_ver: null, max_time_diff_ms: null },
+  reality_site: {
+    dest: 'www.committed.example:443',
+    server_names: ['www.committed.example'],
+    fingerprint: 'chrome',
+    flow: 'xtls-rprx-vision',
+  },
+  overlay: { keepalive_secs: 25, mtu: 1420, disabled_links: [] },
+  ports: { ingress_base: 13443, anytls_base: 14443, hop_base: 20000, hy2_base: 30000 },
+  probe: { endpoint_url: 'http://cp.cloudflare.com/cdn-cgi/trace', timeout_secs: 10, interval_secs: 60 },
+  geodata: { cron: 'CRON_TZ=Asia/Shanghai 30 6 * * *', geoip_url: 'https://geoip', geosite_url: 'https://geosite' },
+  connection: {
+    conn_idle_secs: 300,
+    uplink_only_secs: 2,
+    downlink_only_secs: 5,
+    buffer_size_kb: null,
+    handshake_secs: 60,
+  },
+  relay_mux: {
+    concurrency: 1,
+    min_idle_workers: 0,
+    max_idle_workers: 2,
+    max_probing_workers: 1,
+    probe_interval_secs: 5,
+    probe_timeout_ms: 2000,
+    idle_ttl_secs: 24,
+    max_requests_per_worker: 128,
+  },
+  anytls_padding_scheme: ['stop=4'],
+  stats_user_online: false,
+});
+
+const ROUTES: Record<string, () => unknown> = {
+  '/settings': committedSettings,
+  '/branding': () => ({ site_name: 'brocade', icon: null, accent: null }),
+  '/auth/state': () => ({ public_open: false }),
+  '/certs': () => ({ groups: [], nodes: [], letsencrypt: 'https://acme', letsencrypt_staging: 'https://acme-staging' }),
+  '/distribution': () => ({
+    stored: { agent_public_url: 'https://example', xray_version: '26.7.28' },
+    effective: { agent_public_url: 'https://example', xray_version: '26.7.28' },
+  }),
+  '/agent-log-policy': () => ({
+    global: { agent_journal_mib: 100, xray_mib: 100, phantun_mib: 100 },
+    nodes: [],
+  }),
+  '/ping-probe/settings': () => ({ targets: [], interval_secs: 60, timeout_ms: 420 }),
+  '/links/mtu': () => ({ default_mtu: 1420, nodes: [], links: [] }),
+  '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),
+};
+
+const { SettingsPane } = await import('../src/panes/settings');
+const { AgentReleaseSection } = await import('../src/panes/agent-release');
+const { SubscriptionViewer } = await import('../src/panes/subscription');
+it('F07: successful branding save discards further typing while the request is pending', async () => {
+  draft.init('audit-branding');
+  draft.clear();
+  const qc = client();
+  const keys: Record<string, string> = {
+    '/settings': 'settings',
+    '/branding': 'branding',
+    '/auth/state': 'auth-state',
+    '/certs': 'certs',
+    '/distribution': 'distribution',
+    '/agent-log-policy': 'agent-log-policy',
+    '/ping-probe/settings': 'ping-probe-settings',
+  };
+  for (const [path, key] of Object.entries(keys)) qc.setQueryData([key], ROUTES[path]());
+  qc.setQueryData(['nodes'], { nodes: [] });
+  qc.setQueryData(['link-mtu'], { nodes: [], links: [], default_mtu: 1420 });
+  const response = deferred<Response>();
+  const fetch = vi.fn(() => response.promise);
+  vi.stubGlobal('fetch', fetch);
+  const view = render(
+    <QueryClientProvider client={qc}>
+      <SessionProvider value={{ who }}>
+        <SettingsPane />
+      </SessionProvider>
+    </QueryClientProvider>,
+  );
+  const field = view.container.querySelector('#set-branding input') as HTMLInputElement;
+  fireEvent.change(field, { target: { value: 'submitted title' } });
+  const button = Array.from(view.container.querySelectorAll('#set-branding button')).find(b =>
+    b.textContent?.includes('保存'),
+  )!;
+  fireEvent.click(button);
+  await waitFor(() => expect(fetch).toHaveBeenCalled());
+  fireEvent.change(field, { target: { value: 'later unsaved title' } });
+  expect(field.value).toBe('later unsaved title');
+  await act(async () => response.resolve(json({ site_name: 'submitted title', icon_data_url: null })));
+  await waitFor(() => expect(field.value).toBe('submitted title'));
+});
+it('F08: agent selected-node set is mistaken for all nodes when IDs differ but counts match', async () => {
+  const qc = client();
+  qc.setQueryData(['nodes'], {
+    nodes: [
+      { node_id: 'A', agent_version: null },
+      { node_id: 'B', agent_version: null },
+    ],
+  });
+  qc.setQueryData(['agent-release'], {
+    agent_version: '1',
+    available_release_id: 'a'.repeat(64),
+    available_agents: [],
+    released: { scope: 'nodes', nodes: ['A', 'removed-C'], release_id: 'a'.repeat(64) },
+  });
+  let sent: { scope: string; nodes: string[] } | undefined;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_path, init) => {
+      sent = JSON.parse(init.body);
+      return json({});
+    }),
+  );
+  render(
+    <QueryClientProvider client={qc}>
+      <AgentReleaseSection editable />
+    </QueryClientProvider>,
+  );
+  const picks = screen.getAllByRole('checkbox') as HTMLInputElement[];
+  expect(picks[0].checked).toBe(true);
+  expect(picks[2].checked).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: '批准' }));
+  await waitFor(() => expect(sent).toBeDefined());
+  expect(sent!.scope).toBe('all');
+  expect(sent!.nodes).not.toContain('B');
+});
+it('F09: subscription revisions error remains a loading state with no error message', async () => {
+  const qc = client();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new Error('revision service offline');
+    }),
+  );
+  const view = render(
+    <QueryClientProvider client={qc}>
+      <SubscriptionViewer tenant="platform" user="audit" kind="uri" onClose={() => {}} />
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(qc.getQueryState(['revisions'])?.status).toBe('error'));
+  expect(view.container.textContent).not.toContain('revision service offline');
+  expect(view.container.querySelector('.cfg-code')).toBeNull();
+  expect(view.container.querySelector('.callout.err')).toBeNull();
+});
+it('F10: committing settings draft reverts form to stale saved settings without refetching settings', async () => {
+  draft.init('audit-settings-commit');
+  draft.clear();
+  const qc = client();
+  const keys: Record<string, string> = {
+    '/settings': 'settings',
+    '/branding': 'branding',
+    '/auth/state': 'auth-state',
+    '/certs': 'certs',
+    '/distribution': 'distribution',
+    '/agent-log-policy': 'agent-log-policy',
+    '/ping-probe/settings': 'ping-probe-settings',
+  };
+  for (const [path, key] of Object.entries(keys)) qc.setQueryData([key], ROUTES[path]());
+  qc.setQueryData(['nodes'], { nodes: [] });
+  qc.setQueryData(['link-mtu'], { nodes: [], links: [], default_mtu: 1420 });
+  const pending = committedSettings();
+  pending.overlay.mtu = 1380;
+  draft.push({ op: 'update_settings', settings: pending as unknown as import('../src/api').ModelSettings });
+  let committed = false;
+  const fetch = vi.fn(async (path: string) => {
+    if (path === '/model/apply') {
+      committed = true;
+      return json({ revision_id: 8 });
+    }
+    if (path === '/settings') return json(pending);
+    if (path === '/nodes/agent-state') return json({ nodes: [] });
+    if (ROUTES[path]) return json(ROUTES[path]());
+    throw new Error(path);
+  });
+  vi.stubGlobal('fetch', fetch);
+  const view = render(
+    <QueryClientProvider client={qc}>
+      <SessionProvider value={{ who }}>
+        <DraftBar current={7} />
+        <SettingsPane />
+      </SessionProvider>
+    </QueryClientProvider>,
+  );
+  const field = view.container.querySelectorAll('#set-wg input')[1] as HTMLInputElement;
+  expect(field.value).toBe('1380');
+  fireEvent.click(screen.getByRole('button', { name: '提交' }));
+  await waitFor(() => expect(committed).toBe(true));
+  await waitFor(() => expect(draft.isEmpty()).toBe(true));
+  await waitFor(() => expect(field.value).toBe('1420'));
+  expect(fetch.mock.calls.some(([path]) => path === '/settings')).toBe(false);
+});

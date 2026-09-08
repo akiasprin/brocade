@@ -101,10 +101,61 @@ func (c *SniffingConfig) Build() (*proxyman.SniffingConfig, error) {
 }
 
 type MuxConfig struct {
-	Enabled         bool   `json:"enabled"`
-	Concurrency     int16  `json:"concurrency"`
-	XudpConcurrency int16  `json:"xudpConcurrency"`
-	XudpProxyUDP443 string `json:"xudpProxyUDP443"`
+	Enabled         bool              `json:"enabled"`
+	Concurrency     int16             `json:"concurrency"`
+	XudpConcurrency int16             `json:"xudpConcurrency"`
+	XudpProxyUDP443 string            `json:"xudpProxyUDP443"`
+	WorkerPool      *WorkerPoolConfig `json:"workerPool"`
+}
+
+type WorkerPoolConfig struct {
+	MinIdleWorkers       uint32 `json:"minIdleWorkers"`
+	MaxIdleWorkers       uint32 `json:"maxIdleWorkers"`
+	MaxProbingWorkers    uint32 `json:"maxProbingWorkers"`
+	ProbeIntervalSecs    uint32 `json:"probeIntervalSecs"`
+	ProbeTimeoutMs       uint32 `json:"probeTimeoutMs"`
+	IdleTtlSecs          uint32 `json:"idleTtlSecs"`
+	MaxRequestsPerWorker uint32 `json:"maxRequestsPerWorker"`
+}
+
+func (c *WorkerPoolConfig) Build() (*proxyman.WorkerPoolConfig, error) {
+	if c.MaxIdleWorkers < 1 {
+		return nil, errors.New("maxIdleWorkers must be at least 1")
+	}
+	if c.MinIdleWorkers > c.MaxIdleWorkers {
+		return nil, errors.New("minIdleWorkers must not exceed maxIdleWorkers")
+	}
+	if c.MaxProbingWorkers < 1 || c.MaxProbingWorkers > c.MaxIdleWorkers {
+		return nil, errors.New("maxProbingWorkers must be between 1 and maxIdleWorkers")
+	}
+	if c.ProbeIntervalSecs < 2 || c.ProbeIntervalSecs > 60 {
+		return nil, errors.New("probeIntervalSecs must be between 2 and 60")
+	}
+	if c.ProbeTimeoutMs < 200 || c.ProbeTimeoutMs > 10000 {
+		return nil, errors.New("probeTimeoutMs must be between 200 and 10000")
+	}
+	if uint64(c.ProbeTimeoutMs) >= uint64(c.ProbeIntervalSecs)*1000 {
+		return nil, errors.New("probeTimeoutMs must be shorter than probeIntervalSecs")
+	}
+	if c.IdleTtlSecs < 1 {
+		return nil, errors.New("idleTtlSecs must be at least 1")
+	}
+	minimumTTL := c.ProbeIntervalSecs + (c.ProbeTimeoutMs+999)/1000
+	if c.IdleTtlSecs < minimumTTL {
+		return nil, errors.New("idleTtlSecs must cover one probe interval and timeout")
+	}
+	if c.MaxRequestsPerWorker < 1 || c.MaxRequestsPerWorker > 65535 {
+		return nil, errors.New("maxRequestsPerWorker must be between 1 and 65535")
+	}
+	return &proxyman.WorkerPoolConfig{
+		MinIdleWorkers:       c.MinIdleWorkers,
+		MaxIdleWorkers:       c.MaxIdleWorkers,
+		MaxProbingWorkers:    c.MaxProbingWorkers,
+		ProbeIntervalSecs:    c.ProbeIntervalSecs,
+		ProbeTimeoutMs:       c.ProbeTimeoutMs,
+		IdleTtlSecs:          c.IdleTtlSecs,
+		MaxRequestsPerWorker: c.MaxRequestsPerWorker,
+	}, nil
 }
 
 // Build creates MultiplexingConfig, Concurrency < 0 completely disables mux.
@@ -116,11 +167,26 @@ func (m *MuxConfig) Build() (*proxyman.MultiplexingConfig, error) {
 	default:
 		return nil, errors.New(`unknown "xudpProxyUDP443": `, m.XudpProxyUDP443)
 	}
+	var workerPool *proxyman.WorkerPoolConfig
+	if m.WorkerPool != nil {
+		var err error
+		workerPool, err = m.WorkerPool.Build()
+		if err != nil {
+			return nil, err
+		}
+		if !m.Enabled || m.Concurrency < 1 || m.Concurrency > 128 {
+			return nil, errors.New("workerPool requires enabled mux with concurrency between 1 and 128")
+		}
+		if m.XudpConcurrency > 128 {
+			return nil, errors.New("workerPool requires xudpConcurrency no greater than 128")
+		}
+	}
 	return &proxyman.MultiplexingConfig{
 		Enabled:         m.Enabled,
 		Concurrency:     int32(m.Concurrency),
 		XudpConcurrency: int32(m.XudpConcurrency),
 		XudpProxyUDP443: m.XudpProxyUDP443,
+		WorkerPool:      workerPool,
 	}, nil
 }
 

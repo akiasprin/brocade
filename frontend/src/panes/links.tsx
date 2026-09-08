@@ -161,12 +161,12 @@ function E2eBand({ chains, pending }: { chains: E2eProbeItem[]; pending: boolean
             {oddIps.length === 1 ? (
               <>
                 出口 IP 都是 <b className="mono">{oddIps[0]}</b>
-                {odd[0]?.exit_loc ? `（${odd[0].exit_loc}）` : ''}——那不是这些链的出口机器。
+                {odd[0]?.exit_loc ? `（${odd[0].exit_loc}）` : ''}——那不是这些链的出口节点。
               </>
             ) : (
-              <>出口 IP 不是这些链的出口机器。</>
+              <>出口 IP 不是这些链的出口节点。</>
             )}{' '}
-            流量多半从链头就直接出网了。每跳的计数器照样在涨、编译也没有警告， 所以只有这一格看得见。
+            流量多半从入口节点就直接出网了。每跳的计数器照样在涨、编译也没有警告， 所以只有这一格看得见。
           </>
         )}
       </span>
@@ -182,21 +182,21 @@ function E2eSection({ chains, pending, error }: { chains: E2eProbeItem[]; pendin
     <div className="lk-sec">
       <header>
         <h4>端到端</h4>
-        <span className="hint">由链头为每条链发起一次探测</span>
+        <span className="hint">由入口节点为每条链发起一次探测</span>
       </header>
       {pending ? (
         <Loading />
       ) : error ? (
         <ErrorBox error={error} />
       ) : chains.length === 0 ? (
-        <Empty>还没有链被探过。链头的 agent 每轮自己探，刚建好的链要等一会儿。</Empty>
+        <Empty>还没有链被探过。入口节点的 agent 每轮自己探，刚建好的链要等一会儿。</Empty>
       ) : (
         <table className="tbl cards lk-t">
           <thead>
             <tr>
               <th>端到端</th>
               <th>链</th>
-              <th>链头</th>
+              <th>入口节点</th>
               <th>出口地址</th>
               <th>核对</th>
               <th>最近</th>
@@ -212,7 +212,7 @@ function E2eSection({ chains, pending, error }: { chains: E2eProbeItem[]; pendin
                 <td data-label="链">
                   {c.chain_name} <span className="dim mono">{c.chain_id}</span>
                 </td>
-                <td data-label="链头" title={c.node_id}>
+                <td data-label="入口节点" title={c.node_id}>
                   {nameOf(c.node_id)}
                 </td>
                 <td data-label="出口地址" className="mono dim">
@@ -234,7 +234,7 @@ function E2eSection({ chains, pending, error }: { chains: E2eProbeItem[]; pendin
         </table>
       )}
       <p className="note lk-note">
-        探测走的是<b>与用户相同的路径</b>：链头使用一份编译期派生的隐藏凭据连接自己的入口，穿过整条链到达设置中
+        探测走的是<b>与用户相同的路径</b>：入口节点使用一份编译期派生的隐藏凭据连接自己的入口，穿过整条链到达设置中
         指定的落点。REALITY 参数、路由规则、出口出网都在这一次探测的覆盖范围内，而这三项出问题时，下面两块 都无法察觉。
       </p>
     </div>

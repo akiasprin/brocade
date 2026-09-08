@@ -3685,15 +3685,26 @@ fn ensure_restored_snapshot(
     restored: &ModelSnapshot,
     revision: u64,
 ) -> Result<()> {
-    let certificate_names = restored
+    let certificate_state = restored
         .nodes
         .iter()
-        .map(|node| (node.id.as_str(), node.certificate_name.clone()))
+        .map(|node| {
+            (
+                node.id.as_str(),
+                (
+                    node.certificate_name.clone(),
+                    node.certificate_names.clone(),
+                ),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let mut expected = target.clone();
     expected.revision = revision;
     for node in &mut expected.nodes {
-        node.certificate_name = certificate_names.get(node.id.as_str()).cloned().flatten();
+        if let Some((serving, slots)) = certificate_state.get(node.id.as_str()) {
+            node.certificate_name = serving.clone();
+            node.certificate_names = slots.clone();
+        }
     }
     if expected == *restored {
         return Ok(());
@@ -4279,7 +4290,7 @@ async fn restore_app_tx(
                 anytls_masquerade_headers, anytls_masquerade_status_code,
                 anytls_security, anytls_reality,
                 anytls_reality_private_key, anytls_reality_public_key,
-                anytls_reality_short_ids
+                anytls_reality_short_ids, vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
@@ -4299,7 +4310,7 @@ async fn restore_app_tx(
                 $55, $56, $57, $58,
                 $59, $60, $61,
                 $62, $63, $64, $65, $66, $67, $68, $69, $70,
-                $71, $72, $73
+                $71, $72, $73, $74, $75, $76, $77
              )",
         )
         .bind(&ingress.id)
@@ -4408,6 +4419,10 @@ async fn restore_app_tx(
                 .map(|identity| serde_json::to_value(&identity.short_ids))
                 .transpose()?,
         )
+        .bind(ingress.wires.vless_encryption().map(|wire| i32::from(wire.port)))
+        .bind(ingress.wires.vless_encryption().map(|wire| &wire.private_key))
+        .bind(ingress.wires.vless_encryption().map(|wire| &wire.public_key))
+        .bind(serde_json::to_value(ingress.wires.vless_encryption().map(|wire| wire.options.clone()).unwrap_or_default())?)
         .execute(&mut **tx)
         .await?;
 

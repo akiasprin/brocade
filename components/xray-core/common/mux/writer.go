@@ -86,6 +86,23 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	return writer.WriteMultiBuffer(mb2)
 }
 
+func writeProbeFrame(writer buf.Writer, probeID uint64, ack bool) error {
+	meta := FrameMetadata{
+		SessionStatus: SessionStatusKeepAlive,
+		ProbeID:       probeID,
+	}
+	meta.Option.Set(OptionProbe)
+	if ack {
+		meta.Option.Set(OptionAck)
+	}
+	frame := buf.New()
+	if err := meta.WriteTo(frame); err != nil {
+		frame.Release()
+		return err
+	}
+	return writer.WriteMultiBuffer(buf.MultiBuffer{frame})
+}
+
 func (w *Writer) writeData(mb buf.MultiBuffer) error {
 	meta := w.getNextFrameMeta()
 	meta.Option.Set(OptionData)

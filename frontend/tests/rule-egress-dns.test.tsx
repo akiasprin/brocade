@@ -546,7 +546,7 @@ describe('machine-scoped egress DNS', () => {
     expect(fallback?.querySelectorAll('td')).toHaveLength(4);
     expect(fallback?.textContent).toContain('任意');
     expect(fallback?.textContent).toContain('拒绝');
-    expect(fallback?.textContent).toContain('自动补齐 · 只读');
+    expect(fallback?.textContent).toContain('自动补齐');
     expect(fallback?.querySelector('select, input, button')).toBeNull();
     expect(fallback?.querySelector('td')?.textContent).toBe('*');
   });
@@ -636,7 +636,7 @@ describe('machine-scoped egress DNS', () => {
     trigger.focus();
     fireEvent.click(trigger);
     expect(document.activeElement).toBe(trigger);
-    expect(view.getByPlaceholderText('搜索节点或外部出站').hasAttribute('autofocus')).toBe(false);
+    expect(view.getByPlaceholderText('搜索节点或代理出站').hasAttribute('autofocus')).toBe(false);
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
   });
 

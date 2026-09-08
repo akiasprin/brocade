@@ -18,6 +18,7 @@ import (
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -84,6 +85,82 @@ func TestOutboundWithStatCounter(t *testing.T) {
 	_, ok := conn.(*stat.CounterConnection)
 	if !ok {
 		t.Errorf("Expected conn to be CounterConnection")
+	}
+}
+
+func TestHandlerRejectsInvalidMuxWorkerPoolProto(t *testing.T) {
+	validPool := &proxyman.WorkerPoolConfig{
+		MaxIdleWorkers:       2,
+		MaxProbingWorkers:    1,
+		ProbeIntervalSecs:    5,
+		ProbeTimeoutMs:       2000,
+		IdleTtlSecs:          24,
+		MaxRequestsPerWorker: 128,
+	}
+	tests := map[string]*proxyman.MultiplexingConfig{
+		"invalid values": {
+			Enabled:     true,
+			Concurrency: 1,
+			WorkerPool: &proxyman.WorkerPoolConfig{
+				MaxIdleWorkers:       2,
+				MaxProbingWorkers:    1,
+				ProbeIntervalSecs:    5,
+				ProbeTimeoutMs:       5000,
+				IdleTtlSecs:          24,
+				MaxRequestsPerWorker: 128,
+			},
+		},
+		"disabled mux": {
+			Enabled:     false,
+			Concurrency: 1,
+			WorkerPool:  validPool,
+		},
+	}
+	for name, muxConfig := range tests {
+		t.Run(name, func(t *testing.T) {
+			v, _ := core.New(&core.Config{})
+			v.AddFeature((outbound.Manager)(new(Manager)))
+			ctx := context.WithValue(context.Background(), xrayKey, v)
+			_, err := NewHandler(ctx, &core.OutboundHandlerConfig{
+				Tag: "invalid-pool",
+				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+					MultiplexSettings: muxConfig,
+				}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+			})
+			if err == nil {
+				t.Fatal("invalid direct protobuf worker pool was accepted")
+			}
+		})
+	}
+}
+
+type drainingTestHandler struct {
+	drained atomic.Bool
+}
+
+func (*drainingTestHandler) Start() error                              { return nil }
+func (*drainingTestHandler) Close() error                              { return nil }
+func (*drainingTestHandler) Tag() string                               { return "draining-test" }
+func (*drainingTestHandler) Dispatch(context.Context, *transport.Link) {}
+func (*drainingTestHandler) SenderSettings() *serial.TypedMessage      { return nil }
+func (*drainingTestHandler) ProxySettings() *serial.TypedMessage       { return nil }
+func (h *drainingTestHandler) Drain()                                  { h.drained.Store(true) }
+
+func TestRemoveHandlerDrainsRemovedHandler(t *testing.T) {
+	manager, err := New(context.Background(), &proxyman.OutboundConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &drainingTestHandler{}
+	if err := manager.AddHandler(context.Background(), handler); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RemoveHandler(context.Background(), handler.Tag()); err != nil {
+		t.Fatal(err)
+	}
+	if !handler.drained.Load() {
+		t.Fatal("removed handler was not drained")
 	}
 }
 

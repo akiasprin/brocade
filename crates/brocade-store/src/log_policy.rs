@@ -12,7 +12,8 @@ use sqlx::{PgPool, Row};
 use crate::{AdminContext, Result, StoreError};
 
 pub use brocade_deployment::protocol::{
-    DEFAULT_AGENT_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
+    DEFAULT_AGENT_LOG_MAX_MIB, DEFAULT_PHANTUN_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
+    MIN_AGENT_LOG_MAX_MIB,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

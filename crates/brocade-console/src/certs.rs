@@ -139,50 +139,58 @@ async fn issue_self_signed(
 }
 
 /// Runs one pass over everything that is due. Returns how many succeeded and how many failed.
-pub async fn scan_once(store: &PgStore) -> (usize, usize) {
-    // Serializing inside one process is insufficient when two console replicas share the same
-    // account and DNS zone. Hold a PostgreSQL advisory transaction lock for the complete pass;
-    // another replica skips this round and the next scheduled pass will pick up anything due.
-    let _scan_lock = match store.try_certificate_scan_lock().await {
-        Ok(Some(lock)) => lock,
-        Ok(None) => return (0, 0),
-        Err(error) => {
-            eprintln!("证书：拿不到全局扫描锁：{error}");
-            return (0, 0);
-        }
-    };
+#[derive(Debug, serde::Serialize)]
+pub struct IssuanceResult {
+    pub issued: usize,
+    pub failed: usize,
+}
 
+pub async fn scan_once(store: &PgStore) -> (usize, usize) {
+    let Ok(Some(_lock)) = store.try_certificate_scan_lock().await else {
+        return (0, 0);
+    };
+    match process_pending(store, None, RETRY_AFTER_MINUTES).await {
+        Ok(result) => (result.issued, result.failed),
+        Err(error) => {
+            eprintln!("证书：{error}");
+            (0, 0)
+        }
+    }
+}
+
+/// Caller holds the cross-replica issuance lock. Manual requests use zero retry delay and
+/// keep the response open until issuance finishes, so the UI reports an actual outcome.
+pub async fn process_pending(
+    store: &PgStore,
+    group_id: Option<&str>,
+    retry_after_minutes: i32,
+) -> Result<IssuanceResult, String> {
     // A domain with no credential cannot issue, and rows created against it would show up in the
     // console as pending forever with no explanation. Skipped entirely instead — unless it signs
     // its own, which needs no credential and would otherwise be the one setting that silently
     // never produces a certificate.
-    let domains = match store.cert_domains().await {
-        Ok(domains) => domains,
-        Err(error) => {
-            eprintln!("证书：读不出域名配置：{error}");
-            return (0, 0);
-        }
-    };
+    let domains = store
+        .cert_domains()
+        .await
+        .map_err(|error| error.to_string())?;
     // Before the "nothing to issue" exit below, deliberately. A fleet whose certificates are all
     // current is exactly when nothing is due — and also exactly when a machine may have changed
     // address with nobody watching. Reconciling after that early return would mean DNS is only
     // ever fixed in the same pass as an issuance, which is once every sixty days.
-    reconcile_dns(store, &domains).await;
-
-    let due = match store.certificates_due(RETRY_AFTER_MINUTES).await {
-        Ok(due) => due,
-        Err(error) => {
-            eprintln!("证书：读不出待签清单：{error}");
-            return (0, 0);
-        }
-    };
-    if due.is_empty() {
-        return (0, 0);
+    if group_id.is_none() {
+        reconcile_dns(store, &domains).await;
     }
 
+    let due = store
+        .certificates_due(retry_after_minutes)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut issued = 0;
     let mut failed = 0;
     for order in due {
+        if group_id.is_some_and(|id| id != order.label_id) {
+            continue;
+        }
         // Named by the group, not by a machine: one order covers every machine drawing from it,
         // and saying "hk-01 已签发" when five machines share the certificate would be wrong four
         // times over.
@@ -202,6 +210,7 @@ pub async fn scan_once(store: &PgStore) -> (usize, usize) {
                 eprintln!("证书：{what} 已签发，用时 {seconds:.0}s");
             }
             Ok(IssueOutcome::Obsolete) => {
+                failed += 1;
                 eprintln!("证书：{what} 签发期间设置已变化，丢弃结果并按新设置重新排队");
             }
             Err(error) => {
@@ -215,7 +224,7 @@ pub async fn scan_once(store: &PgStore) -> (usize, usize) {
             }
         }
     }
-    (issued, failed)
+    Ok(IssuanceResult { issued, failed })
 }
 
 /// Points every issued name at the machine it belongs to.

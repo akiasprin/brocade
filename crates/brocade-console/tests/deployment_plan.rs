@@ -1,10 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use brocade_core::model::{
-    Action, AppView, Chain, DestMatch, Dns, DomainStrategy, ExternalOutbound,
-    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding, Grant, Hysteria2,
-    HysteriaPortHop, Ingress, IngressWires, ModelSnapshot, Node, Rule, Step, Transport, User,
-    WireGuardKeys,
+    Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, ExternalOutbound,
+    ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding, Grant, HopDial, HopIn,
+    HopMux, HopPool, HopWire, Hysteria2, HysteriaPortHop, Ingress, IngressWires, ModelSnapshot,
+    Node, Rule, Step, Transport, User, WireGuardKeys,
 };
 use brocade_deployment::plan::{
     narrow_to_kind, plan_deployment, AppliedArtifactState, AppliedGrantsState, DeploymentKind,
@@ -12,6 +12,24 @@ use brocade_deployment::plan::{
     ObservedInbound, PlannedAction, PlannedTarget, PlannedTargetStatus,
 };
 use ipnet::Ipv4Net;
+
+#[test]
+fn changing_certificate_group_requires_a_disruptive_xray_release() {
+    let mut before = snapshot(
+        vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
+        vec![direct_app("direct", "hk", "i-direct", 8443, true, any_egress())],
+    );
+    before.nodes[0].certificate_group_id = Some("group-a".to_owned());
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+    let mut after = before.clone();
+    after.revision += 1;
+    after.nodes[0].certificate_group_id = Some("group-b".to_owned());
+    let plan = plan_deployment(&after, &applied).unwrap();
+    assert_eq!(plan.summary.changed_targets, 1);
+    assert_eq!(plan.summary.disruptive_targets, 1);
+    assert!(target(&plan, "hk").actions.contains(&PlannedAction::ApplyXray));
+    assert!(target(&plan, "hk").disruptive);
+}
 
 #[test]
 fn unchanged_applied_state_is_skipped() {
@@ -36,6 +54,159 @@ fn unchanged_applied_state_is_skipped() {
     assert_eq!(plan.summary.skipped_targets, 1);
     assert_eq!(plan.targets[0].status, PlannedTargetStatus::Skipped);
     assert!(plan.targets[0].actions.is_empty());
+}
+
+#[test]
+fn port_allocation_bases_do_not_change_existing_machine_artifacts() {
+    let before = snapshot(
+        vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
+        vec![direct_app(
+            "direct",
+            "hk",
+            "i-direct",
+            8443,
+            true,
+            any_egress(),
+        )],
+    );
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+    let mut after = before.clone();
+    after.revision += 1;
+    after.settings.ports.ingress_base = 13_443;
+    after.settings.ports.anytls_base = 14_443;
+    after.settings.ports.hop_base = 24_000;
+    after.settings.ports.hy2_base = 34_443;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(plan.summary.changed_targets, 0);
+    assert_eq!(plan.summary.skipped_targets, 1);
+    assert!(plan.targets[0].actions.is_empty());
+}
+
+#[test]
+fn relay_mux_global_change_only_releases_sources_that_follow_global() {
+    let following = relay_app("following", "hk", "sg", HopPool::Mux(None));
+    let overridden = relay_app(
+        "overridden",
+        "jp",
+        "us",
+        HopPool::Mux(Some(HopMux {
+            concurrency: 7,
+            max_idle_workers: 4,
+            max_probing_workers: 2,
+            ..Default::default()
+        })),
+    );
+    let before = relay_snapshot(vec![following, overridden]);
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+
+    let mut after = before.clone();
+    after.revision += 1;
+    after.settings.relay_mux.concurrency = 11;
+    after.settings.relay_mux.max_idle_workers = 6;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(plan.summary.changed_targets, 1);
+    assert_eq!(target(&plan, "hk").actions, vec![PlannedAction::ApplyXray]);
+    for unaffected in ["sg", "jp", "us"] {
+        assert_eq!(
+            target(&plan, unaffected).actions,
+            Vec::new(),
+            "全局值不该改变 {unaffected} 的制品"
+        );
+    }
+}
+
+#[test]
+fn relay_mux_global_change_has_no_machine_actions_when_every_mux_is_overridden() {
+    let before = relay_snapshot(vec![relay_app(
+        "overridden",
+        "hk",
+        "sg",
+        HopPool::Mux(Some(HopMux {
+            concurrency: 7,
+            max_idle_workers: 4,
+            max_probing_workers: 2,
+            ..Default::default()
+        })),
+    )]);
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+
+    let mut after = before.clone();
+    after.revision += 1;
+    after.settings.relay_mux.concurrency = 11;
+    after.settings.relay_mux.max_idle_workers = 6;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(plan.summary.changed_targets, 0);
+    assert!(plan.targets.iter().all(|target| target.actions.is_empty()));
+}
+
+#[test]
+fn relay_mux_global_change_has_no_machine_actions_when_mux_is_unused() {
+    let before = relay_snapshot(vec![relay_app("unpooled", "hk", "sg", HopPool::None)]);
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+
+    let mut after = before.clone();
+    after.revision += 1;
+    after.settings.relay_mux.concurrency = 11;
+    after.settings.relay_mux.max_idle_workers = 6;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(plan.summary.changed_targets, 0);
+    assert!(plan.targets.iter().all(|target| target.actions.is_empty()));
+}
+
+#[test]
+fn relay_mux_rule_override_change_only_releases_its_source_machine() {
+    let first_override = HopMux {
+        concurrency: 7,
+        max_idle_workers: 4,
+        max_probing_workers: 2,
+        ..Default::default()
+    };
+    let untouched_override = HopMux {
+        concurrency: 9,
+        max_idle_workers: 5,
+        max_probing_workers: 2,
+        ..Default::default()
+    };
+    let before = relay_snapshot(vec![
+        relay_app("changed", "hk", "sg", HopPool::Mux(Some(first_override))),
+        relay_app(
+            "untouched",
+            "jp",
+            "us",
+            HopPool::Mux(Some(untouched_override)),
+        ),
+    ]);
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+
+    let mut after = before.clone();
+    after.revision += 1;
+    let Action::Forward { pool, .. } = &mut after.apps[0].steps[0].rules[0].action else {
+        panic!("fixture 的首条规则必须是 Forward");
+    };
+    *pool = HopPool::Mux(Some(HopMux {
+        concurrency: 12,
+        ..first_override
+    }));
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(plan.summary.changed_targets, 1);
+    assert_eq!(target(&plan, "hk").actions, vec![PlannedAction::ApplyXray]);
+    for unaffected in ["sg", "jp", "us"] {
+        assert_eq!(
+            target(&plan, unaffected).actions,
+            Vec::new(),
+            "规则覆盖不该改变 {unaffected} 的制品"
+        );
+    }
 }
 
 #[test]
@@ -645,6 +816,91 @@ fn snapshot(nodes: Vec<Node>, apps: Vec<AppView>) -> ModelSnapshot {
     }
 }
 
+fn relay_snapshot(apps: Vec<AppView>) -> ModelSnapshot {
+    snapshot(
+        vec![
+            node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System),
+            node("sg", "sg.example.net", [10, 66, 0, 2], Dns::System),
+            node("jp", "jp.example.net", [10, 66, 0, 3], Dns::System),
+            node("us", "us.example.net", [10, 66, 0, 4], Dns::System),
+        ],
+        apps,
+    )
+}
+
+fn relay_app(id: &str, from: &str, to: &str, pool: HopPool) -> AppView {
+    let chain_id = format!("c-{id}");
+    let ingress_id = format!("i-{id}");
+    AppView {
+        id: id.to_owned(),
+        label: id.to_owned(),
+        chains: vec![Chain {
+            id: chain_id.clone(),
+            tenant: "platform.acme".to_owned(),
+            name: chain_id.clone(),
+            subscription_country: None,
+        }],
+        ingresses: vec![Ingress {
+            id: ingress_id.clone(),
+            chain: chain_id.clone(),
+            node: from.to_owned(),
+            bind: IpAddr::from(Ipv4Addr::UNSPECIFIED),
+            port: 8443,
+            front: None,
+            projection: Default::default(),
+            guard: brocade_core::model::IngressGuard::OPEN,
+            identity: brocade_core::model::IngressIdentity {
+                private_key: format!("priv-{ingress_id}"),
+                public_key: format!("pub-{ingress_id}"),
+                short_ids: vec!["0123abcd".to_owned()],
+            },
+            anytls_identity: None,
+            wires: IngressWires::Vless(Transport::VlessReality(
+                brocade_core::model::RealitySettings {
+                    dest: "www.example.com:443".to_owned(),
+                    server_names: vec!["www.example.com".to_owned()],
+                    fingerprint: "chrome".to_owned(),
+                    flow: Some("xtls-rprx-vision".to_owned()),
+                    fallback_mode: Default::default(),
+                    fallback_guard: true,
+                    fallback_limits: Default::default(),
+                },
+            )),
+        }],
+        fronts: Vec::new(),
+        steps: vec![
+            Step {
+                chain: chain_id.clone(),
+                node: from.to_owned(),
+                accept: None,
+                hop_in: None,
+                rules: vec![Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::Forward {
+                        to: to.to_owned(),
+                        dial: HopDial::Overlay,
+                        pool,
+                    },
+                }],
+            },
+            Step {
+                chain: chain_id,
+                node: to.to_owned(),
+                accept: Some(Accept {
+                    uuid: format!("uuid-{id}-{to}"),
+                    label: format!("{id}@{to}"),
+                }),
+                hop_in: Some(HopIn {
+                    port: 20_000,
+                    security: HopWire::None,
+                }),
+                rules: vec![any_egress()],
+            },
+        ],
+        grants: Vec::new(),
+    }
+}
+
 fn node(id: &str, public_ipv4: &str, overlay: [u8; 4], dns: Dns) -> Node {
     Node {
         mtu: None,
@@ -658,6 +914,8 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4], dns: Dns) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_names: Vec::new(),
+        certificate_group_id: None,
         certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),
@@ -679,6 +937,7 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4], dns: Dns) -> Node {
 fn tls_node(id: &str, public_ipv4: &str, overlay: [u8; 4]) -> Node {
     Node {
         certificate_name: Some(format!("{id}.example.net")),
+        certificate_group_id: None,
         certificate_track: Some(brocade_core::model::CertificateTrack::PublicCa),
         ..node(id, public_ipv4, overlay, Dns::System)
     }

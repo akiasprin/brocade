@@ -171,7 +171,7 @@ CREATE TABLE IF NOT EXISTS external_outbounds (
     created_revision BIGINT,
     CONSTRAINT external_outbounds_pkey PRIMARY KEY (id),
     CONSTRAINT external_outbounds_port_check CHECK ((port >= 1) AND (port <= 65535)),
-    CONSTRAINT external_outbounds_protocol_check CHECK ((protocol IN ('vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard', 'warp'))),
+    CONSTRAINT external_outbounds_protocol_check CHECK ((protocol IN ('anytls', 'vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard', 'warp'))),
     CONSTRAINT external_outbounds_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT,
     CONSTRAINT external_outbounds_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id)
 );
@@ -341,16 +341,15 @@ CREATE TABLE IF NOT EXISTS chains (
 -- exists to catch obvious misconfiguration: below 1000 TCP throughput collapses, and it is almost
 -- certainly a typo.
 --
--- The two port_*_base values are where automatic port selection starts. They are settings rather
+-- The port_*_base values are where automatic port selection starts. They are settings rather
 -- than constants because they are the operator's facts: 443 on their machines runs their own site
 -- and the 20000 range is taken by something else, while the chain-building UI fills the default back
 -- in every time, so hardcoding them means editing by hand on every occasion.
 --
 -- They affect only the defaults for newly created things. Ports already in the model are untouched —
 -- any change means an altered xray config, a process restart, and every connection on that machine
--- dropping. 8443 rather than 443 by default: something is usually on 443, a collision is two
--- processes fighting over one port, and the symptom only surfaces as a failed xray start. Using 443
--- is the operator's decision, one number away.
+-- dropping. VLESS and AnyTLS use separate high ranges so their automatic allocations remain easy to
+-- identify and do not contend with the service commonly bound to 443.
 --
 -- The probe endpoint is likewise the operator's fact and should not be compiled into the agent.
 -- Cloudflare's trace rather than generate_204 by default: that 204 endpoint cannot return the exit
@@ -413,13 +412,13 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- The same value as materialize.rs's fallback on read, so as not to have two sources of truth
     -- where the database holds NULL and the read yields chrome.
     reality_fingerprint TEXT DEFAULT 'chrome',
-    overlay_keepalive_secs INTEGER DEFAULT 25 NOT NULL,
+    overlay_keepalive_secs INTEGER DEFAULT 10 NOT NULL,
     overlay_mtu INTEGER DEFAULT 1420 NOT NULL,
     -- Explicit exceptions to the otherwise full WireGuard mesh. Each JSON item is an
     -- undirected {"a":"node-a","b":"node-b"} pair, canonicalized by the store.
     overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL,
-    port_ingress_base INTEGER DEFAULT 8443 NOT NULL,
-    port_anytls_base INTEGER DEFAULT 18443 NOT NULL,
+    port_ingress_base INTEGER DEFAULT 13443 NOT NULL,
+    port_anytls_base INTEGER DEFAULT 14443 NOT NULL,
     port_hop_base INTEGER DEFAULT 20000 NOT NULL,
     -- The same number as model.rs's HYSTERIA2_PORT_BASE, which is where a wire with no
     -- allocation of its own falls back to. Two sources for one factory value, but they are
@@ -453,7 +452,7 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- wherever the matching node column is NULL. Agent polls pick up changes without a revision.
     agent_log_max_mib INTEGER DEFAULT 100 NOT NULL,
     xray_log_max_mib INTEGER DEFAULT 100 NOT NULL,
-    phantun_log_max_mib INTEGER DEFAULT 100 NOT NULL,
+    phantun_log_max_mib INTEGER DEFAULT 16 NOT NULL,
     -- Live NIC rates are kept only in control-plane memory, but whether the channel is available
     -- and its fleet-wide cadence must survive a restart. It is independent of both the persisted
     -- 30-second diagnostic windows and the cumulative usage ledger.
@@ -487,6 +486,16 @@ CREATE TABLE IF NOT EXISTS control_state (
     -- client_header_timeout so the value says nothing about what is listening, and a fleet
     -- whose machines each answered differently would be a fleet of distinguishable machines.
     conn_handshake_secs INTEGER DEFAULT 60 NOT NULL,
+    -- Node-to-node Mux.cool defaults. Rules either reference this complete set or store a
+    -- complete per-edge override; no individual field inherits independently.
+    relay_mux_concurrency INTEGER DEFAULT 1 NOT NULL,
+    relay_mux_min_idle_workers INTEGER DEFAULT 0 NOT NULL,
+    relay_mux_max_idle_workers INTEGER DEFAULT 2 NOT NULL,
+    relay_mux_max_probing_workers INTEGER DEFAULT 1 NOT NULL,
+    relay_mux_probe_interval_secs INTEGER DEFAULT 5 NOT NULL,
+    relay_mux_probe_timeout_ms INTEGER DEFAULT 2000 NOT NULL,
+    relay_mux_idle_ttl_secs INTEGER DEFAULT 24 NOT NULL,
+    relay_mux_max_requests_per_worker INTEGER DEFAULT 128 NOT NULL,
     -- Count concurrent source addresses per account. Global, because "does this fleet watch
     -- for shared accounts" has one answer, unlike the per-machine capacity settings above.
     stats_user_online BOOLEAN DEFAULT FALSE NOT NULL,
@@ -582,19 +591,39 @@ ALTER TABLE control_state
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL;
 ALTER TABLE control_state
-    ADD COLUMN IF NOT EXISTS port_anytls_base INTEGER DEFAULT 18443 NOT NULL;
+    ADD COLUMN IF NOT EXISTS port_anytls_base INTEGER DEFAULT 14443 NOT NULL;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS port_hy2_base INTEGER DEFAULT 30000 NOT NULL;
 ALTER TABLE control_state
-    ALTER COLUMN port_anytls_base SET DEFAULT 18443;
+    ALTER COLUMN port_ingress_base SET DEFAULT 13443;
+ALTER TABLE control_state
+    ALTER COLUMN port_anytls_base SET DEFAULT 14443;
 ALTER TABLE control_state
     ALTER COLUMN port_hy2_base SET DEFAULT 30000;
--- Translate the two superseded factory values when replaying this single migration. Values an
+-- Translate superseded factory values when replaying this single migration. Values an
 -- operator moved elsewhere remain untouched.
-UPDATE control_state SET port_anytls_base = 18443 WHERE port_anytls_base = 16000;
+UPDATE control_state SET port_ingress_base = 13443 WHERE port_ingress_base = 8443;
+UPDATE control_state SET port_anytls_base = 14443 WHERE port_anytls_base IN (16000, 18443);
 UPDATE control_state SET port_hy2_base = 30000 WHERE port_hy2_base = 18000;
+UPDATE control_state SET overlay_keepalive_secs = 10 WHERE overlay_keepalive_secs = 25;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS anytls_padding_scheme JSONB DEFAULT '[]'::jsonb NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_concurrency INTEGER DEFAULT 1 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_min_idle_workers INTEGER DEFAULT 0 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_max_idle_workers INTEGER DEFAULT 2 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_max_probing_workers INTEGER DEFAULT 1 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_probe_interval_secs INTEGER DEFAULT 5 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_probe_timeout_ms INTEGER DEFAULT 2000 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_idle_ttl_secs INTEGER DEFAULT 24 NOT NULL;
+ALTER TABLE control_state
+    ADD COLUMN IF NOT EXISTS relay_mux_max_requests_per_worker INTEGER DEFAULT 128 NOT NULL;
 -- TCP-only probing was never a durable compatibility contract. Replaying 0001 drops those old
 -- settings before creating the shared TCP/ICMP model; the fleet deliberately starts this history
 -- afresh rather than carrying two names and two wire formats forever.
@@ -612,7 +641,10 @@ ALTER TABLE control_state
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS xray_log_max_mib INTEGER DEFAULT 100 NOT NULL;
 ALTER TABLE control_state
-    ADD COLUMN IF NOT EXISTS phantun_log_max_mib INTEGER DEFAULT 100 NOT NULL;
+    ADD COLUMN IF NOT EXISTS phantun_log_max_mib INTEGER DEFAULT 16 NOT NULL;
+ALTER TABLE control_state
+    ALTER COLUMN phantun_log_max_mib SET DEFAULT 16;
+UPDATE control_state SET phantun_log_max_mib = 16 WHERE phantun_log_max_mib = 100;
 ALTER TABLE control_state
     ADD COLUMN IF NOT EXISTS realtime_enabled BOOLEAN DEFAULT TRUE NOT NULL;
 ALTER TABLE control_state
@@ -652,6 +684,23 @@ ALTER TABLE control_state
 ALTER TABLE control_state
     ADD CONSTRAINT control_state_anytls_padding_scheme_shape
         CHECK ((jsonb_typeof(anytls_padding_scheme) = 'array'));
+ALTER TABLE control_state
+    DROP CONSTRAINT IF EXISTS control_state_relay_mux_ranges;
+ALTER TABLE control_state
+    ADD CONSTRAINT control_state_relay_mux_ranges CHECK (
+        relay_mux_concurrency BETWEEN 1 AND 128
+        AND relay_mux_min_idle_workers BETWEEN 0 AND 8
+        AND relay_mux_max_idle_workers BETWEEN 1 AND 16
+        AND relay_mux_min_idle_workers <= relay_mux_max_idle_workers
+        AND relay_mux_max_probing_workers BETWEEN 1 AND relay_mux_max_idle_workers
+        AND relay_mux_probe_interval_secs BETWEEN 2 AND 60
+        AND relay_mux_probe_timeout_ms BETWEEN 200 AND 10000
+        AND relay_mux_probe_timeout_ms < relay_mux_probe_interval_secs * 1000
+        AND relay_mux_idle_ttl_secs BETWEEN 5 AND 300
+        AND relay_mux_idle_ttl_secs >= relay_mux_probe_interval_secs
+            + ((relay_mux_probe_timeout_ms + 999) / 1000)
+        AND relay_mux_max_requests_per_worker BETWEEN 1 AND 4096
+    );
 ALTER TABLE control_state
     DROP CONSTRAINT IF EXISTS control_state_site_name_shape;
 ALTER TABLE control_state
@@ -1375,6 +1424,10 @@ CREATE TABLE IF NOT EXISTS fronts (
 );
 
 CREATE TABLE IF NOT EXISTS ingresses (
+    vless_encryption_port INTEGER,
+    vless_encryption_private_key TEXT,
+    vless_encryption_public_key TEXT,
+    vless_encryption_options JSONB NOT NULL DEFAULT '{}'::jsonb,
     id TEXT NOT NULL,
     app_id TEXT NOT NULL,
     chain_id TEXT NOT NULL,
@@ -1722,7 +1775,7 @@ CREATE TABLE IF NOT EXISTS ingresses (
     -- An ingress with neither wire listens on nothing and would compile to an inbound-less
     -- machine. The model makes it unrepresentable (`IngressWires` is an enum, not two Options);
     -- this is the same invariant at the layer that outlives the process.
-    CONSTRAINT ingresses_has_a_wire CHECK ((transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled)),
+    CONSTRAINT ingresses_has_a_wire CHECK ((transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled OR vless_encryption_port IS NOT NULL)),
     CONSTRAINT ingresses_app_id_id_key UNIQUE (app_id, id),
 
     CONSTRAINT ingresses_pkey PRIMARY KEY (id),
@@ -2345,8 +2398,8 @@ CREATE TABLE IF NOT EXISTS certificates (
     -- Self-signed generations have independent SNI identities. Public-CA rows keep this NULL and
     -- use the group's wildcard/bare-name pair for same-name renewal.
     certificate_name TEXT,
-    -- A physical slot is stable across promotion, so promoting B never rewrites both files and
-    -- never creates a window where the old identity disappears. Historical rows have no slot.
+    -- Only self-signed identities use physical A/B slots: their SNI and leaf pin change, so both
+    -- generations must overlap. Public-CA rows keep this NULL and atomically replace current.pem.
     runtime_slot TEXT,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT certificates_pkey PRIMARY KEY (id),
@@ -2365,11 +2418,7 @@ CREATE TABLE IF NOT EXISTS certificates (
 CREATE UNIQUE INDEX IF NOT EXISTS certificates_one_serving_per_label
     ON certificates (label_id) WHERE (status = 'serving');
 CREATE UNIQUE INDEX IF NOT EXISTS certificates_one_runtime_slot_per_label
-    ON certificates (
-        label_id,
-        (CASE WHEN certificate_name IS NULL THEN 'public-ca' ELSE 'self-signed' END),
-        runtime_slot
-    ) WHERE runtime_slot IS NOT NULL;
+    ON certificates (label_id, runtime_slot) WHERE runtime_slot IS NOT NULL;
 
 -- Renewal scans ask "what expires soonest", never "what belongs to this group".
 CREATE INDEX IF NOT EXISTS certificates_expires_at_idx ON certificates (expires_at);
@@ -2426,16 +2475,14 @@ ON CONFLICT (node_id, label_id) DO NOTHING;
 CREATE TABLE IF NOT EXISTS node_cert_state (
     node_id TEXT NOT NULL,
     observed_state TEXT NOT NULL,
-    public_slot_a_sha256 TEXT,
-    public_slot_b_sha256 TEXT,
+    public_ca_sha256 TEXT,
     self_signed_slot_a_sha256 TEXT,
     self_signed_slot_b_sha256 TEXT,
     observed_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT node_cert_state_pkey PRIMARY KEY (node_id),
     CONSTRAINT node_cert_state_known CHECK ((observed_state = 'managed')),
     CONSTRAINT node_cert_state_shape CHECK (
-        (public_slot_a_sha256 IS NULL OR public_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
-        (public_slot_b_sha256 IS NULL OR public_slot_b_sha256 ~ '^[0-9a-f]{64}$') AND
+        (public_ca_sha256 IS NULL OR public_ca_sha256 ~ '^[0-9a-f]{64}$') AND
         (self_signed_slot_a_sha256 IS NULL OR self_signed_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
         (self_signed_slot_b_sha256 IS NULL OR self_signed_slot_b_sha256 ~ '^[0-9a-f]{64}$')
     ),
@@ -3021,6 +3068,8 @@ ALTER TABLE control_state
     ALTER COLUMN reality_dest SET DEFAULT 'addons.mozilla.org:443';
 ALTER TABLE control_state
     ALTER COLUMN reality_server_names SET DEFAULT '["addons.mozilla.org"]'::jsonb;
+ALTER TABLE control_state
+    ALTER COLUMN overlay_keepalive_secs SET DEFAULT 10;
 -- An installation created before this factory target existed has the exact empty pair below.
 -- Upgrade that untouched state, while leaving every configured custom site byte-for-byte alone.
 UPDATE control_state
@@ -3132,6 +3181,11 @@ ALTER TABLE chains
 -- Earlier development schemas stored only maxConcurrency. Once any XMUX field is present Xray no
 -- longer injects its lifecycle defaults, so replaying 0001 expands the scalar into one complete,
 -- explicit policy before dropping the legacy column.
+ALTER TABLE ingresses
+    ADD COLUMN IF NOT EXISTS vless_encryption_port INTEGER CHECK (vless_encryption_port BETWEEN 1 AND 65535),
+    ADD COLUMN IF NOT EXISTS vless_encryption_private_key TEXT,
+    ADD COLUMN IF NOT EXISTS vless_encryption_public_key TEXT;
+
 ALTER TABLE ingresses
     ADD COLUMN IF NOT EXISTS xhttp_xmux JSONB;
 ALTER TABLE ingresses
@@ -3376,7 +3430,7 @@ ALTER TABLE ingresses
         OR anytls_masquerade_status_code BETWEEN 200 AND 599
     ),
     ADD CONSTRAINT ingresses_has_a_wire CHECK (
-        transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled
+        transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled OR vless_encryption_port IS NOT NULL
     );
 
 ALTER TABLE ingress_client_settings
@@ -3659,7 +3713,7 @@ ALTER TABLE external_outbounds
     DROP CONSTRAINT IF EXISTS external_outbounds_protocol_check;
 ALTER TABLE external_outbounds
     ADD CONSTRAINT external_outbounds_protocol_check CHECK (
-        protocol IN ('vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard', 'warp')
+        protocol IN ('anytls', 'vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard', 'warp')
     );
 
 -- App, chain and ingress ids are internal random references. ON UPDATE CASCADE is intentional even
@@ -4361,9 +4415,9 @@ ALTER TABLE certificates
     ADD CONSTRAINT certificates_origin_known
         CHECK (origin IN ('renewal', 'spare', 'bootstrap'));
 
--- Certificate history may contain more than two rows, but only two rows in one group may own a
--- runtime slot. Self-signed and public-CA material remain separate tracks on the Agent; a group's
--- issued row freezes both its trust track and, for self-signed generations, its exact SNI.
+-- Certificate history may contain more than two rows, but only self-signed rows own A/B runtime
+-- slots. Public CA atomically replaces one current.pem. An issued row freezes both its trust track
+-- and, for self-signed generations, its exact SNI.
 DROP TRIGGER IF EXISTS certificates_enforce_self_signed_pool_limit ON certificates;
 DROP FUNCTION IF EXISTS brocade_enforce_self_signed_pool_limit();
 
@@ -4384,17 +4438,12 @@ ALTER TABLE certificates ADD CONSTRAINT certificates_runtime_slot_known
     CHECK (runtime_slot IS NULL OR runtime_slot IN ('a', 'b'));
 DROP INDEX IF EXISTS certificates_one_runtime_slot_per_label;
 CREATE UNIQUE INDEX certificates_one_runtime_slot_per_label
-    ON certificates (
-        label_id,
-        (CASE WHEN certificate_name IS NULL THEN 'public-ca' ELSE 'self-signed' END),
-        runtime_slot
-    ) WHERE runtime_slot IS NOT NULL;
+    ON certificates (label_id, runtime_slot) WHERE runtime_slot IS NOT NULL;
 
--- Existing serving material becomes slot A. Existing ready self-signed leaves all share the old
--- group SNI and cannot safely coexist under leaf pinning, so retain them as history without a
--- runtime slot. No certificate bytes or private keys are deleted.
-UPDATE certificates SET runtime_slot = 'a'
- WHERE status = 'serving' AND runtime_slot IS NULL;
+-- Public CA uses one current file and therefore never owns a runtime slot. Existing serving
+-- self-signed material becomes slot A. Existing ready self-signed leaves all share the old group
+-- SNI and cannot safely coexist under leaf pinning, so retain them as history without a slot.
+UPDATE certificates SET runtime_slot = NULL WHERE certificate_name IS NULL;
 UPDATE certificates AS c SET status = 'superseded', runtime_slot = NULL
   FROM cert_labels AS l, cert_domains AS d
  WHERE c.label_id = l.id AND l.domain_id = d.id
@@ -4408,22 +4457,35 @@ UPDATE certificates AS c
  WHERE c.label_id = l.id AND l.domain_id = d.id
    AND c.acme_directory = 'self-signed' AND c.status IN ('serving', 'compatible')
    AND c.certificate_name IS NULL;
+UPDATE certificates SET runtime_slot = 'a'
+ WHERE status = 'serving' AND certificate_name IS NOT NULL AND runtime_slot IS NULL;
+ALTER TABLE certificates VALIDATE CONSTRAINT certificates_runtime_slot_known;
 
 ALTER TABLE node_cert_state
-    ADD COLUMN IF NOT EXISTS public_slot_a_sha256 TEXT,
-    ADD COLUMN IF NOT EXISTS public_slot_b_sha256 TEXT,
+    ADD COLUMN IF NOT EXISTS public_ca_sha256 TEXT,
     ADD COLUMN IF NOT EXISTS self_signed_slot_a_sha256 TEXT,
     ADD COLUMN IF NOT EXISTS self_signed_slot_b_sha256 TEXT;
 ALTER TABLE node_cert_state DROP CONSTRAINT IF EXISTS node_cert_state_known;
--- The legacy digest covered cert.pem only and is not comparable with the new combined PEM slots.
--- Mark it unknown so protocol v5 sends both files once and establishes an honest baseline.
+-- The legacy digest covered cert.pem only and is not comparable with the new combined PEM layout.
+-- Mark it unknown so protocol v5 sends the managed files once and establishes an honest baseline.
 UPDATE node_cert_state SET observed_state = 'managed';
 ALTER TABLE node_cert_state ADD CONSTRAINT node_cert_state_known CHECK (observed_state = 'managed');
 ALTER TABLE node_cert_state DROP CONSTRAINT IF EXISTS node_cert_state_shape;
 ALTER TABLE node_cert_state ADD CONSTRAINT node_cert_state_shape CHECK (
-    (public_slot_a_sha256 IS NULL OR public_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
-    (public_slot_b_sha256 IS NULL OR public_slot_b_sha256 ~ '^[0-9a-f]{64}$') AND
+    (public_ca_sha256 IS NULL OR public_ca_sha256 ~ '^[0-9a-f]{64}$') AND
     (self_signed_slot_a_sha256 IS NULL OR self_signed_slot_a_sha256 ~ '^[0-9a-f]{64}$') AND
     (self_signed_slot_b_sha256 IS NULL OR self_signed_slot_b_sha256 ~ '^[0-9a-f]{64}$')
 );
 ALTER TABLE node_cert_state DROP COLUMN IF EXISTS observed_sha256;
+ALTER TABLE node_cert_state DROP COLUMN IF EXISTS public_slot_a_sha256;
+ALTER TABLE node_cert_state DROP COLUMN IF EXISTS public_slot_b_sha256;
+
+ALTER TABLE control_state ADD COLUMN IF NOT EXISTS port_vless_encryption_base INTEGER NOT NULL DEFAULT 48000
+    CHECK (port_vless_encryption_base BETWEEN 1 AND 65535);
+
+ALTER TABLE ingresses DROP CONSTRAINT IF EXISTS ingresses_vless_encryption_port_check;
+ALTER TABLE ingresses ADD CONSTRAINT ingresses_vless_encryption_port_check
+    CHECK (vless_encryption_port IS NULL OR (vless_encryption_port BETWEEN 1 AND 65535
+        AND vless_encryption_private_key IS NOT NULL AND vless_encryption_public_key IS NOT NULL));
+
+ALTER TABLE ingresses ADD COLUMN IF NOT EXISTS vless_encryption_options JSONB NOT NULL DEFAULT '{}'::jsonb;

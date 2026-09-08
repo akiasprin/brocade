@@ -56,6 +56,9 @@ export function occupiedPorts(
       if (ingress.wires.vless) {
         put(ingress.node, ingress.port, `线路 ${app.id} 的接入面 ${ingress.id} VLESS`);
       }
+      if (ingress.wires.vless_encryption) {
+        put(ingress.node, ingress.wires.vless_encryption.port, 'VLESS Encryption 接入面 ' + ingress.id);
+      }
       if (ingress.wires.anytls) {
         put(ingress.node, ingress.wires.anytls.port, `线路 ${app.id} 的接入面 ${ingress.id} AnyTLS`);
       }
@@ -89,7 +92,7 @@ export function freePortAcross(taken: Map<string, PortOwners>, nodeIds: string[]
   return port;
 }
 
-// 端口跳转需要连续的一段端口而非单个端口。单端口版本不适用于此：从 `from` 向上找到第一个
+// 端口跳跃需要连续的一段端口而非单个端口。单端口版本不适用于此：从 `from` 向上找到第一个
 // 空闲端口后，若其后第 3 个已被占用则整段不成立，需要从更后的位置重新查找。
 //
 // 返回区间起点。查找失败时（一直到 65535 都冲突）返回 `from`，由上层通过 portClash 报出

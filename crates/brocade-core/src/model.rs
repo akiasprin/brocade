@@ -91,6 +91,10 @@ pub struct ModelSettings {
     /// the same arrangement as `overlay.mtu` and `Node.mtu`.
     #[serde(default)]
     pub connection: ConnectionSettings,
+    /// Default parameters for node-to-node Mux.cool outbounds. A rule may either use this
+    /// complete value or replace it with one complete override; individual fields never inherit.
+    #[serde(default)]
+    pub relay_mux: HopMux,
     /// Count, per account, how many distinct source addresses are using it at a given
     /// time.
     ///
@@ -118,6 +122,7 @@ impl Default for ModelSettings {
             probe: ProbeSettings::default(),
             geodata: GeodataSettings::default(),
             connection: ConnectionSettings::default(),
+            relay_mux: HopMux::default(),
             stats_user_online: false,
         }
     }
@@ -308,12 +313,7 @@ impl Default for ProbeSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortSettings {
-    /// Ingresses search upward from this port.
-    ///
-    /// 8443 rather than 443 by default, because port 443 usually carries the operator's
-    /// own site or reverse proxy. A collision leaves two processes binding one port, and
-    /// the only symptom is a failed xray start. Setting this number to 443 selects 443;
-    /// that is an operator decision rather than a default.
+    /// VLESS ingresses search upward from this port, on TCP.
     pub ingress_base: u16,
     /// AnyTLS ingresses search upward from this port, on TCP.
     ///
@@ -321,6 +321,8 @@ pub struct PortSettings {
     /// read so adding the allocator control does not make those revisions unreadable.
     #[serde(default = "default_anytls_port_base")]
     pub anytls_base: u16,
+    #[serde(default = "default_vless_encryption_port_base")]
+    pub vless_encryption_base: u16,
     /// Relay ports search upward from this port. A high range keeps them clear of
     /// ingresses and system services.
     pub hop_base: u16,
@@ -334,11 +336,17 @@ pub struct PortSettings {
     pub hy2_base: u16,
 }
 
+pub const VLESS_ENCRYPTION_PORT_BASE: u16 = 48000;
+fn default_vless_encryption_port_base() -> u16 {
+    VLESS_ENCRYPTION_PORT_BASE
+}
+
 impl Default for PortSettings {
     fn default() -> Self {
         Self {
-            ingress_base: 8443,
+            ingress_base: VLESS_PORT_BASE,
             anytls_base: ANYTLS_PORT_BASE,
+            vless_encryption_base: VLESS_ENCRYPTION_PORT_BASE,
             hop_base: 20000,
             hy2_base: HYSTERIA2_PORT_BASE,
         }
@@ -347,7 +355,16 @@ impl Default for PortSettings {
 
 #[cfg(test)]
 mod port_settings_tests {
-    use super::{PortSettings, ANYTLS_PORT_BASE};
+    use super::{PortSettings, ANYTLS_PORT_BASE, VLESS_PORT_BASE};
+
+    #[test]
+    fn factory_bases_keep_vless_and_anytls_in_separate_ranges() {
+        let ports = PortSettings::default();
+        assert_eq!(ports.ingress_base, VLESS_PORT_BASE);
+        assert_eq!(ports.ingress_base, 13_443);
+        assert_eq!(ports.anytls_base, ANYTLS_PORT_BASE);
+        assert_eq!(ports.anytls_base, 14_443);
+    }
 
     #[test]
     fn revisions_without_anytls_base_use_the_current_factory_value() {
@@ -359,7 +376,7 @@ mod port_settings_tests {
         .unwrap();
 
         assert_eq!(ports.anytls_base, ANYTLS_PORT_BASE);
-        assert_eq!(ports.anytls_base, 18_443);
+        assert_eq!(ports.anytls_base, 14_443);
     }
 }
 
@@ -368,7 +385,7 @@ mod port_settings_tests {
 #[serde(deny_unknown_fields)]
 pub struct OverlaySettings {
     /// Written into the wg config only for one-way dialing (`Dial::Both` needs no
-    /// keepalive). Environments with aggressive NAT aging need a lower value; 25 seconds
+    /// keepalive). Environments with aggressive NAT aging need a lower value; 10 seconds
     /// is WireGuard's usual default.
     ///
     /// Keepalive is a global setting: it describes the side that keeps the path open
@@ -399,7 +416,7 @@ pub struct DisabledWireGuardLink {
 impl Default for OverlaySettings {
     fn default() -> Self {
         Self {
-            keepalive_secs: 25,
+            keepalive_secs: 10,
             mtu: 1420,
             disabled_links: Vec::new(),
         }
@@ -482,6 +499,14 @@ pub struct Node {
     /// that presents no certificate.
     #[serde(default)]
     pub certificate_name: Option<String>,
+    /// Every SNI currently occupying this node's certificate runtime slots. The serving name
+    /// above remains the one advertised to new clients; this set is for listeners (notably a
+    /// REALITY local cover) that must keep accepting saved configurations for the other slot.
+    #[serde(default)]
+    pub certificate_names: Vec<String>,
+    /// Frozen group ownership. Changing it requires a configuration release and Xray restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_group_id: Option<String>,
     /// Which independent Agent certificate directory Xray must use. Frozen from the serving
     /// certificate rather than inferred from the mutable global issuance setting.
     #[serde(default)]
@@ -857,6 +882,9 @@ pub const EXTERNAL_WIREGUARD_MAX_WORKERS: u16 = 256;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum ExternalOutboundProtocol {
+    Anytls {
+        credential: String,
+    },
     Vless {
         credential: String,
         #[serde(default = "external_vless_encryption_none")]
@@ -1002,7 +1030,8 @@ fn external_warp_keep_alive() -> u16 {
 impl ExternalOutboundProtocol {
     pub fn credential(&self) -> &str {
         match self {
-            Self::Vless { credential, .. }
+            Self::Anytls { credential }
+            | Self::Vless { credential, .. }
             | Self::Shadowsocks2022 { credential, .. }
             | Self::Socks5 { credential, .. }
             | Self::HttpConnect { credential, .. }
@@ -1013,7 +1042,8 @@ impl ExternalOutboundProtocol {
 
     pub fn set_credential(&mut self, value: String) {
         match self {
-            Self::Vless { credential, .. }
+            Self::Anytls { credential }
+            | Self::Vless { credential, .. }
             | Self::Shadowsocks2022 { credential, .. }
             | Self::Socks5 { credential, .. }
             | Self::HttpConnect { credential, .. }
@@ -1542,8 +1572,11 @@ impl AnyTls {
     }
 }
 
+/// Base used when the console creates a VLESS listener without an explicit port.
+pub const VLESS_PORT_BASE: u16 = 13_443;
+
 /// Base used when the console creates an AnyTLS listener without an explicit port.
-pub const ANYTLS_PORT_BASE: u16 = 18_443;
+pub const ANYTLS_PORT_BASE: u16 = 14_443;
 
 const fn default_anytls_port_base() -> u16 {
     ANYTLS_PORT_BASE
@@ -1792,6 +1825,10 @@ pub enum HysteriaMasquerade {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "IngressWiresWire", into = "IngressWiresWire")]
 pub enum IngressWires {
+    WithVlessEncryption {
+        other: Option<Box<IngressWires>>,
+        encryption: VlessEncryption,
+    },
     Vless(Transport),
     AnyTls(AnyTls),
     Hysteria2(Hysteria2),
@@ -1821,6 +1858,8 @@ pub enum IngressWires {
 #[serde(deny_unknown_fields)]
 pub struct IngressWiresWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vless_encryption: Option<VlessEncryption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vless: Option<Transport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anytls: Option<AnyTls>,
@@ -1831,7 +1870,16 @@ pub struct IngressWiresWire {
 impl TryFrom<IngressWiresWire> for IngressWires {
     type Error = &'static str;
 
-    fn try_from(wire: IngressWiresWire) -> Result<Self, Self::Error> {
+    fn try_from(mut wire: IngressWiresWire) -> Result<Self, Self::Error> {
+        if let Some(encryption) = wire.vless_encryption.take() {
+            let other = if wire.vless.is_none() && wire.anytls.is_none() && wire.hysteria2.is_none()
+            {
+                None
+            } else {
+                Some(Box::new(Self::try_from(wire)?))
+            };
+            return Ok(Self::WithVlessEncryption { other, encryption });
+        }
         match (wire.vless, wire.anytls, wire.hysteria2) {
             (Some(vless), Some(anytls), Some(hysteria2)) => Ok(Self::VlessAnyTlsAndHysteria2 {
                 vless,
@@ -1856,32 +1904,48 @@ impl TryFrom<IngressWiresWire> for IngressWires {
 impl From<IngressWires> for IngressWiresWire {
     fn from(wires: IngressWires) -> Self {
         match wires {
+            IngressWires::WithVlessEncryption { other, encryption } => {
+                let mut wire = other.map(|other| Self::from(*other)).unwrap_or(Self {
+                    vless_encryption: None,
+                    vless: None,
+                    anytls: None,
+                    hysteria2: None,
+                });
+                wire.vless_encryption = Some(encryption);
+                wire
+            }
             IngressWires::Vless(vless) => Self {
+                vless_encryption: None,
                 vless: Some(vless),
                 anytls: None,
                 hysteria2: None,
             },
             IngressWires::AnyTls(anytls) => Self {
+                vless_encryption: None,
                 vless: None,
                 anytls: Some(anytls),
                 hysteria2: None,
             },
             IngressWires::Hysteria2(hysteria2) => Self {
+                vless_encryption: None,
                 vless: None,
                 anytls: None,
                 hysteria2: Some(hysteria2),
             },
             IngressWires::VlessAndAnyTls { vless, anytls } => Self {
+                vless_encryption: None,
                 vless: Some(vless),
                 anytls: Some(anytls),
                 hysteria2: None,
             },
             IngressWires::Both { vless, hysteria2 } => Self {
+                vless_encryption: None,
                 vless: Some(vless),
                 anytls: None,
                 hysteria2: Some(hysteria2),
             },
             IngressWires::AnyTlsAndHysteria2 { anytls, hysteria2 } => Self {
+                vless_encryption: None,
                 vless: None,
                 anytls: Some(anytls),
                 hysteria2: Some(hysteria2),
@@ -1891,6 +1955,7 @@ impl From<IngressWires> for IngressWiresWire {
                 anytls,
                 hysteria2,
             } => Self {
+                vless_encryption: None,
                 vless: Some(vless),
                 anytls: Some(anytls),
                 hysteria2: Some(hysteria2),
@@ -1899,10 +1964,182 @@ impl From<IngressWires> for IngressWiresWire {
     }
 }
 
+/// A distinct TCP listener; keys are generated and retained by the control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VlessEncryption {
+    pub port: u16,
+    #[serde(default)]
+    pub options: VlessEncryptionOptions,
+    pub private_key: String,
+    pub public_key: String,
+}
+
+/// Managed VLESS Encryption parameters. Empty padding delegates to the pinned core.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VlessEncryptionOptions {
+    pub appearance: VlessEncryptionAppearance,
+    /// Xray syntax: `600s` means 300–600 seconds; `100-500s` specifies both bounds.
+    pub ticket_lifetime: String,
+    pub client_mode: VlessEncryptionClientMode,
+    pub server_padding: String,
+    pub client_padding: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VlessEncryptionAppearance {
+    #[default]
+    Native,
+    Xorpub,
+    Random,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VlessEncryptionClientMode {
+    #[default]
+    #[serde(rename = "0rtt")]
+    ZeroRtt,
+    #[serde(rename = "1rtt")]
+    OneRtt,
+}
+
+impl VlessEncryptionAppearance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Xorpub => "xorpub",
+            Self::Random => "random",
+        }
+    }
+}
+
+impl VlessEncryptionClientMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ZeroRtt => "0rtt",
+            Self::OneRtt => "1rtt",
+        }
+    }
+}
+
+impl Default for VlessEncryptionOptions {
+    fn default() -> Self {
+        Self {
+            appearance: VlessEncryptionAppearance::Native,
+            ticket_lifetime: "600s".to_owned(),
+            client_mode: VlessEncryptionClientMode::ZeroRtt,
+            server_padding: String::new(),
+            client_padding: String::new(),
+        }
+    }
+}
+
+impl VlessEncryptionOptions {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let raw = self
+            .ticket_lifetime
+            .strip_suffix('s')
+            .ok_or("票据有效期须为 600s 或 100-500s 格式")?;
+        let bounds: Vec<_> = raw.split('-').collect();
+        let parse = |s: &str| -> Option<u32> {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse().ok())
+                .flatten()
+        };
+        if bounds.is_empty() || bounds.len() > 2 {
+            return Err("票据有效期须为单值或起止范围");
+        }
+        let from = parse(bounds[0]).ok_or("票据时间须为非负整数秒")?;
+        let to = if bounds.len() == 2 {
+            parse(bounds[1]).ok_or("票据时间须为非负整数秒")?
+        } else {
+            from
+        };
+        // The pinned core encodes the ticket lifetime using two bytes.
+        if from > to || to > 65535 || (from == 0 && to != 0) {
+            return Err("票据范围须递增且不超过 65535 秒；禁用会话恢复请填 0s");
+        }
+        Self::validate_padding(&self.server_padding)?;
+        Self::validate_padding(&self.client_padding)?;
+        Ok(())
+    }
+
+    pub fn validate_padding(value: &str) -> Result<(), &'static str> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        if value.len() > 4096 {
+            return Err("Padding 规则不能超过 4096 字符");
+        }
+        let blocks: Vec<_> = value.split('.').collect();
+        if blocks.len() % 2 == 0 {
+            return Err("Padding 须以填充段开始和结束，中间交替插入延迟段");
+        }
+        let mut total = 0u32;
+        for (index, block) in blocks.iter().enumerate() {
+            let values: Vec<u32> = block
+                .split('-')
+                .map(|part| {
+                    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err("Padding 须使用 概率-最小值-最大值 格式");
+                    }
+                    part.parse().map_err(|_| "Padding 数值过大")
+                })
+                .collect::<Result<_, _>>()?;
+            if values.len() != 3 || block.len() >= 20 {
+                return Err("Padding 段格式无效");
+            }
+            let (probability, min, max) = (values[0], values[1], values[2]);
+            if probability > 100 || min > max || max > i32::MAX as u32 {
+                return Err("Padding 概率须为 0–100，范围须递增且不超过 2147483647");
+            }
+            if index == 0 && (probability != 100 || min < 35) {
+                return Err("首段 Padding 概率必须为 100%，最小长度至少 35 字节");
+            }
+            if index % 2 == 0 {
+                total = total.checked_add(max).ok_or("Padding 总长度过大")?;
+                if total > 65553 {
+                    return Err("Padding 各填充段最大长度之和不能超过 65553 字节");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decryption(&self, private_key: &str) -> String {
+        self.envelope(&self.ticket_lifetime, &self.server_padding, private_key)
+    }
+
+    pub fn encryption(&self, public_key: &str) -> String {
+        self.envelope(self.client_mode.as_str(), &self.client_padding, public_key)
+    }
+
+    fn envelope(&self, mode: &str, padding: &str, key: &str) -> String {
+        let prefix = format!("mlkem768x25519plus.{}.{mode}", self.appearance.as_str());
+        if padding.is_empty() {
+            format!("{prefix}.{key}")
+        } else {
+            format!("{prefix}.{padding}.{key}")
+        }
+    }
+}
+
 impl IngressWires {
+    pub fn vless_encryption(&self) -> Option<&VlessEncryption> {
+        match self {
+            Self::WithVlessEncryption { encryption, .. } => Some(encryption),
+            _ => None,
+        }
+    }
+
     /// The TCP half, or `None` where this ingress is QUIC only.
     pub fn vless(&self) -> Option<&Transport> {
         match self {
+            Self::WithVlessEncryption { other, .. } => {
+                other.as_ref().and_then(|other| other.vless())
+            }
             Self::Vless(vless) | Self::Both { vless, .. } => Some(vless),
             Self::VlessAndAnyTls { vless, .. } | Self::VlessAnyTlsAndHysteria2 { vless, .. } => {
                 Some(vless)
@@ -1913,6 +2150,9 @@ impl IngressWires {
 
     pub fn vless_mut(&mut self) -> Option<&mut Transport> {
         match self {
+            Self::WithVlessEncryption { other, .. } => {
+                other.as_mut().and_then(|other| other.vless_mut())
+            }
             Self::Vless(vless) | Self::Both { vless, .. } => Some(vless),
             Self::VlessAndAnyTls { vless, .. } | Self::VlessAnyTlsAndHysteria2 { vless, .. } => {
                 Some(vless)
@@ -1924,6 +2164,9 @@ impl IngressWires {
     /// The AnyTLS TCP half, or `None` where this ingress is VLESS or QUIC only.
     pub fn anytls(&self) -> Option<&AnyTls> {
         match self {
+            Self::WithVlessEncryption { other, .. } => {
+                other.as_ref().and_then(|other| other.anytls())
+            }
             Self::AnyTls(anytls)
             | Self::VlessAndAnyTls { anytls, .. }
             | Self::AnyTlsAndHysteria2 { anytls, .. }
@@ -1934,6 +2177,9 @@ impl IngressWires {
 
     pub fn anytls_mut(&mut self) -> Option<&mut AnyTls> {
         match self {
+            Self::WithVlessEncryption { other, .. } => {
+                other.as_mut().and_then(|other| other.anytls_mut())
+            }
             Self::AnyTls(anytls)
             | Self::VlessAndAnyTls { anytls, .. }
             | Self::AnyTlsAndHysteria2 { anytls, .. }
@@ -1945,6 +2191,9 @@ impl IngressWires {
     /// The UDP half, or `None` where this ingress is TCP only.
     pub fn hysteria2(&self) -> Option<&Hysteria2> {
         match self {
+            Self::WithVlessEncryption { other, .. } => {
+                other.as_ref().and_then(|other| other.hysteria2())
+            }
             Self::Hysteria2(hysteria2)
             | Self::Both { hysteria2, .. }
             | Self::AnyTlsAndHysteria2 { hysteria2, .. }
@@ -1955,6 +2204,9 @@ impl IngressWires {
 
     pub fn hysteria2_mut(&mut self) -> Option<&mut Hysteria2> {
         match self {
+            Self::WithVlessEncryption { other, .. } => {
+                other.as_mut().and_then(|other| other.hysteria2_mut())
+            }
             Self::Hysteria2(hysteria2)
             | Self::Both { hysteria2, .. }
             | Self::AnyTlsAndHysteria2 { hysteria2, .. }
@@ -1966,7 +2218,7 @@ impl IngressWires {
     /// Whether a TCP listener exists. `false` for the QUIC-only shape, which is why the
     /// port-occupancy checks call this rather than assuming (`ir/validate.rs`).
     pub fn has_tcp(&self) -> bool {
-        self.vless().is_some() || self.anytls().is_some()
+        self.vless().is_some() || self.anytls().is_some() || self.vless_encryption().is_some()
     }
 
     /// Whether a UDP listener exists.
@@ -2735,8 +2987,49 @@ impl IpFamily {
 /// require it. The consequence is that Mux.cool's retention is a constant in its own
 /// `monitor()` with no configuration key, so the short retention window cannot be changed
 /// from here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "t", content = "v", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HopMux {
+    pub concurrency: u16,
+    pub min_idle_workers: u32,
+    pub max_idle_workers: u32,
+    pub max_probing_workers: u32,
+    pub probe_interval_secs: u16,
+    pub probe_timeout_ms: u32,
+    pub idle_ttl_secs: u32,
+    pub max_requests_per_worker: u16,
+}
+
+impl HopMux {
+    pub const CONCURRENCY_MIN: u16 = 1;
+    pub const CONCURRENCY_MAX: u16 = 128;
+    pub const MAX_IDLE_MIN: u32 = 1;
+    pub const PROBE_INTERVAL_MIN_SECS: u16 = 2;
+    pub const PROBE_INTERVAL_MAX_SECS: u16 = 60;
+    pub const PROBE_TIMEOUT_MIN_MS: u32 = 200;
+    pub const PROBE_TIMEOUT_MAX_MS: u32 = 10_000;
+    pub const IDLE_TTL_MIN_SECS: u32 = 1;
+    pub const MAX_REQUESTS_MIN: u16 = 1;
+    // Mux.Cool session IDs start at 1 and the current allocator never reuses them.
+    pub const MAX_REQUESTS_MAX: u16 = u16::MAX;
+}
+
+impl Default for HopMux {
+    fn default() -> Self {
+        Self {
+            concurrency: 1,
+            min_idle_workers: 0,
+            max_idle_workers: 2,
+            max_probing_workers: 1,
+            probe_interval_secs: 5,
+            probe_timeout_ms: 2000,
+            idle_ttl_secs: 24,
+            max_requests_per_worker: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HopPool {
     /// One connection per stream, closed with it. The behavior of every hop before this
     /// field existed, and still the default: pooling justifies a disruptive release only
@@ -2763,6 +3056,68 @@ pub enum HopPool {
     /// way in the console and runs another on the machine is the failure the golden
     /// artifacts exist to prevent.
     Merge(u16),
+    /// Current Mux model. `None` follows `ModelSettings::relay_mux`; `Some` is one complete
+    /// per-edge override. New write paths use only this variant and `None`.
+    Mux(Option<HopMux>),
+}
+
+impl Serialize for HopPool {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let has_value = matches!(self, Self::Merge(_) | Self::Mux(Some(_)));
+        let mut map = serializer.serialize_map(Some(if has_value { 2 } else { 1 }))?;
+        let tag = match self {
+            Self::None => "none",
+            Self::Pool => "pool",
+            Self::Merge(_) => "merge",
+            Self::Mux(_) => "mux",
+        };
+        map.serialize_entry("t", tag)?;
+        match self {
+            Self::Merge(value) => map.serialize_entry("v", value)?,
+            Self::Mux(Some(value)) => map.serialize_entry("v", value)?,
+            Self::None | Self::Pool | Self::Mux(None) => {}
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for HopPool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Repr {
+            t: String,
+            #[serde(default)]
+            v: Option<serde_json::Value>,
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        match (repr.t.as_str(), repr.v) {
+            ("none", None) => Ok(Self::None),
+            ("pool", None) => Ok(Self::Pool),
+            ("merge", Some(value)) => serde_json::from_value(value)
+                .map(Self::Merge)
+                .map_err(serde::de::Error::custom),
+            ("mux", None) => Ok(Self::Mux(None)),
+            ("mux", Some(value)) => serde_json::from_value(value)
+                .map(|value| Self::Mux(Some(value)))
+                .map_err(serde::de::Error::custom),
+            (tag, _) if !matches!(tag, "none" | "pool" | "merge" | "mux") => Err(
+                serde::de::Error::unknown_variant(tag, &["none", "pool", "merge", "mux"]),
+            ),
+            (tag, _) => Err(serde::de::Error::custom(format!(
+                "HopPool variant {tag} has an invalid v field"
+            ))),
+        }
+    }
 }
 
 impl HopPool {
@@ -3118,5 +3473,32 @@ mod transport_tests {
             let back: Transport = serde_json::from_str(&text).unwrap();
             assert_eq!(back, transport, "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hop_mux_tests {
+    use super::{HopMux, HopPool};
+
+    #[test]
+    fn current_mux_follow_and_override_have_stable_wire_shapes() {
+        let follow = serde_json::to_value(HopPool::Mux(None)).unwrap();
+        assert_eq!(follow, serde_json::json!({ "t": "mux" }));
+
+        let value = HopMux::default();
+        let override_value = serde_json::to_value(HopPool::Mux(Some(value))).unwrap();
+        assert_eq!(
+            override_value,
+            serde_json::json!({ "t": "mux", "v": value })
+        );
+
+        assert_eq!(
+            serde_json::from_value::<HopPool>(follow).unwrap(),
+            HopPool::Mux(None)
+        );
+        assert_eq!(
+            serde_json::from_value::<HopPool>(override_value).unwrap(),
+            HopPool::Mux(Some(value))
+        );
     }
 }

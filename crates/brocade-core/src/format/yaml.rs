@@ -448,6 +448,7 @@ fn subscription_server_names(subscription: &Subscription) -> BTreeSet<&str> {
         .entries
         .iter()
         .map(|entry| match &entry.security {
+            SubscriptionSecurity::VlessEncryption { .. } => "",
             SubscriptionSecurity::Reality(reality) => reality.server_name.as_str(),
             SubscriptionSecurity::Tls(tls) => tls.server_name.as_str(),
             SubscriptionSecurity::AnyTls(anytls) => anytls.server_name.as_str(),
@@ -658,6 +659,22 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
         SubscriptionStream::Tcp => lines.push("    network: tcp".to_owned()),
         SubscriptionStream::Xhttp { .. } => lines.push("    network: xhttp".to_owned()),
     }
+    if let SubscriptionSecurity::VlessEncryption {
+        public_key,
+        options,
+    } = &entry.security
+    {
+        lines.push(format!(
+            "    encryption: {}",
+            scalar(&options.encryption(public_key))
+        ));
+        lines.push("    udp: true".to_owned());
+        lines.push("    tfo: true".to_owned());
+        if let Some(group) = &entry.front_name {
+            lines.push(format!("    dialer-proxy: {}", yaml_quote(group)));
+        }
+        return;
+    }
     lines.push("    tls: true".to_owned());
     lines.push("    udp: true".to_owned());
     // Mihomo's common proxy field. It only affects a TCP transport, so the Hysteria 2 branch
@@ -672,7 +689,9 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
             (&reality.server_name, &reality.flow, Some(reality))
         }
         SubscriptionSecurity::Tls(tls) => (&tls.server_name, &tls.flow, None),
-        SubscriptionSecurity::AnyTls(_) | SubscriptionSecurity::Hysteria2(_) => {
+        SubscriptionSecurity::AnyTls(_)
+        | SubscriptionSecurity::Hysteria2(_)
+        | SubscriptionSecurity::VlessEncryption { .. } => {
             unreachable!("AnyTLS / Hysteria 已在上方单独渲染")
         }
     };
@@ -808,14 +827,30 @@ fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProx
     lines.push(format!("    server: {}", scalar(&proxy.server)));
     lines.push(format!("    port: {}", proxy.port));
     match &proxy.protocol {
+        ExternalOutboundProtocol::Anytls { credential } => {
+            lines.push("    type: anytls".to_owned());
+            lines.push(format!("    password: {}", scalar(credential)));
+            lines.push("    udp: true".to_owned());
+            if let ExternalOutboundSecurity::Tls {
+                server_name,
+                fingerprint,
+            } = &proxy.security
+            {
+                lines.push(format!("    sni: {}", scalar(server_name)));
+                lines.push(format!("    client-fingerprint: {}", scalar(fingerprint)));
+            }
+        }
         ExternalOutboundProtocol::Vless {
             credential,
-            encryption: _,
+            encryption,
             flow,
             transport,
         } => {
             lines.push("    type: vless".to_owned());
             lines.push(format!("    uuid: {}", scalar(credential)));
+            if encryption != "none" {
+                lines.push(format!("    encryption: {}", scalar(encryption)));
+            }
             match transport {
                 ExternalVlessTransport::Raw => lines.push("    network: tcp".to_owned()),
                 ExternalVlessTransport::Xhttp(xhttp) => {

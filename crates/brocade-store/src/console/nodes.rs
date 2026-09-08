@@ -1,10 +1,255 @@
-//! Writes on machines: status (decommission/restore), field updates, and parsing a relay
-//! port's transport layer.
+//! Writes on machines: status (decommission/restore), permanent removal after retirement, field
+//! updates, and parsing a relay port's transport layer.
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::*;
 use crate::{AdminContext, Result, StoreError};
+
+const MAX_REMOVE_NODES: usize = 200;
+
+/// Permanently remove terminally retired machines and every business chain containing one of
+/// them. The entire operation is one model revision and one database transaction.
+///
+/// Retirement has to finish first. Removing an active/retiring row would erase the agent token and
+/// the teardown work order before the remote services were confirmed stopped, recreating exactly
+/// the unmanaged-live-machine failure that the retirement state machine exists to prevent.
+pub async fn remove_retired_nodes(
+    pool: &PgPool,
+    actor: &AdminContext,
+    request: RemoveRetiredNodesRequest,
+) -> Result<RemoveRetiredNodesResult> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can remove retired nodes".to_owned(),
+        ));
+    }
+
+    let mut node_ids = BTreeSet::new();
+    for raw in request.node_ids {
+        node_ids.insert(required_text(raw, "node id")?);
+    }
+    if node_ids.is_empty() {
+        return Err(StoreError::InvalidData(
+            "node_ids must not be empty".to_owned(),
+        ));
+    }
+    if node_ids.len() > MAX_REMOVE_NODES {
+        return Err(StoreError::InvalidData(format!(
+            "at most {MAX_REMOVE_NODES} nodes can be removed at once"
+        )));
+    }
+    let node_ids = node_ids.into_iter().collect::<Vec<_>>();
+
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+
+    let rows = sqlx::query(
+        "SELECT n.id, n.retired_at IS NOT NULL AS retired, lifecycle.phase
+           FROM nodes n
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = n.id
+          WHERE n.id = ANY($1)
+          ORDER BY n.id
+          FOR UPDATE OF n, lifecycle",
+    )
+    .bind(&node_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let found = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    if found.len() != node_ids.len() {
+        let missing = node_ids
+            .iter()
+            .filter(|id| !found.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(StoreError::NotFound(format!(
+            "node(s) {}",
+            missing.join(", ")
+        )));
+    }
+    for row in &rows {
+        let node_id: String = row.try_get("id")?;
+        let retired: bool = row.try_get("retired")?;
+        let phase: String = row.try_get("phase")?;
+        if !retired || !matches!(phase.as_str(), "retired" | "abandoned") {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} must finish retirement before removal (current phase: {phase})"
+            )));
+        }
+    }
+
+    // A provider-managed WARP registration is an external resource. Normal retirement removes it
+    // first; if that cleanup failed, keep the sealed token and refuse deletion so an operator can
+    // retry instead of orphaning an unreachable Cloudflare device.
+    let external = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT node_id
+           FROM external_outbound_bindings
+          WHERE node_id = ANY($1)
+          ORDER BY node_id",
+    )
+    .bind(&node_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !external.is_empty() {
+        return Err(StoreError::Conflict(format!(
+            "node(s) {} still have external WARP resources; retry retirement cleanup first",
+            external.join(", ")
+        )));
+    }
+
+    let note = format!("remove retired nodes {}", node_ids.join(","));
+    let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
+
+    // A machine may be the head, an ordinary hop, or a rule-only branch. In every case the user
+    // asked for its associated line to disappear, so remove the whole chain rather than trimming a
+    // subtree and silently changing where the remainder exits.
+    let chains = sqlx::query(
+        "SELECT DISTINCT chain.app_id, chain.id
+           FROM chains chain
+          WHERE EXISTS (
+                    SELECT 1 FROM steps step
+                     WHERE step.chain_id = chain.id AND step.node_id = ANY($1)
+                )
+             OR EXISTS (
+                    SELECT 1 FROM ingresses ingress
+                     WHERE ingress.chain_id = chain.id AND ingress.node_id = ANY($1)
+                )
+          ORDER BY chain.app_id, chain.id",
+    )
+    .bind(&node_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut removed_chains = Vec::with_capacity(chains.len());
+    for row in chains {
+        let app_id: String = row.try_get("app_id")?;
+        let chain_id: String = row.try_get("id")?;
+        super::steps::delete_whole_chain_tx(&mut tx, actor, &app_id, &chain_id).await?;
+        removed_chains.push(chain_id);
+    }
+
+    // Release work and its convergence rows go first because both may point at usage generations.
+    // Usage rows are accounting/history but the explicit "remove machine" action removes the
+    // machine's complete footprint; retaining them would keep RESTRICT references and make the
+    // visible removal lie about what is still stored.
+    sqlx::query("DELETE FROM deployment_targets WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM node_agent_state WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM node_applied_state WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_samples WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_chain_samples WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_readings WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_report_receipts WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_counter_heads WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_generation_activations WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_agent_cursors WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_generations WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM node_operational_isolations WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM node_lifecycle_state WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+
+    // Remove references stored as JSON rather than foreign keys.
+    sqlx::query(
+        "UPDATE control_state
+            SET overlay_disabled_links = COALESCE(
+                    (SELECT jsonb_agg(link)
+                       FROM jsonb_array_elements(overlay_disabled_links) link
+                      WHERE NOT ((link ->> 'a') = ANY($1) OR (link ->> 'b') = ANY($1))),
+                    '[]'::jsonb
+                ),
+                agent_release_nodes = COALESCE(
+                    (SELECT jsonb_agg(node)
+                       FROM jsonb_array_elements(agent_release_nodes) node
+                      WHERE NOT ((node #>> '{}') = ANY($1))),
+                    '[]'::jsonb
+                )
+          WHERE id = TRUE",
+    )
+    .bind(&node_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE control_state
+            SET agent_release_scope = 'off'
+          WHERE id = TRUE
+            AND agent_release_scope = 'nodes'
+            AND jsonb_array_length(agent_release_nodes) = 0",
+    )
+    .execute(&mut *tx)
+    .await?;
+    for node_id in &node_ids {
+        sqlx::query(
+            "UPDATE subscription_serving_state
+                SET isolated_node_ids = isolated_node_ids - $1,
+                    updated_at = now()
+              WHERE id = TRUE",
+        )
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let removed = sqlx::query("DELETE FROM nodes WHERE id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if removed != node_ids.len() as u64 {
+        return Err(StoreError::Conflict(format!(
+            "removed {removed} of {} requested nodes",
+            node_ids.len()
+        )));
+    }
+
+    let revision_id = commit_revision(&mut tx, revision_id, previous, true).await?;
+    tx.commit().await?;
+    Ok(RemoveRetiredNodesResult {
+        revision_id,
+        removed_nodes: node_ids,
+        removed_chains,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

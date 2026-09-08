@@ -131,6 +131,31 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
     response
 }
 
+/// Both the browser title and React's first render use the same saved branding.
+pub(crate) fn branded_index(html: &str, branding: &brocade_store::BrandingSettings) -> String {
+    let title = format!("{} | 跨境网络小管家", branding.site_name)
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    let mut html = html.to_owned();
+    if let Some(start) = html.find("<title>") {
+        if let Some(end) = html[start..].find("</title>") {
+            html.replace_range(start + "<title>".len()..start + end, &title);
+        }
+    }
+    // JSON in a script element is raw text: escape '<' so a site name cannot close the element.
+    let json = serde_json::to_string(branding)
+        .expect("branding is serializable")
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
+    let bootstrap =
+        format!("<script id=\"brocade-branding\" type=\"application/json\">{json}</script>");
+    html.replacen("</head>", &format!("{bootstrap}</head>"), 1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;

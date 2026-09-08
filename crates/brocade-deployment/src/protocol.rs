@@ -19,6 +19,7 @@ pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 5;
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
 pub const DEFAULT_AGENT_LOG_MAX_MIB: u32 = 100;
+pub const DEFAULT_PHANTUN_LOG_MAX_MIB: u32 = 16;
 pub const MIN_AGENT_LOG_MAX_MIB: u32 = 16;
 pub const MAX_AGENT_LOG_MAX_MIB: u32 = 4096;
 
@@ -207,15 +208,18 @@ pub enum CertificateObservation {
     /// Not reported. An agent from before this existed, and nothing to conclude from it.
     #[default]
     Unmanaged,
-    /// Both independent certificate tracks were inspected. A missing digest means that physical
-    /// slot is absent or unreadable; the other track and slot remain independently observable.
+    /// Both independent certificate tracks were inspected. Public CA uses one atomically replaced
+    /// file; self-signed keeps two physical slots so old and new pinned identities can overlap.
+    /// A missing digest means that file is absent or unreadable.
     Managed {
-        public_ca: CertificatePairObservation,
+        #[serde(default)]
+        public_ca_sha256: Option<String>,
+        #[serde(default)]
         self_signed: CertificatePairObservation,
     },
 }
 
-/// What is present in one track's two fixed runtime slots.
+/// What is present in the self-signed track's two fixed runtime slots.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CertificatePairObservation {
     #[serde(default)]
@@ -262,13 +266,18 @@ pub enum CertificateTrack {
 /// here is that this struct is never logged, included in an error, or returned by a console
 /// route.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeCertificateMaterial {
-    /// Publicly trusted and self-signed materials live under different directories and are never
-    /// loaded into the same Xray certificate set.
-    pub track: CertificateTrack,
-    /// The two files Xray knows from process start. A track with only one live identity repeats it
-    /// in both slots, so every configured path always contains a valid certificate and key.
-    pub slots: [NodeCertificateSlotMaterial; 2],
+#[serde(tag = "track", rename_all = "kebab-case")]
+pub enum NodeCertificateMaterial {
+    /// A publicly trusted renewal keeps the same SNI and needs no leaf pin overlap. One combined
+    /// PEM is atomically replaced and hot-reloaded by Xray.
+    PublicCa {
+        certificate: NodeCertificateSlotMaterial,
+    },
+    /// Self-signed generations use different SNI and leaf pins. Both identities must remain
+    /// available while saved clients move from one generation to the next.
+    SelfSigned {
+        slots: [NodeCertificateSlotMaterial; 2],
+    },
 }
 
 /// One complete certificate identity assigned to a fixed physical slot.
@@ -288,10 +297,16 @@ pub struct NodeCertificateSlotMaterial {
 /// reach a readable output.
 impl std::fmt::Debug for NodeCertificateMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NodeCertificateMaterial")
-            .field("track", &self.track)
-            .field("slots", &self.slots)
-            .finish()
+        match self {
+            Self::PublicCa { certificate } => f
+                .debug_struct("NodeCertificateMaterial::PublicCa")
+                .field("certificate", certificate)
+                .finish(),
+            Self::SelfSigned { slots } => f
+                .debug_struct("NodeCertificateMaterial::SelfSigned")
+                .field("slots", slots)
+                .finish(),
+        }
     }
 }
 
@@ -975,6 +990,8 @@ impl E2eProbeTargetList {
 /// different path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2eProbeTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vless_encryption: Option<String>,
     pub app_id: Option<String>,
     pub chain_id: String,
     pub chain_name: String,
@@ -2022,8 +2039,7 @@ mod tests {
             cert_pem: "CERT".to_owned(),
             key_pem: "KEY".to_owned(),
         };
-        let material = NodeCertificateMaterial {
-            track: CertificateTrack::SelfSigned,
+        let material = NodeCertificateMaterial::SelfSigned {
             slots: [slot.clone(), slot],
         };
         let wire =
@@ -2035,6 +2051,22 @@ mod tests {
         );
         let parsed: DesiredStateResponse = serde_json::from_str(&wire).unwrap();
         assert_eq!(parsed, DesiredStateResponse::Certificates(vec![material]));
+    }
+
+    #[test]
+    fn public_ca_material_has_one_current_certificate() {
+        let certificate = NodeCertificateSlotMaterial {
+            certificate_id: "cert-current".to_owned(),
+            names: vec!["node.example.net".to_owned()],
+            cert_pem: "CERT".to_owned(),
+            key_pem: "KEY".to_owned(),
+        };
+        let wire =
+            serde_json::to_string(&NodeCertificateMaterial::PublicCa { certificate }).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"track":"public-ca","certificate":{"certificate_id":"cert-current","names":["node.example.net"],"cert_pem":"CERT","key_pem":"KEY"}}"#
+        );
     }
 
     #[test]

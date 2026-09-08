@@ -1718,8 +1718,9 @@ fn apply_once_inner(
             return Ok(());
         }
     };
-    // Put the pair on disk before convergence. A failed write fails the round; a Present xray is
-    // forced through its restart path below, while an Unmanaged xray is reloaded explicitly.
+    // Put the pair on disk before convergence. A failed write fails the round. A changed
+    // brocadeCertificateGroup in the published config prevents hot-swap and restarts Xray;
+    // ordinary same-group renewals continue through the certificate watcher.
     let certificate_received = !certificates.is_empty();
     for material in &certificates {
         crate::certfile::apply_material(&options, material)?;

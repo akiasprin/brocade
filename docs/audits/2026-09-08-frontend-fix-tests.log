@@ -1,0 +1,68 @@
+
+> brocade-ui-console@0.0.0 test
+> npm run test:unit && npm run test:ports && npm run test:react
+
+
+> brocade-ui-console@0.0.0 test:unit
+> node --test tests/*.test.mjs
+
+✔ appearance is restored in the document head before the application module (7.730397ms)
+✔ unavailable local storage does not prevent startup (0.652033ms)
+✔ 线路卡片把地区旗垂直居中且不显示拖拽按钮 (1.573312ms)
+✔ an untouched server name follows the complete address instead of freezing on its first character (0.983429ms)
+✔ a manually overridden server name stops following address changes (0.145976ms)
+✔ import mode can save only the currently parsed link (0.111653ms)
+✔ VLESS Encryption validates complete keys, modes, padding and rejects incomplete values (0.675847ms)
+✔ a reverse hop is described as an inbound path rather than a direct target (1.967088ms)
+✔ ordinary hop path descriptions keep their existing meanings (0.358223ms)
+✔ switching between XHTTP security shapes keeps download out of public projection (2.011337ms)
+✔ leaving XHTTP keeps public projection without a download child (0.227819ms)
+✔ an independent download cannot retain stream-one (0.237392ms)
+✔ security and network selectors map only to supported transport shapes (0.208496ms)
+✔ 退役机器面板提供多选和移除全部，并只选择终态机器 (1.407367ms)
+✔ 永久移除调用批量 DELETE 接口并明确清理关联线路 (0.293947ms)
+✔ 所有页面只能复用机器、线路和用户页的三种面板骨架 (2.817489ms)
+✔ 所有面板标题固定使用 PanelTitle，列表页只使用 ListIcon 标题 (2.962901ms)
+✔ 配置控件与说明文字共用 6px 垂直间距 (0.611162ms)
+✔ CSS 全局禁止任何页面或业务标记另造面板皮肤 (25.392016ms)
+✔ a hop range skips forward past the port that blocked it, not by one (0.815153ms)
+✔ the span has to be clear all the way, not just at its head (0.223005ms)
+✔ a free run is returned as-is (0.191479ms)
+✔ spanClash names the first occupied port in the range (0.381742ms)
+✔ the UDP side counts the hysteria2 port and its whole hop range (0.448789ms)
+✔ named presets seed their documented values without becoming custom (1.446847ms)
+✔ custom fallback limits round-trip every upload and download field (0.267687ms)
+✔ custom limits reject zero rates, smaller bursts, fractions and unsafe integers (0.146896ms)
+✔ off, balanced and strict remain named policies (0.151951ms)
+✔ 发布界面统一使用灰度发布用语 (0.975216ms)
+✔ 发布预览不向用户暴露内部字段或实现措辞 (0.19563ms)
+✔ 单租户阶段不在导航菜单暴露租户页 (0.275355ms)
+✔ 更多菜单项有图标，用户页更多入口只显示三点图标 (0.277327ms)
+✔ 注册、资源创建、用量与身份区域不显示租户字段 (0.253179ms)
+✔ 手机用户名册为十行高的纵向滚动列表且不横向溢出 (1.374323ms)
+ℹ tests 34
+ℹ suites 0
+ℹ pass 34
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 118.937231
+
+> brocade-ui-console@0.0.0 test:ports
+> node scripts/ports-check.mjs
+
+ports: 全部通过
+
+> brocade-ui-console@0.0.0 test:react
+> tsc --noEmit -p tsconfig.test.json && vitest run --config vitest.config.ts
+
+
+ RUN  v4.1.11 /mnt/edw/Projects/brocade/frontend
+
+
+ Test Files  41 passed (41)
+      Tests  281 passed (281)
+   Start at  13:12:10
+   Duration  5.50s (transform 11.34s, setup 0ms, import 23.81s, tests 29.89s, environment 42.00s)
+

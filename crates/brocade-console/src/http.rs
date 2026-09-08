@@ -38,7 +38,7 @@ use brocade_deployment::protocol::{
     UpdateRealtimeTelemetryPolicyRequest, UsageReportRequest,
 };
 use brocade_store::{
-    AbandonNodeRequest, AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentRelease,
+    AbandonNodeRequest, AdminContext, AdminLoginRequest, AdminRole, AgentRelease,
     AuthenticatedAdmin, AuthenticatedNode, BinarySource, BrandingSettings,
     ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest,
     CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
@@ -46,9 +46,10 @@ use brocade_store::{
     E2eProbeRequest, IsolateDeploymentTargetRequest, LinkHealthRequest, LinkProbeRequest,
     LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
     PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
-    ProvisionedNode, RegisterWarpBindingRequest, RemoveWarpBindingRequest, SetUserAppQuotaRequest,
-    SetUserPasswordRequest, StoreError, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest,
-    UpdateNodeRequest, UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    ProvisionedNode, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
+    RemoveWarpBindingRequest, SetUserAppQuotaRequest, SetUserPasswordRequest, StoreError,
+    SystemInitRequest, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
     UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
@@ -456,6 +457,42 @@ pub fn with_console_static_dir(router: Router, dist_dir: &str) -> Router {
             .fallback_service(ServeDir::new(dist_dir))
             .layer(axum::middleware::from_fn(static_cache_headers)),
     )
+}
+
+/// Add saved branding to either embedded or directory-served HTML before the browser parses it.
+pub fn with_console_branding(router: Router, store: PgStore) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(store, console_branding))
+}
+
+async fn console_branding(
+    State(store): State<PgStore>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !matches!(request.uri().path(), "/" | "/index.html") || request.method() != axum::http::Method::GET {
+        return next.run(request).await;
+    }
+    // The HTML changes independently of the compiled asset: don't reuse its gzip or validators.
+    for key in [header::ACCEPT_ENCODING, header::IF_NONE_MATCH, header::IF_MODIFIED_SINCE, header::RANGE] {
+        request.headers_mut().remove(key);
+    }
+    let response = next.run(request).await;
+    if response.status() != StatusCode::OK { return response; }
+    let branding = match tokio::time::timeout(std::time::Duration::from_secs(2), store.branding()).await {
+        Ok(Ok(branding)) => branding,
+        _ => return response,
+    };
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let html = crate::assets::branded_index(&String::from_utf8_lossy(&bytes), &branding);
+    for key in [header::CONTENT_LENGTH, header::ETAG, header::LAST_MODIFIED, header::CONTENT_ENCODING] {
+        parts.headers.remove(key);
+    }
+    parts.headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache"));
+    Response::from_parts(parts, axum::body::Body::from(html))
 }
 
 async fn static_cache_headers(
@@ -910,6 +947,7 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(isolate_deployment_target),
         )
         .route("/nodes/provision", post(provision_node))
+        .route("/nodes", delete(remove_retired_nodes))
         .route("/nodes/{node_id}", put(update_node))
         .route("/nodes/{node_id}/status", put(update_node_status))
         .route("/nodes/{node_id}/lifecycle/abandon", post(abandon_node))
@@ -1405,9 +1443,9 @@ struct InitAdminHttpResponse {
 
 async fn auth_init(
     State(state): State<AppState>,
-    Json(request): Json<AdminInitRequest>,
+    Json(request): Json<SystemInitRequest>,
 ) -> ApiResult<Response> {
-    let result = state.store.init_admin(request).await?;
+    let result = state.store.init_system(request).await?;
     let cookie = session_cookie(&result.session.token);
     Ok((
         StatusCode::CREATED,
@@ -2052,9 +2090,15 @@ async fn certs_response(
     state: &AppState,
     admin: &brocade_store::AdminContext,
 ) -> Result<CertsResponse, StoreError> {
-    // One domain is used today, while the table holds several. Taking the first makes it
-    // explicit which one the page edits rather than merging them.
-    let domain = state.store.cert_domains().await?.into_iter().next();
+    // The default self-signed pool owns a synthetic domain alongside an installation's public
+    // domain. The settings form edits public-CA issuance when one exists; lexicographic "first"
+    // would make a random synthetic name decide which configuration the page mutates.
+    let domains = state.store.cert_domains().await?;
+    let domain = domains
+        .iter()
+        .find(|domain| domain.signing_method == brocade_store::CertificateSigningMethod::PublicCa)
+        .cloned()
+        .or_else(|| domains.into_iter().next());
     let (groups, nodes) = if domain.is_some() {
         (
             state.store.cert_groups(admin).await?,
@@ -2090,20 +2134,26 @@ struct CertGroupInput {
     certificate_name: Option<String>,
 }
 
+async fn manual_certificate_lock(state: &AppState) -> Result<brocade_store::CertificateScanLock, StoreError> {
+    state.store.try_certificate_scan_lock().await?.ok_or_else(||
+        StoreError::Unavailable("正在处理其他证书申领，请稍后重试；本次未加入队列".to_owned()))
+}
+
 async fn create_cert_group(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<CertGroupInput>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    // The group hangs off the one domain this page edits, so a caller never names it — and cannot
-    // create a group under a domain that does not exist yet.
-    let domain = state
-        .store
-        .cert_domains()
-        .await?
-        .into_iter()
-        .next()
+    let _lock = manual_certificate_lock(&state).await?;
+    // Operator-created groups use the public domain when configured. The synthetic self-signed
+    // domain exists for the fixed default group and must not win merely by sorting first.
+    let domains = state.store.cert_domains().await?;
+    let domain = domains
+        .iter()
+        .find(|domain| domain.signing_method == brocade_store::CertificateSigningMethod::PublicCa)
+        .cloned()
+        .or_else(|| domains.into_iter().next())
         .ok_or_else(|| StoreError::InvalidData("还没有配证书域，先在上面填好保存".to_owned()))?;
     let name = input.name.unwrap_or_default();
     let id = state
@@ -2116,7 +2166,9 @@ async fn create_cert_group(
             input.certificate_name.as_deref(),
         )
         .await?;
-    Ok(Json(serde_json::json!({ "id": id })).into_response())
+    let processing = crate::certs::process_pending(&state.store, Some(&id), 0)
+        .await.map_err(StoreError::Unavailable)?;
+    Ok(Json(serde_json::json!({ "id": id, "processing": processing })).into_response())
 }
 
 async fn update_cert_group(
@@ -2155,12 +2207,14 @@ async fn request_spare(
     Path(label_id): Path<String>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let _lock = manual_certificate_lock(&state).await?;
     let id = state
         .store
         .request_spare_certificate(&admin, &label_id)
         .await?;
-    state.cert_wake.notify_one();
-    Ok(Json(serde_json::json!({ "id": id })).into_response())
+    let processing = crate::certs::process_pending(&state.store, Some(&label_id), 0)
+        .await.map_err(StoreError::Unavailable)?;
+    Ok(Json(serde_json::json!({ "id": id, "processing": processing })).into_response())
 }
 
 /// Makes a spare the one the group's machines present. The SNI does not change; the bytes do.
@@ -2229,11 +2283,14 @@ async fn update_cert_domain(
 
 async fn scan_certs(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    state.cert_wake.notify_one();
-    // Returns the current state rather than the scan's outcome: the scan takes about half a
-    // minute per node, and holding the request open would tie the page to an unpredictable
-    // duration. The page polls, and the rows report the result.
-    Ok(Json(certs_response(&state, &admin).await?).into_response())
+    let _lock = manual_certificate_lock(&state).await?;
+    let processing = crate::certs::process_pending(&state.store, None, 0)
+        .await.map_err(StoreError::Unavailable)?;
+    let mut response = serde_json::to_value(certs_response(&state, &admin).await?)
+        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+    response["processing"] = serde_json::to_value(processing)
+        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+    Ok(Json(response).into_response())
 }
 
 async fn update_agent_release(
@@ -3167,6 +3224,17 @@ async fn update_node_status(
     Ok(Json(result).into_response())
 }
 
+async fn remove_retired_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RemoveRetiredNodesRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let result = state.store.remove_retired_nodes(&admin, request).await?;
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
 async fn abandon_node(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
@@ -3840,26 +3908,21 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
         return Ok(with_agent_log_policy(response, log_limits));
     }
 
-    // The certificate check runs before the claim: it is a read, the claim is a take, and a
-    // failure after the take would 500 a node that has just been handed a deployment. A failure
-    // here degrades to "no certificate owed" rather than erroring the whole response — one
-    // malformed cert row must not block a deployment.
+    let desired = state.store.claim_desired_for_node(&node.node_id).await?;
+    let certificate_deployment = desired.as_ref().and_then(|deployment| {
+        matches!(deployment.desired.xray, brocade_deployment::plan::DesiredArtifact::Present { .. })
+            .then_some(deployment.deployment_id)
+    });
+    // A group is part of the published configuration. Read the claimed release's group, or
+    // the last applied group for renewal-only polls. Never use the editable model here.
+    // Fail the poll if key delivery fails: applying a new configuration with old keys is unsafe.
     let certificates = if node.lifecycle_phase == NodeLifecyclePhase::Active {
-        match state.store.cert_delta_for_node(&node.node_id).await {
-            Ok(certificates) => certificates,
-            Err(error) => {
-                eprintln!(
-                    "证书：{node} 的证书差异判定失败（{error}），这一轮不带证书",
-                    node = node.node_id
-                );
-                Vec::new()
-            }
-        }
+        state.store.released_cert_delta(&node.node_id, certificate_deployment).await?
     } else {
         Vec::new()
     };
 
-    let response = match state.store.claim_desired_for_node(&node.node_id).await? {
+    let response = match desired {
         Some(mut desired) => {
             // The distribution source is filled in at this layer: it is configuration of the
             // runtime environment, and store should not know env exists.
@@ -4012,14 +4075,14 @@ async fn agent_runtime(
     match &request.certificate {
         brocade_deployment::protocol::CertificateObservation::Unmanaged => {}
         brocade_deployment::protocol::CertificateObservation::Managed {
-            public_ca,
+            public_ca_sha256,
             self_signed,
         } => {
             state
                 .store
                 .record_certificate_observation_at(
                     &node.node_id,
-                    public_ca,
+                    public_ca_sha256.as_deref(),
                     self_signed,
                     request.observed_at_unix_secs,
                 )
@@ -4443,6 +4506,12 @@ async fn ping_probe_nodes(
     Query(query): Query<PingProbeQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    if query.start_unix_secs.is_some() || query.end_unix_secs.is_some() {
+        return Err(StoreError::InvalidData(
+            "the machine list accepts window_secs; fixed ranges belong to one machine".to_owned(),
+        )
+        .into());
+    }
     Ok(Json(
         state
             .store
@@ -4459,17 +4528,32 @@ async fn ping_probe_node(
     Query(query): Query<PingProbeQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    Ok(Json(
-        state
-            .store
-            .node_ping_probe_view(
-                &admin,
-                &node_id,
-                query.window_secs.unwrap_or(86_400).min(7 * 86_400),
+    let result = match (
+        query.start_unix_secs,
+        query.end_unix_secs,
+        query.window_secs,
+    ) {
+        (Some(start), Some(end), None) => {
+            validate_telemetry_range(start, end, DETAIL_LOAD_MAX_RANGE_SECS)?;
+            state
+                .store
+                .node_ping_probe_view_range(&admin, &node_id, start, end)
+                .await?
+        }
+        (None, None, window) => {
+            state
+                .store
+                .node_ping_probe_view(&admin, &node_id, window.unwrap_or(86_400).min(7 * 86_400))
+                .await?
+        }
+        _ => {
+            return Err(StoreError::InvalidData(
+                "provide either window_secs or both PING range boundaries".to_owned(),
             )
-            .await?,
-    )
-    .into_response())
+            .into());
+        }
+    };
+    Ok(Json(result).into_response())
 }
 
 /// Per-hop link quality, optionally narrowed to one chain.
@@ -4496,6 +4580,8 @@ struct LoadQuery {
 #[derive(Debug, Deserialize)]
 struct PingProbeQuery {
     window_secs: Option<u32>,
+    start_unix_secs: Option<i64>,
+    end_unix_secs: Option<i64>,
 }
 
 const LIST_LOAD_MAX_RANGE_SECS: i64 = 2 * 60 * 60;
@@ -4536,28 +4622,39 @@ fn load_absolute_range(
     end_unix_secs: i64,
     max_span_secs: i64,
 ) -> Result<LoadSeriesQuery, StoreError> {
-    if start_unix_secs < 0 || end_unix_secs > MAX_LOAD_UNIX_SECS {
-        return Err(StoreError::InvalidData(
-            "load range is outside the supported timestamp interval".to_owned(),
-        ));
-    }
-    let Some(span) = end_unix_secs.checked_sub(start_unix_secs) else {
-        return Err(StoreError::InvalidData("invalid load range".to_owned()));
-    };
-    if span <= 0 {
-        return Err(StoreError::InvalidData(
-            "load range end must be after start".to_owned(),
-        ));
-    }
-    if span > max_span_secs {
-        return Err(StoreError::InvalidData(format!(
-            "load range spans {span}s, over the {max_span_secs}s limit"
-        )));
-    }
+    validate_telemetry_range(start_unix_secs, end_unix_secs, max_span_secs)?;
     Ok(LoadSeriesQuery::Absolute {
         start_unix_secs,
         end_unix_secs,
     })
+}
+
+fn validate_telemetry_range(
+    start_unix_secs: i64,
+    end_unix_secs: i64,
+    max_span_secs: i64,
+) -> Result<(), StoreError> {
+    if start_unix_secs < 0 || end_unix_secs > MAX_LOAD_UNIX_SECS {
+        return Err(StoreError::InvalidData(
+            "telemetry range is outside the supported timestamp interval".to_owned(),
+        ));
+    }
+    let Some(span) = end_unix_secs.checked_sub(start_unix_secs) else {
+        return Err(StoreError::InvalidData(
+            "invalid telemetry range".to_owned(),
+        ));
+    };
+    if span <= 0 {
+        return Err(StoreError::InvalidData(
+            "telemetry range end must be after start".to_owned(),
+        ));
+    }
+    if span > max_span_secs {
+        return Err(StoreError::InvalidData(format!(
+            "telemetry range spans {span}s, over the {max_span_secs}s limit"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -4602,6 +4699,10 @@ struct UsageSeriesQuery {
     /// How long the series covers, in seconds. The default is 12 minutes, because the bar chart
     /// at the right of the machine list has 24 cells, one per 30-second reporting window.
     window_secs: Option<u32>,
+    /// A fixed historical range used by the machine-detail picker. Both boundaries are required;
+    /// mixing this form with `window_secs` is rejected instead of guessing which one wins.
+    start_unix_secs: Option<i64>,
+    end_unix_secs: Option<i64>,
     /// Machine detail narrows long ranges to one node. Omitted by fleet and usage pages.
     node_id: Option<String>,
 }
@@ -4614,14 +4715,31 @@ async fn list_usage_node_series(
     Query(query): Query<UsageSeriesQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    let result = state
-        .store
-        .list_usage_node_series(
-            &admin,
-            query.window_secs.unwrap_or(720),
-            query.node_id.as_deref(),
-        )
-        .await?;
+    let result = match (
+        query.start_unix_secs,
+        query.end_unix_secs,
+        query.window_secs,
+    ) {
+        (Some(start), Some(end), None) => {
+            validate_telemetry_range(start, end, DETAIL_LOAD_MAX_RANGE_SECS)?;
+            state
+                .store
+                .list_usage_node_series_range(&admin, start, end, query.node_id.as_deref())
+                .await?
+        }
+        (None, None, window) => {
+            state
+                .store
+                .list_usage_node_series(&admin, window.unwrap_or(720), query.node_id.as_deref())
+                .await?
+        }
+        _ => {
+            return Err(StoreError::InvalidData(
+                "provide either window_secs or both usage range boundaries".to_owned(),
+            )
+            .into());
+        }
+    };
     Ok(Json(result).into_response())
 }
 

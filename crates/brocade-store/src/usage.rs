@@ -1078,9 +1078,57 @@ pub async fn list_usage_node_series(
     window_secs: u32,
     node_id: Option<&str>,
 ) -> Result<UsageNodeSeriesList> {
-    // Capped at 24 hours: anything longer belongs in a rollup table rather than scanning
-    // detail rows window by window.
-    let window_secs = i64::from(window_secs.clamp(60, 86_400));
+    list_usage_node_series_selected(
+        pool,
+        actor,
+        UsageSeriesSelection::Recent(window_secs),
+        node_id,
+    )
+    .await
+}
+
+pub async fn list_usage_node_series_range(
+    pool: &PgPool,
+    actor: &AdminContext,
+    start_unix_secs: i64,
+    end_unix_secs: i64,
+    node_id: Option<&str>,
+) -> Result<UsageNodeSeriesList> {
+    let span = end_unix_secs.checked_sub(start_unix_secs).ok_or_else(|| {
+        StoreError::InvalidData("invalid usage series timestamp range".to_owned())
+    })?;
+    if start_unix_secs < 0 || !(1..=86_400).contains(&span) {
+        return Err(StoreError::InvalidData(
+            "usage series range must be positive and no longer than 24 hours".to_owned(),
+        ));
+    }
+    list_usage_node_series_selected(
+        pool,
+        actor,
+        UsageSeriesSelection::Absolute {
+            start_unix_secs,
+            end_unix_secs,
+        },
+        node_id,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum UsageSeriesSelection {
+    Recent(u32),
+    Absolute {
+        start_unix_secs: i64,
+        end_unix_secs: i64,
+    },
+}
+
+async fn list_usage_node_series_selected(
+    pool: &PgPool,
+    actor: &AdminContext,
+    selection: UsageSeriesSelection,
+    node_id: Option<&str>,
+) -> Result<UsageNodeSeriesList> {
     let tenant_scope = actor.tenant_scope();
     let tenant_pattern = actor.tenant_scope_like_pattern();
 
@@ -1096,11 +1144,29 @@ pub async fn list_usage_node_series(
     .fetch_one(pool)
     .await?;
 
-    let (since,): (String,) =
-        sqlx::query_as("SELECT (now() - make_interval(secs => $1::double precision))::text")
+    let (since, until): (String, String) = match selection {
+        UsageSeriesSelection::Recent(window_secs) => {
+            // Capped at 24 hours: anything longer belongs in a rollup table rather than scanning
+            // detail rows window by window.
+            let window_secs = i64::from(window_secs.clamp(60, 86_400));
+            sqlx::query_as(
+                "SELECT (now() - make_interval(secs => $1::double precision))::text, now()::text",
+            )
             .bind(window_secs as f64)
             .fetch_one(pool)
-            .await?;
+            .await?
+        }
+        UsageSeriesSelection::Absolute {
+            start_unix_secs,
+            end_unix_secs,
+        } => {
+            sqlx::query_as("SELECT to_timestamp($1)::text, to_timestamp($2)::text")
+                .bind(start_unix_secs as f64)
+                .bind(end_unix_secs as f64)
+                .fetch_one(pool)
+                .await?
+        }
+    };
 
     // The window series. The two tables are UNIONed and aggregated by (node_id, window_end) —
     // window_end is the right edge of the agent's reporting window, both sides write the same
@@ -1122,12 +1188,14 @@ pub async fn list_usage_node_series(
                     AS relay_downlink_bytes
          FROM node_usage_windows
          WHERE window_end >= $1::timestamptz
-           AND ($2::text IS NULL OR tenant_id = $2 OR tenant_id LIKE $3 ESCAPE '\\')
-           AND ($4::text IS NULL OR node_id = $4)
+           AND window_end <= $2::timestamptz
+           AND ($3::text IS NULL OR tenant_id = $3 OR tenant_id LIKE $4 ESCAPE '\\')
+           AND ($5::text IS NULL OR node_id = $5)
          GROUP BY node_id, window_end
          ORDER BY node_id, window_end",
     )
     .bind(&since)
+    .bind(&until)
     .bind(tenant_scope)
     .bind(&tenant_pattern)
     .bind(node_id)

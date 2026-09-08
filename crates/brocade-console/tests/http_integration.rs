@@ -144,6 +144,35 @@ async fn admin_app(db: &TestPg) -> (Router, String) {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn initial_html_uses_current_branding_without_default_title_flash() {
+    let Some(db) = TestPg::start_if_enabled().await else { return; };
+    db.store.migrate().await.unwrap();
+    let app = brocade_console::http::with_console_branding(
+        with_console_static(admin_router(db.store.clone())), db.store.clone());
+    for (path, name) in [("/", "我的站点"), ("/index.html", "新站点 </script><b>&")] {
+        db.store.update_branding(&AdminContext::system_admin("test"), brocade_store::BrandingSettings {
+            site_name: name.to_owned(), icon_data_url: None,
+        }).await.unwrap();
+        let response = app.clone().oneshot(Request::get(path)
+            .header("accept-encoding", "gzip")
+            .header("if-modified-since", "Wed, 01 Jan 2099 00:00:00 GMT")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-cache");
+        assert!(!response.headers().contains_key("content-encoding"));
+        let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(!html.contains("<title>Brocade"));
+        assert!(!html.contains("</script><b>"));
+        let raw = html.split("type=\"application/json\">").nth(1).unwrap().split("</script>").next().unwrap();
+        let bootstrap: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(bootstrap["site_name"], name);
+        if path == "/" { assert!(html.contains("<title>我的站点 | 跨境网络小管家</title>")); }
+        else { assert!(html.contains("<title>新站点 &lt;/script&gt;&lt;b&gt;&amp; | 跨境网络小管家</title>")); }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_warp_binding_route_updates_every_machine_runtime_override() {
     std::env::set_var(
         brocade_store::secrets::SECRET_KEY_ENV,
@@ -1259,9 +1288,10 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "operator_id": "admin",
-                        "display_name": "Admin",
-                        "password": ADMIN_PASSWORD
+                        "operator_id": "root",
+                        "display_name": "root",
+                        "password": ADMIN_PASSWORD,
+                        "root_tenant": "platform"
                     })
                     .to_string(),
                 ))
@@ -1287,8 +1317,26 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
     assert!(init_cookie.contains("SameSite=Lax"));
     let init_cookie_pair = init_cookie.split(';').next().unwrap().to_owned();
     let body = response_json(response).await;
-    assert_eq!(body["admin"]["operator_id"], "admin");
+    assert_eq!(body["admin"]["operator_id"], "root");
     assert_eq!(body["admin"]["role"], "system-admin");
+    assert!(body.get("default_user_login").is_none());
+    let zero_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE tenant_id = 'platform' AND id = 'zero')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(zero_exists);
+    let zero_login_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM admin_operators WHERE id = 'platform/zero')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        !zero_login_exists,
+        "zero must be unable to log in by default"
+    );
     // Initialization signs no API token: a browser needs nothing beyond the session cookie, and a
     // script wanting one signs it through /admin/operators/{id}/token. One token fewer is one
     // long-lived credential fewer.
@@ -1344,13 +1392,13 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         .unwrap();
     assert_eq!(cookie_whoami.status(), StatusCode::OK);
     let body = response_json(cookie_whoami).await;
-    assert_eq!(body["operator_id"], "admin");
+    assert_eq!(body["operator_id"], "root");
 
     // The Bearer route must still work; the token is simply signed separately rather than handed
     // out by init.
     let api_token = db
         .store
-        .issue_admin_token(&brocade_store::AdminContext::system_admin("admin"), "admin")
+        .issue_admin_token(&brocade_store::AdminContext::system_admin("root"), "root")
         .await
         .unwrap()
         .token;
@@ -1416,7 +1464,7 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "operator_id": "admin",
+                        "operator_id": "root",
                         "password": "not the password"
                     })
                     .to_string(),
@@ -1436,7 +1484,7 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "operator_id": "admin",
+                        "operator_id": "root",
                         "password": ADMIN_PASSWORD
                     })
                     .to_string(),
@@ -1457,7 +1505,27 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         .unwrap()
         .to_owned();
     let body = response_json(login).await;
-    assert_eq!(body["admin"]["operator_id"], "admin");
+    assert_eq!(body["admin"]["operator_id"], "root");
+
+    let user_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "operator_id": "zero",
+                        "password": "zero-has-no-password"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_login.status(), StatusCode::UNAUTHORIZED);
 
     let relogin_whoami = app
         .oneshot(
@@ -2189,7 +2257,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
             "exit_ip": "203.0.113.9",
             "exit_loc": "HK",
             "exit_verdict": "mismatch",
-            "detail": "通了，但出口 IP 不在这条链的出口机器上"
+            "detail": "通了，但出口 IP 不在这条链的出口节点上"
         }]
     });
     let response = agent
@@ -2655,7 +2723,8 @@ async fn http_settings_exposes_and_updates_global_reality_client_policy() {
     assert_eq!(body["reality_client"]["min_client_ver"], "1.0.0");
     assert!(body["reality_client"]["max_client_ver"].is_null());
     assert!(body["reality_client"]["max_time_diff_ms"].is_null());
-    assert_eq!(body["ports"]["anytls_base"], 18_443);
+    assert_eq!(body["ports"]["ingress_base"], 13_443);
+    assert_eq!(body["ports"]["anytls_base"], 14_443);
     assert_eq!(body["ports"]["hy2_base"], 30_000);
 
     let update_body = json!({
@@ -3094,6 +3163,10 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     assert_eq!(cert_group["names"][0], "***.io");
     assert_eq!(cert_group["certificates"][0]["status"], "serving");
     assert_eq!(cert_group["certificates"][0]["signing_method"], "public-ca");
+    assert_eq!(
+        cert_group["certificates"][0]["sha256"], "***",
+        "只读响应不能携带证书字节的完整摘要"
+    );
     assert_eq!(certs.1["nodes"][0]["certificate_name"], "***.io");
     assert_eq!(certs.1["nodes"][0]["on_disk"], "unknown");
     assert!(
@@ -3161,8 +3234,33 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     assert_eq!(full_certs.1["groups"][0]["domain"], "huacu.io");
     assert_eq!(full_certs.1["groups"][0]["label"], "a2335a6d");
     assert_eq!(
+        full_certs.1["groups"][0]["certificates"][0]["sha256"]
+            .as_str()
+            .map(str::len),
+        Some(64),
+        "管理员仍应拿到完整证书摘要用于逐机核对"
+    );
+    assert_eq!(
         full_certs.1["nodes"][0]["certificate_name"],
         "a2335a6d.huacu.io"
+    );
+
+    // `public` 访客走相同的服务端边界。单独从访客 cookie 读一次，避免只证明普通 readonly
+    // 账号被遮住，却让真正的免密访客因为路由或中间件次序不同而拿到原值。
+    let visitor_enabled = put_json(
+        &app,
+        &admin_token,
+        "/visitor-access",
+        json!({ "enabled": true }),
+    )
+    .await;
+    assert_eq!(visitor_enabled.0, StatusCode::OK);
+    let visitor_cookie = login_cookie(&app, "public", "").await;
+    let visitor_certs = get_json_with_cookie(&app, "/certs", &visitor_cookie).await;
+    assert_eq!(visitor_certs.0, StatusCode::OK);
+    assert_eq!(
+        visitor_certs.1["groups"][0]["certificates"][0]["sha256"],
+        "***"
     );
 
     // The compile view stays readable — it is the review surface: topology, chains,
@@ -4764,7 +4862,7 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     insert_node(db.pool()).await;
     let (app, token) = admin_app(&db).await;
 
-    let response = app
+    let response = app.clone()
         .oneshot(
             Request::put("/certs/domain")
                 .header("authorization", format!("Bearer {token}"))
@@ -4809,7 +4907,21 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         )
         .await
         .unwrap();
-    assert_eq!(brocade_console::certs::scan_once(&db.store).await, (1, 0));
+    let lock = db.store.try_certificate_scan_lock().await.unwrap().unwrap();
+    let busy = app.clone().oneshot(Request::post("/certs/scan")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(lock);
+    let processed = app.clone().oneshot(Request::post("/certs/scan")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(processed.status(), StatusCode::OK);
+    let result = response_json(processed).await;
+    assert_eq!(result["processing"]["issued"], 1);
+    assert_eq!(result["processing"]["failed"], 0);
+    assert_eq!(result["groups"][0]["certificates"][0]["status"], "serving");
+
     let groups = db
         .store
         .cert_groups(&AdminContext::system_admin("test-admin"))
@@ -4837,18 +4949,43 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     assert!(!sealed_key.contains("BEGIN PRIVATE KEY"));
     assert_eq!(peer_sha256.len(), 64);
     let material = db.store.cert_delta_for_node("n1").await.unwrap().remove(0);
-    assert_eq!(
-        material.slots[0]
-            .cert_pem
-            .matches("BEGIN CERTIFICATE")
-            .count(),
-        1
-    );
-    assert!(material.slots[0].key_pem.contains("BEGIN PRIVATE KEY"));
-    assert_eq!(
-        material.track,
-        brocade_deployment::protocol::CertificateTrack::SelfSigned
-    );
+    let brocade_deployment::protocol::NodeCertificateMaterial::SelfSigned { slots } = material
+    else {
+        panic!("默认自签证书组必须下发 A/B material");
+    };
+    assert_eq!(slots[0].cert_pem.matches("BEGIN CERTIFICATE").count(), 1);
+    assert!(slots[0].key_pem.contains("BEGIN PRIVATE KEY"));
+    let (status, created) = post_json(&app, &token, "/certs/groups", json!({"name": "Immediate issuance"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["processing"]["issued"], 1);
+    assert_eq!(created["processing"]["failed"], 0);
+    let id = created["id"].as_str().unwrap();
+    let issued: i64 = sqlx::query_scalar("SELECT count(*) FROM certificates WHERE label_id = $1 AND status = 'serving'")
+        .bind(id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(issued, 1, "creation must finish issuance before returning");
+    let (status, spare) = post_json(&app, &token, &format!("/certs/groups/{id}/spare"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(spare["processing"]["issued"], 1);
+    let state: String = sqlx::query_scalar("SELECT status FROM certificates WHERE id = $1")
+        .bind(spare["id"].as_str().unwrap()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(state, "ready", "spare issuance must finish before returning");
+
+    let configured = app.clone().oneshot(Request::put("/certs/domain")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"domain": "missing-token.example.com", "signing_method": "public-ca", "acme_directory": "https://acme.invalid/directory"}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(configured.status(), StatusCode::OK);
+    let (status, blocked) = post_json(&app, &token, "/certs/groups", json!({"name": "Missing credential"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(blocked["processing"]["failed"], 1, "missing credentials must surface as a failed attempt, not a queue");
+    let retry = app.clone().oneshot(Request::post("/certs/scan")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    let counts: (i64, i64) = sqlx::query_as("SELECT count(*), sum(attempts)::bigint FROM certificates WHERE label_id = $1")
+        .bind(blocked["id"].as_str().unwrap()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(counts, (1, 2), "manual retry must reuse the failed request immediately");
+
 }
 
 async fn apply_step_json(

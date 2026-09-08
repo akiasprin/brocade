@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { fetchUsageNodeSeries } from '../src/api';
+import { fetchNodePingProbeRange, fetchUsageNodeSeries, fetchUsageNodeSeriesRange } from '../src/api';
 import type { LoadRange } from '../src/panes/nodes';
 
 let ObserveRangeControl: typeof import('../src/panes/nodes').ObserveRangeControl;
@@ -80,6 +80,27 @@ describe('machine telemetry range', () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  it('applies one fixed date range instead of turning its duration into a recent window', () => {
+    const Harness = () => {
+      const [selected, setSelected] = useState<LoadRange>(LOAD_RANGES[0]);
+      return (
+        <>
+          <ObserveRangeControl value={selected} onChange={setSelected} />
+          <output>{`${selected.startUnixSecs ?? ''}|${selected.endUnixSecs ?? ''}`}</output>
+        </>
+      );
+    };
+    const view = render(<Harness />);
+    fireEvent.click(view.getByRole('button', { name: '观测时间范围：近 30 分钟' }));
+    fireEvent.change(view.getByLabelText('观测开始时间'), { target: { value: '2026-09-06T10:00' } });
+    fireEvent.change(view.getByLabelText('观测结束时间'), { target: { value: '2026-09-06T12:30' } });
+    fireEvent.click(view.getByRole('button', { name: '应用时间范围' }));
+
+    const start = Math.floor(new Date('2026-09-06T10:00').getTime() / 1000);
+    const end = Math.floor(new Date('2026-09-06T12:30').getTime() / 1000);
+    expect(view.getByText(`${start}|${end}`)).toBeTruthy();
+  });
+
   it('narrows a long Xray series request to the current machine', async () => {
     const fetchMock = vi.fn(
       async (_input: RequestInfo | URL) => new Response(JSON.stringify({ since: '', month_start: '', nodes: [] })),
@@ -89,5 +110,22 @@ describe('machine telemetry range', () => {
     await fetchUsageNodeSeries(86_400, 'akile-ogvtw-hinet');
 
     expect(String(fetchMock.mock.calls[0][0])).toBe('/usage/node-series?window_secs=86400&node_id=akile-ogvtw-hinet');
+  });
+
+  it('sends identical absolute boundaries to Xray and PING history endpoints', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL) =>
+      new Response(JSON.stringify({ nodes: [], targets: [] })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchUsageNodeSeriesRange(1_700_000_000, 1_700_003_600, 'n1');
+    await fetchNodePingProbeRange('n1', 1_700_000_000, 1_700_003_600);
+
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      '/usage/node-series?start_unix_secs=1700000000&end_unix_secs=1700003600&node_id=n1',
+    );
+    expect(String(fetchMock.mock.calls[1][0])).toBe(
+      '/ping-probe/nodes/n1?start_unix_secs=1700000000&end_unix_secs=1700003600',
+    );
   });
 });

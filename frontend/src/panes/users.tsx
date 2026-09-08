@@ -52,7 +52,7 @@ import { draft } from '../draft';
 // 新用户直接作为名册中的一条可编辑行出现。它和已有用户处在同一信息结构里，保存后仍以
 // “待提交”行留在名册中；不会跳转到尚不存在的详情页。
 
-type Drill = { p: 'list' } | { p: 'user'; tenant: string; id: string };
+type Drill = { p: 'list' } | { p: 'user'; id: string };
 
 // 行左侧的状态条。与机器面共用同一组件和同一套判读规则（styles.css 的 .lst-bar），
 // 但表示的状态不同：机器面表示 agent 是否仍在拉取配置，此处表示该用户当前能否连接。
@@ -133,7 +133,7 @@ function GeneratedUserAvatar({
 export const userMatchesSearch = (user: UserListItem, rawQuery: string) => {
   const query = rawQuery.trim().toLocaleLowerCase();
   if (!query) return true;
-  return [user.id, user.tenant_id, user.uuid]
+  return [user.id, user.uuid]
     .filter((value): value is string => !!value)
     .some(value => value.toLocaleLowerCase().includes(query));
 };
@@ -358,9 +358,7 @@ function UserPasswordDialog({ user, onClose }: { user: UserListItem; onClose: ()
         <header>
           <span>
             <b>修改密码</b>
-            <small className="mono">
-              {user.tenant_id}/{user.id}
-            </small>
+            <small className="mono">{user.id}</small>
           </span>
           <button type="button" aria-label="关闭" onClick={onClose}>
             ×
@@ -456,7 +454,7 @@ function UserLoginIssuedDialog({
         </header>
         <div className="user-login-issued">
           <span>
-            登录名 <code>{issued.operator_id}</code> <CopyButton text={issued.operator_id} />
+            登录名 <code>{user.id}</code> <CopyButton text={user.id} />
           </span>
           <span>
             密码 <code>{issued.password}</code> <CopyButton text={issued.password} />
@@ -477,6 +475,8 @@ type GrantProbeDisplayItem = GrantProbePlanItem & Partial<Pick<GrantProbeJobItem
 const GRANT_PROBE_SLOTS = [
   { protocol: 'vless', family: 'ipv4', protocolLabel: 'VLESS', familyLabel: 'V4' },
   { protocol: 'vless', family: 'ipv6', protocolLabel: 'VLESS', familyLabel: 'V6' },
+  { protocol: 'vless-encryption', family: 'ipv4', protocolLabel: 'VLESS · Encryption', familyLabel: 'V4' },
+  { protocol: 'vless-encryption', family: 'ipv6', protocolLabel: 'VLESS · Encryption', familyLabel: 'V6' },
   { protocol: 'anytls', family: 'ipv4', protocolLabel: 'AnyTLS', familyLabel: 'V4' },
   { protocol: 'anytls', family: 'ipv6', protocolLabel: 'AnyTLS', familyLabel: 'V6' },
   { protocol: 'hysteria2', family: 'ipv4', protocolLabel: 'Hysteria2', familyLabel: 'V4' },
@@ -495,6 +495,7 @@ const probeBaseName = (item: GrantProbeDisplayItem) => {
   const withoutFamily = item.family === 'ipv6' ? item.name.replace(/ \| v6$/, '') : item.name;
   if (item.protocol === 'hysteria2') return withoutFamily.replace(/ \| QUIC$/, '');
   if (item.protocol === 'anytls') return withoutFamily.replace(/ \| AnyTLS$/, '');
+  if (item.protocol === 'vless-encryption') return withoutFamily.replace(/ \| VLESS Encryption$/, '');
   return withoutFamily;
 };
 
@@ -630,7 +631,8 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
     groups.set(key, group);
   }
   const order = (item: GrantProbeDisplayItem) =>
-    (item.protocol === 'vless' ? 0 : item.protocol === 'anytls' ? 2 : 4) + (item.family === 'ipv6' ? 1 : 0);
+    (item.protocol === 'vless' ? 0 : item.protocol === 'vless-encryption' ? 2 : item.protocol === 'anytls' ? 4 : 6) +
+    (item.family === 'ipv6' ? 1 : 0);
   for (const group of groups.values()) group.items.sort((a, b) => order(a) - order(b));
 
   const busy = job?.status === 'running' || start.isPending || cancel.isPending;
@@ -706,7 +708,7 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
                 </span>
               ))}
             </span>
-            <span>探测</span>
+            <span>拨测</span>
           </div>
         )}
         {[...groups.entries()].map(([key, group]) => {
@@ -761,15 +763,14 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
           <div className="grant-probe-empty">{plan.isPending ? '正在读取 Serving 授权…' : '没有可拨测的生效授权'}</div>
         )}
       </div>
-      <footer
-        className="grant-probe-foot"
-        title="拨测只检查本次授权是否可用，不代替周期健康观测；每项会产生极小真实流量。"
-      >
-        <Icon of="diag" size={13} className="grant-probe-foot-icon" />
-        {readOnly
-          ? `只读查看 ${user.id} 当前生效的 Serving 授权；登录具备操作权限的账号后可发起拨测。`
-          : `使用 ${user.id} 当前生效的真实用户凭据从公网验证；流量计入该用户用量。`}
-      </footer>
+      {!readOnly && (
+        <footer
+          className="user-dcard-foot"
+          title="拨测只检查本次授权是否可用，不代替周期健康观测；每项会产生极小真实流量。"
+        >
+          {`使用 ${user.id} 当前生效的真实用户凭据从公网验证；流量计入该用户用量。`}
+        </footer>
+      )}
     </section>
   );
 }
@@ -880,7 +881,8 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   });
 
   const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
-  const defaultTenant = tenantOptions.find(tenant => tenant.id === who.tenant_scope)?.id ?? tenantOptions[0]?.id ?? '';
+  // 单租户阶段只接受“恰好一条”这个事实，不识别 platform 或操作者 scope 等特殊名字。
+  const defaultTenant = tenantOptions.length === 1 ? tenantOptions[0].id : '';
   const newTenant = newUser?.tenant || defaultTenant;
   const create = useMutation({
     mutationFn: () => createUser({ tenant_id: newTenant, id: newUser?.id.trim() ?? '' }),
@@ -1031,7 +1033,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   const newUserId = newUser?.id.trim() ?? '';
   const newUserBadSlug = newUserId && !isValidSlug(newUserId) ? 'ID 只能用 a-z 0-9 . _ -，最长 32' : null;
   const newUserDuplicate = list.some(user => user.tenant_id === newTenant && user.id === newUserId)
-    ? `${newTenant} 已有 ${newUserId}`
+    ? `用户 ID ${newUserId} 已存在`
     : null;
   const newUserReady = !!newUserId && !!newTenant && !newUserBadSlug && !newUserDuplicate && editable;
   const newUserEditor = newUser && (
@@ -1061,25 +1063,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
           />
           <span className="st st-succeeded">正式</span>
         </span>
-        <span className={`r2${newUserBadSlug || newUserDuplicate ? ' bad' : ''}`}>
-          {tenantOptions.length > 1 ? (
-            <select
-              className="f mono"
-              aria-label="归属租户"
-              value={newTenant}
-              onChange={event => setNewUser({ ...newUser, tenant: event.target.value })}
-            >
-              {tenantOptions.map(tenant => (
-                <option key={tenant.id} value={tenant.id}>
-                  {tenant.id}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <span className="mono">{newTenant || '尚无租户'}</span>
-          )}
-          {(newUserBadSlug || newUserDuplicate) && <span>{newUserBadSlug || newUserDuplicate}</span>}
-        </span>
+        {(newUserBadSlug || newUserDuplicate) && <span className="r2 bad">{newUserBadSlug || newUserDuplicate}</span>}
       </span>
       <span className="rtail user-new-actions">
         <button className="btn primary" type="submit" disabled={!newUserReady || create.isPending}>
@@ -1094,8 +1078,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
 
   // URL 是显式选择的唯一来源，使刷新、分享链接和浏览器前进/后退落到同一用户。根地址仍
   // 默认预览当前筛选的首行；深链接失效时不回落到别人，避免地址写 alice 却展示 bob。
-  const routedKey = drill.p === 'user' ? `${drill.tenant}/${drill.id}` : null;
-  const selected = routedKey ? allRows.find(r => r.key === routedKey) : rows[0];
+  const selected = drill.p === 'user' ? allRows.find(r => r.u.id === drill.id) : rows[0];
 
   // 右栏详情。内容与此前就地展开时完全一致（身份与操作 + 用量额度 + 接入授权，
   // 沿用列表页原有的 .lst-acts / .fgrid / .qta / .grant-cards），只是从行内移到常驻的右栏，
@@ -1109,7 +1092,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
             <span>
               <b className="mono">{u.id}</b> 已加入草稿
             </span>
-            <small>归属 {u.tenant_id} · 正式用户。提交草稿后即可配置登录、额度与授权。</small>
+            <small>正式用户。提交草稿后即可配置登录、额度与授权。</small>
           </div>
         </section>
       );
@@ -1170,7 +1153,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
             </div>
             <div className="user-dhead-actions">
               <div className="user-dacts">
-                {!editable && <span className="user-readonly">{selfService ? '自助访问' : '只读访问'}</span>}
+                {!editable && selfService && <span className="user-readonly">自助访问</span>}
                 <span className="user-account-type" title="用户资料 · 账号类型">
                   <SegSwitch
                     checked={u.account_type === 'test'}
@@ -1210,25 +1193,27 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                 <button
                   className="btn user-dact"
                   disabled={!canOpenSubscription}
-                  title="打开该用户的 vless:// 节点链接，可选择地址族"
+                  title="打开该用户的 vless:// 节点，可选择地址族"
                   onClick={() => setSub({ user: u, kind: 'uri' })}
                 >
                   <Icon of="client" size={13} className="user-dact-icon" />
-                  节点链接
+                  节点
                 </button>
                 <button
                   className="btn user-dact"
                   disabled={!canOpenSubscription}
-                  title="打开 Clash 订阅地址，可选择地址族"
+                  title="打开 Clash 订阅，可选择地址族"
                   onClick={() => setSub({ user: u, kind: 'clash' })}
                 >
                   <Icon of="subscription" size={13} className="user-dact-icon" />
-                  订阅地址
+                  订阅
                 </button>
                 <div className="fg-menuwrap user-action-menuwrap">
                   <button
-                    className="btn user-dact"
+                    className="btn user-dact user-dact-more"
                     disabled={!editable && !selfService}
+                    aria-label="更多操作"
+                    title="更多操作"
                     aria-haspopup="menu"
                     aria-expanded={detailActionsOpen}
                     onClick={event => {
@@ -1237,7 +1222,6 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                     }}
                   >
                     <Icon of="more" size={13} className="user-dact-icon" />
-                    更多
                   </button>
                   {detailActionsOpen && (editable || selfService) && (
                     <div className="fg-menu user-action-menu" role="menu" onClick={() => setDetailActionsOpen(false)}>
@@ -1422,8 +1406,8 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
               </span>
               <button
                 className="btn primary"
-                disabled={!editable || tenantOptions.length === 0 || !!newUser}
-                title={tenantOptions.length === 0 ? '请先创建租户' : undefined}
+                disabled={!editable || tenantOptions.length !== 1 || !!newUser}
+                title={tenantOptions.length !== 1 ? '系统归属配置必须恰好有一条' : undefined}
                 onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
               >
                 ＋ 新增用户
@@ -1452,8 +1436,8 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                 </span>
                 <button
                   className="btn primary"
-                  disabled={!editable || tenantOptions.length === 0 || !!newUser}
-                  title={tenantOptions.length === 0 ? '请先创建租户' : undefined}
+                  disabled={!editable || tenantOptions.length !== 1 || !!newUser}
+                  title={tenantOptions.length !== 1 ? '系统归属配置必须恰好有一条' : undefined}
                   onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
                 >
                   ＋ 新增用户
@@ -1515,7 +1499,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                     role="option"
                     aria-selected={picked}
                     className={`user-row${disabled ? ' off' : ''}${picked ? ' picked' : ''}`}
-                    onClick={() => go({ p: 'user', tenant: u.tenant_id, id: u.id })}
+                    onClick={() => go({ p: 'user', id: u.id })}
                   >
                     <GeneratedUserAvatar id={u.id} lampClass={lampCls} lampTitle={userLampTitle(facts)} />
                     <span className="rbody">
@@ -1559,7 +1543,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
           ) : (
             <section className="panel user-split-detail">
               <div className="user-detail-empty">
-                {routedKey
+                {drill.p === 'user'
                   ? '链接指向的用户不存在，或当前账号无权查看'
                   : search.trim()
                     ? '没有匹配的用户'

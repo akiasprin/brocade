@@ -41,16 +41,18 @@ use crate::{
     NodeLoadView, NodePingProbeList, NodePingProbeView, PingProbeReportRequest,
     PingProbeReportResult, PingProbeSettings, ProbeTargetList, ProvisionNodeRequest,
     ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan,
-    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveWarpBindingRequest,
-    RemoveWarpBindingResult, ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList,
-    RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult, SetUserPasswordRequest,
-    SetUserPasswordResult, StoreError, TargetConvergenceReport, TenantList, UpdateNodeRequest,
-    UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest, UpdateUserStatusRequest,
-    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
-    UpsertChainResult, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
-    UpsertTenantResult, UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList,
-    UsageReportRequest, UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan,
-    UserList, VerifyDeploymentRequest, WarpBindingRemoval,
+    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
+    RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
+    ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
+    SetUserAppQuotaRequest, SetUserAppQuotaResult, SetUserPasswordRequest, SetUserPasswordResult,
+    StoreError, SystemInitRequest, SystemInitResult, TargetConvergenceReport, TenantList,
+    UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest,
+    UpdateUserStatusRequest, UpdateUserStatusResult, UpdateWarpBindingRequest,
+    UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult, UpsertFrontResult,
+    UpsertGrantResult, UpsertIngressResult, UpsertTenantResult, UpsertUserResult,
+    UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest, UsageReportResult,
+    UsageSampleList, UserAppQuotaList, UserGrantProbePlan, UserList, VerifyDeploymentRequest,
+    WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -437,23 +439,23 @@ impl PgStore {
     pub async fn record_certificate_observation(
         &self,
         node_id: &str,
-        public_ca: &brocade_deployment::protocol::CertificatePairObservation,
+        public_ca_sha256: Option<&str>,
         self_signed: &brocade_deployment::protocol::CertificatePairObservation,
     ) -> Result<()> {
-        cert::record_observation(&self.pool, node_id, public_ca, self_signed).await
+        cert::record_observation(&self.pool, node_id, public_ca_sha256, self_signed).await
     }
 
     pub async fn record_certificate_observation_at(
         &self,
         node_id: &str,
-        public_ca: &brocade_deployment::protocol::CertificatePairObservation,
+        public_ca_sha256: Option<&str>,
         self_signed: &brocade_deployment::protocol::CertificatePairObservation,
         observed_at_unix_secs: Option<i64>,
     ) -> Result<()> {
         cert::record_observation_at(
             &self.pool,
             node_id,
-            public_ca,
+            public_ca_sha256,
             self_signed,
             observed_at_unix_secs,
         )
@@ -472,6 +474,12 @@ impl PgStore {
     /// reports holding. `None` when the node is current on this dimension. This is the one
     /// place a node's private key leaves the database — it goes into that node's desired
     /// state and nowhere else.
+    pub async fn released_cert_delta(
+        &self, node_id: &str, deployment_id: Option<i64>,
+    ) -> Result<Vec<brocade_deployment::protocol::NodeCertificateMaterial>> {
+        cert::released_cert_delta(&self.pool, node_id, deployment_id).await
+    }
+
     pub async fn cert_delta_for_node(
         &self,
         node_id: &str,
@@ -916,6 +924,14 @@ impl PgStore {
         crate::deployment::transition_node_status(&self.pool, actor, node_id, request).await
     }
 
+    pub async fn remove_retired_nodes(
+        &self,
+        actor: &AdminContext,
+        request: RemoveRetiredNodesRequest,
+    ) -> Result<RemoveRetiredNodesResult> {
+        console::remove_retired_nodes(&self.pool, actor, request).await
+    }
+
     pub async fn node_lifecycle(&self, node_id: &str) -> Result<crate::NodeLifecycleState> {
         crate::lifecycle::load(&self.pool, node_id).await
     }
@@ -1204,6 +1220,10 @@ impl PgStore {
         admin::init_admin(&self.pool, request).await
     }
 
+    pub async fn init_system(&self, request: SystemInitRequest) -> Result<SystemInitResult> {
+        admin::init_system(&self.pool, request).await
+    }
+
     pub async fn login_admin(&self, request: AdminLoginRequest) -> Result<AdminLoginResult> {
         admin::login_admin(&self.pool, request).await
     }
@@ -1382,6 +1402,23 @@ impl PgStore {
         usage::list_usage_node_series(&self.pool, actor, window_secs, node_id).await
     }
 
+    pub async fn list_usage_node_series_range(
+        &self,
+        actor: &AdminContext,
+        start_unix_secs: i64,
+        end_unix_secs: i64,
+        node_id: Option<&str>,
+    ) -> Result<UsageNodeSeriesList> {
+        usage::list_usage_node_series_range(
+            &self.pool,
+            actor,
+            start_unix_secs,
+            end_unix_secs,
+            node_id,
+        )
+        .await
+    }
+
     // Telemetry. Like quotas, none of this enters the model, so none of these take a revision or
     // touch drafts — they look unlike the neighbouring model writers on purpose.
     pub async fn record_load_report(
@@ -1438,6 +1475,17 @@ impl PgStore {
         window_secs: u32,
     ) -> Result<NodePingProbeView> {
         ping_probe::node_view(&self.pool, actor, node_id, window_secs).await
+    }
+
+    pub async fn node_ping_probe_view_range(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        start_unix_secs: i64,
+        end_unix_secs: i64,
+    ) -> Result<NodePingProbeView> {
+        ping_probe::node_view_range(&self.pool, actor, node_id, start_unix_secs, end_unix_secs)
+            .await
     }
 
     pub async fn list_node_ping_probes(

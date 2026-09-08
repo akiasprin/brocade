@@ -352,6 +352,42 @@ pub(crate) async fn create_user_tx(
     ))
 }
 
+/// Create the root tenant and bootstrap network user as one model revision inside system
+/// initialization. The caller owns both the admin-table lock and this transaction, so the product
+/// cannot become "initialized" without the tenant/user pair that makes it usable.
+pub(crate) async fn bootstrap_tenant_and_user_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<u64> {
+    let previous = lock_control_state(tx).await?;
+    let revision_id = insert_revision(tx, actor.operator_id(), "initialize system").await?;
+    let tenant_changed = create_tenant_tx(
+        tx,
+        actor,
+        revision_id,
+        CreateTenantRequest {
+            id: tenant_id.to_owned(),
+            name: tenant_id.to_owned(),
+            note: None,
+        },
+    )
+    .await?;
+    let (_, user_changed) = create_user_tx(
+        tx,
+        actor,
+        revision_id,
+        CreateUserRequest {
+            tenant_id: tenant_id.to_owned(),
+            id: user_id.to_owned(),
+            note: None,
+        },
+    )
+    .await?;
+    commit_revision(tx, revision_id, previous, tenant_changed || user_changed).await
+}
+
 pub async fn rotate_user_uuid(
     pool: &PgPool,
     actor: &AdminContext,
@@ -822,6 +858,66 @@ pub(crate) async fn reorder_apps_tx(
     Ok(true)
 }
 
+/// Model writes hold the control-state lock, so reference checks and deletion are atomic.
+pub(crate) async fn delete_external_outbound_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    tenant_id: &str,
+    id: &str,
+) -> Result<bool> {
+    actor.require_tenant_access(tenant_id, "proxy outbound")?;
+    let owner = sqlx::query_scalar::<_, String>(
+        "SELECT tenant_id FROM external_outbounds WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    if owner != tenant_id {
+        return Err(StoreError::NotFound(format!(
+            "proxy outbound {tenant_id}/{id}"
+        )));
+    }
+    let referenced = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM steps
+            CROSS JOIN LATERAL jsonb_array_elements(steps.rules) AS item(rule)
+            WHERE COALESCE(item.rule->'action', item.rule->'a')->>'t' = 'proxy'
+              AND COALESCE(item.rule->'action', item.rule->'a')->>'outbound' = $1
+         ) OR EXISTS (SELECT 1 FROM front_external_vias WHERE outbound_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if referenced {
+        return Err(StoreError::InvalidData(
+            "代理出站仍被规则或前置组引用，请先解除引用".to_owned(),
+        ));
+    }
+    let bound = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM external_outbound_bindings WHERE outbound_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if bound {
+        return Err(StoreError::InvalidData(
+            "请先在机器设置中注销此代理出站的 WARP 身份".to_owned(),
+        ));
+    }
+    Ok(
+        sqlx::query("DELETE FROM external_outbounds WHERE id = $1 AND tenant_id = $2")
+            .bind(id)
+            .bind(tenant_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
 pub(crate) async fn upsert_external_outbound_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
@@ -836,6 +932,7 @@ pub(crate) async fn upsert_external_outbound_tx(
     let address = required_text(request.address, "external outbound address")?;
     ensure_nonzero_port(request.port, "external outbound port")?;
     let requested_protocol = match &request.protocol {
+        ExternalOutboundProtocol::Anytls { .. } => "anytls",
         ExternalOutboundProtocol::Vless { .. } => "vless",
         ExternalOutboundProtocol::Shadowsocks2022 { .. } => "shadowsocks2022",
         ExternalOutboundProtocol::Socks5 { .. } => "socks5",
@@ -890,6 +987,7 @@ pub(crate) async fn upsert_external_outbound_tx(
     };
 
     let protocol_options = match request.protocol {
+        ExternalOutboundProtocol::Anytls { .. } => json!({}),
         ExternalOutboundProtocol::Vless {
             encryption,
             flow,
@@ -2075,6 +2173,15 @@ pub(crate) async fn upsert_ingress_tx(
         .map(|settings| serde_json::to_value(&settings.padding_scheme))
         .transpose()?;
     let anytls_keypair = anytls.map(|_| generate_reality_keypair()).transpose()?;
+    let encryption = request.wires.vless_encryption.as_ref();
+    if let Some(encryption) = encryption {
+        ensure_nonzero_port(encryption.port, "VLESS Encryption port")?;
+        encryption
+            .options
+            .validate()
+            .map_err(|message| StoreError::InvalidData(message.to_owned()))?;
+    }
+    let encryption_keypair = encryption.map(|_| generate_reality_keypair()).transpose()?;
     let anytls_short_ids = anytls
         .map(|_| generate_reality_short_id().map(|short_id| json!([short_id])))
         .transpose()?;
@@ -2133,7 +2240,8 @@ pub(crate) async fn upsert_ingress_tx(
             anytls_masquerade_headers, anytls_masquerade_status_code,
             anytls_security, anytls_reality,
             anytls_reality_private_key, anytls_reality_public_key,
-            anytls_reality_short_ids
+            anytls_reality_short_ids,
+            vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
@@ -2152,7 +2260,7 @@ pub(crate) async fn upsert_ingress_tx(
             $55, $56, $57, $58,
             $59, $60, $61,
             $62, $63, $64, $65, $66, $67, $68, $69, $70,
-            $71, $72, $73
+            $71, $72, $73, $74, $75, $76, $77
          )
          ON CONFLICT (id) DO UPDATE SET
             app_id = EXCLUDED.app_id,
@@ -2211,6 +2319,10 @@ pub(crate) async fn upsert_ingress_tx(
             xhttp_tuning = EXCLUDED.xhttp_tuning,
             xhttp_download_v4_origin_port = EXCLUDED.xhttp_download_v4_origin_port,
             xhttp_download_v6_origin_port = EXCLUDED.xhttp_download_v6_origin_port,
+            vless_encryption_port = EXCLUDED.vless_encryption_port,
+            vless_encryption_options = EXCLUDED.vless_encryption_options,
+            vless_encryption_private_key = COALESCE(ingresses.vless_encryption_private_key, EXCLUDED.vless_encryption_private_key),
+            vless_encryption_public_key = COALESCE(ingresses.vless_encryption_public_key, EXCLUDED.vless_encryption_public_key),
             anytls_enabled = EXCLUDED.anytls_enabled,
             anytls_port = EXCLUDED.anytls_port,
             anytls_padding_scheme = EXCLUDED.anytls_padding_scheme,
@@ -2300,13 +2412,17 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.anytls_masquerade_kind, EXCLUDED.anytls_masquerade_content,
                 EXCLUDED.anytls_masquerade_headers, EXCLUDED.anytls_masquerade_status_code,
                 EXCLUDED.anytls_security, EXCLUDED.anytls_reality)
+            OR ingresses.vless_encryption_port IS DISTINCT FROM EXCLUDED.vless_encryption_port
+            OR ingresses.vless_encryption_options IS DISTINCT FROM EXCLUDED.vless_encryption_options
+            OR (EXCLUDED.vless_encryption_port IS NOT NULL AND ingresses.vless_encryption_private_key IS NULL)
             OR (EXCLUDED.anytls_enabled AND ingresses.anytls_reality_private_key IS NULL)
          RETURNING reality_private_key,
                    reality_public_key,
                    reality_short_ids,
                    anytls_reality_private_key,
                    anytls_reality_public_key,
-                   anytls_reality_short_ids",
+                   anytls_reality_short_ids,
+                   vless_encryption_private_key, vless_encryption_public_key",
     )
     .bind(&id)
     .bind(&app_id)
@@ -2458,6 +2574,10 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(anytls_keypair.as_ref().map(|keypair| &keypair.private_key))
     .bind(anytls_keypair.as_ref().map(|keypair| &keypair.public_key))
     .bind(anytls_short_ids)
+    .bind(encryption.map(|settings| i32::from(settings.port)))
+    .bind(encryption_keypair.as_ref().map(|keypair| &keypair.private_key))
+    .bind(encryption_keypair.as_ref().map(|keypair| &keypair.public_key))
+    .bind(serde_json::to_value(encryption.map(|settings| settings.options.clone()).unwrap_or_default())?)
     .fetch_optional(&mut **tx)
     .await?;
     let client_changed = sqlx::query(
@@ -2534,7 +2654,7 @@ pub(crate) async fn upsert_ingress_tx(
             sqlx::query(
                 "SELECT reality_private_key, reality_public_key, reality_short_ids,
                         anytls_reality_private_key, anytls_reality_public_key,
-                        anytls_reality_short_ids
+                        anytls_reality_short_ids, vless_encryption_private_key, vless_encryption_public_key
              FROM ingresses WHERE id = $1",
             )
             .bind(&id)
@@ -2607,6 +2727,16 @@ pub(crate) async fn upsert_ingress_tx(
         projection,
         guard: request.guard,
         wires: IngressWires::try_from(IngressWiresWire {
+            vless_encryption: encryption
+                .map(|settings| -> Result<_> {
+                    Ok(brocade_core::model::VlessEncryption {
+                        port: settings.port,
+                        options: settings.options.clone(),
+                        private_key: row.try_get("vless_encryption_private_key")?,
+                        public_key: row.try_get("vless_encryption_public_key")?,
+                    })
+                })
+                .transpose()?,
             vless: request.wires.vless.as_ref().map(|vless| match vless {
                 TransportRequest::VlessReality => Transport::VlessReality(effective.clone()),
                 TransportRequest::VlessRealityXhttp { .. } => {

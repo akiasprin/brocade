@@ -275,6 +275,19 @@ mod tests {
     }
 
     #[test]
+    fn certificate_group_changes_require_restart_even_with_identical_listeners() {
+        let mut before: Value = serde_json::from_str(&base()).unwrap();
+        before["brocadeCertificateGroup"] = serde_json::json!("group-a");
+        let mut after = before.clone();
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_some());
+        after["brocadeCertificateGroup"] = serde_json::json!("group-b");
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
+        after.as_object_mut().unwrap().remove("brocadeCertificateGroup");
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
+        assert!(hot_swap(&after.to_string(), &before.to_string()).is_none());
+    }
+
+    #[test]
     fn an_identical_config_asks_for_nothing() {
         let swap = hot_swap(&base(), &base()).expect("同一份配置当然可以热切");
         assert!(swap.add_rules.is_empty() && swap.remove_rule_tags.is_empty());

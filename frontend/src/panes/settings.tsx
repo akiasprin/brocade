@@ -1,6 +1,8 @@
+import { useServerForm } from '../ui/server-form';
 import { useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  DEFAULT_HOP_MUX,
   fetchCerts,
   fetchAuthState,
   fetchBranding,
@@ -11,6 +13,7 @@ import {
   fetchAgentLogPolicy,
   fetchLinkMtu,
   fetchSettings,
+  hopMuxError,
   fetchPingProbeSettings,
   saveDistribution,
   saveAgentLogDefault,
@@ -32,8 +35,8 @@ import {
   type AgentLogPolicyNode,
   type AgentLogPolicyView,
   type GroupCertificate,
-  type NodeCertificateState,
   type LinkMtuItem,
+  type HopMux,
   type ModelSettings,
   type PingProbeSettings,
 } from '../api';
@@ -63,6 +66,7 @@ type Form = {
   mtu: string;
   ingressBase: string;
   anytlsBase: string;
+  vlessEncryptionBase: string;
   hopBase: string;
   hy2Base: string;
   probeUrl: string;
@@ -76,6 +80,14 @@ type Form = {
   connDownlink: string;
   connBuffer: string;
   connHandshake: string;
+  muxConcurrency: string;
+  muxMinIdle: string;
+  muxMaxIdle: string;
+  muxMaxProbing: string;
+  muxProbeInterval: string;
+  muxProbeTimeout: string;
+  muxIdleTtl: string;
+  muxMaxRequests: string;
   anyTlsPadding: string;
 };
 
@@ -87,6 +99,21 @@ const numOr = (raw: string, fallback: number) => {
   const n = Number(t);
   return Number.isFinite(n) ? n : fallback;
 };
+
+const numberField = (raw: string): number => (raw.trim() === '' ? Number.NaN : Number(raw));
+
+function relayMuxOfForm(form: Form): HopMux {
+  return {
+    concurrency: numberField(form.muxConcurrency),
+    min_idle_workers: numberField(form.muxMinIdle),
+    max_idle_workers: numberField(form.muxMaxIdle),
+    max_probing_workers: numberField(form.muxMaxProbing),
+    probe_interval_secs: numberField(form.muxProbeInterval),
+    probe_timeout_ms: numberField(form.muxProbeTimeout),
+    idle_ttl_secs: numberField(form.muxIdleTtl),
+    max_requests_per_worker: numberField(form.muxMaxRequests),
+  };
+}
 
 const PROBE_URL_DEFAULT = 'http://cp.cloudflare.com/cdn-cgi/trace';
 const GEODATA_CRON_DEFAULT = 'CRON_TZ=Asia/Shanghai 30 6 * * *';
@@ -122,10 +149,11 @@ const EMPTY: Form = {
   names: '',
   fp: '',
   flow: '',
-  keepalive: '25',
+  keepalive: '10',
   mtu: '1420',
-  ingressBase: '8443',
-  anytlsBase: '18443',
+  ingressBase: '13443',
+  anytlsBase: '14443',
+  vlessEncryptionBase: '48000',
   hopBase: '20000',
   hy2Base: '30000',
   probeUrl: PROBE_URL_DEFAULT,
@@ -141,6 +169,14 @@ const EMPTY: Form = {
   connDownlink: '5',
   connBuffer: '',
   connHandshake: '60',
+  muxConcurrency: String(DEFAULT_HOP_MUX.concurrency),
+  muxMinIdle: String(DEFAULT_HOP_MUX.min_idle_workers),
+  muxMaxIdle: String(DEFAULT_HOP_MUX.max_idle_workers),
+  muxMaxProbing: String(DEFAULT_HOP_MUX.max_probing_workers),
+  muxProbeInterval: String(DEFAULT_HOP_MUX.probe_interval_secs),
+  muxProbeTimeout: String(DEFAULT_HOP_MUX.probe_timeout_ms),
+  muxIdleTtl: String(DEFAULT_HOP_MUX.idle_ttl_secs),
+  muxMaxRequests: String(DEFAULT_HOP_MUX.max_requests_per_worker),
   anyTlsPadding: ANYTLS_PADDING_DEFAULT,
 };
 
@@ -155,10 +191,11 @@ function formOf(s: ModelSettings): Form {
     names: (s.reality_site?.server_names ?? []).join(', '),
     fp: text(s.reality_site?.fingerprint ?? null),
     flow: text(s.reality_site?.flow ?? null),
-    keepalive: String(s.overlay?.keepalive_secs ?? 25),
+    keepalive: String(s.overlay?.keepalive_secs ?? 10),
     mtu: String(s.overlay?.mtu ?? 1420),
-    ingressBase: String(s.ports?.ingress_base ?? 8443),
-    anytlsBase: String(s.ports?.anytls_base ?? 18443),
+    ingressBase: String(s.ports?.ingress_base ?? 13443),
+    anytlsBase: String(s.ports?.anytls_base ?? 14443),
+    vlessEncryptionBase: String(s.ports?.vless_encryption_base ?? 48000),
     hopBase: String(s.ports?.hop_base ?? 20000),
     hy2Base: String(s.ports?.hy2_base ?? 30000),
     probeUrl: s.probe?.endpoint_url ?? PROBE_URL_DEFAULT,
@@ -173,6 +210,14 @@ function formOf(s: ModelSettings): Form {
     // null 需转换为空串而非 '0'：该字段的空值表示不写入该键，而 0 表示不缓冲。
     connBuffer: s.connection?.buffer_size_kb == null ? '' : String(s.connection.buffer_size_kb),
     connHandshake: String(s.connection?.handshake_secs ?? 60),
+    muxConcurrency: String(s.relay_mux?.concurrency ?? 1),
+    muxMinIdle: String(s.relay_mux?.min_idle_workers ?? 0),
+    muxMaxIdle: String(s.relay_mux?.max_idle_workers ?? 2),
+    muxMaxProbing: String(s.relay_mux?.max_probing_workers ?? 1),
+    muxProbeInterval: String(s.relay_mux?.probe_interval_secs ?? 5),
+    muxProbeTimeout: String(s.relay_mux?.probe_timeout_ms ?? 2000),
+    muxIdleTtl: String(s.relay_mux?.idle_ttl_secs ?? 24),
+    muxMaxRequests: String(s.relay_mux?.max_requests_per_worker ?? 128),
     anyTlsPadding: (s.anytls_padding_scheme ?? ANYTLS_PADDING_DEFAULT.split('\n')).join('\n'),
   };
 }
@@ -183,23 +228,38 @@ type SectionKey = 'xray' | 'connection' | 'wireguard' | 'ports' | 'probe' | 'geo
 
 const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
   xray: ['dest', 'names', 'fp', 'flow', 'min', 'max', 'diff', 'anyTlsPadding'],
-  connection: ['connIdle', 'connUplink', 'connDownlink', 'connBuffer', 'connHandshake'],
+  connection: [
+    'connIdle',
+    'connUplink',
+    'connDownlink',
+    'connBuffer',
+    'connHandshake',
+    'muxConcurrency',
+    'muxMinIdle',
+    'muxMaxIdle',
+    'muxMaxProbing',
+    'muxProbeInterval',
+    'muxProbeTimeout',
+    'muxIdleTtl',
+    'muxMaxRequests',
+  ],
   wireguard: ['keepalive', 'mtu'],
-  ports: ['ingressBase', 'anytlsBase', 'hopBase', 'hy2Base'],
+  ports: ['ingressBase', 'anytlsBase', 'vlessEncryptionBase', 'hopBase', 'hy2Base'],
   probe: ['probeUrl', 'probeTimeout', 'probeInterval'],
   geodata: ['geodataCron', 'geodataGeoip', 'geodataGeosite'],
 };
 
-/* 保存之后会发生什么，三档。段标题里只写结果，原因写在段自己的说明里。
+/* 保存之后会发生什么，四类。段标题里只写结果，原因写在段自己的说明里。
  *
  * 这是九段之间最大的一处差别，此前它只出现在每段说明的末尾（「不盖修订，保存即生效」
  * 「修改本段需要发布一次」），与其余的说明同为一句灰色小字，需要读完整句才能得知。 */
-type Apply = 'now' | 'publish' | 'cycle';
+type Apply = 'now' | 'publish' | 'cycle' | 'future';
 
 const APPLY: Record<Apply, string> = {
   now: '保存即生效',
   publish: '需要发布',
   cycle: '下一轮生效',
+  future: '仅影响新建',
 };
 
 /* 标题图标与机器配置、链路设置共用同一套线稿图标。设置项仍按两栏顺序排列；
@@ -215,7 +275,7 @@ const NAV: NavItem[] = [
   { id: 'set-xray', label: 'XRAY', icon: 'protocol', apply: 'publish', key: 'xray' },
   { id: 'set-conn', label: '连接策略', icon: 'config', apply: 'publish', key: 'connection' },
   { id: 'set-wg', label: 'WireGuard', icon: 'tunnels', apply: 'publish', key: 'wireguard' },
-  { id: 'set-ports', label: '端口分配', icon: 'ingress', apply: 'publish', key: 'ports' },
+  { id: 'set-ports', label: '端口分配', icon: 'ingress', apply: 'future', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
   { id: 'set-probe', label: '端到端探测', icon: 'observe', apply: 'cycle', key: 'probe' },
   { id: 'set-ping-probe', label: 'Ping 链路探测', icon: 'diag', apply: 'cycle' },
@@ -229,11 +289,12 @@ function SettingsTitle({ id, children }: { id: string; children: React.ReactNode
   return <PanelTitle of={ICON_OF[id]}>{children}</PanelTitle>;
 }
 
-/** 段标题里的生效方式。只有「需要发布」着主色，
-    且它是唯一一档「保存完还没完」，另外两档保存即到位。 */
+/** 段标题里的生效方式。复用全站状态签：即时生效是完成态，需要发布是待处理态，
+    下一轮生效保持中性，避免再造一套外观相近但语义不同的徽章。 */
 function ApplyBadge({ id }: { id: string }) {
   const kind = APPLY_OF[id];
-  return <span className={kind === 'publish' ? 'applyb pub' : 'applyb'}>{APPLY[kind]}</span>;
+  const tone = kind === 'now' ? 'st-ok' : kind === 'publish' ? 'st-gold' : kind === 'cycle' ? 'st-pending' : '';
+  return <span className={`st settings-apply-status ${tone}`}>{APPLY[kind]}</span>;
 }
 
 function SettingsSaveBar({
@@ -466,6 +527,7 @@ function Section({
   saving,
   savedRev,
   editable,
+  validationError = null,
   onSave,
   children,
 }: {
@@ -476,6 +538,7 @@ function Section({
   saving: boolean;
   savedRev: number | null;
   editable: boolean;
+  validationError?: string | null;
   onSave: () => void;
   children: React.ReactNode;
 }) {
@@ -492,6 +555,8 @@ function Section({
         saving={saving}
         savedText={savedRev !== null ? `已保存，盖出修订 ${savedRev}` : null}
         editable={editable}
+        disabled={validationError !== null}
+        title={validationError ?? undefined}
         onSave={onSave}
       />
     </section>
@@ -525,44 +590,6 @@ function daysLeft(expiresAt: string | null): number | null {
   return Number.isFinite(at) ? Math.floor((at - Date.now()) / DAY) : null;
 }
 
-/** 机器上是否已有该证书。与签发状态是两项内容，必须分开显示——控制面已签发
-    不等同于机器已获取。 */
-/* 机器上是旧证书与控制面尚未收到上报是两种状态，但显示形式相同。
- *
- * 节点上报当前持有的证书与签发不在同一条路径：签发在控制面执行，上报由节点按轮次执行。
- * 因此签发后的短暂窗口内，上报内容仍是上一张证书——不是机器未更新，而是上报数据晚于签发。
- *
- * 判定依据是时间先后而非经过的分钟数：上报时间早于签发时间即表示尚未上报新状态。 */
-function notYetHeard(issuedAt: string | null, observedAt: string | null): boolean {
-  if (!issuedAt || !observedAt) return false;
-  const at = (text: string) => Date.parse(text.replace(' ', 'T'));
-  const issued = at(issuedAt);
-  const observed = at(observedAt);
-  return !Number.isNaN(issued) && !Number.isNaN(observed) && observed < issued;
-}
-
-/** 一台机器是否持有本组当前需要的全部主备槽。
-    agent 每 15 秒拉取，写入后等待 xray 的 5 秒热重载；短暂的「旧」是收敛过程。 */
-function diskState(
-  row: NodeCertificateState,
-  serving: GroupCertificate | undefined,
-): { tone: string; text: string } | null {
-  switch (row.on_disk) {
-    case 'current':
-      return null; // 一切如常的那一档不占版面
-    case 'stale':
-      return notYetHeard(serving?.issued_at ?? null, row.observed_at)
-        ? { tone: 'idle', text: '刚换过，这台还没报上来' }
-        : { tone: 'warn', text: '机器上是旧的' };
-    case 'absent':
-      return { tone: 'err', text: '机器上没有' };
-    default:
-      // 最需要关注的一档：agent 从未上报，说明其版本过旧、不管理证书。在没有该列时，
-      // 该状态与正常状态的显示完全相同。
-      return { tone: 'idle', text: 'agent 没报' };
-  }
-}
-
 /** 一张证书的状态。颜色只表示严重程度，文字负责说明它现在是什么角色。 */
 function certState(cert: GroupCertificate): { tone: string; text: string } {
   const left = daysLeft(cert.expires_at);
@@ -574,11 +601,14 @@ function certState(cert: GroupCertificate): { tone: string; text: string } {
       if (left !== null && left <= 20) return { tone: 'warn', text: `在用 · 还剩 ${left} 天` };
       return { tone: 'ok', text: '在用' };
     case 'ready':
-      return { tone: 'idle', text: '备用槽待发布' };
+      return {
+        tone: 'idle',
+        text: '备用待启用',
+      };
     case 'compatible':
-      return { tone: 'ok', text: '保留兼容' };
+      return { tone: 'idle', text: '保留' };
     case 'pending':
-      return { tone: 'idle', text: '排队签发中' };
+      return { tone: 'idle', text: '待签发' };
     case 'failed':
       return { tone: 'err', text: `签发失败 · 试了 ${cert.attempts} 次` };
     default:
@@ -590,47 +620,41 @@ function retainedCertificate(cert: GroupCertificate): boolean {
   return cert.sha256 !== null && ['ready', 'serving', 'compatible'].includes(cert.status);
 }
 
+const certificateTime = (value: string | null) => (value ? value.slice(0, 19).replace('T', ' ') : '—');
+
+function issuanceResultText(result: { issued: number; failed: number }): string {
+  if (result.issued === 0 && result.failed === 0) return '处理完成，暂无需要签发或续期的证书。';
+  return `处理完成：成功 ${result.issued} 张，失败 ${result.failed} 张。${result.failed ? '请查看下方失败原因，修正后可立即重试。' : ''}`;
+}
+
 function CertSection({ editable, view }: { editable: boolean; view: CertsView }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState<{
-    domain: string;
-    signingMethod: 'public-ca' | 'self-signed';
-    credential: string;
-    directory: string;
-    contact: string;
-    renew: string;
-  } | null>(null);
+  const certForm = (source: CertsView) => ({
+    domain: source.domain?.domain ?? '',
+    signingMethod: source.domain?.signing_method ?? ('public-ca' as const),
+    credential: '',
+    directory: source.domain?.signing_method === 'public-ca' ? source.domain.acme_directory : source.letsencrypt,
+    contact: source.domain?.acme_contact ?? '',
+    renew: String(source.domain?.renew_before_days ?? 30),
+  });
+  const { form: f, setForm, accept } = useServerForm(certForm(view));
   const [saved, setSaved] = useState(false);
-
-  const [syncedFrom, setSyncedFrom] = useState<CertsView | undefined>(undefined);
-  if (view !== syncedFrom) {
-    setSyncedFrom(view);
-    const d = view.domain;
-    setForm({
-      domain: d?.domain ?? '',
-      signingMethod: d?.signing_method ?? 'public-ca',
-      // 凭据不回读，因此表单中始终为空；已存储时通过下方的 placeholder 说明。
-      credential: '',
-      directory: d?.signing_method === 'public-ca' ? d.acme_directory : view.letsencrypt,
-      contact: d?.acme_contact ?? '',
-      renew: String(d?.renew_before_days ?? 30),
-    });
-  }
-
   const save = useMutation({
-    mutationFn: () =>
+    onMutate: () => qc.cancelQueries({ queryKey: ['certs'] }),
+    mutationFn: (submitted: typeof f) =>
       saveCertDomain({
-        domain: form!.domain.trim(),
-        signing_method: form!.signingMethod,
-        dns_credential: form!.credential.trim() ? form!.credential.trim() : null,
-        acme_directory: form!.directory,
-        acme_contact: form!.contact.trim() ? form!.contact.trim() : null,
-        renew_before_days: Number(form!.renew) || 30,
+        domain: submitted.domain.trim(),
+        signing_method: submitted.signingMethod,
+        dns_credential: submitted.credential.trim() || null,
+        acme_directory: submitted.directory,
+        acme_contact: submitted.contact.trim() || null,
+        renew_before_days: Number(submitted.renew) || 30,
       }),
-    onSuccess: () => {
+    onSuccess: async (next, submitted) => {
+      await qc.cancelQueries({ queryKey: ['certs'] });
       setSaved(true);
-      setForm(prev => (prev ? { ...prev, credential: '' } : prev));
-      qc.invalidateQueries({ queryKey: ['certs'] });
+      accept(certForm(next), submitted);
+      qc.setQueryData(['certs'], next);
     },
   });
 
@@ -640,14 +664,6 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
   });
 
   const d = view.domain;
-  const f = form ?? {
-    domain: '',
-    signingMethod: 'public-ca' as const,
-    credential: '',
-    directory: view.letsencrypt,
-    contact: '',
-    renew: '30',
-  };
   const selfSigned = f.signingMethod === 'self-signed';
   const storedDirectory = d?.signing_method === 'public-ca' ? d.acme_directory : view.letsencrypt;
   const dirty =
@@ -667,18 +683,21 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
     <section className="panel config-panel" id="set-cert">
       <header>
         <SettingsTitle id="set-cert">证书</SettingsTitle>
-        <ApplyBadge id="set-cert" />
+        <span className="sub">申领设置与已签发证书分开管理</span>
       </header>
-      <p className="cardsub">
-        {selfSigned
-          ? '默认维护一对主备自签证书，备用就绪后才允许切换'
-          : '按证书组维护一对主备通配证书，由控制面签发并送达节点'}
-      </p>
+      <p className="cardsub">新建证书组会立即申领证书。机器切换证书组需保存草稿、提交并发布，应用时重启 Xray。</p>
       {save.error && <ErrorBox error={save.error} />}
       {scan.error && <ErrorBox error={scan.error} />}
 
-      <div className="setgrp">
-        <p className="eyebrow">签发</p>
+      <details className="setgrp settings-block cert-issuance-settings" open={!d}>
+        <summary>
+          <span className="eyebrow">新证书申领设置</span>
+          <span className="hint">
+            {d ? (d.signing_method === 'self-signed' ? '当前使用自签证书' : "当前使用 Let's Encrypt") : '请先配置'}
+            {dirty ? ' · 有未保存的修改' : ''}
+          </span>
+        </summary>
+        <p className="hint">用于后续新建、备用及续期申领；修改设置不会改写已签发的证书。新申领使用已保存的设置。</p>
 
         <div className="setfld">
           <label>签发方式</label>
@@ -815,8 +834,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
               使用<b>单独的域名</b>。Cloudflare token 按 zone 授权，无法限制到子域，域名分开可防止凭据泄露波及控制面。
             </div>
             <div className="guard">
-              每组一对主备证书，组内机器共享。Let&apos;s Encrypt <b>同一组名字每 7 天最多签发 5 张</b>
-              ，备用槽只保留一张，避免无意义消耗额度。
+              每组运行时只安装一张当前证书，数据库最多保留一张待启用备用。Let&apos;s Encrypt
+              <b> 同一组名字每 7 天最多签发 5 张</b>，避免无意义消耗额度。
             </div>
             <div className="guard">
               证书会进入 CT 公开日志，随机标签防猜测但不防枚举。DNS-01 <b>不需要 A 记录</b>，名字与 IP
@@ -824,59 +843,57 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             </div>
           </>
         )}
-      </div>
+        <SettingsSaveBar
+          dirty={dirty}
+          saving={save.isPending}
+          savedText={saved ? '已保存，后续申领使用此设置' : null}
+          editable={editable}
+          disabled={!view.sealing_available}
+          title={view.sealing_available ? '' : '这台控制面没配 BROCADE_SECRET_KEY，存不了凭据'}
+          label="保存申领设置"
+          onSave={() => save.mutate(f)}
+        />
+      </details>
 
       {d && (
-        <div className="setgrp">
+        <div className="setgrp settings-block">
           <p className="eyebrow">
-            机队 · {view.nodes.length} 台
+            证书状态
             {bad.length > 0 && <b style={{ color: 'var(--err)' }}> · {bad.length} 张要处理</b>}
           </p>
           <div className="setfld">
             <label />
             <div className="v">
               <button className="btn" disabled={!editable || scan.isPending} onClick={() => scan.mutate()}>
-                {scan.isPending ? '已排上…' : '现在检查一轮'}
+                {scan.isPending ? '正在签发与续期…' : '立即签发与续期'}
               </button>
-              <span className="hint">
-                {d.signing_method === 'self-signed'
-                  ? '自签证书在本机生成，完成后随节点轮询热更新'
-                  : '每台约半分钟，串行执行。并发会触发 CA 的速率限制'}
-              </span>
+              <span className="hint">立即处理待签发、失败和需要续期的证书；正常证书不会重新签发。</span>
             </div>
           </div>
 
-          <CertGroups view={view} editable={editable} />
+          {scan.data?.processing && !scan.isPending && (
+            <p role="status" className={scan.data.processing.failed ? 'note bad' : 'hint'}>
+              {issuanceResultText(scan.data.processing)}
+            </p>
+          )}
+          <CertGroups view={view} editable={editable && !scan.isPending} />
 
           <div className="guard">
             续期失败<b>不等于没有证书</b>，在用的到期前仍可用。风险是长期未处理导致过期后整组停服。
           </div>
           <div className="guard">
-            公有证书组内续期不改 SNI；自签证书会先装入备用槽，所有机器确认后才允许启用新的 SNI 与校验值。
+            公有证书组内续期不改 SNI；自签证书会先进入备用槽，预装确认后才允许启用新的 SNI 与校验值。
           </div>
         </div>
       )}
-      <SettingsSaveBar
-        dirty={dirty}
-        saving={save.isPending}
-        savedText={saved ? '已保存，立刻生效' : null}
-        editable={editable}
-        disabled={!view.sealing_available}
-        title={view.sealing_available ? '' : '这台控制面没配 BROCADE_SECRET_KEY，存不了凭据'}
-        label="保存证书设置"
-        onSave={() => save.mutate()}
-      />
     </section>
   );
 }
 
-/** 证书组的列表：一个组、组里的证书、用这个组的机器。
- *
- * 三层而不是一张平表：证书属于组，机器也属于组，但证书和机器之间没有直接关系——同组机器
- * 共用主备证书，各自独立报告两个信任轨的槽位。平表会把同一对证书重复很多遍。 */
+/** 证书组及其完整证书记录。机器与证书组的对应关系暂不在全局设置页展示；这里专注于
+ * 签发材料、运行位置、有效期和失败信息，避免把证书状态与机器收敛状态混在一起。 */
 function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) {
   const qc = useQueryClient();
-  const nameOf = useNodeNames();
   const reload = () => qc.invalidateQueries({ queryKey: ['certs'] });
   const selfSigned = view.domain?.signing_method === 'self-signed';
   const [creating, setCreating] = useState<{ name: string; note: string; certificateName: string } | null>(null);
@@ -888,23 +905,52 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
   } | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [pending, setPending] = useState<string | null>(null);
+  const [resultText, setResultText] = useState<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   // Unlike the section saves, these older actions are plain promises rather than useMutation.
   // Keep a synchronous lock as well as disabled buttons: two click events can be delivered before
   // React commits the pending render, and asking for one spare must never create two rows.
   const pendingRef = useRef(false);
+
+  const openGroup = (id: string) =>
+    setExpandedGroups(current => {
+      if (current.has(id)) return current;
+      const next = new Set(current);
+      next.add(id);
+      return next;
+    });
+
+  const toggleGroup = (id: string) =>
+    setExpandedGroups(current => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   const run = (key: string, what: () => Promise<unknown>, onSuccess?: () => void) => {
     if (pendingRef.current) return;
     pendingRef.current = true;
     setPending(key);
     setFailed(null);
+    setResultText(null);
     Promise.resolve()
       .then(what)
-      .then(() => {
+      .then(result => {
+        if (result && typeof result === 'object' && 'processing' in result) {
+          const processing = result.processing as { issued: number; failed: number };
+          setResultText(issuanceResultText(processing));
+          if ('id' in result && typeof result.id === 'string') {
+            openGroup(key.startsWith('spare:') ? key.slice('spare:'.length) : result.id);
+          }
+        }
         onSuccess?.();
         return reload();
       })
-      .catch((error: unknown) => setFailed(String(error)))
+      .catch((error: unknown) => {
+        setFailed(String(error));
+        return reload();
+      })
       .finally(() => {
         pendingRef.current = false;
         setPending(null);
@@ -917,6 +963,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
         {creating ? (
           <GroupForm
             value={creating}
+            creating
             showCertificateName={selfSigned}
             busy={pending !== null}
             onChange={setCreating}
@@ -949,6 +996,11 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
           </div>
         )}
         {failed && <div className="note bad">{failed}</div>}
+        {resultText && (
+          <p role="status" className="hint">
+            {resultText}
+          </p>
+        )}
       </>
     );
   }
@@ -958,7 +1010,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       <div className="certgroups-toolbar">
         <div>
           <b>证书组</b>
-          <span className="hint">每个组一对主备证书，组内机器共享</span>
+          <span className="hint">按组查看完整的 SNI、签发记录和运行槽</span>
         </div>
         <div className="v">
           <button
@@ -975,6 +1027,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       {creating && (
         <GroupForm
           value={creating}
+          creating
           showCertificateName={selfSigned}
           busy={pending !== null}
           onChange={setCreating}
@@ -994,25 +1047,42 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
         />
       )}
       {failed && <div className="note bad">{failed}</div>}
+      {resultText && (
+        <p role="status" className="hint">
+          {resultText}
+        </p>
+      )}
 
       {view.groups.map(group => {
-        const serving = group.certificates.find(c => c.status === 'serving');
+        const expanded = expandedGroups.has(group.id);
         const members = view.nodes.filter(row => row.label_id === group.id);
+        const groupSelfSigned = group.signing_method === 'self-signed';
+        const failedCount = group.certificates.filter(cert => cert.status === 'failed').length;
+        const pendingCount = group.certificates.filter(cert => cert.status === 'pending').length;
         const xrayPinsActive = group.certificates.some(
           cert => retainedCertificate(cert) && cert.signing_method === 'self-signed',
         );
-        const configuredMethod = view.domain?.signing_method;
+        const configuredMethod = group.signing_method;
         const standbyBusy = group.certificates.some(
           cert =>
             cert.signing_method === configuredMethod &&
             ['pending', 'ready', 'compatible', 'failed'].includes(cert.status),
         );
-        const usableCertificates = group.certificates.filter(cert => retainedCertificate(cert)).length;
         const preloadPending = members.some(row => row.on_disk !== 'current');
+        const runtimeSlots = groupSelfSigned
+          ? group.certificates.filter(cert => cert.signing_method === configuredMethod && cert.runtime_slot !== null)
+              .length
+          : 0;
         return (
-          <article className="certgrp" key={group.id}>
+          <article className={`certgrp${expanded ? ' expanded' : ''}`} key={group.id}>
             <header className="certgrp-hd">
-              <div className="certgrp-identity">
+              <button
+                type="button"
+                className="certgrp-identity certgrp-toggle"
+                aria-expanded={expanded}
+                aria-controls={`certgrp-body-${group.id}`}
+                onClick={() => toggleGroup(group.id)}
+              >
                 <span className="certgrp-mark" aria-hidden="true">
                   {group.is_default ? '默' : group.name.slice(0, 1).toUpperCase()}
                 </span>
@@ -1020,65 +1090,60 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   <div className="certgrp-title">
                     <b>{group.name}</b>
                     {group.is_default && <span className="certgrp-default">默认</span>}
+                    <span className="cert-origin">{groupSelfSigned ? '自签证书' : "Let's Encrypt"}</span>
+                    {failedCount > 0 && <span className="cstate err">{failedCount} 张签发失败</span>}
+                    {pendingCount > 0 && <span className="cstate idle">{pendingCount} 张待签发</span>}
                   </div>
-                  <code className="certgrp-sni">{serving?.certificate_name ?? group.names[1] ?? group.names[0]}</code>
                   {group.note && <span className="certgrp-note">{group.note}</span>}
                 </div>
-              </div>
-              <div className="certgrp-metrics" aria-label="证书组概况">
-                <span>
-                  <b>{members.length}</b>
-                  <small>机器</small>
-                </span>
-                <span>
-                  <b>{usableCertificates}</b>
-                  <small>可用证书</small>
-                </span>
-                <span>
-                  <b>
-                    {
-                      group.certificates.filter(
-                        cert => cert.signing_method === configuredMethod && cert.runtime_slot !== null,
-                      ).length
-                    }
-                    /2
-                  </b>
-                  <small>运行槽</small>
-                </span>
-              </div>
+                <span className="certgrp-disclosure" aria-hidden="true" />
+              </button>
               <span className="ctl">
                 <button
                   type="button"
                   className="btn sm"
                   disabled={!editable || pending !== null || group.is_default}
                   title={group.is_default ? '默认自签证书组名称固定' : '修改证书组名称'}
-                  onClick={() =>
+                  onClick={() => {
+                    openGroup(group.id);
                     setEditing({
                       id: group.id,
                       name: group.name,
                       note: group.note ?? '',
                       certificateName: '',
-                    })
-                  }
+                    });
+                  }}
                 >
                   改名
                 </button>
-                <button
-                  type="button"
-                  className="btn sm"
-                  disabled={!editable || pending !== null || standbyBusy}
-                  title={
-                    standbyBusy ? '主备槽已经占满，请先停止并清理旧兼容证书' : '多签一张待命证书，由你决定何时启用'
-                  }
-                  onClick={() => run(`spare:${group.id}`, () => requestSpareCertificate(group.id))}
-                >
-                  {pending === `spare:${group.id}` ? '添加中…' : '加一张备用'}
-                </button>
+                {!groupSelfSigned && (
+                  <button
+                    type="button"
+                    className="btn sm"
+                    disabled={!editable || pending !== null || standbyBusy}
+                    title={
+                      standbyBusy
+                        ? groupSelfSigned
+                          ? '主备槽已经占满，请先停止并清理旧保留证书'
+                          : '已有待处理的备用证书，请先启用或清理'
+                        : '多签一张待命证书，由你决定何时启用'
+                    }
+                    onClick={() => run(`spare:${group.id}`, () => requestSpareCertificate(group.id))}
+                  >
+                    {pending === `spare:${group.id}` ? '正在申领…' : '立即申领备用证书'}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="btn sm danger"
                   disabled={!editable || members.length > 0 || pending !== null || group.is_default}
-                  title={group.is_default ? '默认自签证书组不能删除' : members.length > 0 ? '还有机器在用这个组' : '删除这个组'}
+                  title={
+                    group.is_default
+                      ? '默认自签证书组不能删除'
+                      : members.length > 0
+                        ? '还有机器在用这个组'
+                        : '删除这个组'
+                  }
                   onClick={() => {
                     if (window.confirm(`删除证书组「${group.name}」？它的证书会一并删除。`)) {
                       run(`delete-group:${group.id}`, () => deleteCertGroup(group.id));
@@ -1090,161 +1155,216 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               </span>
             </header>
 
-            {editing?.id === group.id && (
-              <GroupForm
-                value={editing}
-                busy={pending !== null}
-                onChange={next => setEditing({ ...next, id: group.id })}
-                onCancel={() => setEditing(null)}
-                onSave={() => {
-                  run(
-                    `update-group:${group.id}`,
-                    () => updateCertGroup(group.id, { name: editing.name, note: editing.note || null }),
-                    () => setEditing(null),
-                  );
-                }}
-              />
-            )}
-
-            {xrayPinsActive && (
-              <div className="certtrust-note">
-                自签证书使用独立的主备双槽。新订阅只下发当前证书；保留兼容的旧证书仅用于已保存的旧配置。
-              </div>
-            )}
-
-            <section className="certgrp-section">
-              <header>
-                <b>证书队列</b>
-                <span>{group.certificates.length} 张</span>
-              </header>
-              <div className="certtbl">
-                {group.certificates.length === 0 ? (
-                  <div className="hint">还没有证书。签发每小时一轮，也可以点上方「现在检查一轮」。</div>
+            <div id={`certgrp-body-${group.id}`} className="certgrp-body" hidden={!expanded}>
+              <dl className="certgrp-facts" aria-label="证书组完整信息">
+                <div>
+                  <dt>组状态</dt>
+                  <dd>{group.status === 'active' ? '使用中' : group.status === 'draining' ? '排空中' : '已停用'}</dd>
+                </div>
+                {groupSelfSigned ? (
+                  <div>
+                    <dt>运行槽</dt>
+                    <dd>{runtimeSlots}/2</dd>
+                  </div>
                 ) : (
-                  group.certificates.map(cert => {
-                    const state = certState(cert);
-                    const left = daysLeft(cert.expires_at);
-                    const trustedByXray =
-                      cert.signing_method === 'self-signed' && ['ready', 'serving', 'compatible'].includes(cert.status);
-                    return (
-                      <div className={`certrow cert ${state.tone}`} key={cert.id}>
-                        <div className="certrow-status">
-                          <span className={`cstate ${state.tone}`}>{state.text}</span>
-                          <span className="cert-origin">
-                            {cert.origin === 'bootstrap' ? '初始化' : cert.origin === 'spare' ? '手动添加' : '自动续期'}
-                          </span>
-                        </div>
-                        <div className="certrow-detail">
-                          <span className="cissuer">
-                            {cert.issuer ? (
-                              <span className={/STAGING/i.test(cert.issuer) ? 'cstate warn' : 'hint'}>
-                                {/STAGING/i.test(cert.issuer) ? `${cert.issuer}（不被信任）` : cert.issuer}
-                              </span>
-                            ) : (
-                              <span className="hint">等待签发信息</span>
-                            )}
-                          </span>
-                          {trustedByXray && (
-                            <span className={left !== null && left < 0 ? 'ctrust warn' : 'ctrust'}>
-                              {left !== null && left < 0
-                                ? '已过期 · 仍在运行槽'
-                                : cert.status === 'ready'
-                                  ? '已装入备用槽'
-                                  : 'Xray 正在提供'}
-                            </span>
-                          )}
-                        </div>
-                        <span className="cwhen">
-                          {cert.expires_at ? (
-                            <>
-                              <small>到期</small> {cert.expires_at.slice(0, 10)}
-                              {left !== null && <span className="hint"> · {left} 天</span>}
-                            </>
-                          ) : (
-                            <span className="hint">尚无到期时间</span>
-                          )}
-                        </span>
-                        <div className="certrow-actions">
-                          {(cert.status === 'ready' || cert.status === 'compatible') && (
-                            <button
-                              type="button"
-                              className="btn sm"
-                              disabled={
-                                !editable ||
-                                pending !== null ||
-                                (cert.signing_method === 'self-signed' && preloadPending)
-                              }
-                              title={
-                                cert.status === 'compatible'
-                                  ? '切回这张旧证书；当前证书会继续保留兼容'
-                                  : cert.signing_method === 'self-signed'
-                                  ? preloadPending
-                                    ? '等待所有机器确认主备槽后才能启用'
-                                    : '发布这张证书的新 SNI 与证书校验'
-                                  : '让这个组的机器改用这张同名公有证书'
-                              }
-                              onClick={() => run(`serve:${cert.id}`, () => serveCertificate(cert.id))}
-                            >
-                              {pending === `serve:${cert.id}` ? '切换中…' : cert.status === 'compatible' ? '切回' : '启用'}
-                            </button>
-                          )}
-                          {cert.status !== 'serving' && (
-                            <button
-                              type="button"
-                              className="btn sm danger"
-                              disabled={!editable || pending !== null}
-                              title={
-                                cert.status === 'compatible'
-                                  ? '停止兼容；仍使用旧配置的客户端将无法重新连接'
-                                  : '删除这条证书记录'
-                              }
-                              onClick={() => {
-                                const impact =
-                                  cert.status === 'compatible'
-                                    ? '停止兼容后，仍使用这份旧 SNI 和证书校验的客户端将无法重新连接。继续？'
-                                    : '删除这条证书记录？';
-                                if (window.confirm(impact)) {
-                                  run(`delete-certificate:${cert.id}`, () => deleteCertificate(cert.id));
-                                }
-                              }}
-                            >
-                              删除
-                            </button>
-                          )}
-                        </div>
-                        {cert.last_error && <span className="cerr">{cert.last_error}</span>}
-                      </div>
-                    );
-                  })
+                  <div>
+                    <dt>运行方式</dt>
+                    <dd>单一当前证书</dd>
+                  </div>
                 )}
-              </div>
-            </section>
+                <div>
+                  <dt>标签</dt>
+                  <dd className="mono">{group.label}</dd>
+                </div>
+                <div>
+                  <dt>域名</dt>
+                  <dd className="mono">{group.domain || '—'}</dd>
+                </div>
+                <div className="wide">
+                  <dt>证书名称</dt>
+                  <dd className="mono">{group.names.length > 0 ? group.names.join(' · ') : '—'}</dd>
+                </div>
+                <div className="wide">
+                  <dt>证书组 ID</dt>
+                  <dd className="mono">{group.id}</dd>
+                </div>
+              </dl>
 
-            {members.length > 0 && (
-              <section className="certgrp-section members">
+              {editing?.id === group.id && (
+                <GroupForm
+                  value={editing}
+                  busy={pending !== null}
+                  onChange={next => setEditing({ ...next, id: group.id })}
+                  onCancel={() => setEditing(null)}
+                  onSave={() => {
+                    run(
+                      `update-group:${group.id}`,
+                      () => updateCertGroup(group.id, { name: editing.name, note: editing.note || null }),
+                      () => setEditing(null),
+                    );
+                  }}
+                />
+              )}
+
+              {xrayPinsActive && (
+                <div className="certtrust-note">
+                  两张自签证书的 SNI 始终同时有效。切换只更新新订阅；已保存的配置仍可使用原 SNI，拨测也会继续信任它。
+                </div>
+              )}
+
+              <section className="certgrp-section">
                 <header>
-                  <b>使用机器</b>
-                  <span>{members.length} 台</span>
+                  <b>已签发证书与申领记录</b>
+                  <span>{group.certificates.length} 张</span>
                 </header>
                 <div className="certtbl">
-                  {members.map(row => {
-                    const disk = diskState(row, serving);
-                    return (
-                      <div className="certrow member" key={row.node_id}>
-                        <span className="cname" title={row.node_id}>
-                          {nameOf(row.node_id)}
-                        </span>
-                        {disk ? (
-                          <span className={`cdisk cstate ${disk.tone}`}>{disk.text}</span>
-                        ) : (
-                          <span className="cert-member-ok">证书已就位</span>
-                        )}
-                      </div>
-                    );
-                  })}
+                  {group.certificates.length === 0 ? (
+                    <div className="hint">还没有证书。点击上方「立即签发与续期」开始申领。</div>
+                  ) : (
+                    group.certificates.map(cert => {
+                      const state = certState(cert);
+                      const left = daysLeft(cert.expires_at);
+                      const trustedByXray =
+                        cert.signing_method === 'self-signed' &&
+                        ['ready', 'serving', 'compatible'].includes(cert.status);
+                      const origin =
+                        cert.origin === 'bootstrap' ? '初始化' : cert.origin === 'spare' ? '手动添加' : '自动续期';
+                      return (
+                        <article className={`cert-record ${state.tone}`} key={cert.id}>
+                          <header className="cert-record-head">
+                            <div className="cert-record-state">
+                              <span className={`cstate ${state.tone}`}>{state.text}</span>
+                              <span className="cert-origin">{origin}</span>
+                              {trustedByXray && (
+                                <span className={left !== null && left < 0 ? 'ctrust warn' : 'ctrust'}>
+                                  {left !== null && left < 0
+                                    ? '已过期 · 仍在运行槽'
+                                    : cert.status === 'ready'
+                                      ? '备用槽已就绪'
+                                      : 'XRAY 正在提供'}
+                                </span>
+                              )}
+                            </div>
+                            <div className="cert-record-actions">
+                              {(cert.status === 'ready' || cert.status === 'compatible') && (
+                                <button
+                                  type="button"
+                                  className="btn sm"
+                                  disabled={
+                                    !editable ||
+                                    pending !== null ||
+                                    (cert.signing_method === 'self-signed' && preloadPending)
+                                  }
+                                  title={
+                                    cert.status === 'compatible'
+                                      ? '切换到这张保留证书；当前证书将转为保留'
+                                      : cert.signing_method === 'self-signed'
+                                        ? preloadPending
+                                          ? '等待主备槽预装确认后才能启用'
+                                          : '启用这张证书，更新新订阅的 SNI 与校验值'
+                                        : '让这个组改用这张同名公有证书'
+                                  }
+                                  onClick={() => run(`serve:${cert.id}`, () => serveCertificate(cert.id))}
+                                >
+                                  {pending === `serve:${cert.id}`
+                                    ? '切换中…'
+                                    : cert.status === 'compatible'
+                                      ? '切换'
+                                      : '启用'}
+                                </button>
+                              )}
+                              {cert.status !== 'serving' && (
+                                <button
+                                  type="button"
+                                  className="btn sm danger"
+                                  disabled={!editable || pending !== null}
+                                  title={
+                                    cert.status === 'compatible'
+                                      ? '停止保留；仍使用旧配置的客户端将无法重新连接'
+                                      : '删除这条证书记录'
+                                  }
+                                  onClick={() => {
+                                    const impact =
+                                      cert.status === 'compatible'
+                                        ? '停止保留后，仍使用这份旧 SNI 和证书校验的客户端将无法重新连接。继续？'
+                                        : '删除这条证书记录？';
+                                    if (window.confirm(impact)) {
+                                      run(`delete-certificate:${cert.id}`, () => deleteCertificate(cert.id));
+                                    }
+                                  }}
+                                >
+                                  删除
+                                </button>
+                              )}
+                            </div>
+                          </header>
+                          <dl className="cert-record-facts">
+                            <div className="wide primary">
+                              <dt>SNI / 证书名称</dt>
+                              <dd className="mono">{cert.certificate_name ?? '等待签发'}</dd>
+                            </div>
+                            {cert.signing_method === 'self-signed' && (
+                              <div>
+                                <dt>运行槽</dt>
+                                <dd>{cert.runtime_slot ? cert.runtime_slot.toUpperCase() : '未分配'}</dd>
+                              </div>
+                            )}
+                            <div>
+                              <dt>签发方式</dt>
+                              <dd>{cert.signing_method === 'self-signed' ? '自签证书' : "Let's Encrypt"}</dd>
+                            </div>
+                            <div className="wide">
+                              <dt>签发者</dt>
+                              <dd className={cert.issuer && /STAGING/i.test(cert.issuer) ? 'warn' : undefined}>
+                                {cert.issuer
+                                  ? /STAGING/i.test(cert.issuer)
+                                    ? `${cert.issuer}（不被信任）`
+                                    : cert.issuer
+                                  : '—'}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt>签发时间</dt>
+                              <dd className="mono">{certificateTime(cert.issued_at)}</dd>
+                            </div>
+                            <div>
+                              <dt>到期时间</dt>
+                              <dd className="mono">{certificateTime(cert.expires_at)}</dd>
+                            </div>
+                            <div>
+                              <dt>剩余有效期</dt>
+                              <dd>{left === null ? '—' : left < 0 ? `已过期 ${Math.abs(left)} 天` : `${left} 天`}</dd>
+                            </div>
+                            <div>
+                              <dt>签发尝试</dt>
+                              <dd>{cert.attempts} 次</dd>
+                            </div>
+                            <div>
+                              <dt>最后尝试</dt>
+                              <dd className="mono">{certificateTime(cert.last_attempt_at)}</dd>
+                            </div>
+                            <div className="wide">
+                              <dt>SHA-256</dt>
+                              <dd className="mono break">{cert.sha256 ?? '—'}</dd>
+                            </div>
+                            <div className="wide">
+                              <dt>证书 ID</dt>
+                              <dd className="mono break">{cert.id}</dd>
+                            </div>
+                          </dl>
+                          {cert.last_error && (
+                            <div className="cert-record-error">
+                              <b>最后错误</b>
+                              <span>{cert.last_error}</span>
+                            </div>
+                          )}
+                        </article>
+                      );
+                    })
+                  )}
                 </div>
               </section>
-            )}
+            </div>
           </article>
         );
       })}
@@ -1254,6 +1374,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
 
 /** 建组和改组用同一个表单：两者要填的东西相同，分开写会让它们慢慢长得不一样。 */
 function GroupForm({
+  creating = false,
   value,
   busy,
   showCertificateName = false,
@@ -1261,6 +1382,7 @@ function GroupForm({
   onCancel,
   onSave,
 }: {
+  creating?: boolean;
   value: { name: string; note: string; certificateName: string };
   busy: boolean;
   showCertificateName?: boolean;
@@ -1306,12 +1428,14 @@ function GroupForm({
         )}
       </div>
       <div className="cert-group-form-actions">
-        <span className="hint">{showCertificateName ? '证书名称仅在手动新建时可指定' : '保存后立即更新组信息'}</span>
+        <span className="hint">
+          {creating ? '使用已保存的申领设置，创建后立即签发并显示结果。' : '保存后立即更新组信息'}
+        </span>
         <button type="button" className="btn" disabled={busy} onClick={onCancel}>
           取消
         </button>
         <button type="button" className="btn primary" disabled={busy || !value.name.trim()} onClick={onSave}>
-          {busy ? '保存中…' : '保存'}
+          {busy ? (creating ? '正在创建并申领…' : '保存中…') : creating ? '创建并立即申领' : '保存'}
         </button>
       </div>
     </div>
@@ -1323,23 +1447,18 @@ const BRAND_ICON_MAX_BYTES = 256 * 1024;
 
 function BrandingSection({ editable, data }: { editable: boolean; data: BrandingSettings }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState<BrandingSettings | null>(null);
+  const { form: f, setForm, accept } = useServerForm(data);
   const [savedAt, setSavedAt] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
-  const [syncedFrom, setSyncedFrom] = useState<BrandingSettings | undefined>(undefined);
-  if (data !== syncedFrom) {
-    setSyncedFrom(data);
-    setForm(data);
-  }
-
-  const f = form ?? data;
   const dirty = f.site_name !== data.site_name || f.icon_data_url !== data.icon_data_url;
   const save = useMutation({
-    mutationFn: () => saveBranding(f),
-    onSuccess: saved => {
+    onMutate: () => qc.cancelQueries({ queryKey: ['branding'] }),
+    mutationFn: (submitted: BrandingSettings) => saveBranding(submitted),
+    onSuccess: async (saved, submitted) => {
+      await qc.cancelQueries({ queryKey: ['branding'] });
       setSavedAt(true);
       setFileError(null);
-      setForm(saved);
+      accept(saved, submitted);
       qc.setQueryData(['branding'], saved);
     },
   });
@@ -1376,7 +1495,7 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
       <p className="cardsub">控制台左上角使用这里的名称和图标；名称也同步到登录页和浏览器标题</p>
       {save.error && <ErrorBox error={save.error} />}
       {fileError && <div className="callout err">{fileError}</div>}
-      <Group>
+      <Group label="品牌标识">
         <Fld label="站点名称">
           <input
             className={dirty && f.site_name !== data.site_name ? 'f chg' : 'f'}
@@ -1421,7 +1540,7 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
         saving={save.isPending}
         savedText={savedAt ? '已保存，立刻生效' : null}
         editable={editable}
-        onSave={() => save.mutate()}
+        onSave={() => save.mutate(f)}
       />
     </section>
   );
@@ -1444,7 +1563,7 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
       </header>
       <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客</p>
       {update.error && <ErrorBox error={update.error} />}
-      <Group>
+      <Group label="公开访问">
         <Fld label="访问状态">
           <span className="segsw" role="group">
             <button
@@ -1473,34 +1592,26 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
 
 function DistributionSection({ editable, data }: { editable: boolean; data: DistributionView }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState<{ url: string; version: string } | null>(null);
+  const { form: f, setForm, accept } = useServerForm({ url: data.stored.agent_public_url ?? '' });
   const [savedAt, setSavedAt] = useState(false);
-
-  // 与上面的表使用同一做法：数据就绪后在渲染期填充，不放在 effect 中（会多出一帧空表单）。
-  const [syncedFrom, setSyncedFrom] = useState<DistributionView | undefined>(undefined);
-  if (data !== syncedFrom) {
-    setSyncedFrom(data);
-    setForm({ url: data.stored.agent_public_url ?? '', version: data.stored.xray_version ?? '' });
-  }
-
   const save = useMutation({
-    mutationFn: () =>
+    onMutate: () => qc.cancelQueries({ queryKey: ['distribution'] }),
+    mutationFn: (submitted: { url: string }) =>
       saveDistribution({
-        agent_public_url: form?.url.trim() ? form.url.trim() : null,
-        xray_version: form?.version.trim() ? form.version.trim() : null,
+        agent_public_url: submitted.url.trim() || null,
+        xray_version: data.stored.xray_version,
       }),
-    onSuccess: () => {
+    onSuccess: async (next, submitted) => {
+      await qc.cancelQueries({ queryKey: ['distribution'] });
       setSavedAt(true);
-      qc.invalidateQueries({ queryKey: ['distribution'] });
+      accept({ url: next.stored.agent_public_url ?? '' }, submitted);
+      qc.setQueryData(['distribution'], next);
     },
   });
-
   const stored = data.stored;
   const effective = data.effective;
-  const f = form ?? { url: '', version: '' };
-  const dirty = f.url !== (stored.agent_public_url ?? '') || f.version !== (stored.xray_version ?? '');
-  // 留空不等于没有取值：会回退到进程启动时的环境变量，再回退到内置默认值。因此两个字段都
-  // 显示当前实际使用的值，否则空输入框会被理解为未配置，而安装命令中实际有地址在使用。
+  const dirty = f.url !== (stored.agent_public_url ?? '');
+  // 地址留空会回退到进程启动时的环境变量，因此仍显示实际值，避免把空输入框误解为未配置。
   const fallbackNote = (own: string | null, live: string | null) =>
     !own && live ? <span className="hint">当前生效：{live}（来自环境变量）</span> : null;
 
@@ -1510,9 +1621,9 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
         <SettingsTitle id="set-dist">分发</SettingsTitle>
         <ApplyBadge id="set-dist" />
       </header>
-      <p className="cardsub">节点从哪里访问这台控制面、安装哪个 XRAY</p>
+      <p className="cardsub">节点从哪里访问这台控制面，以及当前控制台内置的 XRAY 构建</p>
       {save.error && <ErrorBox error={save.error} />}
-      <Group>
+      <Group label="节点分发">
         <Fld label="Agent 请求地址">
           <input
             className={dirty && f.url !== (stored.agent_public_url ?? '') ? 'f chg' : 'f'}
@@ -1523,19 +1634,15 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
           />
           {fallbackNote(stored.agent_public_url, effective.agent_public_url)}
         </Fld>
-        <Fld label="XRAY 版本">
-          <input
-            className={dirty && f.version !== (stored.xray_version ?? '') ? 'f chg' : 'f'}
-            style={{ width: 160 }}
-            placeholder={effective.xray_version ?? '未钉'}
-            value={f.version}
-            onChange={e => setForm({ ...f, version: e.target.value })}
-          />
-          {effective.xray_version && fallbackNote(stored.xray_version, effective.xray_version)}
+        <Fld label="内置 XRAY">
+          <span className={effective.xray_version ? 'st st-ok' : 'st st-warn'}>
+            {effective.xray_version ? '内置可用' : '版本未知'}
+          </span>
+          {effective.xray_version && <code>{effective.xray_version}</code>}
+          <span className="hint">随当前控制台构建提供，不支持在设置中覆盖</span>
         </Fld>
         <div className="guard">
-          XRAY 版本不要留空。控制面依赖的两个上游特性没有一个版本以上的重叠区间：geodata 热加载需要 ≥ 26.4，而 VLESS
-          反向隧道自 26.5 起只出不回。留空会让每台新机器安装到最新版本，而最新版本正好在该区间之外。
+          版本与二进制由控制台一同内置，节点安装时会校验文件摘要。升级 XRAY 需要部署包含目标构建的新控制台。
         </div>
       </Group>
       <SettingsSaveBar
@@ -1543,7 +1650,7 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
         saving={save.isPending}
         savedText={savedAt ? '已保存，立刻生效' : null}
         editable={editable}
-        onSave={() => save.mutate()}
+        onSave={() => save.mutate(f)}
       />
     </section>
   );
@@ -1568,22 +1675,19 @@ const AGENT_LOG_CLASSES: ReadonlyArray<{
   kind: string;
   name: string;
   file: string;
-  suffix: string;
 }> = [
   {
     key: 'agent_journal_mib',
     kind: 'Agent',
     name: '系统日志',
     file: '独立 journal 命名空间',
-    suffix: '总计',
   },
-  { key: 'xray_mib', kind: 'XRAY', name: '运行日志', file: 'xray.log + xray.log.1', suffix: '合计' },
+  { key: 'xray_mib', kind: 'XRAY', name: '运行日志', file: 'xray.log + xray.log.1' },
   {
     key: 'phantun_mib',
     kind: 'Phantun',
     name: '每个运行实例',
     file: '每个实例的 .log + .log.1',
-    suffix: '每实例',
   },
 ];
 
@@ -1633,15 +1737,14 @@ export function NodeLogPolicyRow({
   global: AgentLogLimits;
 }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState<AgentLogForm>(() => logOverrideForm(node.overrides));
-  const [syncedFrom, setSyncedFrom] = useState(node);
-  if (node !== syncedFrom) {
-    setSyncedFrom(node);
-    setForm(logOverrideForm(node.overrides));
-  }
+  const { form, setForm, accept } = useServerForm(logOverrideForm(node.overrides));
   const mutation = useMutation({
     mutationFn: (overrides: AgentLogLimitOverrides) => saveNodeLogPolicy(node.node_id, overrides),
-    onSuccess: view => {
+    onMutate: () => qc.cancelQueries({ queryKey: ['agent-log-policy'] }),
+    onSuccess: async (view, submitted) => {
+      await qc.cancelQueries({ queryKey: ['agent-log-policy'] });
+      const saved = view.nodes.find(item => item.node_id === node.node_id);
+      if (saved) accept(logOverrideForm(saved.overrides), logOverrideForm(submitted));
       qc.setQueryData(['agent-log-policy'], view);
     },
   });
@@ -1656,9 +1759,8 @@ export function NodeLogPolicyRow({
       <div className="agent-log-node-head">
         <div className="agent-log-node-name">
           <b>{node.name}</b>
-          <span>{node.tenant_id}</span>
         </div>
-        <span className={overrideCount === 0 ? 'agent-log-source' : 'agent-log-source overridden'}>
+        <span className={overrideCount === 0 ? 'st' : 'st st-warn'}>
           {overrideCount === 0 ? '全部继承' : `${overrideCount} 项覆盖`}
         </span>
       </div>
@@ -1721,17 +1823,17 @@ export function NodeLogPolicyRow({
 
 export function AgentLogPolicySection({ editable, data }: { editable: boolean; data: AgentLogPolicyView }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState<AgentLogForm>(() => logLimitForm(data.global));
-  const [syncedFrom, setSyncedFrom] = useState(data.global);
-  if (data.global !== syncedFrom) {
-    setSyncedFrom(data.global);
-    setForm(logLimitForm(data.global));
-  }
+  const { form, setForm, accept } = useServerForm(logLimitForm(data.global));
   const limits = parsedLogLimits(form);
   const dirty = limits !== null && AGENT_LOG_CLASSES.some(item => limits[item.key] !== data.global[item.key]);
   const save = useMutation({
-    mutationFn: () => saveAgentLogDefault(limits!),
-    onSuccess: view => qc.setQueryData(['agent-log-policy'], view),
+    onMutate: () => qc.cancelQueries({ queryKey: ['agent-log-policy'] }),
+    mutationFn: (submitted: AgentLogForm) => saveAgentLogDefault(parsedLogLimits(submitted)!),
+    onSuccess: async (view, submitted) => {
+      await qc.cancelQueries({ queryKey: ['agent-log-policy'] });
+      accept(logLimitForm(view.global), submitted);
+      qc.setQueryData(['agent-log-policy'], view);
+    },
   });
 
   return (
@@ -1740,9 +1842,9 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
         <SettingsTitle id="set-agent-logs">日志保留</SettingsTitle>
         <ApplyBadge id="set-agent-logs" />
       </header>
-      <p className="cardsub">Agent、XRAY 与 Phantun 分别设置；机器覆盖优先于对应的全局值</p>
+      <p className="cardsub">只设置全局默认值；单台机器的覆盖项在对应机器配置中管理</p>
       {save.error && <ErrorBox error={save.error} />}
-      <Group label="全局默认 · 每类独立">
+      <Group label="全局日志上限 · 每类独立">
         <div className="agent-log-scope" aria-label="日志额度作用范围">
           {AGENT_LOG_CLASSES.map(item => (
             <div className="agent-log-scope-row" key={item.key}>
@@ -1763,31 +1865,17 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
                   value={form[item.key]}
                   onChange={event => setForm({ ...form, [item.key]: event.target.value })}
                 />
-                <span>MiB · {item.suffix}</span>
+                <span>MiB</span>
               </label>
             </div>
           ))}
         </div>
-        <p className="agent-log-scope-note">
-          三项分别计算，不是整机总额度。每项范围 {LOG_MIN_MIB}–{LOG_MAX_MIB} MiB；降低后会立即截断旧日志。
-        </p>
         {limits === null && (
           <span className="agent-log-invalid">
             三项均需填写 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数
           </span>
         )}
-      </Group>
-      <Group label="机器覆盖">
-        <div className="agent-log-nodes">
-          {data.nodes.length === 0 ? (
-            <span className="hint">还没有机器</span>
-          ) : (
-            data.nodes.map(node => (
-              <NodeLogPolicyRow key={node.node_id} editable={editable} node={node} global={data.global} />
-            ))
-          )}
-        </div>
-        <div className="guard">不产生修订、不需要发布线路。降低上限会立即截断已有日志释放空间，不会中断服务。</div>
+        <p className="agent-log-scope-note">保存后由机器下一轮读取，不产生修订，也不需要发布线路。</p>
       </Group>
       <SettingsSaveBar
         dirty={dirty}
@@ -1795,7 +1883,7 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
         savedText={save.isSuccess ? '已保存，下一轮生效' : null}
         editable={editable}
         label="保存全局值"
-        onSave={() => save.mutate()}
+        onSave={() => save.mutate(form)}
       />
     </section>
   );
@@ -1862,16 +1950,8 @@ export function pingProbeFormError(form: PingProbeSettings): string | null {
 
 function PingProbeSettingsSection({ editable, data }: { editable: boolean; data: PingProbeSettings }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState<PingProbeSettings>(() => ({
-    ...data,
-    targets: data.targets.map(target => ({ ...target })),
-  }));
-  const [syncedFrom, setSyncedFrom] = useState(data);
+  const { form, setForm, accept } = useServerForm(data);
   const [saved, setSaved] = useState(false);
-  if (data !== syncedFrom) {
-    setSyncedFrom(data);
-    setForm({ ...data, targets: data.targets.map(target => ({ ...target })) });
-  }
   const normalized = {
     ...form,
     targets: form.targets.map(target => ({ name: target.name.trim(), address: target.address.trim() })),
@@ -1879,10 +1959,16 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
   const dirty = JSON.stringify(normalized) !== JSON.stringify(data);
   const invalid = pingProbeFormError(normalized);
   const save = useMutation({
-    mutationFn: () => savePingProbeSettings(normalized),
-    onSuccess: next => {
+    onMutate: () => qc.cancelQueries({ queryKey: ['ping-probe-settings'] }),
+    mutationFn: (submitted: PingProbeSettings) =>
+      savePingProbeSettings({
+        ...submitted,
+        targets: submitted.targets.map(target => ({ name: target.name.trim(), address: target.address.trim() })),
+      }),
+    onSuccess: async (next, submitted) => {
+      await qc.cancelQueries({ queryKey: ['ping-probe-settings'] });
       setSaved(true);
-      setForm({ ...next, targets: next.targets.map(target => ({ ...target })) });
+      accept(next, submitted);
       qc.setQueryData(['ping-probe-settings'], next);
       qc.invalidateQueries({ queryKey: ['ping-probe-nodes'] });
     },
@@ -1902,57 +1988,95 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
         <SettingsTitle id="set-ping-probe">Ping 链路探测</SettingsTitle>
         <ApplyBadge id="set-ping-probe" />
       </header>
-      <p className="cardsub">每台机器按目标协议执行 TCP Connect 或 ICMP Echo，用于描述机器到目标的链路状态</p>
+      <p className="cardsub">统一配置巡检节奏与目标；TCP Connect 和 ICMP Echo 共用一张目标清单</p>
       {save.error && <ErrorBox error={save.error} />}
-      <Group label="调度">
-        <Fld label="多久探一轮">
-          <input
-            className="f"
-            type="number"
-            min={5}
-            max={86_400}
-            value={form.interval_secs}
-            onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
-          />
-          <span className="unit">秒</span>
-          <span className="hint">默认 60；每轮对每个目标探测 1 次</span>
-        </Fld>
-        <Fld label="探测超时">
-          <input
-            className="f"
-            type="number"
-            min={1}
-            max={120_000}
-            value={form.timeout_ms}
-            onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
-          />
-          <span className="unit">毫秒</span>
-          <span className="hint">默认 420；TCP 建连或 ICMP Echo 超过该值均记为无响应</span>
-        </Fld>
-      </Group>
-      <Group label="探测目标">
+      <div className="ping-probe-schedule" aria-label="Ping 探测调度">
+        <label className="ping-probe-timing">
+          <span>巡检周期</span>
+          <div>
+            <input
+              className="f"
+              aria-label="探测间隔"
+              type="number"
+              min={5}
+              max={86_400}
+              value={form.interval_secs}
+              onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
+            />
+            <b>秒</b>
+          </div>
+          <small>默认 60；每轮每个目标各探测一次</small>
+        </label>
+        <label className="ping-probe-timing">
+          <span>单次超时</span>
+          <div>
+            <input
+              className="f"
+              aria-label="探测超时"
+              type="number"
+              min={1}
+              max={120_000}
+              value={form.timeout_ms}
+              onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
+            />
+            <b>ms</b>
+          </div>
+          <small>默认 420；超过后记为无响应</small>
+        </label>
+      </div>
+      <section className="ping-probe-target-section">
+        <header className="ping-probe-target-head">
+          <div>
+            <b>探测目标</b>
+            <span>{form.targets.length}/32</span>
+          </div>
+          <div className="ping-probe-add">
+            {(['tcp', 'icmp'] as const).map(protocol => (
+              <button
+                className="btn sm"
+                type="button"
+                key={protocol}
+                disabled={!editable || form.targets.length >= 32}
+                onClick={() =>
+                  setForm(current => ({
+                    ...current,
+                    targets: [...current.targets, { name: '', address: `${protocol}://` }],
+                  }))
+                }
+              >
+                ＋ {protocol.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </header>
         <div className="ping-probe-targets">
           {form.targets.map((target, index) => (
             <div className="ping-probe-target" key={index}>
               <span className={`ping-probe-kind ${target.address.startsWith('icmp://') ? 'icmp' : 'tcp'}`}>
                 {target.address.startsWith('icmp://') ? 'ICMP' : target.address.startsWith('tcp://') ? 'TCP' : '—'}
               </span>
-              <input
-                className="f"
-                aria-label={`目标 ${index + 1} 名称`}
-                placeholder="Cloudflare"
-                value={target.name}
-                onChange={event => updateTarget(index, 'name', event.target.value)}
-              />
-              <input
-                className="f mono"
-                aria-label={`目标 ${index + 1} 地址`}
-                placeholder="tcp://1.1.1.1:443 或 icmp://1.1.1.1"
-                value={target.address}
-                onChange={event => updateTarget(index, 'address', event.target.value)}
-              />
+              <label>
+                <span>名称</span>
+                <input
+                  className="f"
+                  aria-label={`目标 ${index + 1} 名称`}
+                  placeholder="Cloudflare"
+                  value={target.name}
+                  onChange={event => updateTarget(index, 'name', event.target.value)}
+                />
+              </label>
+              <label>
+                <span>地址</span>
+                <input
+                  className="f mono"
+                  aria-label={`目标 ${index + 1} 地址`}
+                  placeholder="tcp://1.1.1.1:443 或 icmp://1.1.1.1"
+                  value={target.address}
+                  onChange={event => updateTarget(index, 'address', event.target.value)}
+                />
+              </label>
               <button
-                className="btn sm"
+                className="btn sm ping-probe-remove"
                 type="button"
                 disabled={!editable}
                 onClick={() =>
@@ -1966,32 +2090,19 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
               </button>
             </div>
           ))}
-          {form.targets.length === 0 && <span className="hint">尚未配置目标，Agent 不会执行 Ping 探测</span>}
-        </div>
-        <div className="ping-probe-add">
-          {(['tcp', 'icmp'] as const).map(protocol => (
-            <button
-              className="btn sm"
-              type="button"
-              key={protocol}
-              disabled={!editable || form.targets.length >= 32}
-              onClick={() =>
-                setForm(current => ({
-                  ...current,
-                  targets: [...current.targets, { name: '', address: `${protocol}://` }],
-                }))
-              }
-            >
-              ＋ 添加 {protocol.toUpperCase()} 目标
-            </button>
-          ))}
+          {form.targets.length === 0 && (
+            <div className="ping-probe-empty-settings">
+              <b>还没有探测目标</b>
+              <span>从右上角添加 TCP 或 ICMP 目标后，机器会在下一轮开始采样。</span>
+            </div>
+          )}
         </div>
         {invalid && <span className="agent-log-invalid">{invalid}</span>}
-        <div className="guard ping-probe-note">
+        <p className="ping-probe-note">
           两类计时都从域名解析完成后开始。TCP 只计建连，ICMP 只计 Echo 往返；不会采集 DNS 耗时、内核 RTT、RTO、SYN
           重传或连接错误分类。没有可用 IPv6 路由或 ICMP Socket 权限时记为未探测，不计作丢包。
-        </div>
-      </Group>
+        </p>
+      </section>
       <SettingsSaveBar
         dirty={dirty}
         saving={save.isPending}
@@ -1999,14 +2110,14 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
         editable={editable}
         disabled={invalid !== null}
         title={invalid ?? undefined}
-        onSave={() => save.mutate()}
+        onSave={() => save.mutate(form)}
       />
     </section>
   );
 }
 
-const Group = ({ label, children }: { label?: string; children: React.ReactNode }) => (
-  <div className="setgrp">
+const Group = ({ label, children, className }: { label?: string; children: React.ReactNode; className?: string }) => (
+  <div className={className ? `setgrp settings-block ${className}` : 'setgrp settings-block'}>
     {label && <p className="eyebrow">{label}</p>}
     {children}
   </div>
@@ -2075,6 +2186,7 @@ export function SettingsPane() {
   const pingProbe = useQuery({ queryKey: ['ping-probe-settings'], queryFn: fetchPingProbeSettings });
   const [form, setForm] = useState<Form>(EMPTY);
   const [saved, setSaved] = useState<Partial<Record<SectionKey, number>>>({});
+  const [muxExpanded, setMuxExpanded] = useState(false);
 
   /* 分段保存写的是草稿（`saveSettings` → `update_settings`），因此「已保存」的基准是草稿
      生效后的值，而不是 `GET /settings`——后者是直连接口，草稿提交前不会变。以它为基准有
@@ -2089,18 +2201,18 @@ export function SettingsPane() {
 
   const pristine = pendingSettings ? formOf(pendingSettings) : settings.data ? formOf(settings.data) : null;
 
-  // 服务端数据就绪或变化时重新填充表单。在渲染期执行而非在 effect 中：在 effect 中调用
-  // setState 会额外触发一轮渲染，中间一帧会显示空表单。React 对渲染期调用组件自身的
-  // setState 有特殊处理——它会丢弃本轮输出并重新渲染，不提交该帧。
-  // 使用引用比较：TanStack Query 有结构共享，数据未变化时 data 是同一个对象。
-  //
-  // 触发条件仍是服务端数据本身变化，不跟着草稿走：草稿变化就重填会在保存某一段时，
-  // 把其他段尚未保存的输入一并抹掉（那正是下面 `v` 刻意保留的东西）。首次填充取草稿值——
-  // 打开页面时草稿里已有改动的话，表单应显示它，否则每一段一进来就显示为有未保存的改动。
-  const [syncedFrom, setSyncedFrom] = useState<typeof settings.data>(undefined);
-  if (settings.data && settings.data !== syncedFrom) {
-    setSyncedFrom(settings.data);
-    setForm(formOf(pendingSettings ?? settings.data));
+  // Rebase untouched fields when the draft changes or is discarded. Preserve only genuine
+  // local edits, so saving one section never clears another section's unfinished input.
+  const [syncedFrom, setSyncedFrom] = useState<Form | null>(null);
+  if (pristine && JSON.stringify(pristine) !== JSON.stringify(syncedFrom)) {
+    const next = { ...pristine };
+    if (syncedFrom) {
+      for (const key of Object.keys(next) as (keyof Form)[]) {
+        if (form[key] !== syncedFrom[key]) next[key] = form[key];
+      }
+    }
+    setSyncedFrom(pristine);
+    setForm(next);
   }
 
   const save = useMutation({
@@ -2131,14 +2243,15 @@ export function SettingsPane() {
           flow: orNull(v('flow')),
         },
         overlay: {
-          keepalive_secs: Number(v('keepalive')) || 25,
+          keepalive_secs: Number(v('keepalive')) || 10,
           mtu: Number(v('mtu')) || 1420,
           // 链路禁用由机器页的独立草稿操作维护；保存全局 WG 数值时必须原样带回。
           disabled_links: settings.data?.overlay.disabled_links ?? [],
         },
         ports: {
-          ingress_base: Number(v('ingressBase')) || 8443,
-          anytls_base: Number(v('anytlsBase')) || 18443,
+          ingress_base: Number(v('ingressBase')) || 13443,
+          anytls_base: Number(v('anytlsBase')) || 14443,
+          vless_encryption_base: Number(v('vlessEncryptionBase')),
           hop_base: Number(v('hopBase')) || 20000,
           hy2_base: Number(v('hy2Base')) || 30000,
         },
@@ -2159,14 +2272,36 @@ export function SettingsPane() {
           buffer_size_kb: v('connBuffer').trim() === '' ? null : numOr(v('connBuffer'), 0),
           handshake_secs: numOr(v('connHandshake'), 60),
         },
+        relay_mux: {
+          concurrency: numOr(v('muxConcurrency'), 1),
+          min_idle_workers: numOr(v('muxMinIdle'), 0),
+          max_idle_workers: numOr(v('muxMaxIdle'), 2),
+          max_probing_workers: numOr(v('muxMaxProbing'), 1),
+          probe_interval_secs: numOr(v('muxProbeInterval'), 5),
+          probe_timeout_ms: numOr(v('muxProbeTimeout'), 2000),
+          idle_ttl_secs: numOr(v('muxIdleTtl'), 24),
+          max_requests_per_worker: numOr(v('muxMaxRequests'), 128),
+        },
         // 该项没有对应的表单字段——统计得出的在线数尚无展示位置，提供一个无法看到效果的
         // 开关不如不提供。此处原样传递，避免保存其他段时将其重置为 false。
         stats_user_online: settings.data?.stats_user_online ?? false,
       };
-      return saveSettings(body).then(r => ({ key, revision_id: r.revision_id }));
+      return saveSettings(body).then(r => ({
+        key,
+        revision_id: r.revision_id,
+        submitted: form,
+        normalized: formOf(body),
+      }));
     },
     onSuccess: r => {
       setSaved(s => ({ ...s, [r.key]: r.revision_id }));
+      setForm(current => {
+        const next = { ...current };
+        for (const key of SECTION_FIELDS[r.key]) {
+          if (current[key] === r.submitted[key]) next[key] = r.normalized[key];
+        }
+        return next;
+      });
       qc.invalidateQueries({ queryKey: ['settings'] });
       qc.invalidateQueries({ queryKey: ['revisions'] });
     },
@@ -2196,6 +2331,7 @@ export function SettingsPane() {
     editable,
     onSave: () => save.mutate(key),
   });
+  const relayMuxError = hopMuxError(relayMuxOfForm(form));
 
   return (
     <div className="cardpage">
@@ -2203,8 +2339,8 @@ export function SettingsPane() {
           保存按钮，输入框和分段开关仍能改出一份永远无法保存的“脏”表单。 */}
       <fieldset disabled={!editable} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
         <div className="duo">
-          {/* 两栏各自成流，不对齐底部。分段位置按高度定——证书段带着
-            机队列表，单它一段就抵得上右栏的两段，与它同栏的只能是最短的那两段。
+          {/* 两栏各自成流，不对齐底部。分段位置按高度定——证书段展示完整
+            签发记录，单它一段就抵得上右栏的两段，与它同栏的只能是最短的那两段。
             编号仍从上到下、从左到右连续。 */}
           <div className="col">
             {save.error && <ErrorBox error={save.error} />}
@@ -2231,138 +2367,108 @@ export function SettingsPane() {
             )}
             {certs.error ? <ErrorBox error={certs.error} /> : <CertSection editable={editable} view={certs.data!} />}
 
-            <Section id="set-xray" name="XRAY" sub="所有接入面共用的服务端参数" {...secProps('xray')}>
-              <Group label="REALITY · 目标站点">
-                <Fld label="dest">
-                  <input
-                    className={chg('dest')}
-                    style={{ width: 230 }}
-                    placeholder="example.com:443"
-                    value={form.dest}
-                    onChange={e => setForm({ ...form, dest: e.target.value })}
-                  />
-                  <span className="unit">站点:端口</span>
-                </Fld>
-                <Fld label="server_names">
-                  <input
-                    className={chg('names')}
-                    style={{ width: 280 }}
-                    placeholder="example.com"
-                    value={form.names}
-                    onChange={e => setForm({ ...form, names: e.target.value })}
-                  />
-                  <span className="hint">SNI，多个用逗号分隔</span>
-                </Fld>
-                <Fld label="fingerprint">
-                  <select
-                    className={chg('fp')}
-                    style={{ width: 130 }}
-                    value={form.fp}
-                    onChange={e => setForm({ ...form, fp: e.target.value })}
-                  >
-                    <option value="">未设置</option>
-                    {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
-                      <option value={value} key={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                </Fld>
-                <div className="guard">
-                  SNI 与 dest 必须指向同一个真实站点，不一致会导致握手失败。接入面未填写站点时使用这里的值。
-                </div>
-              </Group>
-
-              <Group label="XTLS · 流控">
-                <Fld label="flow">
-                  <select
-                    className={chg('flow')}
-                    style={{ width: 250 }}
-                    value={form.flow}
-                    onChange={e => setForm({ ...form, flow: e.target.value })}
-                  >
-                    {/* 显示为大写、value 仍为小写：写入 xray.json 和 grants 的必须是
-                  `xtls-rprx-vision` 原值，大写只是该字段的显示形式。 */}
-                    <option value="xtls-rprx-vision">XTLS-RPRX-VISION（默认）</option>
-                    <option value="">关闭（普通 VLESS over TLS）</option>
-                  </select>
-                </Fld>
-                <details className="more">
-                  <summary>为什么默认开着 Vision，以及它为什么不用重启</summary>
-                  <div className="body">
-                    <p>
-                      Vision 使内层不再叠加第二层 TLS，长连接下的 CPU 占用和延迟都更低，因此默认开启。关闭后即为存在
-                      TLS-in-TLS 特征的普通代理，仅在客户端版本过旧时才选择。注意服务端开启而客户端不带 flow 时，XRAY
-                      会直接拒绝连接（<code>rejected since the client flow is empty</code>），不会回退到普通 TLS。
-                    </p>
-                    <p>
-                      它与本节其他参数不同：flow 写在每个用户账号上，不进入 <code>xray.json</code>，因此修改它走 grants
-                      热同步，<b>不重启 XRAY、不断开现有连接</b>。本段末尾「会重启 XRAY」指的是目标站点和客户端限制，
-                      不包括这一项。
-                    </p>
-                  </div>
-                </details>
-              </Group>
-
-              {who.role !== 'readonly' && (
-                <Group label="AnyTLS · Padding">
-                  <Fld label="全局方案">
-                    <textarea
-                      className={chg('anyTlsPadding')}
-                      rows={5}
-                      style={{ width: 280, resize: 'none' }}
-                      value={form.anyTlsPadding}
-                      readOnly
-                      aria-label="AnyTLS 全局 Padding Scheme"
+            <Section id="set-xray" name="XRAY" sub="伪装站点、接入兼容与 AnyTLS 全局填充" {...secProps('xray')}>
+              <div className="xray-settings-grid">
+                <Group className="xray-setting-block" label="REALITY · 伪装站点">
+                  <Fld label="目标地址">
+                    <input
+                      className={`${chg('dest')} xray-control`}
+                      placeholder="example.com:443"
+                      value={form.dest}
+                      onChange={e => setForm({ ...form, dest: e.target.value })}
                     />
-                    <button
-                      type="button"
-                      className="btn sm"
-                      disabled={!editable}
-                      onClick={() => setForm({ ...form, anyTlsPadding: randomAnyTlsPadding() })}
+                    <span className="unit">站点:端口</span>
+                  </Fld>
+                  <Fld label="允许的 SNI">
+                    <input
+                      className={`${chg('names')} xray-control`}
+                      placeholder="example.com"
+                      value={form.names}
+                      onChange={e => setForm({ ...form, names: e.target.value })}
+                    />
+                    <span className="hint">多个名称用逗号分隔</span>
+                  </Fld>
+                  <Fld label="TLS 指纹">
+                    <select
+                      className={`${chg('fp')} xray-control`}
+                      value={form.fp}
+                      onChange={e => setForm({ ...form, fp: e.target.value })}
                     >
-                      重新生成
-                    </button>
-                    <span className="hint">
-                      所有留空的 AnyTLS 入口跟随这一组。4 阶段，第 2 阶段只切一次；最坏填充量不高于原生默认。
-                    </span>
+                      <option value="">未设置</option>
+                      {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                        <option value={value} key={value}>
+                          {label}
+                        </option>
+                      ))}
+                    </select>
                   </Fld>
                 </Group>
-              )}
 
-              <Group label="REALITY · 客户端闸">
-                <Fld label="min_client_ver">
-                  <input
-                    className={chg('min')}
-                    style={{ width: 260 }}
-                    placeholder="留空 = 不限"
-                    value={form.min}
-                    onChange={e => setForm({ ...form, min: e.target.value })}
-                  />
-                </Fld>
-                <Fld label="max_client_ver">
-                  <input
-                    className={chg('max')}
-                    style={{ width: 260 }}
-                    placeholder="留空 = 不限"
-                    value={form.max}
-                    onChange={e => setForm({ ...form, max: e.target.value })}
-                  />
-                </Fld>
-                <Fld label="max_time_diff_ms">
-                  <input
-                    className={chg('diff')}
-                    style={{ width: 260 }}
-                    placeholder="留空 = 使用默认值"
-                    value={form.diff}
-                    onChange={e => setForm({ ...form, diff: e.target.value })}
-                  />
-                </Fld>
-                <div className="guard">
-                  修改目标站点或客户端限制会使<b>所有含 REALITY 入口的节点</b>重启 XRAY，按金丝雀波次逐台确认。
-                  上方的流控不在此列。
-                </div>
-              </Group>
+                <Group className="xray-setting-block" label="REALITY · 接入兼容">
+                  <Fld label="XTLS 流控">
+                    <select
+                      className={`${chg('flow')} xray-control`}
+                      value={form.flow}
+                      onChange={e => setForm({ ...form, flow: e.target.value })}
+                    >
+                      {/* 显示为大写、value 仍为小写：写入 xray.json 和 grants 的必须是
+                      `xtls-rprx-vision` 原值，大写只是该字段的显示形式。 */}
+                      <option value="xtls-rprx-vision">XTLS-RPRX-VISION（默认）</option>
+                      <option value="">关闭（普通 VLESS over TLS）</option>
+                    </select>
+                  </Fld>
+                  <div className="xray-version-grid">
+                    <Fld label="最低客户端版本">
+                      <input
+                        className={`${chg('min')} xray-control`}
+                        placeholder="留空 = 不限"
+                        value={form.min}
+                        onChange={e => setForm({ ...form, min: e.target.value })}
+                      />
+                    </Fld>
+                    <Fld label="最高客户端版本">
+                      <input
+                        className={`${chg('max')} xray-control`}
+                        placeholder="留空 = 不限"
+                        value={form.max}
+                        onChange={e => setForm({ ...form, max: e.target.value })}
+                      />
+                    </Fld>
+                  </div>
+                  <Fld label="最大时钟偏差">
+                    <input
+                      className={`${chg('diff')} xray-control`}
+                      placeholder="留空 = 使用默认值"
+                      value={form.diff}
+                      onChange={e => setForm({ ...form, diff: e.target.value })}
+                    />
+                    <span className="unit">ms</span>
+                  </Fld>
+                </Group>
+
+                {who.role !== 'readonly' && (
+                  <Group className="xray-setting-block wide" label="AnyTLS · Padding">
+                    <Fld label="全局方案">
+                      <textarea
+                        className={`${chg('anyTlsPadding')} xray-padding`}
+                        rows={5}
+                        value={form.anyTlsPadding}
+                        readOnly
+                        aria-label="AnyTLS 全局 Padding Scheme"
+                      />
+                      <button
+                        type="button"
+                        className="btn sm"
+                        disabled={!editable}
+                        onClick={() => setForm({ ...form, anyTlsPadding: randomAnyTlsPadding() })}
+                      >
+                        重新生成
+                      </button>
+                      <span className="hint">所有留空的 AnyTLS 入口跟随这套四阶段方案。</span>
+                    </Fld>
+                  </Group>
+                )}
+              </div>
             </Section>
           </div>
 
@@ -2375,8 +2481,9 @@ export function SettingsPane() {
               name="连接策略"
               sub="连接保持多久、每条占用多少内存。每台机器可单独覆盖"
               {...secProps('connection')}
+              validationError={relayMuxError}
             >
-              <Group>
+              <Group label="连接资源">
                 <Fld label="空闲多久回收（秒）">
                   <input
                     className={chg('connIdle')}
@@ -2389,7 +2496,7 @@ export function SettingsPane() {
                     <b>中转节点的内存主要消耗在这里</b>：空闲连接会持续占用下面的两个缓冲区
                   </span>
                 </Fld>
-                <Fld label="转发缓冲（KB）">
+                <Fld label="转发缓冲（KiB）">
                   <input
                     className={chg('connBuffer')}
                     style={{ width: 90 }}
@@ -2436,7 +2543,7 @@ export function SettingsPane() {
                   。 机器详情页可逐台覆盖。
                 </div>
                 <div className="guard">
-                  转发缓冲留空时 XRAY 按架构取值：x86_64 512 KB，arm64 4 KB。填入数值会统一所有架构。
+                  转发缓冲留空时 XRAY 按架构取值：x86_64 512 KiB，arm64 4 KiB。填入数值会统一所有架构。
                 </div>
                 <div className="guard">
                   上面四项<b>均可按机器单独覆盖</b>（机器详情页），握手超时除外。
@@ -2445,10 +2552,126 @@ export function SettingsPane() {
                   保存后需发布，<b>agent 应用时会重启 XRAY</b>，现有连接断开。
                 </div>
               </Group>
+              <Group label="中继 Mux" className="relay-mux-settings">
+                <div className="relay-mux-summary">
+                  <span>
+                    复用流 {form.muxConcurrency} · 空闲 {form.muxMinIdle}–{form.muxMaxIdle} · 探测{' '}
+                    {form.muxProbeInterval}s/{form.muxProbeTimeout}ms · 寿命 {form.muxIdleTtl}s
+                  </span>
+                  {editable ? (
+                    <button type="button" className="btn sm" onClick={() => setMuxExpanded(open => !open)}>
+                      {muxExpanded ? '收起' : '配置'}
+                    </button>
+                  ) : (
+                    <span
+                      className="btn sm"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setMuxExpanded(open => !open)}
+                      onKeyDown={event => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          setMuxExpanded(open => !open);
+                        }
+                      }}
+                    >
+                      {muxExpanded ? '收起' : '查看'}
+                    </span>
+                  )}
+                </div>
+                {relayMuxError && <p className="note settings-validation-error">{relayMuxError}</p>}
+                {muxExpanded && (
+                  <div className="relay-mux-fields">
+                    <Fld label="复用流数量">
+                      <input
+                        className={chg('muxConcurrency')}
+                        type="number"
+                        min={1}
+                        max={128}
+                        value={form.muxConcurrency}
+                        onChange={e => setForm({ ...form, muxConcurrency: e.target.value })}
+                      />
+                    </Fld>
+                    <Fld label="空闲连接">
+                      <span className="field-pair">
+                        <span className="unit">最少</span>
+                        <input
+                          className={chg('muxMinIdle')}
+                          type="number"
+                          min={0}
+                          value={form.muxMinIdle}
+                          onChange={e => setForm({ ...form, muxMinIdle: e.target.value })}
+                        />
+                        <span className="unit">最多</span>
+                        <input
+                          className={chg('muxMaxIdle')}
+                          type="number"
+                          min={1}
+                          value={form.muxMaxIdle}
+                          onChange={e => setForm({ ...form, muxMaxIdle: e.target.value })}
+                        />
+                      </span>
+                    </Fld>
+                    <Fld label="同时探测">
+                      <input
+                        className={chg('muxMaxProbing')}
+                        type="number"
+                        min={1}
+                        max={Number(form.muxMaxIdle) || undefined}
+                        value={form.muxMaxProbing}
+                        onChange={e => setForm({ ...form, muxMaxProbing: e.target.value })}
+                      />
+                    </Fld>
+                    <Fld label="探测周期">
+                      <input
+                        className={chg('muxProbeInterval')}
+                        type="number"
+                        min={2}
+                        max={60}
+                        value={form.muxProbeInterval}
+                        onChange={e => setForm({ ...form, muxProbeInterval: e.target.value })}
+                      />
+                      <span className="unit">秒</span>
+                    </Fld>
+                    <Fld label="单次超时">
+                      <input
+                        className={chg('muxProbeTimeout')}
+                        type="number"
+                        min={200}
+                        max={10000}
+                        value={form.muxProbeTimeout}
+                        onChange={e => setForm({ ...form, muxProbeTimeout: e.target.value })}
+                      />
+                      <span className="unit">毫秒</span>
+                    </Fld>
+                    <Fld label="空闲寿命">
+                      <input
+                        className={chg('muxIdleTtl')}
+                        type="number"
+                        min={1}
+                        value={form.muxIdleTtl}
+                        onChange={e => setForm({ ...form, muxIdleTtl: e.target.value })}
+                      />
+                      <span className="unit">秒</span>
+                    </Fld>
+                    <Fld label="累计子连接">
+                      <input
+                        className={chg('muxMaxRequests')}
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={form.muxMaxRequests}
+                        onChange={e => setForm({ ...form, muxMaxRequests: e.target.value })}
+                      />
+                    </Fld>
+                    <div className="guard">探测中的连接不会承接新流；没有可用连接时会立即新建，不等待探测超时。</div>
+                  </div>
+                )}
+              </Group>
             </Section>
 
             <Section id="set-wg" name="WIREGUARD" sub="overlay 链路，全互联算出来的" {...secProps('wireguard')}>
-              <Group>
+              <Group label="Overlay 默认值">
                 <Fld label="keepalive_secs">
                   <input
                     className={chg('keepalive')}
@@ -2482,8 +2705,8 @@ export function SettingsPane() {
               sub="自动分配端口时的起始值，仅影响新建，现有端口不变"
               {...secProps('ports')}
             >
-              <Group>
-                <Fld label="接入面">
+              <Group label="新建资源端口基线">
+                <Fld label="VLESS · TLS / REALITY">
                   <input
                     className={chg('ingressBase')}
                     style={{ width: 90 }}
@@ -2491,6 +2714,19 @@ export function SettingsPane() {
                     onChange={e => setForm({ ...form, ingressBase: e.target.value })}
                   />
                   <span className="hint">建链时从该端口向上查找空闲端口</span>
+                </Fld>
+                <Fld label="VLESS · Encryption 起始端口">
+                  <input
+                    className={chg('vlessEncryptionBase')}
+                    style={{ width: 90 }}
+                    type="number"
+                    min={1}
+                    max={65535}
+                    aria-label="VLESS · Encryption 起始端口"
+                    value={form.vlessEncryptionBase}
+                    onChange={e => setForm({ ...form, vlessEncryptionBase: e.target.value })}
+                  />
+                  <span className="hint">默认 48000；新开启入站时向上查找空闲 TCP 端口，现有端口不变</span>
                 </Fld>
                 <Fld label="AnyTLS">
                   <input
@@ -2510,7 +2746,7 @@ export function SettingsPane() {
                   />
                   <span className="hint">
                     走 UDP，与上一项使用各自的端口段。同一个端口号在 TCP 与 UDP
-                    上互不冲突。开启端口跳转时，还会从分配到的 端口向上连续占用一段
+                    上互不冲突。开启端口跳跃时，还会从分配到的 端口向上连续占用一段
                   </span>
                 </Fld>
                 <Fld label="中转口">
@@ -2522,27 +2758,16 @@ export function SettingsPane() {
                   />
                   <span className="hint">默认 20000。挑高位段，不跟接入面和系统服务混在一起</span>
                 </Fld>
-                <details className="more">
-                  <summary>为什么默认 8443 而不是 443</summary>
-                  <div className="body">
-                    <p>443 上通常已有其他服务，冲突时两个进程争用同一端口，症状要到 XRAY 启动失败才会显现。</p>
-                    <p>
-                      抬头那句「只影响新建」是有代价撑着的：端口一变就是 XRAY 配置变、进程重启、
-                      那台机器上所有连接断掉，所以
-                      <b>已经配好的端口一个都不动</b>。
-                    </p>
-                  </div>
-                </details>
               </Group>
             </Section>
 
             <Section
               id="set-probe"
               name="端到端探测"
-              sub="由链头为每条链发起一次探测。改完最长等待一个原有周期"
+              sub="由入口节点为每条链发起一次探测。改完最长等待一个原有周期"
               {...secProps('probe')}
             >
-              <Group>
+              <Group label="探测计划">
                 <Fld label="请求哪个地址">
                   <input
                     className={chg('probeUrl')}
@@ -2591,7 +2816,7 @@ export function SettingsPane() {
               sub="每台机器按计划自行拉取 geoip.dat / geosite.dat，热加载、不重启、不断开连接"
               {...secProps('geodata')}
             >
-              <Group>
+              <Group label="更新计划与来源">
                 <Fld label="什么时候更新">
                   <input
                     className={chg('geodataCron')}

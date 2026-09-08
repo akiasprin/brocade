@@ -2,8 +2,9 @@ use std::ops::RangeInclusive;
 
 use brocade_core::{
     model::{
-        ConnectionSettings, DisabledWireGuardLink, GeodataSettings, ModelSettings, NodeConnection,
-        OverlaySettings, PortSettings, ProbeSettings, RealityClientPolicy, RealitySite,
+        ConnectionSettings, DisabledWireGuardLink, GeodataSettings, HopMux, ModelSettings,
+        NodeConnection, OverlaySettings, PortSettings, ProbeSettings, RealityClientPolicy,
+        RealitySite,
     },
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_server_name, normalize_host_port,
@@ -68,6 +69,7 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             overlay_disabled_links,
             port_ingress_base,
             port_anytls_base,
+            port_vless_encryption_base,
             port_hop_base,
             port_hy2_base,
             probe_endpoint_url,
@@ -82,7 +84,15 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             conn_buffer_size_kb,
             conn_handshake_secs,
             stats_user_online,
-            anytls_padding_scheme
+            anytls_padding_scheme,
+            relay_mux_concurrency,
+            relay_mux_min_idle_workers,
+            relay_mux_max_idle_workers,
+            relay_mux_max_probing_workers,
+            relay_mux_probe_interval_secs,
+            relay_mux_probe_timeout_ms,
+            relay_mux_idle_ttl_secs,
+            relay_mux_max_requests_per_worker
          FROM control_state
          WHERE id = TRUE";
 
@@ -131,6 +141,40 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
                 .transpose()?,
             handshake_secs: secs("conn_handshake_secs")?,
         },
+        relay_mux: HopMux {
+            concurrency: u16_column(
+                "relay_mux_concurrency",
+                row.try_get("relay_mux_concurrency")?,
+            )?,
+            min_idle_workers: u32_bigint_column(
+                "relay_mux_min_idle_workers",
+                row.try_get("relay_mux_min_idle_workers")?,
+            )?,
+            max_idle_workers: u32_bigint_column(
+                "relay_mux_max_idle_workers",
+                row.try_get("relay_mux_max_idle_workers")?,
+            )?,
+            max_probing_workers: u32_bigint_column(
+                "relay_mux_max_probing_workers",
+                row.try_get("relay_mux_max_probing_workers")?,
+            )?,
+            probe_interval_secs: u16_column(
+                "relay_mux_probe_interval_secs",
+                row.try_get("relay_mux_probe_interval_secs")?,
+            )?,
+            probe_timeout_ms: u32_column(
+                "relay_mux_probe_timeout_ms",
+                row.try_get("relay_mux_probe_timeout_ms")?,
+            )?,
+            idle_ttl_secs: u32_bigint_column(
+                "relay_mux_idle_ttl_secs",
+                row.try_get("relay_mux_idle_ttl_secs")?,
+            )?,
+            max_requests_per_worker: u16_column(
+                "relay_mux_max_requests_per_worker",
+                row.try_get("relay_mux_max_requests_per_worker")?,
+            )?,
+        },
         stats_user_online: row.try_get("stats_user_online")?,
         anytls_padding_scheme: crate::materialize::json_string_array(
             "control_state.anytls_padding_scheme",
@@ -171,6 +215,10 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
         ports: PortSettings {
             ingress_base: u16_column("port_ingress_base", row.try_get("port_ingress_base")?)?,
             anytls_base: u16_column("port_anytls_base", row.try_get("port_anytls_base")?)?,
+            vless_encryption_base: u16_column(
+                "port_vless_encryption_base",
+                row.try_get("port_vless_encryption_base")?,
+            )?,
             hop_base: u16_column("port_hop_base", row.try_get("port_hop_base")?)?,
             hy2_base: u16_column("port_hy2_base", row.try_get("port_hy2_base")?)?,
         },
@@ -268,7 +316,16 @@ pub(crate) async fn update_settings_tx(
              conn_handshake_secs = $24,
              stats_user_online = $25,
              overlay_disabled_links = $26,
-             anytls_padding_scheme = $27
+             anytls_padding_scheme = $27,
+             relay_mux_concurrency = $28,
+             relay_mux_min_idle_workers = $29,
+             relay_mux_max_idle_workers = $30,
+             relay_mux_max_probing_workers = $31,
+             relay_mux_probe_interval_secs = $32,
+             relay_mux_probe_timeout_ms = $33,
+             relay_mux_idle_ttl_secs = $34,
+             relay_mux_max_requests_per_worker = $35,
+             port_vless_encryption_base = $36
          WHERE id = TRUE",
     )
     .bind(settings.reality_client.min_client_ver.as_deref())
@@ -309,6 +366,15 @@ pub(crate) async fn update_settings_tx(
     .bind(settings.stats_user_online)
     .bind(serde_json::to_value(&settings.overlay.disabled_links)?)
     .bind(serde_json::to_value(&settings.anytls_padding_scheme)?)
+    .bind(i32::from(settings.relay_mux.concurrency))
+    .bind(i64::from(settings.relay_mux.min_idle_workers))
+    .bind(i64::from(settings.relay_mux.max_idle_workers))
+    .bind(i64::from(settings.relay_mux.max_probing_workers))
+    .bind(i32::from(settings.relay_mux.probe_interval_secs))
+    .bind(i32::try_from(settings.relay_mux.probe_timeout_ms).unwrap_or(i32::MAX))
+    .bind(i64::from(settings.relay_mux.idle_ttl_secs))
+    .bind(i32::from(settings.relay_mux.max_requests_per_worker))
+    .bind(i32::from(settings.ports.vless_encryption_base))
     .execute(&mut **tx)
     .await?;
 
@@ -374,6 +440,10 @@ fn validate_backbone(settings: &ModelSettings) -> Result<()> {
     for (what, port) in [
         ("ports.ingress_base", settings.ports.ingress_base),
         ("ports.anytls_base", settings.ports.anytls_base),
+        (
+            "ports.vless_encryption_base",
+            settings.ports.vless_encryption_base,
+        ),
         ("ports.hop_base", settings.ports.hop_base),
         ("ports.hy2_base", settings.ports.hy2_base),
     ] {
@@ -384,6 +454,11 @@ fn validate_backbone(settings: &ModelSettings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn u32_bigint_column(location: &str, value: i64) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| StoreError::InvalidData(format!("{location} out of range: {value}")))
 }
 
 fn u32_column(location: &str, value: i32) -> Result<u32> {
@@ -419,6 +494,7 @@ fn normalize_settings(settings: ModelSettings) -> ModelSettings {
     ModelSettings {
         // Numbers, with nothing to trim or case-fold; they pass through untouched.
         connection: settings.connection,
+        relay_mux: settings.relay_mux,
         stats_user_online: settings.stats_user_online,
         anytls_padding_scheme: settings
             .anytls_padding_scheme
@@ -477,6 +553,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 }
 
 fn validate_settings(settings: &ModelSettings) -> Result<()> {
+    validate_relay_mux(&settings.relay_mux)?;
     if let Some(link) = settings
         .overlay
         .disabled_links
@@ -568,6 +645,56 @@ fn validate_settings(settings: &ModelSettings) -> Result<()> {
     validate_geodata(&settings.geodata)?;
     validate_connection_settings(&settings.connection)?;
 
+    Ok(())
+}
+
+fn validate_relay_mux(mux: &HopMux) -> Result<()> {
+    let invalid = |field: &str, message: &str| {
+        StoreError::InvalidData(format!("settings.relay_mux.{field} {message}"))
+    };
+    if !(HopMux::CONCURRENCY_MIN..=HopMux::CONCURRENCY_MAX).contains(&mux.concurrency) {
+        return Err(invalid("concurrency", "必须在 1–128 之间"));
+    }
+    if mux.max_idle_workers < HopMux::MAX_IDLE_MIN {
+        return Err(invalid("max_idle_workers", "必须至少为 1"));
+    }
+    if mux.min_idle_workers > mux.max_idle_workers {
+        return Err(invalid("min_idle_workers", "不能大于 max_idle_workers"));
+    }
+    if mux.max_probing_workers == 0 || mux.max_probing_workers > mux.max_idle_workers {
+        return Err(invalid(
+            "max_probing_workers",
+            "必须在 1 与 max_idle_workers 之间",
+        ));
+    }
+    if !(HopMux::PROBE_INTERVAL_MIN_SECS..=HopMux::PROBE_INTERVAL_MAX_SECS)
+        .contains(&mux.probe_interval_secs)
+    {
+        return Err(invalid("probe_interval_secs", "必须在 2–60 秒之间"));
+    }
+    if !(HopMux::PROBE_TIMEOUT_MIN_MS..=HopMux::PROBE_TIMEOUT_MAX_MS)
+        .contains(&mux.probe_timeout_ms)
+        || mux.probe_timeout_ms >= u32::from(mux.probe_interval_secs) * 1000
+    {
+        return Err(invalid(
+            "probe_timeout_ms",
+            "必须在 200–10000 毫秒之间，且小于 probe_interval_secs",
+        ));
+    }
+    if mux.idle_ttl_secs < HopMux::IDLE_TTL_MIN_SECS {
+        return Err(invalid("idle_ttl_secs", "必须为正整数秒"));
+    }
+    let rounded_timeout_secs = mux.probe_timeout_ms.saturating_add(999) / 1000;
+    if mux.idle_ttl_secs < u32::from(mux.probe_interval_secs).saturating_add(rounded_timeout_secs) {
+        return Err(invalid(
+            "idle_ttl_secs",
+            "必须覆盖一个探测间隔和向上取整后的探测超时",
+        ));
+    }
+    if !(HopMux::MAX_REQUESTS_MIN..=HopMux::MAX_REQUESTS_MAX).contains(&mux.max_requests_per_worker)
+    {
+        return Err(invalid("max_requests_per_worker", "必须在 1–65535 之间"));
+    }
     Ok(())
 }
 

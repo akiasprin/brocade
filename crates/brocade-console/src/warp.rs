@@ -785,6 +785,7 @@ mod tests {
             phantun: None,
             xray: Some(XrayPlan {
                 node_id: "warp-live-e2e".to_owned(),
+                certificate_group_id: None,
                 certificate_track: None,
                 api_port: None,
                 reality_client: RealityClientPolicy::default(),
@@ -798,6 +799,7 @@ mod tests {
                     handshake_secs: 60,
                     stats_user_online: false,
                 },
+                relay_mux: Default::default(),
                 dns_route: None,
                 inbounds: Vec::new(),
                 hop_inbounds: Vec::new(),

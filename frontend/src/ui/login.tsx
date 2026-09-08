@@ -1,15 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import {
-  ApiError,
-  createTenantNow,
-  fetchAuthState,
-  fetchSessionWhoami,
-  initAdmin,
-  loginAdmin,
-  setVisitorAccess,
-  type BrandingSettings,
-} from '../api';
+import { ApiError, fetchAuthState, fetchSessionWhoami, initAdmin, loginAdmin, type BrandingSettings } from '../api';
 import type { Session } from '../app';
 import { enterPublic } from '../session';
 
@@ -24,12 +15,14 @@ export function Login({ branding, onLogin }: { branding: BrandingSettings; onLog
     if (whoami.data) onLogin({ who: whoami.data });
   }, [onLogin, whoami.data]);
 
-  const initialized = auth.data?.initialized ?? true;
+  const initialized = auth.data?.initialized;
 
   return (
     <div className="fw active login-fw">
       <div className="fw-head">
-        <span className="fw-kind">{initialized ? '登录' : '初始化'}</span>
+        <span className="fw-kind">
+          {initialized === undefined ? (auth.error ? '暂不可用' : '加载中') : initialized ? '登录' : '初始化'}
+        </span>
         <span className="fw-title">{branding.site_name} | 跨境网络小管家</span>
       </div>
       <div className="fw-body">
@@ -49,8 +42,8 @@ export function Login({ branding, onLogin }: { branding: BrandingSettings; onLog
   );
 }
 
-function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Session) => void; publicOpen: boolean }) {
-  const [operatorId, setOperatorId] = useState('admin');
+export function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Session) => void; publicOpen: boolean }) {
+  const [operatorId, setOperatorId] = useState('root');
   const [password, setPassword] = useState('');
   const login = useMutation({
     mutationFn: () => loginAdmin({ operator_id: operatorId.trim(), password }),
@@ -69,7 +62,7 @@ function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Session) =>
         if (operatorId.trim()) login.mutate();
       }}
     >
-      <p className="note">用户使用「租户/用户名」登录；系统只有一个租户时可只填用户名。公开访客可使用「访客模式」。</p>
+      <p className="note">管理员和用户都直接使用用户名登录。公开访客可使用「访客模式」。</p>
       <label className="fieldline">
         <span>用户名</span>
         <input className="f" autoFocus value={operatorId} onChange={e => setOperatorId(e.target.value)} />
@@ -98,35 +91,22 @@ function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Session) =>
   );
 }
 
-function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) => void }) {
-  const [operatorId, setOperatorId] = useState('admin');
-  const [rootTenant, setRootTenant] = useState('platform');
+export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) => void }) {
+  const [operatorId, setOperatorId] = useState('root');
   const [password, setPassword] = useState('');
   const [reveal, setReveal] = useState(false);
   // 显示名默认与用户名相同：初始化页面不应要求重复输入同一内容。两者在模型中仍然独立——
-  // 用户名是主键，会被 revisions.author 和 deployment actor 引用，不可修改。根租户也在该步骤创建：节点和用户都必须归属某个
-  // 租户，缺少它无法纳管第一台机器，它与第一个管理员同属初始状态的组成部分。
+  // 用户名是主键，会被 revisions.author 和 deployment actor 引用，不可修改。内部归属使用
+  // 固定初始值，单租户产品不把实现细节暴露为一个可选字段。
   const init = useMutation({
-    mutationFn: async () => {
-      const result = await initAdmin({
+    mutationFn: () =>
+      initAdmin({
         operator_id: operatorId.trim(),
         display_name: operatorId.trim(),
         password,
-      });
-      // 此时 session cookie 已存在，创建租户走正常的鉴权流程。
-      // 创建失败不阻止进入——租户可在租户页补建，访客模式可在设置中重开。
-      const tenant = rootTenant.trim();
-      if (tenant) {
-        try {
-          await createTenantNow({ id: tenant, name: tenant });
-          await setVisitorAccess(true);
-        } catch {
-          /* 初始租户或访客入口失败不阻止管理员登录，进入后仍可补齐 */
-        }
-      }
-      return { who: result.admin };
-    },
-    onSuccess: onInitialized,
+        root_tenant: 'platform',
+      }),
+    onSuccess: result => onInitialized({ who: result.admin }),
   });
   const tooShort = password.length > 0 && password.length < 8;
 
@@ -137,14 +117,10 @@ function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) 
         if (operatorId.trim() && password.length >= 8) init.mutate();
       }}
     >
-      <p className="note">数据库中还没有管理员。请先创建第一个 system-admin，之后此入口将关闭。</p>
+      <p className="note">面板支持多用户统计；初始化时会预置使用者 zero，默认不开放登录。</p>
       <label className="fieldline">
         <span>用户名</span>
         <input className="f" autoFocus value={operatorId} onChange={e => setOperatorId(e.target.value)} />
-      </label>
-      <label className="fieldline">
-        <span>根租户</span>
-        <input className="f" value={rootTenant} onChange={e => setRootTenant(e.target.value)} />
       </label>
       <label className="fieldline">
         <span>密码</span>
@@ -162,7 +138,7 @@ function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) 
       </label>
       {tooShort && <div className="callout err">密码至少 8 位</div>}
       {init.error && <div className="callout err">{errorText(init.error)}</div>}
-      <p className="note dim">用户名创建后不可修改；访客模式默认开启，可在设置中关闭。</p>
+      <p className="note dim">用户名创建后不可修改；访客模式默认关闭，可在设置中开启。</p>
       <div className="toolbar">
         <span className="sp" />
         <button

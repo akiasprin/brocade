@@ -64,6 +64,19 @@ pub struct AdminInitRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemInitRequest {
+    pub operator_id: String,
+    pub display_name: String,
+    pub password: String,
+    #[serde(default = "default_root_tenant")]
+    pub root_tenant: String,
+}
+
+fn default_root_tenant() -> String {
+    "platform".to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminLoginRequest {
     pub operator_id: String,
     pub password: String,
@@ -135,6 +148,12 @@ pub struct AdminAuthState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminInitResult {
+    pub admin: AuthenticatedAdmin,
+    pub session: IssuedAdminSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemInitResult {
     pub admin: AuthenticatedAdmin,
     pub session: IssuedAdminSession,
 }
@@ -422,6 +441,73 @@ pub async fn init_admin(pool: &PgPool, request: AdminInitRequest) -> Result<Admi
     })
 }
 
+/// Initialize the complete operator-facing system in one transaction.
+///
+/// The HTTP bootstrap used to create the first administrator, then ask the browser to create the
+/// root tenant. A refresh between those requests permanently closed the initialization screen
+/// while leaving no tenant to hold users or nodes. Keep the operator-only `init_admin` entry point
+/// for administrative callers and tests, but make the product bootstrap atomic: root tenant,
+/// default passwordless `zero` network user are committed together. It exists as the first usage
+/// subject, but receives no login identity until an administrator explicitly enables one later.
+pub async fn init_system(pool: &PgPool, request: SystemInitRequest) -> Result<SystemInitResult> {
+    let operator_id = required_text(&request.operator_id, "admin operator id")?;
+    let display_name = required_text(&request.display_name, "admin operator display_name")?;
+    let root_tenant = required_text(&request.root_tenant, "root tenant")?;
+    let password_hash = hash_admin_password(&request.password)?;
+    let default_user_id = "zero";
+    let default_user_operator_id = format!("{root_tenant}/{default_user_id}");
+    if operator_id == default_user_operator_id {
+        return Err(StoreError::InvalidData(format!(
+            "administrator id {operator_id} conflicts with the default user identity"
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE admin_operators IN EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let existing: i64 = sqlx::query("SELECT count(*) AS n FROM admin_operators")
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("n")?;
+    if existing != 0 {
+        return Err(StoreError::Forbidden(
+            "admin has already been initialized".to_owned(),
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO admin_operators (
+            id, display_name, role, tenant_scope, password_hash,
+            token_hash, token_prefix, token_created_at,
+            token_last_used_at, token_revoked_at
+         )
+         VALUES ($1, $2, 'system-admin', NULL, $3, NULL, NULL, NULL, NULL, NULL)",
+    )
+    .bind(&operator_id)
+    .bind(&display_name)
+    .bind(&password_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    let actor = AdminContext::system_admin(operator_id.clone());
+    crate::console::bootstrap_tenant_and_user_tx(&mut tx, &actor, &root_tenant, default_user_id)
+        .await?;
+    tx.commit().await?;
+
+    let session = issue_admin_session(pool, &operator_id).await?;
+    Ok(SystemInitResult {
+        admin: AuthenticatedAdmin {
+            operator_id,
+            role: AdminRole::SystemAdmin,
+            tenant_scope: None,
+            token_prefix: None,
+            self_user: None,
+        },
+        session,
+    })
+}
+
 pub async fn login_admin(pool: &PgPool, request: AdminLoginRequest) -> Result<AdminLoginResult> {
     let entered_id = required_text(&request.operator_id, "admin operator id")?;
     let operator_id = resolve_password_login_id(pool, &entered_id).await?;
@@ -450,7 +536,6 @@ async fn resolve_password_login_id(pool: &PgPool, entered_id: &str) -> Result<St
          FROM admin_operators o
          WHERE o.role = 'user'
            AND o.user_id = $1
-           AND o.user_tenant_id = (SELECT min(id) FROM tenants)
            AND (SELECT count(*) FROM tenants) = 1
          LIMIT 1",
     )

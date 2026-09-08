@@ -87,6 +87,7 @@ function WarpIpStackControl({ value, onChange }: { value: WarpIpStack; onChange:
 
 const protocolName = (tunnel: ExternalOutbound) =>
   ({
+    anytls: 'AnyTLS',
     vless: 'VLESS',
     shadowsocks2022: 'Shadowsocks 2022',
     socks5: 'SOCKS5',
@@ -97,6 +98,7 @@ const protocolName = (tunnel: ExternalOutbound) =>
 
 const protocolMark = (tunnel: ExternalOutbound) =>
   ({
+    anytls: 'AT',
     vless: 'VL',
     shadowsocks2022: 'SS',
     socks5: 'S5',
@@ -213,7 +215,7 @@ function TunnelList({ go }: { go: (drill: Drill) => void }) {
               <Icon of="tunnels" size={25} />
             </span>
             <b>还没有隧道</b>
-            <p>导入 VLESS、SS2022、SOCKS5、HTTP CONNECT、WireGuard，或为每台出口机器申请独立 WARP 身份。</p>
+            <p>导入 VLESS、SS2022、SOCKS5、HTTP CONNECT、WireGuard，或为每个出口节点申请独立 WARP 身份。</p>
             <button
               className="btn"
               disabled={!editable || tenantOptions.length === 0}
@@ -1551,7 +1553,7 @@ export function WarpRuleManager({
                 编辑默认
               </button>
             </header>
-            <p>默认参数属于租户 WARP 资源；当前机器有覆盖时，以机器参数为准。</p>
+            <p>当前机器有覆盖时，以机器参数为准。</p>
           </section>
 
           <section className="panel config-panel tunnel-panel warp-rule-machine">

@@ -137,6 +137,11 @@ pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<D
 }
 
 fn validate_settings(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) {
+    validate_hop_mux(
+        &snapshot.settings.relay_mux,
+        "settings.relay_mux",
+        diagnostics,
+    );
     let node_ids = snapshot
         .nodes
         .iter()
@@ -207,6 +212,70 @@ fn validate_settings(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>
             "settings.reality_client.max_time_diff_ms",
             format!("max_time_diff_ms 不能超过 {MAX_REALITY_TIME_DIFF_MS}"),
         ));
+    }
+}
+
+fn validate_hop_mux(mux: &crate::model::HopMux, location: &str, diagnostics: &mut Vec<Diagnostic>) {
+    use crate::model::HopMux;
+
+    let mut invalid = |field: &str, message: String| {
+        diagnostics.push(Diagnostic::error(
+            "mux.worker-pool",
+            format!("{location}.{field}"),
+            message,
+        ));
+    };
+    if !(HopMux::CONCURRENCY_MIN..=HopMux::CONCURRENCY_MAX).contains(&mux.concurrency) {
+        invalid("concurrency", "复用流数量必须在 1–128 之间".to_owned());
+    }
+    if mux.max_idle_workers < HopMux::MAX_IDLE_MIN {
+        invalid("max_idle_workers", "最大空闲连接必须至少为 1".to_owned());
+    }
+    if mux.min_idle_workers > mux.max_idle_workers {
+        invalid(
+            "min_idle_workers",
+            "最小空闲连接不能大于最大空闲连接".to_owned(),
+        );
+    }
+    if mux.max_probing_workers == 0 || mux.max_probing_workers > mux.max_idle_workers {
+        invalid(
+            "max_probing_workers",
+            "同时探测连接必须在 1 与最大空闲连接之间".to_owned(),
+        );
+    }
+    if !(HopMux::PROBE_INTERVAL_MIN_SECS..=HopMux::PROBE_INTERVAL_MAX_SECS)
+        .contains(&mux.probe_interval_secs)
+    {
+        invalid(
+            "probe_interval_secs",
+            "探测间隔必须在 2–60 秒之间".to_owned(),
+        );
+    }
+    if !(HopMux::PROBE_TIMEOUT_MIN_MS..=HopMux::PROBE_TIMEOUT_MAX_MS)
+        .contains(&mux.probe_timeout_ms)
+        || mux.probe_timeout_ms >= u32::from(mux.probe_interval_secs) * 1000
+    {
+        invalid(
+            "probe_timeout_ms",
+            "探测超时必须在 200–10000 毫秒之间，且小于探测间隔".to_owned(),
+        );
+    }
+    if mux.idle_ttl_secs < HopMux::IDLE_TTL_MIN_SECS {
+        invalid("idle_ttl_secs", "空闲寿命必须为正整数秒".to_owned());
+    }
+    let rounded_timeout_secs = mux.probe_timeout_ms.saturating_add(999) / 1000;
+    if mux.idle_ttl_secs < u32::from(mux.probe_interval_secs).saturating_add(rounded_timeout_secs) {
+        invalid(
+            "idle_ttl_secs",
+            "空闲寿命必须覆盖一个探测间隔和向上取整后的探测超时".to_owned(),
+        );
+    }
+    if !(HopMux::MAX_REQUESTS_MIN..=HopMux::MAX_REQUESTS_MAX).contains(&mux.max_requests_per_worker)
+    {
+        invalid(
+            "max_requests_per_worker",
+            "累计子连接上限必须在 1–65535 之间".to_owned(),
+        );
     }
 }
 
@@ -377,14 +446,14 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             diagnostics.push(Diagnostic::error(
                 "external-outbound.blank-name",
                 &at,
-                "外部出站名称不能为空",
+                "代理出站名称不能为空",
             ));
         }
         if outbound.address.trim().is_empty() || outbound.address.chars().any(char::is_whitespace) {
             diagnostics.push(Diagnostic::error(
                 "external-outbound.address",
                 &at,
-                "外部出站服务器地址为空或含空白",
+                "代理出站服务器地址为空或含空白",
             ));
         }
         if !outbound.protocol.allows_empty_credential()
@@ -393,21 +462,30 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             diagnostics.push(Diagnostic::error(
                 "external-outbound.credential",
                 &at,
-                "外部出站凭据不能为空",
+                "代理出站凭据不能为空",
             ));
         }
         match &outbound.protocol {
+            ExternalOutboundProtocol::Anytls { .. } => {
+                if !matches!(outbound.security, ExternalOutboundSecurity::Tls { .. }) {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.anytls-security",
+                        &at,
+                        "AnyTLS 代理出站必须使用 TLS",
+                    ));
+                }
+            }
             ExternalOutboundProtocol::Vless {
                 encryption,
                 flow,
                 transport,
                 ..
             } => {
-                if encryption.trim().is_empty() {
+                if !vless_encryption_is_valid(encryption) {
                     diagnostics.push(Diagnostic::error(
                         "external-outbound.vless-encryption",
                         &at,
-                        "VLESS encryption 不能为空；不用协议层加密时应写 none",
+                        "VLESS encryption 必须为 none 或有效的客户端 Encryption 参数（包含服务端公钥）",
                     ));
                 }
                 if flow.as_deref().is_some_and(|value| {
@@ -723,13 +801,12 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             }
         }
         match &outbound.security {
-            ExternalOutboundSecurity::None
-                if matches!(&outbound.protocol, ExternalOutboundProtocol::Vless { .. }) =>
+            ExternalOutboundSecurity::None if matches!(&outbound.protocol, ExternalOutboundProtocol::Vless { encryption, .. } if encryption == "none") =>
             {
                 diagnostics.push(Diagnostic::error(
                     "external-outbound.security-required",
                     &at,
-                    "公网 VLESS 外部出站必须选择 TLS 或 REALITY",
+                    "未启用 Encryption 的 VLESS 代理出站必须选择 TLS 或 REALITY",
                 ));
             }
             ExternalOutboundSecurity::Tls { .. } | ExternalOutboundSecurity::Reality { .. }
@@ -741,7 +818,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 diagnostics.push(Diagnostic::error(
                     "external-outbound.shadowsocks2022-transport",
                     &at,
-                    "SS2022 外部出站只支持 RAW，不叠加 TLS 或 REALITY",
+                    "SS2022 代理出站只支持 RAW，不叠加 TLS 或 REALITY",
                 ));
             }
             ExternalOutboundSecurity::Tls { .. } | ExternalOutboundSecurity::Reality { .. }
@@ -755,7 +832,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 diagnostics.push(Diagnostic::error(
                     "external-outbound.raw-transport",
                     &at,
-                    "SOCKS5 和 WireGuard 外部出站只支持自身的 RAW 传输",
+                    "SOCKS5 和 WireGuard 代理出站只支持自身的 RAW 传输",
                 ));
             }
             ExternalOutboundSecurity::Reality { .. }
@@ -823,7 +900,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 diagnostics.push(Diagnostic::error(
                     "rule.unknown-external-outbound",
                     format!("{}/{}", step.chain, step.node),
-                    format!("规则指向不存在的外部出站 {outbound}"),
+                    format!("规则指向不存在的代理出站 {outbound}"),
                 ));
                 continue;
             };
@@ -847,7 +924,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     "tenant.scope",
                     format!("{}/{}", step.chain, target.id),
                     format!(
-                        "链属于 {}，而外部出站 {} 归属于 {}，不在可见范围内",
+                        "链属于 {}，而代理出站 {} 归属于 {}，不在可见范围内",
                         chain_tenant.unwrap_or_default(),
                         target.id,
                         target.tenant
@@ -1375,6 +1452,31 @@ fn validate_chain_ingresses(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
 
     for ingress in &app.ingresses {
         validate_ingress_stream(diagnostics, ingress);
+        if let Some(encryption) = ingress.wires.vless_encryption() {
+            if let Err(message) = encryption.options.validate() {
+                diagnostics.push(Diagnostic::error(
+                    "ingress.vless-encryption-options",
+                    &ingress.id,
+                    message,
+                ));
+            }
+            if encryption.port == 0 {
+                diagnostics.push(Diagnostic::error(
+                    "ingress.vless-encryption-port",
+                    &ingress.id,
+                    "VLESS Encryption 端口必须在 1–65535 之间",
+                ));
+            }
+            if !is_reality_public_key(&encryption.public_key)
+                || !is_reality_public_key(&encryption.private_key)
+            {
+                diagnostics.push(Diagnostic::error(
+                    "ingress.vless-encryption-key",
+                    &ingress.id,
+                    "VLESS Encryption 需要有效的 X25519 密钥对",
+                ));
+            }
+        }
         if let Some(settings) = ingress.wires.hysteria2() {
             validate_hysteria2(diagnostics, ingress, settings);
         }
@@ -1560,6 +1662,13 @@ fn occupied_ingress_ports(ingress: &Ingress) -> Vec<OccupiedIngressPort> {
         });
     }
 
+    if let Some(encryption) = ingress.wires.vless_encryption() {
+        occupied.push(OccupiedIngressPort {
+            proto: Proto::Tcp,
+            port: encryption.port,
+            suffix: " 的 VLESS Encryption",
+        });
+    }
     if let Some(anytls) = ingress.wires.anytls() {
         occupied.push(OccupiedIngressPort {
             proto: Proto::Tcp,
@@ -2370,7 +2479,7 @@ fn validate_ingress_certificate(diagnostics: &mut Vec<Diagnostic>, ingress: &Ing
         format!(
             "接入面 {} 使用自有证书，但机器 {} 没有可用的证书。\
              去机器页确认它选了证书组，再去证书页确认那个组已经签发出证书；\
-             或者把这个接入面改成 REALITY 指向外部站点，那样不需要本机证书",
+             或者把这个接入面改成 REALITY 指向外部站点，那样不需要本机 TLS 证书",
             ingress.id, ingress.node
         ),
     ));
@@ -2687,7 +2796,7 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
             diagnostics.push(Diagnostic::error(
                 "rule.pool-on-reverse",
                 at.clone(),
-                format!("{to} 是反向接入，本机不发起连接，不能配置出站连接"),
+                format!("{to} 是反向接入，本机不发起连接，不能配置连接复用"),
             ));
         }
 
@@ -2705,7 +2814,7 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
                 "rule.pool-concurrency-one",
                 at.clone(),
                 format!(
-                    "{to} 的连接池使用 Xray Mux.cool concurrency=1；空闲连接复用前不探活，半失效连接可能卡到超时，遇到过卡顿请改为每次新建"
+                    "{to} 的 Mux 复用流数量为 1；空闲连接复用前不探活，半失效连接可能卡到超时，遇到过卡顿请改为每次新建"
                 ),
             ));
         }
@@ -2720,14 +2829,17 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
                     at.clone(),
                     if *n < HopPool::MERGE_MIN {
                         format!(
-                            "{to} 的合并流数为 {n}，最小值为 {}；1 会启用有卡顿风险的实验连接池，只能通过对应档位显式选择",
+                            "{to} 的 Mux 复用流数量为 {n}，最小值为 {}；数量 1 使用单独的兼容编码",
                             HopPool::MERGE_MIN
                         )
                     } else {
-                        format!("{to} 的合并流是 {n}，最多 {}", HopPool::MERGE_MAX)
+                        format!("{to} 的 Mux 复用流数量为 {n}，最多 {}", HopPool::MERGE_MAX)
                     },
                 ));
             }
+        }
+        if let HopPool::Mux(Some(mux)) = pool {
+            validate_hop_mux(mux, &format!("{at}.pool.v"), diagnostics);
         }
 
         let Some((previous_dial, previous_pool)) = by_target.insert(to.as_str(), (dial, pool))
@@ -2745,7 +2857,7 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
             diagnostics.push(Diagnostic::error(
                 "rule.forward-pool-conflict",
                 at,
-                format!("{to} 存在多种出站连接配置；同一条链边只允许一种"),
+                format!("{to} 存在多种连接复用配置；同一条链边只允许一种"),
             ));
         }
     }
@@ -3584,4 +3696,42 @@ fn ip_match(host: &str, values: &[String]) -> MatchVerdict {
     }
 
     MatchVerdict::Miss
+}
+
+// Match the bundled Xray encryption envelope, with at least one complete public key.
+fn vless_encryption_is_valid(value: &str) -> bool {
+    if value == "none" {
+        return true;
+    }
+    let blocks: Vec<_> = value.split('.').collect();
+    if blocks.len() < 4
+        || blocks[0] != "mlkem768x25519plus"
+        || !matches!(blocks[1], "native" | "xorpub" | "random")
+        || !matches!(blocks[2], "0rtt" | "1rtt")
+    {
+        return false;
+    }
+    let mut keys = 0;
+    for block in &blocks[3..] {
+        if block.len() < 20 {
+            let fields: Vec<_> = block.split('-').collect();
+            if keys > 0
+                || fields.len() != 3
+                || fields
+                    .iter()
+                    .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return false;
+            }
+        } else {
+            let Ok(bytes) = general_purpose::URL_SAFE_NO_PAD.decode(block) else {
+                return false;
+            };
+            if !matches!(bytes.len(), 32 | 1184) {
+                return false;
+            }
+            keys += 1;
+        }
+    }
+    keys > 0
 }

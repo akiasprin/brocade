@@ -24,3 +24,14 @@ test('import mode can save only the currently parsed link', () => {
   assert.equal(externalImportCanSave('import', false), false);
   assert.equal(externalImportCanSave('manual', false), true);
 });
+
+test('VLESS Encryption validates complete keys, modes, padding and rejects incomplete values', async () => {
+  const { vlessEncryptionIsValid: valid } = await import('../src/external-outbound.ts');
+  const key = 'A'.repeat(43);
+  assert.equal(valid('none'), true);
+  for (const mode of ['native', 'xorpub', 'random']) {
+    for (const rtt of ['0rtt', '1rtt']) assert.equal(valid(`mlkem768x25519plus.${mode}.${rtt}.${key}`), true);
+  }
+  assert.equal(valid(`mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.${key}`), true);
+  for (const value of ['', 'garbage', 'mlkem768x25519plus.native.1rtt.', `mlkem768x25519plus.native.600s.${key}`, `mlkem768x25519plus.native.1rtt.${key}.100-1-1`]) assert.equal(valid(value), false);
+});

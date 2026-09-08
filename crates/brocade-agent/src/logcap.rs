@@ -13,7 +13,8 @@ use std::{
 };
 
 use brocade_deployment::protocol::{
-    DEFAULT_AGENT_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
+    DEFAULT_AGENT_LOG_MAX_MIB, DEFAULT_PHANTUN_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
+    MIN_AGENT_LOG_MAX_MIB,
 };
 
 const LEGACY_LOG_POLICY_FILE: &str = "log-max-mib";
@@ -265,9 +266,15 @@ fn consume(input: &mut impl Read, path: &Path, max_bytes: u64) -> io::Result<()>
 }
 
 fn consume_dynamic(input: &mut impl Read, path: &Path, policy: &Path) -> io::Result<()> {
+    let default_mib =
+        if policy.file_name().and_then(|name| name.to_str()) == Some(PHANTUN_POLICY_FILE) {
+            DEFAULT_PHANTUN_LOG_MAX_MIB
+        } else {
+            DEFAULT_AGENT_LOG_MAX_MIB
+        };
     let initial = read_policy_mib(policy)
         .map(max_bytes)
-        .unwrap_or_else(|| max_bytes(DEFAULT_AGENT_LOG_MAX_MIB));
+        .unwrap_or_else(|| max_bytes(default_mib));
     consume_with_limit(
         input,
         path,

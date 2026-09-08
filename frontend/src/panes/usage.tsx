@@ -21,7 +21,6 @@ import {
   bucketBytes,
   fetchNodes,
   fetchSnapshot,
-  fetchTenants,
   fetchUsage,
   fetchUsageMonthly,
   fetchUsageNodeSeries,
@@ -336,8 +335,7 @@ function NodeLoad({
 function RawSamples() {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState({ tenant_id: '', user_id: '', node_id: '' });
-  /* 未展开时不发送请求：四个查询中有三个用于填充筛选器的选项，折叠时都不需要 */
-  const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants(), enabled: open });
+  /* 未展开时不发送请求：用于填充筛选器的查询都不需要。内部归属固定为唯一项，不提供筛选。 */
   const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true), enabled: open });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), enabled: open });
   const usage = useQuery({
@@ -389,22 +387,8 @@ function RawSamples() {
         <span className="src">最近 100 条 · 含中继跳</span>
       </summary>
       <div className="raw-bd">
-        {(tenants.error || users.error || nodes.error) && (
-          <ErrorBox error={tenants.error ?? users.error ?? nodes.error} />
-        )}
+        {(users.error || nodes.error) && <ErrorBox error={users.error ?? nodes.error} />}
         <div className="toolbar">
-          <select
-            className="f"
-            value={filter.tenant_id}
-            onChange={e => setFilter({ ...filter, tenant_id: e.target.value })}
-          >
-            <option value="">租户：全部</option>
-            {tenants.data?.tenants.map(t => (
-              <option key={t.id} value={t.id}>
-                {t.id}
-              </option>
-            ))}
-          </select>
           <select
             className="f"
             value={filter.user_id}

@@ -77,6 +77,20 @@ export const previewDraft = (ops: ModelOp[]) => post<DraftPreview>('/model/previ
 let previewCache: { key: string; at: number; p: Promise<DraftPreview> } | null = null;
 const PREVIEW_TTL_MS = 1500;
 
+// A first in-flight query has no cached data, so invalidation alone may leave it running.
+// Never return a response (or error) from an earlier draft generation to a current-view reader.
+async function currentDraftRead<T>(read: () => Promise<T>): Promise<T> {
+  for (;;) {
+    const version = draft.version();
+    try {
+      const value = await read();
+      if (version === draft.version()) return value;
+    } catch (error) {
+      if (version === draft.version()) throw error;
+    }
+  }
+}
+
 export function draftPreview(): Promise<DraftPreview> {
   const ops = draft.ops();
   const key = `${draft.version()}:${JSON.stringify(ops)}`;
@@ -148,7 +162,7 @@ export const fetchAuthState = () => api<AuthState>('/auth/state');
 export const setVisitorAccess = (enabled: boolean) =>
   api<AuthState>('/visitor-access', '', { method: 'PUT', body: JSON.stringify({ enabled }) });
 export const fetchSessionWhoami = () => api<Whoami>('/whoami');
-export const initAdmin = (body: { operator_id: string; display_name: string; password: string }) =>
+export const initAdmin = (body: { operator_id: string; display_name: string; password: string; root_tenant: string }) =>
   api<InitAdminResponse>('/auth/init', '', { method: 'POST', body: JSON.stringify(body) });
 export const loginAdmin = (body: { operator_id: string; password: string }) =>
   api<LoginAdminResponse>('/auth/login', '', { method: 'POST', body: JSON.stringify(body) });
@@ -239,7 +253,7 @@ export const fetchCompile = (revision: number, token = '') => api<CompileView>(`
 // 顶栏角标和诊断窗使用的数据。存在草稿时编译草稿——角标显示「0 错」而草稿中存在
 // 无法通过校验的改动，会给出错误的状态。
 export const fetchCompileView = (revision: number): Promise<CompileView> =>
-  draft.isEmpty() ? fetchCompile(revision) : draftPreview().then(p => p.compile);
+  currentDraftRead(() => (draft.isEmpty() ? fetchCompile(revision) : draftPreview().then(p => p.compile)));
 
 /* ── 节点 ── */
 
@@ -392,6 +406,19 @@ export const setNodeStatus = (id: string, status: 'active' | 'retired') =>
     body: JSON.stringify({ status }),
   });
 
+export interface RemoveRetiredNodesResult {
+  revision_id: number;
+  removed_nodes: string[];
+  removed_chains: string[];
+}
+
+/** Permanently remove terminally retired machines and every chain containing one of them. */
+export const removeRetiredNodes = (nodeIds: string[]) =>
+  api<RemoveRetiredNodesResult>('/nodes', '', {
+    method: 'DELETE',
+    body: JSON.stringify({ node_ids: nodeIds }),
+  });
+
 export const abandonNode = (id: string, unregisterWarp = true) =>
   post<NodeLifecycleTransitionResult>(`/nodes/${encodeURIComponent(id)}/lifecycle/abandon`, {
     unregister_warp: unregisterWarp,
@@ -421,7 +448,7 @@ export interface ProvisionNodeRequest {
   dns: Dns;
   domain_strategy: DomainStrategy;
   note?: string | null;
-  /** 这台机器从哪个证书组取 TLS / Hysteria 2 证书。不填即不属于任何组，那样它没有本机证书，
+  /** 这台机器从哪个证书组取 TLS / Hysteria 2 证书。不填即不属于任何组，那样它没有本机 TLS 证书，
       其上的 TLS 与 Hysteria 2 接入面会在编译时被拒绝——REALITY 指向外部站点的不受影响。
       组决定这台机器的 SNI，建完再改会让已发出去的订阅失效，所以在这里选。 */
   cert_label_id?: string | null;
@@ -603,7 +630,8 @@ export const planDeployment = (revision_id: number, token = '') =>
 export const fetchDeployments = (kind?: 'config' | 'grants', token = '') =>
   api<{ deployments: DeploymentListItem[] }>(`/deployments?limit=50${kind ? `&kind=${kind}` : ''}`, token);
 
-export const fetchDeployment = (id: number, token = '') => api<DeploymentDetail>(`/deployments/${id}`, token);
+export const fetchDeployment = (id: number, token = '', includeContent = false) =>
+  api<DeploymentDetail>(`/deployments/${id}${includeContent ? '?include=content' : ''}`, token);
 
 export interface NodeIsolationCommandResult {
   node_id: string;
@@ -760,7 +788,7 @@ export interface GrantProbePlanItem {
   chain_id: string;
   ingress_id: string;
   family: 'ipv4' | 'ipv6' | 'unknown';
-  protocol: 'vless' | 'anytls' | 'hysteria2';
+  protocol: 'vless' | 'vless-encryption' | 'anytls' | 'hysteria2';
 }
 
 export interface GrantProbePlan {
@@ -1057,7 +1085,7 @@ export const HY2_QUIC_LIMITS = {
 
 export interface Hysteria2Settings {
   /* 该线路自身的 UDP 监听端口，不是接入面的端口。两条线此前共用 ingress.port，
-   * 引入端口跳转后不再可行：跳转是对一段端口的重定向规则，遗漏 `-p udp` 会同时影响
+   * 引入端口跳跃后不再可行：跳转是对一段端口的重定向规则，遗漏 `-p udp` 会同时影响
    * 同号的 TCP 一侧。 */
   port: number;
   /* 客户端轮换使用的 UDP 端口区间，闭区间；null 表示只连接 port。
@@ -1111,13 +1139,27 @@ export type Transport =
 /* 一个接入面启用哪几条线。两条不是二选一：TCP 和 UDP 各建立一个 inbound，共用同一份凭据和
  * 同一条授权，客户端可使用其中任意一条。至少需要启用一条——服务端的类型定义和库中的
  * CHECK 约束都有此要求，前端通过 `wiresAreValid` 在保存前拦截。 */
+export interface VlessEncryptionOptions {
+  appearance: 'native' | 'xorpub' | 'random';
+  ticket_lifetime: string;
+  client_mode: '0rtt' | '1rtt';
+  server_padding: string;
+  client_padding: string;
+}
+export interface VlessEncryptionSettings {
+  port: number;
+  options?: VlessEncryptionOptions;
+}
+
 export interface Wires {
+  vless_encryption?: VlessEncryptionSettings | null;
   vless?: Transport | null;
   anytls?: AnyTlsSettings | null;
   hysteria2?: Hysteria2Settings | null;
 }
 
-export const wiresAreValid = (wires: Wires) => !!wires.vless || !!wires.anytls || !!wires.hysteria2;
+export const wiresAreValid = (wires: Wires) =>
+  !!wires.vless || !!wires.anytls || !!wires.hysteria2 || !!wires.vless_encryption;
 
 /* 该档位是否需要机器自有证书。REALITY 借用其他站点，机器上没有证书；TLS 使用自有证书，
  * 未签发时该接入面不可用（编译器会拦截，`ingress.tls-no-certificate`）。 */
@@ -1258,20 +1300,78 @@ export type HopDial =
 // 该跳发起的连接的使用方式。不填写表示每条流单独建立连接、结束后关闭，
 // 即该字段引入之前的行为。
 //
-// 同一维度上的三档：一条 TCP 同时承载多少条流、流结束后是否保留连接。使用三个名称而非
-// 直接暴露 xray 的 concurrency（1–128），是因为 1 是 Mux.cool 的特殊用法：每条流仍独占
-// 一个 worker，流结束后留下的连接可被下一条复用；从 2 开始才是多条流复用一条连接。
-// 单并发 worker 借出前不探活，半失效连接可能卡到超时，因此 pool 只为已有配置和明确选择保留，
-// 新建规则默认 none。
+// 界面只展示「每次新建 / Mux 复用」两项。历史 pool/merge 只用于读取旧修订；
+// 当前写入使用 mux，可以整组跟随全局或整组覆盖。
 //
 // 只对本机发起的跳有效。reverse 是对端连接本机，本机没有可复用的出站连接——该档位
 // 在界面上不显示（reverseTargets 使用另一个面板），编译器也会拒绝。
 export type HopPool =
   | { t: 'none' }
   | { t: 'pool' }
-  // v ∈ 2..=128。1 对应有卡顿风险的连接池档位，129 及以上 xray 会截断为 128 且不提示，
-  // 两侧编译器均拒绝。
-  | { t: 'merge'; v: number };
+  // 历史 v ∈ 2..=128；编译器拒绝范围外的值。
+  | { t: 'merge'; v: number }
+  /* 当前写入格式。省略或置空 v 表示跟随 settings.relay_mux；v 存在时必须是整组覆盖。 */
+  | { t: 'mux'; v?: HopMux | null };
+
+export interface HopMux {
+  concurrency: number;
+  min_idle_workers: number;
+  max_idle_workers: number;
+  max_probing_workers: number;
+  probe_interval_secs: number;
+  probe_timeout_ms: number;
+  idle_ttl_secs: number;
+  max_requests_per_worker: number;
+}
+
+export const DEFAULT_HOP_MUX: HopMux = {
+  concurrency: 1,
+  min_idle_workers: 0,
+  max_idle_workers: 2,
+  max_probing_workers: 1,
+  probe_interval_secs: 5,
+  probe_timeout_ms: 2000,
+  idle_ttl_secs: 24,
+  max_requests_per_worker: 128,
+};
+
+export function hopMuxError(value: HopMux): string | null {
+  if (!Number.isInteger(value.concurrency) || value.concurrency < 1 || value.concurrency > 128)
+    return '复用流数量必须在 1–128 之间';
+  if (!Number.isInteger(value.min_idle_workers) || value.min_idle_workers < 0) return '最小空闲连接必须为非负整数';
+  if (!Number.isInteger(value.max_idle_workers) || value.max_idle_workers < 1) return '最大空闲连接必须为正整数';
+  // Xray's worker counts are uint32. This is the wire/config representation
+  // boundary, not an application-level pool-size policy.
+  if (value.min_idle_workers > 0xffffffff || value.max_idle_workers > 0xffffffff)
+    return '空闲连接数量超出 uint32 字段可表示范围（4294967295）';
+  if (value.min_idle_workers > value.max_idle_workers) return '最小空闲连接不能大于最大空闲连接';
+  if (
+    !Number.isInteger(value.max_probing_workers) ||
+    value.max_probing_workers < 1 ||
+    value.max_probing_workers > value.max_idle_workers
+  )
+    return '同时探测连接必须在 1 与最大空闲连接之间';
+  if (!Number.isInteger(value.probe_interval_secs) || value.probe_interval_secs < 2 || value.probe_interval_secs > 60)
+    return '探测周期必须在 2–60 秒之间';
+  if (
+    !Number.isInteger(value.probe_timeout_ms) ||
+    value.probe_timeout_ms < 200 ||
+    value.probe_timeout_ms > 10000 ||
+    value.probe_timeout_ms >= value.probe_interval_secs * 1000
+  )
+    return '单次超时必须在 200–10000 毫秒之间，且小于探测周期';
+  if (!Number.isInteger(value.idle_ttl_secs) || value.idle_ttl_secs < 1) return '空闲寿命必须为正整数秒';
+  if (value.idle_ttl_secs > 0xffffffff) return '空闲寿命超出 uint32 秒数字段可表示范围（4294967295）';
+  if (value.idle_ttl_secs < value.probe_interval_secs + Math.ceil(value.probe_timeout_ms / 1000))
+    return '空闲寿命必须覆盖一个探测周期和向上取整后的单次超时';
+  if (
+    !Number.isInteger(value.max_requests_per_worker) ||
+    value.max_requests_per_worker < 1 ||
+    value.max_requests_per_worker > 65535
+  )
+    return '累计子连接上限必须在 1–65535 之间';
+  return null;
+}
 
 export type RuleAction =
   | { t: 'forward'; to: string; dial?: HopDial; pool?: HopPool }
@@ -1288,6 +1388,7 @@ export interface EgressDnsResolution {
 }
 
 export type ExternalOutboundProtocol =
+  | { t: 'anytls'; v: { credential: string } }
   | {
       t: 'vless';
       v: {
@@ -1391,6 +1492,11 @@ export interface ExternalOutbound {
 
 export type ExternalOutboundWrite = Omit<ExternalOutbound, 'tenant' | 'bindings'> & {
   tenant_id: string;
+};
+
+export const deleteExternalOutbound = async (tenantId: string, id: string) => {
+  draft.push({ op: 'delete_external_outbound', tenant_id: tenantId, id });
+  return { revision_id: 0 } as ModelWriteResult;
 };
 
 export const upsertExternalOutbound = async (outbound: ExternalOutboundWrite) => {
@@ -1562,6 +1668,7 @@ export interface SnapshotIngress {
       fallback_limits?: RealityFallbackLimits;
       fallback_guard?: boolean;
     } | null;
+    vless_encryption?: (VlessEncryptionSettings & { public_key?: string }) | null;
     anytls?: AnyTlsSettings | null;
     hysteria2?: Hysteria2Settings | null;
   };
@@ -1587,6 +1694,14 @@ function currentVless(ingress: SnapshotIngress): Transport | null {
 export function currentWires(ingress: SnapshotIngress): Wires {
   return {
     vless: currentVless(ingress),
+    ...(ingress.wires.vless_encryption
+      ? {
+          vless_encryption: {
+            port: ingress.wires.vless_encryption.port,
+            ...(ingress.wires.vless_encryption.options ? { options: ingress.wires.vless_encryption.options } : {}),
+          },
+        }
+      : {}),
     anytls: ingress.wires.anytls ?? null,
     hysteria2: ingress.wires.hysteria2 ?? null,
   };
@@ -1785,7 +1900,11 @@ export interface ConsoleSnapshot {
       public_ipv4_nat?: boolean;
       public_ipv6_nat?: boolean;
       overlay?: boolean;
+      egress_allowed?: boolean;
+      certificate_group_id?: string | null;
       certificate_name?: string | null;
+      /** 当前服务证书实际使用的签发轨道。它与 certificate_name 同源，不能根据域名或 issuer 猜测。 */
+      certificate_track?: CertificateTrack | null;
       dns?: Dns;
       domain_strategy?: DomainStrategy;
       /* 留空表示使用 `settings.overlay.mtu` */
@@ -1803,7 +1922,9 @@ export interface ConsoleSnapshot {
 // 存在草稿时读取的是草稿全部生效后的结果。所有面板统一使用该函数，不需自行判断是否
 // 存在草稿——修改后界面未更新是草稿机制下最常见的问题。
 export const fetchSnapshot = (): Promise<ConsoleSnapshot> =>
-  draft.isEmpty() ? api<ConsoleSnapshot>('/model/snapshot') : draftPreview().then(p => p.snapshot);
+  currentDraftRead(() =>
+    draft.isEmpty() ? api<ConsoleSnapshot>('/model/snapshot') : draftPreview().then(p => p.snapshot),
+  );
 
 /* ── 操作者 ── */
 
@@ -1965,6 +2086,15 @@ export const fetchUsageNodeSeries = (windowSecs = 1800, nodeId?: string) => {
   return api<UsageNodeSeriesList>(`/usage/node-series?window_secs=${windowSecs}${node}`);
 };
 
+/** 固定历史区间。机器详情的日期选择必须把同一组边界交给负载、流量和 PING，不能把
+ * 区间长度重新解释成“从现在往前”，否则查看昨天时只有负载图是昨天的数据。 */
+export const fetchUsageNodeSeriesRange = (startUnixSecs: number, endUnixSecs: number, nodeId?: string) => {
+  const node = nodeId ? `&node_id=${encodeURIComponent(nodeId)}` : '';
+  return api<UsageNodeSeriesList>(
+    `/usage/node-series?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}${node}`,
+  );
+};
+
 /* ── 设置 ── */
 
 export interface BrandingSettings {
@@ -1974,6 +2104,18 @@ export interface BrandingSettings {
 }
 
 export const DEFAULT_BRANDING: BrandingSettings = { site_name: 'Brocade', icon_data_url: null };
+export function initialBranding(): BrandingSettings | undefined {
+  const raw = document.getElementById('brocade-branding')?.textContent;
+  if (!raw) return undefined;
+  try {
+    const value = JSON.parse(raw) as Partial<BrandingSettings>;
+    if (typeof value.site_name !== 'string' || !value.site_name.trim()) return undefined;
+    if (value.icon_data_url !== null && typeof value.icon_data_url !== 'string') return undefined;
+    return value as BrandingSettings;
+  } catch {
+    return undefined;
+  }
+}
 export const fetchBranding = () => api<BrandingSettings>('/branding');
 export const saveBranding = (body: BrandingSettings) =>
   api<BrandingSettings>('/branding', '', { method: 'PUT', body: JSON.stringify(body) });
@@ -2031,6 +2173,7 @@ export interface ModelSettings {
   ports: {
     ingress_base: number;
     anytls_base: number;
+    vless_encryption_base?: number;
     hop_base: number;
     hy2_base: number;
   };
@@ -2047,6 +2190,8 @@ export interface ModelSettings {
   /* 连接的存活时长和内存占用。此处是默认值，机器可逐字段覆盖（Node.connection），
      机制与 overlay.mtu / Node.mtu 相同。 */
   connection: ConnectionSettings;
+  /* 节点间 Mux 的全局完整默认值；规则只会整组跟随或整组覆盖。 */
+  relay_mux: HopMux;
   /* 使 xray 统计每个账号当前有多少个不同的来源地址在使用。
      设为全局而非逐机器配置：是否统计共享账号是机队级的决定，而上面一组是各机器
      各自的容量参数。它只做统计，xray 不会因统计值高而拒绝连接。 */
@@ -2060,7 +2205,7 @@ export interface ConnectionSettings {
   uplink_only_secs: number;
   downlink_only_secs: number;
   /* 每条连接的缓冲区大小。null 表示产物中不写入该键，由 xray 按 CPU 架构决定
-     （x86_64 为 512 KB、arm64 为 4 KB、arm/mips 为 0）。填写具体数值会使不同架构使用同一取值。 */
+     （x86_64 为 512 KiB、arm64 为 4 KiB、arm/mips 为 0）。填写具体数值会使不同架构使用同一取值。 */
   buffer_size_kb: number | null;
   /* 握手超时。全机队使用同一取值，不支持逐机器覆盖：xray 取 60 是为对齐 nginx 的
      client_header_timeout，使该值不暴露后端服务类型；各机器分别设置会使机器之间
@@ -2077,18 +2222,18 @@ export interface NodeConnection {
   buffer_size_kb: number | null;
 }
 
-export const fetchSettings = () => api<ModelSettings>('/settings');
+export const fetchSettings = () => currentDraftRead(() => api<ModelSettings>('/settings'));
 export const saveSettings = async (body: ModelSettings) => {
   draft.push({ op: 'update_settings', settings: body });
   return { revision_id: 0 };
 };
 
-/* ── 分发设置：节点访问控制面的地址，以及安装哪个版本的 xray ──
+/* ── 分发设置：节点访问控制面的地址，以及当前内置的 xray 版本 ──
  *
- * 与上面一组分开，因为两者性质不同：模型设置会编入产物，修改一次产生一个修订并需要一次发布；
- * 这两项不进入任何产物，只决定安装命令中的地址和 /enroll/dist 清单，在安装时被读取。
- * 因此它不进入草稿而是直接 PUT——上面的 saveSettings 写入草稿而此处直接写库，
- * 该差异在客户端同样可见。
+ * 与上面一组分开，因为两者性质不同：模型设置进入修订，只有实际改变机器产物时才需要发布；
+ * 地址不进入模型或任何产物，只决定安装命令中的地址和 /enroll/dist 清单，在安装时被读取，因此
+ * 不进入草稿而是直接 PUT。xray_version 仍在响应结构中承载控制台内置版本；旧数据库可能
+ * 留有同名字段，但当前控制台不会让它覆盖随构建提供的二进制。
  *
  * `stored` 是在此处填写的值，`effective` 是实际生效的值（已填写时即为该值，未填写时
  * 回退到进程启动时的环境变量，再回退到内置默认值）。两者都需要：仍使用环境变量的部署中
@@ -2220,7 +2365,7 @@ export interface CertDomain {
   domain: string;
   dns_provider: string;
   acme_directory: string;
-  signing_method: 'public-ca' | 'self-signed';
+  signing_method: CertificateTrack;
   acme_contact: string | null;
   /** 提前多少天续期；Let's Encrypt 证书通常为 90 天，自签叶证书按本地策略生成。 */
   renew_before_days: number;
@@ -2233,7 +2378,7 @@ export interface CertDomain {
 /** 可写入的部分。凭据是只写的：不填写表示保持原值，使表单可以在无法读取机密的情况下保存。 */
 export interface CertDomainInput {
   domain: string;
-  signing_method: 'public-ca' | 'self-signed';
+  signing_method: CertificateTrack;
   dns_credential?: string | null;
   acme_directory?: string | null;
   acme_contact?: string | null;
@@ -2251,12 +2396,15 @@ export type CertStatus = 'pending' | 'ready' | 'serving' | 'compatible' | 'super
     躺在库里的那条路径。`spare`：手动加签的备用，停在 `ready` 等人选时机，这正是提前要一张的意义。 */
 export type CertOrigin = 'renewal' | 'spare' | 'bootstrap';
 
+export type CertificateTrack = 'public-ca' | 'self-signed';
+
 export interface GroupCertificate {
   id: string;
   status: CertStatus;
   origin: CertOrigin;
-  signing_method: 'public-ca' | 'self-signed';
+  signing_method: CertificateTrack;
   certificate_name: string | null;
+  /** 仅本机自签证书使用；本机 CA 证书始终为 null。 */
   runtime_slot: 'a' | 'b' | null;
   /** 签发者的 CN，从证书**字节中**解析得出，不是根据设置推导。两者可能不一致，而只有前者
       反映实际情况——若机队几个月前设为 staging 且未改回，每张都显示已签发但没有任何客户端
@@ -2278,6 +2426,8 @@ export interface GroupCertificate {
 export interface CertGroup {
   id: string;
   domain: string;
+  /** 该组配置的信任轨；公有 CA 使用单一当前文件，自签证书使用 A/B。 */
+  signing_method: CertificateTrack;
   /** 随机十六进制，进证书名，给 TLS 看。 */
   label: string;
   /** operator 起的名字，给人看，域内唯一。 */
@@ -2327,12 +2477,19 @@ export interface CertsView {
 export const fetchCerts = () => api<CertsView>('/certs');
 export const saveCertDomain = (body: CertDomainInput) =>
   api<CertsView>('/certs/domain', '', { method: 'PUT', body: JSON.stringify(body) });
-/** 触发 worker 立即执行一轮。返回的是当前状态而非本轮结果——一轮中每台约需半分钟，
-    保持请求等待会使页面依赖一个不确定的时长。页面通过轮询获取进展，具体状态显示在行内。 */
-export const scanCerts = () => api<CertsView>('/certs/scan', '', { method: 'POST' });
+export interface CertificateIssuanceResult {
+  issued: number;
+  failed: number;
+}
+/** 立即处理待签发、失败及需要续期的证书，等待完成后返回结果。 */
+export const scanCerts = () =>
+  api<CertsView & { processing: CertificateIssuanceResult }>('/certs/scan', '', { method: 'POST' });
 
 export const createCertGroup = (body: { name: string; note?: string | null; certificate_name?: string | null }) =>
-  api<{ id: string }>('/certs/groups', '', { method: 'POST', body: JSON.stringify(body) });
+  api<{ id: string; processing: CertificateIssuanceResult }>('/certs/groups', '', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 export const updateCertGroup = (id: string, body: { name?: string; note?: string | null }) =>
   api<void>(`/certs/groups/${encodeURIComponent(id)}`, '', {
     method: 'PUT',
@@ -2342,7 +2499,9 @@ export const deleteCertGroup = (id: string) =>
   api<void>(`/certs/groups/${encodeURIComponent(id)}`, '', { method: 'DELETE' });
 /** 给这个组多签一张备用。它停在 `ready`，由人决定何时启用——自动续期那张不经过这里。 */
 export const requestSpareCertificate = (id: string) =>
-  api<{ id: string }>(`/certs/groups/${encodeURIComponent(id)}/spare`, '', { method: 'POST' });
+  api<{ id: string; processing: CertificateIssuanceResult }>(`/certs/groups/${encodeURIComponent(id)}/spare`, '', {
+    method: 'POST',
+  });
 /** 把一张待命的证书变成该组机器出示的那张。SNI 不变，只换字节，因此不需要发布。 */
 export const serveCertificate = (certId: string) =>
   api<void>(`/certs/certificates/${encodeURIComponent(certId)}/serve`, '', { method: 'POST' });
@@ -2350,12 +2509,11 @@ export const serveCertificate = (certId: string) =>
 export const deleteCertificate = (certId: string) =>
   api<void>(`/certs/certificates/${encodeURIComponent(certId)}`, '', { method: 'DELETE' });
 /** 改一台机器所属的证书组，`null` 表示不属于任何组。
-    这会改变该机器的 SNI：已发出去的订阅里写的是旧组的名字，改完就连不上，需要重新拉取。 */
-export const setNodeCertGroup = (nodeId: string, labelId: string | null) =>
-  api<void>(`/nodes/${encodeURIComponent(nodeId)}/cert-group`, '', {
-    method: 'PUT',
-    body: JSON.stringify({ label_id: labelId }),
-  });
+    先保存草稿，提交并发布后切换 SNI、重启 Xray；用户需重新拉取订阅。 */
+export const setNodeCertGroup = (nodeId: string, labelId: string | null) => {
+  draft.push({ op: 'set_node_cert_group', node_id: nodeId, label_id: labelId });
+  return Promise.resolve();
+};
 
 /* ── 链路探测：wg MTU ── */
 
@@ -2542,7 +2700,7 @@ export const fetchArtifactIndex = (revision?: number) =>
 // 当前版本的产物索引。存在草稿时返回草稿的索引——产物栏不随草稿更新时，
 // 三栏中最右一栏显示的内容与实际不符：模型已修改，而它仍显示上次提交的配置。
 export const fetchArtifactIndexView = (revision?: number) =>
-  draft.isEmpty() ? fetchArtifactIndex(revision) : draftPreview().then(p => p.artifacts);
+  currentDraftRead(() => (draft.isEmpty() ? fetchArtifactIndex(revision) : draftPreview().then(p => p.artifacts)));
 
 export interface ArtifactContent {
   revision: number;
@@ -2564,9 +2722,11 @@ export const fetchArtifactContentView = (
   artifactKind: string,
   revision?: number,
 ) =>
-  draft.isEmpty()
-    ? fetchArtifactContent(targetKind, targetId, artifactKind, revision)
-    : previewDraftArtifact(draft.ops(), targetKind, targetId, artifactKind);
+  currentDraftRead(() =>
+    draft.isEmpty()
+      ? fetchArtifactContent(targetKind, targetId, artifactKind, revision)
+      : previewDraftArtifact(draft.ops(), targetKind, targetId, artifactKind),
+  );
 
 // `family` 与 `protocol` 只对用户订阅（uri / clash）有效：可以按地址族、接入协议或二者
 // 交集收窄。不传表示全量，与机队实际提供的内容一致。过滤在服务端执行——Clash 的
@@ -2905,6 +3065,12 @@ export const fetchNodePingProbeList = (windowSecs = 3600, token = '') =>
 
 export const fetchNodePingProbe = (nodeId: string, windowSecs = 86_400, token = '') =>
   api<NodePingProbeView>(`/ping-probe/nodes/${encodeURIComponent(nodeId)}?window_secs=${windowSecs}`, token);
+
+export const fetchNodePingProbeRange = (nodeId: string, startUnixSecs: number, endUnixSecs: number, token = '') =>
+  api<NodePingProbeView>(
+    `/ping-probe/nodes/${encodeURIComponent(nodeId)}?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}`,
+    token,
+  );
 
 export const fetchLinkQuality = (chainId?: string, token = '') =>
   api<{ hops: HopLinkView[] }>(`/links/quality${chainId ? `?chain_id=${encodeURIComponent(chainId)}` : ''}`, token);

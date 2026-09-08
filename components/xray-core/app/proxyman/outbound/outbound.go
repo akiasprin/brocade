@@ -133,13 +133,18 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 		return common.ErrNoClue
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
 
 	m.tagsCache = &sync.Map{}
 
+	handler := m.taggedHandler[tag]
 	delete(m.taggedHandler, tag)
 	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
 		m.defaultHandler = nil
+	}
+	m.access.Unlock()
+
+	if drainer, ok := handler.(interface{ Drain() }); ok {
+		drainer.Drain()
 	}
 
 	return nil

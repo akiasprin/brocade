@@ -134,6 +134,8 @@ pub struct CertDomainInput {
 pub struct CertGroup {
     pub id: String,
     pub domain: String,
+    /// The configured trust track for new certificates in this group.
+    pub signing_method: CertificateSigningMethod,
     pub label: String,
     pub name: String,
     /// The group created with a fresh installation. Its visible name and existence are stable.
@@ -167,7 +169,7 @@ pub struct GroupCertificate {
     /// group's normal name set and leave this empty.
     #[serde(default)]
     pub certificate_name: Option<String>,
-    /// `a` or `b` while this row owns one of the fixed runtime slots.
+    /// `a` or `b` while a self-signed row owns one of the fixed runtime slots. Public CA is null.
     #[serde(default)]
     pub runtime_slot: Option<String>,
     /// Whose signature it carries, as the certificate itself states it. `None` before the first
@@ -865,9 +867,35 @@ pub async fn set_node_label(
 ) -> Result<()> {
     require_system_admin(actor, "move a machine to another certificate group")?;
     let mut tx = pool.begin().await?;
-    assign_node_label(&mut tx, node_id, label_id).await?;
+    set_node_label_tx(&mut tx, actor, node_id, label_id).await?;
     tx.commit().await?;
     Ok(())
+}
+
+pub(crate) async fn set_node_label_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    node_id: &str,
+    label_id: Option<&str>,
+) -> Result<bool> {
+    require_system_admin(actor, "move a machine to another certificate group")?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM nodes WHERE id = $1)")
+        .bind(node_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !exists {
+        return Err(StoreError::InvalidData(format!("没有这台机器：{node_id}")));
+    }
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT label_id FROM node_cert_label WHERE node_id = $1")
+            .bind(node_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if previous.as_deref() == label_id {
+        return Ok(false);
+    }
+    assign_node_label(tx, node_id, label_id).await?;
+    Ok(true)
 }
 
 /// One group's name and where it should point.
@@ -1012,6 +1040,7 @@ pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec
                 id,
                 label,
                 domain,
+                signing_method: CertificateSigningMethod::from_directory(&configured_directory),
                 name: row.try_get("name")?,
                 is_default: row.try_get("is_default")?,
                 note: row.try_get("note")?,
@@ -1031,7 +1060,7 @@ pub async fn list_node_certificate_state(
         "SELECT m.node_id, m.label_id, l.name AS group_name, l.label,
                 COALESCE(c.certificate_name, l.certificate_name) AS certificate_name,
                 d.domain, c.acme_directory AS serving_directory, s.observed_state,
-                s.public_slot_a_sha256, s.public_slot_b_sha256,
+                s.public_ca_sha256,
                 s.self_signed_slot_a_sha256, s.self_signed_slot_b_sha256,
                 s.observed_at::text AS observed_at
            FROM node_cert_label m
@@ -1056,19 +1085,23 @@ pub async fn list_node_certificate_state(
                 let mut all_absent = true;
                 let mut all_current = true;
                 for material in materials {
-                    let desired = material.slots.each_ref().map(slot_bundle_sha256);
-                    let observed = match material.track {
-                        CertificateTrack::PublicCa => [
-                            row.try_get::<Option<String>, _>("public_slot_a_sha256")?,
-                            row.try_get::<Option<String>, _>("public_slot_b_sha256")?,
-                        ],
-                        CertificateTrack::SelfSigned => [
-                            row.try_get::<Option<String>, _>("self_signed_slot_a_sha256")?,
-                            row.try_get::<Option<String>, _>("self_signed_slot_b_sha256")?,
-                        ],
-                    };
-                    all_absent &= observed.iter().all(Option::is_none);
-                    all_current &= observed == desired.map(Some);
+                    match material {
+                        NodeCertificateMaterial::PublicCa { certificate } => {
+                            let observed = row.try_get::<Option<String>, _>("public_ca_sha256")?;
+                            let desired = slot_bundle_sha256(&certificate);
+                            all_absent &= observed.is_none();
+                            all_current &= observed.as_deref() == Some(desired.as_str());
+                        }
+                        NodeCertificateMaterial::SelfSigned { slots } => {
+                            let observed = [
+                                row.try_get::<Option<String>, _>("self_signed_slot_a_sha256")?,
+                                row.try_get::<Option<String>, _>("self_signed_slot_b_sha256")?,
+                            ];
+                            all_absent &= observed.iter().all(Option::is_none);
+                            all_current &=
+                                observed == slots.each_ref().map(slot_bundle_sha256).map(Some);
+                        }
+                    }
                 }
                 if all_absent {
                     "absent"
@@ -1092,39 +1125,108 @@ pub async fn list_node_certificate_state(
     Ok(states)
 }
 
-/// Names whose currently published identity is self-signed. Historical and compatibility rows
-/// remain server-side support for already-saved clients; they never widen a newly rendered
-/// client's trust set.
+/// Every self-signed identity occupying one of the group's two runtime slots.
+///
+/// A self-signed pair has two different names as well as two different leaves. Both names remain
+/// valid at all times: `serving` only selects the identity advertised to newly rendered clients;
+/// `ready` and `compatible` still have a live Xray slot for preloading and saved subscriptions.
+/// Keeping the map keyed by the exact name lets an immutable Serving snapshot keep rendering its
+/// old pin after a switch instead of pairing the old SNI with the new leaf's fingerprint.
 pub(crate) async fn self_signed_certificate_pins(
     pool: &PgPool,
 ) -> Result<BTreeMap<String, String>> {
     let rows = sqlx::query(
-        "SELECT DISTINCT l.label,
+        "SELECT l.label,
                 COALESCE(c.certificate_name, l.certificate_name) AS certificate_name,
                 d.domain, c.peer_sha256
-           FROM node_cert_label m
-           JOIN cert_labels l ON l.id = m.label_id
+           FROM cert_labels l
            JOIN cert_domains d ON d.id = l.domain_id
-           JOIN certificates c ON c.label_id = l.id AND c.status = 'serving'
-          WHERE c.acme_directory = 'self-signed'",
+           JOIN certificates c ON c.label_id = l.id
+          WHERE c.acme_directory = 'self-signed'
+            AND c.status IN ('ready', 'serving', 'compatible')
+            AND c.peer_sha256 IS NOT NULL
+          ORDER BY CASE c.status WHEN 'serving' THEN 0 WHEN 'compatible' THEN 1 ELSE 2 END,
+                   c.issued_at, c.id",
     )
     .fetch_all(pool)
     .await?;
-    rows.iter()
+    let mut pins = BTreeMap::new();
+    for row in rows {
+        let label: String = row.try_get("label")?;
+        let domain: String = row.try_get("domain")?;
+        let certificate_name: Option<String> = row.try_get("certificate_name")?;
+        let peer_sha256: String = row.try_get("peer_sha256")?;
+        // A legacy pair can have reused one SNI for both leaves. Prefer the currently advertised
+        // leaf in that collision; newly generated pairs have one unique name per slot.
+        pins.entry(certificate_name_of(
+            &label,
+            &domain,
+            certificate_name.as_deref(),
+        ))
+        .or_insert(peer_sha256);
+    }
+    Ok(pins)
+}
+
+/// Update only the preferred certificate identity in an already released subscription snapshot.
+///
+/// Certificate promotion is operational state rather than a model revision. Both self-signed
+/// slots have already been installed and admitted by Xray before promotion, so changing which one
+/// new clients prefer must not require another configuration deployment. The old name must still
+/// be one of the current group's retained slots: that guard distinguishes a harmless A/B switch
+/// from moving a node to another certificate group, which still needs an explicit release.
+pub(crate) async fn overlay_serving_certificate_preferences(
+    pool: &PgPool,
+    snapshot: &mut brocade_core::model::ModelSnapshot,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT m.node_id,
+                COALESCE(serving.certificate_name, l.certificate_name, l.label || '.' || d.domain)
+                    AS preferred_name,
+                ARRAY(
+                    SELECT COALESCE(slot.certificate_name, l.certificate_name, l.label || '.' || d.domain)
+                      FROM certificates slot
+                     WHERE slot.label_id = l.id
+                       AND slot.status IN ('ready', 'serving', 'compatible')
+                       AND (slot.acme_directory = 'self-signed') =
+                           (serving.acme_directory = 'self-signed')
+                     ORDER BY slot.runtime_slot NULLS LAST, slot.id
+                ) AS retained_names
+           FROM node_cert_label m
+           JOIN cert_labels l ON l.id = m.label_id
+           JOIN cert_domains d ON d.id = l.domain_id
+           JOIN certificates serving
+             ON serving.label_id = l.id AND serving.status = 'serving'
+          ORDER BY m.node_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let live = rows
+        .iter()
         .map(|row| {
-            let label: String = row.try_get("label")?;
-            let domain: String = row.try_get("domain")?;
-            let certificate_name: Option<String> = row.try_get("certificate_name")?;
-            let peer_sha256: Option<String> = row.try_get("peer_sha256")?;
-            let peer_sha256 = peer_sha256.ok_or_else(|| {
-                StoreError::InvalidData("当前自签证书缺少客户端证书校验值".to_owned())
-            })?;
             Ok((
-                certificate_name_of(&label, &domain, certificate_name.as_deref()),
-                peer_sha256,
+                row.try_get::<String, _>("node_id")?,
+                (
+                    row.try_get::<String, _>("preferred_name")?,
+                    row.try_get::<Vec<String>, _>("retained_names")?,
+                ),
             ))
         })
-        .collect()
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    for node in &mut snapshot.nodes {
+        let Some(released_name) = node.certificate_name.as_deref() else {
+            continue;
+        };
+        let Some((preferred, retained)) = live.get(&node.id) else {
+            continue;
+        };
+        if retained.iter().any(|name| name == released_name) {
+            node.certificate_name = Some(preferred.clone());
+            node.certificate_names = retained.clone();
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn serving_certificate_profile_for_node(
@@ -1134,8 +1236,21 @@ pub(crate) async fn serving_certificate_profile_for_node(
     let row = sqlx::query(
         "SELECT l.label, COALESCE(c.certificate_name, l.certificate_name) AS certificate_name,
                 d.domain, c.acme_directory = 'self-signed' AS requires_pinning,
-                CASE WHEN c.acme_directory = 'self-signed' AND c.peer_sha256 IS NOT NULL
-                     THEN ARRAY[c.peer_sha256] ELSE ARRAY[]::text[] END AS trusted_peer_sha256
+                ARRAY(
+                    SELECT slot.peer_sha256
+                      FROM certificates slot
+                     WHERE slot.label_id = l.id
+                       AND slot.status IN ('ready', 'serving', 'compatible')
+                       AND (slot.acme_directory = 'self-signed') =
+                           (c.acme_directory = 'self-signed')
+                       AND slot.peer_sha256 IS NOT NULL
+                     ORDER BY CASE slot.status
+                                  WHEN 'serving' THEN 0
+                                  WHEN 'compatible' THEN 1
+                                  ELSE 2
+                              END,
+                              slot.issued_at, slot.id
+                ) AS trusted_peer_sha256
            FROM node_cert_label m
            JOIN cert_labels l ON l.id = m.label_id
            JOIN cert_domains d ON d.id = l.domain_id
@@ -1210,14 +1325,14 @@ pub async fn request_spare_certificate(
     }
     if directory != SELF_SIGNED_DIRECTORY && count >= 1 {
         return Err(StoreError::InvalidData(
-            "主备槽已经占满；请先启用或清理当前备用证书".to_owned(),
+            "已经有一张待处理的公有 CA 备用证书；请先启用或清理".to_owned(),
         ));
     }
     let id = generate_id()?;
     let certificate_name = (directory == SELF_SIGNED_DIRECTORY)
         .then(generate_synthetic_certificate_name)
         .transpose()?;
-    let runtime_slot: Option<&str> = {
+    let runtime_slot: Option<&str> = if directory == SELF_SIGNED_DIRECTORY {
         let occupied: Option<String> = sqlx::query_scalar(
             "SELECT runtime_slot FROM certificates
               WHERE label_id = $1
@@ -1236,6 +1351,8 @@ pub async fn request_spare_certificate(
         } else {
             "a"
         })
+    } else {
+        None
     };
     sqlx::query(
         "INSERT INTO certificates
@@ -1288,7 +1405,7 @@ pub async fn promote_certificate(
     }
     if status != "ready" && status != "compatible" {
         return Err(StoreError::InvalidData(format!(
-            "这张证书是 {status}，还不能启用——只有备用或保留兼容的证书可以"
+            "这张证书是 {status}，还不能启用——只有备用或保留的证书可以"
         )));
     }
     let previous_directory: Option<String> = sqlx::query_scalar(
@@ -1315,8 +1432,7 @@ pub async fn promote_certificate(
     // pair after Xray's reload interval. Public-CA renewal within one track keeps the same SNI and
     // remains independently trusted, so it does not need this publication gate.
     if directory == SELF_SIGNED_DIRECTORY && previous_directory.is_some() {
-        let missing =
-            nodes_missing_track_preload(&mut tx, &label_id, CertificateTrack::SelfSigned).await?;
+        let missing = nodes_missing_self_signed_preload(&mut tx, &label_id).await?;
         if !missing.is_empty() {
             return Err(StoreError::Conflict(format!(
                 "备用证书尚未被所有节点载入：{}",
@@ -1340,33 +1456,33 @@ pub async fn promote_certificate(
     .await?;
     sqlx::query(
         "UPDATE certificates
-            SET status = 'serving', runtime_slot = COALESCE(runtime_slot, 'a')
+            SET status = 'serving',
+                runtime_slot = CASE WHEN $2 THEN COALESCE(runtime_slot, 'a') ELSE NULL END
           WHERE id = $1",
     )
     .bind(certificate_id)
+    .bind(directory == SELF_SIGNED_DIRECTORY)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(())
 }
 
-async fn nodes_missing_track_preload(
+async fn nodes_missing_self_signed_preload(
     tx: &mut Transaction<'_, Postgres>,
     label_id: &str,
-    track: CertificateTrack,
 ) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT cert_pem, key_pem_sealed, runtime_slot
            FROM certificates
           WHERE label_id = $1
-            AND (acme_directory = 'self-signed') = $2
+            AND acme_directory = 'self-signed'
             AND status IN ('serving', 'ready', 'compatible')
             AND cert_pem IS NOT NULL AND key_pem_sealed IS NOT NULL
           ORDER BY CASE status WHEN 'serving' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
                    runtime_slot NULLS LAST, id",
     )
     .bind(label_id)
-    .bind(track == CertificateTrack::SelfSigned)
     .fetch_all(&mut **tx)
     .await?;
     let mut slots: [Option<String>; 2] = [None, None];
@@ -1394,7 +1510,6 @@ async fn nodes_missing_track_preload(
     ];
     let members = sqlx::query(
         "SELECT m.node_id,
-                s.public_slot_a_sha256, s.public_slot_b_sha256,
                 s.self_signed_slot_a_sha256, s.self_signed_slot_b_sha256
            FROM node_cert_label m
            LEFT JOIN node_cert_state s ON s.node_id = m.node_id
@@ -1407,16 +1522,10 @@ async fn nodes_missing_track_preload(
     .await?;
     let mut missing = Vec::new();
     for row in members {
-        let observed = match track {
-            CertificateTrack::PublicCa => [
-                row.try_get::<Option<String>, _>("public_slot_a_sha256")?,
-                row.try_get::<Option<String>, _>("public_slot_b_sha256")?,
-            ],
-            CertificateTrack::SelfSigned => [
-                row.try_get::<Option<String>, _>("self_signed_slot_a_sha256")?,
-                row.try_get::<Option<String>, _>("self_signed_slot_b_sha256")?,
-            ],
-        };
+        let observed = [
+            row.try_get::<Option<String>, _>("self_signed_slot_a_sha256")?,
+            row.try_get::<Option<String>, _>("self_signed_slot_b_sha256")?,
+        ];
         if observed != expected.clone().map(Some) {
             missing.push(row.try_get("node_id")?);
         }
@@ -1474,7 +1583,7 @@ pub async fn certificates_due(
           WHERE l.status = 'active'
             AND NOT EXISTS (SELECT 1 FROM certificates c
                              WHERE c.label_id = l.id
-                               AND c.status IN ('pending', 'ready', 'serving', 'compatible'))",
+                               AND c.status IN ('pending', 'ready', 'serving', 'compatible', 'failed'))",
     )
     .fetch_all(pool)
     .await?;
@@ -1484,7 +1593,7 @@ pub async fn certificates_due(
         let certificate_name: Option<String> = row.try_get("certificate_name")?;
         sqlx::query(
             "INSERT INTO certificates (id, label_id, certificate_name, runtime_slot)
-             VALUES ($1, $2, $3, 'a')",
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(generate_id()?)
         .bind(&label_id)
@@ -1493,14 +1602,15 @@ pub async fn certificates_due(
                 .then_some(certificate_name)
                 .flatten(),
         )
+        .bind((directory == SELF_SIGNED_DIRECTORY).then_some("a"))
         .execute(pool)
         .await?;
     }
 
-    // A renewal is a new certificate, not new bytes written over the serving row. Keeping both
-    // rows is what lets clients trust the old and new leaves at the same time while machines pick
-    // up the replacement on their own schedules. Failed renewal rows retry in place; creating a
-    // fresh row for every scan would spend the CA's quota while evading the retry backoff.
+    // A renewal is a new database row rather than new bytes written over the serving row. Public
+    // CA promotes it on issue and atomically replaces one node file; self-signed reserves the
+    // other runtime slot for an explicit publication. Failed renewal rows retry in place; creating
+    // a fresh row for every scan would spend the CA's quota while evading the retry backoff.
     let renewals: Vec<String> = sqlx::query(
         "SELECT l.id
            FROM cert_labels l
@@ -1508,7 +1618,7 @@ pub async fn certificates_due(
            JOIN certificates serving
              ON serving.label_id = l.id AND serving.status = 'serving'
           WHERE l.status = 'active'
-            AND (d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
+            AND ($1 = 0 OR d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
             AND (serving.expires_at < now() + make_interval(days => d.renew_before_days)
                  OR serving.acme_directory IS DISTINCT FROM d.acme_directory)
             -- One self-signed standby is the whole compatibility budget. A third identity cannot
@@ -1525,6 +1635,7 @@ pub async fn certificates_due(
                    AND pending.status IN ('pending', 'ready', 'failed')
             )",
     )
+    .bind(retry_after_minutes)
     .fetch_all(pool)
     .await?
     .iter()
@@ -1547,11 +1658,15 @@ pub async fn certificates_due(
             .then(generate_synthetic_certificate_name)
             .transpose()?;
         let serving_slot: Option<String> = row.try_get("runtime_slot")?;
-        let runtime_slot = Some(if serving_slot.as_deref() == Some("a") {
-            "b"
+        let runtime_slot = if directory == SELF_SIGNED_DIRECTORY {
+            Some(if serving_slot.as_deref() == Some("a") {
+                "b"
+            } else {
+                "a"
+            })
         } else {
-            "a"
-        });
+            None
+        };
         sqlx::query(
             "INSERT INTO certificates
                  (id, label_id, origin, certificate_name, runtime_slot)
@@ -1575,7 +1690,7 @@ pub async fn certificates_due(
            JOIN cert_labels l ON l.id = c.label_id
            JOIN cert_domains d ON d.id = l.domain_id
           -- Public issuance needs a DNS credential to prove the name. Direct self-signing does not.
-          WHERE (d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
+          WHERE ($1 = 0 OR d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
             AND l.status = 'active'
             -- Fresh, manually requested and renewal rows all use one issuance path. A serving row
             -- is never selected here: the block above creates a separate renewal row for it.
@@ -1697,7 +1812,9 @@ pub async fn record_certificate(pool: &PgPool, issued: IssuedCertificate<'_>) ->
                 issued_at = now(), attempts = 0, last_error = NULL, last_attempt_at = now(),
                 status = $8,
                 runtime_slot = CASE
-                    WHEN $8 = 'serving' THEN COALESCE(runtime_slot, 'a')
+                    WHEN $8 = 'serving' AND $7 = 'self-signed'
+                    THEN COALESCE(runtime_slot, 'a')
+                    WHEN $7 <> 'self-signed' THEN NULL
                     ELSE runtime_slot
                 END
           WHERE id = $1",
@@ -1723,16 +1840,16 @@ pub async fn record_certificate(pool: &PgPool, issued: IssuedCertificate<'_>) ->
 pub async fn record_observation(
     pool: &PgPool,
     node_id: &str,
-    public_ca: &CertificatePairObservation,
+    public_ca_sha256: Option<&str>,
     self_signed: &CertificatePairObservation,
 ) -> Result<()> {
-    record_observation_at(pool, node_id, public_ca, self_signed, None).await
+    record_observation_at(pool, node_id, public_ca_sha256, self_signed, None).await
 }
 
 pub async fn record_observation_at(
     pool: &PgPool,
     node_id: &str,
-    public_ca: &CertificatePairObservation,
+    public_ca_sha256: Option<&str>,
     self_signed: &CertificatePairObservation,
     observed_at_unix_secs: Option<i64>,
 ) -> Result<()> {
@@ -1743,21 +1860,19 @@ pub async fn record_observation_at(
     }
     sqlx::query(
         "INSERT INTO node_cert_state
-             (node_id, observed_state, public_slot_a_sha256, public_slot_b_sha256,
+             (node_id, observed_state, public_ca_sha256,
               self_signed_slot_a_sha256, self_signed_slot_b_sha256, observed_at)
-         VALUES ($1, 'managed', $2, $3, $4, $5, COALESCE(to_timestamp($6), now()))
+         VALUES ($1, 'managed', $2, $3, $4, COALESCE(to_timestamp($5), now()))
          ON CONFLICT (node_id) DO UPDATE
             SET observed_state = EXCLUDED.observed_state,
-                public_slot_a_sha256 = EXCLUDED.public_slot_a_sha256,
-                public_slot_b_sha256 = EXCLUDED.public_slot_b_sha256,
+                public_ca_sha256 = EXCLUDED.public_ca_sha256,
                 self_signed_slot_a_sha256 = EXCLUDED.self_signed_slot_a_sha256,
                 self_signed_slot_b_sha256 = EXCLUDED.self_signed_slot_b_sha256,
                 observed_at = EXCLUDED.observed_at
           WHERE node_cert_state.observed_at <= EXCLUDED.observed_at",
     )
     .bind(node_id)
-    .bind(public_ca.slot_a_sha256.as_deref())
-    .bind(public_ca.slot_b_sha256.as_deref())
+    .bind(public_ca_sha256)
     .bind(self_signed.slot_a_sha256.as_deref())
     .bind(self_signed.slot_b_sha256.as_deref())
     .bind(observed_at_unix_secs.map(|at| at as f64))
@@ -1807,27 +1922,34 @@ pub async fn record_certificate_failure(
     Ok(())
 }
 
-/// Both independent certificate tracks a node should hold.
+/// Certificate material a node should hold.
 ///
-/// The currently serving identity and a signed standby are deliberately selected together. This
-/// lets an operator preload a different trust track before publishing it: public-CA and
-/// self-signed files converge independently instead of the current track hiding the next one.
+/// Public CA sends only the serving identity because same-name renewals are atomically replaced.
+/// Self-signed sends both fixed slots because different SNI and leaf pins need to overlap.
 pub async fn node_keys(pool: &PgPool, node_id: &str) -> Result<Vec<NodeCertificateMaterial>> {
+    let label: Option<String> = sqlx::query_scalar("SELECT label_id FROM node_cert_label WHERE node_id = $1")
+        .bind(node_id).fetch_optional(pool).await?;
+    keys_for_group(pool, label.as_deref()).await
+}
+
+async fn keys_for_group(pool: &PgPool, label_id: Option<&str>) -> Result<Vec<NodeCertificateMaterial>> {
     let rows = sqlx::query(
         "SELECT c.id, c.status, c.runtime_slot, c.certificate_name, c.acme_directory,
                 l.label, l.certificate_name AS group_certificate_name, d.domain,
                 c.cert_pem, c.key_pem_sealed
-           FROM node_cert_label m
-           JOIN cert_labels l ON l.id = m.label_id
+           FROM cert_labels l
            JOIN cert_domains d ON d.id = l.domain_id
            JOIN certificates c ON c.label_id = l.id
-          WHERE m.node_id = $1
-            AND c.status IN ('serving', 'ready', 'compatible')
+          WHERE l.id = $1
+            AND (
+                (c.acme_directory <> 'self-signed' AND c.status = 'serving') OR
+                (c.acme_directory = 'self-signed' AND c.status IN ('serving', 'ready', 'compatible'))
+            )
             AND c.cert_pem IS NOT NULL AND c.key_pem_sealed IS NOT NULL
           ORDER BY CASE c.status WHEN 'serving' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
                    c.runtime_slot NULLS LAST, c.id",
     )
-    .bind(node_id)
+    .bind(label_id)
     .fetch_all(pool)
     .await?;
     let mut tracks: BTreeMap<
@@ -1857,8 +1979,8 @@ pub async fn node_keys(pool: &PgPool, node_id: &str) -> Result<Vec<NodeCertifica
         let directory: String = row.try_get("acme_directory")?;
         let track = certificate_track(&directory);
         let (slots, fallback) = tracks.entry(track).or_insert(([None, None], None));
-        // Rows are ordered serving, ready, compatible, so the first usable identity is the right
-        // duplicate for a physically empty slot.
+        // Rows are ordered serving, ready, compatible, so the first self-signed identity is the
+        // right duplicate for a physically empty slot during bootstrap.
         fallback.get_or_insert_with(|| slot.clone());
         match row.try_get::<Option<String>, _>("runtime_slot")?.as_deref() {
             Some("a") => slots[0] = Some(slot),
@@ -1870,14 +1992,18 @@ pub async fn node_keys(pool: &PgPool, node_id: &str) -> Result<Vec<NodeCertifica
         .into_iter()
         .map(|(track, (mut slots, fallback))| {
             let fallback = fallback.ok_or_else(|| {
-                StoreError::InvalidData(format!("{node_id} 的证书轨没有可用证书"))
+                StoreError::InvalidData(format!("证书组 {} 的证书轨没有可用证书", label_id.unwrap_or_default()))
             })?;
-            Ok(NodeCertificateMaterial {
-                track,
-                slots: [
-                    slots[0].take().unwrap_or_else(|| fallback.clone()),
-                    slots[1].take().unwrap_or(fallback),
-                ],
+            Ok(match track {
+                CertificateTrack::PublicCa => NodeCertificateMaterial::PublicCa {
+                    certificate: fallback,
+                },
+                CertificateTrack::SelfSigned => NodeCertificateMaterial::SelfSigned {
+                    slots: [
+                        slots[0].take().unwrap_or_else(|| fallback.clone()),
+                        slots[1].take().unwrap_or(fallback),
+                    ],
+                },
             })
         })
         .collect()
@@ -1908,13 +2034,16 @@ pub async fn cert_delta_for_node(
     node_id: &str,
 ) -> Result<Vec<NodeCertificateMaterial>> {
     let materials = node_keys(pool, node_id).await?;
+    certificate_delta(pool, node_id, materials).await
+}
+
+async fn certificate_delta(pool: &PgPool, node_id: &str, materials: Vec<NodeCertificateMaterial>) -> Result<Vec<NodeCertificateMaterial>> {
     // Two kinds of absence are equivalent here: the node has never reported (no row), or it
     // explicitly reported that the certificate is absent (a row whose observed_sha256 is NULL).
     // Decode the nullable column first and then flatten the optional row; asking sqlx for String
     // makes the second, normal state fail as an unexpected NULL on every agent poll.
     let observed = sqlx::query(
-        "SELECT public_slot_a_sha256, public_slot_b_sha256,
-                self_signed_slot_a_sha256, self_signed_slot_b_sha256
+        "SELECT public_ca_sha256, self_signed_slot_a_sha256, self_signed_slot_b_sha256
            FROM node_cert_state WHERE node_id = $1",
     )
     .bind(node_id)
@@ -1922,23 +2051,30 @@ pub async fn cert_delta_for_node(
     .await?;
     let mut delta = Vec::new();
     for material in materials {
-        let desired = material.slots.each_ref().map(slot_bundle_sha256);
-        let current = if let Some(row) = &observed {
-            let slots = match material.track {
-                CertificateTrack::PublicCa => [
-                    row.try_get::<Option<String>, _>("public_slot_a_sha256")?,
-                    row.try_get::<Option<String>, _>("public_slot_b_sha256")?,
-                ],
-                CertificateTrack::SelfSigned => [
-                    row.try_get::<Option<String>, _>("self_signed_slot_a_sha256")?,
-                    row.try_get::<Option<String>, _>("self_signed_slot_b_sha256")?,
-                ],
-            };
-            Some(slots.map(|slot| slot.unwrap_or_default()))
-        } else {
-            None
+        let current = observed.as_ref();
+        let matches = match &material {
+            NodeCertificateMaterial::PublicCa { certificate } => {
+                current
+                    .map(|row| row.try_get::<Option<String>, _>("public_ca_sha256"))
+                    .transpose()?
+                    .flatten()
+                    .as_deref()
+                    == Some(slot_bundle_sha256(certificate).as_str())
+            }
+            NodeCertificateMaterial::SelfSigned { slots } => {
+                let desired = slots.each_ref().map(slot_bundle_sha256);
+                let current = current
+                    .map(|row| {
+                        Ok::<_, sqlx::Error>([
+                            row.try_get::<Option<String>, _>("self_signed_slot_a_sha256")?,
+                            row.try_get::<Option<String>, _>("self_signed_slot_b_sha256")?,
+                        ])
+                    })
+                    .transpose()?;
+                current.as_ref() == Some(&desired.map(Some))
+            }
         };
-        if current.as_ref() != Some(&desired) {
+        if !matches {
             delta.push(material);
         }
     }
@@ -2015,33 +2151,41 @@ mod tests {
     #[test]
     fn certificate_status_is_readable_only_by_admin_or_masked_roles() {
         assert!(require_certificate_status_reader(&AdminContext::system_admin("root")).is_ok());
-        assert!(require_certificate_status_reader(&AdminContext::new(
-            "reviewer",
-            AdminRole::Readonly,
-            Some("platform".to_owned()),
-        ))
-        .is_ok());
-        assert!(require_certificate_status_reader(&AdminContext::new(
-            "alice",
-            AdminRole::User,
-            Some("platform".to_owned()),
-        ))
-        .is_ok());
-        assert!(require_certificate_status_reader(&AdminContext::new(
-            "editor",
-            AdminRole::Editor,
-            Some("platform".to_owned()),
-        ))
-        .is_err());
+        assert!(
+            require_certificate_status_reader(&AdminContext::new(
+                "reviewer",
+                AdminRole::Readonly,
+                Some("platform".to_owned()),
+            ))
+            .is_ok()
+        );
+        assert!(
+            require_certificate_status_reader(&AdminContext::new(
+                "alice",
+                AdminRole::User,
+                Some("platform".to_owned()),
+            ))
+            .is_ok()
+        );
+        assert!(
+            require_certificate_status_reader(&AdminContext::new(
+                "editor",
+                AdminRole::Editor,
+                Some("platform".to_owned()),
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn a_label_is_lowercase_hex_and_not_the_same_twice() {
         let first = generate_label().unwrap();
         assert_eq!(first.len(), LABEL_BYTES * 2);
-        assert!(first
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
         assert_ne!(first, generate_label().unwrap());
     }
 
@@ -2051,4 +2195,41 @@ mod tests {
         // again. Both would create a second row for the same domain.
         assert_eq!(normalize_domain("  Example.NET.  "), "example.net");
     }
+}
+
+/// Certificate ownership follows the claimed configuration or the last successfully applied
+/// Xray configuration, never the current editable model. Same-group renewal remains live.
+pub(crate) async fn released_cert_delta(
+    pool: &PgPool,
+    node_id: &str,
+    deployment_id: Option<i64>,
+) -> Result<Vec<NodeCertificateMaterial>> {
+    let revision: Option<i64> = sqlx::query_scalar(
+        "SELECT d.revision_id FROM deployments d
+         JOIN deployment_targets t ON t.deployment_id = d.id
+         JOIN deployment_target_state s ON s.deployment_id = d.id AND s.node_id = t.node_id
+         JOIN node_lifecycle_state life ON life.node_id = t.node_id AND life.lifecycle_epoch = s.lifecycle_epoch
+         WHERE t.node_id = $1 AND d.kind = 'config'
+           AND s.desired_structure #>> '{xray,state}' = 'present'
+           AND (($2::bigint IS NOT NULL AND d.id = $2)
+                OR ($2::bigint IS NULL AND t.status = 'succeeded'))
+         ORDER BY d.id DESC LIMIT 1"
+    ).bind(node_id).bind(deployment_id).fetch_optional(pool).await?;
+    let Some(revision) = revision else { return Ok(Vec::new()); };
+    let snapshot = crate::materialize::load_immutable_snapshot(pool, revision as u64).await?;
+    let Some(node) = snapshot.nodes.iter().find(|node| node.id == node_id) else { return Ok(Vec::new()); };
+    let mut label = node.certificate_group_id.clone();
+    // Legacy immutable snapshots predate the group ID. Resolve their frozen SNI, never the
+    // machine's mutable association, so an unpublished move cannot leak through this fallback.
+    if label.is_none() {
+        if let Some(name) = &node.certificate_name {
+            label = sqlx::query_scalar(
+                "SELECT l.id FROM cert_labels l JOIN cert_domains d ON d.id = l.domain_id
+                 LEFT JOIN certificates c ON c.label_id = l.id
+                 WHERE COALESCE(c.certificate_name, l.certificate_name, l.label || '.' || d.domain) = $1
+                 ORDER BY l.id LIMIT 1"
+            ).bind(name).fetch_optional(pool).await?;
+        }
+    }
+    certificate_delta(pool, node_id, keys_for_group(pool, label.as_deref()).await?).await
 }

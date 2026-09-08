@@ -13,12 +13,12 @@ use brocade_core::{
         DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution,
         EgressDnsTransport, ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
-        ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn, HopPool, HopWire, Hysteria2,
-        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
-        IngressWires, IpFamily, ModelSettings, ModelSnapshot, Network, Node, NodeEgressDnsPolicy,
-        OverlaySettings, Reality, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
-        RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp,
-        XhttpMode, XhttpTuning, XhttpXmuxRange,
+        ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn, HopMux, HopPool, HopWire,
+        Hysteria2, HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
+        Ingress, IngressWires, IpFamily, ModelSettings, ModelSnapshot, Network, Node,
+        NodeEgressDnsPolicy, OverlaySettings, Reality, RealityClientPolicy, RealityFallbackLimits,
+        RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User,
+        WireGuardKeys, Xhttp, XhttpMode, XhttpTuning, XhttpXmuxRange,
     },
     physical::node::{project_node, reality_fallback_limits},
     Level,
@@ -33,6 +33,7 @@ fn a_pure_ingress_node_uses_its_assigned_self_signed_track() {
     hk.overlay = false;
     hk.certificate_name = Some("private-edge.example.com".to_owned());
     hk.certificate_track = Some(CertificateTrack::SelfSigned);
+    hk.certificate_group_id = Some("group-hk".to_owned());
     let doc = doc(vec![hk]);
     let mut face = ingress("i", "c", "hk");
     face.wires = IngressWires::Vless(Transport::VlessTls(Tls::default()));
@@ -59,6 +60,7 @@ fn a_pure_ingress_node_uses_its_assigned_self_signed_track() {
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 
     let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    assert_eq!(value["brocadeCertificateGroup"], "group-hk");
     let certificates = inbound(&value, "in:app/i")["streamSettings"]["tlsSettings"]["certificates"]
         .as_array()
         .unwrap();
@@ -613,6 +615,10 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
 fn node_certificate_reality_fallback_is_a_loopback_tls_403() {
     let mut hk = node("hk", [10, 66, 0, 1], true, Dns::System);
     hk.certificate_name = Some("cover.example.net".to_owned());
+    hk.certificate_names = vec![
+        "cover.example.net".to_owned(),
+        "saved-client.example.net".to_owned(),
+    ];
     let doc = doc(vec![hk]);
     let mut face = ingress("i", "c", "hk");
     let reality = face.wires.reality_mut().unwrap();
@@ -655,7 +661,8 @@ fn node_certificate_reality_fallback_is_a_loopback_tls_403() {
     );
     assert_eq!(
         reality["serverNames"],
-        serde_json::json!(["cover.example.net"])
+        serde_json::json!(["cover.example.net", "saved-client.example.net"]),
+        "the local REALITY cover must keep both certificate-slot SNIs valid"
     );
     assert!(
         reality["limitFallbackUpload"]["bytesPerSec"]
@@ -690,6 +697,23 @@ fn node_certificate_reality_fallback_is_a_loopback_tls_403() {
     );
     assert_ne!(cover_rule["outboundTag"], xray::INTERNAL_OUTBOUND_TAG);
     assert!(!value.to_string().contains("www.example.com"), "{value:#?}");
+
+    let mut switched = doc.clone();
+    switched.nodes[0].certificate_name = Some("saved-client.example.net".to_owned());
+    switched.nodes[0].certificate_names.reverse();
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&switched, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&switched, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let after = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    assert_eq!(
+        value, after,
+        "promoting a preloaded certificate must not change the server artifact"
+    );
 }
 
 /// REALITY hands every unauthenticated connection to `dest` — including one asking for a name
@@ -1601,6 +1625,7 @@ fn xray_reality_settings_include_global_client_policy() {
     let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
     doc.settings = ModelSettings {
         connection: Default::default(),
+        relay_mux: Default::default(),
         stats_user_online: false,
         reality_client: RealityClientPolicy {
             min_client_ver: Some("1.8.0".to_owned()),
@@ -1695,6 +1720,14 @@ fn the_connection_setting_reaches_the_hop_outbound() {
         (HopPool::Pool, Some(1)),
         (HopPool::Merge(8), Some(8)),
         (HopPool::Merge(128), Some(128)),
+        (HopPool::Mux(None), Some(1)),
+        (
+            HopPool::Mux(Some(HopMux {
+                concurrency: 8,
+                ..Default::default()
+            })),
+            Some(8),
+        ),
     ] {
         let doc = doc(vec![
             node("hk", [10, 66, 0, 1], true, Dns::System),
@@ -1741,6 +1774,20 @@ fn the_connection_setting_reaches_the_hop_outbound() {
             Some(concurrency) => {
                 assert_eq!(out["mux"]["enabled"], true, "{pool:?}");
                 assert_eq!(out["mux"]["concurrency"], concurrency, "{pool:?}");
+                if matches!(pool, HopPool::Mux(_)) {
+                    assert_eq!(out["mux"]["workerPool"]["minIdleWorkers"], 0, "{pool:?}");
+                    assert_eq!(out["mux"]["workerPool"]["maxIdleWorkers"], 2, "{pool:?}");
+                    assert_eq!(out["mux"]["workerPool"]["maxProbingWorkers"], 1, "{pool:?}");
+                    assert_eq!(out["mux"]["workerPool"]["probeIntervalSecs"], 5, "{pool:?}");
+                    assert_eq!(out["mux"]["workerPool"]["probeTimeoutMs"], 2000, "{pool:?}");
+                    assert_eq!(out["mux"]["workerPool"]["idleTtlSecs"], 24, "{pool:?}");
+                    assert_eq!(
+                        out["mux"]["workerPool"]["maxRequestsPerWorker"], 128,
+                        "{pool:?}"
+                    );
+                } else {
+                    assert!(out["mux"]["workerPool"].is_null(), "{pool:?}: {out:#?}");
+                }
             }
         }
 
@@ -1764,6 +1811,91 @@ fn the_connection_setting_reaches_the_hop_outbound() {
             "{pool:?}: subscriber listener must offer a bounded TFO backlog"
         );
     }
+}
+
+#[test]
+fn current_mux_resolves_global_defaults_without_leaking_them_into_overrides_or_disabled_hops() {
+    let render = |pool: HopPool, relay_mux: HopMux| {
+        let mut doc = doc(vec![
+            node("hk", [10, 66, 0, 1], true, Dns::System),
+            node("sg", [10, 66, 0, 2], true, Dns::System),
+        ]);
+        doc.settings.relay_mux = relay_mux;
+        let app = AppView {
+            id: "relay".to_owned(),
+            label: "中转".to_owned(),
+            chains: vec![chain("c-relay")],
+            ingresses: vec![ingress("i-relay", "c-relay", "hk")],
+            fronts: Vec::new(),
+            steps: vec![
+                step("c-relay", "hk", vec![forward_pool("sg", pool)], None),
+                step(
+                    "c-relay",
+                    "sg",
+                    vec![any_egress()],
+                    Some(accept("uuid-sg", "c-relay@sg")),
+                ),
+            ],
+            grants: Vec::new(),
+        };
+        let mut diagnostics = Vec::new();
+        let sys = compile_system(&doc, &mut diagnostics);
+        let ir = compile_hops(
+            compile_app(&doc, &app, &mut diagnostics),
+            &sys,
+            &mut diagnostics,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let value = parse_xray(&xray::build(&project_node(&sys, &[ir], "hk")));
+        outbound(&value, "out:relay/c-relay>sg").clone()
+    };
+
+    let global_four = HopMux {
+        concurrency: 4,
+        probe_interval_secs: 9,
+        ..Default::default()
+    };
+    let global_sixteen = HopMux {
+        concurrency: 16,
+        probe_interval_secs: 11,
+        ..Default::default()
+    };
+    let followed = render(HopPool::Mux(None), global_four);
+    assert_eq!(followed["mux"]["concurrency"], 4);
+    assert_eq!(followed["mux"]["workerPool"]["probeIntervalSecs"], 9);
+
+    let large_counts = HopMux {
+        min_idle_workers: u32::MAX,
+        max_idle_workers: u32::MAX,
+        max_probing_workers: u32::MAX,
+        max_requests_per_worker: u16::MAX,
+        idle_ttl_secs: 86_400,
+        ..Default::default()
+    };
+    for pool in [HopPool::Mux(None), HopPool::Mux(Some(large_counts))] {
+        let rendered = render(pool, large_counts);
+        assert_eq!(rendered["mux"]["workerPool"]["minIdleWorkers"], u32::MAX);
+        assert_eq!(rendered["mux"]["workerPool"]["maxIdleWorkers"], u32::MAX);
+        assert_eq!(rendered["mux"]["workerPool"]["maxProbingWorkers"], u32::MAX);
+        assert_eq!(rendered["mux"]["workerPool"]["maxRequestsPerWorker"], 65535);
+        assert_eq!(rendered["mux"]["workerPool"]["idleTtlSecs"], 86400);
+    }
+
+    let override_value = HopMux {
+        concurrency: 8,
+        probe_interval_secs: 7,
+        ..Default::default()
+    };
+    assert_eq!(
+        render(HopPool::Mux(Some(override_value)), global_four),
+        render(HopPool::Mux(Some(override_value)), global_sixteen),
+        "global changes must not alter an explicit per-edge override"
+    );
+    assert_eq!(
+        render(HopPool::None, global_four),
+        render(HopPool::None, global_sixteen),
+        "global changes must not alter a non-Mux outbound"
+    );
 }
 
 /// A relay hop speaking Shadowsocks 2022 renders as shadowsocks on both ends.
@@ -3312,6 +3444,8 @@ fn node(id: &str, overlay: [u8; 4], egress_allowed: bool, dns: Dns) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_names: Vec::new(),
+        certificate_group_id: None,
         certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),
@@ -3429,5 +3563,282 @@ fn forward_pool(to: &str, pool: HopPool) -> Rule {
             dial: HopDial::Overlay,
             pool,
         },
+    }
+}
+
+#[test]
+fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
+    use brocade_core::artifacts::subscription::{Subscription, SubscriptionExternalProxy};
+    use brocade_core::ir::validate::validate_app;
+    let encryption = format!("mlkem768x25519plus.native.1rtt.{}", "A".repeat(43));
+    for (protocol, security, name) in [
+        (
+            ExternalOutboundProtocol::Anytls {
+                credential: "anytls-password".to_owned(),
+            },
+            ExternalOutboundSecurity::Tls {
+                server_name: "edge.example.com".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            "anytls",
+        ),
+        (
+            ExternalOutboundProtocol::Vless {
+                credential: "2d2304da-f114-4574-8d44-625afdb1db5c".to_owned(),
+                encryption: encryption.clone(),
+                flow: None,
+                transport: ExternalVlessTransport::Raw,
+            },
+            ExternalOutboundSecurity::None,
+            "vless",
+        ),
+    ] {
+        let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
+        doc.external_outbounds = vec![ExternalOutbound {
+            id: "proxy".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "Proxy".to_owned(),
+            address: "edge.example.com".to_owned(),
+            port: 443,
+            protocol: protocol.clone(),
+            security: security.clone(),
+            bindings: vec![],
+        }];
+        let app = AppView {
+            id: "app".to_owned(),
+            label: "App".to_owned(),
+            chains: vec![chain("c")],
+            ingresses: vec![ingress("i", "c", "hk")],
+            fronts: vec![],
+            grants: vec![],
+            steps: vec![step(
+                "c",
+                "hk",
+                vec![Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::Proxy {
+                        outbound: "proxy".to_owned(),
+                    },
+                }],
+                None,
+            )],
+        };
+        let mut diagnostics = vec![];
+        let sys = compile_system(&doc, &mut diagnostics);
+        let ir = compile_app(&doc, &app, &mut diagnostics);
+        validate_app(&sys, &ir, &mut diagnostics);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code.starts_with("external-outbound.")),
+            "{diagnostics:?}"
+        );
+        let config = parse_xray(&xray::build(&project_node(&sys, &[ir], "hk")));
+        let proxy = outbound(&config, "out:external/proxy");
+        assert_eq!(proxy["protocol"], name);
+        assert_eq!(proxy["settings"]["address"], "edge.example.com");
+        if name == "anytls" {
+            assert_eq!(proxy["settings"]["password"], "anytls-password");
+            assert_eq!(proxy["streamSettings"]["security"], "tls");
+            assert_eq!(
+                proxy["streamSettings"]["tlsSettings"]["serverName"],
+                "edge.example.com"
+            );
+        } else {
+            assert_eq!(proxy["settings"]["encryption"], encryption);
+            assert_eq!(proxy["streamSettings"]["security"], "none");
+            assert!(proxy["streamSettings"].get("tlsSettings").is_none());
+        }
+        let subscription = Subscription {
+            tenant: "platform.acme".to_owned(),
+            user: "alice".to_owned(),
+            entries: vec![],
+            front_groups: vec![],
+            external_proxies: vec![SubscriptionExternalProxy {
+                name: "Proxy".to_owned(),
+                server: "edge.example.com".to_owned(),
+                port: 443,
+                protocol,
+                security,
+            }],
+        };
+        let yaml = brocade_core::format::yaml::clash_subscription(&subscription);
+        assert!(yaml.contains(&format!("type: {name}")), "{yaml}");
+        if name == "vless" {
+            assert!(yaml.contains(&encryption), "{yaml}");
+        } else {
+            assert!(yaml.contains("sni: edge.example.com"), "{yaml}");
+        }
+
+        // Check the generated outbound against the bundled executable when it is installed.
+        if let Some(binary) = std::env::var_os("BROCADE_XRAY_BIN") {
+            let path = std::env::temp_dir()
+                .join(format!("brocade-proxy-{}-{name}.json", std::process::id()));
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({ "outbounds": [proxy] })).unwrap(),
+            )
+            .unwrap();
+            let result = std::process::Command::new(binary)
+                .args(["run", "-test", "-config"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                result.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn vless_encryption_ingress_has_independent_listener_grants_routes_and_subscription() {
+    assert_encryption_ingress(Default::default());
+}
+
+#[test]
+fn vless_encryption_custom_options_reach_inbound_and_both_subscription_formats() {
+    use brocade_core::model::{
+        VlessEncryptionAppearance, VlessEncryptionClientMode, VlessEncryptionOptions,
+    };
+    for appearance in [
+        VlessEncryptionAppearance::Native,
+        VlessEncryptionAppearance::Xorpub,
+        VlessEncryptionAppearance::Random,
+    ] {
+        for client_mode in [
+            VlessEncryptionClientMode::ZeroRtt,
+            VlessEncryptionClientMode::OneRtt,
+        ] {
+            assert_encryption_ingress(VlessEncryptionOptions {
+                appearance,
+                client_mode,
+                ticket_lifetime: "100-500s".to_owned(),
+                server_padding: "100-35-100.75-0-10.50-0-200".to_owned(),
+                client_padding: "100-40-80".to_owned(),
+            });
+        }
+    }
+}
+
+fn assert_encryption_ingress(options: brocade_core::model::VlessEncryptionOptions) {
+    use brocade_core::artifacts::subscription;
+    use brocade_core::model::{IngressWiresWire, VlessEncryption};
+    use brocade_core::physical::user::project_user;
+    let private = "gM453ZKs-8Ahf4hPV2SVK1yf7XXC4NLV6V424ETpe2g";
+    let public = "EdUDF5q3f-LSCmqeYUT5AfA3EBJWUAdqzCPHji78pxY";
+    let doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
+    let mut face = ingress("i", "c", "hk");
+    face.wires = IngressWires::try_from(IngressWiresWire {
+        vless_encryption: Some(VlessEncryption {
+            options: options.clone(),
+            port: 48000,
+            private_key: private.to_owned(),
+            public_key: public.to_owned(),
+        }),
+        vless: face.wires.vless().cloned(),
+        anytls: None,
+        hysteria2: None,
+    })
+    .unwrap();
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "App".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: vec![],
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Egress { send_through: None },
+            }],
+            None,
+        )],
+        grants: vec![Grant {
+            tenant: "platform.acme".to_owned(),
+            user: "alice".to_owned(),
+            ingress: "i".to_owned(),
+        }],
+    };
+    let mut diagnostics = vec![];
+    let sys = compile_system(&doc, &mut diagnostics);
+    let ir = compile_app(&doc, &app, &mut diagnostics);
+    let plan = project_node(&sys, std::slice::from_ref(&ir), "hk");
+    let value = parse_xray(&xray::build(&plan));
+    let encrypted = inbound(&value, "in:app/i:vless-encryption");
+    assert_eq!(encrypted["port"], 48000);
+    assert_eq!(encrypted["protocol"], "vless");
+    assert_eq!(
+        encrypted["settings"]["decryption"],
+        format!("{}", options.decryption(private))
+    );
+    assert_eq!(encrypted["streamSettings"]["security"], "none");
+    assert_eq!(inbound(&value, "in:app/i")["port"], 443);
+    assert!(value["routing"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|rule| rule["inboundTag"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "in:app/i:vless-encryption"))));
+    let grant = plan
+        .grant_sync
+        .updates
+        .iter()
+        .find(|update| update.inbound_tag == "in:app/i:vless-encryption")
+        .unwrap();
+    assert!(grant
+        .clients
+        .iter()
+        .any(|client| client.uuid == "uuid-alice"));
+    assert!(grant.clients.iter().all(|client| client.flow.is_none()));
+    let sub = subscription::build(&project_user(&[ir], "platform.acme", "alice"));
+    let native = sub
+        .entries
+        .iter()
+        .find(|entry| entry.name.contains("VLESS Encryption"))
+        .unwrap();
+    assert_eq!(native.port, 48000);
+    assert_eq!(native.stream, subscription::SubscriptionStream::Tcp);
+    let yaml = brocade_core::format::yaml::clash_subscription(&sub);
+    assert!(yaml.contains(&options.encryption(public)));
+    assert!(!yaml.contains(private));
+    let uri = brocade_core::format::uri::subscription(&sub);
+    assert!(
+        uri.contains(&format!("encryption={}", options.encryption(public))),
+        "{uri}"
+    );
+    assert!(uri.contains("security=none"), "{uri}");
+    if let Some(binary) = std::env::var_os("BROCADE_XRAY_BIN") {
+        let file = std::env::temp_dir().join(format!(
+            "brocade-encryption-inbound-{}-{}-{}-{}.json",
+            std::process::id(),
+            options.appearance.as_str(),
+            options.client_mode.as_str(),
+            options.server_padding.len()
+        ));
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&serde_json::json!({"inbounds": [encrypted]})).unwrap(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(binary)
+            .args(["run", "-test", "-config"])
+            .arg(&file)
+            .output()
+            .unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

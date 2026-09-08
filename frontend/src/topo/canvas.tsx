@@ -503,7 +503,7 @@ export function TopoCanvas() {
           ))}
           <span className="sp" />
           <span className="note">
-            光点 = 当前有流量，移动快慢 = 速率 · 竖虚线 = 同一台入口机器 · 拖动平移，滚轮缩放
+            光点 = 当前有流量，移动快慢 = 速率 · 竖虚线 = 同一个入口节点 · 拖动平移，滚轮缩放
           </span>
         </div>
       </div>

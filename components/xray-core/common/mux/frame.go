@@ -26,6 +26,8 @@ const (
 const (
 	OptionData  bitmask.Byte = 0x01
 	OptionError bitmask.Byte = 0x02
+	OptionProbe bitmask.Byte = 0x04
+	OptionAck   bitmask.Byte = 0x08
 )
 
 type TargetNetwork byte
@@ -60,11 +62,21 @@ type FrameMetadata struct {
 	SessionID     uint16
 	Option        bitmask.Byte
 	SessionStatus SessionStatus
+	ProbeID       uint64
 	GlobalID      [8]byte
 	Inbound       *session.Inbound
 }
 
 func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
+	if f.Option.Has(OptionAck) && !f.Option.Has(OptionProbe) {
+		return errors.New("mux ACK option requires probe option")
+	}
+	if f.Option.Has(OptionProbe) {
+		if f.SessionStatus != SessionStatusKeepAlive || f.SessionID != 0 || (f.Option != OptionProbe && f.Option != OptionProbe|OptionAck) {
+			return errors.New("invalid mux probe metadata")
+		}
+	}
+
 	lenBytes := b.Extend(2)
 
 	len0 := b.Len()
@@ -73,6 +85,10 @@ func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
 
 	common.Must(b.WriteByte(byte(f.SessionStatus)))
 	common.Must(b.WriteByte(byte(f.Option)))
+	if f.Option.Has(OptionProbe) {
+		probeBytes := b.Extend(8)
+		binary.BigEndian.PutUint64(probeBytes, f.ProbeID)
+	}
 
 	if f.SessionStatus == SessionStatusNew {
 		switch f.Target.Network {
@@ -100,7 +116,7 @@ func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
 		} else if b.UDP != nil { // make sure it's user's proxy request
 			b.Write(f.GlobalID[:]) // no need to check whether it's empty
 		}
-	} else if b.UDP != nil {
+	} else if !f.Option.Has(OptionProbe) && b.UDP != nil {
 		b.WriteByte(byte(TargetNetworkUDP))
 		addrParser.WriteAddressPort(b, b.UDP.Address, b.UDP.Port)
 	}
@@ -112,6 +128,7 @@ func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
 
 // Unmarshal reads FrameMetadata from the given reader.
 func (f *FrameMetadata) Unmarshal(reader io.Reader, readSourceAndLocal bool) error {
+	*f = FrameMetadata{}
 	metaLen, err := serial.ReadUint16(reader)
 	if err != nil {
 		return err
@@ -140,6 +157,16 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer, readSourceAndLocal bo
 	f.SessionStatus = SessionStatus(b.Byte(2))
 	f.Option = bitmask.Byte(b.Byte(3))
 	f.Target.Network = net.Network_Unknown
+	if f.Option.Has(OptionAck) && !f.Option.Has(OptionProbe) {
+		return errors.New("mux ACK option requires probe option")
+	}
+	if f.Option.Has(OptionProbe) {
+		if f.SessionStatus != SessionStatusKeepAlive || f.SessionID != 0 || (f.Option != OptionProbe && f.Option != OptionProbe|OptionAck) || b.Len() != 12 {
+			return errors.New("invalid mux probe metadata")
+		}
+		f.ProbeID = binary.BigEndian.Uint64(b.Bytes()[4:12])
+		return nil
+	}
 
 	if f.SessionStatus == SessionStatusNew || (f.SessionStatus == SessionStatusKeep && b.Len() > 4 &&
 		TargetNetwork(b.Byte(4)) == TargetNetworkUDP) { // MUST check the flag first

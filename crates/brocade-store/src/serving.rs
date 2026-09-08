@@ -103,7 +103,8 @@ pub(crate) async fn load_subscription_serving_projection(
     };
 
     let isolated = isolated_nodes_from_json(row.try_get("isolated_node_ids")?)?;
-    let snapshot = crate::subscription_client::compose(topology, &permissions, &client.config)?;
+    let mut snapshot = crate::subscription_client::compose(topology, &permissions, &client.config)?;
+    crate::cert::overlay_serving_certificate_preferences(pool, &mut snapshot).await?;
     let snapshot = overlay_isolated_nodes(snapshot, &isolated);
 
     Ok(SubscriptionServingProjection {

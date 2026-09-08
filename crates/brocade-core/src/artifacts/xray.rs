@@ -30,18 +30,16 @@ use crate::{
 /// time holds its certificate elsewhere, and a TLS ingress on it fails at `xray -test` naming the
 /// path it could not open. That failure appears in the agent's report rather than leaving the
 /// ingress serving nothing.
-pub const NODE_PUBLIC_CA_CERTIFICATE_FILES: [&str; 2] = [
-    "/var/lib/brocade-agent/tls/public-ca/slot-a.pem",
-    "/var/lib/brocade-agent/tls/public-ca/slot-b.pem",
-];
+pub const NODE_PUBLIC_CA_CERTIFICATE_FILE: &str =
+    "/var/lib/brocade-agent/tls/public-ca/current.pem";
 pub const NODE_SELF_SIGNED_CERTIFICATE_FILES: [&str; 2] = [
     "/var/lib/brocade-agent/tls/self-signed/slot-a.pem",
     "/var/lib/brocade-agent/tls/self-signed/slot-b.pem",
 ];
-// Compatibility names for callers that only inspect the first public-CA slot. New code must use
-// the pair constants above; certificate and key intentionally share one combined PEM path.
-pub const NODE_CERTIFICATE_FILE: &str = NODE_PUBLIC_CA_CERTIFICATE_FILES[0];
-pub const NODE_CERTIFICATE_KEY_FILE: &str = NODE_PUBLIC_CA_CERTIFICATE_FILES[0];
+// Certificate and key intentionally share one combined PEM path so Xray never observes a
+// cross-generation pair during an atomic replacement.
+pub const NODE_CERTIFICATE_FILE: &str = NODE_PUBLIC_CA_CERTIFICATE_FILE;
+pub const NODE_CERTIFICATE_KEY_FILE: &str = NODE_PUBLIC_CA_CERTIFICATE_FILE;
 
 pub const API_TAG: &str = "api";
 pub const DNS_TAG: &str = "dns-out";
@@ -98,6 +96,7 @@ pub enum XrayArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayConfig {
+    pub certificate_group_id: Option<String>,
     pub log_level: String,
     pub api: XrayApi,
     pub policy: XrayPolicy,
@@ -241,9 +240,9 @@ pub enum XrayIngressSecurity {
     /// machine keeps its state is that machine's business, set at install time, and a compiler
     /// that had to know it would stop being a function of the model alone.
     Tls {
-        /// Two fixed paths configured from process start. Each path is one combined PEM containing
-        /// its certificate chain and private key, so an atomic rename cannot expose a mixed pair.
-        certificate_files: [String; 2],
+        /// Public CA has one current path; self-signed has two fixed overlap paths. Every path is
+        /// one combined PEM, so an atomic rename cannot expose a mixed certificate/key pair.
+        certificate_files: Vec<String>,
         /// `None` keeps xray's normal negotiation. The local HTTP-403 cover pins HTTP/1.1 because
         /// blackhole's built-in response is an HTTP/1.1 byte string, not an HTTP/2 frame.
         alpn: Option<Vec<String>>,
@@ -286,6 +285,7 @@ pub enum XrayInbound {
         address: String,
     },
     Vless {
+        decryption: Option<String>,
         tag: String,
         listen: String,
         port: u16,
@@ -540,6 +540,19 @@ pub enum XrayOutbound {
 pub struct XrayMux {
     /// Streams per connection. 1 pools without sharing; 2 and up share.
     pub concurrency: u16,
+    /// Absent only for historical `pool`/`merge` revisions, whose artifacts remain unchanged.
+    pub worker_pool: Option<XrayMuxWorkerPool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XrayMuxWorkerPool {
+    pub min_idle_workers: u32,
+    pub max_idle_workers: u32,
+    pub max_probing_workers: u32,
+    pub probe_interval_secs: u16,
+    pub probe_timeout_ms: u32,
+    pub idle_ttl_secs: u32,
+    pub max_requests_per_worker: u16,
 }
 
 /// One account on a shadowsocks relay port.
@@ -737,7 +750,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
     outbounds.extend(
         xray.forward_outbounds
             .iter()
-            .map(|outbound| forward_outbound(outbound, &bridge_tags)),
+            .map(|outbound| forward_outbound(outbound, &bridge_tags, xray.relay_mux)),
     );
     outbounds.extend(
         xray.egress_outbounds
@@ -775,7 +788,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
                 format!("{}:guard", ingress.tag),
                 params.server_names.clone(),
             )),
-            IngressSecurity::Tls => None,
+            IngressSecurity::Tls | IngressSecurity::None => None,
         })
         .collect::<Vec<_>>();
     if !guards.is_empty() {
@@ -952,6 +965,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
     stamp_rule_tags(&mut rules);
 
     XrayArtifact::Config(XrayConfig {
+        certificate_group_id: xray.certificate_group_id.clone(),
         log_level: "warning".to_owned(),
         api: XrayApi {
             tag: API_TAG.to_owned(),
@@ -1035,7 +1049,15 @@ fn ingress_security(
                 .map(|port| format!("127.0.0.1:{port}"))
                 .unwrap_or_else(|| normalize_host_port(&params.dest)),
             server_names: if ingress.cover_port.is_some() {
-                vec![ingress.certificate_name.clone().unwrap_or_default()]
+                let mut names = ingress.certificate_names.clone();
+                if let Some(serving) = ingress.certificate_name.as_ref() {
+                    names.push(serving.clone());
+                }
+                names.retain(|name| !name.trim().is_empty());
+                // 主备切换只改变订阅选用的 SNI，不改变服务端接受的名称集合。
+                names.sort();
+                names.dedup();
+                names
             } else {
                 params.server_names.clone()
             },
@@ -1049,6 +1071,7 @@ fn ingress_security(
                 &ingress.tag,
             ),
         },
+        IngressSecurity::None => XrayIngressSecurity::None,
         IngressSecurity::Tls => XrayIngressSecurity::Tls {
             certificate_files: certificate_files(certificate_track),
             // v26.4.25 does not add h3 on the server side. Without this the client offers only
@@ -1059,12 +1082,14 @@ fn ingress_security(
     }
 }
 
-fn certificate_files(track: CertificateTrack) -> [String; 2] {
-    let files = match track {
-        CertificateTrack::PublicCa => NODE_PUBLIC_CA_CERTIFICATE_FILES,
-        CertificateTrack::SelfSigned => NODE_SELF_SIGNED_CERTIFICATE_FILES,
-    };
-    files.map(str::to_owned)
+fn certificate_files(track: CertificateTrack) -> Vec<String> {
+    match track {
+        CertificateTrack::PublicCa => vec![NODE_PUBLIC_CA_CERTIFICATE_FILE.to_owned()],
+        CertificateTrack::SelfSigned => NODE_SELF_SIGNED_CERTIFICATE_FILES
+            .iter()
+            .map(|file| (*file).to_owned())
+            .collect(),
+    }
 }
 
 fn ingress_inbounds(
@@ -1090,6 +1115,7 @@ fn ingress_inbounds(
                         security: ingress_security(ingress, policy, certificate_track),
                     },
                     XrayInbound::Vless {
+                        decryption: None,
                         tag: ingress.tag.clone(),
                         listen: "127.0.0.1".to_owned(),
                         port: split.core_port,
@@ -1121,7 +1147,7 @@ fn ingress_inbounds(
         // Only reachable from the REALITY security block above, whose dest was pointed here.
         let dest = match &ingress.security {
             IngressSecurity::Reality { params, .. } => params.dest.as_str(),
-            IngressSecurity::Tls => "",
+            IngressSecurity::Tls | IngressSecurity::None => "",
         };
         let (target_address, target_port) = split_host_port(dest);
         inbounds.push(XrayInbound::RealityGuard {
@@ -1155,7 +1181,14 @@ fn ingress_inbound(
     certificate_track: CertificateTrack,
 ) -> XrayInbound {
     match &ingress.protocol {
-        IngressProtocol::Vless => XrayInbound::Vless {
+        IngressProtocol::Vless | IngressProtocol::VlessEncryption { .. } => XrayInbound::Vless {
+            decryption: match &ingress.protocol {
+                IngressProtocol::VlessEncryption {
+                    private_key,
+                    options,
+                } => Some(options.decryption(private_key)),
+                _ => None,
+            },
             tag: ingress.tag.clone(),
             listen: ingress.listen.to_string(),
             port: ingress.port,
@@ -1274,8 +1307,9 @@ fn client(client: &XrayClientPlan, reverse_tag: Option<String>) -> XrayClient {
 fn forward_outbound(
     outbound: &XrayForwardOutboundPlan,
     bridge_tags: &BTreeMap<&str, &str>,
+    relay_mux: crate::model::HopMux,
 ) -> XrayOutbound {
-    let mux = mux_of(outbound.pool);
+    let mux = mux_of(outbound.pool, relay_mux);
     // Same shape as `hop_inbound`, for the same reason.
     let vless = |security| XrayOutbound::Vless {
         tag: outbound.tag.clone(),
@@ -1335,11 +1369,32 @@ fn forward_outbound(
 /// this mapping is retained for authored-model compatibility but is no longer the console's
 /// default; silently changing an existing `Pool` to no mux or concurrency 2 would change its
 /// requested semantics.
-fn mux_of(pool: HopPool) -> Option<XrayMux> {
+fn mux_of(pool: HopPool, relay_mux: crate::model::HopMux) -> Option<XrayMux> {
     match pool {
         HopPool::None => None,
-        HopPool::Pool => Some(XrayMux { concurrency: 1 }),
-        HopPool::Merge(concurrency) => Some(XrayMux { concurrency }),
+        HopPool::Pool => Some(XrayMux {
+            concurrency: 1,
+            worker_pool: None,
+        }),
+        HopPool::Merge(concurrency) => Some(XrayMux {
+            concurrency,
+            worker_pool: None,
+        }),
+        HopPool::Mux(value) => {
+            let value = value.unwrap_or(relay_mux);
+            Some(XrayMux {
+                concurrency: value.concurrency,
+                worker_pool: Some(XrayMuxWorkerPool {
+                    min_idle_workers: value.min_idle_workers,
+                    max_idle_workers: value.max_idle_workers,
+                    max_probing_workers: value.max_probing_workers,
+                    probe_interval_secs: value.probe_interval_secs,
+                    probe_timeout_ms: value.probe_timeout_ms,
+                    idle_ttl_secs: value.idle_ttl_secs,
+                    max_requests_per_worker: value.max_requests_per_worker,
+                }),
+            })
+        }
     }
 }
 
@@ -1617,6 +1672,65 @@ fn put_never(condition: &mut XrayMatchCondition) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ca_has_one_runtime_file_while_self_signed_has_two() {
+        assert_eq!(
+            certificate_files(CertificateTrack::PublicCa),
+            vec![NODE_PUBLIC_CA_CERTIFICATE_FILE.to_owned()]
+        );
+        assert_eq!(
+            certificate_files(CertificateTrack::SelfSigned),
+            NODE_SELF_SIGNED_CERTIFICATE_FILES.map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn switching_the_preferred_certificate_name_does_not_change_reality_server_config() {
+        let ingress = |preferred: &str, names: &[&str]| XrayIngressPlan {
+            id: "ing-cert".to_owned(),
+            tag: "in:cert".to_owned(),
+            listen: "0.0.0.0".parse().unwrap(),
+            port: 14443,
+            sniff: false,
+            protocol: IngressProtocol::Vless,
+            security: IngressSecurity::Reality {
+                params: crate::model::RealitySettings {
+                    dest: "unused.example:443".to_owned(),
+                    server_names: vec!["unused.example".to_owned()],
+                    fingerprint: "chrome".to_owned(),
+                    flow: None,
+                    fallback_mode: crate::model::RealityFallbackMode::NodeCertificate,
+                    fallback_limits: crate::model::RealityFallbackLimits::Off,
+                    fallback_guard: true,
+                },
+                private_key: "private-key".to_owned(),
+                short_ids: vec!["0123456789abcdef".to_owned()],
+            },
+            certificate_name: Some(preferred.to_owned()),
+            certificate_names: names.iter().map(|name| (*name).to_owned()).collect(),
+            xhttp: None,
+            split: None,
+            cover_port: Some(29443),
+            guard_port: None,
+        };
+        let policy = RealityClientPolicy::default();
+        let before = ingress_security(
+            &ingress("slot-a.example", &["slot-a.example", "slot-b.example"]),
+            &policy,
+            CertificateTrack::SelfSigned,
+        );
+        let after = ingress_security(
+            &ingress("slot-b.example", &["slot-b.example", "slot-a.example"]),
+            &policy,
+            CertificateTrack::SelfSigned,
+        );
+
+        assert_eq!(
+            before, after,
+            "主备切换只能改变客户端默认 SNI，不能改变 Xray 产物"
+        );
+    }
 
     fn rule(inbound: &str, outbound: &str) -> XrayRoutingRule {
         XrayRoutingRule {

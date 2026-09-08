@@ -17,6 +17,9 @@
 // * 每条操作有一个 `key`（如 `put_step:app-main/c-lan/cn-edge`）。再次修改同一目标时替换
 // * 原有记录而非追加。否则改动条数会随操作次数增长，而回放结果完全相同。
 
+import { afterSubmission, DraftStorage, type DraftBatch, type DraftBranch } from './draft-storage';
+import { randomKey } from './ui/platform';
+
 import type {
   CreateRealityIngress,
   DestMatch,
@@ -39,6 +42,7 @@ export type ModelOp =
   | { op: 'reorder_apps'; ids: string[] }
   | { op: 'reorder_chains'; app_id: string; ids: string[] }
   | { op: 'upsert_external_outbound'; outbound: ExternalOutboundWrite }
+  | { op: 'delete_external_outbound'; tenant_id: string; id: string }
   | {
       op: 'create_chain';
       app_id: string;
@@ -147,11 +151,13 @@ export type ModelOp =
         wg_transport?: { t: 'udp' } | { t: 'fake_tcp'; v: { port: number } };
       };
     }
+  | { op: 'set_node_cert_group'; node_id: string; label_id: string | null }
   | { op: 'update_node_status'; node_id: string; status: { status: string } }
   | { op: 'set_wireguard_link_disabled'; a: string; b: string; disabled: boolean }
   | { op: 'update_settings'; settings: ModelSettings };
 
 export interface DraftEntry {
+  editId?: string;
   /* 同一目标的重复编辑依据它合并 */
   key: string;
   label: string;
@@ -233,10 +239,12 @@ function entryOf(op: ModelOp): DraftEntry {
         label: `调整链顺序 ${op.app_id}`,
         op,
       };
+    case 'delete_external_outbound':
+      return { key: `external-outbound:${op.tenant_id}/${op.id}`, label: `删除代理出站 ${op.id}`, op };
     case 'upsert_external_outbound':
       return {
         key: `external-outbound:${op.outbound.tenant_id}/${op.outbound.id}`,
-        label: `隧道 ${op.outbound.name || op.outbound.id}`,
+        label: `代理出站 ${op.outbound.name || op.outbound.id}`,
         op,
       };
     case 'upsert_front':
@@ -304,7 +312,7 @@ function entryOf(op: ModelOp): DraftEntry {
         op,
       };
     case 'create_tenant':
-      return { key: `tenant:${op.tenant.id}`, label: `租户 ${op.tenant.id}`, op };
+      return { key: `tenant:${op.tenant.id}`, label: '系统归属变更', op };
     case 'create_user':
       return { key: `user:${op.user.tenant_id}/${op.user.id}`, label: `用户 ${op.user.id}`, op };
     case 'rotate_user_uuid':
@@ -321,6 +329,8 @@ function entryOf(op: ModelOp): DraftEntry {
       };
     case 'update_node':
       return { key: `node:${op.node_id}`, label: `机器 ${op.node_id}`, op };
+    case 'set_node_cert_group':
+      return { key: `node-cert-group:${op.node_id}`, label: `机器证书组 ${op.node_id}`, op };
     case 'update_node_status':
       return {
         key: `node-status:${op.node_id}`,
@@ -348,10 +358,32 @@ function canonicalDnsSelector(selector: DestMatch): DestMatch {
   return selector;
 }
 
-class DraftStore {
+export class DraftStore {
   private entries: DraftEntry[] = [];
   private listeners = new Set<() => void>();
-  private storageKey: string | null = null;
+  private owner: string | null = null;
+  private storage: DraftStorage | null = null;
+  private branches: DraftBranch[] = [];
+  private conflictSnapshot: readonly DraftBranch[] = [];
+  private persistenceError: string | null = null;
+  private unpersisted = false;
+  private pendingReceipts: DraftBatch[] = [];
+  private submitting = false;
+
+  constructor() {
+    if (typeof window !== 'undefined') window.addEventListener('storage', this.onStorage);
+  }
+  dispose = () => {
+    if (typeof window !== 'undefined') window.removeEventListener('storage', this.onStorage);
+  };
+  private onStorage = (event: StorageEvent) => {
+    if (event.key === null || event.key?.startsWith(this.storage?.prefix ?? '\0')) this.sync();
+  };
+  conflicts = () => this.conflictSnapshot;
+  storageError = () => this.persistenceError;
+  isSubmitting = () => this.submitting;
+  ownsBatch = (batch: DraftBatch) => batch.owner === this.owner;
+
   // 快照需要保持稳定引用：useSyncExternalStore 每次接收到新数组都会判定为已变更，
   // 导致持续重渲染。只有实际发生修改时才创建新数组。
   private snap: readonly DraftEntry[] = [];
@@ -369,34 +401,147 @@ class DraftStore {
 
   version = (): number => this.ver;
 
-  /* 按操作者分键恢复。切换用户时重新开始——草稿表示该用户未提交的内容，随用户区分。 */
+  /* Restore and share the operator's draft. Concurrent branch heads are never overwritten. */
   init(operator: string) {
-    // v2 is an intentional hard boundary: v1 drafts can contain chain/ingress IDs replaced by the
-    // grouped model-ID migration. Replaying one after that migration could target a different object
-    // graph, so it is safer to start a clean draft than to guess an old-to-new mapping in the
-    // browser. App slugs stay unchanged; server-side tombstones protect the two migrated kinds.
-    const key = `brocade-console:draft:v2:${operator}`;
-    if (this.storageKey === key) return;
-    this.storageKey = key;
+    if (this.owner === operator) return;
+    this.owner = operator;
     this.entries = [];
+    this.branches = [];
+    this.conflictSnapshot = [];
+    this.persistenceError = null;
+    this.unpersisted = false;
     try {
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        // The former arrow-button UI stored one `swap_*` entry per click. A complete final order
-        // cannot be reconstructed from those pairs without the old base snapshot, so retain every
-        // unrelated edit and discard only these obsolete ordering operations during the upgrade.
-        const restored = JSON.parse(raw) as { op?: { op?: unknown } }[];
-        this.entries = restored.filter(
-          entry => entry.op?.op !== 'swap_apps' && entry.op?.op !== 'swap_chains',
-        ) as DraftEntry[];
-      }
+      this.storage = new DraftStorage(operator, localStorage);
+      this.sync();
     } catch {
-      /* 存储的草稿数据损坏时重新开始，优于整个页面无法打开 */
+      this.storage = null;
+      this.persistenceError = '浏览器无法保存草稿，刷新或关闭页面可能丢失修改。';
     }
+    this.emit();
+  }
+
+  private sync() {
+    // A failed write still belongs to the local editor. A remote refresh must not erase it;
+    // retrying writes from the old parents will preserve the remote branch as a conflict.
+    if (!this.storage || this.unpersisted) return;
+    try {
+      const branches = this.storage.read().map(branch => ({
+        ...branch,
+        entries: this.pendingReceipts
+          .filter(batch => this.ownsBatch(batch))
+          .reduce((entries, batch) => afterSubmission(entries, batch.entries), branch.entries),
+      }));
+      if (JSON.stringify(branches) === JSON.stringify(this.branches)) return;
+      this.branches = branches;
+      this.conflictSnapshot = branches.some(
+        branch => JSON.stringify(branch.entries) !== JSON.stringify(branches[0].entries),
+      )
+        ? branches
+        : [];
+      if (!this.conflictSnapshot.length) this.entries = branches[0]?.entries ?? [];
+      this.emit();
+    } catch {
+      this.persistenceError = '草稿读取失败，请保留当前页面后重试。';
+      this.emit();
+    }
+  }
+
+  private prepare() {
+    this.flushReceipts();
+    this.sync();
+    if (this.conflictSnapshot.length) throw new Error('其他标签页同时修改了草稿，请先选择要保留的版本。');
+  }
+
+  private flushReceipts() {
+    while (this.pendingReceipts.length) {
+      const batch = this.pendingReceipts[0];
+      const storage = this.ownsBatch(batch)
+        ? this.storage
+        : batch.owner
+          ? new DraftStorage(batch.owner, localStorage)
+          : null;
+      try {
+        storage?.acknowledge(batch.entries);
+      } catch {
+        throw new Error('提交已成功，但浏览器尚未保存提交记录；请保留此页面并重试保存记录。');
+      }
+      this.pendingReceipts.shift();
+    }
+  }
+
+  retryPersistence() {
+    if (!this.storage && this.owner) {
+      this.storage = new DraftStorage(this.owner, localStorage);
+      const branches = this.storage.read();
+      // A fresh empty draft can be replaced; existing edits from another tab must survive.
+      this.branches = branches.every(branch => branch.entries.length === 0) ? branches : [];
+      this.unpersisted = true;
+    }
+    this.flushReceipts();
+    this.persistenceError = null;
+    if (this.unpersisted) this.commit();
+    else {
+      this.sync();
+      this.emit();
+    }
+  }
+
+  resolveConflict(id: string) {
+    this.sync();
+    const branch = this.branches.find(item => item.id === id);
+    if (!branch) throw new Error('草稿版本已更新，请重新选择。');
+    this.entries = branch.entries;
     this.commit();
   }
 
+  beginSubmission(): DraftBatch {
+    const reviewed = JSON.stringify(this.entries);
+    this.prepare();
+    if (JSON.stringify(this.entries) !== reviewed) throw new Error('草稿已由其他标签页更新，请查看最新内容后再提交。');
+    if (this.submitting) throw new Error('草稿正在提交，请等待完成。');
+    this.submitting = true;
+    this.emit();
+    return { owner: this.owner, entries: [...this.entries] };
+  }
+
+  finishSubmission(batch: DraftBatch, succeeded: boolean) {
+    try {
+      if (!succeeded) return;
+      // The operator may have changed while the request was pending.
+      const storage =
+        batch.owner === this.owner ? this.storage : batch.owner ? new DraftStorage(batch.owner, localStorage) : null;
+      if (storage) {
+        try {
+          storage.acknowledge(batch.entries);
+        } catch {
+          this.pendingReceipts.push(batch);
+          this.persistenceError = '提交已成功，但浏览器尚未保存提交记录；请保留此页面并重试保存记录。';
+        }
+      }
+      if (batch.owner === this.owner) {
+        this.entries = afterSubmission(this.entries, batch.entries);
+        this.sync();
+      }
+    } finally {
+      this.submitting = false;
+      this.emit();
+    }
+  }
+
   push(op: ModelOp) {
+    const baseEntries = this.entries;
+    const baseBranches = this.branches;
+    const key = entryOf(op).key;
+    this.prepare();
+    // The caller constructed this operation from the last displayed draft. If the same target
+    // changed before its storage event arrived, rebasing here would silently overwrite that edit
+    // (notably a whole update_settings body). Keep both branches instead. Disjoint targets merge.
+    if (
+      baseEntries.find(entry => entry.key === key)?.editId !== this.entries.find(entry => entry.key === key)?.editId
+    ) {
+      this.entries = baseEntries;
+      this.branches = baseBranches;
+    }
     let entry = entryOf(op);
     const at = this.entries.findIndex(e => e.key === entry.key);
     // Editing an object created earlier in the same draft must retain create-only collision
@@ -419,8 +564,10 @@ class DraftStore {
         node: { ...previous.node, ...op.node },
       });
     }
+    entry = { ...entry, editId: randomKey() };
     if (
       at >= 0 &&
+      op.op !== 'delete_external_outbound' &&
       op.op !== 'prune_chain' &&
       op.op !== 'reorder_node_egress_dns' &&
       op.op !== 'reorder_apps' &&
@@ -453,12 +600,16 @@ class DraftStore {
   }
 
   drop(key: string) {
-    this.entries = this.entries.filter(e => e.key !== key);
+    const shown = this.entries.find(entry => entry.key === key);
+    this.prepare();
+    this.entries = this.entries.filter(e => e.key !== key || e.editId !== shown?.editId);
     this.commit();
   }
 
   clear() {
-    this.entries = [];
+    const shown = new Set(this.entries.map(entry => entry.editId));
+    this.prepare();
+    this.entries = this.entries.filter(entry => !shown.has(entry.editId));
     this.commit();
   }
 
@@ -471,13 +622,24 @@ class DraftStore {
   }
 
   private commit() {
-    if (this.storageKey) {
+    if (this.storage) {
       try {
-        localStorage.setItem(this.storageKey, JSON.stringify(this.entries));
+        this.storage.write(
+          this.entries,
+          this.branches.map(branch => branch.id),
+        );
+        this.unpersisted = false;
+        this.persistenceError = null;
+        this.sync();
       } catch {
-        /* 写入失败时不做处理，草稿丢失不影响已提交的内容 */
+        this.unpersisted = true;
+        this.persistenceError = '草稿尚未保存到浏览器，刷新或关闭页面可能丢失修改。';
       }
     }
+    this.emit();
+  }
+
+  private emit() {
     this.ver += 1;
     this.snap = [...this.entries];
     for (const listener of this.listeners) listener();

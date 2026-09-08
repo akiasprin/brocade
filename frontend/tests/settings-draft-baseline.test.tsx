@@ -8,7 +8,7 @@
  * 取数路径必须是真的：stub 的是 `fetch`，不是预置 `setQueryData`。 */
 import { useEffect, useState } from 'react';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CertsView } from '../src/api';
 
@@ -49,7 +49,7 @@ const committedSettings = () => ({
     flow: 'xtls-rprx-vision',
   },
   overlay: { keepalive_secs: 25, mtu: 1420, disabled_links: [] },
-  ports: { ingress_base: 8443, anytls_base: 18443, hop_base: 20000, hy2_base: 30000 },
+  ports: { ingress_base: 13443, anytls_base: 14443, hop_base: 20000, hy2_base: 30000 },
   probe: { endpoint_url: 'http://cp.cloudflare.com/cdn-cgi/trace', timeout_secs: 10, interval_secs: 60 },
   geodata: { cron: 'CRON_TZ=Asia/Shanghai 30 6 * * *', geoip_url: 'https://geoip', geosite_url: 'https://geosite' },
   connection: {
@@ -58,6 +58,16 @@ const committedSettings = () => ({
     downlink_only_secs: 5,
     buffer_size_kb: null,
     handshake_secs: 60,
+  },
+  relay_mux: {
+    concurrency: 1,
+    min_idle_workers: 0,
+    max_idle_workers: 2,
+    max_probing_workers: 1,
+    probe_interval_secs: 5,
+    probe_timeout_ms: 2000,
+    idle_ttl_secs: 24,
+    max_requests_per_worker: 128,
   },
   anytls_padding_scheme: ['stop=4'],
   stats_user_online: false,
@@ -100,6 +110,7 @@ const certsWithGroup = (): CertsView => ({
       domain: 'private.example',
       label: 'a1b2c3d4',
       name: 'CA-1',
+      signing_method: 'self-signed',
       is_default: false,
       note: null,
       status: 'active',
@@ -112,6 +123,21 @@ const certsWithGroup = (): CertsView => ({
   letsencrypt: 'https://acme',
   letsencrypt_staging: 'https://acme-staging',
 });
+
+const publicCaCertsWithGroup = (): CertsView => {
+  const view = certsWithGroup();
+  view.domain = {
+    ...view.domain!,
+    domain: 'example.com',
+    acme_directory: 'https://acme',
+    signing_method: 'public-ca',
+    has_credential: true,
+    has_account: true,
+  };
+  view.groups[0].domain = 'example.com';
+  view.groups[0].signing_method = 'public-ca';
+  return view;
+};
 
 function stubFetch() {
   vi.stubGlobal(
@@ -162,6 +188,12 @@ const section = (id: string) => {
   return within(section);
 };
 
+const fieldInput = (scope: ReturnType<typeof section>, label: string) => {
+  const input = scope.getByText(label).closest('.setfld')?.querySelector('input');
+  if (!(input instanceof HTMLInputElement)) throw new Error(`没有找到字段 ${label}`);
+  return input;
+};
+
 const settingsOp = () => draft.ops().find(op => op.op === 'update_settings');
 
 beforeEach(() => {
@@ -209,6 +241,30 @@ describe('设置页分段保存的基准', () => {
     }
   });
 
+  it('端口基线明确区分 VLESS 与 AnyTLS', async () => {
+    render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+
+    const ports = section('set-ports');
+    expect(await ports.findByText('VLESS · TLS / REALITY')).toBeTruthy();
+    expect((ports.getByDisplayValue('13443') as HTMLInputElement).value).toBe('13443');
+    expect((ports.getByDisplayValue('14443') as HTMLInputElement).value).toBe('14443');
+    expect(ports.queryByText('接入面')).toBeNull();
+    expect(ports.getByText('仅影响新建')).toBeTruthy();
+    expect(ports.queryByText('需要发布')).toBeNull();
+  });
+
+  it('VLESS Encryption 起始端口默认 48000，允许保存自定义起点', async () => {
+    render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+    const ports = section('set-ports');
+    const input = ports.getByRole('spinbutton', { name: 'VLESS · Encryption 起始端口' });
+    expect((input as HTMLInputElement).value).toBe('48000');
+    fireEvent.change(input, { target: { value: '49000' } });
+    fireEvent.click(ports.getByText('保存这一段'));
+    await waitFor(() => expect(settingsOp()).toMatchObject({ settings: { ports: { vless_encryption_base: 49000 } } }));
+  });
+
   it('保存动作默认隐藏，有改动后才出现在卡片底部', async () => {
     render(<Harness />);
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
@@ -221,24 +277,102 @@ describe('设置页分段保存的基准', () => {
     expect(xray.lastElementChild?.classList.contains('settings-savebar')).toBe(true);
   });
 
+  it('中继 Mux 默认收起，收起不丢输入，保存整组参数', async () => {
+    render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+
+    const connection = section('set-conn');
+    expect(connection.queryByText('复用流数量')).toBeNull();
+    expect(connection.getByText(/\u590d用流 1 · 空闲 0–2/)).toBeTruthy();
+
+    fireEvent.click(connection.getByRole('button', { name: '配置' }));
+    const concurrency = fieldInput(connection, '复用流数量');
+    fireEvent.change(concurrency, { target: { value: '8' } });
+    expect(connection.getByText(/\u590d用流 8 · 空闲 0–2/)).toBeTruthy();
+
+    fireEvent.click(connection.getByRole('button', { name: '收起' }));
+    expect(connection.queryByText('复用流数量')).toBeNull();
+    fireEvent.click(connection.getByRole('button', { name: '配置' }));
+    expect(fieldInput(connection, '复用流数量').value).toBe('8');
+
+    fireEvent.click(connection.getByRole('button', { name: '保存这一段' }));
+    await waitFor(() =>
+      expect(settingsOp()).toMatchObject({
+        settings: { relay_mux: { concurrency: 8, min_idle_workers: 0, max_idle_workers: 2 } },
+      }),
+    );
+  });
+
+  it('中继 Mux 的交叉约束会禁用保存，只读角色仍可展开查看', async () => {
+    const editableView = render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+    let connection = section('set-conn');
+    fireEvent.click(connection.getByRole('button', { name: '配置' }));
+    const idleInputs = connection.getByText('空闲连接').closest('.setfld')?.querySelectorAll('input');
+    if (!idleInputs || idleInputs.length !== 2) throw new Error('没有找到空闲连接上下限');
+    fireEvent.change(idleInputs[1], { target: { value: '1' } });
+    fireEvent.change(idleInputs[0], { target: { value: '2' } });
+    expect(connection.getByText('最小空闲连接不能大于最大空闲连接')).toBeTruthy();
+    expect((connection.getByRole('button', { name: '保存这一段' }) as HTMLButtonElement).disabled).toBe(true);
+
+    editableView.unmount();
+    render(<Harness role="editor" />);
+    await screen.findByPlaceholderText('example.com:443');
+    connection = section('set-conn');
+    fireEvent.click(connection.getByRole('button', { name: '查看' }));
+    expect(connection.getByText('复用流数量')).toBeTruthy();
+    // 外层 fieldset 统一控制只读态，后代 input 不会自动获得 disabled
+    // attribute，但在浏览器的有效禁用状态中会匹配 :disabled。
+    expect(fieldInput(connection, '复用流数量').matches(':disabled')).toBe(true);
+  });
+
+  it('立即签发等待完成并显示结果，申领设置与证书记录分开', async () => {
+    const full = certsWithGroup();
+    let complete!: (response: Response) => void;
+    const response = new Promise<Response>(resolve => {
+      complete = resolve;
+    });
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/certs/scan' && init?.method === 'POST') return response;
+      const body = path === '/certs' ? () => full : ROUTES[path];
+      if (!body) throw new Error(`未预期的请求：${path}`);
+      return Response.json(body());
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<Harness />);
+    const process = await screen.findByRole('button', { name: '立即签发与续期' });
+    const settingsTitle = screen.getByText('新证书申领设置');
+    expect(settingsTitle.closest('details')?.open).toBe(false);
+    expect(screen.getByText(/修改设置不会改写已签发的证书/)).toBeTruthy();
+    expect(screen.queryByText('现在检查一轮')).toBeNull();
+    fireEvent.click(process);
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: '正在签发与续期…' }) as HTMLButtonElement).disabled).toBe(true),
+    );
+    expect(screen.queryByText(/处理完成/)).toBeNull();
+    complete(Response.json({ ...full, processing: { issued: 2, failed: 1 } }));
+    expect(await screen.findByText(/处理完成：成功 2 张，失败 1 张/)).toBeTruthy();
+    expect((screen.getByRole('button', { name: '立即签发与续期' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('自签模式隐藏全局域名输入并说明百年随机身份', async () => {
     ROUTES['/certs'] = certsWithGroup;
     render(<Harness />);
 
-    await screen.findByText(/默认维护一对主备自签证书/);
+    await screen.findByText(/默认自签证书组首次初始化一对主备证书/);
     expect(screen.queryByPlaceholderText('example.net')).toBeNull();
     expect(screen.getByText(/单张有效期 100 年/)).toBeTruthy();
     expect(screen.getByText(/不再拼接二级域名或通配符/)).toBeTruthy();
   });
 
-  it('自签证书主备槽占满后禁用继续添加', async () => {
+  it('证书组默认收起，自签模式不提供手动添加备用动作', async () => {
     const full = certsWithGroup();
     full.groups[0].name = '默认自签证书组';
     full.groups[0].is_default = true;
     full.groups[0].names = ['northstar-edge-0123abcd.com'];
     full.groups[0].certificates = Array.from({ length: 2 }, (_, index) => ({
       id: `cert-${index}`,
-      status: index === 0 ? 'serving' : 'ready',
+      status: index === 0 ? 'serving' : 'compatible',
       origin: 'bootstrap',
       signing_method: 'self-signed',
       certificate_name: `private-${index}.com`,
@@ -251,24 +385,46 @@ describe('设置页分段保存的基准', () => {
       last_error: null,
       last_attempt_at: null,
     }));
+    full.nodes = [
+      {
+        node_id: 'hidden-node',
+        label_id: 'group-1',
+        group_name: '默认自签证书组',
+        certificate_name: 'private-0.com',
+        on_disk: 'current',
+        observed_at: '2026-01-01T00:01:00Z',
+      },
+    ];
     ROUTES['/certs'] = () => full;
     render(<Harness />);
 
-    const add = await screen.findByRole('button', { name: '加一张备用' });
-    expect((add as HTMLButtonElement).disabled).toBe(true);
-    expect(add.getAttribute('title')).toContain('主备槽已经占满');
-    expect(screen.getByLabelText('证书组概况').textContent).toContain('2/2运行槽');
+    const toggle = await screen.findByRole('button', { name: /默认自签证书组/ });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('button', { name: '立即申领备用证书' })).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+
+    expect(screen.getByLabelText('证书组完整信息').textContent).toContain('运行槽2/2');
+    expect(screen.getByText('在用').classList.contains('ok')).toBe(true);
+    expect(screen.getByText('保留').classList.contains('idle')).toBe(true);
+    expect(screen.getByRole('button', { name: '切换' })).toBeTruthy();
+    expect(screen.getByText('private-0.com')).toBeTruthy();
+    expect(screen.getByText('cert-0')).toBeTruthy();
+    expect(screen.getAllByText('Northstar Edge Root CA')).toHaveLength(2);
+    expect(screen.queryByText('hidden-node')).toBeNull();
+    expect(screen.queryByText('使用机器')).toBeNull();
     expect((screen.getByRole('button', { name: '改名' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('添加备用证书期间锁住证书动作，连续点击只提交一次', async () => {
+    const publicCa = publicCaCertsWithGroup();
     let resolveSpare!: (response: Response) => void;
     const spareResponse = new Promise<Response>(resolve => {
       resolveSpare = resolve;
     });
     const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/certs/groups/group-1/spare' && init?.method === 'POST') return spareResponse;
-      const body = path === '/certs' ? certsWithGroup : ROUTES[path];
+      const body = path === '/certs' ? () => publicCa : ROUTES[path];
       if (!body) throw new Error(`未预期的请求：${path}`);
       return new Response(JSON.stringify(body()), {
         status: 200,
@@ -278,7 +434,7 @@ describe('设置页分段保存的基准', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     render(<Harness />);
-    const add = await screen.findByRole('button', { name: '加一张备用' });
+    const add = await screen.findByRole('button', { name: '立即申领备用证书' });
     fireEvent.click(add);
     fireEvent.click(add);
 
@@ -288,7 +444,7 @@ describe('设置页分段保存的基准', () => {
       );
       expect(posts).toHaveLength(1);
     });
-    expect((screen.getByRole('button', { name: '添加中…' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '正在申领…' }) as HTMLButtonElement).disabled).toBe(true);
 
     resolveSpare(
       new Response(JSON.stringify({ id: 'spare-1' }), {
@@ -297,7 +453,7 @@ describe('设置页分段保存的基准', () => {
       }),
     );
     await waitFor(() =>
-      expect((screen.getByRole('button', { name: '加一张备用' }) as HTMLButtonElement).disabled).toBe(false),
+      expect((screen.getByRole('button', { name: '立即申领备用证书' }) as HTMLButtonElement).disabled).toBe(false),
     );
   });
 
@@ -322,7 +478,7 @@ describe('设置页分段保存的基准', () => {
     fireEvent.click(await screen.findByRole('button', { name: '新建证书组' }));
     const name = screen.getByPlaceholderText('香港前置') as HTMLInputElement;
     fireEvent.change(name, { target: { value: '新加坡备用' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    fireEvent.click(screen.getByRole('button', { name: '创建并立即申领' }));
 
     await screen.findByText(/证书组写入失败/);
     expect(screen.getByPlaceholderText('香港前置')).toBe(name);
@@ -355,6 +511,93 @@ describe('设置页分段保存的基准', () => {
 
     /* 但基准仍是 GET /settings 的已提交值，该段会一直自认为有未保存的改动 */
     await waitFor(() => expect(section('set-xray').queryByText('有未保存的改动')).toBeNull());
+  });
+
+  it('保存站点名称后，较晚返回的旧请求不会覆盖新名称', async () => {
+    const old = { site_name: '旧站点', icon_data_url: null };
+    const saved = { site_name: '新站点', icon_data_url: null };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['branding'], old);
+    let complete!: (response: Response) => void;
+    const staleResponse = new Promise<Response>(resolve => {
+      complete = resolve;
+    });
+    const fetcher = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/branding') return init?.method === 'PUT' ? Response.json(saved) : staleResponse;
+      const body = ROUTES[path];
+      if (!body) throw new Error(`未预期的请求：${path}`);
+      return Response.json(body());
+    });
+    vi.stubGlobal('fetch', fetcher);
+    render(
+      <QueryClientProvider client={client}>
+        <SessionProvider value={SESSION}>
+          <SettingsPane />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    await screen.findByPlaceholderText('example.com:443');
+    const name = fieldInput(section('set-branding'), '站点名称');
+    fireEvent.change(name, { target: { value: '新站点' } });
+    fireEvent.click(section('set-branding').getByText('保存这一段'));
+    await waitFor(() => expect(client.getQueryData(['branding'])).toEqual(saved));
+    await act(async () => {
+      complete(Response.json(old));
+      await staleResponse;
+    });
+    expect(client.getQueryData(['branding'])).toEqual(saved);
+    expect(name.value).toBe('新站点');
+  });
+
+  it('分发版本刷新不覆盖正在输入的 Agent 地址', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <SessionProvider value={SESSION}>
+          <SettingsPane />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    await screen.findByPlaceholderText('example.com:443');
+    const address = fieldInput(section('set-dist'), 'Agent 请求地址');
+    fireEvent.change(address, { target: { value: 'https://new-control.example' } });
+    act(() =>
+      client.setQueryData(['distribution'], {
+        stored: { agent_public_url: 'https://example', xray_version: '26.7.28' },
+        effective: { agent_public_url: 'https://example', xray_version: 'new-build' },
+      }),
+    );
+    expect(address.value).toBe('https://new-control.example');
+    expect(section('set-dist').getByText('有未保存的改动')).toBeTruthy();
+  });
+
+  it('丢弃草稿恢复已保存字段，并保留其他段尚未保存的输入', async () => {
+    render(<Harness />);
+    const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
+    const hopBase = (await screen.findByDisplayValue('20000')) as HTMLInputElement;
+    fireEvent.change(dest, { target: { value: 'www.edited.example:443' } });
+    fireEvent.click(section('set-xray').getByText('保存这一段'));
+    await waitFor(() => expect(section('set-xray').queryByText('有未保存的改动')).toBeNull());
+    fireEvent.change(hopBase, { target: { value: '20100' } });
+    act(() => draft.clear());
+    await waitFor(() => expect(dest.value).toBe('www.committed.example:443'));
+    expect(section('set-xray').queryByText('有未保存的改动')).toBeNull();
+    expect(hopBase.value).toBe('20100');
+    expect(section('set-ports').getByText('有未保存的改动')).toBeTruthy();
+  });
+
+  it('保存后使用规范化值，不因空格或前导零再次显示保存按钮', async () => {
+    render(<Harness />);
+    const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
+    fireEvent.change(dest, { target: { value: '  www.edited.example:443  ' } });
+    fireEvent.click(section('set-xray').getByText('保存这一段'));
+    await waitFor(() => expect(dest.value).toBe('www.edited.example:443'));
+    expect(section('set-xray').queryByText('有未保存的改动')).toBeNull();
+    const hopBase = (await screen.findByDisplayValue('20000')) as HTMLInputElement;
+    fireEvent.change(hopBase, { target: { value: '020100' } });
+    fireEvent.click(section('set-ports').getByText('保存这一段'));
+    await waitFor(() => expect(hopBase.value).toBe('20100'));
+    expect(section('set-ports').queryByText('有未保存的改动')).toBeNull();
   });
 
   it('保存另一段不会把前一段已入草稿的改动写回旧值', async () => {

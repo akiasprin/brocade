@@ -1,0 +1,20 @@
+
+> brocade-ui-console@0.0.0 build
+> tsc --noEmit && vite build
+
+vite v7.3.6 building client environment for production...
+transforming...
+✓ 728 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                      1.09 kB │ gzip:   0.56 kB
+dist/assets/flags-ClCTupOa.png      57.81 kB
+dist/assets/index-BqUkmXGd.css     280.66 kB │ gzip:  50.72 kB
+dist/assets/tunnels-CtpH4-Kk.js     37.16 kB │ gzip:  10.12 kB
+dist/assets/index-BXxZ8KP-.js    1,381.65 kB │ gzip: 444.42 kB
+
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+✓ built in 5.96s

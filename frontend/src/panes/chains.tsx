@@ -56,12 +56,16 @@ import {
   type IngressProjection,
   type ProjectionEndpoint,
   type RealityFallbackMode,
+  type CertificateTrack,
   type Wires,
   currentWires,
   createApp,
   reorderApps,
   reorderChains,
 } from '../api';
+import { DEFAULT_VLESS_ENCRYPTION, encryptionTicketError, encryptionPaddingError } from '../vless-encryption';
+import type { VlessEncryptionOptions } from '../api';
+import { nodeCertificateLabel } from '../certificate';
 import { draft } from '../draft';
 import { compatibleXhttpMode, transportKindFor, type IngressSecurity } from '../ingress-transport';
 import {
@@ -71,11 +75,11 @@ import {
   type FallbackRateDraft,
 } from '../reality-fallback';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
-import { can, useSession } from '../session';
+import { can, isPublic, useSession } from '../session';
 import { Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { FLAG_SHEET } from '../ui/flags';
 import { RegionFlag } from '../ui/region-flag';
-import { ListIcon, PanelTitle, type IconName } from '../ui/icons';
+import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { ProbeBanner, byChain, toneOf, toneTitle } from '../ui/probe';
 import { appId as randomAppId } from '../model-id';
@@ -101,7 +105,7 @@ import { freePortAcross, freeSpanAcross, occupiedPorts, portClash, spanClash } f
  * 时的回退值，写法与 rules.tsx 的 HOP_PORT_BASE 一致：直接使用硬编码时，运营者修改设置后
  * 界面仍会填入旧值。 */
 const HY2_PORT_BASE = 30000;
-const ANYTLS_PORT_BASE = 18443;
+const ANYTLS_PORT_BASE = 14443;
 const DEFAULT_HOP_SPAN = 100;
 const U32_MAX = 4_294_967_295;
 
@@ -264,7 +268,7 @@ function NewChain({ app, go }: { app: string; go: (d: Drill) => void }) {
         </span>
       </div>
       {usable.length === 0 ? (
-        <div className="callout">还没有机器。先去「机器」里加一台——链头就是接入面所在那台。</div>
+        <div className="callout">还没有机器。先去「机器」里加一台——入口节点就是接入面所在那台。</div>
       ) : (
         <ChainWizard
           fixedApp={{ id: a.id, label: a.label }}
@@ -339,7 +343,7 @@ function chainRows(apps: SnapshotApp[]) {
   );
 }
 
-/* 链卡上的接入方式只写用户需要区分的层级：安全层（REALITY / TLS）、承载层
+/* 链卡上的接入方式只写用户需要区分的层级：传输安全（REALITY / TLS）、承载层
  * （普通 TCP / XHTTP）以及是否另开 HY2。端口已写在路径的入口机器上，再在这里重复会让
  * “接入方式”变成一串配置摘要。 */
 function chainAccessLabel(ingress: SnapshotIngress | null): string {
@@ -348,12 +352,13 @@ function chainAccessLabel(ingress: SnapshotIngress | null): string {
   const vless = ingress.wires.vless;
   if (vless) {
     const security = vless.kind.includes('reality') ? 'REALITY' : 'TLS';
-    labels.push(transportIsXhttp(vless.kind) ? `${security} · XHTTP` : `VLESS · ${security}`);
+    labels.push(transportIsXhttp(vless.kind) ? `VLESS · ${security} · XHTTP` : `VLESS · ${security}`);
   }
-  if (ingress.wires.hysteria2) labels.push('HY2');
+  if (ingress.wires.vless_encryption) labels.push('VLESS · Encryption');
   if (ingress.wires.anytls) {
     labels.push(ingress.wires.anytls.security === 'reality' ? 'AnyTLS · REALITY' : 'AnyTLS');
   }
+  if (ingress.wires.hysteria2) labels.push('HY2');
   return labels.join(' + ') || '—';
 }
 
@@ -779,7 +784,12 @@ export function IngressPortEditor({
   // 只读视角（readonly / public）拿到的是脱敏后的快照，端口被替换为字符串 "***"，据此
   // 算冲突只会得到误报，且该视角改不了端口，提示没有意义。因此仅在可编辑时检测。
   // editable = can(role,'edit')，readonly 与 public 同为 false，两者表现一致。
-  const clash = editable && valid ? portClash(taken, [ingress.node], parsed) : null;
+  const clash =
+    editable && valid
+      ? portClash(taken, [ingress.node], parsed) ||
+        (ingress.wires.vless_encryption?.port === parsed ? '该端口已被 VLESS · Encryption 使用' : null) ||
+        (ingress.wires.anytls?.port === parsed ? '该端口已被 AnyTLS 使用' : null)
+      : null;
 
   const dirty = draftPort !== null && valid && !clash && parsed !== ingress.port;
   /* 端口这一行在两处出现：链详情页的 VLESS 面板里（有面板，登记进那一次提交），
@@ -863,7 +873,7 @@ export function IngressPortEditor({
 
 /* 流控（XTLS Vision）。
  *
- * 单独一行而非并入传输方式：它属于安全层，传输方式属于传输层。但两者存在一条硬约束——
+ * 单独一行而非并入传输方式：它属于传输安全，传输方式属于传输层。但两者存在一条硬约束——
  * Vision 只支持直连的 TLS/REALITY，与 XHTTP 互斥，而 xray **只在运行时**拒绝该组合
  * （其配置检查会通过）。因此两行相邻放置，冲突在两侧都有说明。
  *
@@ -932,7 +942,7 @@ function IngressFlowRow({
   );
 }
 
-/* REALITY 使用哪张证书属于安全层配置，不是另一组 fallback 参数。
+/* REALITY 使用哪张证书属于传输安全配置，不是另一组 fallback 参数。
  *
  * 后端的 `fallback_mode` 仍是该选择的存储字段：REALITY 握手使用的 SNI、订阅中写入的
  * SNI，以及未通过校验的连接的去向，都由同一来源推导。界面只需一次选择。 */
@@ -940,17 +950,25 @@ function IngressRealityRow({
   appId,
   ingress,
   certificateName,
+  certificateTrack,
   editable,
+  settingsReadable,
   target = 'vless',
 }: {
   appId: string;
   ingress: SnapshotIngress;
   certificateName?: string | null;
+  certificateTrack?: CertificateTrack | null;
   editable: boolean;
+  settingsReadable: boolean;
   target?: 'vless' | 'anytls';
 }) {
   const qc = useQueryClient();
-  const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
+  // The passwordless public visitor is intentionally outside `/settings`' allow-list. Existing
+  // ingress values already live in the masked snapshot, so its read-only view must not make a
+  // request that can only answer 403. Ordinary readonly operators may still inspect the masked
+  // global site through the settings endpoint.
+  const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings, enabled: settingsReadable });
   const global = settings.data?.reality_site;
   type RealityCertificateForm = {
     source: RealityFallbackMode;
@@ -1053,7 +1071,7 @@ function IngressRealityRow({
     'reality-site',
     dirty,
     {
-      /* valid 为假 = 自定义站点没填全，或选了本机证书而这台机器还没有证书。 */
+      /* valid 为假 = 自定义站点没填全，或选了本机 TLS 证书而这台机器还没有证书。 */
       blocked: !valid,
       apply: body =>
         target === 'anytls'
@@ -1080,6 +1098,7 @@ function IngressRealityRow({
   );
   // 选项中直接显示当前指向的站点：下拉框收起后，该行即表示客户端将看到哪张证书。
   const globalSite = (global?.dest ?? '').replace(/:\d+$/, '');
+  const certificateLabel = nodeCertificateLabel(certificateTrack);
 
   return (
     <>
@@ -1093,10 +1112,12 @@ function IngressRealityRow({
         >
           {target === 'vless' && (
             <option value="node-certificate" disabled={!certificateName}>
-              {certificateName ? `本机证书 ${certificateName}` : '本机证书（未签发）'}
+              {certificateName ? `${certificateLabel} ${certificateName}` : `${certificateLabel}（未签发）`}
             </option>
           )}
-          <option value="global-site">{globalSite ? `全局站点 ${globalSite}` : '全局站点（未配置）'}</option>
+          <option value="global-site">
+            {globalSite ? `全局站点 ${globalSite}` : settingsReadable ? '全局站点（未配置）' : '全局站点'}
+          </option>
           <option value="custom-site">自定义站点</option>
         </select>
         {form.source === 'custom-site' && (
@@ -1235,9 +1256,9 @@ function IngressGuardBlock({
   const SWITCHES: { key: keyof IngressGuard; name: string; why: string; expr: string; danger?: boolean }[] = [
     {
       key: 'no_private',
-      name: '禁止访问内网与机队',
-      why: '阻止访问机器出口内网和机队 WG 内网。',
-      expr: 'geoip:private + 机队网段',
+      name: '禁止访问内网与节点网络',
+      why: '阻止访问机器出口内网和节点的 WireGuard 内网。',
+      expr: 'geoip:private + 节点网段',
     },
     {
       key: 'no_bittorrent',
@@ -1351,7 +1372,7 @@ function IngressRealityGuardRow({
     },
   });
 
-  /* 使用本机证书时回落不会离开该机器（返回本地固定的 403），不存在需要保护的外部站点。
+  /* 使用本机 TLS 证书时回落不会离开该机器（返回本地固定的 403），不存在需要保护的外部站点。
    * 开关仍然显示但不可修改：隐藏会使人认为该接入面缺少这项防护。 */
   const local = ingress.wires.vless?.fallback_mode === 'node-certificate';
 
@@ -1487,7 +1508,7 @@ function IngressRealityLimitsRow({
  *
  * 接入面的传输层：TCP 或 XHTTP。
  *
- * 它与安全层（REALITY）是两个独立维度。TCP 下每条客户端连接对应一条 TCP 连接，而在 REALITY
+ * 它与传输安全（REALITY）是两个独立维度。TCP 下每条客户端连接对应一条 TCP 连接，而在 REALITY
  * 下每条新连接都需要服务端建立一次到借用站点的 TLS 握手以获取证书——因此握手频繁的入口，
  * 成本不止于握手本身。XHTTP 将多条流复用到一条 HTTP/2 连接上，该开销相应降低。
  *
@@ -1726,7 +1747,7 @@ function IngressHy2PortRow({
         {clash && <div className="note bad">{clash}</div>}
       </dd>
 
-      <dt>端口跳转</dt>
+      <dt>端口跳跃</dt>
       <dd>
         <div className="segsw" role="group">
           <button type="button" aria-pressed={!hop} disabled={!editable} onClick={() => toggleHop(false)}>
@@ -1761,7 +1782,7 @@ function IngressHy2PortRow({
               <span className="dim">共 {span > 0 ? span : 0} 个口</span>
             </div>
             <div className="note">
-              端口跳转将使用机器系统上的 DNAT 规则强制转发整段到 Hysteria。
+              端口跳跃将使用机器系统上的 DNAT 规则强制转发整段到 Hysteria。
               <br />
               请确保无其他 UDP 协议服务监听本段端口。
               <br />
@@ -1777,10 +1798,165 @@ function IngressHy2PortRow({
   );
 }
 
+export function IngressEncryptionRow({ ingress, editable }: { ingress: SnapshotIngress; editable: boolean }) {
+  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: fetchSnapshot });
+  const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const [portDraft, setPortDraft] = useState<string | null>(null);
+  const [optionsDraft, setOptionsDraft] = useState<VlessEncryptionOptions | null>(null);
+  const current = ingress.wires.vless_encryption;
+  const savedOptions = { ...DEFAULT_VLESS_ENCRYPTION, ...current?.options };
+  const options = optionsDraft ?? savedOptions;
+  const update = (patch: Partial<VlessEncryptionOptions>) => setOptionsDraft({ ...options, ...patch });
+  const port = Number(portDraft ?? current?.port ?? 48000);
+  const taken = occupiedPorts(snapshot.data?.snapshot.apps ?? [], nodes.data?.nodes ?? [], undefined, ingress.id);
+  const conflict =
+    portClash(taken, [ingress.node], port) ||
+    (ingress.wires.vless && port === ingress.port ? '该端口已被 VLESS 使用' : null) ||
+    (ingress.wires.anytls?.port === port ? '该端口已被 AnyTLS 使用' : null);
+  const portInvalid = !Number.isInteger(port) || port < 1 || port > 65535 || !!conflict;
+  const ticketError = encryptionTicketError(options.ticket_lifetime);
+  const serverError = encryptionPaddingError(options.server_padding);
+  const clientError = encryptionPaddingError(options.client_padding);
+  const dirty = port !== current?.port || JSON.stringify(options) !== JSON.stringify(savedOptions);
+  usePanelEntry(
+    'vless-encryption',
+    dirty,
+    {
+      blocked: editable && (portInvalid || !!ticketError || !!serverError || !!clientError),
+      apply: body => ({ ...body, wires: { ...body.wires!, vless_encryption: { port, options } } }),
+      reset: () => {
+        setPortDraft(null);
+        setOptionsDraft(null);
+      },
+    },
+    JSON.stringify([port, options]),
+  );
+  const ticketParts = options.ticket_lifetime.slice(0, -1).split('-').map(Number);
+  const ticketNote = ticketError
+    ? ticketError
+    : options.ticket_lifetime === '0s' || options.ticket_lifetime === '0-0s'
+      ? '服务端不签发会话恢复票据，客户端每次执行完整握手。'
+      : `票据有效时间随机取 ${ticketParts.length === 2 ? ticketParts[0] : Math.floor(ticketParts[0] / 2)}–${ticketParts.at(-1)} 秒。`;
+  return (
+    <>
+      <dt>监听端口</dt>
+      <dd>
+        <div className="toolbar" style={{ margin: 0, gap: 6 }}>
+          <input
+            className="f mono"
+            aria-label="VLESS · Encryption 监听端口"
+            style={{ width: 86 }}
+            inputMode="numeric"
+            value={portDraft ?? current?.port ?? 48000}
+            disabled={!editable}
+            onChange={event => setPortDraft(event.target.value)}
+          />
+        </div>
+        {editable && portInvalid && <div className="note bad">{conflict || '端口必须在 1–65535 之间'}</div>}
+      </dd>
+      <dt>传输层</dt>
+      <dd>
+        <select className="f" aria-label="Encryption 传输层" defaultValue="tcp" disabled={!editable}>
+          <option value="tcp">TCP</option>
+        </select>
+      </dd>
+      <dt>握手方式</dt>
+      <dd>
+        <select className="f" aria-label="Encryption 握手方式" defaultValue="mlkem768x25519plus" disabled={!editable}>
+          <option value="mlkem768x25519plus">mlkem768x25519plus</option>
+        </select>
+      </dd>
+      <dt>流量外观</dt>
+      <dd>
+        <select
+          className="f"
+          aria-label="Encryption 流量外观"
+          value={options.appearance}
+          disabled={!editable}
+          onChange={event => update({ appearance: event.target.value as VlessEncryptionOptions['appearance'] })}
+        >
+          <option value="native">native · 原始格式</option>
+          <option value="xorpub">xorpub · 混淆公钥</option>
+          <option value="random">random · 随机外观</option>
+        </select>
+        <div className="note">
+          {options.appearance === 'native'
+            ? '保留原始加密数据包格式，不额外混淆。'
+            : options.appearance === 'xorpub'
+              ? '在原始格式上混淆公钥部分。'
+              : '将流量外观随机化。'}
+          均不提供 HTTPS 伪装；服务端与客户端自动保持一致。
+        </div>
+      </dd>
+      <dt>会话恢复</dt>
+      <dd>
+        <select
+          className="f"
+          aria-label="Encryption 客户端握手"
+          value={options.client_mode}
+          disabled={!editable}
+          onChange={event => update({ client_mode: event.target.value as VlessEncryptionOptions['client_mode'] })}
+        >
+          <option value="0rtt">0-RTT · 尝试复用票据</option>
+          <option value="1rtt">1-RTT · 每次完整握手</option>
+        </select>
+        <div className="note">0-RTT 在已有有效票据时尝试恢复；首次连接或票据失效时仍需握手。</div>
+      </dd>
+      <dt>高级参数</dt>
+      <dd>
+        <details className="form-adv" style={{ width: '100%' }}>
+          <summary>票据与双向 Padding</summary>
+          <label className="hy2-quic-fld">
+            <span>票据有效期</span>
+            <input
+              className="f mono"
+              aria-label="Encryption 票据有效期"
+              value={options.ticket_lifetime}
+              disabled={!editable}
+              placeholder="600s / 100-500s"
+              onChange={event => update({ ticket_lifetime: event.target.value.trim() })}
+            />
+          </label>
+          <div className={ticketError ? 'note bad' : 'note'}>{ticketNote}</div>
+          {(
+            [
+              ['server_padding', '服务端 Padding', serverError],
+              ['client_padding', '客户端 Padding', clientError],
+            ] as const
+          ).map(([key, label, error]) => (
+            <label key={key} style={{ display: 'block', marginTop: 8 }}>
+              <span>{label}</span>
+              <textarea
+                className="f mono"
+                style={{ width: '100%' }}
+                rows={2}
+                aria-label={`Encryption ${label}`}
+                value={options[key]}
+                disabled={!editable}
+                placeholder="留空使用内核默认规则"
+                onChange={event => update({ [key]: event.target.value.trim() })}
+              />
+              {error && <span className="note bad">{error}</span>}
+            </label>
+          ))}
+          <div className="note">
+            两端分别控制各自发送的填充，可使用不同规则。格式为「填充.延迟.填充」，每段填写「概率-最小值-最大值」；填充单位为字节，延迟单位为毫秒。
+          </div>
+          <div className="note">
+            留空使用默认规则：<span className="mono">100-111-1111.75-0-111.50-0-3333</span>。首段概率须为 100%，长度至少
+            35 字节；各填充段最大长度之和不超过 65553 字节。
+          </div>
+        </details>
+      </dd>
+    </>
+  );
+}
+
 export function IngressStreamRow({
   appId,
   ingress,
   certificateName,
+  certificateTrack,
   editable,
   section,
   vlessEnabled,
@@ -1788,11 +1964,14 @@ export function IngressStreamRow({
   hy2Enabled,
   onVlessEnabledChange,
   onAnyTlsEnabledChange,
+  onEncryptionEnabledChange,
   onHy2EnabledChange,
+  settingsReadable = true,
 }: {
   appId: string;
   ingress: SnapshotIngress;
   certificateName?: string | null;
+  certificateTrack?: CertificateTrack | null;
   editable: boolean;
   /** 协议开关与配置卡是不同组件实例。外层传入乐观可见性，让刚开启的配置卡立即挂载。 */
   vlessEnabled?: boolean;
@@ -1800,7 +1979,10 @@ export function IngressStreamRow({
   hy2Enabled?: boolean;
   onVlessEnabledChange?: (enabled: boolean | null) => void;
   onAnyTlsEnabledChange?: (enabled: boolean | null) => void;
+  onEncryptionEnabledChange?: (enabled: boolean | null) => void;
   onHy2EnabledChange?: (enabled: boolean | null) => void;
+  /** Public visitors cannot call `/settings`; editable and ordinary readonly views can. */
+  settingsReadable?: boolean;
   /** 本次渲染的是哪一段。
    *
    *  三段位于三块面板中，但状态、草稿和保存逻辑只有一份——修改一条线时需要将另一条原样带上
@@ -1809,9 +1991,12 @@ export function IngressStreamRow({
   section: 'protocols' | 'vless' | 'anytls' | 'hy2';
 }) {
   const qc = useQueryClient();
-  const portSettings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings });
+  const portSettings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings, enabled: settingsReadable });
   const hy2Base = portSettings.data?.ports?.hy2_base || HY2_PORT_BASE;
   const anytlsBase = portSettings.data?.ports?.anytls_base || ANYTLS_PORT_BASE;
+  const [pendingEncryption, setPendingEncryption] = useState<boolean | null>(null);
+  const encryptionOn = pendingEncryption ?? !!ingress.wires.vless_encryption;
+  const certificateLabel = nodeCertificateLabel(certificateTrack);
   const streamSnapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const streamNodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const streamRevisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
@@ -1831,10 +2016,10 @@ export function IngressStreamRow({
       ),
     [streamSnapshot.data, streamNodes.data, streamCompiled.data, ingress.id],
   );
-  /* 安全层字段表示客户端握手时看到的是哪张证书，REALITY 档对应的是其指向的站点，
+  /* 传输安全字段表示客户端握手时看到的是哪张证书，REALITY 档对应的是其指向的站点，
      而该站点可能来自全局设置。使用相同的 queryKey，与 IngressRealityRow 共用缓存。 */
   /* 两条线是否启用是两个独立的状态。VLESS 一侧未启用时 `storedKind` 为 null，
-     下方所有与安全层和承载层相关的控件都不显示——它们描述的是该侧。 */
+     下方所有与传输安全和承载层相关的控件都不显示——它们描述的是该侧。 */
   const storedVless = ingress.wires.vless ?? null;
   const storedKind = storedVless?.kind ?? null;
   const storedAnyTls = useMemo<AnyTlsSettings>(() => {
@@ -1842,7 +2027,11 @@ export function IngressStreamRow({
     let port = freePortAcross(tcpTaken, [ingress.node], anytlsBase);
     // `occupiedPorts` excludes this ingress while editing. Its VLESS port still belongs to the
     // same Xray process, so keep the generated AnyTLS default distinct from it explicitly.
-    while (port === ingress.port && port < 65536) port += 1;
+    while (
+      port < 65536 &&
+      (port === ingress.port || port === ingress.wires.vless_encryption?.port || tcpTaken.get(ingress.node)?.has(port))
+    )
+      port += 1;
     return {
       port,
       security: 'tls',
@@ -1852,7 +2041,7 @@ export function IngressStreamRow({
       min_idle_session: 1,
       masquerade: { kind: 'not-found' },
     };
-  }, [anytlsBase, ingress.node, ingress.port, ingress.wires.anytls, tcpTaken]);
+  }, [anytlsBase, ingress.node, ingress.port, ingress.wires.anytls, ingress.wires.vless_encryption, tcpTaken]);
   const [pendingTransport, setPendingTransport] = useState<Transport | null>(null);
   const stagedTransport = pendingTransport?.kind === storedKind ? null : pendingTransport;
   const kind: TransportKind | null = stagedTransport?.kind ?? storedKind ?? (vlessEnabled ? 'vless-reality' : null);
@@ -1964,6 +2153,10 @@ export function IngressStreamRow({
             } as Transport)
           : (next.vless ?? null);
       const wires: Wires = {
+        vless_encryption:
+          next.vless_encryption === undefined
+            ? (currentWires(ingress).vless_encryption ?? null)
+            : next.vless_encryption,
         vless,
         anytls: next.anytls ?? null,
         hysteria2: next.hysteria2 ?? null,
@@ -1989,6 +2182,8 @@ export function IngressStreamRow({
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       onVlessEnabledChange?.(null);
       onAnyTlsEnabledChange?.(null);
+      onEncryptionEnabledChange?.(null);
+      setPendingEncryption(null);
       onHy2EnabledChange?.(null);
       setDraftMode(null);
       setPendingTransport(null);
@@ -2004,6 +2199,8 @@ export function IngressStreamRow({
       setPendingHy2On(null);
       onVlessEnabledChange?.(null);
       onAnyTlsEnabledChange?.(null);
+      onEncryptionEnabledChange?.(null);
+      setPendingEncryption(null);
       onHy2EnabledChange?.(null);
     },
   });
@@ -2048,10 +2245,32 @@ export function IngressStreamRow({
 
   /* 启用或关闭一条线路。两条都关闭表示该接入面不接收任何连接，服务端的类型定义和库中的
      CHECK 约束都不允许该状态，因此在点击前拦截，而不是点击后返回错误。 */
-  const toggleWire = (wire: 'vless' | 'anytls' | 'hy2', enabled: boolean) => {
-    const otherWireOn = wire === 'vless' ? anytlsOn || hy2 : wire === 'anytls' ? vlessOn || hy2 : vlessOn || anytlsOn;
+  const toggleWire = (wire: 'vless' | 'anytls' | 'hy2' | 'encryption', enabled: boolean) => {
+    const otherWireOn =
+      wire === 'encryption'
+        ? vlessOn || anytlsOn || hy2
+        : encryptionOn ||
+          (wire === 'vless' ? anytlsOn || hy2 : wire === 'anytls' ? vlessOn || hy2 : vlessOn || anytlsOn);
     if (!enabled && !otherWireOn) {
-      window.alert('至少要保留一条线路：两条都关闭后，这个接入面不再接收任何流量。');
+      window.alert('至少要保留一种入站协议：全部关闭后，这个接入面不再接收任何流量。');
+      return;
+    }
+    if (wire === 'encryption') {
+      let port = freePortAcross(tcpTaken, [ingress.node], portSettings.data?.ports?.vless_encryption_base || 48000);
+      while (
+        port < 65536 &&
+        ((vlessOn && port === ingress.port) ||
+          (anytlsOn && port === anytlsValue.port) ||
+          tcpTaken.get(ingress.node)?.has(port))
+      )
+        port += 1;
+      if (enabled && port > 65535) {
+        window.alert('没有可用的 VLESS · Encryption TCP 端口，请调整起始端口');
+        return;
+      }
+      setPendingEncryption(enabled);
+      onEncryptionEnabledChange?.(enabled);
+      save.mutate({ ...currentWires(ingress), vless_encryption: enabled ? { port } : null });
       return;
     }
     if (wire === 'vless') {
@@ -2159,7 +2378,7 @@ export function IngressStreamRow({
         : kind === 'vless-tls'
           ? { kind }
           : { kind: 'vless-reality' };
-  /* 脏的两种来源：暂存了另一档安全层 / 传输层，或改了任一 XHTTP 参数。 */
+  /* 脏的两种来源：暂存了另一档传输安全 / 传输层，或改了任一 XHTTP 参数。 */
   const dirty =
     stagedTransport !== null ||
     (on &&
@@ -2169,7 +2388,7 @@ export function IngressStreamRow({
         (draftTuning !== undefined && JSON.stringify(tuningValue) !== JSON.stringify(tuning)) ||
         (draftMode !== null && mode !== (current?.mode ?? 'auto')))) ||
     downloadDirty;
-  /* 两段各自登记进所在面板的那一次提交。三个下拉（协议 / 安全层 / 传输层）不在其中：
+  /* 两段各自登记进所在面板的那一次提交。三个下拉（协议 / 传输安全 / 传输层）不在其中：
      它们改完即存，是切换而不是编辑。 */
   usePanelEntry(
     'vless-xhttp',
@@ -2261,7 +2480,8 @@ export function IngressStreamRow({
       anytlsValue.port < 1 ||
       anytlsValue.port > 65535 ||
       !!portClash(tcpTaken, [ingress.node], anytlsValue.port) ||
-      (vlessOn && anytlsValue.port === ingress.port));
+      (vlessOn && anytlsValue.port === ingress.port) ||
+      anytlsValue.port === ingress.wires.vless_encryption?.port);
   const anytlsStatus = Number(anytlsStatusText);
   const anytlsStatusBad =
     !anytlsReality &&
@@ -2369,71 +2589,98 @@ export function IngressStreamRow({
   const dependencyError =
     portSettings.error ?? streamSnapshot.error ?? streamNodes.error ?? streamRevisions.error ?? streamCompiled.error;
   if (editable && dependencyPending) {
-    return section === 'protocols' ? (
-      <>
-        <dt>协议</dt>
-        <dd>
-          <Loading />
-        </dd>
-      </>
-    ) : null;
+    return section === 'protocols' ? <Loading /> : null;
   }
   if (editable && dependencyError) {
-    return section === 'protocols' ? (
-      <>
-        <dt>协议</dt>
-        <dd>
-          <ErrorBox error={dependencyError} />
-        </dd>
-      </>
-    ) : null;
+    return section === 'protocols' ? <ErrorBox error={dependencyError} /> : null;
   }
 
   /* 端口归属协议栈：落点只表示由哪台机器接收，使用哪个端口由各线路自行决定。
-     因此此处分四段渲染——协议开关一段，VLESS、AnyTLS、Hysteria 2 各自包含自己的端口和参数。 */
+     协议选择用衬底标识启用状态，各种入站的端口和参数在独立面板中配置。 */
   if (section === 'protocols') {
     return (
       <>
-        <dt>协议</dt>
-        <dd>
-          {/* 三个独立开关，不是二选一的下拉框：每条线建立自己的 inbound，共用同一份
-            授权凭据。VLESS 与 AnyTLS 都是 TCP，但端口独立；HY2 使用独立 UDP 端口。
-            至少保留一条线路，避免把入口保存成完全不接收流量的状态。 */}
-          <label className="toolbar" style={{ margin: 0, gap: 6 }}>
+        <div className="protocol-picker">
+          <label className={vlessOn ? 'protocol-choice on' : 'protocol-choice'}>
             <input
               type="checkbox"
+              aria-label="VLESS · TLS / REALITY（TCP / XHTTP）"
               checked={vlessOn}
               disabled={!editable || save.isPending}
               onChange={event => toggleWire('vless', event.target.checked)}
             />
-            <span>VLESS（TCP / XHTTP）</span>
+            <span className="protocol-choice-copy">
+              <b>
+                <Icon of="xray" size={14} className="protocol-choice-icon" />
+                VLESS · TLS / REALITY
+              </b>
+              <span className="note">REALITY 侧重抗识别与抗封锁；TLS 使用证书加密连接。</span>
+            </span>
+            <span className="protocol-choice-status" aria-hidden="true">
+              已启用
+            </span>
           </label>
-          <label className="toolbar" style={{ margin: '4px 0 0', gap: 6 }}>
+          <label className={encryptionOn ? 'protocol-choice on' : 'protocol-choice'}>
             <input
               type="checkbox"
+              aria-label="VLESS · Encryption（TCP）"
+              checked={encryptionOn}
+              disabled={!editable || save.isPending}
+              onChange={event => toggleWire('encryption', event.target.checked)}
+            />
+            <span className="protocol-choice-copy">
+              <b>
+                <Icon of="xray" size={14} className="protocol-choice-icon" />
+                VLESS · Encryption
+              </b>
+              <span className="note">仅加密数据流，不提供 HTTPS 伪装，适合无封锁网络。</span>
+            </span>
+            <span className="protocol-choice-status" aria-hidden="true">
+              已启用
+            </span>
+          </label>
+          <label className={anytlsOn ? 'protocol-choice on' : 'protocol-choice'}>
+            <input
+              type="checkbox"
+              aria-label="AnyTLS（TCP）"
               checked={anytlsOn}
               disabled={!editable || save.isPending || stagedAnyTlsOn !== null}
               onChange={event => toggleWire('anytls', event.target.checked)}
             />
-            <span>AnyTLS（TCP）</span>
+            <span className="protocol-choice-copy">
+              <b>
+                <Icon of="bolt" size={14} className="protocol-choice-icon" />
+                AnyTLS
+              </b>
+              <span className="note">
+                基于 TLS 加密，通过 Padding 填充缓解流量特征识别，通过连接复用减少 TLS 握手开销。
+              </span>
+            </span>
+            <span className="protocol-choice-status" aria-hidden="true">
+              已启用
+            </span>
           </label>
-          <label className="toolbar" style={{ margin: '4px 0 0', gap: 6 }}>
+          <label className={hy2 ? 'protocol-choice on' : 'protocol-choice'}>
             <input
               type="checkbox"
+              aria-label="Hysteria 2（QUIC over UDP）"
               checked={hy2}
               disabled={!editable || save.isPending || stagedHy2On !== null}
               onChange={event => toggleWire('hy2', event.target.checked)}
             />
-            <span>Hysteria 2（QUIC over UDP）</span>
+            <span className="protocol-choice-copy">
+              <b>
+                <Icon of="hysteria" size={14} className="protocol-choice-icon" />
+                Hysteria 2
+              </b>
+              <span className="note">适合高延迟、丢包网络，依赖 UDP 可用；UDP 被封锁时无法连接。</span>
+            </span>
+            <span className="protocol-choice-status" aria-hidden="true">
+              已启用
+            </span>
           </label>
-          {Number(vlessOn) + Number(anytlsOn) + Number(hy2) > 1 && (
-            <div className="note">
-              多条线路同时开启：每条线各一个监听，<b>各占一个端口</b>，由下方各面板分别配置。
-              共用一份凭据和一条授权，订阅中分别输出，由客户端自行选择。
-            </div>
-          )}
-          {save.error && <ErrorBox error={save.error} />}
-        </dd>
+        </div>
+        {save.error && <ErrorBox error={save.error} />}
       </>
     );
   }
@@ -2458,13 +2705,13 @@ export function IngressStreamRow({
           </div>
           {anytlsPortBad && <div className="note bad">端口必须是 1–65535，且不能与同机其他监听端口冲突。</div>}
         </dd>
-        <dt>安全层</dt>
+        <dt>传输安全</dt>
         <dd>
           <select
             className="f"
             value={anytlsReality ? 'reality' : 'tls'}
             disabled={!editable || save.isPending}
-            aria-label="AnyTLS 安全层"
+            aria-label="AnyTLS 传输安全"
             onChange={event => {
               const security = event.target.value as 'tls' | 'reality';
               updateAnyTls({
@@ -2490,14 +2737,22 @@ export function IngressStreamRow({
           </select>
           {!anytlsReality && certificateName && (
             <div className="note">
-              使用本机证书 <span className="mono">{certificateName}</span>。
+              使用{certificateLabel} <span className="mono">{certificateName}</span>。
             </div>
           )}
           {!anytlsReality && !certificateName && (
-            <div className="note bad">本机证书未签发，编译会拒绝这个接入面。前往「机器」页签发。</div>
+            <div className="note bad">{certificateLabel}未签发，编译会拒绝这个接入面。前往「机器」页签发。</div>
           )}
         </dd>
-        {anytlsReality && <IngressRealityRow appId={appId} ingress={ingress} editable={editable} target="anytls" />}
+        {anytlsReality && (
+          <IngressRealityRow
+            appId={appId}
+            ingress={ingress}
+            editable={editable}
+            settingsReadable={settingsReadable}
+            target="anytls"
+          />
+        )}
         <dt>参数</dt>
         <dd>
           {editable && (
@@ -2601,21 +2856,21 @@ export function IngressStreamRow({
             </div>
             {anytlsSessionBad && <div className="note bad">数值必须在 0 到 {U32_MAX} 之间；两个时间值须大于 0。</div>}
           </details>
-        </dd>
-        {!anytlsReality && (
-          <>
-            <dt>伪装</dt>
-            <dd>
-              <select
-                className="f words"
-                value={anytlsMasqueradePreset}
-                disabled={!editable}
-                aria-label="AnyTLS Masquerade 类型"
-                onChange={event => selectAnyTlsMasqueradePreset(event.target.value as AnyTlsMasqueradePreset)}
-              >
-                <option value="404">404</option>
-                <option value="custom">自定义</option>
-              </select>
+          {!anytlsReality && (
+            <div style={{ width: '100%', marginTop: 6 }}>
+              <div className="toolbar anytls-parameter-row">
+                <span className="dim">伪装</span>
+                <select
+                  className="f words"
+                  value={anytlsMasqueradePreset}
+                  disabled={!editable}
+                  aria-label="AnyTLS Masquerade 类型"
+                  onChange={event => selectAnyTlsMasqueradePreset(event.target.value as AnyTlsMasqueradePreset)}
+                >
+                  <option value="404">404</option>
+                  <option value="custom">自定义</option>
+                </select>
+              </div>
               {anytlsMasqueradePreset === 'custom' && (
                 <>
                   {anytlsMasquerade.kind === 'string' && (
@@ -2663,9 +2918,9 @@ export function IngressStreamRow({
               )}
               {anytlsStatusBad && <div className="note bad">自定义响应状态码必须是 200–599。</div>}
               <div className="note">未完成 AnyTLS 握手时返回此响应。</div>
-            </dd>
-          </>
-        )}
+            </div>
+          )}
+        </dd>
       </>
     );
   }
@@ -2764,7 +3019,9 @@ export function IngressStreamRow({
                     默认混淆密码：<span className="mono">quick-brown-fox</span>（不含句号）。
                   </div>
                 )}
-                <div className="note">在 QUIC 数据包外层叠加一层对称加密，使流量特征不可被 DPI 识别为 Hysteria。</div>
+                <div className="note">
+                  启用混淆后，数据包呈现随机字节外观，可用于应对针对 QUIC 或 HTTP/3 的封锁，但会失去 HTTP/3 伪装。
+                </div>
               </>
             )}
             <div className="toolbar" style={{ margin: '6px 0 0', gap: 6, flexWrap: 'wrap' }}>
@@ -2880,7 +3137,7 @@ export function IngressStreamRow({
       </dd>
       {
         <>
-          <dt>安全层</dt>
+          <dt>传输安全</dt>
           <dd>
             <select
               className="f"
@@ -2891,20 +3148,32 @@ export function IngressStreamRow({
               <option value="reality">REALITY</option>
               <option value="tls">TLS</option>
             </select>
+            <div className="note">
+              {tls
+                ? '通过 TLS 证书加密连接，支持 TCP / XHTTP。'
+                : '借用目标站点的 TLS 握手外观，侧重抗识别与抗封锁，适合受限网络。'}
+            </div>
             {tls && certificateName && (
               <div className="note">
-                使用本机证书 <span className="mono">{certificateName}</span>。
+                使用{certificateLabel} <span className="mono">{certificateName}</span>。
               </div>
             )}
             {tls && !certificateName && (
-              <div className="note bad">本机证书未签发，编译会拒绝这个接入面。前往「机器」页签发。</div>
+              <div className="note bad">{certificateLabel}未签发，编译会拒绝这个接入面。前往「机器」页签发。</div>
             )}
             {tls && !on && (
               <div className="note warn">TLS 直接承载于 TCP 时存在 TLS-in-TLS 特征，封装进 XHTTP 后消失。</div>
             )}
           </dd>
           {!tls && (
-            <IngressRealityRow appId={appId} ingress={ingress} certificateName={certificateName} editable={editable} />
+            <IngressRealityRow
+              appId={appId}
+              ingress={ingress}
+              certificateName={certificateName}
+              certificateTrack={certificateTrack}
+              editable={editable}
+              settingsReadable={settingsReadable}
+            />
           )}
 
           <dt>传输层</dt>
@@ -3278,7 +3547,7 @@ export function IngressStreamRow({
               </div>
             )}
             {splitReality && hasDownload && (
-              <div className="note">REALITY 独立下载需要本机证书，修改后需发布并重启 xray。</div>
+              <div className="note">REALITY 独立下载需要{certificateLabel}，修改后需发布并重启 xray。</div>
             )}
           </dd>
         </>
@@ -4204,8 +4473,8 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                           data-order-kind="chain"
                           data-order-app={g.app.id}
                           data-order-id={r.chain.id}
-                          // 整卡即拖动手柄（方案 A）。越过 4px 阈值才起拖，之内仍是一次点击；
-                          // 触摸时卡面留给滚动、仅抓手可拖（判定在 beginOrderDrag 内）。
+                          // 桌面端整卡即拖动区域，越过 4px 阈值才起拖，之内仍是一次点击。
+                          // 触摸时卡面优先用于滚动，不显示额外的六点抓手占用标题空间。
                           onPointerDown={event =>
                             beginOrderDrag(event, {
                               kind: 'chains',
@@ -4243,26 +4512,9 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                                 />
                               )}
                             </span>
-                            <button
-                              type="button"
-                              className="order-grip chain-order-grip"
-                              disabled={!owner || selecting}
-                              aria-label={`拖动调整链 ${r.chain.name || r.chain.id} 的顺序`}
-                              title={owner ? '按住拖动排序；聚焦后也可使用方向键' : '只有系统管理员可以调整顺序'}
-                              // 抓手仍是排序的可见提示与键盘入口，但拖动由整张卡统一发起
-                              // （卡片的 onPointerDown 冒泡即含抓手），这里不再单独起拖，
-                              // 否则按住抓手会同时触发两个拖动会话。
-                              onClick={event => event.stopPropagation()}
-                              onKeyDown={event =>
-                                nudgeOrder(event, {
-                                  kind: 'chains',
-                                  appId: g.app.id,
-                                  active: r.chain.id,
-                                  original: g.chains.map(row => row.chain.id),
-                                  order: g.chains.map(row => row.chain.id),
-                                })
-                              }
-                            />
+                            <span className="chain-card-flag">
+                              <RegionFlag code={r.chain.subscription_country} />
+                            </span>
                             <span className="chain-card-title">
                               <b>{r.chain.name || r.chain.id}</b>
                               {r.chain.name && r.chain.name !== r.chain.id && <span>{r.chain.id}</span>}
@@ -4352,15 +4604,16 @@ function ChainPath({
               ? '缺接入面'
               : spine.length === 1
                 ? '直出'
-                : `${spine.length - 1} 跳中继`}
+                : `${spine.length - 1} 跳`}
         </span>
       )}
     </span>
   );
 }
 
-// 链的标识信息：名称、id、租户。它们位于标题中，样式与其他位置的标题一致
-//（`.chain-hd`，机器详情和建链向导使用同一样式）：名称使用大号字，其后是灰色的 id。
+// 链的标识信息：出口地区旗、名称、id、租户。它们位于标题中，样式与其他位置的标题一致
+//（`.chain-hd`，机器详情和建链向导使用同一样式）：旗帜只作只读前缀，名称使用大号字，
+// 其后是灰色的 id。
 //
 // 此前左栏有一块「身份」。而标题中已显示名称和 id，重复显示会削弱标题的作用；
 // 更主要的问题是左栏因此只剩三行只读文本，右栏有九个字段，
@@ -4370,9 +4623,10 @@ function ChainPath({
 // 在标题旁常驻一个「保存」按钮的视觉权重高于其功能——本页多数时间不涉及重命名，
 // 该按钮多数时间处于禁用状态。
 //
-// 只有名称可修改。id 只显示：`chains.id` 是全局主键，修改 id 不是重命名而是将该链连同
-// 规则表迁移到其他项目下（论证见 ports.ts），提供输入框会使该迁移易于误触发。
-// 租户同样只显示，但必须显示——见下面保存部分的说明：它是该操作中最易写错的字段。
+// 只有名称可修改。地区旗始终位于输入框之外，因此改名时不会把 emoji/地区代码写进名称；
+// id 只显示：`chains.id` 是全局主键，修改 id 不是重命名而是将该链连同规则表迁移到其他
+// 项目下（论证见 ports.ts），提供输入框会使该迁移易于误触发。租户同样只显示，但必须
+// 显示——见下面保存部分的说明：它是该操作中最易写错的字段。
 export function ChainTitle({ appId, chain, editable }: { appId: string; chain: SnapshotChain; editable: boolean }) {
   const qc = useQueryClient();
   /* null 表示未处于编辑状态。进入编辑时以当前名称为初值，显示值均实时计算。 */
@@ -4420,6 +4674,7 @@ export function ChainTitle({ appId, chain, editable }: { appId: string; chain: S
   return (
     <>
       <div className="chain-hd">
+        <RegionFlag code={chain.subscription_country} />
         {editable && draft !== null ? (
           <input
             className="f chain-rename"
@@ -4568,6 +4823,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const { who } = useSession();
   const qc = useQueryClient();
   const editable = can(who.role, 'edit');
+  const settingsReadable = !isPublic(who);
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const probes = useQuery({
@@ -4580,9 +4836,13 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const a = snapshot.data?.snapshot.apps.find(x => x.id === app);
   const c = a?.chains?.find(x => x.id === chain);
   const ingress = (a?.ingresses ?? []).find(x => x.chain === chain) ?? null;
+  const ingressNode = snapshot.data?.snapshot.nodes?.find(node => node.id === ingress?.node);
+  const ingressCertificateName = ingressNode?.certificate_name;
+  const ingressCertificateTrack = ingressNode?.certificate_track;
   const [pendingIngressNode, setPendingIngressNode] = useState<string | null>(null);
   const [pendingBind, setPendingBind] = useState<string | null>(null);
   const vlessPanel = useImmediatePanelVisibility(!!ingress?.wires.vless);
+  const encryptionPanel = useImmediatePanelVisibility(!!ingress?.wires.vless_encryption);
   const anyTlsPanel = useImmediatePanelVisibility(!!ingress?.wires.anytls);
   const hy2Panel = useImmediatePanelVisibility(!!ingress?.wires.hysteria2);
   const { projHandles, projDirty, projBlocked, onV4Handle, onV6Handle } = useProjectionHandles();
@@ -4665,7 +4925,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
 
       {/* 两列，按「用户连接到何处」和「隧道的协议配置」划分。
           左栏：结论 + 落点（由哪台机器接收）+ 订阅投影（客户端连接的地址）。
-          右栏：协议栈（协议 / 安全层 / 传输层，以及其下的相关参数）。
+          右栏：协议栈（协议 / 传输安全 / 传输层，以及其下的相关参数）。
 
           此前的划分是「它是什么」和「它的配置」：左栏是状态和标识，右栏是整个接入面。
           问题不在划分方式，而在两侧的内容量——接入面的字段从两个增加到九个，
@@ -4831,52 +5091,59 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
 
         <div className="col">
           {/* ── 协议栈 ──
-            三层（协议 / 安全层 / 传输层）排在最前，三行相同形态的下拉框构成一组；
+            三层（协议 / 传输安全 / 传输层）排在最前，三行相同形态的下拉框构成一组；
             单独命名的参数（目标站点 / 流控 / Fallback 限速）排在该组之后。
             不缩进、不画线、不加层级编号：本栏本身是一张表，增加形态会增加识别成本。
 
-            顺序有明确依据——目标站点和流控都属于安全层，Fallback 限速作用于未通过
-            REALITY 校验、进入 fallback 的连接，同样属于安全层。传输层的参数
+            顺序有明确依据——目标站点和流控都属于传输安全，Fallback 限速作用于未通过
+            REALITY 校验、进入 fallback 的连接，同样属于传输安全。传输层的参数
             （路径、并发、Host、上行）在 IngressStreamRow 中构成独立的「XHTTP」一行。 */}
           {ingress ? (
             <>
               <ConfigPanel title="协议" icon="protocol">
-                {/* 标题右端此前有一枚摘要角标（REALITY · TCP · VISION）。它不含新信息——
-                    三层各取一个词，与下方三行下拉框一一对应，而那三行就在同一屏内、
-                    永远展开。同一件事说两遍，去掉角标留下拉框。 */}
-                <dl className="kv form2 chain-face fill">
-                  <IngressStreamRow
-                    appId={app}
-                    ingress={ingress}
-                    certificateName={
-                      snapshot.data?.snapshot.nodes?.find(node => node.id === ingress.node)?.certificate_name
-                    }
-                    editable={editable}
-                    section="protocols"
-                    onVlessEnabledChange={vlessPanel.preview}
-                    onAnyTlsEnabledChange={anyTlsPanel.preview}
-                    onHy2EnabledChange={hy2Panel.preview}
-                  />
-                </dl>
+                <IngressStreamRow
+                  appId={app}
+                  ingress={ingress}
+                  certificateName={ingressCertificateName}
+                  certificateTrack={ingressCertificateTrack}
+                  editable={editable}
+                  settingsReadable={settingsReadable}
+                  section="protocols"
+                  onVlessEnabledChange={vlessPanel.preview}
+                  onAnyTlsEnabledChange={anyTlsPanel.preview}
+                  onEncryptionEnabledChange={encryptionPanel.preview}
+                  onHy2EnabledChange={hy2Panel.preview}
+                />
               </ConfigPanel>
               {vlessPanel.visible && (
                 <IngressPanel
                   appId={app}
                   ingress={ingress}
-                  title="VLESS"
+                  title="VLESS · TLS / REALITY"
                   editable={editable}
                   panelRef={vlessPanel.panelRef}
                 >
                   <IngressStreamRow
                     appId={app}
                     ingress={ingress}
-                    certificateName={
-                      snapshot.data?.snapshot.nodes?.find(node => node.id === ingress.node)?.certificate_name
-                    }
+                    certificateName={ingressCertificateName}
+                    certificateTrack={ingressCertificateTrack}
                     editable={editable}
+                    settingsReadable={settingsReadable}
                     section="vless"
                     vlessEnabled
                   />
+                </IngressPanel>
+              )}
+              {encryptionPanel.visible && (
+                <IngressPanel
+                  appId={app}
+                  ingress={ingress}
+                  title="VLESS · Encryption"
+                  editable={editable}
+                  panelRef={encryptionPanel.panelRef}
+                >
+                  <IngressEncryptionRow ingress={ingress} editable={editable} />
                 </IngressPanel>
               )}
               {anyTlsPanel.visible && (
@@ -4890,10 +5157,10 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                   <IngressStreamRow
                     appId={app}
                     ingress={ingress}
-                    certificateName={
-                      snapshot.data?.snapshot.nodes?.find(node => node.id === ingress.node)?.certificate_name
-                    }
+                    certificateName={ingressCertificateName}
+                    certificateTrack={ingressCertificateTrack}
                     editable={editable}
+                    settingsReadable={settingsReadable}
                     section="anytls"
                     anytlsEnabled
                   />
@@ -4910,10 +5177,10 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                   <IngressStreamRow
                     appId={app}
                     ingress={ingress}
-                    certificateName={
-                      snapshot.data?.snapshot.nodes?.find(node => node.id === ingress.node)?.certificate_name
-                    }
+                    certificateName={ingressCertificateName}
+                    certificateTrack={ingressCertificateTrack}
                     editable={editable}
+                    settingsReadable={settingsReadable}
                     section="hy2"
                     hy2Enabled
                   />
@@ -4924,7 +5191,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             <ConfigPanel title="没有接入面" icon="warn">
               <div className="callout warn" style={{ margin: 0 }}>
                 编译会报 <span className="mono">chain.no-ingress</span>，发布被挡。
-                没有接入面就没有链头，路径也无从排起。
+                没有接入面就没有入口节点，路径也无从排起。
               </div>
             </ConfigPanel>
           )}
@@ -4937,7 +5204,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
       <section className="panel config-panel rule-sheet-card node-chain-sheet">
         <header>
           <PanelTitle of="chains">链路规则</PanelTitle>
-          <span className="rule-sheet-meta">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳中继`}</span>
+          <span className="rule-sheet-meta">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳`}</span>
         </header>
         {/* 此处不提供「追加一跳」和「改顺序」。这两项操作都在下方的规则表中完成：
             转发目标的候选是全部机器，链外的机器标注为「链外」——选中后该机器即成为该链的
@@ -4962,6 +5229,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                 steps={chainSteps}
                 nodes={nodes.data?.nodes ?? []}
                 selected={ingress?.node ?? spine[0]}
+                settingsReadable={settingsReadable}
                 onRemove={node => {
                   // 删除 step 即删除成员：steps 的记录是链上成员的唯一数据来源，
                   // 只修改规则表时该成员在编译产物中仍然存在。上游规则表中指向它的
@@ -4974,11 +5242,6 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
           </RuleDraftScope>
         ) : (
           <div className="node-chain-use chain-tree">
-            {/* 提示置于树之外：树内每张规则表的标题在该档位下是隐藏的（见 styles.css 的
-                `.chain-rule-tree .rule-editor>.toolbar:first-child`），写在内部不可见。 */}
-            <p className="note" style={{ margin: '0 0 8px' }}>
-              只读：规则按原样列出。
-            </p>
             <ChainRulesPanel
               appId={app}
               chain={c}
@@ -4986,6 +5249,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
               steps={chainSteps}
               nodes={nodes.data?.nodes ?? []}
               selected={ingress?.node ?? spine[0]}
+              settingsReadable={settingsReadable}
               showHeader={false}
               readOnly
             />
@@ -5086,6 +5350,7 @@ export function ChainRulesPanel({
   rootLabelTitle,
   rootSummary,
   readOnly = false,
+  settingsReadable = true,
 }: {
   appId: string;
   chain: SnapshotChain;
@@ -5117,13 +5382,19 @@ export function ChainRulesPanel({
   // 此前整块被替换为「修改规则需要 editor 及以上」——该提示回答的是权限问题，
   // 而进入链详情页需要了解的是当前配置，两者不同。
   readOnly?: boolean;
+  /** False only for the passwordless public visitor, whose route allow-list excludes settings. */
+  settingsReadable?: boolean;
 }) {
   const rows = chainRuleRows(spine, steps);
   const graph = chainRuleGraph(steps, rows);
   /* 中转端口的默认值需要选择未占用的端口。与接入面处共用同一份判定（ports.ts）。 */
   const snapshotForPorts = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodesForPorts = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const settingsForPorts = useQuery({ queryKey: ['settings'], queryFn: () => fetchSettings(), enabled: !readOnly });
+  const settingsForPorts = useQuery({
+    queryKey: ['settings'],
+    queryFn: () => fetchSettings(),
+    enabled: settingsReadable && !readOnly,
+  });
   const revisionsForPorts = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   const currentForPorts = revisionsForPorts.data?.current_revision;
   const compiledForPorts = useQuery({
@@ -5151,7 +5422,7 @@ export function ChainRulesPanel({
   const portDependenciesError =
     snapshotForPorts.error ??
     nodesForPorts.error ??
-    settingsForPorts.error ??
+    (settingsReadable ? settingsForPorts.error : null) ??
     revisionsForPorts.error ??
     compiledForPorts.error;
   const rowOf = new Map(rows.map(row => [row.node, row]));
@@ -5466,7 +5737,7 @@ function summarize(r: Rule, nameOf: (id: string) => string = id => id): string {
       : r.a.t === 'proxy'
         ? `外部代理 ${r.a.outbound}`
         : r.a.t === 'egress'
-          ? '落地'
+          ? '从本机出网'
           : '拒绝';
   return `${m} ${a}`;
 }

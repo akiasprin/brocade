@@ -7,13 +7,13 @@ describe('建链向导协议默认值', () => {
 
     const wires = newChainWires({
       ...NEW_CHAIN_PROTOCOL_DEFAULTS,
-      anytlsPort: 18443,
+      anytlsPort: 14443,
       hy2Start: 30000,
       hy2End: 30099,
     });
     expect(wires.vless).toEqual({ kind: 'vless-reality' });
     expect(wires.anytls).toMatchObject({
-      port: 18443,
+      port: 14443,
       idle_session_check_interval_secs: 30,
       idle_session_timeout_secs: 30,
       min_idle_session: 1,
@@ -29,10 +29,29 @@ describe('建链向导协议默认值', () => {
       vless: true,
       anytls: false,
       hysteria2: false,
-      anytlsPort: 18443,
+      anytlsPort: 14443,
       hy2Start: 30000,
       hy2End: 30099,
     });
     expect(wires).toEqual({ vless: { kind: 'vless-reality' }, anytls: null, hysteria2: null });
   });
+});
+
+it('可单独启用 VLESS Encryption，默认 48000 或使用配置的分配端口', () => {
+  const options = {
+    vless: false,
+    anytls: false,
+    hysteria2: false,
+    vlessEncryption: true,
+    anytlsPort: 14443,
+    hy2Start: 30000,
+    hy2End: 30099,
+  };
+  expect(newChainWires(options)).toEqual({
+    vless: null,
+    anytls: null,
+    hysteria2: null,
+    vless_encryption: { port: 48000 },
+  });
+  expect(newChainWires({ ...options, vlessEncryptionPort: 49002 }).vless_encryption).toEqual({ port: 49002 });
 });

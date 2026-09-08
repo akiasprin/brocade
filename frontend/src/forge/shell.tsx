@@ -56,13 +56,13 @@ import { compactGrantAutomation, RuntimeCrumbStatus, type RuntimeCrumbState } fr
 interface Face {
   key: NavKey;
   label: string;
-  /* 顶栏导航的图标。收入「⋯」的项没有：菜单行是文字列表，图标在那里没有定位作用。 */
+  /* 顶栏和「⋯」菜单共用：菜单里的图标用于快速区分导航与账号操作。 */
   icon?: IconName;
   /* 默认对所有角色可见。按角色隐藏入口属于体验优化，不构成安全边界。 */
   roles?: AdminRole[];
 }
 
-// 顶栏只显示当前主工作流。外部出站已经在规则的「转发给」中管理，独立隧道页暂时
+// 顶栏只显示当前主工作流。代理出站已经在规则的「转发给」中管理，独立隧道页暂时
 // 保留作兼容入口但不再占一个导航位。
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
@@ -80,10 +80,9 @@ const MOBILE_MORE = NAV.filter(f => f.key === 'deploy' || f.key === 'usage');
 // 收入「⋯」的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从「⋯」进入。
 const MORE: Face[] = [
-  { key: 'settings', label: '设置', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
-  { key: 'tenants', label: '租户' },
-  { key: 'topo', label: '拓扑' },
-  { key: 'links', label: '链路与 MTU' },
+  { key: 'settings', label: '设置', icon: 'settings', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
+  { key: 'topo', label: '拓扑', icon: 'chains' },
+  { key: 'links', label: '链路与 MTU', icon: 'link' },
 ];
 
 /* 不进入页面列表，但需要标题：面包屑和窗口名都读取 LABEL。 */
@@ -93,8 +92,7 @@ const LABEL: Record<NavKey, string> = Object.fromEntries(
   [...NAV, ...MORE, ...OFF_NAV].map(f => [f.key, f.label]),
 ) as Record<NavKey, string>;
 
-const visible = (faces: Face[], who: Whoami) =>
-  faces.filter(f => !f.roles || f.roles.includes(who.role));
+const visible = (faces: Face[], who: Whoami) => faces.filter(f => !f.roles || f.roles.includes(who.role));
 
 export function ForgeShell({
   branding,
@@ -126,6 +124,9 @@ export function ForgeShell({
       draft.subscribe(() => {
         qc.invalidateQueries({ queryKey: ['snapshot'] });
         qc.invalidateQueries({ queryKey: ['compile'] });
+        // Submission receipts also arrive from other tabs. Settings must stop using their old
+        // committed baseline when such a receipt removes the pending settings operation.
+        qc.invalidateQueries({ queryKey: ['settings'] });
       }),
     [qc],
   );
@@ -192,13 +193,7 @@ export function ForgeShell({
     refetchInterval: 5_000,
   });
 
-  const {
-    list,
-    changed,
-    dirty,
-    pending: artifactsPending,
-    error: artifactsError,
-  } = useChangedArtifacts(current, prev);
+  const { list, changed, dirty, pending: artifactsPending, error: artifactsError } = useChangedArtifacts(current, prev);
   const draftBlast = useMemo(() => blastRadius(list, changed), [list, changed]);
   const pendingTargets = dirty ? undefined : verify.data?.summary.changed_targets;
   const diagnostics = visibleDiagnostics(compile.data?.diagnostics);
@@ -230,16 +225,16 @@ export function ForgeShell({
               title: draftBlast.size ? [...draftBlast].join(', ') : undefined,
             }
       : verify.isPending
-      ? { text: '检查中', tone: 'normal' }
-      : verify.error
-        ? { text: '发布状态未知', tone: 'bad' }
-        : awaitingDeploy
-          ? { text: `发布 #${awaitingDeploy.id} · 待确认`, tone: 'bad' }
-          : grantRuntime.tone === 'bad'
-            ? grantRuntime
-            : pendingTargets
-              ? { text: `待发布 ${pendingTargets} 台`, tone: 'hot' }
-              : grantRuntime;
+        ? { text: '检查中', tone: 'normal' }
+        : verify.error
+          ? { text: '发布状态未知', tone: 'bad' }
+          : awaitingDeploy
+            ? { text: `发布 #${awaitingDeploy.id} · 待确认`, tone: 'bad' }
+            : grantRuntime.tone === 'bad'
+              ? grantRuntime
+              : pendingTargets
+                ? { text: `待发布 ${pendingTargets} 台`, tone: 'hot' }
+                : grantRuntime;
 
   return (
     <div className={`forge${narrow ? ' narrow' : ''}`}>
@@ -481,11 +476,14 @@ function TopBar({
   );
 
   const menu = more && (
-    <div className="fg-menu" onClick={() => setMore(false)}>
+    <div className="fg-menu nav-menu" onClick={() => setMore(false)}>
       {rest.map(f => (
         <button key={f.key} onClick={() => navigate(f.key)}>
-          {f.label}
-          {f.key === 'deploy' && deploymentMenuHint && <small>{deploymentMenuHint}</small>}
+          {f.icon && <Icon of={f.icon} size={14} className="fg-menu-icon" />}
+          <span>
+            {f.label}
+            {f.key === 'deploy' && deploymentMenuHint && <small>{deploymentMenuHint}</small>}
+          </span>
         </button>
       ))}
       {/* 分隔线用于区分页面项和设置项。上方没有任何项时（公开访客在 MORE 中没有可见页面），
@@ -494,15 +492,22 @@ function TopBar({
       {/* 产物在窄屏下是全屏覆盖层，不是随手查看的内容，因此从导航行收入菜单。 */}
       {narrow && artifacts && (
         <button onClick={() => artifactPanel.toggle()}>
-          产物<small>这一版编译出了什么</small>
+          <Icon of="artifacts" size={14} className="fg-menu-icon" />
+          <span>
+            产物<small>这一版编译出了什么</small>
+          </span>
         </button>
       )}
       <button onClick={() => theme.toggle()}>
-        切换亮 / 暗<small>默认暗色</small>
+        <Icon of="theme" size={14} className="fg-menu-icon" />
+        <span>
+          切换亮 / 暗<small>默认暗色</small>
+        </span>
       </button>
       {/* 调色盘是即时预览项而不是跳转项：点击不关闭菜单（stopPropagation），
           可以连续试色。选中态由 aria-pressed 的圆环表示。 */}
       <div className="fg-accrow" onClick={e => e.stopPropagation()}>
+        <Icon of="theme" size={14} className="fg-menu-icon" />
         <span className="t">配色</span>
         {PALETTES.map(option => (
           <button
@@ -520,21 +525,27 @@ function TopBar({
           公开账户除外：它是免密的共用身份，为其设置密码会导致所有人无法登录。 */}
       {!isPublic(who) && (
         <button onClick={() => navigate('password')}>
-          改密码<small>改自己的登录密码</small>
+          <Icon of="security" size={14} className="fg-menu-icon" />
+          <span>
+            改密码<small>改自己的登录密码</small>
+          </span>
         </button>
       )}
       {/* 公开访客的「退出」即登录入口：该页面上没有其他位置可以返回登录表单。 */}
       <button onClick={onLogout}>
-        {isPublic(who) ? '登录' : '退出'}
-        <small>
-          {isPublic(who) ? (
-            '现在是公开访客，登录换成你自己的身份'
-          ) : (
-            <>
-              {who.operator_id} · {who.role} · scope {who.tenant_scope ?? '全局'}
-            </>
-          )}
-        </small>
+        <Icon of={isPublic(who) ? 'access' : 'outbound'} size={14} className="fg-menu-icon" />
+        <span>
+          {isPublic(who) ? '登录' : '退出'}
+          <small>
+            {isPublic(who) ? (
+              '现在是公开访客，登录换成你自己的身份'
+            ) : (
+              <>
+                {who.self_user?.user_id ?? who.operator_id} · {who.role}
+              </>
+            )}
+          </small>
+        </span>
       </button>
     </div>
   );

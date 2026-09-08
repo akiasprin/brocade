@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 
-/* 全线稿图标库。16 网格、1.5px 描边、圆角线帽、currentColor——用色由使用处的 CSS 定，
-   不随主色。两个出口：ListIcon 是列表页标题行的固定用法（16px、.list-ico 定色 --ink-2）；
+/* 图标库以线稿为主，品牌标识保留原轮廓。16 网格、1.5px 描边、圆角线帽，
+   currentColor 由使用处的 CSS 定。两个出口：ListIcon 是列表页标题行的固定用法（16px、.list-ico 定色 --ink-2）；
    Icon 是通用件，尺寸和着色类由调用点给（顶栏导航 14px、产物/诊断 13px）。 */
 
 const PATHS = {
@@ -69,6 +69,29 @@ const PATHS = {
       <path d="M5.5 8 L7.2 9.7 L10.8 6.1" />
     </>
   ),
+  /* Project X 官网标识：https://xtls.github.io/logo-light.svg
+     来源 Project X 社区（网站 CC-BY-SA 4.0）；保留原轮廓，缩放到 16 网格并跟随文字颜色。 */
+  xray: (
+    <g transform="scale(0.016)" fill="currentColor" stroke="none">
+      <polygon points="530,530 900,530 650,650 530,1000" />
+      <polygon points="470,530 470,900 350,650 0,530" />
+      <polygon points="530,470 530,100 650,350 1000,470" />
+      <polygon points="470,470 100,470 350,350 470,0" />
+    </g>
+  ),
+  /* Hysteria 官网标识：https://v2.hysteria.network/assets/logo.svg
+     保留原轮廓和黄色部分，中性色随文字颜色适配主题。 */
+  hysteria: (
+    <g transform="translate(0 2.15) scale(0.03618)" fill="currentColor" stroke="none">
+      <polygon points="72.8 140.45 60.1 285.55 102.51 285.55 111.5 182.86 111.54 182.86 115.21 140.45 72.8 140.45" />
+      <polygon points="124.16 37.75 81.76 37.75 76.19 101.36 118.59 101.36 124.16 37.75" />
+      <polygon points="318.36 285.56 360.44 285.56 366.01 221.95 323.9 221.95 318.36 285.56" />
+      <polygon points="382.09 37.76 340 37.76 329.16 161.66 221.09 161.66 206.95 323.31 292.78 201.84 438.67 201.84 442.19 161.66 371.25 161.66 382.09 37.76" />
+      <polygon fill="#ffbc00" points="149.41 121.47 3.52 121.47 0 161.66 221.09 161.66 235.23 0 149.41 121.47" />
+    </g>
+  ),
+  /* AnyTLS 使用闪电。 */
+  bolt: <path d="M9.2 1.8 L3.2 8.8 H7 L6.8 14.2 L12.8 7.2 H9 Z" />,
   /* 箭头进入监听边界。 */
   ingress: (
     <>
@@ -133,6 +156,22 @@ const PATHS = {
       <circle cx="3.2" cy="8" r="1" fill="currentColor" stroke="none" />
       <circle cx="8" cy="8" r="1" fill="currentColor" stroke="none" />
       <circle cx="12.8" cy="8" r="1" fill="currentColor" stroke="none" />
+    </>
+  ),
+  /* 日期范围：标题栏观测时间选择器。 */
+  calendar: (
+    <>
+      <rect x="2.2" y="3.4" width="11.6" height="10.3" rx="1.7" />
+      <path d="M5 1.9 V4.8 M11 1.9 V4.8 M2.2 6.4 H13.8" />
+      <path d="M5 8.8 H6 M8 8.8 H9 M11 8.8 H12 M5 11.2 H6 M8 11.2 H9" />
+    </>
+  ),
+  /* 亮暗与配色：半明半暗的太阳。 */
+  theme: (
+    <>
+      <circle cx="8" cy="8" r="3.1" />
+      <path d="M8 1.4 V3 M8 13 V14.6 M1.4 8 H3 M13 8 H14.6 M3.3 3.3 L4.4 4.4 M11.6 11.6 L12.7 12.7 M12.7 3.3 L11.6 4.4 M4.4 11.6 L3.3 12.7" />
+      <path d="M8 4.9 A3.1 3.1 0 0 0 8 11.1 Z" fill="currentColor" stroke="none" opacity=".22" />
     </>
   ),
   /* 出盘上箭头：发布 */
@@ -221,6 +260,15 @@ const PATHS = {
       <path d="M8 2.4 L14.6 13.6 H1.4 Z" />
       <path d="M8 6.6 V9.7" />
       <circle cx="8" cy="11.7" r="0.55" fill="currentColor" stroke="none" />
+    </>
+  ),
+  /* 垃圾桶：永久移除已经退役的资源。只用于明确的破坏性操作，不与普通的减号混用。 */
+  trash: (
+    <>
+      <path d="M2.5 4.5 H13.5" />
+      <path d="M5.7 4.5 V2.5 H10.3 V4.5" />
+      <path d="M4.1 4.5 L4.9 13.5 H11.1 L11.9 4.5" />
+      <path d="M6.6 7 V11 M9.4 7 V11" />
     </>
   ),
 };

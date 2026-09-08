@@ -1,8 +1,10 @@
+import { ingressUpsertBody } from '../src/api';
 import { useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
+  CertificateTrack,
   SnapshotIngress,
   TransportKind,
   UpsertIngressBody,
@@ -10,7 +12,7 @@ import type {
   XhttpXmux,
 } from '../src/api';
 import { draft } from '../src/draft';
-import { IngressPanel, IngressStreamRow } from '../src/panes/chains';
+import { IngressPanel, IngressStreamRow, IngressEncryptionRow } from '../src/panes/chains';
 
 function ingress(
   kind: TransportKind,
@@ -49,11 +51,15 @@ function Harness({
   flow,
   xmux,
   tuning,
+  certificateName,
+  certificateTrack,
 }: {
   kind: TransportKind;
   flow?: string;
   xmux?: XhttpXmux | null;
   tuning?: XhttpTuning | null;
+  certificateName?: string | null;
+  certificateTrack?: CertificateTrack | null;
 }) {
   const [client] = useState(() => {
     const queryClient = new QueryClient({
@@ -80,7 +86,14 @@ function Harness({
   return (
     <QueryClientProvider client={client}>
       <IngressPanel appId="app-1" ingress={value} title="VLESS" editable>
-        <IngressStreamRow appId="app-1" ingress={value} editable section="vless" />
+        <IngressStreamRow
+          appId="app-1"
+          ingress={value}
+          certificateName={certificateName}
+          certificateTrack={certificateTrack}
+          editable
+          section="vless"
+        />
       </IngressPanel>
     </QueryClientProvider>
   );
@@ -114,13 +127,7 @@ function AnyTlsHarness({ editable = true }: { editable?: boolean } = {}) {
     queryClient.setQueryData(['revisions'], { current_revision: null });
     queryClient.setQueryData(['settings'], {
       ports: { anytls_base: 16000, hy2_base: 18000 },
-      anytls_padding_scheme: [
-        'stop=4',
-        '0=22-29',
-        '1=60-96',
-        '2=95-125,c,185-245',
-        '3=200-460',
-      ],
+      anytls_padding_scheme: ['stop=4', '0=22-29', '1=60-96', '2=95-125,c,185-245', '3=200-460'],
       reality_site: {
         dest: 'www.example.com:443',
         server_names: ['www.example.com'],
@@ -187,7 +194,7 @@ function Hy2Harness() {
   );
 }
 
-function NewAnyTlsHarness({ anytlsBase }: { anytlsBase: number }) {
+function NewAnyTlsHarness({ anytlsBase, encryptionBase }: { anytlsBase: number; encryptionBase?: number }) {
   const [anytlsVisible, setAnyTlsVisible] = useState(false);
   const [hy2Visible, setHy2Visible] = useState(false);
   const [client] = useState(() => {
@@ -201,7 +208,7 @@ function NewAnyTlsHarness({ anytlsBase }: { anytlsBase: number }) {
     queryClient.setQueryData(['nodes'], { nodes: [] });
     queryClient.setQueryData(['revisions'], { current_revision: null });
     queryClient.setQueryData(['settings'], {
-      ports: { anytls_base: anytlsBase, hy2_base: 18000 },
+      ports: { anytls_base: anytlsBase, hy2_base: 18000, vless_encryption_base: encryptionBase },
       reality_site: {
         dest: 'www.example.com:443',
         server_names: ['www.example.com'],
@@ -346,6 +353,17 @@ function savedXhttp(body: UpsertIngressBody) {
 }
 
 describe('VLESS security draft', () => {
+  it.each([
+    ['public-ca', '本机 CA 证书'],
+    ['self-signed', '本机自签证书'],
+  ] as const)('labels the node-certificate option for the %s track', (certificateTrack, label) => {
+    const view = render(
+      <Harness kind="vless-reality" certificateName="edge.example.com" certificateTrack={certificateTrack} />,
+    );
+
+    expect(view.getByRole('option', { name: `${label} edge.example.com` })).toBeTruthy();
+  });
+
   it('keeps one stable save action while the security draft appears and disappears', async () => {
     draft.clear();
     const view = render(<Harness kind="vless-tls" />);
@@ -577,10 +595,10 @@ describe('AnyTLS ingress draft', () => {
     allowSnapshotRefresh();
     const view = render(<NewVlessHarness />);
 
-    fireEvent.click(view.getByRole('checkbox', { name: 'VLESS（TCP / XHTTP）' }));
+    fireEvent.click(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' }));
 
     expect(view.getByRole('heading', { name: 'VLESS', level: 4 })).toBeTruthy();
-    expect(view.getByText('安全层')).toBeTruthy();
+    expect(view.getByText('传输安全')).toBeTruthy();
   });
 
   it('exposes the listener, padding presets, session fields, and masquerade presets', async () => {
@@ -679,7 +697,7 @@ describe('AnyTLS ingress draft', () => {
   it('can switch the AnyTLS stream security to REALITY', async () => {
     draft.clear();
     const view = render(<AnyTlsHarness />);
-    const security = view.getByRole('combobox', { name: 'AnyTLS 安全层' }) as HTMLSelectElement;
+    const security = view.getByRole('combobox', { name: 'AnyTLS 传输安全' }) as HTMLSelectElement;
     expect(security.value).toBe('tls');
 
     fireEvent.change(security, { target: { value: 'reality' } });
@@ -773,5 +791,109 @@ describe('Hysteria 2 ingress form', () => {
 
     expect(listener.parentElement?.textContent).toBe('');
     expect(view.queryByRole('button', { name: '重新分配' })).toBeNull();
+  });
+});
+
+describe('VLESS Encryption ingress draft', () => {
+  it.each([
+    [undefined, 48000],
+    [49000, 49000],
+    [443, 444],
+  ])('从设置 %s 分配独立端口，避开普通 VLESS 端口', async (base, expected) => {
+    draft.clear();
+    allowSnapshotRefresh();
+    const view = render(<NewAnyTlsHarness anytlsBase={16000} encryptionBase={base} />);
+    fireEvent.click(view.getByRole('checkbox', { name: 'VLESS · Encryption（TCP）' }));
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
+    const operation = draft.ops()[0];
+    if (operation?.op !== 'upsert_ingress') throw new Error('expected ingress operation');
+    expect((operation.ingress as UpsertIngressBody).wires).toMatchObject({
+      vless: { kind: 'vless-reality' },
+      vless_encryption: { port: expected },
+    });
+  });
+});
+
+function EncryptionHarness({ editable = true }: { editable?: boolean } = {}) {
+  const [client] = useState(() => {
+    const query = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    query.setQueryData(['snapshot'], { snapshot: { apps: [], nodes: [] } });
+    query.setQueryData(['nodes'], { nodes: [] });
+    return query;
+  });
+  const value: SnapshotIngress = {
+    ...ingress('vless-reality'),
+    wires: { vless_encryption: { port: 48000, public_key: 'example-public-key' } },
+  };
+  return (
+    <QueryClientProvider client={client}>
+      <IngressPanel appId="app-1" ingress={value} title="VLESS Encryption" editable={editable}>
+        <IngressEncryptionRow ingress={value} editable={editable} />
+      </IngressPanel>
+    </QueryClientProvider>
+  );
+}
+
+describe('VLESS Encryption options', () => {
+  it('saves non-default appearance, handshake, ticket range and both padding directions', async () => {
+    const view = render(<EncryptionHarness />);
+    expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(view.getByLabelText('Encryption 流量外观'), { target: { value: 'random' } });
+    fireEvent.change(view.getByLabelText('Encryption 客户端握手'), { target: { value: '1rtt' } });
+    fireEvent.click(view.getByText('票据与双向 Padding'));
+    fireEvent.change(view.getByLabelText('Encryption 票据有效期'), { target: { value: '100-500s' } });
+    fireEvent.change(view.getByLabelText('Encryption 服务端 Padding'), {
+      target: { value: '100-35-100.50-0-10.50-0-200' },
+    });
+    fireEvent.change(view.getByLabelText('Encryption 客户端 Padding'), { target: { value: '100-40-80' } });
+    expect(view.getByText('票据有效时间随机取 100–500 秒。')).toBeTruthy();
+    const body = await saveDraft(view);
+    expect(body.wires?.vless_encryption).toEqual({
+      port: 48000,
+      options: {
+        appearance: 'random',
+        client_mode: '1rtt',
+        ticket_lifetime: '100-500s',
+        server_padding: '100-35-100.50-0-10.50-0-200',
+        client_padding: '100-40-80',
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain('example-public-key');
+  });
+
+  it('blocks bad ticket ranges and padding before staging', () => {
+    const view = render(<EncryptionHarness />);
+    fireEvent.click(view.getByText('票据与双向 Padding'));
+    fireEvent.change(view.getByLabelText('Encryption 票据有效期'), { target: { value: '500-100s' } });
+    expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(view.getByLabelText('Encryption 票据有效期'), { target: { value: '0s' } });
+    expect(view.getByText('服务端不签发会话恢复票据，客户端每次执行完整握手。')).toBeTruthy();
+    fireEvent.change(view.getByLabelText('Encryption 客户端 Padding'), { target: { value: '100-1-10' } });
+    expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(view.getByLabelText('Encryption 客户端 Padding'), { target: { value: '100-35-100' } });
+    expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(draft.ops()).toHaveLength(0);
+  });
+
+  it('retains options while saving unrelated ingress fields', () => {
+    const value: SnapshotIngress = {
+      ...ingress('vless-reality'),
+      wires: {
+        vless_encryption: {
+          port: 48000,
+          public_key: 'example-public-key',
+          options: {
+            appearance: 'xorpub',
+            client_mode: '1rtt',
+            ticket_lifetime: '300-600s',
+            server_padding: '',
+            client_padding: '100-35-40',
+          },
+        },
+      },
+    };
+    const body = ingressUpsertBody(value);
+    expect(body.wires?.vless_encryption?.options).toEqual(value.wires.vless_encryption?.options);
+    expect(JSON.stringify(body)).not.toContain('example-public-key');
   });
 });

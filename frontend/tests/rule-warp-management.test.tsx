@@ -120,8 +120,8 @@ describe('WARP management inside forwarding rules', () => {
     fireEvent.click(view.getByRole('button', { name: '机器设置' }));
 
     await waitFor(() => expect(view.getByRole('dialog', { name: '管理当前机器的 WARP 出口' })).toBeTruthy());
-    expect(view.queryByRole('dialog', { name: '配置外部出站' })).toBeNull();
-    expect(view.getByText('默认参数属于租户 WARP 资源；当前机器有覆盖时，以机器参数为准。')).toBeTruthy();
+    expect(view.queryByRole('dialog', { name: '配置代理出站' })).toBeNull();
+    expect(view.getByText('当前机器有覆盖时，以机器参数为准。')).toBeTruthy();
   });
 });
 
@@ -183,4 +183,12 @@ describe('external outbound editor controls', () => {
     fireEvent.change(view.getByRole('textbox', { name: '名称' }), { target: { value: '供应商出口 2' } });
     expect(save.disabled).toBe(false);
   });
+});
+
+it('exposes deletion of unselected proxy resources in the rule target menu', () => {
+  const view = renderEditor([{ m: { t: 'any' }, a: { t: 'proxy', outbound: warp.id } }]);
+  fireEvent.click(view.getByRole('button', { name: /Cloudflare WARP/ }));
+  fireEvent.click(view.getByRole('button', { name: '删除 供应商出口' }));
+  expect(view.getByRole('dialog', { name: '删除代理出站' })).toBeTruthy();
+  expect(view.getByRole('button', { name: '删除代理出站' }).hasAttribute('disabled')).toBe(false);
 });

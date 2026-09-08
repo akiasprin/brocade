@@ -80,6 +80,8 @@ fn model_node(node: &Value, system_nodes: &BTreeMap<String, SystemNodeFixture>) 
         public_ipv6_nat: bool_value(node.get("public_ipv6_nat").unwrap_or(&Value::Bool(false))),
         overlay_addr: system.overlay_addr,
         certificate_name: None,
+        certificate_names: Vec::new(),
+        certificate_group_id: None,
         certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: system.private_key.clone(),

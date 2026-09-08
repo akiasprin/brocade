@@ -25,6 +25,7 @@ import (
 )
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
+var errSniffingAttemptLimit = errors.New("sniffing attempt limit reached")
 
 // sniffingStateAttribute is intentionally an internal routing attribute rather than a
 // protocol field. The JSON router already knows how to match content attributes, so a
@@ -250,16 +251,16 @@ func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip string) {
 	}
 }
 
-func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) bool {
+func (d *DefaultDispatcher) sniffOverrideReason(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) string {
 	domain := result.Domain()
 	if domain == "" {
-		return false
+		return "no_domain"
 	}
 	if request.ExcludeForDomain != nil && request.ExcludeForDomain.MatchAny(strings.ToLower(domain)) {
-		return false
+		return "excluded_domain"
 	}
 	if request.ExcludeForIP != nil && destination.Address.Family().IsIP() && request.ExcludeForIP.Match(destination.Address.IP()) {
-		return false
+		return "excluded_ip"
 	}
 	protocolString := result.Protocol()
 	if resComp, ok := result.(SnifferResultComposite); ok {
@@ -267,21 +268,21 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
 	}
 	for _, p := range request.OverrideDestinationForProtocol {
 		if strings.HasPrefix(protocolString, p) || strings.HasPrefix(p, protocolString) {
-			return true
+			return "accepted"
 		}
 		if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && protocolString != "bittorrent" && p == "fakedns" &&
 			fkr0.IsIPInIPPool(destination.Address) {
 			errors.LogInfo(ctx, "Using sniffer ", protocolString, " since the fake DNS missed")
-			return true
+			return "accepted"
 		}
 		if resultSubset, ok := result.(SnifferIsProtoSubsetOf); ok {
 			if resultSubset.IsProtoSubsetOf(p) {
-				return true
+				return "accepted"
 			}
 		}
 	}
 
-	return false
+	return "protocol_not_selected"
 }
 
 // Dispatch implements routing.Dispatcher.
@@ -306,6 +307,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	sniffingRequest := content.SniffingRequest
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled {
+		logSniffDecision(ctx, sniffingRequest, destination, nil, nil, "disabled", "none", 0)
 		setSniffingState(content, false, false)
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
@@ -315,11 +317,17 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				reader: outbound.Reader.(*pipe.Reader),
 			}
 			outbound.Reader = cReader
+			started := time.Now()
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 			if err == nil {
 				content.Protocol = result.Protocol()
 			}
-			domainRecovered := err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination)
+			reason := ""
+			if err == nil {
+				reason = d.sniffOverrideReason(ctx, result, sniffingRequest, destination)
+			}
+			domainRecovered := err == nil && reason == "accepted"
+			applied := "none"
 			if domainRecovered {
 				domain := result.Domain()
 				errors.LogInfo(ctx, "sniffed domain: ", domain)
@@ -334,10 +342,13 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				}
 				if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
 					ob.RouteTarget = destination
+					applied = "route"
 				} else {
 					ob.Target = destination
+					applied = "destination"
 				}
 			}
+			logSniffDecision(ctx, sniffingRequest, ob.OriginalTarget, result, err, reason, applied, time.Since(started))
 			setSniffingState(content, originalDestinationWasIP, domainRecovered)
 			d.routedDispatch(ctx, outbound, destination)
 		}()
@@ -366,6 +377,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
+		logSniffDecision(ctx, sniffingRequest, destination, nil, nil, "disabled", "none", 0)
 		setSniffingState(content, false, false)
 		d.routedDispatch(ctx, outbound, destination)
 	} else {
@@ -374,11 +386,17 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			reader: outbound.Reader.(buf.TimeoutReader),
 		}
 		outbound.Reader = cReader
+		started := time.Now()
 		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 		if err == nil {
 			content.Protocol = result.Protocol()
 		}
-		domainRecovered := err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination)
+		reason := ""
+		if err == nil {
+			reason = d.sniffOverrideReason(ctx, result, sniffingRequest, destination)
+		}
+		domainRecovered := err == nil && reason == "accepted"
+		applied := "none"
 		if domainRecovered {
 			domain := result.Domain()
 			errors.LogInfo(ctx, "sniffed domain: ", domain)
@@ -393,10 +411,13 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			}
 			if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
 				ob.RouteTarget = destination
+				applied = "route"
 			} else {
 				ob.Target = destination
+				applied = "destination"
 			}
 		}
+		logSniffDecision(ctx, sniffingRequest, ob.OriginalTarget, result, err, reason, applied, time.Since(started))
 		setSniffingState(content, originalDestinationWasIP, domainRecovered)
 		d.routedDispatch(ctx, outbound, destination)
 	}
@@ -445,8 +466,11 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 				} else {
 					totalAttempt++
 				}
-				if totalAttempt >= 2 || cacheDeadline <= 0 {
+				if cacheDeadline <= 0 {
 					return nil, errSniffingTimeout
+				}
+				if totalAttempt >= 2 {
+					return nil, errSniffingAttemptLimit
 				}
 			}
 		}

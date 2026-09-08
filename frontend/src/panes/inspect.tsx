@@ -95,8 +95,6 @@ function NodeInspect({ id, system, apps }: { id: string; system: SystemIr; apps:
         <dd>
           {appNode?.name || n.id} {appNode?.name && <span className="dim mono">{n.id}</span>}
         </dd>
-        <dt>租户</dt>
-        <dd className="mono dim">{n.tenant}</dd>
         <dt>overlay</dt>
         <dd className="mono">{n.overlay_addr}/32</dd>
         <dt>overlay 链路</dt>
@@ -187,7 +185,7 @@ function IngressInspect({ id, apps }: { id: string; apps: AppIr[] }) {
         <dt>前置组</dt>
         <dd className="mono dim">{ing.front ?? '—'}</dd>
         <dt>授权用户</dt>
-        <dd className="mono dim">{users.map(u => `${u.tenant}/${u.user}`).join('、') || '还没人'}</dd>
+        <dd className="mono dim">{users.map(u => u.user).join('、') || '还没人'}</dd>
       </dl>
       {users.length > 0 && (
         <div className="toolbar">

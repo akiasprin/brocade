@@ -16,15 +16,18 @@ import { HOP_WIRE_OPTIONS } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCompileView,
+  DEFAULT_HOP_MUX,
   fetchNodes,
   fetchRevisions,
   fetchSettings,
   fetchSnapshot,
+  hopMuxError,
   pruneChain,
   putStep,
   reorderNodeEgressDns,
   setNodeEgressDns,
   upsertExternalOutbound,
+  deleteExternalOutbound,
   type DestMatch,
   type EgressDnsResolution,
   type ExternalOutbound,
@@ -33,8 +36,10 @@ import {
   type ExternalVlessTransport,
   type HopDial,
   type HopInRequest,
+  type HopMux,
   type HopPool,
   type SnapshotStep,
+  type SnapshotApp,
   type Rule,
   type RuleAction,
   type StepAccept,
@@ -43,7 +48,7 @@ import {
 import { ErrorBox, Loading } from '../ui/bits';
 import { PanelTitle } from '../ui/icons';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
-import { externalImportCanSave, serverNameAfterAddressChange } from '../external-outbound';
+import { externalImportCanSave, serverNameAfterAddressChange, vlessEncryptionIsValid } from '../external-outbound';
 import {
   REALITY_FINGERPRINT_OPTIONS,
   realityFingerprintIsValid,
@@ -64,15 +69,14 @@ const forwardDial = (a: RuleAction): HopDial => (a.t === 'forward' ? (a.dial ?? 
 // 同理，未填写 pool 的规则读取后为 undefined，表示每次新建连接。
 const forwardPool = (a: RuleAction): HopPool => (a.t === 'forward' ? (a.pool ?? { t: 'none' }) : { t: 'none' });
 
-// 三档按复用程度递增排列。该顺序表示代价梯度，按顺序阅读即可了解每一档的取舍。
-// 与 DIAL_ORDER 一样将排列定义在模块层，避免下拉框的顺序和其他位置的判定分别定义后不一致。
-export const POOL_ORDER: HopPool['t'][] = ['none', 'pool', 'merge'];
-export const POOL_LABEL: Record<HopPool['t'], string> = {
+// 历史 pool/merge 只用于读取旧修订。当前写入使用 mux：省略 v 跟随全局，带 v 时整组覆盖。
+export type PoolChoice = 'none' | 'mux';
+export const POOL_ORDER: PoolChoice[] = ['none', 'mux'];
+export const POOL_LABEL: Record<PoolChoice, string> = {
   none: '每次新建',
-  pool: '连接池（实验）',
-  merge: '合并流',
+  mux: 'Mux 复用',
 };
-/* 新建一跳时的出站连接配置。与上面 `forwardPool` 的回退值不同，两者必须区分：
+/* 新建一跳时的连接复用配置。与上面 `forwardPool` 的回退值不同，两者必须区分：
    后者表示该规则中未填写 pool，只能取 none——模型中 HopPool 的 #[default] 即为 none，
    历史修订重新编译需要逐字节一致，修改读取逻辑会使机队中已有的跳全部启用连接池。
    本值是新建一跳时的初始值，与历史数据无关。Mux.cool 的 concurrency=1 会复用未经
@@ -86,10 +90,18 @@ export const POOL_DEFAULT: HopPool = { t: 'none' };
 export const forwardAction = (to: string, dial: HopDial, pool: HopPool = POOL_DEFAULT): RuleAction =>
   dial.t === 'reverse' ? { t: 'forward', to, dial } : { t: 'forward', to, dial, pool };
 
-// 选择合并流时输入框的初始值，同时也是 xray 的默认值。
-export const MERGE_DEFAULT = 8;
-export const MERGE_MIN = 2;
-export const MERGE_MAX = 128;
+// Mux.cool 的 concurrency。1 表示每条连接同时承载一条流，仍可复用空闲连接；
+// 大于 1 时多条流共享连接。界面不再把这两种数值拆成不同连接类型。
+export const MUX_DEFAULT = 1;
+export const MUX_MIN = 1;
+export const MUX_MAX = 128;
+export const poolChoice = (pool: HopPool): PoolChoice => (pool.t === 'none' ? 'none' : 'mux');
+export const muxConcurrency = (pool: HopPool): number =>
+  pool.t === 'merge' ? pool.v : pool.t === 'mux' ? (pool.v?.concurrency ?? MUX_DEFAULT) : MUX_DEFAULT;
+export const poolFromMuxConcurrency = (value: number): HopPool => ({
+  t: 'mux',
+  v: { ...DEFAULT_HOP_MUX, concurrency: value },
+});
 
 // 没有跨机器通用的 REALITY 站点。新建中转入口保持空白，要求操作者明确填写；已有配置
 // 始终显示其自身站点，不会被某个 UI 常量静默覆盖。
@@ -1177,7 +1189,7 @@ export function forwardPeers(args: {
       const blocked = n.retired_at
         ? '已退役'
         : !under(tenant, n.tenant_id)
-          ? `归 ${n.tenant_id}，这条链（${tenant}）看不见它`
+          ? '不在当前线路的可用范围内'
           : n.node_id === root
             ? '链入口'
             : reaches(n.node_id, nodeId)
@@ -1440,9 +1452,16 @@ function RuleEditorReady({
   const externalOutbounds = (snapshot.data?.snapshot.external_outbounds ?? []).filter(
     outbound => chainTenant === outbound.tenant || chainTenant.startsWith(`${outbound.tenant}.`),
   );
+  const [deleteOutbound, setDeleteOutbound] = useState<ExternalOutbound | null>(null);
+  const globalRelayMux = snapshot.data?.snapshot.settings?.relay_mux ?? DEFAULT_HOP_MUX;
   const [externalEditor, setExternalEditor] = useState<{
     existing: ExternalOutbound | null;
     ruleIndex: number;
+  } | null>(null);
+  const [muxEditor, setMuxEditor] = useState<{
+    to: string;
+    followGlobal: boolean;
+    value: HopMux;
   } | null>(null);
   const [warpManagerId, setWarpManagerId] = useState<string | null>(null);
   const [targetPickerRule, setTargetPickerRule] = useState<number | null>(null);
@@ -1945,848 +1964,1051 @@ function RuleEditorReady({
     setRules(pinTerminalRules([...rules, { m: { t: 'sniffing_failed' }, a: defaultRuleAction() }]));
 
   return (
-    // 使用 `fieldset` 仅为其 disabled 属性（它是 HTML 中唯一能一次禁用整棵子树
-    // 表单控件的元素），因此样式上重置为无视觉效果的一层，见 styles.css 的 .rule-ro。
-    <fieldset className="panel rule-editor rule-ro" disabled={readOnly}>
-      <div className="toolbar" style={{ marginBottom: 6 }}>
-        <b className="mono">
-          {chainId} / {nodeId}
-        </b>
-        <span className="note">DNS 策略按机器生效；线路只提供编辑入口</span>
-        <span className="sp" />
-        {onClose && (
-          <button className="btn" onClick={onClose}>
-            关闭
-          </button>
-        )}
-      </div>
-
-      {(nodeDnsPolicies.length > 0 || rules.some(rule => rule.a.t === 'egress' && supportsEgressDns(rule.m))) && (
-        <p className="note node-egress-dns-limit">
-          Xray 的 DNS 选择不携带原路由和出站上下文；DNS 查询可以指定出口，但解析结果无法按出站隔离。
-        </p>
-      )}
-
-      <table className="tbl rule-table">
-        <tbody>
-          {rules.map((r, i) => {
-            const kind = MATCH_KINDS.find(k => k.t === r.m.t);
-            const to = r.a.t === 'forward' ? r.a.to : '';
-            const externalId = r.a.t === 'proxy' ? r.a.outbound : '';
-            const dial = forwardDial(r.a);
-            const peer = peerOf(to);
-            const dk = dialKindOf(dial, peer);
-            const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
-            const targetBadge = external
-              ? externalProtocolBadge(external.protocol.t)
-              : r.a.t === 'forward'
-                ? 'NODE'
-                : '';
-            const targetLabel =
-              external?.name || peer?.name || (r.a.t === 'proxy' ? '外部出站不可用' : to ? '内部节点不可用' : '');
-            return (
-              <Fragment key={i}>
-                <tr>
-                  <td className="mono dim" style={{ width: 24 }}>
-                    {i + 1}
-                  </td>
-                  <td className="rule-match-cell">
-                    <select
-                      className="f"
-                      value={r.m.t}
-                      onChange={e => {
-                        const m = buildMatch(e.target.value as DestMatch['t'], '');
-                        patchMatch(i, r, m);
-                      }}
-                    >
-                      {MATCH_KINDS.map(k => (
-                        <option
-                          key={k.t}
-                          value={k.t}
-                          disabled={
-                            (k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)) ||
-                            (k.t === 'sniffing_failed' &&
-                              r.m.t !== 'sniffing_failed' &&
-                              rules.some(isSniffingFallbackRule))
-                          }
-                        >
-                          {k.label}
-                        </option>
-                      ))}
-                    </select>
-                    {kind?.list !== false && r.m.t !== 'any' && r.m.t !== 'front_downstream' && (
-                      <input
-                        className="f"
-                        placeholder={kind?.hint}
-                        value={matchValues(r.m)}
-                        onChange={e => patchMatch(i, r, buildMatch(r.m.t, e.target.value))}
-                      />
-                    )}
-                  </td>
-                  <td className="rule-action-cell">
-                    <select
-                      className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)}`}
-                      value={r.a.t === 'proxy' ? 'forward' : r.a.t}
-                      onChange={e => {
-                        const t = e.target.value as Exclude<RuleAction['t'], 'proxy'>;
-                        const a: RuleAction =
-                          t === 'forward'
-                            ? // dial 要显式写：不写的语义就是 overlay（模型里 HopDial
-                              // 的 #[default]），会绕过 defaultDial 的选择逻辑。
-                              defaultTarget
-                              ? forwardAction(defaultTarget, defaultDial(defaultTarget))
-                              : externalOutbounds[0]
-                                ? { t: 'proxy', outbound: externalOutbounds[0].id }
-                                : { t: 'forward', to: '' }
-                            : t === 'egress'
-                              ? { t: 'egress', send_through: null }
-                              : { t: 'block' };
-                        patch(i, { ...r, a });
-                        setTargetPickerRule(t === 'forward' ? i : null);
-                      }}
-                    >
-                      <option value="forward">转发给</option>
-                      <option value="egress">从这台落地</option>
-                      <option value="block">拒绝</option>
-                    </select>
-                    {(r.a.t === 'forward' || r.a.t === 'proxy') && (
-                      <span
-                        className="external-target-picker"
-                        ref={targetPickerRule === i ? targetPickerRoot : undefined}
-                      >
-                        <button
-                          type="button"
-                          className={`external-target-trigger${r.a.t === 'forward' ? ' node-target' : ''}`}
-                          aria-expanded={targetPickerRule === i}
-                          onClick={event => {
-                            const opening = targetPickerRule !== i;
-                            if (opening) {
-                              const rect = event.currentTarget.getBoundingClientRect();
-                              const viewportTop = window.visualViewport?.offsetTop ?? 0;
-                              const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-                              const viewportBottom = viewportTop + viewportHeight;
-                              const edgeAndGap = 15;
-                              const above = Math.max(0, rect.top - viewportTop - edgeAndGap);
-                              const below = Math.max(0, viewportBottom - rect.bottom - edgeAndGap);
-                              const openBelow = below >= 320 || below >= above;
-                              setTargetMenuPlacement({
-                                below: openBelow,
-                                maxHeight: Math.max(80, Math.min(520, Math.floor(openBelow ? below : above))),
-                              });
-                            }
-                            setTargetPickerRule(opening ? i : null);
-                            if (opening) setTargetQuery('');
-                          }}
-                        >
-                          <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
-                          <span className="external-target-copy">
-                            <b>{targetLabel || '选择内部节点或外部出站'}</b>
-                          </span>
-                          <span className="external-target-chevron">⌄</span>
-                        </button>
-                        {targetPickerRule === i && (
-                          <span
-                            ref={targetMenu}
-                            className={`external-target-menu${targetMenuPlacement.below ? ' below' : ''}`}
-                            style={{ maxHeight: targetMenuPlacement.maxHeight }}
-                          >
-                            <input
-                              className="f external-target-search"
-                              placeholder="搜索节点或外部出站"
-                              value={targetQuery}
-                              onChange={event => setTargetQuery(event.target.value)}
-                            />
-                            <span className="external-target-menu-label">Brocade 节点</span>
-                            {[...visibleNextPeers, ...visibleInsidePeers, ...visibleForkPeers].map(candidate => (
-                              <button
-                                type="button"
-                                className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
-                                key={candidate.id}
-                                onClick={() => selectForwardTarget(i, r, candidate.id)}
-                              >
-                                <span className="external-target-kind">NODE</span>
-                                <span className="external-target-copy">
-                                  <b>{candidate.name || '未命名节点'}</b>
-                                </span>
-                                <span className="external-target-where">
-                                  {candidate.where === 'next'
-                                    ? '当前下游'
-                                    : candidate.where === 'inside'
-                                      ? '链内其它节点'
-                                      : '主干之外'}
-                                </span>
-                              </button>
-                            ))}
-                            {visibleBlockedPeers.map(candidate => (
-                              <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
-                                <span className="external-target-kind">NODE</span>
-                                <span className="external-target-copy">
-                                  <b>{candidate.name || '未命名节点'}</b>
-                                </span>
-                                <span className="external-target-where">不能选</span>
-                              </button>
-                            ))}
-                            <span className="external-target-menu-label">外部出站</span>
-                            {visibleExternalOutbounds.map(outbound => (
-                              <span className="external-target-option" key={outbound.id}>
-                                <button
-                                  type="button"
-                                  className={`external-target-option-select${
-                                    r.a.t === 'proxy' && r.a.outbound === outbound.id ? ' on' : ''
-                                  }`}
-                                  onClick={() => selectExternalTarget(i, r, outbound.id)}
-                                >
-                                  <span className="external-target-kind external">
-                                    {externalProtocolBadge(outbound.protocol.t)}
-                                  </span>
-                                  <span className="external-target-copy">
-                                    <b>{outbound.name}</b>
-                                  </span>
-                                  <span className="external-target-where">租户资源</span>
-                                </button>
-                                {outbound.protocol.t === 'warp' && (
-                                  <button
-                                    type="button"
-                                    className="external-target-manage"
-                                    aria-label={`管理 ${outbound.name}`}
-                                    title={`管理 ${selfNode?.name || nodeId} 的 WARP 注册与参数`}
-                                    onClick={() => {
-                                      setTargetPickerRule(null);
-                                      setWarpManagerId(outbound.id);
-                                    }}
-                                  >
-                                    管理
-                                  </button>
-                                )}
-                              </span>
-                            ))}
-                            <button
-                              type="button"
-                              className="external-target-new"
-                              onClick={() => {
-                                setTargetPickerRule(null);
-                                setExternalEditor({ existing: null, ruleIndex: i });
-                              }}
-                            >
-                              <span>＋</span>
-                              <b>创建外部出站</b>
-                              <span>粘贴链接或手动填写</span>
-                            </button>
-                            {visibleNextPeers.length +
-                              visibleInsidePeers.length +
-                              visibleForkPeers.length +
-                              visibleBlockedPeers.length +
-                              visibleExternalOutbounds.length ===
-                              0 && <span className="external-target-empty">没有匹配项</span>}
-                          </span>
-                        )}
-                      </span>
-                    )}
-                    {r.a.t === 'forward' && (
-                      <>
-                        <select
-                          className="f"
-                          style={{ marginLeft: 6 }}
-                          value={dk}
-                          title="这一跳连接对端的哪个地址"
-                          onChange={e => setDial(i, to, e.target.value as DialKind)}
-                        >
-                          {/* 排列和可用性判定都在模块层（DIAL_ORDER / dialUnavailable），
-                            与默认档位的选择、建链向导的下拉框共用同一份。 */}
-                          {DIAL_ORDER.map(k => (
-                            <option key={k} value={k} disabled={dialUnavailable(k, peer, selfAddrs)}>
-                              {DIAL_LABEL[k]}
-                            </option>
-                          ))}
-                        </select>
-                        {/* 前三档的地址由推导得出，只读；仅自定义档需要手动填写 */}
-                        {dk === 'overlay' ? (
-                          // 与公网两档一样直接显示地址。显示为「XX 的 overlay 地址」会要求
-                          // 到其他位置查询该值——而它就在编译结果中，可直接获取。
-                          // 获取失败只有一种情况：该机器尚未加入 overlay，这正是需要说明的内容。
-                          <span className="mono dim" style={{ marginLeft: 6 }}>
-                            {overlayOf(to) || (
-                              <span style={{ color: 'var(--gold)' }}>{peer?.name || to} 不在 overlay 里</span>
-                            )}
-                          </span>
-                        ) : dk === 'public_ipv4' ? (
-                          <span className="mono dim" style={{ marginLeft: 6 }}>
-                            {publicIpv4Of(peer) || (
-                              <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv4</span>
-                            )}
-                          </span>
-                        ) : dk === 'public_ipv6' ? (
-                          <span className="mono dim" style={{ marginLeft: 6 }}>
-                            {publicIpv6Of(peer) || (
-                              <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv6</span>
-                            )}
-                          </span>
-                        ) : dk === 'reverse_v4' || dk === 'reverse_v6' ? (
-                          // 与前三档一样由推导得出，只读。显示的是本机的接入地址——
-                          // 对端从该地址接入。连接由哪一方发起、通道如何建立属于传输层的内容，
-                          // 界面不涉及。
-                          <span className="mono dim" style={{ marginLeft: 6 }}>
-                            {selfPublicHostOf(dk === 'reverse_v6' ? 'v6' : 'v4') || (
-                              <span style={{ color: 'var(--gold)' }}>
-                                这台机器没有可直连的{dk === 'reverse_v6' ? '公网 IPv6' : '公网 IPv4'}
-                              </span>
-                            )}
-                          </span>
-                        ) : (
-                          <>
-                            <input
-                              className="f mono"
-                              style={{ marginLeft: 6, width: 150 }}
-                              placeholder="10.0.0.9 / 2001:db8::9"
-                              value={hostOf(dial)}
-                              onChange={e =>
-                                setDialForTarget(
-                                  to,
-                                  {
-                                    t: 'addr',
-                                    v: formatHostPort(e.target.value, Number(hopOf(to).port) || hopBase),
-                                  },
-                                  i,
-                                )
-                              }
-                            />
-                            {natPublicHostOf(peer, hostOf(dial)) && (
-                              <span className="sub" style={{ color: 'var(--gold)' }}>
-                                该地址为 {natPublicHostOf(peer, hostOf(dial))} 且标记为经 NAT，编译会拒绝。
-                              </span>
-                            )}
-                          </>
-                        )}
-                      </>
-                    )}
-                    {r.a.t === 'egress' && (
-                      <span className="egress-dns-reference">
-                        <MachineEgressDnsControls
-                          resolution={effectiveDnsFor(r.m)}
-                          supported={supportsEgressDns(r.m)}
-                          onChange={next => patchMachineDns(r.m, next)}
-                          readOnly={readOnly}
-                          nodeName={selfNode?.name || nodeId}
-                          accessibleSuffix={`（线路规则：${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
-                          showEditor={false}
-                        />
-                      </span>
-                    )}
-                  </td>
-                  {/* 只读时整列不渲染：保留一列禁用按钮表示此处有操作但不可执行，
-                    而规则顺序已由左侧的序号表示。 */}
-                  {!readOnly && (
-                    <td style={{ width: 120, textAlign: 'right' }}>
-                      <button
-                        className="btn"
-                        disabled={i === 0 || isPinnedTerminalRule(r)}
-                        onClick={() => move(i, -1)}
-                        title={
-                          isAnyRule(r)
-                            ? '任意固定在末尾'
-                            : isSniffingFallbackRule(r)
-                              ? '嗅探失败兜底固定在任意之前'
-                              : '上移'
-                        }
-                      >
-                        ↑
-                      </button>
-                      <button
-                        className="btn"
-                        disabled={
-                          i === rules.length - 1 || isPinnedTerminalRule(r) || isPinnedTerminalRule(rules[i + 1])
-                        }
-                        onClick={() => move(i, 1)}
-                        title={
-                          isPinnedTerminalRule(r)
-                            ? '终结规则位置固定'
-                            : isPinnedTerminalRule(rules[i + 1])
-                              ? '不能移动到终结规则之后'
-                              : '下移'
-                        }
-                      >
-                        ↓
-                      </button>
-                      <button
-                        className="btn danger"
-                        disabled={flushing || save.isPending}
-                        onClick={() => {
-                          setRules(rules.filter((_, x) => x !== i));
-                          setFlushing(true);
-                        }}
-                      >
-                        删
-                      </button>
-                    </td>
-                  )}
-                </tr>
-              </Fragment>
-            );
-          })}
-          {orderedNodeDnsPolicies.map((policy, index) => {
-            const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
-            const value = matchValues(policy.selector);
-            return (
-              <tr className="machine-dns-shared-row" key={`machine-dns-${egressDnsSelectorKey(policy.selector)}`}>
-                <td className="mono dim" style={{ width: 24 }}>
-                  D{index + 1}
-                </td>
-                <td className="rule-match-cell">
-                  <span className="f rule-readonly-select">{kind?.label ?? policy.selector.t}</span>
-                  {value && <span className="f rule-readonly-value">{value}</span>}
-                </td>
-                <td className="rule-action-cell">
-                  <MachineEgressDnsControls
-                    resolution={effectiveDnsFor(policy.selector)}
-                    supported
-                    onChange={next => patchMachineDns(policy.selector, next)}
-                    readOnly={readOnly}
-                    nodeName={selfNode?.name || nodeId}
-                    accessibleSuffix={`（机器策略：${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`}
-                  />
-                </td>
-                {!readOnly && (
-                  <td className="dns-priority-cell" style={{ width: 120, textAlign: 'right' }}>
-                    <DnsPriorityControl
-                      index={index}
-                      count={orderedNodeDnsPolicies.length}
-                      label={`${kind?.label ?? policy.selector.t} ${value}`.trim()}
-                      readOnly={readOnly}
-                      showLabel={false}
-                      onMove={delta => moveMachineDns(policy.selector, delta)}
-                    />
-                  </td>
-                )}
-              </tr>
-            );
-          })}
-          {fallback?.pending && (
-            <tr className="rule-fallback-row" aria-label="正在计算编译器兜底规则">
-              <td className="mono dim" style={{ width: 24 }}>
-                *
-              </td>
-              <td className="rule-match-cell">
-                <span className="f rule-readonly-select">正在计算…</span>
-              </td>
-              <td className="rule-action-cell">
-                <span className="dim">兜底规则尚未生成</span>
-                {readOnly && <span className="rule-fallback-sign inline">自动补齐 · 计算中</span>}
-              </td>
-              {!readOnly && (
-                <td className="rule-fallback-sign" style={{ width: 120 }}>
-                  自动补齐 · 计算中
-                </td>
-              )}
-            </tr>
+    <>
+      {/* 使用 `fieldset` 仅为其 disabled 属性（它是 HTML 中唯一能一次禁用整棵子树
+          表单控件的元素），因此样式上重置为无视觉效果的一层，见 styles.css 的 .rule-ro。 */}
+      <fieldset className="panel rule-editor rule-ro" disabled={readOnly}>
+        <div className="toolbar" style={{ marginBottom: 6 }}>
+          <b className="mono">
+            {chainId} / {nodeId}
+          </b>
+          <span className="note">DNS 策略按机器生效；线路只提供编辑入口</span>
+          <span className="sp" />
+          {onClose && (
+            <button className="btn" onClick={onClose}>
+              关闭
+            </button>
           )}
-          {!fallback?.pending &&
-            visibleFallbackRules.map((r, fallbackIndex) => {
-              const kind = MATCH_KINDS.find(candidate => candidate.t === r.m.t);
-              const value = matchValues(r.m);
+        </div>
+
+        {(nodeDnsPolicies.length > 0 || rules.some(rule => rule.a.t === 'egress' && supportsEgressDns(rule.m))) && (
+          <p className="note node-egress-dns-limit">
+            Xray 的 DNS 选择不携带原路由和出站上下文；DNS 查询可以指定出口，但解析结果无法按出站隔离。
+          </p>
+        )}
+
+        <table className="tbl rule-table">
+          <tbody>
+            {rules.map((r, i) => {
+              const kind = MATCH_KINDS.find(k => k.t === r.m.t);
               const to = r.a.t === 'forward' ? r.a.to : '';
               const externalId = r.a.t === 'proxy' ? r.a.outbound : '';
-              const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
+              const dial = forwardDial(r.a);
               const peer = peerOf(to);
-              const targetBadge = external ? externalProtocolBadge(external.protocol.t) : 'NODE';
+              const dk = dialKindOf(dial, peer);
+              const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
+              const targetBadge = external
+                ? externalProtocolBadge(external.protocol.t)
+                : r.a.t === 'forward'
+                  ? 'NODE'
+                  : '';
               const targetLabel =
-                external?.name || peer?.name || (r.a.t === 'proxy' ? '外部出站不可用' : to || '内部节点不可用');
-              const actionLabel =
-                r.a.t === 'forward' || r.a.t === 'proxy' ? '转发给' : r.a.t === 'egress' ? '从这台落地' : '拒绝';
+                external?.name || peer?.name || (r.a.t === 'proxy' ? '代理出站不可用' : to ? '内部节点不可用' : '');
               return (
-                <tr
-                  className="rule-fallback-row"
-                  aria-label="编译器生成的不可编辑兜底规则"
-                  title="编译器根据当前配置自动生成，不能在这里修改"
-                  key={`fallback-${fallbackIndex}`}
-                >
+                <Fragment key={i}>
+                  <tr>
+                    <td className="mono dim" style={{ width: 24 }}>
+                      {i + 1}
+                    </td>
+                    <td className="rule-match-cell">
+                      <select
+                        className="f"
+                        value={r.m.t}
+                        onChange={e => {
+                          const m = buildMatch(e.target.value as DestMatch['t'], '');
+                          patchMatch(i, r, m);
+                        }}
+                      >
+                        {MATCH_KINDS.map(k => (
+                          <option
+                            key={k.t}
+                            value={k.t}
+                            disabled={
+                              (k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)) ||
+                              (k.t === 'sniffing_failed' &&
+                                r.m.t !== 'sniffing_failed' &&
+                                rules.some(isSniffingFallbackRule))
+                            }
+                          >
+                            {k.label}
+                          </option>
+                        ))}
+                      </select>
+                      {kind?.list !== false && r.m.t !== 'any' && r.m.t !== 'front_downstream' && (
+                        <input
+                          className="f"
+                          placeholder={kind?.hint}
+                          value={matchValues(r.m)}
+                          onChange={e => patchMatch(i, r, buildMatch(r.m.t, e.target.value))}
+                        />
+                      )}
+                    </td>
+                    <td className="rule-action-cell">
+                      <select
+                        className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)}`}
+                        value={r.a.t === 'proxy' ? 'forward' : r.a.t}
+                        onChange={e => {
+                          const t = e.target.value as Exclude<RuleAction['t'], 'proxy'>;
+                          const a: RuleAction =
+                            t === 'forward'
+                              ? // dial 要显式写：不写的语义就是 overlay（模型里 HopDial
+                                // 的 #[default]），会绕过 defaultDial 的选择逻辑。
+                                defaultTarget
+                                ? forwardAction(defaultTarget, defaultDial(defaultTarget))
+                                : externalOutbounds[0]
+                                  ? { t: 'proxy', outbound: externalOutbounds[0].id }
+                                  : { t: 'forward', to: '' }
+                              : t === 'egress'
+                                ? { t: 'egress', send_through: null }
+                                : { t: 'block' };
+                          patch(i, { ...r, a });
+                          setTargetPickerRule(t === 'forward' ? i : null);
+                        }}
+                      >
+                        <option value="forward">转发给</option>
+                        <option value="egress">从本机出网</option>
+                        <option value="block">拒绝</option>
+                      </select>
+                      {(r.a.t === 'forward' || r.a.t === 'proxy') && (
+                        <span
+                          className="external-target-picker"
+                          ref={targetPickerRule === i ? targetPickerRoot : undefined}
+                        >
+                          <button
+                            type="button"
+                            className={`external-target-trigger${r.a.t === 'forward' ? ' node-target' : ''}`}
+                            aria-expanded={targetPickerRule === i}
+                            onClick={event => {
+                              const opening = targetPickerRule !== i;
+                              if (opening) {
+                                const rect = event.currentTarget.getBoundingClientRect();
+                                const viewportTop = window.visualViewport?.offsetTop ?? 0;
+                                const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+                                const viewportBottom = viewportTop + viewportHeight;
+                                const edgeAndGap = 15;
+                                const above = Math.max(0, rect.top - viewportTop - edgeAndGap);
+                                const below = Math.max(0, viewportBottom - rect.bottom - edgeAndGap);
+                                const openBelow = below >= 320 || below >= above;
+                                setTargetMenuPlacement({
+                                  below: openBelow,
+                                  maxHeight: Math.max(80, Math.min(520, Math.floor(openBelow ? below : above))),
+                                });
+                              }
+                              setTargetPickerRule(opening ? i : null);
+                              if (opening) setTargetQuery('');
+                            }}
+                          >
+                            <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
+                            <span className="external-target-copy">
+                              <b>{targetLabel || '选择内部节点或代理出站'}</b>
+                            </span>
+                            <span className="external-target-chevron">⌄</span>
+                          </button>
+                          {targetPickerRule === i && (
+                            <span
+                              ref={targetMenu}
+                              className={`external-target-menu${targetMenuPlacement.below ? ' below' : ''}`}
+                              style={{ maxHeight: targetMenuPlacement.maxHeight }}
+                            >
+                              <input
+                                className="f external-target-search"
+                                placeholder="搜索节点或代理出站"
+                                value={targetQuery}
+                                onChange={event => setTargetQuery(event.target.value)}
+                              />
+                              <span className="external-target-menu-label">Brocade 节点</span>
+                              {[...visibleNextPeers, ...visibleInsidePeers, ...visibleForkPeers].map(candidate => (
+                                <button
+                                  type="button"
+                                  className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
+                                  key={candidate.id}
+                                  onClick={() => selectForwardTarget(i, r, candidate.id)}
+                                >
+                                  <span className="external-target-kind">NODE</span>
+                                  <span className="external-target-copy">
+                                    <b>{candidate.name || '未命名节点'}</b>
+                                  </span>
+                                  <span className="external-target-where">
+                                    {candidate.where === 'next'
+                                      ? '当前下游'
+                                      : candidate.where === 'inside'
+                                        ? '链内其它节点'
+                                        : '主干之外'}
+                                  </span>
+                                </button>
+                              ))}
+                              {visibleBlockedPeers.map(candidate => (
+                                <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
+                                  <span className="external-target-kind">NODE</span>
+                                  <span className="external-target-copy">
+                                    <b>{candidate.name || '未命名节点'}</b>
+                                  </span>
+                                  <span className="external-target-where">不能选</span>
+                                </button>
+                              ))}
+                              <span className="external-target-menu-label">代理出站</span>
+                              {visibleExternalOutbounds.map(outbound => (
+                                <span className="external-target-option" key={outbound.id}>
+                                  <button
+                                    type="button"
+                                    className={`external-target-option-select${
+                                      r.a.t === 'proxy' && r.a.outbound === outbound.id ? ' on' : ''
+                                    }`}
+                                    onClick={() => selectExternalTarget(i, r, outbound.id)}
+                                  >
+                                    <span className="external-target-kind external">
+                                      {externalProtocolBadge(outbound.protocol.t)}
+                                    </span>
+                                    <span className="external-target-copy">
+                                      <b>{outbound.name}</b>
+                                    </span>
+                                    <span className="external-target-where">共享资源</span>
+                                  </button>
+                                  {outbound.protocol.t !== 'warp' && !readOnly && (
+                                    <button
+                                      type="button"
+                                      className="external-target-manage"
+                                      aria-label={`编辑 ${outbound.name}`}
+                                      onClick={() => {
+                                        setTargetPickerRule(null);
+                                        setExternalEditor({ existing: outbound, ruleIndex: i });
+                                      }}
+                                    >
+                                      编辑
+                                    </button>
+                                  )}
+                                  {!readOnly && (
+                                    <button
+                                      type="button"
+                                      className="external-target-manage"
+                                      aria-label={`删除 ${outbound.name}`}
+                                      onClick={() => {
+                                        setTargetPickerRule(null);
+                                        setDeleteOutbound(outbound);
+                                      }}
+                                    >
+                                      删除
+                                    </button>
+                                  )}
+                                  {outbound.protocol.t === 'warp' && (
+                                    <button
+                                      type="button"
+                                      className="external-target-manage"
+                                      aria-label={`管理 ${outbound.name}`}
+                                      title={`管理 ${selfNode?.name || nodeId} 的 WARP 注册与参数`}
+                                      onClick={() => {
+                                        setTargetPickerRule(null);
+                                        setWarpManagerId(outbound.id);
+                                      }}
+                                    >
+                                      管理
+                                    </button>
+                                  )}
+                                </span>
+                              ))}
+                              <button
+                                type="button"
+                                className="external-target-new"
+                                onClick={() => {
+                                  setTargetPickerRule(null);
+                                  setExternalEditor({ existing: null, ruleIndex: i });
+                                }}
+                              >
+                                <span>＋</span>
+                                <b>创建代理出站</b>
+                                <span>粘贴链接或手动填写</span>
+                              </button>
+                              {visibleNextPeers.length +
+                                visibleInsidePeers.length +
+                                visibleForkPeers.length +
+                                visibleBlockedPeers.length +
+                                visibleExternalOutbounds.length ===
+                                0 && <span className="external-target-empty">没有匹配项</span>}
+                            </span>
+                          )}
+                        </span>
+                      )}
+                      {r.a.t === 'forward' && (
+                        <>
+                          <select
+                            className="f"
+                            style={{ marginLeft: 6 }}
+                            value={dk}
+                            title="这一跳连接对端的哪个地址"
+                            onChange={e => setDial(i, to, e.target.value as DialKind)}
+                          >
+                            {/* 排列和可用性判定都在模块层（DIAL_ORDER / dialUnavailable），
+                            与默认档位的选择、建链向导的下拉框共用同一份。 */}
+                            {DIAL_ORDER.map(k => (
+                              <option key={k} value={k} disabled={dialUnavailable(k, peer, selfAddrs)}>
+                                {DIAL_LABEL[k]}
+                              </option>
+                            ))}
+                          </select>
+                          {/* 前三档的地址由推导得出，只读；仅自定义档需要手动填写 */}
+                          {dk === 'overlay' ? (
+                            // 与公网两档一样直接显示地址。显示为「XX 的 overlay 地址」会要求
+                            // 到其他位置查询该值——而它就在编译结果中，可直接获取。
+                            // 获取失败只有一种情况：该机器尚未加入 overlay，这正是需要说明的内容。
+                            <span className="mono dim" style={{ marginLeft: 6 }}>
+                              {overlayOf(to) || (
+                                <span style={{ color: 'var(--gold)' }}>{peer?.name || to} 不在 overlay 里</span>
+                              )}
+                            </span>
+                          ) : dk === 'public_ipv4' ? (
+                            <span className="mono dim" style={{ marginLeft: 6 }}>
+                              {publicIpv4Of(peer) || (
+                                <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv4</span>
+                              )}
+                            </span>
+                          ) : dk === 'public_ipv6' ? (
+                            <span className="mono dim" style={{ marginLeft: 6 }}>
+                              {publicIpv6Of(peer) || (
+                                <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv6</span>
+                              )}
+                            </span>
+                          ) : dk === 'reverse_v4' || dk === 'reverse_v6' ? (
+                            // 与前三档一样由推导得出，只读。显示的是本机的接入地址——
+                            // 对端从该地址接入。连接由哪一方发起、通道如何建立属于传输层的内容，
+                            // 界面不涉及。
+                            <span className="mono dim" style={{ marginLeft: 6 }}>
+                              {selfPublicHostOf(dk === 'reverse_v6' ? 'v6' : 'v4') || (
+                                <span style={{ color: 'var(--gold)' }}>
+                                  这台机器没有可直连的{dk === 'reverse_v6' ? '公网 IPv6' : '公网 IPv4'}
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            <>
+                              <input
+                                className="f mono"
+                                style={{ marginLeft: 6, width: 150 }}
+                                placeholder="10.0.0.9 / 2001:db8::9"
+                                value={hostOf(dial)}
+                                onChange={e =>
+                                  setDialForTarget(
+                                    to,
+                                    {
+                                      t: 'addr',
+                                      v: formatHostPort(e.target.value, Number(hopOf(to).port) || hopBase),
+                                    },
+                                    i,
+                                  )
+                                }
+                              />
+                              {natPublicHostOf(peer, hostOf(dial)) && (
+                                <span className="sub" style={{ color: 'var(--gold)' }}>
+                                  该地址为 {natPublicHostOf(peer, hostOf(dial))} 且标记为经 NAT，编译会拒绝。
+                                </span>
+                              )}
+                            </>
+                          )}
+                        </>
+                      )}
+                      {r.a.t === 'egress' && (
+                        <span className="egress-dns-reference">
+                          <MachineEgressDnsControls
+                            resolution={effectiveDnsFor(r.m)}
+                            supported={supportsEgressDns(r.m)}
+                            onChange={next => patchMachineDns(r.m, next)}
+                            readOnly={readOnly}
+                            nodeName={selfNode?.name || nodeId}
+                            accessibleSuffix={`（线路规则：${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
+                            showEditor={false}
+                          />
+                        </span>
+                      )}
+                    </td>
+                    {/* 只读时整列不渲染：保留一列禁用按钮表示此处有操作但不可执行，
+                    而规则顺序已由左侧的序号表示。 */}
+                    {!readOnly && (
+                      <td style={{ width: 120, textAlign: 'right' }}>
+                        <button
+                          className="btn"
+                          disabled={i === 0 || isPinnedTerminalRule(r)}
+                          onClick={() => move(i, -1)}
+                          title={
+                            isAnyRule(r)
+                              ? '任意固定在末尾'
+                              : isSniffingFallbackRule(r)
+                                ? '嗅探失败兜底固定在任意之前'
+                                : '上移'
+                          }
+                        >
+                          ↑
+                        </button>
+                        <button
+                          className="btn"
+                          disabled={
+                            i === rules.length - 1 || isPinnedTerminalRule(r) || isPinnedTerminalRule(rules[i + 1])
+                          }
+                          onClick={() => move(i, 1)}
+                          title={
+                            isPinnedTerminalRule(r)
+                              ? '终结规则位置固定'
+                              : isPinnedTerminalRule(rules[i + 1])
+                                ? '不能移动到终结规则之后'
+                                : '下移'
+                          }
+                        >
+                          ↓
+                        </button>
+                        <button
+                          className="btn danger"
+                          disabled={flushing || save.isPending}
+                          onClick={() => {
+                            setRules(rules.filter((_, x) => x !== i));
+                            setFlushing(true);
+                          }}
+                        >
+                          删
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                </Fragment>
+              );
+            })}
+            {orderedNodeDnsPolicies.map((policy, index) => {
+              const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
+              const value = matchValues(policy.selector);
+              return (
+                <tr className="machine-dns-shared-row" key={`machine-dns-${egressDnsSelectorKey(policy.selector)}`}>
                   <td className="mono dim" style={{ width: 24 }}>
-                    {fallbackIndex === visibleFallbackRules.length - 1 ? '*' : displayedRuleCount + fallbackIndex + 1}
+                    D{index + 1}
                   </td>
                   <td className="rule-match-cell">
-                    <span className="f rule-readonly-select">{kind?.label ?? r.m.t}</span>
+                    <span className="f rule-readonly-select">{kind?.label ?? policy.selector.t}</span>
                     {value && <span className="f rule-readonly-value">{value}</span>}
                   </td>
                   <td className="rule-action-cell">
-                    <span className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)} rule-readonly-select`}>
-                      {actionLabel}
-                    </span>
-                    {(r.a.t === 'forward' || r.a.t === 'proxy') && (
-                      <span className="external-target-picker">
-                        <span className="external-target-trigger rule-readonly-target">
-                          <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
-                          <span className="external-target-copy">
-                            <b>{targetLabel}</b>
-                          </span>
-                        </span>
-                      </span>
-                    )}
-                    {readOnly && <span className="rule-fallback-sign inline">自动补齐 · 只读</span>}
+                    <MachineEgressDnsControls
+                      resolution={effectiveDnsFor(policy.selector)}
+                      supported
+                      onChange={next => patchMachineDns(policy.selector, next)}
+                      readOnly={readOnly}
+                      nodeName={selfNode?.name || nodeId}
+                      accessibleSuffix={`（机器策略：${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`}
+                    />
                   </td>
                   {!readOnly && (
-                    <td className="rule-fallback-sign" style={{ width: 120 }}>
-                      自动补齐 · 只读
+                    <td className="dns-priority-cell" style={{ width: 120, textAlign: 'right' }}>
+                      <DnsPriorityControl
+                        index={index}
+                        count={orderedNodeDnsPolicies.length}
+                        label={`${kind?.label ?? policy.selector.t} ${value}`.trim()}
+                        readOnly={readOnly}
+                        showLabel={false}
+                        onMove={delta => moveMachineDns(policy.selector, delta)}
+                      />
                     </td>
                   )}
                 </tr>
               );
             })}
-        </tbody>
-      </table>
+            {fallback?.pending && (
+              <tr className="rule-fallback-row" aria-label="正在计算编译器兜底规则">
+                <td className="mono dim" style={{ width: 24 }}>
+                  *
+                </td>
+                <td className="rule-match-cell">
+                  <span className="f rule-readonly-select">正在计算…</span>
+                </td>
+                <td className="rule-action-cell">
+                  <span className="dim">兜底规则尚未生成</span>
+                  {readOnly && <span className="rule-fallback-sign inline">自动补齐 · 计算中</span>}
+                </td>
+                {!readOnly && (
+                  <td className="rule-fallback-sign" style={{ width: 120 }}>
+                    自动补齐 · 计算中
+                  </td>
+                )}
+              </tr>
+            )}
+            {!fallback?.pending &&
+              visibleFallbackRules.map((r, fallbackIndex) => {
+                const kind = MATCH_KINDS.find(candidate => candidate.t === r.m.t);
+                const value = matchValues(r.m);
+                const to = r.a.t === 'forward' ? r.a.to : '';
+                const externalId = r.a.t === 'proxy' ? r.a.outbound : '';
+                const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
+                const peer = peerOf(to);
+                const targetBadge = external ? externalProtocolBadge(external.protocol.t) : 'NODE';
+                const targetLabel =
+                  external?.name || peer?.name || (r.a.t === 'proxy' ? '代理出站不可用' : to || '内部节点不可用');
+                const actionLabel =
+                  r.a.t === 'forward' || r.a.t === 'proxy' ? '转发给' : r.a.t === 'egress' ? '从本机出网' : '拒绝';
+                return (
+                  <tr
+                    className="rule-fallback-row"
+                    aria-label="编译器生成的兜底规则"
+                    title="编译器根据当前配置自动生成"
+                    key={`fallback-${fallbackIndex}`}
+                  >
+                    <td className="mono dim" style={{ width: 24 }}>
+                      {fallbackIndex === visibleFallbackRules.length - 1 ? '*' : displayedRuleCount + fallbackIndex + 1}
+                    </td>
+                    <td className="rule-match-cell">
+                      <span className="f rule-readonly-select">{kind?.label ?? r.m.t}</span>
+                      {value && <span className="f rule-readonly-value">{value}</span>}
+                    </td>
+                    <td className="rule-action-cell">
+                      <span
+                        className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)} rule-readonly-select`}
+                      >
+                        {actionLabel}
+                      </span>
+                      {(r.a.t === 'forward' || r.a.t === 'proxy') && (
+                        <span className="external-target-picker">
+                          <span className="external-target-trigger rule-readonly-target">
+                            <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
+                            <span className="external-target-copy">
+                              <b>{targetLabel}</b>
+                            </span>
+                          </span>
+                        </span>
+                      )}
+                      {readOnly && <span className="rule-fallback-sign inline">自动补齐</span>}
+                    </td>
+                    {!readOnly && (
+                      <td className="rule-fallback-sign" style={{ width: 120 }}>
+                        自动补齐
+                      </td>
+                    )}
+                  </tr>
+                );
+              })}
+          </tbody>
+        </table>
 
-      {rules.map((rule, ruleIndex) => {
-        if (rule.a.t !== 'proxy') return null;
-        const outboundId = rule.a.outbound;
-        const outbound = externalOutbounds.find(candidate => candidate.id === outboundId);
-        if (!outbound) {
+        {deleteOutbound && (
+          <ProxyOutboundDeleteDialog
+            outbound={deleteOutbound}
+            apps={snapshot.data?.snapshot.apps ?? []}
+            localRules={rules}
+            onClose={() => setDeleteOutbound(null)}
+          />
+        )}
+        {rules.map((rule, ruleIndex) => {
+          if (rule.a.t !== 'proxy') return null;
+          const outboundId = rule.a.outbound;
+          const outbound = externalOutbounds.find(candidate => candidate.id === outboundId);
+          if (!outbound) {
+            return (
+              <div className="external-outbound-summary missing" key={`external-${ruleIndex}`}>
+                代理出站 <code>{outboundId || '未选择'}</code> 不存在，请重新选择或创建资源。
+              </div>
+            );
+          }
+          const facts = externalOutboundFacts(outbound);
           return (
-            <div className="external-outbound-summary missing" key={`external-${ruleIndex}`}>
-              外部出站 <code>{outboundId || '未选择'}</code> 不存在，请重新选择或创建资源。
-            </div>
+            <section className="external-outbound-summary" key={`external-${ruleIndex}`}>
+              <header>
+                <PanelTitle of="outbound">代理出站</PanelTitle>
+                <span className="external-summary-protocol">{externalProtocolLabel(outbound.protocol.t)}</span>
+                <b>{outbound.name}</b>
+                <span className="sp" />
+                <span className="note">由 {selfNode?.name || nodeId} 发起</span>
+                {!readOnly && (
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() =>
+                      outbound.protocol.t === 'warp'
+                        ? setWarpManagerId(outbound.id)
+                        : setExternalEditor({ existing: outbound, ruleIndex })
+                    }
+                  >
+                    {outbound.protocol.t === 'warp' ? '机器设置' : '编辑'}
+                  </button>
+                )}
+              </header>
+              <div className="external-summary-facts">
+                <span>
+                  <small>服务器</small>
+                  <b className="mono">
+                    {outbound.address}:{outbound.port}
+                  </b>
+                </span>
+                <span>
+                  <small>传输</small>
+                  <b>{facts.transport}</b>
+                </span>
+                <span>
+                  <small>安全</small>
+                  <b>{facts.security}</b>
+                </span>
+                <span>
+                  <small>凭据</small>
+                  <b>{facts.credential}</b>
+                </span>
+              </div>
+              <p className="external-summary-impact">
+                <span>OUT</span>
+                这里只在 <b>{selfNode?.name || nodeId}</b> 的 <code>xray.json</code> 生成
+                outbound；不会为外部服务器创建节点、
+                <code>step</code>、<code>hop_in</code> 或发布目标。修改会重启引用它的内部节点上的 XRAY。
+              </p>
+            </section>
           );
-        }
-        const facts = externalOutboundFacts(outbound);
-        return (
-          <section className="external-outbound-summary" key={`external-${ruleIndex}`}>
-            <header>
-              <PanelTitle of="outbound">外部出站</PanelTitle>
-              <span className="external-summary-protocol">{externalProtocolLabel(outbound.protocol.t)}</span>
-              <b>{outbound.name}</b>
-              <span className="sp" />
-              <span className="note">由 {selfNode?.name || nodeId} 发起</span>
-              {!readOnly && (
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={() =>
-                    outbound.protocol.t === 'warp'
-                      ? setWarpManagerId(outbound.id)
-                      : setExternalEditor({ existing: outbound, ruleIndex })
-                  }
-                >
-                  {outbound.protocol.t === 'warp' ? '机器设置' : '编辑'}
-                </button>
-              )}
-            </header>
-            <div className="external-summary-facts">
-              <span>
-                <small>服务器</small>
-                <b className="mono">
-                  {outbound.address}:{outbound.port}
-                </b>
-              </span>
-              <span>
-                <small>传输</small>
-                <b>{facts.transport}</b>
-              </span>
-              <span>
-                <small>安全</small>
-                <b>{facts.security}</b>
-              </span>
-              <span>
-                <small>凭据</small>
-                <b>{facts.credential}</b>
-              </span>
-            </div>
-            <p className="external-summary-impact">
-              <span>OUT</span>
-              这里只在 <b>{selfNode?.name || nodeId}</b> 的 <code>xray.json</code> 生成
-              outbound；不会为外部服务器创建节点、
-              <code>step</code>、<code>hop_in</code> 或发布目标。修改会重启引用它的内部节点上的 XRAY。
-            </p>
-          </section>
-        );
-      })}
+        })}
 
-      {/* 该跳在对端一侧的配置：使用哪个端口、如何加密。
+        {/* 该跳在对端一侧的配置：使用哪个端口、如何加密。
           配置在此处而非对端页面，因为它属于该跳的组成部分。中转端口关联在
           `(chain, node)` 上，同一条链中多个上游连接同一目标时复用该入口配置。 */}
-      {reverseTargets.length > 0 && (
-        <div className="panel" style={{ marginTop: 10 }}>
-          <header>
-            <PanelTitle of="ingress">反向接入口</PanelTitle>
-            <span className="hint">
-              {reverseTargets.map(to => peerOf(to)?.name || to).join('、')} 从本机的这个端口接入
-            </span>
-          </header>
-          <div className="fgrid one">
-            <div className="row">
-              <span className="k auto">本机</span>
-              <span className="v">
-                <span className="hop-in">
-                  <span className="hopfld">
-                    <span className="hopfld-lbl">端口配置</span>
-                    <input
-                      className="f mono"
-                      style={{ width: 90 }}
-                      value={hopOf(nodeId).port}
-                      placeholder={String(hopBase)}
-                      onChange={e => setHopPort(nodeId, e.target.value)}
-                    />
-                  </span>
-                  <span className="hopfld-sep" />
-                  <span className="hopfld">
-                    <span className="hopfld-lbl">协议</span>
-                    <select
-                      className="f"
-                      value={hopOf(nodeId).kind}
-                      onChange={e => patchHop(nodeId, { kind: e.target.value as ReturnType<typeof hopOf>['kind'] })}
-                    >
-                      {/* 该区块只在存在反向目标时渲染，因此该端口一定是反向接入使用的端口
-                          ——此处不提供 SS2022 选项。 */}
-                      {HOP_WIRE_OPTIONS.map(option => (
-                        <option key={option.kind} value={option.kind} disabled={!option.reverseOk}>
-                          {option.label}
-                          {option.reverseOk ? '' : ' — 反向隧道只有 VLESS 承载'}
-                        </option>
-                      ))}
-                    </select>
-                  </span>
-                  {hopOf(nodeId).kind === 'reality' && (
-                    <>
-                      <input
-                        className="f mono"
-                        style={{ width: 180 }}
-                        value={hopOf(nodeId).dest}
-                        placeholder="example.com:443"
-                        onChange={e => patchHop(nodeId, { dest: e.target.value })}
-                      />
-                      <input
-                        className="f mono"
-                        style={{ width: 180 }}
-                        value={hopOf(nodeId).names}
-                        placeholder="server_names"
-                        onChange={e => patchHop(nodeId, { names: e.target.value })}
-                      />
-                    </>
-                  )}
-                </span>
-                <span className="sub">
-                  该端口开在本机，<b>同一台机器上各条链必须错开</b>，冲突时编译会报 node.port-clash。
-                  {hopOf(nodeId).kind === 'none' && (
-                    <b style={{ color: 'var(--gold)' }}> 明文接入可能暴露 UUID 和目标地址。</b>
-                  )}
-                </span>
+        {reverseTargets.length > 0 && (
+          <div className="panel" style={{ marginTop: 10 }}>
+            <header>
+              <PanelTitle of="ingress">反向接入口</PanelTitle>
+              <span className="hint">
+                {reverseTargets.map(to => peerOf(to)?.name || to).join('、')} 从本机的这个端口接入
               </span>
+            </header>
+            <div className="fgrid one">
+              <div className="row">
+                <span className="k auto">本机</span>
+                <span className="v">
+                  <span className="hop-in">
+                    <span className="hopfld">
+                      <span className="hopfld-lbl">端口配置</span>
+                      <input
+                        className="f mono"
+                        style={{ width: 90 }}
+                        value={hopOf(nodeId).port}
+                        placeholder={String(hopBase)}
+                        onChange={e => setHopPort(nodeId, e.target.value)}
+                      />
+                    </span>
+                    <span className="hopfld-sep" />
+                    <span className="hopfld">
+                      <span className="hopfld-lbl">协议</span>
+                      <select
+                        className="f"
+                        value={hopOf(nodeId).kind}
+                        onChange={e => patchHop(nodeId, { kind: e.target.value as ReturnType<typeof hopOf>['kind'] })}
+                      >
+                        {/* 该区块只在存在反向目标时渲染，因此该端口一定是反向接入使用的端口
+                          ——此处不提供 SS2022 选项。 */}
+                        {HOP_WIRE_OPTIONS.map(option => (
+                          <option key={option.kind} value={option.kind} disabled={!option.reverseOk}>
+                            {option.label}
+                            {option.reverseOk ? '' : ' — 反向隧道只有 VLESS 承载'}
+                          </option>
+                        ))}
+                      </select>
+                    </span>
+                    {hopOf(nodeId).kind === 'reality' && (
+                      <>
+                        <input
+                          className="f mono"
+                          style={{ width: 180 }}
+                          value={hopOf(nodeId).dest}
+                          placeholder="example.com:443"
+                          onChange={e => patchHop(nodeId, { dest: e.target.value })}
+                        />
+                        <input
+                          className="f mono"
+                          style={{ width: 180 }}
+                          value={hopOf(nodeId).names}
+                          placeholder="server_names"
+                          onChange={e => patchHop(nodeId, { names: e.target.value })}
+                        />
+                      </>
+                    )}
+                  </span>
+                  <span className="sub">
+                    该端口开在本机，<b>同一台机器上各条链必须错开</b>，冲突时编译会报 node.port-clash。
+                    {hopOf(nodeId).kind === 'none' && (
+                      <b style={{ color: 'var(--gold)' }}> 明文接入可能暴露 UUID 和目标地址。</b>
+                    )}
+                  </span>
+                </span>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {normalTargets.length > 0 && (
-        <div className="panel" style={{ marginTop: 10 }}>
-          <header>
-            {/* 标题由「转发目标的中转入口」改为当前名称：该表配置的一直是该跳的两端，
-                而原名称只涵盖对端一侧。加入出站连接配置后，不修改名称会导致
+        {normalTargets.length > 0 && (
+          <div className="panel" style={{ marginTop: 10 }}>
+            <header>
+              {/* 标题由「转发目标的中转入口」改为当前名称：该表配置的一直是该跳的两端，
+                而原名称只涵盖对端一侧。加入连接复用配置后，不修改名称会导致
                 在「入口」标题下配置本机出站。 */}
-            <PanelTitle of="chains">这一跳</PanelTitle>
-            <span className="hint">对端在哪个端口接入、本机如何连接过去</span>
-          </header>
-          <div className="fgrid one">
-            {normalTargets.map(to => {
-              const h = hopOf(to);
-              const peer = peerOf(to);
-              const pool = poolOf(to);
-              // 是否有连接从 wg 之外直接连接它。该判定决定 inbound 绑定的地址——
-              // 存在直连时绑定 0.0.0.0，全部走 overlay 时才绑定 overlay 地址
-              // （physical/node.rs 的 listen 判定）。
-              const dialedDirectly = rules.some(
-                r => r.a.t === 'forward' && r.a.to === to && forwardDial(r.a).t !== 'overlay',
-              );
-              return (
-                <div key={to} className="row">
-                  <span className="k auto" title={to}>
-                    {peer?.name || to}
-                  </span>
-                  <span className="v">
-                    <span className="hop-in">
-                      <span className="hopfld">
-                        <span className="hopfld-lbl">端口配置</span>
-                        {/* 走 overlay 时同样显示。该端口会被实际绑定：
+              <PanelTitle of="chains">这一跳</PanelTitle>
+              <span className="hint">对端在哪个端口接入、本机如何连接过去</span>
+            </header>
+            <div className="fgrid one">
+              {normalTargets.map(to => {
+                const h = hopOf(to);
+                const peer = peerOf(to);
+                const pool = poolOf(to);
+                // 是否有连接从 wg 之外直接连接它。该判定决定 inbound 绑定的地址——
+                // 存在直连时绑定 0.0.0.0，全部走 overlay 时才绑定 overlay 地址
+                // （physical/node.rs 的 listen 判定）。
+                const dialedDirectly = rules.some(
+                  r => r.a.t === 'forward' && r.a.to === to && forwardDial(r.a).t !== 'overlay',
+                );
+                return (
+                  <div key={to} className="row">
+                    <span className="k auto" title={to}>
+                      {peer?.name || to}
+                    </span>
+                    <span className="v">
+                      <span className="hop-in">
+                        <span className="hopfld">
+                          <span className="hopfld-lbl">端口配置</span>
+                          {/* 走 overlay 时同样显示。该端口会被实际绑定：
                             xray 的 inbound 需要监听一个端口，wg 只是封装了该跳，
                             端口仍然存在。它同样参与端口冲突校验，修改后会重启 xray。
                             此处此前显示为「已被 WireGuard 托管」，会被理解为不存在端口，
                             在排查时会导致方向错误。 */}
-                        <input
-                          className="f mono"
-                          style={{ width: 90 }}
-                          value={h.port}
-                          placeholder={String(hopBase)}
-                          onChange={e => setHopPort(to, e.target.value)}
-                        />
-                        {!dialedDirectly && <span className="sub">监听 overlay 地址，wg 之外无法连接</span>}
-                      </span>
-                      <span className="hopfld-sep" />
-                      <span className="hopfld">
-                        <span className="hopfld-lbl">协议</span>
-                        <select
-                          className="f"
-                          value={h.kind}
-                          onChange={e => patchHop(to, { kind: e.target.value as typeof h.kind })}
-                        >
-                          {/* 转发目标的端口，四档均可选 */}
-                          {HOP_WIRE_OPTIONS.map(option => (
-                            <option key={option.kind} value={option.kind}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </select>
-                      </span>
-                      {h.kind === 'reality' && (
-                        <>
                           <input
                             className="f mono"
-                            style={{ width: 180 }}
-                            value={h.dest}
-                            placeholder="example.com:443"
-                            onChange={e => patchHop(to, { dest: e.target.value })}
+                            style={{ width: 90 }}
+                            value={h.port}
+                            placeholder={String(hopBase)}
+                            onChange={e => setHopPort(to, e.target.value)}
                           />
-                          <input
-                            className="f mono"
-                            style={{ width: 180 }}
-                            value={h.names}
-                            placeholder="server_names"
-                            onChange={e => patchHop(to, { names: e.target.value })}
-                          />
-                        </>
-                      )}
-                      {/* 竖线右侧是本机出站配置，左侧是对端入口配置。反向目标不在该表中
+                          {!dialedDirectly && <span className="sub">监听 overlay 地址，wg 之外无法连接</span>}
+                        </span>
+                        <span className="hopfld-sep" />
+                        <span className="hopfld">
+                          <span className="hopfld-lbl">协议</span>
+                          <select
+                            className="f"
+                            value={h.kind}
+                            onChange={e => patchHop(to, { kind: e.target.value as typeof h.kind })}
+                          >
+                            {/* 转发目标的端口，四档均可选 */}
+                            {HOP_WIRE_OPTIONS.map(option => (
+                              <option key={option.kind} value={option.kind}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </span>
+                        {h.kind === 'reality' && (
+                          <>
+                            <input
+                              className="f mono"
+                              style={{ width: 180 }}
+                              value={h.dest}
+                              placeholder="example.com:443"
+                              onChange={e => patchHop(to, { dest: e.target.value })}
+                            />
+                            <input
+                              className="f mono"
+                              style={{ width: 180 }}
+                              value={h.names}
+                              placeholder="server_names"
+                              onChange={e => patchHop(to, { names: e.target.value })}
+                            />
+                          </>
+                        )}
+                        {/* 竖线右侧是本机出站配置，左侧是对端入口配置。反向目标不在该表中
                           （它们由上方的「反向接入口」面板处理），因此此处无需判断
                           是否可配置——不可配置的目标不会出现。 */}
-                      <span className="hopfld-sep" />
-                      <span className="hopfld">
-                        <span className="hopfld-lbl">出站连接</span>
-                        <select
-                          className="f"
-                          value={pool.t}
-                          onChange={e => {
-                            const kind = e.target.value as HopPool['t'];
-                            setPoolForTarget(to, kind === 'merge' ? { t: 'merge', v: MERGE_DEFAULT } : { t: kind });
-                          }}
-                        >
-                          {POOL_ORDER.map(k => (
-                            <option key={k} value={k}>
-                              {POOL_LABEL[k]}
-                            </option>
-                          ))}
-                        </select>
-                      </span>
-                      {pool.t === 'merge' && (
+                        <span className="hopfld-sep" />
                         <span className="hopfld">
-                          <span className="hopfld-lbl">每条连接</span>
-                          <input
-                            className="f mono"
-                            style={{ width: 58 }}
-                            value={String(pool.v)}
-                            placeholder={String(MERGE_DEFAULT)}
-                            onChange={e => setPoolForTarget(to, { t: 'merge', v: Number(e.target.value) || 0 })}
-                          />
-                          <span className="hopfld-unit">条流</span>
+                          <span className="hopfld-lbl">出站连接</span>
+                          <select
+                            className="f"
+                            value={poolChoice(pool)}
+                            onChange={e => {
+                              const choice = e.target.value as PoolChoice;
+                              setPoolForTarget(to, choice === 'mux' ? { t: 'mux' } : { t: 'none' });
+                            }}
+                          >
+                            {POOL_ORDER.map(k => (
+                              <option key={k} value={k}>
+                                {POOL_LABEL[k]}
+                              </option>
+                            ))}
+                          </select>
+                        </span>
+                        {pool.t !== 'none' && (
+                          <span className="hopfld">
+                            <span className="hopfld-lbl">参数</span>
+                            <span className="st">{pool.t === 'mux' && !pool.v ? '跟随全局' : '单独配置'}</span>
+                            {readOnly ? (
+                              <span
+                                className="btn sm"
+                                role="button"
+                                tabIndex={0}
+                                onClick={() =>
+                                  setMuxEditor({
+                                    to,
+                                    followGlobal: pool.t === 'mux' && !pool.v,
+                                    value:
+                                      pool.t === 'mux' && pool.v
+                                        ? { ...pool.v }
+                                        : pool.t === 'pool' || pool.t === 'merge'
+                                          ? { ...DEFAULT_HOP_MUX, concurrency: muxConcurrency(pool) }
+                                          : { ...globalRelayMux },
+                                  })
+                                }
+                                onKeyDown={event => {
+                                  if (event.key !== 'Enter' && event.key !== ' ') return;
+                                  event.preventDefault();
+                                  setMuxEditor({
+                                    to,
+                                    followGlobal: pool.t === 'mux' && !pool.v,
+                                    value:
+                                      pool.t === 'mux' && pool.v
+                                        ? { ...pool.v }
+                                        : pool.t === 'pool' || pool.t === 'merge'
+                                          ? { ...DEFAULT_HOP_MUX, concurrency: muxConcurrency(pool) }
+                                          : { ...globalRelayMux },
+                                  });
+                                }}
+                              >
+                                查看
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn sm"
+                                onClick={() =>
+                                  setMuxEditor({
+                                    to,
+                                    followGlobal: pool.t === 'mux' && !pool.v,
+                                    value:
+                                      pool.t === 'mux' && pool.v
+                                        ? { ...pool.v }
+                                        : pool.t === 'pool' || pool.t === 'merge'
+                                          ? { ...DEFAULT_HOP_MUX, concurrency: muxConcurrency(pool) }
+                                          : { ...globalRelayMux },
+                                  })
+                                }
+                              >
+                                配置
+                              </button>
+                            )}
+                          </span>
+                        )}
+                      </span>
+                      <span className="sub">
+                        {/* 该说明对两种连接方式都适用：走 overlay 的 inbound 同样需要绑定
+                          一个端口，同样会与该机器上的其他端口冲突。 */}
+                        端口为对端监听的端口，<b>同一台机器上各条链必须错开</b>，冲突时编译会报 node.port-clash。
+                        {/* 明文警告只针对直连：走 overlay 时 wg 已对该跳加密，
+                          内层不加密是合理的，再加一层会增加无效的 CPU 开销。 */}
+                        {dialedDirectly && h.kind === 'none' && (
+                          <b style={{ color: 'var(--gold)' }}> 明文直连可能暴露 UUID 和目标地址。</b>
+                        )}
+                      </span>
+                      {pool.t !== 'none' && (
+                        <span className="sub" style={{ color: 'var(--gold)' }}>
+                          Mux 复用可减少重复握手；探测中的连接不会承接新流。
                         </span>
                       )}
-                    </span>
-                    <span className="sub">
-                      {/* 该说明对两种连接方式都适用：走 overlay 的 inbound 同样需要绑定
-                          一个端口，同样会与该机器上的其他端口冲突。 */}
-                      端口为对端监听的端口，<b>同一台机器上各条链必须错开</b>，冲突时编译会报 node.port-clash。
-                      {/* 明文警告只针对直连：走 overlay 时 wg 已对该跳加密，
-                          内层不加密是合理的，再加一层会增加无效的 CPU 开销。 */}
-                      {dialedDirectly && h.kind === 'none' && (
-                        <b style={{ color: 'var(--gold)' }}> 明文直连可能暴露 UUID 和目标地址。</b>
+                      {pool.t !== 'none' && (
+                        <span className="sub">修改该项会重写 xray.json 并重启 xray，这台机器上的所有连接会断开。</span>
                       )}
                     </span>
-                    {/* 分别说明各档的影响：三档各有取舍，其中合并流需要明确说明——
-                        它不是性能更高的连接池，在跨境丢包链路上可能劣于每次新建连接。 */}
-                    {pool.t === 'pool' && (
-                      <span className="sub" style={{ color: 'var(--gold)' }}>
-                        Xray 以 Mux.cool 的 <code>concurrency=1</code> 保留空闲连接约 16–32 秒，下一条流可免握手复用；
-                        但它在借出前不探活，半失效连接可能卡到超时。遇到过卡顿的链路请选“每次新建”。
-                      </span>
-                    )}
-                    {pool.t === 'merge' && (
-                      <span className="sub" style={{ color: 'var(--gold)' }}>
-                        多条流合并到同一条 TCP 上，握手开销最低，但<b>一条流丢包会阻塞同一连接上的其他流</b>，
-                        在跨境丢包链路上可能不如每次新建。取值 {MERGE_MIN}–{MERGE_MAX}；不接受 1， 因为 Xray 的单并发
-                        worker 存在上述卡顿风险。
-                      </span>
-                    )}
-                    {pool.t !== 'none' && (
-                      <span className="sub">修改该项会重写 xray.json 并重启 xray，这台机器上的所有连接会断开。</span>
-                    )}
-                  </span>
-                </div>
-              );
-            })}
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {save.error && <ErrorBox error={save.error} />}
+        {save.error && <ErrorBox error={save.error} />}
 
-      {/* 整块常驻，只读时由外层 `fieldset disabled` 一并禁用：按角色隐藏会使只读视角
+        {/* 整块常驻，只读时由外层 `fieldset disabled` 一并禁用：按角色隐藏会使只读视角
           看不到这张表可以增行和保存，页面读起来像是一份静态清单。 */}
-      <div className="toolbar">
-        <button className="btn" onClick={addRule}>
-          ＋ 加一条
-        </button>
-        {hasSniffingDependentRule && !hasSniffingFallback && (
-          <>
-            <button className="btn" onClick={addSniffingFallback}>
-              ＋ 嗅探失败兜底
-            </button>
-            <span className="note">域名/Geosite 规则依赖嗅探；匹配条件与转发、落地或拒绝动作独立配置。</span>
-          </>
-        )}
-        <span className="sp" />
-        {/* 位于规则树中时按钮统一收敛到末尾，此处只保留该表已修改的标记 */}
-        {bus ? (
-          dirty && <span className="st st-warn">有改动，未落草稿</span>
-        ) : (
-          <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate({})}>
-            {save.isPending ? '保存中…' : '保存到草稿'}
+        <div className="toolbar">
+          <button className="btn" onClick={addRule}>
+            ＋ 加一条
           </button>
-        )}
-      </div>
+          {hasSniffingDependentRule && !hasSniffingFallback && (
+            <>
+              <button className="btn" onClick={addSniffingFallback}>
+                ＋ 嗅探失败兜底
+              </button>
+              <span className="note">域名/Geosite 规则依赖嗅探；匹配条件与转发、从本机出网或拒绝动作独立配置。</span>
+            </>
+          )}
+          <span className="sp" />
+          {/* 位于规则树中时按钮统一收敛到末尾，此处只保留该表已修改的标记 */}
+          {bus ? (
+            dirty && <span className="st st-warn">有改动，未落草稿</span>
+          ) : (
+            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate({})}>
+              {save.isPending ? '保存中…' : '保存到草稿'}
+            </button>
+          )}
+        </div>
 
-      {externalEditor && (
-        <ExternalOutboundEditor
-          tenantId={chainTenant}
-          existing={externalEditor.existing}
-          onClose={() => setExternalEditor(null)}
-          onSaved={outbound => {
-            const rule = rules[externalEditor.ruleIndex];
-            if (rule) patch(externalEditor.ruleIndex, { ...rule, a: { t: 'proxy', outbound: outbound.id } });
-            setExternalEditor(null);
+        {externalEditor && (
+          <ExternalOutboundEditor
+            tenantId={chainTenant}
+            existing={externalEditor.existing}
+            onClose={() => setExternalEditor(null)}
+            onSaved={outbound => {
+              const rule = rules[externalEditor.ruleIndex];
+              if (rule) patch(externalEditor.ruleIndex, { ...rule, a: { t: 'proxy', outbound: outbound.id } });
+              setExternalEditor(null);
+            }}
+          />
+        )}
+        {managedWarp && (
+          <Suspense
+            fallback={
+              <div className="external-outbound-wrap">
+                <div className="loading">正在打开 WARP 设置…</div>
+              </div>
+            }
+          >
+            <WarpRuleManager
+              tunnel={managedWarp}
+              nodeId={nodeId}
+              nodeName={selfNode?.name || nodeId}
+              editable={!readOnly}
+              removalBlockedReason={
+                warpReferencedOnCurrentNode(managedWarp.id)
+                  ? '这台机器仍在规则中使用 WARP。请先解除引用、保存草稿并完成发布，再注销身份。'
+                  : undefined
+              }
+              onClose={() => setWarpManagerId(null)}
+            />
+          </Suspense>
+        )}
+      </fieldset>
+      {muxEditor && (
+        <MuxConfigDrawer
+          targetName={peerOf(muxEditor.to)?.name || muxEditor.to}
+          globalValue={globalRelayMux}
+          state={muxEditor}
+          readOnly={readOnly}
+          onChange={setMuxEditor}
+          onClose={() => setMuxEditor(null)}
+          onApply={() => {
+            setPoolForTarget(
+              muxEditor.to,
+              muxEditor.followGlobal ? { t: 'mux' } : { t: 'mux', v: { ...muxEditor.value } },
+            );
+            setMuxEditor(null);
           }}
         />
       )}
-      {managedWarp && (
-        <Suspense
-          fallback={
-            <div className="external-outbound-wrap">
-              <div className="loading">正在打开 WARP 设置…</div>
-            </div>
-          }
-        >
-          <WarpRuleManager
-            tunnel={managedWarp}
-            nodeId={nodeId}
-            nodeName={selfNode?.name || nodeId}
-            editable={!readOnly}
-            removalBlockedReason={
-              warpReferencedOnCurrentNode(managedWarp.id)
-                ? '这台机器仍在规则中使用 WARP。请先解除引用、保存草稿并完成发布，再注销身份。'
-                : undefined
-            }
-            onClose={() => setWarpManagerId(null)}
-          />
-        </Suspense>
-      )}
-    </fieldset>
+    </>
+  );
+}
+
+type MuxEditorState = { to: string; followGlobal: boolean; value: HopMux };
+
+function MuxConfigDrawer({
+  targetName,
+  globalValue,
+  state,
+  readOnly,
+  onChange,
+  onClose,
+  onApply,
+}: {
+  targetName: string;
+  globalValue: HopMux;
+  state: MuxEditorState;
+  readOnly: boolean;
+  onChange: (next: MuxEditorState) => void;
+  onClose: () => void;
+  onApply: () => void;
+}) {
+  const value = state.followGlobal ? globalValue : state.value;
+  const error = hopMuxError(value);
+  const patch = (field: keyof HopMux, raw: string) => {
+    if (raw.trim() === '') return;
+    const number = Number(raw);
+    onChange({ ...state, value: { ...state.value, [field]: number } });
+  };
+  const field = (label: string, key: keyof HopMux, min: number, max?: number, unit?: string) => (
+    <label className="mux-drawer-field">
+      <span>{label}</span>
+      <span>
+        <input
+          className="f mono"
+          type="number"
+          min={min}
+          max={max}
+          value={value[key]}
+          disabled={readOnly || state.followGlobal}
+          onChange={event => patch(key, event.target.value)}
+        />
+        {unit && <small>{unit}</small>}
+      </span>
+    </label>
+  );
+
+  return (
+    <div className="external-outbound-wrap" role="dialog" aria-modal="true" aria-label={`配置 ${targetName} 的 Mux`}>
+      <button className="external-outbound-scrim" aria-label="关闭" onClick={onClose} />
+      <section className="external-outbound-drawer mux-config-drawer">
+        <header>
+          <b>{targetName} · Mux 复用</b>
+          <span className="sp" />
+          <button className="btn" onClick={onClose}>
+            关闭
+          </button>
+        </header>
+        <div className="external-outbound-body">
+          <div className="segsw mux-source-switch" role="group" aria-label="Mux 参数来源">
+            <button
+              type="button"
+              aria-pressed={state.followGlobal}
+              disabled={readOnly}
+              onClick={() => onChange({ ...state, followGlobal: true })}
+            >
+              跟随全局
+            </button>
+            <button
+              type="button"
+              aria-pressed={!state.followGlobal}
+              disabled={readOnly}
+              onClick={() => onChange({ ...state, followGlobal: false, value: { ...globalValue } })}
+            >
+              单独配置
+            </button>
+          </div>
+          <p className="note">
+            当前生效：复用流 {value.concurrency} · 空闲 {value.min_idle_workers}–{value.max_idle_workers} · 探测{' '}
+            {value.probe_interval_secs}s/{value.probe_timeout_ms}ms · 寿命 {value.idle_ttl_secs}s
+          </p>
+          {state.followGlobal && <p className="note">这些值来自设置页的“连接策略 / 中继 Mux”。</p>}
+          <div className="mux-drawer-grid">
+            {field('复用流数量', 'concurrency', 1, 128)}
+            {field('最小空闲连接', 'min_idle_workers', 0)}
+            {field('最大空闲连接', 'max_idle_workers', 1)}
+            {field('同时探测连接', 'max_probing_workers', 1, value.max_idle_workers)}
+            {field('探测周期', 'probe_interval_secs', 2, 60, '秒')}
+            {field('单次超时', 'probe_timeout_ms', 200, 10000, '毫秒')}
+            {field('空闲寿命', 'idle_ttl_secs', 1, undefined, '秒')}
+            {field('累计子连接', 'max_requests_per_worker', 1, 65535)}
+          </div>
+          {error && (
+            <p className="note" style={{ color: 'var(--err)' }}>
+              {error}
+            </p>
+          )}
+        </div>
+        <footer className="mux-drawer-actions">
+          <button className="btn" onClick={onClose}>
+            取消
+          </button>
+          {!readOnly && (
+            <button className="btn primary" disabled={error !== null} onClick={onApply}>
+              应用
+            </button>
+          )}
+        </footer>
+      </section>
+    </div>
   );
 }
 
 function externalProtocolLabel(protocol: ExternalOutboundProtocol['t']): string {
   return {
+    anytls: 'AnyTLS',
     vless: 'VLESS',
     shadowsocks2022: 'Shadowsocks 2022',
     socks5: 'SOCKS5',
@@ -2798,6 +3020,7 @@ function externalProtocolLabel(protocol: ExternalOutboundProtocol['t']): string 
 
 function externalProtocolBadge(protocol: ExternalOutboundProtocol['t']): string {
   return {
+    anytls: 'AnyTLS',
     vless: 'VLESS',
     shadowsocks2022: 'SS2022',
     socks5: 'SOCKS5',
@@ -2822,9 +3045,15 @@ function externalOutboundFacts(outbound: ExternalOutbound): {
     const transport = protocol.v.transport.t === 'xhttp' ? 'XHTTP' : 'RAW';
     return {
       transport: `${transport}${protocol.v.flow ? ` · ${protocol.v.flow}` : ''}`,
-      security: externalSecurityLabel(outbound.security),
+      security:
+        protocol.v.encryption !== 'none'
+          ? `VLESS Encryption${outbound.security.t === 'none' ? '' : ` · ${externalSecurityLabel(outbound.security)}`}`
+          : externalSecurityLabel(outbound.security),
       credential: 'UUID · 已密封',
     };
+  }
+  if (protocol.t === 'anytls') {
+    return { transport: 'TCP', security: externalSecurityLabel(outbound.security), credential: '密码 · 已密封' };
   }
   if (protocol.t === 'shadowsocks2022') {
     return { transport: `RAW · ${protocol.v.method}`, security: 'SS2022', credential: 'PSK · 已密封' };
@@ -3001,9 +3230,32 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
 
   const url = new URL(value);
   const name = decodeURIComponent(url.hash.replace(/^#/, ''));
+  if (url.protocol === 'anytls:') {
+    if (url.password) throw new Error('AnyTLS 密码中的特殊字符必须使用百分号编码');
+    if (!url.username) throw new Error('AnyTLS 链接缺少密码');
+    const insecure = url.searchParams.get('insecure');
+    if (insecure && insecure !== '0') throw new Error('暂不支持跳过 AnyTLS 证书验证，请使用有效证书');
+    const requestedSecurity = url.searchParams.get('security');
+    if (requestedSecurity && requestedSecurity !== 'tls') throw new Error('AnyTLS 代理出站必须使用 TLS');
+    const address = url.hostname.replace(/^\[|\]$/g, '');
+    return {
+      address,
+      port: Number(url.port || 443),
+      name,
+      protocol: { t: 'anytls', v: { credential: decodeURIComponent(url.username) } },
+      security: {
+        t: 'tls',
+        v: { server_name: url.searchParams.get('sni') || address, fingerprint: url.searchParams.get('fp') || 'chrome' },
+      },
+    };
+  }
   if (url.protocol === 'vless:') {
     const transport = parseExternalVlessTransport(url);
     const security = url.searchParams.get('security');
+    const encryption = url.searchParams.get('encryption') || 'none';
+    if (!vlessEncryptionIsValid(encryption))
+      throw new Error('VLESS Encryption 参数无效，请粘贴完整的客户端 encryption 值');
+    if (security && !['none', 'tls', 'reality'].includes(security)) throw new Error('不支持此 VLESS 安全层');
     const serverName = url.searchParams.get('sni') || url.hostname;
     const fingerprint = url.searchParams.get('fp') || 'chrome';
     const securityValue: ExternalOutboundSecurity =
@@ -3020,7 +3272,8 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
         : security === 'tls'
           ? { t: 'tls', v: { server_name: serverName, fingerprint } }
           : { t: 'none' };
-    if (securityValue.t === 'none') throw new Error('公网 VLESS 链接必须包含 TLS 或 REALITY');
+    if (securityValue.t === 'none' && encryption === 'none')
+      throw new Error('VLESS 链接必须启用 Encryption、TLS 或 REALITY');
     return {
       address: url.hostname,
       port: Number(url.port || 443),
@@ -3029,7 +3282,7 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
         t: 'vless',
         v: {
           credential: decodeURIComponent(url.username),
-          encryption: url.searchParams.get('encryption') || 'none',
+          encryption,
           flow: url.searchParams.get('flow') || null,
           transport,
         },
@@ -3064,7 +3317,7 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
           : { t: 'none' },
     };
   }
-  throw new Error('支持 VLESS、SS2022、SOCKS5 和 HTTP(S) 分享链接；WireGuard 请手动填写');
+  throw new Error('支持 AnyTLS、VLESS、SS2022、SOCKS5 和 HTTP(S) 分享链接；WireGuard 请手动填写');
 }
 
 function ss2022KeyIsValid(method: string, credential: string): boolean {
@@ -3169,6 +3422,83 @@ function externalOptionalMuxIsValid(value: string): boolean {
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= 128;
 }
 
+export function ProxyOutboundDeleteDialog({
+  outbound,
+  apps,
+  localRules = [],
+  onClose,
+}: {
+  outbound: ExternalOutbound;
+  apps: SnapshotApp[];
+  localRules?: Rule[];
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const references: string[] = [];
+  for (const app of apps) {
+    for (const step of app.steps) {
+      step.rules.forEach((rule, index) => {
+        if (rule.a.t === 'proxy' && rule.a.outbound === outbound.id) {
+          const chain = app.chains.find(candidate => candidate.id === step.chain);
+          references.push(`${app.label || app.id} / ${chain?.name || step.chain} / ${step.node} / 规则 ${index + 1}`);
+        }
+      });
+    }
+    for (const front of app.fronts) {
+      if (front.external_via?.includes(outbound.id))
+        references.push(`${app.label || app.id} / 前置组 ${front.name || front.id}`);
+    }
+  }
+  if (localRules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === outbound.id)) {
+    references.push('当前正在编辑的规则');
+  }
+  const bound = outbound.bindings.length > 0;
+  const remove = useMutation({
+    mutationFn: () => deleteExternalOutbound(outbound.tenant, outbound.id),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ['snapshot'] });
+      onClose();
+    },
+  });
+  return (
+    <div className="external-outbound-wrap" role="dialog" aria-modal="true" aria-label="删除代理出站">
+      <button className="external-outbound-scrim" aria-label="关闭" onClick={onClose} />
+      <section className="external-outbound-drawer">
+        <header>
+          <b>删除代理出站 · {outbound.name}</b>
+          <span className="sp" />
+          <button className="btn" onClick={onClose}>
+            关闭
+          </button>
+        </header>
+        <div className="external-outbound-body">
+          {references.length > 0 ? (
+            <>
+              <p>请先解除以下引用并保存到草稿，再删除此代理出站。</p>
+              <ul>
+                {references.map((reference, index) => (
+                  <li key={index}>{reference}</li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p>删除「{outbound.name}」将保存到草稿，提交前可以撤销。</p>
+          )}
+          {bound && <p>请先在机器设置中注销 {outbound.bindings.length} 台机器的 WARP 身份。</p>}
+          {remove.error && <ErrorBox error={remove.error} />}
+          <button
+            className="btn danger"
+            disabled={references.length > 0 || bound || remove.isPending}
+            onClick={() => remove.mutate()}
+          >
+            删除代理出站
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 type EditableExternalProtocol = Exclude<ExternalOutboundProtocol['t'], 'warp'>;
 
 export function ExternalOutboundEditor({
@@ -3198,7 +3528,7 @@ export function ExternalOutboundEditor({
     }
   }, [shareLink]);
   const [id, setId] = useState(existing?.id ?? 'external-1');
-  const [name, setName] = useState(existing?.name ?? '新外部出站');
+  const [name, setName] = useState(existing?.name ?? '新代理出站');
   const [address, setAddress] = useState(existing?.address ?? '');
   const [port, setPort] = useState(String(existing?.port ?? 443));
   const [protocolKind, setProtocolKind] = useState<EditableExternalProtocol>(initialProtocol);
@@ -3306,7 +3636,7 @@ export function ExternalOutboundEditor({
     setProtocolKind(next);
     if (next === 'shadowsocks2022' || next === 'socks5' || next === 'wireguard') {
       setSecurityKind('none');
-    } else if (next === 'vless' && securityKind === 'none') {
+    } else if (next === 'anytls' || (next === 'vless' && securityKind === 'none')) {
       setSecurityKind('tls');
     } else if (next === 'http_connect' && securityKind === 'reality') {
       setSecurityKind('tls');
@@ -3372,7 +3702,9 @@ export function ExternalOutboundEditor({
         externalList(allowedIps).length > 0)) &&
     (!rawOnly || securityKind === 'none') &&
     (protocolKind !== 'http_connect' || securityKind !== 'reality') &&
-    (protocolKind !== 'vless' || securityKind !== 'none') &&
+    (protocolKind !== 'vless' ||
+      (vlessEncryptionIsValid(encryption) && (encryption !== 'none' || securityKind !== 'none'))) &&
+    (protocolKind !== 'anytls' || securityKind === 'tls') &&
     xhttpValid &&
     (securityKind === 'none' || !!serverName.trim()) &&
     primaryRealityValid;
@@ -3419,28 +3751,30 @@ export function ExternalOutboundEditor({
           },
         };
   const protocol: ExternalOutboundProtocol =
-    protocolKind === 'vless'
-      ? { t: 'vless', v: { credential, encryption: encryption || 'none', flow: flow || null, transport } }
-      : protocolKind === 'shadowsocks2022'
-        ? { t: 'shadowsocks2022', v: { credential, method } }
-        : protocolKind === 'socks5'
-          ? { t: 'socks5', v: { username: username.trim() || null, credential } }
-          : protocolKind === 'http_connect'
-            ? { t: 'http_connect', v: { username: username.trim() || null, credential } }
-            : {
-                t: 'wireguard',
-                v: {
-                  credential,
-                  peer_public_key: peerPublicKey.trim(),
-                  local_addresses: externalList(localAddresses),
-                  mtu: Number(wireguardMtu),
-                  reserved: reservedBytes ?? [],
-                  keep_alive: Number(keepAlive),
-                  allowed_ips: externalList(allowedIps),
-                  no_kernel_tun: noKernelTun,
-                  domain_strategy: wireguardDomainStrategy,
-                },
-              };
+    protocolKind === 'anytls'
+      ? { t: 'anytls', v: { credential } }
+      : protocolKind === 'vless'
+        ? { t: 'vless', v: { credential, encryption, flow: flow || null, transport } }
+        : protocolKind === 'shadowsocks2022'
+          ? { t: 'shadowsocks2022', v: { credential, method } }
+          : protocolKind === 'socks5'
+            ? { t: 'socks5', v: { username: username.trim() || null, credential } }
+            : protocolKind === 'http_connect'
+              ? { t: 'http_connect', v: { username: username.trim() || null, credential } }
+              : {
+                  t: 'wireguard',
+                  v: {
+                    credential,
+                    peer_public_key: peerPublicKey.trim(),
+                    local_addresses: externalList(localAddresses),
+                    mtu: Number(wireguardMtu),
+                    reserved: reservedBytes ?? [],
+                    keep_alive: Number(keepAlive),
+                    allowed_ips: externalList(allowedIps),
+                    no_kernel_tun: noKernelTun,
+                    domain_strategy: wireguardDomainStrategy,
+                  },
+                };
   const security: ExternalOutboundSecurity =
     securityKind === 'none'
       ? { t: 'none' }
@@ -3506,12 +3840,11 @@ export function ExternalOutboundEditor({
   };
 
   return (
-    <div className="external-outbound-wrap" role="dialog" aria-modal="true" aria-label="配置外部出站">
+    <div className="external-outbound-wrap" role="dialog" aria-modal="true" aria-label="配置代理出站">
       <button className="external-outbound-scrim" aria-label="关闭" onClick={onClose} />
       <section className="external-outbound-drawer">
         <header>
-          <b>{existing ? '配置外部出站' : '创建外部出站'}</b>
-          <small>租户 · {tenantId}</small>
+          <b>{existing ? '配置代理出站' : '创建代理出站'}</b>
           <span className="sp" />
           <button className="btn" onClick={onClose}>
             关闭
@@ -3548,7 +3881,7 @@ export function ExternalOutboundEditor({
                 <span className="external-form-value">
                   <textarea
                     className="f mono external-share-link"
-                    placeholder="vless://… / ss://… / socks5://… / https://…"
+                    placeholder="anytls://… / vless://… / ss://… / socks5://… / https://…"
                     value={shareLink}
                     onChange={event => {
                       const value = event.target.value;
@@ -3585,7 +3918,10 @@ export function ExternalOutboundEditor({
                         parsedShare.value.protocol.v.transport.t === 'xhttp'
                           ? 'XHTTP'
                           : 'RAW'}{' '}
-                        / {parsedShare.value.security.t.toUpperCase()}
+                        /{' '}
+                        {parsedShare.value.protocol.t === 'vless' && parsedShare.value.protocol.v.encryption !== 'none'
+                          ? `VLESS Encryption${parsedShare.value.security.t === 'none' ? '' : ` + ${parsedShare.value.security.t.toUpperCase()}`}`
+                          : parsedShare.value.security.t.toUpperCase()}
                       </b>
                     </span>
                     <span>
@@ -3628,19 +3964,38 @@ export function ExternalOutboundEditor({
                 <span className="external-form-label">协议</span>
                 <span className="external-form-value">
                   <span className="external-protocols">
-                    {(['vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard'] as const).map(protocol => (
-                      <button
-                        type="button"
-                        className={protocolKind === protocol ? 'on' : ''}
-                        aria-pressed={protocolKind === protocol}
-                        key={protocol}
-                        onClick={() => chooseProtocol(protocol)}
-                      >
-                        {externalProtocolLabel(protocol)}
-                      </button>
-                    ))}
+                    <button
+                      type="button"
+                      className={protocolKind === 'vless' && encryption !== 'none' ? 'on' : ''}
+                      aria-pressed={protocolKind === 'vless' && encryption !== 'none'}
+                      onClick={() => {
+                        chooseProtocol('vless');
+                        setEncryption(encryption !== 'none' ? encryption : 'mlkem768x25519plus.native.1rtt.');
+                        setSecurityKind('none');
+                      }}
+                    >
+                      VLESS Encryption
+                    </button>
+                    {(['anytls', 'vless', 'shadowsocks2022', 'socks5', 'http_connect', 'wireguard'] as const).map(
+                      protocol => (
+                        <button
+                          type="button"
+                          className={
+                            protocolKind === protocol && (protocol !== 'vless' || encryption === 'none') ? 'on' : ''
+                          }
+                          aria-pressed={protocolKind === protocol && (protocol !== 'vless' || encryption === 'none')}
+                          key={protocol}
+                          onClick={() => {
+                            chooseProtocol(protocol);
+                            if (protocol === 'vless') setEncryption('none');
+                          }}
+                        >
+                          {externalProtocolLabel(protocol)}
+                        </button>
+                      ),
+                    )}
                   </span>
-                  <small>这里只列外部代理；“从这台落地 / 拒绝”继续由规则动作表达。</small>
+                  <small>这里只列外部代理；“从本机出网 / 拒绝”继续由规则动作表达。</small>
                 </span>
               </section>
               <div className="fgrid one external-manual-fields">
@@ -3712,7 +4067,9 @@ export function ExternalOutboundEditor({
                         ? '预共享密钥'
                         : protocolKind === 'wireguard'
                           ? '本地私钥'
-                          : '密码（可选）'}
+                          : protocolKind === 'anytls'
+                            ? '密码'
+                            : '密码（可选）'}
                   </span>
                   <span className="v">
                     <input
@@ -3737,13 +4094,24 @@ export function ExternalOutboundEditor({
                 {protocolKind === 'vless' && (
                   <>
                     <label className="row">
-                      <span className="k">Encryption</span>
+                      <span className="k">VLESS Encryption</span>
                       <span className="v">
                         <input
                           className="f mono"
+                          aria-label="VLESS Encryption 参数"
+                          placeholder="mlkem768x25519plus.native.1rtt.服务端公钥"
                           value={encryption}
-                          onChange={event => setEncryption(event.target.value)}
+                          aria-invalid={!vlessEncryptionIsValid(encryption)}
+                          onChange={event => setEncryption(event.target.value.trim())}
                         />
+                        <span className="sub">
+                          粘贴服务端提供的客户端 encryption 参数；启用后无需叠加 TLS。填 none 则使用 TLS 或 REALITY。
+                        </span>
+                        {!vlessEncryptionIsValid(encryption) && (
+                          <span className="sub external-field-error">
+                            请输入完整、有效的 Encryption 参数及服务端公钥。
+                          </span>
+                        )}
                       </span>
                     </label>
                     <div className="row">
@@ -4177,7 +4545,10 @@ export function ExternalOutboundEditor({
                       value={securityKind}
                       onChange={event => setSecurityKind(event.target.value as ExternalOutboundSecurity['t'])}
                     >
-                      <option value="none" disabled={protocolKind === 'vless'}>
+                      <option
+                        value="none"
+                        disabled={(protocolKind === 'vless' && encryption === 'none') || protocolKind === 'anytls'}
+                      >
                         无（RAW）
                       </option>
                       <option value="tls" disabled={rawOnly}>
@@ -4187,7 +4558,11 @@ export function ExternalOutboundEditor({
                         REALITY
                       </option>
                     </select>
-                    {protocolKind === 'vless' && <span className="sub">公网 VLESS 必须使用 TLS 或 REALITY。</span>}
+                    {protocolKind === 'vless' && (
+                      <span className="sub">
+                        VLESS Encryption 已加密时可选择「无（RAW）」；encryption 为 none 时需要 TLS 或 REALITY。
+                      </span>
+                    )}
                     {protocolKind === 'http_connect' && (
                       <span className="sub">HTTP CONNECT 可用 RAW 或 TLS；RAW 不适合公网直连，且只能代理 TCP。</span>
                     )}

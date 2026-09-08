@@ -21,6 +21,13 @@ type SessionManager struct {
 	sessions map[uint16]*Session
 	count    uint16
 	closed   bool
+	onEmpty  func()
+}
+
+func (m *SessionManager) SetOnEmpty(onEmpty func()) {
+	m.Lock()
+	m.onEmpty = onEmpty
+	m.Unlock()
 }
 
 func NewSessionManager() *SessionManager {
@@ -56,9 +63,10 @@ func (m *SessionManager) Allocate(Strategy *ClientStrategy) *Session {
 	defer m.Unlock()
 
 	MaxConcurrency := int(Strategy.MaxConcurrency)
-	MaxConnection := uint16(Strategy.MaxConnection)
+	MaxConnection := Strategy.MaxConnection
 
-	if m.closed || (MaxConcurrency > 0 && len(m.sessions) >= MaxConcurrency) || (MaxConnection > 0 && m.count >= MaxConnection) {
+	// IDs start at 1 and are never reused; allocating after 65535 would wrap to 0.
+	if m.closed || m.count == ^uint16(0) || (MaxConcurrency > 0 && len(m.sessions) >= MaxConcurrency) || (MaxConnection > 0 && uint32(m.count) >= MaxConnection) {
 		return nil
 	}
 
@@ -86,17 +94,26 @@ func (m *SessionManager) Add(s *Session) bool {
 }
 
 func (m *SessionManager) Remove(locked bool, id uint16) {
-	if !locked {
-		m.Lock()
-		defer m.Unlock()
-	}
-	locked = true
-
-	if m.closed {
+	if locked {
+		if !m.closed {
+			delete(m.sessions, id)
+		}
 		return
 	}
 
+	m.Lock()
+	if m.closed {
+		m.Unlock()
+		return
+	}
+	_, existed := m.sessions[id]
 	delete(m.sessions, id)
+	empty := existed && len(m.sessions) == 0
+	onEmpty := m.onEmpty
+	m.Unlock()
+	if empty && onEmpty != nil {
+		onEmpty()
+	}
 
 	/*
 		if len(m.sessions) == 0 {
@@ -169,11 +186,23 @@ type Session struct {
 func (s *Session) Close(locked bool) error {
 	if !locked {
 		s.parent.Lock()
-		defer s.parent.Unlock()
-	}
-	locked = true
-	if s.closed {
+		empty, onEmpty := s.closeLocked()
+		s.parent.Unlock()
+		if empty && onEmpty != nil {
+			onEmpty()
+		}
 		return nil
+	}
+	_, _ = s.closeLocked()
+	return nil
+}
+
+// closeLocked closes the session while the parent SessionManager lock is held.
+// It returns a callback separately so callers can invoke it after unlocking;
+// pool callbacks take the picker lock and must never run under SessionManager.
+func (s *Session) closeLocked() (bool, func()) {
+	if s.closed {
+		return false, nil
 	}
 	s.closed = true
 	if s.done != nil {
@@ -197,8 +226,11 @@ func (s *Session) Close(locked bool) error {
 		}
 		XUDPManager.Unlock()
 	}
-	s.parent.Remove(locked, s.ID)
-	return nil
+	if !s.parent.closed {
+		delete(s.parent.sessions, s.ID)
+	}
+	empty := !s.parent.closed && len(s.parent.sessions) == 0
+	return empty, s.parent.onEmpty
 }
 
 // NewReader creates a buf.Reader based on the transfer type of this Session.

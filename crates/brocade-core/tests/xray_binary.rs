@@ -32,7 +32,7 @@ use brocade_core::{
         EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
         ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
-        ExternalWarpBinding, HopDial, HopEncryption, HopIn, HopPool, HopWire, Hysteria2,
+        ExternalWarpBinding, HopDial, HopEncryption, HopIn, HopMux, HopPool, HopWire, Hysteria2,
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
         IngressWires, IpFamily, ModelSnapshot, Node, NodeEgressDnsPolicy,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
@@ -61,6 +61,9 @@ fn machine_egress_dns_without_route_references_loads_in_the_real_binary() {
         return;
     };
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    for node in &mut doc.nodes {
+        node.certificate_group_id = Some("published-group".to_owned());
+    }
     doc.node_egress_dns = vec![
         NodeEgressDnsPolicy {
             node: "sg".to_owned(),
@@ -2081,8 +2084,7 @@ fn write_certificate_bundle(path: &Path, certificate: &str, key: &str) {
 }
 
 fn replace_node_certificate_paths(config: &str, bundle: &Path) -> String {
-    xray::NODE_PUBLIC_CA_CERTIFICATE_FILES
-        .into_iter()
+    std::iter::once(xray::NODE_PUBLIC_CA_CERTIFICATE_FILE)
         .chain(xray::NODE_SELF_SIGNED_CERTIFICATE_FILES)
         .fold(config.to_owned(), |config, path| {
             config.replace(path, &bundle.display().to_string())
@@ -2227,6 +2229,8 @@ fn node(id: &str, overlay: [u8; 4]) -> Node {
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay),
         certificate_name: None,
+        certificate_names: Vec::new(),
+        certificate_group_id: None,
         certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: "QG4l1cVXHNVPQxL0FKBTaFAsuGSKLFB39JYFhTOEXFo=".to_owned(),
@@ -2616,6 +2620,18 @@ fn pooled_hops_load_in_the_real_binary() {
             },
             HopPool::Merge(HopPool::MERGE_MIN),
         ),
+        ("vless-current-mux", HopWire::None, HopPool::Mux(None)),
+        (
+            "shadowsocks-current-mux",
+            HopWire::Shadowsocks2022 {
+                server_psk: SERVER_PSK.to_owned(),
+                user_psk: USER_PSK.to_owned(),
+            },
+            HopPool::Mux(Some(HopMux {
+                concurrency: 8,
+                ..Default::default()
+            })),
+        ),
     ];
 
     for (name, security, pool) in cases {
@@ -2666,9 +2682,16 @@ fn pooled_hops_load_in_the_real_binary() {
                         HopPool::Pool => 1,
                         HopPool::Merge(n) => n,
                         HopPool::None => unreachable!("用例里没有 None"),
+                        HopPool::Mux(value) => value.unwrap_or_default().concurrency,
                     }),
                     "{name}"
                 );
+                if matches!(pool, HopPool::Mux(_)) {
+                    assert_eq!(mux["workerPool"]["probeIntervalSecs"], json!(5), "{name}");
+                    assert_eq!(mux["workerPool"]["probeTimeoutMs"], json!(2000), "{name}");
+                } else {
+                    assert!(mux["workerPool"].is_null(), "{name}: {mux:#?}");
+                }
             }
 
             let path =
@@ -2688,4 +2711,216 @@ fn pooled_hops_load_in_the_real_binary() {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+#[test]
+fn native_vless_encryption_ingress_carries_real_traffic_without_tls() {
+    let Some(binary) = xray_binary() else {
+        eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
+        return;
+    };
+    if Command::new("curl").arg("--version").output().is_err() {
+        eprintln!("跳过：没找到 curl");
+        return;
+    }
+
+    const USER_UUID: &str = "6f9d1a8e-2b3c-4d5e-8f70-1a2b3c4d5e6f";
+    let ports = free_tcp_ports(2);
+    let public_port = ports[0];
+    let socks_port = ports[1];
+
+    let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    app.ingresses[0].wires = IngressWires::WithVlessEncryption {
+        other: None,
+        encryption: brocade_core::model::VlessEncryption {
+            options: Default::default(),
+            port: public_port,
+            private_key: INGRESS_PRIVATE.to_owned(),
+            public_key: INGRESS_PUBLIC.to_owned(),
+        },
+    };
+    app.steps = vec![Step {
+        chain: "c-relay".to_owned(),
+        node: "hk".to_owned(),
+        accept: None,
+        hop_in: None,
+        rules: vec![Rule {
+            dest_match: DestMatch::Any,
+            action: Action::Egress { send_through: None },
+        }],
+    }];
+    let hk = doc.nodes.iter_mut().find(|node| node.id == "hk").unwrap();
+    hk.certificate_name = None;
+    hk.api_port = None;
+
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let mut server: Value = serde_json::from_str(&json::xray(&xray::build(&project_node(
+        &sys,
+        &[app_ir],
+        "hk",
+    ))))
+    .unwrap();
+    // Keep the protocol test independent of geodata files and scheduled downloads.
+    server.as_object_mut().unwrap().remove("geodata");
+    let inbounds = server["inbounds"].as_array_mut().unwrap();
+    let public = inbounds
+        .iter_mut()
+        .find(|inbound| inbound["tag"] == "in:relay/i-relay:vless-encryption")
+        .unwrap();
+    public["settings"]["clients"] = json!([{
+        "id": USER_UUID,
+        "email": "test-user",
+        "level": 0,
+    }]);
+    let business_outbound = server["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|outbound| outbound["tag"] == "out:egress")
+        .unwrap();
+    business_outbound["protocol"] = json!("blackhole");
+    business_outbound["settings"] = json!({ "response": { "type": "http" } });
+
+    let dir = std::env::temp_dir().join(format!("brocade-native-vless-{public_port}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let server_log = dir.join("server.log");
+    let client_log = dir.join("client.log");
+    server["log"] = json!({
+        "loglevel": "info",
+        "access": "none",
+        "error": server_log,
+    });
+    let server_config = serde_json::to_string_pretty(&server).unwrap();
+    let server_path = dir.join("server.json");
+    fs::write(&server_path, server_config).unwrap();
+    let client_path = dir.join("client.json");
+    fs::write(
+        &client_path,
+        serde_json::to_string_pretty(&json!({
+            "log": { "loglevel": "info", "access": "none", "error": client_log },
+            "inbounds": [{
+                "tag": "probe-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": { "auth": "noauth", "udp": false },
+            }],
+            "outbounds": [{
+                "tag": "probe-out",
+                "protocol": "vless",
+                "settings": { "vnext": [{
+                    "address": "127.0.0.1",
+                    "port": public_port,
+                    "users": [{ "id": USER_UUID, "encryption": format!("mlkem768x25519plus.native.0rtt.{INGRESS_PUBLIC}") }],
+                }]},
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none",
+                },
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut server_process = Command::new(&binary)
+        .args(["run", "-c"])
+        .arg(&server_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let server_ready = (0..50).any(|_| {
+        if TcpStream::connect((Ipv4Addr::LOCALHOST, public_port)).is_ok() {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    let mut client_process = server_ready.then(|| {
+        Command::new(&binary)
+            .args(["run", "-c"])
+            .arg(&client_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    });
+    let client_ready = client_process.as_ref().is_some_and(|_| {
+        (0..50).any(|_| {
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, socks_port)).is_ok() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(50));
+                false
+            }
+        })
+    });
+    let response = client_ready.then(|| {
+        Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--include",
+                "--max-time",
+                "5",
+                "--noproxy",
+                "",
+                "--socks5-hostname",
+            ])
+            .arg(format!("127.0.0.1:{socks_port}"))
+            // The business outbound is an HTTP blackhole in this test. A 403 can only get back
+            // through the SOCKS client after VLESS Encryption authentication, VLESS parsing, and routing.
+            .arg("http://93.184.216.34/")
+            .output()
+            .unwrap()
+    });
+    if let Some(process) = &mut client_process {
+        let _ = process.kill();
+        let _ = process.wait();
+    }
+    let _ = server_process.kill();
+    let _ = server_process.wait();
+    let server_log_text = fs::read_to_string(&server_log).unwrap_or_default();
+    let client_log_text = fs::read_to_string(&client_log).unwrap_or_default();
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        server_ready,
+        "server xray 没有监听 VLESS Encryption 入口: {server_log_text}"
+    );
+    assert!(client_ready, "client xray 没有监听 SOCKS 入口");
+    let response = response.unwrap();
+    assert!(
+        response.status.success(),
+        "curl 失败：{}\nserver:\n{server_log_text}\nclient:\n{client_log_text}",
+        String::from_utf8_lossy(&response.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&response.stdout).starts_with("HTTP/1.1 403"),
+        "{}",
+        String::from_utf8_lossy(&response.stdout),
+    );
+    assert!(
+        server_log_text.contains("proxy/vless/inbound: received request"),
+        "合法 VLESS Encryption 流量没有进入 VLESS：\n{server_log_text}"
+    );
+    assert!(
+        server_log_text.contains("taking detour [out:egress]"),
+        "合法 VLESS Encryption 流量没有进入业务出站：\n{server_log_text}"
+    );
 }

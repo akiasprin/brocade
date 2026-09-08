@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useServerForm } from '../ui/server-form';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchAgentRelease, fetchNodes, saveAgentRelease, type AgentReleaseScope, type AgentReleaseView } from '../api';
 import { Ago, ErrorBox, Loading } from '../ui/bits';
@@ -9,6 +9,12 @@ const bareBuild = (raw: string | null) => raw?.replace(/^brocade-agent\//, '') ?
 const onThisBuild = (view: AgentReleaseView, raw: string | null) => {
   const bare = bareBuild(raw);
   return !!bare && view.available_agents.some(a => a.sha256 === bare);
+};
+
+const sameIds = (a: string[], b: string[]) => {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every(id => right.has(id));
 };
 
 export function useAgentDrift(): { pending: number; loading: boolean } {
@@ -26,47 +32,36 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
   const qc = useQueryClient();
   const rel = useQuery({ queryKey: ['agent-release'], queryFn: () => fetchAgentRelease() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const [form, setForm] = useState<{
-    scope: AgentReleaseScope;
-    nodes: string[];
-    note: string;
-  } | null>(null);
-
-  const [syncedFrom, setSyncedFrom] = useState<typeof rel.data>(undefined);
-  // 必须等 nodes.data 一并就绪再 seed：scope 为 all 时选中集要展开成整机队的 id，而它取自
-  // nodes 查询。只等 rel.data 会有竞态——nodes 尚未返回则展开成空集，且 seed 只按 rel.data
-  // 身份跑一次，nodes 后到也不再 seed，空选状态就此固定（刷新时表现为时而全选、时而全空）。
-  if (rel.data && nodes.data && rel.data !== syncedFrom) {
-    setSyncedFrom(rel.data);
-    setForm({
-      scope: rel.data.released.scope,
-      nodes:
-        rel.data.released.scope === 'all' ? (nodes.data?.nodes ?? []).map(n => n.node_id) : rel.data.released.nodes,
-      note: '',
-    });
-  }
+  const { form, setForm, accept } = useServerForm({
+    scope: rel.data?.released.scope ?? ('off' as AgentReleaseScope),
+    nodes: rel.data?.released.nodes ?? [],
+    note: '',
+  });
 
   const save = useMutation({
-    mutationFn: () => {
-      const allNodeIds = (nodes.data?.nodes ?? []).map(n => n.node_id);
-      const scope: AgentReleaseScope =
-        form!.nodes.length === 0 ? 'off' : form!.nodes.length === allNodeIds.length ? 'all' : 'nodes';
+    mutationFn: (submitted: typeof form) => {
+      const allNodeIds = new Set((nodes.data?.nodes ?? []).map(n => n.node_id));
+      const selected = submitted.nodes.filter(id => allNodeIds.has(id));
+      const scope: AgentReleaseScope = submitted.scope === 'all' ? 'all' : selected.length ? 'nodes' : 'off';
       return saveAgentRelease({
         release_id:
           scope === 'off'
             ? (rel.data!.released.release_id ?? rel.data!.available_release_id)
             : rel.data!.available_release_id,
         scope,
-        nodes: form!.nodes,
-        note: form!.note.trim() || null,
+        nodes: scope === 'nodes' ? selected : [],
+        note: submitted.note.trim() || null,
         version: null,
         commit: null,
         released_at: null,
         released_by: null,
       });
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['agent-release'] });
+    onMutate: () => qc.cancelQueries({ queryKey: ['agent-release'] }),
+    onSuccess: async (view, submitted) => {
+      await qc.cancelQueries({ queryKey: ['agent-release'] });
+      accept({ scope: view.released.scope, nodes: view.released.nodes, note: '' }, submitted);
+      qc.setQueryData(['agent-release'], view);
     },
   });
 
@@ -78,17 +73,19 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
   const rows = nodes.data?.nodes ?? [];
   const allIds = rows.map(n => n.node_id);
   const f = form ?? { scope: 'off' as AgentReleaseScope, nodes: [], note: '' };
-  const effectiveScope: AgentReleaseScope =
-    f.nodes.length === 0 ? 'off' : f.nodes.length === allIds.length ? 'all' : 'nodes';
+  const selected = f.scope === 'all' ? allIds : f.nodes.filter(id => allIds.includes(id));
+  const effectiveScope: AgentReleaseScope = f.scope === 'all' ? 'all' : selected.length ? 'nodes' : 'off';
   const dirty =
     effectiveScope !== view.released.scope ||
-    (effectiveScope === 'nodes' && f.nodes.join() !== view.released.nodes.join()) ||
+    (effectiveScope === 'nodes' && !sameIds(selected, view.released.nodes)) ||
     f.note.trim() !== '' ||
     (effectiveScope !== 'off' && view.released.release_id !== view.available_release_id);
-  const toggle = (id: string) =>
-    setForm({ ...f, nodes: f.nodes.includes(id) ? f.nodes.filter(n => n !== id) : [...f.nodes, id] });
-  const allSelected = f.nodes.length === allIds.length;
-  const toggleAll = () => setForm({ ...f, nodes: allSelected ? [] : allIds });
+  const toggle = (id: string) => {
+    const next = selected.includes(id) ? selected.filter(n => n !== id) : [...selected, id];
+    setForm({ ...f, scope: next.length ? 'nodes' : 'off', nodes: next });
+  };
+  const allSelected = allIds.length > 0 && sameIds(selected, allIds);
+  const toggleAll = () => setForm({ ...f, scope: allSelected ? 'off' : 'all', nodes: allSelected ? [] : allIds });
 
   return (
     <section className="panel titled" id="dp-agent">
@@ -101,6 +98,7 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
 
       <div className="guard" style={{ marginBottom: 10 }}>
         批准后 10 分钟内，范围内的机器自行替换并重启。没有回滚，建议先发一台确认。
+        {f.scope === 'all' ? '当前范围为全部机器，包含以后新增的机器。' : '当前范围仅包含勾选的机器。'}
       </div>
 
       <dl className="kv form2">
@@ -124,7 +122,7 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
               </span>
             </>
           ) : (
-            <span className="dim">未批准，机队不会自行更新</span>
+            <span className="dim">未批准，所有机器不会自行更新</span>
           )}
         </dd>
       </dl>
@@ -133,7 +131,13 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
         <thead>
           <tr>
             <th className="pick">
-              <input type="checkbox" checked={allSelected} disabled={!editable} onChange={toggleAll} />
+              <input
+                type="checkbox"
+                aria-label="批准全部机器（包含以后新增的机器）"
+                checked={allSelected}
+                disabled={!editable || save.isPending || allIds.length === 0}
+                onChange={toggleAll}
+              />
             </th>
             <th>机器</th>
             <th>当前构建</th>
@@ -144,11 +148,17 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
         <tbody>
           {rows.map(n => {
             const on = onThisBuild(view, n.agent_version);
-            const picked = f.nodes.includes(n.node_id);
+            const picked = selected.includes(n.node_id);
             return (
               <tr key={n.node_id} className={picked ? undefined : 'out'}>
                 <td className="pick">
-                  <input type="checkbox" checked={picked} disabled={!editable} onChange={() => toggle(n.node_id)} />
+                  <input
+                    type="checkbox"
+                    aria-label={`批准 ${n.name || n.node_id}`}
+                    checked={picked}
+                    disabled={!editable || save.isPending}
+                    onChange={() => toggle(n.node_id)}
+                  />
                 </td>
                 <td className="nm">{n.name || n.node_id}</td>
                 <td className="bd">{bareBuild(n.agent_version)?.slice(0, 12) ?? '—'}</td>
@@ -176,7 +186,7 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
         <button
           className={dirty ? 'btn primary' : 'btn'}
           disabled={!editable || !dirty || save.isPending}
-          onClick={() => save.mutate()}
+          onClick={() => save.mutate(form)}
         >
           {save.isPending ? '批准中…' : '批准'}
         </button>

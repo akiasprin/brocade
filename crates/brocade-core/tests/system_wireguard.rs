@@ -77,7 +77,7 @@ fn a_v4_only_node_does_not_dial_a_nat_peers_public_ipv6() {
         .find(|peer| peer.node_id == "a")
         .unwrap();
     assert_eq!(b_to_a.endpoint.as_deref(), Some("a.example.net:51820"));
-    assert_eq!(b_to_a.persistent_keepalive, Some(25));
+    assert_eq!(b_to_a.persistent_keepalive, Some(10));
 }
 
 // Neither side can reach the other: no link is generated, and the release is not blocked.
@@ -158,7 +158,7 @@ fn wireguard_plan_and_format_keep_endpoint_rules_in_one_place() {
     assert!(text.contains("Endpoint   = a.example.net:51820"));
     assert!(text.contains("# c"));
     assert!(text.contains("Endpoint   = c.example.net:51820"));
-    assert_eq!(text.matches("PersistentKeepalive = 25").count(), 2);
+    assert_eq!(text.matches("PersistentKeepalive = 10").count(), 2);
 }
 
 #[test]
@@ -457,6 +457,8 @@ fn node(id: &str, public_ipv4: Option<&str>, overlay_addr: [u8; 4], on_overlay: 
         public_ipv6_nat: false,
         overlay_addr: Ipv4Addr::from(overlay_addr),
         certificate_name: None,
+        certificate_names: Vec::new(),
+        certificate_group_id: None,
         certificate_track: None,
         wireguard: WireGuardKeys {
             private_key: format!("priv-{id}"),

@@ -123,6 +123,9 @@ pub async fn user_grant_probe_plan(
             None => "unknown",
         };
         let (protocol, reality, tls, hysteria2) = match &entry.security {
+            UserSecurityPlan::VlessEncryption { .. } => {
+                ("vless-encryption", empty_reality(), None, None)
+            }
             UserSecurityPlan::Reality(value) => (
                 "vless",
                 E2eProbeReality {
@@ -206,6 +209,14 @@ pub async fn user_grant_probe_plan(
             family,
             protocol,
             target: E2eProbeTarget {
+                vless_encryption: match &entry.security {
+                    UserSecurityPlan::VlessEncryption {
+                        public_key,
+                        options,
+                        ..
+                    } => Some(options.encryption(public_key)),
+                    _ => None,
+                },
                 app_id: Some(app.id.clone()),
                 chain_id: chain.id.clone(),
                 chain_name: chain.name.clone(),

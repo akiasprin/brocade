@@ -17,7 +17,6 @@ export type NavKey =
   | 'deploy'
   | 'topo'
   | 'settings'
-  | 'tenants'
   | 'usage'
   | 'links'
   // 修改自身的登录密码。它不是功能页面而是身份区的操作，因此顶栏和「⋯」的
@@ -33,7 +32,6 @@ export const NAV_KEYS = [
   'deploy',
   'topo',
   'settings',
-  'tenants',
   'usage',
   'links',
   'password',

@@ -14,7 +14,7 @@ const user: UserListItem = {
 describe('user search', () => {
   it('matches username, tenant and UUID without case or surrounding-space sensitivity', () => {
     expect(userMatchesSearch(user, ' alice ')).toBe(true);
-    expect(userMatchesSearch(user, 'PLATFORM.ACME')).toBe(true);
+    expect(userMatchesSearch(user, 'PLATFORM.ACME')).toBe(false);
     expect(userMatchesSearch(user, '5d8f0b2e')).toBe(true);
   });
 

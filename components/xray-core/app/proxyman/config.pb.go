@@ -420,8 +420,11 @@ type MultiplexingConfig struct {
 	XudpConcurrency int32 `protobuf:"varint,3,opt,name=xudpConcurrency,proto3" json:"xudpConcurrency,omitempty"`
 	// "reject" (default), "allow" or "skip".
 	XudpProxyUDP443 string `protobuf:"bytes,4,opt,name=xudpProxyUDP443,proto3" json:"xudpProxyUDP443,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional bounded idle-worker pool with active Ping/Pong liveness checking.
+	// Missing keeps the upstream Mux behavior unchanged.
+	WorkerPool    *WorkerPoolConfig `protobuf:"bytes,5,opt,name=worker_pool,json=workerPool,proto3" json:"worker_pool,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MultiplexingConfig) Reset() {
@@ -482,6 +485,105 @@ func (x *MultiplexingConfig) GetXudpProxyUDP443() string {
 	return ""
 }
 
+func (x *MultiplexingConfig) GetWorkerPool() *WorkerPoolConfig {
+	if x != nil {
+		return x.WorkerPool
+	}
+	return nil
+}
+
+type WorkerPoolConfig struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	MinIdleWorkers       uint32                 `protobuf:"varint,1,opt,name=min_idle_workers,json=minIdleWorkers,proto3" json:"min_idle_workers,omitempty"`
+	MaxIdleWorkers       uint32                 `protobuf:"varint,2,opt,name=max_idle_workers,json=maxIdleWorkers,proto3" json:"max_idle_workers,omitempty"`
+	MaxProbingWorkers    uint32                 `protobuf:"varint,3,opt,name=max_probing_workers,json=maxProbingWorkers,proto3" json:"max_probing_workers,omitempty"`
+	ProbeIntervalSecs    uint32                 `protobuf:"varint,4,opt,name=probe_interval_secs,json=probeIntervalSecs,proto3" json:"probe_interval_secs,omitempty"`
+	ProbeTimeoutMs       uint32                 `protobuf:"varint,5,opt,name=probe_timeout_ms,json=probeTimeoutMs,proto3" json:"probe_timeout_ms,omitempty"`
+	IdleTtlSecs          uint32                 `protobuf:"varint,6,opt,name=idle_ttl_secs,json=idleTtlSecs,proto3" json:"idle_ttl_secs,omitempty"`
+	MaxRequestsPerWorker uint32                 `protobuf:"varint,7,opt,name=max_requests_per_worker,json=maxRequestsPerWorker,proto3" json:"max_requests_per_worker,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *WorkerPoolConfig) Reset() {
+	*x = WorkerPoolConfig{}
+	mi := &file_app_proxyman_config_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkerPoolConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkerPoolConfig) ProtoMessage() {}
+
+func (x *WorkerPoolConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_app_proxyman_config_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkerPoolConfig.ProtoReflect.Descriptor instead.
+func (*WorkerPoolConfig) Descriptor() ([]byte, []int) {
+	return file_app_proxyman_config_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *WorkerPoolConfig) GetMinIdleWorkers() uint32 {
+	if x != nil {
+		return x.MinIdleWorkers
+	}
+	return 0
+}
+
+func (x *WorkerPoolConfig) GetMaxIdleWorkers() uint32 {
+	if x != nil {
+		return x.MaxIdleWorkers
+	}
+	return 0
+}
+
+func (x *WorkerPoolConfig) GetMaxProbingWorkers() uint32 {
+	if x != nil {
+		return x.MaxProbingWorkers
+	}
+	return 0
+}
+
+func (x *WorkerPoolConfig) GetProbeIntervalSecs() uint32 {
+	if x != nil {
+		return x.ProbeIntervalSecs
+	}
+	return 0
+}
+
+func (x *WorkerPoolConfig) GetProbeTimeoutMs() uint32 {
+	if x != nil {
+		return x.ProbeTimeoutMs
+	}
+	return 0
+}
+
+func (x *WorkerPoolConfig) GetIdleTtlSecs() uint32 {
+	if x != nil {
+		return x.IdleTtlSecs
+	}
+	return 0
+}
+
+func (x *WorkerPoolConfig) GetMaxRequestsPerWorker() uint32 {
+	if x != nil {
+		return x.MaxRequestsPerWorker
+	}
+	return 0
+}
+
 var File_app_proxyman_config_proto protoreflect.FileDescriptor
 
 const file_app_proxyman_config_proto_rawDesc = "" +
@@ -513,12 +615,22 @@ const file_app_proxyman_config_proto_rawDesc = "" +
 	"\x0eproxy_settings\x18\x03 \x01(\v2$.xray.transport.internet.ProxyConfigR\rproxySettings\x12T\n" +
 	"\x12multiplex_settings\x18\x04 \x01(\v2%.xray.app.proxyman.MultiplexingConfigR\x11multiplexSettings\x12\x19\n" +
 	"\bvia_cidr\x18\x05 \x01(\tR\aviaCidr\x12P\n" +
-	"\x0ftarget_strategy\x18\x06 \x01(\x0e2'.xray.transport.internet.DomainStrategyR\x0etargetStrategy\"\xa4\x01\n" +
+	"\x0ftarget_strategy\x18\x06 \x01(\x0e2'.xray.transport.internet.DomainStrategyR\x0etargetStrategy\"\xea\x01\n" +
 	"\x12MultiplexingConfig\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12 \n" +
 	"\vconcurrency\x18\x02 \x01(\x05R\vconcurrency\x12(\n" +
 	"\x0fxudpConcurrency\x18\x03 \x01(\x05R\x0fxudpConcurrency\x12(\n" +
-	"\x0fxudpProxyUDP443\x18\x04 \x01(\tR\x0fxudpProxyUDP443BU\n" +
+	"\x0fxudpProxyUDP443\x18\x04 \x01(\tR\x0fxudpProxyUDP443\x12D\n" +
+	"\vworker_pool\x18\x05 \x01(\v2#.xray.app.proxyman.WorkerPoolConfigR\n" +
+	"workerPool\"\xcb\x02\n" +
+	"\x10WorkerPoolConfig\x12(\n" +
+	"\x10min_idle_workers\x18\x01 \x01(\rR\x0eminIdleWorkers\x12(\n" +
+	"\x10max_idle_workers\x18\x02 \x01(\rR\x0emaxIdleWorkers\x12.\n" +
+	"\x13max_probing_workers\x18\x03 \x01(\rR\x11maxProbingWorkers\x12.\n" +
+	"\x13probe_interval_secs\x18\x04 \x01(\rR\x11probeIntervalSecs\x12(\n" +
+	"\x10probe_timeout_ms\x18\x05 \x01(\rR\x0eprobeTimeoutMs\x12\"\n" +
+	"\ridle_ttl_secs\x18\x06 \x01(\rR\vidleTtlSecs\x125\n" +
+	"\x17max_requests_per_worker\x18\a \x01(\rR\x14maxRequestsPerWorkerBU\n" +
 	"\x15com.xray.app.proxymanP\x01Z&github.com/xtls/xray-core/app/proxyman\xaa\x02\x11Xray.App.Proxymanb\x06proto3"
 
 var (
@@ -533,7 +645,7 @@ func file_app_proxyman_config_proto_rawDescGZIP() []byte {
 	return file_app_proxyman_config_proto_rawDescData
 }
 
-var file_app_proxyman_config_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_app_proxyman_config_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_app_proxyman_config_proto_goTypes = []any{
 	(*InboundConfig)(nil),         // 0: xray.app.proxyman.InboundConfig
 	(*SniffingConfig)(nil),        // 1: xray.app.proxyman.SniffingConfig
@@ -542,34 +654,36 @@ var file_app_proxyman_config_proto_goTypes = []any{
 	(*OutboundConfig)(nil),        // 4: xray.app.proxyman.OutboundConfig
 	(*SenderConfig)(nil),          // 5: xray.app.proxyman.SenderConfig
 	(*MultiplexingConfig)(nil),    // 6: xray.app.proxyman.MultiplexingConfig
-	(*geodata.DomainRule)(nil),    // 7: xray.common.geodata.DomainRule
-	(*geodata.IPRule)(nil),        // 8: xray.common.geodata.IPRule
-	(*net.PortList)(nil),          // 9: xray.common.net.PortList
-	(*net.IPOrDomain)(nil),        // 10: xray.common.net.IPOrDomain
-	(*internet.StreamConfig)(nil), // 11: xray.transport.internet.StreamConfig
-	(*serial.TypedMessage)(nil),   // 12: xray.common.serial.TypedMessage
-	(*internet.ProxyConfig)(nil),  // 13: xray.transport.internet.ProxyConfig
-	(internet.DomainStrategy)(0),  // 14: xray.transport.internet.DomainStrategy
+	(*WorkerPoolConfig)(nil),      // 7: xray.app.proxyman.WorkerPoolConfig
+	(*geodata.DomainRule)(nil),    // 8: xray.common.geodata.DomainRule
+	(*geodata.IPRule)(nil),        // 9: xray.common.geodata.IPRule
+	(*net.PortList)(nil),          // 10: xray.common.net.PortList
+	(*net.IPOrDomain)(nil),        // 11: xray.common.net.IPOrDomain
+	(*internet.StreamConfig)(nil), // 12: xray.transport.internet.StreamConfig
+	(*serial.TypedMessage)(nil),   // 13: xray.common.serial.TypedMessage
+	(*internet.ProxyConfig)(nil),  // 14: xray.transport.internet.ProxyConfig
+	(internet.DomainStrategy)(0),  // 15: xray.transport.internet.DomainStrategy
 }
 var file_app_proxyman_config_proto_depIdxs = []int32{
-	7,  // 0: xray.app.proxyman.SniffingConfig.domains_excluded:type_name -> xray.common.geodata.DomainRule
-	8,  // 1: xray.app.proxyman.SniffingConfig.ips_excluded:type_name -> xray.common.geodata.IPRule
-	9,  // 2: xray.app.proxyman.ReceiverConfig.port_list:type_name -> xray.common.net.PortList
-	10, // 3: xray.app.proxyman.ReceiverConfig.listen:type_name -> xray.common.net.IPOrDomain
-	11, // 4: xray.app.proxyman.ReceiverConfig.stream_settings:type_name -> xray.transport.internet.StreamConfig
+	8,  // 0: xray.app.proxyman.SniffingConfig.domains_excluded:type_name -> xray.common.geodata.DomainRule
+	9,  // 1: xray.app.proxyman.SniffingConfig.ips_excluded:type_name -> xray.common.geodata.IPRule
+	10, // 2: xray.app.proxyman.ReceiverConfig.port_list:type_name -> xray.common.net.PortList
+	11, // 3: xray.app.proxyman.ReceiverConfig.listen:type_name -> xray.common.net.IPOrDomain
+	12, // 4: xray.app.proxyman.ReceiverConfig.stream_settings:type_name -> xray.transport.internet.StreamConfig
 	1,  // 5: xray.app.proxyman.ReceiverConfig.sniffing_settings:type_name -> xray.app.proxyman.SniffingConfig
-	12, // 6: xray.app.proxyman.InboundHandlerConfig.receiver_settings:type_name -> xray.common.serial.TypedMessage
-	12, // 7: xray.app.proxyman.InboundHandlerConfig.proxy_settings:type_name -> xray.common.serial.TypedMessage
-	10, // 8: xray.app.proxyman.SenderConfig.via:type_name -> xray.common.net.IPOrDomain
-	11, // 9: xray.app.proxyman.SenderConfig.stream_settings:type_name -> xray.transport.internet.StreamConfig
-	13, // 10: xray.app.proxyman.SenderConfig.proxy_settings:type_name -> xray.transport.internet.ProxyConfig
+	13, // 6: xray.app.proxyman.InboundHandlerConfig.receiver_settings:type_name -> xray.common.serial.TypedMessage
+	13, // 7: xray.app.proxyman.InboundHandlerConfig.proxy_settings:type_name -> xray.common.serial.TypedMessage
+	11, // 8: xray.app.proxyman.SenderConfig.via:type_name -> xray.common.net.IPOrDomain
+	12, // 9: xray.app.proxyman.SenderConfig.stream_settings:type_name -> xray.transport.internet.StreamConfig
+	14, // 10: xray.app.proxyman.SenderConfig.proxy_settings:type_name -> xray.transport.internet.ProxyConfig
 	6,  // 11: xray.app.proxyman.SenderConfig.multiplex_settings:type_name -> xray.app.proxyman.MultiplexingConfig
-	14, // 12: xray.app.proxyman.SenderConfig.target_strategy:type_name -> xray.transport.internet.DomainStrategy
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	15, // 12: xray.app.proxyman.SenderConfig.target_strategy:type_name -> xray.transport.internet.DomainStrategy
+	7,  // 13: xray.app.proxyman.MultiplexingConfig.worker_pool:type_name -> xray.app.proxyman.WorkerPoolConfig
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_app_proxyman_config_proto_init() }
@@ -583,7 +697,7 @@ func file_app_proxyman_config_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_app_proxyman_config_proto_rawDesc), len(file_app_proxyman_config_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

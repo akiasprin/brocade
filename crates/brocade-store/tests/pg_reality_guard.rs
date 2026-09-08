@@ -65,6 +65,7 @@ async fn fallback_guard_round_trips() {
 
     let face = |guard: Option<bool>| CreateIngressRequest {
         wires: WiresRequest {
+            vless_encryption: None,
             vless: Some(TransportRequest::VlessReality),
             anytls: None,
             hysteria2: None,

@@ -1,3 +1,4 @@
+import { draft } from '../draft';
 import { Fragment, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import * as echarts from 'echarts/core';
 import { LineChart } from 'echarts/charts';
@@ -16,15 +17,18 @@ import {
   fetchRevisions,
   fetchTenants,
   fetchUsageNodeSeries,
+  fetchUsageNodeSeriesRange,
   fetchNodeLoad,
   fetchCerts,
   fetchNodeLoadList,
   fetchNodeLoadListWindows,
   fetchNodePingProbe,
+  fetchNodePingProbeRange,
   fetchNodePingProbeList,
   monthBytes,
   issueNodeToken,
   provisionNode,
+  removeRetiredNodes,
   restoreNodeService,
   saveNodeLogPolicy,
   setNodeCertGroup,
@@ -42,6 +46,7 @@ import {
   type GroupCertificate,
   type LinkHealthItem,
   type NodeAgentStateItem,
+  type NodeCertificateState,
   type NodeLoadView,
   type NodePingProbeView,
   type LoadSample,
@@ -52,7 +57,7 @@ import {
 import { fetchPreviewStatus } from '../preview/api';
 import type { LinkIr } from '../topo/model';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
-import { can, isVisitor, useSession } from '../session';
+import { can, isPublic, isVisitor, useSession } from '../session';
 import { Ago, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { bytes } from '../ui/format';
@@ -207,7 +212,7 @@ const STATE_CLASS: Record<string, string> = {
 
 /* 本版本应下发到机器上的全部产物。需要列全，不能只列常用的两件：控制面判定「待发布」
    依据的就是这些状态，遗漏任何一件时，该机器持续处于待发布状态的原因在控制台上
-   无法查明——端口跳转刚上线时即是如此，库中记录为 unknown，界面上没有任何显示。 */
+   无法查明——端口跳跃刚上线时即是如此，库中记录为 unknown，界面上没有任何显示。 */
 type ArtifactKind = 'phantun' | 'wireguard' | 'xray' | 'hy2_port_hop';
 
 /** 简称。这些值排在同一行内，使用全称会导致该行换行。
@@ -405,6 +410,10 @@ const nodeLabel = (n: NodeAgentStateItem) => n.name || n.node_id;
    中英混名的机器会聚到一头）。Collator 建一次复用，不要每次渲染新建。 */
 const NAME_ORDER = new Intl.Collator('zh', { numeric: true, sensitivity: 'base' });
 
+/** Only terminal lifecycle states have already lost their agent credential and teardown work. */
+export const nodeRemovalReady = (node: Pick<NodeAgentStateItem, 'retired_at' | 'lifecycle_phase'>) =>
+  node.retired_at !== null && (node.lifecycle_phase === 'retired' || node.lifecycle_phase === 'abandoned');
+
 /* 机器在链中的角色。`chains` 是它参与的链数量（不是其所属项目的链数量）。 */
 // `chainUseOf` 返回的 role 是拼接后的字符串（如「入口 / 中转」），区分主干和非主干
 // 两套表述（主干中转 / 中转、主干末跳），另有「规则节点」。列表只需要两端：
@@ -456,9 +465,9 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   //
   // 这几个 hook 必须位于下面两条 early return 之前：放在 `list` 附近可读性更好，但
   // 那样它们只在数据就绪的那次渲染中被调用，hook 数量前后不一致会导致 React 报错（#310）。
-  const [selecting, setSelecting] = useState(false);
+  const [selectionMode, setSelectionMode] = useState<'retire' | 'remove' | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [retiredOpen, setRetiredOpen] = useState<boolean | null>(null);
+  const [removalNotice, setRemovalNotice] = useState<string | null>(null);
   const togglePick = (id: string) =>
     setPicked(prev => {
       const next = new Set(prev);
@@ -467,7 +476,11 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       return next;
     });
   const exitSelect = () => {
-    setSelecting(false);
+    setSelectionMode(null);
+    setPicked(new Set());
+  };
+  const beginSelect = (mode: 'retire' | 'remove') => {
+    setSelectionMode(mode);
     setPicked(new Set());
   };
   const retireAll = useMutation({
@@ -483,6 +496,31 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
       qc.invalidateQueries({ queryKey: ['snapshot'] });
+    },
+  });
+  const removeNodes = useMutation({
+    mutationFn: (nodeIds: string[]) => removeRetiredNodes(nodeIds),
+    onSuccess: result => {
+      exitSelect();
+      setRemovalNotice(
+        `已移除 ${result.removed_nodes.length} 台机器，并清理 ${result.removed_chains.length} 条关联线路。`,
+      );
+      for (const key of [
+        ['nodes'],
+        ['snapshot'],
+        ['revisions'],
+        ['compile'],
+        ['deployments'],
+        ['usage-node-series'],
+        ['node-load-list'],
+        ['ping-probe-nodes'],
+        ['link-health'],
+        ['link-mtu'],
+        ['certs'],
+        ['agent-log-policy'],
+      ]) {
+        qc.invalidateQueries({ queryKey: key });
+      }
     },
   });
 
@@ -512,9 +550,23 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   const offline = live.filter(n => pollTone(n) === 'bad').length;
   const idle = live.filter(n => pollTone(n) === 'idle').length;
   const retiredCount = list.length - live.length;
+  const removable = retired.filter(nodeRemovalReady);
   // 已退役的不计入：对其再次提交退役是不产生任何变更的草稿操作，
   // 而计入后会使操作者认为本次退役了 N 台。
   const pickedLive = [...picked].filter(id => list.some(n => n.node_id === id && !n.retired_at));
+  const pickedRetired = [...picked].filter(id => removable.some(n => n.node_id === id));
+  const confirmRemoval = (ids: string[]) => {
+    const targets = [...new Set(ids)].sort();
+    if (targets.length === 0) return;
+    const names = targets.map(id => nodeLabel(list.find(node => node.node_id === id)!));
+    const confirmed = window.confirm(
+      `确定永久移除 ${targets.length} 台退役机器吗？\n\n${names.join('、')}\n\n` +
+        '所有包含这些机器的线路会一并删除，机器的运行记录、发布目标和用量明细也会清理。此操作不能撤销。',
+    );
+    if (!confirmed) return;
+    setRemovalNotice(null);
+    removeNodes.mutate(targets);
+  };
   const seriesOf = new Map((usage.data?.nodes ?? []).map(s => [s.node_id, s]));
   const renderHeader = (count: number, includeRetired: boolean) => (
     /* 标题栏：标题加一组读数。在线数和掉线数是本页的汇总信息，
@@ -534,7 +586,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
         {idle > 0 && ` · ${idle} 待纳管`}
         {includeRetired && retiredCount > 0 && ` · ${retiredCount} 退役/处理中`}
       </span>
-      {selecting ? (
+      {selectionMode === 'retire' ? (
         <>
           <button className="btn" onClick={exitSelect}>
             取消
@@ -551,7 +603,11 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
         </>
       ) : (
         <>
-          <button className="btn" disabled={!can(who.role, 'system')} onClick={() => setSelecting(true)}>
+          <button
+            className="btn"
+            disabled={!can(who.role, 'system') || selectionMode !== null}
+            onClick={() => beginSelect('retire')}
+          >
             多选
           </button>
           <button
@@ -565,7 +621,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       )}
     </header>
   );
-  const renderCards = (items: NodeAgentStateItem[]) => (
+  const renderCards = (items: NodeAgentStateItem[], purpose: 'retire' | 'remove') => (
     <div className="ncards">
       {items.map(n => (
         <NodeCard
@@ -577,7 +633,8 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
           pingProbe={pingProbeOf.get(n.node_id)}
           pingProbeReady={pingProbe.isSuccess}
           usagePending={usage.isPending}
-          selecting={selecting}
+          selecting={selectionMode === purpose}
+          selectable={purpose === 'retire' ? !n.retired_at : nodeRemovalReady(n)}
           checked={picked.has(n.node_id)}
           onPick={() => togglePick(n.node_id)}
           go={go}
@@ -592,26 +649,75 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
         <section className="panel titled node-list-panel">
           {renderHeader(live.length, false)}
           {retireAll.error && <ErrorBox error={retireAll.error} />}
+          {removalNotice && <div className="callout">{removalNotice}</div>}
           {list.length === 0 ? (
             <Empty>还没有节点。点「纳管节点」加一台。</Empty>
           ) : live.length === 0 ? (
             <Empty>没有在用机器。</Empty>
           ) : (
-            renderCards(live)
+            renderCards(live, 'retire')
           )}
         </section>
         {retired.length > 0 && (
-          <details
-            className="panel titled node-retired-panel"
-            open={retiredOpen ?? retired.some(node => node.lifecycle_phase === 'retiring')}
-            onToggle={event => setRetiredOpen(event.currentTarget.open)}
-          >
-            <summary>
+          <section className="panel titled node-retired-panel">
+            <header>
               <PanelTitle of="nodes">退役机器</PanelTitle>
-              <span className="hint">{retired.length} 台</span>
-            </summary>
-            {renderCards(retired)}
-          </details>
+              <span className="hint">
+                {retired.length} 台{removable.length !== retired.length ? ` · ${removable.length} 台可移除` : ''}
+              </span>
+              <span className="sp" />
+              {selectionMode === 'remove' ? (
+                <>
+                  <button className="btn" type="button" disabled={removeNodes.isPending} onClick={exitSelect}>
+                    取消
+                  </button>
+                  <button
+                    className="btn danger node-remove-button"
+                    type="button"
+                    disabled={pickedRetired.length === 0 || removeNodes.isPending}
+                    onClick={() => confirmRemoval(pickedRetired)}
+                  >
+                    <Icon of="trash" size={13} className="node-remove-button-icon" />
+                    {removeNodes.isPending
+                      ? '移除中…'
+                      : `移除选中${pickedRetired.length > 0 ? ` ${pickedRetired.length}` : ''}`}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    className="btn"
+                    type="button"
+                    disabled={
+                      !can(who.role, 'system') ||
+                      removable.length === 0 ||
+                      selectionMode !== null ||
+                      removeNodes.isPending
+                    }
+                    onClick={() => beginSelect('remove')}
+                  >
+                    多选
+                  </button>
+                  <button
+                    className="btn danger node-remove-button"
+                    type="button"
+                    disabled={
+                      !can(who.role, 'system') ||
+                      removable.length === 0 ||
+                      selectionMode !== null ||
+                      removeNodes.isPending
+                    }
+                    onClick={() => confirmRemoval(removable.map(node => node.node_id))}
+                  >
+                    <Icon of="trash" size={13} className="node-remove-button-icon" />
+                    {removeNodes.isPending ? '移除中…' : '移除全部'}
+                  </button>
+                </>
+              )}
+            </header>
+            {removeNodes.error && <ErrorBox error={removeNodes.error} />}
+            {renderCards(retired, 'remove')}
+          </section>
         )}
       </div>
     );
@@ -621,7 +727,9 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     <div className={section}>
       {renderHeader(list.length, true)}
       {retireAll.error && <ErrorBox error={retireAll.error} />}
-      {list.length === 0 ? <Empty>还没有节点。点「纳管节点」加一台。</Empty> : renderCards(list)}
+      {removeNodes.error && <ErrorBox error={removeNodes.error} />}
+      {removalNotice && <div className="callout">{removalNotice}</div>}
+      {list.length === 0 ? <Empty>还没有节点。点「纳管节点」加一台。</Empty> : renderCards(list, 'retire')}
     </div>
   );
 }
@@ -740,6 +848,7 @@ function NodeCard({
   series,
   usagePending,
   selecting,
+  selectable,
   checked,
   onPick,
   go,
@@ -755,6 +864,7 @@ function NodeCard({
   series?: UsageNodeSeries;
   usagePending: boolean;
   selecting: boolean;
+  selectable: boolean;
   checked: boolean;
   onPick: () => void;
   go: (d: Drill) => void;
@@ -767,7 +877,7 @@ function NodeCard({
   // 具体项写入 title，悬停即可在扫视列表时确认黄/红色对应的问题。
   const lamp = nodeLampState(node, undefined, isolatedNodeIds);
 
-  const open = () => (selecting ? onPick() : go({ p: 'node', id: node.node_id }));
+  const open = () => (selecting ? selectable && onPick() : go({ p: 'node', id: node.node_id }));
   return (
     <article
       role="button"
@@ -791,7 +901,7 @@ function NodeCard({
               type="checkbox"
               className="nc-pick"
               checked={checked}
-              disabled={retired}
+              disabled={!selectable}
               aria-label={`选中 ${node.name || node.node_id}`}
               onChange={onPick}
               onClick={e => e.stopPropagation()}
@@ -846,7 +956,35 @@ export const LOAD_RANGES = [
   { seconds: 12 * 60 * 60, label: '12h', menuLabel: '近 12 小时', heading: '12 HOURS' },
   { seconds: 24 * 60 * 60, label: '24h', menuLabel: '近 24 小时', heading: '24 HOURS' },
 ] as const;
-export type LoadRange = (typeof LOAD_RANGES)[number];
+export interface LoadRange {
+  seconds: number;
+  label: string;
+  menuLabel: string;
+  heading: string;
+  /** 存在时是固定历史区间；没有时是随当前时间移动的最近 N 秒。 */
+  startUnixSecs?: number;
+  endUnixSecs?: number;
+}
+
+const MAX_DETAIL_RANGE_SECS = 24 * 60 * 60;
+const MIN_DETAIL_RANGE_SECS = 60;
+
+export function loadRangeBounds(range: LoadRange): { startUnixSecs: number; endUnixSecs: number } {
+  if (range.startUnixSecs != null && range.endUnixSecs != null) {
+    return { startUnixSecs: range.startUnixSecs, endUnixSecs: range.endUnixSecs };
+  }
+  return absoluteLoadRange(range.seconds);
+}
+
+function loadRangeKey(range: LoadRange): string | number {
+  return range.startUnixSecs != null && range.endUnixSecs != null
+    ? `${range.startUnixSecs}-${range.endUnixSecs}`
+    : range.seconds;
+}
+
+function fixedLoadRange(range: LoadRange): boolean {
+  return range.startUnixSecs != null && range.endUnixSecs != null;
+}
 
 function absoluteLoadRange(seconds: number): { startUnixSecs: number; endUnixSecs: number } {
   const endUnixSecs = Math.floor(Date.now() / 1000);
@@ -856,6 +994,23 @@ function absoluteLoadRange(seconds: number): { startUnixSecs: number; endUnixSec
 function fetchNodeLoadFor(nodeId: string, seconds: number) {
   const { startUnixSecs, endUnixSecs } = absoluteLoadRange(seconds);
   return fetchNodeLoad(nodeId, startUnixSecs, endUnixSecs);
+}
+
+function fetchNodeLoadInRange(nodeId: string, range: LoadRange) {
+  const { startUnixSecs, endUnixSecs } = loadRangeBounds(range);
+  return fetchNodeLoad(nodeId, startUnixSecs, endUnixSecs);
+}
+
+function fetchUsageInRange(nodeId: string, range: LoadRange) {
+  if (!fixedLoadRange(range)) return fetchUsageNodeSeries(range.seconds, nodeId);
+  const { startUnixSecs, endUnixSecs } = loadRangeBounds(range);
+  return fetchUsageNodeSeriesRange(startUnixSecs, endUnixSecs, nodeId);
+}
+
+function fetchPingInRange(nodeId: string, range: LoadRange) {
+  if (!fixedLoadRange(range)) return fetchNodePingProbe(nodeId, range.seconds);
+  const { startUnixSecs, endUnixSecs } = loadRangeBounds(range);
+  return fetchNodePingProbeRange(nodeId, startUnixSecs, endUnixSecs);
 }
 
 function fetchNodeLoadListFor(seconds: number) {
@@ -887,9 +1042,47 @@ export function ObserveLinkControl({ value, onChange }: { value: boolean; onChan
 
 export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onChange: (value: LoadRange) => void }) {
   const [open, setOpen] = useState(false);
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
   const rootRef = useRef<HTMLSpanElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  const localInput = (unixSecs: number) => {
+    const date = new Date(unixSecs * 1000);
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+    return local.toISOString().slice(0, 16);
+  };
+  const resetAbsoluteFields = () => {
+    const bounds = loadRangeBounds(value);
+    setFrom(localInput(bounds.startUnixSecs));
+    setTo(localInput(bounds.endUnixSecs));
+  };
+  const openMenu = () => {
+    if (!open) resetAbsoluteFields();
+    setOpen(current => !current);
+  };
+
+  const fromSecs = Math.floor(new Date(from).getTime() / 1000);
+  const toSecs = Math.floor(new Date(to).getTime() / 1000);
+  const span = toSecs - fromSecs;
+  const absoluteError =
+    !Number.isFinite(fromSecs) || !Number.isFinite(toSecs)
+      ? '请选择完整的起止时间'
+      : span < MIN_DETAIL_RANGE_SECS
+        ? '时间范围至少 1 分钟'
+        : span > MAX_DETAIL_RANGE_SECS
+          ? '时间范围最多 24 小时'
+          : null;
+
+  const shortDateTime = (unixSecs: number) =>
+    new Date(unixSecs * 1000).toLocaleString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
 
   useEffect(() => {
     if (!open) return;
@@ -925,11 +1118,14 @@ export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onC
         type="button"
         className="observe-range-trigger"
         aria-label={`观测时间范围：${value.menuLabel}`}
-        aria-haspopup="listbox"
+        aria-haspopup="dialog"
         aria-expanded={open}
-        onClick={() => setOpen(current => !current)}
+        onClick={openMenu}
         onKeyDown={event => {
-          const selected = LOAD_RANGES.findIndex(option => option.seconds === value.seconds);
+          const selected = Math.max(
+            0,
+            LOAD_RANGES.findIndex(option => !fixedLoadRange(value) && option.seconds === value.seconds),
+          );
           if (event.key === 'ArrowDown') {
             event.preventDefault();
             openFromKeyboard(selected);
@@ -939,66 +1135,99 @@ export function ObserveRangeControl({ value, onChange }: { value: LoadRange; onC
           }
         }}
       >
-        <svg
-          className="observe-range-clock"
-          width="12"
-          height="12"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.2"
-          strokeLinecap="round"
-          aria-hidden="true"
-        >
-          <circle cx="12" cy="12" r="9" />
-          <path d="M12 7.5v5l3.5 2" />
-        </svg>
+        <Icon of="calendar" size={13} className="observe-range-clock" />
         <span>{value.menuLabel}</span>
       </button>
-      <span
-        className="observe-range-menu"
-        role="listbox"
-        aria-label="观测时间范围"
-        hidden={!open}
-        onKeyDown={event => {
-          const current = optionRefs.current.indexOf(document.activeElement as HTMLButtonElement);
-          if (event.key === 'ArrowDown') {
-            event.preventDefault();
-            focusOption(current + 1);
-          } else if (event.key === 'ArrowUp') {
-            event.preventDefault();
-            focusOption(current - 1);
-          } else if (event.key === 'Home') {
-            event.preventDefault();
-            focusOption(0);
-          } else if (event.key === 'End') {
-            event.preventDefault();
-            focusOption(LOAD_RANGES.length - 1);
-          }
-        }}
-      >
-        {LOAD_RANGES.map((option, index) => (
+      <div className="observe-range-menu" role="dialog" aria-label="观测时间范围" hidden={!open}>
+        <div
+          className="observe-range-presets"
+          role="listbox"
+          aria-label="快速范围"
+          onKeyDown={event => {
+            const current = optionRefs.current.indexOf(document.activeElement as HTMLButtonElement);
+            if (event.key === 'ArrowDown') {
+              event.preventDefault();
+              focusOption(current + 1);
+            } else if (event.key === 'ArrowUp') {
+              event.preventDefault();
+              focusOption(current - 1);
+            } else if (event.key === 'Home') {
+              event.preventDefault();
+              focusOption(0);
+            } else if (event.key === 'End') {
+              event.preventDefault();
+              focusOption(LOAD_RANGES.length - 1);
+            }
+          }}
+        >
+          <b>快速范围</b>
+          {LOAD_RANGES.map((option, index) => (
+            <button
+              key={option.seconds}
+              ref={element => {
+                optionRefs.current[index] = element;
+              }}
+              type="button"
+              role="option"
+              aria-selected={!fixedLoadRange(value) && value.seconds === option.seconds}
+              onClick={() => {
+                onChange(option);
+                setOpen(false);
+                triggerRef.current?.focus();
+              }}
+            >
+              {option.menuLabel}
+              <span className="observe-range-check" aria-hidden="true">
+                ✓
+              </span>
+            </button>
+          ))}
+        </div>
+        <div className="observe-range-absolute">
+          <b>自定义范围</b>
+          <label>
+            <span>从</span>
+            <input
+              aria-label="观测开始时间"
+              type="datetime-local"
+              value={from}
+              onChange={event => setFrom(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>到</span>
+            <input
+              aria-label="观测结束时间"
+              type="datetime-local"
+              value={to}
+              onChange={event => setTo(event.target.value)}
+            />
+          </label>
+          <span className={`observe-range-error${absoluteError ? ' bad' : ''}`}>
+            {absoluteError ?? '固定区间，最长 24 小时'}
+          </span>
           <button
-            key={option.seconds}
-            ref={element => {
-              optionRefs.current[index] = element;
-            }}
             type="button"
-            role="option"
-            aria-selected={value.seconds === option.seconds}
+            className="observe-range-apply"
+            disabled={absoluteError !== null}
             onClick={() => {
-              onChange(option);
+              const menuLabel = `${shortDateTime(fromSecs)} → ${shortDateTime(toSecs)}`;
+              onChange({
+                seconds: span,
+                label: 'custom',
+                menuLabel,
+                heading: 'CUSTOM RANGE',
+                startUnixSecs: fromSecs,
+                endUnixSecs: toSecs,
+              });
               setOpen(false);
               triggerRef.current?.focus();
             }}
           >
-            {option.menuLabel}
-            <span className="observe-range-check" aria-hidden="true">
-              ✓
-            </span>
+            应用时间范围
           </button>
-        ))}
-      </span>
+        </div>
+      </div>
     </span>
   );
 }
@@ -1343,16 +1572,17 @@ function usageRoleTimeline(
  * 字节——不能合并进一张图，各自的 Y 轴与图例保持这个差异可见，所以是同卡内的两张图。
  * node-load 与 usage 两个查询的 queryKey 都与页面其它处一致，React Query 去重、不多发请求。 */
 export function ThroughputPanel({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
+  const rangeKey = loadRangeKey(range);
   const load = useQuery({
-    queryKey: ['node-load-history', nodeId, range.seconds],
-    queryFn: () => fetchNodeLoadFor(nodeId, range.seconds),
-    refetchInterval: range.seconds <= 60 * 60 ? 10_000 : 30_000,
+    queryKey: ['node-load-history', nodeId, rangeKey],
+    queryFn: () => fetchNodeLoadInRange(nodeId, range),
+    refetchInterval: fixedLoadRange(range) ? false : range.seconds <= 60 * 60 ? 10_000 : 30_000,
     retry: false,
   });
   const usage = useQuery({
-    queryKey: ['usage-node-series', nodeId, range.seconds],
-    queryFn: () => fetchUsageNodeSeries(range.seconds, nodeId),
-    refetchInterval: 30_000,
+    queryKey: ['usage-node-series', nodeId, rangeKey],
+    queryFn: () => fetchUsageInRange(nodeId, range),
+    refetchInterval: fixedLoadRange(range) ? false : 30_000,
   });
   const report = load.data;
   if (!report) return null;
@@ -1546,7 +1776,9 @@ function WgListenPortRow({
      不在 overlay 中时没有监听端口可设（currentPort 为 null），输入框禁用而不是隐藏——
      隐藏之后这一行只剩一个「—」，看不出是这台机器没有该项还是接口没返回。 */
   const [value, setValue] = useState<string | null>(null);
-  const base = currentPort === null ? '' : String(currentPort);
+  const draftNode = useDraftNode(nodeId);
+  const port = draftNode?.wireguard?.listen_port ?? currentPort;
+  const base = port === null ? '' : String(port);
   const shown = value ?? base;
   const parsed = Number(shown.trim());
   const valid = /^\d+$/.test(shown.trim()) && Number.isInteger(parsed) && parsed >= 1 && parsed <= 65_535;
@@ -1643,8 +1875,21 @@ function WgTransportRow({
     ?.map(link => (link.wrap?.t === 'fake_tcp' ? link.wrap.v?.servers?.[node.node_id] : undefined))
     .find(Boolean);
   const known = touching !== undefined && touching.length > 0;
-  const currentFake = known ? served !== undefined : node.wg_transport_kind === 'fake_tcp';
-  const currentPort = served ? Number(served.split(':').pop()) || null : known ? null : node.wg_fake_tcp_port;
+  const pendingTransport = useDraftNode(node.node_id)?.wg_transport;
+  const currentFake = pendingTransport
+    ? pendingTransport.t === 'fake_tcp'
+    : known
+      ? served !== undefined
+      : node.wg_transport_kind === 'fake_tcp';
+  const currentPort = pendingTransport
+    ? pendingTransport.t === 'fake_tcp'
+      ? pendingTransport.v.port
+      : null
+    : served
+      ? Number(served.split(':').pop()) || null
+      : known
+        ? null
+        : node.wg_fake_tcp_port;
 
   const fake = staged?.fake ?? currentFake;
   const port = staged?.port ?? currentPort ?? 39743;
@@ -1740,7 +1985,10 @@ function OverlayRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
   // 两种情况都视为不在 overlay 中。
   // 编译结果尚未返回时回退到模型值，避免该行为空。
   const systemNodes = (compile.data?.system as { nodes?: { id: string; wireguard?: unknown }[] } | undefined)?.nodes;
-  const currentValue = systemNodes ? systemNodes.find(n => n.id === node.node_id)?.wireguard != null : node.overlay;
+  const draftNode = useDraftNode(node.node_id);
+  const currentValue =
+    draftNode?.overlay ??
+    (systemNodes ? systemNodes.find(n => n.id === node.node_id)?.wireguard != null : node.overlay);
   const value = staged ?? currentValue;
   const dirty = staged !== null && staged !== currentValue;
 
@@ -1840,9 +2088,12 @@ function EgressRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEd
   // 因此取任意一个 app 即可，无需合并所有 app。没有任何项目时无法读取——
   // 此时回退到模型值。
   const appNodes = (compile.data?.apps as AppIr[] | undefined)?.[0]?.nodes;
-  const currentValue = appNodes
-    ? (appNodes.find(n => n.id === node.node_id)?.egress_allowed ?? node.egress_allowed)
-    : node.egress_allowed;
+  const draftNode = useDraftNode(node.node_id);
+  const currentValue =
+    draftNode?.egress_allowed ??
+    (appNodes
+      ? (appNodes.find(n => n.id === node.node_id)?.egress_allowed ?? node.egress_allowed)
+      : node.egress_allowed);
   const value = staged ?? currentValue;
   const dirty = staged !== null && staged !== currentValue;
 
@@ -1964,7 +2215,17 @@ function formatDns(dns: Dns): string {
  * （见 forge/shell.tsx）。 */
 function useDraftNode(nodeId: string) {
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
-  return snapshot.data?.snapshot.nodes?.find(row => row.id === nodeId) ?? null;
+  const entries = useSyncExternalStore(draft.subscribe, draft.snapshot);
+  const model = snapshot.data?.snapshot.nodes?.find(row => row.id === nodeId);
+  const pending = entries.find(entry => entry.op.op === 'update_node' && entry.op.node_id === nodeId)?.op;
+  if (pending?.op !== 'update_node') return model ? { ...model, wg_transport: undefined } : null;
+  return {
+    ...model,
+    ...pending.node,
+    id: nodeId,
+    mtu: pending.node.mtu === 0 ? null : (pending.node.mtu ?? model?.mtu),
+    wireguard: pending.node.wg_listen_port == null ? model?.wireguard : { listen_port: pending.node.wg_listen_port },
+  };
 }
 
 /* 配置页上所有下拉框的宽度。`select.f` 是全站唯一不带 width 声明的表单控件，不给宽度就
@@ -1972,23 +2233,99 @@ function useDraftNode(nodeId: string) {
    域名解析那一项的选项最长（`UseIPv6v4`），它决定了这一档的下限。 */
 const SELECT_FIELD = { width: 200 };
 
-/* 这台机器从哪个证书组取证书。
- *
- * 与相邻几张卡不同，改这里不进草稿也不需要发布：证书走 agent 自己的轮询通道（十分钟一轮），
- * 组决定的 SNI 虽然进编译产物，但换组这件事本身要先落库才谈得上重新编译。所以这里直接保存。
- *
- * 换组会改 SNI，已经发出去的订阅写的是旧名字，改完就连不上。确认框把这句话说清楚，而不是
- * 问一句「确定要修改吗」——后者没有告诉人代价是什么。 */
+/* 机器证书组随模型草稿预览、提交，再由发布流程下发。 */
 export function certificateSigningLabel(certificate: Pick<GroupCertificate, 'signing_method'>): string {
   return certificate.signing_method === 'self-signed' ? '自签证书' : "Let's Encrypt";
 }
 
-function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
+const NODE_CERTIFICATE_PATHS = {
+  'public-ca': '/var/lib/brocade-agent/tls/public-ca/current.pem',
+  'self-signed': {
+    a: '/var/lib/brocade-agent/tls/self-signed/slot-a.pem',
+    b: '/var/lib/brocade-agent/tls/self-signed/slot-b.pem',
+  },
+} as const;
+
+/** 与 xray 产物和 agent 写盘约定相同的固定路径。公有 CA 只有当前证书落盘；自签使用 A/B。 */
+export function certificateInstallPath(
+  certificate: Pick<GroupCertificate, 'signing_method' | 'runtime_slot' | 'status'>,
+): string | null {
+  if (certificate.signing_method === 'public-ca') {
+    return certificate.status === 'serving' ? NODE_CERTIFICATE_PATHS['public-ca'] : null;
+  }
+  if (certificate.runtime_slot == null || !['serving', 'ready', 'compatible'].includes(certificate.status)) {
+    return null;
+  }
+  return NODE_CERTIFICATE_PATHS['self-signed'][certificate.runtime_slot];
+}
+
+function certificateRole(certificate: GroupCertificate): string {
+  switch (certificate.status) {
+    case 'serving':
+      return '当前使用';
+    case 'ready':
+      return '备用';
+    case 'compatible':
+      return '保留';
+    case 'pending':
+      return '等待签发';
+    case 'failed':
+      return '签发失败';
+    default:
+      return '已换下';
+  }
+}
+
+function certificateOrigin(origin: GroupCertificate['origin']): string {
+  return origin === 'bootstrap' ? '初始化' : origin === 'spare' ? '手动添加' : '自动续期';
+}
+
+function certificateTime(value: string | null): string {
+  if (!value) return '—';
+  const parsed = new Date(value.replace(' ', 'T'));
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString('zh-CN', { hour12: false });
+}
+
+function certificateInstallState(
+  certificate: Pick<GroupCertificate, 'signing_method' | 'runtime_slot' | 'status'>,
+  nodeState: NodeCertificateState,
+): { text: string; tone: string } {
+  if (
+    (certificate.signing_method === 'self-signed' && certificate.runtime_slot == null) ||
+    (certificate.signing_method === 'public-ca' && certificate.status !== 'serving') ||
+    !['serving', 'ready', 'compatible'].includes(certificate.status) ||
+    nodeState.on_disk === 'absent'
+  ) {
+    return { text: '未安装', tone: 'st-warn' };
+  }
+  if (nodeState.on_disk === 'current') return { text: '已安装', tone: 'st-ok' };
+  if (nodeState.on_disk === 'stale') return { text: '安装内容不一致', tone: 'st-warn' };
+  return { text: '安装状态未知', tone: '' };
+}
+
+export function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
   const qc = useQueryClient();
   const certs = useQuery({ queryKey: ['certs'], queryFn: () => fetchCerts(), retry: false });
   const groups = certs.data?.groups ?? [];
-  const current = certs.data?.nodes.find(row => row.node_id === node.node_id);
-  const group = groups.find(g => g.id === current?.label_id);
+  const entries = useSyncExternalStore(draft.subscribe, draft.snapshot);
+  const pending = entries.find(entry => entry.op.op === 'set_node_cert_group' && entry.op.node_id === node.node_id)?.op;
+  const observed = certs.data?.nodes.find(row => row.node_id === node.node_id);
+  const base = pending?.op === 'set_node_cert_group' ? (pending.label_id ?? '') : (observed?.label_id ?? '');
+  const [selected, setSelected] = useState<string | null>(null);
+  const value = selected ?? base;
+  const dirty = value !== base;
+  const group = groups.find(g => g.id === value);
+  const current: NodeCertificateState | undefined = group
+    ? {
+        node_id: node.node_id,
+        label_id: group.id,
+        group_name: group.name,
+        certificate_name:
+          group.certificates.find(c => c.status === 'serving')?.certificate_name ?? group.names.join('、'),
+        on_disk: observed?.label_id === group.id ? observed.on_disk : 'absent',
+        observed_at: observed?.label_id === group.id ? observed.observed_at : null,
+      }
+    : undefined;
   const serving = group?.certificates.find(c => c.status === 'serving');
   // issuer 是证书里的自由文本，新的自签证书会随机生成一个逼真的名称，不能拿它判断
   // 信任来源。签发方式在证书落库时已经冻结，切换设置后也不会被改写。
@@ -1997,23 +2334,14 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
 
   const save = useMutation({
     mutationFn: (labelId: string) => setNodeCertGroup(node.node_id, labelId || null),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['certs'] }),
+    onSuccess: () => {
+      setSelected(null);
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+    },
   });
 
   if (certs.isPending) return <Loading />;
   if (certs.error) return <ErrorBox error={certs.error} />;
-
-  const pick = (next: string) => {
-    if (next === (current?.label_id ?? '')) return;
-    const to = next ? (groups.find(g => g.id === next)?.name ?? next) : '不关联证书';
-    const warning = current
-      ? `这台机器的 SNI 会从 ${current.certificate_name} 变成${next ? '新组的名字' : '没有'}。\n\n` +
-        '已经发出去的订阅里写的是旧名字，改完之后这台机器上的 VLESS + TLS 和 Hysteria 2 线路' +
-        '会连不上，需要让用户重新拉取订阅。REALITY 指向外部站点的接入面不受影响。\n\n' +
-        `确定改到「${to}」吗？`
-      : `把这台机器加入「${to}」。它之后出示这个组的证书。`;
-    if (window.confirm(warning)) save.mutate(next);
-  };
 
   return (
     <div className="panel config-panel">
@@ -2025,9 +2353,9 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
           <select
             className="f"
             style={SELECT_FIELD}
-            value={current?.label_id ?? ''}
+            value={value}
             disabled={!canEdit || save.isPending || certs.isPending}
-            onChange={e => pick(e.target.value)}
+            onChange={e => setSelected(e.target.value)}
           >
             <option value="">不关联证书</option>
             {groups.map(g => (
@@ -2039,7 +2367,7 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
           <span className="sub">
             {current
               ? `出示 ${current.certificate_name}${serving ? '' : '（这个组还没有签出证书）'}`
-              : '没有本机证书：这台机器上的 TLS 与 Hysteria 2 接入面会在编译时被拒绝。'}
+              : '未安装：这台机器上的 TLS 与 Hysteria 2 接入面会在编译时被拒绝。'}
           </span>
         </Row>
         {current && serving && (
@@ -2052,7 +2380,82 @@ function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: b
             </Row>
           </>
         )}
+        {current && group && (
+          <div className="node-certificates" aria-label="证书完整信息">
+            {group.certificates.length === 0 ? (
+              <div className="node-cert-empty">
+                <span className="st st-warn">未安装</span>
+                <span className="sub">该证书组还没有签发任何证书。</span>
+              </div>
+            ) : (
+              group.certificates.map(certificate => {
+                const path = certificateInstallPath(certificate);
+                const installed = certificateInstallState(certificate, current);
+                const names = certificate.certificate_name ? [certificate.certificate_name] : group.names;
+                return (
+                  <section className="node-certificate" key={certificate.id}>
+                    <header>
+                      <code title={certificate.id}>{certificate.id}</code>
+                      <span className="st">{certificateRole(certificate)}</span>
+                      <span className={`st ${installed.tone}`}>{installed.text}</span>
+                    </header>
+                    <dl>
+                      <dt>证书名称</dt>
+                      <dd className="mono">{names.join('、')}</dd>
+                      <dt>签发方式</dt>
+                      <dd>{certificateSigningLabel(certificate)}</dd>
+                      <dt>用途 / 来源</dt>
+                      <dd>
+                        {certificateRole(certificate)} / {certificateOrigin(certificate.origin)}
+                      </dd>
+                      <dt>运行槽</dt>
+                      <dd>{certificate.runtime_slot?.toUpperCase() ?? '未安装'}</dd>
+                      <dt>安装路径</dt>
+                      <dd className="mono">{path ?? '未安装'}</dd>
+                      <dt>签发者</dt>
+                      <dd>{certificate.issuer ?? '—'}</dd>
+                      <dt>签发时间</dt>
+                      <dd>{certificateTime(certificate.issued_at)}</dd>
+                      <dt>到期时间</dt>
+                      <dd>{certificateTime(certificate.expires_at)}</dd>
+                      <dt>SHA-256</dt>
+                      <dd className="mono">{certificate.sha256 ?? '—'}</dd>
+                      <dt>签发尝试</dt>
+                      <dd>
+                        {certificate.attempts} 次
+                        {certificate.last_attempt_at ? ` · 最近 ${certificateTime(certificate.last_attempt_at)}` : ''}
+                      </dd>
+                      {certificate.last_error && (
+                        <>
+                          <dt>最后错误</dt>
+                          <dd className="bad">{certificate.last_error}</dd>
+                        </>
+                      )}
+                    </dl>
+                  </section>
+                );
+              })
+            )}
+            <div className="node-cert-observed sub">
+              机器上报：
+              {current.observed_at ? certificateTime(current.observed_at) : '从未上报'}
+            </div>
+          </div>
+        )}
+        <span className="sub">
+          保存到草稿后，需提交并发布才切换证书组；应用时会重启 Xray，现有连接会中断，用户需重新拉取订阅。
+        </span>
         {save.error && <ErrorBox error={save.error} />}
+        {canEdit && dirty && (
+          <div className="toolbar">
+            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate(value)}>
+              {save.isPending ? '保存中…' : '保存到草稿'}
+            </button>
+            <button className="btn" disabled={save.isPending} onClick={() => setSelected(null)}>
+              还原
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2189,13 +2592,13 @@ export function DnsCard({
  * 自造词，无法与 xray 文档对应。键名是此处唯一既准确又能与配置完全对应的名称。 */
 const CONN_FIELDS = [
   // 单位写入标签而非附加在值之后。附加在值之后时，缓冲区未设置的情况会显示为
-  // 「跟架构 KB」——非数值的取值加上单位后无法读通，且需要为此单独判断是否显示。
+  // 「跟架构 KiB」——非数值的取值加上单位后无法读通，且需要为此单独判断是否显示。
   //
   // 「等待」两字从后两项的标签中去掉：标签栏与本页其他卡共用一条竖线（见 styles.css
   // 的 `.nd-tab-config .fgrid .k`），`DownlinkOnly 等待（秒）` 是全页唯一撑不下的标签，
   // 为它一项把整页标签栏加宽到 176px，其余各卡的输入框就都跟着右移。
   { key: 'conn_idle_secs', label: '空闲回收（秒）', pick: false },
-  { key: 'buffer_size_kb', label: '转发缓冲（KB）', pick: false },
+  { key: 'buffer_size_kb', label: '转发缓冲（KiB）', pick: false },
   { key: 'uplink_only_secs', label: 'UplinkOnly（秒）', pick: true },
   { key: 'downlink_only_secs', label: 'DownlinkOnly（秒）', pick: true },
 ] as const;
@@ -2228,7 +2631,7 @@ function ConnectionCard({
 
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
 
-  const fromModel = snapshot.data?.snapshot.nodes?.find(n => n.id === node.node_id)?.connection;
+  const fromModel = useDraftNode(node.node_id)?.connection;
   // 快照尚未返回，或较旧的控制面不包含该字段时，视为未覆盖任何一项，而非使整张卡报错——
   // 四项均显示全局值、标题显示「跟全局一样」，与该情况下的实际状态一致。
   const mine = fromModel ?? node.connection ?? EMPTY_NODE_CONNECTION;
@@ -2372,7 +2775,7 @@ function ConnectionCard({
 /* 日志保留。与连接策略分开成卡而不是合成一张「本机覆盖」：两者的生效方式相反——
    连接策略写草稿、要发布一次；这一项直接落库，未覆盖的机器随下一轮 agent 轮询读到全局值。
    同卡时这条差别只能靠两条小标题说明，分卡之后由卡本身承担。 */
-function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
+export function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
   const qc = useQueryClient();
   /* 与设置页共用查询键：那一页已经拉过时直接命中缓存，两处显示的是同一份数据。
      旧控制面没有该接口，失败时不重试也不报错——整张卡不画，页面其余部分照常。 */
@@ -2382,11 +2785,11 @@ function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit
   const overrideCount = Object.values(mine.overrides).filter(value => value !== null).length;
 
   return (
-    <div className="panel config-panel">
-      <header>
+    <details className="panel config-panel node-log-retention">
+      <summary>
         <PanelTitle of="artifacts">日志保留</PanelTitle>
-        <span className="hint">{overrideCount === 0 ? '全部继承' : `${overrideCount} 项本机覆盖`}</span>
-      </header>
+        <span className="hint">{overrideCount === 0 ? '全部继承' : `本机覆盖 ${overrideCount} 项`}</span>
+      </summary>
       <div className="fgrid one">
         <NodeLogLimitRow
           node={mine}
@@ -2395,16 +2798,14 @@ function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit
           onSaved={view => qc.setQueryData(['agent-log-policy'], view)}
         />
       </div>
-    </div>
+    </details>
   );
 }
 
-/** 该项取自机队默认值还是这台机器自己设置的。样式与设置页机队表里的同名标记共用
-    （`.agent-log-source`）——同一个判断在两页显示为同一枚标记。 */
+/** 该项取自全局默认值还是这台机器自己设置的。继承只是来源说明，使用中性标签；
+    本机覆盖是需要留意的差异状态。 */
 function OverrideTag({ own }: { own: boolean }) {
-  return (
-    <span className={own ? 'agent-log-source overridden' : 'agent-log-source'}>{own ? '本机覆盖' : '继承全局'}</span>
-  );
+  return <span className={own ? 'st st-warn' : 'st'}>{own ? '本机覆盖' : '继承全局'}</span>;
 }
 
 /* Agent、XRAY 与每个 Phantun 日志项的磁盘上限，本机覆盖优先于全局。
@@ -2416,10 +2817,10 @@ function OverrideTag({ own }: { own: boolean }) {
 type NodeLogKey = keyof AgentLogLimits;
 type NodeLogForm = Record<NodeLogKey, string>;
 
-const NODE_LOG_CLASSES: ReadonlyArray<{ key: NodeLogKey; label: string; note: string | null }> = [
-  { key: 'agent_journal_mib', label: 'Agent 日志', note: null },
-  { key: 'xray_mib', label: 'XRAY（MiB）', note: 'xray.log 与 xray.log.1 合计' },
-  { key: 'phantun_mib', label: 'Phantun（MiB）', note: '每个 Phantun 实例分别计算' },
+const NODE_LOG_CLASSES: ReadonlyArray<{ key: NodeLogKey; label: string }> = [
+  { key: 'agent_journal_mib', label: 'Agent 日志（MiB）' },
+  { key: 'xray_mib', label: 'XRAY 日志（MiB）' },
+  { key: 'phantun_mib', label: 'Phantun 日志（MiB）' },
 ];
 
 function NodeLogLimitRow({
@@ -2440,9 +2841,10 @@ function NodeLogLimitRow({
   });
   const base = toForm(node.overrides);
   const [form, setForm] = useState<NodeLogForm | null>(null);
-  const [syncedFrom, setSyncedFrom] = useState(node);
-  if (node !== syncedFrom) {
-    setSyncedFrom(node);
+  const source = JSON.stringify([node.node_id, node.overrides]);
+  const [syncedFrom, setSyncedFrom] = useState(source);
+  if (source !== syncedFrom) {
+    setSyncedFrom(source);
     setForm(null);
   }
   const shown = form ?? base;
@@ -2482,18 +2884,13 @@ function NodeLogLimitRow({
               />
               <OverrideTag own={own} />
             </span>
-            {item.note && (
-              <span className="sub">{own ? item.note : `留空继承全局 ${global[item.key]}；${item.note}`}</span>
-            )}
           </Row>
         );
       })}
-      {invalid ? (
+      {invalid && (
         <span className="sub" style={{ color: 'var(--err)' }}>
           三项均需留空或填写 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数。
         </span>
-      ) : (
-        <span className="sub">降低上限会立即截断旧日志，不会中断服务。</span>
       )}
       {dirty && (
         <>
@@ -3131,7 +3528,7 @@ export function FleetNetPanel() {
   const unitName = geo ? observeBpsUnit(observeValueAxis(geo.peak)).name : null;
   const head = (
     <header>
-      <PanelTitle of="usage">网络吞吐 · 全机队</PanelTitle>
+      <PanelTitle of="usage">网络吞吐 · 全部机器</PanelTitle>
       {unitName && <span className="chart-unit">({unitName})</span>}
       <span className="sp" />
       <span className="hint">网卡汇总 对 XRAY 承载 · 接收在上 / 发送在下 · 近 2 小时</span>
@@ -3184,11 +3581,11 @@ function LoadCardFor({ nodeId, range, linked }: { nodeId: string; range: LoadRan
      真正的分辨率仍是 30 秒，那要改 agent 的窗口，且用量窗口得一起动（两者故意对齐，
      遥测页把流量柱和 CPU 线叠在同一根时间轴上就靠这个）。 */
   const load = useQuery({
-    queryKey: ['node-load-history', nodeId, range.seconds],
-    queryFn: () => fetchNodeLoadFor(nodeId, range.seconds),
+    queryKey: ['node-load-history', nodeId, loadRangeKey(range)],
+    queryFn: () => fetchNodeLoadInRange(nodeId, range),
     // 长范围通常有约 2,880 个深度窗口，而原数据本身每 30 秒才增加一点。
     // 30m/1h 保留 10s 的低延迟；6h 以上按数据分辨率拉取，避免重复传输同一大段历史。
-    refetchInterval: range.seconds <= 60 * 60 ? 10_000 : 30_000,
+    refetchInterval: fixedLoadRange(range) ? false : range.seconds <= 60 * 60 ? 10_000 : 30_000,
     retry: false,
   });
   if (!load.data) return null;
@@ -3253,8 +3650,9 @@ function PingLatencyChart({ view, range, group }: { view: NodePingProbeView; ran
       }),
     );
     const valueAxis = observeValueAxis(Math.max(...successful, 0.1));
-    const now = Date.now();
-    const start = now - range.seconds * 1000;
+    const bounds = loadRangeBounds(range);
+    const start = bounds.startUnixSecs * 1000;
+    const now = bounds.endUnixSecs * 1000;
     // x 轴显示墙钟时刻（hh:mm）。轴起点即首个样本时刻（无样本时退回窗口起点），曲线紧贴
     // y 轴；不再向下取整到整分，以免首点的秒数变成左端留白。见 ThroughputChart 同处说明。
     const firstMs = times.length > 0 ? times[0] * 1000 : start;
@@ -3447,9 +3845,9 @@ function PingProbeBlock({
 
 function PingProbePanel({ nodeId, range, linked }: { nodeId: string; range: LoadRange; linked: boolean }) {
   const probe = useQuery({
-    queryKey: ['node-ping-probe', nodeId, range.seconds],
-    queryFn: () => fetchNodePingProbe(nodeId, range.seconds),
-    refetchInterval: 5_000,
+    queryKey: ['node-ping-probe', nodeId, loadRangeKey(range)],
+    queryFn: () => fetchPingInRange(nodeId, range),
+    refetchInterval: fixedLoadRange(range) ? false : 5_000,
     retry: false,
   });
   if (probe.error && !probe.data) return null;
@@ -3868,10 +4266,10 @@ function chainUseOf(args: {
   if (spineIndex < 0 && !ownStep && upstreams.size === 0 && !hostsIngress) return null;
 
   const roles: string[] = [];
-  if (hostsIngress || spineIndex === 0) roles.push('入口');
-  else if (spineIndex > 0 && spineIndex === spine.length - 1) roles.push('主干末跳');
-  else if (spineIndex > 0) roles.push('主干中转');
-  if (ownStep && downstreams.size > 0 && spineIndex < 0) roles.push('中转');
+  if (hostsIngress || spineIndex === 0) roles.push('入口节点');
+  else if (spineIndex > 0 && spineIndex === spine.length - 1) roles.push('出口节点');
+  else if (spineIndex > 0) roles.push('中转节点');
+  if (ownStep && downstreams.size > 0 && spineIndex < 0) roles.push('中转节点');
   if (ownStep && roles.length === 0) roles.push('规则节点');
 
   return {
@@ -3892,11 +4290,13 @@ function NodeChainRuleTree({
   use,
   nodes,
   readOnly = false,
+  settingsReadable = true,
 }: {
   nodeId: string;
   use: NodeChainUse;
   nodes: NodeAgentStateItem[];
   readOnly?: boolean;
+  settingsReadable?: boolean;
 }) {
   return (
     <div className="node-chain-use">
@@ -3916,6 +4316,7 @@ function NodeChainRuleTree({
           ) : undefined
         }
         readOnly={readOnly}
+        settingsReadable={settingsReadable}
       />
     </div>
   );
@@ -3927,6 +4328,7 @@ function NodeChainsSection({
   nodes,
   canEdit,
   canCreate,
+  settingsReadable,
   go,
 }: {
   id: string;
@@ -3934,6 +4336,7 @@ function NodeChainsSection({
   nodes: NodeAgentStateItem[];
   canEdit: boolean;
   canCreate: boolean;
+  settingsReadable: boolean;
   go: (d: Drill) => void;
 }) {
   return (
@@ -3952,7 +4355,13 @@ function NodeChainsSection({
         // 「保存到草稿」，本屏会出现七八个。统一收敛为整段末尾的一个。
         <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
           {inChains.map(use => (
-            <NodeChainRuleTree key={`${use.appId}/${use.chain.id}`} nodeId={id} use={use} nodes={nodes} />
+            <NodeChainRuleTree
+              key={`${use.appId}/${use.chain.id}`}
+              nodeId={id}
+              use={use}
+              nodes={nodes}
+              settingsReadable={settingsReadable}
+            />
           ))}
         </RuleDraftScope>
       ) : (
@@ -3965,14 +4374,15 @@ function NodeChainsSection({
         // 保存条（RuleDraftScope）只在可编辑时包裹：它是一个「保存到草稿」按钮，
         // 只读时始终处于禁用状态。
         <>
-          {/* 提示置于树之外：树内每张规则表的标题在该档位下是隐藏的（见 styles.css 的
-              `.chain-rule-tree .rule-editor>.toolbar:first-child`），写在内部不可见。
-              整段一条即可——机器属于多条链时，每张卡各显示一次属于重复。 */}
-          <p className="note" style={{ margin: '0 0 8px' }}>
-            只读：规则按原样列出。
-          </p>
           {inChains.map(use => (
-            <NodeChainRuleTree key={`${use.appId}/${use.chain.id}`} nodeId={id} use={use} nodes={nodes} readOnly />
+            <NodeChainRuleTree
+              key={`${use.appId}/${use.chain.id}`}
+              nodeId={id}
+              use={use}
+              nodes={nodes}
+              readOnly
+              settingsReadable={settingsReadable}
+            />
           ))}
         </>
       )}
@@ -4322,51 +4732,88 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
                   ⋯
                 </button>
                 {actsOpen && (
-                  <div className="fg-menu" onClick={() => setActsOpen(false)}>
+                  <div className="fg-menu action-menu" role="menu" onClick={() => setActsOpen(false)}>
                     {tab === 'observed' && (
-                      <button disabled={!verifyAllowed || verify.isPending} onClick={() => verify.mutate()}>
-                        {verify.isPending ? '验证中…' : '验证接入'}
-                        <small>空跑一次收敛，确认这台与当前模型一致，不改任何配置</small>
+                      <button
+                        role="menuitem"
+                        disabled={!verifyAllowed || verify.isPending}
+                        onClick={() => verify.mutate()}
+                      >
+                        <Icon of="check" size={14} className="action-menu-icon" />
+                        <span>
+                          {verify.isPending ? '验证中…' : '验证接入'}
+                          <small>空跑一次收敛，确认这台与当前模型一致，不改任何配置</small>
+                        </span>
                       </button>
                     )}
                     <button
+                      role="menuitem"
                       disabled={!system || issue.isPending || n.lifecycle_phase !== 'active'}
                       onClick={() => issue.mutate()}
                     >
-                      {n.token_prefix && !n.token_revoked_at ? '重签 token' : '签发 token'}
-                      <small>凭据只显示一次；重签后旧 token 立即失效</small>
+                      <Icon of="access" size={14} className="action-menu-icon" />
+                      <span>
+                        {n.token_prefix && !n.token_revoked_at ? '重签 token' : '签发 token'}
+                        <small>凭据只显示一次；重签后旧 token 立即失效</small>
+                      </span>
                     </button>
                     <hr />
                     <button
+                      role="menuitem"
                       className={n.lifecycle_phase === 'active' ? 'dg' : undefined}
                       disabled={!system || retire.isPending}
                       onClick={() => retire.mutate(n.lifecycle_phase === 'active' ? 'retired' : 'active')}
                     >
-                      {retire.isPending ? '提交中…' : n.lifecycle_phase === 'active' ? '退役机器' : '恢复机器'}
-                      <small>
-                        {n.lifecycle_phase === 'active'
-                          ? '立即创建完整停用发布；不会删除机器记录'
-                          : '递增生命周期代次并创建恢复发布；需要重新签发 Token'}
-                      </small>
+                      <Icon
+                        of={n.lifecycle_phase === 'active' ? 'dash' : 'check'}
+                        size={14}
+                        className="action-menu-icon"
+                      />
+                      <span>
+                        {retire.isPending ? '提交中…' : n.lifecycle_phase === 'active' ? '退役机器' : '恢复机器'}
+                        <small>
+                          {n.lifecycle_phase === 'active'
+                            ? '立即创建完整停用发布；不会删除机器记录'
+                            : '递增生命周期代次并创建恢复发布；需要重新签发 Token'}
+                        </small>
+                      </span>
                     </button>
                     {n.lifecycle_phase === 'retiring' && (
                       <>
                         {teardownNeedsRepair && (
-                          <button disabled={!system || retire.isPending} onClick={() => retire.mutate('retired')}>
-                            重建停用发布
-                            <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
+                          <button
+                            role="menuitem"
+                            disabled={!system || retire.isPending}
+                            onClick={() => retire.mutate('retired')}
+                          >
+                            <Icon of="deploy" size={14} className="action-menu-icon" />
+                            <span>
+                              重建停用发布
+                              <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
+                            </span>
                           </button>
                         )}
-                        <button className="dg" disabled={!system || abandon.isPending} onClick={() => abandon.mutate()}>
-                          {abandon.isPending ? '处理中…' : '强制退役'}
-                          <small>仅用于机器永久失联；结果会保留为警告状态</small>
+                        <button
+                          role="menuitem"
+                          className="dg"
+                          disabled={!system || abandon.isPending}
+                          onClick={() => abandon.mutate()}
+                        >
+                          <Icon of="warn" size={14} className="action-menu-icon" />
+                          <span>
+                            {abandon.isPending ? '处理中…' : '强制退役'}
+                            <small>仅用于机器永久失联；结果会保留为警告状态</small>
+                          </span>
                         </button>
                       </>
                     )}
                     {n.lifecycle_deployment_id && (
-                      <button onClick={() => openTabByKey('deploy')}>
-                        查看发布 #{n.lifecycle_deployment_id}
-                        <small>打开发布页查看停用动作与波次确认</small>
+                      <button role="menuitem" onClick={() => openTabByKey('deploy')}>
+                        <Icon of="deploy" size={14} className="action-menu-icon" />
+                        <span>
+                          查看发布 #{n.lifecycle_deployment_id}
+                          <small>打开发布页查看停用动作与波次确认</small>
+                        </span>
                       </button>
                     )}
                   </div>
@@ -4605,6 +5052,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
               nodes={nodes.data?.nodes ?? []}
               canEdit={can(who.role, 'edit')}
               canCreate={can(who.role, 'edit')}
+              settingsReadable={!isPublic(who)}
               go={go}
             />
           </div>
@@ -4640,7 +5088,6 @@ function Provision({ drill, go }: { drill: WizDrill; go: (d: Drill) => void }) {
 /* 第一种状态：机器尚未入库。 */
 function ProvisionForm({ go }: { go: (d: Drill) => void }) {
   const qc = useQueryClient();
-  const { who } = useSession();
   /* GET /tenants 在服务端已按操作者的租户子树过滤，因此该列表即为其可见范围。 */
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
   const options = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
@@ -4656,7 +5103,6 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
     public_ipv6: '',
     public_ipv4_nat: false,
     public_ipv6_nat: false,
-    tenant_id: '',
     wg_listen_port: 51820,
     api_port: 10085,
     overlay: true,
@@ -4674,10 +5120,9 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
   const defaultCertLabelId = (certs.data?.groups ?? []).find(group => group.is_default)?.id ?? '';
   const selectedCertLabelId = form.cert_label_id === '__none__' ? '' : form.cert_label_id || defaultCertLabelId;
 
-  // 归属租户取默认值：操作者绑定了子树时用该子树，只有一个租户时用该租户，
-  // 否则取排序后的第一个。只有需要指定时才修改该项。
-  const defaultTenant = options.find(t => t.id === who.tenant_scope)?.id ?? (options.length ? options[0].id : '');
-  const tenantId = form.tenant_id || defaultTenant;
+  // 单租户阶段不显示归属选择，并且只按数量判断：恰好一条才可纳管，不识别任何特殊名称。
+  const defaultTenant = options.length === 1 ? options[0].id : '';
+  const tenantId = defaultTenant;
 
   const provision = useMutation({
     mutationFn: () => {
@@ -4766,20 +5211,6 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
           />
           <p className="note">列表和拓扑图上显示的名称，可随时修改</p>
         </div>
-        <div className="wz-fld">
-          <label>归属租户</label>
-          {/* 始终使用下拉框，只有一个选项时同样如此——与建链向导的该字段规则一致：
-              同一字段在不同情况下使用两种控件时，需要先判断当前是否可修改。 */}
-          <select className="f" value={tenantId} onChange={e => setForm({ ...form, tenant_id: e.target.value })}>
-            {options.length === 0 && <option value="">还没有租户</option>}
-            {options.map(t => (
-              <option key={t.id} value={t.id}>
-                {t.name && t.name !== t.id ? `${t.name}（${t.id}）` : t.id}
-              </option>
-            ))}
-          </select>
-          <p className="note">创建后不可修改。</p>
-        </div>
       </div>
 
       {/* ── 网络：一条 IP 一行，NAT 置于行内 ── */}
@@ -4824,7 +5255,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
               />
             </span>
             <span className="attr">
-              <span className="note">可留空；机器首次上线后自动识别并回填公网 IPv4。</span>
+              <span className="note">可留空；机器首次上线后自动识别并回填，手填地址不会被覆盖。</span>
             </span>
           </span>
         </div>
@@ -4865,7 +5296,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
               />
             </span>
             <span className="attr">
-              <span className="note">可留空并在首次上线后自动回填；手填地址不会被覆盖。</span>
+              <span className="note">可留空；机器首次上线后自动识别并回填，手填地址不会被覆盖。</span>
             </span>
           </span>
         </div>
@@ -4899,7 +5330,7 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
               on="允许"
             />
           </div>
-          <p className="note">禁止时它只能作为中转，指向它的落地规则会在编译时被拒绝。</p>
+          <p className="note">禁止时它只能作为中转节点，指向它的本机出网规则会在编译时被拒绝。</p>
         </div>
         {/* 和上面两项同属角色，因此不收进折叠区：它决定这台机器能不能承载 TLS 与 Hysteria 2，
             与「能不能出网」是同一层的取舍。而且建完再改会让已发出去的订阅失效——组决定 SNI，
@@ -4995,18 +5426,14 @@ function ProvisionForm({ go }: { go: (d: Drill) => void }) {
         </div>
       </details>
 
-      {tenants.data && tenants.data.tenants.length === 0 && (
+      {tenants.data && tenants.data.tenants.length !== 1 && (
         <div className="callout warn" style={{ marginTop: 12 }}>
-          还没有租户。机器必须归属一个租户，请先在「租户」页创建。
+          系统归属配置异常：当前必须恰好有一条，实际为 {tenants.data.tenants.length} 条。
         </div>
       )}
       {provision.error && <ErrorBox error={provision.error} />}
 
       <div className="wz-foot">
-        {/* 这是纳管与建链的主要差异，说明置于按钮旁 */}
-        <span className="note warn">
-          <b>这一步没有草稿</b>：提交后立即写入库并盖出一版新修订，不可撤销。
-        </span>
         <span className="sp" />
         <button type="button" className="btn" onClick={() => go({ p: 'list' })}>
           取消
@@ -5211,7 +5638,7 @@ function ProvisionInstall({
                   </>
                 ) : !certRow ? (
                   <>
-                    这台机器没有选证书组，因此没有本机证书，其上的 TLS 和 Hysteria 2 接入面会在
+                    这台机器没有选证书组，因此没有本机 TLS 证书，其上的 TLS 和 Hysteria 2 接入面会在
                     <b>编译时被拒绝</b>。在下方「证书组」里选一个。 REALITY 指向外部站点的接入面不受影响。
                   </>
                 ) : certServing ? (

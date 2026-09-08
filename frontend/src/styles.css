@@ -1751,7 +1751,6 @@ select {
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
-
 /* ═══ z2 窗口层 ═══ */
 #winlayer {
   position: fixed;
@@ -2439,6 +2438,86 @@ textarea.f::placeholder {
 }
 .nd-tab-config .fgrid .v > :is(.segsw, input.f, select.f, .btn) {
   vertical-align: middle;
+}
+
+/* 机器配置里的证书不再只给一行 serving 摘要：主、备、兼容和失败记录逐张展开，路径和
+   安装状态放在同一块里，排查时不必再去设置页拼接控制面事实与机器事实。 */
+.node-certificates {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+.node-certificate {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--sunk);
+}
+.node-certificate > header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--band) 72%, var(--block));
+}
+.node-certificate > header code {
+  min-width: 0;
+  margin-right: auto;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-certificate dl {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  margin: 0;
+}
+.node-certificate :is(dt, dd) {
+  min-width: 0;
+  margin: 0;
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.node-certificate dt {
+  color: var(--ink-4);
+  font-family: var(--mono);
+}
+.node-certificate dd {
+  color: var(--ink-2);
+}
+.node-certificate :is(dt, dd):nth-last-child(-n + 2) {
+  border-bottom: 0;
+}
+.node-cert-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--sunk);
+}
+.node-cert-observed {
+  padding-inline: 2px;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: right;
+}
+
+/* 日志名称同时包含组件名、中文名称和单位，比其他机器配置标签略长。只放宽这一张卡，
+   其余配置卡仍沿用统一的 124px 标签栏。 */
+.node-log-retention .fgrid .k {
+  width: 140px;
 }
 .wg-peer-empty {
   display: block;
@@ -3503,7 +3582,8 @@ textarea.f::placeholder {
   font-size: 10.5px;
 }
 .rule-sheet-card.node-chain-sheet > header + .node-chain-use {
-  margin-top: -11px;
+  /* 标题自带 11px 下外距，保留 8px 空白再开始规则列表。 */
+  margin-top: -3px;
 }
 /* 保存状态属于卡片的收口，不是内容区里又一条浮动工具栏。DNS 面板的保存条位于 fieldset
    内，链路面板的保存条由 RuleDraftScope 直接渲染，因此需要覆盖这两种真实 DOM。 */
@@ -8238,6 +8318,40 @@ body.has-artpanel .topo-deck {
   font-size: 11px;
   margin-top: 2px;
 }
+.fg-menu.action-menu button {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 8px;
+}
+.action-menu-icon,
+.action-menu-icon svg {
+  display: block;
+  flex: none;
+}
+.action-menu-icon {
+  margin-top: 2px;
+}
+.fg-menu.action-menu button > span:last-child {
+  min-width: 0;
+}
+.fg-menu.nav-menu > button {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 8px;
+}
+.fg-menu-icon,
+.fg-menu-icon svg {
+  display: block;
+  flex: none;
+}
+.fg-menu-icon {
+  margin-top: 2px;
+}
+.fg-menu.nav-menu > button > span:last-child {
+  min-width: 0;
+}
 .fg-menu button:hover small {
   color: var(--action-on);
   opacity: 0.72;
@@ -8278,6 +8392,9 @@ body.has-artpanel .topo-deck {
   align-items: center;
   gap: 8px;
   padding: 7px 10px;
+}
+.fg-accrow > .fg-menu-icon {
+  margin-right: 0;
 }
 .fg-accrow .t {
   margin-right: auto;
@@ -10838,6 +10955,9 @@ body.fg-dragging * {
   font: 600 15px var(--sans);
   color: var(--ink);
 }
+.chain-hd > .geo-flag {
+  flex: none;
+}
 .chain-hd .sp {
   flex: 1;
 }
@@ -11980,6 +12100,11 @@ h4.sec > .btn {
   gap: 6px;
   white-space: nowrap;
 }
+.user-dacts .user-dact-more {
+  width: 32px;
+  padding: 0;
+  justify-content: center;
+}
 .user-account-type {
   display: inline-flex;
   align-items: stretch;
@@ -12562,22 +12687,6 @@ h4.sec > .btn {
   font-size: 11px;
   text-align: center;
 }
-.grant-probe-foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 -13px -11px;
-  padding: 9px 12px;
-  border-top: 1px solid var(--line-soft);
-  color: var(--ink-4);
-  background: var(--band);
-  font-size: 10.5px;
-}
-.grant-probe-foot-icon,
-.grant-probe-foot-icon svg {
-  display: block;
-  flex: none;
-}
 .grant-probe-legend {
   display: flex;
   gap: 10px;
@@ -12674,9 +12783,6 @@ h4.sec > .btn {
   }
   .grant-probe-legend {
     display: none;
-  }
-  .grant-probe-foot {
-    align-items: flex-start;
   }
 }
 
@@ -12886,8 +12992,9 @@ h4.sec > .btn {
   }
 }
 
-/* 用户页手机形态：主从双栏改为单栏，名册横向滑动，所选用户详情紧接其后。
-   只把列表纵向堆叠会让五六个用户先占满整屏，点选后仍需向下找详情。 */
+/* 用户页手机形态：主从双栏改为单栏，名册固定纵向排列。列表视口最多容纳十行，
+   更多用户留在名册内部纵向滚动，并始终保留上方搜索；横向卡片会隐藏用户名状态、
+   也让用户误以为整张详情面板可以左右滑，因此移动端明确禁止横向溢出。 */
 @media (max-width: 760px) {
   .user-split {
     grid-template-columns: minmax(0, 1fr);
@@ -12898,28 +13005,34 @@ h4.sec > .btn {
     border-radius: 8px;
   }
   .user-roster-options {
-    display: flex;
-    gap: 7px;
-    padding: 7px;
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scroll-snap-type: x proximity;
-    scrollbar-width: none;
+    display: block;
+    max-height: 520px;
+    padding: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
   }
   .user-roster-options::-webkit-scrollbar {
-    display: none;
+    width: 5px;
+  }
+  .user-roster-options::-webkit-scrollbar-thumb {
+    border-radius: 3px;
+    background: var(--line);
   }
   .user-row {
-    flex: 0 0 min(232px, calc(100vw - 58px));
-    min-height: 56px;
-    padding: 8px 10px;
-    border-color: var(--line-soft);
-    background: color-mix(in srgb, var(--sheet) 42%, transparent);
-    box-shadow: none;
-    scroll-snap-align: start;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    min-height: 52px;
+    border-color: transparent;
+    border-radius: 0;
+    box-shadow: inset 0 -1px 0 var(--line-soft);
   }
   .user-new-row {
-    flex-basis: min(340px, calc(100vw - 58px));
+    min-height: 60px;
+    border-color: color-mix(in srgb, var(--action) 30%, var(--line));
   }
   .user-row:last-child {
     box-shadow: none;
@@ -14268,7 +14381,8 @@ input.f.ing-pj-port {
   background: var(--surface);
 }
 .observe-range-trigger:focus-visible,
-.observe-range-menu button:focus-visible {
+.observe-range-menu button:focus-visible,
+.observe-range-menu input:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--action) 45%, transparent);
   outline-offset: 1px;
 }
@@ -14281,8 +14395,10 @@ input.f.ing-pj-port {
   z-index: 60;
   top: calc(100% + 5px);
   right: 0;
-  min-width: 132px;
-  padding: 4px;
+  display: grid;
+  grid-template-columns: 132px minmax(236px, 1fr);
+  width: 390px;
+  padding: 5px;
   border: 1px solid var(--line);
   border-radius: 9px;
   background: var(--glass-strong);
@@ -14292,7 +14408,20 @@ input.f.ing-pj-port {
 .observe-range-menu[hidden] {
   display: none;
 }
-.observe-range-menu button {
+.observe-range-presets {
+  padding-right: 5px;
+  border-right: 1px solid var(--line-soft);
+}
+.observe-range-presets > b,
+.observe-range-absolute > b {
+  display: block;
+  padding: 5px 9px 6px;
+  color: var(--ink-4);
+  font: 600 9.5px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.observe-range-presets button {
   display: flex;
   width: 100%;
   padding: 6px 9px;
@@ -14307,11 +14436,11 @@ input.f.ing-pj-port {
   text-align: left;
   white-space: nowrap;
 }
-.observe-range-menu button:hover,
-.observe-range-menu button:focus-visible {
+.observe-range-presets button:hover,
+.observe-range-presets button:focus-visible {
   background: color-mix(in srgb, var(--action-wash) 60%, transparent);
 }
-.observe-range-menu button[aria-selected='true'] {
+.observe-range-presets button[aria-selected='true'] {
   color: var(--action);
   font-weight: 500;
 }
@@ -14321,8 +14450,85 @@ input.f.ing-pj-port {
   font-size: 10px;
   opacity: 0;
 }
-.observe-range-menu button[aria-selected='true'] .observe-range-check {
+.observe-range-presets button[aria-selected='true'] .observe-range-check {
   opacity: 1;
+}
+.observe-range-absolute {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding-left: 5px;
+}
+.observe-range-absolute label {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.observe-range-absolute input {
+  min-width: 0;
+  height: 29px;
+  box-sizing: border-box;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--block);
+  color: var(--ink-2);
+  color-scheme: light dark;
+  font: 10.5px var(--mono);
+}
+.observe-range-absolute input:focus {
+  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+}
+.observe-range-error {
+  min-height: 15px;
+  padding: 3px 8px 5px 39px;
+  color: var(--ink-4);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.observe-range-error.bad {
+  color: var(--err);
+}
+.observe-range-menu .observe-range-apply {
+  display: inline-flex;
+  width: auto;
+  min-height: 29px;
+  align-self: flex-end;
+  align-items: center;
+  margin: auto 8px 4px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: var(--action);
+  color: var(--action-on);
+  cursor: pointer;
+  font: 500 11px var(--sans);
+}
+.observe-range-menu .observe-range-apply:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+@media (max-width: 520px) {
+  .observe-range-menu {
+    grid-template-columns: 104px minmax(0, 1fr);
+    width: min(360px, calc(100vw - 24px));
+  }
+  .observe-range-presets button {
+    padding-inline: 7px;
+    font-size: 10.5px;
+  }
+  .observe-range-absolute label {
+    grid-template-columns: 20px minmax(0, 1fr);
+    padding-inline: 6px;
+  }
+  .observe-range-absolute input {
+    padding-inline: 5px;
+    font-size: 9.5px;
+  }
 }
 .observe-history {
   --observe-user: var(--data);
@@ -15421,14 +15627,17 @@ input.f.ing-pj-port {
 .node-cardpage > .panel + .panel {
   margin-top: 12px;
 }
-/* 已退役与在用机器分层，默认折叠；标题带尺寸与设置页的段卡片一致。 */
-.node-cardpage .panel.titled > summary {
-  margin: -14px -13px 12px;
-  padding: 7px 13px;
-  min-height: 38px;
+/* 退役机器使用与在用机器相同的普通标题栏。它曾是 details/summary，浏览器的展开标记
+   会落在「移除全部」右侧，使按钮无法与上方「纳管节点」的右边缘对齐，也像按钮自带
+   一个下拉菜单。退役清单本身不需要折叠，改为普通 section 后两层操作栏严格同宽。 */
+.node-remove-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
-.node-cardpage .panel.titled:not([open]) > summary {
-  margin-bottom: -16px;
+.node-remove-button-icon {
+  display: inline-flex;
+  flex: none;
 }
 
 .ncards {
@@ -15907,6 +16116,92 @@ input.f.ing-pj-port {
   }
 }
 
+/* 协议选择：B 方案的选中衬底。沿用站点操作色，亮暗主题和调色盘同步变化。 */
+.protocol-picker {
+  display: grid;
+  gap: 8px;
+  padding: 4px 0;
+}
+.protocol-choice {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--action) 3%, var(--block));
+  cursor: pointer;
+}
+.protocol-choice.on {
+  border-color: color-mix(in srgb, var(--action) 16%, var(--block));
+  background: color-mix(in srgb, var(--action) 7%, var(--block));
+}
+.protocol-choice:has(> input:enabled):hover {
+  border-color: color-mix(in srgb, var(--action) 32%, var(--block));
+}
+.protocol-choice:has(> input:focus-visible) {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+.protocol-choice:has(> input:disabled) {
+  cursor: default;
+}
+.protocol-choice > input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--action);
+  cursor: inherit;
+}
+.protocol-choice-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.protocol-choice-copy > b {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 20px;
+}
+.protocol-choice-icon {
+  display: inline-flex;
+  flex: none;
+}
+.protocol-choice.on .protocol-choice-copy > b {
+  color: color-mix(in srgb, var(--action) 72%, var(--ink));
+}
+.protocol-choice-copy > .note {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.protocol-choice-status {
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--action) 13%, var(--block));
+  color: color-mix(in srgb, var(--action) 78%, var(--ink-3));
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.protocol-choice:not(.on) .protocol-choice-status {
+  visibility: hidden;
+}
+@media (max-width: 480px) {
+  .protocol-choice {
+    gap: 10px;
+    padding: 12px;
+  }
+}
+
 /* ── 接入面的安全策略 ──
    左侧是开关、右侧是规则表。并排不是排版偏好：这些限制是否生效取决于它们排在链路规则之前，
    而该顺序只有通过版面呈现才能看出。窄屏折为上下两段，规则表位于开关之后，顺序仍然明确。 */
@@ -16047,7 +16342,7 @@ input.f.ing-pj-port {
  * 双栏骨架与链详情页的 `.duo` 同源。设置段直接复用普通配置面板，只额外保留生效方式
  * 和自己的保存按钮；标题与卡面不再分叉。
  *
- * 本块只放两类东西：这一页自己的类（.setsub / .applyb），以及**确实被别的页共用**的类
+ * 本块只放两类东西：这一页自己的类，以及**确实被别的页共用**的类
  * 的页内覆盖（.panel.titled 仍供列表与发布页使用，.eyebrow 顶栏也在用）。只有设置页在用的类
  * ——.setfld 一族、.certgrp / .certrow 一族——取值直接写在它们各自的基线规则上，
  * 不在这里再压一层：那样只会造出一场特异性竞赛，而两条同为两个类的选择器谁赢取决于
@@ -16132,21 +16427,12 @@ input.f.ing-pj-port {
   line-height: 1.55;
 }
 
-/* 生效方式。三档只写结果，原因写在段的说明里。
-   「需要发布」着主色：九段里这一档最多，且它是唯一一档「保存完还没完」。 */
-.applyb {
+/* 生效方式直接复用全站 `.st` 状态签。标题栏由 gap 管间距，因此去掉状态签为行内文本
+   预留的右边距；尺寸、底色和语义色不在设置页另起一套。 */
+.settings-apply-status {
   flex: none;
-  padding: 1px 8px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  font: 10.5px var(--sans);
-  letter-spacing: 0;
-  color: var(--ink-4);
-  white-space: nowrap;
-}
-.applyb.pub {
-  border-color: color-mix(in srgb, var(--action) 38%, transparent);
-  color: var(--action);
+  margin-right: 0;
+  vertical-align: 0;
 }
 
 /* 组标题：小字加一条填满剩余宽度的线。不用主色——一张卡片里最多三个组，
@@ -16207,18 +16493,6 @@ input.f.ing-pj-port {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.agent-log-source {
-  padding: 1px 6px;
-  border: 1px solid var(--line-soft);
-  border-radius: 999px;
-  color: var(--ink-4);
-  font-size: 9.5px;
-  white-space: nowrap;
-}
-.agent-log-source.overridden {
-  border-color: color-mix(in srgb, var(--action) 34%, var(--line));
-  color: var(--action);
-}
 .agent-log-value {
   display: inline-flex;
   align-items: center;
@@ -16241,27 +16515,106 @@ input.f.ing-pj-port {
   font-size: 10px;
 }
 
+/* Ping 探测先展示节奏，再展示目标清单。两项调度值做成同级小块，目标每项自带字段名，
+   不再把协议、名称、地址和删除按钮挤成一行没有表头的表格。 */
+.ping-probe-schedule {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin-bottom: 14px;
+}
+.ping-probe-timing {
+  display: grid;
+  gap: 5px;
+  padding: 10px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sunk) 58%, transparent);
+}
+.ping-probe-timing > span,
+.ping-probe-target label > span {
+  color: var(--ink-4);
+  font: 10px var(--mono);
+}
+.ping-probe-timing > div {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.ping-probe-timing input[type='number'] {
+  width: 100px;
+  font: 500 12.5px var(--mono);
+}
+.ping-probe-timing b {
+  color: var(--ink-3);
+  font: 10px var(--mono);
+}
+.ping-probe-timing small {
+  color: var(--ink-4);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.ping-probe-target-section {
+  overflow: hidden;
+  margin-bottom: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--sunk) 48%, transparent);
+}
+.ping-probe-target-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.ping-probe-target-head > div:first-child {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.ping-probe-target-head b {
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+.ping-probe-target-head span {
+  color: var(--ink-4);
+  font: 10px var(--mono);
+}
+.ping-probe-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .ping-probe-targets {
   display: grid;
   gap: 8px;
-  margin-bottom: 10px;
+  padding: 10px;
 }
-
 .ping-probe-target {
   display: grid;
-  grid-template-columns: 48px minmax(96px, 0.7fr) minmax(210px, 1.5fr) auto;
+  grid-template-columns: 48px minmax(90px, 0.65fr) minmax(180px, 1.35fr) auto;
   gap: 8px;
-  align-items: center;
+  align-items: end;
+  padding: 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--block);
 }
-
+.ping-probe-target > label {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
 .ping-probe-target .f {
   width: 100%;
   min-width: 0;
 }
-
 .ping-probe-kind {
   display: inline-flex;
   align-items: center;
+  align-self: center;
   gap: 6px;
   color: var(--ink-4);
   font: 9px var(--mono);
@@ -16277,26 +16630,156 @@ input.f.ing-pj-port {
 .ping-probe-kind.icmp::before {
   background: var(--observe-2);
 }
-.ping-probe-add {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+.ping-probe-remove {
+  margin-bottom: 1px;
 }
-.ping-probe-settings .setgrp > .ping-probe-note {
+.ping-probe-empty-settings {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 22px 12px;
+  color: var(--ink-4);
+  text-align: center;
+}
+.ping-probe-empty-settings b {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.ping-probe-empty-settings span {
+  font-size: 10.5px;
+}
+.ping-probe-target-section > .agent-log-invalid {
   display: block;
+  padding: 0 11px 8px;
 }
-.ping-probe-settings input[type='number'] {
-  width: 90px;
+.ping-probe-note {
+  margin: 0;
+  padding: 9px 11px 11px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-4);
+  font-size: 10.5px;
+  line-height: 1.55;
 }
 
 @media (max-width: 720px) {
+  .ping-probe-schedule {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .ping-probe-target {
     grid-template-columns: 48px minmax(0, 1fr) auto;
   }
-
-  .ping-probe-target .f:nth-child(3) {
+  .ping-probe-target > label:nth-of-type(2) {
     grid-column: 1 / -1;
     grid-row: 2;
+  }
+}
+
+/* 设置页的每组配置统一使用 XRAY 面板确立的块形态。标签置于控件上方，长字段名不再
+   挤压值列；边框与浅底把配置项和说明区分开，但不再给每个字段套一层卡片。 */
+.settings-block {
+  min-width: 0;
+  margin: 0;
+  padding: 10px 11px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sunk) 50%, transparent);
+}
+.settings-block > .eyebrow {
+  margin-bottom: 7px;
+}
+.settings-block .setfld {
+  display: block;
+  padding: 7px 0;
+}
+.settings-block .setfld > label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--ink-4);
+  font: 10px/1.35 var(--mono);
+}
+.settings-block .setfld > label:empty {
+  display: none;
+}
+.settings-block .setfld > .v {
+  min-width: 0;
+  align-items: center;
+}
+.settings-block .setfld .f {
+  max-width: 100%;
+}
+.settings-block > .guard {
+  margin-right: -11px;
+  margin-left: -11px;
+  padding-right: 11px;
+  padding-left: 23px;
+}
+.relay-mux-settings {
+  margin-top: 10px;
+}
+
+.settings-validation-error {
+  color: var(--err);
+}
+.relay-mux-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: var(--ctl-h);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.relay-mux-summary > span {
+  min-width: 0;
+}
+.relay-mux-fields {
+  margin-top: 7px;
+  padding-top: 1px;
+  border-top: 1px solid var(--line-soft);
+}
+.relay-mux-fields .f {
+  width: 90px;
+}
+.relay-mux-fields .field-pair {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* XRAY 的七项设置按“伪装站点 / 接入兼容 / AnyTLS”分成三个明确区域；前两块并排比较，
+   Padding 横跨整行。 */
+#set-xray {
+  container-type: inline-size;
+}
+.xray-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.xray-setting-block.wide {
+  grid-column: 1 / -1;
+}
+#set-xray .xray-control {
+  width: 100%;
+  min-width: 0;
+  flex: 1 1 150px;
+}
+.xray-version-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 8px;
+}
+.xray-padding {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  font: 11px/1.5 var(--mono);
+}
+@container (max-width: 520px) {
+  .xray-settings-grid,
+  .xray-version-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 .agent-log-node > .err,
@@ -16326,7 +16809,7 @@ input.f.ing-pj-port {
   padding: 7px 10px;
 }
 
-/* 证书组是“组概况 → 证书队列 → 使用机器”三层，不再把所有字段压成一条文本行。 */
+/* 证书组是“组概况 → 完整证书队列”两层；机器归属暂不在全局设置中展示。 */
 #set-cert {
   container-type: inline-size;
 }
@@ -16374,6 +16857,29 @@ input.f.ing-pj-port {
   align-items: center;
   min-width: 0;
   gap: 10px;
+}
+.certgrp-toggle {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.certgrp-disclosure {
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  flex: none;
+  border-right: 1.5px solid var(--ink-3);
+  border-bottom: 1.5px solid var(--ink-3);
+  transform: rotate(45deg);
+  transition: transform 0.12s ease;
+}
+.certgrp.expanded .certgrp-disclosure {
+  transform: rotate(225deg);
 }
 .certgrp-mark {
   display: inline-grid;
@@ -16660,6 +17166,166 @@ input.f.ing-pj-port {
   }
 }
 
+/* 全局证书页只展示“证书组 → 证书记录”，不展示机器归属。组的身份字段与每张证书的
+   签发字段都完整展开；长 SNI、SHA 和内部 ID 可换行，不以省略号藏掉尾部。 */
+.certgrp-hd {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.certgrp-note {
+  white-space: normal;
+}
+.certgrp-facts,
+.cert-record-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  margin: 0;
+}
+.certgrp-facts {
+  gap: 8px 16px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--sunk) 38%, transparent);
+}
+.certgrp-facts > div,
+.cert-record-facts > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+.certgrp-facts > .wide,
+.cert-record-facts > .wide {
+  grid-column: 1 / -1;
+}
+.certgrp-facts dt,
+.cert-record-facts dt {
+  color: var(--ink-4);
+  font: 9.5px var(--mono);
+}
+.certgrp-facts dd,
+.cert-record-facts dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.certgrp-section .certtbl {
+  display: grid;
+  gap: 10px;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.cert-record {
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--line);
+  border-radius: 8px;
+  background: var(--block);
+}
+.cert-record.ok {
+  border-left-color: var(--ok);
+}
+.cert-record.warn {
+  border-left-color: var(--warn);
+}
+.cert-record.err {
+  border-left-color: var(--err);
+}
+.cert-record-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--sunk) 45%, transparent);
+}
+.cert-record-state,
+.cert-record-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cert-record-actions {
+  justify-content: flex-end;
+}
+.cert-record .cstate {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.cert-record .cstate::before {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+}
+.cert-record .cstate.ok {
+  color: var(--ok);
+}
+.cert-record .cstate.warn,
+.cert-record-facts dd.warn,
+.cert-record .ctrust.warn {
+  color: var(--warn);
+}
+.cert-record .cstate.err {
+  color: var(--err);
+}
+.cert-record .cstate.idle,
+.cert-record .ctrust {
+  color: var(--ink-3);
+}
+.cert-record .ctrust {
+  font-size: 10px;
+}
+.cert-record-facts {
+  gap: 10px 16px;
+  padding: 11px 12px 13px;
+}
+.cert-record-facts > .primary dd {
+  color: var(--ink);
+  font-size: 11.5px;
+}
+.cert-record-facts dd.mono,
+.cert-record-facts dd.break,
+.certgrp-facts dd.mono {
+  font-family: var(--mono);
+}
+.cert-record-error {
+  display: grid;
+  gap: 3px;
+  padding: 9px 12px 11px;
+  border-top: 1px solid color-mix(in srgb, var(--err) 24%, var(--line-soft));
+  background: color-mix(in srgb, var(--err) 5%, transparent);
+}
+.cert-record-error b {
+  color: var(--err);
+  font: 9.5px var(--mono);
+}
+.cert-record-error span {
+  color: var(--ink-2);
+  font-size: 10.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+@container (max-width: 520px) {
+  .cert-record-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .cert-record-actions {
+    justify-content: flex-start;
+  }
+}
+
 /* ═══ 线路列表 · 链卡 ═══════════════════════════════════════════════
  * 外层沿用机器列表和设置页的 `.panel.titled`：有底色的标题条与内容属于同一张段卡，
  * 而不是一条悬浮页头加若干直接落在网格台面上的卡片。项目只作为段卡内部的章节，靠留白
@@ -16834,8 +17500,8 @@ input.f.ing-pj-port {
   font: 600 17px/1 var(--mono);
   font-variant-numeric: tabular-nums;
 }
-/* 两层排序共用一枚六点抓手。它只承担拖动，不再把“排序”渲染成两枚常驻的上下按钮；
-   键盘聚焦后仍可用方向键移动，视觉上则保持一件工具、一种含义。 */
+/* 分组排序使用一枚六点抓手。链卡本身就是拖动区域，不再在标题左侧重复放一枚按钮；
+   分组抓手仍保留键盘入口，聚焦后可使用方向键移动。 */
 .order-grip {
   position: relative;
   width: 20px;
@@ -17087,10 +17753,15 @@ input.f.ing-pj-port {
   margin: 0;
   accent-color: var(--action);
 }
-.chain-order-grip {
-  width: 18px;
-  height: 20px;
-  margin: -3px 8px 0 -3px;
+.chain-card-flag {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  height: 18px;
+  margin-right: 8px;
+}
+.chain-card-flag:empty {
+  display: none;
 }
 /* 被拖起的链卡仍保留完整内容，用实线强调当前落位；幽灵只负责跟随指针。
    随顺序变化实时移动到目标槽位，配合 FLIP 平滑滑动，标出松手后的落点。 */
@@ -17117,7 +17788,7 @@ input.f.ing-pj-port {
 }
 .chain-card-title > b {
   color: var(--ink);
-  font: 600 14px var(--sans);
+  font: 600 14px/18px var(--sans);
 }
 .chain-card-title > span {
   margin-top: 2px;
@@ -17426,7 +18097,7 @@ input.f.ing-pj-port {
   white-space: nowrap;
 }
 
-/* XRAY 规则的「转发给」同时容纳 Brocade 节点和外部出站。规则行只显示名称，完整地址与协议
+/* XRAY 规则的「转发给」同时容纳 Brocade 节点和代理出站。规则行只显示名称，完整地址与协议
    细节放在下方摘要；协议徽标让外部资源不会被误读成另一台受管节点。 */
 .external-target-picker {
   position: relative;
@@ -17812,6 +18483,42 @@ input.f.ing-pj-port {
   border-left: 1px solid var(--line);
   background: var(--sheet);
   box-shadow: -18px 0 50px rgba(0, 0, 0, 0.24);
+}
+.mux-config-drawer {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(540px, 100vw);
+}
+.mux-source-switch {
+  margin-bottom: 12px;
+}
+.mux-drawer-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+  margin-top: 15px;
+}
+.mux-drawer-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--ink-4);
+  font: 10px var(--mono);
+}
+.mux-drawer-field > span:last-child {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.mux-drawer-field .f {
+  width: 100%;
+  min-width: 0;
+}
+.mux-drawer-field small {
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.mux-drawer-actions {
+  justify-content: flex-end !important;
 }
 .warp-rule-manager {
   grid-template-rows: auto minmax(0, 1fr);
@@ -18246,6 +18953,9 @@ input.f.ing-pj-port {
   .external-transport-options {
     grid-template-columns: minmax(0, 1fr);
   }
+  .mux-drawer-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .external-form-grid,
   .external-manual-fields .row {
     grid-template-columns: minmax(0, 1fr);
@@ -18495,4 +19205,17 @@ input.f.ing-pj-port {
   .agent-log-node-limits {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* Issuance defaults are separate from the certificates operators inspect day to day. */
+.cert-issuance-settings > summary {
+  cursor: pointer;
+  padding: 10px 0;
+}
+.cert-issuance-settings > summary .eyebrow {
+  display: inline;
+  margin-right: 16px;
+}
+.cert-issuance-settings[open] > summary {
+  margin-bottom: 12px;
 }

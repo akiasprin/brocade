@@ -135,6 +135,7 @@ const PORT_KEYS: &[&str] = &[
     // redirects to its listener.
     "end",
     "anytls_base",
+    "vless_encryption_base",
     "hop_base",
     "hy2_base",
     "ingress_base",
@@ -169,6 +170,19 @@ pub fn mask_json(value: &mut Value) {
                 && map.contains_key("domain")
             {
                 map.insert("label".to_owned(), Value::String(HIDDEN.to_owned()));
+            }
+            // A leaf certificate's digest is useful to an operator comparing the control-plane
+            // record with a machine, but it is not part of the public review surface. Do not mask
+            // every `sha256`: release and artifact digests are deliberately visible build
+            // identities. Match the certificate row by its stable wire shape, and retain `null`
+            // for a pending/failed row which has no certificate bytes yet.
+            if map.contains_key("signing_method")
+                && map.contains_key("certificate_name")
+                && map.contains_key("runtime_slot")
+                && map.contains_key("issuer")
+                && map.get("sha256").is_some_and(Value::is_string)
+            {
+                map.insert("sha256".to_owned(), Value::String(HIDDEN.to_owned()));
             }
             // A UUID is a usable VLESS credential, not review material. Remove the member rather
             // than replacing its value: `***` still suggests a field callers may rely on, while
@@ -488,6 +502,39 @@ mod tests {
             "***.io"
         );
         assert!(!snapshot.to_string().contains("a2335a6d.huacu.io"));
+    }
+
+    #[test]
+    fn a_certificate_digest_is_hidden_without_masking_other_sha256_values() {
+        let certificate_sha = "a".repeat(64);
+        let artifact_sha = "b".repeat(64);
+        let mut response = json!({
+            "groups": [{
+                "certificates": [{
+                    "id": "cert-1",
+                    "signing_method": "public-ca",
+                    "certificate_name": "edge.example.com",
+                    "runtime_slot": null,
+                    "issuer": "Example CA",
+                    "sha256": certificate_sha,
+                }, {
+                    "id": "cert-pending",
+                    "signing_method": "public-ca",
+                    "certificate_name": null,
+                    "runtime_slot": null,
+                    "issuer": null,
+                    "sha256": null,
+                }]
+            }],
+            "artifacts": [{ "id": "xray", "sha256": artifact_sha }],
+        });
+
+        mask_json(&mut response);
+
+        assert_eq!(response["groups"][0]["certificates"][0]["sha256"], HIDDEN);
+        assert!(response["groups"][0]["certificates"][1]["sha256"].is_null());
+        assert_eq!(response["artifacts"][0]["sha256"], "b".repeat(64));
+        assert!(!response.to_string().contains(&"a".repeat(64)));
     }
 
     /// A diagnostic's sentence carries whatever the compiler had to say, and what it

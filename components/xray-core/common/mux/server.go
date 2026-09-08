@@ -156,6 +156,12 @@ func (w *ServerWorker) Close() error {
 }
 
 func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	if meta.Option.Has(OptionProbe) {
+		if meta.Option.Has(OptionAck) {
+			return nil
+		}
+		return writeProbeFrame(w.link.Writer, meta.ProbeID, true)
+	}
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}

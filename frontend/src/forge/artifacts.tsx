@@ -138,16 +138,16 @@ export function blastRadius(list: ArtifactIndexEntry[], changed: Set<string>): S
 function nodeRoles(apps: SnapshotApp[], nodeId: string): string[] {
   const r = new Set<string>();
   for (const a of apps) {
-    if (a.ingresses.some(i => i.node === nodeId)) r.add('入口');
+    if (a.ingresses.some(i => i.node === nodeId)) r.add('入口节点');
     for (const s of a.steps) {
       for (const rule of s.rules) {
-        if (s.node === nodeId && rule.a.t === 'egress') r.add('落地');
+        if (s.node === nodeId && rule.a.t === 'egress') r.add('出口节点');
         if (s.node === nodeId && rule.a.t === 'proxy') r.add('外部代理');
-        if (rule.a.t === 'forward' && (s.node === nodeId || rule.a.to === nodeId)) r.add('中转');
+        if (rule.a.t === 'forward' && (s.node === nodeId || rule.a.to === nodeId)) r.add('中转节点');
       }
     }
   }
-  return ['入口', '中转', '外部代理', '落地'].filter(x => r.has(x));
+  return ['入口节点', '中转节点', '外部代理', '出口节点'].filter(x => r.has(x));
 }
 
 const GROUPS: { kind: string; label: string }[] = [
@@ -247,7 +247,7 @@ export function ArtifactRail({
                         <span className="who">{t}</span>
                         {roles.length > 0 && (
                           <span
-                            className={`role${roles[0] === '入口' ? ' r-in' : roles.includes('落地') ? ' r-eg' : ''}`}
+                            className={`role${roles[0] === '入口节点' ? ' r-in' : roles.includes('出口节点') ? ' r-eg' : ''}`}
                           >
                             {roles.join('·')}
                           </span>
@@ -292,9 +292,7 @@ export function ArtifactRail({
               或编译因错误而中止（产物只在 can_publish 为真时产生）。
               后一种更常见，此前的「该版本没有产物」会引导向前一种理解，
               而实际需要查看的是诊断。因此两种原因都说明。 */}
-          {!error && !pending && list.length === 0 && (
-            <Empty>当前无产物或编译检测出无法解决的问题。</Empty>
-          )}
+          {!error && !pending && list.length === 0 && <Empty>当前无产物或编译检测出无法解决的问题。</Empty>}
         </div>
 
         <div className="fg-artpane">

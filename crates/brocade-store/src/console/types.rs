@@ -69,6 +69,24 @@ pub struct NodeAgentStateList {
     pub nodes: Vec<NodeAgentStateItem>,
 }
 
+/// Permanently remove machines whose retirement has reached a terminal state.
+///
+/// This is intentionally a batch request: the retired-machines panel supports selecting several
+/// rows, and deleting them in separate transactions could leave half the requested machines (and
+/// half their chains) behind after one failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveRetiredNodesRequest {
+    pub node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveRetiredNodesResult {
+    pub revision_id: u64,
+    pub removed_nodes: Vec<String>,
+    pub removed_chains: Vec<String>,
+}
+
 /// An empty JSON object counts as absent.
 ///
 /// The `runtime_versions`, `spool_backlog`, and `geodata_observed` columns are all
@@ -683,6 +701,8 @@ impl<'de> Deserialize<'de> for TransportRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WiresRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub vless_encryption: Option<VlessEncryptionRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vless: Option<TransportRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anytls: Option<AnyTls>,
@@ -690,10 +710,19 @@ pub struct WiresRequest {
     pub hysteria2: Option<Hysteria2>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VlessEncryptionRequest {
+    pub port: u16,
+    #[serde(default)]
+    pub options: brocade_core::model::VlessEncryptionOptions,
+}
+
 impl Default for WiresRequest {
     /// A bare create with no `wires` gets what every ingress was before there was a choice.
     fn default() -> Self {
         Self {
+            vless_encryption: None,
             vless: Some(TransportRequest::default()),
             anytls: None,
             hysteria2: None,
@@ -710,6 +739,8 @@ impl<'de> Deserialize<'de> for WiresRequest {
         #[serde(deny_unknown_fields)]
         struct Wire {
             #[serde(default)]
+            vless_encryption: Option<VlessEncryptionRequest>,
+            #[serde(default)]
             vless: Option<TransportRequest>,
             #[serde(default)]
             anytls: Option<AnyTls>,
@@ -717,12 +748,17 @@ impl<'de> Deserialize<'de> for WiresRequest {
             hysteria2: Option<Hysteria2>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        if wire.vless.is_none() && wire.anytls.is_none() && wire.hysteria2.is_none() {
+        if wire.vless.is_none()
+            && wire.anytls.is_none()
+            && wire.hysteria2.is_none()
+            && wire.vless_encryption.is_none()
+        {
             return Err(serde::de::Error::custom(
-                "接入面至少要有一条线：wires.vless、wires.anytls 和 wires.hysteria2 不能都空着",
+                "接入面至少要有一条线：wires.vless、wires.vless_encryption、wires.anytls 和 wires.hysteria2 不能都空着",
             ));
         }
         Ok(Self {
+            vless_encryption: wire.vless_encryption,
             vless: wire.vless,
             anytls: wire.anytls,
             hysteria2: wire.hysteria2,

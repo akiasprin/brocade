@@ -267,6 +267,170 @@ func TestMuxConfig_Build(t *testing.T) {
 	}
 }
 
+func TestMuxWorkerPoolConfigBuild(t *testing.T) {
+	raw := `{
+		"enabled": true,
+		"concurrency": 1,
+		"workerPool": {
+			"minIdleWorkers": 0,
+			"maxIdleWorkers": 2,
+			"maxProbingWorkers": 1,
+			"probeIntervalSecs": 5,
+			"probeTimeoutMs": 2000,
+			"idleTtlSecs": 24,
+			"maxRequestsPerWorker": 128
+		}
+	}`
+	var config MuxConfig
+	common.Must(json.Unmarshal([]byte(raw), &config))
+	got, err := config.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &proxyman.WorkerPoolConfig{
+		MinIdleWorkers:       0,
+		MaxIdleWorkers:       2,
+		MaxProbingWorkers:    1,
+		ProbeIntervalSecs:    5,
+		ProbeTimeoutMs:       2000,
+		IdleTtlSecs:          24,
+		MaxRequestsPerWorker: 128,
+	}
+	if !proto.Equal(want, got.WorkerPool) {
+		t.Fatalf("worker pool mismatch: want %v, got %v", want, got.WorkerPool)
+	}
+}
+
+func TestMuxWorkerPoolConfigRejectsInvalidValues(t *testing.T) {
+	valid := WorkerPoolConfig{
+		MinIdleWorkers:       0,
+		MaxIdleWorkers:       2,
+		MaxProbingWorkers:    1,
+		ProbeIntervalSecs:    5,
+		ProbeTimeoutMs:       2000,
+		IdleTtlSecs:          24,
+		MaxRequestsPerWorker: 128,
+	}
+	tests := map[string]func(*WorkerPoolConfig){
+		"max below limit":      func(c *WorkerPoolConfig) { c.MaxIdleWorkers = 0 },
+		"min above max":        func(c *WorkerPoolConfig) { c.MinIdleWorkers = 3 },
+		"probing zero":         func(c *WorkerPoolConfig) { c.MaxProbingWorkers = 0 },
+		"probing above max":    func(c *WorkerPoolConfig) { c.MaxProbingWorkers = 3 },
+		"interval below limit": func(c *WorkerPoolConfig) { c.ProbeIntervalSecs = 1 },
+		"interval above limit": func(c *WorkerPoolConfig) { c.ProbeIntervalSecs = 61 },
+		"timeout below limit":  func(c *WorkerPoolConfig) { c.ProbeTimeoutMs = 199 },
+		"timeout above limit":  func(c *WorkerPoolConfig) { c.ProbeTimeoutMs = 10001 },
+		"timeout not shorter":  func(c *WorkerPoolConfig) { c.ProbeTimeoutMs = 5000 },
+		"ttl below limit":      func(c *WorkerPoolConfig) { c.IdleTtlSecs = 0 },
+		"ttl cannot fit probe": func(c *WorkerPoolConfig) { c.IdleTtlSecs = 6 },
+		"requests below limit": func(c *WorkerPoolConfig) { c.MaxRequestsPerWorker = 0 },
+		"requests above limit": func(c *WorkerPoolConfig) { c.MaxRequestsPerWorker = 65536 },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := valid
+			mutate(&config)
+			if _, err := config.Build(); err == nil {
+				t.Fatal("invalid worker pool was accepted")
+			}
+		})
+	}
+}
+
+func TestMuxWorkerPoolConfigAcceptsEveryLegalBoundary(t *testing.T) {
+	tests := map[string]WorkerPoolConfig{
+		"all lower bounds": {
+			MinIdleWorkers:       0,
+			MaxIdleWorkers:       1,
+			MaxProbingWorkers:    1,
+			ProbeIntervalSecs:    2,
+			ProbeTimeoutMs:       200,
+			IdleTtlSecs:          5,
+			MaxRequestsPerWorker: 1,
+		},
+		"all upper bounds": {
+			MinIdleWorkers:       ^uint32(0),
+			MaxIdleWorkers:       ^uint32(0),
+			MaxProbingWorkers:    ^uint32(0),
+			ProbeIntervalSecs:    60,
+			ProbeTimeoutMs:       10000,
+			IdleTtlSecs:          ^uint32(0),
+			MaxRequestsPerWorker: 65535,
+		},
+		"equal idle bounds": {
+			MinIdleWorkers:       8,
+			MaxIdleWorkers:       8,
+			MaxProbingWorkers:    8,
+			ProbeIntervalSecs:    5,
+			ProbeTimeoutMs:       2000,
+			IdleTtlSecs:          24,
+			MaxRequestsPerWorker: 128,
+		},
+		"24 hour idle TTL": {
+			MaxIdleWorkers:       2,
+			MaxProbingWorkers:    1,
+			ProbeIntervalSecs:    5,
+			ProbeTimeoutMs:       2000,
+			IdleTtlSecs:          86400,
+			MaxRequestsPerWorker: 128,
+		},
+	}
+	for name, pool := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := MuxConfig{Enabled: true, Concurrency: 1, WorkerPool: &pool}
+			if _, err := config.Build(); err != nil {
+				t.Fatalf("legal boundary was rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestMuxWorkerPoolRequiresEnabledMux(t *testing.T) {
+	pool := &WorkerPoolConfig{
+		MaxIdleWorkers:       1,
+		MaxProbingWorkers:    1,
+		ProbeIntervalSecs:    2,
+		ProbeTimeoutMs:       200,
+		IdleTtlSecs:          5,
+		MaxRequestsPerWorker: 1,
+	}
+	for _, config := range []MuxConfig{
+		{Enabled: false, Concurrency: 1, WorkerPool: pool},
+		{Enabled: true, Concurrency: 0, WorkerPool: pool},
+		{Enabled: true, Concurrency: -1, WorkerPool: pool},
+	} {
+		if _, err := config.Build(); err == nil {
+			t.Fatalf("invalid mux config was accepted: %+v", config)
+		}
+	}
+}
+
+func FuzzMuxWorkerPoolConfigBuild(f *testing.F) {
+	f.Add(uint32(0), uint32(2), uint32(1), uint32(5), uint32(2000), uint32(24), uint32(128))
+	f.Add(^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0))
+	f.Fuzz(func(t *testing.T, minIdle, maxIdle, maxProbing, interval, timeout, ttl, maxRequests uint32) {
+		config := WorkerPoolConfig{
+			MinIdleWorkers:       minIdle,
+			MaxIdleWorkers:       maxIdle,
+			MaxProbingWorkers:    maxProbing,
+			ProbeIntervalSecs:    interval,
+			ProbeTimeoutMs:       timeout,
+			IdleTtlSecs:          ttl,
+			MaxRequestsPerWorker: maxRequests,
+		}
+		built, err := config.Build()
+		if err != nil {
+			return
+		}
+		if built.MinIdleWorkers > built.MaxIdleWorkers || built.MaxProbingWorkers > built.MaxIdleWorkers {
+			t.Fatalf("Build() accepted inconsistent values: %+v", built)
+		}
+		if uint64(built.ProbeTimeoutMs) >= uint64(built.ProbeIntervalSecs)*1000 {
+			t.Fatalf("Build() accepted timeout >= interval: %+v", built)
+		}
+	})
+}
+
 func TestConfig_Override(t *testing.T) {
 	tests := []struct {
 		name string

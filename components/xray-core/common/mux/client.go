@@ -27,6 +27,23 @@ type ClientManager struct {
 	Picker  WorkerPicker
 }
 
+func (m *ClientManager) Drain() error {
+	if m == nil || m.Picker == nil {
+		return nil
+	}
+	if drainer, ok := m.Picker.(interface{ Drain() error }); ok {
+		return drainer.Drain()
+	}
+	return nil
+}
+
+func (m *ClientManager) Close() error {
+	if m == nil || m.Picker == nil {
+		return nil
+	}
+	return common.Close(m.Picker)
+}
+
 func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
 	for i := 0; i < 16; i++ {
 		worker, err := m.Picker.PickAvailable()
@@ -47,10 +64,24 @@ type WorkerPicker interface {
 
 type IncrementalWorkerPicker struct {
 	Factory ClientWorkerFactory
+	Pool    *WorkerPoolConfig
+	Tag     string
 
-	access      sync.Mutex
-	workers     []*ClientWorker
-	cleanupTask *task.Periodic
+	access          sync.Mutex
+	workers         []*ClientWorker
+	cleanupTask     *task.Periodic
+	config          *WorkerPoolConfig
+	poolClosed      bool
+	poolUsed        bool
+	warmRunning     bool
+	warmFailures    int
+	nextWarmAttempt time.Time
+	warmTimer       poolTimer
+	lastTimeoutLog  time.Time
+	suppressedLogs  uint64
+	clock           poolClock
+	jitter          func(time.Duration) time.Duration
+	poolStats       workerPoolStats
 }
 
 func (p *IncrementalWorkerPicker) cleanupFunc() error {
@@ -76,6 +107,16 @@ func (p *IncrementalWorkerPicker) cleanup() {
 }
 
 func (p *IncrementalWorkerPicker) findAvailable() int {
+	if p.config != nil {
+		for _, desired := range []clientWorkerState{workerActive, workerIdleReady} {
+			for idx, worker := range p.workers {
+				if worker.reserveForDispatch(desired, false) {
+					return idx
+				}
+			}
+		}
+		return -1
+	}
 	for idx, w := range p.workers {
 		if !w.IsFull() {
 			return idx
@@ -88,14 +129,21 @@ func (p *IncrementalWorkerPicker) findAvailable() int {
 func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
 	p.access.Lock()
 	defer p.access.Unlock()
+	if p.poolClosed {
+		return nil, false, errors.New("mux worker picker is closed")
+	}
+	if p.config == nil {
+		p.config = p.Pool
+	}
 
 	idx := p.findAvailable()
 	if idx >= 0 {
+		worker := p.workers[idx]
 		n := len(p.workers)
 		if n > 1 && idx != n-1 {
 			p.workers[n-1], p.workers[idx] = p.workers[idx], p.workers[n-1]
 		}
-		return p.workers[idx], false, nil
+		return worker, false, nil
 	}
 
 	p.cleanup()
@@ -104,9 +152,26 @@ func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	if p.config != nil && !worker.attachPool(p, workerActive, p.nowLocked()) {
+		common.Close(worker)
+		return nil, false, errors.New("new mux worker closed before use")
+	}
+	if p.config != nil && !worker.reserveForDispatch(workerActive, true) {
+		common.Close(worker)
+		return nil, false, errors.New("new mux worker could not reserve its first request")
+	}
 	p.workers = append(p.workers, worker)
+	if p.config != nil {
+		p.poolStats.workerCreatedDemand.Add(1)
+		p.warmFailures = 0
+		p.nextWarmAttempt = time.Time{}
+		if p.warmTimer != nil {
+			p.warmTimer.Stop()
+			p.warmTimer = nil
+		}
+	}
 
-	if p.cleanupTask == nil {
+	if p.config == nil && p.cleanupTask == nil {
 		p.cleanupTask = &task.Periodic{
 			Interval: time.Second * 30,
 			Execute:  p.cleanupFunc,
@@ -118,7 +183,7 @@ func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
 
 func (p *IncrementalWorkerPicker) PickAvailable() (*ClientWorker, error) {
 	worker, start, err := p.pickInternal()
-	if start {
+	if start && p.cleanupTask != nil {
 		common.Must(p.cleanupTask.Start())
 	}
 
@@ -148,12 +213,19 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		return nil, err
 	}
 
-	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
+	go func(p proxy.Outbound, d internet.Dialer, c *done.Instance) {
 		outbounds := []*session.Outbound{{
 			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
 		}}
 		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
 		ctx, cancel := context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-c.Wait():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
 
 		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {
 			errC := errors.Cause(errP)
@@ -161,8 +233,8 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 				errors.LogInfoInner(ctx, errP, "failed to handler mux client connection")
 			}
 		}
-		common.Must(c.Close())
 		cancel()
+		common.Must(c.Close())
 	}(f.Proxy, f.Dialer, c.done)
 
 	return c, nil
@@ -171,6 +243,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 type ClientStrategy struct {
 	MaxConcurrency uint32
 	MaxConnection  uint32
+	WorkerPool     *WorkerPoolConfig
 }
 
 type ClientWorker struct {
@@ -179,6 +252,22 @@ type ClientWorker struct {
 	done           *done.Instance
 	timer          *time.Ticker
 	strategy       ClientStrategy
+
+	poolAccess          sync.Mutex
+	poolOwner           *IncrementalWorkerPicker
+	poolClock           poolClock
+	poolState           clientWorkerState
+	idleSince           time.Time
+	lastIO              time.Time
+	nextProbeAt         time.Time
+	poolTimer           poolTimer
+	poolTimerGeneration uint64
+	probeGeneration     uint64
+	nextProbeID         uint64
+	pendingProbeID      uint64
+	pendingProbe        chan struct{}
+	pendingProbeAcked   bool
+	poolReservations    uint32
 }
 
 var (
@@ -192,8 +281,16 @@ func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, er
 		sessionManager: NewSessionManager(),
 		link:           stream,
 		done:           done.New(),
-		timer:          time.NewTicker(time.Second * 16),
 		strategy:       s,
+		poolState:      workerActive,
+	}
+	if s.WorkerPool == nil {
+		c.timer = time.NewTicker(time.Second * 16)
+	} else {
+		c.nextProbeID = newProbeSeed()
+		c.sessionManager.SetOnEmpty(c.onSessionEmpty)
+		c.link.Reader = &poolActivityReader{Reader: c.link.Reader, worker: c}
+		c.link.Writer = &poolActivityWriter{Writer: c.link.Writer, worker: c}
 	}
 
 	go c.fetchOutput()
@@ -224,6 +321,23 @@ func (m *ClientWorker) Close() error {
 }
 
 func (m *ClientWorker) monitor() {
+	if m.timer == nil {
+		<-m.done.Wait()
+		m.sessionManager.Close()
+		common.Interrupt(m.link.Writer)
+		common.Interrupt(m.link.Reader)
+		m.poolAccess.Lock()
+		owner := m.poolOwner
+		if owner == nil {
+			m.poolState = workerClosed
+			m.stopPoolTimerLocked()
+		}
+		m.poolAccess.Unlock()
+		if owner != nil {
+			owner.onWorkerClosed(m)
+		}
+		return
+	}
 	defer m.timer.Stop()
 
 	for {
@@ -297,26 +411,117 @@ func (m *ClientWorker) IsClosing() bool {
 // IsFull returns true if this ClientWorker is unable to accept more connections.
 // it might be because it is closing, or the number of connections has reached the limit.
 func (m *ClientWorker) IsFull() bool {
+	if m.strategy.WorkerPool == nil {
+		if m.IsClosing() || m.Closed() {
+			return true
+		}
+		sm := m.sessionManager
+		return m.strategy.MaxConcurrency > 0 && sm.Size() >= int(m.strategy.MaxConcurrency)
+	}
+	m.poolAccess.Lock()
+	defer m.poolAccess.Unlock()
+	if m.poolState != workerActive && m.poolState != workerIdleReady {
+		return true
+	}
+	if m.poolState == workerIdleReady && (m.poolClock == nil || !m.idleReadyFreshLocked(m.poolClock.Now())) {
+		return true
+	}
 	if m.IsClosing() || m.Closed() {
 		return true
 	}
 
 	sm := m.sessionManager
-	if m.strategy.MaxConcurrency > 0 && sm.Size() >= int(m.strategy.MaxConcurrency) {
+	active := uint32(sm.Size())
+	if m.poolState == workerActive && active == 0 && m.poolReservations == 0 && m.poolOwner != nil {
+		return true
+	}
+	if m.strategy.MaxConcurrency > 0 && active+m.poolReservations >= m.strategy.MaxConcurrency {
+		return true
+	}
+	if m.strategy.MaxConnection > 0 && uint32(sm.Count())+m.poolReservations >= m.strategy.MaxConnection {
 		return true
 	}
 	return false
 }
 
-func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
-	if m.IsFull() {
+// reserveForDispatch makes Picker selection and capacity accounting one atomic
+// operation. In particular, an active worker whose last session has already
+// left the map cannot be reused in the short interval before its onEmpty
+// callback completes the idle transition.
+func (m *ClientWorker) reserveForDispatch(desired clientWorkerState, allowEmptyActive bool) bool {
+	m.poolAccess.Lock()
+	defer m.poolAccess.Unlock()
+	if m.poolState != desired || m.IsClosing() || m.Closed() {
 		return false
 	}
-
-	sm := m.sessionManager
-	s := sm.Allocate(&m.strategy)
-	if s == nil {
+	// A due timer may still be waiting to run. Never let scheduling latency extend
+	// the idle reuse window or the business idle TTL.
+	if desired == workerIdleReady && (m.poolClock == nil || !m.idleReadyFreshLocked(m.poolClock.Now())) {
 		return false
+	}
+	active := uint32(m.sessionManager.Size())
+	if desired == workerActive && active == 0 && m.poolReservations == 0 && !allowEmptyActive {
+		return false
+	}
+	if m.strategy.MaxConcurrency > 0 && active+m.poolReservations >= m.strategy.MaxConcurrency {
+		return false
+	}
+	if m.strategy.MaxConnection > 0 && uint32(m.sessionManager.Count())+m.poolReservations >= m.strategy.MaxConnection {
+		return false
+	}
+	m.poolReservations++
+	m.stopPoolTimerLocked()
+	m.poolState = workerActive
+	m.idleSince = time.Time{}
+	m.nextProbeAt = time.Time{}
+	return true
+}
+
+func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
+	sm := m.sessionManager
+	var s *Session
+	var owner *IncrementalWorkerPicker
+	if m.strategy.WorkerPool == nil {
+		if m.IsClosing() || m.Closed() || (m.strategy.MaxConcurrency > 0 && sm.Size() >= int(m.strategy.MaxConcurrency)) {
+			return false
+		}
+		s = sm.Allocate(&m.strategy)
+		if s == nil {
+			return false
+		}
+	} else {
+		m.poolAccess.Lock()
+		managed := m.poolOwner != nil
+		if managed {
+			if m.poolReservations == 0 {
+				m.poolAccess.Unlock()
+				return false
+			}
+			m.poolReservations--
+		}
+		if m.poolState != workerActive && m.poolState != workerIdleReady {
+			m.poolAccess.Unlock()
+			return false
+		}
+		if m.IsClosing() || m.Closed() || (m.strategy.MaxConcurrency > 0 && sm.Size() >= int(m.strategy.MaxConcurrency)) {
+			m.poolAccess.Unlock()
+			return false
+		}
+		s = sm.Allocate(&m.strategy)
+		if s == nil {
+			m.poolAccess.Unlock()
+			return false
+		}
+		m.stopPoolTimerLocked()
+		if m.strategy.MaxConnection > 0 && sm.Count() >= int(m.strategy.MaxConnection) {
+			m.poolState = workerDraining
+		} else {
+			m.poolState = workerActive
+		}
+		m.idleSince = time.Time{}
+		m.nextProbeAt = time.Time{}
+		owner = m.poolOwner
+		m.poolAccess.Unlock()
 	}
 	s.input = link.Reader
 	s.output = link.Writer
@@ -327,10 +532,29 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 		case <-s.done.Wait():
 		}
 	}
+	if owner != nil {
+		owner.onWorkerUsed(m)
+	}
 	return true
 }
 
+func (m *ClientWorker) onSessionEmpty() {
+	m.poolAccess.Lock()
+	owner := m.poolOwner
+	m.poolAccess.Unlock()
+	if owner != nil {
+		owner.onWorkerIdle(m)
+	}
+}
+
 func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	if meta.Option.Has(OptionProbe) {
+		if meta.Option.Has(OptionAck) {
+			m.acceptPong(meta.ProbeID)
+			return nil
+		}
+		return writeProbeFrame(m.link.Writer, meta.ProbeID, true)
+	}
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
@@ -358,7 +582,13 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
-	rr := s.NewReader(reader, &meta.Target)
+	// PacketReader attaches the destination pointer to the buffer that it emits.
+	// That buffer may remain queued in the downstream pipe after this handler
+	// returns, while fetchOutput reuses and resets its FrameMetadata for the next
+	// frame. Give every emitted packet an independently owned destination so a
+	// later metadata reset (or endpoint override) cannot mutate an in-flight one.
+	target := meta.Target
+	rr := s.NewReader(reader, &target)
 	err := buf.Copy(rr, s.output)
 	if err != nil && buf.IsWriteError(err) {
 		errors.LogInfoInner(context.Background(), err, "failed to write to downstream. closing session ", s.ID)

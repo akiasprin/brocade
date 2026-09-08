@@ -4,7 +4,21 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Brocade | 跨境网络小管家</title>
+    <title>跨境网络小管家</title>
+    <script id="appearance-bootstrap">
+      (() => {
+        let theme = 'dark';
+        let palette = 'dailan';
+        try {
+          theme = localStorage.getItem('brocade-console:theme') === 'light' ? 'light' : 'dark';
+          const saved = localStorage.getItem('brocade-console:palette');
+          if (['jinzi', 'dailan', 'songlv', 'oufen', 'xuanmo'].includes(saved)) palette = saved;
+        } catch {}
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.dataset.palette = palette;
+        document.querySelector('meta[name="color-scheme"]').content = theme;
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
