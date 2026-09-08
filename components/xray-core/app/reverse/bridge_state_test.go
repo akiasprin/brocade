@@ -1,0 +1,52 @@
+package reverse
+
+import (
+	"context"
+	"sync"
+	"testing"
+
+	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/mux"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/pipe"
+	"google.golang.org/protobuf/proto"
+)
+
+func TestReviewBridgeStateConcurrentControl(t *testing.T) {
+	input, inputWriter := pipe.New()
+	output, outputWriter := pipe.New()
+	worker, err := mux.NewServerWorker(context.Background(), nil,
+		&transport.Link{Reader: input, Writer: outputWriter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	defer inputWriter.Close()
+	defer output.Interrupt()
+	w := &BridgeWorker{Worker: worker}
+	control, controlWriter := pipe.New()
+	defer control.Interrupt()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		w.handleInternalConn(&transport.Link{Reader: control})
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100000; i++ {
+			_ = w.IsActive()
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		data, err := proto.Marshal(&Control{State: Control_State(i % 2)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := controlWriter.WriteMultiBuffer(buf.MergeBytes(nil, data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controlWriter.Close()
+	wg.Wait()
+}

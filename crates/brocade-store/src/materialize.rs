@@ -154,7 +154,7 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
             conn_buffer_size_kb, conn_handshake_secs, stats_user_online, \
-            relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
+            reverse_health, reverse_health_overrides, relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
             relay_mux_max_probing_workers, relay_mux_probe_interval_secs, \
             relay_mux_probe_timeout_ms, relay_mux_idle_ttl_secs, relay_mux_max_requests_per_worker \
          FROM control_state WHERE id = TRUE",
@@ -251,6 +251,10 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             )?,
         },
         relay_mux: hop_mux_from_row(&state)?,
+        reverse_health: serde_json::from_value(state.try_get("reverse_health")?)?,
+        reverse_health_overrides: serde_json::from_value(
+            state.try_get("reverse_health_overrides")?,
+        )?,
         stats_user_online: state.try_get("stats_user_online")?,
         geodata: GeodataSettings {
             cron: state.try_get("geodata_cron")?,
@@ -793,7 +797,7 @@ pub(crate) async fn load_current_snapshot_tx(
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
             conn_buffer_size_kb, conn_handshake_secs, stats_user_online, \
-            relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
+            reverse_health, reverse_health_overrides, relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
             relay_mux_max_probing_workers, relay_mux_probe_interval_secs, \
             relay_mux_probe_timeout_ms, relay_mux_idle_ttl_secs, relay_mux_max_requests_per_worker \
          FROM control_state WHERE id = TRUE",
@@ -890,6 +894,10 @@ pub(crate) async fn load_current_snapshot_tx(
             )?,
         },
         relay_mux: hop_mux_from_row(&state)?,
+        reverse_health: serde_json::from_value(state.try_get("reverse_health")?)?,
+        reverse_health_overrides: serde_json::from_value(
+            state.try_get("reverse_health_overrides")?,
+        )?,
         stats_user_online: state.try_get("stats_user_online")?,
         geodata: GeodataSettings {
             cron: state.try_get("geodata_cron")?,

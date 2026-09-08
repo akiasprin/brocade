@@ -1,0 +1,24 @@
+{
+  "probe_interval_ms": 1500,
+  "probe_timeout_ms": 750,
+  "confirm_timeout_ms": 750,
+  "health_lease_ms": 3000,
+  "min_healthy_workers": 2,
+  "max_idle_ready_workers": 3,
+  "max_parallel_dials_per_pair": 2,
+  "dial_ready_timeout_ms": 2000,
+  "reconnect_backoff_cap_ms": 2000,
+  "tuning": {
+    "probe_jitter_percent": 20,
+    "recovery_successes": 3,
+    "spare_workers": 2,
+    "max_healthy_workers": 6,
+    "max_sessions_per_worker": 4,
+    "reconnect_backoff_base_ms": 100,
+    "reconnect_stable_reset_ms": 2000,
+    "canary_interval_ms": 2000,
+    "canary_timeout_ms": 1000,
+    "canary_successes": 4,
+    "canary_stable_window_ms": 5000
+  }
+}

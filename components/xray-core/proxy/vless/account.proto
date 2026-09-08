@@ -8,9 +8,38 @@ option java_multiple_files = true;
 
 import "app/proxyman/config.proto";
 
+message ReverseHealthTuning {
+ uint32 probe_jitter_percent = 1;
+ uint32 recovery_successes = 2;
+ uint32 spare_workers = 3;
+ uint32 max_healthy_workers = 4;
+ uint32 max_sessions_per_worker = 5;
+ uint32 reconnect_backoff_base_ms = 6;
+ uint32 reconnect_stable_reset_ms = 7;
+ uint32 canary_interval_ms = 8;
+ uint32 canary_timeout_ms = 9;
+ uint32 canary_successes = 10;
+ uint32 canary_stable_window_ms = 11;
+}
+
+message ReverseHealth {
+ uint32 probe_interval_ms = 1;
+ uint32 probe_timeout_ms = 2;
+ uint32 confirm_timeout_ms = 3;
+ uint32 health_lease_ms = 4;
+ uint32 min_healthy_workers = 5;
+ uint32 max_idle_ready_workers = 6;
+ uint32 max_parallel_dials_per_pair = 7;
+ uint32 dial_ready_timeout_ms = 8;
+ uint32 reconnect_backoff_cap_ms = 9;
+ ReverseHealthTuning tuning = 10;
+}
+
 message Reverse {
   string tag = 1;
   xray.app.proxyman.SniffingConfig sniffing = 2;
+  ReverseHealth health = 3;
+  string canary_url = 4;
 }
 
 message Account {

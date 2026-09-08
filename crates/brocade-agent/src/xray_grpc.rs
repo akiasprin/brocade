@@ -897,6 +897,9 @@ mod tests {
         // No traffic has flowed, so no user counter exists yet. What this proves is the call
         // itself: path, framing, flow-control windows, and an empty response decoding to an
         // empty list rather than an error.
+        let health = reverse_health(api_port).expect("read reverse health API");
+        assert!(!health.boot_id.is_empty());
+        assert!(health.workers.is_empty());
         assert!(query_stats(api_port, "user>>>")
             .expect("native query stats")
             .is_empty());
@@ -928,4 +931,25 @@ mod tests {
                 .port()
         }
     }
+}
+
+pub(crate) fn reverse_health(
+    api_port: u16,
+) -> Result<brocade_deployment::protocol::ReverseHealthReport, String> {
+    let response = grpc_unary(
+        api_port,
+        "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot",
+        &[],
+    )?;
+    let mut cursor = 0;
+    while let Some((number, field)) = next_field(&response, &mut cursor)? {
+        if let (1, Field::Bytes(bytes)) = (number, field) {
+            if bytes.len() > 256 * 1024 {
+                return Err("reverse health snapshot exceeds telemetry limit".into());
+            }
+            return serde_json::from_slice(bytes)
+                .map_err(|err| format!("invalid reverse health snapshot: {err}"));
+        }
+    }
+    Err("missing reverse health snapshot".into())
 }

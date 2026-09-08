@@ -95,6 +95,10 @@ pub struct ModelSettings {
     /// complete value or replace it with one complete override; individual fields never inherit.
     #[serde(default)]
     pub relay_mux: HopMux,
+    #[serde(default)]
+    pub reverse_health: ReverseHealth,
+    #[serde(default)]
+    pub reverse_health_overrides: Vec<ReverseHealthOverride>,
     /// Count, per account, how many distinct source addresses are using it at a given
     /// time.
     ///
@@ -123,6 +127,8 @@ impl Default for ModelSettings {
             geodata: GeodataSettings::default(),
             connection: ConnectionSettings::default(),
             relay_mux: HopMux::default(),
+            reverse_health: ReverseHealth::default(),
+            reverse_health_overrides: Vec::new(),
             stats_user_online: false,
         }
     }
@@ -355,7 +361,7 @@ impl Default for PortSettings {
 
 #[cfg(test)]
 mod port_settings_tests {
-    use super::{PortSettings, ANYTLS_PORT_BASE, VLESS_PORT_BASE};
+    use super::{ANYTLS_PORT_BASE, PortSettings, VLESS_PORT_BASE};
 
     #[test]
     fn factory_bases_keep_vless_and_anytls_in_separate_ranges() {
@@ -3500,5 +3506,197 @@ mod hop_mux_tests {
             serde_json::from_value::<HopPool>(override_value).unwrap(),
             HopPool::Mux(Some(value))
         );
+    }
+}
+
+/// Same-tunnel, bidirectional reverse liveness; independent from ordinary Mux pooling.
+/// Present policies are complete values, never partial field inheritance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseHealth {
+    pub probe_interval_ms: u32,
+    pub probe_timeout_ms: u32,
+    pub confirm_timeout_ms: u32,
+    pub health_lease_ms: u32,
+    pub min_healthy_workers: u32,
+    pub max_idle_ready_workers: u32,
+    pub max_parallel_dials_per_pair: u32,
+    pub dial_ready_timeout_ms: u32,
+    pub reconnect_backoff_cap_ms: u32,
+    #[serde(default)]
+    pub tuning: ReverseHealthTuning,
+}
+impl Default for ReverseHealth {
+    fn default() -> Self {
+        Self {
+            probe_interval_ms: 1000,
+            probe_timeout_ms: 750,
+            confirm_timeout_ms: 750,
+            health_lease_ms: 3000,
+            min_healthy_workers: 2,
+            max_idle_ready_workers: 2,
+            max_parallel_dials_per_pair: 2,
+            dial_ready_timeout_ms: 2000,
+            reconnect_backoff_cap_ms: 2000,
+            tuning: ReverseHealthTuning::default(),
+        }
+    }
+}
+impl ReverseHealth {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.tuning.validate()?;
+        if self.tuning.reconnect_backoff_base_ms > self.reconnect_backoff_cap_ms
+            || self.tuning.max_healthy_workers < self.max_idle_ready_workers
+            || self.tuning.spare_workers > self.max_idle_ready_workers
+            || !(100..=60000).contains(&self.probe_interval_ms)
+            || !(50..=10000).contains(&self.probe_timeout_ms)
+            || self.probe_timeout_ms >= self.probe_interval_ms
+            || !(50..=10000).contains(&self.confirm_timeout_ms)
+            || self.health_lease_ms
+                < self
+                    .probe_interval_ms
+                    .saturating_mul(100 + self.tuning.probe_jitter_percent)
+                    / 100
+                    + self.probe_timeout_ms
+            || self.health_lease_ms > 120000
+            || !(1..=8).contains(&self.min_healthy_workers)
+            || self.max_idle_ready_workers < self.min_healthy_workers
+            || self.max_idle_ready_workers > 16
+            || !(1..=8).contains(&self.max_parallel_dials_per_pair)
+            || !(200..=30000).contains(&self.dial_ready_timeout_ms)
+            || !(250..=30000).contains(&self.reconnect_backoff_cap_ms)
+        {
+            return Err("reverse health 参数超出范围，或探活超时/健康租约/备用连接数量不一致");
+        };
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseHealthOverride {
+    pub chain: String,
+    pub from: String,
+    pub to: String,
+    pub health: ReverseHealth,
+}
+impl ModelSettings {
+    pub fn reverse_health_for(&self, chain: &str, from: &str, to: &str) -> ReverseHealth {
+        self.reverse_health_overrides
+            .iter()
+            .find(|r| r.chain == chain && r.from == from && r.to == to)
+            .map(|r| r.health)
+            .unwrap_or(self.reverse_health)
+    }
+    pub fn validate_reverse_health(&self) -> Result<(), String> {
+        self.reverse_health.validate().map_err(str::to_owned)?;
+        let mut keys = std::collections::BTreeSet::new();
+        for r in &self.reverse_health_overrides {
+            r.health.validate().map_err(str::to_owned)?;
+            if r.chain.is_empty()
+                || r.from.is_empty()
+                || r.to.is_empty()
+                || r.from == r.to
+                || !keys.insert((&r.chain, &r.from, &r.to))
+            {
+                return Err("reverse health 覆盖必须指定唯一的 chain/from/to".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Optional as a group for compatibility with policies saved before tuning existed.
+/// Once supplied the group is complete, including for directional overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseHealthTuning {
+    pub probe_jitter_percent: u32,
+    pub recovery_successes: u32,
+    pub spare_workers: u32,
+    pub max_healthy_workers: u32,
+    pub max_sessions_per_worker: u32,
+    pub reconnect_backoff_base_ms: u32,
+    pub reconnect_stable_reset_ms: u32,
+    pub canary_interval_ms: u32,
+    pub canary_timeout_ms: u32,
+    pub canary_successes: u32,
+    pub canary_stable_window_ms: u32,
+}
+impl Default for ReverseHealthTuning {
+    fn default() -> Self {
+        Self {
+            probe_jitter_percent: 10,
+            recovery_successes: 2,
+            spare_workers: 1,
+            max_healthy_workers: 32,
+            max_sessions_per_worker: 16,
+            reconnect_backoff_base_ms: 250,
+            reconnect_stable_reset_ms: 10000,
+            canary_interval_ms: 1000,
+            canary_timeout_ms: 750,
+            canary_successes: 20,
+            canary_stable_window_ms: 10000,
+        }
+    }
+}
+impl ReverseHealthTuning {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(0..=50).contains(&self.probe_jitter_percent)
+            || !(1..=8).contains(&self.recovery_successes)
+            || !(1..=8).contains(&self.spare_workers)
+            || !(1..=32).contains(&self.max_healthy_workers)
+            || !(1..=256).contains(&self.max_sessions_per_worker)
+            || !(50..=30000).contains(&self.reconnect_backoff_base_ms)
+            || !(1000..=300000).contains(&self.reconnect_stable_reset_ms)
+            || !(100..=60000).contains(&self.canary_interval_ms)
+            || !(50..=30000).contains(&self.canary_timeout_ms)
+            || !(1..=1000).contains(&self.canary_successes)
+            || !(0..=300000).contains(&self.canary_stable_window_ms)
+            || self.canary_timeout_ms >= self.canary_interval_ms
+        {
+            return Err("反向隧道高级参数超出范围，或业务探测超时不小于间隔");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reverse_tuning_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_policy_defaults_only_the_new_group_and_round_trips_tuning() {
+        let mut old = serde_json::to_value(ReverseHealth::default()).unwrap();
+        old.as_object_mut().unwrap().remove("tuning");
+        let mut policy: ReverseHealth = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(policy.tuning, ReverseHealthTuning::default());
+        policy.tuning.recovery_successes = 3;
+        policy.tuning.probe_jitter_percent = 25;
+        policy.tuning.max_sessions_per_worker = 4;
+        policy.tuning.canary_interval_ms = 2000;
+        policy.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<ReverseHealth>(serde_json::to_value(policy).unwrap()).unwrap(),
+            policy
+        );
+        old["tuning"] = serde_json::json!({"recovery_successes":3});
+        assert!(serde_json::from_value::<ReverseHealth>(old).is_err());
+        policy.tuning.reconnect_backoff_base_ms = policy.reconnect_backoff_cap_ms + 1;
+        assert!(policy.validate().is_err());
+        policy.tuning = ReverseHealthTuning::default();
+        policy.tuning.spare_workers = policy.max_idle_ready_workers + 1;
+        assert!(policy.validate().is_err());
+        policy.tuning = ReverseHealthTuning::default();
+        policy.tuning.max_healthy_workers = policy.max_idle_ready_workers - 1;
+        assert!(policy.validate().is_err());
+        policy.tuning = ReverseHealthTuning::default();
+        policy.tuning.canary_timeout_ms = policy.tuning.canary_interval_ms;
+        assert!(policy.validate().is_err());
+        policy.tuning = ReverseHealthTuning::default();
+        policy.health_lease_ms = 1800;
+        policy.tuning.probe_jitter_percent = 0;
+        policy.validate().unwrap();
+        policy.tuning.probe_jitter_percent = 50;
+        assert!(policy.validate().is_err());
     }
 }

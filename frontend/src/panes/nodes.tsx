@@ -1,3 +1,4 @@
+import { ReverseHealthCard } from '../reverse-health';
 import { draft } from '../draft';
 import { Fragment, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import * as echarts from 'echarts/core';
@@ -4828,6 +4829,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
   return (
     <NodeDetailLayout sheeted={sheeted} node={n} lamp={lamp} toolbar={detailToolbar}>
+      <ReverseHealthCard nodeId={id} />
       {n.operationally_isolated && (
         <div className="callout warn node-isolation-banner">
           <div className="node-isolation-copy">

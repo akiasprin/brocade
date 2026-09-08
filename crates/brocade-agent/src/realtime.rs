@@ -26,8 +26,8 @@ const IO_POLL: Duration = Duration::from_millis(20);
 const IDLE_POLL: Duration = Duration::from_millis(250);
 const INITIAL_RECONNECT: Duration = Duration::from_secs(1);
 const MAX_RECONNECT: Duration = Duration::from_secs(300);
-const MAX_FRAME_BYTES: usize = 16 * 1024;
-const MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_FRAME_BYTES: usize = 512 * 1024;
+const MAX_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 fn accepted_interval(interval_millis: u32) -> bool {
     matches!(interval_millis, 1_000 | 2_000 | 5_000)
 }
@@ -86,6 +86,7 @@ impl RateSampler {
         self.sequence = self.sequence.wrapping_add(1).max(1);
         let has_timing_gap = elapsed > expected_interval.saturating_mul(2);
         let sample = AgentRealtimeSample {
+            reverse_health: None,
             sequence: self.sequence,
             sampled_at_unix_millis: reading.sampled_at_unix_millis,
             elapsed_millis,
@@ -99,13 +100,30 @@ impl RateSampler {
     }
 }
 
+type HealthCache =
+    std::sync::Arc<std::sync::Mutex<Option<brocade_deployment::protocol::ReverseHealthReport>>>;
 pub(crate) fn run(options: &Options) {
+    let health: HealthCache = Default::default();
+    let cache = health.clone();
+    let state_dir = options.state_dir.clone();
+    // Polling fallback is independent of management connectivity and NIC sampling.
+    thread::spawn(move || loop {
+        let started = Instant::now();
+        let report = fs::read_to_string(state_dir.join("xray.json"))
+            .ok()
+            .and_then(|content| crate::xray_api_port(&content))
+            .and_then(|port| crate::xray_grpc::reverse_health(port).ok());
+        if let Ok(mut value) = cache.lock() {
+            *value = report;
+        }
+        thread::sleep(Duration::from_secs(1).saturating_sub(started.elapsed()));
+    });
     let mut backoff = INITIAL_RECONNECT;
     loop {
         match connect(options) {
             Ok(socket) => {
                 backoff = INITIAL_RECONNECT;
-                if let Err(error) = serve(socket) {
+                if let Err(error) = serve(socket, &health) {
                     eprintln!("realtime: connection ended: {error}");
                 }
             }
@@ -183,7 +201,7 @@ fn websocket_url(server: &str) -> Result<String, String> {
     Err("server URL must start with http:// or https://".to_owned())
 }
 
-fn serve(mut socket: WebSocket<Stream>) -> Result<(), String> {
+fn serve(mut socket: WebSocket<Stream>, health: &HealthCache) -> Result<(), String> {
     let mut active_interval = None;
     let mut next_sample = Instant::now();
     let mut sampler = RateSampler::default();
@@ -235,7 +253,9 @@ fn serve(mut socket: WebSocket<Stream>) -> Result<(), String> {
                 } else {
                     match read_nic(now) {
                         Ok(reading) => {
-                            if let Some(sample) = sampler.advance(reading, interval) {
+                            if let Some(mut sample) = sampler.advance(reading, interval) {
+                                sample.reverse_health =
+                                    health.lock().ok().and_then(|value| value.clone());
                                 let text = serde_json::to_string(&sample)
                                     .map_err(|error| error.to_string())?;
                                 write_pending = send_sample(&mut socket, text)?;
@@ -425,7 +445,7 @@ mod tests {
             apply_mode: ApplyMode::StateDir,
         };
         let socket = connect(&options).unwrap();
-        serve(socket).unwrap();
+        serve(socket, &Default::default()).unwrap();
         server.join().unwrap();
     }
 }

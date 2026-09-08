@@ -24,10 +24,12 @@ const (
 )
 
 const (
-	OptionData  bitmask.Byte = 0x01
-	OptionError bitmask.Byte = 0x02
-	OptionProbe bitmask.Byte = 0x04
-	OptionAck   bitmask.Byte = 0x08
+	OptionData      bitmask.Byte = 0x01
+	OptionError     bitmask.Byte = 0x02
+	OptionProbe     bitmask.Byte = 0x04
+	OptionAck       bitmask.Byte = 0x08
+	OptionValidated bitmask.Byte = 0x10
+	OptionDrain     bitmask.Byte = 0x20
 )
 
 type TargetNetwork byte
@@ -68,11 +70,11 @@ type FrameMetadata struct {
 }
 
 func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
-	if f.Option.Has(OptionAck) && !f.Option.Has(OptionProbe) {
+	if (f.Option.Has(OptionAck) || f.Option.Has(OptionValidated) || f.Option.Has(OptionDrain)) && !f.Option.Has(OptionProbe) {
 		return errors.New("mux ACK option requires probe option")
 	}
 	if f.Option.Has(OptionProbe) {
-		if f.SessionStatus != SessionStatusKeepAlive || f.SessionID != 0 || (f.Option != OptionProbe && f.Option != OptionProbe|OptionAck) {
+		if f.SessionStatus != SessionStatusKeepAlive || f.SessionID != 0 || (f.Option != OptionProbe && f.Option != OptionProbe|OptionAck && f.Option != OptionProbe|OptionValidated && f.Option != OptionProbe|OptionDrain) {
 			return errors.New("invalid mux probe metadata")
 		}
 	}
@@ -157,11 +159,11 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer, readSourceAndLocal bo
 	f.SessionStatus = SessionStatus(b.Byte(2))
 	f.Option = bitmask.Byte(b.Byte(3))
 	f.Target.Network = net.Network_Unknown
-	if f.Option.Has(OptionAck) && !f.Option.Has(OptionProbe) {
+	if (f.Option.Has(OptionAck) || f.Option.Has(OptionValidated) || f.Option.Has(OptionDrain)) && !f.Option.Has(OptionProbe) {
 		return errors.New("mux ACK option requires probe option")
 	}
 	if f.Option.Has(OptionProbe) {
-		if f.SessionStatus != SessionStatusKeepAlive || f.SessionID != 0 || (f.Option != OptionProbe && f.Option != OptionProbe|OptionAck) || b.Len() != 12 {
+		if f.SessionStatus != SessionStatusKeepAlive || f.SessionID != 0 || (f.Option != OptionProbe && f.Option != OptionProbe|OptionAck && f.Option != OptionProbe|OptionValidated && f.Option != OptionProbe|OptionDrain) || b.Len() != 12 {
 			return errors.New("invalid mux probe metadata")
 		}
 		f.ProbeID = binary.BigEndian.Uint64(b.Bytes()[4:12])

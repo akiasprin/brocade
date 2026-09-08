@@ -2,6 +2,8 @@ package reverse
 
 import (
 	"context"
+	"github.com/xtls/xray-core/common/buf"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -99,6 +101,7 @@ func (b *Bridge) Close() error {
 }
 
 type BridgeWorker struct {
+	stateMu    sync.RWMutex
 	Tag        string
 	Worker     *mux.ServerWorker
 	Dispatcher routing.Dispatcher
@@ -151,7 +154,10 @@ func (w *BridgeWorker) Close() error {
 }
 
 func (w *BridgeWorker) IsActive() bool {
-	return w.State == Control_ACTIVE && !w.Worker.Closed()
+	w.stateMu.RLock()
+	active := w.State == Control_ACTIVE
+	w.stateMu.RUnlock()
+	return active && !w.Worker.Closed() && (w.Worker.ReverseHealth() == nil || w.Worker.ReverseHealth().Usable())
 }
 
 func (w *BridgeWorker) Closed() bool {
@@ -186,12 +192,16 @@ func (w *BridgeWorker) handleInternalConn(link *transport.Link) {
 				if w.Timer != nil {
 					w.Timer.SetTimeout(0)
 				}
+				buf.ReleaseMulti(mb)
 				return
 			}
+			w.stateMu.Lock()
 			if ctl.State != w.State {
 				w.State = ctl.State
 			}
+			w.stateMu.Unlock()
 		}
+		buf.ReleaseMulti(mb)
 	}
 }
 

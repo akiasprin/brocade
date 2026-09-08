@@ -1624,6 +1624,8 @@ fn fallback_limit_presets_are_stable_but_not_fleet_wide_constants() {
 fn xray_reality_settings_include_global_client_policy() {
     let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
     doc.settings = ModelSettings {
+        reverse_health: Default::default(),
+        reverse_health_overrides: Vec::new(),
         connection: Default::default(),
         relay_mux: Default::default(),
         stats_user_online: false,
@@ -3841,4 +3843,87 @@ fn assert_encryption_ingress(options: brocade_core::model::VlessEncryptionOption
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn reverse_health_override_reaches_both_ends_with_canary() {
+    let mut doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true, Dns::System),
+        node("sg", [10, 66, 0, 2], false, Dns::System),
+    ]);
+    let relay = AppView {
+        id: "relay".to_owned(),
+        label: "中转".to_owned(),
+        chains: vec![chain("c-relay")],
+        ingresses: vec![ingress("i-relay", "c-relay", "hk")],
+        fronts: Vec::new(),
+        steps: vec![
+            step(
+                "c-relay",
+                "hk",
+                vec![forward_dial("sg", HopDial::Reverse(IpFamily::V4))],
+                Some(accept("uuid-hk", "c-relay@hk")),
+            ),
+            Step {
+                hop_in: None,
+                ..step(
+                    "c-relay",
+                    "sg",
+                    vec![any_egress()],
+                    Some(accept("uuid-sg", "c-relay@sg")),
+                )
+            },
+        ],
+        grants: Vec::new(),
+    };
+    let policy = brocade_core::model::ReverseHealth {
+        tuning: brocade_core::model::ReverseHealthTuning {
+            max_sessions_per_worker: 4,
+            canary_interval_ms: 2000,
+            ..Default::default()
+        },
+        probe_interval_ms: 1800,
+        probe_timeout_ms: 900,
+        health_lease_ms: 4000,
+        ..Default::default()
+    };
+    doc.settings.reverse_health_overrides = vec![brocade_core::model::ReverseHealthOverride {
+        chain: "c-relay".into(),
+        from: "hk".into(),
+        to: "sg".into(),
+        health: policy,
+    }];
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &relay, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.iter().all(|d| d.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+
+    let portal_tag = "rev:portal:relay/c-relay>sg";
+
+    let upstream = parse_xray(&xray::build(&project_node(
+        &sys,
+        std::slice::from_ref(&app_ir),
+        "hk",
+    )));
+    let downstream = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "sg")));
+    let reverse = upstream["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i.pointer("/settings/clients").and_then(Value::as_array))
+        .flatten()
+        .find_map(|client| client.get("reverse"))
+        .unwrap();
+    let dial = outbound(&downstream, "out:rev:relay/c-relay<hk");
+    assert_eq!(reverse["tag"], portal_tag);
+    assert_eq!(reverse["health"], serde_json::to_value(policy).unwrap());
+    assert_eq!(dial["settings"]["reverse"]["health"], reverse["health"]);
+    assert_eq!(reverse["canary_url"], doc.settings.probe.endpoint_url);
 }

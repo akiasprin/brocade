@@ -19,19 +19,23 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	StatsService_GetStats_FullMethodName             = "/xray.app.stats.command.StatsService/GetStats"
-	StatsService_GetStatsOnline_FullMethodName       = "/xray.app.stats.command.StatsService/GetStatsOnline"
-	StatsService_QueryStats_FullMethodName           = "/xray.app.stats.command.StatsService/QueryStats"
-	StatsService_GetSysStats_FullMethodName          = "/xray.app.stats.command.StatsService/GetSysStats"
-	StatsService_GetStatsOnlineIpList_FullMethodName = "/xray.app.stats.command.StatsService/GetStatsOnlineIpList"
-	StatsService_GetAllOnlineUsers_FullMethodName    = "/xray.app.stats.command.StatsService/GetAllOnlineUsers"
-	StatsService_GetUsersStats_FullMethodName        = "/xray.app.stats.command.StatsService/GetUsersStats"
+	StatsService_GetReverseHealthSnapshot_FullMethodName = "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot"
+	StatsService_WatchReverseHealth_FullMethodName       = "/xray.app.stats.command.StatsService/WatchReverseHealth"
+	StatsService_GetStats_FullMethodName                 = "/xray.app.stats.command.StatsService/GetStats"
+	StatsService_GetStatsOnline_FullMethodName           = "/xray.app.stats.command.StatsService/GetStatsOnline"
+	StatsService_QueryStats_FullMethodName               = "/xray.app.stats.command.StatsService/QueryStats"
+	StatsService_GetSysStats_FullMethodName              = "/xray.app.stats.command.StatsService/GetSysStats"
+	StatsService_GetStatsOnlineIpList_FullMethodName     = "/xray.app.stats.command.StatsService/GetStatsOnlineIpList"
+	StatsService_GetAllOnlineUsers_FullMethodName        = "/xray.app.stats.command.StatsService/GetAllOnlineUsers"
+	StatsService_GetUsersStats_FullMethodName            = "/xray.app.stats.command.StatsService/GetUsersStats"
 )
 
 // StatsServiceClient is the client API for StatsService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type StatsServiceClient interface {
+	GetReverseHealthSnapshot(ctx context.Context, in *ReverseHealthRequest, opts ...grpc.CallOption) (*ReverseHealthResponse, error)
+	WatchReverseHealth(ctx context.Context, in *ReverseHealthRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReverseHealthResponse], error)
 	GetStats(ctx context.Context, in *GetStatsRequest, opts ...grpc.CallOption) (*GetStatsResponse, error)
 	GetStatsOnline(ctx context.Context, in *GetStatsRequest, opts ...grpc.CallOption) (*GetStatsResponse, error)
 	QueryStats(ctx context.Context, in *QueryStatsRequest, opts ...grpc.CallOption) (*QueryStatsResponse, error)
@@ -48,6 +52,35 @@ type statsServiceClient struct {
 func NewStatsServiceClient(cc grpc.ClientConnInterface) StatsServiceClient {
 	return &statsServiceClient{cc}
 }
+
+func (c *statsServiceClient) GetReverseHealthSnapshot(ctx context.Context, in *ReverseHealthRequest, opts ...grpc.CallOption) (*ReverseHealthResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReverseHealthResponse)
+	err := c.cc.Invoke(ctx, StatsService_GetReverseHealthSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *statsServiceClient) WatchReverseHealth(ctx context.Context, in *ReverseHealthRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReverseHealthResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StatsService_ServiceDesc.Streams[0], StatsService_WatchReverseHealth_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ReverseHealthRequest, ReverseHealthResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StatsService_WatchReverseHealthClient = grpc.ServerStreamingClient[ReverseHealthResponse]
 
 func (c *statsServiceClient) GetStats(ctx context.Context, in *GetStatsRequest, opts ...grpc.CallOption) (*GetStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -123,6 +156,8 @@ func (c *statsServiceClient) GetUsersStats(ctx context.Context, in *GetUsersStat
 // All implementations must embed UnimplementedStatsServiceServer
 // for forward compatibility.
 type StatsServiceServer interface {
+	GetReverseHealthSnapshot(context.Context, *ReverseHealthRequest) (*ReverseHealthResponse, error)
+	WatchReverseHealth(*ReverseHealthRequest, grpc.ServerStreamingServer[ReverseHealthResponse]) error
 	GetStats(context.Context, *GetStatsRequest) (*GetStatsResponse, error)
 	GetStatsOnline(context.Context, *GetStatsRequest) (*GetStatsResponse, error)
 	QueryStats(context.Context, *QueryStatsRequest) (*QueryStatsResponse, error)
@@ -140,6 +175,12 @@ type StatsServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedStatsServiceServer struct{}
 
+func (UnimplementedStatsServiceServer) GetReverseHealthSnapshot(context.Context, *ReverseHealthRequest) (*ReverseHealthResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetReverseHealthSnapshot not implemented")
+}
+func (UnimplementedStatsServiceServer) WatchReverseHealth(*ReverseHealthRequest, grpc.ServerStreamingServer[ReverseHealthResponse]) error {
+	return status.Error(codes.Unimplemented, "method WatchReverseHealth not implemented")
+}
 func (UnimplementedStatsServiceServer) GetStats(context.Context, *GetStatsRequest) (*GetStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStats not implemented")
 }
@@ -181,6 +222,35 @@ func RegisterStatsServiceServer(s grpc.ServiceRegistrar, srv StatsServiceServer)
 	}
 	s.RegisterService(&StatsService_ServiceDesc, srv)
 }
+
+func _StatsService_GetReverseHealthSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReverseHealthRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StatsServiceServer).GetReverseHealthSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StatsService_GetReverseHealthSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StatsServiceServer).GetReverseHealthSnapshot(ctx, req.(*ReverseHealthRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StatsService_WatchReverseHealth_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ReverseHealthRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(StatsServiceServer).WatchReverseHealth(m, &grpc.GenericServerStream[ReverseHealthRequest, ReverseHealthResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StatsService_WatchReverseHealthServer = grpc.ServerStreamingServer[ReverseHealthResponse]
 
 func _StatsService_GetStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetStatsRequest)
@@ -316,6 +386,10 @@ var StatsService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*StatsServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
+			MethodName: "GetReverseHealthSnapshot",
+			Handler:    _StatsService_GetReverseHealthSnapshot_Handler,
+		},
+		{
 			MethodName: "GetStats",
 			Handler:    _StatsService_GetStats_Handler,
 		},
@@ -344,6 +418,12 @@ var StatsService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _StatsService_GetUsersStats_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchReverseHealth",
+			Handler:       _StatsService_WatchReverseHealth_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "app/stats/command/command.proto",
 }

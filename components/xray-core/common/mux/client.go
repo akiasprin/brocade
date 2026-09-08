@@ -244,9 +244,11 @@ type ClientStrategy struct {
 	MaxConcurrency uint32
 	MaxConnection  uint32
 	WorkerPool     *WorkerPoolConfig
+	ReverseHealth  *ReverseHealthConfig
 }
 
 type ClientWorker struct {
+	health         *ReverseHealth
 	sessionManager *SessionManager
 	link           transport.Link
 	done           *done.Instance
@@ -284,7 +286,18 @@ func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, er
 		strategy:       s,
 		poolState:      workerActive,
 	}
-	if s.WorkerPool == nil {
+	if s.ReverseHealth != nil {
+		c.link.Writer = newHealthWriter(stream.Writer, c.done)
+		hc := *s.ReverseHealth
+		hc.ActiveSessions = c.ActiveConnections
+		hc.DrainIdle = func() bool { return c.sessionManager.Size() == 0 }
+		c.health = newReverseHealth(hc, c.link.Writer.(*healthWriter), c.done)
+		c.sessionManager.SetOnEmpty(func() {
+			if c.IsClosing() {
+				c.Close()
+			}
+		})
+	} else if s.WorkerPool == nil {
 		c.timer = time.NewTicker(time.Second * 16)
 	} else {
 		c.nextProbeID = newProbeSeed()
@@ -317,12 +330,18 @@ func (m *ClientWorker) WaitClosed() <-chan struct{} {
 }
 
 func (m *ClientWorker) Close() error {
+	if m.health != nil {
+		m.health.stop("closed")
+	}
 	return m.done.Close()
 }
 
 func (m *ClientWorker) monitor() {
 	if m.timer == nil {
 		<-m.done.Wait()
+		if m.health != nil {
+			m.health.stop("transport_closed")
+		}
 		m.sessionManager.Close()
 		common.Interrupt(m.link.Writer)
 		common.Interrupt(m.link.Reader)
@@ -345,6 +364,9 @@ func (m *ClientWorker) monitor() {
 		checkCount := m.sessionManager.Count()
 		select {
 		case <-m.done.Wait():
+			if m.health != nil {
+				m.health.stop("transport_closed")
+			}
 			m.sessionManager.Close()
 			common.Interrupt(m.link.Writer)
 			common.Interrupt(m.link.Reader)
@@ -485,7 +507,18 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 		if m.IsClosing() || m.Closed() || (m.strategy.MaxConcurrency > 0 && sm.Size() >= int(m.strategy.MaxConcurrency)) {
 			return false
 		}
-		s = sm.Allocate(&m.strategy)
+		if m.health != nil {
+			m.health.mu.Lock()
+			if m.health.usableLocked(time.Now()) {
+				s = sm.allocateLink(&m.strategy, link)
+			} else {
+				m.health.snapshot.RejectedDispatches++
+				m.health.counters.rejected.Add(1)
+			}
+			m.health.mu.Unlock()
+		} else {
+			s = sm.allocateLink(&m.strategy, link)
+		}
 		if s == nil {
 			return false
 		}
@@ -507,7 +540,7 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 			m.poolAccess.Unlock()
 			return false
 		}
-		s = sm.Allocate(&m.strategy)
+		s = sm.allocateLink(&m.strategy, link)
 		if s == nil {
 			m.poolAccess.Unlock()
 			return false
@@ -523,8 +556,9 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 		owner = m.poolOwner
 		m.poolAccess.Unlock()
 	}
-	s.input = link.Reader
-	s.output = link.Writer
+	if m.health != nil && m.IsClosing() {
+		m.health.Drain()
+	}
 	go fetchInput(ctx, s, m.link.Writer)
 	if _, ok := link.Reader.(*pipe.Reader); !ok {
 		select {
@@ -549,6 +583,9 @@ func (m *ClientWorker) onSessionEmpty() {
 
 func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if meta.Option.Has(OptionProbe) {
+		if m.health != nil {
+			return m.health.receive(meta)
+		}
 		if meta.Option.Has(OptionAck) {
 			m.acceptPong(meta.ProbeID)
 			return nil

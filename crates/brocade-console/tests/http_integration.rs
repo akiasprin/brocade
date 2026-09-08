@@ -492,6 +492,7 @@ async fn realtime_websocket_authenticates_leases_and_forwards_a_sample() {
     );
 
     let sample = brocade_deployment::protocol::AgentRealtimeSample {
+        reverse_health: None,
         sequence: 1,
         sampled_at_unix_millis: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4862,7 +4863,8 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     insert_node(db.pool()).await;
     let (app, token) = admin_app(&db).await;
 
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             Request::put("/certs/domain")
                 .header("authorization", format!("Bearer {token}"))
@@ -4908,14 +4910,28 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         .await
         .unwrap();
     let lock = db.store.try_certificate_scan_lock().await.unwrap().unwrap();
-    let busy = app.clone().oneshot(Request::post("/certs/scan")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty()).unwrap()).await.unwrap();
+    let busy = app
+        .clone()
+        .oneshot(
+            Request::post("/certs/scan")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
     drop(lock);
-    let processed = app.clone().oneshot(Request::post("/certs/scan")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty()).unwrap()).await.unwrap();
+    let processed = app
+        .clone()
+        .oneshot(
+            Request::post("/certs/scan")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(processed.status(), StatusCode::OK);
     let result = response_json(processed).await;
     assert_eq!(result["processing"]["issued"], 1);
@@ -4955,37 +4971,84 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     };
     assert_eq!(slots[0].cert_pem.matches("BEGIN CERTIFICATE").count(), 1);
     assert!(slots[0].key_pem.contains("BEGIN PRIVATE KEY"));
-    let (status, created) = post_json(&app, &token, "/certs/groups", json!({"name": "Immediate issuance"})).await;
+    let (status, created) = post_json(
+        &app,
+        &token,
+        "/certs/groups",
+        json!({"name": "Immediate issuance"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(created["processing"]["issued"], 1);
     assert_eq!(created["processing"]["failed"], 0);
     let id = created["id"].as_str().unwrap();
-    let issued: i64 = sqlx::query_scalar("SELECT count(*) FROM certificates WHERE label_id = $1 AND status = 'serving'")
-        .bind(id).fetch_one(db.pool()).await.unwrap();
+    let issued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM certificates WHERE label_id = $1 AND status = 'serving'",
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     assert_eq!(issued, 1, "creation must finish issuance before returning");
-    let (status, spare) = post_json(&app, &token, &format!("/certs/groups/{id}/spare"), json!({})).await;
+    let (status, spare) = post_json(
+        &app,
+        &token,
+        &format!("/certs/groups/{id}/spare"),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(spare["processing"]["issued"], 1);
     let state: String = sqlx::query_scalar("SELECT status FROM certificates WHERE id = $1")
-        .bind(spare["id"].as_str().unwrap()).fetch_one(db.pool()).await.unwrap();
-    assert_eq!(state, "ready", "spare issuance must finish before returning");
+        .bind(spare["id"].as_str().unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        state, "ready",
+        "spare issuance must finish before returning"
+    );
 
     let configured = app.clone().oneshot(Request::put("/certs/domain")
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({"domain": "missing-token.example.com", "signing_method": "public-ca", "acme_directory": "https://acme.invalid/directory"}).to_string())).unwrap()).await.unwrap();
     assert_eq!(configured.status(), StatusCode::OK);
-    let (status, blocked) = post_json(&app, &token, "/certs/groups", json!({"name": "Missing credential"})).await;
+    let (status, blocked) = post_json(
+        &app,
+        &token,
+        "/certs/groups",
+        json!({"name": "Missing credential"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(blocked["processing"]["failed"], 1, "missing credentials must surface as a failed attempt, not a queue");
-    let retry = app.clone().oneshot(Request::post("/certs/scan")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(
+        blocked["processing"]["failed"], 1,
+        "missing credentials must surface as a failed attempt, not a queue"
+    );
+    let retry = app
+        .clone()
+        .oneshot(
+            Request::post("/certs/scan")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(retry.status(), StatusCode::OK);
-    let counts: (i64, i64) = sqlx::query_as("SELECT count(*), sum(attempts)::bigint FROM certificates WHERE label_id = $1")
-        .bind(blocked["id"].as_str().unwrap()).fetch_one(db.pool()).await.unwrap();
-    assert_eq!(counts, (1, 2), "manual retry must reuse the failed request immediately");
-
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), sum(attempts)::bigint FROM certificates WHERE label_id = $1",
+    )
+    .bind(blocked["id"].as_str().unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        counts,
+        (1, 2),
+        "manual retry must reuse the failed request immediately"
+    );
 }
 
 async fn apply_step_json(

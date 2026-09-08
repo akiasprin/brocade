@@ -235,6 +235,8 @@ pub struct XrayPlan {
 // tunnel was established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayReversePortalPlan {
+    pub canary_url: String,
+    pub health: crate::model::ReverseHealth,
     pub tag: String,
     /// The identity the downstream connects with (xray's client email). The tag is
     /// attached to this credential, so holding it is what authorizes attaching the
@@ -247,6 +249,7 @@ pub struct XrayReversePortalPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayReverseBridgePlan {
+    pub health: crate::model::ReverseHealth,
     pub tag: String,
     /// The outbound used to dial the upstream. The reverse tunnel's TCP connection
     /// originates here.
@@ -724,8 +727,8 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
         forward_outbounds: xray_forward_outbounds(apps, node_id),
         egress_outbounds: xray_egress_outbounds(apps, node_id, &app_node.egress_dns),
         external_outbounds: xray_external_outbounds(apps, node_id),
-        reverse_portals: xray_reverse_portals(apps, node_id),
-        reverse_bridges: xray_reverse_bridges(apps, node_id),
+        reverse_portals: xray_reverse_portals(apps, node_id, &sys.settings),
+        reverse_bridges: xray_reverse_bridges(apps, node_id, &sys.settings),
         // Counts only `Action::Block` step rules, not ingress guards — a known gap, left as-is
         // for now. A guard also compiles to deny rules pointing at `out:block` (the guard loop in
         // `xray_routing_rules`), so a node whose only blocking comes from a guard — a guarded
@@ -1240,7 +1243,11 @@ fn xray_forward_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayForwardOutbo
     outbounds.into_values().collect()
 }
 
-fn xray_reverse_portals(apps: &[AppIr], node_id: &str) -> Vec<XrayReversePortalPlan> {
+fn xray_reverse_portals(
+    apps: &[AppIr],
+    node_id: &str,
+    settings: &crate::model::ModelSettings,
+) -> Vec<XrayReversePortalPlan> {
     let mut plans = Vec::new();
     for app in sorted_apps(apps) {
         for hop in app
@@ -1249,6 +1256,8 @@ fn xray_reverse_portals(apps: &[AppIr], node_id: &str) -> Vec<XrayReversePortalP
             .filter(|hop| hop.from == node_id && hop.path == HopPath::Reverse)
         {
             plans.push(XrayReversePortalPlan {
+                canary_url: settings.probe.endpoint_url.clone(),
+                health: settings.reverse_health_for(&hop.chain, &hop.from, &hop.to),
                 tag: reverse_portal_tag(app, &hop.chain, &hop.to),
                 peer_label: hop.credential.label.clone(),
                 inbound_tag: hop_inbound_tag(app, &hop.chain),
@@ -1259,7 +1268,11 @@ fn xray_reverse_portals(apps: &[AppIr], node_id: &str) -> Vec<XrayReversePortalP
     plans
 }
 
-fn xray_reverse_bridges(apps: &[AppIr], node_id: &str) -> Vec<XrayReverseBridgePlan> {
+fn xray_reverse_bridges(
+    apps: &[AppIr],
+    node_id: &str,
+    settings: &crate::model::ModelSettings,
+) -> Vec<XrayReverseBridgePlan> {
     let mut plans = Vec::new();
     for app in sorted_apps(apps) {
         for hop in app
@@ -1268,6 +1281,7 @@ fn xray_reverse_bridges(apps: &[AppIr], node_id: &str) -> Vec<XrayReverseBridgeP
             .filter(|hop| hop.to == node_id && hop.path == HopPath::Reverse)
         {
             plans.push(XrayReverseBridgePlan {
+                health: settings.reverse_health_for(&hop.chain, &hop.from, &hop.to),
                 tag: reverse_bridge_tag(app, &hop.chain, &hop.from),
                 dial_tag: reverse_dial_tag(app, &hop.chain, &hop.from),
             });

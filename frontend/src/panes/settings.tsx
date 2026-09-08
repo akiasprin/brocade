@@ -1,8 +1,12 @@
 import { useServerForm } from '../ui/server-form';
+import { ReverseHealthSettings, reversePoliciesError } from '../reverse-health-settings';
 import { useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   DEFAULT_HOP_MUX,
+  DEFAULT_REVERSE_HEALTH,
+  type ReverseHealthPolicy,
+  type ReverseHealthOverride,
   fetchCerts,
   fetchAuthState,
   fetchBranding,
@@ -89,6 +93,8 @@ type Form = {
   muxIdleTtl: string;
   muxMaxRequests: string;
   anyTlsPadding: string;
+  reverseHealth: string;
+  reverseOverrides: string;
 };
 
 /* `Number(x) || 默认值` 在该组字段上不适用：0 是合法取值——上下行半关闭等待 0 秒表示
@@ -178,12 +184,16 @@ const EMPTY: Form = {
   muxIdleTtl: String(DEFAULT_HOP_MUX.idle_ttl_secs),
   muxMaxRequests: String(DEFAULT_HOP_MUX.max_requests_per_worker),
   anyTlsPadding: ANYTLS_PADDING_DEFAULT,
+  reverseHealth: JSON.stringify(DEFAULT_REVERSE_HEALTH),
+  reverseOverrides: '[]',
 };
 
 // 将已保存的设置转换为表单的形态。修改判定基于它：字符串与字符串比较，
 // 不需要在 null、数字和空串之间做转换——这正是此前未修改却显示为已修改的原因。
 function formOf(s: ModelSettings): Form {
   return {
+    reverseHealth: JSON.stringify(s.reverse_health ?? DEFAULT_REVERSE_HEALTH),
+    reverseOverrides: JSON.stringify(s.reverse_health_overrides ?? []),
     min: text(s.reality_client?.min_client_ver ?? null),
     max: text(s.reality_client?.max_client_ver ?? null),
     diff: s.reality_client?.max_time_diff_ms == null ? '' : String(s.reality_client.max_time_diff_ms),
@@ -229,6 +239,8 @@ type SectionKey = 'xray' | 'connection' | 'wireguard' | 'ports' | 'probe' | 'geo
 const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
   xray: ['dest', 'names', 'fp', 'flow', 'min', 'max', 'diff', 'anyTlsPadding'],
   connection: [
+    'reverseHealth',
+    'reverseOverrides',
     'connIdle',
     'connUplink',
     'connDownlink',
@@ -2272,6 +2284,8 @@ export function SettingsPane() {
           buffer_size_kb: v('connBuffer').trim() === '' ? null : numOr(v('connBuffer'), 0),
           handshake_secs: numOr(v('connHandshake'), 60),
         },
+        reverse_health: JSON.parse(v('reverseHealth')) as ReverseHealthPolicy,
+        reverse_health_overrides: JSON.parse(v('reverseOverrides')) as ReverseHealthOverride[],
         relay_mux: {
           concurrency: numOr(v('muxConcurrency'), 1),
           min_idle_workers: numOr(v('muxMinIdle'), 0),
@@ -2332,6 +2346,8 @@ export function SettingsPane() {
     onSave: () => save.mutate(key),
   });
   const relayMuxError = hopMuxError(relayMuxOfForm(form));
+  const reversePolicy = JSON.parse(form.reverseHealth) as ReverseHealthPolicy;
+  const reverseOverrides = JSON.parse(form.reverseOverrides) as ReverseHealthOverride[];
 
   return (
     <div className="cardpage">
@@ -2479,9 +2495,9 @@ export function SettingsPane() {
             <Section
               id="set-conn"
               name="连接策略"
-              sub="连接保持多久、每条占用多少内存。每台机器可单独覆盖"
+              sub="连接资源、中继 Mux 与反向隧道的探测、恢复策略"
               {...secProps('connection')}
-              validationError={relayMuxError}
+              validationError={relayMuxError ?? reversePoliciesError(reversePolicy, reverseOverrides)}
             >
               <Group label="连接资源">
                 <Fld label="空闲多久回收（秒）">
@@ -2667,6 +2683,14 @@ export function SettingsPane() {
                     <div className="guard">探测中的连接不会承接新流；没有可用连接时会立即新建，不等待探测超时。</div>
                   </div>
                 )}
+              </Group>
+              <Group label="反向隧道">
+                <ReverseHealthSettings
+                  policy={reversePolicy}
+                  rows={reverseOverrides}
+                  onPolicyChange={policy => setForm({ ...form, reverseHealth: JSON.stringify(policy) })}
+                  onOverridesChange={rows => setForm({ ...form, reverseOverrides: JSON.stringify(rows) })}
+                />
               </Group>
             </Section>
 

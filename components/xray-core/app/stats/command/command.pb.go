@@ -811,6 +811,87 @@ func (x *GetUsersStatsResponse) GetUsers() []*UserStat {
 	return nil
 }
 
+// JSON schema is shared with the Brocade Agent; sequence gaps require a fresh snapshot.
+type ReverseHealthRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReverseHealthRequest) Reset() {
+	*x = ReverseHealthRequest{}
+	mi := &file_app_stats_command_command_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReverseHealthRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReverseHealthRequest) ProtoMessage() {}
+
+func (x *ReverseHealthRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_app_stats_command_command_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReverseHealthRequest.ProtoReflect.Descriptor instead.
+func (*ReverseHealthRequest) Descriptor() ([]byte, []int) {
+	return file_app_stats_command_command_proto_rawDescGZIP(), []int{15}
+}
+
+type ReverseHealthResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Json          []byte                 `protobuf:"bytes,1,opt,name=json,proto3" json:"json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReverseHealthResponse) Reset() {
+	*x = ReverseHealthResponse{}
+	mi := &file_app_stats_command_command_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReverseHealthResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReverseHealthResponse) ProtoMessage() {}
+
+func (x *ReverseHealthResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_app_stats_command_command_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReverseHealthResponse.ProtoReflect.Descriptor instead.
+func (*ReverseHealthResponse) Descriptor() ([]byte, []int) {
+	return file_app_stats_command_command_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ReverseHealthResponse) GetJson() []byte {
+	if x != nil {
+		return x.Json
+	}
+	return nil
+}
+
 type Config struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -819,7 +900,7 @@ type Config struct {
 
 func (x *Config) Reset() {
 	*x = Config{}
-	mi := &file_app_stats_command_command_proto_msgTypes[15]
+	mi := &file_app_stats_command_command_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -831,7 +912,7 @@ func (x *Config) String() string {
 func (*Config) ProtoMessage() {}
 
 func (x *Config) ProtoReflect() protoreflect.Message {
-	mi := &file_app_stats_command_command_proto_msgTypes[15]
+	mi := &file_app_stats_command_command_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -844,7 +925,7 @@ func (x *Config) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Config.ProtoReflect.Descriptor instead.
 func (*Config) Descriptor() ([]byte, []int) {
-	return file_app_stats_command_command_proto_rawDescGZIP(), []int{15}
+	return file_app_stats_command_command_proto_rawDescGZIP(), []int{17}
 }
 
 var File_app_stats_command_command_proto protoreflect.FileDescriptor
@@ -903,9 +984,14 @@ const file_app_stats_command_command_proto_rawDesc = "" +
 	"\x0finclude_traffic\x18\x01 \x01(\bR\x0eincludeTraffic\x12\x14\n" +
 	"\x05reset\x18\x02 \x01(\bR\x05reset\"O\n" +
 	"\x15GetUsersStatsResponse\x126\n" +
-	"\x05users\x18\x01 \x03(\v2 .xray.app.stats.command.UserStatR\x05users\"\b\n" +
-	"\x06Config2\x86\x06\n" +
-	"\fStatsService\x12_\n" +
+	"\x05users\x18\x01 \x03(\v2 .xray.app.stats.command.UserStatR\x05users\"\x16\n" +
+	"\x14ReverseHealthRequest\"+\n" +
+	"\x15ReverseHealthResponse\x12\x12\n" +
+	"\x04json\x18\x01 \x01(\fR\x04json\"\b\n" +
+	"\x06Config2\xf8\a\n" +
+	"\fStatsService\x12y\n" +
+	"\x18GetReverseHealthSnapshot\x12,.xray.app.stats.command.ReverseHealthRequest\x1a-.xray.app.stats.command.ReverseHealthResponse\"\x00\x12u\n" +
+	"\x12WatchReverseHealth\x12,.xray.app.stats.command.ReverseHealthRequest\x1a-.xray.app.stats.command.ReverseHealthResponse\"\x000\x01\x12_\n" +
 	"\bGetStats\x12'.xray.app.stats.command.GetStatsRequest\x1a(.xray.app.stats.command.GetStatsResponse\"\x00\x12e\n" +
 	"\x0eGetStatsOnline\x12'.xray.app.stats.command.GetStatsRequest\x1a(.xray.app.stats.command.GetStatsResponse\"\x00\x12e\n" +
 	"\n" +
@@ -928,7 +1014,7 @@ func file_app_stats_command_command_proto_rawDescGZIP() []byte {
 	return file_app_stats_command_command_proto_rawDescData
 }
 
-var file_app_stats_command_command_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_app_stats_command_command_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_app_stats_command_command_proto_goTypes = []any{
 	(*GetStatsRequest)(nil),              // 0: xray.app.stats.command.GetStatsRequest
 	(*Stat)(nil),                         // 1: xray.app.stats.command.Stat
@@ -945,32 +1031,38 @@ var file_app_stats_command_command_proto_goTypes = []any{
 	(*UserStat)(nil),                     // 12: xray.app.stats.command.UserStat
 	(*GetUsersStatsRequest)(nil),         // 13: xray.app.stats.command.GetUsersStatsRequest
 	(*GetUsersStatsResponse)(nil),        // 14: xray.app.stats.command.GetUsersStatsResponse
-	(*Config)(nil),                       // 15: xray.app.stats.command.Config
-	nil,                                  // 16: xray.app.stats.command.GetStatsOnlineIpListResponse.IpsEntry
+	(*ReverseHealthRequest)(nil),         // 15: xray.app.stats.command.ReverseHealthRequest
+	(*ReverseHealthResponse)(nil),        // 16: xray.app.stats.command.ReverseHealthResponse
+	(*Config)(nil),                       // 17: xray.app.stats.command.Config
+	nil,                                  // 18: xray.app.stats.command.GetStatsOnlineIpListResponse.IpsEntry
 }
 var file_app_stats_command_command_proto_depIdxs = []int32{
 	1,  // 0: xray.app.stats.command.GetStatsResponse.stat:type_name -> xray.app.stats.command.Stat
 	1,  // 1: xray.app.stats.command.QueryStatsResponse.stat:type_name -> xray.app.stats.command.Stat
-	16, // 2: xray.app.stats.command.GetStatsOnlineIpListResponse.ips:type_name -> xray.app.stats.command.GetStatsOnlineIpListResponse.IpsEntry
+	18, // 2: xray.app.stats.command.GetStatsOnlineIpListResponse.ips:type_name -> xray.app.stats.command.GetStatsOnlineIpListResponse.IpsEntry
 	10, // 3: xray.app.stats.command.UserStat.ips:type_name -> xray.app.stats.command.OnlineIPEntry
 	11, // 4: xray.app.stats.command.UserStat.traffic:type_name -> xray.app.stats.command.TrafficUserStat
 	12, // 5: xray.app.stats.command.GetUsersStatsResponse.users:type_name -> xray.app.stats.command.UserStat
-	0,  // 6: xray.app.stats.command.StatsService.GetStats:input_type -> xray.app.stats.command.GetStatsRequest
-	0,  // 7: xray.app.stats.command.StatsService.GetStatsOnline:input_type -> xray.app.stats.command.GetStatsRequest
-	3,  // 8: xray.app.stats.command.StatsService.QueryStats:input_type -> xray.app.stats.command.QueryStatsRequest
-	5,  // 9: xray.app.stats.command.StatsService.GetSysStats:input_type -> xray.app.stats.command.SysStatsRequest
-	0,  // 10: xray.app.stats.command.StatsService.GetStatsOnlineIpList:input_type -> xray.app.stats.command.GetStatsRequest
-	8,  // 11: xray.app.stats.command.StatsService.GetAllOnlineUsers:input_type -> xray.app.stats.command.GetAllOnlineUsersRequest
-	13, // 12: xray.app.stats.command.StatsService.GetUsersStats:input_type -> xray.app.stats.command.GetUsersStatsRequest
-	2,  // 13: xray.app.stats.command.StatsService.GetStats:output_type -> xray.app.stats.command.GetStatsResponse
-	2,  // 14: xray.app.stats.command.StatsService.GetStatsOnline:output_type -> xray.app.stats.command.GetStatsResponse
-	4,  // 15: xray.app.stats.command.StatsService.QueryStats:output_type -> xray.app.stats.command.QueryStatsResponse
-	6,  // 16: xray.app.stats.command.StatsService.GetSysStats:output_type -> xray.app.stats.command.SysStatsResponse
-	7,  // 17: xray.app.stats.command.StatsService.GetStatsOnlineIpList:output_type -> xray.app.stats.command.GetStatsOnlineIpListResponse
-	9,  // 18: xray.app.stats.command.StatsService.GetAllOnlineUsers:output_type -> xray.app.stats.command.GetAllOnlineUsersResponse
-	14, // 19: xray.app.stats.command.StatsService.GetUsersStats:output_type -> xray.app.stats.command.GetUsersStatsResponse
-	13, // [13:20] is the sub-list for method output_type
-	6,  // [6:13] is the sub-list for method input_type
+	15, // 6: xray.app.stats.command.StatsService.GetReverseHealthSnapshot:input_type -> xray.app.stats.command.ReverseHealthRequest
+	15, // 7: xray.app.stats.command.StatsService.WatchReverseHealth:input_type -> xray.app.stats.command.ReverseHealthRequest
+	0,  // 8: xray.app.stats.command.StatsService.GetStats:input_type -> xray.app.stats.command.GetStatsRequest
+	0,  // 9: xray.app.stats.command.StatsService.GetStatsOnline:input_type -> xray.app.stats.command.GetStatsRequest
+	3,  // 10: xray.app.stats.command.StatsService.QueryStats:input_type -> xray.app.stats.command.QueryStatsRequest
+	5,  // 11: xray.app.stats.command.StatsService.GetSysStats:input_type -> xray.app.stats.command.SysStatsRequest
+	0,  // 12: xray.app.stats.command.StatsService.GetStatsOnlineIpList:input_type -> xray.app.stats.command.GetStatsRequest
+	8,  // 13: xray.app.stats.command.StatsService.GetAllOnlineUsers:input_type -> xray.app.stats.command.GetAllOnlineUsersRequest
+	13, // 14: xray.app.stats.command.StatsService.GetUsersStats:input_type -> xray.app.stats.command.GetUsersStatsRequest
+	16, // 15: xray.app.stats.command.StatsService.GetReverseHealthSnapshot:output_type -> xray.app.stats.command.ReverseHealthResponse
+	16, // 16: xray.app.stats.command.StatsService.WatchReverseHealth:output_type -> xray.app.stats.command.ReverseHealthResponse
+	2,  // 17: xray.app.stats.command.StatsService.GetStats:output_type -> xray.app.stats.command.GetStatsResponse
+	2,  // 18: xray.app.stats.command.StatsService.GetStatsOnline:output_type -> xray.app.stats.command.GetStatsResponse
+	4,  // 19: xray.app.stats.command.StatsService.QueryStats:output_type -> xray.app.stats.command.QueryStatsResponse
+	6,  // 20: xray.app.stats.command.StatsService.GetSysStats:output_type -> xray.app.stats.command.SysStatsResponse
+	7,  // 21: xray.app.stats.command.StatsService.GetStatsOnlineIpList:output_type -> xray.app.stats.command.GetStatsOnlineIpListResponse
+	9,  // 22: xray.app.stats.command.StatsService.GetAllOnlineUsers:output_type -> xray.app.stats.command.GetAllOnlineUsersResponse
+	14, // 23: xray.app.stats.command.StatsService.GetUsersStats:output_type -> xray.app.stats.command.GetUsersStatsResponse
+	15, // [15:24] is the sub-list for method output_type
+	6,  // [6:15] is the sub-list for method input_type
 	6,  // [6:6] is the sub-list for extension type_name
 	6,  // [6:6] is the sub-list for extension extendee
 	0,  // [0:6] is the sub-list for field type_name
@@ -987,7 +1079,7 @@ func file_app_stats_command_command_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_app_stats_command_command_proto_rawDesc), len(file_app_stats_command_command_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   17,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -255,6 +255,10 @@ impl RealtimeService {
         let oldest = received_at_unix_millis
             - i64::try_from(RING_RETENTION.as_millis()).expect("retention fits i64");
         let ring = inner.rings.entry(node_id.to_owned()).or_default();
+        // Keep bulky worker state only on the newest ring entry; NIC history stays small.
+        if let Some(previous) = ring.back_mut() {
+            previous.sample.reverse_health = None;
+        }
         ring.push_back(event.clone());
         trim_ring(ring, oldest);
         let _ = self.events.send(RealtimeBroadcast::Sample(event));
@@ -444,6 +448,7 @@ mod tests {
             interface: "eth0".to_owned(),
             rx_bytes_per_sec: 123,
             tx_bytes_per_sec: 45,
+            reverse_health: None,
             has_gap: false,
         }
     }

@@ -1,0 +1,2 @@
+ALTER TABLE control_state ADD COLUMN reverse_health JSONB NOT NULL DEFAULT '{"probe_interval_ms":1000,"probe_timeout_ms":750,"confirm_timeout_ms":750,"health_lease_ms":3000,"min_healthy_workers":2,"max_idle_ready_workers":2,"max_parallel_dials_per_pair":2,"dial_ready_timeout_ms":2000,"reconnect_backoff_cap_ms":2000}';
+ALTER TABLE control_state ADD COLUMN reverse_health_overrides JSONB NOT NULL DEFAULT '[]';

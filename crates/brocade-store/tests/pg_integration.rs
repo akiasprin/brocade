@@ -2803,6 +2803,8 @@ async fn global_settings_update_materializes_reality_client_policy() {
         .update_settings(
             &system_admin(),
             ModelSettings {
+                reverse_health: Default::default(),
+                reverse_health_overrides: Vec::new(),
                 connection: Default::default(),
                 relay_mux: HopMux {
                     concurrency: 8,
@@ -2870,6 +2872,8 @@ async fn global_settings_update_materializes_reality_client_policy() {
         .update_settings(
             &system_admin(),
             ModelSettings {
+                reverse_health: Default::default(),
+                reverse_health_overrides: Vec::new(),
                 connection: Default::default(),
                 relay_mux: Default::default(),
                 stats_user_online: false,
@@ -4805,6 +4809,8 @@ async fn connection_policy_bounds_hold_on_both_the_node_and_the_settings() {
         .update_settings(
             &system_admin(),
             ModelSettings {
+                reverse_health: Default::default(),
+                reverse_health_overrides: Vec::new(),
                 connection: ConnectionSettings {
                     conn_idle_secs: 0,
                     ..settings.connection
@@ -4823,6 +4829,8 @@ async fn connection_policy_bounds_hold_on_both_the_node_and_the_settings() {
         .update_settings(
             &system_admin(),
             ModelSettings {
+                reverse_health: Default::default(),
+                reverse_health_overrides: Vec::new(),
                 connection: ConnectionSettings {
                     handshake_secs: 0,
                     ..settings.connection
@@ -18874,6 +18882,61 @@ async fn vless_encryption_ingress_round_trips_with_configurable_port_and_stable_
     assert!(db
         .store
         .upsert_ingress(&system_admin(), "app-ab12", invalid)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn reverse_health_settings_round_trip_and_validate() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let mut settings = db.store.settings().await.unwrap();
+    assert_eq!(
+        settings.reverse_health,
+        brocade_core::model::ReverseHealth::default()
+    );
+    settings.reverse_health.probe_interval_ms = 1500;
+    settings.reverse_health.tuning.recovery_successes = 3;
+    settings.reverse_health.tuning.canary_interval_ms = 2000;
+    settings.reverse_health_overrides = vec![brocade_core::model::ReverseHealthOverride {
+        chain: "test-chain".into(),
+        from: "a".into(),
+        to: "b".into(),
+        health: brocade_core::model::ReverseHealth {
+            tuning: brocade_core::model::ReverseHealthTuning {
+                max_sessions_per_worker: 4,
+                ..Default::default()
+            },
+            probe_interval_ms: 2000,
+            health_lease_ms: 4000,
+            ..Default::default()
+        },
+    }];
+    let saved = db
+        .store
+        .update_settings(&system_admin(), settings.clone())
+        .await
+        .unwrap();
+    assert_eq!(saved.settings.reverse_health, settings.reverse_health);
+    assert_eq!(
+        db.store.settings().await.unwrap().reverse_health_overrides,
+        settings.reverse_health_overrides
+    );
+    let materialized = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(
+        materialized.settings.reverse_health,
+        settings.reverse_health
+    );
+    assert_eq!(
+        materialized.settings.reverse_health_overrides,
+        settings.reverse_health_overrides
+    );
+    settings.reverse_health.probe_timeout_ms = 2000;
+    assert!(db
+        .store
+        .update_settings(&system_admin(), settings)
         .await
         .is_err());
 }
