@@ -45,22 +45,11 @@ export interface ForgeState {
   diag: boolean;
 }
 
-const KEY = 'brocade-console:forge-nav';
+export const DEFAULT_NAV: NavKey = 'nodes';
 
 class ForgeStore {
-  private state: ForgeState = { nav: 'nodes', diag: false };
+  private state: ForgeState = { nav: DEFAULT_NAV, diag: false };
   private listeners = new Set<() => void>();
-
-  constructor() {
-    // 记录上次所在的页面——刷新后回到机器列表会要求每次重新导航。
-    // 只记录所在页面，不记录页面内的层级：后者是临时状态。
-    try {
-      const saved = localStorage.getItem(KEY);
-      if (saved && isNavKey(saved)) this.state = { ...this.state, nav: saved };
-    } catch {
-      /* 读取失败时使用默认值 */
-    }
-  }
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -74,11 +63,6 @@ class ForgeStore {
   setNav(nav: NavKey) {
     if (this.state.nav === nav && !this.state.diag) return;
     this.state = { ...this.state, nav, diag: false };
-    try {
-      localStorage.setItem(KEY, nav);
-    } catch {
-      /* 写入失败时不做处理 */
-    }
     this.emit();
   }
 

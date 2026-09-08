@@ -20,7 +20,7 @@
 //   DeployPane 遇到没有携带键的 plan 时会自行生成。
 
 import { wm } from '../wm/store';
-import { forge, isNavKey, type NavKey } from './state';
+import { DEFAULT_NAV, forge, isNavKey, type NavKey } from './state';
 
 // 下钻状态在各页面中是私有的 `type Drill`，此处只将其视为一组字段。
 // 两侧的一致性由下面的表保证：字段名写错时 TS 无法检查，但页面会立即变为空白。
@@ -187,12 +187,13 @@ let started = false;
     订阅和监听只挂一次。 */
 export function startRouting(label: (nav: NavKey) => string) {
   labelOf = label;
-  // 首帧：地址中有位置时以地址为准，没有时将当前位置（forge 从 localStorage 恢复的页面）
-  // 写入地址。使用 replace——进入时即写入一条历史记录会使后退键退到空白页。
+  // 地址中有位置时以地址为准；站点根地址始终打开默认列表，不恢复上次页面或下钻。
+  // 使用 replace，避免为首次进入额外增加一条历史记录。
   const initial = parse(window.location.hash);
   if (initial) {
     apply(initial);
   } else {
+    apply({ nav: DEFAULT_NAV });
     window.history.replaceState(null, '', serialize(current()));
   }
 
@@ -212,8 +213,7 @@ export function startRouting(label: (nav: NavKey) => string) {
   // popstate 处理前进后退；hashchange 处理手动修改地址栏。同一次导航同时触发两者不影响结果，
   // apply 到相同位置时不产生任何操作。
   const restore = () => {
-    const loc = parse(window.location.hash);
-    if (loc) apply(loc);
+    apply(parse(window.location.hash) ?? { nav: DEFAULT_NAV });
   };
   window.addEventListener('popstate', restore);
   window.addEventListener('hashchange', restore);
