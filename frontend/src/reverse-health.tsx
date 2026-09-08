@@ -22,6 +22,7 @@ interface Transition extends Worker {
   from: string;
 }
 interface Canary {
+  freshness_budget_ms?: number;
   pair: string;
   state: string;
   reason: string;
@@ -112,12 +113,16 @@ export function ReverseHealthCard({ nodeId }: { nodeId: string }) {
       <h3>
         反向隧道健康 <small>{stale ? 'UNKNOWN · 数据未到达或已过期' : '实时'}</small>
       </h3>
-      <p>隧道 ACK、可分配容量与业务探测分别显示。业务探测每秒通过实际反向路由访问已配置的探测地址。</p>
+      <p>隧道 ACK、可分配容量与业务探测分别显示。业务探测按链路配置的周期，通过实际反向路由访问探测地址。</p>
       {(report?.canaries ?? []).map(c => (
         <p key={c.pair}>
           <b>{c.pair} 业务探测：</b>
-          {stale || (report?.sampled_at_unix_ms ?? 0) - c.sampled_at_unix_ms > 15000 ? 'UNKNOWN' : c.state} ·{' '}
-          {c.latency_ms} ms · 连续成功 {c.consecutive_successes} 次{' '}
+          {stale ||
+          (report?.sampled_at_unix_ms ?? 0) - c.sampled_at_unix_ms >
+            ((c.freshness_budget_ms ?? 0) > 0 ? c.freshness_budget_ms! : 15000)
+            ? 'UNKNOWN'
+            : c.state}{' '}
+          · {c.latency_ms} ms · 连续成功 {c.consecutive_successes} 次{' '}
           {c.stable_since_unix_ms > 0
             ? `· 持续恢复起点 ${new Date(c.stable_since_unix_ms).toLocaleTimeString()}`
             : '· 尚未确认持续恢复'}

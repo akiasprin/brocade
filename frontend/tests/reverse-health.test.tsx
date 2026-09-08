@@ -91,3 +91,37 @@ it('validates reverse policy independently from ordinary Mux second-based bounds
   expect(reverseHealthError({ ...DEFAULT_REVERSE_HEALTH, max_idle_ready_workers: 1 })).not.toBeNull();
   expect(reverseHealthError({ ...DEFAULT_REVERSE_HEALTH, health_lease_ms: 1000 })).not.toBeNull();
 });
+
+it('uses the configured business probe freshness while keeping telemetry freshness independent', () => {
+  render(<ReverseHealthCard nodeId="node-a" />);
+  const now = Date.now();
+  act(() =>
+    Events.current.send('sample', {
+      received_at_unix_millis: now,
+      sample: {
+        sampled_at_unix_millis: now,
+        reverse_health: {
+          boot_id: '1',
+          sequence: 1,
+          sampled_at_unix_ms: now,
+          workers: [],
+          events: [],
+          canaries: [
+            {
+              pair: 'slow-canary',
+              state: 'AVAILABLE',
+              latency_ms: 150,
+              consecutive_successes: 3,
+              stable_since_unix_ms: 0,
+              sampled_at_unix_ms: now - 30000,
+              freshness_budget_ms: 120750,
+            },
+          ],
+        },
+      },
+    }),
+  );
+  expect(screen.getByText(/AVAILABLE/)).toBeTruthy();
+  act(() => vi.advanceTimersByTime(16000));
+  expect(screen.queryByText(/AVAILABLE/)).toBeNull();
+});

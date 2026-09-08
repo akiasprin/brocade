@@ -249,3 +249,73 @@ func TestReverseWorkerDoesNotMutateSharedInbound(t *testing.T) {
 		t.Fatal("worker modified shared inbound metadata")
 	}
 }
+
+func TestReverseTuningJitterAndRecoveryThreshold(t *testing.T) {
+	h := healthForTest(t)
+	h.config.ProbeJitterPercent = 0
+	if h.probeDelay() != h.config.ProbeInterval {
+		t.Fatal("zero jitter changed interval")
+	}
+	h.config.ProbeJitterPercent = 25
+	for id := uint64(0); id < 1000; id++ {
+		h.nextID = id
+		d := h.probeDelay()
+		if d < 750*time.Millisecond || d > 1250*time.Millisecond {
+			t.Fatalf("jitter out of range: %v", d)
+		}
+	}
+	h.config.RecoverySuccesses = 3
+	h.ownValidated = true
+	h.pendingID = 10
+	h.pendingDeadline = time.Now().Add(-time.Millisecond)
+	h.Usable()
+	for i := 1; i <= 3; i++ {
+		if err := h.receive(&FrameMetadata{Option: OptionProbe | OptionAck, ProbeID: h.pendingID}); err != nil {
+			t.Fatal(err)
+		}
+		if (h.snapshot.State == "READY") != (i == 3) {
+			t.Fatalf("ack %d, state %s", i, h.snapshot.State)
+		}
+	}
+}
+
+func TestReverseCanaryConfiguredSuccessCountAndWindow(t *testing.T) {
+	config := DefaultReverseHealthConfig("canary-tuning-test", "portal")
+	config.CanarySuccesses = 3
+	config.CanaryStableWindow = time.Second
+	config.CanaryInterval = time.Minute
+	c := NewReverseCanary("canary-tuning-test", config)
+	if c.FreshnessBudgetMS != 120750 {
+		t.Fatal("canary freshness ignored interval")
+	}
+	defer c.Close()
+	for i := 0; i < 3; i++ {
+		c.Record(time.Now(), "success")
+	}
+	if c.StableSinceUnixMS != 0 {
+		t.Fatal("success count bypassed stable window")
+	}
+	reverseHealthRegistry.Lock()
+	c.FirstOKUnixMS = time.Now().Add(-2 * time.Second).UnixMilli()
+	reverseHealthRegistry.Unlock()
+	c.Record(time.Now(), "success")
+	if c.StableSinceUnixMS == 0 {
+		t.Fatal("configured threshold did not mark stable")
+	}
+	c.Record(time.Now(), "request_failed")
+	if c.StableSinceUnixMS != 0 || c.ConsecutiveSuccesses != 0 {
+		t.Fatal("failure did not reset stability")
+	}
+	c.Record(time.Now(), "success")
+	reverseHealthRegistry.Lock()
+	c.FirstOKUnixMS = time.Now().Add(-2 * time.Second).UnixMilli()
+	reverseHealthRegistry.Unlock()
+	c.Record(time.Now(), "success")
+	if c.StableSinceUnixMS != 0 {
+		t.Fatal("window bypassed success count")
+	}
+	c.Record(time.Now(), "success")
+	if c.StableSinceUnixMS == 0 {
+		t.Fatal("third success did not mark stable")
+	}
+}

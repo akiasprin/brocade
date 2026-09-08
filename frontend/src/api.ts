@@ -3077,6 +3077,33 @@ export const fetchNodePingProbeRange = (nodeId: string, startUnixSecs: number, e
 export const fetchLinkQuality = (chainId?: string, token = '') =>
   api<{ hops: HopLinkView[] }>(`/links/quality${chainId ? `?chain_id=${encodeURIComponent(chainId)}` : ''}`, token);
 
+export interface ReverseHealthTuning {
+  probe_jitter_percent: number;
+  recovery_successes: number;
+  spare_workers: number;
+  max_healthy_workers: number;
+  max_sessions_per_worker: number;
+  reconnect_backoff_base_ms: number;
+  reconnect_stable_reset_ms: number;
+  canary_interval_ms: number;
+  canary_timeout_ms: number;
+  canary_successes: number;
+  canary_stable_window_ms: number;
+}
+export const DEFAULT_REVERSE_HEALTH_TUNING: ReverseHealthTuning = {
+  probe_jitter_percent: 10,
+  recovery_successes: 2,
+  spare_workers: 1,
+  max_healthy_workers: 32,
+  max_sessions_per_worker: 16,
+  reconnect_backoff_base_ms: 250,
+  reconnect_stable_reset_ms: 10000,
+  canary_interval_ms: 1000,
+  canary_timeout_ms: 750,
+  canary_successes: 20,
+  canary_stable_window_ms: 10000,
+};
+
 export interface ReverseHealthPolicy {
   probe_interval_ms: number;
   probe_timeout_ms: number;
@@ -3087,18 +3114,89 @@ export interface ReverseHealthPolicy {
   max_parallel_dials_per_pair: number;
   dial_ready_timeout_ms: number;
   reconnect_backoff_cap_ms: number;
+  tuning?: ReverseHealthTuning;
 }
 export interface ReverseHealthOverride {
-  chain: string; from: string; to: string; health: ReverseHealthPolicy;
+  chain: string;
+  from: string;
+  to: string;
+  health: ReverseHealthPolicy;
 }
 export const DEFAULT_REVERSE_HEALTH: ReverseHealthPolicy = {
-  probe_interval_ms: 1000, probe_timeout_ms: 750, confirm_timeout_ms: 750,
-  health_lease_ms: 3000, min_healthy_workers: 2, max_idle_ready_workers: 2,
-  max_parallel_dials_per_pair: 2, dial_ready_timeout_ms: 2000, reconnect_backoff_cap_ms: 2000,
+  probe_interval_ms: 1000,
+  probe_timeout_ms: 750,
+  confirm_timeout_ms: 750,
+  health_lease_ms: 3000,
+  min_healthy_workers: 2,
+  max_idle_ready_workers: 2,
+  max_parallel_dials_per_pair: 2,
+  dial_ready_timeout_ms: 2000,
+  reconnect_backoff_cap_ms: 2000,
+  tuning: DEFAULT_REVERSE_HEALTH_TUNING,
 };
 export function reverseHealthError(p: ReverseHealthPolicy): string | null {
-  if (Object.values(p).some(v => !Number.isInteger(v))) return '所有参数必须填写整数';
-  if (p.probe_interval_ms < 100 || p.probe_interval_ms > 60000 || p.probe_timeout_ms < 50 || p.probe_timeout_ms > 10000 || p.probe_timeout_ms >= p.probe_interval_ms || p.confirm_timeout_ms < 50 || p.confirm_timeout_ms > 10000 || p.health_lease_ms < Math.floor(p.probe_interval_ms * 1.1) + p.probe_timeout_ms || p.health_lease_ms > 120000 || p.min_healthy_workers < 1 || p.min_healthy_workers > 8 || p.max_idle_ready_workers < p.min_healthy_workers || p.max_idle_ready_workers > 16 || p.max_parallel_dials_per_pair < 1 || p.max_parallel_dials_per_pair > 8 || p.dial_ready_timeout_ms < 200 || p.dial_ready_timeout_ms > 30000 || p.reconnect_backoff_cap_ms < 250 || p.reconnect_backoff_cap_ms > 30000)
-    return '参数超出范围，或超时、健康租约、备用连接数量不一致';
+  const t = p.tuning ?? DEFAULT_REVERSE_HEALTH_TUNING;
+  if (
+    Object.entries(p).some(
+      ([k, v]) => k !== "tuning" && !Number.isInteger(v),
+    ) ||
+    Object.keys(DEFAULT_REVERSE_HEALTH_TUNING).some(
+      (k) => !Number.isInteger(t[k as keyof ReverseHealthTuning]),
+    )
+  )
+    return "所有参数必须填写整数";
+  if (
+    t.probe_jitter_percent < 0 ||
+    t.probe_jitter_percent > 50 ||
+    t.recovery_successes < 1 ||
+    t.recovery_successes > 8 ||
+    t.spare_workers < 1 ||
+    t.spare_workers > 8 ||
+    t.max_healthy_workers < 1 ||
+    t.max_healthy_workers > 32 ||
+    t.max_sessions_per_worker < 1 ||
+    t.max_sessions_per_worker > 256 ||
+    t.reconnect_backoff_base_ms < 50 ||
+    t.reconnect_backoff_base_ms > 30000 ||
+    t.reconnect_stable_reset_ms < 1000 ||
+    t.reconnect_stable_reset_ms > 300000 ||
+    t.canary_interval_ms < 100 ||
+    t.canary_interval_ms > 60000 ||
+    t.canary_timeout_ms < 50 ||
+    t.canary_timeout_ms > 30000 ||
+    t.canary_successes < 1 ||
+    t.canary_successes > 1000 ||
+    t.canary_stable_window_ms < 0 ||
+    t.canary_stable_window_ms > 300000 ||
+    t.canary_timeout_ms >= t.canary_interval_ms ||
+    t.max_healthy_workers < p.max_idle_ready_workers ||
+    t.spare_workers > p.max_idle_ready_workers ||
+    t.reconnect_backoff_base_ms > p.reconnect_backoff_cap_ms
+  )
+    return "高级参数超出范围，或容量、退避、业务探测时间不一致";
+  if (
+    p.probe_interval_ms < 100 ||
+    p.probe_interval_ms > 60000 ||
+    p.probe_timeout_ms < 50 ||
+    p.probe_timeout_ms > 10000 ||
+    p.probe_timeout_ms >= p.probe_interval_ms ||
+    p.confirm_timeout_ms < 50 ||
+    p.confirm_timeout_ms > 10000 ||
+    p.health_lease_ms <
+      Math.floor((p.probe_interval_ms * (100 + t.probe_jitter_percent)) / 100) +
+        p.probe_timeout_ms ||
+    p.health_lease_ms > 120000 ||
+    p.min_healthy_workers < 1 ||
+    p.min_healthy_workers > 8 ||
+    p.max_idle_ready_workers < p.min_healthy_workers ||
+    p.max_idle_ready_workers > 16 ||
+    p.max_parallel_dials_per_pair < 1 ||
+    p.max_parallel_dials_per_pair > 8 ||
+    p.dial_ready_timeout_ms < 200 ||
+    p.dial_ready_timeout_ms > 30000 ||
+    p.reconnect_backoff_cap_ms < 250 ||
+    p.reconnect_backoff_cap_ms > 30000
+  )
+    return "参数超出范围，或超时、健康租约、备用连接数量不一致";
   return null;
 }

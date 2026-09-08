@@ -13,7 +13,7 @@ import (
 // The canary uses the same tagged outbound, picker and TCP dispatch as business
 // traffic. A backend failure changes only this verdict, never worker ACK health.
 func (r *Reverse) runCanary(ctx context.Context) {
-	observation := mux.NewReverseCanary(r.tag)
+	observation := mux.NewReverseCanary(r.tag, r.health)
 	defer observation.Close()
 	tr := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		dest, err := net.ParseDestination(network + ":" + address)
@@ -23,8 +23,8 @@ func (r *Reverse) runCanary(ctx context.Context) {
 		return tagged.Dialer(ctx, r.dispatcher, dest, r.tag)
 	}}
 	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, Timeout: 750 * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	ticker := time.NewTicker(time.Second)
+	client := &http.Client{Transport: tr, Timeout: r.health.CanaryTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	ticker := time.NewTicker(r.health.CanaryInterval)
 	defer ticker.Stop()
 	for {
 		started := time.Now()

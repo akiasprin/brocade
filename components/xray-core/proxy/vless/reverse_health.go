@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// A present group must be complete. Missing values are not field-by-field
+// A present group must be complete. Omitted tuning uses versioned defaults. Missing values are not field-by-field
 // inheritance: both directions must compile the same effective policy.
 func (r *Reverse) HealthConfig(role string) (mux.ReverseHealthConfig, error) {
 	c := mux.DefaultReverseHealthConfig(r.Tag, role)
@@ -21,7 +21,56 @@ func (r *Reverse) HealthConfig(role string) (mux.ReverseHealthConfig, error) {
 	if h == nil {
 		return c, nil
 	}
-	if h.ProbeIntervalMs < 100 || h.ProbeIntervalMs > 60000 || h.ProbeTimeoutMs < 50 || h.ProbeTimeoutMs > 10000 || h.ProbeTimeoutMs >= h.ProbeIntervalMs || h.ConfirmTimeoutMs < 50 || h.ConfirmTimeoutMs > 10000 || h.HealthLeaseMs < h.ProbeIntervalMs*11/10+h.ProbeTimeoutMs || h.HealthLeaseMs > 120000 || h.DialReadyTimeoutMs < 200 || h.DialReadyTimeoutMs > 30000 || h.MinHealthyWorkers < 1 || h.MinHealthyWorkers > 8 || h.MaxIdleReadyWorkers < h.MinHealthyWorkers || h.MaxIdleReadyWorkers > 16 || h.MaxParallelDialsPerPair < 1 || h.MaxParallelDialsPerPair > 8 || h.ReconnectBackoffCapMs < 250 || h.ReconnectBackoffCapMs > 30000 {
+	if t := h.Tuning; t != nil {
+		if t.ProbeJitterPercent > 50 {
+			return c, errors.New("invalid reverse health tuning: probe_jitter_percent")
+		}
+		if t.RecoverySuccesses < 1 || t.RecoverySuccesses > 8 {
+			return c, errors.New("invalid reverse health tuning: recovery_successes")
+		}
+		if t.SpareWorkers < 1 || t.SpareWorkers > 8 {
+			return c, errors.New("invalid reverse health tuning: spare_workers")
+		}
+		if t.MaxHealthyWorkers < 1 || t.MaxHealthyWorkers > 32 {
+			return c, errors.New("invalid reverse health tuning: max_healthy_workers")
+		}
+		if t.MaxSessionsPerWorker < 1 || t.MaxSessionsPerWorker > 256 {
+			return c, errors.New("invalid reverse health tuning: max_sessions_per_worker")
+		}
+		if t.ReconnectBackoffBaseMs < 50 || t.ReconnectBackoffBaseMs > 30000 {
+			return c, errors.New("invalid reverse health tuning: reconnect_backoff_base_ms")
+		}
+		if t.ReconnectStableResetMs < 1000 || t.ReconnectStableResetMs > 300000 {
+			return c, errors.New("invalid reverse health tuning: reconnect_stable_reset_ms")
+		}
+		if t.CanaryIntervalMs < 100 || t.CanaryIntervalMs > 60000 {
+			return c, errors.New("invalid reverse health tuning: canary_interval_ms")
+		}
+		if t.CanaryTimeoutMs < 50 || t.CanaryTimeoutMs > 30000 {
+			return c, errors.New("invalid reverse health tuning: canary_timeout_ms")
+		}
+		if t.CanarySuccesses < 1 || t.CanarySuccesses > 1000 {
+			return c, errors.New("invalid reverse health tuning: canary_successes")
+		}
+		if t.CanaryStableWindowMs > 300000 {
+			return c, errors.New("invalid reverse health tuning: canary_stable_window_ms")
+		}
+		c.ProbeJitterPercent = t.ProbeJitterPercent
+		c.RecoverySuccesses = t.RecoverySuccesses
+		c.SpareWorkers = t.SpareWorkers
+		c.MaxHealthyWorkers = t.MaxHealthyWorkers
+		c.MaxSessionsPerWorker = t.MaxSessionsPerWorker
+		c.BackoffBase = time.Duration(t.ReconnectBackoffBaseMs) * time.Millisecond
+		c.StableReset = time.Duration(t.ReconnectStableResetMs) * time.Millisecond
+		c.CanaryInterval = time.Duration(t.CanaryIntervalMs) * time.Millisecond
+		c.CanaryTimeout = time.Duration(t.CanaryTimeoutMs) * time.Millisecond
+		c.CanarySuccesses = t.CanarySuccesses
+		c.CanaryStableWindow = time.Duration(t.CanaryStableWindowMs) * time.Millisecond
+	}
+	if c.BackoffBase > time.Duration(h.ReconnectBackoffCapMs)*time.Millisecond || c.MaxHealthyWorkers < h.MaxIdleReadyWorkers || c.SpareWorkers > h.MaxIdleReadyWorkers || c.CanaryTimeout >= c.CanaryInterval {
+		return c, errors.New("inconsistent reverse health tuning")
+	}
+	if h.ProbeIntervalMs < 100 || h.ProbeIntervalMs > 60000 || h.ProbeTimeoutMs < 50 || h.ProbeTimeoutMs > 10000 || h.ProbeTimeoutMs >= h.ProbeIntervalMs || h.ConfirmTimeoutMs < 50 || h.ConfirmTimeoutMs > 10000 || h.HealthLeaseMs < h.ProbeIntervalMs*(100+c.ProbeJitterPercent)/100+h.ProbeTimeoutMs || h.HealthLeaseMs > 120000 || h.DialReadyTimeoutMs < 200 || h.DialReadyTimeoutMs > 30000 || h.MinHealthyWorkers < 1 || h.MinHealthyWorkers > 8 || h.MaxIdleReadyWorkers < h.MinHealthyWorkers || h.MaxIdleReadyWorkers > 16 || h.MaxParallelDialsPerPair < 1 || h.MaxParallelDialsPerPair > 8 || h.ReconnectBackoffCapMs < 250 || h.ReconnectBackoffCapMs > 30000 {
 		return c, errors.New("invalid or incomplete reverse health policy")
 	}
 	c.ProbeInterval = time.Duration(h.ProbeIntervalMs) * time.Millisecond

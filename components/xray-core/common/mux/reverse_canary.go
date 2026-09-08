@@ -3,6 +3,9 @@ package mux
 import "time"
 
 type ReverseCanary struct {
+	FreshnessBudgetMS    int64 `json:"freshness_budget_ms"`
+	requiredSuccesses    uint64
+	stableWindow         time.Duration
 	Pair                 string `json:"pair"`
 	State                string `json:"state"`
 	Reason               string `json:"reason"`
@@ -17,8 +20,8 @@ type ReverseCanary struct {
 }
 
 var reverseCanaries = make(map[string]*ReverseCanary) // guarded by reverseHealthRegistry
-func NewReverseCanary(pair string) *ReverseCanary {
-	c := &ReverseCanary{Pair: pair, State: "UNKNOWN", Reason: "awaiting_probe"}
+func NewReverseCanary(pair string, config ReverseHealthConfig) *ReverseCanary {
+	c := &ReverseCanary{FreshnessBudgetMS: max(15*time.Second, 2*config.CanaryInterval+config.CanaryTimeout).Milliseconds(), requiredSuccesses: uint64(config.CanarySuccesses), stableWindow: config.CanaryStableWindow, Pair: pair, State: "UNKNOWN", Reason: "awaiting_probe"}
 	reverseHealthRegistry.Lock()
 	reverseCanaries[pair] = c
 	reverseHealthRegistry.seq++
@@ -43,7 +46,7 @@ func (c *ReverseCanary) Record(started time.Time, reason string) {
 		if c.ConsecutiveSuccesses == 1 {
 			c.FirstOKUnixMS = now.UnixMilli()
 		}
-		if c.ConsecutiveSuccesses >= 20 && now.UnixMilli()-c.FirstOKUnixMS >= 10000 {
+		if c.ConsecutiveSuccesses >= c.requiredSuccesses && now.UnixMilli()-c.FirstOKUnixMS >= c.stableWindow.Milliseconds() {
 			c.StableSinceUnixMS = c.FirstOKUnixMS
 		}
 	} else {

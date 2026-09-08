@@ -477,19 +477,14 @@ func (r *Reverse) monitor() error {
 		if r.stableSince.IsZero() {
 			r.stableSince = now
 		}
-		if now.Sub(r.stableSince) >= 10*time.Second {
+		if now.Sub(r.stableSince) >= r.health.StableReset {
 			r.failures = 0
 		}
 	} else {
 		r.stableSince = time.Time{}
 	}
-	// MinHealthyWorkers is a total healthy floor. Keep one spare under load;
-	// adding the full floor to each transient canary would churn an extra dial
-	// every second against MaxIdleReadyWorkers.
-	desired := max(r.health.MinHealthyWorkers, busy+1)
-	if desired > 32 {
-		desired = 32
-	}
+	// Keep the configured spare capacity without exceeding the healthy pool limit.
+	desired := r.desiredWorkers(busy)
 	if ready+pending >= desired || pending >= r.health.MaxParallelDials || now.Before(r.nextAttempt) {
 		return nil
 	}
@@ -549,7 +544,7 @@ func (r *Reverse) monitor() error {
 			}
 		}()
 	}
-	base := min(250*time.Millisecond<<min(r.failures, 7), r.health.BackoffCap)
+	base := r.backoffBase()
 	r.failures++
 	r.nextAttempt = now.Add(base/2 + time.Duration(now.UnixNano()%int64(base/2)))
 	return nil
@@ -600,4 +595,11 @@ func (r *Reverse) Close() error {
 		w.Worker.Close()
 	}
 	return nil
+}
+
+func (r *Reverse) desiredWorkers(busy int) int {
+	return min(max(r.health.MinHealthyWorkers, busy+int(r.health.SpareWorkers)), int(r.health.MaxHealthyWorkers))
+}
+func (r *Reverse) backoffBase() time.Duration {
+	return min(r.health.BackoffBase<<min(r.failures, 10), r.health.BackoffCap)
 }

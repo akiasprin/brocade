@@ -15,6 +15,18 @@ import (
 // Reverse health is independent of the ordinary idle Mux pool. Both ends must
 // run this protocol; an endpoint without VALIDATED support never becomes READY.
 type ReverseHealthConfig struct {
+	ProbeJitterPercent   uint32
+	RecoverySuccesses    uint32
+	SpareWorkers         uint32
+	MaxHealthyWorkers    uint32
+	MaxSessionsPerWorker uint32
+	BackoffBase          time.Duration
+	StableReset          time.Duration
+	CanaryInterval       time.Duration
+	CanaryTimeout        time.Duration
+	CanarySuccesses      uint32
+	CanaryStableWindow   time.Duration
+
 	ActiveSessions                                           func() uint32
 	DrainIdle                                                func() bool
 	MinHealthyWorkers, MaxIdleReadyWorkers, MaxParallelDials int
@@ -30,7 +42,7 @@ type ReverseHealthConfig struct {
 }
 
 func DefaultReverseHealthConfig(pair, role string) ReverseHealthConfig {
-	return ReverseHealthConfig{MinHealthyWorkers: 2, MaxIdleReadyWorkers: 2, MaxParallelDials: 2, BackoffCap: 2 * time.Second, Pair: pair, Role: role, ProbeInterval: time.Second, ProbeTimeout: 750 * time.Millisecond, ConfirmTimeout: 750 * time.Millisecond, HealthLease: 3 * time.Second, ReadyTimeout: 2 * time.Second}
+	return ReverseHealthConfig{ProbeJitterPercent: 10, RecoverySuccesses: 2, SpareWorkers: 1, MaxHealthyWorkers: 32, MaxSessionsPerWorker: 16, BackoffBase: 250 * time.Millisecond, StableReset: 10000 * time.Millisecond, CanaryInterval: 1000 * time.Millisecond, CanaryTimeout: 750 * time.Millisecond, CanarySuccesses: 20, CanaryStableWindow: 10000 * time.Millisecond, MinHealthyWorkers: 2, MaxIdleReadyWorkers: 2, MaxParallelDials: 2, BackoffCap: 2 * time.Second, Pair: pair, Role: role, ProbeInterval: time.Second, ProbeTimeout: 750 * time.Millisecond, ConfirmTimeout: 750 * time.Millisecond, HealthLease: 3 * time.Second, ReadyTimeout: 2 * time.Second}
 }
 
 type ReverseHealthSnapshot struct {
@@ -348,14 +360,14 @@ func (h *ReverseHealth) receive(meta *FrameMetadata) error {
 		}
 		if h.snapshot.State == "SUSPECT" {
 			h.recoveryAcks++
-			if h.recoveryAcks < 2 {
+			if uint32(h.recoveryAcks) < h.config.RecoverySuccesses {
 				h.probeLocked(now, time.Until(h.hardDeadline))
 				return nil
 			}
 			h.transitionLocked("READY", "confirmed_recovery")
 		}
-		// Deterministic per-worker jitter bounded to +/- 10%, avoiding fleet alignment.
-		h.nextProbe = now.Add(h.config.ProbeInterval * time.Duration(900+h.nextID%201) / 1000)
+		// Per-worker jitter prevents synchronized fleet probes.
+		h.nextProbe = now.Add(h.probeDelay())
 	default:
 		h.peerID = meta.ProbeID
 		if !h.sendLocked(meta.ProbeID, OptionAck) {
@@ -395,3 +407,9 @@ func (h *ReverseHealth) run() {
 }
 func (m *ClientWorker) ReverseHealth() *ReverseHealth { return m.health }
 func (w *ServerWorker) ReverseHealth() *ReverseHealth { return w.health }
+
+func (h *ReverseHealth) probeDelay() time.Duration {
+	jitter := uint64(h.config.ProbeJitterPercent) * 10
+	factor := 1000 - jitter + h.nextID%(2*jitter+1)
+	return h.config.ProbeInterval * time.Duration(factor) / 1000
+}

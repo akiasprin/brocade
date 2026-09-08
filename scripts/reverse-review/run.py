@@ -31,9 +31,13 @@ def main():
     parser.add_argument('--window',type=int,default=30)
     parser.add_argument('--rtt-ms',type=int,default=0)
     parser.add_argument('--race',action='store_true')
+    parser.add_argument('--health-policy', type=Path, help='Complete reverse health policy JSON applied to both ends')
     parser.add_argument('--jobs',type=int,default=6)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    policy = json.loads(args.health_policy.read_text()) if args.health_policy else None
+    if policy is not None:
+        (args.output / "health-policy.json").write_text(json.dumps(policy, indent=2))
     image = 'brocade-reverse-review:' + uuid.uuid4().hex[:10]
     cases = [('flush_same', 90, {}), ('change_ip', 90, {}),
              ('change_ip_silent', args.silent_window, {}),
@@ -66,6 +70,8 @@ def main():
                     '--tmpfs', '/run', '--privileged', '--entrypoint', 'sleep', image, 'infinity',
                     stdout=sp.DEVNULL)
                 command = ['docker', 'exec']
+                if policy is not None:
+                    command += ['-e', 'LAB_REVERSE_HEALTH=' + json.dumps(policy)]
                 for key, value in env.items():
                     command += ['-e', key + '=' + value]
                 command += [name, 'python3', '/lab/reverse-nat-lab.py', case, str(window)]

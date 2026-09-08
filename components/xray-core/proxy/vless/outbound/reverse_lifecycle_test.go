@@ -51,3 +51,22 @@ func TestReverseDialAdmissionPrioritizesMissingPairsAndIsBounded(t *testing.T) {
 		t.Fatalf("node dial budget=%d", acquired)
 	}
 }
+
+func TestReverseConfiguredCapacityAndBackoff(t *testing.T) {
+	r := &Reverse{health: mux.DefaultReverseHealthConfig("tuning", "bridge")}
+	r.health.SpareWorkers = 3
+	r.health.MaxHealthyWorkers = 7
+	for busy, want := range map[int]int{0: 3, 2: 5, 20: 7} {
+		if got := r.desiredWorkers(busy); got != want {
+			t.Fatalf("busy=%d desired=%d want=%d", busy, got, want)
+		}
+	}
+	r.health.BackoffBase = 50 * time.Millisecond
+	r.health.BackoffCap = 30 * time.Second
+	for failures, want := range map[uint]time.Duration{0: 50 * time.Millisecond, 3: 400 * time.Millisecond, 10: 30 * time.Second, 100: 30 * time.Second} {
+		r.failures = failures
+		if got := r.backoffBase(); got != want {
+			t.Fatalf("failures=%d base=%v want=%v", failures, got, want)
+		}
+	}
+}

@@ -194,6 +194,10 @@ def main():
             portal['inbounds'].append({'tag': 'udp'+str(target), 'listen': '127.0.0.1', 'port': 18081+target,
                 'protocol': 'dokodemo-door', 'settings': {'address': '10.77.1.2', 'port': 8080+target, 'network': 'udp'}})
             portal['routing']['rules'].append({'type': 'field', 'inboundTag': ['udp'+str(target)], 'outboundTag': 'portal'})
+        if os.environ.get('LAB_REVERSE_HEALTH'):
+            health = json.loads(os.environ['LAB_REVERSE_HEALTH'])
+            portal['inbounds'][0]['settings']['clients'][0]['reverse']['health'] = health
+            bridge['outbounds'][1]['settings']['reverse']['health'] = health
         transport = os.environ.get('LAB_TRANSPORT', 'raw')
         if transport in ('tls', 'reality'):
             cert, key = out+'/cert.pem', out+'/key.pem'

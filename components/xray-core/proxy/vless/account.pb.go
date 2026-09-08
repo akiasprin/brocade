@@ -22,6 +22,130 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type ReverseHealthTuning struct {
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	ProbeJitterPercent     uint32                 `protobuf:"varint,1,opt,name=probe_jitter_percent,json=probeJitterPercent,proto3" json:"probe_jitter_percent,omitempty"`
+	RecoverySuccesses      uint32                 `protobuf:"varint,2,opt,name=recovery_successes,json=recoverySuccesses,proto3" json:"recovery_successes,omitempty"`
+	SpareWorkers           uint32                 `protobuf:"varint,3,opt,name=spare_workers,json=spareWorkers,proto3" json:"spare_workers,omitempty"`
+	MaxHealthyWorkers      uint32                 `protobuf:"varint,4,opt,name=max_healthy_workers,json=maxHealthyWorkers,proto3" json:"max_healthy_workers,omitempty"`
+	MaxSessionsPerWorker   uint32                 `protobuf:"varint,5,opt,name=max_sessions_per_worker,json=maxSessionsPerWorker,proto3" json:"max_sessions_per_worker,omitempty"`
+	ReconnectBackoffBaseMs uint32                 `protobuf:"varint,6,opt,name=reconnect_backoff_base_ms,json=reconnectBackoffBaseMs,proto3" json:"reconnect_backoff_base_ms,omitempty"`
+	ReconnectStableResetMs uint32                 `protobuf:"varint,7,opt,name=reconnect_stable_reset_ms,json=reconnectStableResetMs,proto3" json:"reconnect_stable_reset_ms,omitempty"`
+	CanaryIntervalMs       uint32                 `protobuf:"varint,8,opt,name=canary_interval_ms,json=canaryIntervalMs,proto3" json:"canary_interval_ms,omitempty"`
+	CanaryTimeoutMs        uint32                 `protobuf:"varint,9,opt,name=canary_timeout_ms,json=canaryTimeoutMs,proto3" json:"canary_timeout_ms,omitempty"`
+	CanarySuccesses        uint32                 `protobuf:"varint,10,opt,name=canary_successes,json=canarySuccesses,proto3" json:"canary_successes,omitempty"`
+	CanaryStableWindowMs   uint32                 `protobuf:"varint,11,opt,name=canary_stable_window_ms,json=canaryStableWindowMs,proto3" json:"canary_stable_window_ms,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *ReverseHealthTuning) Reset() {
+	*x = ReverseHealthTuning{}
+	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReverseHealthTuning) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReverseHealthTuning) ProtoMessage() {}
+
+func (x *ReverseHealthTuning) ProtoReflect() protoreflect.Message {
+	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReverseHealthTuning.ProtoReflect.Descriptor instead.
+func (*ReverseHealthTuning) Descriptor() ([]byte, []int) {
+	return file_proxy_vless_account_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *ReverseHealthTuning) GetProbeJitterPercent() uint32 {
+	if x != nil {
+		return x.ProbeJitterPercent
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetRecoverySuccesses() uint32 {
+	if x != nil {
+		return x.RecoverySuccesses
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetSpareWorkers() uint32 {
+	if x != nil {
+		return x.SpareWorkers
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetMaxHealthyWorkers() uint32 {
+	if x != nil {
+		return x.MaxHealthyWorkers
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetMaxSessionsPerWorker() uint32 {
+	if x != nil {
+		return x.MaxSessionsPerWorker
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetReconnectBackoffBaseMs() uint32 {
+	if x != nil {
+		return x.ReconnectBackoffBaseMs
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetReconnectStableResetMs() uint32 {
+	if x != nil {
+		return x.ReconnectStableResetMs
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetCanaryIntervalMs() uint32 {
+	if x != nil {
+		return x.CanaryIntervalMs
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetCanaryTimeoutMs() uint32 {
+	if x != nil {
+		return x.CanaryTimeoutMs
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetCanarySuccesses() uint32 {
+	if x != nil {
+		return x.CanarySuccesses
+	}
+	return 0
+}
+
+func (x *ReverseHealthTuning) GetCanaryStableWindowMs() uint32 {
+	if x != nil {
+		return x.CanaryStableWindowMs
+	}
+	return 0
+}
+
 type ReverseHealth struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
 	ProbeIntervalMs         uint32                 `protobuf:"varint,1,opt,name=probe_interval_ms,json=probeIntervalMs,proto3" json:"probe_interval_ms,omitempty"`
@@ -33,13 +157,14 @@ type ReverseHealth struct {
 	MaxParallelDialsPerPair uint32                 `protobuf:"varint,7,opt,name=max_parallel_dials_per_pair,json=maxParallelDialsPerPair,proto3" json:"max_parallel_dials_per_pair,omitempty"`
 	DialReadyTimeoutMs      uint32                 `protobuf:"varint,8,opt,name=dial_ready_timeout_ms,json=dialReadyTimeoutMs,proto3" json:"dial_ready_timeout_ms,omitempty"`
 	ReconnectBackoffCapMs   uint32                 `protobuf:"varint,9,opt,name=reconnect_backoff_cap_ms,json=reconnectBackoffCapMs,proto3" json:"reconnect_backoff_cap_ms,omitempty"`
+	Tuning                  *ReverseHealthTuning   `protobuf:"bytes,10,opt,name=tuning,proto3" json:"tuning,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ReverseHealth) Reset() {
 	*x = ReverseHealth{}
-	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	mi := &file_proxy_vless_account_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -51,7 +176,7 @@ func (x *ReverseHealth) String() string {
 func (*ReverseHealth) ProtoMessage() {}
 
 func (x *ReverseHealth) ProtoReflect() protoreflect.Message {
-	mi := &file_proxy_vless_account_proto_msgTypes[0]
+	mi := &file_proxy_vless_account_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -64,7 +189,7 @@ func (x *ReverseHealth) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReverseHealth.ProtoReflect.Descriptor instead.
 func (*ReverseHealth) Descriptor() ([]byte, []int) {
-	return file_proxy_vless_account_proto_rawDescGZIP(), []int{0}
+	return file_proxy_vless_account_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *ReverseHealth) GetProbeIntervalMs() uint32 {
@@ -130,6 +255,13 @@ func (x *ReverseHealth) GetReconnectBackoffCapMs() uint32 {
 	return 0
 }
 
+func (x *ReverseHealth) GetTuning() *ReverseHealthTuning {
+	if x != nil {
+		return x.Tuning
+	}
+	return nil
+}
+
 type Reverse struct {
 	state         protoimpl.MessageState   `protogen:"open.v1"`
 	Tag           string                   `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
@@ -142,7 +274,7 @@ type Reverse struct {
 
 func (x *Reverse) Reset() {
 	*x = Reverse{}
-	mi := &file_proxy_vless_account_proto_msgTypes[1]
+	mi := &file_proxy_vless_account_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -154,7 +286,7 @@ func (x *Reverse) String() string {
 func (*Reverse) ProtoMessage() {}
 
 func (x *Reverse) ProtoReflect() protoreflect.Message {
-	mi := &file_proxy_vless_account_proto_msgTypes[1]
+	mi := &file_proxy_vless_account_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -167,7 +299,7 @@ func (x *Reverse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Reverse.ProtoReflect.Descriptor instead.
 func (*Reverse) Descriptor() ([]byte, []int) {
-	return file_proxy_vless_account_proto_rawDescGZIP(), []int{1}
+	return file_proxy_vless_account_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Reverse) GetTag() string {
@@ -217,7 +349,7 @@ type Account struct {
 
 func (x *Account) Reset() {
 	*x = Account{}
-	mi := &file_proxy_vless_account_proto_msgTypes[2]
+	mi := &file_proxy_vless_account_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -229,7 +361,7 @@ func (x *Account) String() string {
 func (*Account) ProtoMessage() {}
 
 func (x *Account) ProtoReflect() protoreflect.Message {
-	mi := &file_proxy_vless_account_proto_msgTypes[2]
+	mi := &file_proxy_vless_account_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -242,7 +374,7 @@ func (x *Account) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Account.ProtoReflect.Descriptor instead.
 func (*Account) Descriptor() ([]byte, []int) {
-	return file_proxy_vless_account_proto_rawDescGZIP(), []int{2}
+	return file_proxy_vless_account_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *Account) GetId() string {
@@ -312,7 +444,20 @@ var File_proxy_vless_account_proto protoreflect.FileDescriptor
 
 const file_proxy_vless_account_proto_rawDesc = "" +
 	"\n" +
-	"\x19proxy/vless/account.proto\x12\x10xray.proxy.vless\x1a\x19app/proxyman/config.proto\"\xca\x03\n" +
+	"\x19proxy/vless/account.proto\x12\x10xray.proxy.vless\x1a\x19app/proxyman/config.proto\"\xb4\x04\n" +
+	"\x13ReverseHealthTuning\x120\n" +
+	"\x14probe_jitter_percent\x18\x01 \x01(\rR\x12probeJitterPercent\x12-\n" +
+	"\x12recovery_successes\x18\x02 \x01(\rR\x11recoverySuccesses\x12#\n" +
+	"\rspare_workers\x18\x03 \x01(\rR\fspareWorkers\x12.\n" +
+	"\x13max_healthy_workers\x18\x04 \x01(\rR\x11maxHealthyWorkers\x125\n" +
+	"\x17max_sessions_per_worker\x18\x05 \x01(\rR\x14maxSessionsPerWorker\x129\n" +
+	"\x19reconnect_backoff_base_ms\x18\x06 \x01(\rR\x16reconnectBackoffBaseMs\x129\n" +
+	"\x19reconnect_stable_reset_ms\x18\a \x01(\rR\x16reconnectStableResetMs\x12,\n" +
+	"\x12canary_interval_ms\x18\b \x01(\rR\x10canaryIntervalMs\x12*\n" +
+	"\x11canary_timeout_ms\x18\t \x01(\rR\x0fcanaryTimeoutMs\x12)\n" +
+	"\x10canary_successes\x18\n" +
+	" \x01(\rR\x0fcanarySuccesses\x125\n" +
+	"\x17canary_stable_window_ms\x18\v \x01(\rR\x14canaryStableWindowMs\"\x89\x04\n" +
 	"\rReverseHealth\x12*\n" +
 	"\x11probe_interval_ms\x18\x01 \x01(\rR\x0fprobeIntervalMs\x12(\n" +
 	"\x10probe_timeout_ms\x18\x02 \x01(\rR\x0eprobeTimeoutMs\x12,\n" +
@@ -322,7 +467,9 @@ const file_proxy_vless_account_proto_rawDesc = "" +
 	"\x16max_idle_ready_workers\x18\x06 \x01(\rR\x13maxIdleReadyWorkers\x12<\n" +
 	"\x1bmax_parallel_dials_per_pair\x18\a \x01(\rR\x17maxParallelDialsPerPair\x121\n" +
 	"\x15dial_ready_timeout_ms\x18\b \x01(\rR\x12dialReadyTimeoutMs\x127\n" +
-	"\x18reconnect_backoff_cap_ms\x18\t \x01(\rR\x15reconnectBackoffCapMs\"\xb2\x01\n" +
+	"\x18reconnect_backoff_cap_ms\x18\t \x01(\rR\x15reconnectBackoffCapMs\x12=\n" +
+	"\x06tuning\x18\n" +
+	" \x01(\v2%.xray.proxy.vless.ReverseHealthTuningR\x06tuning\"\xb2\x01\n" +
 	"\aReverse\x12\x10\n" +
 	"\x03tag\x18\x01 \x01(\tR\x03tag\x12=\n" +
 	"\bsniffing\x18\x02 \x01(\v2!.xray.app.proxyman.SniffingConfigR\bsniffing\x127\n" +
@@ -355,22 +502,24 @@ func file_proxy_vless_account_proto_rawDescGZIP() []byte {
 	return file_proxy_vless_account_proto_rawDescData
 }
 
-var file_proxy_vless_account_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_proxy_vless_account_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_proxy_vless_account_proto_goTypes = []any{
-	(*ReverseHealth)(nil),           // 0: xray.proxy.vless.ReverseHealth
-	(*Reverse)(nil),                 // 1: xray.proxy.vless.Reverse
-	(*Account)(nil),                 // 2: xray.proxy.vless.Account
-	(*proxyman.SniffingConfig)(nil), // 3: xray.app.proxyman.SniffingConfig
+	(*ReverseHealthTuning)(nil),     // 0: xray.proxy.vless.ReverseHealthTuning
+	(*ReverseHealth)(nil),           // 1: xray.proxy.vless.ReverseHealth
+	(*Reverse)(nil),                 // 2: xray.proxy.vless.Reverse
+	(*Account)(nil),                 // 3: xray.proxy.vless.Account
+	(*proxyman.SniffingConfig)(nil), // 4: xray.app.proxyman.SniffingConfig
 }
 var file_proxy_vless_account_proto_depIdxs = []int32{
-	3, // 0: xray.proxy.vless.Reverse.sniffing:type_name -> xray.app.proxyman.SniffingConfig
-	0, // 1: xray.proxy.vless.Reverse.health:type_name -> xray.proxy.vless.ReverseHealth
-	1, // 2: xray.proxy.vless.Account.reverse:type_name -> xray.proxy.vless.Reverse
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	0, // 0: xray.proxy.vless.ReverseHealth.tuning:type_name -> xray.proxy.vless.ReverseHealthTuning
+	4, // 1: xray.proxy.vless.Reverse.sniffing:type_name -> xray.app.proxyman.SniffingConfig
+	1, // 2: xray.proxy.vless.Reverse.health:type_name -> xray.proxy.vless.ReverseHealth
+	2, // 3: xray.proxy.vless.Account.reverse:type_name -> xray.proxy.vless.Reverse
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_proxy_vless_account_proto_init() }
@@ -384,7 +533,7 @@ func file_proxy_vless_account_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_vless_account_proto_rawDesc), len(file_proxy_vless_account_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

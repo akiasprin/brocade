@@ -66,3 +66,57 @@ Go 相关包 `go test -race`、真实进程三传输 race NAT 实验、TCP/UDP �
 协议新增健康帧及验证/排空通知，默认启用，无旧版本回退。必须成对升级 portal/bridge；旧端点无法完成 READY 验证。先在测试 pair 发布，再灰度完整 pair，观察 canary、超时、RTT、拒绝派发与重连；回滚也应成对切回匹配二进制和旧配置。不要只更新单端。未发布到生产。
 
 尚未完成 1000 轮 p99 验收、100000 worker-hour 误杀率、极端丢包/高 RTT、高并发容量和管理网络端到端延迟门槛。默认短超时适合本次 RTT 150 ms 环境；高 RTT 场景需显式扩大策略并重新验收。本文不把有限实验解释为生产恢复时间上界。
+
+
+## 配置补全与设置页位置（2026-09-08 后续实现）
+
+设置入口为 **设置 → 连接策略 → 反向隧道**。基础 9 项及新增高级 11 项一起使用“保存这一段”，加入同一份草稿，再发布到两端。定向 `(chain, from, to)` 覆盖也在此处维护。保存其他设置段会保留已写入草稿的反向隧道策略；只读用户不能编辑。
+
+高级参数位于 `reverse_health.tuning`（定向覆盖则为 `health.tuning`）。旧策略没有 tuning 时，整组采用下表默认值；一旦指定 tuning，必须完整提供该组，不逐字段继承。已有 JSONB 数据无需数据库结构迁移，旧数据读取后自动补齐默认组，保存时写出完整策略。生成的 Xray JSON 两端一致。
+
+| 参数 | 含义 | 默认 | 范围 |
+| --- | --- | ---: | --- |
+| `probe_jitter_percent` | 探活间隔抖动（百分比） | 10 | 0–50 |
+| `recovery_successes` | 恢复所需连续应答次数 | 2 | 1–8 |
+| `spare_workers` | 忙时备用隧道数 | 1 | 1–8 |
+| `max_healthy_workers` | 健康隧道总数上限 | 32 | 1–32 |
+| `max_sessions_per_worker` | 每条隧道业务并发上限 | 16 | 1–256 |
+| `reconnect_backoff_base_ms` | 重试退避起点（毫秒） | 250 | 50–30000 |
+| `reconnect_stable_reset_ms` | 稳定后重置退避（毫秒） | 10000 | 1000–300000 |
+| `canary_interval_ms` | 业务探测间隔（毫秒） | 1000 | 100–60000 |
+| `canary_timeout_ms` | 业务探测超时（毫秒） | 750 | 50–30000 |
+| `canary_successes` | 业务稳定所需连续成功次数 | 20 | 1–1000 |
+| `canary_stable_window_ms` | 业务稳定最短观察期（毫秒） | 10000 | 0–300000 |
+
+关联校验：健康租约必须覆盖最大抖动后的间隔加探测超时；备用数 ≤ 空闲上限 ≤ 健康总数上限；退避起点 ≤ 退避上限；canary 超时 < canary 间隔。确认阶段的多个应答仍需在同一个确认窗口内完成，调整成功次数时应同时考虑 RTT 和确认预算。
+
+高级参数直接作用于健康状态机、bridge 容量/退避、portal 业务并发及 canary 定时器/稳定判断。canary 结果有效期随配置变为 `max(15 秒, 2 × canary 间隔 + canary 超时)`；管理采集自身仍使用独立的 15 秒过期判断，不能用较长的业务周期掩盖失联。
+
+仍固定的内部边界已明确：双端探测和双向验证不能关闭；控制队列容量 8、状态事件尾部 256、健康调度 tick 25 ms、bridge 兜底扫描 100 ms、进程级建连并发保护 32；Agent 本地采集间隔 1 秒、管理断连过期 15 秒。它们目前不是此链路策略的可调项，不能通过多个链路覆盖修改进程级边界。启动延迟 2 秒和单 worker 累计 session 上限 4096 也保留原行为。
+
+复现实验可传入自定义策略文件：
+
+```sh
+python3 scripts/reverse-review/run.py --case change_ip_silent \
+  --case downstream_silent --transport raw --transport tls --transport reality \
+  --rtt-ms 150 --window 35 --race --health-policy docs/reverse-health-tuning-example.json \
+  --output target/reverse-tuning-verified
+```
+
+新增回归覆盖配置兼容与完整性、抖动范围/零抖动、自定义恢复应答次数、容量/退避、canary 连续成功与时间窗口、较长业务周期的 UI 有效期、设置页位置、统一保存、跨设置段草稿保留和无效参数禁止保存。前文恢复结果属于前一提交的实验，不作为任意自定义参数下的恢复承诺。
+
+
+配置补全后的最终验证：Go 相关包 race 回归通过；Core 完整测试（含 20 项真实 Xray 二进制测试）通过；Agent 215 项、Deployment 26 项通过；显式启用 Docker 的 PostgreSQL 设置往返通过；Frontend 39 文件、241 项通过，生产构建及修改文件 ESLint 通过。Core 第一次执行因 `.tools` 缺少 geodata 资源而失败，补齐忽略的测试资源后完整重跑通过；未把跳过数据库的初次运行计为真实 PostgreSQL 验证。
+
+自定义策略见 `reverse-health-tuning-example.json`，包含 1500 ms 探测间隔、20% 抖动、3 次恢复应答、2 条备用、6 条健康上限、每 worker 4 条业务并发、100 ms 退避起点、2 秒 canary 周期。RTT 150 ms，真实进程 `-race`，固定 UDP socket，以下 6 项均通过且无 DATA RACE：
+
+| 场景 / 传输 | TCP 稳定恢复 | UDP 稳定恢复 |
+| --- | ---: | ---: |
+| change_ip_silent-raw-0 | 3.074 s | 3.308 s |
+| change_ip_silent-reality-0 | 2.147 s | 3.297 s |
+| change_ip_silent-tls-0 | 2.300 s | 2.541 s |
+| downstream_silent-raw-0 | 2.937 s | 3.316 s |
+| downstream_silent-reality-0 | 1.730 s | 2.576 s |
+| downstream_silent-tls-0 | 2.179 s | 3.346 s |
+
+每场景仅 1 次，不能视为分位数或上界。测试输出 `target/reverse-tuning-verified` 保留实际两端策略、故障注入记录和源码哈希，生产 Go 源码与该次测试逐文件一致。

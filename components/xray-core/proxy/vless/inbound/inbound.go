@@ -679,7 +679,7 @@ func (r *Reverse) Tag() string {
 }
 
 func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer features.Feature) error {
-	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{ReverseHealth: &r.health, MaxConcurrency: 16, MaxConnection: 4096})
+	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{ReverseHealth: &r.health, MaxConcurrency: r.health.MaxSessionsPerWorker, MaxConnection: 4096})
 	if err != nil {
 		return errors.New("failed to create mux client worker").Base(err).AtWarning()
 	}

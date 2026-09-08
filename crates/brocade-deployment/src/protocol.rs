@@ -2245,6 +2245,8 @@ pub struct ReverseHealthReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReverseCanaryReport {
+    #[serde(default)]
+    pub freshness_budget_ms: i64,
     pub pair: String,
     pub state: String,
     pub reason: String,

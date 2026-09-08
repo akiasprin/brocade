@@ -18898,11 +18898,17 @@ async fn reverse_health_settings_round_trip_and_validate() {
         brocade_core::model::ReverseHealth::default()
     );
     settings.reverse_health.probe_interval_ms = 1500;
+    settings.reverse_health.tuning.recovery_successes = 3;
+    settings.reverse_health.tuning.canary_interval_ms = 2000;
     settings.reverse_health_overrides = vec![brocade_core::model::ReverseHealthOverride {
         chain: "test-chain".into(),
         from: "a".into(),
         to: "b".into(),
         health: brocade_core::model::ReverseHealth {
+            tuning: brocade_core::model::ReverseHealthTuning {
+                max_sessions_per_worker: 4,
+                ..Default::default()
+            },
             probe_interval_ms: 2000,
             health_lease_ms: 4000,
             ..Default::default()

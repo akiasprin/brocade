@@ -3877,6 +3877,11 @@ fn reverse_health_override_reaches_both_ends_with_canary() {
         grants: Vec::new(),
     };
     let policy = brocade_core::model::ReverseHealth {
+        tuning: brocade_core::model::ReverseHealthTuning {
+            max_sessions_per_worker: 4,
+            canary_interval_ms: 2000,
+            ..Default::default()
+        },
         probe_interval_ms: 1800,
         probe_timeout_ms: 900,
         health_lease_ms: 4000,

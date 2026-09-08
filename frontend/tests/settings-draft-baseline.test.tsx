@@ -642,3 +642,59 @@ describe('设置页分段保存的基准', () => {
     expect(section('set-ports').getByText('有未保存的改动')).toBeTruthy();
   });
 });
+
+it('反向隧道参数位于连接策略，统一保存并保留到其他段的草稿', async () => {
+  render(<Harness />);
+  await screen.findByPlaceholderText('example.com:443');
+  const connection = section('set-conn');
+  expect(connection.getByLabelText('反向隧道恢复设置')).toBeTruthy();
+  const advanced = connection.getByText('高级参数：探活、容量、退避与业务探测');
+  fireEvent.click(advanced);
+  fireEvent.change(connection.getByLabelText('恢复所需连续应答次数'), { target: { value: '3' } });
+  fireEvent.change(connection.getByLabelText('业务探测间隔（毫秒）'), { target: { value: '2000' } });
+  fireEvent.click(connection.getByRole('button', { name: '添加定向覆盖' }));
+  const row = within(connection.getByText('定向链路覆盖 1').closest('fieldset')!);
+  for (const [label, value] of [
+    ['链路 ID', 'c1'],
+    ['流量起点节点 ID', 'n1'],
+    ['流量终点节点 ID', 'n2'],
+  ]) {
+    fireEvent.change(row.getByLabelText(label), { target: { value } });
+  }
+  fireEvent.change(row.getByLabelText('每条隧道业务并发上限'), { target: { value: '4' } });
+  fireEvent.click(connection.getByRole('button', { name: '保存这一段' }));
+  await waitFor(() =>
+    expect(settingsOp()).toMatchObject({
+      settings: {
+        reverse_health: { tuning: { recovery_successes: 3, canary_interval_ms: 2000 } },
+        reverse_health_overrides: [
+          { chain: 'c1', from: 'n1', to: 'n2', health: { tuning: { max_sessions_per_worker: 4 } } },
+        ],
+      },
+    }),
+  );
+  await waitFor(() => expect(connection.queryByRole('button', { name: '保存这一段' })).toBeNull());
+  fireEvent.change(screen.getByPlaceholderText('example.com:443'), { target: { value: 'new.example:443' } });
+  fireEvent.click(section('set-xray').getByRole('button', { name: '保存这一段' }));
+  await waitFor(() =>
+    expect(settingsOp()).toMatchObject({
+      settings: {
+        reality_site: { dest: 'new.example:443' },
+        reverse_health: { tuning: { recovery_successes: 3 } },
+        reverse_health_overrides: [{ health: { tuning: { max_sessions_per_worker: 4 } } }],
+      },
+    }),
+  );
+});
+
+it('反向隧道高级参数无效时禁止保存连接策略', async () => {
+  render(<Harness />);
+  await screen.findByPlaceholderText('example.com:443');
+  const connection = section('set-conn');
+  fireEvent.click(connection.getByText('高级参数：探活、容量、退避与业务探测'));
+  fireEvent.change(connection.getByLabelText('业务探测超时（毫秒）'), { target: { value: '2000' } });
+  const save = connection.getByRole('button', { name: '保存这一段' }) as HTMLButtonElement;
+  expect(save.disabled).toBe(true);
+  fireEvent.click(save);
+  expect(settingsOp()).toBeUndefined();
+});
