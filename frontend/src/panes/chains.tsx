@@ -5387,7 +5387,9 @@ function listenerRelayLabel(action: Rule['a'], local: boolean): string | null {
 }
 
 type ListenerTreeLink =
-  { kind: 'root' } | { kind: 'forward'; from: ListenerRef } | { kind: 'reference'; from: ListenerRef };
+  | { kind: 'root' }
+  | { kind: 'forward'; from: ListenerRef; staged: boolean }
+  | { kind: 'reference'; from: ListenerRef; staged: boolean };
 
 /**
  * A read-only projection of the actual rule graph.  A referenced listener is expanded from its
@@ -5423,15 +5425,17 @@ export function ListenerDecisionTree({
   // refreshing.  Current-chain props win, and missing rows are added instead of disappearing.
   for (const step of currentSteps) steps.set(listenerRefKey({ chain: step.chain, node: step.node }), step);
 
-  const effectiveRules = (ref: ListenerRef, step: SnapshotStep): { rule: Rule; generated: boolean }[] => {
-    const written =
-      ref.chain === currentChain.id && currentStepKeys.has(listenerRefKey(ref))
-        ? (draftRules[ref.node] ?? step.rules)
-        : step.rules;
+  const effectiveRules = (
+    ref: ListenerRef,
+    step: SnapshotStep,
+  ): { rule: Rule; generated: boolean; staged: boolean }[] => {
+    const usesLocalDraft =
+      ref.chain === currentChain.id && currentStepKeys.has(listenerRefKey(ref)) && Object.hasOwn(draftRules, ref.node);
+    const written = usesLocalDraft ? draftRules[ref.node] : step.rules;
     const generated = compilerFallbackRules(written, compiledRules.get(listenerRefKey(ref)) ?? []);
     return [
-      ...written.map(rule => ({ rule, generated: false })),
-      ...generated.map(rule => ({ rule, generated: true })),
+      ...written.map(rule => ({ rule, generated: false, staged: usesLocalDraft })),
+      ...generated.map(rule => ({ rule, generated: true, staged: false })),
     ];
   };
 
@@ -5454,19 +5458,25 @@ export function ListenerDecisionTree({
     return step.hop_in ? `${step.hop_in.port} / ${hopWireLabel(step.hop_in.security.t)}` : '未配置监听端口';
   };
 
-  const renderMissing = (ref: ListenerRef, pathKey: string) => (
-    <div className="listener-map-card is-missing" key={pathKey}>
-      <span className="listener-map-kicker">引用失效</span>
-      <b>{nodeNames.get(ref.node) || ref.node}</b>
-      <small>{chainNames.get(ref.chain) || ref.chain}</small>
-      <code>找不到监听所有者</code>
-    </div>
-  );
+  const renderMissing = (ref: ListenerRef, link: ListenerTreeLink, pathKey: string) => {
+    // Selecting “create a listener on this machine” first changes the source rule.  Its target
+    // step is created only when the rule editor is saved, so the absence is an expected local
+    // draft state rather than a broken durable reference.
+    const pendingListener = link.kind === 'forward' && link.staged && ref.chain === currentChain.id;
+    return (
+      <div className={`listener-map-card ${pendingListener ? 'is-pending' : 'is-missing'}`} key={pathKey}>
+        <span className="listener-map-kicker">{pendingListener ? '待保存的新监听' : '引用失效'}</span>
+        <b>{nodeNames.get(ref.node) || ref.node}</b>
+        <small>{chainNames.get(ref.chain) || ref.chain}</small>
+        <code>{pendingListener ? '保存到草稿后建立' : '找不到监听所有者'}</code>
+      </div>
+    );
+  };
 
   const renderListener = (ref: ListenerRef, link: ListenerTreeLink, path: Set<string>, pathKey: string): ReactNode => {
     const key = listenerRefKey(ref);
     const step = steps.get(key);
-    if (!step) return renderMissing(ref, pathKey);
+    if (!step) return renderMissing(ref, link, pathKey);
     if (path.has(key)) {
       return (
         <div className="listener-map-card is-cycle" key={pathKey}>
@@ -5504,7 +5514,7 @@ export function ListenerDecisionTree({
         </div>
         {rules.length > 0 && (
           <div className="listener-map-branches">
-            {rules.map(({ rule, generated }, index) => {
+            {rules.map(({ rule, generated, staged }, index) => {
               const target = actionListenerRef(rule.a, ref.chain);
               const terminal = listenerTerminal(rule.a);
               const relay = listenerRelayLabel(
@@ -5534,7 +5544,7 @@ export function ListenerDecisionTree({
                   {target ? (
                     renderListener(
                       target,
-                      { kind: rule.a.t === 'reuse_listener' ? 'reference' : 'forward', from: ref },
+                      { kind: rule.a.t === 'reuse_listener' ? 'reference' : 'forward', from: ref, staged },
                       nextPath,
                       `${branchKey}/${listenerRefKey(target)}`,
                     )

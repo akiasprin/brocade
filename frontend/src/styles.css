@@ -4640,6 +4640,11 @@ input.f {
   border-left-color: var(--listener-ref);
   background: color-mix(in srgb, var(--listener-ref) 5%, var(--card));
 }
+.listener-map-card.is-pending {
+  border-color: color-mix(in srgb, var(--gold) 48%, var(--line));
+  border-left-color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 6%, var(--card));
+}
 .listener-map-card.is-missing,
 .listener-map-card.is-cycle {
   border-color: color-mix(in srgb, var(--err) 48%, var(--line));
@@ -4657,6 +4662,9 @@ input.f {
 }
 .listener-map-card.is-reference > .listener-map-kicker {
   color: var(--listener-ref);
+}
+.listener-map-card.is-pending > .listener-map-kicker {
+  color: var(--gold);
 }
 .listener-map-card:is(.is-missing, .is-cycle) > .listener-map-kicker {
   color: var(--err);

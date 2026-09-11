@@ -242,6 +242,34 @@ describe('监听规则子树复用', () => {
     ).toEqual(['01', '01', '02', '01', '02']);
   });
 
+  it('把草稿中新建但尚未保存的监听显示为待建立状态', () => {
+    const source = listenerStep('source-chain', 'source', 21000, [egressRule()]);
+    const app: SnapshotApp = {
+      id: 'app',
+      label: '项目',
+      chains: [chain('source-chain', '源线路')],
+      ingresses: [ingress('source-in', 'source-chain', 'source')],
+      steps: [source],
+      fronts: [],
+      grants: [],
+    };
+    const view = render(
+      <ListenerDecisionTree
+        app={app}
+        currentChain={app.chains[0]}
+        currentSteps={[source]}
+        root="source"
+        draftRules={{ source: [forwardRule('new-listener')] }}
+        compiledRules={new Map()}
+        nodeNames={new Map([['new-listener', '新加坡节点']])}
+      />,
+    );
+
+    expect(view.getByText('待保存的新监听')).toBeTruthy();
+    expect(view.getByText('保存到草稿后建立')).toBeTruthy();
+    expect(view.queryByText('找不到监听所有者')).toBeNull();
+  });
+
   it('在草稿里只保存监听身份和承载选择，不复制目标端口和规则', async () => {
     const source: SnapshotStep = {
       chain: 'source-chain',
