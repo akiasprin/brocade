@@ -1,8 +1,6 @@
 import {
   Fragment,
-  Suspense,
   createContext,
-  lazy,
   useContext,
   useEffect,
   useId,
@@ -56,11 +54,7 @@ import {
   realityServerNameIsValid,
   realityShortIdIsValid,
 } from '../reality';
-
-// The tunnel resource page is intentionally absent from primary navigation. Load its shared WARP
-// lifecycle editor only when an operator asks to manage a WARP target from a rule; a dynamic edge
-// also avoids turning `tunnels -> rules -> tunnels` into an eager module cycle.
-const WarpRuleManager = lazy(() => import('./tunnels').then(module => ({ default: module.WarpRuleManager })));
+import { navigate } from '../forge/route';
 
 const forwardDial = (a: RuleAction): HopDial => (a.t === 'forward' ? a.dial : { t: 'overlay' });
 
@@ -1444,18 +1438,12 @@ function RuleEditorReady({
   const externalOutbounds = (snapshot.data?.snapshot.external_outbounds ?? []).filter(
     outbound => chainTenant === outbound.tenant || chainTenant.startsWith(`${outbound.tenant}.`),
   );
-  const [deleteOutbound, setDeleteOutbound] = useState<ExternalOutbound | null>(null);
   const globalRelayMux = snapshot.data?.snapshot.settings?.relay_mux ?? DEFAULT_HOP_MUX;
-  const [externalEditor, setExternalEditor] = useState<{
-    existing: ExternalOutbound | null;
-    ruleIndex: number;
-  } | null>(null);
   const [muxEditor, setMuxEditor] = useState<{
     to: string;
     followGlobal: boolean;
     value: HopMux;
   } | null>(null);
-  const [warpManagerId, setWarpManagerId] = useState<string | null>(null);
   const [targetPickerRule, setTargetPickerRule] = useState<number | null>(null);
   const [targetQuery, setTargetQuery] = useState('');
   const targetPickerRoot = useRef<HTMLSpanElement>(null);
@@ -1525,16 +1513,6 @@ function RuleEditorReady({
   // （steps 主键为 chain_id + node_id）。
   const ownRules = useState<Rule[]>(() => pinTerminalRules(initial));
   const [rules, setRules] = shared ? [shared.rules, shared.setRules] : ownRules;
-  const warpReferencedOnCurrentNode = (outboundId: string) =>
-    rules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === outboundId) ||
-    (snapshot.data?.snapshot.apps ?? []).some(candidateApp =>
-      candidateApp.steps.some(
-        step =>
-          step.node === nodeId &&
-          !(candidateApp.id === appId && step.chain === chainId) &&
-          step.rules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === outboundId),
-      ),
-    );
   // Only local overrides live in the editor. The query remains the canonical baseline and is
   // replaced by the server-side draft preview after saving, so two chain pages never maintain
   // copied policy state of their own.
@@ -1604,9 +1582,6 @@ function RuleEditorReady({
   const visibleExternalOutbounds = externalOutbounds.filter(outbound =>
     targetMatches(outbound.id, outbound.name, outbound.address, externalProtocolLabel(outbound.protocol.t)),
   );
-  const managedWarp = warpManagerId
-    ? (externalOutbounds.find(outbound => outbound.id === warpManagerId && outbound.protocol.t === 'warp') ?? null)
-    : null;
   /* 新增转发规则时的默认目标。优先使用主干下一跳：它是沿链继续的默认路径。 */
   const defaultTarget = selectable[0]?.id ?? '';
 
@@ -2156,59 +2131,35 @@ function RuleEditorReady({
                                     </span>
                                     <span className="external-target-where">共享资源</span>
                                   </button>
-                                  {outbound.protocol.t !== 'warp' && !readOnly && (
-                                    <button
-                                      type="button"
-                                      className="external-target-manage"
-                                      aria-label={`编辑 ${outbound.name}`}
-                                      onClick={() => {
-                                        setTargetPickerRule(null);
-                                        setExternalEditor({ existing: outbound, ruleIndex: i });
-                                      }}
-                                    >
-                                      编辑
-                                    </button>
-                                  )}
-                                  {!readOnly && (
-                                    <button
-                                      type="button"
-                                      className="external-target-manage"
-                                      aria-label={`删除 ${outbound.name}`}
-                                      onClick={() => {
-                                        setTargetPickerRule(null);
-                                        setDeleteOutbound(outbound);
-                                      }}
-                                    >
-                                      删除
-                                    </button>
-                                  )}
-                                  {outbound.protocol.t === 'warp' && (
-                                    <button
-                                      type="button"
-                                      className="external-target-manage"
-                                      aria-label={`管理 ${outbound.name}`}
-                                      title={`管理 ${selfNode?.name || nodeId} 的 WARP 注册与参数`}
-                                      onClick={() => {
-                                        setTargetPickerRule(null);
-                                        setWarpManagerId(outbound.id);
-                                      }}
-                                    >
-                                      管理
-                                    </button>
-                                  )}
+                                  <button
+                                    type="button"
+                                    className="external-target-manage"
+                                    aria-label={`打开隧道 ${outbound.name}`}
+                                    onClick={() => {
+                                      setTargetPickerRule(null);
+                                      navigate('tunnels', {
+                                        p: 'tunnel',
+                                        tenant: outbound.tenant,
+                                        id: outbound.id,
+                                      });
+                                    }}
+                                  >
+                                    查看
+                                  </button>
                                 </span>
                               ))}
                               <button
                                 type="button"
                                 className="external-target-new"
+                                aria-label="管理隧道"
                                 onClick={() => {
                                   setTargetPickerRule(null);
-                                  setExternalEditor({ existing: null, ruleIndex: i });
+                                  navigate('tunnels');
                                 }}
                               >
-                                <span>＋</span>
-                                <b>创建代理出站</b>
-                                <span>粘贴链接或手动填写</span>
+                                <span>↗</span>
+                                <b>管理隧道</b>
+                                <span>新建、编辑和删除都在隧道页</span>
                               </button>
                               {visibleNextPeers.length +
                                 visibleInsidePeers.length +
@@ -2473,14 +2424,6 @@ function RuleEditorReady({
           </tbody>
         </table>
 
-        {deleteOutbound && (
-          <ProxyOutboundDeleteDialog
-            outbound={deleteOutbound}
-            apps={snapshot.data?.snapshot.apps ?? []}
-            localRules={rules}
-            onClose={() => setDeleteOutbound(null)}
-          />
-        )}
         {rules.map((rule, ruleIndex) => {
           if (rule.a.t !== 'proxy') return null;
           const outboundId = rule.a.outbound;
@@ -2501,19 +2444,13 @@ function RuleEditorReady({
                 <b>{outbound.name}</b>
                 <span className="sp" />
                 <span className="note">由 {selfNode?.name || nodeId} 发起</span>
-                {!readOnly && (
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() =>
-                      outbound.protocol.t === 'warp'
-                        ? setWarpManagerId(outbound.id)
-                        : setExternalEditor({ existing: outbound, ruleIndex })
-                    }
-                  >
-                    {outbound.protocol.t === 'warp' ? '机器设置' : '编辑'}
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => navigate('tunnels', { p: 'tunnel', tenant: outbound.tenant, id: outbound.id })}
+                >
+                  隧道详情
+                </button>
               </header>
               <div className="external-summary-facts">
                 <span>
@@ -2819,41 +2756,6 @@ function RuleEditorReady({
             </button>
           )}
         </div>
-
-        {externalEditor && (
-          <ExternalOutboundEditor
-            tenantId={chainTenant}
-            existing={externalEditor.existing}
-            onClose={() => setExternalEditor(null)}
-            onSaved={outbound => {
-              const rule = rules[externalEditor.ruleIndex];
-              if (rule) patch(externalEditor.ruleIndex, { ...rule, a: { t: 'proxy', outbound: outbound.id } });
-              setExternalEditor(null);
-            }}
-          />
-        )}
-        {managedWarp && (
-          <Suspense
-            fallback={
-              <div className="external-outbound-wrap">
-                <div className="loading">正在打开 WARP 设置…</div>
-              </div>
-            }
-          >
-            <WarpRuleManager
-              tunnel={managedWarp}
-              nodeId={nodeId}
-              nodeName={selfNode?.name || nodeId}
-              editable={!readOnly}
-              removalBlockedReason={
-                warpReferencedOnCurrentNode(managedWarp.id)
-                  ? '这台机器仍在规则中使用 WARP。请先解除引用、保存草稿并完成发布，再注销身份。'
-                  : undefined
-              }
-              onClose={() => setWarpManagerId(null)}
-            />
-          </Suspense>
-        )}
       </fieldset>
       {muxEditor && (
         <MuxConfigDrawer
@@ -3429,16 +3331,16 @@ function externalOptionalMuxIsValid(value: string): boolean {
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= 128;
 }
 
-export function ProxyOutboundDeleteDialog({
+export function TunnelDeleteDialog({
   outbound,
   apps,
-  localRules = [],
   onClose,
+  onDeleted,
 }: {
   outbound: ExternalOutbound;
   apps: SnapshotApp[];
-  localRules?: Rule[];
   onClose: () => void;
+  onDeleted?: () => void;
 }) {
   const qc = useQueryClient();
   const references: string[] = [];
@@ -3456,23 +3358,21 @@ export function ProxyOutboundDeleteDialog({
         references.push(`${app.label || app.id} / 前置组 ${front.name || front.id}`);
     }
   }
-  if (localRules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === outbound.id)) {
-    references.push('当前正在编辑的规则');
-  }
   const bound = outbound.bindings.length > 0;
   const remove = useMutation({
     mutationFn: () => deleteExternalOutbound(outbound.tenant, outbound.id),
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
+      onDeleted?.();
       onClose();
     },
   });
   return (
-    <div className="external-outbound-wrap" role="dialog" aria-modal="true" aria-label="删除代理出站">
+    <div className="external-outbound-wrap" role="dialog" aria-modal="true" aria-label="删除隧道">
       <button className="external-outbound-scrim" aria-label="关闭" onClick={onClose} />
       <section className="external-outbound-drawer">
         <header>
-          <b>删除代理出站 · {outbound.name}</b>
+          <b>删除隧道 · {outbound.name}</b>
           <span className="sp" />
           <button className="btn" onClick={onClose}>
             关闭
@@ -3491,14 +3391,14 @@ export function ProxyOutboundDeleteDialog({
           ) : (
             <p>删除「{outbound.name}」将保存到草稿，提交前可以撤销。</p>
           )}
-          {bound && <p>请先在机器设置中注销 {outbound.bindings.length} 台机器的 WARP 身份。</p>}
+          {bound && <p>请先在隧道详情中注销 {outbound.bindings.length} 台机器的 WARP 身份。</p>}
           {remove.error && <ErrorBox error={remove.error} />}
           <button
             className="btn danger"
             disabled={references.length > 0 || bound || remove.isPending}
             onClick={() => remove.mutate()}
           >
-            删除代理出站
+            删除隧道
           </button>
         </div>
       </section>
@@ -3847,11 +3747,18 @@ export function ExternalOutboundEditor({
   };
 
   return (
-    <div className="external-outbound-wrap" role="dialog" aria-modal="true" aria-label="配置代理出站">
+    <div
+      className="external-outbound-wrap"
+      role="dialog"
+      aria-modal="true"
+      aria-label={purpose === 'resource' ? (existing ? '编辑隧道' : '创建隧道') : '配置代理出站'}
+    >
       <button className="external-outbound-scrim" aria-label="关闭" onClick={onClose} />
       <section className="external-outbound-drawer">
         <header>
-          <b>{existing ? '配置代理出站' : '创建代理出站'}</b>
+          <b>
+            {purpose === 'resource' ? (existing ? '编辑隧道' : '创建隧道') : existing ? '配置代理出站' : '创建代理出站'}
+          </b>
           <span className="sp" />
           <button className="btn" onClick={onClose}>
             关闭

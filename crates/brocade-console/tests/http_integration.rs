@@ -3057,6 +3057,258 @@ async fn http_settings_exposes_and_updates_global_reality_client_policy() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+/// The browser keeps structural creation in a draft, but these control-plane-only edits must use
+/// ordinary HTTP writes once their objects exist.  Front-end tests assert that no browser draft is
+/// added; this boundary test closes the other half by proving the writes reach the durable model,
+/// advance the active subscription client checkpoint, and create no machine deployment.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_control_plane_only_edits_commit_immediately_without_a_deployment() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-c3d4', 'App B', 1)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('chn-e5f6-a7b8', 'app-a1b2', 'platform.acme', 'Chain B', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingresses (
+            id, app_id, chain_id, node_id, bind, port, front_id, transport_kind,
+            reality_private_key, reality_public_key, reality_short_ids,
+            reality_dest, reality_server_names, reality_flow, reality_fallback_mode
+         ) VALUES (
+            'ing-e5f6', 'app-a1b2', 'chn-e5f6-a7b8', 'n1', '0.0.0.0', 444, NULL, 'vless-reality',
+            'reality-private-2', 'reality-public-2', '[\"9b41d8ef\"]'::jsonb,
+            'www.example.com:443', '[\"www.example.com\"]'::jsonb, 'xtls-rprx-vision', 'custom-site'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingress_client_settings (ingress_id, reality_fingerprint)
+         VALUES ('ing-e5f6', 'chrome')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO steps (chain_id, node_id, rules)
+         VALUES ('chn-e5f6-a7b8', 'n1',
+                 '[{\"m\":{\"t\":\"any\"},\"a\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let (app, admin_token) = admin_app(&db).await;
+    seed_subscription_serving(&db).await;
+    let baseline_artifacts = get_json(&app, &admin_token, "/artifacts/index").await;
+    assert_eq!(
+        baseline_artifacts.0,
+        StatusCode::OK,
+        "{:?}",
+        baseline_artifacts.1
+    );
+
+    let renamed_app = post_json(
+        &app,
+        &admin_token,
+        "/apps",
+        json!({ "id": "app-a1b2", "label": "Renamed App" }),
+    )
+    .await;
+    assert_eq!(renamed_app.0, StatusCode::OK, "{:?}", renamed_app.1);
+
+    let renamed_chain = post_json(
+        &app,
+        &admin_token,
+        "/apps/app-a1b2/chains",
+        json!({
+            "id": "chn-b2c3-d4e5",
+            "tenant_id": "platform.acme",
+            "name": "Renamed Chain",
+            "subscription_country": "TW"
+        }),
+    )
+    .await;
+    assert_eq!(renamed_chain.0, StatusCode::OK, "{:?}", renamed_chain.1);
+
+    let user = post_json(
+        &app,
+        &admin_token,
+        "/users",
+        json!({ "tenant_id": "platform.acme", "id": "bob" }),
+    )
+    .await;
+    assert_eq!(user.0, StatusCode::CREATED, "{:?}", user.1);
+
+    let port_settings = json!({
+        "ingress_base": 13453,
+        "anytls_base": 14453,
+        "vless_encryption_base": 13810,
+        "hop_base": 21000,
+        "hy2_base": 31000
+    });
+    let ports = put_json(&app, &admin_token, "/settings/ports", port_settings.clone()).await;
+    assert_eq!(ports.0, StatusCode::OK, "{:?}", ports.1);
+    assert_eq!(ports.1["settings"]["ports"], port_settings);
+
+    let probe = put_json(
+        &app,
+        &admin_token,
+        "/settings/probe",
+        json!({
+            "endpoint_url": "  http://probe.example.test/cdn-cgi/trace  ",
+            "timeout_secs": 12,
+            "interval_secs": 75
+        }),
+    )
+    .await;
+    assert_eq!(probe.0, StatusCode::OK, "{:?}", probe.1);
+    assert_eq!(
+        probe.1["settings"]["probe"]["endpoint_url"],
+        "http://probe.example.test/cdn-cgi/trace"
+    );
+
+    let app_order = put_json(
+        &app,
+        &admin_token,
+        "/apps/order",
+        json!({ "ids": ["app-c3d4", "app-a1b2"] }),
+    )
+    .await;
+    assert_eq!(app_order.0, StatusCode::OK, "{:?}", app_order.1);
+    let chain_order = put_json(
+        &app,
+        &admin_token,
+        "/apps/app-a1b2/chains/order",
+        json!({ "ids": ["chn-e5f6-a7b8", "chn-b2c3-d4e5"] }),
+    )
+    .await;
+    assert_eq!(chain_order.0, StatusCode::OK, "{:?}", chain_order.1);
+
+    let current_revision = chain_order.1["revision_id"].as_u64().unwrap();
+    let snapshot = get_json(&app, &admin_token, "/model/snapshot").await;
+    assert_eq!(snapshot.0, StatusCode::OK, "{:?}", snapshot.1);
+    assert_eq!(snapshot.1["snapshot"]["revision"], current_revision);
+    let apps = snapshot.1["snapshot"]["apps"].as_array().unwrap();
+    assert_eq!(
+        apps.iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["app-c3d4", "app-a1b2"]
+    );
+    let renamed = apps.iter().find(|item| item["id"] == "app-a1b2").unwrap();
+    assert_eq!(renamed["label"], "Renamed App");
+    assert_eq!(
+        renamed["chains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["chn-e5f6-a7b8", "chn-b2c3-d4e5"]
+    );
+    let chain = renamed["chains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "chn-b2c3-d4e5")
+        .unwrap();
+    assert_eq!(chain["name"], "Renamed Chain");
+    assert_eq!(chain["subscription_country"], "TW");
+
+    let settings = get_json(&app, &admin_token, "/settings").await;
+    assert_eq!(settings.1["ports"], port_settings);
+    assert_eq!(settings.1["probe"], probe.1["settings"]["probe"]);
+    let users = get_json(
+        &app,
+        &admin_token,
+        "/users?tenant_id=platform.acme&include_disabled=true",
+    )
+    .await;
+    assert!(users.1["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "bob"));
+
+    // The serving pointer—not merely the mutable head—moves immediately for subscription-only
+    // metadata, even though no topology deployment exists.
+    let serving_document: Value = sqlx::query_scalar(
+        "SELECT snapshot.document
+           FROM subscription_serving_state serving
+           JOIN subscription_client_snapshots snapshot
+             ON snapshot.id = serving.client_snapshot_id
+          WHERE serving.id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        serving_document["app_order"],
+        json!(["app-c3d4", "app-a1b2"])
+    );
+    assert_eq!(
+        serving_document["chain_order"]["app-a1b2"],
+        json!(["chn-e5f6-a7b8", "chn-b2c3-d4e5"])
+    );
+    assert_eq!(
+        serving_document["chains"]["chn-b2c3-d4e5"]["name"],
+        "Renamed Chain"
+    );
+    assert_eq!(
+        serving_document["chains"]["chn-b2c3-d4e5"]["subscription_country"],
+        "TW"
+    );
+
+    let current_artifacts = get_json(&app, &admin_token, "/artifacts/index").await;
+    assert_eq!(current_artifacts.0, StatusCode::OK);
+    let baseline_machine_artifacts = baseline_artifacts.1["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|artifact| artifact["target_kind"] == "node")
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_machine_artifacts = current_artifacts.1["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|artifact| artifact["target_kind"] == "node")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        current_machine_artifacts, baseline_machine_artifacts,
+        "control-plane-only edits must leave every machine artifact byte-for-byte unchanged"
+    );
+    assert!(current_artifacts.1["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact["target_kind"] == "user"
+            && artifact["target_id"] == "platform.acme:bob"));
+
+    let deployments: i64 = sqlx::query_scalar("SELECT count(*) FROM deployments")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        deployments, 0,
+        "pure control-plane writes need no deployment"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service() {

@@ -58,6 +58,7 @@ const DRILL: Partial<Record<NavKey, DrillSpec[]>> = {
     { seg: 'install', fields: [{ name: 'node' }], rest: { step: 4 } },
   ],
   chains: [{ seg: 'chain', fields: [{ name: 'app' }, { name: 'chain' }] }],
+  tunnels: [{ seg: 'tunnel', fields: [{ name: 'tenant' }, { name: 'id' }] }],
   /* 单租户阶段用户 id 足以恢复详情，内部归属不进入可见地址。 */
   users: [{ seg: 'new' }, { seg: 'user', fields: [{ name: 'id' }] }],
   deploy: [{ seg: 'plan' }, { seg: 'detail', fields: [{ name: 'id', num: true }] }],

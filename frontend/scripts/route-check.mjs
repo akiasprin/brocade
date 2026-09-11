@@ -71,10 +71,11 @@ trip('没下钻的面', { nav: 'settings' }, '#/settings');
 trip('不走 wm 的面', { nav: 'topo' }, '#/topo');
 trip('链路详情两段', { nav: 'chains', drill: { p: 'chain', app: 'app-1', chain: 'c-a' } }, '#/chains/chain/app-1/c-a');
 trip(
-  '用户详情由用户名定位',
-  { nav: 'users', drill: { p: 'user', id: 'alice' } },
-  '#/users/user/alice',
+  '隧道详情由租户和资源 id 定位',
+  { nav: 'tunnels', drill: { p: 'tunnel', tenant: 'platform', id: 'warp-hk' } },
+  '#/tunnels/tunnel/platform/warp-hk',
 );
+trip('用户详情由用户名定位', { nav: 'users', drill: { p: 'user', id: 'alice' } }, '#/users/user/alice');
 
 console.log('\n— 类型要还原 —');
 trip('发布详情的 id 是数字', { nav: 'deploy', drill: { p: 'detail', id: 12 } }, '#/deploy/detail/12');
@@ -105,12 +106,12 @@ trip(
 );
 console.log('\n— 坏地址不许炸出坏状态 —');
 reads('不认识的面', '#/nonsense', null);
-reads('已隐藏的隧道页', '#/tunnels', null);
 reads('空地址', '#/', null);
 reads('什么都没有', '', null);
 reads('不认识的下钻', '#/nodes/bogus', { nav: 'nodes' });
 reads('详情少了 id', '#/deploy/detail', { nav: 'deploy' });
 reads('机器详情少了 id', '#/nodes/node', { nav: 'nodes' });
+reads('隧道详情少了资源 id', '#/tunnels/tunnel/platform', { nav: 'tunnels' });
 reads('用户详情少了用户名', '#/users/user', { nav: 'users' });
 reads('用户详情多出路径段', '#/users/user/acme/alice', { nav: 'users' });
 reads('机器详情多出路径段', '#/nodes/node/hk-01/extra', { nav: 'nodes' });

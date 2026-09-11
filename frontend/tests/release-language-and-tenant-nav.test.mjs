@@ -38,6 +38,16 @@ test('单租户阶段不在导航菜单暴露租户页', () => {
   assert.doesNotMatch(panes, /TenantsPane|case 'tab:tenants'/);
 });
 
+test('隧道页接入主导航、路由和页面容器', () => {
+  const nav = shell.match(/const NAV: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
+  const mobileMore = shell.match(/const MOBILE_MORE = ([^;]+);/)?.[1] ?? '';
+  const routable = state.match(/export const NAV_KEYS = \[([\s\S]*?)\n\]/)?.[1] ?? '';
+  assert.match(nav, /key: 'tunnels'/);
+  assert.match(mobileMore, /f\.key === 'tunnels'/);
+  assert.match(routable, /'tunnels'/);
+  assert.match(panes, /TunnelsPane|case 'tab:tunnels'/);
+});
+
 test('更多菜单项有图标，用户页更多入口只显示三点图标', () => {
   assert.match(shell, /className="fg-menu nav-menu"/);
   assert.match(shell, /className="fg-menu-icon"/);

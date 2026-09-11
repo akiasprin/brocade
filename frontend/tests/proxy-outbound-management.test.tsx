@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { ExternalOutbound, SnapshotApp } from '../src/api';
 import { draft } from '../src/draft';
-import { ExternalOutboundEditor, ProxyOutboundDeleteDialog } from '../src/panes/rules';
+import { ExternalOutboundEditor, TunnelDeleteDialog } from '../src/panes/rules';
 
 const encryption = `mlkem768x25519plus.native.1rtt.${'A'.repeat(43)}`;
 const outbound: ExternalOutbound = {
@@ -82,9 +82,11 @@ it('offers native VLESS Encryption as a manual choice with no TLS fields', () =>
 });
 it('deletes an unused resource through a reversible draft', async () => {
   const closed = vi.fn();
-  const view = wrap(<ProxyOutboundDeleteDialog outbound={outbound} apps={[]} onClose={closed} />);
-  fireEvent.click(view.getByRole('button', { name: '删除代理出站' }));
+  const deleted = vi.fn();
+  const view = wrap(<TunnelDeleteDialog outbound={outbound} apps={[]} onClose={closed} onDeleted={deleted} />);
+  fireEvent.click(view.getByRole('button', { name: '删除隧道' }));
   await waitFor(() => expect(closed).toHaveBeenCalled());
+  expect(deleted).toHaveBeenCalledOnce();
   expect(draft.snapshot()[0].op).toEqual({ op: 'delete_external_outbound', tenant_id: 'platform', id: 'vendor' });
 });
 it('shows rule and front references and blocks deletion', () => {
@@ -105,10 +107,10 @@ it('shows rule and front references and blocks deletion', () => {
     ],
     fronts: [{ id: 'f', name: '前置', tenant: 'platform', strategy: 'select', via: [], external_via: [outbound.id] }],
   };
-  const view = wrap(<ProxyOutboundDeleteDialog outbound={outbound} apps={[app]} onClose={() => undefined} />);
+  const view = wrap(<TunnelDeleteDialog outbound={outbound} apps={[app]} onClose={() => undefined} />);
   expect(view.getByText('线路 / 链 / hk / 规则 1')).toBeTruthy();
   expect(view.getByText('线路 / 前置组 前置')).toBeTruthy();
-  expect(view.getByRole('button', { name: '删除代理出站' }).hasAttribute('disabled')).toBe(true);
+  expect(view.getByRole('button', { name: '删除隧道' }).hasAttribute('disabled')).toBe(true);
 });
 it('moves deletion after earlier reference-removal operations when replacing an upsert', () => {
   draft.push({ op: 'upsert_external_outbound', outbound: { ...outbound, tenant_id: outbound.tenant } });

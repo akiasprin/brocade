@@ -37,8 +37,8 @@ use crate::{
     E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, HopLinkList,
     IssuedAdminToken, IssuedNodeToken, IssuedUserLogin, LinkHealthItem, LinkHealthRequest,
     LinkHealthResult, LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest,
-    LoadReportResult, LoadSeriesQuery, NodeAgentStateList, NodeDesiredDeployment, NodeLoadList,
-    NodeLoadView, NodePingProbeList, NodePingProbeView, PingProbeReportRequest,
+    LoadReportResult, LoadSeriesQuery, ModelWriteResult, NodeAgentStateList, NodeDesiredDeployment,
+    NodeLoadList, NodeLoadView, NodePingProbeList, NodePingProbeView, PingProbeReportRequest,
     PingProbeReportResult, PingProbeSettings, ProbeTargetList, ProvisionNodeRequest,
     ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan,
     RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
@@ -748,6 +748,22 @@ impl PgStore {
         settings::update_settings(&self.pool, actor, settings, Some(expected_revision)).await
     }
 
+    pub async fn update_port_settings(
+        &self,
+        actor: &AdminContext,
+        ports: brocade_core::model::PortSettings,
+    ) -> Result<UpdateSettingsResult> {
+        settings::update_port_settings(&self.pool, actor, ports).await
+    }
+
+    pub async fn update_probe_settings(
+        &self,
+        actor: &AdminContext,
+        probe: brocade_core::model::ProbeSettings,
+    ) -> Result<UpdateSettingsResult> {
+        settings::update_probe_settings(&self.pool, actor, probe).await
+    }
+
     pub async fn plan_deployment(
         &self,
         actor: &AdminContext,
@@ -1078,6 +1094,14 @@ impl PgStore {
         console::upsert_app(&self.pool, actor, request).await
     }
 
+    pub async fn reorder_apps(
+        &self,
+        actor: &AdminContext,
+        ids: Vec<String>,
+    ) -> Result<ModelWriteResult> {
+        console::reorder_apps(&self.pool, actor, ids).await
+    }
+
     pub async fn register_warp_binding(
         &self,
         actor: &AdminContext,
@@ -1120,6 +1144,15 @@ impl PgStore {
         request: CreateChainRequest,
     ) -> Result<UpsertChainResult> {
         console::upsert_chain(&self.pool, actor, app_id, request).await
+    }
+
+    pub async fn reorder_chains(
+        &self,
+        actor: &AdminContext,
+        app_id: &str,
+        ids: Vec<String>,
+    ) -> Result<ModelWriteResult> {
+        console::reorder_chains(&self.pool, actor, app_id, ids).await
     }
 
     pub async fn upsert_front(

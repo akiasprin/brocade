@@ -19,7 +19,8 @@ import { Empty, ErrorBox, Loading } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { useCrumb } from '../wm/crumb';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
-import { ExternalOutboundEditor } from './rules';
+import { navigate } from '../forge/route';
+import { ExternalOutboundEditor, TunnelDeleteDialog } from './rules';
 
 type Drill = { p: 'list' } | { p: 'tunnel'; tenant: string; id: string };
 
@@ -634,6 +635,7 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
   const [editing, setEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [bindingNode, setBindingNode] = useState('');
   const [acceptTerms, setAcceptTerms] = useState(false);
   const [bindError, setBindError] = useState<unknown>(null);
@@ -655,10 +657,9 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
         chainId: step.chain,
       })),
   );
-  /* 规则引用跳转到对应线路：打开（或聚焦）线路 tab 并下钻到该链。 */
+  /* 规则引用跳转到对应线路，并把位置写入地址栏以支持刷新和浏览器后退。 */
   const openChain = (appId: string, chainId: string) => {
-    const target = wm.open('tab:chains', '线路');
-    wm.patchData(target.id, { drill: { p: 'chain', app: appId, chain: chainId } });
+    navigate('chains', { p: 'chain', app: appId, chain: chainId });
   };
   const boundNodes = new Set((tunnel?.bindings ?? []).map(binding => binding.node));
   const missing = [...new Set(references.map(reference => reference.node))].filter(node => !boundNodes.has(node));
@@ -739,6 +740,9 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
             </span>
           </div>
           <div className="nd-acts">
+            <button className="btn danger" disabled={!editable} onClick={() => setDeleting(true)}>
+              删除
+            </button>
             <button className="btn" disabled={!editable} onClick={() => setEditing(true)}>
               编辑
             </button>
@@ -933,6 +937,14 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
         />
       )}
       {editing && isWarp && <WarpEdit tunnel={tunnel} onClose={() => setEditing(false)} />}
+      {deleting && (
+        <TunnelDeleteDialog
+          outbound={tunnel}
+          apps={apps}
+          onClose={() => setDeleting(false)}
+          onDeleted={() => go({ p: 'list' })}
+        />
+      )}
     </div>
   );
 }
@@ -1463,149 +1475,6 @@ export function WarpEdit({ tunnel, onClose }: { tunnel: ExternalOutbound; onClos
           </button>
         </footer>
       </section>
-    </div>
-  );
-}
-
-/**
- * The rule editor owns the WARP lifecycle for its current machine. Keeping this component next to
- * the existing binding/default editors means the hidden resource page and the rule path cannot
- * drift into two implementations of registration, overrides, or destructive removal.
- */
-export function WarpRuleManager({
-  tunnel,
-  nodeId,
-  nodeName,
-  editable,
-  removalBlockedReason,
-  onClose,
-}: {
-  tunnel: ExternalOutbound;
-  nodeId: string;
-  nodeName: string;
-  editable: boolean;
-  removalBlockedReason?: string;
-  onClose: () => void;
-}) {
-  const qc = useQueryClient();
-  const protocol = tunnel.protocol.t === 'warp' ? tunnel.protocol : null;
-  const binding = tunnel.bindings.find(candidate => candidate.node === nodeId);
-  const [acceptTerms, setAcceptTerms] = useState(false);
-  const [editingDefaults, setEditingDefaults] = useState(false);
-  const [suggestedEndpoint, setSuggestedEndpoint] = useState<string | null>(null);
-
-  const bind = useMutation({
-    mutationFn: () => registerWarpBinding(tunnel.tenant, tunnel.id, nodeId),
-    onSuccess: async result => {
-      setAcceptTerms(false);
-      setSuggestedEndpoint(result.suggested_endpoint ?? null);
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: ['snapshot'] }),
-        qc.invalidateQueries({ queryKey: ['revisions'] }),
-        qc.invalidateQueries({ queryKey: ['compile'] }),
-      ]);
-    },
-  });
-
-  if (!protocol) return null;
-  const stack = warpIpStackOf(protocol);
-  return (
-    <div
-      className="external-outbound-wrap warp-rule-manager-wrap"
-      role="dialog"
-      aria-modal="true"
-      aria-label="管理当前机器的 WARP 出口"
-    >
-      <button className="external-outbound-scrim" aria-label="关闭" onClick={onClose} />
-      <section className="external-outbound-drawer warp-rule-manager">
-        <header>
-          <b>Cloudflare WARP</b>
-          <small>{nodeName} · 当前机器</small>
-          <span className="sp" />
-          <button className="btn" onClick={onClose}>
-            关闭
-          </button>
-        </header>
-        <div className="external-outbound-body">
-          <section className="warp-rule-defaults">
-            <header>
-              <span>
-                <small>默认 Endpoint</small>
-                <b className="mono">{endpoint(tunnel)}</b>
-              </span>
-              <span>
-                <small>出口策略</small>
-                <b>{warpIpStackLabel(stack)}</b>
-              </span>
-              <span>
-                <small>MTU / Keepalive</small>
-                <b className="mono">
-                  {protocol.v.mtu} / {protocol.v.keep_alive}s
-                </b>
-              </span>
-              <span>
-                <small>TUN / Workers</small>
-                <b>
-                  {protocol.v.no_kernel_tun ? '仅用户态' : '系统优先'} · {protocol.v.workers || '自动'}
-                </b>
-              </span>
-              <button className="btn" disabled={!editable} onClick={() => setEditingDefaults(true)}>
-                编辑默认
-              </button>
-            </header>
-            <p>当前机器有覆盖时，以机器参数为准。</p>
-          </section>
-
-          <section className="panel config-panel tunnel-panel warp-rule-machine">
-            <header>
-              <PanelTitle of="identity">机器身份</PanelTitle>
-              <span className={`st ${binding ? '' : 'st-warn'}`}>{binding ? '已注册' : '待注册'}</span>
-            </header>
-            {binding ? (
-              <div className="warp-bindings">
-                <WarpBindingCard
-                  tenantId={tunnel.tenant}
-                  outboundId={tunnel.id}
-                  binding={binding}
-                  nodeName={nodeName}
-                  defaultAddress={tunnel.address}
-                  defaultPort={tunnel.port}
-                  defaults={protocol}
-                  editable={editable}
-                  removalBlockedReason={removalBlockedReason}
-                />
-              </div>
-            ) : (
-              <div className="warp-bind-box warp-rule-register">
-                <p>
-                  为 <b>{nodeName}</b> 申请一套独立的 WireGuard 密钥、地址与 Cloudflare 设备身份。打开面板不会发起申请。
-                </p>
-                <label className="warp-terms">
-                  <input
-                    type="checkbox"
-                    checked={acceptTerms}
-                    disabled={!editable || bind.isPending}
-                    onChange={event => setAcceptTerms(event.target.checked)}
-                  />
-                  <span>我同意 Cloudflare Application Terms，并知悉 WireGuard 注册接口为非官方兼容能力。</span>
-                </label>
-                {bind.error && <ErrorBox error={bind.error} />}
-                {suggestedEndpoint && (
-                  <p className="tunnel-warn">Cloudflare 返回的建议 Endpoint：{suggestedEndpoint}</p>
-                )}
-                <button
-                  className="btn primary"
-                  disabled={!editable || !acceptTerms || bind.isPending}
-                  onClick={() => bind.mutate()}
-                >
-                  {bind.isPending ? '正在注册…' : '注册并绑定当前机器'}
-                </button>
-              </div>
-            )}
-          </section>
-        </div>
-      </section>
-      {editingDefaults && <WarpEdit tunnel={tunnel} onClose={() => setEditingDefaults(false)} />}
     </div>
   );
 }

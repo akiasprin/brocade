@@ -7,7 +7,6 @@ import {
   WarpBindingCard,
   WarpCreate,
   WarpEdit,
-  WarpRuleManager,
   warpIpRouting,
   warpIpStackOf,
   warpReferenceStatus,
@@ -281,49 +280,5 @@ describe('WARP exit stack settings', () => {
     const remove = card.getByRole('button', { name: '注销并移除' }) as HTMLButtonElement;
     expect(remove.disabled).toBe(true);
     expect(card.getByText(/请先解除引用并完成发布/)).toBeTruthy();
-  });
-
-  it('registers the current rule machine only after explicit terms acceptance', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        revision_id: 4,
-        binding: {},
-        suggested_endpoint: 'engage.cloudflareclient.com:2408',
-      }),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const onClose = vi.fn();
-    const tunnel: ExternalOutbound = {
-      id: 'warp',
-      tenant: 'platform',
-      name: 'Cloudflare WARP',
-      address: 'engage.cloudflareclient.com',
-      port: 2408,
-      protocol: protocol(),
-      security: { t: 'none' },
-      bindings: [],
-    };
-    const view = render(
-      <QueryClientProvider client={client}>
-        <WarpRuleManager tunnel={tunnel} nodeId="hk" nodeName="香港" editable onClose={onClose} />
-      </QueryClientProvider>,
-    );
-
-    const register = view.getByRole('button', { name: '注册并绑定当前机器' }) as HTMLButtonElement;
-    expect(register.disabled).toBe(true);
-    fireEvent.click(view.getByRole('checkbox'));
-    expect(register.disabled).toBe(false);
-    fireEvent.click(register);
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('/tenants/platform/tunnels/warp/warp-bindings');
-    expect(init.method).toBe('POST');
-    expect(JSON.parse(String(init.body))).toEqual({ node_id: 'hk', accept_terms: true });
-    expect(onClose).not.toHaveBeenCalled();
-    vi.unstubAllGlobals();
   });
 });

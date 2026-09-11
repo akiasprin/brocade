@@ -1,5 +1,5 @@
-/* 设置页的分段保存写的是草稿（`saveSettings` → `draft.push({op:'update_settings'})`），
- * 而基准 `pristine` 读的是 `GET /settings`——直连接口，草稿提交前不会变。
+/* 会改机器产物的设置段写草稿；端口默认值与端到端探测设置直接写库。`pristine` 必须同时
+ * 合并草稿基准和这两个已提交分段，否则后续保存会把其中一边覆盖回旧值。
  *
  * 与机器详情页那三处是同一个根因（见 draft-discard-refresh.test.tsx），但症状不同：
  * 表单里的值不会回落（TanStack 的结构共享让 `settings.data` 引用不变，重填分支不触发），
@@ -39,7 +39,7 @@ const SESSION = {
   },
 };
 
-/** 已提交的全局设置。分段保存写草稿，这一份始终不变——正是问题所在。 */
+/** 已提交的全局设置。机器相关分段写草稿时这一份不变。 */
 const committedSettings = () => ({
   reality_client: { min_client_ver: null, max_client_ver: null, max_time_diff_ms: null },
   reality_site: {
@@ -90,6 +90,9 @@ const ROUTES: Record<string, () => unknown> = {
   '/links/mtu': () => ({ default_mtu: 1420, nodes: [], links: [] }),
   '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),
 };
+
+const immediateSettingsWrites: { path: string; body: unknown }[] = [];
+let immediateRevision = 8;
 
 const certsWithGroup = (): CertsView => ({
   sealing_available: true,
@@ -142,7 +145,16 @@ const publicCaCertsWithGroup = (): CertsView => {
 function stubFetch() {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (path: string) => {
+    vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/settings/ports' || path === '/settings/probe') {
+        const body = JSON.parse(String(init?.body));
+        const current = ROUTES['/settings']() as ReturnType<typeof committedSettings>;
+        const key = path === '/settings/ports' ? 'ports' : 'probe';
+        const next = { ...current, [key]: body } as ReturnType<typeof committedSettings>;
+        ROUTES['/settings'] = () => next;
+        immediateSettingsWrites.push({ path, body });
+        return Response.json({ revision_id: immediateRevision++, settings: next });
+      }
       const body = ROUTES[path];
       if (!body) throw new Error(`未预期的请求：${path}`);
       return new Response(JSON.stringify(body()), {
@@ -199,6 +211,9 @@ const settingsOp = () => draft.ops().find(op => op.op === 'update_settings');
 beforeEach(() => {
   draft.init(`settings-baseline-${Math.random()}`);
   draft.clear();
+  ROUTES['/settings'] = committedSettings;
+  immediateSettingsWrites.length = 0;
+  immediateRevision = 8;
   stubFetch();
 });
 
@@ -315,7 +330,30 @@ describe('设置页分段保存的基准', () => {
     expect((input as HTMLInputElement).value).toBe('13800');
     fireEvent.change(input, { target: { value: '49000' } });
     fireEvent.click(ports.getByText('保存这一段'));
-    await waitFor(() => expect(settingsOp()).toMatchObject({ settings: { ports: { vless_encryption_base: 49000 } } }));
+    await waitFor(() =>
+      expect(immediateSettingsWrites).toContainEqual({
+        path: '/settings/ports',
+        body: expect.objectContaining({ vless_encryption_base: 49000 }),
+      }),
+    );
+    expect(settingsOp()).toBeUndefined();
+  });
+
+  it('端到端探测设置即时写库，不进入草稿', async () => {
+    render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+    const probe = section('set-probe');
+    const interval = fieldInput(probe, '多久探一轮');
+    fireEvent.change(interval, { target: { value: '90' } });
+    fireEvent.click(probe.getByText('保存这一段'));
+
+    await waitFor(() =>
+      expect(immediateSettingsWrites).toContainEqual({
+        path: '/settings/probe',
+        body: expect.objectContaining({ interval_secs: 90 }),
+      }),
+    );
+    expect(settingsOp()).toBeUndefined();
   });
 
   it('保存动作默认隐藏，有改动后才出现在卡片底部', async () => {
@@ -736,7 +774,7 @@ describe('设置页分段保存的基准', () => {
     expect(section('set-ports').queryByText('有未保存的改动')).toBeNull();
   });
 
-  it('保存另一段不会把前一段已入草稿的改动写回旧值', async () => {
+  it('即时保存端口不会覆盖机器设置草稿，草稿也不会覆盖新的端口基准', async () => {
     render(<Harness />);
 
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
@@ -751,8 +789,15 @@ describe('设置页分段保存的基准', () => {
     fireEvent.change(hopBase, { target: { value: '20100' } });
     fireEvent.click(section('set-ports').getByText('保存这一段'));
 
-    await waitFor(() => expect(settingsOp()).toMatchObject({ settings: { ports: { hop_base: 20100 } } }));
+    await waitFor(() =>
+      expect(immediateSettingsWrites).toContainEqual({
+        path: '/settings/ports',
+        body: expect.objectContaining({ hop_base: 20100 }),
+      }),
+    );
     expect(settingsOp()).toMatchObject({ settings: { reality_site: { dest: 'www.edited.example:443' } } });
+    expect(hopBase.value).toBe('20100');
+    expect(section('set-ports').queryByText('有未保存的改动')).toBeNull();
   });
 
   /* 分段保存的本意：保存 A 段时，B 段「改了但没点保存」的输入既不能被提交，也不能被抹掉。

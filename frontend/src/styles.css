@@ -1088,18 +1088,6 @@
   .warp-binding-remove-actions {
     justify-content: flex-end;
   }
-  .warp-rule-defaults > header {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 9px;
-  }
-  .warp-rule-defaults > header > span {
-    padding: 0;
-    border-left: 0;
-  }
-  .warp-rule-defaults > header > .btn {
-    grid-column: 1 / -1;
-    justify-self: end;
-  }
 }
 /* ═══ 亮色 ═══
    不是暗色的直接反转：角色色需要压深，中性面改用暖白，分隔线降低对比。默认仍为暗色。 */
@@ -18678,76 +18666,6 @@ input.f.ing-pj-port {
 }
 .mux-drawer-actions {
   justify-content: flex-end !important;
-}
-.warp-rule-manager {
-  grid-template-rows: auto minmax(0, 1fr);
-  width: min(720px, 100vw);
-}
-.warp-rule-manager .external-outbound-body {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.warp-rule-defaults {
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--block);
-}
-.warp-rule-defaults > header {
-  display: grid;
-  grid-template-columns: 1.35fr 0.8fr 0.8fr 0.9fr auto;
-  align-items: center;
-  gap: 0;
-  padding: 10px;
-}
-.warp-rule-defaults > header > span {
-  display: grid;
-  min-width: 0;
-  gap: 3px;
-  padding: 0 10px;
-  border-left: 1px solid var(--line-soft);
-}
-.warp-rule-defaults > header > span:first-child {
-  padding-left: 0;
-  border-left: 0;
-}
-.warp-rule-defaults small {
-  color: var(--ink-4);
-  font-size: 9px;
-}
-.warp-rule-defaults b {
-  overflow: hidden;
-  color: var(--ink-2);
-  font-size: 10px;
-  font-weight: 520;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.warp-rule-defaults > p {
-  margin: 0;
-  padding: 7px 10px;
-  border-top: 1px solid var(--line-soft);
-  color: var(--ink-4);
-  font-size: 9.5px;
-}
-.warp-rule-machine {
-  margin: 0;
-}
-.warp-rule-machine > header .st {
-  margin-left: auto;
-}
-.warp-rule-register {
-  margin: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-}
-.warp-rule-register > p:first-child {
-  margin: 0;
-  color: var(--ink-3);
-  font-size: 10px;
-  line-height: 1.55;
 }
 .external-outbound-drawer > header,
 .external-outbound-drawer > footer {

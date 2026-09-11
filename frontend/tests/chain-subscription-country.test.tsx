@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { draft } from '../src/draft';
 import { ChainSubscriptionCountryRow, ChainTitle, subscriptionFlag } from '../src/panes/chains';
 import type { E2eProbeItem, SnapshotChain } from '../src/api';
@@ -27,6 +27,8 @@ const probe = (country: string): E2eProbeItem => ({
   samples: [],
 });
 
+const writes: { path: string; body: unknown }[] = [];
+
 const mount = (value: SnapshotChain, observed?: E2eProbeItem, editable = true) => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   return render(
@@ -41,6 +43,20 @@ const mount = (value: SnapshotChain, observed?: E2eProbeItem, editable = true) =
 afterEach(() => {
   cleanup();
   draft.clear();
+  vi.unstubAllGlobals();
+});
+
+beforeEach(() => {
+  draft.init(`chain-country-${Math.random()}`);
+  draft.clear();
+  writes.length = 0;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (path: string, init?: RequestInit) => {
+      writes.push({ path, body: init?.body ? JSON.parse(String(init.body)) : null });
+      return Response.json({ revision_id: writes.length });
+    }),
+  );
 });
 
 describe('chain subscription country', () => {
@@ -50,25 +66,22 @@ describe('chain subscription country', () => {
     expect(subscriptionFlag('ZZ')).toBe('');
   });
 
-  it('writes the explicit country while preserving the rest of the chain upsert', async () => {
+  it('immediately writes the explicit country while preserving the rest of the chain upsert', async () => {
     const view = mount(chain());
     expect(view.getByRole('option', { name: '🇹🇼 TW · 台湾' })).toBeTruthy();
     fireEvent.change(view.getByRole('combobox', { name: '出口地区标识' }), { target: { value: 'TW' } });
 
-    await waitFor(() =>
-      expect(draft.ops()).toEqual([
-        {
-          op: 'upsert_chain',
-          app_id: 'app-main',
-          chain: {
-            id: 'c-tw',
-            tenant_id: 'platform.acme',
-            name: '台北直连',
-            subscription_country: 'TW',
-          },
-        },
-      ]),
-    );
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toEqual({
+      path: '/apps/app-main/chains',
+      body: {
+        id: 'c-tw',
+        tenant_id: 'platform.acme',
+        name: '台北直连',
+        subscription_country: 'TW',
+      },
+    });
+    expect(draft.ops()).toEqual([]);
   });
 
   it('preserves the configured country when renaming a chain', async () => {
@@ -87,27 +100,25 @@ describe('chain subscription country', () => {
     fireEvent.change(input, { target: { value: '台湾高速' } });
     fireEvent.keyDown(input, { key: 'Enter' });
 
-    await waitFor(() =>
-      expect(draft.ops()).toEqual([
-        {
-          op: 'upsert_chain',
-          app_id: 'app-main',
-          chain: {
-            id: 'c-tw',
-            tenant_id: 'platform.acme',
-            name: '台湾高速',
-            subscription_country: 'TW',
-          },
-        },
-      ]),
-    );
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toEqual({
+      path: '/apps/app-main/chains',
+      body: {
+        id: 'c-tw',
+        tenant_id: 'platform.acme',
+        name: '台湾高速',
+        subscription_country: 'TW',
+      },
+    });
+    expect(draft.ops()).toEqual([]);
   });
 
   it('offers a successful E2E country as an explicit choice and previews the flag', async () => {
     const view = mount(chain(), probe('TW'));
     fireEvent.click(view.getByRole('button', { name: '采用当前出口 TW' }));
 
-    await waitFor(() => expect(draft.ops()[0]).toMatchObject({ chain: { subscription_country: 'TW' } }));
+    await waitFor(() => expect(writes[0]).toMatchObject({ body: { subscription_country: 'TW' } }));
+    expect(draft.ops()).toEqual([]);
     expect(subscriptionFlag('TW')).toBe('🇹🇼');
   });
 

@@ -94,6 +94,62 @@ fn port_allocation_bases_do_not_change_existing_machine_artifacts() {
 }
 
 #[test]
+fn end_to_end_probe_schedule_does_not_change_machine_artifacts() {
+    let before = snapshot(
+        vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
+        vec![direct_app(
+            "direct",
+            "hk",
+            "i-direct",
+            8443,
+            true,
+            any_egress(),
+        )],
+    );
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+    let mut after = before.clone();
+    after.revision += 1;
+    after.settings.probe.endpoint_url = "http://probe.example.test/trace".to_owned();
+    after.settings.probe.timeout_secs = 25;
+    after.settings.probe.interval_secs = 90;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(plan.summary.changed_targets, 0);
+    assert_eq!(plan.summary.skipped_targets, 1);
+    assert!(plan.targets[0].actions.is_empty());
+}
+
+#[test]
+fn names_display_order_and_ungranted_users_do_not_change_machine_artifacts() {
+    let before = snapshot(
+        vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
+        vec![
+            direct_app("app-a", "hk", "ing-a", 8443, true, any_egress()),
+            direct_app("app-b", "hk", "ing-b", 9443, true, any_egress()),
+        ],
+    );
+    let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
+    let mut after = before.clone();
+    after.revision += 1;
+    after.apps.reverse();
+    after.apps[0].label = "Renamed App".to_owned();
+    after.apps[0].chains[0].name = "Renamed Chain".to_owned();
+    after.apps[0].chains[0].subscription_country = Some("TW".to_owned());
+    after.users.push(User {
+        id: "new-user".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        uuid: "00000000-0000-4000-8000-000000000099".to_owned(),
+    });
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(plan.summary.changed_targets, 0);
+    assert_eq!(plan.summary.skipped_targets, 1);
+    assert!(plan.targets[0].actions.is_empty());
+}
+
+#[test]
 fn relay_mux_global_change_only_releases_sources_that_follow_global() {
     let following = relay_app("following", "hk", "sg", HopPool::Mux(None));
     let overridden = relay_app(

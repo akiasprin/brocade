@@ -768,6 +768,22 @@ pub(crate) async fn reorder_apps_tx(
     Ok(true)
 }
 
+/// Commit the final display/subscription order immediately. Machine artifact construction
+/// canonicalizes apps by stable ID, so this ordering has nothing to wait for in a deployment.
+pub async fn reorder_apps(
+    pool: &PgPool,
+    actor: &AdminContext,
+    ids: Vec<String>,
+) -> Result<ModelWriteResult> {
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+    let revision_id = insert_revision(&mut tx, actor.operator_id(), "reorder apps").await?;
+    let changed = reorder_apps_tx(&mut tx, actor, ids).await?;
+    let revision_id = commit_revision(&mut tx, revision_id, previous, changed).await?;
+    tx.commit().await?;
+    Ok(ModelWriteResult { revision_id })
+}
+
 /// Model writes hold the control-state lock, so reference checks and deletion are atomic.
 pub(crate) async fn delete_external_outbound_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -1743,6 +1759,28 @@ pub(crate) async fn reorder_chains_tx(
     .execute(&mut **tx)
     .await?;
     Ok(true)
+}
+
+/// Commit one app's client-visible chain order immediately. The order is consumed by console and
+/// subscription projections, not by machine artifact planning.
+pub async fn reorder_chains(
+    pool: &PgPool,
+    actor: &AdminContext,
+    app_id: &str,
+    ids: Vec<String>,
+) -> Result<ModelWriteResult> {
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+    let revision_id = insert_revision(
+        &mut tx,
+        actor.operator_id(),
+        &format!("reorder chains in app {app_id}"),
+    )
+    .await?;
+    let changed = reorder_chains_tx(&mut tx, actor, app_id.to_owned(), ids).await?;
+    let revision_id = commit_revision(&mut tx, revision_id, previous, changed).await?;
+    tx.commit().await?;
+    Ok(ModelWriteResult { revision_id })
 }
 
 /// Normalize and verify a complete ordering document against rows locked by the caller.

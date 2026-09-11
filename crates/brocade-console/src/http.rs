@@ -29,7 +29,7 @@ use axum::{
 };
 use brocade_core::{
     hash::{hex_lower, sha256_hex},
-    model::{IpFamily, ModelSettings},
+    model::{IpFamily, ModelSettings, PortSettings, ProbeSettings},
     physical::user::{SubscriptionFilter, SubscriptionProtocol},
 };
 use brocade_deployment::plan::DeploymentKind;
@@ -848,6 +848,8 @@ fn admin_router_with_state(state: AppState) -> Router {
         // still require a system administrator in the handler below.
         .route("/branding", get(get_branding).put(update_branding))
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/settings/ports", put(update_port_settings))
+        .route("/settings/probe", put(update_probe_settings))
         .route(
             "/realtime/settings",
             get(get_realtime_settings).put(update_realtime_settings),
@@ -1009,6 +1011,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/grants/automation", get(grant_automation_status))
         .route("/quotas", get(list_user_app_quotas).put(set_user_app_quota))
         .route("/apps", post(upsert_app))
+        .route("/apps/order", put(reorder_apps))
         .route(
             "/tenants/{tenant_id}/tunnels/{outbound_id}/warp-bindings",
             post(register_warp_binding),
@@ -1018,6 +1021,7 @@ fn admin_router_with_state(state: AppState) -> Router {
             put(update_warp_binding).delete(remove_warp_binding),
         )
         .route("/apps/{app_id}/chains", post(upsert_chain))
+        .route("/apps/{app_id}/chains/order", put(reorder_chains))
         .route("/apps/{app_id}/fronts", post(upsert_front))
         .route("/apps/{app_id}/ingresses", post(upsert_ingress))
         .route(
@@ -2402,6 +2406,24 @@ async fn update_settings(
     Ok(Json(result).into_response())
 }
 
+async fn update_port_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(ports): Json<PortSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(state.store.update_port_settings(&admin, ports).await?).into_response())
+}
+
+async fn update_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(probe): Json<ProbeSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(state.store.update_probe_settings(&admin, probe).await?).into_response())
+}
+
 fn settings_if_match(headers: &HeaderMap) -> ApiResult<u64> {
     let value = headers
         .get(header::IF_MATCH)
@@ -3617,6 +3639,21 @@ async fn upsert_app(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReorderRequest {
+    ids: Vec<String>,
+}
+
+async fn reorder_apps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReorderRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(state.store.reorder_apps(&admin, request.ids).await?).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterWarpBindingHttpRequest {
     node_id: String,
     /// The compatible registration endpoint submits Cloudflare's application terms timestamp.
@@ -3841,6 +3878,22 @@ async fn upsert_chain(
     let result = state.store.upsert_chain(&admin, &app_id, request).await?;
     state.grants_wake.notify_one();
     Ok(Json(result).into_response())
+}
+
+async fn reorder_chains(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ReorderRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(
+        state
+            .store
+            .reorder_chains(&admin, &app_id, request.ids)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn upsert_front(

@@ -395,13 +395,14 @@ async fn apply_op(
             crate::settings::set_wireguard_link_disabled_tx(tx, actor, a, b, disabled).await?
         }
         ModelOp::UpdateSettings { mut settings } => {
-            // Disabled mesh links have their own pair-scoped operation. Preserve the transaction's
-            // current list here so a whole-settings form saved later in the same draft cannot
-            // erase an earlier link change (and the reverse operation order behaves identically).
-            settings.overlay.disabled_links = crate::settings::load_settings_tx(tx)
-                .await?
-                .overlay
-                .disabled_links;
+            // These fields have section-scoped write paths outside the browser draft. Preserve the
+            // transaction's current values so an older whole-settings draft cannot roll an
+            // immediately-saved section back when it is eventually committed. Disabled mesh links
+            // likewise have their own pair-scoped operation.
+            let current = crate::settings::load_settings_tx(tx).await?;
+            settings.overlay.disabled_links = current.overlay.disabled_links;
+            settings.ports = current.ports;
+            settings.probe = current.probe;
             crate::settings::update_settings_tx(tx, actor, settings)
                 .await?
                 .1

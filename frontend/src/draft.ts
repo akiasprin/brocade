@@ -1,4 +1,5 @@
-// 草稿：编辑累积在浏览器中，点击提交后写库，一次提交产生一个修订。
+// 草稿：会改变机器产物或需要跨表原子落地的编辑累积在浏览器中，点击提交后写库，
+// 一次提交产生一个修订。纯控制面字段由 api.ts 的分段接口即时提交。
 // *
 // * 该设计替代了原有的编辑即提交。原方案的问题在使用后显现：
 // * 模型写接口是纯 upsert（`steps` 没有删除接口），因此文档中的「撤销即反向修改一次」
@@ -239,11 +240,11 @@ function entryOf(op: ModelOp): DraftEntry {
         op,
       };
     case 'delete_external_outbound':
-      return { key: `external-outbound:${op.tenant_id}/${op.id}`, label: `删除代理出站 ${op.id}`, op };
+      return { key: `external-outbound:${op.tenant_id}/${op.id}`, label: `删除隧道 ${op.id}`, op };
     case 'upsert_external_outbound':
       return {
         key: `external-outbound:${op.outbound.tenant_id}/${op.outbound.id}`,
-        label: `代理出站 ${op.outbound.name || op.outbound.id}`,
+        label: `隧道 ${op.outbound.name || op.outbound.id}`,
         op,
       };
     case 'upsert_front':

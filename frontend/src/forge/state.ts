@@ -7,6 +7,7 @@ import { useSyncExternalStore } from 'react';
 export type NavKey =
   | 'nodes'
   | 'chains'
+  | 'tunnels'
   | 'users'
   | 'deploy'
   | 'topo'
@@ -22,6 +23,7 @@ export type NavKey =
 export const NAV_KEYS = [
   'nodes',
   'chains',
+  'tunnels',
   'users',
   'deploy',
   'topo',

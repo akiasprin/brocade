@@ -48,19 +48,20 @@ interface Face {
   roles?: AdminRole[];
 }
 
-// 顶栏只显示当前主工作流。代理出站在规则的「转发给」中管理，不另设导航项。
+// 顶栏只显示当前主工作流。规则负责选择转发目标；隧道资源本身的生命周期统一在隧道页管理。
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
   { key: 'chains', label: '线路', icon: 'chains' },
+  { key: 'tunnels', label: '隧道', icon: 'tunnels' },
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },
 ];
 
-/* 手机端只把三项高频配置入口留在顶栏，腾出的宽度用于恢复按钮文字。发布和用量仍使用
-   同一份 Face 定义，只是移动到更多菜单，避免两套角色权限和名称逐渐分叉。 */
+/* 手机端只把三项高频配置入口留在顶栏，腾出的宽度用于恢复按钮文字。隧道、发布和用量仍
+   使用同一份 Face 定义，只是移动到更多菜单，避免两套角色权限和名称逐渐分叉。 */
 const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'users');
-const MOBILE_MORE = NAV.filter(f => f.key === 'deploy' || f.key === 'usage');
+const MOBILE_MORE = NAV.filter(f => f.key === 'tunnels' || f.key === 'deploy' || f.key === 'usage');
 
 // 收入「⋯」的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从「⋯」进入。
@@ -536,7 +537,7 @@ function TopBar({
   );
 
   if (narrow) {
-    /* 窄屏只有这一行：品牌 + 三个高频页面 + 诊断 + ⋯。发布和用量收入更多菜单，
+    /* 窄屏只有这一行：品牌 + 三个高频页面 + 诊断 + ⋯。隧道、发布和用量收入更多菜单，
        发布状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
     return (
       <div className="fg-top fg-navrow">

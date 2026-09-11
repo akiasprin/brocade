@@ -267,6 +267,65 @@ pub async fn update_settings(
     })
 }
 
+/// Persist port-allocation defaults immediately. These values only seed newly-created model
+/// objects; they never alter an existing machine artifact. Keeping this as a section-scoped write
+/// lets a settings form save them without carrying stale machine-owned settings along with it.
+pub async fn update_port_settings(
+    pool: &PgPool,
+    actor: &AdminContext,
+    ports: PortSettings,
+) -> Result<UpdateSettingsResult> {
+    update_settings_section(
+        pool,
+        actor,
+        "update port allocation defaults",
+        move |settings| {
+            settings.ports = ports;
+        },
+    )
+    .await
+}
+
+/// Persist end-to-end probe scheduling immediately. Probes read the current committed model on
+/// their next cycle, while no generated machine artifact contains these fields.
+pub async fn update_probe_settings(
+    pool: &PgPool,
+    actor: &AdminContext,
+    probe: ProbeSettings,
+) -> Result<UpdateSettingsResult> {
+    update_settings_section(
+        pool,
+        actor,
+        "update end-to-end probe settings",
+        move |settings| {
+            settings.probe = probe;
+        },
+    )
+    .await
+}
+
+async fn update_settings_section(
+    pool: &PgPool,
+    actor: &AdminContext,
+    note: &str,
+    patch: impl FnOnce(&mut ModelSettings),
+) -> Result<UpdateSettingsResult> {
+    let mut tx = pool.begin().await?;
+    let previous = crate::console::lock_control_state(&mut tx).await?;
+    let mut settings = load_settings_tx(&mut tx).await?;
+    patch(&mut settings);
+    let revision_id = crate::console::insert_revision(&mut tx, actor.operator_id(), note).await?;
+    let (settings, changed) = update_settings_tx(&mut tx, actor, settings).await?;
+    let revision_id =
+        crate::console::commit_revision(&mut tx, revision_id, previous, changed).await?;
+    tx.commit().await?;
+
+    Ok(UpdateSettingsResult {
+        revision_id,
+        settings,
+    })
+}
+
 pub(crate) async fn update_settings_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor: &AdminContext,

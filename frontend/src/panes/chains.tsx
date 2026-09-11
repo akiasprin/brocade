@@ -3879,6 +3879,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const editable = can(who.role, 'edit');
   const [creating, setCreating] = useState<{ id: string; label: string } | null>(null);
   const [renaming, setRenaming] = useState<{ id: string; label: string } | null>(null);
+  const [orderError, setOrderError] = useState<unknown>(null);
   const [orderDrag, setOrderDragState] = useState<OrderDrag | null>(null);
   const orderDragRef = useRef<OrderDrag | null>(null);
   // FLIP 用：`.chain-sections` 容器、上一帧各卡片的位置、以及「这一帧要不要播动画」的开关。
@@ -3944,11 +3945,12 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
 
   const persistOrder = (order: OrderDrag) => {
     if (sameOrder(order.order, order.original)) return;
-    if (order.kind === 'apps') {
-      void reorderApps(order.order).then(invalidate);
-    } else {
-      void reorderChains(order.appId, order.order).then(invalidate);
-    }
+    setOrderError(null);
+    const request = order.kind === 'apps' ? reorderApps(order.order) : reorderChains(order.appId, order.order);
+    void request.then(invalidate).catch(error => {
+      setOrderError(error);
+      invalidate();
+    });
   };
 
   const nudgeOrder = (event: ReactKeyboardEvent<HTMLButtonElement>, order: OrderDrag) => {
@@ -4306,6 +4308,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
         </header>
 
         {probes.error && <ErrorBox error={probes.error} />}
+        {orderError !== null && <ErrorBox error={orderError} />}
 
         {/* 技术 ID 自动生成；创建时只要求用户填写真正用于辨识的分组名称。 */}
         {creating && (

@@ -555,16 +555,13 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
 
     let result = db
         .store
-        .apply_draft(
+        .reorder_apps(
             &system_admin(),
-            vec![ModelOp::ReorderApps {
-                ids: vec!["app-secondary".to_owned(), "app-main".to_owned()],
-            }],
-            None,
+            vec!["app-secondary".to_owned(), "app-main".to_owned()],
         )
         .await
         .unwrap();
-    assert_eq!(result.changed, 1);
+    assert!(result.revision_id > 1);
 
     let positions: Vec<(String, i32)> =
         sqlx::query_as("SELECT id, position FROM apps ORDER BY position")
@@ -11575,8 +11572,8 @@ async fn rollback_deployment_restores_target_snapshot_then_force_syncs_when_acti
         .await
         .unwrap();
     // Exercise every family the old rollback writer omitted. Connection and geodata affect
-    // artifacts; ports and probe settings affect future allocation/agent work and still belong to
-    // the revisioned model. Node connection overrides were omitted by the second restore writer.
+    // artifacts and must roll back. Ports and probe settings are independently effective and must
+    // survive the machine rollback. Node connection overrides were omitted by the old writer too.
     sqlx::query(
         "UPDATE control_state SET
             current_revision = $1,
@@ -11614,6 +11611,7 @@ async fn rollback_deployment_restores_target_snapshot_then_force_syncs_when_acti
     .await
     .unwrap();
     store_current_model_snapshot(db.pool(), &db.store).await;
+    let current_before_rollback = db.store.materialize_snapshot(None).await.unwrap();
 
     let second = db
         .store
@@ -11702,9 +11700,11 @@ async fn rollback_deployment_restores_target_snapshot_then_force_syncs_when_acti
     assert_eq!(restored.revision, rollback.plan.revision);
     let mut expected = target_snapshot;
     expected.revision = restored.revision;
+    expected.settings.ports = current_before_rollback.settings.ports;
+    expected.settings.probe = current_before_rollback.settings.probe;
     assert_eq!(
         restored, expected,
-        "rollback must restore the complete model"
+        "rollback restores machine state without rewinding independently effective settings"
     );
 
     let desired = db
@@ -11719,7 +11719,7 @@ async fn rollback_deployment_restores_target_snapshot_then_force_syncs_when_acti
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn discard_pending_changes_restores_settings_and_node_connection_policy() {
+async fn discard_pending_changes_restores_machine_settings_but_keeps_immediate_fields() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -11797,24 +11797,24 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
         "succeeded"
     );
 
-    let reordered = db
+    let reordered_apps = db
         .store
-        .apply_draft(
+        .reorder_apps(
             &system_admin(),
-            vec![
-                ModelOp::ReorderApps {
-                    ids: vec!["app-secondary".to_owned(), "app-main".to_owned()],
-                },
-                ModelOp::ReorderChains {
-                    app_id: "app-main".to_owned(),
-                    ids: vec!["c-secondary".to_owned(), "chn-a1b2-c3d4".to_owned()],
-                },
-            ],
-            None,
+            vec!["app-secondary".to_owned(), "app-main".to_owned()],
         )
         .await
         .unwrap();
-    assert!(reordered.revision_id > 1);
+    let reordered_chains = db
+        .store
+        .reorder_chains(
+            &system_admin(),
+            "app-main",
+            vec!["c-secondary".to_owned(), "chn-a1b2-c3d4".to_owned()],
+        )
+        .await
+        .unwrap();
+    assert!(reordered_chains.revision_id > reordered_apps.revision_id);
     let pending_order: Vec<String> = sqlx::query_scalar("SELECT id FROM apps ORDER BY position")
         .fetch_all(db.pool())
         .await
@@ -11827,6 +11827,21 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
             .unwrap();
     assert_eq!(pending_chain_order, ["c-secondary", "chn-a1b2-c3d4"]);
 
+    let mut immediate_ports = target_snapshot.settings.ports;
+    immediate_ports.hop_base = 21_000;
+    db.store
+        .update_port_settings(&system_admin(), immediate_ports)
+        .await
+        .unwrap();
+    let mut immediate_probe = target_snapshot.settings.probe.clone();
+    immediate_probe.interval_secs = 90;
+    db.store
+        .update_probe_settings(&system_admin(), immediate_probe.clone())
+        .await
+        .unwrap();
+
+    // Replay a whole-settings machine draft built before the immediate section writes. Its stale
+    // ports/probe copies must be ignored both here and by the later discard.
     let mut changed_settings = target_snapshot.settings.clone();
     changed_settings.geodata.cron = "CRON_TZ=UTC 15 3 * * *".to_owned();
     changed_settings.geodata.geoip_url = "https://changed.example/geoip.dat".to_owned();
@@ -11834,7 +11849,13 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
     changed_settings.connection.buffer_size_kb = Some(64);
     changed_settings.stats_user_online = !changed_settings.stats_user_online;
     db.store
-        .update_settings(&system_admin(), changed_settings)
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpdateSettings {
+                settings: changed_settings,
+            }],
+            None,
+        )
         .await
         .unwrap();
     let changed_node = db
@@ -11863,18 +11884,32 @@ async fn discard_pending_changes_restores_settings_and_node_connection_policy() 
     let restored = db.store.materialize_snapshot(None).await.unwrap();
     let mut expected = target_snapshot;
     expected.revision = discarded.current_revision;
+    expected.settings.ports = immediate_ports;
+    expected.settings.probe = immediate_probe;
+    expected.apps.swap(0, 1);
+    let expected_main = expected
+        .apps
+        .iter_mut()
+        .find(|app| app.id == "app-main")
+        .unwrap();
+    expected_main.chains.swap(0, 1);
+    expected_main.ingresses.swap(0, 1);
     assert_eq!(
         restored, expected,
-        "discard must restore the complete model"
+        "discard restores deployable state while retaining independently effective fields"
     );
     let restored_order: Vec<&str> = restored.apps.iter().map(|app| app.id.as_str()).collect();
-    assert_eq!(restored_order, ["app-main", "app-secondary"]);
-    let restored_chain_order: Vec<&str> = restored.apps[0]
+    assert_eq!(restored_order, ["app-secondary", "app-main"]);
+    let restored_chain_order: Vec<&str> = restored
+        .apps
+        .iter()
+        .find(|app| app.id == "app-main")
+        .unwrap()
         .chains
         .iter()
         .map(|chain| chain.id.as_str())
         .collect();
-    assert_eq!(restored_chain_order, ["chn-a1b2-c3d4", "c-secondary"]);
+    assert_eq!(restored_chain_order, ["c-secondary", "chn-a1b2-c3d4"]);
 }
 
 #[tokio::test]

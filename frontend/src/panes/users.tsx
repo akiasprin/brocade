@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ApiError,
@@ -40,7 +40,6 @@ import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { isValidSlug } from './ports';
 import { SubscriptionViewer, type SubscriptionKind } from './subscription';
-import { draft } from '../draft';
 import { navigate } from '../forge/route';
 
 // 用户列表：一行一个用户，点击后就地展开。
@@ -50,8 +49,7 @@ import { navigate } from '../forge/route';
 //
 // 一个授权项对应一条 grant。点击只触发 grant-sync 批次，不重启进程，不断开连接。
 //
-// 新用户直接作为名册中的一条可编辑行出现。它和已有用户处在同一信息结构里，保存后仍以
-// “待提交”行留在名册中；不会跳转到尚不存在的详情页。
+// 新用户直接作为名册中的一条可编辑行出现；添加成功即写库并刷新名册，无需再提交草稿。
 
 type Drill = { p: 'list' } | { p: 'user'; id: string };
 
@@ -794,9 +792,6 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   const [busy, setBusy] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [newUser, setNewUser] = useState<{ id: string; tenant: string } | null>(null);
-  // A create is a browser draft operation. Subscribe explicitly so the resulting pending user
-  // remains visible as a roster row until the top-bar draft is committed or discarded.
-  const draftEntries = useSyncExternalStore(draft.subscribe, draft.snapshot);
   /* 当前查看的订阅（用户 + 格式）。null 表示未打开。同时只显示一份，与上面的展开策略一致。 */
   const [sub, setSub] = useState<{ user: UserListItem; kind: SubscriptionKind } | null>(null);
   const [detailActionsOpen, setDetailActionsOpen] = useState(false);
@@ -889,8 +884,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
     mutationFn: () => createUser({ tenant_id: newTenant, id: newUser?.id.trim() ?? '' }),
     onSuccess: () => {
       setNewUser(null);
-      void qc.invalidateQueries({ queryKey: ['snapshot'] });
-      void qc.invalidateQueries({ queryKey: ['revisions'] });
+      refresh();
     },
   });
 
@@ -920,26 +914,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
       ? listedUsers.map(user => (`${user.tenant_id}/${user.id}` === selfKey ? me.data : user))
       : [me.data, ...listedUsers]
     : listedUsers;
-  type RosterUser = UserListItem & { staged?: boolean };
-  const existingKeys = new Set(serverUsers.map(user => `${user.tenant_id}/${user.id}`));
-  const stagedUsers: RosterUser[] = draftEntries.flatMap(entry => {
-    if (entry.op.op !== 'create_user') return [];
-    const { tenant_id, id } = entry.op.user;
-    if (existingKeys.has(`${tenant_id}/${id}`)) return [];
-    return [
-      {
-        tenant_id,
-        id,
-        status: 'active',
-        account_type: 'formal',
-        login_enabled: false,
-        created_at: '',
-        created_revision: null,
-        staged: true,
-      },
-    ];
-  });
-  const list: RosterUser[] = [...serverUsers, ...stagedUsers];
+  const list = serverUsers;
   const canManageLogin = can(who.role, 'manage-tenants');
   /* 订阅是完整可用的配置，readonly 角色在 API 侧返回 403（见 session.tsx 的 can）。
      入口同步隐藏，避免点击后只得到一个错误。 */
@@ -1086,18 +1061,6 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
   // 并在顶部补一条身份标题条。
   const detailOf = (r: (typeof rows)[number]) => {
     const { u, mine, suspended, use, quotaRows, facts, tone } = r;
-    if (u.staged) {
-      return (
-        <section className="panel user-split-detail">
-          <div className="user-detail-empty">
-            <span>
-              <b className="mono">{u.id}</b> 已加入草稿
-            </span>
-            <small>正式用户。提交草稿后即可配置登录、额度与授权。</small>
-          </div>
-        </section>
-      );
-    }
     const disabled = u.status === 'disabled';
     const isMe = r.key === selfKey;
     const selfService = who.role === 'user' && isMe;
@@ -1509,7 +1472,6 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                         <span className={`st ${u.account_type === 'test' ? 'st-warn' : 'st-succeeded'}`}>
                           {accountTypeBadge(u.account_type)}
                         </span>
-                        {u.staged && <span className="st">待提交</span>}
                       </span>
                       <span className="r2">
                         <span className={`rstate${lampCls ? ` ${lampCls}` : ''}`}>{stateLine}</span>

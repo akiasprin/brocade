@@ -22,6 +22,8 @@ import {
   saveDistribution,
   saveAgentLogDefault,
   saveNodeLogPolicy,
+  savePortSettings,
+  saveProbeSettings,
   saveSettings,
   savePingProbeSettings,
   setVisitorAccess,
@@ -2178,8 +2180,8 @@ export function SettingsPane() {
   const [saved, setSaved] = useState<Partial<Record<SectionKey, number>>>({});
   const [muxExpanded, setMuxExpanded] = useState(false);
 
-  /* 分段保存写的是草稿（`saveSettings` → `update_settings`），因此「已保存」的基准是草稿
-     生效后的值，而不是 `GET /settings`——后者是直连接口，草稿提交前不会变。以它为基准有
+  /* 会改变机器产物的分段保存写入草稿（`saveSettings` → `update_settings`），因此这些段
+     「已保存」的基准是草稿生效后的值，而不是 `GET /settings`。以它为基准有
      两个后果，都实测复现过（tests/settings-draft-baseline.test.tsx）：
        一、保存完那一段，标题栏仍显示「有未保存的改动」，保存按钮一直亮着；
        二、更严重的是保存另一段时，本段未覆盖的字段会从已提交值重新取一遍
@@ -2188,8 +2190,13 @@ export function SettingsPane() {
   useSyncExternalStore(draft.subscribe, draft.version);
   const pendingOp = draft.ops().find(op => op.op === 'update_settings');
   const pendingSettings = pendingOp?.op === 'update_settings' ? pendingOp.settings : null;
-
-  const pristine = pendingSettings ? formOf(pendingSettings) : settings.data ? formOf(settings.data) : null;
+  // 端口默认值和端到端探测设置已改为分段即时提交。机器设置草稿仍会携带保存当时的
+  // ports/probe 副本；显示和后续保存必须用当前已提交值覆盖，服务端回放时也做同样保护。
+  const pendingBaseline =
+    pendingSettings && settings.data
+      ? { ...pendingSettings, ports: settings.data.ports, probe: settings.data.probe }
+      : pendingSettings;
+  const pristine = pendingBaseline ? formOf(pendingBaseline) : settings.data ? formOf(settings.data) : null;
 
   // Rebase untouched fields when the draft changes or is discarded. Preserve only genuine
   // local edits, so saving one section never clears another section's unfinished input.
@@ -2278,14 +2285,28 @@ export function SettingsPane() {
         // 开关不如不提供。此处原样传递，避免保存其他段时将其重置为 false。
         stats_user_online: settings.data?.stats_user_online ?? false,
       };
-      return saveSettings(body).then(r => ({
-        key,
-        revision_id: r.revision_id,
-        submitted: form,
-        normalized: formOf(body),
-      }));
+      const request: Promise<{ revision_id: number; settings?: ModelSettings }> =
+        key === 'ports'
+          ? savePortSettings(body.ports)
+          : key === 'probe'
+            ? saveProbeSettings(body.probe)
+            : saveSettings(body);
+      return request.then(r => {
+        const committed = r.settings ?? null;
+        return {
+          key,
+          revision_id: r.revision_id,
+          submitted: form,
+          normalized: formOf(committed ?? body),
+          committed,
+        };
+      });
     },
-    onSuccess: r => {
+    onSuccess: async r => {
+      if (r.committed) {
+        await qc.cancelQueries({ queryKey: ['settings'] });
+        qc.setQueryData(['settings'], r.committed);
+      }
       setSaved(s => ({ ...s, [r.key]: r.revision_id }));
       setForm(current => {
         const next = { ...current };

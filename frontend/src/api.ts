@@ -59,8 +59,8 @@ export async function api<T>(path: string, token = '', init?: RequestInit): Prom
 const req = <T>(path: string, init: RequestInit) => api<T>(path, '', init);
 
 // ── 草稿 ──
-// 编辑在前端累积，提交时才写库。读取也遵循同一规则——存在草稿时读取的是草稿全部生效后的
-// 结果，由服务端在一个最终回滚的事务中计算（见 draft.ts 开头）。
+// 会改变机器产物或需要跨表原子落地的编辑在前端累积，提交时才写库；纯控制面字段走下方
+// 各自的即时接口。草稿读取由服务端在一个最终回滚的事务中计算（见 draft.ts 开头）。
 export interface DraftPreview {
   snapshot: ConsoleSnapshot;
   compile: CompileView;
@@ -105,6 +105,31 @@ export function draftPreview(): Promise<DraftPreview> {
     if (previewCache?.p === p) previewCache = null;
   });
   return p;
+}
+
+/** Write one control-plane-only field immediately and invalidate the draft projection cache. */
+async function immediateModelWrite<T>(write: () => Promise<T>): Promise<T> {
+  const result = await write();
+  previewCache = null;
+  return result;
+}
+
+// Drag events can finish before the preceding request returns. Serialize each independent order
+// scope so the final gesture, rather than the slowest response, determines the stored order.
+const immediateOrderWrites = new Map<string, Promise<unknown>>();
+function enqueueImmediateOrder<T>(scope: string, write: () => Promise<T>): Promise<T> {
+  const previous = immediateOrderWrites.get(scope) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(write);
+  immediateOrderWrites.set(scope, next);
+  next.then(
+    () => {
+      if (immediateOrderWrites.get(scope) === next) immediateOrderWrites.delete(scope);
+    },
+    () => {
+      if (immediateOrderWrites.get(scope) === next) immediateOrderWrites.delete(scope);
+    },
+  );
+  return next;
 }
 
 export const applyDraft = (ops: ModelOp[], note?: string) =>
@@ -735,10 +760,8 @@ export interface UserListItem {
 export const fetchUsers = (includeDisabled = true) =>
   api<{ users: UserListItem[] }>(`/users?include_disabled=${includeDisabled}`);
 
-export const createUser = async (body: { tenant_id: string; id: string }) => {
-  draft.push({ op: 'create_user', user: body });
-  return {} as unknown;
-};
+export const createUser = (body: { tenant_id: string; id: string }) =>
+  immediateModelWrite(() => post<ModelWriteResult>('/users', body));
 
 // Permission changes bypass the browser draft.  The server commits a revision and a durable
 // automatic-grants job together; the worker creates the non-disruptive grants deployment.
@@ -909,12 +932,15 @@ export interface ModelWriteResult {
   revision_id: number;
 }
 
-// 下列函数不再直接写库，而是向草稿中追加一条操作（`draft.ts`）。函数签名保持不变，
-// 因此面板侧仍然调用 `await upsertChain(...)`，只是结果写入浏览器本地，
-// 点击顶栏的「提交」后整批写库并产生一个修订。需要立即写入的（如签发安装令牌）使用 `*Now`。
+// 新建项目/链仍需和向导中的接入面、规则一起原子提交；既有对象的名称等客户端元数据则
+// 立即落库。若对象本身尚在当前草稿中创建，后续编辑必须继续合并进那条 create 操作。
 export const upsertApp = async (body: { id: string; label: string; note?: string }) => {
-  draft.push({ op: 'upsert_app', app: { id: body.id, label: body.label } });
-  return { revision_id: 0 } as ModelWriteResult;
+  const key = `app:${body.id}`;
+  if (draft.snapshot().find(entry => entry.key === key)?.op.op === 'create_app') {
+    draft.push({ op: 'upsert_app', app: { id: body.id, label: body.label } });
+    return { revision_id: 0 } as ModelWriteResult;
+  }
+  return immediateModelWrite(() => post<ModelWriteResult>('/apps', body));
 };
 
 export const createApp = async (body: { id: string; label: string }) => {
@@ -924,31 +950,58 @@ export const createApp = async (body: { id: string; label: string }) => {
 
 /** Persist the complete final line order produced by a drag gesture. */
 export const reorderApps = async (ids: string[]) => {
-  draft.push({ op: 'reorder_apps', ids });
-  return { revision_id: 0 } as ModelWriteResult;
+  if (draft.snapshot().some(entry => entry.op.op === 'create_app')) {
+    draft.push({ op: 'reorder_apps', ids });
+    return { revision_id: 0 } as ModelWriteResult;
+  }
+  return enqueueImmediateOrder('apps', () =>
+    immediateModelWrite(() =>
+      api<ModelWriteResult>('/apps/order', '', { method: 'PUT', body: JSON.stringify({ ids }) }),
+    ),
+  );
 };
 
 /** Persist one line's complete final chain order without changing any stable chain ID. */
 export const reorderChains = async (appId: string, ids: string[]) => {
-  draft.push({ op: 'reorder_chains', app_id: appId, ids });
-  return { revision_id: 0 } as ModelWriteResult;
+  const hasPendingMembershipChange = draft
+    .snapshot()
+    .some(
+      entry =>
+        (entry.op.op === 'create_app' && entry.op.app.id === appId) ||
+        ((entry.op.op === 'create_chain' || entry.op.op === 'delete_chain') && entry.op.app_id === appId),
+    );
+  if (hasPendingMembershipChange) {
+    draft.push({ op: 'reorder_chains', app_id: appId, ids });
+    return { revision_id: 0 } as ModelWriteResult;
+  }
+  return enqueueImmediateOrder(`chains:${appId}`, () =>
+    immediateModelWrite(() =>
+      api<ModelWriteResult>(`/apps/${encodeURIComponent(appId)}/chains/order`, '', {
+        method: 'PUT',
+        body: JSON.stringify({ ids }),
+      }),
+    ),
+  );
 };
 
 export const upsertChain = async (
   appId: string,
   body: { id: string; tenant_id: string; name: string; subscription_country: string | null; note?: string },
 ) => {
-  draft.push({
-    op: 'upsert_chain',
-    app_id: appId,
-    chain: {
-      id: body.id,
-      tenant_id: body.tenant_id,
-      name: body.name,
-      subscription_country: body.subscription_country ?? null,
-    },
-  });
-  return { revision_id: 0 } as ModelWriteResult;
+  const key = `chain:${appId}/${body.id}`;
+  const chain = {
+    id: body.id,
+    tenant_id: body.tenant_id,
+    name: body.name,
+    subscription_country: body.subscription_country ?? null,
+  };
+  if (draft.snapshot().find(entry => entry.key === key)?.op.op === 'create_chain') {
+    draft.push({ op: 'upsert_chain', app_id: appId, chain });
+    return { revision_id: 0 } as ModelWriteResult;
+  }
+  return immediateModelWrite(() =>
+    post<ModelWriteResult>(`/apps/${encodeURIComponent(appId)}/chains`, { ...chain, note: body.note }),
+  );
 };
 
 export const createChain = async (
@@ -2228,6 +2281,21 @@ export const saveSettings = async (body: ModelSettings) => {
   draft.push({ op: 'update_settings', settings: body });
   return { revision_id: 0 };
 };
+
+export interface UpdateSettingsResult {
+  revision_id: number;
+  settings: ModelSettings;
+}
+
+export const savePortSettings = (ports: ModelSettings['ports']) =>
+  immediateModelWrite(() =>
+    api<UpdateSettingsResult>('/settings/ports', '', { method: 'PUT', body: JSON.stringify(ports) }),
+  );
+
+export const saveProbeSettings = (probe: ModelSettings['probe']) =>
+  immediateModelWrite(() =>
+    api<UpdateSettingsResult>('/settings/probe', '', { method: 'PUT', body: JSON.stringify(probe) }),
+  );
 
 /* ── 分发设置：节点访问控制面的地址，以及当前内置的 xray 版本 ──
  *

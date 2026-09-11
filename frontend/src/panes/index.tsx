@@ -19,6 +19,7 @@ import { UsagePane } from './usage';
 import { SettingsPane } from './settings';
 import { InspectPane } from './inspect';
 import { ChainsPane } from './chains';
+import { TunnelsPane } from './tunnels';
 
 export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
   switch (win.key) {
@@ -26,6 +27,8 @@ export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
       return <NodesPane win={win} bare={bare} />;
     case 'tab:chains':
       return <ChainsPane win={win} />;
+    case 'tab:tunnels':
+      return <TunnelsPane win={win} />;
     case 'tab:deploy':
       return <DeployPane win={win} />;
     case 'tab:users':

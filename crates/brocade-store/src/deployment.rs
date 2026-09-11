@@ -1,4 +1,4 @@
-use brocade_core::client_config::ClientProjectionDownloadEndpoint;
+use brocade_core::client_config::{ClientProjectionDownloadEndpoint, SubscriptionClientConfig};
 use brocade_core::hash::sha256_hex;
 use brocade_core::model::{
     AnyTlsMasquerade, AppView, Dns, DomainStrategy, ExternalOutbound, HysteriaCongestion,
@@ -1292,6 +1292,13 @@ pub async fn create_rollback_deployment(
     let target_snapshot = rollback_target_snapshot(&mut tx, request.target_deployment_id).await?;
     let target_revision = target_snapshot.revision;
     let previous_revision = console::lock_control_state(&mut tx).await?;
+    let current_snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
+    let client_config =
+        crate::subscription_client::locked_head_for_revision_tx(&mut tx, previous_revision)
+            .await?
+            .config;
+    let target_snapshot =
+        preserve_immediate_fields(target_snapshot, &current_snapshot, &client_config);
     let uncertain_nodes = cancel_active_deployment_for_rollback(&mut tx).await?;
     let actor_id = request
         .actor
@@ -3142,6 +3149,13 @@ pub async fn cancel_deployment_and_rollback(
     let target_snapshot = materialize::load_snapshot_tx(&mut tx, Some(target.revision_id)).await?;
     let canceled = cancel_deployment_tx(&mut tx, deployment_id).await?;
     let previous_revision = console::lock_control_state(&mut tx).await?;
+    let current_snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
+    let client_config =
+        crate::subscription_client::locked_head_for_revision_tx(&mut tx, previous_revision)
+            .await?
+            .config;
+    let target_snapshot =
+        preserve_immediate_fields(target_snapshot, &current_snapshot, &client_config);
     let actor_id = actor.operator_id().to_owned();
     let note = format!(
         "cancel deployment #{} and rollback current model to deployment #{} (revision {})",
@@ -3628,6 +3642,79 @@ async fn restore_model_snapshot_tx(
     Ok(())
 }
 
+/// Machine rollback restores the deployable topology, not control-plane fields which were already
+/// made effective independently of a deployment. Objects absent from the rollback target stay
+/// absent: creating an app or chain is still a structural draft change. For objects present on
+/// both sides, retain only the explicitly immediate fields and their client-visible order.
+fn preserve_immediate_fields(
+    mut target: ModelSnapshot,
+    current: &ModelSnapshot,
+    client: &SubscriptionClientConfig,
+) -> ModelSnapshot {
+    target.settings.ports = current.settings.ports;
+    target.settings.probe = current.settings.probe.clone();
+    target.users = current.users.clone();
+
+    let app_rank = client
+        .app_order
+        .iter()
+        .enumerate()
+        .map(|(position, app_id)| (app_id.as_str(), position))
+        .collect::<BTreeMap<_, _>>();
+    for app in &mut target.apps {
+        if let Some(current_app) = current.apps.iter().find(|candidate| candidate.id == app.id) {
+            app.label = current_app.label.clone();
+        }
+
+        for chain in &mut app.chains {
+            if let Some(current_chain) = client.chains.get(&chain.id) {
+                chain.name = current_chain.name.clone();
+                chain.subscription_country = current_chain.subscription_country.clone();
+            }
+        }
+        if let Some(chain_order) = client.chain_order.get(&app.id) {
+            let chain_rank = chain_order
+                .iter()
+                .enumerate()
+                .map(|(position, chain_id)| (chain_id.as_str(), position))
+                .collect::<BTreeMap<_, _>>();
+            app.chains.sort_by_key(|chain| {
+                chain_rank
+                    .get(chain.id.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        // Materialization groups ingresses by the position of their chain. Keep the target's
+        // dependent vector in that same canonical order or the restore guard would reject an
+        // otherwise identical snapshot after a client-only chain reorder.
+        let chain_rank = app
+            .chains
+            .iter()
+            .enumerate()
+            .map(|(position, chain)| (chain.id.as_str(), position))
+            .collect::<BTreeMap<_, _>>();
+        app.ingresses.sort_by(|left, right| {
+            chain_rank
+                .get(left.chain.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &chain_rank
+                        .get(right.chain.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+                .then_with(|| left.chain.cmp(&right.chain))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+    target
+        .apps
+        .sort_by_key(|app| app_rank.get(app.id.as_str()).copied().unwrap_or(usize::MAX));
+    target
+}
+
 async fn restore_node_egress_dns_tx(
     tx: &mut Transaction<'_, Postgres>,
     revision_id: u64,
@@ -3663,8 +3750,8 @@ async fn restore_node_egress_dns_tx(
 /// Refuse to commit a restore that merely carries the expected revision number.
 ///
 /// Certificate names are observed operational state: renewal is deliberately not a model
-/// revision, and rollback must keep the certificate a node currently holds. Everything else in
-/// the snapshot is revisioned model state and must equal the historical target exactly.
+/// revision, and rollback must keep the certificate a node currently holds. The caller has also
+/// overlaid section-scoped immediate fields onto `target`; everything else must match exactly.
 fn ensure_restored_snapshot(
     operation: &str,
     target: &ModelSnapshot,
@@ -6260,6 +6347,12 @@ pub async fn discard_pending_changes(
         "discard {} pending revision(s), restore model to published revision {base_revision}",
         discarded.len()
     );
+    let current_snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
+    let client_config = crate::subscription_client::locked_head_for_revision_tx(&mut tx, current)
+        .await?
+        .config;
+    let restore_snapshot =
+        preserve_immediate_fields(restore_snapshot, &current_snapshot, &client_config);
     let new_revision = console::insert_revision(&mut tx, &actor_id, &note).await?;
     restore_model_snapshot_tx(&mut tx, new_revision, &restore_snapshot).await?;
     // Restoring the last published snapshot does not need a new permission release: those are
@@ -6297,7 +6390,143 @@ pub async fn discard_pending_changes(
 
 #[cfg(test)]
 mod tests {
-    use super::{flow_column, strip_commit_prefix};
+    use super::{flow_column, preserve_immediate_fields, strip_commit_prefix};
+    use brocade_core::{
+        client_config::SubscriptionClientConfig,
+        model::{AppView, Chain, ModelSettings, ModelSnapshot, User},
+    };
+
+    fn app(id: &str, label: &str, chains: Vec<Chain>) -> AppView {
+        AppView {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            chains,
+            ingresses: Vec::new(),
+            fronts: Vec::new(),
+            steps: Vec::new(),
+            grants: Vec::new(),
+        }
+    }
+
+    fn chain(id: &str, name: &str, country: Option<&str>) -> Chain {
+        Chain {
+            id: id.to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: name.to_owned(),
+            subscription_country: country.map(str::to_owned),
+        }
+    }
+
+    fn snapshot(
+        revision: u64,
+        settings: ModelSettings,
+        apps: Vec<AppView>,
+        users: Vec<User>,
+    ) -> ModelSnapshot {
+        ModelSnapshot {
+            revision,
+            overlay_cidr: "10.88.0.0/16".parse().unwrap(),
+            settings,
+            nodes: Vec::new(),
+            node_egress_dns: Vec::new(),
+            users,
+            external_outbounds: Vec::new(),
+            apps,
+        }
+    }
+
+    #[test]
+    fn machine_rollback_keeps_only_immediate_fields_on_shared_objects() {
+        let mut old_settings = ModelSettings::default();
+        old_settings.ports.hop_base = 20_000;
+        old_settings.probe.interval_secs = 60;
+        let mut current_settings = old_settings.clone();
+        current_settings.ports.hop_base = 21_000;
+        current_settings.probe.interval_secs = 90;
+
+        let old_user = User {
+            id: "old-user".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            uuid: "00000000-0000-4000-8000-000000000001".to_owned(),
+        };
+        let current_user = User {
+            id: "new-user".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            uuid: "00000000-0000-4000-8000-000000000002".to_owned(),
+        };
+        let target = snapshot(
+            4,
+            old_settings,
+            vec![
+                app("app-b", "旧 B", vec![]),
+                app(
+                    "app-a",
+                    "旧 A",
+                    vec![
+                        chain("chain-b", "旧链 B", None),
+                        chain("chain-a", "旧链 A", None),
+                    ],
+                ),
+                app("removed-app", "待恢复", vec![]),
+            ],
+            vec![old_user],
+        );
+        let current = snapshot(
+            9,
+            current_settings.clone(),
+            vec![
+                app(
+                    "app-a",
+                    "新 A",
+                    vec![
+                        chain("chain-a", "新链 A", Some("TW")),
+                        chain("chain-b", "新链 B", Some("JP")),
+                        chain("new-chain", "新建链", None),
+                    ],
+                ),
+                app("app-b", "新 B", vec![]),
+                app("new-app", "新建项目", vec![]),
+            ],
+            vec![current_user.clone()],
+        );
+
+        let client = SubscriptionClientConfig::from_snapshot(&current);
+        let mut current_after_pending_delete = current;
+        current_after_pending_delete.apps[0]
+            .chains
+            .retain(|chain| chain.id != "chain-b");
+        let restored = preserve_immediate_fields(target, &current_after_pending_delete, &client);
+
+        assert_eq!(restored.settings.ports, current_settings.ports);
+        assert_eq!(restored.settings.probe, current_settings.probe);
+        assert_eq!(restored.users, vec![current_user]);
+        assert_eq!(
+            restored
+                .apps
+                .iter()
+                .map(|app| app.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app-a", "app-b", "removed-app"]
+        );
+        assert_eq!(restored.apps[0].label, "新 A");
+        assert_eq!(
+            restored.apps[0]
+                .chains
+                .iter()
+                .map(|chain| {
+                    (
+                        chain.id.as_str(),
+                        chain.name.as_str(),
+                        chain.subscription_country.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("chain-a", "新链 A", Some("TW")),
+                ("chain-b", "新链 B", Some("JP")),
+            ]
+        );
+    }
 
     /// A rollback restores each ingress's `reality_flow` column, and the column carries three
     /// states, not two. The one that used to be lost is Vision-off: written as NULL it reads back

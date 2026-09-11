@@ -1,9 +1,20 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ConsoleSnapshot, ExternalOutbound, NodeAgentStateItem, Rule } from '../src/api';
 import { draft } from '../src/draft';
 import { ExternalOutboundEditor, RuleEditor } from '../src/panes/rules';
+
+window.matchMedia = ((query: string) => ({
+  matches: false,
+  media: query,
+  onchange: null,
+  addListener: () => undefined,
+  removeListener: () => undefined,
+  addEventListener: () => undefined,
+  removeEventListener: () => undefined,
+  dispatchEvent: () => false,
+})) as unknown as typeof window.matchMedia;
 
 const warp: ExternalOutbound = {
   id: 'warp',
@@ -43,6 +54,7 @@ const vendor: ExternalOutbound = {
 afterEach(() => {
   cleanup();
   draft.clear();
+  window.history.replaceState(null, '', '#/nodes');
 });
 
 function renderEditor(initial: Rule[]) {
@@ -102,26 +114,32 @@ function renderEditor(initial: Rule[]) {
   );
 }
 
-describe('WARP management inside forwarding rules', () => {
-  it('keeps WARP manageable from the target menu even when another outbound is selected', async () => {
+describe('tunnel navigation from forwarding rules', () => {
+  it('opens an unselected outbound in the tunnel page', () => {
     const view = renderEditor([{ m: { t: 'any' }, a: { t: 'proxy', outbound: vendor.id } }]);
 
     fireEvent.click(view.getByRole('button', { name: /供应商出口/ }));
-    fireEvent.click(view.getByRole('button', { name: '管理 Cloudflare WARP' }));
+    fireEvent.click(view.getByRole('button', { name: '打开隧道 Cloudflare WARP' }));
 
-    await waitFor(() => expect(view.getByRole('dialog', { name: '管理当前机器的 WARP 出口' })).toBeTruthy());
-    expect(view.getByText('香港落地 · 当前机器')).toBeTruthy();
-    expect(view.getByRole('button', { name: '注册并绑定当前机器' })).toBeTruthy();
+    expect(window.location.hash).toBe('#/tunnels/tunnel/platform/warp');
   });
 
-  it('opens machine lifecycle settings instead of the generic protocol editor for selected WARP', async () => {
+  it('opens the selected outbound summary in the tunnel page', () => {
     const view = renderEditor([{ m: { t: 'any' }, a: { t: 'proxy', outbound: warp.id } }]);
 
-    fireEvent.click(view.getByRole('button', { name: '机器设置' }));
+    fireEvent.click(view.getByRole('button', { name: '隧道详情' }));
 
-    await waitFor(() => expect(view.getByRole('dialog', { name: '管理当前机器的 WARP 出口' })).toBeTruthy());
-    expect(view.queryByRole('dialog', { name: '配置代理出站' })).toBeNull();
-    expect(view.getByText('当前机器有覆盖时，以机器参数为准。')).toBeTruthy();
+    expect(window.location.hash).toBe('#/tunnels/tunnel/platform/warp');
+  });
+
+  it('sends resource creation and editing to the tunnel page', () => {
+    const view = renderEditor([{ m: { t: 'any' }, a: { t: 'proxy', outbound: warp.id } }]);
+
+    fireEvent.click(view.getByRole('button', { name: /Cloudflare WARP/ }));
+    expect(view.queryByRole('button', { name: '删除 供应商出口' })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '管理隧道' }));
+
+    expect(window.location.hash).toBe('#/tunnels');
   });
 });
 
@@ -183,12 +201,4 @@ describe('external outbound editor controls', () => {
     fireEvent.change(view.getByRole('textbox', { name: '名称' }), { target: { value: '供应商出口 2' } });
     expect(save.disabled).toBe(false);
   });
-});
-
-it('exposes deletion of unselected proxy resources in the rule target menu', () => {
-  const view = renderEditor([{ m: { t: 'any' }, a: { t: 'proxy', outbound: warp.id } }]);
-  fireEvent.click(view.getByRole('button', { name: /Cloudflare WARP/ }));
-  fireEvent.click(view.getByRole('button', { name: '删除 供应商出口' }));
-  expect(view.getByRole('dialog', { name: '删除代理出站' })).toBeTruthy();
-  expect(view.getByRole('button', { name: '删除代理出站' }).hasAttribute('disabled')).toBe(false);
 });
