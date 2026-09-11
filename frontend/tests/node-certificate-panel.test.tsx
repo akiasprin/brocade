@@ -191,6 +191,14 @@ describe('机器日志保留面板', () => {
     await view.findByText('日志保留');
     const details = view.container.querySelector('details');
     expect(details?.open).toBe(false);
+    expect(details?.classList.contains('config-disclosure')).toBe(true);
     expect(view.getByText('本机覆盖 1 项')).toBeTruthy();
+    expect(details?.querySelector('.config-disclosure-toggle')?.textContent).toBe('展开');
+
+    const summary = details?.querySelector('summary');
+    if (!(summary instanceof HTMLElement)) throw new Error('日志保留没有折叠标题');
+    fireEvent.click(summary);
+    expect(details?.open).toBe(true);
+    await waitFor(() => expect(details?.querySelector('.config-disclosure-toggle')?.textContent).toBe('收起'));
   });
 });

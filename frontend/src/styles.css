@@ -3050,35 +3050,41 @@ textarea.f::placeholder {
   padding-inline: 10px;
   font-size: 12px;
 }
-.ingress-protocol-panel > summary {
+.config-disclosure > summary {
   display: flex;
+  align-items: center;
   gap: 8px;
   min-width: 0;
   cursor: pointer;
   list-style: none;
 }
-.ingress-protocol-panel > summary::-webkit-details-marker {
+.config-disclosure > summary::-webkit-details-marker {
   display: none;
 }
-.ingress-protocol-panel > summary .panel-title {
+.config-disclosure > summary .panel-title {
   flex: none;
 }
-.ingress-protocol-summary {
+.config-disclosure-summary {
   min-width: 0;
   overflow: hidden;
   color: var(--ink-4);
   font: 10px var(--mono);
+  line-height: 1.4;
   letter-spacing: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ingress-protocol-toggle {
+.config-disclosure-toggle {
   flex: none;
   color: var(--ink-4);
   font: 10px var(--sans);
+  line-height: 1.4;
   letter-spacing: 0;
 }
-.ingress-protocol-panel > summary:focus-visible {
+.config-disclosure > summary::after {
+  margin-left: 0;
+}
+.config-disclosure > summary:focus-visible {
   outline: 2px solid var(--action);
   outline-offset: -2px;
 }

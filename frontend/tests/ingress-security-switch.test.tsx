@@ -14,7 +14,7 @@ import type {
   XhttpXmux,
 } from '../src/api';
 import { draft } from '../src/draft';
-import { IngressPanel, IngressStreamRow, IngressEncryptionRow } from '../src/panes/chains';
+import { IngressGuardBlock, IngressPanel, IngressStreamRow, IngressEncryptionRow } from '../src/panes/chains';
 
 function ingress(
   kind: TransportKind,
@@ -310,7 +310,7 @@ function NewVlessHarness() {
 }
 
 describe('接入协议面板折叠', () => {
-  it('已有协议默认折叠，刚添加的协议默认展开', () => {
+  it('已有协议默认折叠，刚添加的协议默认展开', async () => {
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const value = ingress('vless-reality');
     const fields = (
@@ -344,12 +344,38 @@ describe('接入协议面板折叠', () => {
     }
     expect(existing.open).toBe(false);
     expect(fresh.open).toBe(true);
+    expect(existing.classList.contains('config-disclosure')).toBe(true);
     expect(existing.querySelector('summary')?.textContent).toContain('TCP 443 · REALITY · TCP');
+    expect(existing.querySelector('.config-disclosure-toggle')?.textContent).toBe('展开');
+    expect(fresh.querySelector('.config-disclosure-toggle')?.textContent).toBe('收起');
 
     const summary = existing.querySelector('summary');
     if (!(summary instanceof HTMLElement)) throw new Error('协议面板没有折叠标题');
     fireEvent.click(summary);
     expect(existing.open).toBe(true);
+    await waitFor(() => expect(existing.querySelector('.config-disclosure-toggle')?.textContent).toBe('收起'));
+  });
+
+  it('安全策略默认收起并使用相同的摘要和开关布局', async () => {
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <IngressGuardBlock appId="app-1" ingress={ingress('vless-reality')} editable />
+      </QueryClientProvider>,
+    );
+
+    const panel = view.getByRole('heading', { name: '安全策略', level: 4 }).closest('details');
+    if (!(panel instanceof HTMLDetailsElement)) throw new Error('安全策略没有使用可折叠面板');
+    expect(panel.open).toBe(false);
+    expect(panel.classList.contains('config-disclosure')).toBe(true);
+    expect(panel.querySelector('.config-disclosure-summary')?.textContent).toBe('已启用 4 / 5 项');
+    expect(panel.querySelector('.config-disclosure-toggle')?.textContent).toBe('展开');
+
+    const summary = panel.querySelector('summary');
+    if (!(summary instanceof HTMLElement)) throw new Error('安全策略没有折叠标题');
+    fireEvent.click(summary);
+    expect(panel.open).toBe(true);
+    await waitFor(() => expect(panel.querySelector('.config-disclosure-toggle')?.textContent).toBe('收起'));
   });
 });
 

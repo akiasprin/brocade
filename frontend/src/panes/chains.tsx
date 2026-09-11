@@ -770,17 +770,17 @@ export function IngressPanel({
     <PanelSaveCtx.Provider value={put}>
       {collapsible ? (
         <details
-          className="panel config-panel ingress-protocol-panel"
+          className="panel config-panel config-disclosure ingress-protocol-panel"
           open={expanded}
           ref={panelRef as Ref<HTMLDetailsElement>}
           onToggle={event => setExpanded(event.currentTarget.open)}
         >
           <summary>
             <PanelTitle of="protocol">{title}</PanelTitle>
-            {summary && <span className="ingress-protocol-summary">{summary}</span>}
+            {summary && <span className="config-disclosure-summary">{summary}</span>}
             <span className="sp" />
             {pending.length > 0 && <span className="st st-warn">未保存</span>}
-            <span className="ingress-protocol-toggle">{expanded ? '收起' : '展开'}</span>
+            <span className="config-disclosure-toggle">{expanded ? '收起' : '展开'}</span>
           </summary>
           {contents}
         </details>
@@ -1282,7 +1282,7 @@ function FallbackRateFields({
  * 排在其后的限制不会被触发，而界面上五个开关仍显示为启用。将顺序呈现出来是使该问题可见的方式。
  *
  * 保存使用整表覆盖的 upsert，与修改端口、迁移机器为同一入口，因此产生修订并随发布下发。 */
-function IngressGuardBlock({
+export function IngressGuardBlock({
   appId,
   ingress,
   editable,
@@ -1348,10 +1348,24 @@ function IngressGuardBlock({
     },
   ];
 
+  const enabledCount = SWITCHES.filter(row => form[row.key]).length;
+  const [expanded, setExpanded] = useState(false);
+
   return (
-    <ConfigPanel title="安全策略" icon="security">
-      {/* 标题栏不放读数：启用了哪几项，五个勾选框自己就写着，而「排在链路规则之前」
-          是这一块恒定的性质，不是一项随取值变化的状态。 */}
+    <details
+      className="panel config-panel config-disclosure ingress-guard-panel"
+      open={expanded}
+      onToggle={event => setExpanded(event.currentTarget.open)}
+    >
+      <summary>
+        <PanelTitle of="security">安全策略</PanelTitle>
+        <span className="config-disclosure-summary">
+          {enabledCount === 0 ? '未启用限制' : `已启用 ${enabledCount} / ${SWITCHES.length} 项`}
+        </span>
+        <span className="sp" />
+        {dirty && <span className="st st-warn">未保存</span>}
+        <span className="config-disclosure-toggle">{expanded ? '收起' : '展开'}</span>
+      </summary>
       <div className="guard-switches">
         {SWITCHES.map(row => (
           <label key={row.key} className={form[row.key] ? 'guard-row on' : 'guard-row'}>
@@ -1386,7 +1400,7 @@ function IngressGuardBlock({
         </div>
       )}
       {save.error && <ErrorBox error={save.error} />}
-    </ConfigPanel>
+    </details>
   );
 }
 

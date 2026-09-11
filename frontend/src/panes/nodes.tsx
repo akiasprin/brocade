@@ -2596,6 +2596,7 @@ function ConnectionCard({
   // null 表示本次尚未修改任何字段，当前值直接读取模型。与出网与解析一致：控件常驻，
   // 修改后才显示工具条。
   const [form, setForm] = useState<Record<ConnKey, string> | null>(null);
+  const [expanded, setExpanded] = useState(true);
 
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
 
@@ -2663,17 +2664,19 @@ function ConnectionCard({
   });
 
   return (
-    <details className="panel config-panel conn-card" open>
+    <details
+      className="panel config-panel config-disclosure conn-card"
+      open={expanded}
+      onToggle={event => setExpanded(event.currentTarget.open)}
+    >
       <summary>
         <PanelTitle of="config">连接策略</PanelTitle>
-        <span className="hint">{ownCount === 0 ? '与全局一致' : `本机覆盖 ${ownCount} 项`}</span>
+        <span className="config-disclosure-summary">{ownCount === 0 ? '与全局一致' : `本机覆盖 ${ownCount} 项`}</span>
+        <span className="sp" />
         {/* 折叠状态下内部的改动不可见——`details` 不卸载子树，编辑内容仍然存在，
             但界面上无法看出已有修改。由标题说明该状态。 */}
-        {dirty && (
-          <span className="hint" style={{ color: 'var(--gold)' }}>
-            有未保存的改动
-          </span>
-        )}
+        {dirty && <span className="st st-warn">未保存</span>}
+        <span className="config-disclosure-toggle">{expanded ? '收起' : '展开'}</span>
       </summary>
       <div className="fgrid one">
         {CONN_FIELDS.map(f => (
@@ -2745,6 +2748,7 @@ function ConnectionCard({
    同卡时这条差别只能靠两条小标题说明，分卡之后由卡本身承担。 */
 export function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
   const qc = useQueryClient();
+  const [expanded, setExpanded] = useState(false);
   /* 与设置页共用查询键：那一页已经拉过时直接命中缓存，两处显示的是同一份数据。
      旧控制面没有该接口，失败时不重试也不报错——整张卡不画，页面其余部分照常。 */
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy, retry: false });
@@ -2753,10 +2757,18 @@ export function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; 
   const overrideCount = Object.values(mine.overrides).filter(value => value !== null).length;
 
   return (
-    <details className="panel config-panel node-log-retention">
+    <details
+      className="panel config-panel config-disclosure node-log-retention"
+      open={expanded}
+      onToggle={event => setExpanded(event.currentTarget.open)}
+    >
       <summary>
         <PanelTitle of="artifacts">日志保留</PanelTitle>
-        <span className="hint">{overrideCount === 0 ? '与全局一致' : `本机覆盖 ${overrideCount} 项`}</span>
+        <span className="config-disclosure-summary">
+          {overrideCount === 0 ? '与全局一致' : `本机覆盖 ${overrideCount} 项`}
+        </span>
+        <span className="sp" />
+        <span className="config-disclosure-toggle">{expanded ? '收起' : '展开'}</span>
       </summary>
       <div className="fgrid one">
         <NodeLogLimitRow
