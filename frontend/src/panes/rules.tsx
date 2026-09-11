@@ -10,6 +10,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { HOP_WIRE_OPTIONS, hopWireLabel } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -60,6 +61,47 @@ import {
 import { navigate } from '../forge/route';
 
 type RelayRuleAction = Extract<RuleAction, { t: 'forward' | 'reuse_listener' }>;
+
+type TargetMenuPlacement = {
+  below: boolean;
+  left: number;
+  top: number;
+  width: number;
+  maxHeight: number;
+};
+
+const TARGET_MENU_EDGE = 10;
+const TARGET_MENU_GAP = 5;
+const TARGET_MENU_MAX_HEIGHT = 520;
+const TARGET_MENU_MIN_HEIGHT = 80;
+const TARGET_MENU_WIDTH = 430;
+
+function placeTargetMenu(anchor: DOMRect, preferredBelow?: boolean, wantedHeight = TARGET_MENU_MAX_HEIGHT) {
+  const viewport = window.visualViewport;
+  const viewportTop = viewport?.offsetTop ?? 0;
+  const viewportLeft = viewport?.offsetLeft ?? 0;
+  const viewportHeight = viewport?.height ?? window.innerHeight;
+  const viewportWidth = viewport?.width ?? window.innerWidth;
+  const viewportBottom = viewportTop + viewportHeight;
+  const viewportRight = viewportLeft + viewportWidth;
+  const above = Math.max(0, anchor.top - viewportTop - TARGET_MENU_EDGE - TARGET_MENU_GAP);
+  const below = Math.max(0, viewportBottom - anchor.bottom - TARGET_MENU_EDGE - TARGET_MENU_GAP);
+  let openBelow = preferredBelow ?? (below >= 320 || below >= above);
+  const chosen = openBelow ? below : above;
+  const opposite = openBelow ? above : below;
+  if (preferredBelow !== undefined && chosen < TARGET_MENU_MIN_HEIGHT && opposite > chosen) openBelow = !openBelow;
+
+  const availableHeight = openBelow ? below : above;
+  const maxHeight = Math.max(1, Math.min(wantedHeight, Math.floor(availableHeight)));
+  const availableWidth = Math.max(1, Math.floor(viewportWidth - TARGET_MENU_EDGE * 2));
+  const width = Math.min(TARGET_MENU_WIDTH, availableWidth);
+  const minLeft = viewportLeft + TARGET_MENU_EDGE;
+  const maxLeft = Math.max(minLeft, viewportRight - TARGET_MENU_EDGE - width);
+  const left = Math.min(Math.max(anchor.left, minLeft), maxLeft);
+  const top = openBelow ? anchor.bottom + TARGET_MENU_GAP : anchor.top - TARGET_MENU_GAP - maxHeight;
+
+  return { below: openBelow, left, top, width, maxHeight } satisfies TargetMenuPlacement;
+}
 
 const isRelayAction = (a: RuleAction): a is RelayRuleAction => a.t === 'forward' || a.t === 'reuse_listener';
 
@@ -1625,7 +1667,7 @@ export function RuleEditor(props: RuleEditorProps) {
   return (
     <fieldset disabled={!!error} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
       {error && <ErrorBox error={error} />}
-      <RuleEditorReady {...props} />
+      <RuleEditorReady {...props} editorDisabled={!!error} />
     </fieldset>
   );
 }
@@ -1647,7 +1689,8 @@ function RuleEditorReady({
   ruleDrafts,
   saves = true,
   readOnly = false,
-}: RuleEditorProps) {
+  editorDisabled,
+}: RuleEditorProps & { editorDisabled: boolean }) {
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const app = snapshot.data?.snapshot.apps.find(candidate => candidate.id === appId);
@@ -1660,12 +1703,19 @@ function RuleEditorReady({
   const [targetPickerRule, setTargetPickerRule] = useState<number | null>(null);
   const [targetQuery, setTargetQuery] = useState('');
   const targetPickerRoot = useRef<HTMLSpanElement>(null);
-  const targetMenu = useRef<HTMLSpanElement>(null);
-  const [targetMenuPlacement, setTargetMenuPlacement] = useState({ below: false, maxHeight: 520 });
+  const targetMenu = useRef<HTMLFieldSetElement>(null);
+  const [targetMenuPlacement, setTargetMenuPlacement] = useState<TargetMenuPlacement>({
+    below: false,
+    left: 0,
+    top: 0,
+    width: TARGET_MENU_WIDTH,
+    maxHeight: TARGET_MENU_MAX_HEIGHT,
+  });
   useEffect(() => {
     if (targetPickerRule === null) return;
     const closeOutside = (event: PointerEvent) => {
       if (event.target instanceof Node && targetPickerRoot.current?.contains(event.target)) return;
+      if (event.target instanceof Node && targetMenu.current?.contains(event.target)) return;
       setTargetPickerRule(null);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1688,25 +1738,18 @@ function RuleEditorReady({
       const menu = targetMenu.current;
       if (!root || !menu) return;
       const rootRect = root.getBoundingClientRect();
-      const viewportTop = window.visualViewport?.offsetTop ?? 0;
-      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-      const viewportBottom = viewportTop + viewportHeight;
-      const edge = 10;
-      const gap = 5;
-      const above = Math.max(0, rootRect.top - viewportTop - edge - gap);
-      const below = Math.max(0, viewportBottom - rootRect.bottom - edge - gap);
-      const wanted = Math.min(520, menu.scrollHeight);
+      const wanted = Math.min(TARGET_MENU_MAX_HEIGHT, Math.max(TARGET_MENU_MIN_HEIGHT, menu.scrollHeight + 2));
       setTargetMenuPlacement(current => {
         // The click handler chooses the side before mounting. Keep it while filtering changes the
         // menu height; moving a live menu across the trigger looks like browser focus jumped.
-        const chosen = current.below ? below : above;
-        const opposite = current.below ? above : below;
-        const openBelow = chosen < 80 && opposite > chosen ? !current.below : current.below;
-        const available = openBelow ? below : above;
-        const maxHeight = Math.max(80, Math.min(wanted, Math.floor(available)));
-        return current.below === openBelow && current.maxHeight === maxHeight
+        const next = placeTargetMenu(rootRect, current.below, wanted);
+        return current.below === next.below &&
+          current.left === next.left &&
+          current.top === next.top &&
+          current.width === next.width &&
+          current.maxHeight === next.maxHeight
           ? current
-          : { below: openBelow, maxHeight };
+          : next;
       });
     };
     place();
@@ -2355,17 +2398,7 @@ function RuleEditorReady({
                               const opening = targetPickerRule !== i;
                               if (opening) {
                                 const rect = event.currentTarget.getBoundingClientRect();
-                                const viewportTop = window.visualViewport?.offsetTop ?? 0;
-                                const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-                                const viewportBottom = viewportTop + viewportHeight;
-                                const edgeAndGap = 15;
-                                const above = Math.max(0, rect.top - viewportTop - edgeAndGap);
-                                const below = Math.max(0, viewportBottom - rect.bottom - edgeAndGap);
-                                const openBelow = below >= 320 || below >= above;
-                                setTargetMenuPlacement({
-                                  below: openBelow,
-                                  maxHeight: Math.max(80, Math.min(520, Math.floor(openBelow ? below : above))),
-                                });
+                                setTargetMenuPlacement(placeTargetMenu(rect));
                               }
                               setTargetPickerRule(opening ? i : null);
                               if (opening) setTargetQuery('');
@@ -2384,153 +2417,164 @@ function RuleEditorReady({
                             </span>
                             <span className="external-target-chevron">⌄</span>
                           </button>
-                          {targetPickerRule === i && (
-                            <span
-                              ref={targetMenu}
-                              className={`external-target-menu${targetMenuPlacement.below ? ' below' : ''}`}
-                              style={{ maxHeight: targetMenuPlacement.maxHeight }}
-                            >
-                              <input
-                                className="f external-target-search"
-                                placeholder="搜索监听端口、节点或代理出站"
-                                value={targetQuery}
-                                onChange={event => setTargetQuery(event.target.value)}
-                              />
-                              <span className="external-target-menu-label">可复用的监听端口</span>
-                              {visibleListeners.map(candidate => (
-                                <button
-                                  type="button"
-                                  disabled={Boolean(candidate.blocked)}
-                                  title={candidate.blocked ?? '只保存引用；端口、安全参数和规则由源线路维护'}
-                                  className={
-                                    r.a.t === 'reuse_listener' && sameListener(r.a.listener, candidate.ref) ? 'on' : ''
-                                  }
-                                  key={`listener-${candidate.key}`}
-                                  onClick={() => selectListenerTarget(i, r, candidate)}
-                                >
-                                  <span className="external-target-kind listener">
-                                    {candidate.local ? '本机' : '监听'}
-                                  </span>
-                                  <span className="external-target-copy">
-                                    <b>
-                                      {candidate.nodeName} · TCP {candidate.step.hop_in?.port}
-                                    </b>
-                                    <small>
-                                      {candidate.ownerName} · {candidate.step.rules.length} 条规则
-                                    </small>
-                                  </span>
-                                  <span className="external-target-where">
-                                    {candidate.blocked ?? `${candidate.references} 处引用`}
-                                  </span>
-                                </button>
-                              ))}
-                              <span className="external-target-menu-label">本链已有监听节点</span>
-                              {[...visibleNextPeers, ...visibleInsidePeers].map(candidate => (
-                                <button
-                                  type="button"
-                                  className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
-                                  key={candidate.id}
-                                  onClick={() => selectForwardTarget(i, r, candidate.id)}
-                                >
-                                  <span className="external-target-kind">NODE</span>
-                                  <span className="external-target-copy">
-                                    <b>{candidate.name || '未命名节点'}</b>
-                                  </span>
-                                  <span className="external-target-where">
-                                    {candidate.where === 'next'
-                                      ? '当前下游'
-                                      : candidate.where === 'inside'
-                                        ? '链内其它节点'
-                                        : '主干之外'}
-                                  </span>
-                                </button>
-                              ))}
-                              <span className="external-target-menu-label">在机器上新建本链监听</span>
-                              {visibleForkPeers.map(candidate => (
-                                <button
-                                  type="button"
-                                  className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
-                                  key={`new-${candidate.id}`}
-                                  title="保存时在这台机器创建本链监听和一棵空规则子树"
-                                  onClick={() => selectForwardTarget(i, r, candidate.id)}
-                                >
-                                  <span className="external-target-kind new-listener">新建</span>
-                                  <span className="external-target-copy">
-                                    <b>{candidate.name || '未命名节点'}</b>
-                                    <small>新端口 · 空规则子树</small>
-                                  </span>
-                                  <span className="external-target-where">加入本链</span>
-                                </button>
-                              ))}
-                              {visibleBlockedPeers.length > 0 && (
-                                <span className="external-target-menu-label">不可用的机器</span>
-                              )}
-                              {visibleBlockedPeers.map(candidate => (
-                                <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
-                                  <span className="external-target-kind">NODE</span>
-                                  <span className="external-target-copy">
-                                    <b>{candidate.name || '未命名节点'}</b>
-                                  </span>
-                                  <span className="external-target-where">不能选</span>
-                                </button>
-                              ))}
-                              <span className="external-target-menu-label">代理出站</span>
-                              {visibleExternalOutbounds.map(outbound => (
-                                <span className="external-target-option" key={outbound.id}>
-                                  <button
-                                    type="button"
-                                    className={`external-target-option-select${
-                                      r.a.t === 'proxy' && r.a.outbound === outbound.id ? ' on' : ''
-                                    }`}
-                                    onClick={() => selectExternalTarget(i, r, outbound.id)}
-                                  >
-                                    <span className="external-target-kind external">
-                                      {externalProtocolBadge(outbound.protocol.t)}
-                                    </span>
-                                    <span className="external-target-copy">
-                                      <b>{outbound.name}</b>
-                                    </span>
-                                    <span className="external-target-where">共享资源</span>
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="external-target-manage"
-                                    aria-label={`打开隧道 ${outbound.name}`}
-                                    onClick={() => {
-                                      setTargetPickerRule(null);
-                                      navigate('tunnels', {
-                                        p: 'tunnel',
-                                        tenant: outbound.tenant,
-                                        id: outbound.id,
-                                      });
-                                    }}
-                                  >
-                                    查看
-                                  </button>
-                                </span>
-                              ))}
-                              <button
-                                type="button"
-                                className="external-target-new"
-                                aria-label="管理隧道"
-                                onClick={() => {
-                                  setTargetPickerRule(null);
-                                  navigate('tunnels');
+                          {targetPickerRule === i &&
+                            typeof document !== 'undefined' &&
+                            createPortal(
+                              <fieldset
+                                ref={targetMenu}
+                                disabled={editorDisabled}
+                                className={`external-target-menu${targetMenuPlacement.below ? ' below' : ''}`}
+                                style={{
+                                  left: targetMenuPlacement.left,
+                                  top: targetMenuPlacement.top,
+                                  width: targetMenuPlacement.width,
+                                  maxHeight: targetMenuPlacement.maxHeight,
                                 }}
                               >
-                                <span>↗</span>
-                                <b>管理隧道</b>
-                                <span>新建、编辑和删除都在隧道页</span>
-                              </button>
-                              {visibleNextPeers.length +
-                                visibleInsidePeers.length +
-                                visibleForkPeers.length +
-                                visibleBlockedPeers.length +
-                                visibleListeners.length +
-                                visibleExternalOutbounds.length ===
-                                0 && <span className="external-target-empty">没有匹配项</span>}
-                            </span>
-                          )}
+                                <input
+                                  className="f external-target-search"
+                                  placeholder="搜索监听端口、节点或代理出站"
+                                  value={targetQuery}
+                                  onChange={event => setTargetQuery(event.target.value)}
+                                />
+                                <span className="external-target-menu-label">可复用的监听端口</span>
+                                {visibleListeners.map(candidate => (
+                                  <button
+                                    type="button"
+                                    disabled={Boolean(candidate.blocked)}
+                                    title={candidate.blocked ?? '只保存引用；端口、安全参数和规则由源线路维护'}
+                                    className={
+                                      r.a.t === 'reuse_listener' && sameListener(r.a.listener, candidate.ref)
+                                        ? 'on'
+                                        : ''
+                                    }
+                                    key={`listener-${candidate.key}`}
+                                    onClick={() => selectListenerTarget(i, r, candidate)}
+                                  >
+                                    <span className="external-target-kind listener">
+                                      {candidate.local ? '本机' : '监听'}
+                                    </span>
+                                    <span className="external-target-copy">
+                                      <b>
+                                        {candidate.nodeName} · TCP {candidate.step.hop_in?.port}
+                                      </b>
+                                      <small>
+                                        {candidate.ownerName} · {candidate.step.rules.length} 条规则
+                                      </small>
+                                    </span>
+                                    <span className="external-target-where">
+                                      {candidate.blocked ?? `${candidate.references} 处引用`}
+                                    </span>
+                                  </button>
+                                ))}
+                                <span className="external-target-menu-label">本链已有监听节点</span>
+                                {[...visibleNextPeers, ...visibleInsidePeers].map(candidate => (
+                                  <button
+                                    type="button"
+                                    className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
+                                    key={candidate.id}
+                                    onClick={() => selectForwardTarget(i, r, candidate.id)}
+                                  >
+                                    <span className="external-target-kind">NODE</span>
+                                    <span className="external-target-copy">
+                                      <b>{candidate.name || '未命名节点'}</b>
+                                    </span>
+                                    <span className="external-target-where">
+                                      {candidate.where === 'next'
+                                        ? '当前下游'
+                                        : candidate.where === 'inside'
+                                          ? '链内其它节点'
+                                          : '主干之外'}
+                                    </span>
+                                  </button>
+                                ))}
+                                <span className="external-target-menu-label">在机器上新建本链监听</span>
+                                {visibleForkPeers.map(candidate => (
+                                  <button
+                                    type="button"
+                                    className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
+                                    key={`new-${candidate.id}`}
+                                    title="保存时在这台机器创建本链监听和一棵空规则子树"
+                                    onClick={() => selectForwardTarget(i, r, candidate.id)}
+                                  >
+                                    <span className="external-target-kind new-listener">新建</span>
+                                    <span className="external-target-copy">
+                                      <b>{candidate.name || '未命名节点'}</b>
+                                      <small>新端口 · 空规则子树</small>
+                                    </span>
+                                    <span className="external-target-where">加入本链</span>
+                                  </button>
+                                ))}
+                                {visibleBlockedPeers.length > 0 && (
+                                  <span className="external-target-menu-label">不可用的机器</span>
+                                )}
+                                {visibleBlockedPeers.map(candidate => (
+                                  <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
+                                    <span className="external-target-kind">NODE</span>
+                                    <span className="external-target-copy">
+                                      <b>{candidate.name || '未命名节点'}</b>
+                                    </span>
+                                    <span className="external-target-where">不能选</span>
+                                  </button>
+                                ))}
+                                <span className="external-target-menu-label">代理出站</span>
+                                {visibleExternalOutbounds.map(outbound => (
+                                  <span className="external-target-option" key={outbound.id}>
+                                    <button
+                                      type="button"
+                                      className={`external-target-option-select${
+                                        r.a.t === 'proxy' && r.a.outbound === outbound.id ? ' on' : ''
+                                      }`}
+                                      onClick={() => selectExternalTarget(i, r, outbound.id)}
+                                    >
+                                      <span className="external-target-kind external">
+                                        {externalProtocolBadge(outbound.protocol.t)}
+                                      </span>
+                                      <span className="external-target-copy">
+                                        <b>{outbound.name}</b>
+                                      </span>
+                                      <span className="external-target-where">共享资源</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="external-target-manage"
+                                      aria-label={`打开隧道 ${outbound.name}`}
+                                      onClick={() => {
+                                        setTargetPickerRule(null);
+                                        navigate('tunnels', {
+                                          p: 'tunnel',
+                                          tenant: outbound.tenant,
+                                          id: outbound.id,
+                                        });
+                                      }}
+                                    >
+                                      查看
+                                    </button>
+                                  </span>
+                                ))}
+                                <button
+                                  type="button"
+                                  className="external-target-new"
+                                  aria-label="管理隧道"
+                                  onClick={() => {
+                                    setTargetPickerRule(null);
+                                    navigate('tunnels');
+                                  }}
+                                >
+                                  <span>↗</span>
+                                  <b>管理隧道</b>
+                                  <span>新建、编辑和删除都在隧道页</span>
+                                </button>
+                                {visibleNextPeers.length +
+                                  visibleInsidePeers.length +
+                                  visibleForkPeers.length +
+                                  visibleBlockedPeers.length +
+                                  visibleListeners.length +
+                                  visibleExternalOutbounds.length ===
+                                  0 && <span className="external-target-empty">没有匹配项</span>}
+                              </fieldset>,
+                              document.body,
+                            )}
                         </span>
                       )}
                       {isRelayAction(r.a) && (

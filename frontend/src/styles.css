@@ -18673,16 +18673,17 @@ input.f.ing-pj-port {
   color: var(--ink-4);
   font-size: 13px;
 }
+/* 规则卡和规则树都必须裁切自己的圆角，菜单若留在原 DOM 层级会被祖先的 overflow 截断。
+   菜单由 React portal 挂到 body，再用视口坐标固定定位；抽屉的 120 层级仍会正常盖住它。 */
 .external-target-menu {
-  position: absolute;
+  position: fixed;
   z-index: 70;
-  top: auto;
-  bottom: calc(100% + 5px);
-  left: 0;
   display: grid;
-  width: min(430px, 72vw);
+  width: min(430px, calc(100vw - 20px));
+  min-width: 0;
   box-sizing: border-box;
   max-height: min(520px, calc(100vh - 120px));
+  margin: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
@@ -18695,8 +18696,6 @@ input.f.ing-pj-port {
   animation: external-target-menu-in 90ms ease-out;
 }
 .external-target-menu.below {
-  top: calc(100% + 5px);
-  bottom: auto;
   transform-origin: top center;
 }
 @keyframes external-target-menu-in {
@@ -18713,13 +18712,6 @@ input.f.ing-pj-port {
   .external-target-menu {
     animation: none;
   }
-}
-/* 规则树卡片平时裁切圆角；目标菜单向上越过卡片时必须临时放开，否则菜单只有落在卡片内的
-   最后一截可见，看起来像“无法滚动”。给整棵规则树提升层级，菜单也不会被上方配置卡盖住。 */
-.node-chain-use.chain-tree:has(.external-target-menu) {
-  position: relative;
-  z-index: 80;
-  overflow: visible;
 }
 .external-target-menu-label {
   display: flex;

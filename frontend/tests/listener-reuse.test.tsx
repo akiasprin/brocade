@@ -383,6 +383,11 @@ describe('监听规则子树复用', () => {
     if (!(action instanceof HTMLSelectElement)) throw new Error('没有动作选择器');
     fireEvent.change(action, { target: { value: 'forward' } });
     const choice = await view.findByRole('button', { name: /新加坡共享监听 · TCP 22000/ });
+    const menu = choice.closest('.external-target-menu');
+    expect(menu?.parentElement).toBe(document.body);
+    expect(view.container.contains(menu)).toBe(false);
+    fireEvent.pointerDown(choice);
+    expect(document.body.contains(choice)).toBe(true);
     fireEvent.click(choice);
     expect(view.getByText(/引用子树 · 共享出口/)).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
