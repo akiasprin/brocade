@@ -11,9 +11,9 @@ use std::{
 };
 
 use brocade_deployment::protocol::{
-    E2eProbeRequest, E2eProbeStatus, E2eProbeTargetList, LinkHealth, LinkHealthRequest, LinkProbe,
-    LinkProbeRequest, LinkProbeStatus, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
-    ProbeTargetList, ProbeTransport,
+    E2eExitVerdict, E2eProbeRequest, E2eProbeStatus, E2eProbeTargetList, LinkHealth,
+    LinkHealthRequest, LinkProbe, LinkProbeRequest, LinkProbeStatus, PingProbeReportRequest,
+    PingProbeSample, PingProbeSettings, ProbeTargetList, ProbeTransport,
 };
 
 use crate::{current_unix_secs, e2e, http::HttpClient, icmp, options::Options};
@@ -324,10 +324,15 @@ pub(crate) fn collect_e2e_probe_report(
     for chain in &chains {
         match chain.status {
             E2eProbeStatus::Ok => println!(
-                "e2e: {} 通，{}ms，出口 {}",
+                "e2e: {} 通，{}ms，出口 {}{}",
                 chain.chain_id,
                 chain.ttfb_ms.unwrap_or_default(),
                 chain.exit_ip.as_deref().unwrap_or("?"),
+                match chain.exit_verdict {
+                    E2eExitVerdict::Match => "（对得上）",
+                    E2eExitVerdict::Mismatch => "（对不上！流量没走完这条链）",
+                    E2eExitVerdict::Unknown => "（未核对）",
+                }
             ),
             _ => println!(
                 "e2e: {} 不通：{}",

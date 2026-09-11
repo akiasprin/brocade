@@ -283,7 +283,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 7;
+export const AGENT_PROTOCOL_VERSION = 8;
 
 export interface NodeVersions {
   agent: string;
@@ -2235,7 +2235,7 @@ export interface ModelSettings {
     disabled_links: { a: string; b: string }[];
   };
   probe: {
-    // 端到端探测的目标地址。只用 HTTP 状态和首字节时间判定健康。
+    // 端到端探测的目标地址。要求返回纯文本且包含 `ip=` 一行——出口核对依据该行。
     // 使用明文 HTTP 是有意的：测量对象是链路本身，不应包含目标站点的 TLS 握手时间。
     endpoint_url: string;
     timeout_secs: number;
@@ -2670,7 +2670,11 @@ export const fetchLinkHealth = (token = '') => api<{ hops: LinkHealthItem[] }>('
 // 前两者无法覆盖该场景的原因：REALITY 参数配置错误、路由规则遗漏、出口被封禁——
 // 这三种情况都不会使任何一跳的计数器停止增长，但用户已经无法使用。
 //
+// `exit_verdict` 的三个档位是本类存在的主要原因。「连通但出口 IP 不符」表示流量
+// 未穿过完整的链（通常从链头直接出网），而规则表合法、每跳均连通、编译无警告——
+// 静态校验无法发现该情况。因此它既不属于成功也不属于失败，必须作为独立档位。
 export type E2eProbeStatus = 'ok' | 'handshake-failed' | 'chain-broken' | 'timeout' | 'unsupported';
+export type E2eExitVerdict = 'match' | 'mismatch' | 'unknown';
 
 export interface E2eProbeSample {
   probed_at: string;
@@ -2688,8 +2692,9 @@ export interface E2eProbeItem {
   /* 首字节时间。只有连通时才有取值——失败时的耗时等于超时值，与链路速度无关 */
   ttfb_ms: number | null;
   exit_ip: string | null;
-  /* 探测目标返回的国家码，仅用于展示实际出网位置，不参与连通性判断。 */
+  /* 探测目标返回的国家码。无法核对 IP 时，它可以表明出网的国家 */
   exit_loc: string | null;
+  exit_verdict: E2eExitVerdict;
   detail: string | null;
   probed_at: string;
   /* 最近 6 小时结果，按时间正序（旧到新）排列；前端按 probed_at 放到真实时间轴上。 */

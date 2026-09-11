@@ -452,7 +452,7 @@ impl GrantProbeService {
     }
 
     fn record_result(&self, job: &ProbeJob, target: &UserGrantProbeTarget, result: E2eProbe) {
-        let passed = result.status == E2eProbeStatus::Ok;
+        let passed = authorization_probe_passed(&result);
         let detail = safe_result_detail(&result);
         self.finish_item(
             job,
@@ -663,9 +663,14 @@ fn safe_result_detail(result: &E2eProbe) -> Option<String> {
     }
 }
 
+fn authorization_probe_passed(result: &E2eProbe) -> bool {
+    result.status == E2eProbeStatus::Ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brocade_deployment::protocol::E2eExitVerdict;
 
     #[test]
     fn embedded_probe_is_available_without_an_installed_xray() {
@@ -730,6 +735,7 @@ mod tests {
             ttfb_ms: None,
             exit_ip: Some("203.0.113.8".to_owned()),
             exit_loc: Some("ZZ".to_owned()),
+            exit_verdict: E2eExitVerdict::Unknown,
             detail: Some("uuid secret at 203.0.113.8 vendor-name".to_owned()),
         };
         let safe = safe_result_detail(&result).unwrap();
@@ -740,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reachable_chain_has_no_failure_detail() {
+    fn authorization_success_does_not_depend_on_the_observed_exit() {
         let result = E2eProbe {
             app_id: None,
             chain_id: "chain".to_owned(),
@@ -748,8 +754,10 @@ mod tests {
             ttfb_ms: Some(42),
             exit_ip: None,
             exit_loc: None,
+            exit_verdict: E2eExitVerdict::Mismatch,
             detail: None,
         };
+        assert!(authorization_probe_passed(&result));
         assert_eq!(safe_result_detail(&result), None);
     }
 

@@ -57,6 +57,7 @@ const HOST_KEYS: &[&str] = &[
     "endpoint",
     "endpoint_host",
     "exit_ip",
+    "expected_exit_ips",
     "host",
     "ipv4",
     "ipv6",

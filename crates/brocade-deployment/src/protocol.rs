@@ -9,7 +9,7 @@ use crate::plan::{
 /// Wire contract spoken by this agent build. Desired state is withheld from incompatible
 /// protocols so an agent never claims work whose fields or actions it cannot interpret; the
 /// independently approved self-update endpoint remains available as the recovery path.
-pub const AGENT_PROTOCOL_VERSION: u32 = 7;
+pub const AGENT_PROTOCOL_VERSION: u32 = 8;
 
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
@@ -944,6 +944,13 @@ pub struct E2eProbeTarget {
     /// be as well. Absent, the probe dials TCP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp: Option<E2eProbeXhttp>,
+    /// Which machines this chain may exit from. The IP the endpoint saw must fall in this set to
+    /// agree.
+    ///
+    /// Empty means the check cannot be made, because an exit is behind NAT, has no public address,
+    /// or may traverse an external tunnel. That outcome is reported explicitly rather than
+    /// counted as a verified address match.
+    pub expected_exit_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,8 +1086,10 @@ pub struct E2eProbe {
     /// The caller's IP as the endpoint saw it.
     pub exit_ip: Option<String>,
     /// The location the endpoint reported (cloudflare trace's `loc=`). Where the IP cannot be
-    /// determined, this remains absent.
+    /// checked, it still identifies the country the traffic left from.
     pub exit_loc: Option<String>,
+    /// The exit check's verdict.
+    pub exit_verdict: E2eExitVerdict,
     /// On failure, a human-readable sentence identifying where it failed. Not intended to be
     /// parsed.
     pub detail: Option<String>,
@@ -1107,6 +1116,25 @@ pub enum E2eProbeStatus {
     /// `LinkProbeStatus::Unsupported`. Reported as `ChainBroken`, it would send the operator to
     /// investigate a working chain.
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum E2eExitVerdict {
+    /// The IP the endpoint saw is among the expected set.
+    Match,
+    /// The probe connected, and the exit IP is not one this chain should use.
+    ///
+    /// This is neither a success nor a failure. It means the traffic did not travel the whole
+    /// chain, and it occurs with a valid rule table, every hop up, and no compilation warning, so
+    /// static validation does not detect it. This is the primary reason end-to-end probing
+    /// exists.
+    Mismatch,
+    /// The expected set is empty, so the check cannot run: an exit is behind NAT — on either
+    /// family, which disqualifies the machine's other family too — has no public address, or may
+    /// traverse an external tunnel. It is its own outcome so that an unrunnable check is not
+    /// reported as a verified one.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2057,7 +2085,8 @@ mod tests {
                     "flow": null
                 }
             },
-            "xhttp": null
+            "xhttp": null,
+            "expected_exit_ips": []
         });
         let target: E2eProbeTarget = serde_json::from_value(current.clone()).unwrap();
         assert!(matches!(target.security, E2eProbeSecurity::Tls(_)));

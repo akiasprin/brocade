@@ -243,6 +243,10 @@ pub async fn user_grant_probe_plan(
                     }),
                     mode: xhttp.mode.as_str().map(str::to_owned),
                 }),
+                // An operator-triggered authorization probe answers whether the advertised
+                // credential and transport can complete a request. NAT, dynamic addresses and
+                // external tunnels must not turn that successful authentication into a failure.
+                expected_exit_ips: Vec::new(),
             },
         });
     }

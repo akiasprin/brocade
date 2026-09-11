@@ -989,9 +989,14 @@ CREATE TABLE e2e_probe_samples (
 --                reach the internet
 --
 -- Why every hop being up does not mean the chain works: a mistyped REALITY parameter, one missing
--- routing rule, or a blocked exit does not stop every hop's counters, yet users can no longer get
--- through. Exit addresses are recorded only as observations and never decide health: NAT, dynamic
--- addresses and external proxy actions make model-to-observation IP comparison unreliable.
+-- routing rule, a blocked exit — not one of the three stops any hop's counters, and yet users can no
+-- longer get through.
+--
+-- exit_verdict's three outcomes are the main reason this table exists. "Connected but the exit IP is
+-- wrong" means the traffic did not travel the whole chain (usually exiting straight from the head),
+-- while the rule table is valid, every hop is alive, and compilation warns of nothing — static
+-- validation catches none of it. It is neither success nor failure and must therefore be its own
+-- outcome.
 CREATE TABLE e2e_probes (
     chain_id TEXT NOT NULL,
     app_id TEXT NOT NULL,
@@ -1000,12 +1005,15 @@ CREATE TABLE e2e_probes (
     ttfb_ms INTEGER,
     exit_ip TEXT,
     exit_loc TEXT,
+    exit_verdict TEXT NOT NULL,
     detail TEXT,
     probed_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT e2e_probes_exit_verdict CHECK ((exit_verdict IN ('match', 'mismatch', 'unknown'))),
     CONSTRAINT e2e_probes_status CHECK ((status IN ('ok', 'handshake-failed', 'chain-broken', 'timeout', 'unsupported'))),
     CONSTRAINT e2e_probes_ttfb_matches_status CHECK ((((status = 'ok') AND (ttfb_ms IS NOT NULL)) OR ((status <> 'ok') AND (ttfb_ms IS NULL)))),
     CONSTRAINT e2e_probes_ttfb_range CHECK (((ttfb_ms IS NULL) OR ((ttfb_ms >= 0) AND (ttfb_ms <= 600000)))),
+    CONSTRAINT e2e_probes_verdict_needs_success CHECK (((status = 'ok') OR (exit_verdict = 'unknown'))),
     CONSTRAINT e2e_probes_pkey PRIMARY KEY (chain_id),
     CONSTRAINT e2e_probes_app_id_fkey FOREIGN KEY (app_id) REFERENCES apps(id) ON UPDATE CASCADE ON DELETE CASCADE,
     CONSTRAINT e2e_probes_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES chains(id) ON UPDATE CASCADE ON DELETE CASCADE,

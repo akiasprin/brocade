@@ -11,11 +11,11 @@ use brocade_core::{
     physical::probe::{ProbePlan, ProbeSecurity},
 };
 use brocade_deployment::protocol::{
-    E2eProbe, E2eProbeAnyTls, E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest, E2eProbeResult,
-    E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList, E2eProbeTls,
-    E2eProbeXhttp, E2eProbeXhttpRange, E2eProbeXhttpXmux, LinkHealthRequest, LinkHealthResult,
-    LinkProbeRequest, LinkProbeResult, LinkProbeStatus, ProbeTarget, ProbeTargetList,
-    ProbeTransport,
+    E2eExitVerdict, E2eProbe, E2eProbeAnyTls, E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest,
+    E2eProbeResult, E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
+    E2eProbeTls, E2eProbeXhttp, E2eProbeXhttpRange, E2eProbeXhttpXmux, LinkHealthRequest,
+    LinkHealthResult, LinkProbeRequest, LinkProbeResult, LinkProbeStatus, ProbeTarget,
+    ProbeTargetList, ProbeTransport,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -535,6 +535,7 @@ pub struct E2eProbeItem {
     pub ttfb_ms: Option<u32>,
     pub exit_ip: Option<String>,
     pub exit_loc: Option<String>,
+    pub exit_verdict: String,
     pub detail: Option<String>,
     pub probed_at: String,
     /// The last six hours in chronological order (oldest to newest). The UI places them on a real
@@ -680,6 +681,7 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                     }),
                     mode: xhttp.mode.as_str().map(str::to_owned),
                 }),
+                expected_exit_ips: target.expected_exit_ips,
             })
             .collect(),
         endpoint_url: probe_settings.endpoint_url,
@@ -764,11 +766,13 @@ pub async fn record_e2e_probe(
 
         let status = status_text_e2e(chain.status);
         let ttfb = ttfb_for(chain);
+        let verdict = verdict_text(chain.exit_verdict, chain.status);
 
         sqlx::query(
             "INSERT INTO e2e_probes
-                 (chain_id, app_id, node_id, status, ttfb_ms, exit_ip, exit_loc, detail, probed_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9))
+                 (chain_id, app_id, node_id, status, ttfb_ms, exit_ip, exit_loc,
+                  exit_verdict, detail, probed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10))
              ON CONFLICT (chain_id) DO UPDATE SET
                  app_id = EXCLUDED.app_id,
                  node_id = EXCLUDED.node_id,
@@ -776,6 +780,7 @@ pub async fn record_e2e_probe(
                  ttfb_ms = EXCLUDED.ttfb_ms,
                  exit_ip = EXCLUDED.exit_ip,
                  exit_loc = EXCLUDED.exit_loc,
+                 exit_verdict = EXCLUDED.exit_verdict,
                  detail = EXCLUDED.detail,
                  probed_at = EXCLUDED.probed_at,
                  updated_at = now()
@@ -788,6 +793,7 @@ pub async fn record_e2e_probe(
         .bind(ttfb)
         .bind(chain.exit_ip.as_deref())
         .bind(chain.exit_loc.as_deref())
+        .bind(verdict)
         .bind(chain.detail.as_deref())
         .bind(request.probed_at_unix_secs as f64)
         .execute(&mut *tx)
@@ -845,7 +851,7 @@ pub async fn e2e_probe_view(
 
     let rows = sqlx::query(
         "SELECT p.chain_id, p.app_id, c.name AS chain_name, p.node_id, p.status, p.ttfb_ms,
-                p.exit_ip, p.exit_loc, p.detail, p.probed_at::text AS probed_at
+                p.exit_ip, p.exit_loc, p.exit_verdict, p.detail, p.probed_at::text AS probed_at
          FROM e2e_probes p
          JOIN chains c ON c.id = p.chain_id
          JOIN apps a ON a.id = c.app_id
@@ -903,6 +909,7 @@ pub async fn e2e_probe_view(
                 ttfb_ms: optional_u32(row.try_get("ttfb_ms")?),
                 exit_ip: row.try_get("exit_ip")?,
                 exit_loc: row.try_get("exit_loc")?,
+                exit_verdict: row.try_get("exit_verdict")?,
                 detail: row.try_get("detail")?,
                 probed_at: row.try_get("probed_at")?,
                 samples: samples.remove(&chain_id).unwrap_or_default(),
@@ -933,6 +940,21 @@ fn status_text_e2e(status: E2eProbeStatus) -> &'static str {
         E2eProbeStatus::ChainBroken => "chain-broken",
         E2eProbeStatus::Timeout => "timeout",
         E2eProbeStatus::Unsupported => "unsupported",
+    }
+}
+
+/// Without a connection there is no exit to check. An agent reporting a match with a status
+/// other than ok is an agent bug — but blocking it here beats letting the database's CHECK throw
+/// a 500: the right treatment for this row is recording it as uncheckable, not failing the whole
+/// batch.
+fn verdict_text(verdict: E2eExitVerdict, status: E2eProbeStatus) -> &'static str {
+    if !matches!(status, E2eProbeStatus::Ok) {
+        return "unknown";
+    }
+    match verdict {
+        E2eExitVerdict::Match => "match",
+        E2eExitVerdict::Mismatch => "mismatch",
+        E2eExitVerdict::Unknown => "unknown",
     }
 }
 

@@ -526,10 +526,10 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
     sqlx::query(
         "INSERT INTO e2e_probes (
             chain_id, app_id, node_id, status, ttfb_ms, exit_ip,
-            exit_loc, probed_at
+            exit_loc, exit_verdict, probed_at
          ) VALUES (
             'chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 25, '192.0.2.10',
-            'test-region', now()
+            'test-region', 'match', now()
          )",
     )
     .execute(db.pool())
@@ -727,11 +727,11 @@ async fn chain_order_is_app_local_and_keeps_ids_statistics_and_projections_stabl
     }
     sqlx::query(
         "INSERT INTO e2e_probes (
-            chain_id, app_id, node_id, status, ttfb_ms, probed_at
+            chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at
          ) VALUES
-            ('chn-b2c3-d4e5', 'app-main', 'n1', 'ok', 21, now()),
-            ('chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 22, now()),
-            ('chn-c3d4-e5f6', 'app-main', 'n1', 'ok', 23, now())",
+            ('chn-b2c3-d4e5', 'app-main', 'n1', 'ok', 21, 'match', now()),
+            ('chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 22, 'match', now()),
+            ('chn-c3d4-e5f6', 'app-main', 'n1', 'ok', 23, 'match', now())",
     )
     .execute(db.pool())
     .await
@@ -949,10 +949,10 @@ async fn line_order_drives_every_operator_facing_projection() {
     .unwrap();
     sqlx::query(
         "INSERT INTO e2e_probes (
-            chain_id, app_id, node_id, status, ttfb_ms, probed_at
+            chain_id, app_id, node_id, status, ttfb_ms, exit_verdict, probed_at
          ) VALUES
-            ('c-alpha', 'app-a1fa', 'n1', 'ok', 20, now()),
-            ('chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 30, now())",
+            ('c-alpha', 'app-a1fa', 'n1', 'ok', 20, 'match', now()),
+            ('chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 30, 'match', now())",
     )
     .execute(db.pool())
     .await
@@ -13481,6 +13481,10 @@ async fn retained_self_signed_trust_survives_expiry_and_rejects_a_ca_track_switc
         .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
         .await
         .unwrap();
+    assert!(probe
+        .items
+        .iter()
+        .all(|item| item.target.expected_exit_ips.is_empty()));
     let anytls = anytls_probe_settings(&probe.items[0].target);
     assert_eq!(anytls.pinned_peer_cert_sha256.as_deref(), Some(pin));
 

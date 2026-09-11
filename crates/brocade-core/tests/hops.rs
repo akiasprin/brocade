@@ -253,6 +253,9 @@ fn compile_enters_and_keeps_a_listener_owned_by_another_app() {
         .hop_inbounds
         .iter()
         .any(|inbound| inbound.tag == "in:hop:owner-app/owner" && inbound.port == 22001));
+
+    let probe = compiled.project_probe("hk").unwrap();
+    assert_eq!(probe.targets[0].exit_nodes, vec!["sg"]);
 }
 
 #[test]
