@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { appId, appIdFromBytes, isModelId, modelIdPair, modelIdPairFromBytes, modelIdsArePaired } from '../src/model-id';
+import {
+  appId,
+  appIdFromBytes,
+  isModelId,
+  modelIdPair,
+  modelIdPairFromBytes,
+  modelIdsArePaired,
+  tunnelId,
+  tunnelIdFromBytes,
+} from '../src/model-id';
 
 describe('关联模型 ID', () => {
   it('分组使用 app 加四位十六进制随机值', () => {
@@ -28,5 +37,12 @@ describe('关联模型 ID', () => {
     expect(modelIdsArePaired(second)).toBe(true);
     expect(second.ingressId).not.toBe(first.ingressId);
     expect(second.chainId).not.toBe(first.chainId);
+  });
+
+  it('隧道使用 tunnel 加两段四位十六进制随机值', () => {
+    expect(tunnelIdFromBytes(new Uint8Array([0x8f, 0x3a, 0x2d, 0x71]))).toBe('tunnel-8f3a-2d71');
+    expect(isModelId('tunnel', 'tunnel-8f3a-2d71')).toBe(true);
+    expect(isModelId('tunnel', 'external-1')).toBe(false);
+    expect(tunnelId(new Set(['tunnel-0000-0000']))).toMatch(/^tunnel-[0-9a-f]{4}-[0-9a-f]{4}$/);
   });
 });

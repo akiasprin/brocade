@@ -127,16 +127,27 @@ fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport(
     }));
 
     doc.external_outbounds[0].security = ExternalOutboundSecurity::None;
-    let mut classic = Vec::new();
-    let sys = compile_system(&doc, &mut classic);
-    let app_ir = compile_app(&doc, &app, &mut classic);
-    validate_app(&sys, &app_ir, &mut classic);
-    assert!(
-        classic.iter().all(|diagnostic| !diagnostic
-            .code
-            .starts_with("external-outbound.shadowsocks2022")),
-        "{classic:#?}"
-    );
+    for method in [
+        "aes-128-gcm",
+        "aes-256-gcm",
+        "chacha20-ietf-poly1305",
+        "xchacha20-ietf-poly1305",
+    ] {
+        doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Shadowsocks2022 {
+            credential: "ordinary-password".to_owned(),
+            method: method.to_owned(),
+        };
+        let mut classic = Vec::new();
+        let sys = compile_system(&doc, &mut classic);
+        let app_ir = compile_app(&doc, &app, &mut classic);
+        validate_app(&sys, &app_ir, &mut classic);
+        assert!(
+            classic.iter().all(|diagnostic| !diagnostic
+                .code
+                .starts_with("external-outbound.shadowsocks2022")),
+            "{method}: {classic:#?}"
+        );
+    }
 
     doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Shadowsocks2022 {
         credential: "ordinary-password".to_owned(),

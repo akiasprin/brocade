@@ -59,6 +59,7 @@ import {
   realityShortIdIsValid,
 } from '../reality';
 import { navigate } from '../forge/route';
+import { tunnelId as randomTunnelId } from '../model-id';
 
 type RelayRuleAction = Extract<RuleAction, { t: 'forward' | 'reuse_listener' }>;
 
@@ -3762,7 +3763,10 @@ function externalString(value: unknown): string | null {
 }
 
 const SHADOWSOCKS_METHODS = [
+  'aes-128-gcm',
   'aes-256-gcm',
+  'chacha20-ietf-poly1305',
+  'xchacha20-ietf-poly1305',
   '2022-blake3-aes-128-gcm',
   '2022-blake3-aes-256-gcm',
   '2022-blake3-chacha20-poly1305',
@@ -3770,6 +3774,21 @@ const SHADOWSOCKS_METHODS = [
 
 const shadowsocksMethodIsSupported = (method: string) =>
   SHADOWSOCKS_METHODS.includes(method as (typeof SHADOWSOCKS_METHODS)[number]);
+
+const shadowsocksMethodIs2022 = (method: string) => method.startsWith('2022-blake3-');
+
+function canonicalShadowsocksMethod(method: string): string | null {
+  const aliases: Record<string, string> = {
+    aead_aes_128_gcm: 'aes-128-gcm',
+    aead_aes_256_gcm: 'aes-256-gcm',
+    'chacha20-poly1305': 'chacha20-ietf-poly1305',
+    aead_chacha20_poly1305: 'chacha20-ietf-poly1305',
+    'xchacha20-poly1305': 'xchacha20-ietf-poly1305',
+    aead_xchacha20_poly1305: 'xchacha20-ietf-poly1305',
+  };
+  const canonical = aliases[method] ?? method;
+  return shadowsocksMethodIsSupported(canonical) ? canonical : null;
+}
 
 function parseExternalXhttpMode(value: unknown, field: string): XhttpMode {
   if (value === undefined || value === null || value === '' || value === 'auto') return 'auto';
@@ -3878,10 +3897,9 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
     if (!userInfo.includes(':')) userInfo = decodeShareBase64(userInfo);
     const separator = userInfo.indexOf(':');
     if (separator < 1) throw new Error('Shadowsocks 链接缺少加密方式或密码');
-    const method = decodeURIComponent(userInfo.slice(0, separator)).toLowerCase();
-    if (!shadowsocksMethodIsSupported(method)) {
-      throw new Error('Shadowsocks 仅支持 aes-256-gcm 和三种 SS2022 加密方式');
-    }
+    const importedMethod = decodeURIComponent(userInfo.slice(0, separator)).toLowerCase();
+    const method = canonicalShadowsocksMethod(importedMethod);
+    if (!method) throw new Error('Shadowsocks 加密方式不在当前 Xray 支持列表中');
     const endpoint = new URL(`http://${authority.slice(at + 1)}`);
     return {
       address: endpoint.hostname,
@@ -3990,7 +4008,7 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
 function shadowsocksCredentialIsValid(method: string, credential: string): boolean {
   if (credential === '<redacted>') return true;
   if (!shadowsocksMethodIsSupported(method)) return false;
-  if (method === 'aes-256-gcm') return credential.trim().length > 0;
+  if (!shadowsocksMethodIs2022(method)) return credential.trim().length > 0;
   const expected = method === '2022-blake3-aes-128-gcm' ? 16 : 32;
   return (
     !!credential &&
@@ -4171,12 +4189,14 @@ type EditableExternalProtocol = Exclude<ExternalOutboundProtocol['t'], 'warp'>;
 export function ExternalOutboundEditor({
   tenantId,
   existing,
+  existingIds = new Set(),
   onClose,
   onSaved,
   purpose = 'rule',
 }: {
   tenantId: string;
   existing: ExternalOutbound | null;
+  existingIds?: ReadonlySet<string>;
   onClose: () => void;
   onSaved: (outbound: ExternalOutbound) => void;
   purpose?: 'rule' | 'resource';
@@ -4194,7 +4214,7 @@ export function ExternalOutboundEditor({
       return { value: null, error: error instanceof Error ? error.message : '无法解析分享链接' };
     }
   }, [shareLink]);
-  const [id, setId] = useState(existing?.id ?? 'external-1');
+  const [id, setId] = useState(() => existing?.id ?? randomTunnelId(existingIds));
   const [name, setName] = useState(existing?.name ?? '新代理出站');
   const [address, setAddress] = useState(existing?.address ?? '');
   const [port, setPort] = useState(String(existing?.port ?? 443));
@@ -4443,7 +4463,7 @@ export function ExternalOutboundEditor({
                   },
                 };
   const security: ExternalOutboundSecurity =
-    securityKind === 'none'
+    protocolKind === 'shadowsocks2022' || securityKind === 'none'
       ? { t: 'none' }
       : securityKind === 'tls'
         ? {
@@ -4585,28 +4605,38 @@ export function ExternalOutboundEditor({
                         {parsedShare.value.address}:{parsedShare.value.port}
                       </b>
                     </span>
-                    <span>
-                      <small>传输 / 安全</small>
-                      <b>
-                        {parsedShare.value.protocol.t === 'vless' &&
-                        parsedShare.value.protocol.v.transport.t === 'xhttp'
-                          ? 'XHTTP'
-                          : 'RAW'}{' '}
-                        /{' '}
-                        {parsedShare.value.protocol.t === 'vless' && parsedShare.value.protocol.v.encryption !== 'none'
-                          ? `VLESS Encryption${parsedShare.value.security.t === 'none' ? '' : ` + ${parsedShare.value.security.t.toUpperCase()}`}`
-                          : parsedShare.value.security.t.toUpperCase()}
-                      </b>
-                    </span>
-                    <span>
-                      <small>流控 / 指纹</small>
-                      <b>
-                        {parsedShare.value.protocol.t === 'vless'
-                          ? (parsedShare.value.protocol.v.flow ?? '无').replace('xtls-rprx-', '').toUpperCase()
-                          : '—'}{' '}
-                        / {parsedShare.value.security.t === 'none' ? '—' : parsedShare.value.security.v.fingerprint}
-                      </b>
-                    </span>
+                    {parsedShare.value.protocol.t === 'shadowsocks2022' ? (
+                      <span>
+                        <small>加密方式</small>
+                        <b>{parsedShare.value.protocol.v.method}</b>
+                      </span>
+                    ) : (
+                      <>
+                        <span>
+                          <small>传输 / 安全</small>
+                          <b>
+                            {parsedShare.value.protocol.t === 'vless' &&
+                            parsedShare.value.protocol.v.transport.t === 'xhttp'
+                              ? 'XHTTP'
+                              : 'RAW'}{' '}
+                            /{' '}
+                            {parsedShare.value.protocol.t === 'vless' &&
+                            parsedShare.value.protocol.v.encryption !== 'none'
+                              ? `VLESS Encryption${parsedShare.value.security.t === 'none' ? '' : ` + ${parsedShare.value.security.t.toUpperCase()}`}`
+                              : parsedShare.value.security.t.toUpperCase()}
+                          </b>
+                        </span>
+                        <span>
+                          <small>流控 / 指纹</small>
+                          <b>
+                            {parsedShare.value.protocol.t === 'vless'
+                              ? (parsedShare.value.protocol.v.flow ?? '无').replace('xtls-rprx-', '').toUpperCase()
+                              : '—'}{' '}
+                            / {parsedShare.value.security.t === 'none' ? '—' : parsedShare.value.security.v.fingerprint}
+                          </b>
+                        </span>
+                      </>
+                    )}
                   </div>
                 </article>
               ) : (
@@ -4738,9 +4768,9 @@ export function ExternalOutboundEditor({
                     {protocolKind === 'vless'
                       ? 'UUID'
                       : protocolKind === 'shadowsocks2022'
-                        ? method === 'aes-256-gcm'
-                          ? '密码'
-                          : '预共享密钥'
+                        ? shadowsocksMethodIs2022(method)
+                          ? '预共享密钥'
+                          : '密码'
                         : protocolKind === 'wireguard'
                           ? '本地私钥'
                           : protocolKind === 'anytls'
@@ -4758,9 +4788,9 @@ export function ExternalOutboundEditor({
                     {existing && <span className="sub">保持 &lt;redacted&gt; 可沿用已密封的凭据。</span>}
                     {protocolKind === 'shadowsocks2022' && (
                       <span className="sub">
-                        {method === 'aes-256-gcm'
-                          ? '普通 Shadowsocks 密码，按原样密封保存。'
-                          : `Base64 编码的 ${method === '2022-blake3-aes-128-gcm' ? 16 : 32} 字节 PSK；多用户服务端填写 server-key:user-key。`}
+                        {shadowsocksMethodIs2022(method)
+                          ? `Base64 编码的 ${method === '2022-blake3-aes-128-gcm' ? 16 : 32} 字节 PSK；多用户服务端填写 server-key:user-key。`
+                          : '普通 Shadowsocks 密码，按原样密封保存。'}
                       </span>
                     )}
                     {protocolKind === 'wireguard' && (
@@ -5109,10 +5139,11 @@ export function ExternalOutboundEditor({
                           if (event.target.value !== method && credential === '<redacted>') setCredential('');
                         }}
                       >
-                        <option value="aes-256-gcm">aes-256-gcm</option>
-                        <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
-                        <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
-                        <option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>
+                        {SHADOWSOCKS_METHODS.map(value => (
+                          <option value={value} key={value}>
+                            {value}
+                          </option>
+                        ))}
                       </select>
                     </span>
                   </label>
@@ -5222,42 +5253,44 @@ export function ExternalOutboundEditor({
                     </label>
                   </>
                 )}
-                <label className="row">
-                  <span className="k">安全层</span>
-                  <span className="v">
-                    <select
-                      className="f"
-                      value={securityKind}
-                      onChange={event => setSecurityKind(event.target.value as ExternalOutboundSecurity['t'])}
-                    >
-                      <option
-                        value="none"
-                        disabled={(protocolKind === 'vless' && encryption === 'none') || protocolKind === 'anytls'}
+                {protocolKind !== 'shadowsocks2022' && (
+                  <label className="row">
+                    <span className="k">安全层</span>
+                    <span className="v">
+                      <select
+                        className="f"
+                        value={securityKind}
+                        onChange={event => setSecurityKind(event.target.value as ExternalOutboundSecurity['t'])}
                       >
-                        无（RAW）
-                      </option>
-                      <option value="tls" disabled={rawOnly}>
-                        TLS
-                      </option>
-                      <option value="reality" disabled={protocolKind !== 'vless'}>
-                        REALITY
-                      </option>
-                    </select>
-                    {protocolKind === 'vless' && (
-                      <span className="sub">
-                        VLESS Encryption 已加密时可选择「无（RAW）」；encryption 为 none 时需要 TLS 或 REALITY。
-                      </span>
-                    )}
-                    {protocolKind === 'http_connect' && (
-                      <span className="sub">HTTP CONNECT 可用 RAW 或 TLS；RAW 不适合公网直连，且只能代理 TCP。</span>
-                    )}
-                    {protocolKind === 'socks5' && <span className="sub">SOCKS5 本身不加密，不适合公网直连。</span>}
-                    {protocolKind === 'wireguard' && (
-                      <span className="sub">Xray 的 WireGuard outbound 不支持 streamSettings。</span>
-                    )}
-                  </span>
-                </label>
-                {securityKind !== 'none' && (
+                        <option
+                          value="none"
+                          disabled={(protocolKind === 'vless' && encryption === 'none') || protocolKind === 'anytls'}
+                        >
+                          无（RAW）
+                        </option>
+                        <option value="tls" disabled={rawOnly}>
+                          TLS
+                        </option>
+                        <option value="reality" disabled={protocolKind !== 'vless'}>
+                          REALITY
+                        </option>
+                      </select>
+                      {protocolKind === 'vless' && (
+                        <span className="sub">
+                          VLESS Encryption 已加密时可选择「无（RAW）」；encryption 为 none 时需要 TLS 或 REALITY。
+                        </span>
+                      )}
+                      {protocolKind === 'http_connect' && (
+                        <span className="sub">HTTP CONNECT 可用 RAW 或 TLS；RAW 不适合公网直连，且只能代理 TCP。</span>
+                      )}
+                      {protocolKind === 'socks5' && <span className="sub">SOCKS5 本身不加密，不适合公网直连。</span>}
+                      {protocolKind === 'wireguard' && (
+                        <span className="sub">Xray 的 WireGuard outbound 不支持 streamSettings。</span>
+                      )}
+                    </span>
+                  </label>
+                )}
+                {protocolKind !== 'shadowsocks2022' && securityKind !== 'none' && (
                   <>
                     <label className="row">
                       <span className="k">SNI</span>

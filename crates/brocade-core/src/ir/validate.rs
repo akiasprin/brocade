@@ -563,11 +563,17 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     _ => None,
                 };
                 match (method.as_str(), ss2022_key_len) {
-                    ("aes-256-gcm", _) => {}
+                    (
+                        "aes-128-gcm"
+                        | "aes-256-gcm"
+                        | "chacha20-ietf-poly1305"
+                        | "xchacha20-ietf-poly1305",
+                        _,
+                    ) => {}
                     (_, None) => diagnostics.push(Diagnostic::error(
                         "external-outbound.shadowsocks2022-method",
                         &at,
-                        "外部 Shadowsocks 支持 aes-256-gcm 及 SS2022 的三种 2022-blake3-* 加密方式",
+                        "外部 Shadowsocks 加密方式不在当前 Xray 支持列表中",
                     )),
                     (_, Some(key_len)) if !ss2022_credential_is_valid(credential, key_len) => {
                         diagnostics.push(Diagnostic::error(

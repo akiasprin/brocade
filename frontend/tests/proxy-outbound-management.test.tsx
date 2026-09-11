@@ -31,6 +31,13 @@ function editor() {
   );
   return { ...view, saved };
 }
+it('generates an opaque tunnel id for a new outbound', () => {
+  const view = editor();
+  fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+  expect((view.getByDisplayValue(/^tunnel-[0-9a-f]{4}-[0-9a-f]{4}$/) as HTMLInputElement).value).toMatch(
+    /^tunnel-[0-9a-f]{4}-[0-9a-f]{4}$/,
+  );
+});
 it('imports AnyTLS with encoded password, IPv6, SNI and default port into the draft', async () => {
   const view = editor();
   fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
@@ -91,8 +98,18 @@ it('offers classic and 2022 methods under the Shadowsocks manual protocol', () =
   const view = editor();
   fireEvent.click(view.getByRole('button', { name: '手动填写' }));
   fireEvent.click(view.getByRole('button', { name: 'Shadowsocks' }));
-  expect(view.getByRole('option', { name: 'aes-256-gcm' })).toBeTruthy();
-  expect(view.getByRole('option', { name: '2022-blake3-aes-256-gcm' })).toBeTruthy();
+  for (const method of [
+    'aes-128-gcm',
+    'aes-256-gcm',
+    'chacha20-ietf-poly1305',
+    'xchacha20-ietf-poly1305',
+    '2022-blake3-aes-128-gcm',
+    '2022-blake3-aes-256-gcm',
+    '2022-blake3-chacha20-poly1305',
+  ]) {
+    expect(view.getByRole('option', { name: method })).toBeTruthy();
+  }
+  expect(view.queryByText('安全层')).toBeNull();
   expect(view.queryByRole('button', { name: 'Shadowsocks 2022' })).toBeNull();
 });
 it('offers native VLESS Encryption as a manual choice with no TLS fields', () => {

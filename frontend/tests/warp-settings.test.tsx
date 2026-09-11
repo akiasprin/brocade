@@ -80,6 +80,7 @@ describe('WARP exit stack settings', () => {
       </QueryClientProvider>,
     );
 
+    expect(view.getByDisplayValue('cloudflare-warp')).toBeTruthy();
     expect(view.getByRole('textbox', { name: 'Endpoint 地址' })).toBeTruthy();
     expect(view.getByRole('spinbutton', { name: 'Endpoint 端口' })).toBeTruthy();
   });

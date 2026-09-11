@@ -105,6 +105,7 @@ it('owns editing, deletion and subscription-front selection on the tunnel detail
   const view = mount({ drill: { p: 'tunnel', tenant: 'platform', id: outbound.id } });
 
   expect(view.getByRole('heading', { name: outbound.name })).toBeTruthy();
+  expect(view.queryByText(/租户/)).toBeNull();
   expect(view.getByText('订阅前置')).toBeTruthy();
   expect((view.getByRole('checkbox') as HTMLInputElement).checked).toBe(false);
 

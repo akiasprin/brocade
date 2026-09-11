@@ -1,4 +1,4 @@
-export type ModelIdKind = 'app' | 'chain' | 'ingress';
+export type ModelIdKind = 'app' | 'chain' | 'ingress' | 'tunnel';
 
 export interface ModelIdPair {
   ingressId: string;
@@ -10,6 +10,7 @@ const APP_RANDOM_BYTES = 2;
 const APP_ID = /^app-([0-9a-f]{4})$/;
 const INGRESS_ID = /^ing-([0-9a-f]{4})$/;
 const CHAIN_ID = /^chn-([0-9a-f]{4})-([0-9a-f]{4})$/;
+const TUNNEL_ID = /^tunnel-([0-9a-f]{4})-([0-9a-f]{4})$/;
 
 const hex = (bytes: Uint8Array, start: number): string =>
   [...bytes.slice(start, start + 2)].map(byte => byte.toString(16).padStart(2, '0')).join('');
@@ -28,8 +29,13 @@ export const appIdFromBytes = (bytes: Uint8Array): string => {
   return `app-${hex(bytes, 0)}`;
 };
 
+export const tunnelIdFromBytes = (bytes: Uint8Array): string => {
+  if (bytes.length < RANDOM_BYTES) throw new Error(`tunnel id needs ${RANDOM_BYTES} random bytes`);
+  return `tunnel-${hex(bytes, 0)}-${hex(bytes, 2)}`;
+};
+
 export const isModelId = (kind: ModelIdKind, value: string): boolean =>
-  (kind === 'app' ? APP_ID : kind === 'ingress' ? INGRESS_ID : CHAIN_ID).test(value);
+  (kind === 'app' ? APP_ID : kind === 'ingress' ? INGRESS_ID : kind === 'chain' ? CHAIN_ID : TUNNEL_ID).test(value);
 
 export const modelIdsArePaired = ({ ingressId, chainId }: ModelIdPair): boolean => {
   const ingressToken = INGRESS_ID.exec(ingressId)?.[1];
@@ -62,4 +68,15 @@ export function appId(used: ReadonlySet<string> = new Set()): string {
     if (!used.has(id)) return id;
   }
   throw new Error('无法生成不重复的分组 ID，请重试');
+}
+
+/** Generate an opaque external tunnel id; the display name remains its operator-facing identity. */
+export function tunnelId(used: ReadonlySet<string> = new Set()): string {
+  const crypto = globalThis.crypto;
+  if (!crypto?.getRandomValues) throw new Error('浏览器不支持安全随机数，无法生成 ID');
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const id = tunnelIdFromBytes(crypto.getRandomValues(new Uint8Array(RANDOM_BYTES)));
+    if (!used.has(id)) return id;
+  }
+  throw new Error('无法生成不重复的隧道 ID，请重试');
 }

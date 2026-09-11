@@ -236,12 +236,12 @@ fn external_proxy_protocols_load_in_the_real_binary() {
         ExternalOutbound {
             id: "ss-classic-external".to_owned(),
             tenant: "platform".to_owned(),
-            name: "Shadowsocks AES-256-GCM".to_owned(),
+            name: "Shadowsocks XChaCha20".to_owned(),
             address: "ss-classic.example.net".to_owned(),
             port: 8389,
             protocol: ExternalOutboundProtocol::Shadowsocks2022 {
                 credential: "classic-password".to_owned(),
-                method: "aes-256-gcm".to_owned(),
+                method: "xchacha20-ietf-poly1305".to_owned(),
             },
             security: ExternalOutboundSecurity::None,
             bindings: Vec::new(),

@@ -361,6 +361,7 @@ function TunnelList({ go }: { go: (drill: Drill) => void }) {
         <ExternalOutboundEditor
           tenantId={selectedTenant}
           existing={null}
+          existingIds={new Set(tunnels.map(tunnel => tunnel.id))}
           purpose="resource"
           onClose={() => setCreate(null)}
           onSaved={tunnel => {
@@ -633,7 +634,6 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: fetchSnapshot });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [bindingNode, setBindingNode] = useState('');
@@ -645,7 +645,6 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
   const apps = snapshot.data?.snapshot.apps ?? [];
   const nodeList = (nodes.data?.nodes ?? []).filter(node => node.tenant_id === tunnel?.tenant && !node.retired_at);
   const nodeName = new Map((nodes.data?.nodes ?? []).map(node => [node.node_id, node.name]));
-  const tenantName = tenants.data?.tenants.find(tenant => tenant.id === tunnel?.tenant)?.name || tunnel?.tenant;
   const references = apps.flatMap(app =>
     app.steps
       .filter(step => step.rules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === tunnelId))
@@ -681,10 +680,9 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
     onError: setBindError,
   });
 
-  if (snapshot.isPending || nodes.isPending || tenants.isPending) return <Loading />;
+  if (snapshot.isPending || nodes.isPending) return <Loading />;
   if (snapshot.error) return <ErrorBox error={snapshot.error} />;
   if (nodes.error) return <ErrorBox error={nodes.error} />;
-  if (tenants.error) return <ErrorBox error={tenants.error} />;
   if (!tunnel)
     return (
       <Empty>
@@ -734,7 +732,6 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
           </div>
           <div className="tunnel-head-meta">
             <span>{protocolName(tunnel)}</span>
-            <span>租户 {tenantName}</span>
             <span>
               <b>{references.length}</b> 处引用
             </span>
@@ -775,14 +772,22 @@ function TunnelDetail({ tenantId, tunnelId, go }: { tenantId: string; tunnelId: 
                 <dd>{protocolName(tunnel)}</dd>
               </div>
             )}
-            <div>
-              <dt>{isWarp ? 'TUN / Workers' : '安全层'}</dt>
-              <dd>
-                {isWarp && warpDefaults
-                  ? `${warpDefaults.no_kernel_tun ? '仅用户态' : '系统优先'} · ${warpDefaults.workers || '自动'}`
-                  : tunnel.security.t.toUpperCase()}
-              </dd>
-            </div>
+            {isWarp && warpDefaults ? (
+              <div>
+                <dt>TUN / Workers</dt>
+                <dd>{`${warpDefaults.no_kernel_tun ? '仅用户态' : '系统优先'} · ${warpDefaults.workers || '自动'}`}</dd>
+              </div>
+            ) : tunnel.protocol.t === 'shadowsocks2022' ? (
+              <div>
+                <dt>加密方式</dt>
+                <dd className="mono">{tunnel.protocol.v.method}</dd>
+              </div>
+            ) : (
+              <div>
+                <dt>安全层</dt>
+                <dd>{tunnel.security.t.toUpperCase()}</dd>
+              </div>
+            )}
           </dl>
 
           {/* 机器注册（WARP）/ 订阅前置（自定义）排在规则引用之前 */}
