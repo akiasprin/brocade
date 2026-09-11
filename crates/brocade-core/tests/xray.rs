@@ -3795,13 +3795,13 @@ fn assert_encryption_ingress(options: brocade_core::model::VlessEncryptionOption
         .any(|client| client.uuid == "uuid-alice"));
     assert!(grant.clients.iter().all(|client| client.flow.is_none()));
     let sub = subscription::build(&project_user(&[ir], "platform.acme", "alice"));
-    let native = sub
+    let entry = sub
         .entries
         .iter()
         .find(|entry| entry.name.contains("VLESS Encryption"))
         .unwrap();
-    assert_eq!(native.port, 48000);
-    assert_eq!(native.stream, subscription::SubscriptionStream::Tcp);
+    assert_eq!(entry.port, 48000);
+    assert_eq!(entry.stream, subscription::SubscriptionStream::Tcp);
     let yaml = brocade_core::format::yaml::clash_subscription(&sub);
     assert!(yaml.contains(&options.encryption(public)));
     assert!(!yaml.contains(private));

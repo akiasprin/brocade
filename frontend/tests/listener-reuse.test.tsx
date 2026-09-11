@@ -478,7 +478,11 @@ describe('监听规则子树复用', () => {
     expect(view.queryByRole('button', { name: /新加坡共享监听 · TCP 22000/ })).toBeNull();
     expect(view.queryByRole('button', { name: /同链监听 · TCP 21001/ })).toBeNull();
     const custom = await view.findByRole('button', { name: /自定义.*复用已有监听/ });
-    expect(custom.querySelector('span')?.textContent).toBe('↗');
+    const manage = view.getByRole('button', { name: '管理隧道' });
+    expect(custom.textContent).not.toContain('↗');
+    expect(manage.textContent).not.toContain('↗');
+    expect(custom.querySelector('.external-target-copy')).not.toBeNull();
+    expect(manage.querySelector('.external-target-copy')).not.toBeNull();
     const menu = custom.closest('.external-target-menu');
     expect(menu?.parentElement).toBe(document.body);
     expect(view.container.contains(menu)).toBe(false);
@@ -495,6 +499,16 @@ describe('监听规则子树复用', () => {
     expect(view.queryByRole('button', { name: '打开源规则' })).toBeNull();
     expect(view.queryByText('高亮规则子树')).toBeNull();
     expect(view.queryByRole('button', { name: /高亮 .*规则子树/ })).toBeNull();
+    const referencePanel = [...view.container.querySelectorAll<HTMLElement>('.listener-reference-panel')].find(panel =>
+      panel.querySelector('.panel-title')?.textContent?.includes('引用监听'),
+    );
+    const referencePool = referencePanel?.querySelector('select');
+    if (!(referencePool instanceof HTMLSelectElement)) throw new Error('没有引用监听的连接复用选择器');
+    fireEvent.change(referencePool, { target: { value: 'mux' } });
+    const referenceMux = referencePanel?.querySelector('.listener-reference-mux');
+    expect(referenceMux?.textContent).toContain('Mux 参数跟随全局配置参数');
+    expect(referenceMux?.parentElement?.classList.contains('listener-inline-facts')).toBe(true);
+    fireEvent.change(referencePool, { target: { value: 'none' } });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => {

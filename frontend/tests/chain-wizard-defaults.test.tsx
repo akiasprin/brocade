@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { NEW_CHAIN_PROTOCOL_DEFAULTS, newChainWires } from '../src/panes/chain-wizard';
+import { NEW_CHAIN_PROTOCOL_DEFAULTS, defaultListenerHopWire, newChainWires } from '../src/panes/chain-wizard';
+import { defaultHopWire, defaultHopWireForListener, seedHopIn, seedHops, type ForwardPeer } from '../src/panes/rules';
+import type { HopDial, Rule } from '../src/api';
 
 describe('建链向导协议默认值', () => {
   it('默认开启所有接入协议并填入 AnyTLS 连接复用参数', () => {
@@ -54,4 +56,75 @@ it('可单独启用 VLESS Encryption，默认 13800 或使用配置的分配端�
     vless_encryption: { port: 13800 },
   });
   expect(newChainWires({ ...options, vlessEncryptionPort: 49002 }).vless_encryption).toEqual({ port: 49002 });
+});
+
+describe('链路承载协议默认值', () => {
+  const rule = (dial: HopDial): Rule => ({
+    m: { t: 'any' },
+    a: { t: 'forward', to: 'relay', dial, pool: { t: 'none' } },
+  });
+  const relay: ForwardPeer = {
+    id: 'relay',
+    name: 'Relay',
+    public_ipv4: '192.0.2.2',
+    public_ipv6: null,
+    public_ipv4_nat: false,
+    public_ipv6_nat: false,
+    step: null,
+    where: 'next',
+    blocked: null,
+  };
+
+  it.each([
+    [{ t: 'addr', v: '192.0.2.2:20000' } as HopDial, 'encryption'],
+    [{ t: 'reverse', v: 'v4' } as HopDial, 'encryption'],
+    [{ t: 'overlay' } as HopDial, 'none'],
+  ])('按连接方式为 %o 选择 %s', (dial, expected) => {
+    expect(defaultHopWire(dial)).toBe(expected);
+    expect(seedHopIn(null, 'relay', new Map(), dial)?.security?.t).toBe(expected);
+  });
+
+  it('规则编辑器只让纯 WireGuard 新监听默认 VLESS-NONE，并保留已有配置', () => {
+    const direct = seedHops([relay], undefined, 20000, { sourceNode: 'entry', rules: [rule({ t: 'addr', v: '' })] });
+    const overlay = seedHops([relay], undefined, 20000, { sourceNode: 'entry', rules: [rule({ t: 'overlay' })] });
+    expect(direct.relay).toMatchObject({ kind: 'encryption', wireAutomatic: true });
+    expect(overlay.relay).toMatchObject({ kind: 'none', wireAutomatic: true });
+
+    const saved = seedHops(
+      [
+        {
+          ...relay,
+          step: {
+            chain: 'chain',
+            node: 'relay',
+            accept: null,
+            hop_in: { port: 21000, security: { t: 'none' } },
+            rules: [],
+          },
+        },
+      ],
+      undefined,
+      20000,
+      { sourceNode: 'entry', rules: [rule({ t: 'addr', v: '' })] },
+    );
+    expect(saved.relay).toMatchObject({ kind: 'none', wireAutomatic: false });
+  });
+
+  it('同一监听只要承载一条非 WireGuard 边就默认 VLESS-ENCRY', () => {
+    const mixedRules: Rule[] = [
+      rule({ t: 'overlay' }),
+      {
+        m: { t: 'domain_suffix', v: ['example.com'] },
+        a: { t: 'forward', to: 'tail', dial: { t: 'reverse', v: 'v4' }, pool: { t: 'none' } },
+      },
+    ];
+    expect(defaultHopWireForListener('entry', 'relay', mixedRules)).toBe('none');
+    expect(defaultHopWireForListener('entry', 'entry', mixedRules)).toBe('encryption');
+
+    const spine = ['entry', 'relay', 'tail'];
+    expect(
+      defaultListenerHopWire(spine, 'relay', index => (index === 1 ? { t: 'overlay' } : { t: 'reverse', v: 'v4' })),
+    ).toBe('encryption');
+    expect(defaultListenerHopWire(['entry', 'relay'], 'relay', () => ({ t: 'overlay' }))).toBe('none');
+  });
 });

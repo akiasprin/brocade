@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { HOP_WIRE_OPTIONS, hopWireLabel } from '../ui/format';
+import { HOP_WIRE_OPTIONS, hopWireLabel, type HopWireKind } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCompileView,
@@ -108,6 +108,28 @@ function placeTargetMenu(anchor: DOMRect, preferredBelow?: boolean, wantedHeight
 const isRelayAction = (a: RuleAction): a is RelayRuleAction => a.t === 'forward' || a.t === 'reuse_listener';
 
 const forwardDial = (a: RuleAction): HopDial => (a.t === 'forward' ? a.dial : { t: 'overlay' });
+
+/** A new relay listener is encrypted unless WireGuard already protects every connection using it. */
+export const defaultHopWire = (dial: Pick<HopDial, 't'>): Extract<HopWireKind, 'none' | 'encryption'> =>
+  dial.t === 'overlay' ? 'none' : 'encryption';
+
+/**
+ * Resolve the automatic wire for one listener in a rule table. Reverse connections listen on the
+ * source node; ordinary connections listen on their target. A shared listener stays encrypted if
+ * even one of its users leaves the WireGuard overlay.
+ */
+export function defaultHopWireForListener(sourceNode: string, listenerNode: string, rules: Rule[]): HopWireKind {
+  let usedOverOverlay = false;
+  for (const rule of rules) {
+    if (rule.a.t !== 'forward') continue;
+    const dial = forwardDial(rule.a);
+    const host = dial.t === 'reverse' ? sourceNode : rule.a.to;
+    if (host !== listenerNode) continue;
+    if (defaultHopWire(dial) === 'encryption') return 'encryption';
+    usedOverOverlay = true;
+  }
+  return usedOverOverlay ? 'none' : 'encryption';
+}
 
 const forwardPool = (a: RuleAction): HopPool => (isRelayAction(a) ? a.pool : { t: 'none' });
 
@@ -1017,8 +1039,8 @@ const natPublicHostOf = (peer: PublicAddrs | null | undefined, host: string) => 
 // 非 NAT 地址（本机连接对端），反向两档判断本机是否有（对端连接本机）。均不可用时回退到
 // overlay——该档不需要任何地址，始终可用。
 //
-// 选出的公网档为明文直连。中转端口的默认加密为 PLAIN（`seedHopIn`），因此选中后
-// 编辑器中的「明文直连可能暴露 UUID 和目标地址」提示会同时显示，可在同一屏内修改加密方式。
+// 公网和反向档默认使用 VLESS Encryption；只有 WireGuard 档默认使用 VLESS-NONE，避免
+// 在已经加密的 overlay 内重复增加一层。默认值由 `defaultHopWire` 统一决定。
 //
 // 导出该函数是因为档位选择不止规则编辑器一处使用：建链向导的线性中继同样需要，
 // 且两处选出的必须是同一档——分别实现会导致向导创建的链走 wg 而手动添加的跳走公网，
@@ -1466,6 +1488,8 @@ export type HopsDraft = Record<
   {
     port: string;
     kind: 'none' | 'encryption' | 'reality' | 'shadowsocks2022';
+    /** False only when the kind came from a saved listener or an explicit operator choice. */
+    wireAutomatic: boolean;
     dest: string;
     names: string;
   }
@@ -1554,14 +1578,21 @@ function DnsPriorityControl({
 // 走 overlay 时界面上不显示该字段（该类 inbound 绑定在 overlay 地址上，wg 之外无法访问，
 // 端口取值不影响使用），但它仍会提交进模型、被 xray 绑定、参与端口冲突校验——
 // 硬编码默认值会导致未经填写的取值占用其他配置的端口。
-export function seedHops(peers: ForwardPeer[], taken?: Map<string, PortOwners>, base = HOP_PORT_BASE): HopsDraft {
+export function seedHops(
+  peers: ForwardPeer[],
+  taken?: Map<string, PortOwners>,
+  base = HOP_PORT_BASE,
+  context?: { sourceNode: string; rules: Rule[] },
+): HopsDraft {
   const seed: HopsDraft = {};
   for (const p of peers) {
     const h = p.step?.hop_in ?? null;
     const fallbackPort = taken ? freePortAcross(taken, [p.id], base) : base;
     seed[p.id] = {
       port: String(h?.port ?? fallbackPort),
-      kind: h?.security.t ?? 'none',
+      kind:
+        h?.security.t ?? (context ? defaultHopWireForListener(context.sourceNode, p.id, context.rules) : 'encryption'),
+      wireAutomatic: !h,
       dest: h?.security.t === 'reality' ? h.security.v.dest : EMPTY_REALITY_SITE.dest,
       names: h?.security.t === 'reality' ? h.security.v.server_names.join(', ') : EMPTY_REALITY_SITE.names,
     };
@@ -1584,14 +1615,13 @@ export function seedHopIn(
   prev: SnapshotStep['hop_in'] | null | undefined,
   nodeId: string,
   taken: Map<string, PortOwners>,
+  dial: HopDial,
   base = HOP_PORT_BASE,
 ): HopInRequest | undefined {
   if (prev) return undefined;
   return {
     port: freePortAcross(taken, [nodeId], base),
-    // 明文。是否加密是该跳的策略，由规则编辑器中的下拉框控制，不应由「追加一跳」
-    // 代为决定——走 overlay 时 wg 已对该跳加密，再加一层会增加无效的 CPU 开销。
-    security: { t: 'none' },
+    security: { t: defaultHopWire(dial) },
   };
 }
 
@@ -1965,29 +1995,34 @@ function RuleEditorReady({
     return true;
   });
   const displayedRuleCount = rules.length;
-  const ownHops = useState<HopsDraft>(() => seedHops(peers, portPool, hopBase));
+  const ownHops = useState<HopsDraft>(() => seedHops(peers, portPool, hopBase, { sourceNode: nodeId, rules: initial }));
   const [hops, setHops] = shared ? [shared.hops, shared.setHops] : ownHops;
   // `seedHops` 只初始化转发目标，不包含本机——反向接入时端口开在本机，
   // 因此走该回退分支。选择空闲端口而非硬编码 20000，原因同 seedHops：硬编码会导致
   // 未经填写的取值占用其他配置的端口。
-  const hopOf = (id: string) =>
-    hops[id] ??
-    (id === nodeId && selfHopIn
-      ? {
-          port: String(selfHopIn.port),
-          kind: selfHopIn.security.t,
-          dest: selfHopIn.security.t === 'reality' ? selfHopIn.security.v.dest : EMPTY_REALITY_SITE.dest,
-          names:
-            selfHopIn.security.t === 'reality'
-              ? selfHopIn.security.v.server_names.join(', ')
-              : EMPTY_REALITY_SITE.names,
-        }
-      : {
-          port: String(freePortAcross(portPool, [id], hopBase)),
-          kind: 'none' as const,
-          dest: EMPTY_REALITY_SITE.dest,
-          names: EMPTY_REALITY_SITE.names,
-        });
+  const hopOf = (id: string) => {
+    const stored =
+      hops[id] ??
+      (id === nodeId && selfHopIn
+        ? {
+            port: String(selfHopIn.port),
+            kind: selfHopIn.security.t,
+            wireAutomatic: false,
+            dest: selfHopIn.security.t === 'reality' ? selfHopIn.security.v.dest : EMPTY_REALITY_SITE.dest,
+            names:
+              selfHopIn.security.t === 'reality'
+                ? selfHopIn.security.v.server_names.join(', ')
+                : EMPTY_REALITY_SITE.names,
+          }
+        : {
+            port: String(freePortAcross(portPool, [id], hopBase)),
+            kind: defaultHopWireForListener(nodeId, id, rules),
+            wireAutomatic: true,
+            dest: EMPTY_REALITY_SITE.dest,
+            names: EMPTY_REALITY_SITE.names,
+          });
+    return stored.wireAutomatic ? { ...stored, kind: defaultHopWireForListener(nodeId, id, rules) } : stored;
+  };
   const patchHop = (id: string, next: Partial<ReturnType<typeof hopOf>>) =>
     setHops({ ...hops, [id]: { ...hopOf(id), ...next } });
   const setHopPort = (id: string, port: string) => {
@@ -2595,9 +2630,10 @@ function RuleEditorReady({
                                         navigate('tunnels');
                                       }}
                                     >
-                                      <span>↗</span>
-                                      <b>管理隧道</b>
-                                      <span>新建、编辑和删除都在隧道页</span>
+                                      <span className="external-target-copy">
+                                        <b>管理隧道</b>
+                                      </span>
+                                      <span className="external-target-where">新建、编辑和删除</span>
                                     </button>
                                     <button
                                       type="button"
@@ -2607,9 +2643,10 @@ function RuleEditorReady({
                                         setTargetQuery('');
                                       }}
                                     >
-                                      <span>↗</span>
-                                      <b>自定义</b>
-                                      <span>复用已有监听</span>
+                                      <span className="external-target-copy">
+                                        <b>自定义</b>
+                                      </span>
+                                      <span className="external-target-where">复用已有监听</span>
                                     </button>
                                     {visibleNextPeers.length +
                                       visibleInsidePeers.length +
@@ -3127,7 +3164,7 @@ function RuleEditorReady({
                         </small>
                       </span>
                     </div>
-                    <div className="listener-reference-facts">
+                    <div className="listener-reference-facts listener-inline-facts">
                       <span>
                         <small>安全</small>
                         <b>{hopWireLabel(target.step.hop_in?.security.t ?? 'none')}</b>
@@ -3157,9 +3194,13 @@ function RuleEditorReady({
                         </select>
                       </label>
                       {pool.t === 'mux' && (
-                        <button type="button" className="btn sm" onClick={openMux}>
-                          {readOnly ? '查看参数' : '配置参数'}
-                        </button>
+                        <span className="listener-reference-mux">
+                          <small>Mux 参数</small>
+                          <b>{pool.v ? '单独配置' : '跟随全局'}</b>
+                          <button type="button" className="btn sm" onClick={openMux}>
+                            {readOnly ? '查看参数' : '配置参数'}
+                          </button>
+                        </span>
                       )}
                     </div>
                     <p>
@@ -3215,7 +3256,10 @@ function RuleEditorReady({
                       className="f"
                       value={hopOf(nodeId).kind}
                       onChange={event =>
-                        patchHop(nodeId, { kind: event.target.value as ReturnType<typeof hopOf>['kind'] })
+                        patchHop(nodeId, {
+                          kind: event.target.value as ReturnType<typeof hopOf>['kind'],
+                          wireAutomatic: false,
+                        })
                       }
                     >
                       {/* 该区块只在存在反向目标时渲染，因此该端口一定是反向接入使用的端口
@@ -3257,7 +3301,6 @@ function RuleEditorReady({
                     {reverseTargets.map(to => peerOf(to)?.name || to).join('、')} 发起；同机各链端口必须错开。
                   </span>
                   {hopOf(nodeId).kind === 'none' && <strong>明文接入可能暴露 UUID 和目标地址。</strong>}
-                  <span>发布会重启受影响的 Xray。</span>
                 </p>
               </div>
             </div>
@@ -3307,7 +3350,9 @@ function RuleEditorReady({
                         <select
                           className="f"
                           value={h.kind}
-                          onChange={event => patchHop(to, { kind: event.target.value as typeof h.kind })}
+                          onChange={event =>
+                            patchHop(to, { kind: event.target.value as typeof h.kind, wireAutomatic: false })
+                          }
                         >
                           {HOP_WIRE_OPTIONS.map(option => (
                             <option key={option.kind} value={option.kind}>
@@ -3334,50 +3379,48 @@ function RuleEditorReady({
                         </select>
                       </label>
                       {pool.t === 'mux' && (
-                        <span className="hop-target-mux">
+                        <span className="hopfld hop-target-mux">
                           <small>Mux 参数</small>
-                          <span>
-                            <b>{pool.v ? '单独配置' : '跟随全局'}</b>
-                            {readOnly ? (
-                              <span
-                                className="btn sm"
-                                role="button"
-                                tabIndex={0}
-                                onClick={() =>
-                                  setMuxEditor({
-                                    to,
-                                    followGlobal: !pool.v,
-                                    value: pool.v ? { ...pool.v } : { ...globalRelayMux },
-                                  })
-                                }
-                                onKeyDown={event => {
-                                  if (event.key !== 'Enter' && event.key !== ' ') return;
-                                  event.preventDefault();
-                                  setMuxEditor({
-                                    to,
-                                    followGlobal: !pool.v,
-                                    value: pool.v ? { ...pool.v } : { ...globalRelayMux },
-                                  });
-                                }}
-                              >
-                                查看参数
-                              </span>
-                            ) : (
-                              <button
-                                type="button"
-                                className="btn sm"
-                                onClick={() =>
-                                  setMuxEditor({
-                                    to,
-                                    followGlobal: !pool.v,
-                                    value: pool.v ? { ...pool.v } : { ...globalRelayMux },
-                                  })
-                                }
-                              >
-                                配置参数
-                              </button>
-                            )}
-                          </span>
+                          <b>{pool.v ? '单独配置' : '跟随全局'}</b>
+                          {readOnly ? (
+                            <span
+                              className="btn sm"
+                              role="button"
+                              tabIndex={0}
+                              onClick={() =>
+                                setMuxEditor({
+                                  to,
+                                  followGlobal: !pool.v,
+                                  value: pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                })
+                              }
+                              onKeyDown={event => {
+                                if (event.key !== 'Enter' && event.key !== ' ') return;
+                                event.preventDefault();
+                                setMuxEditor({
+                                  to,
+                                  followGlobal: !pool.v,
+                                  value: pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                });
+                              }}
+                            >
+                              查看参数
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn sm"
+                              onClick={() =>
+                                setMuxEditor({
+                                  to,
+                                  followGlobal: !pool.v,
+                                  value: pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                })
+                              }
+                            >
+                              配置参数
+                            </button>
+                          )}
                         </span>
                       )}
                     </div>
@@ -3411,7 +3454,6 @@ function RuleEditorReady({
                           : '当前每条业务流单独建连。'}
                       </span>
                       {dialedDirectly && h.kind === 'none' && <strong>明文直连会暴露 UUID 和目标地址。</strong>}
-                      <span>发布会重启受影响的 Xray。</span>
                     </p>
                   </div>
                 );

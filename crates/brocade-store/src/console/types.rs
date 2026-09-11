@@ -1050,4 +1050,16 @@ mod tests {
         }));
         assert!(request.is_err());
     }
+
+    #[test]
+    fn vless_encryption_request_defaults_to_random_appearance() {
+        let request: WiresRequest = serde_json::from_value(serde_json::json!({
+            "vless_encryption": { "port": 13800 }
+        }))
+        .unwrap();
+        assert_eq!(
+            request.vless_encryption.unwrap().options.appearance,
+            brocade_core::model::VlessEncryptionAppearance::Random
+        );
+    }
 }

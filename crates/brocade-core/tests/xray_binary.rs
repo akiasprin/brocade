@@ -2986,7 +2986,7 @@ fn pooled_hops_load_in_the_real_binary() {
 }
 
 #[test]
-fn native_vless_encryption_ingress_carries_real_traffic_without_tls() {
+fn random_vless_encryption_ingress_carries_real_traffic_without_tls() {
     let Some(binary) = xray_binary() else {
         eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
         return;
@@ -3065,7 +3065,7 @@ fn native_vless_encryption_ingress_carries_real_traffic_without_tls() {
     business_outbound["protocol"] = json!("blackhole");
     business_outbound["settings"] = json!({ "response": { "type": "http" } });
 
-    let dir = std::env::temp_dir().join(format!("brocade-native-vless-{public_port}"));
+    let dir = std::env::temp_dir().join(format!("brocade-random-vless-{public_port}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let server_log = dir.join("server.log");
@@ -3096,7 +3096,7 @@ fn native_vless_encryption_ingress_carries_real_traffic_without_tls() {
                 "settings": { "vnext": [{
                     "address": "127.0.0.1",
                     "port": public_port,
-                    "users": [{ "id": USER_UUID, "encryption": format!("mlkem768x25519plus.native.0rtt.{INGRESS_PUBLIC}") }],
+                    "users": [{ "id": USER_UUID, "encryption": format!("mlkem768x25519plus.random.0rtt.{INGRESS_PUBLIC}") }],
                 }]},
                 "streamSettings": {
                     "network": "tcp",

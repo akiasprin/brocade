@@ -189,7 +189,11 @@ describe('规则页 Mux Worker 池', () => {
     fireEvent.change(connectionSelect(view), { target: { value: 'mux' } });
 
     expect(view.getByText('跟随全局')).toBeTruthy();
+    const muxSummary = view.getByText('Mux 参数').closest('.hop-target-mux');
+    expect(muxSummary?.classList.contains('hopfld')).toBe(true);
+    expect(muxSummary?.textContent).toContain('Mux 参数跟随全局配置参数');
     expect(panel?.textContent).toContain('“跟随全局”只继承参数，不与其他边共池。');
+    expect(panel?.textContent).not.toContain('发布会重启受影响的 Xray');
     expect(view.container.querySelector('.mux-drawer-grid')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 

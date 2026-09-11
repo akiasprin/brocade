@@ -113,13 +113,23 @@ describe('chain subscription country', () => {
     expect(draft.ops()).toEqual([]);
   });
 
-  it('offers a successful E2E country as an explicit choice and previews the flag', async () => {
+  it('automatically adopts a successful E2E country when no region is configured', async () => {
     const view = mount(chain(), probe('TW'));
-    fireEvent.click(view.getByRole('button', { name: '采用当前出口 TW' }));
 
-    await waitFor(() => expect(writes[0]).toMatchObject({ body: { subscription_country: 'TW' } }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toMatchObject({ body: { subscription_country: 'TW' } });
+    expect((view.getByRole('combobox', { name: '出口地区标识' }) as HTMLSelectElement).value).toBe('TW');
+    expect(view.queryByRole('button', { name: '采用当前出口 TW' })).toBeNull();
+    expect(view.getByText('🇹🇼台北直连')).toBeTruthy();
     expect(draft.ops()).toEqual([]);
     expect(subscriptionFlag('TW')).toBe('🇹🇼');
+  });
+
+  it('does not adopt an unknown probe location and uses region terminology', async () => {
+    const view = mount(chain(), probe('ZZ'));
+    expect(view.getByRole('option', { name: '不显示地区标识' })).toBeTruthy();
+    expect(view.queryByText(/国旗/)).toBeNull();
+    await waitFor(() => expect(writes).toHaveLength(0));
   });
 
   it('shows configured metadata without an editor to readonly users', () => {

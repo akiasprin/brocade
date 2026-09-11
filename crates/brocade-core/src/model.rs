@@ -1928,9 +1928,9 @@ pub struct VlessEncryptionOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VlessEncryptionAppearance {
-    #[default]
     Native,
     Xorpub,
+    #[default]
     Random,
 }
 
@@ -1965,7 +1965,7 @@ impl VlessEncryptionClientMode {
 impl Default for VlessEncryptionOptions {
     fn default() -> Self {
         Self {
-            appearance: VlessEncryptionAppearance::Native,
+            appearance: VlessEncryptionAppearance::Random,
             ticket_lifetime: "600s".to_owned(),
             client_mode: VlessEncryptionClientMode::ZeroRtt,
             server_padding: String::new(),

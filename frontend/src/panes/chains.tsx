@@ -4881,7 +4881,11 @@ export function ChainSubscriptionCountryRow({
   const qc = useQueryClient();
   const configured = chain.subscription_country?.trim().toUpperCase() ?? '';
   const observed = probe?.status === 'ok' ? (probe.exit_loc?.trim().toUpperCase() ?? '') : '';
-  const suggested = SUBSCRIPTION_COUNTRY_CODE_SET.has(observed) && observed !== configured ? observed : '';
+  const observedCountry = SUBSCRIPTION_COUNTRY_CODE_SET.has(observed) ? observed : '';
+  const automatic = configured ? '' : observedCountry;
+  const displayed = configured || automatic;
+  const suggested = configured && observedCountry !== configured ? observedCountry : '';
+  const automaticRequest = useRef('');
   const save = useMutation({
     mutationFn: (country: string | null) =>
       upsertChain(appId, {
@@ -4896,10 +4900,19 @@ export function ChainSubscriptionCountryRow({
       qc.invalidateQueries({ queryKey: ['compile'] });
     },
   });
+  useEffect(() => {
+    if (!editable || !automatic || automaticRequest.current === automatic) return;
+    automaticRequest.current = automatic;
+    save.mutate(automatic);
+  }, [automatic, editable, save]);
   const update = (country: string) => {
-    if (country !== configured) save.mutate(country || null);
+    if (country === configured) return;
+    // Clearing an explicit choice must not be immediately undone by the automatic effect in this
+    // mounted editor. A later visit can adopt a newly observed location again.
+    if (!country && observedCountry) automaticRequest.current = observedCountry;
+    save.mutate(country || null);
   };
-  const preview = `${configured ? subscriptionFlag(configured) : ''}${chain.name}`;
+  const preview = `${displayed ? subscriptionFlag(displayed) : ''}${chain.name}`;
 
   return (
     <>
@@ -4910,11 +4923,11 @@ export function ChainSubscriptionCountryRow({
             <select
               className="f"
               aria-label="出口地区标识"
-              value={configured}
+              value={displayed}
               disabled={save.isPending}
               onChange={event => update(event.target.value)}
             >
-              <option value="">不显示国旗</option>
+              <option value="">不显示地区标识</option>
               {SUBSCRIPTION_COUNTRY_CODES.map(code => (
                 <option key={code} value={code}>
                   {subscriptionCountryLabel(code)}
@@ -4922,7 +4935,7 @@ export function ChainSubscriptionCountryRow({
               ))}
             </select>
           ) : (
-            <span>{configured ? subscriptionCountryLabel(configured) : '不显示国旗'}</span>
+            <span>{displayed ? subscriptionCountryLabel(displayed) : '不显示地区标识'}</span>
           )}
           {editable && suggested && (
             <button className="btn" type="button" disabled={save.isPending} onClick={() => update(suggested)}>
@@ -6138,7 +6151,12 @@ export function ChainRulesPanel({
                 shared={{
                   rules: draftRules[node] ?? step?.rules ?? [],
                   setRules: next => setDraftRules(prev => ({ ...prev, [node]: next })),
-                  hops: draftHops[node] ?? seedHops(peersOf(node), portPool, hopBase),
+                  hops:
+                    draftHops[node] ??
+                    seedHops(peersOf(node), portPool, hopBase, {
+                      sourceNode: node,
+                      rules: draftRules[node] ?? step?.rules ?? [],
+                    }),
                   setHops: next => setDraftHops(prev => ({ ...prev, [node]: next })),
                   dns: draftDns[node] ?? {},
                   setDns: next => setDraftDns(prev => ({ ...prev, [node]: next })),

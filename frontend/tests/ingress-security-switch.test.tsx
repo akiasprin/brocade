@@ -999,12 +999,12 @@ function EncryptionHarness({ editable = true }: { editable?: boolean } = {}) {
 }
 
 describe('VLESS Encryption options', () => {
-  it('saves non-default appearance, fixed 0rtt, ticket range and both padding directions', async () => {
+  it('defaults appearance to random and saves fixed 0rtt, ticket range and both padding directions', async () => {
     const view = render(<EncryptionHarness />);
     expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
     const appearance = view.getByLabelText('Encryption 流量外观') as HTMLSelectElement;
     expect(Array.from(appearance.options).map(option => option.textContent)).toEqual(['native', 'xorpub', 'random']);
-    fireEvent.change(appearance, { target: { value: 'random' } });
+    expect(appearance.value).toBe('random');
     expect(view.queryByLabelText('Encryption 客户端握手')).toBeNull();
     expect(view.queryByText('会话恢复')).toBeNull();
     expect(view.queryByText('0rtt')).toBeNull();

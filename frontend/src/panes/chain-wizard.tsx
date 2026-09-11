@@ -25,6 +25,7 @@ import { can, useSession } from '../session';
 import {
   DIAL_LABEL,
   DIAL_ORDER,
+  defaultHopWire,
   defaultHopDial,
   dialKindOf,
   dialUnavailable,
@@ -148,6 +149,18 @@ type PortEdit = { port?: string; sec?: HopSec };
 // 且中转端口未加密。走 overlay 时 wg 已对该跳加密，内层不加密是合理的。
 // 判定与规则编辑器中的对应警告一致。
 const plaintextHop = (dial: HopDial, sec: HopSec) => dial.t === 'addr' && sec === 'none';
+
+/** Default the wire of one listener from every chain edge that uses it. */
+export function defaultListenerHopWire(spine: string[], host: string, dialAt: (index: number) => HopDial): HopSec {
+  let usedOverOverlay = false;
+  for (let i = 1; i < spine.length; i += 1) {
+    const dial = dialAt(i);
+    if (hopListener(spine, i, dial.t === 'reverse') !== host) continue;
+    if (defaultHopWire(dial) === 'encryption') return 'encryption';
+    usedOverOverlay = true;
+  }
+  return usedOverOverlay ? 'none' : 'encryption';
+}
 
 export function ChainWizard({
   node,
@@ -357,7 +370,6 @@ export function ChainWizard({
   for (const host of listeners) autoHostPorts.set(host, freePortAcross(taken, [host], hopBase));
 
   const hostPortOf = (host: string) => portEdits[host]?.port ?? String(autoHostPorts.get(host) ?? hopBase);
-  const hostSecOf = (host: string): HopSec => portEdits[host]?.sec ?? 'none';
   /* 自定义档的地址需手动填写，其余各档可推导得出。 */
   const hopDialFor = (id: string): HopDial => {
     const kind = hopKindOf(id);
@@ -369,6 +381,8 @@ export function ChainWizard({
     }
     return hopDialOf(kind, nodeOf(id), p);
   };
+  const hostSecOf = (host: string): HopSec =>
+    portEdits[host]?.sec ?? defaultListenerHopWire(spine, host, i => hopDialFor(spine[i]));
   const patchHop = (id: string, next: HopEdit) => setHopEdits(prev => ({ ...prev, [id]: { ...prev[id], ...next } }));
   const patchPort = (host: string, next: PortEdit) =>
     setPortEdits(prev => ({ ...prev, [host]: { ...prev[host], ...next } }));

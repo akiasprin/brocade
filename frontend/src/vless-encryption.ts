@@ -1,7 +1,7 @@
 import type { VlessEncryptionOptions } from './api';
 
 export const DEFAULT_VLESS_ENCRYPTION: VlessEncryptionOptions = {
-  appearance: 'native',
+  appearance: 'random',
   ticket_lifetime: '600s',
   client_mode: '0rtt',
   server_padding: '',

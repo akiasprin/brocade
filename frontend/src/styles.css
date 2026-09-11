@@ -18853,30 +18853,21 @@ input.f.ing-pj-port {
   white-space: nowrap;
 }
 .external-target-menu > button.external-target-new {
-  display: flex;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
   width: 100%;
-  margin-top: 5px;
-  padding: 8px;
-  border: 1px dashed color-mix(in srgb, var(--action) 44%, var(--line));
-  border-radius: 6px;
-  background: var(--action-wash);
+  margin-top: 2px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
   color: var(--action-hover);
-  font-size: 12px;
   text-align: left;
 }
 .external-target-menu > button.external-target-custom {
-  border-color: color-mix(in srgb, var(--hue-3) 38%, var(--line));
-  background: color-mix(in srgb, var(--hue-3) 6%, var(--sheet));
   color: var(--hue-3);
-}
-.external-target-new > span:first-child {
-  font: 500 14px var(--mono);
-}
-.external-target-new > span:last-child {
-  margin-left: auto;
-  color: var(--ink-4);
-  font-size: 10.5px;
 }
 .external-target-empty {
   padding: 13px 8px;
@@ -18975,15 +18966,16 @@ input.f.ing-pj-port {
 }
 .listener-reference-facts {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: flex-end;
-  gap: 14px;
+  gap: 12px;
 }
 .listener-reference-facts > span,
 .listener-reference-facts > label {
-  display: grid;
-  gap: 3px;
-  min-width: 66px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
 }
 .listener-reference-facts small {
   color: var(--ink-4);
@@ -19000,6 +18992,10 @@ input.f.ing-pj-port {
   min-width: 98px;
   height: 27px;
   font-size: 10.5px;
+}
+.listener-reference-mux > button,
+.hop-target-mux > :is(button, .btn) {
+  flex: none;
 }
 .listener-reference-row > p {
   grid-column: 1 / -1;
@@ -19042,11 +19038,6 @@ input.f.ing-pj-port {
 .hop-target-facts .hop-target-pool select.f {
   width: 104px;
 }
-.hop-target-mux > span {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
 .hop-target-security {
   position: relative;
   z-index: 1;
@@ -19078,34 +19069,70 @@ input.f.ing-pj-port {
 }
 
 @container rules (max-width: 820px) {
-  .listener-reference-row:not(.hop-target-row) {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .listener-reference-facts {
-    justify-content: flex-start;
+  .listener-reference-panel > header {
+    align-items: flex-start;
     flex-wrap: wrap;
   }
-  .hop-target-row {
-    grid-template-columns: minmax(82px, 1fr) minmax(0, max-content);
-    gap: 7px;
+  .listener-reference-panel > header .hint {
+    flex: 1 1 100%;
+    margin: 2px 0 0;
+    line-height: 1.35;
   }
+  .listener-reference-row,
+  .hop-target-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 8px;
+  }
+  .listener-reference-main {
+    width: 100%;
+  }
+  .listener-reference-facts,
   .hop-target-row .hop-target-facts {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    width: 100%;
     min-width: 0;
-    overflow-x: auto;
-    flex-wrap: nowrap;
+    justify-content: stretch;
+    gap: 6px;
+    overflow: visible;
+  }
+  .listener-reference-facts > span,
+  .listener-reference-facts > label,
+  .hop-target-panel .hop-target-facts > .hopfld {
+    display: grid;
+    grid-template-columns: 68px minmax(0, 1fr) auto;
+    align-items: center;
+    width: 100%;
+    min-width: 0;
     gap: 6px;
   }
+  .listener-reference-facts b {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .listener-reference-facts select.f,
+  .hop-target-facts input.f,
+  .hop-target-facts select.f {
+    width: 100%;
+    min-width: 0;
+  }
+  .hop-target-facts .hop-target-port,
+  .hop-target-facts .hop-target-wire {
+    min-width: 0;
+  }
   .hop-target-facts .hop-target-port input.f {
-    width: 56px;
-    min-width: 56px;
+    width: 100%;
+    min-width: 0;
   }
   .hop-target-facts .hop-target-wire select.f {
-    width: 104px;
-    min-width: 104px;
+    width: 100%;
+    min-width: 0;
   }
   .hop-target-facts .hop-target-pool select.f {
-    width: 76px;
-    min-width: 76px;
+    width: 100%;
+    min-width: 0;
   }
   .hop-target-security {
     grid-template-columns: minmax(0, 1fr);

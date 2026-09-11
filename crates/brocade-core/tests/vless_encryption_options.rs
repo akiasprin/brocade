@@ -1,8 +1,9 @@
-use brocade_core::model::{VlessEncryption, VlessEncryptionOptions};
+use brocade_core::model::{VlessEncryption, VlessEncryptionAppearance, VlessEncryptionOptions};
 
 #[test]
 fn complete_settings_are_required_and_keep_wire_encoding() {
     let options = VlessEncryptionOptions::default();
+    assert_eq!(options.appearance, VlessEncryptionAppearance::Random);
     let wire: VlessEncryption = serde_json::from_value(serde_json::json!({
         "port": 13800,
         "options": options,
@@ -13,11 +14,11 @@ fn complete_settings_are_required_and_keep_wire_encoding() {
     assert_eq!(wire.options, options);
     assert_eq!(
         wire.options.decryption("private"),
-        "mlkem768x25519plus.native.600s.private"
+        "mlkem768x25519plus.random.600s.private"
     );
     assert_eq!(
         wire.options.encryption("public"),
-        "mlkem768x25519plus.native.0rtt.public"
+        "mlkem768x25519plus.random.0rtt.public"
     );
     assert!(
         serde_json::from_value::<VlessEncryption>(serde_json::json!({
