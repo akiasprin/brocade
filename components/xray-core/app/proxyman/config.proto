@@ -72,17 +72,19 @@ message MultiplexingConfig {
   int32 xudpConcurrency = 3;
   // "reject" (default), "allow" or "skip".
   string xudpProxyUDP443 = 4;
-  // Optional bounded idle-worker pool with active Ping/Pong liveness checking.
+  // Optional worker pool with idle Ping/Pong validation and a soft base capacity.
   // Missing keeps the upstream Mux behavior unchanged.
   WorkerPoolConfig worker_pool = 5;
 }
 
 message WorkerPoolConfig {
-  uint32 min_idle_workers = 1;
-  uint32 max_idle_workers = 2;
+  // Best-effort idle prewarm target within the base worker budget.
+  uint32 prewarm_workers = 1;
+  // Total worker threshold before active reuse; overflow is allowed.
+  uint32 reuse_threshold = 2;
   uint32 max_probing_workers = 3;
-  uint32 probe_interval_secs = 4;
+  uint32 probe_interval_ms = 4;
   uint32 probe_timeout_ms = 5;
-  uint32 idle_ttl_secs = 6;
+  uint32 idle_ttl_ms = 6;
   uint32 max_requests_per_worker = 7;
 }

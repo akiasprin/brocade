@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"path/filepath"
@@ -109,51 +110,66 @@ type MuxConfig struct {
 }
 
 type WorkerPoolConfig struct {
-	MinIdleWorkers       uint32 `json:"minIdleWorkers"`
-	MaxIdleWorkers       uint32 `json:"maxIdleWorkers"`
+	PrewarmWorkers uint32 `json:"prewarmWorkers"`
+	// Total worker reuse threshold, not an idle-only or hard cap.
+	ReuseThreshold       uint32 `json:"reuseThreshold"`
 	MaxProbingWorkers    uint32 `json:"maxProbingWorkers"`
-	ProbeIntervalSecs    uint32 `json:"probeIntervalSecs"`
+	ProbeIntervalMs      uint32 `json:"probeIntervalMs"`
 	ProbeTimeoutMs       uint32 `json:"probeTimeoutMs"`
-	IdleTtlSecs          uint32 `json:"idleTtlSecs"`
+	IdleTtlMs            uint32 `json:"idleTtlMs"`
 	MaxRequestsPerWorker uint32 `json:"maxRequestsPerWorker"`
 }
 
+// Worker-pool policies are explicit: unknown/retired keys must not silently
+// reset a value (especially the valid zero prewarm target).
+func (c *WorkerPoolConfig) UnmarshalJSON(data []byte) error {
+	type policy WorkerPoolConfig
+	var value policy
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	*c = WorkerPoolConfig(value)
+	return nil
+}
+
 func (c *WorkerPoolConfig) Build() (*proxyman.WorkerPoolConfig, error) {
-	if c.MaxIdleWorkers < 1 {
-		return nil, errors.New("maxIdleWorkers must be at least 1")
+	if c.ReuseThreshold < 1 {
+		return nil, errors.New("worker reuse threshold (reuseThreshold) must be at least 1")
 	}
-	if c.MinIdleWorkers > c.MaxIdleWorkers {
-		return nil, errors.New("minIdleWorkers must not exceed maxIdleWorkers")
+	if c.PrewarmWorkers > c.ReuseThreshold {
+		return nil, errors.New("prewarmWorkers must not exceed worker reuse threshold (reuseThreshold)")
 	}
-	if c.MaxProbingWorkers < 1 || c.MaxProbingWorkers > c.MaxIdleWorkers {
-		return nil, errors.New("maxProbingWorkers must be between 1 and maxIdleWorkers")
+	if c.MaxProbingWorkers < 1 || c.MaxProbingWorkers > c.ReuseThreshold {
+		return nil, errors.New("maxProbingWorkers must be between 1 and worker reuse threshold (reuseThreshold)")
 	}
-	if c.ProbeIntervalSecs < 2 || c.ProbeIntervalSecs > 60 {
-		return nil, errors.New("probeIntervalSecs must be between 2 and 60")
+	if c.ProbeIntervalMs < 2000 || c.ProbeIntervalMs > 60000 {
+		return nil, errors.New("probeIntervalMs must be between 2000 and 60000")
 	}
 	if c.ProbeTimeoutMs < 200 || c.ProbeTimeoutMs > 10000 {
 		return nil, errors.New("probeTimeoutMs must be between 200 and 10000")
 	}
-	if uint64(c.ProbeTimeoutMs) >= uint64(c.ProbeIntervalSecs)*1000 {
-		return nil, errors.New("probeTimeoutMs must be shorter than probeIntervalSecs")
+	if c.ProbeTimeoutMs >= c.ProbeIntervalMs {
+		return nil, errors.New("probeTimeoutMs must be shorter than probeIntervalMs")
 	}
-	if c.IdleTtlSecs < 1 {
-		return nil, errors.New("idleTtlSecs must be at least 1")
+	if c.IdleTtlMs < 1000 {
+		return nil, errors.New("idleTtlMs must be at least 1000")
 	}
-	minimumTTL := c.ProbeIntervalSecs + (c.ProbeTimeoutMs+999)/1000
-	if c.IdleTtlSecs < minimumTTL {
-		return nil, errors.New("idleTtlSecs must cover one probe interval and timeout")
+	minimumTTL := uint64(c.ProbeIntervalMs) + uint64(c.ProbeTimeoutMs)
+	if uint64(c.IdleTtlMs) < minimumTTL {
+		return nil, errors.New("idleTtlMs must cover one probe interval and timeout")
 	}
 	if c.MaxRequestsPerWorker < 1 || c.MaxRequestsPerWorker > 65535 {
 		return nil, errors.New("maxRequestsPerWorker must be between 1 and 65535")
 	}
 	return &proxyman.WorkerPoolConfig{
-		MinIdleWorkers:       c.MinIdleWorkers,
-		MaxIdleWorkers:       c.MaxIdleWorkers,
+		PrewarmWorkers:       c.PrewarmWorkers,
+		ReuseThreshold:       c.ReuseThreshold,
 		MaxProbingWorkers:    c.MaxProbingWorkers,
-		ProbeIntervalSecs:    c.ProbeIntervalSecs,
+		ProbeIntervalMs:      c.ProbeIntervalMs,
 		ProbeTimeoutMs:       c.ProbeTimeoutMs,
-		IdleTtlSecs:          c.IdleTtlSecs,
+		IdleTtlMs:            c.IdleTtlMs,
 		MaxRequestsPerWorker: c.MaxRequestsPerWorker,
 	}, nil
 }
@@ -616,11 +632,6 @@ func (c *Config) Build() (*core.Config, error) {
 
 	if c.Reverse != nil {
 		return nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)
-		r, err := c.Reverse.Build()
-		if err != nil {
-			return nil, errors.New("failed to build reverse configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
 
 	if c.FakeDNS != nil {

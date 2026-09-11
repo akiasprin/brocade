@@ -420,7 +420,7 @@ type MultiplexingConfig struct {
 	XudpConcurrency int32 `protobuf:"varint,3,opt,name=xudpConcurrency,proto3" json:"xudpConcurrency,omitempty"`
 	// "reject" (default), "allow" or "skip".
 	XudpProxyUDP443 string `protobuf:"bytes,4,opt,name=xudpProxyUDP443,proto3" json:"xudpProxyUDP443,omitempty"`
-	// Optional bounded idle-worker pool with active Ping/Pong liveness checking.
+	// Optional worker pool with idle Ping/Pong validation and a soft base capacity.
 	// Missing keeps the upstream Mux behavior unchanged.
 	WorkerPool    *WorkerPoolConfig `protobuf:"bytes,5,opt,name=worker_pool,json=workerPool,proto3" json:"worker_pool,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -493,14 +493,16 @@ func (x *MultiplexingConfig) GetWorkerPool() *WorkerPoolConfig {
 }
 
 type WorkerPoolConfig struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	MinIdleWorkers       uint32                 `protobuf:"varint,1,opt,name=min_idle_workers,json=minIdleWorkers,proto3" json:"min_idle_workers,omitempty"`
-	MaxIdleWorkers       uint32                 `protobuf:"varint,2,opt,name=max_idle_workers,json=maxIdleWorkers,proto3" json:"max_idle_workers,omitempty"`
-	MaxProbingWorkers    uint32                 `protobuf:"varint,3,opt,name=max_probing_workers,json=maxProbingWorkers,proto3" json:"max_probing_workers,omitempty"`
-	ProbeIntervalSecs    uint32                 `protobuf:"varint,4,opt,name=probe_interval_secs,json=probeIntervalSecs,proto3" json:"probe_interval_secs,omitempty"`
-	ProbeTimeoutMs       uint32                 `protobuf:"varint,5,opt,name=probe_timeout_ms,json=probeTimeoutMs,proto3" json:"probe_timeout_ms,omitempty"`
-	IdleTtlSecs          uint32                 `protobuf:"varint,6,opt,name=idle_ttl_secs,json=idleTtlSecs,proto3" json:"idle_ttl_secs,omitempty"`
-	MaxRequestsPerWorker uint32                 `protobuf:"varint,7,opt,name=max_requests_per_worker,json=maxRequestsPerWorker,proto3" json:"max_requests_per_worker,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Best-effort idle prewarm target within the base worker budget.
+	PrewarmWorkers uint32 `protobuf:"varint,1,opt,name=prewarm_workers,json=prewarmWorkers,proto3" json:"prewarm_workers,omitempty"`
+	// Total worker threshold before active reuse; overflow is allowed.
+	ReuseThreshold       uint32 `protobuf:"varint,2,opt,name=reuse_threshold,json=reuseThreshold,proto3" json:"reuse_threshold,omitempty"`
+	MaxProbingWorkers    uint32 `protobuf:"varint,3,opt,name=max_probing_workers,json=maxProbingWorkers,proto3" json:"max_probing_workers,omitempty"`
+	ProbeIntervalMs      uint32 `protobuf:"varint,4,opt,name=probe_interval_ms,json=probeIntervalMs,proto3" json:"probe_interval_ms,omitempty"`
+	ProbeTimeoutMs       uint32 `protobuf:"varint,5,opt,name=probe_timeout_ms,json=probeTimeoutMs,proto3" json:"probe_timeout_ms,omitempty"`
+	IdleTtlMs            uint32 `protobuf:"varint,6,opt,name=idle_ttl_ms,json=idleTtlMs,proto3" json:"idle_ttl_ms,omitempty"`
+	MaxRequestsPerWorker uint32 `protobuf:"varint,7,opt,name=max_requests_per_worker,json=maxRequestsPerWorker,proto3" json:"max_requests_per_worker,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -535,16 +537,16 @@ func (*WorkerPoolConfig) Descriptor() ([]byte, []int) {
 	return file_app_proxyman_config_proto_rawDescGZIP(), []int{7}
 }
 
-func (x *WorkerPoolConfig) GetMinIdleWorkers() uint32 {
+func (x *WorkerPoolConfig) GetPrewarmWorkers() uint32 {
 	if x != nil {
-		return x.MinIdleWorkers
+		return x.PrewarmWorkers
 	}
 	return 0
 }
 
-func (x *WorkerPoolConfig) GetMaxIdleWorkers() uint32 {
+func (x *WorkerPoolConfig) GetReuseThreshold() uint32 {
 	if x != nil {
-		return x.MaxIdleWorkers
+		return x.ReuseThreshold
 	}
 	return 0
 }
@@ -556,9 +558,9 @@ func (x *WorkerPoolConfig) GetMaxProbingWorkers() uint32 {
 	return 0
 }
 
-func (x *WorkerPoolConfig) GetProbeIntervalSecs() uint32 {
+func (x *WorkerPoolConfig) GetProbeIntervalMs() uint32 {
 	if x != nil {
-		return x.ProbeIntervalSecs
+		return x.ProbeIntervalMs
 	}
 	return 0
 }
@@ -570,9 +572,9 @@ func (x *WorkerPoolConfig) GetProbeTimeoutMs() uint32 {
 	return 0
 }
 
-func (x *WorkerPoolConfig) GetIdleTtlSecs() uint32 {
+func (x *WorkerPoolConfig) GetIdleTtlMs() uint32 {
 	if x != nil {
-		return x.IdleTtlSecs
+		return x.IdleTtlMs
 	}
 	return 0
 }
@@ -622,14 +624,14 @@ const file_app_proxyman_config_proto_rawDesc = "" +
 	"\x0fxudpConcurrency\x18\x03 \x01(\x05R\x0fxudpConcurrency\x12(\n" +
 	"\x0fxudpProxyUDP443\x18\x04 \x01(\tR\x0fxudpProxyUDP443\x12D\n" +
 	"\vworker_pool\x18\x05 \x01(\v2#.xray.app.proxyman.WorkerPoolConfigR\n" +
-	"workerPool\"\xcb\x02\n" +
-	"\x10WorkerPoolConfig\x12(\n" +
-	"\x10min_idle_workers\x18\x01 \x01(\rR\x0eminIdleWorkers\x12(\n" +
-	"\x10max_idle_workers\x18\x02 \x01(\rR\x0emaxIdleWorkers\x12.\n" +
-	"\x13max_probing_workers\x18\x03 \x01(\rR\x11maxProbingWorkers\x12.\n" +
-	"\x13probe_interval_secs\x18\x04 \x01(\rR\x11probeIntervalSecs\x12(\n" +
-	"\x10probe_timeout_ms\x18\x05 \x01(\rR\x0eprobeTimeoutMs\x12\"\n" +
-	"\ridle_ttl_secs\x18\x06 \x01(\rR\vidleTtlSecs\x125\n" +
+	"workerPool\"\xc1\x02\n" +
+	"\x10WorkerPoolConfig\x12'\n" +
+	"\x0fprewarm_workers\x18\x01 \x01(\rR\x0eprewarmWorkers\x12'\n" +
+	"\x0freuse_threshold\x18\x02 \x01(\rR\x0ereuseThreshold\x12.\n" +
+	"\x13max_probing_workers\x18\x03 \x01(\rR\x11maxProbingWorkers\x12*\n" +
+	"\x11probe_interval_ms\x18\x04 \x01(\rR\x0fprobeIntervalMs\x12(\n" +
+	"\x10probe_timeout_ms\x18\x05 \x01(\rR\x0eprobeTimeoutMs\x12\x1e\n" +
+	"\vidle_ttl_ms\x18\x06 \x01(\rR\tidleTtlMs\x125\n" +
 	"\x17max_requests_per_worker\x18\a \x01(\rR\x14maxRequestsPerWorkerBU\n" +
 	"\x15com.xray.app.proxymanP\x01Z&github.com/xtls/xray-core/app/proxyman\xaa\x02\x11Xray.App.Proxymanb\x06proto3"
 

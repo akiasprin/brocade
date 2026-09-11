@@ -40,8 +40,8 @@ permissions:
   contents: read
 
 jobs:
-  xray-anytls:
-    name: xray anytls test + race
+  xray-data-plane:
+    name: xray AnyTLS + Mux/reverse test, vet and race
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -72,17 +72,35 @@ jobs:
       - name: AnyTLS race tests
         run: go test -race ./proxy/anytls -count=3 -timeout=10m
 
+      - name: Mux and reverse deterministic tests
+        run: go test ./common/mux ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless -count=1 -timeout=10m
+
+      - name: Mux and reverse vet
+        run: go vet ./common/mux ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless
+
+      - name: Mux race tests
+        run: go test -race ./common/mux -count=1 -timeout=10m
+
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Reject whitespace errors in this revision
+        run: git diff --check HEAD^ HEAD
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Install front-end dependencies
+        working-directory: frontend
+        run: npm ci
 
       - uses: actions/setup-go@v5
         with:
@@ -125,10 +143,11 @@ jobs:
           cargo test -p brocade-store --test pg_integration --locked -- --ignored
           cargo test -p brocade-console --test http_integration --locked -- --ignored
 
-      - name: Front-end lint and self-checks
+      - name: Front-end lint, tests and self-checks
         working-directory: frontend
         run: |
-          npm run lint
+          npm run lint:strict
+          npm test
           node scripts/route-check.mjs
 
   build:

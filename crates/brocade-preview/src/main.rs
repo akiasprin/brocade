@@ -13,20 +13,20 @@ mod param;
 mod probe;
 mod provision;
 
+use std::sync::Arc;
+
 use axum::{
     routing::{any, delete, get, post},
     Router,
 };
 use reqwest::Client;
+use tokio::sync::Mutex;
 
 use crate::config::Config;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let state = AppState {
-        config: Config::from_env()?,
-        client: Client::new(),
-    };
+    let state = AppState::new(Config::from_env()?);
     let bind = state.config.bind;
     let app = Router::new()
         .route("/preview/status", get(node::preview_status))
@@ -60,4 +60,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 pub(crate) struct AppState {
     config: Config,
     client: Client,
+    subscription_probe_lock: Arc<Mutex<()>>,
+}
+
+impl AppState {
+    fn new(config: Config) -> Self {
+        Self {
+            config,
+            client: Client::new(),
+            subscription_probe_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloned_state_shares_the_subscription_probe_gate() {
+        let first = AppState::new(Config::for_test());
+        let second = first.clone();
+        let held = first.subscription_probe_lock.lock().await;
+
+        assert!(second.subscription_probe_lock.try_lock().is_err());
+
+        drop(held);
+        assert!(second.subscription_probe_lock.try_lock().is_ok());
+    }
 }

@@ -15,17 +15,14 @@ import (
 // Reverse health is independent of the ordinary idle Mux pool. Both ends must
 // run this protocol; an endpoint without VALIDATED support never becomes READY.
 type ReverseHealthConfig struct {
-	ProbeJitterPercent   uint32
-	RecoverySuccesses    uint32
-	SpareWorkers         uint32
-	MaxHealthyWorkers    uint32
-	MaxSessionsPerWorker uint32
-	BackoffBase          time.Duration
-	StableReset          time.Duration
-	CanaryInterval       time.Duration
-	CanaryTimeout        time.Duration
-	CanarySuccesses      uint32
-	CanaryStableWindow   time.Duration
+	DisconnectOnHealthFailure bool
+	ProbeJitterPercent        uint32
+	RecoverySuccesses         uint32
+	SpareWorkers              uint32
+	MaxHealthyWorkers         uint32
+	MaxSessionsPerWorker      uint32
+	BackoffBase               time.Duration
+	StableReset               time.Duration
 
 	ActiveSessions                                           func() uint32
 	DrainIdle                                                func() bool
@@ -42,7 +39,7 @@ type ReverseHealthConfig struct {
 }
 
 func DefaultReverseHealthConfig(pair, role string) ReverseHealthConfig {
-	return ReverseHealthConfig{ProbeJitterPercent: 10, RecoverySuccesses: 2, SpareWorkers: 1, MaxHealthyWorkers: 32, MaxSessionsPerWorker: 16, BackoffBase: 250 * time.Millisecond, StableReset: 10000 * time.Millisecond, CanaryInterval: 1000 * time.Millisecond, CanaryTimeout: 750 * time.Millisecond, CanarySuccesses: 20, CanaryStableWindow: 10000 * time.Millisecond, MinHealthyWorkers: 2, MaxIdleReadyWorkers: 2, MaxParallelDials: 2, BackoffCap: 2 * time.Second, Pair: pair, Role: role, ProbeInterval: time.Second, ProbeTimeout: 750 * time.Millisecond, ConfirmTimeout: 750 * time.Millisecond, HealthLease: 3 * time.Second, ReadyTimeout: 2 * time.Second}
+	return ReverseHealthConfig{DisconnectOnHealthFailure: false, ProbeJitterPercent: 10, RecoverySuccesses: 2, SpareWorkers: 1, MaxHealthyWorkers: 32, MaxSessionsPerWorker: 16, BackoffBase: 250 * time.Millisecond, StableReset: 10000 * time.Millisecond, MinHealthyWorkers: 2, MaxIdleReadyWorkers: 2, MaxParallelDials: 2, BackoffCap: 2 * time.Second, Pair: pair, Role: role, ProbeInterval: time.Second, ProbeTimeout: 750 * time.Millisecond, ConfirmTimeout: 750 * time.Millisecond, HealthLease: 3 * time.Second, ReadyTimeout: 2 * time.Second}
 }
 
 type ReverseHealthSnapshot struct {
@@ -204,12 +201,23 @@ func (h *ReverseHealth) failLocked(reason string) {
 	h.transitionLocked("DEAD", reason)
 	h.done.Close() // done.Close only closes a channel; transport cleanup runs outside this lock.
 }
+func (h *ReverseHealth) failHealthLocked(reason string) {
+	if h.config.DisconnectOnHealthFailure || h.config.ActiveSessions == nil || h.config.ActiveSessions() == 0 {
+		h.failLocked(reason)
+		return
+	}
+	h.pendingID = 0
+	h.transitionLocked("DRAINING", reason)
+	if err := h.writer.enqueue(FrameMetadata{SessionStatus: SessionStatusKeepAlive, Option: OptionProbe | OptionDrain, ProbeID: h.nextID}); err != nil && h.counters != nil {
+		h.counters.queueFailures.Add(1)
+	}
+}
 func (h *ReverseHealth) sendLocked(id uint64, option bitmask.Byte) bool {
 	if err := h.writer.enqueue(FrameMetadata{SessionStatus: SessionStatusKeepAlive, Option: OptionProbe | option, ProbeID: id}); err != nil {
 		if h.counters != nil {
 			h.counters.queueFailures.Add(1)
 		}
-		h.failLocked("control_queue_full_or_closed")
+		h.failHealthLocked("control_queue_full_or_closed")
 		return false
 	}
 	return true
@@ -233,12 +241,15 @@ func (h *ReverseHealth) checkLocked(now time.Time) {
 	if state == "CLOSED" || state == "DEAD" {
 		return
 	}
+	if h.done.Done() {
+		h.transitionLocked("DEAD", "transport_closed")
+		return
+	}
 	if state == "DRAINING" && h.config.DrainIdle != nil && h.config.DrainIdle() {
 		h.failLocked("drain_complete")
 		return
 	}
-	if h.done.Done() {
-		h.transitionLocked("DEAD", "transport_closed")
+	if state == "DRAINING" && !h.config.DisconnectOnHealthFailure {
 		return
 	}
 	if state == "VALIDATING" && !now.Before(h.started.Add(h.config.ReadyTimeout)) {
@@ -246,7 +257,7 @@ func (h *ReverseHealth) checkLocked(now time.Time) {
 		return
 	}
 	if state == "SUSPECT" && !now.Before(h.hardDeadline) {
-		h.failLocked("confirmation_timeout")
+		h.failHealthLocked("confirmation_timeout")
 		return
 	}
 	expired := h.pendingID != 0 && !now.Before(h.pendingDeadline)
@@ -257,7 +268,7 @@ func (h *ReverseHealth) checkLocked(now time.Time) {
 			h.counters.timeouts.Add(1)
 		}
 		if state == "SUSPECT" || state == "DRAINING" {
-			h.failLocked("probe_timeout")
+			h.failHealthLocked("probe_timeout")
 			return
 		}
 		if state == "VALIDATING" {
@@ -272,7 +283,7 @@ func (h *ReverseHealth) checkLocked(now time.Time) {
 			h.hardDeadline = h.pendingDeadline.Add(h.config.ConfirmTimeout)
 		}
 		if !now.Before(h.hardDeadline) {
-			h.failLocked("confirmation_timeout")
+			h.failHealthLocked("confirmation_timeout")
 			return
 		}
 		h.probeLocked(now, h.hardDeadline.Sub(now))

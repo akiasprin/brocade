@@ -195,7 +195,7 @@ pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeRepo
         .and_then(|text| serde_json::from_str(&text).ok());
     let spool = collect_spool_backlog(state_dir)?;
     Ok(NodeRuntimeReport {
-        observed_at_unix_secs: Some(current_unix_secs()?),
+        observed_at_unix_secs: current_unix_secs()?,
         versions,
         certificate,
         geodata,

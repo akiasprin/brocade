@@ -612,7 +612,10 @@ describe('machine-scoped egress DNS', () => {
 
   it('highlights the NODE target instead of the Forward action and keeps focus on the trigger', () => {
     const forwardRules: Rule[] = [
-      { m: { t: 'domain_suffix', v: ['example.com'] }, a: { t: 'forward', to: 'sg', dial: { t: 'overlay' } } },
+      {
+        m: { t: 'domain_suffix', v: ['example.com'] },
+        a: { t: 'forward', to: 'sg', dial: { t: 'overlay' }, pool: { t: 'none' } },
+      },
     ];
     const peers: ForwardPeer[] = [
       {

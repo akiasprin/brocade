@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <style>
+    .weave { stroke: #3f5aa6; }
+    @media (prefers-color-scheme: dark) { .weave { stroke: #8ca6dc; } }
+  </style>
+  <g class="weave" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8.5 5v14" stroke-dasharray="1.7 3.6 8.7" />
+    <path d="M15.5 5v14" stroke-dasharray="8.7 3.6 1.7" />
+    <path d="M5 8.5h14" stroke-dasharray="8.7 3.6 1.7" />
+    <path d="M5 15.5h14" stroke-dasharray="1.7 3.6 8.7" />
+  </g>
+</svg>

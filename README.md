@@ -36,7 +36,7 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 
 实时网卡速率是第三条独立通道：Agent 主动维持到控制面的 WebSocket，无浏览器查看时只保活、不采样；查看机器或机器总览时，控制面下发临时租约并按全局 1/2/5 秒配置采样，最后一个查看者离开 15 秒后停止。控制面只保留每台机器最近 120 秒、最多 600 点的内存环，进程重启即可丢失，不写数据库、不进入离线重放，也不改变诊断和用量的 30 秒口径。浏览器仅通过控制面的 SSE 读取数据，永远不连接 Agent，也不会收到节点地址或节点令牌。
 
-节点日志默认有界：设置页配置全局上限（默认 100 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。Agent 使用独立 journald namespace；Agent 拉起的 Xray 与每个 Phantun 实例分别写入 `$BROCADE_AGENT_STATE_DIR/logs`，每个日志项的当前段与前一段合计不超过生效上限。降低上限会在线截断已有分段，不重启 Xray/Phantun。查看 Agent 日志使用 `journalctl --namespace=brocade-agent -u brocade-agent`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动，旧版 `/tmp/brocade-agent-*.log` 会在对应进程完成一次受控重启后移除。
+节点日志默认有界：设置页配置全局上限（默认 100 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。systemd 节点使用独立 journald namespace；OpenRC（Alpine）节点写入 `$BROCADE_AGENT_STATE_DIR/logs/agent.log`；Agent 拉起的 Xray 与每个 Phantun 实例也分别写入该 `logs` 目录。每个日志项的当前段与前一段合计不超过生效上限，降低上限会在线截断已有分段，不重启 Xray/Phantun。systemd 上使用 `journalctl --namespace=brocade-agent -u brocade-agent` 查看 Agent 日志，OpenRC 上使用 `tail -n 100 $BROCADE_AGENT_STATE_DIR/logs/agent.log`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动。
 
 ## 代码结构
 

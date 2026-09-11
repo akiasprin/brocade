@@ -590,7 +590,10 @@ pub async fn create_admin_operator(
     // log anybody out.
     let row = sqlx::query(
         "INSERT INTO admin_operators (id, display_name, role, tenant_scope, password_hash)
-         VALUES ($1, $2, $3, $4, $5)
+         VALUES (
+            $1, $2, $3, $4,
+            COALESCE($5, (SELECT password_hash FROM admin_operators WHERE id = $1))
+         )
          ON CONFLICT (id) DO UPDATE SET
             display_name = EXCLUDED.display_name,
             role = EXCLUDED.role,
@@ -1147,8 +1150,8 @@ async fn authenticate_admin_password(
     let role = parse_admin_role(row.try_get("role")?)?;
     let password_hash: Option<String> = row.try_get("password_hash")?;
     match password_hash {
-        // Apply the invariant while authenticating as well as while writing. That immediately
-        // makes legacy unsafe passwordless rows unusable without waiting for a migration.
+        // Apply the invariant while authenticating as well as while writing. Authentication must
+        // fail closed even if the database invariant was bypassed outside this process.
         None => {
             let id: String = row.try_get("id")?;
             if !password.is_empty() || id != PUBLIC_OPERATOR_ID || role != AdminRole::Readonly {

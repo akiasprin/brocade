@@ -12,8 +12,8 @@ use brocade_core::{
     physical::user::UserSecurityPlan,
 };
 use brocade_deployment::protocol::{
-    E2eProbeAnyTls, E2eProbeHysteria2, E2eProbeReality, E2eProbeTarget, E2eProbeTls, E2eProbeXhttp,
-    E2eProbeXhttpRange, E2eProbeXhttpXmux,
+    E2eProbeAnyTls, E2eProbeHysteria2, E2eProbeReality, E2eProbeSecurity, E2eProbeTarget,
+    E2eProbeTls, E2eProbeXhttp, E2eProbeXhttpRange, E2eProbeXhttpXmux,
 };
 use sqlx::PgPool;
 
@@ -122,52 +122,59 @@ pub async fn user_grant_probe_plan(
             Some(IpFamily::V6) => "ipv6",
             None => "unknown",
         };
-        let (protocol, reality, tls, hysteria2) = match &entry.security {
-            UserSecurityPlan::VlessEncryption { .. } => {
-                ("vless-encryption", empty_reality(), None, None)
-            }
+        let (protocol, security) = match &entry.security {
+            UserSecurityPlan::VlessEncryption {
+                public_key,
+                options,
+                ..
+            } => (
+                "vless-encryption",
+                E2eProbeSecurity::VlessEncryption {
+                    encryption: options.encryption(public_key),
+                },
+            ),
             UserSecurityPlan::Reality(value) => (
                 "vless",
-                E2eProbeReality {
+                E2eProbeSecurity::Reality(E2eProbeReality {
                     public_key: value.public_key.clone(),
                     short_id: value.short_id.clone(),
                     server_name: value.server_name.clone(),
                     fingerprint: value.fingerprint.clone(),
                     flow: value.flow.clone(),
-                },
-                None,
-                None,
+                }),
             ),
             UserSecurityPlan::Tls(value) => (
                 "vless",
-                empty_reality(),
-                Some(E2eProbeTls {
+                E2eProbeSecurity::Tls(E2eProbeTls {
                     server_name: value.server_name.clone(),
                     pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                     flow: value.flow.clone(),
                 }),
-                None,
             ),
             UserSecurityPlan::AnyTls(value) => (
                 "anytls",
-                value
-                    .reality
-                    .as_ref()
-                    .map_or_else(empty_reality, |reality| E2eProbeReality {
+                E2eProbeSecurity::AnyTls {
+                    settings: E2eProbeAnyTls {
+                        server_name: value.server_name.clone(),
+                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
+                        idle_session_check_interval_secs: value
+                            .settings
+                            .idle_session_check_interval_secs,
+                        idle_session_timeout_secs: value.settings.idle_session_timeout_secs,
+                        min_idle_session: value.settings.min_idle_session,
+                    },
+                    reality: value.reality.as_ref().map(|reality| E2eProbeReality {
                         public_key: reality.public_key.clone(),
                         short_id: reality.short_id.clone(),
                         server_name: reality.server_name.clone(),
                         fingerprint: reality.fingerprint.clone(),
                         flow: None,
                     }),
-                None,
-                None,
+                },
             ),
             UserSecurityPlan::Hysteria2(value) => (
                 "hysteria2",
-                empty_reality(),
-                None,
-                Some(E2eProbeHysteria2 {
+                E2eProbeSecurity::Hysteria2(E2eProbeHysteria2 {
                     server_name: value.server_name.clone(),
                     pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                     congestion: value.settings.congestion.as_str().to_owned(),
@@ -209,14 +216,6 @@ pub async fn user_grant_probe_plan(
             family,
             protocol,
             target: E2eProbeTarget {
-                vless_encryption: match &entry.security {
-                    UserSecurityPlan::VlessEncryption {
-                        public_key,
-                        options,
-                        ..
-                    } => Some(options.encryption(public_key)),
-                    _ => None,
-                },
                 app_id: Some(app.id.clone()),
                 chain_id: chain.id.clone(),
                 chain_name: chain.name.clone(),
@@ -224,21 +223,7 @@ pub async fn user_grant_probe_plan(
                 dial_host: entry.server,
                 port: entry.port,
                 uuid: entry.uuid,
-                reality,
-                hysteria2,
-                anytls: match &entry.security {
-                    UserSecurityPlan::AnyTls(value) => Some(E2eProbeAnyTls {
-                        server_name: value.server_name.clone(),
-                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
-                        idle_session_check_interval_secs: value
-                            .settings
-                            .idle_session_check_interval_secs,
-                        idle_session_timeout_secs: value.settings.idle_session_timeout_secs,
-                        min_idle_session: value.settings.min_idle_session,
-                    }),
-                    _ => None,
-                },
-                tls,
+                security,
                 xhttp: entry.xhttp.as_ref().map(|xhttp| E2eProbeXhttp {
                     path: xhttp.path.clone(),
                     host: xhttp.host.clone(),
@@ -302,14 +287,4 @@ pub async fn user_grant_probe_generation_matches(pool: &PgPool, expected: u64) -
     let serving = crate::serving::load_subscription_serving_projection(pool).await?;
     serving.ensure_available()?;
     Ok(serving.generation() == expected)
-}
-
-fn empty_reality() -> E2eProbeReality {
-    E2eProbeReality {
-        public_key: String::new(),
-        short_id: String::new(),
-        server_name: String::new(),
-        fingerprint: String::new(),
-        flow: None,
-    }
 }

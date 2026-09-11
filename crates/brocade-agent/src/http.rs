@@ -463,11 +463,11 @@ mod tests {
     #[test]
     fn response_headers_are_case_insensitive() {
         let response = parse_http_response(
-            b"HTTP/1.1 204 No Content\r\nX-Brocade-Log-Max-MiB: 256\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Xray-Log-Max-MiB: 256\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
-        assert_eq!(response.header("x-brocade-log-max-mib"), Some("256"));
-        assert_eq!(response.header("X-BROCADE-LOG-MAX-MIB"), Some("256"));
+        assert_eq!(response.header("x-brocade-xray-log-max-mib"), Some("256"));
+        assert_eq!(response.header("X-BROCADE-XRAY-LOG-MAX-MIB"), Some("256"));
     }
 
     /// Without an explicit port the Host header must not carry one either. With

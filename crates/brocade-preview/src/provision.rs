@@ -9,7 +9,7 @@ use crate::{
     config::Config,
     docker::{
         container_name, docker_ok, docker_output, docker_output_owned, LABEL_IPV4, LABEL_IPV6,
-        LABEL_IP_LEGACY, LABEL_NODE_ID, LABEL_PREVIEW,
+        LABEL_NODE_ID, LABEL_PREVIEW,
     },
     error::PreviewError,
 };
@@ -20,8 +20,6 @@ pub(crate) const INSTALL_LOG_PATH: &str = "/var/log/brocade-preview-install.log"
 #[derive(Debug, Serialize)]
 pub(crate) struct PreviewRuntime {
     container_name: String,
-    /// Backward-compatible alias for existing UI code.
-    ip: Ipv4Addr,
     ipv4: Ipv4Addr,
     ipv6: Ipv6Addr,
     network: String,
@@ -82,8 +80,6 @@ pub(crate) async fn start_node_container(
             "--label".to_owned(),
             format!("{LABEL_NODE_ID}={node_id}"),
             "--label".to_owned(),
-            format!("{LABEL_IP_LEGACY}={}", address.ipv4),
-            "--label".to_owned(),
             format!("{LABEL_IPV4}={}", address.ipv4),
             "--label".to_owned(),
             format!("{LABEL_IPV6}={}", address.ipv6),
@@ -111,7 +107,6 @@ pub(crate) async fn start_node_container(
     .await?;
     Ok(PreviewRuntime {
         container_name: container,
-        ip: address.ipv4,
         ipv4: address.ipv4,
         ipv6: address.ipv6,
         network: config.network.clone(),
@@ -273,7 +268,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -330,5 +325,17 @@ mod tests {
         let command = install_command(&config);
 
         assert!(!command.contains("--agent-bin-sha256"));
+    }
+
+    #[test]
+    fn node_image_carries_the_timezone_database_required_by_geodata_cron() {
+        let dockerfile = include_str!("../node-image/Dockerfile");
+
+        assert!(
+            dockerfile
+                .split_ascii_whitespace()
+                .any(|package| package == "tzdata"),
+            "the default CRON_TZ=Asia/Shanghai must resolve inside preview nodes"
+        );
     }
 }

@@ -235,7 +235,6 @@ pub struct XrayPlan {
 // tunnel was established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayReversePortalPlan {
-    pub canary_url: String,
     pub health: crate::model::ReverseHealth,
     pub tag: String,
     /// The identity the downstream connects with (xray's client email). The tag is
@@ -774,19 +773,6 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                 .flatten()
                 .map(|download| download.node_port())
                 .collect::<Vec<_>>();
-            // Read the historical nested representation while old snapshots are still being
-            // served. New writes and new checkpoints use Xhttp.download exclusively.
-            if download_ports.is_empty() {
-                download_ports = [
-                    ingress.projection.v4.as_ref(),
-                    ingress.projection.v6.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                .filter_map(|endpoint| endpoint.download.as_ref())
-                .map(|download| download.node_port())
-                .collect();
-            }
             download_ports.sort_unstable();
             download_ports.dedup();
             let split = matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)))
@@ -1256,7 +1242,6 @@ fn xray_reverse_portals(
             .filter(|hop| hop.from == node_id && hop.path == HopPath::Reverse)
         {
             plans.push(XrayReversePortalPlan {
-                canary_url: settings.probe.endpoint_url.clone(),
                 health: settings.reverse_health_for(&hop.chain, &hop.from, &hop.to),
                 tag: reverse_portal_tag(app, &hop.chain, &hop.to),
                 peer_label: hop.credential.label.clone(),

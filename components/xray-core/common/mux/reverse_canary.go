@@ -2,6 +2,22 @@ package mux
 
 import "time"
 
+type ReverseCanaryConfig struct {
+	Interval     time.Duration
+	Timeout      time.Duration
+	Successes    uint32
+	StableWindow time.Duration
+}
+
+func DefaultReverseCanaryConfig() ReverseCanaryConfig {
+	return ReverseCanaryConfig{
+		Interval:     time.Second,
+		Timeout:      750 * time.Millisecond,
+		Successes:    20,
+		StableWindow: 10 * time.Second,
+	}
+}
+
 type ReverseCanary struct {
 	FreshnessBudgetMS    int64 `json:"freshness_budget_ms"`
 	requiredSuccesses    uint64
@@ -20,14 +36,16 @@ type ReverseCanary struct {
 }
 
 var reverseCanaries = make(map[string]*ReverseCanary) // guarded by reverseHealthRegistry
-func NewReverseCanary(pair string, config ReverseHealthConfig) *ReverseCanary {
-	c := &ReverseCanary{FreshnessBudgetMS: max(15*time.Second, 2*config.CanaryInterval+config.CanaryTimeout).Milliseconds(), requiredSuccesses: uint64(config.CanarySuccesses), stableWindow: config.CanaryStableWindow, Pair: pair, State: "UNKNOWN", Reason: "awaiting_probe"}
+
+func NewReverseCanary(pair string, config ReverseCanaryConfig) *ReverseCanary {
+	c := &ReverseCanary{FreshnessBudgetMS: max(15*time.Second, 2*config.Interval+config.Timeout).Milliseconds(), requiredSuccesses: uint64(config.Successes), stableWindow: config.StableWindow, Pair: pair, State: "UNKNOWN", Reason: "awaiting_probe"}
 	reverseHealthRegistry.Lock()
 	reverseCanaries[pair] = c
 	reverseHealthRegistry.seq++
 	reverseHealthRegistry.Unlock()
 	return c
 }
+
 func (c *ReverseCanary) Record(started time.Time, reason string) {
 	now := time.Now()
 	reverseHealthRegistry.Lock()
@@ -61,6 +79,7 @@ func (c *ReverseCanary) Record(started time.Time, reason string) {
 		reverseHealthRegistry.seq++
 	}
 }
+
 func (c *ReverseCanary) Close() {
 	reverseHealthRegistry.Lock()
 	defer reverseHealthRegistry.Unlock()

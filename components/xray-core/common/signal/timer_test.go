@@ -58,3 +58,10 @@ func TestActivityTimerZeroTimeout(t *testing.T) {
 	}
 	runtime.KeepAlive(timer)
 }
+
+func TestNoopActivityTimerNeverOwnsCancellation(t *testing.T) {
+	timer := NewNoopActivityTimer()
+	timer.Update()
+	timer.SetTimeout(0)
+	runtime.KeepAlive(timer)
+}

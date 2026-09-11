@@ -96,7 +96,6 @@ pub enum XrayArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayConfig {
-    pub reverse_canary_urls: BTreeMap<String, String>,
     pub reverse_health: BTreeMap<String, crate::model::ReverseHealth>,
     pub certificate_group_id: Option<String>,
     pub log_level: String,
@@ -254,8 +253,7 @@ pub enum XrayIngressSecurity {
 /// What an ingress's stream is carried inside, which is xray's `streamSettings.network`.
 ///
 /// Its own type rather than a flag, because the two carry different settings objects and one of
-/// them has fields. `Tcp` writes exactly what was written before this existed, so every ingress
-/// that has not asked for anything else produces byte-identical artifacts.
+/// them has fields. `Tcp` is the canonical direct transport and carries no settings object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XrayStream {
     Tcp,
@@ -380,7 +378,7 @@ pub enum XrayHopInboundWire {
     /// The same `security: "reality"` as an ingress.
     ///
     /// Without `RealityClientPolicy`, meaning the minClientVer settings. Those exist to
-    /// reject old clients and replays on the user side, whereas both ends of this hop
+    /// reject incompatible clients and replay attempts on the user side, whereas both ends of this hop
     /// run the same xray version this system distributes, so applying them would break
     /// relaying whenever upgrades are out of step.
     Reality {
@@ -523,6 +521,11 @@ pub enum XrayOutbound {
         /// `XrayRouting::domain_strategy` uses: casing is xray's configuration syntax, so
         /// it is resolved here rather than in `format/json.rs`.
         domain_strategy: String,
+        /// Xray implicitly blocks private addresses for traffic whose original inbound is
+        /// VLESS/VMess/etc. Business egress cannot use that hidden policy: Brocade's ingress
+        /// guard already made the explicit per-ingress decision, including an intentional
+        /// `no_private = false`.
+        allow_private: bool,
     },
     Blackhole {
         tag: String,
@@ -542,18 +545,17 @@ pub enum XrayOutbound {
 pub struct XrayMux {
     /// Streams per connection. 1 pools without sharing; 2 and up share.
     pub concurrency: u16,
-    /// Absent only for historical `pool`/`merge` revisions, whose artifacts remain unchanged.
-    pub worker_pool: Option<XrayMuxWorkerPool>,
+    pub worker_pool: XrayMuxWorkerPool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XrayMuxWorkerPool {
-    pub min_idle_workers: u32,
-    pub max_idle_workers: u32,
+    pub prewarm_workers: u32,
+    pub reuse_threshold: u32,
     pub max_probing_workers: u32,
-    pub probe_interval_secs: u16,
+    pub probe_interval_ms: u32,
     pub probe_timeout_ms: u32,
-    pub idle_ttl_secs: u32,
+    pub idle_ttl_ms: u32,
     pub max_requests_per_worker: u16,
 }
 
@@ -810,6 +812,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
         // and this outbound is egress. A fixed value would make one machine resolve two
         // ways, which is an unrequested difference that would not be looked for.
         domain_strategy: domain_strategy_name(xray.domain_strategy).to_owned(),
+        allow_private: false,
     });
 
     let mut rules = Vec::new();
@@ -967,11 +970,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
     stamp_rule_tags(&mut rules);
 
     XrayArtifact::Config(XrayConfig {
-        reverse_canary_urls: xray
-            .reverse_portals
-            .iter()
-            .map(|p| (p.tag.clone(), p.canary_url.clone()))
-            .collect(),
         reverse_health: xray
             .reverse_portals
             .iter()
@@ -1377,39 +1375,22 @@ fn forward_outbound(
     }
 }
 
-/// `HopPool` reduced to what the artifact carries.
-///
-/// `Pool` is `concurrency: 1` rather than a separate mechanism: xray reuses an idle worker
-/// before creating one, and at a limit of one stream per worker a finished stream leaves its
-/// connection available for the next. Measured on 26.4.25: 20 sequential streams used one
-/// connection, and 8 concurrent streams used eight. The worker is not probed before reuse, so
-/// this mapping is retained for authored-model compatibility but is no longer the console's
-/// default; silently changing an existing `Pool` to no mux or concurrency 2 would change its
-/// requested semantics.
 fn mux_of(pool: HopPool, relay_mux: crate::model::HopMux) -> Option<XrayMux> {
     match pool {
         HopPool::None => None,
-        HopPool::Pool => Some(XrayMux {
-            concurrency: 1,
-            worker_pool: None,
-        }),
-        HopPool::Merge(concurrency) => Some(XrayMux {
-            concurrency,
-            worker_pool: None,
-        }),
         HopPool::Mux(value) => {
             let value = value.unwrap_or(relay_mux);
             Some(XrayMux {
                 concurrency: value.concurrency,
-                worker_pool: Some(XrayMuxWorkerPool {
-                    min_idle_workers: value.min_idle_workers,
-                    max_idle_workers: value.max_idle_workers,
+                worker_pool: XrayMuxWorkerPool {
+                    prewarm_workers: value.prewarm_workers,
+                    reuse_threshold: value.reuse_threshold,
                     max_probing_workers: value.max_probing_workers,
-                    probe_interval_secs: value.probe_interval_secs,
+                    probe_interval_ms: value.probe_interval_ms,
                     probe_timeout_ms: value.probe_timeout_ms,
-                    idle_ttl_secs: value.idle_ttl_secs,
+                    idle_ttl_ms: value.idle_ttl_ms,
                     max_requests_per_worker: value.max_requests_per_worker,
-                }),
+                },
             })
         }
     }
@@ -1421,6 +1402,10 @@ fn egress_outbound(outbound: &XrayEgressOutboundPlan, strategy: DomainStrategy) 
         send_through: outbound.send_through,
         domain_strategy: domain_strategy_name(outbound.domain_strategy.unwrap_or(strategy))
             .to_owned(),
+        // The ingress guard is the single policy owner. In particular, a request that
+        // passed an ingress with `no_private = false` must not be denied later merely
+        // because a relay hop changed the immediate inbound identity to VLESS.
+        allow_private: true,
     }
 }
 

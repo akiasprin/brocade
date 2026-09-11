@@ -13,11 +13,11 @@ use crate::{
     console::get_console_json,
     docker::{
         docker_ok, docker_output, docker_output_owned, preview_container_by_ip, CLIENT_CONTAINER,
-        ECHO_CONTAINER, LABEL_IPV4, LABEL_IPV6, LABEL_IP_LEGACY, LABEL_PREVIEW, LABEL_ROLE,
+        ECHO_CONTAINER, LABEL_IPV4, LABEL_IPV6, LABEL_PREVIEW, LABEL_ROLE,
     },
     error::PreviewError,
     param::{percent_encode_path_segment, required_slug},
-    provision::{ensure_network, ensure_node_image},
+    provision::{ensure_network, ensure_node_image, shell_quote},
     AppState,
 };
 
@@ -54,10 +54,14 @@ pub(crate) async fn preview_verify_subscription(
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+
+    // Every request uses the same client container, fixed SOCKS port, process name, and temp
+    // files. Keep the complete probe transaction exclusive across HTTP requests as well as
+    // serializing entries below, otherwise concurrent callers can kill each other's Xray.
+    let _probe_guard = state.subscription_probe_lock.lock().await;
     ensure_probe_containers(&state.config).await?;
 
-    // One at a time: the probes share one client container and one fixed port, and running them
-    // concurrently has them tread on each other.
+    // One entry at a time for the same shared resources.
     let user_stat_prefix = format!("{user}@{tenant}#");
     let mut results = Vec::new();
     for line in content.lines().filter(|line| line.starts_with("vless://")) {
@@ -122,8 +126,6 @@ async fn ensure_probe_containers(config: &Config) -> Result<(), PreviewError> {
                 "--label".to_owned(),
                 format!("{LABEL_ROLE}=client"),
                 "--label".to_owned(),
-                format!("{LABEL_IP_LEGACY}={client_ipv4}"),
-                "--label".to_owned(),
                 format!("{LABEL_IPV4}={client_ipv4}"),
                 "--label".to_owned(),
                 format!("{LABEL_IPV6}={client_ipv6}"),
@@ -135,6 +137,7 @@ async fn ensure_probe_containers(config: &Config) -> Result<(), PreviewError> {
         )
         .await?;
     }
+    ensure_probe_xray(config).await?;
 
     let echo_ipv4_addr = preview_ipv4(config, ECHO_SLOT)?;
     let echo_ipv6_addr = preview_ipv6(config, ECHO_SLOT)?;
@@ -174,8 +177,6 @@ HTTPServer(("0.0.0.0", 80), H).serve_forever()
                 "--label".to_owned(),
                 format!("{LABEL_ROLE}=echo"),
                 "--label".to_owned(),
-                format!("{LABEL_IP_LEGACY}={echo_ipv4_addr}"),
-                "--label".to_owned(),
                 format!("{LABEL_IPV4}={echo_ipv4_addr}"),
                 "--label".to_owned(),
                 format!("{LABEL_IPV6}={echo_ipv6_addr}"),
@@ -189,6 +190,62 @@ HTTPServer(("0.0.0.0", 80), H).serve_forever()
         .await?;
     }
     Ok(())
+}
+
+/// Keep the probe client on the same Brocade Xray distributed to managed nodes. The helper
+/// container deliberately starts from the bare node image, so it has not run the enrollment
+/// installer that normally supplies this binary.
+async fn ensure_probe_xray(config: &Config) -> Result<(), PreviewError> {
+    docker_output_owned(
+        config,
+        vec![
+            "exec".to_owned(),
+            CLIENT_CONTAINER.to_owned(),
+            "sh".to_owned(),
+            "-lc".to_owned(),
+            probe_xray_install_script(config),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+fn probe_xray_install_script(config: &Config) -> String {
+    let configured_url = config.xray_bin_url.as_deref().unwrap_or("");
+    let configured_sha256 = config.xray_bin_sha256.as_deref().unwrap_or("");
+    format!(
+        r#"set -eu
+XRAY_URL={configured_url}
+XRAY_SHA256={configured_sha256}
+if [ -z "$XRAY_URL" ]; then
+  case "$(uname -m)" in
+    x86_64|amd64) XRAY_ARCH=x86_64 ;;
+    aarch64|arm64) XRAY_ARCH=aarch64 ;;
+    *) echo "unsupported preview probe architecture: $(uname -m)" >&2; exit 1 ;;
+  esac
+  curl -fsSL {dist_url}/enroll/dist -o /tmp/brocade-probe-dist.json
+  XRAY_URL=$(jq -er --arg key "xray_bin_url_$XRAY_ARCH" '.xray_bin_url // .[$key] // empty' /tmp/brocade-probe-dist.json)
+  XRAY_SHA256=$(jq -er --arg key "xray_bin_sha256_$XRAY_ARCH" '.xray_bin_sha256 // .[$key] // empty' /tmp/brocade-probe-dist.json)
+  [ -n "$XRAY_SHA256" ] || {{ echo "control-plane Xray digest is missing" >&2; exit 1; }}
+fi
+if [ -x /usr/local/bin/xray ]; then
+  if [ -z "$XRAY_SHA256" ] || printf '%s  %s\n' "$XRAY_SHA256" /usr/local/bin/xray | sha256sum -c - >/dev/null 2>&1; then
+    rm -f /tmp/brocade-probe-dist.json
+    exit 0
+  fi
+fi
+curl -fsSL "$XRAY_URL" -o /tmp/brocade-probe-xray
+if [ -n "$XRAY_SHA256" ]; then
+  printf '%s  %s\n' "$XRAY_SHA256" /tmp/brocade-probe-xray | sha256sum -c -
+fi
+install -m 0755 /tmp/brocade-probe-xray /usr/local/bin/xray
+rm -f /tmp/brocade-probe-xray /tmp/brocade-probe-dist.json
+xray version >/dev/null
+"#,
+        configured_url = shell_quote(configured_url),
+        configured_sha256 = shell_quote(configured_sha256),
+        dist_url = shell_quote(&config.agent_url),
+    )
 }
 
 /// Run one subscription entry: read the user's counters, pass traffic, read them again.
@@ -403,5 +460,28 @@ mod tests {
 
         assert_eq!(body, "");
         assert_eq!(log, "failed to dial");
+    }
+
+    #[test]
+    fn probe_client_installs_the_control_plane_xray_with_its_digest() {
+        let script = probe_xray_install_script(&Config::for_test());
+
+        assert!(script.contains("curl -fsSL 'http://host.docker.internal:8081'/enroll/dist"));
+        assert!(script.contains("xray_bin_url_$XRAY_ARCH"));
+        assert!(script.contains("xray_bin_sha256_$XRAY_ARCH"));
+        assert!(script.contains("sha256sum -c -"));
+        assert!(script.contains("install -m 0755"));
+    }
+
+    #[test]
+    fn probe_client_prefers_an_explicit_xray_distribution() {
+        let mut config = Config::for_test();
+        config.xray_bin_url = Some("https://example.test/brocade xray".to_owned());
+        config.xray_bin_sha256 = Some("abc123".to_owned());
+
+        let script = probe_xray_install_script(&config);
+
+        assert!(script.contains("XRAY_URL='https://example.test/brocade xray'"));
+        assert!(script.contains("XRAY_SHA256='abc123'"));
     }
 }

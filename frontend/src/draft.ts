@@ -76,9 +76,9 @@ export type ModelOp =
         port: number;
         front_id?: string;
         reality: CreateRealityIngress;
-        projection?: IngressProjection;
-        wires?: Wires;
-        guard?: IngressGuard;
+        projection: IngressProjection;
+        wires: Wires;
+        guard: IngressGuard;
       };
     }
   | {
@@ -92,9 +92,9 @@ export type ModelOp =
         port: number;
         front_id?: string;
         reality: CreateRealityIngress;
-        projection?: IngressProjection;
-        wires?: Wires;
-        guard?: IngressGuard;
+        projection: IngressProjection;
+        wires: Wires;
+        guard: IngressGuard;
       };
     }
   | {
@@ -195,9 +195,8 @@ function mergeChanged(base: unknown, next: unknown, pending: unknown): unknown {
   const result: Record<string, unknown> = isRecord(pending) ? { ...pending } : { ...base };
   const keys = new Set([...Object.keys(base), ...Object.keys(next)]);
   const changedKeys = [...keys].filter(key => !sameValue(base[key], next[key]));
-  // A projection endpoint being removed is an explicit user action. An XHTTP-only edit made
-  // from the old snapshot changes only that endpoint's `download` child; it must not resurrect
-  // the endpoint while the pending deletion is still in the draft.
+  // Removing a projection endpoint is an explicit pending edit. A simultaneous XHTTP edit only
+  // changes that endpoint's download child and must not recreate the endpoint around the deletion.
   if (pending === null && changedKeys.length === 1 && changedKeys[0] === 'download') return pending;
   for (const key of keys) {
     const baseHas = Object.prototype.hasOwnProperty.call(base, key);

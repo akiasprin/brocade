@@ -5,7 +5,9 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   CertificateTrack,
+  Hysteria2Settings,
   SnapshotIngress,
+  SnapshotVless,
   TransportKind,
   UpsertIngressBody,
   XhttpTuning,
@@ -20,20 +22,29 @@ function ingress(
   xmux: XhttpXmux | null = null,
   tuning: XhttpTuning | null = null,
 ): SnapshotIngress {
-  const vless = kind.endsWith('-xhttp')
-    ? {
-        kind,
-        flow,
-        xhttp: { path: '/existing', host: null, xmux, tuning, mode: 'auto' as const },
-      }
-    : { kind, flow };
+  const xhttp = { path: '/existing', host: null, xmux, tuning, mode: 'auto' as const };
+  let vless: SnapshotVless;
+  switch (kind) {
+    case 'vless-reality':
+      vless = { kind, flow };
+      break;
+    case 'vless-tls':
+      vless = { kind, flow };
+      break;
+    case 'vless-reality-xhttp':
+      vless = { kind, flow, xhttp };
+      break;
+    case 'vless-tls-xhttp':
+      vless = { kind, flow, xhttp };
+      break;
+  }
   return {
     id: 'ingress-1',
     chain: 'chain-1',
     node: 'node-1',
     bind: '0.0.0.0',
     port: 443,
-    projection: null,
+    projection: {},
     guard: {
       no_private: true,
       no_bittorrent: true,
@@ -107,6 +118,7 @@ function anytlsIngress(): SnapshotIngress {
       vless: base.wires.vless,
       anytls: {
         port: 19443,
+        security: 'tls',
         padding_scheme: [],
         masquerade: { kind: 'not-found' },
       },
@@ -148,7 +160,13 @@ function AnyTlsHarness({ editable = true }: { editable?: boolean } = {}) {
   );
 }
 
-function Hy2Harness() {
+function Hy2Harness({
+  settings = {},
+  editable = true,
+}: {
+  settings?: Partial<Hysteria2Settings>;
+  editable?: boolean;
+} = {}) {
   const [client] = useState(() => {
     const queryClient = new QueryClient({
       defaultOptions: {
@@ -181,14 +199,15 @@ function Hy2Harness() {
         congestion: 'brutal',
         obfs: null,
         masquerade: { kind: 'not-found' },
+        ...settings,
       },
     },
   };
 
   return (
     <QueryClientProvider client={client}>
-      <IngressPanel appId="app-1" ingress={value} title="Hysteria 2" editable>
-        <IngressStreamRow appId="app-1" ingress={value} editable section="hy2" />
+      <IngressPanel appId="app-1" ingress={value} title="Hysteria 2" editable={editable}>
+        <IngressStreamRow appId="app-1" ingress={value} editable={editable} section="hy2" />
       </IngressPanel>
     </QueryClientProvider>
   );
@@ -341,13 +360,11 @@ async function saveDraft(view: ReturnType<typeof render>) {
   await waitFor(() => expect(draft.ops()).toHaveLength(1));
   const operation = draft.ops()[0];
   if (operation?.op !== 'upsert_ingress') throw new Error('expected an ingress draft operation');
-  // ModelOp keeps the historical minimum ingress shape, while upsertIngress stages the complete
-  // UpsertIngressBody at runtime. Assert the actual staged payload, including wires and guard.
-  return operation.ingress as UpsertIngressBody;
+  return operation.ingress;
 }
 
 function savedXhttp(body: UpsertIngressBody) {
-  const transport = body.wires?.vless;
+  const transport = body.wires.vless;
   if (!transport || !('xhttp' in transport)) throw new Error('expected an XHTTP transport');
   return transport.xhttp;
 }
@@ -610,10 +627,10 @@ describe('AnyTLS ingress draft', () => {
     expect(listener.value).toBe('19443');
     expect(listener.parentElement?.textContent).toBe('');
     const paddingPreset = view.getByRole('combobox', {
-      name: 'AnyTLS Padding Scheme 预设',
+      name: 'AnyTLS Padding 预设',
     }) as HTMLSelectElement;
     expect(paddingPreset.value).toBe('global');
-    expect(view.queryByRole('textbox', { name: 'AnyTLS Padding Scheme' })).toBeNull();
+    expect(view.queryByRole('textbox', { name: 'AnyTLS Padding' })).toBeNull();
     expect(view.getByRole('option', { name: '原生精简 2 段' })).toBeTruthy();
     expect(view.getByRole('option', { name: '原生精简 4 段' })).toBeTruthy();
     expect(view.getByRole('option', { name: '原生完整 8 段' })).toBeTruthy();
@@ -625,10 +642,12 @@ describe('AnyTLS ingress draft', () => {
     expect(Array.from(masquerade.options).map(option => option.textContent)).toEqual(['404', '自定义']);
     expect(view.queryByRole('spinbutton', { name: 'AnyTLS Masquerade 状态码' })).toBeNull();
     expect(view.queryByRole('textbox', { name: 'AnyTLS Masquerade Headers' })).toBeNull();
-    expect(view.getByText('参数')).toBeTruthy();
+    expect(view.getByText('高级参数')).toBeTruthy();
     expect(view.queryByText('Session')).toBeNull();
     const session = view.getByText('连接复用（留空 = 使用默认值）');
-    expect(paddingPreset.closest('.anytls-parameter-row')?.nextElementSibling).toBe(session.closest('details'));
+    const masqueradeGroup = masquerade.closest('.anytls-masquerade');
+    expect(paddingPreset.closest('.anytls-parameter-row')?.nextElementSibling).toBe(masqueradeGroup);
+    expect(masqueradeGroup?.nextElementSibling).toBe(session.closest('details'));
     fireEvent.click(session);
     expect((view.getByRole('spinbutton', { name: 'AnyTLS Session 检查间隔' }) as HTMLInputElement).placeholder).toBe(
       '30',
@@ -638,18 +657,18 @@ describe('AnyTLS ingress draft', () => {
     fireEvent.change(paddingPreset, {
       target: { value: 'two-stage' },
     });
-    expect(view.queryByRole('textbox', { name: 'AnyTLS Padding Scheme' })).toBeNull();
+    expect(view.queryByRole('textbox', { name: 'AnyTLS Padding' })).toBeNull();
     fireEvent.change(paddingPreset, {
       target: { value: 'custom' },
     });
-    expect((view.getByRole('textbox', { name: 'AnyTLS Padding Scheme' }) as HTMLTextAreaElement).value).toBe(
+    expect((view.getByRole('textbox', { name: 'AnyTLS Padding' }) as HTMLTextAreaElement).value).toBe(
       'stop=2\n0=30-30\n1=100-400',
     );
 
     fireEvent.change(listener, {
       target: { value: '20443' },
     });
-    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Padding Scheme' }), {
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Padding' }), {
       target: { value: 'stop=2\n0=30-30\n1=70000-70000' },
     });
     fireEvent.change(view.getByRole('spinbutton', { name: 'AnyTLS Session 检查间隔' }), {
@@ -669,6 +688,7 @@ describe('AnyTLS ingress draft', () => {
     expect(saved.wires?.vless).toEqual({ kind: 'vless-reality' });
     expect(saved.wires?.anytls).toEqual({
       port: 20443,
+      security: 'tls',
       padding_scheme: ['stop=2', '0=30-30', '1=70000-70000'],
       idle_session_check_interval_secs: 11,
       idle_session_timeout_secs: 22,
@@ -751,23 +771,23 @@ describe('AnyTLS ingress draft', () => {
   it('hides padding configuration from readonly viewers', () => {
     const view = render(<AnyTlsHarness editable={false} />);
 
-    expect(view.queryByText('Padding Scheme')).toBeNull();
-    expect(view.queryByRole('combobox', { name: 'AnyTLS Padding Scheme 预设' })).toBeNull();
-    expect(view.queryByRole('textbox', { name: 'AnyTLS Padding Scheme' })).toBeNull();
+    expect(view.queryByText('Padding')).toBeNull();
+    expect(view.queryByRole('combobox', { name: 'AnyTLS Padding 预设' })).toBeNull();
+    expect(view.queryByRole('textbox', { name: 'AnyTLS Padding' })).toBeNull();
   });
 
   it('blocks malformed padding before it can be saved', async () => {
     draft.clear();
     const view = render(<AnyTlsHarness />);
-    fireEvent.change(view.getByRole('combobox', { name: 'AnyTLS Padding Scheme 预设' }), {
+    fireEvent.change(view.getByRole('combobox', { name: 'AnyTLS Padding 预设' }), {
       target: { value: 'custom' },
     });
-    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Padding Scheme' }), {
+    fireEvent.change(view.getByRole('textbox', { name: 'AnyTLS Padding' }), {
       target: { value: '0=30-30\n0=40-40' },
     });
 
     await waitFor(() => expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true));
-    expect(view.getByText(/Padding Scheme 格式无效/)).toBeTruthy();
+    expect(view.getByText(/Padding 格式无效/)).toBeTruthy();
   });
 
   it('blocks session values outside the backend u32 range', async () => {
@@ -792,11 +812,85 @@ describe('Hysteria 2 ingress form', () => {
     expect(listener.parentElement?.textContent).toBe('');
     expect(view.queryByRole('button', { name: '重新分配' })).toBeNull();
   });
+
+  it.each([
+    ['bbr', true],
+    ['brutal', true],
+    ['reno', false],
+    ['force-brutal', false],
+  ] as const)('always shows the saved BBR profile for %s; editable=%s', (congestion, enabled) => {
+    const view = render(
+      <Hy2Harness
+        settings={{ congestion, bandwidth: { up: '20 mbps', down: '40 mbps' }, bbr_profile: 'conservative' }}
+      />,
+    );
+    const profile = view.getByRole('combobox', { name: 'Hysteria 2 BBR 策略' }) as HTMLSelectElement;
+
+    expect(profile.value).toBe('conservative');
+    expect(profile.disabled).toBe(!enabled);
+    expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
+    if (congestion === 'brutal') expect(view.getByText(/回退 BBR 时生效；本端发送带宽或对端接收带宽/)).toBeTruthy();
+    if (!enabled) expect(view.getByText('当前拥塞模式不使用 BBR；保留策略，切回后生效。')).toBeTruthy();
+  });
+
+  it('keeps the default profile editable when Brutal bandwidth is filled or cleared', () => {
+    const view = render(<Hy2Harness />);
+    const profile = view.getByRole('combobox', { name: 'Hysteria 2 BBR 策略' }) as HTMLSelectElement;
+    const bandwidth = view.getAllByPlaceholderText('留空用 BBR');
+
+    expect(profile.value).toBe('standard');
+    expect(profile.disabled).toBe(false);
+    for (const input of bandwidth) fireEvent.change(input, { target: { value: '20 mbps' } });
+    expect(view.getByRole('combobox', { name: 'Hysteria 2 BBR 策略' })).toBe(profile);
+    expect(profile.disabled).toBe(false);
+    for (const input of bandwidth) fireEvent.change(input, { target: { value: '' } });
+    expect(profile.value).toBe('standard');
+    expect(profile.disabled).toBe(false);
+  });
+
+  it.each(['bbr', 'brutal', 'reno', 'force-brutal'] as const)(
+    'shows but never enables the BBR profile for read-only %s',
+    congestion => {
+      const view = render(<Hy2Harness editable={false} settings={{ congestion, bbr_profile: 'aggressive' }} />);
+      const profile = view.getByRole('combobox', { name: 'Hysteria 2 BBR 策略' }) as HTMLSelectElement;
+      expect(profile.value).toBe('aggressive');
+      expect(profile.disabled).toBe(true);
+    },
+  );
+
+  it('preserves the profile through mode switches and saves it even when the mode disables it', async () => {
+    const view = render(<Hy2Harness settings={{ bandwidth: { up: '20 mbps', down: '40 mbps' } }} />);
+    const profile = view.getByRole('combobox', { name: 'Hysteria 2 BBR 策略' }) as HTMLSelectElement;
+    const congestion = view.getByRole('combobox', { name: 'Hysteria 2 拥塞控制' });
+    fireEvent.change(profile, { target: { value: 'aggressive' } });
+
+    for (const mode of ['reno', 'force-brutal', 'bbr', 'brutal', 'reno']) {
+      fireEvent.change(congestion, { target: { value: mode } });
+      expect(profile.value).toBe('aggressive');
+      expect(profile.disabled).toBe(mode === 'reno' || mode === 'force-brutal');
+    }
+
+    const saved = await saveDraft(view);
+    expect(saved.wires?.hysteria2).toMatchObject({
+      congestion: 'reno',
+      bbr_profile: 'aggressive',
+      bandwidth: { up: '20 mbps', down: '40 mbps' },
+    });
+  });
+
+  it('saves a BBR fallback profile for Brutal with explicit bandwidth', async () => {
+    const view = render(<Hy2Harness settings={{ bandwidth: { up: '20 mbps', down: '40 mbps' } }} />);
+    fireEvent.change(view.getByRole('combobox', { name: 'Hysteria 2 BBR 策略' }), {
+      target: { value: 'conservative' },
+    });
+    const saved = await saveDraft(view);
+    expect(saved.wires?.hysteria2).toMatchObject({ congestion: 'brutal', bbr_profile: 'conservative' });
+  });
 });
 
 describe('VLESS Encryption ingress draft', () => {
   it.each([
-    [undefined, 48000],
+    [undefined, 13800],
     [49000, 49000],
     [443, 444],
   ])('从设置 %s 分配独立端口，避开普通 VLESS 端口', async (base, expected) => {
@@ -835,11 +929,15 @@ function EncryptionHarness({ editable = true }: { editable?: boolean } = {}) {
 }
 
 describe('VLESS Encryption options', () => {
-  it('saves non-default appearance, handshake, ticket range and both padding directions', async () => {
+  it('saves non-default appearance, fixed 0rtt, ticket range and both padding directions', async () => {
     const view = render(<EncryptionHarness />);
     expect((view.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.change(view.getByLabelText('Encryption 流量外观'), { target: { value: 'random' } });
-    fireEvent.change(view.getByLabelText('Encryption 客户端握手'), { target: { value: '1rtt' } });
+    const appearance = view.getByLabelText('Encryption 流量外观') as HTMLSelectElement;
+    expect(Array.from(appearance.options).map(option => option.textContent)).toEqual(['native', 'xorpub', 'random']);
+    fireEvent.change(appearance, { target: { value: 'random' } });
+    expect(view.queryByLabelText('Encryption 客户端握手')).toBeNull();
+    expect(view.queryByText('会话恢复')).toBeNull();
+    expect(view.queryByText('0rtt')).toBeNull();
     fireEvent.click(view.getByText('票据与双向 Padding'));
     fireEvent.change(view.getByLabelText('Encryption 票据有效期'), { target: { value: '100-500s' } });
     fireEvent.change(view.getByLabelText('Encryption 服务端 Padding'), {
@@ -852,7 +950,7 @@ describe('VLESS Encryption options', () => {
       port: 48000,
       options: {
         appearance: 'random',
-        client_mode: '1rtt',
+        client_mode: '0rtt',
         ticket_lifetime: '100-500s',
         server_padding: '100-35-100.50-0-10.50-0-200',
         client_padding: '100-40-80',

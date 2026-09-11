@@ -93,7 +93,7 @@ class WindowManager {
   // 没有该保护时刚打开的窗口会被随后的 init 清除，而子组件的依赖未变化不会再次打开，
   // 界面会停留在加载状态。切换用户（operator 变化）时仍然整体重新初始化。
   init(operator: string) {
-    /* 键中包含布局版本：默认窗口形态变更时递增版本，旧布局整体失效 */
+    /* 键中包含布局版本：默认窗口形态变更时递增版本，不同形态互不混用。 */
     const key = `brocade-console:wm:v4:${operator}`;
     if (this.storageKey === key) return;
     this.storageKey = key;

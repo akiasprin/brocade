@@ -69,32 +69,25 @@ pub struct ClientProjection {
     pub v4: Option<ClientProjectionEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v6: Option<ClientProjectionEndpoint>,
-    /// Outer `None` is a checkpoint written before client transport controls moved here.
-    /// `Some(None)` explicitly omits HTTP Host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xhttp_host: Option<Option<String>>,
-    /// Outer `None` preserves an old checkpoint's topology-era value. New checkpoints always
-    /// write `Some`, including `Some(None)` when XMUX is intentionally left to Xray.
+    pub xhttp_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xhttp_xmux: Option<Option<XhttpXmux>>,
-    /// Client-side independent download for IPv4. The outer `None` preserves checkpoints from
-    /// before download settings moved out of the address projection; `Some(None)` disables it.
+    pub xhttp_xmux: Option<XhttpXmux>,
+    /// Client-side independent download for IPv4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xhttp_download_v4: Option<Option<ClientProjectionDownloadEndpoint>>,
+    pub xhttp_download_v4: Option<ClientProjectionDownloadEndpoint>,
     /// Client-side independent download for IPv6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xhttp_download_v6: Option<Option<ClientProjectionDownloadEndpoint>>,
+    pub xhttp_download_v6: Option<ClientProjectionDownloadEndpoint>,
     /// ClientHello preset used by subscribers and probes. The REALITY listener never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_fingerprint: Option<String>,
-    /// Outer `None` preserves a checkpoint written before AnyTLS session controls moved here;
-    /// `Some(None)` explicitly follows the consuming client's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anytls_idle_session_check_interval_secs: Option<Option<u32>>,
+    pub anytls_idle_session_check_interval_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anytls_idle_session_timeout_secs: Option<Option<u32>>,
+    pub anytls_idle_session_timeout_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anytls_min_idle_session: Option<Option<u32>>,
+    pub anytls_min_idle_session: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,8 +95,6 @@ pub struct ClientProjection {
 pub struct ClientProjectionEndpoint {
     pub host: String,
     pub port: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download: Option<ClientProjectionDownloadEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,24 +319,15 @@ impl SubscriptionClientConfig {
                 let reality_split =
                     matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)));
                 if let Some(xhttp) = ingress.wires.xhttp_mut() {
-                    if let Some(host) = &client.xhttp_host {
-                        xhttp.host.clone_from(host);
-                    }
-                    if let Some(xmux) = &client.xhttp_xmux {
-                        xhttp.xmux.clone_from(xmux);
-                    }
+                    xhttp.host.clone_from(&client.xhttp_host);
+                    xhttp.xmux.clone_from(&client.xhttp_xmux);
                     client.apply_xhttp_download(xhttp, reality_split)?;
                 }
                 if let Some(anytls) = ingress.wires.anytls_mut() {
-                    if let Some(value) = client.anytls_idle_session_check_interval_secs {
-                        anytls.idle_session_check_interval_secs = value;
-                    }
-                    if let Some(value) = client.anytls_idle_session_timeout_secs {
-                        anytls.idle_session_timeout_secs = value;
-                    }
-                    if let Some(value) = client.anytls_min_idle_session {
-                        anytls.min_idle_session = value;
-                    }
+                    anytls.idle_session_check_interval_secs =
+                        client.anytls_idle_session_check_interval_secs;
+                    anytls.idle_session_timeout_secs = client.anytls_idle_session_timeout_secs;
+                    anytls.min_idle_session = client.anytls_min_idle_session;
                 }
             }
         }
@@ -435,31 +417,25 @@ impl From<&Ingress> for ClientProjection {
                 .v6
                 .as_ref()
                 .map(ClientProjectionEndpoint::from),
-            xhttp_host: xhttp.map(|xhttp| xhttp.host.clone()),
-            xhttp_xmux: xhttp.map(|xhttp| xhttp.xmux.clone()),
-            xhttp_download_v4: xhttp.map(|xhttp| {
-                xhttp
-                    .download
-                    .as_ref()
-                    .and_then(|download| download.v4.as_ref())
-                    .map(ClientProjectionDownloadEndpoint::from)
-            }),
-            xhttp_download_v6: xhttp.map(|xhttp| {
-                xhttp
-                    .download
-                    .as_ref()
-                    .and_then(|download| download.v6.as_ref())
-                    .map(ClientProjectionDownloadEndpoint::from)
-            }),
+            xhttp_host: xhttp.and_then(|xhttp| xhttp.host.clone()),
+            xhttp_xmux: xhttp.and_then(|xhttp| xhttp.xmux.clone()),
+            xhttp_download_v4: xhttp
+                .and_then(|xhttp| xhttp.download.as_ref())
+                .and_then(|download| download.v4.as_ref())
+                .map(ClientProjectionDownloadEndpoint::from),
+            xhttp_download_v6: xhttp
+                .and_then(|xhttp| xhttp.download.as_ref())
+                .and_then(|download| download.v6.as_ref())
+                .map(ClientProjectionDownloadEndpoint::from),
             reality_fingerprint: value
                 .wires
                 .reality()
                 .map(|reality| reality.fingerprint.clone()),
             anytls_idle_session_check_interval_secs: anytls
-                .map(|settings| settings.idle_session_check_interval_secs),
+                .and_then(|settings| settings.idle_session_check_interval_secs),
             anytls_idle_session_timeout_secs: anytls
-                .map(|settings| settings.idle_session_timeout_secs),
-            anytls_min_idle_session: anytls.map(|settings| settings.min_idle_session),
+                .and_then(|settings| settings.idle_session_timeout_secs),
+            anytls_min_idle_session: anytls.and_then(|settings| settings.min_idle_session),
         }
     }
 }
@@ -469,9 +445,6 @@ impl From<&ProjectionEndpoint> for ClientProjectionEndpoint {
         Self {
             host: value.host.clone(),
             port: value.port,
-            // Historical checkpoints may still contain this nested value and are handled as a
-            // fallback during apply. New checkpoints keep download settings on ClientProjection.
-            download: None,
         }
     }
 }
@@ -510,9 +483,6 @@ impl ClientProjection {
     ) -> Result<(), String> {
         let v4 = self.download_for(
             self.xhttp_download_v4.as_ref(),
-            self.v4
-                .as_ref()
-                .and_then(|endpoint| endpoint.download.as_ref()),
             xhttp
                 .download
                 .as_ref()
@@ -521,9 +491,6 @@ impl ClientProjection {
         )?;
         let v6 = self.download_for(
             self.xhttp_download_v6.as_ref(),
-            self.v6
-                .as_ref()
-                .and_then(|endpoint| endpoint.download.as_ref()),
             xhttp
                 .download
                 .as_ref()
@@ -537,22 +504,10 @@ impl ClientProjection {
 
     fn download_for(
         &self,
-        configured: Option<&Option<ClientProjectionDownloadEndpoint>>,
-        legacy: Option<&ClientProjectionDownloadEndpoint>,
+        configured: Option<&ClientProjectionDownloadEndpoint>,
         serving: Option<&ProjectionDownloadEndpoint>,
         reality_split: bool,
     ) -> Result<Option<ProjectionDownloadEndpoint>, String> {
-        let Some(configured) = configured else {
-            return Ok(serving.cloned().or_else(|| {
-                legacy.map(|legacy| ProjectionDownloadEndpoint {
-                    host: legacy.host.clone(),
-                    port: legacy.port,
-                    origin_port: None,
-                    http_host: legacy.http_host.clone(),
-                    mux: legacy.mux,
-                })
-            }));
-        };
         let Some(configured) = configured else {
             return Ok(None);
         };
@@ -577,8 +532,6 @@ impl ClientProjectionEndpoint {
         Ok(ProjectionEndpoint {
             host: self.host.clone(),
             port: self.port,
-            // Legacy nested downloads are read by ClientProjection::apply_xhttp_download.
-            download: None,
         })
     }
 }

@@ -6,7 +6,11 @@
       "id": "au-01",
       "tenant": "platform.acme",
       "name": "澳洲落地",
-      "host": "au1.example.net",
+      "public_ipv4": "au1.example.net",
+      "public_ipv6": null,
+      "public_ipv4_nat": false,
+      "public_ipv6_nat": false,
+      "domain_strategy": "use_ip",
       "egress_allowed": true,
       "api_port": 10085,
       "dns": {
@@ -19,7 +23,11 @@
       "id": "hk-01",
       "tenant": "platform.acme",
       "name": "香港入口",
-      "host": "hk1.example.net",
+      "public_ipv4": "hk1.example.net",
+      "public_ipv6": null,
+      "public_ipv4_nat": false,
+      "public_ipv6_nat": false,
+      "domain_strategy": "use_ip",
       "egress_allowed": true,
       "api_port": 10085,
       "dns": {
@@ -31,7 +39,11 @@
       "id": "jp-01",
       "tenant": "platform.acme",
       "name": "日本入口",
-      "host": "jp1.example.net",
+      "public_ipv4": "jp1.example.net",
+      "public_ipv6": null,
+      "public_ipv4_nat": false,
+      "public_ipv6_nat": false,
+      "domain_strategy": "use_ip",
       "egress_allowed": false,
       "api_port": 10085,
       "dns": {
@@ -43,7 +55,11 @@
       "id": "sg-01",
       "tenant": "platform.acme",
       "name": "新加坡中转",
-      "host": "sg1.example.net",
+      "public_ipv4": "sg1.example.net",
+      "public_ipv6": null,
+      "public_ipv4_nat": false,
+      "public_ipv6_nat": false,
+      "domain_strategy": "use_ip",
       "egress_allowed": true,
       "api_port": 10085,
       "dns": {
@@ -55,7 +71,11 @@
       "id": "us-01",
       "tenant": "platform.acme",
       "name": "美国落地",
-      "host": "us1.example.net",
+      "public_ipv4": "us1.example.net",
+      "public_ipv6": null,
+      "public_ipv4_nat": false,
+      "public_ipv6_nat": false,
+      "domain_strategy": "use_ip",
       "egress_allowed": true,
       "api_port": 10085,
       "dns": {
@@ -666,7 +686,7 @@
           "a": {
             "t": "forward",
             "to": "sg-01",
-            "pool": "pool"
+            "pool": "mux:1"
           }
         }
       ]
@@ -803,7 +823,7 @@
           "a": {
             "t": "forward",
             "to": "us-01",
-            "pool": "merge:8"
+            "pool": "mux:8"
           }
         }
       ]

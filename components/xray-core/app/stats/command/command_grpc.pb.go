@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	StatsService_GetReverseHealthSnapshot_FullMethodName = "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot"
 	StatsService_WatchReverseHealth_FullMethodName       = "/xray.app.stats.command.StatsService/WatchReverseHealth"
+	StatsService_GetMuxSnapshot_FullMethodName           = "/xray.app.stats.command.StatsService/GetMuxSnapshot"
 	StatsService_GetStats_FullMethodName                 = "/xray.app.stats.command.StatsService/GetStats"
 	StatsService_GetStatsOnline_FullMethodName           = "/xray.app.stats.command.StatsService/GetStatsOnline"
 	StatsService_QueryStats_FullMethodName               = "/xray.app.stats.command.StatsService/QueryStats"
@@ -36,6 +37,7 @@ const (
 type StatsServiceClient interface {
 	GetReverseHealthSnapshot(ctx context.Context, in *ReverseHealthRequest, opts ...grpc.CallOption) (*ReverseHealthResponse, error)
 	WatchReverseHealth(ctx context.Context, in *ReverseHealthRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReverseHealthResponse], error)
+	GetMuxSnapshot(ctx context.Context, in *MuxRequest, opts ...grpc.CallOption) (*MuxResponse, error)
 	GetStats(ctx context.Context, in *GetStatsRequest, opts ...grpc.CallOption) (*GetStatsResponse, error)
 	GetStatsOnline(ctx context.Context, in *GetStatsRequest, opts ...grpc.CallOption) (*GetStatsResponse, error)
 	QueryStats(ctx context.Context, in *QueryStatsRequest, opts ...grpc.CallOption) (*QueryStatsResponse, error)
@@ -81,6 +83,16 @@ func (c *statsServiceClient) WatchReverseHealth(ctx context.Context, in *Reverse
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type StatsService_WatchReverseHealthClient = grpc.ServerStreamingClient[ReverseHealthResponse]
+
+func (c *statsServiceClient) GetMuxSnapshot(ctx context.Context, in *MuxRequest, opts ...grpc.CallOption) (*MuxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MuxResponse)
+	err := c.cc.Invoke(ctx, StatsService_GetMuxSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *statsServiceClient) GetStats(ctx context.Context, in *GetStatsRequest, opts ...grpc.CallOption) (*GetStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -158,6 +170,7 @@ func (c *statsServiceClient) GetUsersStats(ctx context.Context, in *GetUsersStat
 type StatsServiceServer interface {
 	GetReverseHealthSnapshot(context.Context, *ReverseHealthRequest) (*ReverseHealthResponse, error)
 	WatchReverseHealth(*ReverseHealthRequest, grpc.ServerStreamingServer[ReverseHealthResponse]) error
+	GetMuxSnapshot(context.Context, *MuxRequest) (*MuxResponse, error)
 	GetStats(context.Context, *GetStatsRequest) (*GetStatsResponse, error)
 	GetStatsOnline(context.Context, *GetStatsRequest) (*GetStatsResponse, error)
 	QueryStats(context.Context, *QueryStatsRequest) (*QueryStatsResponse, error)
@@ -180,6 +193,9 @@ func (UnimplementedStatsServiceServer) GetReverseHealthSnapshot(context.Context,
 }
 func (UnimplementedStatsServiceServer) WatchReverseHealth(*ReverseHealthRequest, grpc.ServerStreamingServer[ReverseHealthResponse]) error {
 	return status.Error(codes.Unimplemented, "method WatchReverseHealth not implemented")
+}
+func (UnimplementedStatsServiceServer) GetMuxSnapshot(context.Context, *MuxRequest) (*MuxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMuxSnapshot not implemented")
 }
 func (UnimplementedStatsServiceServer) GetStats(context.Context, *GetStatsRequest) (*GetStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStats not implemented")
@@ -251,6 +267,24 @@ func _StatsService_WatchReverseHealth_Handler(srv interface{}, stream grpc.Serve
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type StatsService_WatchReverseHealthServer = grpc.ServerStreamingServer[ReverseHealthResponse]
+
+func _StatsService_GetMuxSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MuxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StatsServiceServer).GetMuxSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StatsService_GetMuxSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StatsServiceServer).GetMuxSnapshot(ctx, req.(*MuxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _StatsService_GetStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetStatsRequest)
@@ -388,6 +422,10 @@ var StatsService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetReverseHealthSnapshot",
 			Handler:    _StatsService_GetReverseHealthSnapshot_Handler,
+		},
+		{
+			MethodName: "GetMuxSnapshot",
+			Handler:    _StatsService_GetMuxSnapshot_Handler,
 		},
 		{
 			MethodName: "GetStats",

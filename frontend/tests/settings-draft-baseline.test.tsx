@@ -61,12 +61,12 @@ const committedSettings = () => ({
   },
   relay_mux: {
     concurrency: 1,
-    min_idle_workers: 0,
-    max_idle_workers: 2,
+    prewarm_workers: 0,
+    reuse_threshold: 2,
     max_probing_workers: 1,
-    probe_interval_secs: 5,
+    probe_interval_ms: 5000,
     probe_timeout_ms: 2000,
-    idle_ttl_secs: 24,
+    idle_ttl_ms: 24000,
     max_requests_per_worker: 128,
   },
   anytls_padding_scheme: ['stop=4'],
@@ -94,14 +94,14 @@ const ROUTES: Record<string, () => unknown> = {
 const certsWithGroup = (): CertsView => ({
   sealing_available: true,
   domain: {
-    id: 'private.example',
-    domain: 'private.example',
+    id: 'public.example',
+    domain: 'public.example',
     dns_provider: 'cloudflare',
-    acme_directory: 'self-signed',
-    signing_method: 'self-signed',
+    acme_directory: 'https://acme',
+    signing_method: 'public-ca',
     acme_contact: null,
     renew_before_days: 30,
-    has_credential: false,
+    has_credential: true,
     has_account: false,
   },
   groups: [
@@ -189,7 +189,7 @@ const section = (id: string) => {
 };
 
 const fieldInput = (scope: ReturnType<typeof section>, label: string) => {
-  const input = scope.getByText(label).closest('.setfld')?.querySelector('input');
+  const input = scope.getByText(label, { selector: 'label' }).closest('.setfld')?.querySelector('input');
   if (!(input instanceof HTMLInputElement)) throw new Error(`没有找到字段 ${label}`);
   return input;
 };
@@ -206,6 +206,8 @@ afterEach(() => {
   cleanup();
   draft.clear();
   vi.unstubAllGlobals();
+  ROUTES['/settings'] = committedSettings;
+  ROUTES['/links/mtu'] = () => ({ default_mtu: 1420, nodes: [], links: [] });
   ROUTES['/certs'] = () => ({
     groups: [],
     nodes: [],
@@ -252,14 +254,65 @@ describe('设置页分段保存的基准', () => {
     expect(ports.queryByText('接入面')).toBeNull();
     expect(ports.getByText('仅影响新建')).toBeTruthy();
     expect(ports.queryByText('需要发布')).toBeNull();
+    expect(ports.getByDisplayValue('13443').closest('.port-allocation-grid')).toBeTruthy();
+    expect(document.getElementById('set-ports')?.querySelector('.settings-parameter-group')).toBeNull();
+    expect(document.getElementById('set-ports')?.querySelector('.settings-field-grid-five')).toBeNull();
   });
 
-  it('VLESS Encryption 起始端口默认 48000，允许保存自定义起点', async () => {
+  it('全局 MTU 使用明确名称，缺省值为 1280，探测区不再主动渲染风险提示', async () => {
+    ROUTES['/settings'] = () => ({ ...committedSettings(), overlay: undefined });
+    ROUTES['/links/mtu'] = () => ({
+      default_mtu: 1280,
+      nodes: [
+        {
+          node_id: 'node-1',
+          current_mtu: 1400,
+          overridden: true,
+          suggested_mtu: 1399,
+          tightest_peer: 'node-2',
+          inconclusive: 0,
+        },
+      ],
+      links: [
+        {
+          node_id: 'node-1',
+          peer_node_id: 'node-2',
+          endpoint_host: '192.0.2.2',
+          status: 'ok',
+          path_mtu: 1459,
+          suggested_wg_mtu: 1399,
+          probed_at: '2026-09-08T00:00:00Z',
+        },
+      ],
+    });
+    render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+
+    const wireguard = section('set-wg');
+    expect(fieldInput(wireguard, '全局 MTU').value).toBe('1280');
+    expect(await wireguard.findByRole('button', { name: '看探测结果' })).toBeTruthy();
+    expect(wireguard.queryByText(/大包会被打掉|生效值大过探测建议|还有余量/)).toBeNull();
+  });
+
+  it('Ping 调度与探测目标沿用设置页的平面配置组', async () => {
+    render(<Harness />);
+    await screen.findByPlaceholderText('example.com:443');
+
+    const ping = section('set-ping-probe');
+    const schedule = ping.getByLabelText('Ping 探测调度');
+    const targets = ping.getByText('探测目标', { selector: '.eyebrow' }).closest('.ping-probe-target-section');
+    expect(schedule.classList.contains('settings-block')).toBe(true);
+    expect(schedule.querySelector('.ping-probe-schedule-grid')).toBeTruthy();
+    expect(targets?.classList.contains('settings-block')).toBe(true);
+    expect(document.getElementById('set-ping-probe')?.querySelector('.ping-probe-timing')).toBeTruthy();
+  });
+
+  it('VLESS Encryption 起始端口默认 13800，允许保存自定义起点', async () => {
     render(<Harness />);
     await screen.findByPlaceholderText('example.com:443');
     const ports = section('set-ports');
     const input = ports.getByRole('spinbutton', { name: 'VLESS · Encryption 起始端口' });
-    expect((input as HTMLInputElement).value).toBe('48000');
+    expect((input as HTMLInputElement).value).toBe('13800');
     fireEvent.change(input, { target: { value: '49000' } });
     fireEvent.click(ports.getByText('保存这一段'));
     await waitFor(() => expect(settingsOp()).toMatchObject({ settings: { ports: { vless_encryption_base: 49000 } } }));
@@ -283,22 +336,46 @@ describe('设置页分段保存的基准', () => {
 
     const connection = section('set-conn');
     expect(connection.queryByText('复用流数量')).toBeNull();
-    expect(connection.getByText(/\u590d用流 1 · 空闲 0–2/)).toBeTruthy();
+    expect(connection.getByLabelText('中继 Mux 当前参数').textContent).toContain('复用流1预热目标0复用阈值2');
 
-    fireEvent.click(connection.getByRole('button', { name: '配置' }));
+    const muxToggle = connection.getByRole('button', { name: '配置中继 Mux 参数' });
+    expect(muxToggle.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(muxToggle);
+    expect(muxToggle.getAttribute('aria-expanded')).toBe('true');
     const concurrency = fieldInput(connection, '复用流数量');
+    const probeInterval = fieldInput(connection, '探活周期');
+    const idleTtl = fieldInput(connection, '超额空闲寿命');
+    expect(probeInterval.value).toBe('5000');
+    expect(idleTtl.value).toBe('24000');
+    expect(connection.getAllByText('ms')).toHaveLength(3);
+    expect(connection.getByText('连接池', { selector: '.eyebrow' })).toBeTruthy();
+    expect(connection.getByText('探活', { selector: '.eyebrow' })).toBeTruthy();
+    expect(concurrency.closest('.settings-parameter-group')).toBeTruthy();
+    expect(concurrency.closest('.settings-parameter-grid')).toBeTruthy();
     fireEvent.change(concurrency, { target: { value: '8' } });
-    expect(connection.getByText(/\u590d用流 8 · 空闲 0–2/)).toBeTruthy();
+    fireEvent.change(probeInterval, { target: { value: '6125' } });
+    fireEvent.change(idleTtl, { target: { value: '25125' } });
+    expect(connection.getByLabelText('中继 Mux 当前参数').textContent).toContain('复用流8预热目标0复用阈值2');
 
-    fireEvent.click(connection.getByRole('button', { name: '收起' }));
+    fireEvent.click(connection.getByRole('button', { name: '收起中继 Mux 参数' }));
     expect(connection.queryByText('复用流数量')).toBeNull();
-    fireEvent.click(connection.getByRole('button', { name: '配置' }));
+    fireEvent.click(connection.getByRole('button', { name: '配置中继 Mux 参数' }));
     expect(fieldInput(connection, '复用流数量').value).toBe('8');
+    expect(fieldInput(connection, '探活周期').value).toBe('6125');
+    expect(fieldInput(connection, '超额空闲寿命').value).toBe('25125');
 
     fireEvent.click(connection.getByRole('button', { name: '保存这一段' }));
     await waitFor(() =>
       expect(settingsOp()).toMatchObject({
-        settings: { relay_mux: { concurrency: 8, min_idle_workers: 0, max_idle_workers: 2 } },
+        settings: {
+          relay_mux: {
+            concurrency: 8,
+            prewarm_workers: 0,
+            reuse_threshold: 2,
+            probe_interval_ms: 6125,
+            idle_ttl_ms: 25125,
+          },
+        },
       }),
     );
   });
@@ -307,26 +384,26 @@ describe('设置页分段保存的基准', () => {
     const editableView = render(<Harness />);
     await screen.findByPlaceholderText('example.com:443');
     let connection = section('set-conn');
-    fireEvent.click(connection.getByRole('button', { name: '配置' }));
-    const idleInputs = connection.getByText('空闲连接').closest('.setfld')?.querySelectorAll('input');
-    if (!idleInputs || idleInputs.length !== 2) throw new Error('没有找到空闲连接上下限');
-    fireEvent.change(idleInputs[1], { target: { value: '1' } });
-    fireEvent.change(idleInputs[0], { target: { value: '2' } });
-    expect(connection.getByText('最小空闲连接不能大于最大空闲连接')).toBeTruthy();
+    fireEvent.click(connection.getByRole('button', { name: '配置中继 Mux 参数' }));
+    const minIdle = fieldInput(connection, '预热目标');
+    const maxIdle = fieldInput(connection, '复用阈值');
+    fireEvent.change(maxIdle, { target: { value: '1' } });
+    fireEvent.change(minIdle, { target: { value: '2' } });
+    expect(connection.getByText('预热目标不能大于复用阈值')).toBeTruthy();
     expect((connection.getByRole('button', { name: '保存这一段' }) as HTMLButtonElement).disabled).toBe(true);
 
     editableView.unmount();
     render(<Harness role="editor" />);
     await screen.findByPlaceholderText('example.com:443');
     connection = section('set-conn');
-    fireEvent.click(connection.getByRole('button', { name: '查看' }));
+    fireEvent.click(connection.getByRole('button', { name: '查看中继 Mux 参数' }));
     expect(connection.getByText('复用流数量')).toBeTruthy();
     // 外层 fieldset 统一控制只读态，后代 input 不会自动获得 disabled
     // attribute，但在浏览器的有效禁用状态中会匹配 :disabled。
     expect(fieldInput(connection, '复用流数量').matches(':disabled')).toBe(true);
   });
 
-  it('立即签发等待完成并显示结果，申领设置与证书记录分开', async () => {
+  it('立即签发等待完成并显示结果，签发配置与证书记录分开', async () => {
     const full = certsWithGroup();
     let complete!: (response: Response) => void;
     const response = new Promise<Response>(resolve => {
@@ -341,9 +418,13 @@ describe('设置页分段保存的基准', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<Harness />);
     const process = await screen.findByRole('button', { name: '立即签发与续期' });
-    const settingsTitle = screen.getByText('新证书申领设置');
-    expect(settingsTitle.closest('details')?.open).toBe(false);
-    expect(screen.getByText(/修改设置不会改写已签发的证书/)).toBeTruthy();
+    expect(screen.getByText('签发配置')).toBeTruthy();
+    const selfSigned = screen.getByText('自签证书', { selector: '.cert-method-config-name' }).closest('details');
+    const publicCa = screen.getByText("Let's Encrypt", { selector: '.cert-method-config-name' }).closest('details');
+    expect(selfSigned?.open).toBe(false);
+    expect(publicCa?.open).toBe(false);
+    expect(screen.getByText('已配置 · 固定 A/B 主备')).toBeTruthy();
+    expect(screen.queryByText(/不代表当前选中了哪一种/)).toBeNull();
     expect(screen.queryByText('现在检查一轮')).toBeNull();
     fireEvent.click(process);
     await waitFor(() =>
@@ -355,20 +436,43 @@ describe('设置页分段保存的基准', () => {
     expect((screen.getByRole('button', { name: '立即签发与续期' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('自签模式隐藏全局域名输入并说明百年随机身份', async () => {
-    ROUTES['/certs'] = certsWithGroup;
+  it('两项签发配置同时展示，只在新建证书组时选择类型', async () => {
+    const full = certsWithGroup();
+    full.groups[0].name = '默认自签证书组';
+    full.groups[0].is_default = true;
+    ROUTES['/certs'] = () => full;
     render(<Harness />);
 
-    await screen.findByText(/默认自签证书组首次初始化一对主备证书/);
-    expect(screen.queryByPlaceholderText('example.net')).toBeNull();
-    expect(screen.getByText(/单张有效期 100 年/)).toBeTruthy();
-    expect(screen.getByText(/不再拼接二级域名或通配符/)).toBeTruthy();
+    await screen.findByText('默认自签证书组');
+    const publicCa = screen.getByText("Let's Encrypt", { selector: '.cert-method-config-name' }).closest('details')!;
+    expect(publicCa.open).toBe(false);
+    fireEvent.click(publicCa.querySelector('summary')!);
+    expect(publicCa.open).toBe(true);
+    expect(within(publicCa).getByPlaceholderText('example.net')).toBeTruthy();
+    expect(screen.queryByRole('group', { name: '证书组类型' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '新建证书组' }));
+    const method = screen.getByRole('group', { name: '证书组类型' });
+    const selfSigned = within(method).getByRole('button', { name: '自签证书' });
+    const letsEncrypt = within(method).getByRole('button', { name: "Let's Encrypt + Cloudflare DNS" });
+    expect(selfSigned.getAttribute('aria-pressed')).toBe('false');
+    expect(letsEncrypt.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(selfSigned);
+    expect(selfSigned.getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(letsEncrypt);
+    expect(letsEncrypt.getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(selfSigned);
+    expect(screen.getByPlaceholderText('example.net')).toBeTruthy();
+    expect(screen.getByText(/创建后立即生成并签发固定主备两份/)).toBeTruthy();
   });
 
   it('证书组默认收起，自签模式不提供手动添加备用动作', async () => {
     const full = certsWithGroup();
     full.groups[0].name = '默认自签证书组';
     full.groups[0].is_default = true;
+    // 即使旧数据里的组配置字段损坏，也必须以当前 serving 证书的冻结签发方式为准，
+    // 不能再把实际自签的组标成 Let's Encrypt。
+    full.groups[0].signing_method = 'public-ca';
     full.groups[0].names = ['northstar-edge-0123abcd.com'];
     full.groups[0].certificates = Array.from({ length: 2 }, (_, index) => ({
       id: `cert-${index}`,
@@ -400,7 +504,13 @@ describe('设置页分段保存的基准', () => {
 
     const toggle = await screen.findByRole('button', { name: /默认自签证书组/ });
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(screen.queryByRole('button', { name: '立即申领备用证书' })).toBeNull();
+    expect(screen.getAllByText('自签证书').length).toBeGreaterThan(0);
+    expect(screen.getByText('组配置类型异常')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /增加证书/ })).toBeNull();
+    fireEvent.click(toggle.closest('header')!);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(toggle.closest('header')!);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
 
@@ -418,6 +528,23 @@ describe('设置页分段保存的基准', () => {
 
   it('添加备用证书期间锁住证书动作，连续点击只提交一次', async () => {
     const publicCa = publicCaCertsWithGroup();
+    publicCa.groups[0].certificates = [
+      {
+        id: 'ready-existing',
+        status: 'ready',
+        origin: 'spare',
+        signing_method: 'public-ca',
+        certificate_name: null,
+        runtime_slot: null,
+        issuer: "Let's Encrypt",
+        issued_at: '2026-01-01T00:00:00Z',
+        expires_at: '2026-12-01T00:00:00Z',
+        sha256: 'a'.repeat(64),
+        attempts: 0,
+        last_error: null,
+        last_attempt_at: null,
+      },
+    ];
     let resolveSpare!: (response: Response) => void;
     const spareResponse = new Promise<Response>(resolve => {
       resolveSpare = resolve;
@@ -434,7 +561,8 @@ describe('设置页分段保存的基准', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     render(<Harness />);
-    const add = await screen.findByRole('button', { name: '立即申领备用证书' });
+    const add = await screen.findByRole('button', { name: /增加证书/ });
+    expect((add as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(add);
     fireEvent.click(add);
 
@@ -453,7 +581,7 @@ describe('设置页分段保存的基准', () => {
       }),
     );
     await waitFor(() =>
-      expect((screen.getByRole('button', { name: '立即申领备用证书' }) as HTMLButtonElement).disabled).toBe(false),
+      expect((screen.getByRole('button', { name: /增加证书/ }) as HTMLButtonElement).disabled).toBe(false),
     );
   });
 
@@ -476,11 +604,19 @@ describe('设置页分段保存的基准', () => {
 
     render(<Harness />);
     fireEvent.click(await screen.findByRole('button', { name: '新建证书组' }));
+    fireEvent.click(
+      within(screen.getByRole('group', { name: '证书组类型' })).getByRole('button', { name: '自签证书' }),
+    );
     const name = screen.getByPlaceholderText('香港前置') as HTMLInputElement;
     fireEvent.change(name, { target: { value: '新加坡备用' } });
     fireEvent.click(screen.getByRole('button', { name: '创建并立即申领' }));
 
     await screen.findByText(/证书组写入失败/);
+    const createCall = fetchMock.mock.calls.find(([path, init]) => path === '/certs/groups' && init?.method === 'POST');
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({
+      name: '新加坡备用',
+      signing_method: 'self-signed',
+    });
     expect(screen.getByPlaceholderText('香港前置')).toBe(name);
     expect(name.value).toBe('新加坡备用');
   });
@@ -648,28 +784,24 @@ it('反向隧道参数位于连接策略，统一保存并保留到其他段的�
   await screen.findByPlaceholderText('example.com:443');
   const connection = section('set-conn');
   expect(connection.getByLabelText('反向隧道恢复设置')).toBeTruthy();
-  const advanced = connection.getByText('高级参数：探活、容量、退避与业务探测');
-  fireEvent.click(advanced);
+  /* 面板默认收起；展开后按语义分组，不再套第二层「高级参数」。 */
+  const expand = connection.getByRole('button', { name: '配置反向隧道参数' });
+  expect(expand.getAttribute('aria-expanded')).toBe('false');
+  expect(connection.queryByText('业务探测')).toBeNull();
+  fireEvent.click(expand);
+  expect(expand.getAttribute('aria-expanded')).toBe('true');
+  expect(connection.queryByText('业务探测')).toBeNull();
+  expect(connection.getByText('故障处理')).toBeTruthy();
+  expect(connection.getByRole('button', { name: '保留' }).getAttribute('aria-pressed')).toBe('true');
+  expect(connection.queryByRole('button', { name: '添加定向覆盖' })).toBeNull();
   fireEvent.change(connection.getByLabelText('恢复所需连续应答次数'), { target: { value: '3' } });
-  fireEvent.change(connection.getByLabelText('业务探测间隔（毫秒）'), { target: { value: '2000' } });
-  fireEvent.click(connection.getByRole('button', { name: '添加定向覆盖' }));
-  const row = within(connection.getByText('定向链路覆盖 1').closest('fieldset')!);
-  for (const [label, value] of [
-    ['链路 ID', 'c1'],
-    ['流量起点节点 ID', 'n1'],
-    ['流量终点节点 ID', 'n2'],
-  ]) {
-    fireEvent.change(row.getByLabelText(label), { target: { value } });
-  }
-  fireEvent.change(row.getByLabelText('每条隧道业务并发上限'), { target: { value: '4' } });
+  fireEvent.click(connection.getByRole('button', { name: '主动断开' }));
   fireEvent.click(connection.getByRole('button', { name: '保存这一段' }));
   await waitFor(() =>
     expect(settingsOp()).toMatchObject({
       settings: {
-        reverse_health: { tuning: { recovery_successes: 3, canary_interval_ms: 2000 } },
-        reverse_health_overrides: [
-          { chain: 'c1', from: 'n1', to: 'n2', health: { tuning: { max_sessions_per_worker: 4 } } },
-        ],
+        reverse_health: { disconnect_on_health_failure: true, tuning: { recovery_successes: 3 } },
+        reverse_health_overrides: [],
       },
     }),
   );
@@ -681,20 +813,22 @@ it('反向隧道参数位于连接策略，统一保存并保留到其他段的�
       settings: {
         reality_site: { dest: 'new.example:443' },
         reverse_health: { tuning: { recovery_successes: 3 } },
-        reverse_health_overrides: [{ health: { tuning: { max_sessions_per_worker: 4 } } }],
+        reverse_health_overrides: [],
       },
     }),
   );
 });
 
-it('反向隧道高级参数无效时禁止保存连接策略', async () => {
+it('反向隧道参数无效时禁止保存连接策略', async () => {
   render(<Harness />);
   await screen.findByPlaceholderText('example.com:443');
   const connection = section('set-conn');
-  fireEvent.click(connection.getByText('高级参数：探活、容量、退避与业务探测'));
-  fireEvent.change(connection.getByLabelText('业务探测超时（毫秒）'), { target: { value: '2000' } });
+  fireEvent.click(connection.getByRole('button', { name: '配置反向隧道参数' }));
+  expect(connection.getByLabelText('首次超时（毫秒）')).toBeTruthy();
+  fireEvent.change(connection.getByLabelText('首次超时（毫秒）'), { target: { value: '1000' } });
   const save = connection.getByRole('button', { name: '保存这一段' }) as HTMLButtonElement;
   expect(save.disabled).toBe(true);
+  expect(connection.getByRole('alert').textContent).toContain('参数超出范围');
   fireEvent.click(save);
   expect(settingsOp()).toBeUndefined();
 });

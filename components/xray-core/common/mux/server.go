@@ -3,6 +3,7 @@ package mux
 import (
 	"context"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -91,6 +92,9 @@ type ServerWorker struct {
 	sessionManager *SessionManager
 	done           *done.Instance
 	timer          *time.Ticker
+	idle           serverIdleGuard
+	endingSessions atomic.Int32
+	endDraining    atomic.Bool
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
@@ -107,15 +111,17 @@ func newServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 		link:           link,
 		sessionManager: NewSessionManager(),
 		done:           done.New(),
-		timer:          time.NewTicker(60 * time.Second),
 	}
+	copyLink := *link
+	copyLink.Writer = newHealthWriter(link.Writer, worker.done)
+	worker.link = &copyLink
 	if config != nil {
-		copyLink := *link
-		copyLink.Writer = newHealthWriter(link.Writer, worker.done)
-		worker.link = &copyLink
 		hc := *config
 		hc.ActiveSessions = worker.ActiveConnections
+		hc.DrainIdle = func() bool { return worker.ActiveConnections() == 0 }
 		worker.health = newReverseHealth(hc, copyLink.Writer.(*healthWriter), worker.done)
+	} else {
+		worker.timer = time.NewTicker(serverIdleCheckInterval)
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		copyInbound := *inbound
@@ -128,18 +134,23 @@ func newServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 }
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
-	writer := NewResponseWriter(s.ID, output, s.transferType)
+	writer := NewResponseWriter(s.ID, s.frameWriter(output), s.transferType)
+	stopCancellation := s.watchCancellation(ctx)
+	defer stopCancellation()
+	defer s.finishInput(writer)
 	if err := buf.Copy(s.input, writer); err != nil {
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
 	}
 
-	writer.Close()
-	s.Close(false)
 }
 
 func (w *ServerWorker) monitor() {
-	defer w.timer.Stop()
+	var idle <-chan time.Time
+	if w.timer != nil {
+		idle = w.timer.C
+		defer w.timer.Stop()
+	}
 
 	for {
 		checkSize := w.sessionManager.Size()
@@ -153,8 +164,8 @@ func (w *ServerWorker) monitor() {
 			common.Interrupt(w.link.Writer)
 			common.Interrupt(w.link.Reader)
 			return
-		case <-w.timer.C:
-			if w.sessionManager.CloseIfNoSessionAndIdle(checkSize, checkCount) {
+		case <-idle:
+			if w.idle.closeIfIdle(w.sessionManager, checkSize, checkCount) {
 				common.Must(w.done.Close())
 			}
 		}
@@ -188,6 +199,13 @@ func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.Bu
 		if meta.Option.Has(OptionAck) {
 			return nil
 		}
+		if writer, ok := w.link.Writer.(*healthWriter); ok {
+			// Do not park the shared receive loop behind a backpressured Pong.
+			// A full queue may lose this reply; the caller's lease quarantines
+			// new admission without terminating unrelated established sessions.
+			_ = writer.enqueue(FrameMetadata{SessionStatus: SessionStatusKeepAlive, Option: OptionProbe | OptionAck, ProbeID: meta.ProbeID})
+			return nil
+		}
 		return writeProbeFrame(w.link.Writer, meta.ProbeID, true)
 	}
 	if meta.Option.Has(OptionData) {
@@ -197,14 +215,33 @@ func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.Bu
 }
 
 func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata, reader *buf.BufferedReader) error {
+	reject := w.endDraining.Load()
 	if w.health != nil {
 		w.health.mu.Lock()
 		w.health.checkLocked(time.Now())
 		state := w.health.snapshot.State
-		w.health.mu.Unlock()
-		if state != "READY" && state != "DRAINING" {
-			return errors.New("reverse worker not dispatchable")
+		plannedDrain := state == "DRAINING" && (w.health.snapshot.Reason == "planned_rotation" || w.health.snapshot.Reason == "peer_rotation")
+		if state != "READY" && !plannedDrain {
+			reject = true
+			w.health.snapshot.RejectedDispatches++
+			if w.health.counters != nil {
+				w.health.counters.rejected.Add(1)
+			}
 		}
+		w.health.mu.Unlock()
+	}
+	if reject {
+		// A New can already be in flight when the receiving side quarantines
+		// its worker. Reject that session, not all pre-existing business.
+		if writer, ok := w.link.Writer.(*healthWriter); ok {
+			if err := writer.enqueue(FrameMetadata{SessionID: meta.SessionID, SessionStatus: SessionStatusEnd, Option: OptionError}); err != nil && w.health != nil && w.health.counters != nil {
+				w.health.counters.queueFailures.Add(1)
+			}
+		}
+		if meta.Option.Has(OptionData) {
+			return buf.Copy(NewStreamReader(reader), buf.Discard)
+		}
+		return nil
 	}
 	ctx = session.SubContextFromMuxInbound(ctx)
 	if meta.Inbound != nil && meta.Inbound.Source.IsValid() && meta.Inbound.Local.IsValid() {
@@ -323,10 +360,17 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
 	}
+	if w.health == nil {
+		s.lifecycle = w.newSessionLifecycle(realPoolClock{})
+	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
 	}
 	if !w.sessionManager.Add(s) {
+		// No handle goroutine owns this unpublished session's End phase.
+		if s.lifecycle != nil {
+			s.lifecycle.complete()
+		}
 		s.Close(false)
 		return errors.New("failed to add new session")
 	}
@@ -343,6 +387,20 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return buf.Copy(rr, buf.Discard)
 	}
 	return err
+}
+
+func (w *ServerWorker) newSessionLifecycle(clock poolClock) *sessionLifecycle {
+	return &sessionLifecycle{
+		clock: clock, timeout: sessionEndTimeout,
+		begin: func() { w.endingSessions.Add(1) },
+		finish: func() {
+			if w.endingSessions.Add(-1) == 0 && w.endDraining.Load() && w.ActiveConnections() == 0 {
+				w.Close()
+			}
+		},
+		fail:      func() { w.Close() },
+		onTimeout: func() { w.endDraining.Store(true) },
+	}
 }
 
 func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
@@ -386,6 +444,16 @@ func (w *ServerWorker) handleFrame(ctx context.Context, reader *buf.BufferedRead
 	err := meta.Unmarshal(reader, session.IsReverseMuxFromContext(ctx))
 	if err != nil {
 		return errors.New("failed to read metadata").Base(err)
+	}
+	if w.health == nil {
+		switch meta.SessionStatus {
+		case SessionStatusKeepAlive:
+			if meta.Option == OptionProbe {
+				w.idle.received(true)
+			}
+		case SessionStatusNew, SessionStatusKeep, SessionStatusEnd:
+			w.idle.received(false)
+		}
 	}
 
 	switch meta.SessionStatus {

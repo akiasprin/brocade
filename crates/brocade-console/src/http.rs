@@ -60,7 +60,6 @@ use tower_http::services::ServeDir;
 const ADMIN_SESSION_COOKIE: &str = "brocade_session";
 const ROUTE_IPV4_HEADER: &str = "x-brocade-route-ipv4";
 const ROUTE_IPV6_HEADER: &str = "x-brocade-route-ipv6";
-const AGENT_LOG_MAX_MIB_HEADER: &str = "x-brocade-log-max-mib";
 const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
 const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
 const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
@@ -461,7 +460,10 @@ pub fn with_console_static_dir(router: Router, dist_dir: &str) -> Router {
 
 /// Add saved branding to either embedded or directory-served HTML before the browser parses it.
 pub fn with_console_branding(router: Router, store: PgStore) -> Router {
-    router.layer(axum::middleware::from_fn_with_state(store, console_branding))
+    router.layer(axum::middleware::from_fn_with_state(
+        store,
+        console_branding,
+    ))
 }
 
 async fn console_branding(
@@ -469,29 +471,47 @@ async fn console_branding(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if !matches!(request.uri().path(), "/" | "/index.html") || request.method() != axum::http::Method::GET {
+    if !matches!(request.uri().path(), "/" | "/index.html")
+        || request.method() != axum::http::Method::GET
+    {
         return next.run(request).await;
     }
     // The HTML changes independently of the compiled asset: don't reuse its gzip or validators.
-    for key in [header::ACCEPT_ENCODING, header::IF_NONE_MATCH, header::IF_MODIFIED_SINCE, header::RANGE] {
+    for key in [
+        header::ACCEPT_ENCODING,
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::RANGE,
+    ] {
         request.headers_mut().remove(key);
     }
     let response = next.run(request).await;
-    if response.status() != StatusCode::OK { return response; }
-    let branding = match tokio::time::timeout(std::time::Duration::from_secs(2), store.branding()).await {
-        Ok(Ok(branding)) => branding,
-        _ => return response,
-    };
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let branding =
+        match tokio::time::timeout(std::time::Duration::from_secs(2), store.branding()).await {
+            Ok(Ok(branding)) => branding,
+            _ => return response,
+        };
     let (mut parts, body) = response.into_parts();
     let bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let html = crate::assets::branded_index(&String::from_utf8_lossy(&bytes), &branding);
-    for key in [header::CONTENT_LENGTH, header::ETAG, header::LAST_MODIFIED, header::CONTENT_ENCODING] {
+    for key in [
+        header::CONTENT_LENGTH,
+        header::ETAG,
+        header::LAST_MODIFIED,
+        header::CONTENT_ENCODING,
+    ] {
         parts.headers.remove(key);
     }
-    parts.headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache"));
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
     Response::from_parts(parts, axum::body::Body::from(html))
 }
 
@@ -510,33 +530,8 @@ pub fn admin_router(store: PgStore) -> Router {
     admin_router_with_state(AppState::new(store))
 }
 
-/// The variant sharing a wake signal with the quota loop. `main.rs` uses this one and tests the one
-/// above.
-pub fn admin_router_with_quota_wake(store: PgStore, quota_wake: Arc<Notify>) -> Router {
-    admin_router_with_state(AppState::with_quota_wake(store, quota_wake))
-}
-
-/// The production workers' wakes. A separate constructor rather than another parameter on the
-/// ones above, so callers with no certificate worker, namely the tests and `brocade-preview`,
-/// keep their existing signature and receive a handle with no listener.
-pub fn admin_router_with_wakes(
-    store: PgStore,
-    quota_wake: Arc<Notify>,
-    grants_wake: Arc<Notify>,
-    cert_wake: Arc<Notify>,
-    geoip: crate::geoip::GeoIpLookup,
-) -> Router {
-    admin_router_with_state(
-        AppState::with_quota_wake(store, quota_wake)
-            .and_grants_wake(grants_wake)
-            .and_cert_wake(cert_wake)
-            .and_geoip(geoip),
-    )
-}
-
-/// Production variant carrying the same process-local realtime service onto the admin face.
-/// Kept separate so existing test and preview constructors remain source-compatible.
-pub fn admin_router_with_wakes_and_realtime(
+/// Build the administrative face with every process-local worker service.
+pub fn admin_router_with_services(
     store: PgStore,
     quota_wake: Arc<Notify>,
     grants_wake: Arc<Notify>,
@@ -1740,7 +1735,14 @@ async fn realtime_fleet_events(
 }
 
 async fn realtime_events_response(state: &AppState, nodes: Vec<String>) -> ApiResult<Response> {
-    let mut subscription = state.realtime.subscribe(nodes).await;
+    Ok(realtime_stream_response(
+        state.realtime.subscribe(nodes).await,
+    ))
+}
+
+/// Split out from the handler so the regression test can hold a real response body without an
+/// `AppState`: the property under test is that holding the body holds the demand lease.
+fn realtime_stream_response(subscription: crate::realtime::RealtimeSubscription) -> Response {
     let initial = Event::default()
         .event("snapshot")
         .json_data(json!({ "policy": subscription.policy, "nodes": subscription.snapshots }))
@@ -1749,6 +1751,15 @@ async fn realtime_events_response(state: &AppState, nodes: Vec<String>) -> ApiRe
     let stream = async_stream::stream! {
         // Keeping `subscription` inside this generator is intentional: its Drop implementation
         // releases every per-node demand lease when the browser disconnects.
+        //
+        // This line is what keeps it inside. Rust 2021 captures the individual fields a
+        // generator names, so a body that only mentions `subscription.events` and
+        // `subscription.visible_nodes` leaves the private `_lease` field behind, and the lease
+        // is then released the moment this handler returns — while the browser is still
+        // streaming. The control plane then stops the Agent one stop-grace later, and the live
+        // view goes silent on a healthy connection. Moving the whole binding in restores
+        // whole-variable capture; the regression test below pins it.
+        let mut subscription = subscription;
         yield Ok::<Event, Infallible>(initial);
         loop {
             match subscription.events.recv().await {
@@ -1787,7 +1798,7 @@ async fn realtime_events_response(state: &AppState, nodes: Vec<String>) -> ApiRe
     response
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
-    Ok(response)
+    response
 }
 
 async fn artifact_index(
@@ -2097,16 +2108,12 @@ async fn certs_response(
     let domain = domains
         .iter()
         .find(|domain| domain.signing_method == brocade_store::CertificateSigningMethod::PublicCa)
-        .cloned()
-        .or_else(|| domains.into_iter().next());
-    let (groups, nodes) = if domain.is_some() {
-        (
-            state.store.cert_groups(admin).await?,
-            state.store.node_certificate_state(admin).await?,
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
+        .cloned();
+    // The self-signed default pool is useful before a public CA has been configured. Keep its
+    // groups visible while leaving `domain` empty so the issuance form creates a new public-CA
+    // domain instead of editing the private pool's synthetic domain in place.
+    let groups = state.store.cert_groups(admin).await?;
+    let nodes = state.store.node_certificate_state(admin).await?;
     Ok(CertsResponse {
         sealing_available: brocade_store::secrets::sealing_available(),
         domain,
@@ -2132,6 +2139,8 @@ struct CertGroupInput {
     note: Option<String>,
     #[serde(default)]
     certificate_name: Option<String>,
+    #[serde(default)]
+    signing_method: brocade_store::CertificateSigningMethod,
 }
 
 async fn manual_certificate_lock(
@@ -2153,15 +2162,24 @@ async fn create_cert_group(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     let _lock = manual_certificate_lock(&state).await?;
-    // Operator-created groups use the public domain when configured. The synthetic self-signed
-    // domain exists for the fixed default group and must not win merely by sorting first.
+    // The trust track is a property of the group, chosen when it is created. It cannot be inferred
+    // from whichever domain happens to sort first because normal installations keep both the
+    // synthetic self-signed pool and an optional public-CA domain.
     let domains = state.store.cert_domains().await?;
     let domain = domains
         .iter()
-        .find(|domain| domain.signing_method == brocade_store::CertificateSigningMethod::PublicCa)
+        .find(|domain| domain.signing_method == input.signing_method)
         .cloned()
-        .or_else(|| domains.into_iter().next())
-        .ok_or_else(|| StoreError::InvalidData("还没有配证书域，先在上面填好保存".to_owned()))?;
+        .ok_or_else(|| {
+            StoreError::InvalidData(match input.signing_method {
+                brocade_store::CertificateSigningMethod::PublicCa => {
+                    "还没有配置 Let’s Encrypt，先在上面保存证书域名与凭据".to_owned()
+                }
+                brocade_store::CertificateSigningMethod::SelfSigned => {
+                    "自签证书池尚未初始化，请重启控制面后重试".to_owned()
+                }
+            })
+        })?;
     let name = input.name.unwrap_or_default();
     let id = state
         .store
@@ -2489,7 +2507,7 @@ async fn install_dist(State(state): State<AppState>) -> ApiResult<Response> {
 }
 
 /// The distribution manifest's contents. Separate from the handler so it can be tested without a
-/// database. A mistyped key can silently keep an old Agent or make Brocade Xray installation fail,
+/// database. A mistyped key can silently prevent an Agent update or make Brocade Xray installation fail,
 /// so the shell parser and every architecture-specific key are tested below.
 fn dist_json(d: &AgentDistribution) -> serde_json::Value {
     // The embedded copies are listed per architecture and the script selects with `uname -m`. The
@@ -3815,10 +3833,10 @@ async fn delete_step(
     Ok(Json(result).into_response())
 }
 
-// Remove the unreachable steps on this chain. The console calls it once after the whole rule tree
-// has been written table by table, because the test needs the chain's complete rule table and the
-// browser holds only one table at a time (see prune_chain in store). A no-op is a valid outcome:
-// on an already clean chain nothing is deleted and the revision number is unchanged.
+// Normalize one chain after its whole rule tree has been written table by table: remove unreachable
+// steps and relay inbounds that no final hop listens on. Both tests need the complete rule table,
+// while the browser holds only one table at a time (see prune_chain in store). A no-op is valid: on
+// an already clean chain the revision number is unchanged.
 async fn prune_chain(
     State(state): State<AppState>,
     Path((app_id, chain_id)): Path<(String, String)>,
@@ -3876,8 +3894,8 @@ async fn change_admin_password(
 async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     // Operational policy rides on the response header so it is present even when the node is
-    // otherwise converged and the body is 204. Older agents ignore it; newer agents can change
-    // retention without inventing a fake deployment or restarting Xray.
+    // otherwise converged and the body is 204. This changes retention without inventing a fake
+    // deployment or restarting Xray.
     let log_limits = state.store.effective_node_log_limits(&node.node_id).await?;
     let agent_version = user_agent(&headers).map(str::to_owned);
     let protocol_version = agent_protocol_version(&headers);
@@ -3909,7 +3927,7 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
         }
     }
 
-    if protocol_version.unwrap_or(0) < brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION {
+    if protocol_version != Some(brocade_deployment::protocol::AGENT_PROTOCOL_VERSION) {
         let mut response = StatusCode::NO_CONTENT.into_response();
         response.headers_mut().insert(
             "x-brocade-agent-upgrade-required",
@@ -3966,19 +3984,6 @@ fn with_agent_log_policy(
     mut response: Response,
     limits: brocade_store::AgentLogLimits,
 ) -> Response {
-    // Old agents understand one ceiling only. The smallest value is the safe compatibility
-    // fallback: an old binary may retain less than requested for one class, but it can never let
-    // any class exceed its newly configured disk-safety bound. New agents prefer the three
-    // specific headers below.
-    let legacy_max_mib = limits
-        .agent_journal_mib
-        .min(limits.xray_mib)
-        .min(limits.phantun_mib);
-    response.headers_mut().insert(
-        AGENT_LOG_MAX_MIB_HEADER,
-        HeaderValue::from_str(&legacy_max_mib.to_string())
-            .expect("u32 is a valid HTTP header value"),
-    );
     for (name, value) in [
         (AGENT_JOURNAL_MAX_MIB_HEADER, limits.agent_journal_mib),
         (XRAY_LOG_MAX_MIB_HEADER, limits.xray_mib),
@@ -4030,14 +4035,10 @@ fn with_agent_log_policy(
 async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     let release = state.store.agent_release().await?;
-    let legacy_protocol = agent_protocol_version(&headers).unwrap_or(0)
-        < brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION;
-    if node.lifecycle_phase != NodeLifecyclePhase::Active && !legacy_protocol {
+    if node.lifecycle_phase != NodeLifecyclePhase::Active {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    if !(release.offers(&node.node_id, embedded_release_id())
-        || legacy_protocol && release.offers_protocol_rescue(&node.node_id))
-    {
+    if !release.offers(&node.node_id, embedded_release_id()) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let Some(arch) = headers
@@ -4100,7 +4101,7 @@ async fn agent_runtime(
                     &node.node_id,
                     public_ca_sha256.as_deref(),
                     self_signed,
-                    request.observed_at_unix_secs,
+                    Some(request.observed_at_unix_secs),
                 )
                 .await?;
         }
@@ -4114,12 +4115,10 @@ async fn agent_observation(
     Json(request): Json<AgentObservationRequest>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
-    if let Some(route) = &request.route {
-        state
-            .store
-            .record_node_route_ips(&node.node_id, route)
-            .await?;
-    }
+    state
+        .store
+        .record_node_route_ips(&node.node_id, &request.route)
+        .await?;
     let result = state
         .store
         .report_target_result(TargetConvergenceReport {
@@ -5224,8 +5223,49 @@ mod tests {
     };
     use brocade_store::LoadSeriesQuery;
 
+    /// The live view is demand-driven: the Agent samples only while the control plane counts at
+    /// least one watching browser, and the count is held by a lease inside the SSE response body.
+    ///
+    /// Rust 2021 captures the individual fields a generator names. A body that mentions only
+    /// `subscription.events` and `subscription.visible_nodes` therefore leaves the lease field
+    /// behind, releasing it as soon as the handler returns; one stop-grace later the control
+    /// plane stops the Agent while the browser is still streaming, and every live panel goes
+    /// silent on a healthy connection. Nothing else in the system reports an error when that
+    /// happens — the socket stays open, the Agent stays connected — so this has to be a test.
+    #[tokio::test]
+    async fn the_live_stream_holds_its_demand_lease_until_the_body_is_dropped() {
+        let realtime = crate::realtime::RealtimeService::new(Default::default());
+        let _agent = realtime.register_agent("n1".to_owned()).await;
+
+        let response =
+            super::realtime_stream_response(realtime.subscribe(vec!["n1".to_owned()]).await);
+        // 让任何已经排上的释放任务先跑完，再断言——否则「还没来得及释放」会被误读成「没释放」。
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            realtime.watcher_count("n1").await,
+            1,
+            "响应体还活着，租约必须还在——否则控制面会在宽限期后停掉采样"
+        );
+
+        drop(response);
+        // `WatchLease` 的释放是 spawn 出去的，让它跑完。
+        for _ in 0..8 {
+            if realtime.watcher_count("n1").await == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            realtime.watcher_count("n1").await,
+            0,
+            "响应体丢弃后租约必须释放，否则没人看的机器会一直采样"
+        );
+    }
+
     #[test]
-    fn agent_log_headers_keep_old_agents_under_every_specific_ceiling() {
+    fn agent_log_headers_publish_every_specific_ceiling() {
         let response = super::with_agent_log_policy(
             StatusCode::NO_CONTENT.into_response(),
             AgentLogLimits {
@@ -5234,7 +5274,6 @@ mod tests {
                 phantun_mib: 64,
             },
         );
-        assert_eq!(response.headers()[super::AGENT_LOG_MAX_MIB_HEADER], "64");
         assert_eq!(
             response.headers()[super::AGENT_JOURNAL_MAX_MIB_HEADER],
             "96"
@@ -5573,6 +5612,45 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("-H \"@$auth_header\""));
         assert!(!INSTALL_SCRIPT.contains("-H \"Authorization: Bearer $ENROLL_TOKEN\""));
         assert!(INSTALL_SCRIPT.contains("net.ipv4.tcp_fastopen = 3"));
+    }
+
+    #[test]
+    fn install_script_supports_supervised_openrc() {
+        assert!(INSTALL_SCRIPT.contains("BROCADE_AGENT_SERVICE_MODE:-auto"));
+        assert!(INSTALL_SCRIPT.contains("auto|systemd|openrc|foreground"));
+        assert!(INSTALL_SCRIPT.contains("supervisor=\"supervise-daemon\""));
+        assert!(INSTALL_SCRIPT.contains("respawn_delay=5"));
+        assert!(INSTALL_SCRIPT.contains("respawn_max=0"));
+        assert!(INSTALL_SCRIPT.contains("rc-update add brocade-agent default"));
+        assert!(INSTALL_SCRIPT.contains("rc-service brocade-agent restart"));
+        assert!(INSTALL_SCRIPT.contains("output_logger=\"$AGENT_BIN log-sink"));
+        assert!(INSTALL_SCRIPT.contains("export \"\\$line\""));
+        assert!(!INSTALL_SCRIPT.contains("目前只支持 systemd"));
+    }
+
+    #[test]
+    fn install_script_is_valid_shell() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("跑得了 sh");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(INSTALL_SCRIPT.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "install.sh 语法错误：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

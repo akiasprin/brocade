@@ -712,17 +712,13 @@ fn anytls_masquerade(masquerade: &AnyTlsMasquerade) -> Value {
     }
 }
 
-/// Add the `mux` block, or leave the outbound as it was.
+/// Add the `mux` block only when pooling is configured.
 ///
 /// Written by mutation rather than as a field in each `json!`, because absent and
-/// `"enabled": false` have to stay distinguishable in the artifact: a machine that was never
-/// asked to pool should read identically to how it read before this feature existed, so that
-/// enabling pooling on one hop is the only line the golden diff shows.
+/// `"enabled": false` are distinct artifact states. Omission keeps a non-pooled outbound minimal.
 /// An ingress's `streamSettings`, whichever network it is carried over.
 ///
-/// The TCP branch writes exactly the object that was written before XHTTP existed, key for key —
-/// which is what keeps every ingress that has not asked for XHTTP producing byte-identical
-/// artifacts, and what makes the golden files a real check rather than a formality.
+/// The TCP branch emits the canonical direct transport shape; XHTTP adds only its own settings.
 fn stream_settings(stream: &XrayStream, security: &XrayIngressSecurity) -> Value {
     if matches!(security, XrayIngressSecurity::None) {
         return match stream {
@@ -854,20 +850,19 @@ fn insert_mux(value: &mut Value, mux: Option<&XrayMux>) {
         .as_object_mut()
         .expect("xray outbound must be an object before inserting mux");
     let mut config = json!({ "enabled": true, "concurrency": mux.concurrency });
-    if let Some(pool) = mux.worker_pool {
-        config.as_object_mut().unwrap().insert(
-            "workerPool".to_owned(),
-            json!({
-                "minIdleWorkers": pool.min_idle_workers,
-                "maxIdleWorkers": pool.max_idle_workers,
-                "maxProbingWorkers": pool.max_probing_workers,
-                "probeIntervalSecs": pool.probe_interval_secs,
-                "probeTimeoutMs": pool.probe_timeout_ms,
-                "idleTtlSecs": pool.idle_ttl_secs,
-                "maxRequestsPerWorker": pool.max_requests_per_worker,
-            }),
-        );
-    }
+    let pool = mux.worker_pool;
+    config.as_object_mut().unwrap().insert(
+        "workerPool".to_owned(),
+        json!({
+            "prewarmWorkers": pool.prewarm_workers,
+            "reuseThreshold": pool.reuse_threshold,
+            "maxProbingWorkers": pool.max_probing_workers,
+            "probeIntervalMs": pool.probe_interval_ms,
+            "probeTimeoutMs": pool.probe_timeout_ms,
+            "idleTtlMs": pool.idle_ttl_ms,
+            "maxRequestsPerWorker": pool.max_requests_per_worker,
+        }),
+    );
     object.insert("mux".to_owned(), config);
 }
 
@@ -1099,6 +1094,7 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             tag,
             send_through,
             domain_strategy,
+            allow_private,
         } => {
             let mut object = Map::new();
             object.insert("tag".to_owned(), json!(tag));
@@ -1110,10 +1106,14 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             // `domainStrategy` as the fallback when `targetStrategy` is absent
             // (`infra/conf/freedom.go`), so the older key works on both sides of that
             // rename while the newer one would not.
-            object.insert(
-                "settings".to_owned(),
-                json!({ "domainStrategy": domain_strategy }),
-            );
+            let mut settings = json!({ "domainStrategy": domain_strategy });
+            if *allow_private {
+                // An explicit empty list disables Xray's protocol-based default private
+                // matcher. Omitting the key does not mean empty: VLESS, VMess, Trojan,
+                // Hysteria and WireGuard inbounds all acquire the implicit matcher.
+                settings["ipsBlocked"] = json!([]);
+            }
+            object.insert("settings".to_owned(), settings);
             Value::Object(object)
         }
         XrayOutbound::Blackhole { tag, http_response } => {
@@ -1392,9 +1392,33 @@ fn put_condition(object: &mut Map<String, Value>, condition: &XrayMatchCondition
     }
 }
 
+fn attach_reverse_health(reverse: Option<&mut Value>, config: &XrayConfig) {
+    if let Some(reverse) = reverse {
+        if let Some(policy) = reverse
+            .get("tag")
+            .and_then(Value::as_str)
+            .and_then(|tag| config.reverse_health.get(tag))
+        {
+            reverse["health"] = json!(policy);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn business_egress_can_honor_an_ingress_that_allows_private_targets() {
+        let value = outbound(&XrayOutbound::Freedom {
+            tag: "out:egress".to_owned(),
+            send_through: None,
+            domain_strategy: "UseIP".to_owned(),
+            allow_private: true,
+        });
+
+        assert_eq!(value["settings"]["ipsBlocked"], json!([]));
+    }
 
     #[test]
     #[should_panic(expected = "xray outbound must be an object before inserting mux")]
@@ -1404,27 +1428,16 @@ mod tests {
             &mut value,
             Some(&XrayMux {
                 concurrency: 2,
-                worker_pool: None,
+                worker_pool: crate::artifacts::xray::XrayMuxWorkerPool {
+                    prewarm_workers: 0,
+                    reuse_threshold: 2,
+                    max_probing_workers: 1,
+                    probe_interval_ms: 5_000,
+                    probe_timeout_ms: 2_000,
+                    idle_ttl_ms: 24_000,
+                    max_requests_per_worker: 128,
+                },
             }),
         );
-    }
-}
-
-fn attach_reverse_health(reverse: Option<&mut Value>, config: &XrayConfig) {
-    if let Some(reverse) = reverse {
-        if let Some(url) = reverse
-            .get("tag")
-            .and_then(Value::as_str)
-            .and_then(|tag| config.reverse_canary_urls.get(tag))
-        {
-            reverse["canary_url"] = json!(url);
-        }
-        if let Some(policy) = reverse
-            .get("tag")
-            .and_then(Value::as_str)
-            .and_then(|tag| config.reverse_health.get(tag))
-        {
-            reverse["health"] = json!(policy);
-        }
     }
 }

@@ -17,7 +17,6 @@ use brocade_deployment::protocol::{
     MIN_AGENT_LOG_MAX_MIB,
 };
 
-const LEGACY_LOG_POLICY_FILE: &str = "log-max-mib";
 const AGENT_JOURNAL_POLICY_FILE: &str = "log-agent-journal-max-mib";
 const XRAY_POLICY_FILE: &str = "log-xray-max-mib";
 const PHANTUN_POLICY_FILE: &str = "log-phantun-max-mib";
@@ -52,10 +51,6 @@ fn validate_mib(max_mib: u32) -> Result<u32, String> {
     Ok(max_mib)
 }
 
-fn legacy_policy_path(state_dir: &Path) -> PathBuf {
-    state_dir.join(LEGACY_LOG_POLICY_FILE)
-}
-
 fn policy_path(state_dir: &Path, file: &str) -> PathBuf {
     state_dir.join(file)
 }
@@ -70,10 +65,8 @@ fn workload_policy_path(state_dir: &Path, workload: WorkloadLog) -> PathBuf {
     )
 }
 
-fn read_policy_or_legacy(state_dir: &Path, file: &str) -> u32 {
-    read_policy_mib(&policy_path(state_dir, file))
-        .or_else(|| read_policy_mib(&legacy_policy_path(state_dir)))
-        .unwrap_or(DEFAULT_AGENT_LOG_MAX_MIB)
+fn read_policy_or_default(state_dir: &Path, file: &str) -> u32 {
+    read_policy_mib(&policy_path(state_dir, file)).unwrap_or(DEFAULT_AGENT_LOG_MAX_MIB)
 }
 
 fn read_policy_mib(path: &Path) -> Option<u32> {
@@ -109,7 +102,7 @@ pub(crate) fn ensure_agent_journal_namespace(state_dir: &Path) -> Result<bool, S
 
     let dropin = Path::new(AGENT_JOURNAL_DROPIN);
     let config = Path::new(AGENT_JOURNAL_CONFIG);
-    let max_mib = read_policy_or_legacy(state_dir, AGENT_JOURNAL_POLICY_FILE);
+    let max_mib = read_policy_or_default(state_dir, AGENT_JOURNAL_POLICY_FILE);
     let dropin_changed = write_if_changed(dropin, AGENT_JOURNAL_DROPIN_CONTENT)?;
     let config_changed = write_if_changed(config, &journal_policy(max_mib))?;
     if !dropin_changed && !config_changed {
@@ -152,17 +145,6 @@ fn persist_policy_files(state_dir: &Path, policy: LogPolicy) -> Result<bool, Str
             format!("{max_mib}\n").as_bytes(),
         )?;
     }
-    // Version-2 child sinks still watch the old shared file until the marker migration restarts
-    // them. Keep that short window bounded by the smallest of the three requested ceilings.
-    let legacy = policy
-        .agent_journal_mib
-        .min(policy.xray_mib)
-        .min(policy.phantun_mib);
-    changed |= write_if_changed(
-        &legacy_policy_path(state_dir),
-        format!("{legacy}\n").as_bytes(),
-    )?;
-
     Ok(changed)
 }
 
@@ -300,9 +282,8 @@ fn consume_with_limit(
     let mut segment_bytes = max_bytes / 2;
     normalize_segment(&archive, segment_bytes)?;
 
-    // A legacy unbounded current file becomes the predecessor. Starting a fresh current segment
-    // guarantees that bytes arriving after the upgrade are retained, instead of immediately
-    // deleting them at the next boundary.
+    // If the current file already exceeds a segment (for example after lowering the limit),
+    // retain its newest tail as the predecessor and start a fresh current segment.
     if path
         .metadata()
         .is_ok_and(|metadata| metadata.len() >= segment_bytes)
@@ -444,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_is_persisted_per_workload_with_a_safe_legacy_fallback() {
+    fn policy_is_persisted_per_workload() {
         let dir = temp("class-policy");
         let _ = fs::remove_dir_all(&dir);
         let policy = LogPolicy {
@@ -465,11 +446,6 @@ mod tests {
             fs::read_to_string(dir.join(PHANTUN_POLICY_FILE)).unwrap(),
             "64\n"
         );
-        assert_eq!(
-            fs::read_to_string(dir.join(LEGACY_LOG_POLICY_FILE)).unwrap(),
-            "64\n"
-        );
-
         let xray = command(&dir.join("logs/xray.log"), &dir, WorkloadLog::Xray).unwrap();
         let phantun = command(
             &dir.join("logs/phantun-client-bt0.log"),
@@ -505,8 +481,8 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_legacy_file_is_bounded_before_new_bytes_arrive() {
-        let dir = temp("legacy");
+    fn an_oversized_file_is_bounded_before_new_bytes_arrive() {
+        let dir = temp("oversized");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("xray.log");

@@ -182,18 +182,16 @@ impl PgStore {
         &self.pool
     }
 
-    pub async fn migrate(&self) -> Result<usize> {
+    pub async fn migrate(&self) -> Result<()> {
         // Keep migrations embedded in the store crate; cargo only refreshes this
         // list when the crate is rebuilt.
         sqlx::migrate!("./migrations").run(&self.pool).await?;
-        // Repair durable subscription pointers immediately after schema/data migrations. Later
-        // initializers may commit a model revision and must never advance from a checkpoint whose
-        // resource IDs no longer match the migrated model.
+        // Establish immutable model and subscription checkpoints before later initializers can
+        // commit another model revision.
         materialize::ensure_current_snapshot(&self.pool).await?;
         crate::subscription_client::ensure_checkpoint(&self.pool).await?;
         settings::ensure_anytls_padding_scheme(&self.pool).await?;
-        let default_warps = console::ensure_default_warp_outbounds(&self.pool).await?;
-        Ok(default_warps)
+        Ok(())
     }
 
     pub async fn materialize_snapshot(&self, revision: Option<u64>) -> Result<ModelSnapshot> {
@@ -475,7 +473,9 @@ impl PgStore {
     /// place a node's private key leaves the database — it goes into that node's desired
     /// state and nowhere else.
     pub async fn released_cert_delta(
-        &self, node_id: &str, deployment_id: Option<i64>,
+        &self,
+        node_id: &str,
+        deployment_id: Option<i64>,
     ) -> Result<Vec<brocade_deployment::protocol::NodeCertificateMaterial>> {
         cert::released_cert_delta(&self.pool, node_id, deployment_id).await
     }

@@ -64,7 +64,7 @@ describe('WARP exit stack settings', () => {
     });
   });
 
-  it('does not widen legacy or custom IPv4-only tunnels when they are edited', () => {
+  it('does not widen custom IPv4-only tunnels when they are edited', () => {
     expect(warpIpStackOf(protocol())).toBe('dual');
     expect(warpIpStackOf(protocol({ domain_strategy: 'ForceIPv4' }))).toBe('ipv4');
     expect(warpIpStackOf(protocol({ domain_strategy: 'ForceIPv4v6' }))).toBe('prefer_ipv4');

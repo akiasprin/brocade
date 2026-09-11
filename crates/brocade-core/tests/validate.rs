@@ -24,39 +24,27 @@ use brocade_core::{
 use ipnet::Ipv4Net;
 
 #[test]
-fn legacy_egress_dns_binding_is_ignored_and_cleaned_when_serialized() {
-    let action: Action = serde_json::from_value(serde_json::json!({
+fn egress_rejects_unknown_fields() {
+    let result = serde_json::from_value::<Action>(serde_json::json!({
         "t": "egress",
         "send_through": null,
         "dns": true,
         "resolution": { "address": "192.0.2.53", "port": 53 }
-    }))
-    .unwrap();
-    assert_eq!(action, Action::Egress { send_through: None });
-    assert_eq!(
-        serde_json::to_value(action).unwrap(),
-        serde_json::json!({ "t": "egress", "send_through": null })
-    );
+    }));
+    assert!(result.is_err());
 }
 
 #[test]
-fn legacy_external_vless_without_transport_deserializes_as_raw() {
-    let protocol: ExternalOutboundProtocol = serde_json::from_value(serde_json::json!({
+fn external_vless_requires_an_explicit_transport() {
+    let result = serde_json::from_value::<ExternalOutboundProtocol>(serde_json::json!({
         "t": "vless",
         "v": {
-            "credential": "legacy-uuid",
+            "credential": "test-uuid",
             "encryption": "none",
             "flow": null
         }
-    }))
-    .unwrap();
-    assert!(matches!(
-        protocol,
-        ExternalOutboundProtocol::Vless {
-            transport: ExternalVlessTransport::Raw,
-            ..
-        }
-    ));
+    }));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -2092,7 +2080,6 @@ fn validate_app_set_reports_a_split_download_port_used_by_another_view() {
     split.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: None,
     });
     let app_a = AppView {
         id: "a".to_owned(),
@@ -2151,7 +2138,6 @@ fn validate_rejects_stream_one_with_an_independent_download() {
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3255,12 +3241,10 @@ fn validate_app_rejects_a_projection_that_is_switched_on_but_blank() {
         v4: Some(ProjectionEndpoint {
             host: "   ".to_owned(),
             port: 20443,
-            download: None,
         }),
         v6: Some(ProjectionEndpoint {
             host: "v6.acc.example.net".to_owned(),
             port: 0,
-            download: None,
         }),
     };
     let app = AppView {
@@ -3300,7 +3284,6 @@ fn validate_app_stays_quiet_about_a_filled_in_projection() {
         v4: Some(ProjectionEndpoint {
             host: "cu.acc.example.net".to_owned(),
             port: 20443,
-            download: None,
         }),
         v6: None,
     };
@@ -3335,50 +3318,6 @@ fn validate_app_stays_quiet_about_a_filled_in_projection() {
 }
 
 #[test]
-fn legacy_projection_download_is_not_an_xhttp_download() {
-    let mut projected = ingress("i", "c", "hk", None);
-    projected.projection.v4 = Some(ProjectionEndpoint {
-        host: "104.21.35.113".to_owned(),
-        port: 8443,
-        download: Some(ProjectionDownloadEndpoint {
-            host: "172.67.218.231".to_owned(),
-            port: 8443,
-            origin_port: None,
-            http_host: None,
-            mux: None,
-        }),
-    });
-    let app = AppView {
-        id: "app".to_owned(),
-        label: "应用".to_owned(),
-        chains: vec![chain("c")],
-        ingresses: vec![projected],
-        fronts: Vec::new(),
-        steps: Vec::new(),
-        grants: Vec::new(),
-    };
-    let doc = doc(vec![node(
-        "hk",
-        "platform.acme",
-        Some("hk.example.net"),
-        [10, 66, 0, 1],
-        true,
-    )]);
-    let mut diagnostics = Vec::new();
-    let sys = compile_system(&doc, &mut diagnostics);
-    let app_ir = compile_app(&doc, &app, &mut diagnostics);
-
-    validate_app(&sys, &app_ir, &mut diagnostics);
-
-    assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.code.starts_with("ingress.xhttp-download")),
-        "legacy projection download must not become an active XHTTP setting: {diagnostics:#?}"
-    );
-}
-
-#[test]
 fn validate_accepts_reality_xhttp_with_a_tls_download_front() {
     let mut projected = ingress("i", "c", "hk", None);
     projected.wires = IngressWires::Vless(Transport::VlessRealityXhttp(RealityXhttp {
@@ -3405,7 +3344,6 @@ fn validate_accepts_reality_xhttp_with_a_tls_download_front() {
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3464,7 +3402,6 @@ fn validate_rejects_invalid_xhttp_client_routing_fields() {
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3528,7 +3465,6 @@ fn validate_reality_split_requires_a_certificate_and_a_distinct_port() {
     projected.projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.10".to_owned(),
         port: 443,
-        download: None,
     });
     let app = AppView {
         id: "app".to_owned(),
@@ -3747,7 +3683,13 @@ fn grant(user: &str, ingress: &str) -> Grant {
 /// on the machine ever acts on it.
 #[test]
 fn a_connection_setting_on_a_reverse_hop_is_refused() {
-    for pool in [HopPool::Pool, HopPool::Merge(8)] {
+    for pool in [
+        HopPool::Mux(None),
+        HopPool::Mux(Some(HopMux {
+            concurrency: 8,
+            ..Default::default()
+        })),
+    ] {
         let mut diagnostics = Vec::new();
         let (sys, app_ir) = pool_ir(HopDial::Reverse(IpFamily::V4), pool, &mut diagnostics);
         validate_app(&sys, &app_ir, &mut diagnostics);
@@ -3774,22 +3716,22 @@ fn relay_mux_global_boundaries_and_cross_constraints_are_validated() {
     for mux in [
         HopMux {
             concurrency: 1,
-            min_idle_workers: 0,
-            max_idle_workers: 1,
+            prewarm_workers: 0,
+            reuse_threshold: 1,
             max_probing_workers: 1,
-            probe_interval_secs: 2,
+            probe_interval_ms: 2_000,
             probe_timeout_ms: 200,
-            idle_ttl_secs: 5,
+            idle_ttl_ms: 2_200,
             max_requests_per_worker: 1,
         },
         HopMux {
             concurrency: 128,
-            min_idle_workers: u32::MAX,
-            max_idle_workers: u32::MAX,
+            prewarm_workers: u32::MAX,
+            reuse_threshold: u32::MAX,
             max_probing_workers: u32::MAX,
-            probe_interval_secs: 60,
+            probe_interval_ms: 60_000,
             probe_timeout_ms: 10_000,
-            idle_ttl_secs: u32::MAX,
+            idle_ttl_ms: u32::MAX,
             max_requests_per_worker: u16::MAX,
         },
     ] {
@@ -3811,35 +3753,35 @@ fn relay_mux_global_boundaries_and_cross_constraints_are_validated() {
             ..Default::default()
         },
         HopMux {
-            min_idle_workers: 9,
+            prewarm_workers: 9,
             ..Default::default()
         },
         HopMux {
-            max_idle_workers: 0,
+            reuse_threshold: 0,
             ..Default::default()
         },
         HopMux {
-            min_idle_workers: 3,
-            max_idle_workers: 2,
+            prewarm_workers: 3,
+            reuse_threshold: 2,
             ..Default::default()
         },
         HopMux {
             max_probing_workers: 3,
-            max_idle_workers: 2,
+            reuse_threshold: 2,
             ..Default::default()
         },
         HopMux {
-            probe_interval_secs: 1,
+            probe_interval_ms: 1,
             ..Default::default()
         },
         HopMux {
             probe_timeout_ms: 5_000,
-            probe_interval_secs: 5,
+            probe_interval_ms: 5_000,
             ..Default::default()
         },
         HopMux {
-            idle_ttl_secs: 6,
-            probe_interval_secs: 5,
+            idle_ttl_ms: 6_999,
+            probe_interval_ms: 5_000,
             probe_timeout_ms: 2_000,
             ..Default::default()
         },
@@ -3863,61 +3805,13 @@ fn relay_mux_rule_override_uses_the_same_validation() {
         HopDial::Overlay,
         HopPool::Mux(Some(HopMux {
             max_probing_workers: 3,
-            max_idle_workers: 2,
+            reuse_threshold: 2,
             ..Default::default()
         })),
         &mut diagnostics,
     );
     validate_app(&sys, &app_ir, &mut diagnostics);
     assert_has(&diagnostics, Level::Error, "mux.worker-pool");
-}
-
-/// The concurrency-one pool remains valid for existing authored models, but it must not look as
-/// safe as a normal connection pool. Xray selects an idle Mux.cool worker without probing the
-/// underlying TCP connection first, which is the observed source of long stalls after idle reuse.
-#[test]
-fn a_concurrency_one_pool_warns_once_per_edge() {
-    let mut diagnostics = Vec::new();
-    let (sys, app_ir) = pool_ir_rules(
-        vec![
-            forward_pool("relay", HopDial::Overlay, HopPool::Pool),
-            forward_pool("relay", HopDial::Overlay, HopPool::Pool),
-        ],
-        &mut diagnostics,
-    );
-    validate_app(&sys, &app_ir, &mut diagnostics);
-
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code == "rule.pool-concurrency-one")
-        .collect::<Vec<_>>();
-    assert_eq!(warnings.len(), 1, "{diagnostics:#?}");
-    assert_eq!(warnings[0].level, Level::Warn);
-}
-
-/// The merge count is refused outside 2..=128 rather than clamped into it.
-///
-/// xray reads 0 as 8 and caps anything above 128, so reproducing either would leave the console
-/// showing one number while the machine runs another — and 1 is not out of range so much as
-/// spelled elsewhere, which the message has to say or the operator retries 1 and gets the same
-/// error.
-#[test]
-fn a_merge_count_outside_the_range_is_refused() {
-    for n in [0, 1, 129, 1000] {
-        let mut diagnostics = Vec::new();
-        let (sys, app_ir) = pool_ir(HopDial::Overlay, HopPool::Merge(n), &mut diagnostics);
-        validate_app(&sys, &app_ir, &mut diagnostics);
-        assert_has(&diagnostics, Level::Error, "rule.pool-range");
-    }
-    for n in [2, 8, 128] {
-        let mut diagnostics = Vec::new();
-        let (sys, app_ir) = pool_ir(HopDial::Overlay, HopPool::Merge(n), &mut diagnostics);
-        validate_app(&sys, &app_ir, &mut diagnostics);
-        assert!(
-            !diagnostics.iter().any(|d| d.code == "rule.pool-range"),
-            "{n} 该是合法的：{diagnostics:#?}"
-        );
-    }
 }
 
 /// Two rules pointing at one target must agree, the same way they already must on `dial`.
@@ -3930,8 +3824,15 @@ fn two_rules_to_one_target_must_agree_on_the_connection_setting() {
     let mut diagnostics = Vec::new();
     let (sys, app_ir) = pool_ir_rules(
         vec![
-            forward_pool("relay", HopDial::Overlay, HopPool::Pool),
-            forward_pool("relay", HopDial::Overlay, HopPool::Merge(8)),
+            forward_pool("relay", HopDial::Overlay, HopPool::Mux(None)),
+            forward_pool(
+                "relay",
+                HopDial::Overlay,
+                HopPool::Mux(Some(HopMux {
+                    concurrency: 8,
+                    ..Default::default()
+                })),
+            ),
         ],
         &mut diagnostics,
     );
@@ -4068,9 +3969,7 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
         validate_app(&sys, &ir, &mut diagnostics);
         diagnostics.into_iter().map(|d| d.code).collect::<Vec<_>>()
     };
-    assert!(codes(&doc)
-        .iter()
-        .any(|code| *code == "external-outbound.anytls-security"));
+    assert!(codes(&doc).contains(&"external-outbound.anytls-security"));
     for (value, valid) in [
         ("none".to_owned(), true),
         (
@@ -4088,16 +3987,12 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
         };
         let codes = codes(&doc);
         assert_eq!(
-            !codes
-                .iter()
-                .any(|code| *code == "external-outbound.vless-encryption"),
+            !codes.contains(&"external-outbound.vless-encryption"),
             valid,
             "{value}"
         );
         assert_eq!(
-            codes
-                .iter()
-                .any(|code| *code == "external-outbound.security-required"),
+            codes.contains(&"external-outbound.security-required"),
             value == "none"
         );
     }

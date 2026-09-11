@@ -605,7 +605,6 @@ fn projected(host: &str, port: u16) -> Option<ProjectionEndpoint> {
     Some(ProjectionEndpoint {
         host: host.to_owned(),
         port,
-        download: None,
     })
 }
 
@@ -888,19 +887,21 @@ fn a_tls_xhttp_projection_can_use_an_independent_download_endpoint() {
                 xmux: Some(XhttpXmux::with_concurrency(8)),
                 tuning: None,
                 mode: XhttpMode::Auto,
-                download: None,
+                download: Some(XhttpDownload {
+                    v4: Some(ProjectionDownloadEndpoint {
+                        host: "172.67.218.231".to_owned(),
+                        port: 8443,
+                        origin_port: None,
+                        http_host: None,
+                        mux: None,
+                    }),
+                    v6: None,
+                }),
             },
         }));
         face.projection.v4 = Some(ProjectionEndpoint {
             host: "104.21.35.113".to_owned(),
             port: 8443,
-            download: Some(ProjectionDownloadEndpoint {
-                host: "172.67.218.231".to_owned(),
-                port: 8443,
-                origin_port: None,
-                http_host: None,
-                mux: None,
-            }),
         });
     });
 
@@ -957,20 +958,22 @@ fn a_reality_xhttp_projection_uses_tls_only_for_its_download() {
                 xmux: Some(XhttpXmux::with_concurrency(8)),
                 tuning: None,
                 mode: XhttpMode::Auto,
-                download: None,
+                download: Some(XhttpDownload {
+                    v4: Some(ProjectionDownloadEndpoint {
+                        host: "cdn.example.net".to_owned(),
+                        port: 443,
+                        origin_port: Some(8443),
+                        http_host: Some("download.route.example".to_owned()),
+                        mux: Some(24),
+                    }),
+                    v6: None,
+                }),
             },
         }));
         face.wires.set_flow(None);
         face.projection.v4 = Some(ProjectionEndpoint {
             host: "198.51.100.10".to_owned(),
             port: 443,
-            download: Some(ProjectionDownloadEndpoint {
-                host: "cdn.example.net".to_owned(),
-                port: 443,
-                origin_port: Some(8443),
-                http_host: Some("download.route.example".to_owned()),
-                mux: Some(24),
-            }),
         });
     });
 

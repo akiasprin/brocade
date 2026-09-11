@@ -37,7 +37,7 @@ use brocade_core::{
         IngressWires, IpFamily, ModelSnapshot, Node, NodeEgressDnsPolicy,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
         RealityFallbackMode, RealitySettings, RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport,
-        User, WireGuardKeys, Xhttp, XhttpMode, XhttpXmux,
+        User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
     },
     physical::{node::project_node, user::project_user},
     Level,
@@ -1191,20 +1191,22 @@ fn split_reality_upload_and_tls_download_load_in_the_real_binary() {
             xmux: Some(XhttpXmux::with_concurrency(8)),
             tuning: None,
             mode: XhttpMode::Auto,
-            download: None,
+            download: Some(XhttpDownload {
+                v4: Some(ProjectionDownloadEndpoint {
+                    host: "cdn.example.net".to_owned(),
+                    port: 443,
+                    origin_port: Some(8443),
+                    http_host: None,
+                    mux: None,
+                }),
+                v6: None,
+            }),
         },
     }));
     app.ingresses[0].wires.set_flow(None);
     app.ingresses[0].projection.v4 = Some(ProjectionEndpoint {
         host: "198.51.100.20".to_owned(),
         port: 443,
-        download: Some(ProjectionDownloadEndpoint {
-            host: "cdn.example.net".to_owned(),
-            port: 443,
-            origin_port: Some(8443),
-            http_host: None,
-            mux: None,
-        }),
     });
     doc.nodes
         .iter_mut()
@@ -2598,31 +2600,9 @@ fn pooled_hops_load_in_the_real_binary() {
     const USER_PSK: &str = "QnJvY2FkZVVzZXJLZXkwMDA9";
 
     let cases = [
-        ("vless-pool", HopWire::None, HopPool::Pool),
+        ("vless-mux", HopWire::None, HopPool::Mux(None)),
         (
-            "vless-merge",
-            HopWire::None,
-            HopPool::Merge(HopPool::MERGE_MAX),
-        ),
-        (
-            "shadowsocks-pool",
-            HopWire::Shadowsocks2022 {
-                server_psk: SERVER_PSK.to_owned(),
-                user_psk: USER_PSK.to_owned(),
-            },
-            HopPool::Pool,
-        ),
-        (
-            "shadowsocks-merge",
-            HopWire::Shadowsocks2022 {
-                server_psk: SERVER_PSK.to_owned(),
-                user_psk: USER_PSK.to_owned(),
-            },
-            HopPool::Merge(HopPool::MERGE_MIN),
-        ),
-        ("vless-current-mux", HopWire::None, HopPool::Mux(None)),
-        (
-            "shadowsocks-current-mux",
+            "shadowsocks-mux",
             HopWire::Shadowsocks2022 {
                 server_psk: SERVER_PSK.to_owned(),
                 user_psk: USER_PSK.to_owned(),
@@ -2679,19 +2659,13 @@ fn pooled_hops_load_in_the_real_binary() {
                 assert_eq!(
                     mux["concurrency"],
                     json!(match pool {
-                        HopPool::Pool => 1,
-                        HopPool::Merge(n) => n,
                         HopPool::None => unreachable!("用例里没有 None"),
                         HopPool::Mux(value) => value.unwrap_or_default().concurrency,
                     }),
                     "{name}"
                 );
-                if matches!(pool, HopPool::Mux(_)) {
-                    assert_eq!(mux["workerPool"]["probeIntervalSecs"], json!(5), "{name}");
-                    assert_eq!(mux["workerPool"]["probeTimeoutMs"], json!(2000), "{name}");
-                } else {
-                    assert!(mux["workerPool"].is_null(), "{name}: {mux:#?}");
-                }
+                assert_eq!(mux["workerPool"]["probeIntervalMs"], json!(5000), "{name}");
+                assert_eq!(mux["workerPool"]["probeTimeoutMs"], json!(2000), "{name}");
             }
 
             let path =

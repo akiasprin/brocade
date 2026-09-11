@@ -37,7 +37,7 @@ describe('建链向导协议默认值', () => {
   });
 });
 
-it('可单独启用 VLESS Encryption，默认 48000 或使用配置的分配端口', () => {
+it('可单独启用 VLESS Encryption，默认 13800 或使用配置的分配端口', () => {
   const options = {
     vless: false,
     anytls: false,
@@ -51,7 +51,7 @@ it('可单独启用 VLESS Encryption，默认 48000 或使用配置的分配端�
     vless: null,
     anytls: null,
     hysteria2: null,
-    vless_encryption: { port: 48000 },
+    vless_encryption: { port: 13800 },
   });
   expect(newChainWires({ ...options, vlessEncryptionPort: 49002 }).vless_encryption).toEqual({ port: 49002 });
 });

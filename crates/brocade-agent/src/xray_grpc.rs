@@ -21,6 +21,7 @@ use std::{
 const ALTER_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/AlterInbound";
 const GET_INBOUND_USERS_PATH: &str = "/xray.app.proxyman.command.HandlerService/GetInboundUsers";
 const QUERY_STATS_PATH: &str = "/xray.app.stats.command.StatsService/QueryStats";
+const MUX_SNAPSHOT_PATH: &str = "/xray.app.stats.command.StatsService/GetMuxSnapshot";
 const ADD_USER_OPERATION: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER_OPERATION: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
@@ -545,6 +546,47 @@ fn decode_account(message: &[u8]) -> Result<Option<(String, Option<String>)>, St
     Ok(id.map(|id| (id, flow.filter(|flow| !flow.is_empty()))))
 }
 
+pub(crate) fn reverse_health(
+    api_port: u16,
+) -> Result<brocade_deployment::protocol::ReverseHealthReport, String> {
+    let response = grpc_unary(
+        api_port,
+        "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot",
+        &[],
+    )?;
+    let mut cursor = 0;
+    while let Some((number, field)) = next_field(&response, &mut cursor)? {
+        if let (1, Field::Bytes(bytes)) = (number, field) {
+            if bytes.len() > 256 * 1024 {
+                return Err("reverse health snapshot exceeds telemetry limit".into());
+            }
+            return serde_json::from_slice(bytes)
+                .map_err(|err| format!("invalid reverse health snapshot: {err}"));
+        }
+    }
+    Err("missing reverse health snapshot".into())
+}
+
+pub(crate) fn mux_snapshot(
+    api_port: u16,
+) -> Result<brocade_deployment::protocol::MuxReport, String> {
+    let response = grpc_unary(api_port, MUX_SNAPSHOT_PATH, &[])?;
+    let mut cursor = 0;
+    while let Some((number, field)) = next_field(&response, &mut cursor)? {
+        if let (1, Field::Bytes(bytes)) = (number, field) {
+            // Leave room for the NIC fields and WebSocket framing under the realtime channel's
+            // 512 KiB message ceiling. A pathological number of pools becomes "no Mux report"
+            // for this frame instead of repeatedly tearing down the Agent connection.
+            if bytes.len() > 384 * 1024 {
+                return Err("mux snapshot exceeds telemetry limit".into());
+            }
+            return serde_json::from_slice(bytes)
+                .map_err(|err| format!("invalid mux snapshot: {err}"));
+        }
+    }
+    Err("missing mux snapshot".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,6 +942,10 @@ mod tests {
         let health = reverse_health(api_port).expect("read reverse health API");
         assert!(!health.boot_id.is_empty());
         assert!(health.workers.is_empty());
+        let mux = mux_snapshot(api_port).expect("read Mux snapshot API");
+        assert!(!mux.boot_id.is_empty());
+        assert!(mux.pools.is_empty());
+        assert!(mux.workers.is_empty());
         assert!(query_stats(api_port, "user>>>")
             .expect("native query stats")
             .is_empty());
@@ -931,25 +977,4 @@ mod tests {
                 .port()
         }
     }
-}
-
-pub(crate) fn reverse_health(
-    api_port: u16,
-) -> Result<brocade_deployment::protocol::ReverseHealthReport, String> {
-    let response = grpc_unary(
-        api_port,
-        "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot",
-        &[],
-    )?;
-    let mut cursor = 0;
-    while let Some((number, field)) = next_field(&response, &mut cursor)? {
-        if let (1, Field::Bytes(bytes)) = (number, field) {
-            if bytes.len() > 256 * 1024 {
-                return Err("reverse health snapshot exceeds telemetry limit".into());
-            }
-            return serde_json::from_slice(bytes)
-                .map_err(|err| format!("invalid reverse health snapshot: {err}"));
-        }
-    }
-    Err("missing reverse health snapshot".into())
 }

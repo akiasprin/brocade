@@ -258,6 +258,8 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
+export const AGENT_PROTOCOL_VERSION = 6;
+
 export interface NodeVersions {
   agent: string;
   xray: string | null;
@@ -320,7 +322,7 @@ export interface NodeAgentStateItem {
   token_revoked_at: string | null;
   agent_version: string | null;
   agent_protocol_version: number | null;
-  // 运行时对账。null 表示尚未上报（旧版本 agent，或刚纳管尚未轮到），
+  // 运行时对账。null 表示尚未上报（刚纳管尚未轮到，或协议尚未恢复），
   // 需要与上报值为零区分——界面显示为「—」而非 0，否则状态最差的机器
   // 会显示为状态最好的。
   runtime_versions: NodeVersions | null;
@@ -876,7 +878,7 @@ export const revokeMyClashHaitunSubscription = () =>
 
 // ── 流量额度（用户 × 项目）──
 // 额度不修改任何产物——xray.json 中不写入用户——因此它是直接写入的运营参数；
-// 实际超限时由配额执行器修改 grant，并走同类的自动化授权单（论证见 migrations/0002）。
+// 实际超限时由配额执行器修改 grant，并走同类的自动化授权单（论证见 migrations/0001_init.sql）。
 export interface UserAppQuota {
   tenant_id: string;
   user_id: string;
@@ -960,9 +962,9 @@ export const createChain = async (
 // 全部留空时使用全局设置中的 REALITY 站点（settings.reality_site），
 // 填写后作为该接入面的覆盖值。密钥对由 store 生成，不经过浏览器。
 export interface CreateRealityIngress {
-  fallback_mode?: RealityFallbackMode;
-  fallback_limits?: RealityFallbackLimits;
-  fallback_guard?: boolean;
+  fallback_mode: RealityFallbackMode;
+  fallback_limits: RealityFallbackLimits;
+  fallback_guard: boolean;
   dest?: string;
   server_names?: string[];
   fingerprint?: string;
@@ -1055,7 +1057,7 @@ export type TransportKind = 'vless-reality' | 'vless-reality-xhttp' | 'vless-tls
 
 export type HysteriaCongestion = 'brutal' | 'bbr' | 'reno' | 'force-brutal';
 
-/* BBR 策略。只在该连接实际使用 BBR 时被读取：congestion 为 bbr，或为 brutal 且带宽未填写。 */
+/* BBR 策略。只在该连接实际使用 BBR 时读取：选择 bbr，或 brutal 因本端发送带宽 / 对端接收带宽回退。 */
 export type HysteriaBbrProfile = 'standard' | 'conservative' | 'aggressive';
 
 /* finalmask.quicParams 中除拥塞控制和带宽之外的调优项。
@@ -1106,8 +1108,8 @@ export type AnyTlsMasquerade =
 export interface AnyTlsSettings {
   /** AnyTLS owns its own TCP listener and does not reuse `Ingress.port`. */
   port: number;
-  /** Outer stream security. Older snapshots omit it and therefore remain TLS. */
-  security?: 'tls' | 'reality';
+  /** Outer stream security. */
+  security: 'tls' | 'reality';
   /** AnyTLS's own effective REALITY target; it is independent from VLESS on the same ingress. */
   reality?: {
     dest: string;
@@ -1167,7 +1169,7 @@ export const transportNeedsCertificate = (kind: TransportKind) => kind === 'vles
 
 /* 只要有一条线使用自有证书就需要证书。hy2 必然使用，TLS 两档同样使用。 */
 export const wiresNeedCertificate = (wires: Wires) =>
-  (!!wires.anytls && (wires.anytls.security ?? 'tls') === 'tls') ||
+  (!!wires.anytls && wires.anytls.security === 'tls') ||
   !!wires.hysteria2 ||
   (!!wires.vless && transportNeedsCertificate(wires.vless.kind));
 
@@ -1181,11 +1183,10 @@ export interface UpsertIngressBody {
   port: number;
   front_id?: string;
   reality: CreateRealityIngress;
-  /** 不传表示只有 VLESS + REALITY 一条线。 */
-  wires?: Wires;
-  projection?: IngressProjection;
-  /** 该入口拒绝承载的流量类型。不传表示四项默认启用——服务端同样如此，遗漏时取受保护的一侧。 */
-  guard?: IngressGuard;
+  wires: Wires;
+  projection: IngressProjection;
+  /** 该入口拒绝承载的流量类型。 */
+  guard: IngressGuard;
   note?: string;
 }
 
@@ -1216,8 +1217,6 @@ export interface IngressProjection {
 export interface ProjectionEndpoint {
   host: string;
   port: number;
-  /** Legacy snapshots only. New independent download settings live on Xhttp.download. */
-  download?: ProjectionDownloadEndpoint | null;
 }
 
 export interface ProjectionDownloadEndpoint {
@@ -1297,73 +1296,68 @@ export type HopDial =
   // 地址族需要显式指定：两个族的可达性相互独立，不做自动选择。
   | { t: 'reverse'; v: 'v4' | 'v6' };
 
-// 该跳发起的连接的使用方式。不填写表示每条流单独建立连接、结束后关闭，
-// 即该字段引入之前的行为。
-//
-// 界面只展示「每次新建 / Mux 复用」两项。历史 pool/merge 只用于读取旧修订；
-// 当前写入使用 mux，可以整组跟随全局或整组覆盖。
+// 该跳发起的连接的使用方式。
 //
 // 只对本机发起的跳有效。reverse 是对端连接本机，本机没有可复用的出站连接——该档位
 // 在界面上不显示（reverseTargets 使用另一个面板），编译器也会拒绝。
 export type HopPool =
   | { t: 'none' }
-  | { t: 'pool' }
-  // 历史 v ∈ 2..=128；编译器拒绝范围外的值。
-  | { t: 'merge'; v: number }
-  /* 当前写入格式。省略或置空 v 表示跟随 settings.relay_mux；v 存在时必须是整组覆盖。 */
+  /* 省略或置空 v 表示跟随 settings.relay_mux；v 存在时必须是整组覆盖。 */
   | { t: 'mux'; v?: HopMux | null };
 
 export interface HopMux {
   concurrency: number;
-  min_idle_workers: number;
-  max_idle_workers: number;
+  /** 复用阈值内尽力维持的空闲预热目标。 */
+  prewarm_workers: number;
+  /** 总 Worker 复用阈值，允许业务突发超过。 */
+  reuse_threshold: number;
   max_probing_workers: number;
-  probe_interval_secs: number;
+  probe_interval_ms: number;
   probe_timeout_ms: number;
-  idle_ttl_secs: number;
+  idle_ttl_ms: number;
   max_requests_per_worker: number;
 }
 
 export const DEFAULT_HOP_MUX: HopMux = {
   concurrency: 1,
-  min_idle_workers: 0,
-  max_idle_workers: 2,
+  prewarm_workers: 0,
+  reuse_threshold: 2,
   max_probing_workers: 1,
-  probe_interval_secs: 5,
+  probe_interval_ms: 5000,
   probe_timeout_ms: 2000,
-  idle_ttl_secs: 24,
+  idle_ttl_ms: 24000,
   max_requests_per_worker: 128,
 };
 
 export function hopMuxError(value: HopMux): string | null {
   if (!Number.isInteger(value.concurrency) || value.concurrency < 1 || value.concurrency > 128)
     return '复用流数量必须在 1–128 之间';
-  if (!Number.isInteger(value.min_idle_workers) || value.min_idle_workers < 0) return '最小空闲连接必须为非负整数';
-  if (!Number.isInteger(value.max_idle_workers) || value.max_idle_workers < 1) return '最大空闲连接必须为正整数';
+  if (!Number.isInteger(value.prewarm_workers) || value.prewarm_workers < 0) return '预热目标必须为非负整数';
+  if (!Number.isInteger(value.reuse_threshold) || value.reuse_threshold < 1) return '复用阈值必须为正整数';
   // Xray's worker counts are uint32. This is the wire/config representation
   // boundary, not an application-level pool-size policy.
-  if (value.min_idle_workers > 0xffffffff || value.max_idle_workers > 0xffffffff)
-    return '空闲连接数量超出 uint32 字段可表示范围（4294967295）';
-  if (value.min_idle_workers > value.max_idle_workers) return '最小空闲连接不能大于最大空闲连接';
+  if (value.prewarm_workers > 0xffffffff || value.reuse_threshold > 0xffffffff)
+    return '连接池数量超出 uint32 字段可表示范围（4294967295）';
+  if (value.prewarm_workers > value.reuse_threshold) return '预热目标不能大于复用阈值';
   if (
     !Number.isInteger(value.max_probing_workers) ||
     value.max_probing_workers < 1 ||
-    value.max_probing_workers > value.max_idle_workers
+    value.max_probing_workers > value.reuse_threshold
   )
-    return '同时探测连接必须在 1 与最大空闲连接之间';
-  if (!Number.isInteger(value.probe_interval_secs) || value.probe_interval_secs < 2 || value.probe_interval_secs > 60)
-    return '探测周期必须在 2–60 秒之间';
+    return '探活并发必须在 1 与复用阈值之间';
+  if (!Number.isInteger(value.probe_interval_ms) || value.probe_interval_ms < 2000 || value.probe_interval_ms > 60000)
+    return '探活周期必须在 2000–60000 ms 之间';
   if (
     !Number.isInteger(value.probe_timeout_ms) ||
     value.probe_timeout_ms < 200 ||
     value.probe_timeout_ms > 10000 ||
-    value.probe_timeout_ms >= value.probe_interval_secs * 1000
+    value.probe_timeout_ms >= value.probe_interval_ms
   )
-    return '单次超时必须在 200–10000 毫秒之间，且小于探测周期';
-  if (!Number.isInteger(value.idle_ttl_secs) || value.idle_ttl_secs < 1) return '空闲寿命必须为正整数秒';
-  if (value.idle_ttl_secs > 0xffffffff) return '空闲寿命超出 uint32 秒数字段可表示范围（4294967295）';
-  if (value.idle_ttl_secs < value.probe_interval_secs + Math.ceil(value.probe_timeout_ms / 1000))
-    return '空闲寿命必须覆盖一个探测周期和向上取整后的单次超时';
+    return '探活超时必须在 200–10000 ms 之间，且小于探活周期';
+  if (!Number.isInteger(value.idle_ttl_ms) || value.idle_ttl_ms < 1000) return '超额空闲寿命必须不小于 1000 ms';
+  if (value.idle_ttl_ms > 0xffffffff) return '超额空闲寿命超出可表示范围（4294967295 ms）';
+  if (value.idle_ttl_ms < value.probe_interval_ms + value.probe_timeout_ms)
+    return '超额空闲寿命必须覆盖一个探活周期和探活超时';
   if (
     !Number.isInteger(value.max_requests_per_worker) ||
     value.max_requests_per_worker < 1 ||
@@ -1374,7 +1368,7 @@ export function hopMuxError(value: HopMux): string | null {
 }
 
 export type RuleAction =
-  | { t: 'forward'; to: string; dial?: HopDial; pool?: HopPool }
+  | { t: 'forward'; to: string; dial: HopDial; pool: HopPool }
   | { t: 'egress'; send_through?: string | null }
   | { t: 'proxy'; outbound: string }
   | { t: 'block' };
@@ -1617,9 +1611,9 @@ export const deleteStep = (appId: string, chainId: string, nodeId: string) => {
   return Promise.resolve({ revision_id: 0 });
 };
 
-// 移除该链上不再被引用的 step——保存整棵规则树时作为最后一条操作。
-// 判定在服务端执行。判断哪些 step 不再被引用需要整条链的规则表，而浏览器中一次只有
-// 一张表是最新草稿，其余表仍是库中的旧状态；按该不完整的图执行删除时，
+// 规范化该链的最终拓扑——移除不再被引用的 step，并清除没有实际监听关系的 hop_in。
+// 保存整棵规则树时作为最后一条操作。判定在服务端执行：可达性和端口归属都需要整条链
+// 的规则表，而浏览器中一次只有一张表是最新草稿，其余表仍是库中的旧状态；按该不完整的图执行时，
 // 刚在另一张表中连接的机器会被判定为不再被引用并删除，表现为提交后编译报 relay.no-accept
 // （规则指向它，但其 step 已被删除）。因此在逐张 putStep 完成后追加该操作，由服务端按完整数据计算。
 // 界面上计算的结果（orphansAfter）只用于提示，不触发删除。
@@ -1635,6 +1629,17 @@ export const deleteChain = (appId: string, chainId: string) => {
   return Promise.resolve({ revision_id: 0 });
 };
 
+export type SnapshotVless = Transport & {
+  /* 下列借用站点字段只在 REALITY 两档中存在。 */
+  dest?: string;
+  server_names?: string[];
+  fingerprint?: string | null;
+  flow?: string | null;
+  fallback_mode?: RealityFallbackMode;
+  fallback_limits?: RealityFallbackLimits;
+  fallback_guard?: boolean;
+};
+
 // 模型快照：授权矩阵使用其中的 apps → ingresses / grants 作为列和当前状态
 // （服务端已移除密钥并按租户过滤）；规则编辑还需要 chains（主干顺序）和 steps（现有规则）。
 export interface SnapshotIngress {
@@ -1644,7 +1649,7 @@ export interface SnapshotIngress {
   bind: string;
   port: number;
   front?: string | null;
-  projection?: IngressProjection | null;
+  projection: IngressProjection;
   guard: IngressGuard;
   identity: {
     public_key: string;
@@ -1656,18 +1661,7 @@ export interface SnapshotIngress {
    * 两条线各占一个字段，字段存在即表示该线启用。读取前需判空：只启用 UDP 的接入面
    * 其 `vless` 为 undefined。 */
   wires: {
-    vless?: {
-      kind: TransportKind;
-      xhttp?: Xhttp | null;
-      /* 下列借用站点字段只在 REALITY 两档中存在。 */
-      dest?: string;
-      server_names?: string[];
-      fingerprint?: string | null;
-      flow?: string | null;
-      fallback_mode?: RealityFallbackMode;
-      fallback_limits?: RealityFallbackLimits;
-      fallback_guard?: boolean;
-    } | null;
+    vless?: SnapshotVless | null;
     vless_encryption?: (VlessEncryptionSettings & { public_key?: string }) | null;
     anytls?: AnyTlsSettings | null;
     hysteria2?: Hysteria2Settings | null;
@@ -1679,16 +1673,16 @@ export interface SnapshotIngress {
 function currentVless(ingress: SnapshotIngress): Transport | null {
   const vless = ingress.wires.vless;
   if (!vless) return null;
-  const { kind, xhttp } = vless;
-  if (!transportIsXhttp(kind)) {
-    return kind === 'vless-tls' ? { kind } : { kind: 'vless-reality' };
+  switch (vless.kind) {
+    case 'vless-reality':
+      return { kind: 'vless-reality' };
+    case 'vless-tls':
+      return { kind: 'vless-tls' };
+    case 'vless-reality-xhttp':
+      return { kind: 'vless-reality-xhttp', xhttp: vless.xhttp };
+    case 'vless-tls-xhttp':
+      return { kind: 'vless-tls-xhttp', xhttp: vless.xhttp };
   }
-  // 缺少 xhttp 的 XHTTP 档在库中无法表示（有 CHECK 约束），若出现则回退到同一安全层的
-  // TCP 档——回退到 REALITY 会将使用自有证书的接入面切换为借用站点。
-  if (!xhttp) {
-    return kind === 'vless-tls-xhttp' ? { kind: 'vless-tls' } : { kind: 'vless-reality' };
-  }
-  return { kind, xhttp } as Transport;
 }
 
 export function currentWires(ingress: SnapshotIngress): Wires {
@@ -1746,7 +1740,7 @@ export function ingressUpsertBody(
     // 该请求是全量覆盖而非 PATCH：不携带 projection 即表示两个地址族都不投影。
     // 因此未修改投影的调用方（修改端口、迁移机器）也必须将现有值原样带上，
     // 否则一次端口修改会清除投影配置。
-    projection: patch.projection ?? ingress.projection ?? {},
+    projection: patch.projection ?? ingress.projection,
     // 同样属于全量覆盖的问题：不携带 wires 即表示回到只有 VLESS+REALITY 一条线，
     // 因此一次端口修改会改变 XHTTP 或整条 QUIC 线路，且已下发的客户端配置全部失效——
     // 与上面 projection 处属同一类问题。
@@ -1910,7 +1904,12 @@ export interface ConsoleSnapshot {
       /* 留空表示使用 `settings.overlay.mtu` */
       mtu?: number | null;
       connection?: NodeConnection;
-      wireguard?: { listen_port: number };
+      wireguard?: {
+        listen_port: number;
+        /* 当前节点声明的入站方式。它不能从编译后的 phantun 服务部署位置反推：
+           NAT 节点会借用对端部署服务端，两者在这种情况下不是同一台机器。 */
+        transport: { t: 'udp' } | { t: 'fake_tcp'; v: { port: number } };
+      };
     }[];
     settings?: ModelSettings;
   };
@@ -2234,8 +2233,8 @@ export const saveSettings = async (body: ModelSettings) => {
  *
  * 与上面一组分开，因为两者性质不同：模型设置进入修订，只有实际改变机器产物时才需要发布；
  * 地址不进入模型或任何产物，只决定安装命令中的地址和 /enroll/dist 清单，在安装时被读取，因此
- * 不进入草稿而是直接 PUT。xray_version 仍在响应结构中承载控制台内置版本；旧数据库可能
- * 留有同名字段，但当前控制台不会让它覆盖随构建提供的二进制。
+ * 不进入草稿而是直接 PUT。xray_version 在响应结构中承载控制台内置版本，存储值不会覆盖
+ * 随构建提供的二进制。
  *
  * `stored` 是在此处填写的值，`effective` 是实际生效的值（已填写时即为该值，未填写时
  * 回退到进程启动时的环境变量，再回退到内置默认值）。两者都需要：仍使用环境变量的部署中
@@ -2455,11 +2454,11 @@ export interface NodeCertificateState {
   group_name: string;
   /** 裸名，也就是这台机器的订阅里写的 sni。 */
   certificate_name: string;
-  /** `unknown` 从未上报（agent 版本过旧，不管理证书）、`absent` 已检查且不存在、
+  /** `unknown` 从未上报、`absent` 已检查且不存在、
       `current` 与该组正在出示的一致、`stale` 有证书但不是这一张（轮换后一小时内属正常，
       xray 按自己的周期热重载）。
       没有它时页面显示的是控制面**已签发的内容**，而不是机器上**实际存在的内容**——
-      写盘失败、文件被覆盖、agent 版本过旧，三种情况的显示与正常状态相同。 */
+      写盘失败或文件被覆盖时，显示会与正常状态相同。 */
   on_disk: 'unknown' | 'absent' | 'current' | 'stale';
   observed_at: string | null;
 }
@@ -2487,7 +2486,12 @@ export interface CertificateIssuanceResult {
 export const scanCerts = () =>
   api<CertsView & { processing: CertificateIssuanceResult }>('/certs/scan', '', { method: 'POST' });
 
-export const createCertGroup = (body: { name: string; note?: string | null; certificate_name?: string | null }) =>
+export const createCertGroup = (body: {
+  name: string;
+  signing_method: CertificateTrack;
+  note?: string | null;
+  certificate_name?: string | null;
+}) =>
   api<{ id: string; processing: CertificateIssuanceResult }>('/certs/groups', '', {
     method: 'POST',
     body: JSON.stringify(body),
@@ -3105,6 +3109,7 @@ export const DEFAULT_REVERSE_HEALTH_TUNING: ReverseHealthTuning = {
 };
 
 export interface ReverseHealthPolicy {
+  disconnect_on_health_failure: boolean;
   probe_interval_ms: number;
   probe_timeout_ms: number;
   confirm_timeout_ms: number;
@@ -3114,7 +3119,7 @@ export interface ReverseHealthPolicy {
   max_parallel_dials_per_pair: number;
   dial_ready_timeout_ms: number;
   reconnect_backoff_cap_ms: number;
-  tuning?: ReverseHealthTuning;
+  tuning: ReverseHealthTuning;
 }
 export interface ReverseHealthOverride {
   chain: string;
@@ -3123,6 +3128,7 @@ export interface ReverseHealthOverride {
   health: ReverseHealthPolicy;
 }
 export const DEFAULT_REVERSE_HEALTH: ReverseHealthPolicy = {
+  disconnect_on_health_failure: false,
   probe_interval_ms: 1000,
   probe_timeout_ms: 750,
   confirm_timeout_ms: 750,
@@ -3134,69 +3140,58 @@ export const DEFAULT_REVERSE_HEALTH: ReverseHealthPolicy = {
   reconnect_backoff_cap_ms: 2000,
   tuning: DEFAULT_REVERSE_HEALTH_TUNING,
 };
+const U32_MAX = 4_294_967_295;
 export function reverseHealthError(p: ReverseHealthPolicy): string | null {
-  const t = p.tuning ?? DEFAULT_REVERSE_HEALTH_TUNING;
+  const t = p.tuning;
+  if (typeof p.disconnect_on_health_failure !== 'boolean') return '主动断开必须选择保留或主动断开';
   if (
     Object.entries(p).some(
-      ([k, v]) => k !== "tuning" && !Number.isInteger(v),
+      ([k, v]) => k !== 'tuning' && k !== 'disconnect_on_health_failure' && !Number.isInteger(v),
     ) ||
-    Object.keys(DEFAULT_REVERSE_HEALTH_TUNING).some(
-      (k) => !Number.isInteger(t[k as keyof ReverseHealthTuning]),
-    )
+    Object.keys(DEFAULT_REVERSE_HEALTH_TUNING).some(k => !Number.isInteger(t[k as keyof ReverseHealthTuning]))
   )
-    return "所有参数必须填写整数";
+    return '所有参数必须填写整数';
   if (
     t.probe_jitter_percent < 0 ||
-    t.probe_jitter_percent > 50 ||
+    t.probe_jitter_percent > 100 ||
     t.recovery_successes < 1 ||
-    t.recovery_successes > 8 ||
-    t.spare_workers < 1 ||
-    t.spare_workers > 8 ||
+    t.recovery_successes > U32_MAX ||
+    t.spare_workers < 0 ||
+    t.spare_workers > U32_MAX ||
     t.max_healthy_workers < 1 ||
-    t.max_healthy_workers > 32 ||
-    t.max_sessions_per_worker < 1 ||
-    t.max_sessions_per_worker > 256 ||
-    t.reconnect_backoff_base_ms < 50 ||
-    t.reconnect_backoff_base_ms > 30000 ||
-    t.reconnect_stable_reset_ms < 1000 ||
-    t.reconnect_stable_reset_ms > 300000 ||
-    t.canary_interval_ms < 100 ||
-    t.canary_interval_ms > 60000 ||
-    t.canary_timeout_ms < 50 ||
-    t.canary_timeout_ms > 30000 ||
-    t.canary_successes < 1 ||
-    t.canary_successes > 1000 ||
-    t.canary_stable_window_ms < 0 ||
-    t.canary_stable_window_ms > 300000 ||
-    t.canary_timeout_ms >= t.canary_interval_ms ||
+    t.max_healthy_workers > U32_MAX ||
+    t.max_sessions_per_worker < 0 ||
+    t.max_sessions_per_worker > 65535 ||
+    t.reconnect_backoff_base_ms < 1 ||
+    t.reconnect_backoff_base_ms > U32_MAX ||
+    t.reconnect_stable_reset_ms < 0 ||
+    t.reconnect_stable_reset_ms > U32_MAX ||
     t.max_healthy_workers < p.max_idle_ready_workers ||
     t.spare_workers > p.max_idle_ready_workers ||
     t.reconnect_backoff_base_ms > p.reconnect_backoff_cap_ms
   )
-    return "高级参数超出范围，或容量、退避、业务探测时间不一致";
+    return '高级参数超出有效范围，或容量、退避关系不一致';
   if (
-    p.probe_interval_ms < 100 ||
-    p.probe_interval_ms > 60000 ||
-    p.probe_timeout_ms < 50 ||
-    p.probe_timeout_ms > 10000 ||
+    p.probe_interval_ms < 1 ||
+    p.probe_interval_ms > U32_MAX ||
+    p.probe_timeout_ms < 1 ||
+    p.probe_timeout_ms > U32_MAX ||
     p.probe_timeout_ms >= p.probe_interval_ms ||
-    p.confirm_timeout_ms < 50 ||
-    p.confirm_timeout_ms > 10000 ||
-    p.health_lease_ms <
-      Math.floor((p.probe_interval_ms * (100 + t.probe_jitter_percent)) / 100) +
-        p.probe_timeout_ms ||
-    p.health_lease_ms > 120000 ||
+    p.confirm_timeout_ms < 1 ||
+    p.confirm_timeout_ms > U32_MAX ||
+    p.health_lease_ms < Math.floor((p.probe_interval_ms * (100 + t.probe_jitter_percent)) / 100) + p.probe_timeout_ms ||
+    p.health_lease_ms > U32_MAX ||
     p.min_healthy_workers < 1 ||
-    p.min_healthy_workers > 8 ||
+    p.min_healthy_workers > U32_MAX ||
     p.max_idle_ready_workers < p.min_healthy_workers ||
-    p.max_idle_ready_workers > 16 ||
+    p.max_idle_ready_workers > U32_MAX ||
     p.max_parallel_dials_per_pair < 1 ||
-    p.max_parallel_dials_per_pair > 8 ||
-    p.dial_ready_timeout_ms < 200 ||
-    p.dial_ready_timeout_ms > 30000 ||
-    p.reconnect_backoff_cap_ms < 250 ||
-    p.reconnect_backoff_cap_ms > 30000
+    p.max_parallel_dials_per_pair > U32_MAX ||
+    p.dial_ready_timeout_ms < 1 ||
+    p.dial_ready_timeout_ms > U32_MAX ||
+    p.reconnect_backoff_cap_ms < 1 ||
+    p.reconnect_backoff_cap_ms > U32_MAX
   )
-    return "参数超出范围，或超时、健康租约、备用连接数量不一致";
+    return '参数超出范围，或超时、健康租约、备用连接数量不一致';
   return null;
 }

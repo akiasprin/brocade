@@ -18,7 +18,6 @@ fn set_projection_host(snapshot: &mut ModelSnapshot, host: &str) {
         v4: Some(ProjectionEndpoint {
             host: host.to_owned(),
             port: 443,
-            download: None,
         }),
         v6: None,
     };
@@ -264,7 +263,6 @@ fn projection_candidate_switches_only_when_topology_contract_matches() {
         v4: Some(ProjectionEndpoint {
             host: "old.edge.example".to_owned(),
             port: 443,
-            download: None,
         }),
         v6: None,
     };
@@ -315,7 +313,6 @@ fn public_projection_change_activates_without_a_topology_change() {
         v4: Some(ProjectionEndpoint {
             host: "old.edge.example".to_owned(),
             port: 443,
-            download: None,
         }),
         v6: None,
     };
@@ -565,7 +562,7 @@ fn anytls_session_controls_advance_without_topology_release() {
 }
 
 #[test]
-fn anytls_session_checkpoint_distinguishes_legacy_values_from_explicit_defaults() {
+fn anytls_session_checkpoint_preserves_explicit_absence() {
     let topology = anytls_topology();
     let initial = SubscriptionClientConfig::from_snapshot(&topology);
     let mut desired = topology.clone();
@@ -580,25 +577,6 @@ fn anytls_session_checkpoint_distinguishes_legacy_values_from_explicit_defaults(
     assert_eq!(anytls.idle_session_check_interval_secs, None);
     assert_eq!(anytls.idle_session_timeout_secs, None);
     assert_eq!(anytls.min_idle_session, None);
-
-    let mut legacy = initial;
-    let projection = legacy
-        .ingresses
-        .values_mut()
-        .next()
-        .unwrap()
-        .projections
-        .values_mut()
-        .next()
-        .unwrap();
-    projection.anytls_idle_session_check_interval_secs = None;
-    projection.anytls_idle_session_timeout_secs = None;
-    projection.anytls_min_idle_session = None;
-    let composed = legacy.apply(topology).unwrap();
-    let anytls = composed.apps[0].ingresses[0].wires.anytls().unwrap();
-    assert_eq!(anytls.idle_session_check_interval_secs, Some(5));
-    assert_eq!(anytls.idle_session_timeout_secs, Some(10));
-    assert_eq!(anytls.min_idle_session, Some(1));
 }
 
 #[test]
@@ -633,7 +611,6 @@ fn projection_tombstone_disables_the_serving_projection_without_deleting_topolog
         v4: Some(ProjectionEndpoint {
             host: "old.edge.example".to_owned(),
             port: 443,
-            download: None,
         }),
         v6: None,
     };

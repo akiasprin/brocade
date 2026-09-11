@@ -1,5 +1,18 @@
 import type { BrandingSettings } from '../api';
 
+/** Keep the browser-tab icon in step with the saved site mark. */
+export function syncFavicon(iconDataUrl: string | null) {
+  let favicon = document.querySelector<HTMLLinkElement>('link#brocade-favicon');
+  if (!favicon) {
+    favicon = document.createElement('link');
+    favicon.id = 'brocade-favicon';
+    favicon.rel = 'icon';
+    favicon.dataset.defaultHref = '/favicon.svg';
+    document.head.append(favicon);
+  }
+  favicon.href = iconDataUrl ?? favicon.dataset.defaultHref ?? '/favicon.svg';
+}
+
 /** Custom raster mark when configured; otherwise the built-in woven Brocade mark. */
 export function BrandIcon({ branding, className = 'fg-logo' }: { branding: BrandingSettings; className?: string }) {
   if (branding.icon_data_url) {

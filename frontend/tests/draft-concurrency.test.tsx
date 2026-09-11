@@ -137,20 +137,6 @@ describe('cross-tab persistence', () => {
     notify();
     expect(a.ops()).toEqual([{ op: 'update_node', node_id: 'B', node: { name: 'later' } }]);
   });
-  it('migrates v2 once and keeps operators separate', () => {
-    localStorage.setItem(
-      'brocade-console:draft:v2:old',
-      JSON.stringify([
-        { key: 'node:A', label: 'A', op: { op: 'update_node', node_id: 'A', node: { name: 'legacy' } } },
-      ]),
-    );
-    const a = tab('old');
-    const b = tab('old');
-    expect(a.ops()).toEqual(b.ops());
-    a.clear();
-    expect(tab('old').ops()).toEqual([]);
-    expect(tab('another').ops()).toEqual([]);
-  });
 });
 
 describe('storage failures', () => {
@@ -193,6 +179,7 @@ describe('storage failures', () => {
 
 it('retries when a head is replaced between enumeration and reading', () => {
   const disk = new DraftStorage('concurrency', localStorage);
+  disk.write([], []);
   const old = disk.read()[0];
   const original = Storage.prototype.getItem;
   let replaced = false;

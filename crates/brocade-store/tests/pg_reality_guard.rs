@@ -63,7 +63,7 @@ async fn fallback_guard_round_trips() {
     .await
     .unwrap();
 
-    let face = |guard: Option<bool>| CreateIngressRequest {
+    let face = |guard: bool| CreateIngressRequest {
         wires: WiresRequest {
             vless_encryption: None,
             vless: Some(TransportRequest::VlessReality),
@@ -78,8 +78,8 @@ async fn fallback_guard_round_trips() {
         front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
-            fallback_mode: None,
-            fallback_limits: None,
+            fallback_mode: brocade_core::model::RealityFallbackMode::CustomSite,
+            fallback_limits: brocade_core::model::RealityFallbackLimits::Balanced,
             fallback_guard: guard,
             dest: Some("www.example.com:443".to_owned()),
             server_names: vec!["www.example.com".to_owned()],
@@ -91,22 +91,9 @@ async fn fallback_guard_round_trips() {
     };
     let admin = AdminContext::system_admin("test-system");
 
-    // Absent means on.
-    store
-        .upsert_ingress(&admin, "app-main", face(None))
-        .await
-        .unwrap();
-    let snapshot = store.materialize_snapshot(None).await.unwrap();
-    let stored = snapshot.apps[0].ingresses[0]
-        .wires
-        .reality()
-        .unwrap()
-        .clone();
-    assert!(stored.fallback_guard, "缺省应当是开");
-
     // Off survives the write and comes back off.
     store
-        .upsert_ingress(&admin, "app-main", face(Some(false)))
+        .upsert_ingress(&admin, "app-main", face(false))
         .await
         .unwrap();
     let snapshot = store.materialize_snapshot(None).await.unwrap();
@@ -119,7 +106,7 @@ async fn fallback_guard_round_trips() {
 
     // And back on again, so that the column is not merely stuck at whatever landed first.
     let echo = store
-        .upsert_ingress(&admin, "app-main", face(Some(true)))
+        .upsert_ingress(&admin, "app-main", face(true))
         .await
         .unwrap();
     // The echo is what the console reads back after a save, so the flag has to be in it — a UI

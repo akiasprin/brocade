@@ -32,6 +32,7 @@ import {
   serveCertificate,
   updateCertGroup,
   type CertsView,
+  type CertificateTrack,
   type BrandingSettings,
   type DistributionView,
   type AgentLogLimits,
@@ -50,6 +51,7 @@ import { ErrorBox, Loading } from '../ui/bits';
 import { BrandIcon } from '../ui/branding';
 import { PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
+import { SettingsParameterSummary } from '../ui/settings-parameter-summary';
 import { REALITY_FINGERPRINT_OPTIONS } from '../reality';
 
 /* 空串表示不设置该项（服务端类型为 Option<T>），不应将空串作为 "" 提交 */
@@ -85,8 +87,8 @@ type Form = {
   connBuffer: string;
   connHandshake: string;
   muxConcurrency: string;
-  muxMinIdle: string;
-  muxMaxIdle: string;
+  muxPrewarmWorkers: string;
+  muxReuseThreshold: string;
   muxMaxProbing: string;
   muxProbeInterval: string;
   muxProbeTimeout: string;
@@ -111,12 +113,12 @@ const numberField = (raw: string): number => (raw.trim() === '' ? Number.NaN : N
 function relayMuxOfForm(form: Form): HopMux {
   return {
     concurrency: numberField(form.muxConcurrency),
-    min_idle_workers: numberField(form.muxMinIdle),
-    max_idle_workers: numberField(form.muxMaxIdle),
+    prewarm_workers: numberField(form.muxPrewarmWorkers),
+    reuse_threshold: numberField(form.muxReuseThreshold),
     max_probing_workers: numberField(form.muxMaxProbing),
-    probe_interval_secs: numberField(form.muxProbeInterval),
+    probe_interval_ms: numberField(form.muxProbeInterval),
     probe_timeout_ms: numberField(form.muxProbeTimeout),
-    idle_ttl_secs: numberField(form.muxIdleTtl),
+    idle_ttl_ms: numberField(form.muxIdleTtl),
     max_requests_per_worker: numberField(form.muxMaxRequests),
   };
 }
@@ -156,10 +158,10 @@ const EMPTY: Form = {
   fp: '',
   flow: '',
   keepalive: '10',
-  mtu: '1420',
+  mtu: '1280',
   ingressBase: '13443',
   anytlsBase: '14443',
-  vlessEncryptionBase: '48000',
+  vlessEncryptionBase: '13800',
   hopBase: '20000',
   hy2Base: '30000',
   probeUrl: PROBE_URL_DEFAULT,
@@ -176,12 +178,12 @@ const EMPTY: Form = {
   connBuffer: '',
   connHandshake: '60',
   muxConcurrency: String(DEFAULT_HOP_MUX.concurrency),
-  muxMinIdle: String(DEFAULT_HOP_MUX.min_idle_workers),
-  muxMaxIdle: String(DEFAULT_HOP_MUX.max_idle_workers),
+  muxPrewarmWorkers: String(DEFAULT_HOP_MUX.prewarm_workers),
+  muxReuseThreshold: String(DEFAULT_HOP_MUX.reuse_threshold),
   muxMaxProbing: String(DEFAULT_HOP_MUX.max_probing_workers),
-  muxProbeInterval: String(DEFAULT_HOP_MUX.probe_interval_secs),
+  muxProbeInterval: String(DEFAULT_HOP_MUX.probe_interval_ms),
   muxProbeTimeout: String(DEFAULT_HOP_MUX.probe_timeout_ms),
-  muxIdleTtl: String(DEFAULT_HOP_MUX.idle_ttl_secs),
+  muxIdleTtl: String(DEFAULT_HOP_MUX.idle_ttl_ms),
   muxMaxRequests: String(DEFAULT_HOP_MUX.max_requests_per_worker),
   anyTlsPadding: ANYTLS_PADDING_DEFAULT,
   reverseHealth: JSON.stringify(DEFAULT_REVERSE_HEALTH),
@@ -202,10 +204,10 @@ function formOf(s: ModelSettings): Form {
     fp: text(s.reality_site?.fingerprint ?? null),
     flow: text(s.reality_site?.flow ?? null),
     keepalive: String(s.overlay?.keepalive_secs ?? 10),
-    mtu: String(s.overlay?.mtu ?? 1420),
+    mtu: String(s.overlay?.mtu ?? 1280),
     ingressBase: String(s.ports?.ingress_base ?? 13443),
     anytlsBase: String(s.ports?.anytls_base ?? 14443),
-    vlessEncryptionBase: String(s.ports?.vless_encryption_base ?? 48000),
+    vlessEncryptionBase: String(s.ports?.vless_encryption_base ?? 13800),
     hopBase: String(s.ports?.hop_base ?? 20000),
     hy2Base: String(s.ports?.hy2_base ?? 30000),
     probeUrl: s.probe?.endpoint_url ?? PROBE_URL_DEFAULT,
@@ -221,12 +223,12 @@ function formOf(s: ModelSettings): Form {
     connBuffer: s.connection?.buffer_size_kb == null ? '' : String(s.connection.buffer_size_kb),
     connHandshake: String(s.connection?.handshake_secs ?? 60),
     muxConcurrency: String(s.relay_mux?.concurrency ?? 1),
-    muxMinIdle: String(s.relay_mux?.min_idle_workers ?? 0),
-    muxMaxIdle: String(s.relay_mux?.max_idle_workers ?? 2),
+    muxPrewarmWorkers: String(s.relay_mux?.prewarm_workers ?? 0),
+    muxReuseThreshold: String(s.relay_mux?.reuse_threshold ?? 2),
     muxMaxProbing: String(s.relay_mux?.max_probing_workers ?? 1),
-    muxProbeInterval: String(s.relay_mux?.probe_interval_secs ?? 5),
+    muxProbeInterval: String(s.relay_mux?.probe_interval_ms ?? 5000),
     muxProbeTimeout: String(s.relay_mux?.probe_timeout_ms ?? 2000),
-    muxIdleTtl: String(s.relay_mux?.idle_ttl_secs ?? 24),
+    muxIdleTtl: String(s.relay_mux?.idle_ttl_ms ?? 24000),
     muxMaxRequests: String(s.relay_mux?.max_requests_per_worker ?? 128),
     anyTlsPadding: (s.anytls_padding_scheme ?? ANYTLS_PADDING_DEFAULT.split('\n')).join('\n'),
   };
@@ -247,8 +249,8 @@ const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
     'connBuffer',
     'connHandshake',
     'muxConcurrency',
-    'muxMinIdle',
-    'muxMaxIdle',
+    'muxPrewarmWorkers',
+    'muxReuseThreshold',
     'muxMaxProbing',
     'muxProbeInterval',
     'muxProbeTimeout',
@@ -401,35 +403,8 @@ function MtuProbe() {
   const data = probe.data;
   if (!data || data.links.length === 0) return <div className="note dim">还没有探测结果</div>;
 
-  // 生效值跟探测建议不相等不是问题，两个方向的意思完全相反：偏大是包大过路径能过的
-  // 尺寸，大包被中间某一跳悄悄打掉，这才要报；偏小只是没跑满、链路照常通，而全局默认
-  // 本来就是个保守兜底，没有义务等于任何一台探出来的数。从前这里拿 `!==` 一把抓，
-  // 于是「还有余量」也顶着一句金色的「对不上」，逼人去改一个本来就对的值。
-  const tooBig = data.nodes.filter(n => n.suggested_mtu != null && n.current_mtu > n.suggested_mtu);
-  const headroom = data.nodes.filter(n => n.suggested_mtu != null && n.current_mtu < n.suggested_mtu);
-  /* 建议值人人相同时就把数写进那句话里，省得为一个数点开表格。各台不同时只报台数。 */
-  const oneOf = (list: typeof data.nodes) => {
-    const set = new Set(list.map(n => n.suggested_mtu));
-    return set.size === 1 ? [...set][0] : null;
-  };
-  const tooBigTo = oneOf(tooBig);
-  const headroomTo = oneOf(headroom);
-
   return (
     <>
-      {tooBig.length > 0 && (
-        <span className="cost hot">
-          <b>{tooBig.length} 台</b>
-          {tooBigTo != null ? `的生效值大过探测建议 ${tooBigTo}，大包会被打掉` : '的生效值大过探测建议，大包会被打掉'}
-        </span>
-      )}
-      {tooBig.length === 0 && headroom.length > 0 && (
-        <span className="hint">
-          {headroom.length} 台还有余量
-          {headroomTo != null && `，最大能到 ${headroomTo}`}
-          ——不调也通，调了快一点
-        </span>
-      )}
       {/* SettingsPane 的只读态由 fieldset 保证；查看探测结果不修改配置，仍应可展开。
           使用非表单控件避免被 fieldset 一并禁用，并补齐键盘语义。 */}
       <span
@@ -643,9 +618,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
   const qc = useQueryClient();
   const certForm = (source: CertsView) => ({
     domain: source.domain?.domain ?? '',
-    signingMethod: source.domain?.signing_method ?? ('public-ca' as const),
     credential: '',
-    directory: source.domain?.signing_method === 'public-ca' ? source.domain.acme_directory : source.letsencrypt,
+    directory: source.domain?.acme_directory ?? source.letsencrypt,
     contact: source.domain?.acme_contact ?? '',
     renew: String(source.domain?.renew_before_days ?? 30),
   });
@@ -656,7 +630,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
     mutationFn: (submitted: typeof f) =>
       saveCertDomain({
         domain: submitted.domain.trim(),
-        signing_method: submitted.signingMethod,
+        signing_method: 'public-ca',
         dns_credential: submitted.credential.trim() || null,
         acme_directory: submitted.directory,
         acme_contact: submitted.contact.trim() || null,
@@ -676,79 +650,82 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
   });
 
   const d = view.domain;
-  const selfSigned = f.signingMethod === 'self-signed';
-  const storedDirectory = d?.signing_method === 'public-ca' ? d.acme_directory : view.letsencrypt;
+  const storedDirectory = d?.acme_directory ?? view.letsencrypt;
   const dirty =
-    (!selfSigned && f.domain.trim() !== (d?.domain ?? '')) ||
-    f.signingMethod !== (d?.signing_method ?? 'public-ca') ||
+    f.domain.trim() !== (d?.domain ?? '') ||
     f.credential.trim() !== '' ||
-    (!selfSigned && f.directory !== storedDirectory) ||
-    (!selfSigned && f.contact.trim() !== (d?.acme_contact ?? '')) ||
-    (!selfSigned && Number(f.renew) !== (d?.renew_before_days ?? 30));
+    f.directory !== storedDirectory ||
+    f.contact.trim() !== (d?.acme_contact ?? '') ||
+    Number(f.renew) !== (d?.renew_before_days ?? 30);
 
   const staging = f.directory === view.letsencrypt_staging;
-  // 折叠标题上的计数：看的是签发失败的证书张数，不是机器台数——一张证书失败会连累整组机器，
-  // 数机器会把同一个问题报成好几个。
-  const bad = view.groups.flatMap(group => group.certificates.filter(cert => cert.status === 'failed'));
-
+  const publicCaConfigured = d?.signing_method === 'public-ca';
   return (
     <section className="panel config-panel" id="set-cert">
       <header>
         <SettingsTitle id="set-cert">证书</SettingsTitle>
-        <span className="sub">申领设置与已签发证书分开管理</span>
       </header>
-      <p className="cardsub">新建证书组会立即申领证书。机器切换证书组需保存草稿、提交并发布，应用时重启 Xray。</p>
+      <p className="cardsub">
+        签发配置与证书组分开管理。新建证书组时选择证书类型；类型建成后固定。机器切换证书组需保存草稿、提交并发布，应用时重启
+        Xray。
+      </p>
       {save.error && <ErrorBox error={save.error} />}
       {scan.error && <ErrorBox error={scan.error} />}
 
-      <details className="setgrp settings-block cert-issuance-settings" open={!d}>
-        <summary>
-          <span className="eyebrow">新证书申领设置</span>
-          <span className="hint">
-            {d ? (d.signing_method === 'self-signed' ? '当前使用自签证书' : "当前使用 Let's Encrypt") : '请先配置'}
-            {dirty ? ' · 有未保存的修改' : ''}
-          </span>
-        </summary>
-        <p className="hint">用于后续新建、备用及续期申领；修改设置不会改写已签发的证书。新申领使用已保存的设置。</p>
+      <div className="setgrp settings-block cert-method-settings">
+        <p className="eyebrow">签发配置</p>
 
-        <div className="setfld">
-          <label>签发方式</label>
-          <div className="v">
-            <span
-              className={dirty && f.signingMethod !== (d?.signing_method ?? 'public-ca') ? 'segsw chg' : 'segsw'}
-              role="group"
-              aria-label="证书签发方式"
-            >
-              <button
-                type="button"
-                aria-pressed={!selfSigned}
-                onClick={() =>
-                  setForm({
-                    ...f,
-                    signingMethod: 'public-ca',
-                    directory: f.directory === 'self-signed' ? view.letsencrypt : f.directory,
-                  })
-                }
-              >
-                Let&apos;s Encrypt
-              </button>
-              <button
-                type="button"
-                aria-pressed={selfSigned}
-                onClick={() => setForm({ ...f, signingMethod: 'self-signed', credential: '' })}
-              >
-                自签证书
-              </button>
-            </span>
-            <span className="hint">
-              {selfSigned
-                ? '自动生成随机但逼真的专用 SNI，无需填写或持有域名。'
-                : "由 Let's Encrypt 验证域名并签发，客户端默认信任。"}
-            </span>
-          </div>
-        </div>
+        <details className="cert-method-config">
+          <summary className="cert-method-config-head">
+            <div>
+              <span className="cert-method-config-name">自签证书</span>
+              <span className="cert-origin">系统内置</span>
+            </div>
+            <span className="hint">已配置 · 固定 A/B 主备</span>
+          </summary>
+          <dl className="cert-config-facts" aria-label="自签证书配置概览">
+            <div>
+              <dt>运行槽</dt>
+              <dd>固定 A / B 两份</dd>
+            </div>
+            <div>
+              <dt>域名与验证</dt>
+              <dd>无需域名与 DNS 验证</dd>
+            </div>
+            <div>
+              <dt>公开信息</dt>
+              <dd>不进入 CT 公开日志</dd>
+            </div>
+          </dl>
+        </details>
 
-        {!selfSigned && (
+        <details className="cert-method-config">
+          <summary className="cert-method-config-head">
+            <div>
+              <span className="cert-method-config-name">Let&apos;s Encrypt</span>
+              <span className="cert-origin">Cloudflare DNS-01</span>
+            </div>
+            <span className={publicCaConfigured ? 'hint' : 'hint bad'}>
+              {publicCaConfigured ? '已配置' : '未配置'}
+              {dirty ? ' · 有未保存的修改' : ''}
+            </span>
+          </summary>
+
+          <dl className="cert-config-notes" aria-label="Let's Encrypt 配置说明">
+            <div>
+              <dt>运行槽</dt>
+              <dd>数量不限，权威证书无需预先固定</dd>
+            </div>
+            <div>
+              <dt>域名与验证</dt>
+              <dd>独立域名，通过 Cloudflare DNS-01 验证</dd>
+            </div>
+            <div>
+              <dt>公开信息</dt>
+              <dd>证书名称会进入 CT 公开日志</dd>
+            </div>
+          </dl>
+
           <div className="setfld">
             <label>证书域名</label>
             <div className="v">
@@ -761,66 +738,57 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
               />
             </div>
           </div>
-        )}
 
-        {!selfSigned && (
-          <>
-            <div className="setfld">
-              <label>Cloudflare Token</label>
-              <div className="v">
-                <input
-                  className={f.credential ? 'f chg' : 'f'}
-                  style={{ width: 430 }}
-                  type="password"
-                  placeholder={d?.has_credential ? '已配置（重填才会覆盖）' : 'Zone:Read + DNS:Edit'}
-                  value={f.credential}
-                  onChange={e => setForm({ ...f, credential: e.target.value })}
-                />
-                {d?.has_credential && !f.credential && <span className="hint">已配置，不可读出</span>}
-              </div>
+          <div className="setfld">
+            <label>Cloudflare Token</label>
+            <div className="v">
+              <input
+                className={f.credential ? 'f chg' : 'f'}
+                style={{ width: 430 }}
+                type="password"
+                placeholder={d?.has_credential ? '已配置（重填才会覆盖）' : 'Zone:Read + DNS:Edit'}
+                value={f.credential}
+                onChange={e => setForm({ ...f, credential: e.target.value })}
+              />
+              {d?.has_credential && !f.credential && <span className="hint">已配置，不可读出</span>}
             </div>
+          </div>
 
-            <div className="setfld">
-              <label>签发环境</label>
-              <div className="v">
-                <span
-                  className={dirty && f.directory !== (d?.acme_directory ?? view.letsencrypt) ? 'segsw chg' : 'segsw'}
-                  role="group"
+          <div className="setfld">
+            <label>签发环境</label>
+            <div className="v">
+              <span className={dirty && f.directory !== storedDirectory ? 'segsw chg' : 'segsw'} role="group">
+                <button
+                  type="button"
+                  aria-pressed={!staging}
+                  onClick={() => setForm({ ...f, directory: view.letsencrypt })}
                 >
-                  <button
-                    type="button"
-                    aria-pressed={!staging}
-                    onClick={() => setForm({ ...f, directory: view.letsencrypt })}
-                  >
-                    正式
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={staging}
-                    onClick={() => setForm({ ...f, directory: view.letsencrypt_staging })}
-                  >
-                    staging
-                  </button>
-                </span>
-              </div>
+                  正式
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={staging}
+                  onClick={() => setForm({ ...f, directory: view.letsencrypt_staging })}
+                >
+                  staging
+                </button>
+              </span>
             </div>
+          </div>
 
-            <div className="setfld">
-              <label>联系邮箱</label>
-              <div className="v">
-                <input
-                  className={dirty && f.contact.trim() !== (d?.acme_contact ?? '') ? 'f chg' : 'f'}
-                  style={{ width: 280 }}
-                  placeholder="选填"
-                  value={f.contact}
-                  onChange={e => setForm({ ...f, contact: e.target.value })}
-                />
-              </div>
+          <div className="setfld">
+            <label>联系邮箱</label>
+            <div className="v">
+              <input
+                className={dirty && f.contact.trim() !== (d?.acme_contact ?? '') ? 'f chg' : 'f'}
+                style={{ width: 280 }}
+                placeholder="选填"
+                value={f.contact}
+                onChange={e => setForm({ ...f, contact: e.target.value })}
+              />
             </div>
-          </>
-        )}
+          </div>
 
-        {!selfSigned && (
           <div className="setfld">
             <label>提前续期</label>
             <div className="v">
@@ -833,71 +801,39 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
               <span className="unit">天</span>
             </div>
           </div>
-        )}
 
-        {selfSigned ? (
-          <div className="guard">
-            默认自签证书组首次初始化一对主备证书，单张有效期 100 年。自动名称使用随机生成的 <b>.com</b>
-            域名，不再拼接二级域名或通配符；私钥加密保存。
-          </div>
-        ) : (
-          <>
-            <div className="guard">
-              使用<b>单独的域名</b>。Cloudflare token 按 zone 授权，无法限制到子域，域名分开可防止凭据泄露波及控制面。
-            </div>
-            <div className="guard">
-              每组运行时只安装一张当前证书，数据库最多保留一张待启用备用。Let&apos;s Encrypt
-              <b> 同一组名字每 7 天最多签发 5 张</b>，避免无意义消耗额度。
-            </div>
-            <div className="guard">
-              证书会进入 CT 公开日志，随机标签防猜测但不防枚举。DNS-01 <b>不需要 A 记录</b>，名字与 IP
-              的对应关系不公开。
-            </div>
-          </>
-        )}
-        <SettingsSaveBar
-          dirty={dirty}
-          saving={save.isPending}
-          savedText={saved ? '已保存，后续申领使用此设置' : null}
-          editable={editable}
-          disabled={!view.sealing_available}
-          title={view.sealing_available ? '' : '这台控制面没配 BROCADE_SECRET_KEY，存不了凭据'}
-          label="保存申领设置"
-          onSave={() => save.mutate(f)}
-        />
-      </details>
+          <SettingsSaveBar
+            dirty={dirty}
+            saving={save.isPending}
+            savedText={saved ? '已保存，此配置可供新证书组使用' : null}
+            editable={editable}
+            disabled={!view.sealing_available}
+            title={view.sealing_available ? '' : '这台控制面没配 BROCADE_SECRET_KEY，存不了凭据'}
+            label="保存配置"
+            onSave={() => save.mutate(f)}
+          />
+        </details>
+      </div>
 
-      {d && (
-        <div className="setgrp settings-block">
-          <p className="eyebrow">
-            证书状态
-            {bad.length > 0 && <b style={{ color: 'var(--err)' }}> · {bad.length} 张要处理</b>}
-          </p>
-          <div className="setfld">
-            <label />
-            <div className="v">
-              <button className="btn" disabled={!editable || scan.isPending} onClick={() => scan.mutate()}>
-                {scan.isPending ? '正在签发与续期…' : '立即签发与续期'}
-              </button>
-              <span className="hint">立即处理待签发、失败和需要续期的证书；正常证书不会重新签发。</span>
-            </div>
-          </div>
-
-          {scan.data?.processing && !scan.isPending && (
-            <p role="status" className={scan.data.processing.failed ? 'note bad' : 'hint'}>
-              {issuanceResultText(scan.data.processing)}
-            </p>
-          )}
-          <CertGroups view={view} editable={editable && !scan.isPending} />
-
-          <div className="guard">
-            续期失败<b>不等于没有证书</b>，在用的到期前仍可用。风险是长期未处理导致过期后整组停服。
-          </div>
-          <div className="guard">
-            公有证书组内续期不改 SNI；自签证书会先进入备用槽，预装确认后才允许启用新的 SNI 与校验值。
+      <div className="setgrp settings-block">
+        <p className="eyebrow">证书状态</p>
+        <div className="setfld">
+          <label />
+          <div className="v">
+            <button className="btn" disabled={!editable || scan.isPending} onClick={() => scan.mutate()}>
+              {scan.isPending ? '正在签发与续期…' : '立即签发与续期'}
+            </button>
+            <span className="hint">只处理待签发、失败和即将到期的证书</span>
           </div>
         </div>
-      )}
+
+        {scan.data?.processing && !scan.isPending && (
+          <p role="status" className={scan.data.processing.failed ? 'note bad' : 'hint'}>
+            {issuanceResultText(scan.data.processing)}
+          </p>
+        )}
+        <CertGroups view={view} editable={editable && !scan.isPending} />
+      </div>
     </section>
   );
 }
@@ -907,19 +843,20 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
 function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) {
   const qc = useQueryClient();
   const reload = () => qc.invalidateQueries({ queryKey: ['certs'] });
-  const selfSigned = view.domain?.signing_method === 'self-signed';
-  const [creating, setCreating] = useState<{ name: string; note: string; certificateName: string } | null>(null);
-  const [editing, setEditing] = useState<{
-    id: string;
-    name: string;
-    note: string;
-    certificateName: string;
-  } | null>(null);
+  const publicCaConfigured = view.domain?.signing_method === 'public-ca';
+  const emptyGroup = (): CertificateGroupFormValue => ({
+    name: '',
+    note: '',
+    certificateName: '',
+    signingMethod: null,
+  });
+  const [creating, setCreating] = useState<CertificateGroupFormValue | null>(null);
+  const [editing, setEditing] = useState<(CertificateGroupFormValue & { id: string }) | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [pending, setPending] = useState<string | null>(null);
   const [resultText, setResultText] = useState<string | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
-  // Unlike the section saves, these older actions are plain promises rather than useMutation.
+  // Unlike the section saves, these actions are plain promises rather than useMutation.
   // Keep a synchronous lock as well as disabled buttons: two click events can be delivered before
   // React commits the pending render, and asking for one spare must never create two rows.
   const pendingRef = useRef(false);
@@ -976,7 +913,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
           <GroupForm
             value={creating}
             creating
-            showCertificateName={selfSigned}
+            publicCaConfigured={publicCaConfigured}
             busy={pending !== null}
             onChange={setCreating}
             onCancel={() => setCreating(null)}
@@ -986,6 +923,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                 () =>
                   createCertGroup({
                     name: creating.name,
+                    signing_method: creating.signingMethod!,
                     note: creating.note || null,
                     certificate_name: creating.certificateName.trim() || null,
                   }),
@@ -1000,7 +938,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               <button
                 className="btn"
                 disabled={!editable || pending !== null}
-                onClick={() => setCreating({ name: '', note: '', certificateName: '' })}
+                onClick={() => setCreating(emptyGroup())}
               >
                 新建证书组
               </button>
@@ -1030,7 +968,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
             className="btn"
             aria-label="新建证书组"
             disabled={!editable || !!creating || pending !== null}
-            onClick={() => setCreating({ name: '', note: '', certificateName: '' })}
+            onClick={() => setCreating(emptyGroup())}
           >
             ＋ 新建证书组
           </button>
@@ -1040,7 +978,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
         <GroupForm
           value={creating}
           creating
-          showCertificateName={selfSigned}
+          publicCaConfigured={publicCaConfigured}
           busy={pending !== null}
           onChange={setCreating}
           onCancel={() => setCreating(null)}
@@ -1050,6 +988,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               () =>
                 createCertGroup({
                   name: creating.name,
+                  signing_method: creating.signingMethod!,
                   note: creating.note || null,
                   certificate_name: creating.certificateName.trim() || null,
                 }),
@@ -1068,18 +1007,16 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       {view.groups.map(group => {
         const expanded = expandedGroups.has(group.id);
         const members = view.nodes.filter(row => row.label_id === group.id);
-        const groupSelfSigned = group.signing_method === 'self-signed';
+        const servingMethod = group.certificates.find(cert => cert.status === 'serving')?.signing_method;
+        const displayedMethod = servingMethod ?? group.signing_method;
+        const groupSelfSigned = displayedMethod === 'self-signed';
+        const methodMismatch = servingMethod !== undefined && servingMethod !== group.signing_method;
         const failedCount = group.certificates.filter(cert => cert.status === 'failed').length;
         const pendingCount = group.certificates.filter(cert => cert.status === 'pending').length;
         const xrayPinsActive = group.certificates.some(
           cert => retainedCertificate(cert) && cert.signing_method === 'self-signed',
         );
-        const configuredMethod = group.signing_method;
-        const standbyBusy = group.certificates.some(
-          cert =>
-            cert.signing_method === configuredMethod &&
-            ['pending', 'ready', 'compatible', 'failed'].includes(cert.status),
-        );
+        const configuredMethod = displayedMethod;
         const preloadPending = members.some(row => row.on_disk !== 'current');
         const runtimeSlots = groupSelfSigned
           ? group.certificates.filter(cert => cert.signing_method === configuredMethod && cert.runtime_slot !== null)
@@ -1087,7 +1024,13 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
           : 0;
         return (
           <article className={`certgrp${expanded ? ' expanded' : ''}`} key={group.id}>
-            <header className="certgrp-hd">
+            <header
+              className="certgrp-hd"
+              onClick={event => {
+                if ((event.target as HTMLElement).closest('button')) return;
+                toggleGroup(group.id);
+              }}
+            >
               <button
                 type="button"
                 className="certgrp-identity certgrp-toggle"
@@ -1103,12 +1046,12 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                     <b>{group.name}</b>
                     {group.is_default && <span className="certgrp-default">默认</span>}
                     <span className="cert-origin">{groupSelfSigned ? '自签证书' : "Let's Encrypt"}</span>
+                    {methodMismatch && <span className="cstate err">组配置类型异常</span>}
                     {failedCount > 0 && <span className="cstate err">{failedCount} 张签发失败</span>}
                     {pendingCount > 0 && <span className="cstate idle">{pendingCount} 张待签发</span>}
                   </div>
                   {group.note && <span className="certgrp-note">{group.note}</span>}
                 </div>
-                <span className="certgrp-disclosure" aria-hidden="true" />
               </button>
               <span className="ctl">
                 <button
@@ -1123,6 +1066,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                       name: group.name,
                       note: group.note ?? '',
                       certificateName: '',
+                      signingMethod: displayedMethod,
                     });
                   }}
                 >
@@ -1132,17 +1076,11 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   <button
                     type="button"
                     className="btn sm"
-                    disabled={!editable || pending !== null || standbyBusy}
-                    title={
-                      standbyBusy
-                        ? groupSelfSigned
-                          ? '主备槽已经占满，请先停止并清理旧保留证书'
-                          : '已有待处理的备用证书，请先启用或清理'
-                        : '多签一张待命证书，由你决定何时启用'
-                    }
+                    disabled={!editable || pending !== null}
+                    title="再签一张同名证书；可保留多张，由你决定启用或删除"
                     onClick={() => run(`spare:${group.id}`, () => requestSpareCertificate(group.id))}
                   >
-                    {pending === `spare:${group.id}` ? '正在申领…' : '立即申领备用证书'}
+                    {pending === `spare:${group.id}` ? '正在申领…' : '＋ 增加证书'}
                   </button>
                 )}
                 <button
@@ -1176,12 +1114,12 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                 {groupSelfSigned ? (
                   <div>
                     <dt>运行槽</dt>
-                    <dd>{runtimeSlots}/2</dd>
+                    <dd>{runtimeSlots}/2 · 固定主备</dd>
                   </div>
                 ) : (
                   <div>
-                    <dt>运行方式</dt>
-                    <dd>单一当前证书</dd>
+                    <dt>证书数量</dt>
+                    <dd>{group.certificates.length} 张 · 任选一张在用</dd>
                   </div>
                 )}
                 <div>
@@ -1285,7 +1223,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                                       : '启用'}
                                 </button>
                               )}
-                              {cert.status !== 'serving' && (
+                              {cert.status !== 'serving' && !groupSelfSigned && (
                                 <button
                                   type="button"
                                   className="btn sm danger"
@@ -1313,7 +1251,10 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                           <dl className="cert-record-facts">
                             <div className="wide primary">
                               <dt>SNI / 证书名称</dt>
-                              <dd className="mono">{cert.certificate_name ?? '等待签发'}</dd>
+                              <dd className="mono">
+                                {cert.certificate_name ??
+                                  (group.names.length > 0 ? group.names.join(' · ') : '等待签发')}
+                              </dd>
                             </div>
                             {cert.signing_method === 'self-signed' && (
                               <div>
@@ -1384,26 +1325,69 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
   );
 }
 
-/** 建组和改组用同一个表单：两者要填的东西相同，分开写会让它们慢慢长得不一样。 */
+/** 建组和改组共用名称与备注；申领类型只在建组时选择，建成后不跨信任轨修改。 */
+type CertificateGroupFormValue = {
+  name: string;
+  note: string;
+  certificateName: string;
+  signingMethod: CertificateTrack | null;
+};
+
 function GroupForm({
   creating = false,
   value,
   busy,
-  showCertificateName = false,
+  publicCaConfigured = false,
   onChange,
   onCancel,
   onSave,
 }: {
   creating?: boolean;
-  value: { name: string; note: string; certificateName: string };
+  value: CertificateGroupFormValue;
   busy: boolean;
-  showCertificateName?: boolean;
-  onChange: (next: { name: string; note: string; certificateName: string }) => void;
+  publicCaConfigured?: boolean;
+  onChange: (next: CertificateGroupFormValue) => void;
   onCancel: () => void;
   onSave: () => void;
 }) {
+  const methodMissing = creating && value.signingMethod === null;
+  const publicCaUnavailable = creating && value.signingMethod === 'public-ca' && !publicCaConfigured;
   return (
     <div className="cert-group-form">
+      {creating && (
+        <div className="cert-group-method">
+          <span>证书类型</span>
+          <div className="v">
+            <span className="segsw" role="group" aria-label="证书组类型">
+              <button
+                type="button"
+                aria-pressed={value.signingMethod === 'self-signed'}
+                disabled={busy}
+                onClick={() => onChange({ ...value, signingMethod: 'self-signed' })}
+              >
+                自签证书
+              </button>
+              <button
+                type="button"
+                aria-pressed={value.signingMethod === 'public-ca'}
+                disabled={busy}
+                onClick={() => onChange({ ...value, signingMethod: 'public-ca' })}
+              >
+                Let&apos;s Encrypt + Cloudflare DNS
+              </button>
+            </span>
+            <span className={publicCaUnavailable ? 'hint bad' : 'hint'}>
+              {value.signingMethod === null
+                ? '请选择这个证书组的类型。'
+                : value.signingMethod === 'self-signed'
+                  ? '系统立即生成固定 A/B 主备两份；不能增加第三份。'
+                  : publicCaConfigured
+                    ? '使用上方已保存的 Let’s Encrypt + Cloudflare DNS 配置；组内可以继续增加多份证书。'
+                    : '这项配置尚未完成，请先保存上方的证书域名与 Cloudflare Token。'}
+            </span>
+          </div>
+        </div>
+      )}
       <div className="cert-group-form-fields">
         <label>
           <span>组名</span>
@@ -1425,28 +1409,26 @@ function GroupForm({
             onChange={e => onChange({ ...value, note: e.target.value })}
           />
         </label>
-        {showCertificateName && (
-          <label>
-            <span>证书名称</span>
-            <input
-              className="f mono"
-              placeholder="选填；留空自动生成"
-              value={value.certificateName ?? ''}
-              disabled={busy}
-              onChange={e => onChange({ ...value, certificateName: e.target.value })}
-              title="仅手动新建时可指定；留空会生成随机的 .com 名称"
-            />
-          </label>
-        )}
       </div>
       <div className="cert-group-form-actions">
         <span className="hint">
-          {creating ? '使用已保存的申领设置，创建后立即签发并显示结果。' : '保存后立即更新组信息'}
+          {creating
+            ? value.signingMethod === null
+              ? '选择证书类型后才能创建。'
+              : value.signingMethod === 'self-signed'
+                ? '创建后立即生成并签发固定主备两份。'
+                : '创建后立即申领第一份证书，之后可按需继续增加。'
+            : '保存后立即更新组信息'}
         </span>
         <button type="button" className="btn" disabled={busy} onClick={onCancel}>
           取消
         </button>
-        <button type="button" className="btn primary" disabled={busy || !value.name.trim()} onClick={onSave}>
+        <button
+          type="button"
+          className="btn primary"
+          disabled={busy || !value.name.trim() || methodMissing || publicCaUnavailable}
+          onClick={onSave}
+        >
           {busy ? (creating ? '正在创建并申领…' : '保存中…') : creating ? '创建并立即申领' : '保存'}
         </button>
       </div>
@@ -1504,7 +1486,7 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
         <SettingsTitle id="set-branding">站点外观</SettingsTitle>
         <ApplyBadge id="set-branding" />
       </header>
-      <p className="cardsub">控制台左上角使用这里的名称和图标；名称也同步到登录页和浏览器标题</p>
+      <p className="cardsub">控制台左上角使用这里的名称和图标；它们也同步到登录页和浏览器标签页</p>
       {save.error && <ErrorBox error={save.error} />}
       {fileError && <div className="callout err">{fileError}</div>}
       <Group label="品牌标识">
@@ -1571,7 +1553,6 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
         <SettingsTitle id="set-visitor">访客模式</SettingsTitle>
         <ApplyBadge id="set-visitor" />
         <span className="sp" />
-        <b>{enabled ? '已开启' : '已关闭'}</b>
       </header>
       <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客</p>
       {update.error && <ErrorBox error={update.error} />}
@@ -1773,7 +1754,7 @@ export function NodeLogPolicyRow({
           <b>{node.name}</b>
         </div>
         <span className={overrideCount === 0 ? 'st' : 'st st-warn'}>
-          {overrideCount === 0 ? '全部继承' : `${overrideCount} 项覆盖`}
+          {overrideCount === 0 ? '与全局一致' : `${overrideCount} 项覆盖`}
         </span>
       </div>
       <div className="agent-log-node-limits">
@@ -1819,7 +1800,7 @@ export function NodeLogPolicyRow({
             disabled={!editable || mutation.isPending}
             onClick={() => mutation.mutate(clear)}
           >
-            {mutation.isPending ? '清除中…' : '全部继承'}
+            {mutation.isPending ? '清除中…' : '与全局一致'}
           </button>
         )}
       </div>
@@ -1861,10 +1842,6 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
           {AGENT_LOG_CLASSES.map(item => (
             <div className="agent-log-scope-row" key={item.key}>
               <span className="agent-log-scope-kind">{item.kind}</span>
-              <span className="agent-log-scope-name">
-                <b>{item.name}</b>
-                <code>{item.file}</code>
-              </span>
               <label className="agent-log-scope-limit">
                 <input
                   className={limits && limits[item.key] !== data.global[item.key] ? 'f chg' : 'f'}
@@ -2002,46 +1979,47 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
       </header>
       <p className="cardsub">统一配置巡检节奏与目标；TCP Connect 和 ICMP Echo 共用一张目标清单</p>
       {save.error && <ErrorBox error={save.error} />}
-      <div className="ping-probe-schedule" aria-label="Ping 探测调度">
-        <label className="ping-probe-timing">
-          <span>巡检周期</span>
-          <div>
-            <input
-              className="f"
-              aria-label="探测间隔"
-              type="number"
-              min={5}
-              max={86_400}
-              value={form.interval_secs}
-              onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
-            />
-            <b>秒</b>
-          </div>
-          <small>默认 60；每轮每个目标各探测一次</small>
-        </label>
-        <label className="ping-probe-timing">
-          <span>单次超时</span>
-          <div>
-            <input
-              className="f"
-              aria-label="探测超时"
-              type="number"
-              min={1}
-              max={120_000}
-              value={form.timeout_ms}
-              onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
-            />
-            <b>ms</b>
-          </div>
-          <small>默认 420；超过后记为无响应</small>
-        </label>
+      <div className="setgrp settings-block ping-probe-schedule" aria-label="Ping 探测调度">
+        <p className="eyebrow">探测节奏</p>
+        <div className="ping-probe-schedule-grid">
+          <label className="ping-probe-timing">
+            <span>巡检周期</span>
+            <div>
+              <input
+                className="f"
+                aria-label="探测间隔"
+                type="number"
+                min={5}
+                max={86_400}
+                value={form.interval_secs}
+                onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
+              />
+              <b>秒</b>
+            </div>
+            <small>默认 60；每轮每个目标各探测一次</small>
+          </label>
+          <label className="ping-probe-timing">
+            <span>单次超时</span>
+            <div>
+              <input
+                className="f"
+                aria-label="探测超时"
+                type="number"
+                min={1}
+                max={120_000}
+                value={form.timeout_ms}
+                onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
+              />
+              <b>ms</b>
+            </div>
+            <small>默认 420；超过后记为无响应</small>
+          </label>
+        </div>
       </div>
-      <section className="ping-probe-target-section">
-        <header className="ping-probe-target-head">
-          <div>
-            <b>探测目标</b>
-            <span>{form.targets.length}/32</span>
-          </div>
+      <section className="setgrp settings-block ping-probe-target-section">
+        <p className="eyebrow">探测目标</p>
+        <div className="ping-probe-target-toolbar">
+          <span className="hint">已配置 {form.targets.length}/32</span>
           <div className="ping-probe-add">
             {(['tcp', 'icmp'] as const).map(protocol => (
               <button
@@ -2060,11 +2038,11 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
               </button>
             ))}
           </div>
-        </header>
+        </div>
         <div className="ping-probe-targets">
           {form.targets.map((target, index) => (
             <div className="ping-probe-target" key={index}>
-              <span className={`ping-probe-kind ${target.address.startsWith('icmp://') ? 'icmp' : 'tcp'}`}>
+              <span className="ping-probe-kind">
                 {target.address.startsWith('icmp://') ? 'ICMP' : target.address.startsWith('tcp://') ? 'TCP' : '—'}
               </span>
               <label>
@@ -2256,7 +2234,7 @@ export function SettingsPane() {
         },
         overlay: {
           keepalive_secs: Number(v('keepalive')) || 10,
-          mtu: Number(v('mtu')) || 1420,
+          mtu: Number(v('mtu')) || 1280,
           // 链路禁用由机器页的独立草稿操作维护；保存全局 WG 数值时必须原样带回。
           disabled_links: settings.data?.overlay.disabled_links ?? [],
         },
@@ -2288,12 +2266,12 @@ export function SettingsPane() {
         reverse_health_overrides: JSON.parse(v('reverseOverrides')) as ReverseHealthOverride[],
         relay_mux: {
           concurrency: numOr(v('muxConcurrency'), 1),
-          min_idle_workers: numOr(v('muxMinIdle'), 0),
-          max_idle_workers: numOr(v('muxMaxIdle'), 2),
+          prewarm_workers: numOr(v('muxPrewarmWorkers'), 0),
+          reuse_threshold: numOr(v('muxReuseThreshold'), 2),
           max_probing_workers: numOr(v('muxMaxProbing'), 1),
-          probe_interval_secs: numOr(v('muxProbeInterval'), 5),
+          probe_interval_ms: numOr(v('muxProbeInterval'), 5000),
           probe_timeout_ms: numOr(v('muxProbeTimeout'), 2000),
-          idle_ttl_secs: numOr(v('muxIdleTtl'), 24),
+          idle_ttl_ms: numOr(v('muxIdleTtl'), 24000),
           max_requests_per_worker: numOr(v('muxMaxRequests'), 128),
         },
         // 该项没有对应的表单字段——统计得出的在线数尚无展示位置，提供一个无法看到效果的
@@ -2348,6 +2326,7 @@ export function SettingsPane() {
   const relayMuxError = hopMuxError(relayMuxOfForm(form));
   const reversePolicy = JSON.parse(form.reverseHealth) as ReverseHealthPolicy;
   const reverseOverrides = JSON.parse(form.reverseOverrides) as ReverseHealthOverride[];
+  const reversePolicyError = reversePoliciesError(reversePolicy, reverseOverrides);
 
   return (
     <div className="cardpage">
@@ -2497,7 +2476,7 @@ export function SettingsPane() {
               name="连接策略"
               sub="连接资源、中继 Mux 与反向隧道的探测、恢复策略"
               {...secProps('connection')}
-              validationError={relayMuxError ?? reversePoliciesError(reversePolicy, reverseOverrides)}
+              validationError={relayMuxError ?? reversePolicyError}
             >
               <Group label="连接资源">
                 <Fld label="空闲多久回收（秒）">
@@ -2568,126 +2547,140 @@ export function SettingsPane() {
                   保存后需发布，<b>agent 应用时会重启 XRAY</b>，现有连接断开。
                 </div>
               </Group>
-              <Group label="中继 Mux" className="relay-mux-settings">
-                <div className="relay-mux-summary">
-                  <span>
-                    复用流 {form.muxConcurrency} · 空闲 {form.muxMinIdle}–{form.muxMaxIdle} · 探测{' '}
-                    {form.muxProbeInterval}s/{form.muxProbeTimeout}ms · 寿命 {form.muxIdleTtl}s
-                  </span>
-                  {editable ? (
-                    <button type="button" className="btn sm" onClick={() => setMuxExpanded(open => !open)}>
-                      {muxExpanded ? '收起' : '配置'}
-                    </button>
-                  ) : (
-                    <span
-                      className="btn sm"
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => setMuxExpanded(open => !open)}
-                      onKeyDown={event => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault();
-                          setMuxExpanded(open => !open);
-                        }
-                      }}
-                    >
-                      {muxExpanded ? '收起' : '查看'}
-                    </span>
-                  )}
-                </div>
+              <Group label="中继 Mux" className="relay-mux-settings settings-field-grid-container">
+                <SettingsParameterSummary
+                  label="中继 Mux"
+                  metrics={[
+                    { label: '复用流', value: form.muxConcurrency },
+                    { label: '预热目标', value: form.muxPrewarmWorkers },
+                    { label: '复用阈值', value: form.muxReuseThreshold },
+                    { label: '探活', value: `${form.muxProbeInterval} / ${form.muxProbeTimeout} ms` },
+                    { label: '寿命', value: `${form.muxIdleTtl} ms` },
+                  ]}
+                  expanded={muxExpanded}
+                  editable={editable}
+                  controls="relay-mux-parameters"
+                  onToggle={() => setMuxExpanded(open => !open)}
+                />
                 {relayMuxError && <p className="note settings-validation-error">{relayMuxError}</p>}
                 {muxExpanded && (
-                  <div className="relay-mux-fields">
-                    <Fld label="复用流数量">
-                      <input
-                        className={chg('muxConcurrency')}
-                        type="number"
-                        min={1}
-                        max={128}
-                        value={form.muxConcurrency}
-                        onChange={e => setForm({ ...form, muxConcurrency: e.target.value })}
-                      />
-                    </Fld>
-                    <Fld label="空闲连接">
-                      <span className="field-pair">
-                        <span className="unit">最少</span>
-                        <input
-                          className={chg('muxMinIdle')}
-                          type="number"
-                          min={0}
-                          value={form.muxMinIdle}
-                          onChange={e => setForm({ ...form, muxMinIdle: e.target.value })}
-                        />
-                        <span className="unit">最多</span>
-                        <input
-                          className={chg('muxMaxIdle')}
-                          type="number"
-                          min={1}
-                          value={form.muxMaxIdle}
-                          onChange={e => setForm({ ...form, muxMaxIdle: e.target.value })}
-                        />
-                      </span>
-                    </Fld>
-                    <Fld label="同时探测">
-                      <input
-                        className={chg('muxMaxProbing')}
-                        type="number"
-                        min={1}
-                        max={Number(form.muxMaxIdle) || undefined}
-                        value={form.muxMaxProbing}
-                        onChange={e => setForm({ ...form, muxMaxProbing: e.target.value })}
-                      />
-                    </Fld>
-                    <Fld label="探测周期">
-                      <input
-                        className={chg('muxProbeInterval')}
-                        type="number"
-                        min={2}
-                        max={60}
-                        value={form.muxProbeInterval}
-                        onChange={e => setForm({ ...form, muxProbeInterval: e.target.value })}
-                      />
-                      <span className="unit">秒</span>
-                    </Fld>
-                    <Fld label="单次超时">
-                      <input
-                        className={chg('muxProbeTimeout')}
-                        type="number"
-                        min={200}
-                        max={10000}
-                        value={form.muxProbeTimeout}
-                        onChange={e => setForm({ ...form, muxProbeTimeout: e.target.value })}
-                      />
-                      <span className="unit">毫秒</span>
-                    </Fld>
-                    <Fld label="空闲寿命">
-                      <input
-                        className={chg('muxIdleTtl')}
-                        type="number"
-                        min={1}
-                        value={form.muxIdleTtl}
-                        onChange={e => setForm({ ...form, muxIdleTtl: e.target.value })}
-                      />
-                      <span className="unit">秒</span>
-                    </Fld>
-                    <Fld label="累计子连接">
-                      <input
-                        className={chg('muxMaxRequests')}
-                        type="number"
-                        min={1}
-                        max={65535}
-                        value={form.muxMaxRequests}
-                        onChange={e => setForm({ ...form, muxMaxRequests: e.target.value })}
-                      />
-                    </Fld>
-                    <div className="guard">探测中的连接不会承接新流；没有可用连接时会立即新建，不等待探测超时。</div>
+                  <div className="settings-parameter-content" id="relay-mux-parameters">
+                    <div className="settings-parameter-group">
+                      <p className="eyebrow">复用容量</p>
+                      <div className="settings-parameter-grid">
+                        <Fld label="复用流数量">
+                          <input
+                            className={chg('muxConcurrency')}
+                            type="number"
+                            min={1}
+                            max={128}
+                            value={form.muxConcurrency}
+                            onChange={e => setForm({ ...form, muxConcurrency: e.target.value })}
+                          />
+                        </Fld>
+                        <Fld label="累计子连接">
+                          <input
+                            className={chg('muxMaxRequests')}
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={form.muxMaxRequests}
+                            onChange={e => setForm({ ...form, muxMaxRequests: e.target.value })}
+                          />
+                        </Fld>
+                      </div>
+                    </div>
+                    <div className="settings-parameter-group">
+                      <p className="eyebrow">连接池</p>
+                      <div className="settings-parameter-grid">
+                        <Fld label="预热目标">
+                          <input
+                            className={chg('muxPrewarmWorkers')}
+                            type="number"
+                            min={0}
+                            value={form.muxPrewarmWorkers}
+                            onChange={e => setForm({ ...form, muxPrewarmWorkers: e.target.value })}
+                          />
+                        </Fld>
+                        <Fld label="复用阈值">
+                          <input
+                            className={chg('muxReuseThreshold')}
+                            type="number"
+                            min={1}
+                            value={form.muxReuseThreshold}
+                            onChange={e => setForm({ ...form, muxReuseThreshold: e.target.value })}
+                          />
+                        </Fld>
+                        <Fld label="超额空闲寿命">
+                          <input
+                            className={chg('muxIdleTtl')}
+                            type="number"
+                            min={1000}
+                            value={form.muxIdleTtl}
+                            onChange={e => setForm({ ...form, muxIdleTtl: e.target.value })}
+                          />
+                          <span className="unit">ms</span>
+                        </Fld>
+                      </div>
+                    </div>
+                    <div className="settings-parameter-group">
+                      <p className="eyebrow">探活</p>
+                      <div className="settings-parameter-grid">
+                        <Fld label="探活并发">
+                          <input
+                            className={chg('muxMaxProbing')}
+                            type="number"
+                            min={1}
+                            max={Number(form.muxReuseThreshold) || undefined}
+                            value={form.muxMaxProbing}
+                            onChange={e => setForm({ ...form, muxMaxProbing: e.target.value })}
+                          />
+                        </Fld>
+                        <Fld label="探活周期">
+                          <input
+                            className={chg('muxProbeInterval')}
+                            type="number"
+                            min={2000}
+                            max={60000}
+                            value={form.muxProbeInterval}
+                            onChange={e => setForm({ ...form, muxProbeInterval: e.target.value })}
+                          />
+                          <span className="unit">ms</span>
+                        </Fld>
+                        <Fld label="探活超时">
+                          <input
+                            className={chg('muxProbeTimeout')}
+                            type="number"
+                            min={200}
+                            max={10000}
+                            value={form.muxProbeTimeout}
+                            onChange={e => setForm({ ...form, muxProbeTimeout: e.target.value })}
+                          />
+                          <span className="unit">ms</span>
+                        </Fld>
+                      </div>
+                    </div>
+                    <p className="hint settings-parameter-note">
+                      优先使用已验证的空闲 Worker；没有空闲时先建到复用阈值，再复用活跃 Worker
+                      的槽位。可用槽位用尽后允许突发扩容，超额 Worker 空闲后回收。
+                    </p>
+                    <p className="hint settings-parameter-note">
+                      预热只在复用阈值内尽力补足空闲连接，不保证业务繁忙时仍有空闲。健康探测会保留预热目标内
+                      的空闲 Worker；寿命只回收超出预热目标的空闲容量。
+                    </p>
+                    <p className="hint settings-parameter-note">
+                      探活或收尾中的 Worker 不承接新流；End 写入使用独立 10 秒宽限，超时后只转为排空，
+                      不会因此关闭同载的其他业务流。
+                    </p>
                   </div>
                 )}
               </Group>
-              <Group label="反向隧道">
+              <Group label="反向隧道" className="reverse-health-settings">
                 <ReverseHealthSettings
                   policy={reversePolicy}
                   rows={reverseOverrides}
+                  editable={editable}
+                  validationError={reversePolicyError}
                   onPolicyChange={policy => setForm({ ...form, reverseHealth: JSON.stringify(policy) })}
                   onOverridesChange={rows => setForm({ ...form, reverseOverrides: JSON.stringify(rows) })}
                 />
@@ -2705,7 +2698,7 @@ export function SettingsPane() {
                   />
                   <span className="hint">默认 25。NAT 表项老化较快的环境应调小</span>
                 </Fld>
-                <Fld label="mtu 默认值">
+                <Fld label="全局 MTU">
                   <input
                     className={chg('mtu')}
                     style={{ width: 90 }}
@@ -2729,59 +2722,60 @@ export function SettingsPane() {
               sub="自动分配端口时的起始值，仅影响新建，现有端口不变"
               {...secProps('ports')}
             >
-              <Group label="新建资源端口基线">
-                <Fld label="VLESS · TLS / REALITY">
-                  <input
-                    className={chg('ingressBase')}
-                    style={{ width: 90 }}
-                    value={form.ingressBase}
-                    onChange={e => setForm({ ...form, ingressBase: e.target.value })}
-                  />
-                  <span className="hint">建链时从该端口向上查找空闲端口</span>
-                </Fld>
-                <Fld label="VLESS · Encryption 起始端口">
-                  <input
-                    className={chg('vlessEncryptionBase')}
-                    style={{ width: 90 }}
-                    type="number"
-                    min={1}
-                    max={65535}
-                    aria-label="VLESS · Encryption 起始端口"
-                    value={form.vlessEncryptionBase}
-                    onChange={e => setForm({ ...form, vlessEncryptionBase: e.target.value })}
-                  />
-                  <span className="hint">默认 48000；新开启入站时向上查找空闲 TCP 端口，现有端口不变</span>
-                </Fld>
-                <Fld label="AnyTLS">
-                  <input
-                    className={chg('anytlsBase')}
-                    style={{ width: 90 }}
-                    value={form.anytlsBase}
-                    onChange={e => setForm({ ...form, anytlsBase: e.target.value })}
-                  />
-                  <span className="hint">走 TCP；新开启 AnyTLS 时从该端口向上查找空闲端口</span>
-                </Fld>
-                <Fld label="Hysteria 2">
-                  <input
-                    className={chg('hy2Base')}
-                    style={{ width: 90 }}
-                    value={form.hy2Base}
-                    onChange={e => setForm({ ...form, hy2Base: e.target.value })}
-                  />
-                  <span className="hint">
-                    走 UDP，与上一项使用各自的端口段。同一个端口号在 TCP 与 UDP
-                    上互不冲突。开启端口跳跃时，还会从分配到的 端口向上连续占用一段
-                  </span>
-                </Fld>
-                <Fld label="中转口">
-                  <input
-                    className={chg('hopBase')}
-                    style={{ width: 90 }}
-                    value={form.hopBase}
-                    onChange={e => setForm({ ...form, hopBase: e.target.value })}
-                  />
-                  <span className="hint">默认 20000。挑高位段，不跟接入面和系统服务混在一起</span>
-                </Fld>
+              <Group label="新建资源端口基线" className="settings-field-grid-container">
+                <div className="settings-field-grid port-allocation-grid">
+                  <Fld label="VLESS · TLS / REALITY">
+                    <input
+                      className={chg('ingressBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.ingressBase}
+                      onChange={e => setForm({ ...form, ingressBase: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="VLESS · Encryption">
+                    <input
+                      className={chg('vlessEncryptionBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      aria-label="VLESS · Encryption 起始端口"
+                      value={form.vlessEncryptionBase}
+                      onChange={e => setForm({ ...form, vlessEncryptionBase: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="AnyTLS · TCP">
+                    <input
+                      className={chg('anytlsBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.anytlsBase}
+                      onChange={e => setForm({ ...form, anytlsBase: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="Hysteria 2 · UDP">
+                    <input
+                      className={chg('hy2Base')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.hy2Base}
+                      onChange={e => setForm({ ...form, hy2Base: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="中转端口">
+                    <input
+                      className={chg('hopBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.hopBase}
+                      onChange={e => setForm({ ...form, hopBase: e.target.value })}
+                    />
+                  </Fld>
+                </div>
               </Group>
             </Section>
 

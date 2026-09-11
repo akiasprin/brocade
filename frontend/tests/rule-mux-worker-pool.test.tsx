@@ -8,12 +8,12 @@ import { RuleEditor, type ForwardPeer } from '../src/panes/rules';
 
 const GLOBAL_MUX: HopMux = {
   concurrency: 7,
-  min_idle_workers: 1,
-  max_idle_workers: 4,
+  prewarm_workers: 1,
+  reuse_threshold: 4,
   max_probing_workers: 2,
-  probe_interval_secs: 9,
+  probe_interval_ms: 9125,
   probe_timeout_ms: 1200,
-  idle_ttl_secs: 22,
+  idle_ttl_ms: 22125,
   max_requests_per_worker: 300,
 };
 
@@ -142,34 +142,36 @@ afterEach(() => {
 });
 
 describe('规则页 Mux Worker 池', () => {
-  it('保存大连接数量和 24 小时空闲寿命，不截断或更改默认值', async () => {
+  it('使用毫秒编辑并保存大连接数量和 24 小时超额空闲寿命', async () => {
     const view = renderEditor({ t: 'mux' });
     fireEvent.click(view.getByRole('button', { name: '配置' }));
     const dialog = view.getByRole('dialog', { name: '配置 新加坡中继 的 Mux' });
     fireEvent.click(within(dialog).getByRole('button', { name: '单独配置' }));
-    expect(muxField(dialog, '最小空闲连接').getAttribute('max')).toBeNull();
-    expect(muxField(dialog, '最大空闲连接').getAttribute('max')).toBeNull();
-    expect(muxField(dialog, '空闲寿命').getAttribute('max')).toBeNull();
-    fireEvent.change(muxField(dialog, '最大空闲连接'), { target: { value: '100000' } });
-    fireEvent.change(muxField(dialog, '最小空闲连接'), { target: { value: '70000' } });
-    fireEvent.change(muxField(dialog, '同时探测连接'), { target: { value: '32' } });
+    expect(muxField(dialog, '预热目标').getAttribute('max')).toBeNull();
+    expect(muxField(dialog, '复用阈值').getAttribute('max')).toBeNull();
+    expect(muxField(dialog, '超额空闲寿命').getAttribute('max')).toBeNull();
+    expect(muxField(dialog, '超额空闲寿命').value).toBe('22125');
+    expect(muxField(dialog, '探活周期').value).toBe('9125');
+    fireEvent.change(muxField(dialog, '复用阈值'), { target: { value: '100000' } });
+    fireEvent.change(muxField(dialog, '预热目标'), { target: { value: '70000' } });
+    fireEvent.change(muxField(dialog, '探活并发'), { target: { value: '32' } });
     fireEvent.change(muxField(dialog, '累计子连接'), { target: { value: '65535' } });
-    fireEvent.change(muxField(dialog, '空闲寿命'), { target: { value: '86400' } });
+    fireEvent.change(muxField(dialog, '超额空闲寿命'), { target: { value: '86400125' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '应用' }));
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     const pool = {
       t: 'mux',
       v: {
         ...GLOBAL_MUX,
-        min_idle_workers: 70000,
-        max_idle_workers: 100000,
+        prewarm_workers: 70000,
+        reuse_threshold: 100000,
         max_probing_workers: 32,
         max_requests_per_worker: 65535,
-        idle_ttl_secs: 86400,
+        idle_ttl_ms: 86400125,
       },
     };
     await waitFor(() => expect(savedPools()).toEqual([pool, pool]));
-    expect(DEFAULT_HOP_MUX.idle_ttl_secs).toBe(24);
+    expect(DEFAULT_HOP_MUX.idle_ttl_ms).toBe(24000);
     expect(DEFAULT_HOP_MUX.max_requests_per_worker).toBe(128);
   });
 
@@ -241,9 +243,9 @@ describe('规则页 Mux Worker 池', () => {
     fireEvent.click(view.getByRole('button', { name: '配置' }));
     const dialog = view.getByRole('dialog', { name: '配置 新加坡中继 的 Mux' });
     fireEvent.click(within(dialog).getByRole('button', { name: '单独配置' }));
-    fireEvent.change(muxField(dialog, '最小空闲连接'), { target: { value: '5' } });
-    fireEvent.change(muxField(dialog, '最大空闲连接'), { target: { value: '4' } });
-    expect(within(dialog).getByText('最小空闲连接不能大于最大空闲连接')).toBeTruthy();
+    fireEvent.change(muxField(dialog, '预热目标'), { target: { value: '5' } });
+    fireEvent.change(muxField(dialog, '复用阈值'), { target: { value: '4' } });
+    expect(within(dialog).getByText('预热目标不能大于复用阈值')).toBeTruthy();
     expect((within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
 
@@ -253,48 +255,32 @@ describe('规则页 Mux Worker 池', () => {
     await waitFor(() => expect(savedPools()).toEqual([{ t: 'none' }, { t: 'none' }]));
   });
 
-  it('历史 pool/merge 统一显示为 Mux，只读时可以打开抽屉但不能编辑', () => {
-    const legacyPool = renderEditor({ t: 'pool' });
-    expect(connectionSelect(legacyPool).value).toBe('mux');
-    expect(legacyPool.getByText('单独配置')).toBeTruthy();
-    expect(legacyPool.queryByText('连接池')).toBeNull();
-    expect(legacyPool.queryByText('合并流')).toBeNull();
-    legacyPool.unmount();
-
-    const legacyMerge = renderEditor({ t: 'merge', v: 8 }, true);
-    expect(connectionSelect(legacyMerge).value).toBe('mux');
-    fireEvent.click(legacyMerge.getByRole('button', { name: '查看' }));
-    const dialog = legacyMerge.getByRole('dialog', { name: '配置 新加坡中继 的 Mux' });
-    expect(muxField(dialog, '复用流数量').value).toBe('8');
-    expect(muxField(dialog, '复用流数量').disabled).toBe(true);
-    expect(within(dialog).queryByRole('button', { name: '应用' })).toBeNull();
-  });
 });
 
 describe('Mux 参数前端校验', () => {
   it.each([
     ['复用流数量', { concurrency: 0 }, '复用流数量必须在 1–128 之间'],
-    ['最小空闲连接', { min_idle_workers: -1 }, '最小空闲连接必须为非负整数'],
-    ['最大空闲连接', { max_idle_workers: 0 }, '最大空闲连接必须为正整数'],
-    ['同时探测连接', { max_probing_workers: 17 }, '同时探测连接必须在 1 与最大空闲连接之间'],
-    ['探测间隔', { probe_interval_secs: 1 }, '探测周期必须在 2–60 秒之间'],
-    ['探测超时', { probe_timeout_ms: 199 }, '单次超时必须在 200–10000 毫秒之间，且小于探测周期'],
-    ['空闲寿命', { idle_ttl_secs: 0 }, '空闲寿命必须为正整数秒'],
-    ['空闲寿命类型溢出', { idle_ttl_secs: 4294967296 }, '空闲寿命超出 uint32 秒数字段可表示范围（4294967295）'],
+    ['预热目标', { prewarm_workers: -1 }, '预热目标必须为非负整数'],
+    ['复用阈值', { reuse_threshold: 0 }, '复用阈值必须为正整数'],
+    ['探活并发', { max_probing_workers: 17 }, '探活并发必须在 1 与复用阈值之间'],
+    ['探活周期', { probe_interval_ms: 1 }, '探活周期必须在 2000–60000 ms 之间'],
+    ['探活超时', { probe_timeout_ms: 199 }, '探活超时必须在 200–10000 ms 之间，且小于探活周期'],
+    ['超额空闲寿命', { idle_ttl_ms: 0 }, '超额空闲寿命必须不小于 1000 ms'],
+    ['超额空闲寿命类型溢出', { idle_ttl_ms: 4294967296 }, '超额空闲寿命超出可表示范围（4294967295 ms）'],
     ['累计流上限', { max_requests_per_worker: 0 }, '累计子连接上限必须在 1–65535 之间'],
     ['累计子连接溢出', { max_requests_per_worker: 65536 }, '累计子连接上限必须在 1–65535 之间'],
-    ['空闲连接类型溢出', { max_idle_workers: 4294967296 }, '空闲连接数量超出 uint32 字段可表示范围（4294967295）'],
-    ['空闲上下限', { min_idle_workers: 3, max_idle_workers: 2 }, '最小空闲连接不能大于最大空闲连接'],
-    ['探测并发上限', { max_probing_workers: 3, max_idle_workers: 2 }, '同时探测连接必须在 1 与最大空闲连接之间'],
+    ['空闲连接类型溢出', { reuse_threshold: 4294967296 }, '连接池数量超出 uint32 字段可表示范围（4294967295）'],
+    ['空闲上下限', { prewarm_workers: 3, reuse_threshold: 2 }, '预热目标不能大于复用阈值'],
+    ['探活并发上限', { max_probing_workers: 3, reuse_threshold: 2 }, '探活并发必须在 1 与复用阈值之间'],
     [
       '超时与周期',
-      { probe_interval_secs: 2, probe_timeout_ms: 2000 },
-      '单次超时必须在 200–10000 毫秒之间，且小于探测周期',
+      { probe_interval_ms: 2000, probe_timeout_ms: 2000 },
+      '探活超时必须在 200–10000 ms 之间，且小于探活周期',
     ],
     [
       '寿命窗口',
-      { probe_interval_secs: 5, probe_timeout_ms: 2000, idle_ttl_secs: 6 },
-      '空闲寿命必须覆盖一个探测周期和向上取整后的单次超时',
+      { probe_interval_ms: 5000, probe_timeout_ms: 2000, idle_ttl_ms: 6999 },
+      '超额空闲寿命必须覆盖一个探活周期和探活超时',
     ],
   ])('拒绝%s非法值', (_name, patch, message) => {
     expect(hopMuxError({ ...DEFAULT_HOP_MUX, ...patch })).toBe(message);
@@ -304,12 +290,12 @@ describe('Mux 参数前端校验', () => {
     expect(
       hopMuxError({
         concurrency: 128,
-        min_idle_workers: 0xffffffff,
-        max_idle_workers: 0xffffffff,
+        prewarm_workers: 0xffffffff,
+        reuse_threshold: 0xffffffff,
         max_probing_workers: 0xffffffff,
-        probe_interval_secs: 60,
+        probe_interval_ms: 60000,
         probe_timeout_ms: 10000,
-        idle_ttl_secs: 0xffffffff,
+        idle_ttl_ms: 0xffffffff,
         max_requests_per_worker: 65535,
       }),
     ).toBeNull();

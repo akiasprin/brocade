@@ -202,10 +202,21 @@ func (f *tcpWorkerFactory) Create() (*ClientWorker, error) {
 		return nil, err
 	}
 	f.created.Add(1)
-	return NewClientWorker(transport.Link{
+	worker, err := NewClientWorker(transport.Link{
 		Reader: buf.NewReader(connection),
 		Writer: buf.NewWriter(connection),
 	}, f.strategy)
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	// The fixture owns this socket, just as the outbound Process owns the
+	// carrier in DialingWorkerFactory. buf wrappers do not forward Close.
+	go func() {
+		<-worker.WaitClosed()
+		_ = connection.Close()
+	}()
+	return worker, nil
 }
 
 type faultEchoSession struct {
@@ -263,10 +274,53 @@ func dispatchEcho(t *testing.T, manager *ClientManager, payload string) *pipe.Wr
 	return session.input
 }
 
+func TestAsyncPipeDispatchOutlivesCompletedHandlerContext(t *testing.T) {
+	cfg := testPoolConfig()
+	cfg.ReuseThreshold = 1
+	proxy := newFaultTCPProxy(t, &faultEchoDispatcher{})
+	factory := &tcpWorkerFactory{
+		address: proxy.address(),
+		strategy: ClientStrategy{
+			MaxConcurrency: 1,
+			MaxConnection:  128,
+			WorkerPool:     cfg,
+		},
+	}
+	picker := &IncrementalWorkerPicker{Factory: factory, Pool: cfg}
+	manager := &ClientManager{Enabled: true, Picker: picker}
+	t.Cleanup(func() { manager.Close() })
+
+	inputReader, inputWriter := pipe.New(pipe.WithoutSizeLimit())
+	outputReader, outputWriter := pipe.New(pipe.WithoutSizeLimit())
+	t.Cleanup(func() { inputWriter.Close() })
+	ctx, cancel := context.WithCancel(lifecycleTestContext(context.Background()))
+	if err := manager.Dispatch(ctx, &transport.Link{Reader: inputReader, Writer: outputWriter}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	// The outbound handler returns before protocols such as REALITY finish their
+	// handshake and put the first business bytes into this pipe. Its context may
+	// therefore be complete while the transferred stream is still live.
+	time.Sleep(150 * time.Millisecond)
+	payload := "late-business-payload"
+	if err := inputWriter.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte(payload))}); err != nil {
+		t.Fatal("handler context closed its asynchronous input pipe:", err)
+	}
+	result, err := outputReader.ReadMultiBufferTimeout(time.Second)
+	if err != nil {
+		t.Fatal("late payload did not receive a response:", err)
+	}
+	defer buf.ReleaseMulti(result)
+	if got := result.String(); got != payload {
+		t.Fatalf("echo response = %q, want %q", got, payload)
+	}
+}
+
 func TestFaultProxyBlackholedProbeDoesNotDelayNextRequest(t *testing.T) {
 	cfg := &WorkerPoolConfig{
-		MinIdleWorkers:    0,
-		MaxIdleWorkers:    2,
+		PrewarmWorkers:    0,
+		ReuseThreshold:    2,
 		MaxProbingWorkers: 1,
 		ProbeInterval:     2 * time.Second,
 		ProbeTimeout:      200 * time.Millisecond,
@@ -289,13 +343,15 @@ func TestFaultProxyBlackholedProbeDoesNotDelayNextRequest(t *testing.T) {
 	firstInput := dispatchEcho(t, manager, "first")
 	waitForTest(t, "first TCP connection", func() bool { return proxy.connectionCount() == 1 })
 	proxy.connection(0).setMode(faultBlackhole, 0)
+	// Let the last actual response expire while the session is still active.
+	// Closing it then writes an End into a working local TCP send path, but
+	// that write must not buy another reuse window on the blackholed worker.
+	clock.Advance(cfg.ProbeInterval)
 	_ = firstInput.Close()
 
 	picker.access.Lock()
 	firstWorker := picker.workers[0]
 	picker.access.Unlock()
-	waitForTest(t, "first worker freshly idle", func() bool { return workerStateForTest(firstWorker) == workerIdleReady })
-	clock.Advance(cfg.ProbeInterval)
 	waitForTest(t, "first worker probing", func() bool { return workerStateForTest(firstWorker) == workerProbing })
 
 	started := time.Now()
@@ -307,7 +363,11 @@ func TestFaultProxyBlackholedProbeDoesNotDelayNextRequest(t *testing.T) {
 		t.Fatalf("TCP connections created = %d, want 2", got)
 	}
 	_ = secondInput.Close()
-	waitForTest(t, "blackholed Ping written", func() bool { return picker.WorkerPoolStats().ProbeSentTotal == 1 })
+	waitForTest(t, "blackholed idle Ping written", func() bool {
+		firstWorker.poolAccess.Lock()
+		defer firstWorker.poolAccess.Unlock()
+		return firstWorker.poolProbes >= 2 // Routine active Ping, then idle validation.
+	})
 	clock.Advance(cfg.ProbeTimeout)
 	waitForTest(t, "blackholed worker timeout", firstWorker.Closed)
 
@@ -331,12 +391,53 @@ func TestFaultProxyBlackholedProbeDoesNotDelayNextRequest(t *testing.T) {
 	}
 }
 
+func TestFaultProxyWarmPoolPacksLongLivedSessions(t *testing.T) {
+	cfg := testPoolConfig()
+	cfg.PrewarmWorkers = 1
+	cfg.ReuseThreshold = 1
+	proxy := newFaultTCPProxy(t, &faultEchoDispatcher{})
+	factory := &tcpWorkerFactory{
+		address: proxy.address(),
+		strategy: ClientStrategy{
+			MaxConcurrency: 4,
+			MaxConnection:  128,
+			WorkerPool:     cfg,
+		},
+	}
+	picker := &IncrementalWorkerPicker{Factory: factory, Pool: cfg}
+	manager := &ClientManager{Picker: picker}
+	t.Cleanup(func() { manager.Close() })
+	var sessions []*faultEchoSession
+	for i := range 8 {
+		business := openFaultEchoSession(t, manager)
+		t.Cleanup(func() { business.input.Close() })
+		business.echo(t, fmt.Sprintf("session-%d", i))
+		sessions = append(sessions, business)
+		waitForTest(t, "warm base-budget check", func() bool {
+			picker.access.Lock()
+			defer picker.access.Unlock()
+			return !picker.warmRunning
+		})
+	}
+	stats := picker.WorkerPoolStats()
+	if stats.WorkersActive != 2 || stats.WorkersIdleReady != 0 || factory.created.Load() != 2 || proxy.connectionCount() != 2 {
+		t.Fatalf("warm pool amplified physical TCP connections: dials=%d sockets=%d stats=%+v", factory.created.Load(), proxy.connectionCount(), stats)
+	}
+	for _, business := range sessions {
+		business.input.Close()
+	}
+	waitForTest(t, "real sockets converge to one idle spare", func() bool {
+		s := picker.WorkerPoolStats()
+		return s.WorkersActive == 0 && s.WorkersIdleReady == 1 && s.WorkersProbing+s.WorkersProbeQueued+s.WorkersWarmDialing == 0 && proxy.activeConnectionCount() == 1
+	})
+}
+
 func TestFaultProxyFINAndRSTRecovery(t *testing.T) {
 	for _, reset := range []bool{false, true} {
 		name := map[bool]string{false: "FIN", true: "RST"}[reset]
 		t.Run(name, func(t *testing.T) {
 			cfg := &WorkerPoolConfig{
-				MaxIdleWorkers:    2,
+				ReuseThreshold:    2,
 				MaxProbingWorkers: 1,
 				ProbeInterval:     2 * time.Second,
 				ProbeTimeout:      200 * time.Millisecond,
@@ -378,7 +479,7 @@ func TestFaultProxyOneWayProbeLossTimesOut(t *testing.T) {
 	for _, direction := range []string{"ping", "pong"} {
 		t.Run(direction, func(t *testing.T) {
 			cfg := &WorkerPoolConfig{
-				MaxIdleWorkers:    2,
+				ReuseThreshold:    2,
 				MaxProbingWorkers: 1,
 				ProbeInterval:     2 * time.Second,
 				ProbeTimeout:      200 * time.Millisecond,
@@ -424,7 +525,7 @@ func TestFaultProxyOneWayProbeLossTimesOut(t *testing.T) {
 
 func TestProbeFailureDoesNotInterruptAnotherActiveWorker(t *testing.T) {
 	cfg := &WorkerPoolConfig{
-		MaxIdleWorkers:    2,
+		ReuseThreshold:    2,
 		MaxProbingWorkers: 1,
 		ProbeInterval:     2 * time.Second,
 		ProbeTimeout:      200 * time.Millisecond,
@@ -462,7 +563,11 @@ func TestProbeFailureDoesNotInterruptAnotherActiveWorker(t *testing.T) {
 	clock.Advance(cfg.ProbeInterval)
 	waitForTest(t, "second worker probing", func() bool { return workerStateForTest(workers[1]) == workerProbing })
 	active.echo(t, "active-during-probe")
-	waitForTest(t, "second Ping written", func() bool { return picker.WorkerPoolStats().ProbeSentTotal == 1 })
+	waitForTest(t, "second worker Ping written", func() bool {
+		workers[1].poolAccess.Lock()
+		defer workers[1].poolAccess.Unlock()
+		return workers[1].poolProbes == 1
+	})
 	clock.Advance(cfg.ProbeTimeout)
 	waitForTest(t, "second worker timeout", workers[1].Closed)
 	active.echo(t, "active-after-timeout")
@@ -484,7 +589,7 @@ func TestWorkerPoolResourcePressureAndConvergence(t *testing.T) {
 	}
 
 	cfg := &WorkerPoolConfig{
-		MaxIdleWorkers:    8,
+		ReuseThreshold:    8,
 		MaxProbingWorkers: 8,
 		ProbeInterval:     2 * time.Second,
 		ProbeTimeout:      200 * time.Millisecond,
@@ -518,7 +623,7 @@ func TestWorkerPoolResourcePressureAndConvergence(t *testing.T) {
 		for {
 			stats := picker.WorkerPoolStats()
 			reservedIdle := stats.WorkersIdleReady + stats.WorkersProbeQueued + stats.WorkersProbing + stats.WorkersWarmDialing
-			if stats.WorkersActive == 0 && stats.WorkersDraining == 0 && reservedIdle <= cfg.MaxIdleWorkers {
+			if stats.WorkersActive == 0 && stats.WorkersDraining == 0 && reservedIdle <= cfg.ReuseThreshold {
 				return
 			}
 			if time.Now().After(convergenceDeadline) {
@@ -576,8 +681,8 @@ func TestWorkerPoolResourcePressureAndConvergence(t *testing.T) {
 	}
 
 	waitForConvergence("concurrent pressure")
-	if stats := picker.WorkerPoolStats(); stats.WorkersIdleReady+stats.WorkersProbeQueued+stats.WorkersProbing+stats.WorkersWarmDialing > cfg.MaxIdleWorkers {
-		t.Fatalf("pool did not honor max idle after pressure: %+v", stats)
+	if stats := picker.WorkerPoolStats(); stats.WorkersIdleReady+stats.WorkersProbeQueued+stats.WorkersProbing+stats.WorkersWarmDialing > cfg.ReuseThreshold {
+		t.Fatalf("pool did not reclaim overflow after pressure: %+v", stats)
 	}
 
 	if err := manager.Close(); err != nil {

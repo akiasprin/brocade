@@ -52,7 +52,7 @@ function trip(name, loc, hash, back = loc) {
   console.log(`✓ ${name}  ${hash}`);
 }
 
-/* 只验一个方向：人手改出来的、或者上一版留下的地址 */
+/* 只验一个方向：人手改出来的地址 */
 function reads(name, hash, expected) {
   const got = parse(hash);
   if (!eq(got, expected)) {
@@ -71,9 +71,9 @@ trip('没下钻的面', { nav: 'settings' }, '#/settings');
 trip('不走 wm 的面', { nav: 'topo' }, '#/topo');
 trip('链路详情两段', { nav: 'chains', drill: { p: 'chain', app: 'app-1', chain: 'c-a' } }, '#/chains/chain/app-1/c-a');
 trip(
-  '用户详情由租户和用户名共同定位',
-  { nav: 'users', drill: { p: 'user', tenant: 'acme/apac', id: 'alice' } },
-  '#/users/user/acme%2Fapac/alice',
+  '用户详情由用户名定位',
+  { nav: 'users', drill: { p: 'user', id: 'alice' } },
+  '#/users/user/alice',
 );
 
 console.log('\n— 类型要还原 —');
@@ -111,8 +111,9 @@ reads('什么都没有', '', null);
 reads('不认识的下钻', '#/nodes/bogus', { nav: 'nodes' });
 reads('详情少了 id', '#/deploy/detail', { nav: 'deploy' });
 reads('机器详情少了 id', '#/nodes/node', { nav: 'nodes' });
-reads('用户详情少了用户名', '#/users/user/acme', { nav: 'users' });
-reads('多余的段忽略', '#/nodes/node/hk-01/extra', { nav: 'nodes', drill: { p: 'node', id: 'hk-01' } });
+reads('用户详情少了用户名', '#/users/user', { nav: 'users' });
+reads('用户详情多出路径段', '#/users/user/acme/alice', { nav: 'users' });
+reads('机器详情多出路径段', '#/nodes/node/hk-01/extra', { nav: 'nodes' });
 
 console.log('\n— 缺字段的 loc 退回面的根 —');
 trip('detail 没带 id', { nav: 'deploy', drill: { p: 'detail' } }, '#/deploy', { nav: 'deploy' });

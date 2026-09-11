@@ -18,7 +18,7 @@ RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       wireguard-tools bash iproute2 iptables nftables \
       curl dnsutils tcpdump jq procps ca-certificates unzip wget \
-      iputils-ping \
+      iputils-ping tzdata \
  && rm -rf /var/lib/apt/lists/*
 
 # Xray 不烤进镜像。preview 也运行 Console 返回的 install.sh，由 /enroll/dist 选择并校验

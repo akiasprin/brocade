@@ -14,19 +14,9 @@ fn demo_raw_configs_match_core_compiler() {
     let snapshot = demo_snapshot();
     let output = compile(&snapshot);
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
-    // The demo deliberately carries one Pool hop so the concurrency-one artifact path keeps a
-    // golden baseline. Its seven older domain/Geosite rule tables do not yet carry the explicit
-    // sniffing-failure fallback, so the compiler also identifies each migration point without
-    // blocking publication.
-    assert_eq!(output.summary.warnings, 8, "{:#?}", output.diagnostics);
-    assert_eq!(
-        output
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "rule.pool-concurrency-one")
-            .count(),
-        1
-    );
+    // Seven domain/Geosite rule tables omit the explicit sniffing-failure fallback, so the
+    // compiler identifies each decision point without blocking publication.
+    assert_eq!(output.summary.warnings, 7, "{:#?}", output.diagnostics);
     assert_eq!(
         output
             .diagnostics

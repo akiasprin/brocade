@@ -23,6 +23,18 @@ type ActivityTimer struct {
 	once      sync.Once
 }
 
+// NewNoopActivityTimer returns an updater that never owns cancellation or
+// half-close deadlines. It is used by long-lived control transports whose
+// lifecycle is governed by their own protocol state machine.
+func NewNoopActivityTimer() *ActivityTimer {
+	timer := &ActivityTimer{
+		updated:   make(chan struct{}, 1),
+		onTimeout: func() {},
+	}
+	timer.consumed.Store(true)
+	return timer
+}
+
 func (t *ActivityTimer) Update() {
 	select {
 	case t.updated <- struct{}{}:

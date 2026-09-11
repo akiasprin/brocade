@@ -20,35 +20,36 @@ describe('new relay hop connection handling', () => {
     });
   });
 
-  it('keeps an explicit pool choice for authored-model compatibility', () => {
-    expect(forwardAction('relay', { t: 'overlay' }, { t: 'pool' })).toEqual({
+  it('keeps an explicit mux override', () => {
+    const pool = poolFromMuxConcurrency(8);
+    expect(forwardAction('relay', { t: 'overlay' }, pool)).toEqual({
       t: 'forward',
       to: 'relay',
       dial: { t: 'overlay' },
-      pool: { t: 'pool' },
+      pool,
     });
   });
 
-  it('presents one Mux choice, reads legacy shapes, and writes only the current full override shape', () => {
+  it('presents one Mux choice and writes a full override shape', () => {
     expect(POOL_ORDER).toEqual(['none', 'mux']);
     expect(POOL_LABEL).toEqual({ none: '每次新建', mux: 'Mux 复用' });
-    expect(poolChoice({ t: 'pool' })).toBe('mux');
-    expect(poolChoice({ t: 'merge', v: 8 })).toBe('mux');
-    expect(muxConcurrency({ t: 'pool' })).toBe(1);
-    expect(muxConcurrency({ t: 'merge', v: 8 })).toBe(8);
+    expect(poolChoice({ t: 'mux' })).toBe('mux');
+    expect(muxConcurrency({ t: 'mux' })).toBe(1);
     expect(poolFromMuxConcurrency(1)).toEqual({
       t: 'mux',
       v: {
         concurrency: 1,
-        min_idle_workers: 0,
-        max_idle_workers: 2,
+        prewarm_workers: 0,
+        reuse_threshold: 2,
         max_probing_workers: 1,
-        probe_interval_secs: 5,
+        probe_interval_ms: 5000,
         probe_timeout_ms: 2000,
-        idle_ttl_secs: 24,
+        idle_ttl_ms: 24000,
         max_requests_per_worker: 128,
       },
     });
-    expect(poolFromMuxConcurrency(8)).toMatchObject({ t: 'mux', v: { concurrency: 8 } });
+    const eight = poolFromMuxConcurrency(8);
+    expect(eight).toMatchObject({ t: 'mux', v: { concurrency: 8 } });
+    expect(muxConcurrency(eight)).toBe(8);
   });
 });

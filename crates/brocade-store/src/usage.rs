@@ -126,23 +126,16 @@ fn unknown_counter_fingerprint(node_id: &str, label: &str) -> [u8; 32] {
     digest.finalize().into()
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum FirstReadingPolicy {
     /// The control plane did not witness this counter being created. Its first absolute value may
     /// contain historical traffic, so it can only establish the durable head.
-    #[default]
     EstablishBaseline,
     /// This label became billable after a previously known generation did not own it. Xray's
     /// counter therefore starts at zero for this authorization, and the first absolute value is
     /// real traffic rather than an unknown historical balance.
     CountFromZero,
-}
-
-impl FirstReadingPolicy {
-    fn establishes_baseline(value: &Self) -> bool {
-        *value == Self::EstablishBaseline
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,13 +147,7 @@ enum FrozenBinding {
         user_id: String,
         ingress_id: String,
         app_id: String,
-        /// Missing on generations written before first-reading provenance existed. Defaulting to
-        /// the conservative policy prevents a rolling upgrade from billing an old cumulative
-        /// counter as if this control plane had watched it start at zero.
-        #[serde(
-            default,
-            skip_serializing_if = "FirstReadingPolicy::establishes_baseline"
-        )]
+        /// Whether the first observed absolute counter is a baseline or billable from zero.
         first_reading: FirstReadingPolicy,
     },
     ChainHop {
@@ -252,21 +239,19 @@ struct UsageGeneration {
 }
 
 fn report_identity(request: &UsageReportRequest) -> Result<(String, u64)> {
-    match (&request.agent_instance_id, request.sequence) {
-        (Some(instance), Some(sequence))
-            if sequence > 0
-                && instance.len() == 32
-                && instance
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
-        {
-            Ok((instance.clone(), sequence))
-        }
-        (None, None) => Ok(("legacy".to_owned(), request.read_at_unix_secs as u64)),
-        _ => Err(StoreError::InvalidData(
-            "usage agent_instance_id must be 32 lowercase hex bytes and sequence must be positive; both are required together".to_owned(),
-        )),
+    let instance = &request.agent_instance_id;
+    if request.sequence == 0
+        || instance.len() != 32
+        || !instance
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StoreError::InvalidData(
+            "usage agent_instance_id must be 32 lowercase hex bytes and sequence must be positive"
+                .to_owned(),
+        ));
     }
+    Ok((instance.clone(), request.sequence))
 }
 
 /// Freeze the namespace for a target before it can be dispatched. This function reads only the
@@ -388,8 +373,9 @@ pub(crate) async fn create_usage_generation_for_target(
 
 /// Attach provenance to a newly frozen namespace.
 ///
-/// A missing durable head alone is not enough to count the first absolute reading: on the first
-/// generation after an upgrade it may be an old Xray counter. A prior generation is the witness.
+/// A missing durable head alone is not enough to count the first absolute reading: the counter
+/// may already have accumulated traffic before the control plane observed it. A prior generation
+/// is the witness.
 /// If that known namespace did not own this label, the new authorization starts from zero. The
 /// marker is carried across unrelated generations until a head exists, so a quiet new user does
 /// not lose their first window merely because another release landed before they connected.
@@ -552,77 +538,24 @@ fn frozen_bindings(
 async fn resolve_usage_generation(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
-    explicit: Option<i64>,
-    read_at_unix_secs: i64,
+    generation_id: i64,
 ) -> Result<UsageGeneration> {
-    let row = if let Some(id) = explicit {
-        sqlx::query(
-            "SELECT id, deployment_id, revision_id, bindings
-             FROM usage_generations WHERE id = $1 AND node_id = $2",
-        )
-        .bind(id)
-        .bind(node_id)
-        .fetch_optional(&mut **tx)
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT g.id, g.deployment_id, g.revision_id, g.bindings
-             FROM usage_generation_activations a
-             JOIN usage_generations g ON g.id = a.generation_id
-             WHERE a.node_id = $1
-               AND a.activated_at <= to_timestamp($2::double precision)
-             ORDER BY a.activated_at DESC, g.id DESC LIMIT 1",
-        )
-        .bind(node_id)
-        .bind(read_at_unix_secs)
-        .fetch_optional(&mut **tx)
-        .await?
-    };
-    let row = match row {
-        Some(row) => row,
-        None if explicit.is_some() => {
-            return Err(StoreError::InvalidData(format!(
-                "usage generation {} does not belong to node {node_id}",
-                explicit.unwrap_or_default()
-            )))
-        }
-        None => {
-            // Rolling upgrade baseline: create one immutable interpretation of the current model.
-            // All protocol-v3 targets create their own generation before dispatch, so this branch
-            // is used only until the first such target reaches this machine.
-            let snapshot = crate::materialize::load_snapshot_tx(tx, None).await?;
-            let bindings = frozen_bindings(&snapshot, node_id, None);
-            let revision_id = i64::try_from(snapshot.revision).map_err(|_| {
-                StoreError::InvalidData("current revision is out of range".to_owned())
-            })?;
-            let id: i64 = sqlx::query_scalar(
-                "INSERT INTO usage_generations (node_id, revision_id, bindings)
-                 VALUES ($1, $2, $3) RETURNING id",
-            )
-            .bind(node_id)
-            .bind(revision_id)
-            .bind(serde_json::to_value(bindings)?)
-            .fetch_one(&mut **tx)
-            .await?;
-            sqlx::query(
-                "INSERT INTO usage_generation_activations (node_id, generation_id, activated_at)
-                 VALUES ($1, $2, '-infinity'::timestamptz)",
-            )
-            .bind(node_id)
-            .bind(id)
-            .execute(&mut **tx)
-            .await?;
-            sqlx::query(
-                "SELECT id, deployment_id, revision_id, bindings
-                 FROM usage_generations WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_one(&mut **tx)
-            .await?
-        }
-    };
+    let row = sqlx::query(
+        "SELECT id, deployment_id, revision_id, bindings
+         FROM usage_generations WHERE id = $1 AND node_id = $2",
+    )
+    .bind(generation_id)
+    .bind(node_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        StoreError::InvalidData(format!(
+            "usage generation {generation_id} does not belong to node {node_id}"
+        ))
+    })?;
+    let id: i64 = row.try_get("id")?;
     Ok(UsageGeneration {
-        id: row.try_get("id")?,
+        id,
         deployment_id: row.try_get("deployment_id")?,
         revision_id: row.try_get("revision_id")?,
         bindings: serde_json::from_value(row.try_get("bindings")?)?,
@@ -636,7 +569,7 @@ async fn resolve_usage_generation(
              WHERE node_id = $1 AND generation_id = $2",
         )
         .bind(node_id)
-        .bind(row.try_get::<i64, _>("id")?)
+        .bind(id)
         .fetch_optional(&mut **tx)
         .await?
         .flatten(),
@@ -664,24 +597,20 @@ pub async fn record_usage_report(
             "usage report contains too many counters".to_owned(),
         ));
     }
-    if request
-        .xray_epoch
-        .as_ref()
-        .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
-    {
+    if request.xray_epoch.trim().is_empty() || request.xray_epoch.len() > 128 {
         return Err(StoreError::InvalidData(
             "usage xray_epoch must contain 1..128 bytes".to_owned(),
         ));
     }
-    if request.usage_generation_id.is_some_and(|id| id <= 0) {
+    if request.usage_generation_id <= 0 {
         return Err(StoreError::InvalidData(
             "usage generation id must be positive".to_owned(),
         ));
     }
 
-    // Spool replay is intentionally old. Only a clock in the future is unsafe, because it can
-    // put bytes in an accounting period which has not begun. Conflict is retryable by the agent;
-    // once NTP repairs the clock, a newer report can move the queue again without losing this one.
+    // Delayed spool delivery is valid. Only a clock in the future is unsafe, because it can put
+    // bytes in an accounting period which has not begun. Conflict is retryable by the agent;
+    // once NTP repairs the clock, a newer report can move the queue without losing this one.
     let (server_now,): (i64,) = sqlx::query_as("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(pool)
         .await?;
@@ -695,15 +624,7 @@ pub async fn record_usage_report(
     let payload_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
     let (agent_instance_id, sequence) = report_identity(&request)?;
     let sequence_i64 = u64_to_i64("sequence", sequence)?;
-    let has_exact_xray_epoch = request
-        .xray_epoch
-        .as_ref()
-        .is_some_and(|v| !v.trim().is_empty());
-    let xray_epoch = request
-        .xray_epoch
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "legacy".to_owned());
+    let xray_epoch = request.xray_epoch.clone();
 
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -756,13 +677,8 @@ pub async fn record_usage_report(
         }
     }
 
-    let generation = resolve_usage_generation(
-        &mut tx,
-        node_id,
-        request.usage_generation_id,
-        request.read_at_unix_secs,
-    )
-    .await?;
+    let generation =
+        resolve_usage_generation(&mut tx, node_id, request.usage_generation_id).await?;
     let metadata = UsageMetadata {
         revision_id: generation.revision_id,
         deployment_id: generation.deployment_id,
@@ -805,14 +721,12 @@ pub async fn record_usage_report(
         }
         let Some(binding) = generation.bindings.get(&label) else {
             skipped_counters += 1;
-            if has_exact_xray_epoch {
-                unknown_counters.push(UnknownCounterObservation {
-                    fingerprint: unknown_counter_fingerprint(node_id, &label),
-                    xray_epoch: xray_epoch.clone(),
-                    uplink_bytes: counter.uplink_bytes,
-                    downlink_bytes: counter.downlink_bytes,
-                });
-            }
+            unknown_counters.push(UnknownCounterObservation {
+                fingerprint: unknown_counter_fingerprint(node_id, &label),
+                xray_epoch: xray_epoch.clone(),
+                uplink_bytes: counter.uplink_bytes,
+                downlink_bytes: counter.downlink_bytes,
+            });
             continue;
         };
         let first_reading_policy = binding.first_reading_policy();
@@ -862,8 +776,7 @@ pub async fn record_usage_report(
                 // above; treating equality as one made a healthy grants hot-swap surface as
                 // "out of order" in the node health UI.
                 update_head = false;
-            } else if has_exact_xray_epoch
-                && previous.xray_epoch == xray_epoch
+            } else if previous.xray_epoch == xray_epoch
                 && (uplink_bytes < previous.uplink_bytes
                     || downlink_bytes < previous.downlink_bytes)
             {
@@ -873,15 +786,7 @@ pub async fn record_usage_report(
                 rejected_counters += 1;
                 update_head = false;
             } else {
-                let restarted = if has_exact_xray_epoch {
-                    previous.xray_epoch != xray_epoch
-                } else {
-                    // A rolling downgrade (or the last queued report from an old Agent) carries
-                    // no exact epoch. Do not interpret the literal fallback value `legacy` as a
-                    // process change after an exact v3 head: old reports retain the historical
-                    // counter-regression rule and therefore cannot rebill a climbing counter.
-                    uplink_bytes < previous.uplink_bytes || downlink_bytes < previous.downlink_bytes
-                };
+                let restarted = previous.xray_epoch != xray_epoch;
                 let (window_start, uplink_delta, downlink_delta, has_gap) = if restarted {
                     (
                         previous
@@ -932,9 +837,8 @@ pub async fn record_usage_report(
                 Some(activated_at) if activated_at <= request.read_at_unix_secs => {
                     (activated_at.max(request.xray_started_at_unix_secs), false)
                 }
-                // An old Agent did not report the application boundary, or this queued reading
-                // arrived before the convergence observation. Keep every byte, use a minimal
-                // non-empty window, and expose the imprecise boundary through has_gap.
+                // The reading arrived before the convergence observation. Keep every byte, use a
+                // minimal non-empty window, and expose the imprecise boundary through has_gap.
                 Some(_) | None => (request.read_at_unix_secs.saturating_sub(1), true),
             };
             // Unix seconds have one-second resolution. A user can transfer bytes in the same
@@ -988,7 +892,7 @@ pub async fn record_usage_report(
         node_id: node_id.to_owned(),
         agent_instance_id: request.agent_instance_id.clone(),
         sequence: request.sequence,
-        usage_generation_id: Some(generation.id),
+        usage_generation_id: generation.id,
         duplicate: false,
         accepted_readings,
         inserted_samples,
@@ -1881,7 +1785,7 @@ mod runtime_tests {
     }
 
     #[test]
-    fn first_generation_and_legacy_bindings_remain_conservative_baselines() {
+    fn first_generation_uses_a_conservative_baseline() {
         let mut bindings = BTreeMap::from([(
             "alice@platform.acme#i-main".to_owned(),
             user_binding("alice", FirstReadingPolicy::EstablishBaseline),
@@ -1890,26 +1794,6 @@ mod runtime_tests {
         assert_eq!(
             bindings.values().next().unwrap().first_reading_policy(),
             FirstReadingPolicy::EstablishBaseline
-        );
-
-        let legacy: FrozenBinding = serde_json::from_value(serde_json::json!({
-            "kind": "user",
-            "tenant_id": "platform.acme",
-            "user_id": "alice",
-            "ingress_id": "i-main",
-            "app_id": "app-main"
-        }))
-        .unwrap();
-        assert_eq!(
-            legacy.first_reading_policy(),
-            FirstReadingPolicy::EstablishBaseline
-        );
-        assert!(
-            serde_json::to_value(legacy)
-                .unwrap()
-                .get("first_reading")
-                .is_none(),
-            "the default stays absent so old generation JSON remains byte-shape compatible"
         );
     }
 

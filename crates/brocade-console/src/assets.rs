@@ -145,6 +145,9 @@ pub(crate) fn branded_index(html: &str, branding: &brocade_store::BrandingSettin
             html.replace_range(start + "<title>".len()..start + end, &title);
         }
     }
+    if let Some(icon) = &branding.icon_data_url {
+        replace_favicon_href(&mut html, icon);
+    }
     // JSON in a script element is raw text: escape '<' so a site name cannot close the element.
     let json = serde_json::to_string(branding)
         .expect("branding is serializable")
@@ -154,6 +157,40 @@ pub(crate) fn branded_index(html: &str, branding: &brocade_store::BrandingSettin
     let bootstrap =
         format!("<script id=\"brocade-branding\" type=\"application/json\">{json}</script>");
     html.replacen("</head>", &format!("{bootstrap}</head>"), 1)
+}
+
+/// Replace the built-in mark in the already-built HTML so the first browser paint uses the saved
+/// icon. React repeats this update after a live settings save; this path covers reloads before the
+/// JavaScript bundle has started.
+fn replace_favicon_href(html: &mut String, href: &str) {
+    let Some(id) = html.find("id=\"brocade-favicon\"") else {
+        return;
+    };
+    let Some(tag_start) = html[..id].rfind("<link") else {
+        return;
+    };
+    let Some(tag_end) = html[id..].find('>').map(|offset| id + offset) else {
+        return;
+    };
+    let Some(href_start) = html[tag_start..tag_end]
+        .find("href=\"")
+        .map(|offset| tag_start + offset + "href=\"".len())
+    else {
+        return;
+    };
+    let Some(href_end) = html[href_start..tag_end]
+        .find('"')
+        .map(|offset| href_start + offset)
+    else {
+        return;
+    };
+    let href = href
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    html.replace_range(href_start..href_end, &href);
 }
 
 #[cfg(test)]
@@ -191,6 +228,35 @@ mod tests {
             cache_control_for("/assets/index-abc123.js"),
             "public, max-age=31536000, immutable"
         );
+    }
+
+    #[test]
+    fn saved_site_icon_is_the_initial_favicon() {
+        let html = r#"<html><head><link id="brocade-favicon" rel="icon" href="/favicon.svg" data-default-href="/favicon.svg" /><title>跨境网络小管家</title></head></html>"#;
+        let branding = brocade_store::BrandingSettings {
+            site_name: "我的站点".to_owned(),
+            icon_data_url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
+        };
+
+        let branded = branded_index(html, &branding);
+
+        assert!(branded.contains(
+            r#"id="brocade-favicon" rel="icon" href="data:image/png;base64,iVBORw0KGgo=" data-default-href="/favicon.svg""#
+        ));
+    }
+
+    #[test]
+    fn saved_site_icon_cannot_escape_the_favicon_attribute() {
+        let html = r#"<html><head><link id="brocade-favicon" rel="icon" href="/favicon.svg" /><title>跨境网络小管家</title></head></html>"#;
+        let branding = brocade_store::BrandingSettings {
+            site_name: "我的站点".to_owned(),
+            icon_data_url: Some(r#"x" onload="alert(1)&<>'"#.to_owned()),
+        };
+
+        let branded = branded_index(html, &branding);
+
+        assert!(branded.contains(r#"href="x&quot; onload=&quot;alert(1)&amp;&lt;&gt;&#39;""#));
+        assert!(!branded.contains(r#"href="x" onload="#));
     }
 
     #[test]

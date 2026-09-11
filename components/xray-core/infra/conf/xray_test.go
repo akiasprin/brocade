@@ -272,12 +272,12 @@ func TestMuxWorkerPoolConfigBuild(t *testing.T) {
 		"enabled": true,
 		"concurrency": 1,
 		"workerPool": {
-			"minIdleWorkers": 0,
-			"maxIdleWorkers": 2,
+			"prewarmWorkers": 0,
+			"reuseThreshold": 2,
 			"maxProbingWorkers": 1,
-			"probeIntervalSecs": 5,
+			"probeIntervalMs": 5125,
 			"probeTimeoutMs": 2000,
-			"idleTtlSecs": 24,
+			"idleTtlMs": 24125,
 			"maxRequestsPerWorker": 128
 		}
 	}`
@@ -288,12 +288,12 @@ func TestMuxWorkerPoolConfigBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := &proxyman.WorkerPoolConfig{
-		MinIdleWorkers:       0,
-		MaxIdleWorkers:       2,
+		PrewarmWorkers:       0,
+		ReuseThreshold:       2,
 		MaxProbingWorkers:    1,
-		ProbeIntervalSecs:    5,
+		ProbeIntervalMs:      5125,
 		ProbeTimeoutMs:       2000,
-		IdleTtlSecs:          24,
+		IdleTtlMs:            24125,
 		MaxRequestsPerWorker: 128,
 	}
 	if !proto.Equal(want, got.WorkerPool) {
@@ -301,28 +301,47 @@ func TestMuxWorkerPoolConfigBuild(t *testing.T) {
 	}
 }
 
+func TestMuxWorkerPoolProtobufRoundTrip(t *testing.T) {
+	config := &proxyman.WorkerPoolConfig{PrewarmWorkers: 3, ReuseThreshold: 7}
+	wire, err := proto.Marshal(config)
+	common.Must(err)
+	var decoded proxyman.WorkerPoolConfig
+	common.Must(proto.Unmarshal(wire, &decoded))
+	if !proto.Equal(config, &decoded) {
+		t.Fatal("new policy did not round-trip")
+	}
+}
+
+func TestMuxWorkerPoolConfigRejectsUnknownFields(t *testing.T) {
+	raw := `{"prewarmWorkers":0,"reuseThreshold":2,"maxProbingWorkers":1,"probeIntervalMs":5000,"probeTimeoutMs":2000,"idleTtlMs":24000,"maxRequestsPerWorker":128,"unexpected":true}`
+	var config WorkerPoolConfig
+	if err := json.Unmarshal([]byte(raw), &config); err == nil {
+		t.Fatal("unknown worker-pool field was accepted")
+	}
+}
+
 func TestMuxWorkerPoolConfigRejectsInvalidValues(t *testing.T) {
 	valid := WorkerPoolConfig{
-		MinIdleWorkers:       0,
-		MaxIdleWorkers:       2,
+		PrewarmWorkers:       0,
+		ReuseThreshold:       2,
 		MaxProbingWorkers:    1,
-		ProbeIntervalSecs:    5,
+		ProbeIntervalMs:      5000,
 		ProbeTimeoutMs:       2000,
-		IdleTtlSecs:          24,
+		IdleTtlMs:            24000,
 		MaxRequestsPerWorker: 128,
 	}
 	tests := map[string]func(*WorkerPoolConfig){
-		"max below limit":      func(c *WorkerPoolConfig) { c.MaxIdleWorkers = 0 },
-		"min above max":        func(c *WorkerPoolConfig) { c.MinIdleWorkers = 3 },
+		"max below limit":      func(c *WorkerPoolConfig) { c.ReuseThreshold = 0 },
+		"min above max":        func(c *WorkerPoolConfig) { c.PrewarmWorkers = 3 },
 		"probing zero":         func(c *WorkerPoolConfig) { c.MaxProbingWorkers = 0 },
 		"probing above max":    func(c *WorkerPoolConfig) { c.MaxProbingWorkers = 3 },
-		"interval below limit": func(c *WorkerPoolConfig) { c.ProbeIntervalSecs = 1 },
-		"interval above limit": func(c *WorkerPoolConfig) { c.ProbeIntervalSecs = 61 },
+		"interval below limit": func(c *WorkerPoolConfig) { c.ProbeIntervalMs = 1 },
+		"interval above limit": func(c *WorkerPoolConfig) { c.ProbeIntervalMs = 60001 },
 		"timeout below limit":  func(c *WorkerPoolConfig) { c.ProbeTimeoutMs = 199 },
 		"timeout above limit":  func(c *WorkerPoolConfig) { c.ProbeTimeoutMs = 10001 },
 		"timeout not shorter":  func(c *WorkerPoolConfig) { c.ProbeTimeoutMs = 5000 },
-		"ttl below limit":      func(c *WorkerPoolConfig) { c.IdleTtlSecs = 0 },
-		"ttl cannot fit probe": func(c *WorkerPoolConfig) { c.IdleTtlSecs = 6 },
+		"ttl below limit":      func(c *WorkerPoolConfig) { c.IdleTtlMs = 0 },
+		"ttl cannot fit probe": func(c *WorkerPoolConfig) { c.IdleTtlMs = 6999 },
 		"requests below limit": func(c *WorkerPoolConfig) { c.MaxRequestsPerWorker = 0 },
 		"requests above limit": func(c *WorkerPoolConfig) { c.MaxRequestsPerWorker = 65536 },
 	}
@@ -340,38 +359,38 @@ func TestMuxWorkerPoolConfigRejectsInvalidValues(t *testing.T) {
 func TestMuxWorkerPoolConfigAcceptsEveryLegalBoundary(t *testing.T) {
 	tests := map[string]WorkerPoolConfig{
 		"all lower bounds": {
-			MinIdleWorkers:       0,
-			MaxIdleWorkers:       1,
+			PrewarmWorkers:       0,
+			ReuseThreshold:       1,
 			MaxProbingWorkers:    1,
-			ProbeIntervalSecs:    2,
+			ProbeIntervalMs:      2000,
 			ProbeTimeoutMs:       200,
-			IdleTtlSecs:          5,
+			IdleTtlMs:            2200,
 			MaxRequestsPerWorker: 1,
 		},
 		"all upper bounds": {
-			MinIdleWorkers:       ^uint32(0),
-			MaxIdleWorkers:       ^uint32(0),
+			PrewarmWorkers:       ^uint32(0),
+			ReuseThreshold:       ^uint32(0),
 			MaxProbingWorkers:    ^uint32(0),
-			ProbeIntervalSecs:    60,
+			ProbeIntervalMs:      60000,
 			ProbeTimeoutMs:       10000,
-			IdleTtlSecs:          ^uint32(0),
+			IdleTtlMs:            ^uint32(0),
 			MaxRequestsPerWorker: 65535,
 		},
 		"equal idle bounds": {
-			MinIdleWorkers:       8,
-			MaxIdleWorkers:       8,
+			PrewarmWorkers:       8,
+			ReuseThreshold:       8,
 			MaxProbingWorkers:    8,
-			ProbeIntervalSecs:    5,
+			ProbeIntervalMs:      5125,
 			ProbeTimeoutMs:       2000,
-			IdleTtlSecs:          24,
+			IdleTtlMs:            24125,
 			MaxRequestsPerWorker: 128,
 		},
 		"24 hour idle TTL": {
-			MaxIdleWorkers:       2,
+			ReuseThreshold:       2,
 			MaxProbingWorkers:    1,
-			ProbeIntervalSecs:    5,
+			ProbeIntervalMs:      5000,
 			ProbeTimeoutMs:       2000,
-			IdleTtlSecs:          86400,
+			IdleTtlMs:            86400125,
 			MaxRequestsPerWorker: 128,
 		},
 	}
@@ -387,11 +406,11 @@ func TestMuxWorkerPoolConfigAcceptsEveryLegalBoundary(t *testing.T) {
 
 func TestMuxWorkerPoolRequiresEnabledMux(t *testing.T) {
 	pool := &WorkerPoolConfig{
-		MaxIdleWorkers:       1,
+		ReuseThreshold:       1,
 		MaxProbingWorkers:    1,
-		ProbeIntervalSecs:    2,
+		ProbeIntervalMs:      2000,
 		ProbeTimeoutMs:       200,
-		IdleTtlSecs:          5,
+		IdleTtlMs:            2200,
 		MaxRequestsPerWorker: 1,
 	}
 	for _, config := range []MuxConfig{
@@ -406,26 +425,26 @@ func TestMuxWorkerPoolRequiresEnabledMux(t *testing.T) {
 }
 
 func FuzzMuxWorkerPoolConfigBuild(f *testing.F) {
-	f.Add(uint32(0), uint32(2), uint32(1), uint32(5), uint32(2000), uint32(24), uint32(128))
+	f.Add(uint32(0), uint32(2), uint32(1), uint32(5125), uint32(2000), uint32(24125), uint32(128))
 	f.Add(^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0))
 	f.Fuzz(func(t *testing.T, minIdle, maxIdle, maxProbing, interval, timeout, ttl, maxRequests uint32) {
 		config := WorkerPoolConfig{
-			MinIdleWorkers:       minIdle,
-			MaxIdleWorkers:       maxIdle,
+			PrewarmWorkers:       minIdle,
+			ReuseThreshold:       maxIdle,
 			MaxProbingWorkers:    maxProbing,
-			ProbeIntervalSecs:    interval,
+			ProbeIntervalMs:      interval,
 			ProbeTimeoutMs:       timeout,
-			IdleTtlSecs:          ttl,
+			IdleTtlMs:            ttl,
 			MaxRequestsPerWorker: maxRequests,
 		}
 		built, err := config.Build()
 		if err != nil {
 			return
 		}
-		if built.MinIdleWorkers > built.MaxIdleWorkers || built.MaxProbingWorkers > built.MaxIdleWorkers {
+		if built.PrewarmWorkers > built.ReuseThreshold || built.MaxProbingWorkers > built.ReuseThreshold {
 			t.Fatalf("Build() accepted inconsistent values: %+v", built)
 		}
-		if uint64(built.ProbeTimeoutMs) >= uint64(built.ProbeIntervalSecs)*1000 {
+		if built.ProbeTimeoutMs >= built.ProbeIntervalMs {
 			t.Fatalf("Build() accepted timeout >= interval: %+v", built)
 		}
 	})

@@ -2,7 +2,7 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::Router;
 use brocade_console::http::{
-    admin_router_with_wakes_and_realtime, agent_router_with_origin_and_realtime,
+    admin_router_with_services, agent_router_with_origin_and_realtime,
     merged_router_with_wakes_and_realtime, with_console_branding, with_console_static,
     with_console_static_dir,
 };
@@ -43,12 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // them differently (an allow-list in front of the console while the machines reach the agent
     // face), and that is a decision the operator makes, so it waits to be asked for.
     //
-    // `BROCADE_BIND` is the older spelling of the same request and still counts as asking.
-    let agent_bind: Option<SocketAddr> =
-        match env::var("BROCADE_AGENT_BIND").or_else(|_| env::var("BROCADE_BIND")) {
-            Ok(value) => Some(value.parse()?),
-            Err(_) => None,
-        };
+    let agent_bind: Option<SocketAddr> = match env::var("BROCADE_AGENT_BIND") {
+        Ok(value) => Some(value.parse()?),
+        Err(_) => None,
+    };
 
     // A first start otherwise stops on a database nobody has created yet, which is a step with no
     // decision in it: the name is already in DATABASE_URL, and the process is about to create every
@@ -66,12 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let store = PgStore::connect(&database_url).await?;
-    let default_warps = store.migrate().await?;
-    if default_warps > 0 {
-        eprintln!(
-            "brocade-console created {default_warps} missing tenant default WARP resource(s)"
-        );
-    }
+    store.migrate().await?;
     if store.ensure_default_app_group().await? {
         eprintln!("brocade-console created the line group 默认分组");
     }
@@ -275,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(agent_listener) => {
             let admin = axum::serve(
                 admin_listener,
-                with_console(admin_router_with_wakes_and_realtime(
+                with_console(admin_router_with_services(
                     store.clone(),
                     quota_wake,
                     grants_wake,

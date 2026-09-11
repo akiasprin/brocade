@@ -33,12 +33,14 @@
 //! an agent compares its own sha against the one it is told and installs anything different, in
 //! either direction. There is no notion of newer.
 //!
-//! The state in between deserves care, because self-update is what makes it easy to reach: a fleet
-//! running agents *newer* than the control plane driving them. Field-level compatibility mostly
-//! holds — the protocol structs default their unknown fields — but an agent that has learned to
-//! ask for something the older control plane never served will keep asking. `/agent/v1/agent-release`
-//! is itself the example: answered 404 there, which the agent treats as "no self-update here"
-//! rather than as an error (`selfupdate.rs`).
+//! # Protocol isolation and recovery
+//!
+//! Desired state and self-update deliberately have separate gates. An Agent whose wire protocol
+//! is incompatible receives no desired state, but it may still authenticate to
+//! `/agent/v1/agent-release`. That endpoint returns bytes only when an administrator approved the
+//! embedded build, the scope includes the node, the node is active, and its architecture is
+//! available. This narrow path restores protocol compatibility without granting an isolated Agent
+//! access to configuration it cannot safely interpret.
 //!
 //! # Why there is no percentage
 //!
@@ -144,12 +146,6 @@ impl AgentRelease {
             return false;
         }
         self.reaches(node_id)
-    }
-
-    /// Emergency compatibility offer: keep the configured rollout scope, but ignore the stored
-    /// build id so a control-plane redeploy cannot strand an agent below the minimum protocol.
-    pub fn offers_protocol_rescue(&self, node_id: &str) -> bool {
-        self.release_id.is_some() && self.reaches(node_id)
     }
 }
 
@@ -443,24 +439,5 @@ mod tests {
         assert!(validate(&paused).is_ok());
         assert_eq!(paused.release_id.as_deref(), Some(BUILD));
         assert_eq!(paused.nodes, vec!["n1".to_owned()]);
-    }
-
-    #[test]
-    fn protocol_rescue_keeps_scope_but_ignores_a_stale_build_id() {
-        let staged = AgentRelease {
-            release_id: Some("0".repeat(64)),
-            scope: AgentReleaseScope::Nodes,
-            nodes: vec!["n1".to_owned()],
-            ..release_record_placeholders()
-        };
-        assert!(!staged.offers("n1", BUILD));
-        assert!(staged.offers_protocol_rescue("n1"));
-        assert!(!staged.offers_protocol_rescue("n2"));
-
-        let paused = AgentRelease {
-            scope: AgentReleaseScope::Off,
-            ..staged
-        };
-        assert!(!paused.offers_protocol_rescue("n1"));
     }
 }

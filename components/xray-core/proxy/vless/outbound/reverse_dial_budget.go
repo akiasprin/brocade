@@ -23,9 +23,6 @@ func (r *Reverse) reportDialDemand(ready, pending int, eligible bool) {
 func (r *Reverse) acquireDial() bool {
 	reverseDials.Lock()
 	defer reverseDials.Unlock()
-	if reverseDials.active >= 32 {
-		return false
-	}
 	mine := reverseDials.pairs[r]
 	if mine.ready+mine.pending > 0 {
 		for pair, demand := range reverseDials.pairs {

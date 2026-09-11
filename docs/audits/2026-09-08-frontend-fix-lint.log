@@ -1,4 +1,0 @@
-
-> brocade-ui-console@0.0.0 lint:strict
-> eslint src --max-warnings 0
-

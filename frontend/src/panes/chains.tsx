@@ -10,7 +10,6 @@ import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
   type Ref,
 } from 'react';
 import { hopWireLabel } from '../ui/format';
@@ -745,8 +744,7 @@ export function IngressPortEditor({
   /** 只渲染输入框和按钮，不带「机器 @ 地址 :」前缀。
    *
    *  在链详情页中它位于 `.kv` 的格内，左侧列已标注「监听端口」，
-   *  机器名也在同一张表的上一行——再次显示属于重复。
-   *  机器详情页的情况不同：那里一台机器关联多条链，前缀是区分依据。 */
+   *  机器名也在同一张表的上一行——再次显示属于重复。 */
   compact?: boolean;
 }) {
   const qc = useQueryClient();
@@ -833,15 +831,17 @@ export function IngressPortEditor({
           <span className="dim">:</span>
         </>
       )}
-      {editable ? (
+      <input
+        className="f mono"
+        style={{ width: 86 }}
+        value={value}
+        inputMode="numeric"
+        disabled={!editable}
+        aria-label="VLESS · TLS / REALITY 监听端口"
+        onChange={e => setDraftPort(e.target.value)}
+      />
+      {editable && (
         <>
-          <input
-            className="f mono"
-            style={{ width: 86 }}
-            value={value}
-            inputMode="numeric"
-            onChange={e => setDraftPort(e.target.value)}
-          />
           {!inPanel && (
             <button
               className="btn"
@@ -863,8 +863,6 @@ export function IngressPortEditor({
             </span>
           )}
         </>
-      ) : (
-        <span className="mono">{ingress.port}</span>
       )}
       {save.error && <ErrorBox error={save.error} />}
     </div>
@@ -1605,13 +1603,10 @@ type XhttpDownloadDraft = {
 
 type XhttpDownloadDrafts = Partial<Record<ProjectionFamily, XhttpDownloadDraft | null>>;
 
-function xhttpDownloadDraftsOf(
-  downloadConfig: Xhttp['download'],
-  legacyProjection?: IngressProjection | null,
-): XhttpDownloadDrafts {
+function xhttpDownloadDraftsOf(downloadConfig: Xhttp['download']): XhttpDownloadDrafts {
   const drafts: XhttpDownloadDrafts = {};
   for (const family of PROJECTION_FAMILIES) {
-    const download = downloadConfig?.[family] ?? legacyProjection?.[family]?.download;
+    const download = downloadConfig?.[family];
     if (!download) {
       drafts[family] = null;
       continue;
@@ -1628,13 +1623,12 @@ function xhttpDownloadDraftsOf(
 }
 
 function xhttpDownloadDraftOf(endpoint: ProjectionEndpoint, splitReality: boolean): XhttpDownloadDraft {
-  const download = endpoint.download;
   return {
-    host: download?.host ?? endpoint.host,
-    port: String(download?.port ?? endpoint.port),
-    originPort: splitReality ? String(download?.origin_port ?? download?.port ?? endpoint.port) : null,
-    httpHost: download?.http_host ?? '',
-    mux: download?.mux == null ? '' : String(download.mux),
+    host: endpoint.host,
+    port: String(endpoint.port),
+    originPort: splitReality ? String(endpoint.port) : null,
+    httpHost: '',
+    mux: '',
   };
 }
 
@@ -1804,10 +1798,11 @@ export function IngressEncryptionRow({ ingress, editable }: { ingress: SnapshotI
   const [portDraft, setPortDraft] = useState<string | null>(null);
   const [optionsDraft, setOptionsDraft] = useState<VlessEncryptionOptions | null>(null);
   const current = ingress.wires.vless_encryption;
-  const savedOptions = { ...DEFAULT_VLESS_ENCRYPTION, ...current?.options };
+  // 客户端会话恢复固定为 0rtt。仍接受历史模型中的 1rtt，但面板下一次保存时会收敛为固定值。
+  const savedOptions = { ...DEFAULT_VLESS_ENCRYPTION, ...current?.options, client_mode: '0rtt' as const };
   const options = optionsDraft ?? savedOptions;
   const update = (patch: Partial<VlessEncryptionOptions>) => setOptionsDraft({ ...options, ...patch });
-  const port = Number(portDraft ?? current?.port ?? 48000);
+  const port = Number(portDraft ?? current?.port ?? 13800);
   const taken = occupiedPorts(snapshot.data?.snapshot.apps ?? [], nodes.data?.nodes ?? [], undefined, ingress.id);
   const conflict =
     portClash(taken, [ingress.node], port) ||
@@ -1847,7 +1842,7 @@ export function IngressEncryptionRow({ ingress, editable }: { ingress: SnapshotI
             aria-label="VLESS · Encryption 监听端口"
             style={{ width: 86 }}
             inputMode="numeric"
-            value={portDraft ?? current?.port ?? 48000}
+            value={portDraft ?? current?.port ?? 13800}
             disabled={!editable}
             onChange={event => setPortDraft(event.target.value)}
           />
@@ -1875,9 +1870,9 @@ export function IngressEncryptionRow({ ingress, editable }: { ingress: SnapshotI
           disabled={!editable}
           onChange={event => update({ appearance: event.target.value as VlessEncryptionOptions['appearance'] })}
         >
-          <option value="native">native · 原始格式</option>
-          <option value="xorpub">xorpub · 混淆公钥</option>
-          <option value="random">random · 随机外观</option>
+          <option value="native">native</option>
+          <option value="xorpub">xorpub</option>
+          <option value="random">random</option>
         </select>
         <div className="note">
           {options.appearance === 'native'
@@ -1887,20 +1882,6 @@ export function IngressEncryptionRow({ ingress, editable }: { ingress: SnapshotI
               : '将流量外观随机化。'}
           均不提供 HTTPS 伪装；服务端与客户端自动保持一致。
         </div>
-      </dd>
-      <dt>会话恢复</dt>
-      <dd>
-        <select
-          className="f"
-          aria-label="Encryption 客户端握手"
-          value={options.client_mode}
-          disabled={!editable}
-          onChange={event => update({ client_mode: event.target.value as VlessEncryptionOptions['client_mode'] })}
-        >
-          <option value="0rtt">0-RTT · 尝试复用票据</option>
-          <option value="1rtt">1-RTT · 每次完整握手</option>
-        </select>
-        <div className="note">0-RTT 在已有有效票据时尝试恢复；首次连接或票据失效时仍需握手。</div>
       </dd>
       <dt>高级参数</dt>
       <dd>
@@ -2058,7 +2039,12 @@ export function IngressStreamRow({
   const [draftAnyTlsIdleCheck, setDraftAnyTlsIdleCheck] = useState<string | null>(null);
   const [draftAnyTlsIdleTimeout, setDraftAnyTlsIdleTimeout] = useState<string | null>(null);
   const [draftAnyTlsMinIdle, setDraftAnyTlsMinIdle] = useState<string | null>(null);
-  const current = stagedTransport && 'xhttp' in stagedTransport ? stagedTransport.xhttp : (storedVless?.xhttp ?? null);
+  const current =
+    stagedTransport && 'xhttp' in stagedTransport
+      ? stagedTransport.xhttp
+      : storedVless && 'xhttp' in storedVless
+        ? storedVless.xhttp
+        : null;
   const on = kind !== null && transportIsXhttp(kind);
   const tls = kind !== null && kind.startsWith('vless-tls');
   /* 尚未启用 hy2 时用于填充表单的默认值。端口不能固定为 50000：同一台机器上启用第二个
@@ -2102,7 +2088,7 @@ export function IngressStreamRow({
   const xmux = current?.xmux ?? null;
   const tuning = current?.tuning ?? null;
   const storedMode: XhttpMode = current?.mode ?? 'auto';
-  const storedDownloadDrafts = xhttpDownloadDraftsOf(current?.download, ingress.projection);
+  const storedDownloadDrafts = xhttpDownloadDraftsOf(current?.download);
   const [draftPath, setDraftPath] = useState<string | null>(null);
   const [draftHost, setDraftHost] = useState<string | null>(null);
   const [draftXmux, setDraftXmux] = useState<XmuxDraft | undefined>(undefined);
@@ -2256,7 +2242,7 @@ export function IngressStreamRow({
       return;
     }
     if (wire === 'encryption') {
-      let port = freePortAcross(tcpTaken, [ingress.node], portSettings.data?.ports?.vless_encryption_base || 48000);
+      let port = freePortAcross(tcpTaken, [ingress.node], portSettings.data?.ports?.vless_encryption_base || 13800);
       while (
         port < 65536 &&
         ((vlessOn && port === ingress.port) ||
@@ -2449,9 +2435,9 @@ export function IngressStreamRow({
     quicBad(quicValue.max_incoming_streams, HY2_QUIC_LIMITS.streams.min);
   const hy2Bad =
     hy2BandwidthBad || hy2ObfsBad || hy2MasqueradeBad || hy2HopBad || hy2PortBad || hy2ForceBrutalBad || hy2QuicBad;
-  /* BBR 策略只在该连接实际使用 BBR 时被读取：选择 bbr，或选择 brutal 且带宽留空。
-     reno 和已指定带宽的 brutal 都不读取该字段，此时显示该项相当于提供一个无效的选择。 */
-  const bbrInPlay = hy2Value.congestion === 'bbr' || (hy2Value.congestion === 'brutal' && hy2Up.trim() === '');
+  /* Brutal 是否回退 BBR 还取决于对端公布的接收带宽，不能只凭本地带宽隐藏策略。
+     所有模式保留并显示原值；只有确定不用 BBR 的 Reno / force-brutal 禁止编辑。 */
+  const bbrMayApply = hy2Value.congestion === 'bbr' || hy2Value.congestion === 'brutal';
   const hy2Dirty = draftHy2 !== null && JSON.stringify(hy2Value) !== JSON.stringify(activeHy2);
   usePanelEntry(
     'hy2',
@@ -2469,7 +2455,7 @@ export function IngressStreamRow({
   const anytlsHeaders = anytlsValue.masquerade.headers;
   const anytlsHeadersText = draftAnyTlsHeaders ?? anyTlsHeadersText(anytlsHeaders);
   const anytlsMasqueradeIsString = anytlsValue.masquerade.kind === 'string';
-  const anytlsReality = (anytlsValue.security ?? 'tls') === 'reality';
+  const anytlsReality = anytlsValue.security === 'reality';
   const anytlsStoredStatus =
     anytlsValue.masquerade.kind === 'string' ? (anytlsValue.masquerade.status_code ?? 200) : 404;
   const anytlsStatusText = draftAnyTlsStatus ?? String(anytlsStoredStatus);
@@ -2753,16 +2739,16 @@ export function IngressStreamRow({
             target="anytls"
           />
         )}
-        <dt>参数</dt>
+        <dt>高级参数</dt>
         <dd>
           {editable && (
             <>
               <div className="toolbar anytls-parameter-row">
-                <span className="dim">Padding Scheme</span>
+                <span className="dim">Padding</span>
                 <select
                   className="f words"
                   value={anytlsPaddingPreset}
-                  aria-label="AnyTLS Padding Scheme 预设"
+                  aria-label="AnyTLS Padding 预设"
                   onChange={event => {
                     if (event.target.value === 'custom') {
                       setForceAnyTlsPaddingCustom(true);
@@ -2789,75 +2775,18 @@ export function IngressStreamRow({
                   rows={5}
                   style={{ borderColor: anytlsPaddingBad ? 'var(--err)' : undefined }}
                   value={anytlsPaddingText}
-                  aria-label="AnyTLS Padding Scheme"
+                  aria-label="AnyTLS Padding"
                   placeholder="每行一条规则"
                   onChange={event => setDraftAnyTlsPadding(event.target.value)}
                 />
               )}
               {anytlsPaddingBad && (
-                <div className="note bad">Padding Scheme 格式无效：请检查 `=`、重复编号、stop 和字节范围。</div>
+                <div className="note bad">Padding 格式无效：请检查 `=`、重复编号、stop 和字节范围。</div>
               )}
             </>
           )}
-          <details className="form-adv anytls-session" style={{ width: '100%' }}>
-            <summary>连接复用（留空 = 使用默认值）</summary>
-            <div className="hy2-quic">
-              <label className="hy2-quic-fld">
-                <span>
-                  检查间隔 <small>秒</small>
-                </span>
-                <input
-                  className="f mono"
-                  type="number"
-                  min={1}
-                  max={U32_MAX}
-                  placeholder="30"
-                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
-                  value={anytlsIdleCheckText}
-                  disabled={!editable}
-                  aria-label="AnyTLS Session 检查间隔"
-                  onChange={event => setDraftAnyTlsIdleCheck(event.target.value)}
-                />
-              </label>
-              <label className="hy2-quic-fld">
-                <span>
-                  空闲超时 <small>秒</small>
-                </span>
-                <input
-                  className="f mono"
-                  type="number"
-                  min={1}
-                  max={U32_MAX}
-                  placeholder="30"
-                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
-                  value={anytlsIdleTimeoutText}
-                  disabled={!editable}
-                  aria-label="AnyTLS Session 空闲超时"
-                  onChange={event => setDraftAnyTlsIdleTimeout(event.target.value)}
-                />
-              </label>
-              <label className="hy2-quic-fld">
-                <span>
-                  最少保留 <small>个</small>
-                </span>
-                <input
-                  className="f mono"
-                  type="number"
-                  min={0}
-                  max={U32_MAX}
-                  placeholder="0"
-                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
-                  value={anytlsMinIdleText}
-                  disabled={!editable}
-                  aria-label="AnyTLS Session 最少保留数量"
-                  onChange={event => setDraftAnyTlsMinIdle(event.target.value)}
-                />
-              </label>
-            </div>
-            {anytlsSessionBad && <div className="note bad">数值必须在 0 到 {U32_MAX} 之间；两个时间值须大于 0。</div>}
-          </details>
           {!anytlsReality && (
-            <div style={{ width: '100%', marginTop: 6 }}>
+            <div className="anytls-masquerade">
               <div className="toolbar anytls-parameter-row">
                 <span className="dim">伪装</span>
                 <select
@@ -2920,6 +2849,63 @@ export function IngressStreamRow({
               <div className="note">未完成 AnyTLS 握手时返回此响应。</div>
             </div>
           )}
+          <details className="form-adv anytls-session" style={{ width: '100%' }}>
+            <summary>连接复用（留空 = 使用默认值）</summary>
+            <div className="hy2-quic">
+              <label className="hy2-quic-fld">
+                <span>
+                  检查间隔 <small>秒</small>
+                </span>
+                <input
+                  className="f mono"
+                  type="number"
+                  min={1}
+                  max={U32_MAX}
+                  placeholder="30"
+                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  value={anytlsIdleCheckText}
+                  disabled={!editable}
+                  aria-label="AnyTLS Session 检查间隔"
+                  onChange={event => setDraftAnyTlsIdleCheck(event.target.value)}
+                />
+              </label>
+              <label className="hy2-quic-fld">
+                <span>
+                  空闲超时 <small>秒</small>
+                </span>
+                <input
+                  className="f mono"
+                  type="number"
+                  min={1}
+                  max={U32_MAX}
+                  placeholder="30"
+                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  value={anytlsIdleTimeoutText}
+                  disabled={!editable}
+                  aria-label="AnyTLS Session 空闲超时"
+                  onChange={event => setDraftAnyTlsIdleTimeout(event.target.value)}
+                />
+              </label>
+              <label className="hy2-quic-fld">
+                <span>
+                  最少保留 <small>个</small>
+                </span>
+                <input
+                  className="f mono"
+                  type="number"
+                  min={0}
+                  max={U32_MAX}
+                  placeholder="0"
+                  style={{ borderColor: anytlsSessionBad ? 'var(--err)' : undefined }}
+                  value={anytlsMinIdleText}
+                  disabled={!editable}
+                  aria-label="AnyTLS Session 最少保留数量"
+                  onChange={event => setDraftAnyTlsMinIdle(event.target.value)}
+                />
+              </label>
+            </div>
+            {anytlsSessionBad && <div className="note bad">数值必须在 0 到 {U32_MAX} 之间；两个时间值须大于 0。</div>}
+          </details>
         </dd>
       </>
     );
@@ -2958,29 +2944,33 @@ export function IngressStreamRow({
                 className="f"
                 value={hy2Value.congestion}
                 disabled={!editable}
+                aria-label="Hysteria 2 拥塞控制"
                 onChange={event => updateHy2({ congestion: event.target.value as Hysteria2Settings['congestion'] })}
               >
-                <option value="brutal">Brutal（带宽留空时退回 BBR）</option>
+                <option value="brutal">Brutal（可回退 BBR）</option>
                 <option value="reno">New Reno（不看带宽）</option>
                 <option value="bbr">BBR（忽略带宽）</option>
                 <option value="force-brutal">Brutal 强制</option>
               </select>
             </div>
-            {bbrInPlay && (
-              <div className="toolbar" style={{ margin: '6px 0 0', gap: 6, flexWrap: 'wrap' }}>
-                <span className="dim">BBR 策略</span>
-                <select
-                  className="f"
-                  value={hy2Value.bbr_profile ?? 'standard'}
-                  disabled={!editable}
-                  onChange={event => updateHy2({ bbr_profile: event.target.value as HysteriaBbrProfile })}
-                >
-                  <option value="standard">Standard（默认）</option>
-                  <option value="conservative">Conservative（更保守）</option>
-                  <option value="aggressive">Aggressive（更激进）</option>
-                </select>
-              </div>
-            )}
+            <div className="toolbar" style={{ margin: '6px 0 0', gap: 6, flexWrap: 'wrap' }}>
+              <span className="dim">BBR 策略</span>
+              <select
+                className="f"
+                value={hy2Value.bbr_profile ?? 'standard'}
+                disabled={!editable || !bbrMayApply}
+                aria-label="Hysteria 2 BBR 策略"
+                onChange={event => updateHy2({ bbr_profile: event.target.value as HysteriaBbrProfile })}
+              >
+                <option value="standard">Standard（默认）</option>
+                <option value="conservative">Conservative（更保守）</option>
+                <option value="aggressive">Aggressive（更激进）</option>
+              </select>
+              {hy2Value.congestion === 'brutal' && (
+                <span className="note">回退 BBR 时生效；本端发送带宽或对端接收带宽未提供时可能回退。</span>
+              )}
+              {!bbrMayApply && <span className="note">当前拥塞模式不使用 BBR；保留策略，切回后生效。</span>}
+            </div>
             <div className="toolbar" style={{ margin: '6px 0 0', gap: 6, flexWrap: 'wrap' }}>
               <span className="dim">混淆</span>
               <select
@@ -5348,7 +5338,6 @@ export function ChainRulesPanel({
   defaultOpenSelected = false,
   rootLabel,
   rootLabelTitle,
-  rootSummary,
   readOnly = false,
   settingsReadable = true,
 }: {
@@ -5377,7 +5366,6 @@ export function ChainRulesPanel({
   defaultOpenSelected?: boolean;
   rootLabel?: string;
   rootLabelTitle?: string;
-  rootSummary?: ReactNode;
   // readonly 角色看到的是同一棵树和同一张表，只是全部禁用（见 RuleEditor 的 readOnly）。
   // 此前整块被替换为「修改规则需要 editor 及以上」——该提示回答的是权限问题，
   // 而进入链详情页需要了解的是当前配置，两者不同。
@@ -5442,6 +5430,17 @@ export function ChainRulesPanel({
   const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
   const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
   const peersOf = (node: string) => forwardPeers({ nodeId: node, spine, tenant: chain.tenant, steps, nodes });
+
+  // The folded port summary is a property of the row's machine, never of the edge used to arrive
+  // there. Normal hops listen on `to`; reverse hops listen on `from`. Derive that ownership from
+  // the complete effective rule tree so a stale `step.hop_in` cannot masquerade as a live socket.
+  const hopListeners = new Set<string>();
+  for (const candidate of steps) {
+    for (const rule of draftRules[candidate.node] ?? candidate.rules) {
+      if (rule.a.t !== 'forward') continue;
+      hopListeners.add(rule.a.dial?.t === 'reverse' ? candidate.node : rule.a.to);
+    }
+  }
 
   // 展开状态按出现位置记录（从根到该节点的完整路径），不按机器记录：
   // 同一台机器在树中出现两次时，点击哪一处展开哪一处。另一处不同步展开——
@@ -5521,7 +5520,9 @@ export function ChainRulesPanel({
     const rootOccurrence = path.size === 0 && rootNodes.includes(node);
     /* 该机器在其他位置已展开（而非此处）：高亮提示，不同步展开 */
     const sameOpen = !expanded && openNodes.has(node);
-    /* 摘要行的两项内容：规则条数、中转端口（含加密档位，PLAIN 即该处的明文提示）。 */
+    const listensForHop = hopListeners.has(node);
+    const hopTitle = listensForHop ? `${nameOf(node)} 实际监听的中转端口与承载协议` : undefined;
+    const hopSummary = listensForHop ? (step?.hop_in ? summarizeHopIn(step) : '未配置') : '—';
     const written = step?.rules.length ?? 0;
 
     const badges = (
@@ -5596,8 +5597,8 @@ export function ChainRulesPanel({
           </span>
           <div className="meta">
             <span className="m-rules">{written === 0 ? '没写规则' : `${written} 条规则`}</span>
-            <div className="m-hop">
-              {rootOccurrence && rootSummary ? rootSummary : <span className="mono">{summarizeHopIn(step)}</span>}
+            <div className="m-hop" title={hopTitle}>
+              <span className="mono">{hopSummary}</span>
             </div>
           </div>
         </div>

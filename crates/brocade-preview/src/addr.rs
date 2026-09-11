@@ -10,9 +10,7 @@ use serde_json::Value;
 use crate::{
     config::Config,
     console::get_console_json,
-    docker::{
-        docker_output, label_template, LABEL_IPV4, LABEL_IPV6, LABEL_IP_LEGACY, LABEL_PREVIEW,
-    },
+    docker::{docker_output, label_template, LABEL_IPV4, LABEL_IPV6, LABEL_PREVIEW},
     error::PreviewError,
     AppState,
 };
@@ -94,9 +92,7 @@ pub(crate) async fn allocate_address(
         }
     }
     let filter = format!("label={LABEL_PREVIEW}=1");
-    let template = [LABEL_IP_LEGACY, LABEL_IPV4, LABEL_IPV6]
-        .map(label_template)
-        .join(" ");
+    let template = [LABEL_IPV4, LABEL_IPV6].map(label_template).join(" ");
     if let Ok(output) = docker_output(
         &state.config,
         &["ps", "-a", "--filter", &filter, "--format", &template],

@@ -125,10 +125,10 @@ pub enum ModelOp {
         app_id: String,
         chain_id: String,
     },
-    /// Drop the steps on this chain unreachable from its head. It comes last when the console
-    /// saves a whole rule tree — the test needs the chain's complete rule table, while a draft
-    /// replays operation by operation and every intermediate state is incomplete (see
-    /// `prune_chain` in console.rs).
+    /// Normalize the chain after the whole rule tree has landed: drop steps unreachable from its
+    /// head and clear relay inbounds from machines no final hop listens on. A draft replays
+    /// operation by operation and every intermediate state is incomplete, so this must come last
+    /// (see `prune_chain` in console.rs).
     PruneChain {
         app_id: String,
         chain_id: String,
@@ -214,7 +214,7 @@ impl ModelOp {
             }
             ModelOp::DeleteChain { app_id, chain_id } => format!("删除链 {app_id}/{chain_id}"),
             ModelOp::PruneChain { app_id, chain_id } => {
-                format!("清理落单节点 {app_id}/{chain_id}")
+                format!("清理链状态 {app_id}/{chain_id}")
             }
             ModelOp::UpsertGrant { grant } => format!(
                 "{} 授权 {}/{} → {}",
@@ -357,9 +357,9 @@ async fn apply_op(
                 .changed
         }
         ModelOp::PruneChain { app_id, chain_id } => {
-            !c::prune_chain_tx(tx, actor, &app_id, &chain_id)
+            c::prune_chain_tx(tx, actor, &app_id, &chain_id)
                 .await?
-                .is_empty()
+                .changed()
         }
         ModelOp::UpsertGrant { grant } => {
             c::upsert_grant_tx(tx, actor, revision_id, grant).await?.1

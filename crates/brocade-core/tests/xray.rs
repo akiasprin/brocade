@@ -1705,23 +1705,11 @@ fn xray_reality_dest_removes_spaces_around_the_port_separator() {
     assert_eq!(reality["dest"], "apps.apple.com:443");
 }
 
-/// The three connection settings each reach the artifact as their own shape.
-///
-/// Asserted together in one table rather than as three tests, because what matters is that they
-/// differ: `None` writing `"enabled": false` instead of nothing, or `Pool` and `Merge(8)` both
-/// arriving as 8, are the mistakes worth catching, and each is invisible when a variant is
-/// checked on its own.
-///
-/// The absent case is asserted as an absent key, not a falsy one. A machine that was never asked
-/// to pool has to read exactly as it did before this feature existed, or every golden artifact
-/// gains a line that means nothing.
+/// The connection setting reaches the artifact in its exact current shape.
 #[test]
 fn the_connection_setting_reaches_the_hop_outbound() {
     for (pool, expected) in [
         (HopPool::None, None),
-        (HopPool::Pool, Some(1)),
-        (HopPool::Merge(8), Some(8)),
-        (HopPool::Merge(128), Some(128)),
         (HopPool::Mux(None), Some(1)),
         (
             HopPool::Mux(Some(HopMux {
@@ -1729,6 +1717,13 @@ fn the_connection_setting_reaches_the_hop_outbound() {
                 ..Default::default()
             })),
             Some(8),
+        ),
+        (
+            HopPool::Mux(Some(HopMux {
+                concurrency: 128,
+                ..Default::default()
+            })),
+            Some(128),
         ),
     ] {
         let doc = doc(vec![
@@ -1776,20 +1771,19 @@ fn the_connection_setting_reaches_the_hop_outbound() {
             Some(concurrency) => {
                 assert_eq!(out["mux"]["enabled"], true, "{pool:?}");
                 assert_eq!(out["mux"]["concurrency"], concurrency, "{pool:?}");
-                if matches!(pool, HopPool::Mux(_)) {
-                    assert_eq!(out["mux"]["workerPool"]["minIdleWorkers"], 0, "{pool:?}");
-                    assert_eq!(out["mux"]["workerPool"]["maxIdleWorkers"], 2, "{pool:?}");
-                    assert_eq!(out["mux"]["workerPool"]["maxProbingWorkers"], 1, "{pool:?}");
-                    assert_eq!(out["mux"]["workerPool"]["probeIntervalSecs"], 5, "{pool:?}");
-                    assert_eq!(out["mux"]["workerPool"]["probeTimeoutMs"], 2000, "{pool:?}");
-                    assert_eq!(out["mux"]["workerPool"]["idleTtlSecs"], 24, "{pool:?}");
-                    assert_eq!(
-                        out["mux"]["workerPool"]["maxRequestsPerWorker"], 128,
-                        "{pool:?}"
-                    );
-                } else {
-                    assert!(out["mux"]["workerPool"].is_null(), "{pool:?}: {out:#?}");
-                }
+                assert_eq!(out["mux"]["workerPool"]["prewarmWorkers"], 0, "{pool:?}");
+                assert_eq!(out["mux"]["workerPool"]["reuseThreshold"], 2, "{pool:?}");
+                assert_eq!(out["mux"]["workerPool"]["maxProbingWorkers"], 1, "{pool:?}");
+                assert_eq!(
+                    out["mux"]["workerPool"]["probeIntervalMs"], 5000,
+                    "{pool:?}"
+                );
+                assert_eq!(out["mux"]["workerPool"]["probeTimeoutMs"], 2000, "{pool:?}");
+                assert_eq!(out["mux"]["workerPool"]["idleTtlMs"], 24000, "{pool:?}");
+                assert_eq!(
+                    out["mux"]["workerPool"]["maxRequestsPerWorker"], 128,
+                    "{pool:?}"
+                );
             }
         }
 
@@ -1854,38 +1848,38 @@ fn current_mux_resolves_global_defaults_without_leaking_them_into_overrides_or_d
 
     let global_four = HopMux {
         concurrency: 4,
-        probe_interval_secs: 9,
+        probe_interval_ms: 9_125,
         ..Default::default()
     };
     let global_sixteen = HopMux {
         concurrency: 16,
-        probe_interval_secs: 11,
+        probe_interval_ms: 11_250,
         ..Default::default()
     };
     let followed = render(HopPool::Mux(None), global_four);
     assert_eq!(followed["mux"]["concurrency"], 4);
-    assert_eq!(followed["mux"]["workerPool"]["probeIntervalSecs"], 9);
+    assert_eq!(followed["mux"]["workerPool"]["probeIntervalMs"], 9125);
 
     let large_counts = HopMux {
-        min_idle_workers: u32::MAX,
-        max_idle_workers: u32::MAX,
+        prewarm_workers: u32::MAX,
+        reuse_threshold: u32::MAX,
         max_probing_workers: u32::MAX,
         max_requests_per_worker: u16::MAX,
-        idle_ttl_secs: 86_400,
+        idle_ttl_ms: 86_400_125,
         ..Default::default()
     };
     for pool in [HopPool::Mux(None), HopPool::Mux(Some(large_counts))] {
         let rendered = render(pool, large_counts);
-        assert_eq!(rendered["mux"]["workerPool"]["minIdleWorkers"], u32::MAX);
-        assert_eq!(rendered["mux"]["workerPool"]["maxIdleWorkers"], u32::MAX);
+        assert_eq!(rendered["mux"]["workerPool"]["prewarmWorkers"], u32::MAX);
+        assert_eq!(rendered["mux"]["workerPool"]["reuseThreshold"], u32::MAX);
         assert_eq!(rendered["mux"]["workerPool"]["maxProbingWorkers"], u32::MAX);
         assert_eq!(rendered["mux"]["workerPool"]["maxRequestsPerWorker"], 65535);
-        assert_eq!(rendered["mux"]["workerPool"]["idleTtlSecs"], 86400);
+        assert_eq!(rendered["mux"]["workerPool"]["idleTtlMs"], 86_400_125);
     }
 
     let override_value = HopMux {
         concurrency: 8,
-        probe_interval_secs: 7,
+        probe_interval_ms: 7_375,
         ..Default::default()
     };
     assert_eq!(
@@ -2437,7 +2431,7 @@ fn sniffing_failure_rule_opts_relay_into_sniffing_and_can_route_to_local_egress(
         inbound(&value, "in:hop:relay/c-relay")
             .get("sniffing")
             .is_none(),
-        "a legacy domain rule must not silently add another 200ms relay sniff window"
+        "an ordinary domain rule must not silently add another 200ms relay sniff window"
     );
 
     relay.steps[1].rules.insert(
@@ -3846,7 +3840,7 @@ fn assert_encryption_ingress(options: brocade_core::model::VlessEncryptionOption
 }
 
 #[test]
-fn reverse_health_override_reaches_both_ends_with_canary() {
+fn reverse_health_override_reaches_both_ends_without_canary() {
     let mut doc = doc(vec![
         node("hk", [10, 66, 0, 1], true, Dns::System),
         node("sg", [10, 66, 0, 2], false, Dns::System),
@@ -3879,7 +3873,6 @@ fn reverse_health_override_reaches_both_ends_with_canary() {
     let policy = brocade_core::model::ReverseHealth {
         tuning: brocade_core::model::ReverseHealthTuning {
             max_sessions_per_worker: 4,
-            canary_interval_ms: 2000,
             ..Default::default()
         },
         probe_interval_ms: 1800,
@@ -3925,5 +3918,9 @@ fn reverse_health_override_reaches_both_ends_with_canary() {
     assert_eq!(reverse["tag"], portal_tag);
     assert_eq!(reverse["health"], serde_json::to_value(policy).unwrap());
     assert_eq!(dial["settings"]["reverse"]["health"], reverse["health"]);
-    assert_eq!(reverse["canary_url"], doc.settings.probe.endpoint_url);
+    assert!(
+        dial.get("mux").is_none() || dial["mux"].is_null(),
+        "reverse carrier inherited ordinary relay mux policy: {dial:#?}"
+    );
+    assert!(reverse.get("canary_url").is_none());
 }

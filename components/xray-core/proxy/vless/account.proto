@@ -33,6 +33,7 @@ message ReverseHealth {
  uint32 dial_ready_timeout_ms = 8;
  uint32 reconnect_backoff_cap_ms = 9;
  ReverseHealthTuning tuning = 10;
+ bool disconnect_on_health_failure = 11;
 }
 
 message Reverse {

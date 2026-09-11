@@ -17,7 +17,14 @@ use ipnet::Ipv4Net;
 fn changing_certificate_group_requires_a_disruptive_xray_release() {
     let mut before = snapshot(
         vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
-        vec![direct_app("direct", "hk", "i-direct", 8443, true, any_egress())],
+        vec![direct_app(
+            "direct",
+            "hk",
+            "i-direct",
+            8443,
+            true,
+            any_egress(),
+        )],
     );
     before.nodes[0].certificate_group_id = Some("group-a".to_owned());
     let applied = applied_from_plan(&plan_deployment(&before, &[]).unwrap());
@@ -27,7 +34,9 @@ fn changing_certificate_group_requires_a_disruptive_xray_release() {
     let plan = plan_deployment(&after, &applied).unwrap();
     assert_eq!(plan.summary.changed_targets, 1);
     assert_eq!(plan.summary.disruptive_targets, 1);
-    assert!(target(&plan, "hk").actions.contains(&PlannedAction::ApplyXray));
+    assert!(target(&plan, "hk")
+        .actions
+        .contains(&PlannedAction::ApplyXray));
     assert!(target(&plan, "hk").disruptive);
 }
 
@@ -93,7 +102,7 @@ fn relay_mux_global_change_only_releases_sources_that_follow_global() {
         "us",
         HopPool::Mux(Some(HopMux {
             concurrency: 7,
-            max_idle_workers: 4,
+            reuse_threshold: 4,
             max_probing_workers: 2,
             ..Default::default()
         })),
@@ -104,7 +113,7 @@ fn relay_mux_global_change_only_releases_sources_that_follow_global() {
     let mut after = before.clone();
     after.revision += 1;
     after.settings.relay_mux.concurrency = 11;
-    after.settings.relay_mux.max_idle_workers = 6;
+    after.settings.relay_mux.reuse_threshold = 6;
 
     let plan = plan_deployment(&after, &applied).unwrap();
 
@@ -127,7 +136,7 @@ fn relay_mux_global_change_has_no_machine_actions_when_every_mux_is_overridden()
         "sg",
         HopPool::Mux(Some(HopMux {
             concurrency: 7,
-            max_idle_workers: 4,
+            reuse_threshold: 4,
             max_probing_workers: 2,
             ..Default::default()
         })),
@@ -137,7 +146,7 @@ fn relay_mux_global_change_has_no_machine_actions_when_every_mux_is_overridden()
     let mut after = before.clone();
     after.revision += 1;
     after.settings.relay_mux.concurrency = 11;
-    after.settings.relay_mux.max_idle_workers = 6;
+    after.settings.relay_mux.reuse_threshold = 6;
 
     let plan = plan_deployment(&after, &applied).unwrap();
 
@@ -153,7 +162,7 @@ fn relay_mux_global_change_has_no_machine_actions_when_mux_is_unused() {
     let mut after = before.clone();
     after.revision += 1;
     after.settings.relay_mux.concurrency = 11;
-    after.settings.relay_mux.max_idle_workers = 6;
+    after.settings.relay_mux.reuse_threshold = 6;
 
     let plan = plan_deployment(&after, &applied).unwrap();
 
@@ -165,13 +174,13 @@ fn relay_mux_global_change_has_no_machine_actions_when_mux_is_unused() {
 fn relay_mux_rule_override_change_only_releases_its_source_machine() {
     let first_override = HopMux {
         concurrency: 7,
-        max_idle_workers: 4,
+        reuse_threshold: 4,
         max_probing_workers: 2,
         ..Default::default()
     };
     let untouched_override = HopMux {
         concurrency: 9,
-        max_idle_workers: 5,
+        reuse_threshold: 5,
         max_probing_workers: 2,
         ..Default::default()
     };
@@ -637,10 +646,7 @@ fn a_hop_only_release_still_carries_the_hop_artifact() {
     );
 }
 
-/// That observation payload must be accepted verbatim. The observation side used to reuse the
-/// desired side's type and errored outright on a missing `level`, and `load_applied_states` collects
-/// in one pass, so one machine's observation failing to parse left the whole fleet without a plan.
-/// An older observation without flow reads as None.
+/// Xray omits `flow` for a client which has none; the observation contract reads that as `None`.
 #[test]
 fn observation_payload_from_the_spec_deserializes() {
     let payload = r#"[{

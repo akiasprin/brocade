@@ -5906,6 +5906,11 @@ details.raw .tbl {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.chain-rule-node-head .m-hop-direction {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* 端点标签：入口使用 accent。声明在 .st 的默认规则之后以覆盖颜色。 */
 .chain-rule-node-head .st.b-role,
@@ -11082,6 +11087,10 @@ body.fg-dragging * {
   max-width: none;
 }
 .anytls-padding-custom {
+  width: 100%;
+  margin-top: 6px;
+}
+.anytls-masquerade {
   width: 100%;
   margin-top: 6px;
 }
@@ -16515,21 +16524,20 @@ input.f.ing-pj-port {
   font-size: 10px;
 }
 
-/* Ping 探测先展示节奏，再展示目标清单。两项调度值做成同级小块，目标每项自带字段名，
-   不再把协议、名称、地址和删除按钮挤成一行没有表头的表格。 */
+/* Ping 探测沿用设置页的 settings-block 平面层级。调度和目标是两个同级配置组；目标行只用
+   细分隔线划分，不再在组内叠加背景、圆角卡片或协议色点。 */
 .ping-probe-schedule {
+  margin-bottom: 10px;
+}
+.ping-probe-schedule-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 9px;
-  margin-bottom: 14px;
+  gap: 0 14px;
 }
 .ping-probe-timing {
   display: grid;
   gap: 5px;
-  padding: 10px 11px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--sunk) 58%, transparent);
+  padding: 3px 0 5px;
 }
 .ping-probe-timing > span,
 .ping-probe-target label > span {
@@ -16555,32 +16563,15 @@ input.f.ing-pj-port {
   line-height: 1.45;
 }
 .ping-probe-target-section {
-  overflow: hidden;
   margin-bottom: 10px;
-  border: 1px solid var(--line-soft);
-  border-radius: 9px;
-  background: color-mix(in srgb, var(--sunk) 48%, transparent);
 }
-.ping-probe-target-head {
+.ping-probe-target-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 9px 11px;
-  border-bottom: 1px solid var(--line-soft);
-}
-.ping-probe-target-head > div:first-child {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-}
-.ping-probe-target-head b {
-  color: var(--ink-2);
-  font-size: 11.5px;
-}
-.ping-probe-target-head span {
-  color: var(--ink-4);
-  font: 10px var(--mono);
+  min-height: var(--ctl-h);
+  padding: 1px 0 7px;
 }
 .ping-probe-add {
   display: flex;
@@ -16589,18 +16580,14 @@ input.f.ing-pj-port {
 }
 .ping-probe-targets {
   display: grid;
-  gap: 8px;
-  padding: 10px;
 }
 .ping-probe-target {
   display: grid;
   grid-template-columns: 48px minmax(90px, 0.65fr) minmax(180px, 1.35fr) auto;
   gap: 8px;
   align-items: end;
-  padding: 9px;
-  border: 1px solid var(--line-soft);
-  border-radius: 7px;
-  background: var(--block);
+  padding: 9px 0;
+  border-top: 1px solid var(--line-soft);
 }
 .ping-probe-target > label {
   display: grid;
@@ -16615,20 +16602,8 @@ input.f.ing-pj-port {
   display: inline-flex;
   align-items: center;
   align-self: center;
-  gap: 6px;
   color: var(--ink-4);
-  font: 9px var(--mono);
-}
-.ping-probe-kind::before {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: 50%;
-  background: var(--observe-1);
-  content: '';
-}
-.ping-probe-kind.icmp::before {
-  background: var(--observe-2);
+  font: 10px var(--mono);
 }
 .ping-probe-remove {
   margin-bottom: 1px;
@@ -16637,7 +16612,7 @@ input.f.ing-pj-port {
   display: grid;
   justify-items: center;
   gap: 4px;
-  padding: 22px 12px;
+  padding: 22px 0;
   color: var(--ink-4);
   text-align: center;
 }
@@ -16650,11 +16625,11 @@ input.f.ing-pj-port {
 }
 .ping-probe-target-section > .agent-log-invalid {
   display: block;
-  padding: 0 11px 8px;
+  padding: 0 0 8px;
 }
 .ping-probe-note {
   margin: 0;
-  padding: 9px 11px 11px;
+  padding: 9px 0 0;
   border-top: 1px solid var(--line-soft);
   color: var(--ink-4);
   font-size: 10.5px;
@@ -16662,8 +16637,13 @@ input.f.ing-pj-port {
 }
 
 @media (max-width: 720px) {
-  .ping-probe-schedule {
+  .ping-probe-schedule-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .ping-probe-timing + .ping-probe-timing {
+    margin-top: 8px;
+    padding-top: 9px;
+    border-top: 1px solid var(--line-soft);
   }
   .ping-probe-target {
     grid-template-columns: 48px minmax(0, 1fr) auto;
@@ -16713,38 +16693,188 @@ input.f.ing-pj-port {
   padding-right: 11px;
   padding-left: 23px;
 }
-.relay-mux-settings {
+.relay-mux-settings,
+.reverse-health-settings {
   margin-top: 10px;
+}
+.settings-field-grid-container {
+  container-type: inline-size;
 }
 
 .settings-validation-error {
   color: var(--err);
 }
-.relay-mux-summary {
+.settings-disclosure-summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   min-height: var(--ctl-h);
   color: var(--ink-2);
-  font-size: 12px;
 }
-.relay-mux-summary > span {
-  min-width: 0;
-}
-.relay-mux-fields {
-  margin-top: 7px;
-  padding-top: 1px;
-  border-top: 1px solid var(--line-soft);
-}
-.relay-mux-fields .f {
-  width: 90px;
-}
-.relay-mux-fields .field-pair {
-  display: inline-flex;
+.settings-summary-copy {
+  display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 3px 0;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.settings-summary-metric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+.settings-summary-metric + .settings-summary-metric {
+  margin-left: 7px;
+}
+.settings-summary-metric + .settings-summary-metric::before {
+  content: '·';
+  margin-right: 2px;
+  color: var(--ink-4);
+}
+.settings-summary-metric > span {
+  color: var(--ink-4);
+}
+.settings-summary-metric > b {
+  color: var(--ink-2);
+  font: 500 11px/1.4 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.settings-disclosure-toggle {
+  flex: none;
+}
+.settings-parameter-content {
+  margin-top: 7px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line-soft);
+}
+.settings-field-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0 10px;
+}
+.settings-field-grid-two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.settings-field-grid-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.settings-block .settings-field-grid > .setfld + .setfld {
+  border-top: 0;
+}
+.settings-field-grid > .guard {
+  grid-column: 1 / -1;
+}
+.port-allocation-grid {
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 0 12px;
+}
+.port-allocation-grid .f {
+  width: 100%;
+  max-width: 112px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+@container (max-width: 560px) {
+  .settings-field-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container (max-width: 300px) {
+  .settings-field-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 中继 Mux 与反向隧道都属于连接池参数：展开内容共用同一组标题、字段网格、分隔线和说明。
+   auto-fit 让同一骨架在设置页主卡和定向覆盖的窄 fieldset 中自行调整列数。 */
+.settings-parameter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 4px 12px;
+}
+.settings-block .settings-parameter-grid .setfld + .setfld {
+  border-top: 0;
+}
+.settings-parameter-grid .setfld {
+  padding: 3px 0 5px;
+}
+.settings-parameter-grid .setfld > label {
+  margin-bottom: 5px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  letter-spacing: 0.015em;
+}
+.settings-parameter-grid .setfld > .v {
+  flex-wrap: nowrap;
+  gap: 6px;
+}
+.settings-parameter-grid .f {
+  width: 100%;
+  min-width: 0;
+  max-width: 112px;
+}
+.settings-parameter-grid input[type='number'] {
+  color: var(--ink-1);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.settings-parameter-group {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 5px 13px;
+  min-width: 0;
+  padding: 10px 0;
+}
+.settings-parameter-group + .settings-parameter-group {
+  margin-top: 0;
+  padding-top: 11px;
+  border-top: 1px solid var(--line-soft);
+}
+.settings-parameter-group > .eyebrow {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: start;
+  margin: 1px 0 0;
+  padding: 4px 0;
+  color: var(--ink-3);
+  font: 600 10.5px/1.35 var(--mono);
+  letter-spacing: 0.04em;
+}
+.settings-parameter-group > .settings-parameter-grid {
+  grid-column: 2;
+  grid-row: 1;
+}
+.settings-parameter-note {
+  grid-column: 2;
+  margin: 1px 0 0;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+.settings-parameter-content > .settings-parameter-note {
+  margin: 1px 0 3px 117px;
+}
+@container (max-width: 520px) {
+  .settings-parameter-group {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+  .settings-parameter-group > :is(.eyebrow, .settings-parameter-grid, .settings-parameter-note) {
+    grid-column: 1;
+    grid-row: auto;
+  }
+  .settings-parameter-group > .eyebrow {
+    margin-bottom: 2px;
+  }
+  .settings-parameter-content > .settings-parameter-note {
+    margin-left: 0;
+  }
 }
 
 /* XRAY 的七项设置按“伪装站点 / 接入兼容 / AnyTLS”分成三个明确区域；前两块并排比较，
@@ -17083,7 +17213,24 @@ input.f.ing-pj-port {
 }
 .cert-group-form-fields {
   display: grid;
-  grid-template-columns: minmax(130px, 0.65fr) minmax(220px, 1.3fr) minmax(220px, 1fr);
+  grid-template-columns: minmax(160px, 0.75fr) minmax(260px, 1.25fr);
+  gap: 9px;
+}
+.cert-group-method {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.cert-group-method > span {
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.cert-group-method > .v {
+  align-items: center;
   gap: 9px;
 }
 .cert-group-form-fields > label {
@@ -17150,7 +17297,8 @@ input.f.ing-pj-port {
     border-left: 0;
   }
   .certrow.cert,
-  .cert-group-form-fields {
+  .cert-group-form-fields,
+  .cert-group-method {
     grid-template-columns: minmax(0, 1fr);
   }
   .certrow-actions,
@@ -18491,11 +18639,22 @@ input.f.ing-pj-port {
 .mux-source-switch {
   margin-bottom: 12px;
 }
+.mux-drawer-groups {
+  display: grid;
+  gap: 12px;
+  margin-top: 15px;
+}
+.mux-drawer-groups > section + section {
+  padding-top: 11px;
+  border-top: 1px solid var(--line-soft);
+}
+.mux-drawer-groups .eyebrow {
+  margin: 0 0 6px;
+}
 .mux-drawer-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px 14px;
-  margin-top: 15px;
 }
 .mux-drawer-field {
   display: grid;
@@ -18953,9 +19112,6 @@ input.f.ing-pj-port {
   .external-transport-options {
     grid-template-columns: minmax(0, 1fr);
   }
-  .mux-drawer-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
   .external-form-grid,
   .external-manual-fields .row {
     grid-template-columns: minmax(0, 1fr);
@@ -18981,6 +19137,12 @@ input.f.ing-pj-port {
   .external-summary-facts > span:nth-child(3) {
     padding-left: 0;
     border-left: 0;
+  }
+}
+
+@media (max-width: 340px) {
+  .mux-drawer-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -19138,54 +19300,55 @@ input.f.ing-pj-port {
 }
 .agent-log-scope {
   display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
   margin: 7px 0 2px;
 }
 .agent-log-scope-row {
   display: grid;
-  grid-template-columns: 62px minmax(0, 1fr) auto;
-  gap: 9px;
-  align-items: center;
-  min-height: 42px;
-  padding: 6px 0;
-}
-.agent-log-scope-row + .agent-log-scope-row {
-  border-top: 1px solid var(--line-soft);
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--sunk) 58%, transparent);
 }
 .agent-log-scope-kind {
+  justify-self: start;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--block);
   color: var(--ink-3);
-  font: 600 9.5px var(--mono);
+  font: 600 9px/1.35 var(--mono);
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
-.agent-log-scope-name {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-.agent-log-scope-name b {
-  color: var(--ink-2);
-  font-size: 11px;
-  font-weight: 550;
-}
-.agent-log-scope-name code {
-  overflow: hidden;
-  color: var(--ink-4);
-  font: 9.5px var(--mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .agent-log-scope-limit {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
+  position: relative;
+  display: block;
+  grid-column: 1;
+  width: 100%;
+  margin-top: 1px;
   color: var(--ink-4);
   font: 9.5px var(--mono);
-  white-space: nowrap;
 }
 .agent-log-scope-limit > input {
-  width: 72px;
+  width: 100%;
+  padding-right: 43px;
   font-variant-numeric: tabular-nums;
+}
+.agent-log-scope-limit > span {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.agent-log-scope-limit > input.chg {
+  border-color: var(--gold-line);
+  background: var(--gold-wash);
 }
 .agent-log-scope-note {
   margin: 6px 2px 5px;
@@ -19195,36 +19358,1143 @@ input.f.ing-pj-port {
 }
 
 @media (max-width: 620px) {
-  .agent-log-scope-row {
-    grid-template-columns: 54px minmax(0, 1fr);
-  }
-  .agent-log-scope-limit {
-    grid-column: 2;
-    justify-content: flex-start;
+  .agent-log-scope {
+    grid-template-columns: minmax(0, 1fr);
+    column-gap: 0;
   }
   .agent-log-node-limits {
     grid-template-columns: minmax(0, 1fr);
   }
 }
 
-/* Issuance defaults are separate from the certificates operators inspect day to day. */
-.cert-issuance-settings > summary {
+/* 签发配置是可供证书组选择的配置模型，不是一个全局二选一状态。外层 settings-block 已经
+   提供卡片边界，内部两项只用留白和分隔线组织；不再套第二层卡片，避免边框、底色层层叠加。 */
+.cert-method-config {
+  min-width: 0;
+  margin-top: 11px;
+}
+.cert-method-config + .cert-method-config {
+  margin-top: 9px;
+}
+.cert-method-config[open],
+#set-cert .certgrp.expanded {
+  padding: 0 10px 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sunk) 34%, transparent);
+}
+.cert-method-config-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 0 10px;
+  list-style: none;
   cursor: pointer;
-  padding: 10px 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sunk) 46%, transparent);
 }
-.cert-issuance-settings > summary .eyebrow {
-  display: inline;
-  margin-right: 16px;
+.cert-method-config-head::-webkit-details-marker {
+  display: none;
 }
-.cert-issuance-settings[open] > summary {
-  margin-bottom: 12px;
+.cert-method-config-head::after {
+  content: '›';
+  flex: none;
+  margin-left: 2px;
+  color: var(--ink-4);
+  transition: transform 0.12s ease;
+}
+.cert-method-config[open] > .cert-method-config-head,
+#set-cert .certgrp.expanded > .certgrp-hd {
+  margin: 0 -10px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  border-radius: 0;
+  background: color-mix(in srgb, var(--sunk) 62%, transparent);
+}
+.cert-method-config[open] > .cert-method-config-head::after {
+  transform: rotate(90deg);
+}
+@media (hover: hover) {
+  .cert-method-config-head:hover {
+    border-color: var(--line);
+    background: color-mix(in srgb, var(--sunk) 62%, transparent);
+  }
+}
+.cert-method-config-head > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.cert-method-config-name {
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 400;
+}
+.cert-method-config-head > .hint {
+  flex: none;
+  margin-left: auto;
+  text-align: right;
+}
+.cert-method-config > .setfld {
+  padding-right: 0;
+  padding-left: 0;
+}
+.cert-config-facts,
+.cert-config-notes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 0;
+}
+.cert-config-facts > div,
+.cert-config-notes > div {
+  min-width: 0;
+  min-height: 78px;
+  box-sizing: border-box;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sunk) 68%, var(--block));
+}
+.cert-config-facts dt,
+.cert-config-notes dt {
+  margin: 0 0 6px;
+  color: var(--ink-4);
+  font: 10px/1.35 var(--mono);
+}
+.cert-config-facts dd,
+.cert-config-notes dd {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.55;
+}
+.cert-method-config > .settings-savebar {
+  margin-right: -10px;
+  margin-bottom: -10px;
+  margin-left: -10px;
+}
+@container (max-width: 520px) {
+  .cert-config-facts,
+  .cert-config-notes {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+  .cert-method-config-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+    padding-top: 8px;
+    padding-right: 30px;
+    padding-bottom: 8px;
+  }
+  .cert-method-config-head > .hint {
+    margin-left: 0;
+    text-align: left;
+  }
+  .cert-method-config-head::after {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    transform: translateY(-50%);
+  }
+  .cert-method-config[open] > .cert-method-config-head::after {
+    transform: translateY(-50%) rotate(90deg);
+  }
 }
 
-.reverse-health-card { margin: 16px 0; padding: 16px; border: 1px solid var(--line, #8885); border-radius: 8px; overflow-x: auto; }
-.reverse-health-card h3 { margin-top: 0; }
-.reverse-health-card h3 small { font-size: 12px; font-weight: normal; }
-.reverse-health-card table { width: 100%; text-align: left; border-collapse: collapse; }
-.reverse-health-card th, .reverse-health-card td { padding: 6px 12px 6px 0; }
-.reverse-health-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 12px 0; }
-.reverse-health-fields label { display: flex; flex-direction: column; gap: 5px; }
-.reverse-health-fields input { max-width: 180px; }
+/* ═══ 反向隧道（观测页的一张卡，`reverse-health.tsx`） ═══
+   骨架是公共的 .panel，读数用 .st / table.t / .rt-dx / .lamp，本节只补这张卡自己的
+   排版：判定带、隧道表的异常行、事件时间线。状态色不新开一档，映射写在组件里。 */
+
+/* .lamp 只有 ok / bad 两档。一对的判定有第三档：仍有可用隧道，但另有隧道被隔离。 */
+.lamp.warn {
+  background: var(--gold);
+}
+
+/* 一对的名字。上报的 pair 是下发给 xray 的反向标签，链在标签里——同一对机器上的
+   两条链是两个标签，因此链名必须显示。排版与链路页的「链名 + 标识」一致。 */
+.rvh-name {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 6px;
+  min-width: 0;
+}
+.rvh-name b {
+  font: 600 12.5px var(--sans);
+  color: var(--ink);
+}
+.rvh-name .rvh-chain {
+  font: 500 11.5px var(--sans);
+  color: var(--ink-2);
+}
+.rvh-name .rvh-chain::after {
+  content: '·';
+  margin-left: 6px;
+  color: var(--ink-4);
+}
+/* 原始标签：日常按名称识别，检索 xray 日志和 QueryStats 时需要它。 */
+.rvh-tag {
+  font: 10.5px var(--mono);
+  color: var(--ink-4);
+  word-break: break-all;
+}
+
+/* 判定带：名称在前、可用隧道数在后，右端给出整组就绪情况。 */
+.rvh-verdict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 7px 0;
+}
+.rvh-verdict + .rvh-verdict,
+.rvh-pair + .rvh-pair {
+  border-top: 1px solid var(--line-soft);
+}
+
+/* 整卡总计。几百对隧道时它是唯一一眼能读完的读数，因此排在所有逐对内容之前，
+   并且比判定带重一档：判定带是某一对的事实，这一行是整台机器的事实。 */
+.rvh-total {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  margin: 0;
+  padding: 8px 0 9px;
+  border-bottom: 1px solid var(--line);
+  font: 12.5px var(--sans);
+  color: var(--ink-2);
+}
+.rvh-total b {
+  font: 600 12.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+/* 正常的对/池整组折起：判定带一行一对，几百对仍然是几百行。计数行本身已经回答了
+   「有没有问题」，逐对的名字只在排查时才需要。 */
+.rvh-rest {
+  border-top: 0;
+  padding-top: 0;
+}
+/* 段内折叠（逐条隧道表、逐池计数）：不再画分隔线——它属于上面那一对，不是新的一段。 */
+.rvh-fold.rvh-sub {
+  margin: 3px 0 0;
+  border-top: 0;
+  padding-top: 0;
+}
+.rvh-fold.rvh-sub + .rvh-fold.rvh-sub {
+  margin-top: 3px;
+}
+.rvh-pair > .rvh-fold.rvh-sub:last-child,
+.mux-pool > .rvh-fold.rvh-sub:last-child {
+  margin-bottom: 6px;
+}
+
+/* 右端小字：判定带写这一对的结论，总计行写整台机器的结论，排版是同一件事。 */
+.rvh-verdict .rvh-tail,
+.rvh-total .rvh-tail {
+  margin-left: auto;
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-4);
+  white-space: nowrap;
+}
+
+/* 每对一段：段标题给出这一对的短标识与角色，右端是这一对承载的业务流总数。 */
+.rvh-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  margin: 12px 0 0;
+  font: 600 10px var(--mono);
+  letter-spacing: 0.12em;
+  color: var(--ink-4);
+  text-transform: uppercase;
+}
+.rvh-none {
+  margin: 6px 0 0;
+}
+
+table.t.trvh {
+  margin-top: 4px;
+}
+table.t.trvh td.rvh-w {
+  font: 12px var(--mono);
+  color: var(--ink-2);
+}
+/* 异常行整行浅底：一行里最先被读到的应当是「哪一条出了问题」，而不是某一列的数值。 */
+table.t.trvh tr.rvh-row-bad td {
+  background: color-mix(in srgb, var(--err) 5%, transparent);
+}
+table.t.trvh tr.rvh-row-warn td {
+  background: color-mix(in srgb, var(--gold) 5%, transparent);
+}
+.rvh-reason {
+  display: block;
+  margin-top: 2px;
+  font: 11px var(--sans);
+  color: var(--ink-4);
+}
+
+/* 事件区默认收起，出现异常时展开——正常的机器上这一段整天没有新内容。 */
+.rvh-fold {
+  margin: 10px 0 0;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 8px;
+}
+/* 标题行必须一眼看出是可以点的：收折之后它是这两张卡唯一的展开入口，而同尺寸的小字在
+   卡里到处都是说明文字。整行浅底控件，箭头固定在右端；四种折叠——整组正常项、段内计数、
+   段内逐条表、卡尾事件轴——共用这一种外观，认一次就够。 */
+.rvh-fold > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  cursor: pointer;
+  list-style: none;
+  font: 11px var(--mono);
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+}
+.rvh-fold > summary:hover {
+  border-color: var(--line);
+  color: var(--ink);
+}
+.rvh-fold > summary::-webkit-details-marker {
+  display: none;
+}
+.rvh-fold > summary::after {
+  content: '›';
+  margin-left: auto;
+  color: var(--ink-4);
+}
+.rvh-fold[open] > summary::after {
+  content: '⌄';
+}
+
+/* 时间线：一列时间加序号、一列事，行首 2px 色带表示这条是坏还是恢复。 */
+.rvh-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: 268px;
+  overflow-y: auto;
+  margin-top: 8px;
+  padding-right: 2px;
+}
+.rvh-ev {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 0 9px;
+  padding: 6px 0 6px 9px;
+  border-left: 2px solid var(--line);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.rvh-log > * + * > .rvh-ev {
+  border-top: 1px solid var(--line-soft);
+}
+.rvh-ev.bad {
+  border-left-color: var(--err);
+}
+.rvh-ev.warn {
+  border-left-color: var(--gold);
+}
+.rvh-ev.ok {
+  border-left-color: var(--ok);
+}
+.rvh-ev time {
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-4);
+}
+.rvh-ev time u {
+  display: block;
+  text-decoration: none;
+  font-size: 10px;
+  color: var(--ink-4);
+  opacity: 0.72;
+}
+.rvh-ev b {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.rvh-ev i {
+  display: block;
+  font-style: normal;
+  color: var(--ink-4);
+}
+.rvh-ev .rvh-arrow {
+  font-family: var(--mono);
+  color: var(--ink-4);
+}
+/* 序号断档。不画成事件行——它不是一次状态变化，而是一段读不到的区间。 */
+.rvh-gap {
+  margin: 0 0 0 2px;
+  padding: 5px 0 5px 9px;
+  border-left: 2px dashed var(--line);
+  font: 10.5px var(--mono);
+  letter-spacing: 0.04em;
+  color: var(--ink-4);
+}
+
+/* ═══ 普通出站 Mux（观测页的一张卡，`mux-observation.tsx`） ═══
+   状态带、Worker 表和事件轴沿用反向隧道词汇；这里只补「本次打开页面以来」的复用效率。
+   每个 picker 单独成段，TCP 与 XUDP 即使使用同一个出站标签也不会混算。 */
+.mux-pool + .mux-pool {
+  margin-top: 13px;
+  padding-top: 5px;
+  border-top: 1px solid var(--line-soft);
+}
+.mux-efficiency {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(82px, 1fr));
+  gap: 1px;
+  margin: 3px 0 8px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--line-soft);
+}
+.mux-metric {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  background: var(--sunk);
+}
+.mux-metric small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mux-metric b {
+  color: var(--ink-2);
+  font: 600 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.mux-metric.bad b {
+  color: var(--err);
+}
+.mux-table-scroll {
+  overflow-x: auto;
+}
+.mux-table-scroll > table {
+  min-width: 720px;
+}
+@container (max-width: 700px) {
+  .mux-efficiency {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .mux-metric:last-child {
+    grid-column: 1 / -1;
+  }
+}
+
+/* ═══ 大规模 Worker 观测概览（`observation-overview.tsx`） ═══
+   单组可能包含数百条 Worker。默认仅展示组级摘要；展开后先给状态分布、聚合指标和重点对象，
+   完整表格固定在可筛选的滚动区内，避免正常记录淹没异常。 */
+.ov-pair + .ov-pair {
+  margin-top: 12px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* 状态分布条保留最小段宽，使少量异常在大量 READY 条目中仍可识别。 */
+.ov-bar {
+  display: flex;
+  gap: 1px;
+  height: 5px;
+  margin: 6px 0 0;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--sunk);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+}
+.ov-bar > i {
+  min-width: 2px;
+}
+.s-ok {
+  background: var(--ok);
+}
+.s-run {
+  background: var(--action);
+}
+.s-idle {
+  background: var(--ink-4);
+}
+.s-warn {
+  background: var(--gold);
+}
+.s-bad {
+  background: var(--err);
+}
+.ov-mix {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 12px;
+  margin: 7px 0 0;
+}
+.ov-mix > .ov-bar {
+  flex: 0 0 148px;
+  margin: 0;
+}
+.ov-mix > .ov-legend {
+  margin: 0;
+}
+.ov-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  margin: 6px 0 0;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ov-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.ov-legend i {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 2px;
+}
+.ov-legend b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+
+/* RTT 采用分位数，标签与数值保持稳定基线，便于横向比较。 */
+.ov-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 16px;
+  margin: 7px 0 0;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ov-stats > span + span::before {
+  content: '·';
+  margin-right: 12px;
+  color: var(--line);
+}
+.ov-stats b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.ov-stats b.bad {
+  color: var(--err);
+}
+.ov-stats b.warn {
+  color: var(--gold);
+}
+
+/* 重点对象优先列出非 READY 条目，其次列出 READY 状态下的性能异常。 */
+.ov-picks {
+  margin: 9px 0 0;
+}
+.ov-pick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 5px 9px;
+  border-left: 2px solid var(--line);
+  font-size: 11.5px;
+}
+.ov-pick + .ov-pick {
+  border-top: 1px solid var(--line-soft);
+}
+.ov-pick.v-bad {
+  border-left-color: var(--err);
+}
+.ov-pick.v-warn {
+  border-left-color: var(--gold);
+}
+.ov-pick.v-idle {
+  border-left-color: var(--ink-4);
+}
+.ov-pick > .id {
+  color: var(--ink-2);
+  font: 12px var(--mono);
+}
+.ov-pick > .why {
+  color: var(--ink-3);
+}
+.ov-pick > .nums {
+  margin-left: auto;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 完整明细固定高度，表头在纵向滚动时保持可见。 */
+.ov-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 6px;
+}
+.ov-tools input.f {
+  width: 180px;
+  height: 26px;
+  font-size: 11.5px;
+}
+.ov-chips {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+}
+.ov-chips button {
+  appearance: none;
+  padding: 4px 9px;
+  border: 0;
+  background: var(--btn);
+  color: var(--ink-3);
+  cursor: pointer;
+  font: 10.5px var(--mono);
+}
+.ov-chips button + button {
+  border-left: 1px solid var(--line);
+}
+.ov-chips button[aria-pressed='true'] {
+  background: var(--action);
+  color: var(--action-on);
+}
+.ov-count {
+  margin-left: auto;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ov-scroll {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-ctl);
+}
+.ov-scroll > table.t {
+  margin: 0;
+}
+.ov-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 6px 12px 6px 10px;
+  background: var(--band);
+  box-shadow: inset 0 -1px var(--line);
+}
+.ov-scroll > table.t.wide {
+  min-width: 680px;
+}
+.ov-scroll td {
+  padding: 5px 12px 5px 10px;
+}
+.ov-scroll td:first-child,
+.ov-scroll th:first-child {
+  padding-left: 10px;
+}
+.ov-empty {
+  margin: 0;
+  padding: 16px 10px;
+  color: var(--ink-4);
+  text-align: center;
+  font-size: 11.5px;
+}
+
+/* 每组收拢为单行摘要：状态、名称、节点关系、分布与容量依次排列。 */
+.ov-one > summary {
+  align-items: center;
+  gap: 7px;
+}
+.ov-one.ov-mux > summary {
+  display: grid;
+  grid-template-columns: 10px 88px minmax(0, 1fr) 44px 116px 8px;
+  column-gap: 8px;
+}
+.ov-one.ov-mux > summary > .lamp {
+  grid-column: 1;
+}
+.ov-one.ov-mux > summary > b {
+  grid-column: 2;
+}
+.ov-one.ov-mux > summary > .peer {
+  grid-column: 3;
+}
+.ov-one.ov-mux > summary > .ov-bar {
+  grid-column: 4;
+}
+.ov-one.ov-mux > summary > .nums {
+  grid-column: 5;
+}
+.ov-one.ov-mux > summary::after {
+  grid-column: 6;
+  margin-left: 0;
+  justify-self: end;
+}
+.ov-one.ov-mux > summary > b,
+.ov-one.ov-mux > summary > .peer {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ov-one.ov-mux > summary > .nums {
+  justify-self: end;
+  text-align: right;
+}
+.ov-one > summary .lamp {
+  margin: 0 2px 0 0;
+}
+.ov-one > summary .ov-bar {
+  height: 4px;
+  flex: 0 0 44px;
+  margin: 0;
+}
+.ov-one > summary b {
+  color: var(--ink-2);
+  font: 500 11.5px var(--sans);
+}
+.ov-one > summary .peer {
+  color: var(--ink-3);
+  font: 11.5px var(--sans);
+}
+.ov-one > summary .nums {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ov-one > summary .nums b {
+  color: var(--ink-2);
+  font: 600 11px var(--mono);
+}
+.ov-one > summary .tail {
+  color: var(--ink-3);
+}
+.ov-one.v-bad > summary .tail {
+  color: var(--err);
+}
+.ov-one.v-warn > summary .tail {
+  color: var(--gold);
+}
+
+/* Mux 汇总行使用无衬线字体，数值以字重和等宽数字特性区分。 */
+.ov-card.ov-mux-card > .rvh-total {
+  font: 500 12px/1.55 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.ov-card.ov-mux-card > .rvh-total b {
+  font: 600 12.5px/1.55 var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+.ov-card.ov-mux-card > .rvh-total .rvh-tail {
+  font: 11px/1.55 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+@media (max-width: 720px) {
+  .ov-one.ov-mux > summary {
+    grid-template-columns: 9px minmax(0, 1fr) 8px;
+    grid-template-areas:
+      'lamp name arrow'
+      '. peer .'
+      '. mix .'
+      '. nums .';
+    row-gap: 3px;
+  }
+  .ov-one.ov-mux > summary > .lamp {
+    grid-area: lamp;
+  }
+  .ov-one.ov-mux > summary > b {
+    grid-area: name;
+  }
+  .ov-one.ov-mux > summary > .peer {
+    grid-area: peer;
+  }
+  .ov-one.ov-mux > summary > .ov-bar {
+    grid-area: mix;
+    width: 96px;
+    justify-self: start;
+  }
+  .ov-one.ov-mux > summary > .nums {
+    grid-area: nums;
+    justify-self: start;
+    text-align: left;
+  }
+  .ov-one.ov-mux > summary::after {
+    grid-area: arrow;
+  }
+}
+
+/* 展开内容统一采用左侧组名、右侧指标的排障顺序。 */
+.ov-g {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 0 12px;
+  padding: 6px 0;
+}
+.ov-g + .ov-g {
+  border-top: 1px solid var(--line-soft);
+}
+.ov-gl {
+  padding-top: 2px;
+  color: var(--ink-4);
+  text-align: right;
+  text-transform: uppercase;
+  font: 600 10px var(--mono);
+  letter-spacing: 0.1em;
+}
+.ov-gv {
+  min-width: 0;
+}
+.ov-gv > .rt-dx,
+.ov-gv > .ov-stats,
+.ov-gv > .ov-mix,
+.ov-gv > .ov-picks {
+  margin: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.ov-gv > .rt-dx + .rt-dx {
+  margin-top: 4px;
+}
+.ov-gv > .rvh-fold {
+  margin: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.ov-gv > .rvh-fold + .rvh-fold {
+  margin-top: 3px;
+}
+.ov-gv .rvh-tag {
+  word-break: break-all;
+}
+.ov-onebody {
+  margin-left: 3px;
+  padding: 0 0 2px 10px;
+  border-left: 1px solid var(--line-soft);
+}
+
+/* 分区标题始终可见，只有各组对象参与折叠。 */
+.ov-sec {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin: 13px 0 4px;
+  color: var(--ink-4);
+  text-transform: uppercase;
+  font: 600 10px var(--mono);
+  letter-spacing: 0.12em;
+}
+.ov-sec.bad {
+  color: var(--err);
+}
+.ov-sec em {
+  color: var(--ink-4);
+  font-style: normal;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+.ov-picks .ov-pick:first-child {
+  border-top: 0;
+}
+.ov-note {
+  margin: 4px 0 0 11px;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+
+@media (max-width: 720px) {
+  .ov-g {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+  .ov-gl {
+    text-align: left;
+  }
+}
+
+/* 设置页的反向隧道恢复策略卡仍用这一族，与上面的观测卡不共用骨架。 */
+.reverse-health-card {
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid var(--line, #8885);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.reverse-health-card h3 {
+  margin-top: 0;
+}
+.reverse-health-card h3 small {
+  font-size: 12px;
+  font-weight: normal;
+}
+.reverse-health-card table {
+  width: 100%;
+  text-align: left;
+  border-collapse: collapse;
+}
+.reverse-health-card th,
+.reverse-health-card td {
+  padding: 6px 12px 6px 0;
+}
+.reverse-health-settings {
+  container-type: inline-size;
+}
+.reverse-health-override {
+  min-width: 0;
+  margin: 12px 0 0;
+  padding: 5px 11px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--block) 46%, transparent);
+}
+.reverse-health-override > legend {
+  padding: 0 6px;
+  color: var(--hue, var(--action));
+  font: 600 10px var(--mono);
+  letter-spacing: 0.05em;
+}
+/* 三个链路 ID 恒为三列，不跟着共享参数网格按宽度铺：它们是一组，拆成两行读作两组。 */
+.reverse-health-route {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.reverse-health-route .reverse-health-route-id {
+  width: 100%;
+}
+.reverse-health-reset {
+  margin-top: 10px;
+}
+
+/* 容器窄到放不下三个链路 ID 时改为一列；单列下字段又是一行一个，横线要补回来。
+   数值网格不在此列——它用的是 auto-fill，列数自己会随宽度掉到 1。 */
+@container (max-width: 520px) {
+  .reverse-health-route {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-block .reverse-health-route .setfld + .setfld {
+    border-top: 1px solid var(--line-soft);
+  }
+}
+
+/* ═══ 设置页视觉收敛：证书 ═══
+ *
+ * 本段不改变 DOM、字段顺序或版式，只调整既有组件的材质、字色与状态反馈。
+ * 继续使用 config-panel / settings-block / setfld / f / btn / st 的公共骨架。 */
+
+/* 数字输入保留原生的数值语义、键盘与 min/max 校验，只隐藏浏览器绘制的上下微调按钮。
+ * 这是控件级规则：设置页之外的数字字段也不再出现一套与站内按钮无关的浏览器按钮。 */
+input[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+/* 证书组只调整组内的折叠密度；外层直接复用 settings-block，不另建一套面板样式。 */
+#set-cert .certgrp {
+  border-color: var(--line-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sunk) 52%, var(--block));
+  box-shadow: none;
+}
+#set-cert .certgrp-hd {
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 36px;
+  gap: 8px;
+  padding: 3px 7px 3px 10px;
+  border-bottom: 0;
+  background: var(--band);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  #set-cert .certgrp:not(.expanded) .certgrp-hd:hover {
+    background: color-mix(in srgb, var(--sunk) 72%, var(--band));
+  }
+}
+#set-cert .certgrp-mark {
+  display: none;
+}
+#set-cert .certgrp-identity {
+  gap: 7px;
+}
+#set-cert .certgrp-identity > div {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+}
+#set-cert .certgrp-title {
+  min-width: 0;
+  gap: 6px;
+}
+#set-cert .certgrp-title b {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 11.5px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#set-cert .certgrp-default,
+#set-cert .cert-origin {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--block);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+#set-cert .certgrp-note {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 10px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#set-cert .certgrp-hd .ctl {
+  grid-column: auto;
+  flex-wrap: nowrap;
+  gap: 4px;
+  cursor: default;
+}
+#set-cert .certgrp-hd .btn.sm {
+  min-height: 24px;
+  padding: 0 7px;
+  font-size: 10.5px;
+}
+#set-cert .certgrp.expanded .certgrp-body {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0;
+  background: transparent;
+}
+#set-cert .certgrp.expanded .certgrp-facts {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+#set-cert .certgrp.expanded .certgrp-facts > div {
+  min-height: 62px;
+  box-sizing: border-box;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--sunk) 70%, var(--block));
+}
+#set-cert .certgrp.expanded .certgrp-facts > .wide {
+  grid-column: auto;
+}
+#set-cert .certgrp-facts dt,
+#set-cert .cert-record-facts dt {
+  font-size: 9px;
+  font-weight: 400;
+}
+#set-cert .certgrp-facts dd,
+#set-cert .cert-record-facts dd {
+  font-weight: 400;
+}
+#set-cert .certgrp.expanded .certgrp-section {
+  padding: 0;
+  border-bottom: 0;
+}
+#set-cert .certgrp-section > header {
+  margin-bottom: 7px;
+}
+#set-cert .certgrp-section > header b {
+  color: var(--ink-4);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.035em;
+}
+#set-cert .certgrp.expanded .cert-group-form {
+  margin: 0;
+}
+#set-cert .certgrp.expanded .certtrust-note {
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+}
+#set-cert .cert-record {
+  border-color: var(--line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sunk) 62%, var(--block));
+}
+#set-cert .cert-record-head {
+  min-height: 34px;
+  padding: 5px 10px;
+  background: var(--band);
+}
+#set-cert .cert-record .cstate {
+  font-size: 11px;
+}
+#set-cert .cert-record-facts {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 14px;
+  padding: 10px;
+}
+#set-cert .cert-record-facts > .primary {
+  grid-column: auto;
+}
+#set-cert .cert-record-error b {
+  font-weight: 400;
+}
+#set-cert .cert-method-settings {
+  margin-bottom: 14px;
+}
+
+@container (max-width: 520px) {
+  #set-cert .certgrp-hd {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  #set-cert .certgrp-hd .ctl {
+    padding-top: 4px;
+    border-top: 1px solid var(--line-soft);
+    justify-content: flex-start;
+  }
+  #set-cert .certgrp-title {
+    flex-wrap: wrap;
+  }
+  #set-cert .certgrp.expanded .certgrp-facts,
+  #set-cert .cert-record-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

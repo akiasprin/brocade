@@ -609,9 +609,7 @@ fn family_server(
             address: host.to_owned(),
             family: Some(family),
             port: projected.port,
-            download: xhttp_download
-                .cloned()
-                .or_else(|| projected.download.clone()),
+            download: xhttp_download.cloned(),
             name_suffix,
         });
     }

@@ -275,7 +275,7 @@ impl GeoIpLookup {
         cache.database = Some(database);
     }
 
-    /// Drops what is held, for the case where the setting was emptied. Keeping the old database
+    /// Drops what is held when the setting is emptied. Keeping the cached database
     /// would show countries the fleet is no longer configured to look up.
     async fn clear(&self) {
         let mut cache = self.cache.lock().await;

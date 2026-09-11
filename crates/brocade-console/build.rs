@@ -202,6 +202,7 @@ const GO_ENV_VAR: &str = "BROCADE_GO";
 /// be added here**, and until it is, changes inside it are invisible to the build.
 const FRONTEND_WATCHED: &[&str] = &[
     "frontend/src",
+    "frontend/public",
     "frontend/index.html",
     "frontend/package.json",
     "frontend/package-lock.json",

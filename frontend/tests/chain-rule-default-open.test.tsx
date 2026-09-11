@@ -12,16 +12,14 @@ const step = (node: string, rules: Rule[] = []): SnapshotStep => ({
 
 const forward = (to: string): Rule => ({
   m: { t: 'any' },
-  a: { t: 'forward', to },
+  a: { t: 'forward', to, dial: { t: 'overlay' }, pool: { t: 'none' } },
 });
 
 describe('machine-detail rule default expansion', () => {
   it('locates the current machine by its full path from the chain entry', () => {
     const steps = [step('entry', [forward('relay')]), step('relay', [forward('egress')]), step('egress')];
 
-    expect(defaultChainRuleOccurrence(['entry', 'relay', 'egress'], steps, 'egress')).toBe(
-      'entry>relay>egress',
-    );
+    expect(defaultChainRuleOccurrence(['entry', 'relay', 'egress'], steps, 'egress')).toBe('entry>relay>egress');
   });
 
   it('also locates a current machine whose rule step is disconnected from the entry', () => {
@@ -43,19 +41,25 @@ describe('compiler fallback extraction', () => {
 
   it('returns only the terminal fallback when machine DNS was inserted before it', () => {
     expect(
-      compilerFallbackRules([], [
-        { dest_match: dmm.m, action: dmm.a },
-        { dest_match: any.m, action: any.a },
-      ]),
+      compilerFallbackRules(
+        [],
+        [
+          { dest_match: dmm.m, action: dmm.a },
+          { dest_match: any.m, action: any.a },
+        ],
+      ),
     ).toEqual([any]);
   });
 
   it('returns no fallback when the written table already ends in Any', () => {
     expect(
-      compilerFallbackRules([any], [
-        { dest_match: dmm.m, action: dmm.a },
-        { dest_match: any.m, action: any.a },
-      ]),
+      compilerFallbackRules(
+        [any],
+        [
+          { dest_match: dmm.m, action: dmm.a },
+          { dest_match: any.m, action: any.a },
+        ],
+      ),
     ).toEqual([]);
   });
 });

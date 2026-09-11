@@ -6,13 +6,13 @@
 //! and dangling rows remain in the database while the compiler sees a broken chain.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use brocade_core::model::{Action, Rule};
+use brocade_core::model::{Action, HopDial, Rule};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::types::{
-    DeleteStepOutcome, DeleteStepResult, HopInRequest, HopWireRequest, PruneChainResult,
-    PutStepRequest,
+    DeleteStepOutcome, DeleteStepResult, HopInRequest, HopWireRequest, PruneChainOutcome,
+    PruneChainResult, PutStepRequest,
 };
 use super::{
     chain_tenant_tx, commit_revision, ensure_node_exists_tx, existing_step_accept_uuid,
@@ -363,14 +363,14 @@ pub async fn prune_chain(
     let mut tx = pool.begin().await?;
     let previous = lock_control_state(&mut tx).await?;
     let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
-    let removed_steps = prune_chain_tx(&mut tx, actor, app_id, chain_id).await?;
-    let revision_id =
-        commit_revision(&mut tx, revision_id, previous, !removed_steps.is_empty()).await?;
+    let outcome = prune_chain_tx(&mut tx, actor, app_id, chain_id).await?;
+    let revision_id = commit_revision(&mut tx, revision_id, previous, outcome.changed()).await?;
     tx.commit().await?;
 
     Ok(PruneChainResult {
         revision_id,
-        removed_steps,
+        removed_steps: outcome.removed_steps,
+        cleared_hop_ins: outcome.cleared_hop_ins,
     })
 }
 
@@ -379,10 +379,98 @@ pub(crate) async fn prune_chain_tx(
     actor: &AdminContext,
     app_id: &str,
     chain_id: &str,
-) -> Result<Vec<String>> {
+) -> Result<PruneChainOutcome> {
     let chain_tenant = chain_tenant_tx(tx, app_id, chain_id).await?;
     actor.require_tenant_access(&chain_tenant, "chain")?;
-    prune_unreachable_tx(tx, chain_id).await
+    let removed_steps = prune_unreachable_tx(tx, chain_id).await?;
+    let cleared_hop_ins = clear_unused_hop_ins_tx(tx, chain_id).await?;
+    Ok(PruneChainOutcome {
+        removed_steps,
+        cleared_hop_ins,
+    })
+}
+
+/// Remove relay-inbound state from reachable machines that no final hop listens on.
+///
+/// This runs only after the whole rule tree has landed. Doing it inside `put_step_tx` would inspect
+/// a transient graph: a normal hop changed to reverse is written across two step rows, and clearing
+/// between those writes can remove the port that the second write is about to reference.
+async fn clear_unused_hop_ins_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    chain_id: &str,
+) -> Result<Vec<String>> {
+    // Match `prune_unreachable_tx`: without an ingress there is no authoritative head and the
+    // stored graph may be intentionally incomplete, so normalization must not infer ownership.
+    let has_head: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ingresses WHERE chain_id = $1)")
+            .bind(chain_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !has_head {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        "SELECT node_id, rules,
+                (hop_in_port IS NOT NULL OR hop_in_wire IS NOT NULL) AS has_hop_in
+           FROM steps
+          WHERE chain_id = $1
+          ORDER BY node_id",
+    )
+    .bind(chain_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut steps = Vec::with_capacity(rows.len());
+    let mut configured = BTreeSet::new();
+    for row in rows {
+        let node = row.try_get::<String, _>("node_id")?;
+        let rules = serde_json::from_value::<Vec<Rule>>(row.try_get("rules")?)
+            .map_err(|error| StoreError::InvalidData(format!("steps 规则解不开：{error}")))?;
+        if row.try_get::<bool, _>("has_hop_in")? {
+            configured.insert(node.clone());
+        }
+        steps.push((node, rules));
+    }
+
+    let listeners = hop_listener_nodes(&steps);
+    let mut cleared = Vec::new();
+    for node in configured.difference(&listeners) {
+        let affected = sqlx::query(
+            "UPDATE steps
+                SET hop_in_port = NULL, hop_in_wire = NULL
+              WHERE chain_id = $1 AND node_id = $2
+                AND (hop_in_port IS NOT NULL OR hop_in_wire IS NOT NULL)",
+        )
+        .bind(chain_id)
+        .bind(node)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if affected > 0 {
+            cleared.push(node.clone());
+        }
+    }
+    Ok(cleared)
+}
+
+/// Relay ports belong to the machine that accepts the connection. A normal hop listens on `to`;
+/// Xray reverse inverts only connection establishment, so its listener is `from`.
+fn hop_listener_nodes(steps: &[(String, Vec<Rule>)]) -> BTreeSet<String> {
+    let mut listeners = BTreeSet::new();
+    for (from, rules) in steps {
+        for rule in rules {
+            let Action::Forward { to, dial, .. } = &rule.action else {
+                continue;
+            };
+            if matches!(dial, HopDial::Reverse(_)) {
+                listeners.insert(from.clone());
+            } else {
+                listeners.insert(to.clone());
+            }
+        }
+    }
+    listeners
 }
 
 /// The closure reachable from `from` along rule Forwards (`from` itself included).

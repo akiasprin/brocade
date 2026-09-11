@@ -316,18 +316,12 @@ pub fn public_route_ip(value: &str) -> Option<IpAddr> {
 /// `None` means "no local reconcile ran this round", not "the last one no longer counts" —
 /// erasing it deletes the only record of drift there is.
 ///
-/// `agent_version` is not written. That column's sole writer is `record_node_poll` (taking the
-/// User-Agent header). A version that wrote it here too existed, and the result was one column
-/// written by two paths in two formats — poll wrapped the value in `brocade-agent/…` and this
-/// wrote it bare — while poll runs far more often, always writes last, and always wins. So the
-/// runtime write was pure waste and left the impression that the column held two formats. What
-/// the agent reports about itself stays in `runtime_versions.agent`, alongside the
-/// xray/phantun/wg fields, which is where it belongs.
+/// `agent_version` is not written here. That column's sole writer is `record_node_poll`, taking
+/// the User-Agent header; the agent's runtime self-observation stays in `runtime_versions.agent`
+/// alongside the xray/phantun/wg fields.
 ///
 /// Both values are the sha256 of the agent's own binary rather than a version number, so what a
-/// reader of either column is comparing is a build. Old agents still in the fleet report a
-/// hand-written version like `0.1.0`; nothing here rejects those, and the console displays them
-/// as they came.
+/// reader of either column is comparing is a build.
 pub async fn record_node_runtime(
     pool: &PgPool,
     node_id: &str,
@@ -336,7 +330,7 @@ pub async fn record_node_runtime(
     let server_now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(pool)
         .await?;
-    let observed_at = report.observed_at_unix_secs.unwrap_or(server_now);
+    let observed_at = report.observed_at_unix_secs;
     if observed_at <= 0 {
         return Err(StoreError::InvalidData(
             "runtime observed_at must be positive unix seconds".to_owned(),

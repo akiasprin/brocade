@@ -10,10 +10,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tagged"
 )
 
-// The canary uses the same tagged outbound, picker and TCP dispatch as business
-// traffic. A backend failure changes only this verdict, never worker ACK health.
+// The optional canary uses the same tagged outbound, picker and TCP dispatch as
+// business traffic. Brocade does not configure it; direct Xray users may opt in
+// with canary_url. A backend failure never changes worker ACK health.
 func (r *Reverse) runCanary(ctx context.Context) {
-	observation := mux.NewReverseCanary(r.tag, r.health)
+	observation := mux.NewReverseCanary(r.tag, r.canary)
 	defer observation.Close()
 	tr := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		dest, err := net.ParseDestination(network + ":" + address)
@@ -23,8 +24,8 @@ func (r *Reverse) runCanary(ctx context.Context) {
 		return tagged.Dialer(ctx, r.dispatcher, dest, r.tag)
 	}}
 	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, Timeout: r.health.CanaryTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	ticker := time.NewTicker(r.health.CanaryInterval)
+	client := &http.Client{Transport: tr, Timeout: r.canary.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	ticker := time.NewTicker(r.canary.Interval)
 	defer ticker.Stop()
 	for {
 		started := time.Now()

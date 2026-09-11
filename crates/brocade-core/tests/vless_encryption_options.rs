@@ -1,11 +1,16 @@
 use brocade_core::model::{VlessEncryption, VlessEncryptionOptions};
 
 #[test]
-fn defaults_accept_old_snapshots_and_keep_wire_encoding() {
-    let wire: VlessEncryption =
-        serde_json::from_str(r#"{"port":48000,"private_key":"private","public_key":"public"}"#)
-            .unwrap();
-    assert_eq!(wire.options, VlessEncryptionOptions::default());
+fn complete_settings_are_required_and_keep_wire_encoding() {
+    let options = VlessEncryptionOptions::default();
+    let wire: VlessEncryption = serde_json::from_value(serde_json::json!({
+        "port": 13800,
+        "options": options,
+        "private_key": "private",
+        "public_key": "public"
+    }))
+    .unwrap();
+    assert_eq!(wire.options, options);
     assert_eq!(
         wire.options.decryption("private"),
         "mlkem768x25519plus.native.600s.private"
@@ -13,6 +18,14 @@ fn defaults_accept_old_snapshots_and_keep_wire_encoding() {
     assert_eq!(
         wire.options.encryption("public"),
         "mlkem768x25519plus.native.0rtt.public"
+    );
+    assert!(
+        serde_json::from_value::<VlessEncryption>(serde_json::json!({
+            "port": 13800,
+            "private_key": "private",
+            "public_key": "public"
+        }))
+        .is_err()
     );
 }
 

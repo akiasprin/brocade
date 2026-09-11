@@ -37,6 +37,44 @@ func TestReverseExpiredDeadlineQuarantinesWithoutTimer(t *testing.T) {
 		t.Fatal("confirmation deadline did not close worker")
 	}
 }
+func TestReverseConfirmedFailureDrainsActiveRequestsByDefault(t *testing.T) {
+	h := healthForTest(t)
+	active := uint32(3)
+	h.config.ActiveSessions = func() uint32 { return active }
+	h.config.DrainIdle = func() bool { return active == 0 }
+	now := time.Now()
+	h.pendingID = 10
+	h.pendingDeadline = now.Add(-time.Millisecond)
+	h.Usable()
+	h.mu.Lock()
+	h.checkLocked(now.Add(time.Second))
+	h.mu.Unlock()
+	if h.done.Done() || h.snapshot.State != "DRAINING" {
+		t.Fatalf("active requests were terminated: %+v", h.snapshot)
+	}
+	active = 0
+	h.mu.Lock()
+	h.checkLocked(now.Add(2 * time.Second))
+	h.mu.Unlock()
+	if !h.done.Done() || h.snapshot.State != "DEAD" {
+		t.Fatalf("idle draining worker was not reclaimed: %+v", h.snapshot)
+	}
+}
+func TestReverseConfirmedFailureCanDisconnectActiveRequests(t *testing.T) {
+	h := healthForTest(t)
+	h.config.DisconnectOnHealthFailure = true
+	h.config.ActiveSessions = func() uint32 { return 3 }
+	now := time.Now()
+	h.pendingID = 10
+	h.pendingDeadline = now.Add(-time.Millisecond)
+	h.Usable()
+	h.mu.Lock()
+	h.checkLocked(now.Add(time.Second))
+	h.mu.Unlock()
+	if !h.done.Done() || h.snapshot.State != "DEAD" || h.snapshot.AffectedSessions != 3 {
+		t.Fatalf("configured active disconnect was not applied: %+v", h.snapshot)
+	}
+}
 func TestReversePendingProbeDoesNotQuarantineReadyWorker(t *testing.T) {
 	h := healthForTest(t)
 	h.pendingID = 10
@@ -118,7 +156,7 @@ func TestReversePairValidationAndAtomicDispatchClose(t *testing.T) {
 	}
 	defer server.Close()
 	cc := DefaultReverseHealthConfig("pair", "portal")
-	client, err := NewClientWorker(transport.Link{Reader: b, Writer: aw}, ClientStrategy{ReverseHealth: &cc})
+	client, err := NewReverseClientWorker(transport.Link{Reader: b, Writer: aw}, cc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +198,7 @@ func reverseEchoPair(t *testing.T) (*ClientWorker, *ServerWorker) {
 		t.Fatal(err)
 	}
 	cc := DefaultReverseHealthConfig("echo", "portal")
-	client, err := NewClientWorker(transport.Link{Reader: b, Writer: aw}, ClientStrategy{ReverseHealth: &cc})
+	client, err := NewReverseClientWorker(transport.Link{Reader: b, Writer: aw}, cc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,6 +215,25 @@ func reverseEchoPair(t *testing.T) (*ClientWorker, *ServerWorker) {
 	}
 	return client, server
 }
+
+func TestReversePairDoesNotInstallOrdinaryIdleReaper(t *testing.T) {
+	client, server := reverseEchoPair(t)
+	if client.timer != nil || server.timer != nil {
+		t.Fatal("reverse pair inherited the ordinary idle reaper")
+	}
+	if client.strategy.WorkerPool != nil || client.strategy.MaxConcurrency != client.health.config.MaxSessionsPerWorker || client.strategy.MaxConnection != uint32(^uint16(0)) {
+		t.Fatalf("reverse client inherited or lost strategy parameters: %+v", client.strategy)
+	}
+	select {
+	case <-server.WaitClosed():
+		t.Fatal("ordinary idle reaper closed healthy reverse worker")
+	case <-time.After(25 * time.Millisecond):
+	}
+	if client.Closed() || !client.health.Usable() || !server.health.Usable() {
+		t.Fatal("idle reverse pair did not remain healthy")
+	}
+}
+
 func TestReverseTCPAndUDPFailClosedAndFreshGenerationWorks(t *testing.T) {
 	for _, network := range []net.Network{net.Network_TCP, net.Network_UDP} {
 		t.Run(network.String(), func(t *testing.T) {
@@ -280,15 +337,15 @@ func TestReverseTuningJitterAndRecoveryThreshold(t *testing.T) {
 }
 
 func TestReverseCanaryConfiguredSuccessCountAndWindow(t *testing.T) {
-	config := DefaultReverseHealthConfig("canary-tuning-test", "portal")
-	config.CanarySuccesses = 3
-	config.CanaryStableWindow = time.Second
-	config.CanaryInterval = time.Minute
+	config := DefaultReverseCanaryConfig()
+	config.Successes = 3
+	config.StableWindow = time.Second
+	config.Interval = time.Minute
 	c := NewReverseCanary("canary-tuning-test", config)
+	defer c.Close()
 	if c.FreshnessBudgetMS != 120750 {
 		t.Fatal("canary freshness ignored interval")
 	}
-	defer c.Close()
 	for i := 0; i < 3; i++ {
 		c.Record(time.Now(), "success")
 	}
@@ -305,17 +362,5 @@ func TestReverseCanaryConfiguredSuccessCountAndWindow(t *testing.T) {
 	c.Record(time.Now(), "request_failed")
 	if c.StableSinceUnixMS != 0 || c.ConsecutiveSuccesses != 0 {
 		t.Fatal("failure did not reset stability")
-	}
-	c.Record(time.Now(), "success")
-	reverseHealthRegistry.Lock()
-	c.FirstOKUnixMS = time.Now().Add(-2 * time.Second).UnixMilli()
-	reverseHealthRegistry.Unlock()
-	c.Record(time.Now(), "success")
-	if c.StableSinceUnixMS != 0 {
-		t.Fatal("window bypassed success count")
-	}
-	c.Record(time.Now(), "success")
-	if c.StableSinceUnixMS == 0 {
-		t.Fatal("third success did not mark stable")
 	}
 }

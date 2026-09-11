@@ -288,13 +288,7 @@ function ConfigSection({ go }: { go: (d: Drill) => void }) {
             // 因此需要向后统计（更早的记录）。
             const tries = items.filter(x => x.revision_id === d.revision_id && x.kind === d.kind);
             const nth = tries.length > 1 ? tries.length - tries.indexOf(d) : 0;
-            // 新发布的备注由服务端生成为「变更内容 · 机器数」（store 的 `default_note`），
-            // 每条不同，适合作为主要内容显示。
-            // 保留该正则只为识别历史数据：此项改动之前，控制台为每条发布填入的是
-            // 「console · 修订 N」——重复了右侧已显示的编号，全表各行内容相同。
-            // 这些记录仍在库中（备注是历史记录，不回填），识别后降级为灰色副标题。
-            const legacy = new RegExp(`^\\S+ · 修订 ${d.revision_id}$`);
-            const written = d.note && !legacy.test(d.note) ? d.note : null;
+            const written = d.note;
             return (
               <Fragment key={d.id}>
                 {newDay && <div className="dp-day">{day}</div>}
@@ -630,7 +624,7 @@ function PlanPreview({
             </div>
           ) : (
             <div className="callout">
-              创建前会再次确认配置仍是修订 {target}；如果期间有新的修改，本次创建会自动停止。
+              创建时，系统会再次检查当前配置是否仍为修订 {target}。如果配置已更新，本次创建将取消，请重新预览。
             </div>
           )}
           <div className="toolbar">
@@ -771,42 +765,52 @@ export function ArtifactChanges({
   );
   // 订阅不通过发布下发，但发生变化时需要提示。按用户数统计而非文件数：
   // 一个用户对应 clash 和 uri 两份，显示为「2 份变更」会被理解为涉及两个用户。
-  const subs = [
-    ...new Set(
-      list.filter(a => a.target_kind === 'user' && (base == null || changed.has(entryId(a)))).map(a => a.target_id),
-    ),
-  ];
+  const subscriptionChanges = list.filter(a => a.target_kind === 'user' && (base == null || changed.has(entryId(a))));
+  const usersWithSubscriptionChanges = [...new Set(subscriptionChanges.map(a => a.target_id))];
 
-  if (nodeChanges.length === 0) {
-    return (
-      <div className="callout">
-        {base === revision && targets.length > 0
-          ? '证书等运行状态已经变化，需要重新下发；创建后可在发布详情中查看实际文件记录'
-          : base == null
-            ? '第一次发布没有可新建的机器产物'
-            : `跟修订 ${base} 比，这几台的产物没变`}
-        {subs.length > 0 ? `（另有 ${subs.length} 人的订阅变了）` : ''}。
-      </div>
-    );
-  }
-
-  const byNode = [...new Set(nodeChanges.map(a => a.target_id))];
   return (
     <>
-      {byNode.map(node => (
-        <NodeDiff
-          key={node}
-          name={nameOf(node)}
-          nodeId={node}
-          entries={nodeChanges.filter(a => a.target_id === node)}
-          revision={revision}
-          base={base}
-        />
-      ))}
-      {subs.length > 0 && (
-        <div className="note" style={{ marginTop: 8 }}>
-          另有 {subs.length} 人的订阅发生变更：{subs.join('、')}
+      {nodeChanges.length === 0 ? (
+        <div className="callout">
+          {base === revision && targets.length > 0
+            ? '证书等运行状态已经变化，需要重新下发；创建后可在发布详情中查看实际文件记录'
+            : base == null
+              ? '第一次发布没有可新建的机器产物'
+              : `与修订 ${base} 相比，上方 ${targets.length} 台机器的产物没有变化`}
+          。
         </div>
+      ) : (
+        [...new Set(nodeChanges.map(a => a.target_id))].map(node => (
+          <TargetDiff
+            key={node}
+            name={nameOf(node)}
+            targetId={node}
+            entries={nodeChanges.filter(a => a.target_id === node)}
+            revision={revision}
+            base={base}
+          />
+        ))
+      )}
+      {usersWithSubscriptionChanges.length > 0 && (
+        <>
+          <div className="wavehead" style={{ marginTop: 14 }}>
+            <span>
+              用户订阅{base == null ? '新建' : '变更'} · {usersWithSubscriptionChanges.length} 人
+            </span>
+            <span className="rule" />
+          </div>
+          {usersWithSubscriptionChanges.map(userKey => (
+            <TargetDiff
+              key={userKey}
+              name={`用户 ${userKey.split(':').at(-1)}`}
+              targetId={userKey}
+              entries={subscriptionChanges.filter(a => a.target_id === userKey)}
+              revision={revision}
+              base={base}
+              defaultOpen={usersWithSubscriptionChanges.length === 1}
+            />
+          ))}
+        </>
       )}
     </>
   );
@@ -923,27 +927,29 @@ function RecordedFileDiff({
   );
 }
 
-/* 每台一个折叠块，内容按需拉取。 */
-function NodeDiff({
+/* 每台机器或每位用户一个折叠块，内容按需拉取。 */
+function TargetDiff({
   name,
-  nodeId,
+  targetId,
   entries,
   revision,
   base,
+  defaultOpen,
 }: {
   name: string;
-  nodeId: string;
+  targetId: string;
   entries: ArtifactIndexEntry[];
   revision: number;
   base: number | null;
+  defaultOpen?: boolean;
 }) {
   // 首次发布没有旧内容可对照，完整的新建内容就是 diff 本身，因此默认展开。
-  const [open, setOpen] = useState(() => base == null);
+  const [open, setOpen] = useState(() => defaultOpen ?? base == null);
   return (
     <div className="dp-node">
       <button className="dp-nodehead" onClick={() => setOpen(!open)} aria-expanded={open}>
         <span className="tw">{open ? '▾' : '▸'}</span>
-        <span className="nm" title={nodeId}>
+        <span className="nm" title={targetId}>
           {name}
         </span>
         <span className="files">

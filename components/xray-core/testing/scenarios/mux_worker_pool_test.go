@@ -38,23 +38,27 @@ const realProcessProbeTimeout = 3 * time.Second
 
 func testWorkerPoolConfig() *proxyman.WorkerPoolConfig {
 	return &proxyman.WorkerPoolConfig{
-		MinIdleWorkers:       0,
-		MaxIdleWorkers:       2,
+		PrewarmWorkers:       0,
+		ReuseThreshold:       2,
 		MaxProbingWorkers:    1,
-		ProbeIntervalSecs:    5,
+		ProbeIntervalMs:      5000,
 		ProbeTimeoutMs:       uint32(realProcessProbeTimeout / time.Millisecond),
-		IdleTtlSecs:          24,
+		IdleTtlMs:            24000,
 		MaxRequestsPerWorker: 128,
 	}
 }
 
 func testMuxSender(stream *internet.StreamConfig, concurrency int32) *serial.TypedMessage {
+	return testMuxSenderWithPool(stream, concurrency, testWorkerPoolConfig())
+}
+
+func testMuxSenderWithPool(stream *internet.StreamConfig, concurrency int32, pool *proxyman.WorkerPoolConfig) *serial.TypedMessage {
 	return serial.ToTypedMessage(&proxyman.SenderConfig{
 		StreamSettings: stream,
 		MultiplexSettings: &proxyman.MultiplexingConfig{
 			Enabled:     true,
 			Concurrency: concurrency,
-			WorkerPool:  testWorkerPoolConfig(),
+			WorkerPool:  pool,
 		},
 	})
 }
@@ -339,6 +343,11 @@ func stopMuxProcessesWithin(commands []*exec.Cmd, timeout time.Duration) error {
 
 func startRealMuxScenario(t *testing.T, protocolName string, concurrency int32, destination net.Destination) *realMuxScenario {
 	t.Helper()
+	return startRealMuxScenarioWithPool(t, protocolName, concurrency, destination, testWorkerPoolConfig())
+}
+
+func startRealMuxScenarioWithPool(t *testing.T, protocolName string, concurrency int32, destination net.Destination, pool *proxyman.WorkerPoolConfig) *realMuxScenario {
+	t.Helper()
 	relayID := protocol.NewID(uuid.New())
 	relayPort := tcp.PickPort()
 	proxy := newMuxHopProxy(t, relayPort)
@@ -362,7 +371,7 @@ func startRealMuxScenario(t *testing.T, protocolName string, concurrency int32, 
 		}},
 		Outbound: []*core.OutboundHandlerConfig{{
 			Tag:            "mux-hop",
-			SenderSettings: testMuxSender(nil, concurrency),
+			SenderSettings: testMuxSenderWithPool(nil, concurrency, pool),
 			ProxySettings: serial.ToTypedMessage(&vlessoutbound.Config{Vnext: &protocol.ServerEndpoint{
 				Address: net.NewIPOrDomain(net.LocalHostIP), Port: uint32(proxy.port()),
 				User: &protocol.User{Email: "mux-hop@example.com", Account: serial.ToTypedMessage(&vless.Account{Id: relayID.String()})},
@@ -438,9 +447,24 @@ func runMuxProcessDataPlane(t *testing.T, protocolName string, concurrency int32
 		t.Fatalf("healthy sequential streams used %d physical mux connections, want 1", got)
 	}
 
-	var group errgroup.Group
+	// Keep all sessions alive before checking capacity. Short sessions that
+	// finish during the burst may be ending/quarantined, so their historical
+	// dial count is not a bound on concurrent packing.
+	var connections []stdnet.Conn
 	for range 16 {
-		group.Go(testTCPConn(scenario.clientPort, 256*1024, 20*time.Second))
+		conn, err := stdnet.DialTimeout("tcp", stdnet.JoinHostPort("127.0.0.1", scenario.clientPort.String()), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		connections = append(connections, conn)
+		if err := testTCPConn2(conn, 16*1024, 20*time.Second)(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var group errgroup.Group
+	for _, conn := range connections {
+		group.Go(testTCPConn2(conn, 256*1024, 20*time.Second))
 	}
 	if err := group.Wait(); err != nil {
 		t.Fatal(err)
@@ -449,7 +473,54 @@ func runMuxProcessDataPlane(t *testing.T, protocolName string, concurrency int32
 	if got := scenario.proxy.connectionCount(); got > maxConnections {
 		t.Fatalf("concurrent streams used %d physical mux connections, want at most %d", got, maxConnections)
 	}
+	for _, conn := range connections {
+		conn.Close()
+	}
 	waitMuxScenario(t, "idle pool bound", 5*time.Second, func() bool { return scenario.proxy.active.Load() <= 2 })
+	scenario.close(t)
+}
+
+func TestMuxWorkerPoolRealProcessWarmSpareSurvivesServerMinute(t *testing.T) {
+	if testing.Short() {
+		t.Skip("observes a real server idle tick for 65 seconds")
+	}
+	backend := tcp.Server{MsgProcessor: xor}
+	destination, err := backend.Start()
+	common.Must(err)
+	defer backend.Close()
+	pool := testWorkerPoolConfig()
+	pool.PrewarmWorkers, pool.ReuseThreshold = 1, 2
+	pool.IdleTtlMs = uint32((5 * time.Hour) / time.Millisecond)
+	scenario := startRealMuxScenarioWithPool(t, "VLESS", 2, destination, pool)
+	// Prewarming starts with allocation, including for non-pipe ingress.
+	// Finish a primer before holding a stream alongside the warm spare.
+	if err := testTCPConn(scenario.clientPort, 16*1024, 10*time.Second)(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond) // Complete the primer's End and any initial warm validation.
+	connection, err := stdnet.DialTimeout("tcp", stdnet.JoinHostPort("127.0.0.1", scenario.clientPort.String()), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err := testTCPConn2(connection, 16*1024, 10*time.Second)(); err != nil {
+		t.Fatal(err)
+	}
+	waitMuxScenario(t, "one active worker and one never-used warm spare", 5*time.Second, func() bool {
+		return scenario.proxy.connectionCount() == 2 && scenario.proxy.active.Load() == 2
+	})
+	deadline := time.Now().Add(65 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, active := scenario.proxy.connectionCount(), scenario.proxy.active.Load(); got != 2 || active != 2 {
+			t.Fatalf("healthy warm spare churned before its five-hour TTL: created=%d active=%d", got, active)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err := testTCPConn2(connection, 16*1024, 10*time.Second)(); err != nil {
+		t.Fatalf("active stream failed after the server idle check: %v", err)
+	}
+	t.Log("65 seconds: 2 physical workers throughout, no warm replacement, active business still works")
+	connection.Close()
 	scenario.close(t)
 }
 
@@ -493,7 +564,7 @@ func TestMuxWorkerPoolRealProcessFaultMatrix(t *testing.T) {
 					// VLESS may keep the just-closed logical stream in teardown for
 					// about one second. Let the configured recent-I/O window expire
 					// after teardown, while remaining inside the probe timeout.
-					time.Sleep(time.Duration(testWorkerPoolConfig().ProbeIntervalSecs)*time.Second + 1800*time.Millisecond)
+					time.Sleep(time.Duration(testWorkerPoolConfig().ProbeIntervalMs)*time.Millisecond + 1800*time.Millisecond)
 
 					started := time.Now()
 					longLived, err := stdnet.DialTimeout("tcp", stdnet.JoinHostPort("127.0.0.1", scenario.clientPort.String()), 5*time.Second)
@@ -542,7 +613,7 @@ func TestMuxWorkerPoolShutdownDuringBlackholedProbe(t *testing.T) {
 			scenario.proxy.connection(0).blackhole.Store(true)
 			_ = first.Close()
 			// Shutdown must interrupt an actual in-flight probe, after recent I/O expires.
-			time.Sleep(time.Duration(testWorkerPoolConfig().ProbeIntervalSecs)*time.Second + 1800*time.Millisecond)
+			time.Sleep(time.Duration(testWorkerPoolConfig().ProbeIntervalMs)*time.Millisecond + 1800*time.Millisecond)
 
 			scenario.closeWithin(t, 5*time.Second)
 		})

@@ -147,19 +147,20 @@ func (x *ReverseHealthTuning) GetCanaryStableWindowMs() uint32 {
 }
 
 type ReverseHealth struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	ProbeIntervalMs         uint32                 `protobuf:"varint,1,opt,name=probe_interval_ms,json=probeIntervalMs,proto3" json:"probe_interval_ms,omitempty"`
-	ProbeTimeoutMs          uint32                 `protobuf:"varint,2,opt,name=probe_timeout_ms,json=probeTimeoutMs,proto3" json:"probe_timeout_ms,omitempty"`
-	ConfirmTimeoutMs        uint32                 `protobuf:"varint,3,opt,name=confirm_timeout_ms,json=confirmTimeoutMs,proto3" json:"confirm_timeout_ms,omitempty"`
-	HealthLeaseMs           uint32                 `protobuf:"varint,4,opt,name=health_lease_ms,json=healthLeaseMs,proto3" json:"health_lease_ms,omitempty"`
-	MinHealthyWorkers       uint32                 `protobuf:"varint,5,opt,name=min_healthy_workers,json=minHealthyWorkers,proto3" json:"min_healthy_workers,omitempty"`
-	MaxIdleReadyWorkers     uint32                 `protobuf:"varint,6,opt,name=max_idle_ready_workers,json=maxIdleReadyWorkers,proto3" json:"max_idle_ready_workers,omitempty"`
-	MaxParallelDialsPerPair uint32                 `protobuf:"varint,7,opt,name=max_parallel_dials_per_pair,json=maxParallelDialsPerPair,proto3" json:"max_parallel_dials_per_pair,omitempty"`
-	DialReadyTimeoutMs      uint32                 `protobuf:"varint,8,opt,name=dial_ready_timeout_ms,json=dialReadyTimeoutMs,proto3" json:"dial_ready_timeout_ms,omitempty"`
-	ReconnectBackoffCapMs   uint32                 `protobuf:"varint,9,opt,name=reconnect_backoff_cap_ms,json=reconnectBackoffCapMs,proto3" json:"reconnect_backoff_cap_ms,omitempty"`
-	Tuning                  *ReverseHealthTuning   `protobuf:"bytes,10,opt,name=tuning,proto3" json:"tuning,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                     protoimpl.MessageState `protogen:"open.v1"`
+	ProbeIntervalMs           uint32                 `protobuf:"varint,1,opt,name=probe_interval_ms,json=probeIntervalMs,proto3" json:"probe_interval_ms,omitempty"`
+	ProbeTimeoutMs            uint32                 `protobuf:"varint,2,opt,name=probe_timeout_ms,json=probeTimeoutMs,proto3" json:"probe_timeout_ms,omitempty"`
+	ConfirmTimeoutMs          uint32                 `protobuf:"varint,3,opt,name=confirm_timeout_ms,json=confirmTimeoutMs,proto3" json:"confirm_timeout_ms,omitempty"`
+	HealthLeaseMs             uint32                 `protobuf:"varint,4,opt,name=health_lease_ms,json=healthLeaseMs,proto3" json:"health_lease_ms,omitempty"`
+	MinHealthyWorkers         uint32                 `protobuf:"varint,5,opt,name=min_healthy_workers,json=minHealthyWorkers,proto3" json:"min_healthy_workers,omitempty"`
+	MaxIdleReadyWorkers       uint32                 `protobuf:"varint,6,opt,name=max_idle_ready_workers,json=maxIdleReadyWorkers,proto3" json:"max_idle_ready_workers,omitempty"`
+	MaxParallelDialsPerPair   uint32                 `protobuf:"varint,7,opt,name=max_parallel_dials_per_pair,json=maxParallelDialsPerPair,proto3" json:"max_parallel_dials_per_pair,omitempty"`
+	DialReadyTimeoutMs        uint32                 `protobuf:"varint,8,opt,name=dial_ready_timeout_ms,json=dialReadyTimeoutMs,proto3" json:"dial_ready_timeout_ms,omitempty"`
+	ReconnectBackoffCapMs     uint32                 `protobuf:"varint,9,opt,name=reconnect_backoff_cap_ms,json=reconnectBackoffCapMs,proto3" json:"reconnect_backoff_cap_ms,omitempty"`
+	Tuning                    *ReverseHealthTuning   `protobuf:"bytes,10,opt,name=tuning,proto3" json:"tuning,omitempty"`
+	DisconnectOnHealthFailure bool                   `protobuf:"varint,11,opt,name=disconnect_on_health_failure,json=disconnectOnHealthFailure,proto3" json:"disconnect_on_health_failure,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *ReverseHealth) Reset() {
@@ -260,6 +261,13 @@ func (x *ReverseHealth) GetTuning() *ReverseHealthTuning {
 		return x.Tuning
 	}
 	return nil
+}
+
+func (x *ReverseHealth) GetDisconnectOnHealthFailure() bool {
+	if x != nil {
+		return x.DisconnectOnHealthFailure
+	}
+	return false
 }
 
 type Reverse struct {
@@ -457,7 +465,7 @@ const file_proxy_vless_account_proto_rawDesc = "" +
 	"\x11canary_timeout_ms\x18\t \x01(\rR\x0fcanaryTimeoutMs\x12)\n" +
 	"\x10canary_successes\x18\n" +
 	" \x01(\rR\x0fcanarySuccesses\x125\n" +
-	"\x17canary_stable_window_ms\x18\v \x01(\rR\x14canaryStableWindowMs\"\x89\x04\n" +
+	"\x17canary_stable_window_ms\x18\v \x01(\rR\x14canaryStableWindowMs\"\xca\x04\n" +
 	"\rReverseHealth\x12*\n" +
 	"\x11probe_interval_ms\x18\x01 \x01(\rR\x0fprobeIntervalMs\x12(\n" +
 	"\x10probe_timeout_ms\x18\x02 \x01(\rR\x0eprobeTimeoutMs\x12,\n" +
@@ -469,7 +477,8 @@ const file_proxy_vless_account_proto_rawDesc = "" +
 	"\x15dial_ready_timeout_ms\x18\b \x01(\rR\x12dialReadyTimeoutMs\x127\n" +
 	"\x18reconnect_backoff_cap_ms\x18\t \x01(\rR\x15reconnectBackoffCapMs\x12=\n" +
 	"\x06tuning\x18\n" +
-	" \x01(\v2%.xray.proxy.vless.ReverseHealthTuningR\x06tuning\"\xb2\x01\n" +
+	" \x01(\v2%.xray.proxy.vless.ReverseHealthTuningR\x06tuning\x12?\n" +
+	"\x1cdisconnect_on_health_failure\x18\v \x01(\bR\x19disconnectOnHealthFailure\"\xb2\x01\n" +
 	"\aReverse\x12\x10\n" +
 	"\x03tag\x18\x01 \x01(\tR\x03tag\x12=\n" +
 	"\bsniffing\x18\x02 \x01(\v2!.xray.app.proxyman.SniffingConfigR\bsniffing\x127\n" +

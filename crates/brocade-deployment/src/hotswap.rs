@@ -282,7 +282,10 @@ mod tests {
         assert!(hot_swap(&before.to_string(), &after.to_string()).is_some());
         after["brocadeCertificateGroup"] = serde_json::json!("group-b");
         assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
-        after.as_object_mut().unwrap().remove("brocadeCertificateGroup");
+        after
+            .as_object_mut()
+            .unwrap()
+            .remove("brocadeCertificateGroup");
         assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
         assert!(hot_swap(&after.to_string(), &before.to_string()).is_none());
     }

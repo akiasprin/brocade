@@ -36,9 +36,18 @@ func newHealthWriter(output buf.Writer, closed *done.Instance) *healthWriter {
 }
 func (w *healthWriter) Interrupt() { common.Interrupt(w.output) }
 func (w *healthWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.writeCancelable(mb, nil)
+}
+
+// Once accepted, a complete frame belongs to the single writer even if its
+// session stops waiting. Never interrupt a shared frame/transport on cancellation.
+func (w *healthWriter) writeCancelable(mb buf.MultiBuffer, cancel <-chan struct{}) error {
 	r := healthWrite{mb: mb, result: make(chan error, 1)}
 	select {
 	case w.data <- r:
+	case <-cancel:
+		buf.ReleaseMulti(mb)
+		return io.ErrClosedPipe
 	case <-w.done:
 		buf.ReleaseMulti(mb)
 		return io.ErrClosedPipe
@@ -46,6 +55,8 @@ func (w *healthWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	select {
 	case err := <-r.result:
 		return err
+	case <-cancel:
+		return io.ErrClosedPipe
 	case <-w.done:
 		return io.ErrClosedPipe
 	}

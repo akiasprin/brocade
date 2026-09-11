@@ -83,10 +83,7 @@ const USAGE_CURSOR_FILE: &str = "usage-cursor.json";
 const USAGE_GENERATION_FILE: &str = "usage-generation";
 /// Presence means the running Xray was launched through the bounded sink. It deliberately sits
 /// outside xray.json: logging is agent runtime state, not part of the compiled Xray artifact.
-const XRAY_BOUNDED_LOG_MARKER: &str = "xray.bounded-log-v3";
-const XRAY_SHARED_POLICY_LOG_MARKER: &str = "xray.bounded-log-v2";
-const XRAY_OLD_BOUNDED_LOG_MARKER: &str = "xray.bounded-log-v1";
-const AGENT_LOG_MAX_MIB_HEADER: &str = "x-brocade-log-max-mib";
+const XRAY_BOUNDED_LOG_MARKER: &str = "xray.bounded-log";
 const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
 const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
 const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
@@ -141,8 +138,8 @@ fn write_usage_generation(state_dir: &Path, generation_id: i64) -> Result<(), St
 }
 
 /// Self-healing runs without operator involvement, so every occurrence has to emit a
-/// line whose level appears at the start. journald collects logs on these machines and
-/// operators filter with `grep`, which cannot match a level embedded in the wording.
+/// line whose level appears at the start. The service log collects these lines and operators
+/// filter with `grep`, which cannot match a level embedded in the wording.
 fn warn(message: impl AsRef<str>) {
     eprintln!("warn: {}", message.as_ref());
 }
@@ -152,8 +149,8 @@ fn warn(message: impl AsRef<str>) {
 // plane observes a healthy machine. A stopped usage thread understates bills, and a
 // stopped watchdog leaves drifted links unrepaired; both are harder to detect than an
 // error.
-// systemd's Restart=always does not cover this: a panic off the main thread does not
-// terminate the process, so the unit never restarts.
+// A service supervisor does not cover this: a panic off the main thread does not terminate the
+// process, so neither systemd nor OpenRC sees anything to restart.
 // AssertUnwindSafe adds no new assumption: the locks here are already handled uniformly
 // as usable even when poisoned.
 fn each_round(name: &str, body: impl FnOnce()) {
@@ -688,7 +685,7 @@ fn reconcile_local_inner(
         // recorded.
         if let Some(want) = desired_grants_on_disk(state_dir)? {
             if force || restarted || grants_drifted(&want, api_port) {
-                sync_grants(state_dir, &content, api_port, &want)?;
+                sync_grants(&content, api_port, &want)?;
                 acted.push("grants".to_owned());
             }
         }
@@ -716,9 +713,9 @@ fn live_wg_mtu() -> Option<u16> {
         .ok()
 }
 
-/// The last full set of desired grants this agent accepted. An older agent never wrote
-/// this file, so the result is None, and taking no action is preferable to deriving the
-/// full set from an incremental batch.
+/// The last full set of desired grants this agent accepted. Before the first grants convergence
+/// the file is absent, and taking no action is preferable to deriving a full set from an
+/// incremental batch.
 fn desired_grants_on_disk(state_dir: &Path) -> Result<Option<Vec<GrantInbound>>, String> {
     let path = state_dir.join("grants.desired.json");
     if !path.exists() {
@@ -855,8 +852,9 @@ fn health(state_dir: &Path) -> Result<(), String> {
             "{} 是空的，agent 连 204 都没收到过。\n\
              多半是这两种：--server 指到了 admin 端口（默认 8080，那上面没有 /agent/v1/*），\
              或者 token 不对/被吊销了。\n\
-             journalctl -u brocade-agent -n 50 里有具体那条错。",
-            state_dir.display()
+             systemd 用 journalctl -u brocade-agent -n 50；OpenRC 用 tail -n 50 {} 查看具体错误。",
+            state_dir.display(),
+            state_dir.join("logs/agent.log").display()
         ));
     }
 
@@ -1517,20 +1515,20 @@ fn run_forever(options: Options) -> Result<(), String> {
         if let Err(error) = apply_once_locked(&options, &meter) {
             eprintln!("apply: {error}");
         }
-        // Checked after the round rather than before the sleep, so that the wait for systemd to
-        // restart does not also include a full apply interval.
+        // Checked after the round rather than before the sleep, so that the wait for the service
+        // supervisor to restart does not also include a full apply interval.
         //
-        // Exit 0, and systemd's `Restart=always` starts the replacement after `RestartSec` (5s).
-        // Deliberately not `systemctl restart`: that command kills the process group it was
-        // issued from, which is this process, and systemd's behavior for a unit whose restart
-        // command exited mid-restart is not specified. Exiting is unambiguous.
+        // Exit 0. systemd's `Restart=always` or OpenRC's `supervise-daemon` starts the replacement
+        // after five seconds. Deliberately do not invoke the service manager from inside the
+        // service: exiting is unambiguous and works under either init.
         //
-        // Four properties keep this from interrupting traffic: `KillMode=process` in the unit, so
-        // xray, which this agent started with nohup in the same cgroup, is not killed alongside;
-        // wg0 is a kernel interface and is unaffected; convergence is idempotent and re-runs every
-        // 15 seconds; and anything owed to the control plane is already on disk in the spool.
+        // Four properties keep this from interrupting traffic: the service definitions stop only
+        // the supervised Agent process (`KillMode=process` on systemd and no `stopgroup` on
+        // OpenRC), so nohup'd Xray/Phantun children are not killed alongside; wg0 is a kernel
+        // interface and is unaffected; convergence is idempotent and re-runs every 15 seconds; and
+        // anything owed to the control plane is already on disk in the spool.
         if wants_exit.load(std::sync::atomic::Ordering::SeqCst) {
-            println!("selfupdate: 这一轮收敛做完了，退出让 systemd 用新二进制拉起来");
+            println!("selfupdate: 这一轮收敛做完了，退出让服务管理器用新二进制拉起来");
             std::process::exit(0);
         }
         let now = Instant::now();
@@ -1557,70 +1555,19 @@ fn log_limit_header(response: &HttpResponse, name: &str) -> Result<Option<u32>, 
         .transpose()
 }
 
-/// New control planes send one ceiling per workload class. The legacy scalar remains a fallback
-/// in both directions: a new Agent can still poll an old console, and a rolling console update can
-/// serve an Agent binary that has not restarted into the new release yet.
 fn log_policy_from_response(response: &HttpResponse) -> Result<Option<logcap::LogPolicy>, String> {
-    let legacy = log_limit_header(response, AGENT_LOG_MAX_MIB_HEADER)?;
     let agent = log_limit_header(response, AGENT_JOURNAL_MAX_MIB_HEADER)?;
     let xray = log_limit_header(response, XRAY_LOG_MAX_MIB_HEADER)?;
     let phantun = log_limit_header(response, PHANTUN_LOG_MAX_MIB_HEADER)?;
-    if legacy.is_none() && agent.is_none() && xray.is_none() && phantun.is_none() {
+    if agent.is_none() && xray.is_none() && phantun.is_none() {
         return Ok(None);
     }
-    let missing = |name: &str| format!("{name} 缺失且没有旧版统一上限可回退");
+    let missing = |name: &str| format!("{name} 缺失");
     Ok(Some(logcap::LogPolicy {
-        agent_journal_mib: agent
-            .or(legacy)
-            .ok_or_else(|| missing(AGENT_JOURNAL_MAX_MIB_HEADER))?,
-        xray_mib: xray
-            .or(legacy)
-            .ok_or_else(|| missing(XRAY_LOG_MAX_MIB_HEADER))?,
-        phantun_mib: phantun
-            .or(legacy)
-            .ok_or_else(|| missing(PHANTUN_LOG_MAX_MIB_HEADER))?,
+        agent_journal_mib: agent.ok_or_else(|| missing(AGENT_JOURNAL_MAX_MIB_HEADER))?,
+        xray_mib: xray.ok_or_else(|| missing(XRAY_LOG_MAX_MIB_HEADER))?,
+        phantun_mib: phantun.ok_or_else(|| missing(PHANTUN_LOG_MAX_MIB_HEADER))?,
     }))
-}
-
-fn upgrade_dynamic_log_sinks(
-    options: &Options,
-    meter: Option<&Arc<Mutex<()>>>,
-) -> Result<(), String> {
-    let state_dir = &options.state_dir;
-    let phantun_conf = state_dir.join("phantun.json");
-    if phantun_conf.exists()
-        && !state_dir.join("phantun.disabled").exists()
-        && !state_dir.join(phantun::PHANTUN_BOUNDED_LOG_MARKER).exists()
-    {
-        let content = fs::read_to_string(&phantun_conf)
-            .map_err(|error| format!("读取 phantun 日志迁移配置失败：{error}"))?;
-        apply_phantun(state_dir, &content, None)?;
-        println!("phantun 日志已切到动态上限");
-    }
-
-    let xray_conf = state_dir.join("xray.json");
-    if xray_conf.exists()
-        && !state_dir.join("xray.disabled").exists()
-        && !state_dir.join(XRAY_BOUNDED_LOG_MARKER).exists()
-    {
-        let content = fs::read_to_string(&xray_conf)
-            .map_err(|error| format!("读取 xray 日志迁移配置失败：{error}"))?;
-        let api_port = xray_api_port(&content).unwrap_or(10085);
-        let _guard = meter.map(|meter| {
-            meter
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        });
-        if let Err(error) = collect_usage_report(options) {
-            // The migration remains necessary for the disk bound. Preserve the same release
-            // policy as a normal restart: log a failed pre-sample, then continue rather than
-            // leaving an unbounded/fixed child forever.
-            eprintln!("usage: 切换动态日志前的采集没成功：{error}");
-        }
-        apply_xray(&xray_conf, api_port)?;
-        println!("xray 日志已切到动态上限");
-    }
-    Ok(())
 }
 
 fn apply_once_inner(
@@ -1674,11 +1621,6 @@ fn apply_once_inner(
         // control plane, yet it has to distinguish a machine not included in any plan
         // from one that cannot reach the control plane.
         mark_no_desired(&options.state_dir);
-        // Version 3 changes the shared policy file into one file per workload class. It needs one
-        // workload restart to replace the old pipe, but that restart must sample Xray's volatile
-        // counters first. General local reconcile cannot do that safely because it has no meter;
-        // perform the migration here, where the accounting lock is available.
-        upgrade_dynamic_log_sinks(&options, meter)?;
         // 204 means the control plane judged both dimensions converged: no deployment
         // owed, and the reported certificate sha matches the serving certificate.
         // The control plane compares artifacts only against what was last reported and
@@ -1784,7 +1726,7 @@ fn apply_once_inner(
         observed_before: before,
         observed_after: after,
         error: error.clone(),
-        route: Some(route_ip_report()),
+        route: route_ip_report(),
         usage_activated_at_unix_secs,
     };
     // Write to disk before sending. Convergence has already happened on this machine and
@@ -1981,7 +1923,7 @@ fn build_load_report(options: &Options) -> Result<Option<LoadReportRequest>, Str
             )
         }
         Err(error) => {
-            // Insufficient privilege and a kernel without inet_diag are both legitimate legacy
+            // Insufficient privilege and a kernel without inet_diag are both legitimate fallback
             // environments. Lose these optional details, never the host sample around them.
             eprintln!("load: inet_diag unavailable: {error}");
             Vec::new()
@@ -2078,12 +2020,13 @@ fn read_usage_report(state_dir: &Path) -> Result<UsageReportRequest, String> {
     let (agent_instance_id, sequence) = reserve_usage_sequence(state_dir)?;
     let process = xray_process_identity()?;
     Ok(UsageReportRequest {
-        agent_instance_id: Some(agent_instance_id),
-        sequence: Some(sequence),
-        usage_generation_id: read_usage_generation(state_dir)?,
+        agent_instance_id,
+        sequence,
+        usage_generation_id: read_usage_generation(state_dir)?
+            .ok_or("xray has no active usage generation")?,
         read_at_unix_secs: current_unix_secs()?,
         xray_started_at_unix_secs: process.started_at_unix_secs,
-        xray_epoch: Some(process.epoch),
+        xray_epoch: process.epoch,
         route: Some(route_ip_report()),
         counters: read_xray_usage_counters(api_port)?,
     })
@@ -2368,11 +2311,8 @@ fn converge_linux_xray(
         }
         DesiredArtifact::Disabled { reason } => {
             terminate_xray()?;
-            let _ = fs::remove_file("/tmp/brocade-agent-xray.log");
             let _ = fs::remove_file(state_dir.join("xray.json"));
             let _ = fs::remove_file(state_dir.join(XRAY_BOUNDED_LOG_MARKER));
-            let _ = fs::remove_file(state_dir.join(XRAY_SHARED_POLICY_LOG_MARKER));
-            let _ = fs::remove_file(state_dir.join(XRAY_OLD_BOUNDED_LOG_MARKER));
             fs::write(state_dir.join("xray.disabled"), reason)
                 .map_err(|error| error.to_string())?;
             Ok(())
@@ -2486,7 +2426,7 @@ fn apply_hot_swap(
         // then restarts, which reloads the config and takes the path that re-pushes the
         // accounts.
         if let Some(want) = desired_grants_on_disk(state_dir)? {
-            sync_grants(state_dir, xray_content, api_port, &want)?;
+            sync_grants(xray_content, api_port, &want)?;
         }
     }
 
@@ -2544,11 +2484,6 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     ))?;
     fs::write(state_dir.join(XRAY_BOUNDED_LOG_MARKER), b"dynamic\n")
         .map_err(|error| format!("failed to record bounded xray logging: {error}"))?;
-    let _ = fs::remove_file(state_dir.join(XRAY_SHARED_POLICY_LOG_MARKER));
-    let _ = fs::remove_file(state_dir.join(XRAY_OLD_BOUNDED_LOG_MARKER));
-    // The legacy file is no longer held open once the old Xray has exited. Removing it here, not
-    // during installation, guarantees its blocks are actually released immediately.
-    let _ = fs::remove_file("/tmp/brocade-agent-xray.log");
     Ok(())
 }
 
@@ -2597,14 +2532,13 @@ fn converge_linux_grants(
             };
             let xray_content = xray_content.as_str();
             let api_port = xray_api_port(xray_content).unwrap_or(10085);
-            // Persist the full desired set so that local reconvergence works without
-            // a deployment. grants.adu.json cannot stand in: it is the last
-            // incremental batch and holds only the people added that time.
+            // Persist the full desired set so local reconciliation can run without
+            // a deployment response.
             write_private(
                 &state_dir.join("grants.desired.json"),
                 &serde_json::to_string_pretty(inbounds).map_err(|error| error.to_string())?,
             )?;
-            sync_grants(state_dir, xray_content, api_port, inbounds)?;
+            sync_grants(xray_content, api_port, inbounds)?;
             Ok(())
         }
         DesiredGrants::Disabled { .. } => Ok(()),
@@ -2703,7 +2637,7 @@ fn observe_linux_xray(state_dir: &Path, desired: &DesiredArtifact) -> AppliedArt
                 return artifact_dirty(format!("xray api port {api_port} is not listening"));
             }
             if !state_dir.join(XRAY_BOUNDED_LOG_MARKER).exists() {
-                return artifact_dirty("xray is still using the legacy unbounded log");
+                return artifact_dirty("xray was not launched through the bounded log sink");
             }
             AppliedArtifactState::Present {
                 sha256: sha256_hex(content.as_bytes()),
@@ -2783,14 +2717,8 @@ fn grants_dirty(reason: impl Into<String>) -> AppliedGrantsState {
     }
 }
 
-fn sync_grants(
-    state_dir: &Path,
-    xray_content: &str,
-    api_port: u16,
-    desired: &[GrantInbound],
-) -> Result<(), String> {
-    let backend = configured_grant_write_backend()?;
-    sync_grants_with_backend(state_dir, xray_content, api_port, desired, backend)
+fn sync_grants(xray_content: &str, api_port: u16, desired: &[GrantInbound]) -> Result<(), String> {
+    sync_running_grants(xray_content, api_port, desired)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2808,182 +2736,18 @@ struct GrantAddition {
     account: GrantAccount,
 }
 
-trait GrantWriteBackend {
-    fn validate_protocol(&self, protocol: GrantProtocol) -> Result<(), String>;
-
-    fn remove_user(&self, api_port: u16, tag: &str, email: &str) -> Result<(), String>;
-
-    fn add_users(
-        &self,
-        state_dir: &Path,
-        api_port: u16,
-        additions: &[GrantAddition],
-        cli_inbounds: &[serde_json::Value],
-    ) -> Result<(), String>;
-}
-
-/// Native gRPC is the only default. A protocol or transport failure is not retried through a
-/// subprocess with different behavior.
-struct GrpcGrantWriteBackend;
-
-impl GrantWriteBackend for GrpcGrantWriteBackend {
-    fn validate_protocol(&self, _protocol: GrantProtocol) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn remove_user(&self, api_port: u16, tag: &str, email: &str) -> Result<(), String> {
-        xray_grpc::remove_user(api_port, tag, email)
-    }
-
-    fn add_users(
-        &self,
-        _state_dir: &Path,
-        api_port: u16,
-        additions: &[GrantAddition],
-        _cli_inbounds: &[serde_json::Value],
-    ) -> Result<(), String> {
-        for addition in additions {
-            let account = match &addition.account {
-                GrantAccount::Vless { id, flow } => xray_grpc::XrayAccount::Vless {
-                    id,
-                    flow: flow.as_deref(),
-                },
-                GrantAccount::Hysteria2 { auth } => xray_grpc::XrayAccount::Hysteria2 { auth },
-                GrantAccount::AnyTls { password } => xray_grpc::XrayAccount::AnyTls { password },
-            };
-            xray_grpc::add_user(
-                api_port,
-                &addition.tag,
-                &addition.email,
-                u32::from(addition.level),
-                account,
-            )?;
-        }
-        Ok(())
-    }
-}
-
-/// Compatibility implementation for old deployments and manual rollback only.
-///
-/// New reconciliation must use [`GrpcGrantWriteBackend`]. This backend is intentionally never an
-/// automatic fallback: falling back would hide a broken native encoder or API contract.
-#[deprecated(note = "use GrpcGrantWriteBackend; the xray CLI grant writer is compatibility-only")]
-struct XrayCliGrantWriteBackend;
-
-#[allow(deprecated)]
-impl GrantWriteBackend for XrayCliGrantWriteBackend {
-    fn validate_protocol(&self, protocol: GrantProtocol) -> Result<(), String> {
-        match protocol {
-            GrantProtocol::Vless => Ok(()),
-            GrantProtocol::Hysteria2 => Err(
-                "deprecated xray CLI grant backend cannot add Hysteria 2 users; use native gRPC"
-                    .to_owned(),
-            ),
-            GrantProtocol::AnyTls => Err(
-                "deprecated xray CLI grant backend cannot add AnyTLS users; use native gRPC"
-                    .to_owned(),
-            ),
-        }
-    }
-
-    fn remove_user(&self, api_port: u16, tag: &str, email: &str) -> Result<(), String> {
-        run_command(
-            "xray",
-            &[
-                "api",
-                "rmu",
-                &format!("--server=127.0.0.1:{api_port}"),
-                &format!("-tag={tag}"),
-                email,
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// The file exists only as a command-line argument.
-    ///
-    /// It was previously written by the shared path and left in place, which made it resemble a
-    /// stored record. It is not one: it holds only the accounts added in that one round, so it
-    /// substitutes for neither the desired set (`grants.desired.json`, which local
-    /// reconvergence reads) nor the compiled grants artifact. It does hold credentials in the
-    /// clear, so it is written by the code that needs it and removed as soon as that call
-    /// returns.
-    fn add_users(
-        &self,
-        state_dir: &Path,
-        api_port: u16,
-        _additions: &[GrantAddition],
-        cli_inbounds: &[serde_json::Value],
-    ) -> Result<(), String> {
-        let path = state_dir.join("grants.adu.json");
-        let payload = serde_json::json!({ "inbounds": cli_inbounds });
-        let text = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
-        write_private(&path, &text)?;
-        let result = run_command(
-            "xray",
-            &[
-                "api",
-                "adu",
-                &format!("--server=127.0.0.1:{api_port}"),
-                &path.display().to_string(),
-            ],
-        );
-        // Unconditionally: a failed call leaves its detail in the error, not on the disk.
-        let _ = fs::remove_file(&path);
-        result?;
-        Ok(())
-    }
-}
-
-static GRPC_GRANT_WRITE_BACKEND: GrpcGrantWriteBackend = GrpcGrantWriteBackend;
-#[allow(deprecated)]
-static CLI_GRANT_WRITE_BACKEND: XrayCliGrantWriteBackend = XrayCliGrantWriteBackend;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GrantWriteBackendChoice {
-    Grpc,
-    Cli,
-}
-
-fn grant_write_backend_choice(value: Option<&str>) -> Result<GrantWriteBackendChoice, String> {
-    match value.map(str::trim).filter(|value| !value.is_empty()) {
-        None | Some("grpc") => Ok(GrantWriteBackendChoice::Grpc),
-        Some("cli") => Ok(GrantWriteBackendChoice::Cli),
-        Some(value) => Err(format!(
-            "unknown BROCADE_XRAY_GRANT_BACKEND {value}; expected grpc or cli"
-        )),
-    }
-}
-
-fn configured_grant_write_backend() -> Result<&'static dyn GrantWriteBackend, String> {
-    match grant_write_backend_choice(env::var("BROCADE_XRAY_GRANT_BACKEND").ok().as_deref())? {
-        GrantWriteBackendChoice::Grpc => Ok(&GRPC_GRANT_WRITE_BACKEND),
-        GrantWriteBackendChoice::Cli => {
-            warn("BROCADE_XRAY_GRANT_BACKEND=cli 已 deprecated，仅用于 VLESS 兼容/回滚");
-            Ok(&CLI_GRANT_WRITE_BACKEND)
-        }
-    }
-}
-
-fn sync_grants_with_backend(
-    state_dir: &Path,
+fn sync_running_grants(
     xray_content: &str,
     api_port: u16,
     desired: &[GrantInbound],
-    backend: &dyn GrantWriteBackend,
 ) -> Result<(), String> {
     let xray: serde_json::Value =
         serde_json::from_str(xray_content).map_err(|error| error.to_string())?;
 
-    let mut add_inbounds = Vec::new();
     let mut additions = Vec::new();
     for inbound in desired {
-        let mut xray_inbound = xray_inbound_by_tag(&xray, &inbound.tag)?;
+        let xray_inbound = xray_inbound_by_tag(&xray, &inbound.tag)?;
         let protocol = grant_protocol(&xray_inbound, &inbound.tag)?;
-        // Checked before observing or removing any account. The deprecated CLI backend cannot
-        // add Hysteria accounts, and detecting that after the removals would turn an
-        // unsupported compatibility setting into an outage.
-        backend.validate_protocol(protocol)?;
         let desired_clients = inbound
             .clients
             .iter()
@@ -3011,7 +2775,7 @@ fn sync_grants_with_backend(
                     desired_uuid != uuid || desired_flow != flow
                 })
             {
-                backend.remove_user(api_port, &inbound.tag, email)?;
+                xray_grpc::remove_user(api_port, &inbound.tag, email)?;
             }
         }
 
@@ -3030,67 +2794,56 @@ fn sync_grants_with_backend(
             continue;
         }
 
-        let clients = missing
-            .into_iter()
-            .map(|client| {
-                let (json, addition) = grant_addition(protocol, &inbound.tag, client);
-                additions.push(addition);
-                json
-            })
-            .collect::<Vec<_>>();
-        xray_inbound["settings"]["clients"] = serde_json::Value::Array(clients);
-        add_inbounds.push(xray_inbound);
+        additions.extend(
+            missing
+                .into_iter()
+                .map(|client| grant_addition(protocol, &inbound.tag, client)),
+        );
     }
 
-    if add_inbounds.is_empty() {
-        return Ok(());
-    }
+    add_grant_users(api_port, &additions)
+}
 
-    backend.add_users(state_dir, api_port, &additions, &add_inbounds)?;
+fn add_grant_users(api_port: u16, additions: &[GrantAddition]) -> Result<(), String> {
+    for addition in additions {
+        let account = match &addition.account {
+            GrantAccount::Vless { id, flow } => xray_grpc::XrayAccount::Vless {
+                id,
+                flow: flow.as_deref(),
+            },
+            GrantAccount::Hysteria2 { auth } => xray_grpc::XrayAccount::Hysteria2 { auth },
+            GrantAccount::AnyTls { password } => xray_grpc::XrayAccount::AnyTls { password },
+        };
+        xray_grpc::add_user(
+            api_port,
+            &addition.tag,
+            &addition.email,
+            u32::from(addition.level),
+            account,
+        )?;
+    }
     Ok(())
 }
 
-fn grant_addition(
-    protocol: GrantProtocol,
-    tag: &str,
-    client: &GrantClient,
-) -> (serde_json::Value, GrantAddition) {
-    let mut object = serde_json::Map::new();
-    object.insert("email".to_owned(), serde_json::json!(client.email));
-    object.insert("level".to_owned(), serde_json::json!(client.level));
+fn grant_addition(protocol: GrantProtocol, tag: &str, client: &GrantClient) -> GrantAddition {
     let account = match protocol {
-        GrantProtocol::Vless => {
-            object.insert("id".to_owned(), serde_json::json!(client.uuid));
-            if let Some(flow) = &client.flow {
-                object.insert("flow".to_owned(), serde_json::json!(flow));
-            }
-            GrantAccount::Vless {
-                id: client.uuid.clone(),
-                flow: client.flow.clone(),
-            }
-        }
-        GrantProtocol::Hysteria2 => {
-            object.insert("auth".to_owned(), serde_json::json!(client.uuid));
-            GrantAccount::Hysteria2 {
-                auth: client.uuid.clone(),
-            }
-        }
-        GrantProtocol::AnyTls => {
-            object.insert("password".to_owned(), serde_json::json!(client.uuid));
-            GrantAccount::AnyTls {
-                password: client.uuid.clone(),
-            }
-        }
-    };
-    (
-        serde_json::Value::Object(object),
-        GrantAddition {
-            tag: tag.to_owned(),
-            email: client.email.clone(),
-            level: client.level,
-            account,
+        GrantProtocol::Vless => GrantAccount::Vless {
+            id: client.uuid.clone(),
+            flow: client.flow.clone(),
         },
-    )
+        GrantProtocol::Hysteria2 => GrantAccount::Hysteria2 {
+            auth: client.uuid.clone(),
+        },
+        GrantProtocol::AnyTls => GrantAccount::AnyTls {
+            password: client.uuid.clone(),
+        },
+    };
+    GrantAddition {
+        tag: tag.to_owned(),
+        email: client.email.clone(),
+        level: client.level,
+        account,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3630,9 +3383,9 @@ fn unknown_state() -> ReportedNodeState {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn log_policy_prefers_specific_headers_and_falls_back_to_the_legacy_scalar() {
+    fn log_policy_requires_all_specific_headers() {
         let specific = crate::http::parse_http_response(
-            b"HTTP/1.1 204 No Content\r\nX-Brocade-Log-Max-MiB: 64\r\nX-Brocade-Agent-Journal-Max-MiB: 96\r\nX-Brocade-Xray-Log-Max-MiB: 80\r\nX-Brocade-Phantun-Log-Max-MiB: 72\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Agent-Journal-Max-MiB: 96\r\nX-Brocade-Xray-Log-Max-MiB: 80\r\nX-Brocade-Phantun-Log-Max-MiB: 72\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
         assert_eq!(
@@ -3644,18 +3397,11 @@ mod tests {
             })
         );
 
-        let legacy = crate::http::parse_http_response(
-            b"HTTP/1.1 204 No Content\r\nX-Brocade-Log-Max-MiB: 64\r\nContent-Length: 0\r\n\r\n",
+        let incomplete = crate::http::parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Agent-Journal-Max-MiB: 96\r\nX-Brocade-Xray-Log-Max-MiB: 80\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
-        assert_eq!(
-            super::log_policy_from_response(&legacy).unwrap(),
-            Some(crate::logcap::LogPolicy {
-                agent_journal_mib: 64,
-                xray_mib: 64,
-                phantun_mib: 64,
-            })
-        );
+        assert!(super::log_policy_from_response(&incomplete).is_err());
     }
 
     // By default a panic on a thread terminates only that thread while the process
@@ -3980,113 +3726,24 @@ mod tests {
     }
 
     #[test]
-    fn a_hysteria_addition_carries_auth_and_never_a_vless_id() {
-        let dir = test_state_dir("hysteria2-grants-adu");
+    fn a_hysteria_addition_uses_the_hysteria_account_shape() {
         let client = GrantClient {
             email: "alice@platform#hy2".to_owned(),
             uuid: "plain-hysteria-auth".to_owned(),
-            // A stale VLESS-only field must not cross the account-type boundary.
             flow: Some("xtls-rprx-vision".to_owned()),
             level: 0,
         };
-        let (client_json, addition) =
+        let addition =
             super::grant_addition(super::GrantProtocol::Hysteria2, "in:app/hy2", &client);
-        assert_eq!(client_json["auth"], "plain-hysteria-auth");
-        assert!(client_json.get("id").is_none());
-        assert!(client_json.get("flow").is_none());
         assert!(matches!(
             addition.account,
             super::GrantAccount::Hysteria2 { ref auth } if auth == "plain-hysteria-auth"
         ));
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    /// The default path must leave no credential file behind.
-    ///
-    /// `grants.adu.json` is not a stored record: it holds only the accounts added in one round,
-    /// so it substitutes for neither the desired set that local reconvergence reads
-    /// (`grants.desired.json`) nor the compiled grants artifact. Under gRPC nothing reads it,
-    /// and an unread plaintext copy of credentials only adds exposure.
-    #[test]
-    fn the_grpc_backend_writes_no_credentials_to_disk() {
-        let dir = test_state_dir("grants-no-spill");
-        let inbound = serde_json::json!({
-            "tag": "in:app/hy2",
-            "protocol": "hysteria",
-            "settings": { "clients": [{ "email": "u@t#i", "auth": "plain-hysteria-auth" }] }
-        });
-        let addition = super::GrantAddition {
-            tag: "in:app/hy2".to_owned(),
-            email: "u@t#i".to_owned(),
-            level: 0,
-            account: super::GrantAccount::Hysteria2 {
-                auth: "plain-hysteria-auth".to_owned(),
-            },
-        };
-
-        // No xray is listening, so the call fails. The assertion is about what it wrote to
-        // disk before failing.
-        let _ = super::GrantWriteBackend::add_users(
-            &super::GrpcGrantWriteBackend,
-            &dir,
-            1,
-            &[addition],
-            &[inbound],
-        );
-
-        assert!(
-            !dir.join("grants.adu.json").exists(),
-            "gRPC 那条路不该往盘上落任何凭据"
-        );
-        let spilled = fs::read_dir(&dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        fs::read_to_string(entry.path())
-                            .map(|text| text.contains("plain-hysteria-auth"))
-                            .unwrap_or(false)
-                    })
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        assert!(spilled.is_empty(), "凭据落到了这些文件里：{spilled:?}");
-
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn grant_backend_defaults_to_grpc_and_cli_refuses_hysteria_before_writing() {
-        assert_eq!(
-            super::grant_write_backend_choice(None).unwrap(),
-            super::GrantWriteBackendChoice::Grpc
-        );
-        assert_eq!(
-            super::grant_write_backend_choice(Some("grpc")).unwrap(),
-            super::GrantWriteBackendChoice::Grpc
-        );
-        assert_eq!(
-            super::grant_write_backend_choice(Some("cli")).unwrap(),
-            super::GrantWriteBackendChoice::Cli
-        );
-        assert!(super::grant_write_backend_choice(Some("automatic-fallback")).is_err());
-        assert!(super::GrantWriteBackend::validate_protocol(
-            &super::XrayCliGrantWriteBackend,
-            super::GrantProtocol::Hysteria2,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn desired_grants_on_disk_is_the_full_set_not_the_add_batch() {
+    fn desired_grants_on_disk_reads_the_full_set() {
         let dir = test_state_dir("grants-desired");
-        // Never written means None: the grants.adu.json an older agent left is an
-        // incremental batch, and taking it as the full set would treat every user
-        // outside that batch as one that should not exist.
-        fs::write(dir.join("grants.adu.json"), "{\"inbounds\":[]}").unwrap();
         assert_eq!(super::desired_grants_on_disk(&dir).unwrap(), None);
 
         fs::write(

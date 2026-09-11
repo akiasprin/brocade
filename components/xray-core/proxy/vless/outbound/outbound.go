@@ -66,6 +66,51 @@ type ConnExpire struct {
 	Expire time.Time
 }
 
+func requestCommandForTarget(target net.Destination) (protocol.RequestCommand, error) {
+	command := protocol.RequestCommandTCP
+	if target.Network == net.Network_UDP {
+		command = protocol.RequestCommandUDP
+	}
+	if target.Address == nil || !target.Address.Family().IsDomain() {
+		return command, nil
+	}
+	switch target.Address.Domain() {
+	case "v1.mux.cool":
+		return protocol.RequestCommandMux, nil
+	case "v1.rvs.cool":
+		if target.Network != net.Network_Unknown {
+			return 0, errors.New("nice try baby").AtError()
+		}
+		return protocol.RequestCommandRvs, nil
+	default:
+		return command, nil
+	}
+}
+
+func dialVLESSServer(ctx context.Context, dialer internet.Dialer, destination net.Destination, command protocol.RequestCommand) (stat.Connection, error) {
+	if command == protocol.RequestCommandRvs {
+		// The reverse pool owns retries, concurrency and backoff. One pool attempt
+		// must therefore correspond to exactly one physical dial.
+		return dialer.Dial(ctx, destination)
+	}
+	var conn stat.Connection
+	err := retry.ExponentialBackoff(5, 200).On(func() error {
+		var err error
+		conn, err = dialer.Dial(ctx, destination)
+		return err
+	})
+	return conn, err
+}
+
+func requestActivityTimer(ctx context.Context, command protocol.RequestCommand, onTimeout context.CancelFunc, timeout time.Duration) *signal.ActivityTimer {
+	if command == protocol.RequestCommandRvs {
+		// Reverse health owns carrier liveness and drain. Per-user TCP idle and
+		// half-close policy must not shorten that lifecycle.
+		return signal.NewNoopActivityTimer()
+	}
+	return signal.CancelAfterInactivity(ctx, onTimeout, timeout)
+}
+
 // New creates a new VLess outbound handler.
 func New(ctx context.Context, config *Config) (*Handler, error) {
 	if config.Vnext == nil {
@@ -147,7 +192,12 @@ func (h *Handler) Close() error {
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
-	if !ob.Target.IsValid() && ob.Target.Address.String() != "v1.rvs.cool" {
+	target := ob.Target
+	command, err := requestCommandForTarget(target)
+	if err != nil {
+		return err
+	}
+	if !target.IsValid() && command != protocol.RequestCommandRvs {
 		return errors.New("target not specified").AtError()
 	}
 	ob.Name = "vless"
@@ -188,14 +238,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	if conn == nil {
-		if err := retry.ExponentialBackoff(5, 200).On(func() error {
-			var err error
-			conn, err = dialer.Dial(ctx, rec.Destination)
-			if err != nil {
-				return err
-			}
-			return nil
-		}); err != nil {
+		conn, err = dialVLESSServer(ctx, dialer, rec.Destination, command)
+		if err != nil {
 			return errors.New("failed to find an available destination").Base(err).AtWarning()
 		}
 	}
@@ -204,29 +248,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Conn = conn // for Vision's pre-connect
 
 	iConn := stat.TryUnwrapStatsConn(conn)
-	target := ob.Target
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
 
 	if h.encryption != nil {
 		var err error
 		if conn, err = h.encryption.Handshake(conn); err != nil {
 			return errors.New("ML-KEM-768 handshake failed").Base(err).AtInfo()
-		}
-	}
-
-	command := protocol.RequestCommandTCP
-	if target.Network == net.Network_UDP {
-		command = protocol.RequestCommandUDP
-	}
-	if target.Address.Family().IsDomain() {
-		switch target.Address.Domain() {
-		case "v1.mux.cool":
-			command = protocol.RequestCommandMux
-		case "v1.rvs.cool":
-			if target.Network != net.Network_Unknown {
-				return errors.New("nice try baby").AtError()
-			}
-			command = protocol.RequestCommandRvs
 		}
 	}
 
@@ -301,7 +328,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	sessionPolicy := h.policyManager.ForLevel(request.User.Level)
 	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, func() {
+	timer := requestActivityTimer(ctx, request.Command, func() {
 		cancel()
 		if newCancel != nil {
 			newCancel()
@@ -601,5 +628,9 @@ func (r *Reverse) desiredWorkers(busy int) int {
 	return min(max(r.health.MinHealthyWorkers, busy+int(r.health.SpareWorkers)), int(r.health.MaxHealthyWorkers))
 }
 func (r *Reverse) backoffBase() time.Duration {
-	return min(r.health.BackoffBase<<min(r.failures, 10), r.health.BackoffCap)
+	shift := min(r.failures, 10)
+	if r.health.BackoffBase > r.health.BackoffCap>>shift {
+		return r.health.BackoffCap
+	}
+	return min(r.health.BackoffBase<<shift, r.health.BackoffCap)
 }

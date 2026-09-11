@@ -4,22 +4,20 @@ use std::{
 };
 
 use brocade_core::client_config::ClientProjectionDownloadEndpoint;
-use brocade_core::hash::hex_lower;
 use brocade_core::model::{
-    Accept, Action, AnyTls, AnyTlsMasquerade, AnyTlsSecurity, AppView, Chain, ConnectionSettings,
-    DestMatch, DisabledWireGuardLink, Dns, ExternalOutbound, ExternalOutboundProtocol,
+    Accept, AnyTls, AnyTlsMasquerade, AnyTlsSecurity, AppView, Chain, ConnectionSettings,
+    DisabledWireGuardLink, Dns, ExternalOutbound, ExternalOutboundProtocol,
     ExternalOutboundSecurity, ExternalWarpBinding, Front, FrontStrategy, GeodataSettings, Grant,
-    HopDial, HopIn, HopMux, HopPool, Hysteria2, HysteriaBandwidth, HysteriaBbrProfile,
-    HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, HysteriaQuic, Ingress,
-    IngressGuard, IngressIdentity, IngressWires, IngressWiresWire, ModelSettings, ModelSnapshot,
-    Network, Node, NodeConnection, OverlaySettings, PortSettings, ProbeSettings, Projection,
+    HopIn, HopMux, Hysteria2, HysteriaBandwidth, HysteriaBbrProfile, HysteriaCongestion,
+    HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, HysteriaQuic, Ingress, IngressGuard,
+    IngressIdentity, IngressWires, IngressWiresWire, ModelSettings, ModelSnapshot, Node,
+    NodeConnection, OverlaySettings, PortSettings, ProbeSettings, Projection,
     ProjectionDownloadEndpoint, ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits,
     RealityFallbackMode, RealitySettings, RealitySite, RealityXhttp, Rule, Step, Tls, TlsXhttp,
     Transport, User, WireGuardKeys, Xhttp, XhttpMode,
 };
 use ipnet::Ipv4Net;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{Result, StoreError};
@@ -154,9 +152,9 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
             conn_buffer_size_kb, conn_handshake_secs, stats_user_online, \
-            reverse_health, reverse_health_overrides, relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
-            relay_mux_max_probing_workers, relay_mux_probe_interval_secs, \
-            relay_mux_probe_timeout_ms, relay_mux_idle_ttl_secs, relay_mux_max_requests_per_worker \
+            reverse_health, reverse_health_overrides, relay_mux_concurrency, relay_mux_prewarm_workers, relay_mux_reuse_threshold, \
+            relay_mux_max_probing_workers, relay_mux_probe_interval_ms, \
+            relay_mux_probe_timeout_ms, relay_mux_idle_ttl_ms, relay_mux_max_requests_per_worker \
          FROM control_state WHERE id = TRUE",
     )
     .fetch_one(pool)
@@ -287,13 +285,8 @@ pub(crate) async fn load_current_immutable_snapshot(pool: &PgPool) -> Result<Mod
            JOIN model_snapshots AS snapshots ON snapshots.revision_id = state.current_revision
           WHERE state.id = TRUE",
     )
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await?;
-    let Some(row) = row else {
-        // Compatibility for a database created by an older build before revision snapshots were
-        // mandatory. Its next successful revision creates the row and moves this path to one GET.
-        return load_current_snapshot(pool).await;
-    };
     let revision = revision_to_u64(row.try_get::<i64, _>("current_revision")?)?;
     decode_stored_snapshot(row.try_get("snapshot")?, revision)
 }
@@ -339,13 +332,6 @@ pub(crate) async fn load_immutable_snapshot_tx(
 }
 
 fn decode_stored_snapshot(mut snapshot: Value, revision: u64) -> Result<ModelSnapshot> {
-    fold_legacy_node_egress_dns_positions(&mut snapshot)?;
-    fold_legacy_stream(&mut snapshot);
-    fold_legacy_xhttp_mux(&mut snapshot)?;
-    fold_removed_ingress_client_controls(&mut snapshot);
-    fold_legacy_ingress_identity(&mut snapshot)?;
-    // Last, because the two above reach into `transport` by name and this is what moves it.
-    fold_legacy_transport(&mut snapshot);
     open_snapshot_external_credentials(&mut snapshot)?;
     let snapshot = serde_json::from_value::<ModelSnapshot>(snapshot)?;
     if snapshot.revision != revision {
@@ -355,47 +341,6 @@ fn decode_stored_snapshot(mut snapshot: Value, revision: u64) -> Result<ModelSna
         )));
     }
     Ok(snapshot)
-}
-
-/// Give snapshots written before machine DNS had an independent priority their canonical order.
-///
-/// The table always materializes policies in `(node_id, position)` order, so the array order in a
-/// legacy snapshot is the only ordering fact it contains. Re-indexing each machine from that array
-/// is therefore lossless. If one entry is missing the field, normalize the whole array: this also
-/// repairs partially rewritten development snapshots without creating duplicate positions.
-fn fold_legacy_node_egress_dns_positions(snapshot: &mut Value) -> Result<()> {
-    let root = snapshot
-        .as_object_mut()
-        .ok_or_else(|| invalid_error("model snapshot must be an object"))?;
-    let policies = root
-        .entry("node_egress_dns".to_owned())
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or_else(|| invalid_error("model snapshot node_egress_dns must be an array"))?;
-    if policies
-        .iter()
-        .all(|policy| policy.get("position").is_some())
-    {
-        return Ok(());
-    }
-
-    let mut next_by_node = BTreeMap::<String, u32>::new();
-    for policy in policies {
-        let object = policy.as_object_mut().ok_or_else(|| {
-            invalid_error("model snapshot node_egress_dns entry must be an object")
-        })?;
-        let node = object
-            .get("node")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_error("model snapshot node_egress_dns entry is missing node"))?
-            .to_owned();
-        let position = next_by_node.entry(node).or_default();
-        object.insert("position".to_owned(), Value::from(*position));
-        *position = position
-            .checked_add(1)
-            .ok_or_else(|| invalid_error("model snapshot node_egress_dns position overflow"))?;
-    }
-    Ok(())
 }
 
 /// Historical snapshots remain fully compilable, but their proxy credentials must not turn the
@@ -425,19 +370,11 @@ fn transform_snapshot_external_credentials(
         return Ok(());
     };
     for outbound in outbounds {
-        // Snapshots written before tunnels became tenant resources used `app` as their sealing
-        // scope. Open those under the old context, then remove the obsolete field before serde
-        // decodes the deny-unknown-fields model. New snapshots seal directly under `tenant`.
-        let legacy_app = outbound
-            .get("app")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let tenant = outbound
             .get("tenant")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_error("external outbound snapshot is missing tenant"))?
             .to_owned();
-        let scope = legacy_app.as_deref().unwrap_or(&tenant).to_owned();
         let id = outbound
             .get("id")
             .and_then(Value::as_str)
@@ -449,7 +386,7 @@ fn transform_snapshot_external_credentials(
             .map(str::to_owned)
         {
             let transformed = transform(
-                &crate::secrets::external_outbound_context(&scope, &id),
+                &crate::secrets::external_outbound_context(&tenant, &id),
                 &credential,
             )?;
             *outbound.pointer_mut("/protocol/v/credential").unwrap() = Value::String(transformed);
@@ -480,7 +417,7 @@ fn transform_snapshot_external_credentials(
                     })?
                     .to_owned();
                 let transformed = transform(
-                    &crate::secrets::external_outbound_binding_key_context(&scope, &id, &node),
+                    &crate::secrets::external_outbound_binding_key_context(&tenant, &id, &node),
                     &private_key,
                 )?;
                 binding
@@ -489,285 +426,8 @@ fn transform_snapshot_external_credentials(
                     .insert("private_key".to_owned(), Value::String(transformed));
             }
         }
-        if legacy_app.is_some() {
-            outbound.as_object_mut().unwrap().remove("app");
-        }
     }
     Ok(())
-}
-
-/// Move credentials written inside legacy transport objects to the ingress-owned identity.
-fn fold_legacy_ingress_identity(snapshot: &mut Value) -> Result<()> {
-    let Some(apps) = snapshot.get_mut("apps").and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
-    for ingress in apps
-        .iter_mut()
-        .filter_map(|app| app.get_mut("ingresses").and_then(Value::as_array_mut))
-        .flatten()
-    {
-        let Some(object) = ingress.as_object_mut() else {
-            continue;
-        };
-        if object.contains_key("identity") {
-            continue;
-        }
-        let ingress_id = object
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let Some(transport) = object.get_mut("transport").and_then(Value::as_object_mut) else {
-            continue;
-        };
-        let Some(private_key) = transport
-            .remove("private_key")
-            .and_then(|value| value.as_str().map(str::to_owned))
-        else {
-            continue;
-        };
-        let public_key = match transport
-            .remove("public_key")
-            .and_then(|value| value.as_str().map(str::to_owned))
-        {
-            Some(public_key) => public_key,
-            None => crate::credentials::reality_public_key(&private_key)?,
-        };
-        let short_ids = transport.remove("short_ids").unwrap_or_else(|| {
-            let digest = Sha256::digest(format!("{private_key}:{ingress_id}").as_bytes());
-            Value::Array(vec![Value::String(hex_lower(&digest[..8]))])
-        });
-        object.insert(
-            "identity".to_owned(),
-            serde_json::json!({
-                "private_key": private_key,
-                "public_key": public_key,
-                "short_ids": short_ids,
-            }),
-        );
-    }
-    Ok(())
-}
-
-/// Fold a pre-`Transport` snapshot's `stream` field into the shape that replaced it.
-///
-/// A revision's snapshot is an immutable record of what the model was, so it is read as written
-/// and never rewritten — which means this build has to be able to read what earlier builds wrote.
-/// Those wrote the network layer as its own `stream` field beside `transport`, and `Ingress`
-/// denies unknown fields, so without this every historical revision fails to load: no rollback,
-/// no recompile, no artifact view. The failure does not appear until a *newer* revision exists,
-/// because the current one is materialized from the tables and never touches this row.
-///
-/// Dropping the field instead of folding it would be worse than the error. An old revision whose
-/// ingress ran over XHTTP would come back as a TCP one, recompile into a different machine
-/// configuration than it originally produced, and roll back to something nobody ever deployed.
-fn fold_legacy_stream(snapshot: &mut Value) {
-    let Some(apps) = snapshot.get_mut("apps").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for app in apps {
-        let Some(ingresses) = app.get_mut("ingresses").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for ingress in ingresses {
-            let Some(stream) = ingress
-                .as_object_mut()
-                .and_then(|ingress| ingress.remove("stream"))
-            else {
-                continue;
-            };
-            // `{"t":"xhttp","v":{...}}` was the only shape that carried anything; `tcp` and an
-            // absent field both mean the transport already says everything there is to say.
-            if stream.get("t").and_then(Value::as_str) != Some("xhttp") {
-                continue;
-            }
-            let Some(xhttp) = stream.get("v") else {
-                continue;
-            };
-            let Some(transport) = ingress.get_mut("transport").and_then(Value::as_object_mut)
-            else {
-                continue;
-            };
-            transport.insert(
-                "kind".to_owned(),
-                Value::String("vless-reality-xhttp".to_owned()),
-            );
-            // `mode` did not exist then, and its absence is the value it would have had.
-            transport.insert("xhttp".to_owned(), xhttp.clone());
-        }
-    }
-}
-
-/// Expand the old scalar XHTTP `mux` shorthand without removing the `xhttp` layer.
-///
-/// The scalar always meant the client-side `xhttp.xmux.maxConcurrency`; it was never the generic
-/// VLESS mux.  Once any XMUX value is present Xray stops injecting its request-count and lifetime
-/// defaults, so the canonical model stores one complete policy. Historical snapshots are immutable
-/// rollback inputs and may contain the shorthand under either the old `transport` shape or the
-/// current `wires.vless` shape. Normalize only those two exact XHTTP objects: download projection
-/// and imported outbound structures also have legitimate fields named `mux` with different shapes.
-fn fold_legacy_xhttp_mux(snapshot: &mut Value) -> Result<()> {
-    let Some(apps) = snapshot.get_mut("apps").and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
-    for ingress in apps
-        .iter_mut()
-        .filter_map(|app| app.get_mut("ingresses").and_then(Value::as_array_mut))
-        .flatten()
-    {
-        let Some(ingress) = ingress.as_object_mut() else {
-            continue;
-        };
-        let xhttp = if ingress.contains_key("wires") {
-            ingress
-                .get_mut("wires")
-                .and_then(|wires| wires.get_mut("vless"))
-                .and_then(|vless| vless.get_mut("xhttp"))
-        } else {
-            ingress
-                .get_mut("transport")
-                .and_then(|transport| transport.get_mut("xhttp"))
-        };
-        let Some(xhttp) = xhttp.and_then(Value::as_object_mut) else {
-            continue;
-        };
-        let Some(legacy) = xhttp.remove("mux") else {
-            continue;
-        };
-        // `Option<u16>` serialized None as null. Removing the obsolete key restores the exact
-        // meaning: no custom XMUX object, so the client uses Xray's own defaults.
-        if legacy.is_null() || xhttp.contains_key("xmux") {
-            continue;
-        }
-        let concurrency = legacy.as_u64().ok_or_else(|| {
-            invalid_error("historical xhttp.mux must be a positive integer or null")
-        })?;
-        if !(1..=128).contains(&concurrency) {
-            return Err(invalid_error(format!(
-                "historical xhttp.mux {concurrency} is outside 1..=128"
-            )));
-        }
-        xhttp.insert(
-            "xmux".to_owned(),
-            serde_json::json!({
-                "max_concurrency": concurrency,
-                "h_max_request_times": { "from": 600, "to": 900 },
-                "h_max_reusable_secs": { "from": 1800, "to": 3000 }
-            }),
-        );
-    }
-    Ok(())
-}
-
-/// Remove fields written during the short period when ordinary TLS ClientHello selection and
-/// POST upload tuning were managed. They no longer belong to the model: TLS clients use their
-/// own defaults, and XHTTP retains only the settings Brocade applies coherently at both ends.
-fn fold_removed_ingress_client_controls(snapshot: &mut Value) {
-    let Some(apps) = snapshot.get_mut("apps").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for ingress in apps
-        .iter_mut()
-        .filter_map(|app| app.get_mut("ingresses").and_then(Value::as_array_mut))
-        .flatten()
-    {
-        let Some(ingress) = ingress.as_object_mut() else {
-            continue;
-        };
-        let vless = if ingress.contains_key("wires") {
-            ingress
-                .get_mut("wires")
-                .and_then(|wires| wires.get_mut("vless"))
-        } else {
-            ingress.get_mut("transport")
-        };
-        let Some(vless) = vless.and_then(Value::as_object_mut) else {
-            continue;
-        };
-        match vless.get("kind").and_then(Value::as_str) {
-            Some("vless-tls") => {
-                vless.remove("fingerprint");
-            }
-            Some("vless-tls-xhttp") => {
-                vless.remove("fingerprint");
-                vless.remove("alpn");
-            }
-            _ => {}
-        }
-        let Some(xhttp) = vless.get_mut("xhttp").and_then(Value::as_object_mut) else {
-            continue;
-        };
-        let remove_tuning =
-            if let Some(tuning) = xhttp.get_mut("tuning").and_then(Value::as_object_mut) {
-                for field in [
-                    "sc_max_each_post_bytes",
-                    "sc_min_posts_interval_ms",
-                    "sc_max_buffered_posts",
-                    "uplink_chunk_size",
-                ] {
-                    tuning.remove(field);
-                }
-                tuning.is_empty()
-            } else {
-                false
-            };
-        if remove_tuning {
-            xhttp.remove("tuning");
-        }
-    }
-}
-
-/// Move the single `transport` an earlier build wrote into the two-wire `wires`.
-///
-/// Same reasoning as `fold_legacy_stream`, and the same blast radius: stored snapshots are
-/// written once and never rewritten, `Ingress` denies unknown fields, so a renamed field makes
-/// every historical revision unreadable — no rollback, no recompile, no artifact view. It does
-/// not show up until a newer revision exists, because the current one is materialized from the
-/// tables and never touches these rows. It showed up exactly that way.
-///
-/// Two shapes were written before `wires`:
-///
-/// - the four VLESS ones, which become the TCP half verbatim;
-/// - a short-lived `kind: "hysteria2"`, from when Hysteria 2 was a fifth `Transport` variant
-///   rather than the second wire. Its settings sat flattened beside `kind`, so the whole object
-///   minus `kind` is the QUIC half.
-///
-/// Dropping the field instead of folding it would be worse than the error: an ingress would come
-/// back with no wire at all, fail `IngressWires`' own "at least one" check, and take the whole
-/// revision down with a message about something that was never wrong.
-fn fold_legacy_transport(snapshot: &mut Value) {
-    let Some(apps) = snapshot.get_mut("apps").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for app in apps {
-        let Some(ingresses) = app.get_mut("ingresses").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for ingress in ingresses {
-            let Some(object) = ingress.as_object_mut() else {
-                continue;
-            };
-            // Already the new shape: a snapshot written after the rename carries `wires` and no
-            // `transport`, and must be left exactly as it is.
-            if object.contains_key("wires") {
-                object.remove("transport");
-                continue;
-            }
-            let Some(transport) = object.remove("transport") else {
-                continue;
-            };
-            let quic = transport.get("kind").and_then(Value::as_str) == Some("hysteria2");
-            let mut wires = serde_json::Map::new();
-            if quic {
-                let mut hysteria2 = transport.as_object().cloned().unwrap_or_default();
-                hysteria2.remove("kind");
-                wires.insert("hysteria2".to_owned(), Value::Object(hysteria2));
-            } else {
-                wires.insert("vless".to_owned(), transport);
-            }
-            object.insert("wires".to_owned(), Value::Object(wires));
-        }
-    }
 }
 
 async fn current_revision_tx(tx: &mut Transaction<'_, Postgres>) -> Result<u64> {
@@ -797,9 +457,9 @@ pub(crate) async fn load_current_snapshot_tx(
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
             conn_buffer_size_kb, conn_handshake_secs, stats_user_online, \
-            reverse_health, reverse_health_overrides, relay_mux_concurrency, relay_mux_min_idle_workers, relay_mux_max_idle_workers, \
-            relay_mux_max_probing_workers, relay_mux_probe_interval_secs, \
-            relay_mux_probe_timeout_ms, relay_mux_idle_ttl_secs, relay_mux_max_requests_per_worker \
+            reverse_health, reverse_health_overrides, relay_mux_concurrency, relay_mux_prewarm_workers, relay_mux_reuse_threshold, \
+            relay_mux_max_probing_workers, relay_mux_probe_interval_ms, \
+            relay_mux_probe_timeout_ms, relay_mux_idle_ttl_ms, relay_mux_max_requests_per_worker \
          FROM control_state WHERE id = TRUE",
     )
     .fetch_one(&mut **tx)
@@ -1229,9 +889,8 @@ fn external_outbound_from_row(
     let id = text(row, "id")?;
     let tenant = text(row, "tenant_id")?;
     let stored_protocol = text(row, "protocol")?;
-    // WARP credentials belong to each machine binding, not to the tenant resource. New rows use
-    // an empty sentinel and older rows may still contain a sealed empty string; neither is data
-    // the model needs, so do not require a secret key merely to materialize an unbound default.
+    // WARP credentials belong to each machine binding, not to the tenant resource. Its
+    // resource-level credential is therefore an empty sentinel.
     let credential = if stored_protocol == "warp" {
         String::new()
     } else {
@@ -1248,7 +907,11 @@ fn external_outbound_from_row(
             encryption: options
                 .get("encryption")
                 .and_then(Value::as_str)
-                .unwrap_or("none")
+                .ok_or_else(|| {
+                    invalid_error(format!(
+                        "external_outbounds.protocol_options 缺少 encryption（{tenant}/{id}）"
+                    ))
+                })?
                 .to_owned(),
             flow: options
                 .get("flow")
@@ -1257,14 +920,17 @@ fn external_outbound_from_row(
             transport: options
                 .get("transport")
                 .cloned()
-                .map(serde_json::from_value)
-                .transpose()
+                .ok_or_else(|| {
+                    invalid_error(format!(
+                        "external_outbounds.protocol_options 缺少 transport（{tenant}/{id}）"
+                    ))
+                })
+                .and_then(|value| serde_json::from_value(value).map_err(StoreError::from))
                 .map_err(|error| {
                     invalid_error(format!(
                         "external_outbounds.protocol_options.transport 无效（{tenant}/{id}）：{error}"
                     ))
-                })?
-                .unwrap_or_default(),
+                })?,
         },
         "shadowsocks2022" => ExternalOutboundProtocol::Shadowsocks2022 {
             credential,
@@ -1329,21 +995,7 @@ fn external_outbound_from_row(
                     ))
                 })?,
             domain_strategy: external_option_string(&options, "domain_strategy", &tenant, &id)?,
-            // Rows and snapshots written before worker tuning existed deliberately inherit
-            // wireguard-go's automatic fallback.
-            workers: match options.get("workers") {
-                None => 0,
-                Some(value) => u16::try_from(value.as_u64().ok_or_else(|| {
-                    invalid_error(format!(
-                        "external_outbounds.protocol_options.workers 不是非负整数（{tenant}/{id}）"
-                    ))
-                })?)
-                .map_err(|_| {
-                    invalid_error(format!(
-                        "external_outbounds.protocol_options.workers 超出 u16（{tenant}/{id}）"
-                    ))
-                })?,
-            },
+            workers: external_option_u16(&options, "workers", &tenant, &id)?,
         },
         protocol => return invalid(format!("unknown external outbound protocol {protocol}")),
     };
@@ -1732,13 +1384,7 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             guard_no_private, guard_no_bittorrent, guard_no_mail, \
             guard_no_udp_amplification, guard_tcp_and_quic_only, \
             projection_v4_host, projection_v4_port, \
-            projection_v4_download_host, projection_v4_download_port, \
-            projection_v4_download_origin_port, \
-            projection_v4_download_http_host, projection_v4_download_mux, \
             projection_v6_host, projection_v6_port, \
-            projection_v6_download_host, projection_v6_download_port, \
-            projection_v6_download_origin_port, \
-            projection_v6_download_http_host, projection_v6_download_mux, \
             client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
@@ -1785,13 +1431,7 @@ async fn load_ingresses_tx(
             guard_no_private, guard_no_bittorrent, guard_no_mail, \
             guard_no_udp_amplification, guard_tcp_and_quic_only, \
             projection_v4_host, projection_v4_port, \
-            projection_v4_download_host, projection_v4_download_port, \
-            projection_v4_download_origin_port, \
-            projection_v4_download_http_host, projection_v4_download_mux, \
             projection_v6_host, projection_v6_port, \
-            projection_v6_download_host, projection_v6_download_port, \
-            projection_v6_download_origin_port, \
-            projection_v6_download_http_host, projection_v6_download_mux, \
             client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
@@ -1861,9 +1501,14 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
         fingerprint,
         flow,
         fallback_mode: match text(row, "reality_fallback_mode")?.as_str() {
+            "global-site" => RealityFallbackMode::GlobalSite,
             "node-certificate" => RealityFallbackMode::NodeCertificate,
             "custom-site" => RealityFallbackMode::CustomSite,
-            _ => RealityFallbackMode::GlobalSite,
+            value => {
+                return invalid(format!(
+                    "ingresses.reality_fallback_mode has unknown value {value}"
+                ));
+            }
         },
         fallback_limits: serde_json::from_value::<RealityFallbackLimits>(
             row.try_get("reality_fallback_limits")?,
@@ -1876,39 +1521,6 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
         fallback_guard: row.try_get("reality_fallback_guard")?,
     };
 
-    // Absent columns cannot happen — the schema defaults them — but an unknown kind can, if a
-    // future build wrote one and this one is a rollback. Treated as the plain shape rather than
-    // refused: the machine keeps serving what it has, which beats a control plane that cannot
-    // compile at all.
-    let xhttp = Xhttp {
-        path: row
-            .try_get::<Option<String>, _>("xhttp_path")?
-            .unwrap_or_default(),
-        host: row.try_get("xhttp_host")?,
-        xmux: row
-            .try_get::<Option<Value>, _>("xhttp_xmux")?
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| {
-                StoreError::InvalidData(format!("ingresses.xhttp_xmux is invalid: {error}"))
-            })?,
-        tuning: row
-            .try_get::<Option<Value>, _>("xhttp_tuning")?
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| {
-                StoreError::InvalidData(format!("ingresses.xhttp_tuning is invalid: {error}"))
-            })?,
-        // Same rollback reasoning: a value this build does not know reads as the default,
-        // which is the one shape every client can speak.
-        mode: match row.try_get::<Option<String>, _>("xhttp_mode")?.as_deref() {
-            Some("packet-up") => XhttpMode::PacketUp,
-            Some("stream-up") => XhttpMode::StreamUp,
-            Some("stream-one") => XhttpMode::StreamOne,
-            _ => XhttpMode::Auto,
-        },
-        download: xhttp_download_from_row(row)?,
-    };
     let anytls = if row.try_get::<bool, _>("anytls_enabled")? {
         let padding_scheme = json_string_array(
             "ingresses.anytls_padding_scheme",
@@ -1926,24 +1538,47 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             "string" => AnyTlsMasquerade::String {
                 content: text(row, "anytls_masquerade_content")?,
                 headers,
-                status_code: u16::try_from(row.try_get::<i32, _>("anytls_masquerade_status_code")?)
-                    .unwrap_or(200),
+                status_code: {
+                    let value = row.try_get::<i32, _>("anytls_masquerade_status_code")?;
+                    if !(200..=599).contains(&value) {
+                        return invalid(format!(
+                            "ingresses.anytls_masquerade_status_code out of range: {value}"
+                        ));
+                    }
+                    u16::try_from(value).map_err(|_| {
+                        invalid_error(format!(
+                            "ingresses.anytls_masquerade_status_code out of range: {value}"
+                        ))
+                    })?
+                },
             },
-            _ => AnyTlsMasquerade::NotFound { headers },
+            "404" => AnyTlsMasquerade::NotFound { headers },
+            value => {
+                return invalid(format!(
+                    "ingresses.anytls_masquerade_kind has unknown value {value}"
+                ));
+            }
         };
         let security = match text(row, "anytls_security")?.as_str() {
+            "tls" => AnyTlsSecurity::Tls,
             "reality" => AnyTlsSecurity::Reality,
-            _ => AnyTlsSecurity::Tls,
+            value => {
+                return invalid(format!(
+                    "ingresses.anytls_security has unknown value {value}"
+                ));
+            }
         };
+        let reality = match security {
+            AnyTlsSecurity::Tls => None,
+            AnyTlsSecurity::Reality => Some(anytls_reality_from_row(row, site)?),
+        };
+        let raw_port = row
+            .try_get::<Option<i32>, _>("anytls_port")?
+            .ok_or_else(|| invalid_error("enabled AnyTLS ingress has no port"))?;
         Some(AnyTls {
-            port: row
-                .try_get::<Option<i32>, _>("anytls_port")?
-                .and_then(|port| u16::try_from(port).ok())
-                .unwrap_or(brocade_core::model::ANYTLS_PORT_BASE),
+            port: port(raw_port)?,
             security,
-            // Keep the protocol's own target while TLS is selected so switching back to REALITY
-            // neither borrows VLESS state nor silently resets an AnyTLS custom target.
-            reality: Some(anytls_reality_from_row(row, site)?),
+            reality,
             padding_scheme,
             idle_session_check_interval_secs: optional_u32_bigint(
                 row,
@@ -1956,82 +1591,108 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
     } else {
         None
     };
-    // The borrowed-site columns are read for every shape and simply go unused by the ones that
-    // hold a certificate: an ingress keeps its REALITY identity in storage while it is on TLS, so
-    // moving it back does not mint a new public key behind everybody's back.
     let tls = Tls {
         flow: reality.flow.clone(),
     };
-    let hysteria2 = Hysteria2 {
-        // The column is NULL exactly where this ingress has no UDP wire, and the value is then
-        // never read — `quic` below discards the whole struct. Falling back to the allocator's
-        // base rather than erroring keeps a row with an inconsistent pair (which the CHECK
-        // forbids anyway) from taking the whole snapshot down with it.
-        port: row
+    let hysteria2 = if row.try_get::<bool, _>("hy2_enabled")? {
+        let raw_port = row
             .try_get::<Option<i32>, _>("hy2_port")?
-            .and_then(|port| u16::try_from(port).ok())
-            .unwrap_or(brocade_core::model::HYSTERIA2_PORT_BASE),
-        hop: match (
+            .ok_or_else(|| invalid_error("enabled Hysteria 2 ingress has no port"))?;
+        let hop = match (
             row.try_get::<Option<i32>, _>("hy2_hop_start")?,
             row.try_get::<Option<i32>, _>("hy2_hop_end")?,
         ) {
             (Some(start), Some(end)) => Some(HysteriaPortHop {
-                start: u16::try_from(start).unwrap_or_default(),
-                end: u16::try_from(end).unwrap_or_default(),
+                start: port(start)?,
+                end: port(end)?,
             }),
-            _ => None,
-        },
-        bandwidth: HysteriaBandwidth {
-            up: row.try_get("hy2_up")?,
-            down: row.try_get("hy2_down")?,
-        },
-        congestion: match text(row, "hy2_congestion")?.as_str() {
+            (None, None) => None,
+            _ => return invalid("ingresses Hysteria 2 hop range is only partially populated"),
+        };
+        let congestion = match text(row, "hy2_congestion")?.as_str() {
+            "brutal" => HysteriaCongestion::Brutal,
             "bbr" => HysteriaCongestion::Bbr,
             "reno" => HysteriaCongestion::Reno,
             "force-brutal" => HysteriaCongestion::ForceBrutal,
-            _ => HysteriaCongestion::Brutal,
-        },
-        bbr_profile: match text(row, "hy2_bbr_profile")?.as_str() {
+            value => {
+                return invalid(format!(
+                    "ingresses.hy2_congestion has unknown value {value}"
+                ));
+            }
+        };
+        let bbr_profile = match text(row, "hy2_bbr_profile")?.as_str() {
+            "standard" => HysteriaBbrProfile::Standard,
             "conservative" => HysteriaBbrProfile::Conservative,
             "aggressive" => HysteriaBbrProfile::Aggressive,
-            _ => HysteriaBbrProfile::Standard,
-        },
-        quic: HysteriaQuic {
-            init_stream_receive_window: window(row, "hy2_quic_init_stream_window")?,
-            max_stream_receive_window: window(row, "hy2_quic_max_stream_window")?,
-            init_connection_receive_window: window(row, "hy2_quic_init_conn_window")?,
-            max_connection_receive_window: window(row, "hy2_quic_max_conn_window")?,
-            max_idle_timeout_secs: secs(row, "hy2_quic_max_idle_secs")?,
-            keep_alive_period_secs: secs(row, "hy2_quic_keepalive_secs")?,
-            max_incoming_streams: secs(row, "hy2_quic_max_incoming_streams")?,
-            disable_path_mtu_discovery: row.try_get("hy2_quic_disable_pmtud")?,
-        },
-        obfs: row
-            .try_get::<Option<String>, _>("hy2_obfs_password")?
-            .map(|password| HysteriaObfs::Salamander { password }),
-        masquerade: match text(row, "hy2_masquerade_kind")?.as_str() {
+            value => {
+                return invalid(format!(
+                    "ingresses.hy2_bbr_profile has unknown value {value}"
+                ));
+            }
+        };
+        let masquerade = match text(row, "hy2_masquerade_kind")?.as_str() {
+            "not-found" => HysteriaMasquerade::NotFound,
             "proxy" => HysteriaMasquerade::Proxy {
                 url: row
                     .try_get::<Option<String>, _>("hy2_masquerade_url")?
-                    .unwrap_or_default(),
+                    .ok_or_else(|| {
+                        invalid_error("Hysteria 2 proxy masquerade has no target URL")
+                    })?,
             },
-            _ => HysteriaMasquerade::NotFound,
-        },
-        // Same column as the TLS shapes read: one certificate, one question about it.
+            value => {
+                return invalid(format!(
+                    "ingresses.hy2_masquerade_kind has unknown value {value}"
+                ));
+            }
+        };
+        Some(Hysteria2 {
+            port: port(raw_port)?,
+            hop,
+            bandwidth: HysteriaBandwidth {
+                up: row.try_get("hy2_up")?,
+                down: row.try_get("hy2_down")?,
+            },
+            congestion,
+            bbr_profile,
+            quic: HysteriaQuic {
+                init_stream_receive_window: window(row, "hy2_quic_init_stream_window")?,
+                max_stream_receive_window: window(row, "hy2_quic_max_stream_window")?,
+                init_connection_receive_window: window(row, "hy2_quic_init_conn_window")?,
+                max_connection_receive_window: window(row, "hy2_quic_max_conn_window")?,
+                max_idle_timeout_secs: secs(row, "hy2_quic_max_idle_secs")?,
+                keep_alive_period_secs: secs(row, "hy2_quic_keepalive_secs")?,
+                max_incoming_streams: secs(row, "hy2_quic_max_incoming_streams")?,
+                disable_path_mtu_discovery: row.try_get("hy2_quic_disable_pmtud")?,
+            },
+            obfs: row
+                .try_get::<Option<String>, _>("hy2_obfs_password")?
+                .map(|password| HysteriaObfs::Salamander { password }),
+            masquerade,
+        })
+    } else {
+        None
     };
-    // Two nullable halves in storage, one non-optional pair in the model. A row with neither is
-    // refused by the schema's own CHECK, so the `None` arm below is unreachable through the
-    // console — it can only be a hand-edited database, and reading it as "TCP with the defaults"
-    // would quietly serve a shape nobody asked for.
-    let vless = row
+    let vless = match row
         .try_get::<Option<String>, _>("transport_kind")?
-        .map(|kind| match kind.as_str() {
-            "vless-reality-xhttp" => Transport::VlessRealityXhttp(RealityXhttp { reality, xhttp }),
-            "vless-tls" => Transport::VlessTls(tls),
-            "vless-tls-xhttp" => Transport::VlessTlsXhttp(TlsXhttp { tls, xhttp }),
-            _ => Transport::VlessReality(reality),
-        });
-    let quic = row.try_get::<bool, _>("hy2_enabled")?.then_some(hysteria2);
+        .as_deref()
+    {
+        None => None,
+        Some("vless-reality") => Some(Transport::VlessReality(reality)),
+        Some("vless-reality-xhttp") => Some(Transport::VlessRealityXhttp(RealityXhttp {
+            reality,
+            xhttp: xhttp_from_row(row)?,
+        })),
+        Some("vless-tls") => Some(Transport::VlessTls(tls)),
+        Some("vless-tls-xhttp") => Some(Transport::VlessTlsXhttp(TlsXhttp {
+            tls,
+            xhttp: xhttp_from_row(row)?,
+        })),
+        Some(value) => {
+            return invalid(format!(
+                "ingresses.transport_kind has unknown value {value}"
+            ));
+        }
+    };
     let wires = IngressWires::try_from(IngressWiresWire {
         vless_encryption: row
             .try_get::<Option<i32>, _>("vless_encryption_port")?
@@ -2048,7 +1709,7 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             .transpose()?,
         vless,
         anytls,
-        hysteria2: quic,
+        hysteria2,
     })
     .map_err(|error| StoreError::InvalidData(format!("ingresses 行没有任何一条线：{error}")))?;
 
@@ -2076,6 +1737,41 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
     })
 }
 
+fn xhttp_from_row(row: &sqlx::postgres::PgRow) -> Result<Xhttp> {
+    let path = row
+        .try_get::<Option<String>, _>("xhttp_path")?
+        .ok_or_else(|| invalid_error("XHTTP ingress has no path"))?;
+    let mode = match row.try_get::<Option<String>, _>("xhttp_mode")?.as_deref() {
+        None => XhttpMode::Auto,
+        Some("packet-up") => XhttpMode::PacketUp,
+        Some("stream-up") => XhttpMode::StreamUp,
+        Some("stream-one") => XhttpMode::StreamOne,
+        Some(value) => {
+            return invalid(format!("ingresses.xhttp_mode has unknown value {value}"));
+        }
+    };
+    Ok(Xhttp {
+        path,
+        host: row.try_get("xhttp_host")?,
+        xmux: row
+            .try_get::<Option<Value>, _>("xhttp_xmux")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                StoreError::InvalidData(format!("ingresses.xhttp_xmux is invalid: {error}"))
+            })?,
+        tuning: row
+            .try_get::<Option<Value>, _>("xhttp_tuning")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                StoreError::InvalidData(format!("ingresses.xhttp_tuning is invalid: {error}"))
+            })?,
+        mode,
+        download: xhttp_download_from_row(row)?,
+    })
+}
+
 fn anytls_identity_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<IngressIdentity>> {
     let private_key = row.try_get::<Option<String>, _>("anytls_reality_private_key")?;
     let public_key = row.try_get::<Option<String>, _>("anytls_reality_public_key")?;
@@ -2093,8 +1789,7 @@ fn anytls_identity_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<Ingres
     }
 }
 
-/// Resolve AnyTLS's own REALITY target. Older experimental rows have no value in the new column;
-/// they move to the global site instead of silently inheriting VLESS's per-ingress override.
+/// Resolve AnyTLS's own REALITY target and apply the current global site where requested.
 fn anytls_reality_from_row(
     row: &sqlx::postgres::PgRow,
     site: &RealitySite,
@@ -2106,15 +1801,9 @@ fn anytls_reality_from_row(
         .map_err(|error| {
             StoreError::InvalidData(format!("ingresses.anytls_reality is invalid: {error}"))
         })?;
-    let mut reality = stored.unwrap_or(RealitySettings {
-        dest: String::new(),
-        server_names: Vec::new(),
-        fingerprint: String::new(),
-        flow: None,
-        fallback_mode: RealityFallbackMode::GlobalSite,
-        fallback_limits: RealityFallbackLimits::Balanced,
-        fallback_guard: true,
-    });
+    let mut reality = stored.ok_or_else(|| {
+        StoreError::InvalidData("AnyTLS REALITY ingress has no target settings".to_owned())
+    })?;
     if reality.fallback_mode == RealityFallbackMode::NodeCertificate {
         return Err(StoreError::InvalidData(
             "AnyTLS REALITY target must be global-site or custom-site".to_owned(),
@@ -2147,28 +1836,25 @@ fn xhttp_download_endpoint_from_row(
 ) -> Result<Option<ProjectionDownloadEndpoint>> {
     let client_column = format!("xhttp_download_{family}");
     let origin_column = format!("xhttp_download_{family}_origin_port");
-    if let Some(value) = row.try_get::<Option<Value>, _>(client_column.as_str())? {
-        let client =
-            serde_json::from_value::<ClientProjectionDownloadEndpoint>(value).map_err(|error| {
-                StoreError::InvalidData(format!(
-                    "ingress_client_settings.{client_column} is invalid: {error}"
-                ))
-            })?;
-        return Ok(Some(ProjectionDownloadEndpoint {
-            host: client.host,
-            port: client.port,
-            origin_port: row
-                .try_get::<Option<i32>, _>(origin_column.as_str())?
-                .map(port)
-                .transpose()?,
-            http_host: client.http_host,
-            mux: client.mux,
-        }));
-    }
-
-    // Old snapshots stored the entire download under projection. Keep this read fallback until
-    // all existing rows have passed through the idempotent migration and a normal save.
-    Ok(projection_endpoint(row, family)?.and_then(|endpoint| endpoint.download))
+    let Some(value) = row.try_get::<Option<Value>, _>(client_column.as_str())? else {
+        return Ok(None);
+    };
+    let client =
+        serde_json::from_value::<ClientProjectionDownloadEndpoint>(value).map_err(|error| {
+            StoreError::InvalidData(format!(
+                "ingress_client_settings.{client_column} is invalid: {error}"
+            ))
+        })?;
+    Ok(Some(ProjectionDownloadEndpoint {
+        host: client.host,
+        port: client.port,
+        origin_port: row
+            .try_get::<Option<i32>, _>(origin_column.as_str())?
+            .map(port)
+            .transpose()?,
+        http_host: client.http_host,
+        mux: client.mux,
+    }))
 }
 
 /// One family's projected endpoint. Both columns NULL means no projection.
@@ -2177,10 +1863,9 @@ fn xhttp_download_endpoint_from_row(
 /// (`ingresses_projection_v4_check`), so a half row encountered here is not glossed over as
 /// "no projection" — doing so would quietly read an already-corrupt database as a healthy
 /// snapshot.
-/// `family` is `v4` or `v6`; the seven columns are that prefix plus a fixed suffix.
+/// `family` is `v4` or `v6`; the two columns are that prefix plus a fixed suffix.
 ///
-/// Taken as one family rather than seven column names because seven `&str` parameters in a row is
-/// an argument order nobody can check by reading — two swapped names would compile, and read the
+/// Taken as one family rather than two column names because swapped names would compile and read the
 /// v6 columns into the v4 endpoint.
 fn projection_endpoint(
     row: &sqlx::postgres::PgRow,
@@ -2193,44 +1878,10 @@ fn projection_endpoint(
     let raw_port = row.try_get::<Option<i32>, _>(port_column.as_str())?;
     match (host, raw_port) {
         (None, None) => Ok(None),
-        (Some(host), Some(raw_port)) => {
-            let download_host_column = column("download_host");
-            let download_port_column = column("download_port");
-            let download_mux_column = column("download_mux");
-            let download_host = row.try_get::<Option<String>, _>(download_host_column.as_str())?;
-            let download_port = row.try_get::<Option<i32>, _>(download_port_column.as_str())?;
-            let download = match (download_host, download_port) {
-                (None, None) => None,
-                (Some(host), Some(raw_port)) => Some(ProjectionDownloadEndpoint {
-                    host,
-                    port: port(raw_port)?,
-                    origin_port: row
-                        .try_get::<Option<i32>, _>(column("download_origin_port").as_str())?
-                        .map(port)
-                        .transpose()?,
-                    http_host: row.try_get(column("download_http_host").as_str())?,
-                    mux: row
-                        .try_get::<Option<i32>, _>(download_mux_column.as_str())?
-                        .map(u16::try_from)
-                        .transpose()
-                        .map_err(|_| {
-                            StoreError::InvalidData(format!(
-                                "ingresses.{download_mux_column} 超出 u16"
-                            ))
-                        })?,
-                }),
-                _ => {
-                    return Err(StoreError::InvalidData(format!(
-                        "ingresses.{download_host_column}/{download_port_column} 只填了一半"
-                    )));
-                }
-            };
-            Ok(Some(ProjectionEndpoint {
-                host,
-                port: port(raw_port)?,
-                download,
-            }))
-        }
+        (Some(host), Some(raw_port)) => Ok(Some(ProjectionEndpoint {
+            host,
+            port: port(raw_port)?,
+        })),
         _ => Err(StoreError::InvalidData(format!(
             "ingresses.{host_column}/{port_column} 只填了一半"
         ))),
@@ -2357,161 +2008,8 @@ fn parse_front_strategy(value: &str) -> Result<FrontStrategy> {
 }
 
 fn parse_rules(value: &Value) -> Result<Vec<Rule>> {
-    let Value::Array(items) = value else {
-        return invalid("steps.rules must be a JSON array");
-    };
-
-    items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let object = item
-                .as_object()
-                .ok_or_else(|| invalid_error(format!("steps.rules[{index}] must be an object")))?;
-            let dest_match = object
-                .get("match")
-                .or_else(|| object.get("dest_match"))
-                .or_else(|| object.get("m"))
-                .ok_or_else(|| invalid_error(format!("steps.rules[{index}].match is missing")))
-                .and_then(parse_dest_match)?;
-            let action = object
-                .get("action")
-                .or_else(|| object.get("a"))
-                .ok_or_else(|| invalid_error(format!("steps.rules[{index}].action is missing")))
-                .and_then(parse_action)?;
-            Ok(Rule { dest_match, action })
-        })
-        .collect()
-}
-
-fn parse_dest_match(value: &Value) -> Result<DestMatch> {
-    let tag = tagged_kind(value)?;
-    match tag {
-        "any" => Ok(DestMatch::Any),
-        "sniffing_failed" => Ok(DestMatch::SniffingFailed),
-        "domain_suffix" => Ok(DestMatch::DomainSuffix(tagged_string_array(value)?)),
-        "domain_keyword" => Ok(DestMatch::DomainKeyword(tagged_string_array(value)?)),
-        "domain_regex" => Ok(DestMatch::DomainRegex(tagged_string(value)?)),
-        "geosite" => Ok(DestMatch::Geosite(tagged_string_array(value)?)),
-        "ip_cidr" => Ok(DestMatch::IpCidr(tagged_string_array(value)?)),
-        "geoip" => Ok(DestMatch::Geoip(tagged_string_array(value)?)),
-        "port" => Ok(DestMatch::Port(tagged_string_array(value)?)),
-        "network" => match tagged_string(value)?.as_str() {
-            "tcp" => Ok(DestMatch::Network(Network::Tcp)),
-            "udp" => Ok(DestMatch::Network(Network::Udp)),
-            value => invalid(format!("unknown network match {value}")),
-        },
-        "all" => {
-            let value = tagged_value(value)?;
-            let Value::Array(items) = value else {
-                return invalid("all match value must be an array");
-            };
-            Ok(DestMatch::All(
-                items
-                    .iter()
-                    .map(parse_dest_match)
-                    .collect::<Result<Vec<_>>>()?,
-            ))
-        }
-        "front_downstream" => Ok(DestMatch::FrontDownstream),
-        value => invalid(format!("unknown dest match {value}")),
-    }
-}
-
-fn parse_action(value: &Value) -> Result<Action> {
-    let tag = tagged_kind(value)?;
-    match tag {
-        "forward" => {
-            let object = value
-                .as_object()
-                .ok_or_else(|| invalid_error("forward action must be an object"))?;
-            let to = object
-                .get("to")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_error("forward action requires string field to"))?;
-            // This is a hand-written parser, not serde — without recognizing `dial` here, the
-            // address written on the chain is lost on the way back while the artifacts look
-            // entirely correct (the default overlay is a legitimate path). The value itself is
-            // judged by serde, so as not to write a second copy of `HopDial`'s definition that
-            // slowly diverges.
-            let dial = match object.get("dial") {
-                None | Some(Value::Null) => HopDial::Overlay,
-                // The reason must come along. Swallowing it for a "must be overlay or addr"
-                // makes that sentence stale with every variant added to `HopDial`, and someone
-                // following it only turns a correct value into a wrong one.
-                Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
-                    invalid_error(format!("forward action dial 解析不了：{value}（{err}）"))
-                })?,
-            };
-            // Same treatment as `dial`, and for the same reason: a hand-written parser that
-            // does not know the key drops it silently, and the artifacts still compile —
-            // the hop just stops pooling and nobody can see why.
-            let pool = match object.get("pool") {
-                None | Some(Value::Null) => HopPool::None,
-                Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
-                    invalid_error(format!("forward action pool 解析不了：{value}（{err}）"))
-                })?,
-            };
-            Ok(Action::Forward {
-                to: to.to_owned(),
-                dial,
-                pool,
-            })
-        }
-        "egress" => {
-            let object = value
-                .as_object()
-                .ok_or_else(|| invalid_error("egress action must be an object"))?;
-            let send_through = match object.get("send_through") {
-                None | Some(Value::Null) => None,
-                Some(value) => Some(parse_ip(value.as_str().ok_or_else(|| {
-                    invalid_error("egress send_through must be null or a string IP")
-                })?)?),
-            };
-            // Old development rows may still carry `resolution` or the later `dns` activation
-            // flag. Ignore both: machine DNS is the only authoritative source, and re-serializing
-            // the rule naturally cleans those keys.
-            Ok(Action::Egress { send_through })
-        }
-        "proxy" => {
-            let outbound = value
-                .as_object()
-                .and_then(|object| object.get("outbound"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_error("proxy action requires string field outbound"))?;
-            Ok(Action::Proxy {
-                outbound: outbound.to_owned(),
-            })
-        }
-        "block" => Ok(Action::Block),
-        value => invalid(format!("unknown action {value}")),
-    }
-}
-
-fn tagged_kind(value: &Value) -> Result<&str> {
-    value
-        .as_object()
-        .and_then(|object| object.get("t"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_error("tagged JSON object requires string field t"))
-}
-
-fn tagged_value(value: &Value) -> Result<&Value> {
-    value
-        .as_object()
-        .and_then(|object| object.get("v"))
-        .ok_or_else(|| invalid_error("tagged JSON object requires field v"))
-}
-
-fn tagged_string(value: &Value) -> Result<String> {
-    tagged_value(value)?
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| invalid_error("tagged JSON value must be a string"))
-}
-
-fn tagged_string_array(value: &Value) -> Result<Vec<String>> {
-    json_string_array("tagged.v", tagged_value(value)?)
+    serde_json::from_value(value.clone())
+        .map_err(|error| invalid_error(format!("steps.rules is invalid: {error}")))
 }
 
 pub(crate) fn json_string_array(field: &str, value: &Value) -> Result<Vec<String>> {
@@ -2539,20 +2037,24 @@ fn text(row: &sqlx::postgres::PgRow, field: &str) -> Result<String> {
     Ok(row.try_get(field)?)
 }
 
-/// A nullable BIGINT read back as the model's `u64`. Negative values cannot get past the column's
-/// CHECK, so a negative here means the constraint is gone; taking `None` rather than wrapping
-/// keeps the artifact from carrying a window of 18 exabytes.
+/// A nullable BIGINT read back as the model's `u64`.
 fn window(row: &sqlx::postgres::PgRow, field: &str) -> Result<Option<u64>> {
-    Ok(row
-        .try_get::<Option<i64>, _>(field)?
-        .and_then(|value| u64::try_from(value).ok()))
+    row.try_get::<Option<i64>, _>(field)?
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| invalid_error(format!("ingresses.{field} out of range: {value}")))
+        })
+        .transpose()
 }
 
 /// The same for the second/count columns, which the model holds as `u32`.
 fn secs(row: &sqlx::postgres::PgRow, field: &str) -> Result<Option<u32>> {
-    Ok(row
-        .try_get::<Option<i32>, _>(field)?
-        .and_then(|value| u32::try_from(value).ok()))
+    row.try_get::<Option<i32>, _>(field)?
+        .map(|value| {
+            u32::try_from(value)
+                .map_err(|_| invalid_error(format!("ingresses.{field} out of range: {value}")))
+        })
+        .transpose()
 }
 
 fn port(value: i32) -> Result<u16> {
@@ -2636,29 +2138,29 @@ fn hop_mux_from_row(row: &sqlx::postgres::PgRow) -> Result<HopMux> {
             "control_state.relay_mux_concurrency",
             row.try_get("relay_mux_concurrency")?,
         )?,
-        min_idle_workers: u32_bigint_column(
-            "control_state.relay_mux_min_idle_workers",
-            row.try_get("relay_mux_min_idle_workers")?,
+        prewarm_workers: u32_bigint_column(
+            "control_state.relay_mux_prewarm_workers",
+            row.try_get("relay_mux_prewarm_workers")?,
         )?,
-        max_idle_workers: u32_bigint_column(
-            "control_state.relay_mux_max_idle_workers",
-            row.try_get("relay_mux_max_idle_workers")?,
+        reuse_threshold: u32_bigint_column(
+            "control_state.relay_mux_reuse_threshold",
+            row.try_get("relay_mux_reuse_threshold")?,
         )?,
         max_probing_workers: u32_bigint_column(
             "control_state.relay_mux_max_probing_workers",
             row.try_get("relay_mux_max_probing_workers")?,
         )?,
-        probe_interval_secs: u16_column(
-            "control_state.relay_mux_probe_interval_secs",
-            row.try_get("relay_mux_probe_interval_secs")?,
+        probe_interval_ms: u32_column(
+            "control_state.relay_mux_probe_interval_ms",
+            row.try_get("relay_mux_probe_interval_ms")?,
         )?,
         probe_timeout_ms: u32_column(
             "control_state.relay_mux_probe_timeout_ms",
             row.try_get("relay_mux_probe_timeout_ms")?,
         )?,
-        idle_ttl_secs: u32_bigint_column(
-            "control_state.relay_mux_idle_ttl_secs",
-            row.try_get("relay_mux_idle_ttl_secs")?,
+        idle_ttl_ms: u32_bigint_column(
+            "control_state.relay_mux_idle_ttl_ms",
+            row.try_get("relay_mux_idle_ttl_ms")?,
         )?,
         max_requests_per_worker: u16_column(
             "control_state.relay_mux_max_requests_per_worker",
@@ -2675,17 +2177,23 @@ fn u16_column(location: &str, value: i32) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brocade_core::model::{Action, DestMatch, HopDial, HopPool, Network};
     use serde_json::json;
 
     #[test]
-    fn parse_rules_supports_core_match_and_action_shapes() {
+    fn parse_rules_accepts_the_current_wire_shape() {
         let rules = parse_rules(&json!([
             {
-                "match": { "t": "geosite", "v": ["netflix", "openai"] },
-                "action": { "t": "forward", "to": "au-01" }
+                "m": { "t": "geosite", "v": ["netflix", "openai"] },
+                "a": {
+                    "t": "forward",
+                    "to": "au-01",
+                    "dial": { "t": "overlay" },
+                    "pool": { "t": "none" }
+                }
             },
             {
-                "match": {
+                "m": {
                     "t": "all",
                     "v": [
                         { "t": "domain_suffix", "v": ["example.com"] },
@@ -2693,30 +2201,19 @@ mod tests {
                         { "t": "port", "v": ["443"] }
                     ]
                 },
-                "action": { "t": "egress", "send_through": "10.66.0.4" }
+                "a": { "t": "egress", "send_through": "10.66.0.4" }
             },
             {
-                "match": { "t": "front_downstream" },
-                "action": { "t": "block" }
+                "m": { "t": "front_downstream" },
+                "a": { "t": "block" }
             },
             {
-                "match": { "t": "sniffing_failed" },
-                "action": { "t": "block" }
+                "m": { "t": "sniffing_failed" },
+                "a": { "t": "block" }
             },
             {
-                "match": { "t": "geosite", "v": ["netflix"] },
-                "action": {
-                    "t": "egress",
-                    "send_through": null,
-                    "dns": true,
-                    "resolution": {
-                        "address": "192.0.2.53",
-                        "port": 5353,
-                        "transport": "tcp",
-                        "address_strategy": "use_ipv4",
-                        "fallback": "machine"
-                    }
-                }
+                "m": { "t": "geosite", "v": ["netflix"] },
+                "a": { "t": "egress", "send_through": null }
             }
         ]))
         .unwrap();
@@ -2726,8 +2223,6 @@ mod tests {
             vec![
                 Rule {
                     dest_match: DestMatch::Geosite(vec!["netflix".to_owned(), "openai".to_owned()]),
-                    // This JSON has no dial and no pool — absent means the overlay, and a
-                    // connection per stream.
                     action: Action::Forward {
                         to: "au-01".to_owned(),
                         dial: HopDial::Overlay,
@@ -2762,253 +2257,21 @@ mod tests {
 
     #[test]
     fn parse_rules_reports_missing_action() {
-        let error = parse_rules(&json!([{ "match": { "t": "any" } }])).unwrap_err();
-        assert!(error.to_string().contains("action is missing"));
+        let error = parse_rules(&json!([{ "m": { "t": "any" } }])).unwrap_err();
+        assert!(error.to_string().contains("missing field `a`"));
     }
 
     #[test]
-    fn legacy_machine_dns_uses_its_snapshot_order_as_position() {
-        let mut snapshot = serde_json::json!({
-            "node_egress_dns": [
-                { "node": "n1", "selector": { "t": "geosite", "v": ["first"] } },
-                { "node": "n2", "selector": { "t": "geosite", "v": ["other"] } },
-                {
-                    "node": "n1",
-                    "position": 99,
-                    "selector": { "t": "geosite", "v": ["second"] }
-                }
-            ]
-        });
-
-        super::fold_legacy_node_egress_dns_positions(&mut snapshot).unwrap();
-
-        let policies = snapshot["node_egress_dns"].as_array().unwrap();
-        assert_eq!(policies[0]["position"], 0);
-        assert_eq!(policies[1]["position"], 0);
-        assert_eq!(policies[2]["position"], 1);
-    }
-
-    #[test]
-    fn snapshot_before_machine_dns_gets_an_empty_policy_list() {
-        let mut snapshot = serde_json::json!({});
-        super::fold_legacy_node_egress_dns_positions(&mut snapshot).unwrap();
-        assert_eq!(snapshot["node_egress_dns"], serde_json::json!([]));
-    }
-    /// Snapshots written before `Transport` gained the XHTTP shape carry the network layer as a
-    /// separate `stream` field. `Ingress` denies unknown fields, so those rows fail to load
-    /// outright — and the failure is invisible until a newer revision exists, because the current
-    /// revision is materialized from the tables and never reads this row.
-    #[test]
-    fn a_snapshot_written_before_the_transport_shape_still_loads() {
-        let mut snapshot = serde_json::json!({
-            "apps": [{
-                "ingresses": [
-                    {
-                        "id": "i-xhttp",
-                        "transport": {"kind": "vless-reality", "dest": "a:443"},
-                        "stream": {"t": "xhttp", "v": {"path": "/probe", "mux": 16}},
-                    },
-                    {
-                        "id": "i-tcp",
-                        "transport": {"kind": "vless-reality", "dest": "a:443"},
-                        "stream": {"t": "tcp"},
-                    },
-                ]
-            }]
-        });
-
-        super::fold_legacy_stream(&mut snapshot);
-        super::fold_legacy_xhttp_mux(&mut snapshot).unwrap();
-
-        let ingresses = &snapshot["apps"][0]["ingresses"];
-        assert!(ingresses[0].get("stream").is_none());
-        assert_eq!(ingresses[0]["transport"]["kind"], "vless-reality-xhttp");
-        assert_eq!(ingresses[0]["transport"]["xhttp"]["path"], "/probe");
-        assert!(ingresses[0]["transport"]["xhttp"].get("mux").is_none());
-        assert_eq!(
-            ingresses[0]["transport"]["xhttp"]["xmux"],
-            serde_json::json!({
-                "max_concurrency": 16,
-                "h_max_request_times": { "from": 600, "to": 900 },
-                "h_max_reusable_secs": { "from": 1800, "to": 3000 }
-            })
-        );
-        // The REALITY parameters stay where they were, which is what the new shape expects too.
-        assert_eq!(ingresses[0]["transport"]["dest"], "a:443");
-
-        assert!(ingresses[1].get("stream").is_none());
-        assert_eq!(ingresses[1]["transport"]["kind"], "vless-reality");
-        assert!(ingresses[1]["transport"].get("xhttp").is_none());
-    }
-
-    #[test]
-    fn legacy_null_xhttp_mux_is_removed_inside_wires_without_touching_other_mux_fields() {
-        let mut snapshot = serde_json::json!({
-            "apps": [{
-                "ingresses": [{
-                    "wires": {
-                        "vless": {
-                            "kind": "vless-reality-xhttp",
-                            "xhttp": { "path": "/probe", "mux": null, "mode": "auto" }
-                        }
-                    },
-                    "projection": {
-                        "v4": { "download": { "host": "download.example", "port": 443, "mux": 8 } }
-                    }
-                }]
-            }]
-        });
-
-        super::fold_legacy_xhttp_mux(&mut snapshot).unwrap();
-
-        let ingress = &snapshot["apps"][0]["ingresses"][0];
-        assert!(ingress["wires"]["vless"]["xhttp"].get("mux").is_none());
-        assert!(ingress["wires"]["vless"]["xhttp"].get("xmux").is_none());
-        assert_eq!(ingress["projection"]["v4"]["download"]["mux"], 8);
-    }
-
-    #[test]
-    fn removed_tls_and_post_controls_are_folded_out_of_historical_snapshots() {
-        let mut snapshot = serde_json::json!({
-            "apps": [{
-                "ingresses": [
-                    {
-                        "transport": {
-                            "kind": "vless-tls",
-                            "flow": "",
-                            "fingerprint": "none"
-                        }
-                    },
-                    {
-                        "wires": { "vless": {
-                            "kind": "vless-tls-xhttp",
-                            "flow": "",
-                            "fingerprint": "chrome",
-                            "alpn": "http1",
-                            "xhttp": {
-                                "path": "/tls",
-                                "tuning": {
-                                    "x_padding_bytes": { "from": 200, "to": 600 },
-                                    "sc_max_each_post_bytes": { "from": 500000, "to": 1000000 },
-                                    "sc_min_posts_interval_ms": { "from": 10, "to": 30 },
-                                    "sc_max_buffered_posts": 64,
-                                    "uplink_chunk_size": { "from": 65536, "to": 131072 }
-                                }
-                            }
-                        }}
-                    },
-                    {
-                        "wires": { "vless": {
-                            "kind": "vless-reality-xhttp",
-                            "fingerprint": "chrome",
-                            "xhttp": {
-                                "path": "/reality",
-                                "tuning": { "sc_max_buffered_posts": 64 }
-                            }
-                        }}
-                    }
-                ]
-            }]
-        });
-
-        super::fold_removed_ingress_client_controls(&mut snapshot);
-
-        let ingresses = &snapshot["apps"][0]["ingresses"];
-        assert!(ingresses[0]["transport"].get("fingerprint").is_none());
-        assert!(ingresses[1]["wires"]["vless"].get("fingerprint").is_none());
-        assert!(ingresses[1]["wires"]["vless"].get("alpn").is_none());
-        assert_eq!(
-            ingresses[1]["wires"]["vless"]["xhttp"]["tuning"],
-            serde_json::json!({
-                "x_padding_bytes": { "from": 200, "to": 600 }
-            })
-        );
-        assert_eq!(ingresses[2]["wires"]["vless"]["fingerprint"], "chrome");
-        assert!(ingresses[2]["wires"]["vless"]["xhttp"]
-            .get("tuning")
-            .is_none());
-    }
-
-    /// Every revision written before `wires` existed carries `transport`, and `Ingress` denies
-    /// unknown fields. Without the fold, opening any of them fails with
-    /// `unknown field \`transport\`` — which is how this was found, on a control plane holding
-    /// 52 of them.
-    #[test]
-    fn a_legacy_transport_folds_into_the_tcp_wire() {
-        let mut snapshot = serde_json::json!({
-            "apps": [{
-                "ingresses": [
-                    { "id": "i-vless", "transport": { "kind": "vless-reality", "dest": "a:443" } },
-                    { "id": "i-quic", "transport": {
-                        "kind": "hysteria2",
-                        "congestion": "brutal",
-                        "masquerade": { "kind": "not-found" }
-                    }},
-                    // A snapshot written after the rename must come back untouched.
-                    { "id": "i-new", "wires": { "vless": { "kind": "vless-tls" } } },
-                ]
-            }]
-        });
-
-        super::fold_legacy_transport(&mut snapshot);
-        let ingresses = &snapshot["apps"][0]["ingresses"];
-
-        assert_eq!(ingresses[0]["wires"]["vless"]["kind"], "vless-reality");
-        assert_eq!(ingresses[0]["wires"]["vless"]["dest"], "a:443");
-        assert!(ingresses[0].get("transport").is_none());
-
-        // The fifth-variant era wrote Hysteria's settings flattened beside `kind`; everything but
-        // `kind` is the QUIC half, and `kind` itself has no home in the new shape.
-        assert_eq!(ingresses[1]["wires"]["hysteria2"]["congestion"], "brutal");
-        assert!(ingresses[1]["wires"]["hysteria2"].get("kind").is_none());
-        assert!(ingresses[1]["wires"].get("vless").is_none());
-
-        assert_eq!(ingresses[2]["wires"]["vless"]["kind"], "vless-tls");
-    }
-
-    #[test]
-    fn legacy_ingress_credentials_move_out_of_every_transport_shape() {
-        let pair = crate::credentials::generate_reality_keypair().unwrap();
-        let mut snapshot = serde_json::json!({
-            "apps": [{"ingresses": [
-                {
-                    "id": "reality",
-                    "transport": {
-                        "kind": "vless-reality",
-                        "private_key": pair.private_key,
-                        "public_key": pair.public_key,
-                        "short_ids": ["0123abcd"],
-                        "dest": "a:443"
-                    }
-                },
-                {
-                    "id": "tls",
-                    "transport": {
-                        "kind": "vless-tls",
-                        "private_key": pair.private_key,
-                        "fingerprint": "chrome"
-                    }
-                }
-            ]}]
-        });
-
-        super::fold_legacy_ingress_identity(&mut snapshot).unwrap();
-
-        let ingresses = snapshot["apps"][0]["ingresses"].as_array().unwrap();
-        assert_eq!(ingresses[0]["identity"]["public_key"], pair.public_key);
-        assert_eq!(ingresses[0]["identity"]["short_ids"][0], "0123abcd");
-        assert_eq!(ingresses[1]["identity"]["public_key"], pair.public_key);
-        assert_eq!(
-            ingresses[1]["identity"]["short_ids"][0]
-                .as_str()
-                .unwrap()
-                .len(),
-            16
-        );
-        for ingress in ingresses {
-            assert!(ingress["transport"].get("private_key").is_none());
-            assert!(ingress["transport"].get("public_key").is_none());
-            assert!(ingress["transport"].get("short_ids").is_none());
-        }
+    fn parse_rules_rejects_non_contract_field_names_and_incomplete_forwards() {
+        assert!(parse_rules(&json!([{
+            "match": { "t": "any" },
+            "action": { "t": "block" }
+        }]))
+        .is_err());
+        assert!(parse_rules(&json!([{
+            "m": { "t": "any" },
+            "a": { "t": "forward", "to": "au-01" }
+        }]))
+        .is_err());
     }
 }

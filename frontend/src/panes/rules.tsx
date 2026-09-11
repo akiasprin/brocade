@@ -62,33 +62,25 @@ import {
 // also avoids turning `tunnels -> rules -> tunnels` into an eager module cycle.
 const WarpRuleManager = lazy(() => import('./tunnels').then(module => ({ default: module.WarpRuleManager })));
 
-// 未填写 dial 的规则读取后为 undefined，等同于 overlay。在此统一补全，
-// 避免每处各写一次 `?? {t:'overlay'}`，遗漏其中一处会导致下拉框为空。
-const forwardDial = (a: RuleAction): HopDial => (a.t === 'forward' ? (a.dial ?? { t: 'overlay' }) : { t: 'overlay' });
+const forwardDial = (a: RuleAction): HopDial => (a.t === 'forward' ? a.dial : { t: 'overlay' });
 
-// 同理，未填写 pool 的规则读取后为 undefined，表示每次新建连接。
-const forwardPool = (a: RuleAction): HopPool => (a.t === 'forward' ? (a.pool ?? { t: 'none' }) : { t: 'none' });
+const forwardPool = (a: RuleAction): HopPool => (a.t === 'forward' ? a.pool : { t: 'none' });
 
-// 历史 pool/merge 只用于读取旧修订。当前写入使用 mux：省略 v 跟随全局，带 v 时整组覆盖。
 export type PoolChoice = 'none' | 'mux';
 export const POOL_ORDER: PoolChoice[] = ['none', 'mux'];
 export const POOL_LABEL: Record<PoolChoice, string> = {
   none: '每次新建',
   mux: 'Mux 复用',
 };
-/* 新建一跳时的连接复用配置。与上面 `forwardPool` 的回退值不同，两者必须区分：
-   后者表示该规则中未填写 pool，只能取 none——模型中 HopPool 的 #[default] 即为 none，
-   历史修订重新编译需要逐字节一致，修改读取逻辑会使机队中已有的跳全部启用连接池。
-   本值是新建一跳时的初始值，与历史数据无关。Mux.cool 的 concurrency=1 会复用未经
-   借出前探活的空闲 worker，半失效连接可能一直卡到连接超时，因此新建规则采用稳妥的
-   每次建连；已有规则仍保留其显式选择。 */
+/* 新建一跳时默认每条流单独建立连接。Mux.cool 的 concurrency=1 会复用未经借出前
+   探活的空闲 worker，半失效连接可能一直卡到连接超时。 */
 export const POOL_DEFAULT: HopPool = { t: 'none' };
 
 /* 新建转发规则的动作，四个建链入口共用同一份。分散定义时增加一档默认值需要修改四处，
    遗漏的一处不会报错，只是行为与其他位置不同。
-   反向档不带 pool：本机不发起连接，携带该字段时编译器会报 rule.pool-on-reverse。 */
+   反向档固定为 none：本机不发起可复用的出站连接。 */
 export const forwardAction = (to: string, dial: HopDial, pool: HopPool = POOL_DEFAULT): RuleAction =>
-  dial.t === 'reverse' ? { t: 'forward', to, dial } : { t: 'forward', to, dial, pool };
+  ({ t: 'forward', to, dial, pool: dial.t === 'reverse' ? POOL_DEFAULT : pool });
 
 // Mux.cool 的 concurrency。1 表示每条连接同时承载一条流，仍可复用空闲连接；
 // 大于 1 时多条流共享连接。界面不再把这两种数值拆成不同连接类型。
@@ -97,7 +89,7 @@ export const MUX_MIN = 1;
 export const MUX_MAX = 128;
 export const poolChoice = (pool: HopPool): PoolChoice => (pool.t === 'none' ? 'none' : 'mux');
 export const muxConcurrency = (pool: HopPool): number =>
-  pool.t === 'merge' ? pool.v : pool.t === 'mux' ? (pool.v?.concurrency ?? MUX_DEFAULT) : MUX_DEFAULT;
+  pool.t === 'mux' ? (pool.v?.concurrency ?? MUX_DEFAULT) : MUX_DEFAULT;
 export const poolFromMuxConcurrency = (value: number): HopPool => ({
   t: 'mux',
   v: { ...DEFAULT_HOP_MUX, concurrency: value },
@@ -1875,7 +1867,7 @@ function RuleEditorReady({
           ? // 出站连接跟着一起写回去，否则换一次拨号方式就把它抹了——而换拨号和
             // 修改连接方式与此无关。唯一需要清除的是切换到反向档：此时本机不再发起连接，
             // 保留的取值指向一个不存在的出站（编译器会报 rule.pool-on-reverse）。
-            { ...rule, a: { t: 'forward', to, dial, pool: dial.t === 'reverse' ? undefined : forwardPool(rule.a) } }
+            { ...rule, a: forwardAction(to, dial, forwardPool(rule.a)) }
           : rule,
       ),
     );
@@ -2057,7 +2049,7 @@ function RuleEditorReady({
                                 ? forwardAction(defaultTarget, defaultDial(defaultTarget))
                                 : externalOutbounds[0]
                                   ? { t: 'proxy', outbound: externalOutbounds[0].id }
-                                  : { t: 'forward', to: '' }
+                                  : forwardAction('', { t: 'overlay' })
                               : t === 'egress'
                                 ? { t: 'egress', send_through: null }
                                 : { t: 'block' };
@@ -2740,11 +2732,7 @@ function RuleEditorReady({
                                     to,
                                     followGlobal: pool.t === 'mux' && !pool.v,
                                     value:
-                                      pool.t === 'mux' && pool.v
-                                        ? { ...pool.v }
-                                        : pool.t === 'pool' || pool.t === 'merge'
-                                          ? { ...DEFAULT_HOP_MUX, concurrency: muxConcurrency(pool) }
-                                          : { ...globalRelayMux },
+                                      pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   })
                                 }
                                 onKeyDown={event => {
@@ -2754,11 +2742,7 @@ function RuleEditorReady({
                                     to,
                                     followGlobal: pool.t === 'mux' && !pool.v,
                                     value:
-                                      pool.t === 'mux' && pool.v
-                                        ? { ...pool.v }
-                                        : pool.t === 'pool' || pool.t === 'merge'
-                                          ? { ...DEFAULT_HOP_MUX, concurrency: muxConcurrency(pool) }
-                                          : { ...globalRelayMux },
+                                      pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   });
                                 }}
                               >
@@ -2773,11 +2757,7 @@ function RuleEditorReady({
                                     to,
                                     followGlobal: pool.t === 'mux' && !pool.v,
                                     value:
-                                      pool.t === 'mux' && pool.v
-                                        ? { ...pool.v }
-                                        : pool.t === 'pool' || pool.t === 'merge'
-                                          ? { ...DEFAULT_HOP_MUX, concurrency: muxConcurrency(pool) }
-                                          : { ...globalRelayMux },
+                                      pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   })
                                 }
                               >
@@ -2931,7 +2911,7 @@ function MuxConfigDrawer({
           type="number"
           min={min}
           max={max}
-          value={value[key]}
+          value={Number(value[key])}
           disabled={readOnly || state.followGlobal}
           onChange={event => patch(key, event.target.value)}
         />
@@ -2971,20 +2951,47 @@ function MuxConfigDrawer({
             </button>
           </div>
           <p className="note">
-            当前生效：复用流 {value.concurrency} · 空闲 {value.min_idle_workers}–{value.max_idle_workers} · 探测{' '}
-            {value.probe_interval_secs}s/{value.probe_timeout_ms}ms · 寿命 {value.idle_ttl_secs}s
+            当前生效：复用流 {value.concurrency} · 预热目标 {value.prewarm_workers} · 复用阈值 {value.reuse_threshold} ·
+            探活 {value.probe_interval_ms}ms/{value.probe_timeout_ms}ms · 超额空闲寿命 {value.idle_ttl_ms}ms
           </p>
           {state.followGlobal && <p className="note">这些值来自设置页的“连接策略 / 中继 Mux”。</p>}
-          <div className="mux-drawer-grid">
-            {field('复用流数量', 'concurrency', 1, 128)}
-            {field('最小空闲连接', 'min_idle_workers', 0)}
-            {field('最大空闲连接', 'max_idle_workers', 1)}
-            {field('同时探测连接', 'max_probing_workers', 1, value.max_idle_workers)}
-            {field('探测周期', 'probe_interval_secs', 2, 60, '秒')}
-            {field('单次超时', 'probe_timeout_ms', 200, 10000, '毫秒')}
-            {field('空闲寿命', 'idle_ttl_secs', 1, undefined, '秒')}
-            {field('累计子连接', 'max_requests_per_worker', 1, 65535)}
+          <div className="mux-drawer-groups">
+            <section>
+              <p className="eyebrow">复用容量</p>
+              <div className="mux-drawer-grid">
+                {field('复用流数量', 'concurrency', 1, 128)}
+                {field('累计子连接', 'max_requests_per_worker', 1, 65535)}
+              </div>
+            </section>
+            <section>
+              <p className="eyebrow">连接池</p>
+              <div className="mux-drawer-grid">
+                {field('预热目标', 'prewarm_workers', 0)}
+                {field('复用阈值', 'reuse_threshold', 1)}
+                {field('超额空闲寿命', 'idle_ttl_ms', 1000, undefined, 'ms')}
+              </div>
+            </section>
+            <section>
+              <p className="eyebrow">探活</p>
+              <div className="mux-drawer-grid">
+                {field('探活并发', 'max_probing_workers', 1, value.reuse_threshold)}
+                {field('探活周期', 'probe_interval_ms', 2000, 60000, 'ms')}
+                {field('探活超时', 'probe_timeout_ms', 200, 10000, 'ms')}
+              </div>
+            </section>
           </div>
+          <p className="note">
+            优先使用已验证的空闲 Worker；没有空闲时先建到复用阈值，再复用活跃 Worker
+            的槽位。可用槽位用尽后允许突发扩容，超额 Worker 空闲后回收。
+          </p>
+          <p className="note">
+            预热只在复用阈值内尽力补足空闲连接，不保证业务繁忙时仍有空闲。健康探测会保留预热目标内
+            的空闲 Worker；寿命只回收超出预热目标的空闲容量。
+          </p>
+          <p className="note">
+            探活或收尾中的 Worker 不承接新流；End 写入使用独立 10 秒宽限，超时后只转为排空，
+            不会因此关闭同载的其他业务流。
+          </p>
           {error && (
             <p className="note" style={{ color: 'var(--err)' }}>
               {error}

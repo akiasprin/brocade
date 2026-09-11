@@ -213,8 +213,12 @@ func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
 		if err != nil {
 			return nil, err
 		}
+		cc, err := a.Reverse.CanaryConfig()
+		if err != nil {
+			return nil, err
+		}
 		picker, _ := reverse.NewStaticMuxPicker()
-		r = &Reverse{canaryURL: a.Reverse.CanaryUrl, ctx: h.ctx, dispatcher: h.defaultDispatcher, health: hc, tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
+		r = &Reverse{canaryURL: a.Reverse.CanaryUrl, canary: cc, ctx: h.ctx, dispatcher: h.defaultDispatcher, health: hc, tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
 		if len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
 			r.Close()
 			return nil, errors.New("reverse awaits default outbound initialization")
@@ -666,6 +670,7 @@ type Reverse struct {
 	closed       bool
 	ctx          context.Context
 	canaryURL    string
+	canary       mux.ReverseCanaryConfig
 	dispatcher   routing.Dispatcher
 	canaryCancel context.CancelFunc
 	health       mux.ReverseHealthConfig
@@ -679,7 +684,7 @@ func (r *Reverse) Tag() string {
 }
 
 func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer features.Feature) error {
-	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{ReverseHealth: &r.health, MaxConcurrency: r.health.MaxSessionsPerWorker, MaxConnection: 4096})
+	muxClient, err := mux.NewReverseClientWorker(*link, r.health)
 	if err != nil {
 		return errors.New("failed to create mux client worker").Base(err).AtWarning()
 	}

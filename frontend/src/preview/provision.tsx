@@ -3,7 +3,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchNodes, fetchRevisions, fetchTenants } from '../api';
 import { useAgentLiveness } from '../ui/agent-alive';
 import { ErrorBox, Loading } from '../ui/bits';
-import { openTabByKey } from '../ui/topbar';
 import { navigate } from '../forge/route';
 import {
   fetchPreviewNodeLogs,
@@ -404,8 +403,6 @@ function PreviewInstall({
           disabled={target == null || probe?.state !== 'online'}
           title={probe?.state === 'online' ? '' : '等 agent 上线后再发布'}
           onClick={() => {
-            /* 与 panes/nodes.tsx 中的对应按钮一致：旧外壳使用窗口，新外壳使用 nav 和地址栏 */
-            openTabByKey('deploy');
             navigate('deploy', { p: 'plan', revision: target });
             go({ p: 'list' });
           }}

@@ -24,6 +24,13 @@ const base = {
       xhttp: { path: '/xhttp', host: null, xmux: null, tuning: null, mode: 'auto' as const },
     },
   },
+  guard: {
+    no_private: true,
+    no_bittorrent: true,
+    no_mail: true,
+    no_udp_amplification: true,
+    tcp_and_quic_only: false,
+  },
 };
 
 afterEach(() => {

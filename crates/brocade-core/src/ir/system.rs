@@ -161,7 +161,7 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
                     // server also needs a fixed port (the server forwards packets to
                     // the local wg), but that is not known until the links are
                     // computed and is filled in below — see
-                    // `backfill_listen_ports`.
+                    // `assign_server_listen_ports`.
                     listen_port: endpoint.is_some().then_some(node.wireguard.listen_port),
                     endpoint,
                 }),
@@ -265,7 +265,7 @@ pub fn compile_system(doc: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) ->
         }
     }
 
-    backfill_listen_ports(doc, &mut nodes, &links);
+    assign_server_listen_ports(doc, &mut nodes, &links);
 
     if links.len() > 64 {
         diagnostics.push(Diagnostic::warn(
@@ -416,7 +416,7 @@ fn has_landing(
 /// This step can only follow the links: whether a machine hosts a server is decided by
 /// all of its links together, and the links cannot be computed until every machine's
 /// endpoint is known.
-fn backfill_listen_ports(doc: &ModelSnapshot, nodes: &mut [SystemNode], links: &[Link]) {
+fn assign_server_listen_ports(doc: &ModelSnapshot, nodes: &mut [SystemNode], links: &[Link]) {
     let hosts = links
         .iter()
         .filter_map(|link| match &link.wrap {

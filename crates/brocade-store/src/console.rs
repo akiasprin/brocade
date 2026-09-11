@@ -140,11 +140,8 @@ pub(crate) async fn create_tenant_tx(
     ensure_tenant_management_allowed(actor, &request.id)?;
     let id = required_text(request.id, "tenant id")?;
     let name = required_text(request.name, "tenant name")?;
-    // The WHERE does not compare created_revision: an unchanged name touches the whole row not
-    // at all, that field included. Compared, an older row whose created_revision is still NULL
-    // would be judged changed for the sake of backfilling metadata and consume a revision number
-    // for nothing; and once updated here the row references that number and it can no longer be
-    // returned.
+    // `created_revision` is immutable metadata, not part of semantic equality. Renaming is the
+    // only conflict update that should consume a new model revision.
     let tenant_changed = sqlx::query(
         "INSERT INTO tenants (id, name, created_revision)
          VALUES ($1, $2, $3)
@@ -172,8 +169,8 @@ const DEFAULT_WARP_PORT: u16 = 2408;
 
 /// Add the one managed WARP target every tenant receives.
 ///
-/// Existing WARP resources win, including ones created before this invariant existed. We do not
-/// rename or duplicate them: their references and operator-selected defaults remain authoritative.
+/// An operator-created WARP resource wins. We do not rename or duplicate it: its references and
+/// selected defaults remain authoritative.
 /// Callers hold the control-state write lock, which serializes allocation with every ordinary
 /// model write and makes the existence check + globally unique id allocation atomic.
 async fn ensure_default_warp_for_tenant_tx(
@@ -255,48 +252,6 @@ async fn external_outbound_id_available_tx(
     .bind(id)
     .fetch_one(&mut **tx)
     .await?)
-}
-
-/// Reconcile development/production databases created before default WARP resources existed.
-///
-/// This is deliberately a normal model revision rather than migration DML: the control-state
-/// number and stored snapshot move together, historical revisions stay truthful, and a second
-/// process or restart becomes a no-op.
-pub(crate) async fn ensure_default_warp_outbounds(pool: &PgPool) -> Result<usize> {
-    let mut tx = pool.begin().await?;
-    let previous = lock_control_state(&mut tx).await?;
-    let tenants = sqlx::query_scalar::<_, String>(
-        "SELECT tenant.id
-           FROM tenants AS tenant
-          WHERE NOT EXISTS (
-                    SELECT 1 FROM external_outbounds AS outbound
-                     WHERE outbound.tenant_id = tenant.id AND outbound.protocol = 'warp'
-                )
-          ORDER BY tenant.id",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    if tenants.is_empty() {
-        tx.commit().await?;
-        return Ok(0);
-    }
-
-    let revision_id = insert_revision(
-        &mut tx,
-        "brocade-system",
-        &format!("为 {} 个租户补齐默认 WARP", tenants.len()),
-    )
-    .await?;
-    let actor = AdminContext::system_admin("brocade-system");
-    let mut changed = 0_usize;
-    for tenant_id in &tenants {
-        if ensure_default_warp_for_tenant_tx(&mut tx, &actor, revision_id, tenant_id).await? {
-            changed += 1;
-        }
-    }
-    commit_revision(&mut tx, revision_id, previous, changed > 0).await?;
-    tx.commit().await?;
-    Ok(changed)
 }
 
 pub async fn create_user(
@@ -653,8 +608,7 @@ pub async fn upsert_app(
 /// Create the one built-in line group on a genuinely fresh installation.
 ///
 /// The durable flag matters more than the current row count: an operator may intentionally remove
-/// every group later, and a restart must not silently recreate one. Existing installations which
-/// predate the flag are marked initialized without changing their groups.
+/// every group later, and a restart must not silently recreate one.
 pub(crate) async fn ensure_default_app_group(pool: &PgPool) -> Result<bool> {
     let mut tx = pool.begin().await?;
     let previous = lock_control_state(&mut tx).await?;
@@ -664,19 +618,6 @@ pub(crate) async fn ensure_default_app_group(pool: &PgPool) -> Result<bool> {
     .fetch_one(&mut *tx)
     .await?;
     if initialized {
-        tx.commit().await?;
-        return Ok(false);
-    }
-
-    let has_apps: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apps)")
-        .fetch_one(&mut *tx)
-        .await?;
-    if has_apps {
-        sqlx::query(
-            "UPDATE control_state SET default_app_group_initialized = TRUE WHERE id = TRUE",
-        )
-        .execute(&mut *tx)
-        .await?;
         tx.commit().await?;
         return Ok(false);
     }
@@ -742,49 +683,18 @@ pub(crate) async fn upsert_app_tx(
         return Ok(true);
     }
 
-    // A fresh database has no operator-defined order yet: migration backfill establishes the
-    // legacy ID order. Keep that fallback exact as new lines arrive. Once the current sequence no
-    // longer equals ID order, it is operator-owned; a new line appends instead of silently moving
-    // any of those choices. The deferred uniqueness constraint makes the one-statement shift safe.
-    let rows = sqlx::query("SELECT id, position FROM apps ORDER BY position, id FOR UPDATE")
-        .fetch_all(&mut **tx)
-        .await?;
-    let positioned = rows
-        .iter()
-        .map(|row| {
-            Ok((
-                row.try_get::<String, _>("id")?,
-                row.try_get::<i32, _>("position")?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let follows_id = positioned.windows(2).all(|pair| pair[0].0 < pair[1].0);
-    let append_position = positioned
-        .iter()
-        .map(|(_, position)| *position)
-        .max()
-        .map(|position| {
-            position
-                .checked_add(1)
-                .ok_or_else(|| StoreError::InvalidData("app position exceeds i32 range".to_owned()))
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let position = if follows_id {
-        positioned
-            .iter()
-            .find(|(existing_id, _)| existing_id > &id)
-            .map(|(_, position)| *position)
-            .unwrap_or(append_position)
-    } else {
-        append_position
-    };
-    if position != append_position {
-        sqlx::query("UPDATE apps SET position = position + 1 WHERE position >= $1")
-            .bind(position)
-            .execute(&mut **tx)
-            .await?;
-    }
+    let position = sqlx::query_scalar::<_, i32>(
+        "SELECT position FROM apps ORDER BY position DESC, id DESC LIMIT 1 FOR UPDATE",
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|position| {
+        position
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidData("app position exceeds i32 range".to_owned()))
+    })
+    .transpose()?
+    .unwrap_or(0);
     sqlx::query(
         "INSERT INTO apps (id, label, position, created_revision)
          VALUES ($1, $2, $3, $4)",
@@ -957,9 +867,8 @@ pub(crate) async fn upsert_external_outbound_tx(
     }
     let credential = request.protocol.credential();
     // WARP has no resource-level credential: its private key and provider token are generated per
-    // machine binding and sealed in external_outbound_bindings. Storing an encrypted empty string
-    // here made an otherwise harmless default target depend on BROCADE_SECRET_KEY and conveyed no
-    // security property, so the column carries an explicit empty sentinel for this protocol.
+    // machine binding and sealed in external_outbound_bindings, so this column carries an empty
+    // sentinel for the protocol.
     let credential_sealed = if requested_protocol == "warp" {
         String::new()
     } else if credential == "<redacted>" {
@@ -1667,7 +1576,7 @@ pub(crate) async fn upsert_chain_tx(
         .transpose()?;
     let position = match (&existing, existing_app.as_deref()) {
         (Some(row), Some(current_app)) if current_app == app_id => row.try_get("position")?,
-        _ => new_chain_position_tx(tx, &app_id, &id).await?,
+        _ => new_chain_position_tx(tx, &app_id).await?,
     };
     let head_changed = match existing {
         Some(row) => {
@@ -1765,67 +1674,27 @@ pub(crate) async fn create_chain_tx(
     upsert_chain_tx(tx, actor, revision_id, app_id, request).await
 }
 
-/// Select the slot for a new chain inside one app.
-///
-/// As with apps, ID order is the fallback only while the operator has not established a custom
-/// sequence. A chain created after a custom reorder appends and cannot disturb that sequence.
-async fn new_chain_position_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    app_id: &str,
-    id: &str,
-) -> Result<i32> {
-    let rows = sqlx::query(
-        "SELECT id, position
+/// Select the next slot for a new chain inside one app.
+async fn new_chain_position_tx(tx: &mut Transaction<'_, Postgres>, app_id: &str) -> Result<i32> {
+    let position = sqlx::query_scalar::<_, i32>(
+        "SELECT position
          FROM chains
          WHERE app_id = $1
-         ORDER BY position, id
+         ORDER BY position DESC, id DESC
+         LIMIT 1
          FOR UPDATE",
     )
     .bind(app_id)
-    .fetch_all(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    let positioned = rows
-        .iter()
-        .map(|row| {
-            Ok((
-                row.try_get::<String, _>("id")?,
-                row.try_get::<i32, _>("position")?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let follows_id = positioned.windows(2).all(|pair| pair[0].0 < pair[1].0);
-    let append_position = positioned
-        .iter()
-        .map(|(_, position)| *position)
-        .max()
+    position
         .map(|position| {
             position.checked_add(1).ok_or_else(|| {
                 StoreError::InvalidData(format!("chain position exceeds i32 range in app {app_id}"))
             })
         })
-        .transpose()?
-        .unwrap_or(0);
-    let position = if follows_id {
-        positioned
-            .iter()
-            .find(|(existing_id, _)| existing_id.as_str() > id)
-            .map(|(_, position)| *position)
-            .unwrap_or(append_position)
-    } else {
-        append_position
-    };
-    if position != append_position {
-        sqlx::query(
-            "UPDATE chains
-             SET position = position + 1
-             WHERE app_id = $1 AND position >= $2",
-        )
-        .bind(app_id)
-        .bind(position)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(position)
+        .transpose()
+        .map(|position| position.unwrap_or(0))
 }
 
 /// Persist one app's complete final chain order while keeping every stable chain ID intact.
@@ -2028,17 +1897,7 @@ pub(crate) async fn upsert_ingress_tx(
     // operation may have just changed the global REALITY site, reading from the pool would take
     // the old value, and the dest echoed back would disagree with what actually landed.
     let site = crate::settings::load_settings_tx(tx).await?.reality_site;
-    let same_site = reality.dest.as_deref() == site.dest.as_deref()
-        && reality.server_names == site.server_names
-        && reality.fingerprint.as_deref().unwrap_or("chrome")
-            == site.fingerprint.as_deref().unwrap_or("chrome");
-    let fallback_mode = reality.fallback_mode.unwrap_or_else(|| {
-        if (reality.dest.is_none() && reality.server_names.is_empty()) || same_site {
-            RealityFallbackMode::GlobalSite
-        } else {
-            RealityFallbackMode::CustomSite
-        }
-    });
+    let fallback_mode = reality.fallback_mode;
     match fallback_mode {
         RealityFallbackMode::GlobalSite | RealityFallbackMode::NodeCertificate => {
             reality.dest = None;
@@ -2053,13 +1912,8 @@ pub(crate) async fn upsert_ingress_tx(
             }
         }
     }
-    let fallback_limits = reality
-        .fallback_limits
-        .clone()
-        .unwrap_or(RealityFallbackLimits::Balanced);
-    // Absent means on. Old callers submit the whole ingress on every edit, so treating absence as
-    // off would turn any unrelated change made by one of them into silently removing the guard.
-    let fallback_guard = reality.fallback_guard.unwrap_or(true);
+    let fallback_limits = reality.fallback_limits.clone();
+    let fallback_guard = reality.fallback_guard;
     let (anytls_reality_json, anytls_reality_effective) =
         normalize_anytls_reality_request(request.wires.anytls.as_ref(), &site)?;
     ensure_app_exists_tx(tx, &app_id).await?;
@@ -2077,9 +1931,8 @@ pub(crate) async fn upsert_ingress_tx(
     let server_names = serde_json::to_value(&reality.server_names)?;
     let fallback_limits_json = serde_json::to_value(&fallback_limits)?;
     let short_ids = serde_json::json!([short_id]);
-    // The console owns only Padding. POST upload controls and client-only transport selectors may
-    // still arrive from a stale browser or an old immutable snapshot, but a new managed write
-    // must not persist them.
+    // The console owns only Padding. POST upload controls and client-only transport selectors are
+    // deliberately excluded from managed writes.
     let reality_split = matches!(
         request.wires.vless.as_ref(),
         Some(TransportRequest::VlessRealityXhttp { .. })
@@ -2218,13 +2071,7 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_up, hy2_down, hy2_congestion, hy2_obfs_password,
             hy2_masquerade_kind, hy2_masquerade_url,
             projection_v4_host, projection_v4_port,
-            projection_v4_download_host, projection_v4_download_port,
-            projection_v4_download_origin_port,
-            projection_v4_download_http_host, projection_v4_download_mux,
             projection_v6_host, projection_v6_port,
-            projection_v6_download_host, projection_v6_download_port,
-            projection_v6_download_origin_port,
-            projection_v6_download_http_host, projection_v6_download_mux,
             guard_no_private, guard_no_bittorrent, guard_no_mail,
             guard_no_udp_amplification, guard_tcp_and_quic_only,
             created_revision,
@@ -2251,16 +2098,15 @@ pub(crate) async fn upsert_ingress_tx(
             $17, $18, $19, $20,
             $21, $22, $23,
             $24, $25, $26, $27, $28, $29,
-            $30, $31, $32, $33, $34, $35, $36,
-            $37, $38, $39, $40, $41, $42, $43,
-            $44, $45, $46, $47, $48,
-            $49,
-            $50,
-            $51, $52, $53, $54,
-            $55, $56, $57, $58,
-            $59, $60, $61,
-            $62, $63, $64, $65, $66, $67, $68, $69, $70,
-            $71, $72, $73, $74, $75, $76, $77
+            $30, $31, $32, $33,
+            $34, $35, $36, $37, $38,
+            $39,
+            $40,
+            $41, $42, $43, $44,
+            $45, $46, $47, $48,
+            $49, $50, $51,
+            $52, $53, $54, $55, $56, $57, $58, $59, $60,
+            $61, $62, $63, $64, $65, $66, $67
          )
          ON CONFLICT (id) DO UPDATE SET
             app_id = EXCLUDED.app_id,
@@ -2290,18 +2136,8 @@ pub(crate) async fn upsert_ingress_tx(
             hy2_masquerade_url = EXCLUDED.hy2_masquerade_url,
             projection_v4_host = EXCLUDED.projection_v4_host,
             projection_v4_port = EXCLUDED.projection_v4_port,
-            projection_v4_download_host = EXCLUDED.projection_v4_download_host,
-            projection_v4_download_port = EXCLUDED.projection_v4_download_port,
-            projection_v4_download_origin_port = EXCLUDED.projection_v4_download_origin_port,
-            projection_v4_download_http_host = EXCLUDED.projection_v4_download_http_host,
-            projection_v4_download_mux = EXCLUDED.projection_v4_download_mux,
             projection_v6_host = EXCLUDED.projection_v6_host,
             projection_v6_port = EXCLUDED.projection_v6_port,
-            projection_v6_download_host = EXCLUDED.projection_v6_download_host,
-            projection_v6_download_port = EXCLUDED.projection_v6_download_port,
-            projection_v6_download_origin_port = EXCLUDED.projection_v6_download_origin_port,
-            projection_v6_download_http_host = EXCLUDED.projection_v6_download_http_host,
-            projection_v6_download_mux = EXCLUDED.projection_v6_download_mux,
             guard_no_private = EXCLUDED.guard_no_private,
             guard_no_bittorrent = EXCLUDED.guard_no_bittorrent,
             guard_no_mail = EXCLUDED.guard_no_mail,
@@ -2356,13 +2192,7 @@ pub(crate) async fn upsert_ingress_tx(
                    ingresses.hy2_congestion, ingresses.hy2_obfs_password,
                    ingresses.hy2_masquerade_kind, ingresses.hy2_masquerade_url,
                    ingresses.projection_v4_host, ingresses.projection_v4_port,
-                   ingresses.projection_v4_download_host, ingresses.projection_v4_download_port,
-                   ingresses.projection_v4_download_origin_port,
-                   ingresses.projection_v4_download_http_host, ingresses.projection_v4_download_mux,
                    ingresses.projection_v6_host, ingresses.projection_v6_port,
-                   ingresses.projection_v6_download_host, ingresses.projection_v6_download_port,
-                   ingresses.projection_v6_download_origin_port,
-                   ingresses.projection_v6_download_http_host, ingresses.projection_v6_download_mux,
                    ingresses.guard_no_private, ingresses.guard_no_bittorrent,
                    ingresses.guard_no_mail, ingresses.guard_no_udp_amplification,
                    ingresses.guard_tcp_and_quic_only,
@@ -2390,13 +2220,7 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.hy2_congestion, EXCLUDED.hy2_obfs_password,
                 EXCLUDED.hy2_masquerade_kind, EXCLUDED.hy2_masquerade_url,
                 EXCLUDED.projection_v4_host, EXCLUDED.projection_v4_port,
-                EXCLUDED.projection_v4_download_host, EXCLUDED.projection_v4_download_port,
-                EXCLUDED.projection_v4_download_origin_port,
-                EXCLUDED.projection_v4_download_http_host, EXCLUDED.projection_v4_download_mux,
                 EXCLUDED.projection_v6_host, EXCLUDED.projection_v6_port,
-                EXCLUDED.projection_v6_download_host, EXCLUDED.projection_v6_download_port,
-                EXCLUDED.projection_v6_download_origin_port,
-                EXCLUDED.projection_v6_download_http_host, EXCLUDED.projection_v6_download_mux,
                 EXCLUDED.guard_no_private, EXCLUDED.guard_no_bittorrent,
                 EXCLUDED.guard_no_mail, EXCLUDED.guard_no_udp_amplification,
                 EXCLUDED.guard_tcp_and_quic_only,
@@ -2464,87 +2288,15 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(hy2_masquerade_url)
     .bind(projection.v4.as_ref().map(|to| to.host.clone()))
     .bind(projection.v4.as_ref().map(|to| i32::from(to.port)))
-    .bind(
-        projection
-            .v4
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .map(|to| to.host.clone()),
-    )
-    .bind(
-        projection
-            .v4
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .map(|to| i32::from(to.port)),
-    )
-    .bind(
-        projection
-            .v4
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .and_then(|to| to.origin_port.map(i32::from)),
-    )
-    .bind(
-        projection
-            .v4
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .and_then(|to| to.http_host.clone()),
-    )
-    .bind(
-        projection
-            .v4
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .and_then(|to| to.mux.map(i32::from)),
-    )
     .bind(projection.v6.as_ref().map(|to| to.host.clone()))
     .bind(projection.v6.as_ref().map(|to| i32::from(to.port)))
-    .bind(
-        projection
-            .v6
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .map(|to| to.host.clone()),
-    )
-    .bind(
-        projection
-            .v6
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .map(|to| i32::from(to.port)),
-    )
-    .bind(
-        projection
-            .v6
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .and_then(|to| to.origin_port.map(i32::from)),
-    )
-    .bind(
-        projection
-            .v6
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .and_then(|to| to.http_host.clone()),
-    )
-    .bind(
-        projection
-            .v6
-            .as_ref()
-            .and_then(|to| to.download.as_ref())
-            .and_then(|to| to.mux.map(i32::from)),
-    )
     .bind(request.guard.no_private)
     .bind(request.guard.no_bittorrent)
     .bind(request.guard.no_mail)
     .bind(request.guard.no_udp_amplification)
     .bind(request.guard.tcp_and_quic_only)
     .bind(u64_to_i64(revision_id, "revision_id")?)
-    /* 九个 QUIC 调优项排在 created_revision 之后，是为了不动前面 53 个占位符的编号。
-    这条 INSERT 的参数是位置式的，插在中间会把后面每一个绑定挪到邻居身上——不报错、
-    不失败，只是这个接入面读回来带着别人的值（见 tests/pg_reality_guard.rs 的模块头）。 */
+    /* 这些绑定必须和 INSERT 的列顺序保持一致；集成测试覆盖完整回读。 */
     .bind(
         hysteria2
             .map(|h| h.bbr_profile)
@@ -2951,15 +2703,15 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 s.token_revoked_at::text AS token_revoked_at,
                 s.agent_version,
                 s.agent_protocol_version,
-                s.runtime_versions,
-                s.spool_backlog,
+                COALESCE(s.runtime_versions, '{}'::jsonb) AS runtime_versions,
+                COALESCE(s.spool_backlog, '{}'::jsonb) AS spool_backlog,
                 s.last_local_reconcile,
-                s.wireguard_health,
+                COALESCE(s.wireguard_health, '{}'::jsonb) AS wireguard_health,
                 s.runtime_reported_at::text AS runtime_reported_at,
-                s.geodata_observed,
+                COALESCE(s.geodata_observed, '{}'::jsonb) AS geodata_observed,
                 s.last_poll_at::text AS last_poll_at,
                 s.last_usage_report_at::text AS last_usage_report_at,
-                s.usage_last_result,
+                COALESCE(s.usage_last_result, '{}'::jsonb) AS usage_last_result,
                 s.usage_generation_id,
                 s.xray_started_at::text AS xray_started_at,
                 a.phantun_state,
@@ -3030,15 +2782,15 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 s.token_revoked_at::text AS token_revoked_at,
                 s.agent_version,
                 s.agent_protocol_version,
-                s.runtime_versions,
-                s.spool_backlog,
+                COALESCE(s.runtime_versions, '{}'::jsonb) AS runtime_versions,
+                COALESCE(s.spool_backlog, '{}'::jsonb) AS spool_backlog,
                 s.last_local_reconcile,
-                s.wireguard_health,
+                COALESCE(s.wireguard_health, '{}'::jsonb) AS wireguard_health,
                 s.runtime_reported_at::text AS runtime_reported_at,
-                s.geodata_observed,
+                COALESCE(s.geodata_observed, '{}'::jsonb) AS geodata_observed,
                 s.last_poll_at::text AS last_poll_at,
                 s.last_usage_report_at::text AS last_usage_report_at,
-                s.usage_last_result,
+                COALESCE(s.usage_last_result, '{}'::jsonb) AS usage_last_result,
                 s.usage_generation_id,
                 s.xray_started_at::text AS xray_started_at,
                 a.phantun_state,
@@ -3085,33 +2837,32 @@ fn node_conn_column(row: &sqlx::postgres::PgRow, column: &str) -> Result<Option<
 }
 
 fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentStateItem> {
-    let applied = row
-        .try_get::<Option<String>, _>("wireguard_state")?
-        .map(|wireguard_state| {
-            json!({
-                "phantun": {
-                    "state": row.try_get::<Option<String>, _>("phantun_state").ok().flatten(),
-                    "sha256": row.try_get::<Option<String>, _>("phantun_sha256").ok().flatten()
-                },
-                "wireguard": {
-                    "state": wireguard_state,
-                    "sha256": row.try_get::<Option<String>, _>("wireguard_sha256").ok().flatten()
-                },
-                "xray": {
-                    "state": row.try_get::<Option<String>, _>("xray_state").ok().flatten(),
-                    "sha256": row.try_get::<Option<String>, _>("xray_sha256").ok().flatten()
-                },
-                "hy2_port_hop": {
-                    "state": row.try_get::<Option<String>, _>("hy2_port_hop_state").ok().flatten(),
-                    "sha256": row.try_get::<Option<String>, _>("hy2_port_hop_sha256").ok().flatten()
-                },
-                "grants": {
-                    "state": row.try_get::<Option<String>, _>("grants_state").ok().flatten()
-                },
-                "source_deployment_id": row.try_get::<Option<i64>, _>("source_deployment_id").ok().flatten(),
-                "observed_at": row.try_get::<Option<String>, _>("observed_at").ok().flatten()
-            })
-        });
+    let applied = match row.try_get::<Option<String>, _>("wireguard_state")? {
+        Some(wireguard_state) => Some(json!({
+            "phantun": {
+                "state": row.try_get::<Option<String>, _>("phantun_state")?,
+                "sha256": row.try_get::<Option<String>, _>("phantun_sha256")?
+            },
+            "wireguard": {
+                "state": wireguard_state,
+                "sha256": row.try_get::<Option<String>, _>("wireguard_sha256")?
+            },
+            "xray": {
+                "state": row.try_get::<Option<String>, _>("xray_state")?,
+                "sha256": row.try_get::<Option<String>, _>("xray_sha256")?
+            },
+            "hy2_port_hop": {
+                "state": row.try_get::<Option<String>, _>("hy2_port_hop_state")?,
+                "sha256": row.try_get::<Option<String>, _>("hy2_port_hop_sha256")?
+            },
+            "grants": {
+                "state": row.try_get::<Option<String>, _>("grants_state")?
+            },
+            "source_deployment_id": row.try_get::<Option<i64>, _>("source_deployment_id")?,
+            "observed_at": row.try_get::<Option<String>, _>("observed_at")?
+        })),
+        None => None,
+    };
 
     let operationally_isolated: bool = row.try_get("operationally_isolated")?;
     let convergence_debt_count = u64::try_from(row.try_get::<i64, _>("convergence_debt_count")?)
@@ -3184,18 +2935,16 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         token_revoked_at: row.try_get("token_revoked_at")?,
         agent_version: row.try_get("agent_version")?,
         agent_protocol_version: row.try_get("agent_protocol_version")?,
-        // An empty object counts as never reported, as NULL does: the column is
-        // NOT NULL DEFAULT '{}', a newly enrolled machine is born with an empty object, and that
-        // is the same thing as an older agent's NULL.
-        runtime_versions: non_empty_json(row.try_get("runtime_versions").ok()),
-        spool_backlog: non_empty_json(row.try_get("spool_backlog").ok()),
-        last_local_reconcile: row.try_get("last_local_reconcile").ok().flatten(),
-        wireguard_health: non_empty_json(row.try_get("wireguard_health").ok()),
+        // A newly enrolled machine starts with an empty object until its first runtime report.
+        runtime_versions: non_empty_json(row.try_get("runtime_versions")?),
+        spool_backlog: non_empty_json(row.try_get("spool_backlog")?),
+        last_local_reconcile: row.try_get("last_local_reconcile")?,
+        wireguard_health: non_empty_json(row.try_get("wireguard_health")?),
         runtime_reported_at: row.try_get("runtime_reported_at")?,
-        geodata_observed: non_empty_json(row.try_get("geodata_observed").ok()),
+        geodata_observed: non_empty_json(row.try_get("geodata_observed")?),
         last_poll_at: row.try_get("last_poll_at")?,
         last_usage_report_at: row.try_get("last_usage_report_at")?,
-        usage_last_result: non_empty_json(row.try_get("usage_last_result").ok()),
+        usage_last_result: non_empty_json(row.try_get("usage_last_result")?),
         usage_generation_id: row.try_get("usage_generation_id")?,
         xray_started_at: row.try_get("xray_started_at")?,
         overlay: row.try_get("overlay")?,
@@ -3881,9 +3630,7 @@ fn normalize_reality_request(
     // usable on a single ingress.
     let flow = request.flow.map(|value| value.trim().to_owned());
     crate::settings::validate_flow(flow.as_deref(), "reality.flow")?;
-    if let Some(RealityFallbackLimits::Custom { upload, download }) =
-        request.fallback_limits.as_ref()
-    {
+    if let RealityFallbackLimits::Custom { upload, download } = &request.fallback_limits {
         validate_fallback_rate(upload, "reality.fallback_limits.upload")?;
         validate_fallback_rate(download, "reality.fallback_limits.download")?;
     }
@@ -3898,9 +3645,9 @@ fn normalize_reality_request(
     })
 }
 
-/// AnyTLS owns a REALITY target separate from VLESS. Its request is nested in the AnyTLS wire,
-/// while the older top-level `reality` object remains VLESS-only. Only global and custom targets
-/// are accepted: a node certificate is the TLS mode, not an AnyTLS REALITY fallback mode.
+/// AnyTLS owns a REALITY target separate from VLESS. Its request is nested in the AnyTLS wire;
+/// the top-level `reality` object belongs to VLESS. Only global and custom targets are accepted:
+/// a node certificate is the TLS mode, not an AnyTLS REALITY fallback mode.
 fn normalize_anytls_reality_request(
     anytls: Option<&brocade_core::model::AnyTls>,
     site: &brocade_core::model::RealitySite,
@@ -3908,33 +3655,33 @@ fn normalize_anytls_reality_request(
     let Some(anytls) = anytls else {
         return Ok((None, None));
     };
-    let requested = anytls.reality.clone().unwrap_or(RealitySettings {
-        dest: String::new(),
-        server_names: Vec::new(),
-        fingerprint: String::new(),
-        flow: None,
-        fallback_mode: RealityFallbackMode::GlobalSite,
-        fallback_limits: RealityFallbackLimits::Balanced,
-        fallback_guard: true,
-    });
+    if anytls.security == AnyTlsSecurity::Tls {
+        if anytls.reality.is_some() {
+            return Err(StoreError::InvalidData(
+                "AnyTLS TLS must not carry REALITY settings".to_owned(),
+            ));
+        }
+        return Ok((None, None));
+    }
+    let requested = anytls.reality.clone().ok_or_else(|| {
+        StoreError::InvalidData("AnyTLS REALITY requires its target settings".to_owned())
+    })?;
     if requested.fallback_mode == RealityFallbackMode::NodeCertificate {
         return Err(StoreError::InvalidData(
             "AnyTLS REALITY target must be global-site or custom-site".to_owned(),
         ));
     }
     let mut normalized = normalize_reality_request(CreateRealityIngressRequest {
-        fallback_mode: Some(requested.fallback_mode),
-        fallback_limits: Some(requested.fallback_limits),
-        fallback_guard: Some(requested.fallback_guard),
+        fallback_mode: requested.fallback_mode,
+        fallback_limits: requested.fallback_limits,
+        fallback_guard: requested.fallback_guard,
         dest: (!requested.dest.trim().is_empty()).then_some(requested.dest),
         server_names: requested.server_names,
         fingerprint: (!requested.fingerprint.trim().is_empty()).then_some(requested.fingerprint),
         // Vision is a VLESS account flow. AnyTLS never stores or emits it.
         flow: None,
     })?;
-    let fallback_mode = normalized
-        .fallback_mode
-        .unwrap_or(RealityFallbackMode::GlobalSite);
+    let fallback_mode = normalized.fallback_mode;
     match fallback_mode {
         RealityFallbackMode::GlobalSite => {
             normalized.dest = None;
@@ -3956,10 +3703,8 @@ fn normalize_anytls_reality_request(
         fingerprint: normalized.fingerprint.unwrap_or_default(),
         flow: None,
         fallback_mode,
-        fallback_limits: normalized
-            .fallback_limits
-            .unwrap_or(RealityFallbackLimits::Balanced),
-        fallback_guard: normalized.fallback_guard.unwrap_or(true),
+        fallback_limits: normalized.fallback_limits,
+        fallback_guard: normalized.fallback_guard,
     };
     let mut effective = stored.clone();
     if fallback_mode == RealityFallbackMode::GlobalSite {
@@ -4065,8 +3810,7 @@ fn optional_owned_text(value: Option<String>) -> Option<String> {
 }
 
 /// Normalization of one family's projected endpoint. `None` on the way in means no projection,
-/// landing as two NULLs. The nested download shape is historical client state and is deliberately
-/// discarded here; XHTTP downloads are persisted from `wires.*.xhttp.download` instead.
+/// landing as two NULLs. XHTTP downloads are persisted from `wires.*.xhttp.download`.
 ///
 /// An empty host is turned back here rather than left to the database's CHECK: what a constraint
 /// reports is "violates ingresses_projection_v4_check", from which the UI cannot tell which field
@@ -4084,7 +3828,6 @@ fn normalized_projection(
     Ok(Some(ProjectionEndpoint {
         host,
         port: endpoint.port,
-        download: None,
     }))
 }
 

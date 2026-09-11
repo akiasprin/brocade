@@ -133,12 +133,12 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 					return nil, errors.New("mux worker pool requires concurrency between 1 and 128")
 				}
 				workerPool = &mux.WorkerPoolConfig{
-					MinIdleWorkers:    pool.MinIdleWorkers,
-					MaxIdleWorkers:    pool.MaxIdleWorkers,
+					PrewarmWorkers:    pool.PrewarmWorkers,
+					ReuseThreshold:    pool.ReuseThreshold,
 					MaxProbingWorkers: pool.MaxProbingWorkers,
-					ProbeInterval:     time.Duration(pool.ProbeIntervalSecs) * time.Second,
+					ProbeInterval:     time.Duration(pool.ProbeIntervalMs) * time.Millisecond,
 					ProbeTimeout:      time.Duration(pool.ProbeTimeoutMs) * time.Millisecond,
-					IdleTTL:           time.Duration(pool.IdleTtlSecs) * time.Second,
+					IdleTTL:           time.Duration(pool.IdleTtlMs) * time.Millisecond,
 				}
 				maxRequests = pool.MaxRequestsPerWorker
 				if err := workerPool.Validate(maxRequests); err != nil {
@@ -152,21 +152,25 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				config.Concurrency = 8 // same as before
 			}
 			if config.Concurrency > 0 {
-				h.mux = &mux.ClientManager{
-					Enabled: true,
-					Picker: &mux.IncrementalWorkerPicker{
-						Pool: workerPool,
-						Tag:  h.tag,
-						Factory: &mux.DialingWorkerFactory{
-							Proxy:  proxyHandler,
-							Dialer: h,
-							Strategy: mux.ClientStrategy{
-								MaxConcurrency: uint32(config.Concurrency),
-								MaxConnection:  maxRequests,
-								WorkerPool:     workerPool,
-							},
+				picker := &mux.IncrementalWorkerPicker{
+					Pool: workerPool,
+					Tag:  h.tag,
+					Factory: &mux.DialingWorkerFactory{
+						Proxy:  proxyHandler,
+						Dialer: h,
+						Strategy: mux.ClientStrategy{
+							MaxConcurrency: uint32(config.Concurrency),
+							MaxConnection:  maxRequests,
+							WorkerPool:     workerPool,
 						},
 					},
+				}
+				if workerPool != nil {
+					picker.EnableObservation("tcp")
+				}
+				h.mux = &mux.ClientManager{
+					Enabled: true,
+					Picker:  picker,
 				}
 			}
 			if config.XudpConcurrency < 0 {
@@ -176,21 +180,25 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				h.xudp = nil // same as before
 			}
 			if config.XudpConcurrency > 0 {
-				h.xudp = &mux.ClientManager{
-					Enabled: true,
-					Picker: &mux.IncrementalWorkerPicker{
-						Pool: workerPool,
-						Tag:  h.tag,
-						Factory: &mux.DialingWorkerFactory{
-							Proxy:  proxyHandler,
-							Dialer: h,
-							Strategy: mux.ClientStrategy{
-								MaxConcurrency: uint32(config.XudpConcurrency),
-								MaxConnection:  maxRequests,
-								WorkerPool:     workerPool,
-							},
+				picker := &mux.IncrementalWorkerPicker{
+					Pool: workerPool,
+					Tag:  h.tag,
+					Factory: &mux.DialingWorkerFactory{
+						Proxy:  proxyHandler,
+						Dialer: h,
+						Strategy: mux.ClientStrategy{
+							MaxConcurrency: uint32(config.XudpConcurrency),
+							MaxConnection:  maxRequests,
+							WorkerPool:     workerPool,
 						},
 					},
+				}
+				if workerPool != nil {
+					picker.EnableObservation("xudp")
+				}
+				h.xudp = &mux.ClientManager{
+					Enabled: true,
+					Picker:  picker,
 				}
 			}
 			h.udp443 = config.XudpProxyUDP443

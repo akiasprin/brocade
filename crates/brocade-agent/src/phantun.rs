@@ -16,9 +16,7 @@ use crate::{
     shell_quote, write_private,
 };
 
-pub(crate) const PHANTUN_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log-v3";
-const PHANTUN_SHARED_POLICY_LOG_MARKER: &str = "phantun.bounded-log-v2";
-const PHANTUN_OLD_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log-v1";
+pub(crate) const PHANTUN_BOUNDED_LOG_MARKER: &str = "phantun.bounded-log";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PhantunInstanceKind {
@@ -120,11 +118,8 @@ pub(crate) fn converge_linux_phantun(
         }
         DesiredArtifact::Disabled { reason } => {
             stop_phantun();
-            let _ = fs::remove_file("/tmp/brocade-agent-phantun.log");
             let _ = fs::remove_file(state_dir.join("phantun.json"));
             let _ = fs::remove_file(state_dir.join(PHANTUN_BOUNDED_LOG_MARKER));
-            let _ = fs::remove_file(state_dir.join(PHANTUN_SHARED_POLICY_LOG_MARKER));
-            let _ = fs::remove_file(state_dir.join(PHANTUN_OLD_BOUNDED_LOG_MARKER));
             fs::write(state_dir.join("phantun.disabled"), reason)
                 .map_err(|error| error.to_string())?;
             Ok(())
@@ -197,10 +192,6 @@ pub(crate) fn apply_phantun(
     }
     fs::write(state_dir.join(PHANTUN_BOUNDED_LOG_MARKER), b"dynamic\n")
         .map_err(|error| format!("failed to record bounded phantun logging: {error}"))?;
-    let _ = fs::remove_file(state_dir.join(PHANTUN_SHARED_POLICY_LOG_MARKER));
-    let _ = fs::remove_file(state_dir.join(PHANTUN_OLD_BOUNDED_LOG_MARKER));
-    // stop_phantun has closed every legacy descriptor, so this unlink releases the blocks now.
-    let _ = fs::remove_file("/tmp/brocade-agent-phantun.log");
     Ok(())
 }
 
@@ -482,16 +473,13 @@ pub(crate) fn observe_linux_phantun(
 
 /// The servers to stand up according to `phantun.json`.
 ///
-/// The current format is a `servers` array — one public machine may host a server
-/// for each of several peers behind NAT (`ir::system::LinkWrap`). The old format
-/// was a singular `server` object, accepted here as well: what sits in state_dir
-/// may predate the upgrade, and failing to read it amounts to "this machine needs
-/// no phantun", which is the hardest kind of silent failure to find.
+/// One public machine may host a server for each of several peers behind NAT
+/// (`ir::system::LinkWrap`).
 pub(crate) fn phantun_servers(plan: &serde_json::Value) -> Vec<&serde_json::Value> {
-    if let Some(servers) = plan.get("servers").and_then(serde_json::Value::as_array) {
-        return servers.iter().collect();
-    }
-    plan.get("server").into_iter().collect()
+    plan.get("servers")
+        .and_then(serde_json::Value::as_array)
+        .map(|servers| servers.iter().collect())
+        .unwrap_or_default()
 }
 
 fn required_u16(instance: &serde_json::Value, key: &str, location: &str) -> Result<u16, String> {
@@ -743,38 +731,11 @@ mod tests {
         dir
     }
 
-    /// The old format is a singular `server` object, the new one a `servers`
-    /// array. What landed in state_dir before the upgrade is the old shape, and
-    /// failing to read it amounts to "this machine needs no phantun" — no server
-    /// started, no DNAT written, and the console showing everything as fine. That
-    /// is the hardest kind of silent failure to find, so both spellings count.
     #[test]
-    fn both_the_old_singular_server_and_the_new_array_are_read() {
-        let new = json!({ "servers": [{ "tcp_port": 39743 }, { "tcp_port": 39744 }] });
-        assert_eq!(phantun_servers(&new).len(), 2);
-
-        let old = json!({ "server": { "tcp_port": 39743 } });
-        let found = phantun_servers(&old);
-        assert_eq!(found.len(), 1, "老格式的单数 server 也要认");
-        assert_eq!(found[0]["tcp_port"], 39743);
-
-        // Only with neither key present does this machine truly host no
-        // server.
+    fn servers_are_read_from_the_array() {
+        let plan = json!({ "servers": [{ "tcp_port": 39743 }, { "tcp_port": 39744 }] });
+        assert_eq!(phantun_servers(&plan).len(), 2);
         assert!(phantun_servers(&json!({ "clients": [] })).is_empty());
-    }
-
-    /// With `servers` present, `server` is not consulted. Both at once can only
-    /// mean corruption, and treating the old key as a supplement conjures an extra
-    /// process and an extra DNAT out of nothing.
-    #[test]
-    fn the_new_array_wins_when_both_spellings_are_present() {
-        let both = json!({
-            "servers": [{ "tcp_port": 39743 }],
-            "server": { "tcp_port": 1 },
-        });
-        let found = phantun_servers(&both);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0]["tcp_port"], 39743);
     }
 
     /// An empty array means "this machine needs no phantun", not "unreadable".

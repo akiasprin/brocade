@@ -29,7 +29,6 @@ use sha2::{Digest, Sha256};
 pub struct ModelSnapshot {
     pub revision: u64,
     pub overlay_cidr: Ipv4Net,
-    #[serde(default)]
     pub settings: ModelSettings,
     pub nodes: Vec<Node>,
     /// DNS policies belong to one machine's Xray instance. Every stored policy is emitted and
@@ -43,7 +42,6 @@ pub struct ModelSnapshot {
     /// They live beside nodes and users rather than inside `AppView`: a project consumes a tunnel
     /// but does not own it. Tunnel ids are globally unique, so a rule can keep its compact id-only
     /// reference without becoming ambiguous across tenant ancestry.
-    #[serde(default)]
     pub external_outbounds: Vec<ExternalOutbound>,
     pub apps: Vec<AppView>,
 }
@@ -73,10 +71,7 @@ pub struct ModelSettings {
     /// Fleet-wide AnyTLS padding used by every ingress which does not carry an override.
     ///
     /// This is one current scheme, not a version list. A fresh control plane replaces the
-    /// deterministic compatibility fallback with an installation-specific random scheme while
-    /// migrating its database; keeping a serde default is still necessary for historical model
-    /// snapshots written before the field existed.
-    #[serde(default = "default_anytls_padding_scheme")]
+    /// deterministic bootstrap value with an installation-specific random scheme.
     pub anytls_padding_scheme: Vec<String>,
     #[serde(default)]
     pub overlay: OverlaySettings,
@@ -134,8 +129,7 @@ impl Default for ModelSettings {
     }
 }
 
-/// Compatibility fallback for old snapshots. Database-backed installations receive a random
-/// scheme with the same four-stage shape instead (see `brocade-store::settings`).
+/// Bootstrap scheme used before the database installs its random four-stage value.
 ///
 /// Each range is deliberately cheaper than Xray's built-in AnyTLS scheme: packet zero never
 /// exceeds its fixed 30 bytes, packet one never exceeds its 100-byte minimum, packet two has one
@@ -323,11 +317,7 @@ pub struct PortSettings {
     pub ingress_base: u16,
     /// AnyTLS ingresses search upward from this port, on TCP.
     ///
-    /// Older serialized model revisions predate this setting. They use the factory value when
-    /// read so adding the allocator control does not make those revisions unreadable.
-    #[serde(default = "default_anytls_port_base")]
     pub anytls_base: u16,
-    #[serde(default = "default_vless_encryption_port_base")]
     pub vless_encryption_base: u16,
     /// Relay ports search upward from this port. A high range keeps them clear of
     /// ingresses and system services.
@@ -342,10 +332,7 @@ pub struct PortSettings {
     pub hy2_base: u16,
 }
 
-pub const VLESS_ENCRYPTION_PORT_BASE: u16 = 48000;
-fn default_vless_encryption_port_base() -> u16 {
-    VLESS_ENCRYPTION_PORT_BASE
-}
+pub const VLESS_ENCRYPTION_PORT_BASE: u16 = 13800;
 
 impl Default for PortSettings {
     fn default() -> Self {
@@ -361,7 +348,7 @@ impl Default for PortSettings {
 
 #[cfg(test)]
 mod port_settings_tests {
-    use super::{ANYTLS_PORT_BASE, PortSettings, VLESS_PORT_BASE};
+    use super::{PortSettings, ANYTLS_PORT_BASE, VLESS_ENCRYPTION_PORT_BASE, VLESS_PORT_BASE};
 
     #[test]
     fn factory_bases_keep_vless_and_anytls_in_separate_ranges() {
@@ -370,19 +357,8 @@ mod port_settings_tests {
         assert_eq!(ports.ingress_base, 13_443);
         assert_eq!(ports.anytls_base, ANYTLS_PORT_BASE);
         assert_eq!(ports.anytls_base, 14_443);
-    }
-
-    #[test]
-    fn revisions_without_anytls_base_use_the_current_factory_value() {
-        let ports: PortSettings = serde_json::from_value(serde_json::json!({
-            "ingress_base": 8443,
-            "hop_base": 20000,
-            "hy2_base": 18000
-        }))
-        .unwrap();
-
-        assert_eq!(ports.anytls_base, ANYTLS_PORT_BASE);
-        assert_eq!(ports.anytls_base, 14_443);
+        assert_eq!(ports.vless_encryption_base, VLESS_ENCRYPTION_PORT_BASE);
+        assert_eq!(ports.vless_encryption_base, 13_800);
     }
 }
 
@@ -423,7 +399,7 @@ impl Default for OverlaySettings {
     fn default() -> Self {
         Self {
             keepalive_secs: 10,
-            mtu: 1420,
+            mtu: 1280,
             disabled_links: Vec::new(),
         }
     }
@@ -523,9 +499,7 @@ pub struct Node {
     pub overlay: bool,
     pub egress_allowed: bool,
     pub dns: Dns,
-    /// See `DomainStrategy`. Defaulted so that a snapshot written before this field existed
-    /// still deserializes, landing on the value the artifact layer used to hard-code.
-    #[serde(default)]
+    /// See [`DomainStrategy`].
     pub domain_strategy: DomainStrategy,
     /// Decommissioned. A decommissioned machine stays in the snapshot because it still
     /// has to receive a desired state that disables all three artifacts, which the agent
@@ -598,8 +572,7 @@ pub enum HopWire {
     /// The account is required. Relay traffic is attributed by the credential that carried
     /// it: the routing rules select on it, and the usage counters are keyed by it. A port
     /// holding only the port-wide key therefore admits traffic with no attribution, which
-    /// leaves by whichever rule matches next and is never counted. This shipped once and was
-    /// found when a chain in the preview cluster took an unrelated relay's exit.
+    /// leaves by whichever rule matches next and is never counted.
     ///
     /// Both keys are secret in full. Unlike VLESS Encryption or REALITY, whose private half
     /// stays on the listener, these are written into the dialing machine's artifacts as well,
@@ -778,8 +751,8 @@ pub enum EgressDnsFallback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DomainStrategy {
-    /// The default, and the value the artifact layer previously hard-coded. Both families are
-    /// queried and the address is selected at random from the merged list, per dial, so one
+    /// The default. Both families are queried and the address is selected at random from the
+    /// merged list, per dial, so one
     /// domain may leave over v4 on one connection and v6 on the next. This is not a preference
     /// order: the probability follows the record count rather than the family, so four A
     /// records and one AAAA give a one-in-five chance of leaving over v6.
@@ -893,13 +866,9 @@ pub enum ExternalOutboundProtocol {
     },
     Vless {
         credential: String,
-        #[serde(default = "external_vless_encryption_none")]
         encryption: String,
-        #[serde(default)]
         flow: Option<String>,
-        /// The wire carrying VLESS. Missing on rows and historical snapshots written before
-        /// external XHTTP existed, where RAW/TCP was the only possible value.
-        #[serde(default)]
+        /// The wire carrying VLESS.
         transport: ExternalVlessTransport,
     },
     Shadowsocks2022 {
@@ -1009,10 +978,6 @@ pub struct ExternalVlessXhttpDownload {
     pub mode: XhttpMode,
 }
 
-fn external_vless_encryption_none() -> String {
-    "none".to_owned()
-}
-
 fn external_wireguard_mtu() -> u16 {
     1420
 }
@@ -1117,8 +1082,8 @@ pub struct Chain {
     pub tenant: String,
     pub name: String,
     /// Optional ISO 3166-1 alpha-2 code rendered as a flag in user-facing subscription names.
-    /// It is explicit model state rather than a live GeoIP result so historical artifacts and
-    /// rollback remain deterministic. Old snapshots omit it and therefore retain their names.
+    /// It is explicit model state rather than a live GeoIP result so stored artifacts and
+    /// rollback remain deterministic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_country: Option<String>,
 }
@@ -1135,17 +1100,15 @@ pub struct Ingress {
     pub front: Option<String>,
     /// Stable credentials owned by the ingress, independent of how its traffic is carried.
     pub identity: IngressIdentity,
-    /// AnyTLS REALITY owns a separately generated identity. It is optional for snapshots created
-    /// before AnyTLS REALITY existed and for ingresses that have never enabled AnyTLS.
+    /// AnyTLS REALITY owns a separately generated identity. It is absent until the ingress enables
+    /// that wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anytls_identity: Option<IngressIdentity>,
     pub wires: IngressWires,
     /// This ingress's outward address. With neither family projected, the artifacts are
     /// byte for byte what they would be without this field.
-    #[serde(default)]
     pub projection: Projection,
     /// What this ingress refuses to carry, applied before the chain's rules.
-    #[serde(default)]
     pub guard: IngressGuard,
 }
 
@@ -1177,31 +1140,22 @@ pub struct IngressGuard {
     /// The fleet's own overlay and every private range. This is isolation rather than abuse
     /// protection: without it a subscriber reaches this machine's `10.66.0.0/16` neighbours and
     /// anything else on the datacenter's internal network.
-    #[serde(default = "yes")]
     pub no_private: bool,
     /// BitTorrent, by protocol rather than by port.
     ///
     /// Depends on sniffing: the match reads the sniffer's result, so an ingress that does not
     /// sniff cannot apply it. Rejected at validation (`ingress.guard-needs-sniffing`) rather
     /// than compiled into a rule that matches nothing.
-    #[serde(default = "yes")]
     pub no_bittorrent: bool,
     /// Outbound SMTP. Abuse of this port is the most common cause of the machine's address being
     /// blacklisted, and ordinary clients do not send mail through a proxy.
-    #[serde(default = "yes")]
     pub no_mail: bool,
     /// The UDP services used for reflection attacks: chargen, DNS, NTP, SNMP, CLDAP, SSDP,
     /// memcached. A subscriber reaches these deliberately only when running their own.
-    #[serde(default = "yes")]
     pub no_udp_amplification: bool,
     /// Everything UDP except 443. Off by default, because it also blocks games, voice, and every
     /// self-hosted UDP service. QUIC continues to work, since it runs on 443.
-    #[serde(default)]
     pub tcp_and_quic_only: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 impl Default for IngressGuard {
@@ -1217,8 +1171,7 @@ impl Default for IngressGuard {
 }
 
 impl IngressGuard {
-    /// Nothing refused. The behavior of an ingress created before this field existed, and the
-    /// value the tests asserting on the old artifacts require.
+    /// Explicitly allow every traffic class.
     pub const OPEN: Self = Self {
         no_private: false,
         no_bittorrent: false,
@@ -1282,11 +1235,6 @@ pub struct ProjectionEndpoint {
     /// `format/uri.rs` adds them.
     pub host: String,
     pub port: u16,
-    /// Optional client downlink. It reaches the same XHTTP core and inherits the ingress's path,
-    /// TLS name and fingerprint. A split REALITY ingress may additionally name the node-side TLS
-    /// listener separately from the public dial port.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download: Option<ProjectionDownloadEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1457,17 +1405,10 @@ pub struct Hysteria2 {
     /// The UDP port this wire listens on. It belongs to the wire, not to the ingress.
     ///
     /// A port belongs to a wire because the ingress identifies which machine receives and the
-    /// wire identifies where on that machine. The two wires previously shared `Ingress::port`,
-    /// on the grounds that TCP and UDP are separate spaces and one number collides with nothing.
-    /// That holds until port hopping, which claims a whole UDP range; a range containing the TCP
-    /// wire's number is one omitted `-p udp` away from capturing it. Separate numbers make that
-    /// class of error unrepresentable.
+    /// wire identifies where on that machine. TCP and UDP have separate number spaces, but port
+    /// hopping claims a whole UDP range; keeping each wire's port explicit makes accidental range
+    /// capture unrepresentable.
     ///
-    /// Defaulted rather than required on the wire so that a payload written before this field
-    /// existed still parses. The default is the allocator's base, which is wrong for every
-    /// ingress after the first, and detectably so: two of them on one machine produce a
-    /// `node.port-clash` that blocks the release.
-    #[serde(default = "default_hysteria2_port")]
     pub port: u16,
     /// The UDP range clients rotate through. `None` keeps every client on `port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1507,7 +1448,6 @@ pub struct AnyTls {
     /// The outer security layer. TLS presents the node certificate; REALITY uses its own global
     /// or custom target and an independently generated, persisted protocol identity. The resolved
     /// REALITY parameters are filled by the store and ignored for TLS.
-    #[serde(default)]
     pub security: AnyTlsSecurity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality: Option<RealitySettings>,
@@ -1584,10 +1524,6 @@ pub const VLESS_PORT_BASE: u16 = 13_443;
 /// Base used when the console creates an AnyTLS listener without an explicit port.
 pub const ANYTLS_PORT_BASE: u16 = 14_443;
 
-const fn default_anytls_port_base() -> u16 {
-    ANYTLS_PORT_BASE
-}
-
 /// The response body and headers used by Xray's built-in `type: 404` masquerade are owned by
 /// Xray. Brocade stores only optional header overrides for that form; the status and body stay
 /// the stable upstream defaults.
@@ -1649,9 +1585,6 @@ impl Default for Hysteria2 {
 pub const HYSTERIA2_PORT_BASE: u16 = 30_000;
 const DEFAULT_HYSTERIA2_PORT: u16 = HYSTERIA2_PORT_BASE;
 
-fn default_hysteria2_port() -> u16 {
-    DEFAULT_HYSTERIA2_PORT
-}
 /// How many ports a newly enabled hop covers. Ten is wide enough that blocking the range costs
 /// more than blocking one port, and narrow enough that a machine can still find a free run.
 pub const DEFAULT_HYSTERIA2_HOP_SPAN: u16 = 10;
@@ -1975,7 +1908,6 @@ impl From<IngressWires> for IngressWiresWire {
 #[serde(deny_unknown_fields)]
 pub struct VlessEncryption {
     pub port: u16,
-    #[serde(default)]
     pub options: VlessEncryptionOptions,
     pub private_key: String,
     pub public_key: String,
@@ -2802,7 +2734,12 @@ pub struct Rule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "t", content = "v", rename_all = "snake_case")]
+#[serde(
+    tag = "t",
+    content = "v",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum DestMatch {
     Any,
     /// Content sniffing was enabled for an IP destination, but no domain was recovered for
@@ -2967,54 +2904,40 @@ impl IpFamily {
     }
 }
 
-/// How this hop manages the TCP connections it opens to the peer.
-///
-/// One axis covering two properties: how many streams share a connection, and whether a
-/// connection outlives the stream that opened it. Without pooling, each stream dials its own
-/// connection and closes it on completion, so every new stream pays the handshake of every
-/// hop down the chain in sequence. The cost falls on connection setup rather than on
-/// throughput.
-///
-/// The three variants are named rather than exposing xray's `concurrency` as a bare number,
-/// because 1 is a different arrangement rather than the low end of a range: at 1 each stream
-/// gets its own worker and a later stream may reuse it once idle. From 2 upward, streams share a
-/// live connection and a loss on one delays the rest. A flat 1–128 field would place that
-/// boundary in the middle of a range.
-///
-/// Applicable only where this machine dials. Under `HopDial::Reverse` the peer opens the
-/// connection and traffic travels back along it, so there is no outbound to pool; see the
-/// check in `validate`.
-///
-/// Mux.cool is the only mechanism available here rather than the preferred one. xray's other
-/// multiplexer, `xmux`, exposes what this one lacks: `maxConnections` for a pool ceiling, and
-/// `hMaxReusableSecs` and `hKeepAlivePeriod` for connection retention. It sits under
-/// `xhttpSettings` and works only over HTTP/2 and HTTP/3, while a relay hop is plain TCP
-/// inside wg, so reaching it would mean wrapping the hop in HTTP for a path that does not
-/// require it. The consequence is that Mux.cool's retention is a constant in its own
-/// `monitor()` with no configuration key, so the short retention window cannot be changed
-/// from here.
+/// Brocade's ordinary outbound Mux.cool pool policy, separate from reverse health and XMux.
+/// Healthy idle workers are preferred; otherwise grow to the worker reuse threshold, then
+/// reuse active capacity, then overflow if no usable slots remain. Returning idle workers
+/// reclaim overflow without terminating active business merely to meet the threshold.
+/// Prewarming shares that base budget; it does not guarantee spare workers under load.
+/// Concurrency 1 still allows sequential reuse. Idle reuse requires a matching Pong or
+/// recent inbound activity within a valid lease; only matching Pong renews the active
+/// bidirectional lease (3 probe intervals). Matching validation retains the configured
+/// prewarm reserve; idle TTL reclaims only idle capacity above that reserve.
+/// Applicable only where this machine dials; reverse tunnels own their own pool policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HopMux {
     pub concurrency: u16,
-    pub min_idle_workers: u32,
-    pub max_idle_workers: u32,
+    /// Best-effort idle prewarm target within the base worker budget.
+    pub prewarm_workers: u32,
+    /// Total worker reuse threshold, NOT a hard connection cap.
+    pub reuse_threshold: u32,
     pub max_probing_workers: u32,
-    pub probe_interval_secs: u16,
+    pub probe_interval_ms: u32,
     pub probe_timeout_ms: u32,
-    pub idle_ttl_secs: u32,
+    pub idle_ttl_ms: u32,
     pub max_requests_per_worker: u16,
 }
 
 impl HopMux {
     pub const CONCURRENCY_MIN: u16 = 1;
     pub const CONCURRENCY_MAX: u16 = 128;
-    pub const MAX_IDLE_MIN: u32 = 1;
-    pub const PROBE_INTERVAL_MIN_SECS: u16 = 2;
-    pub const PROBE_INTERVAL_MAX_SECS: u16 = 60;
+    pub const REUSE_THRESHOLD_MIN: u32 = 1;
+    pub const PROBE_INTERVAL_MIN_MS: u32 = 2_000;
+    pub const PROBE_INTERVAL_MAX_MS: u32 = 60_000;
     pub const PROBE_TIMEOUT_MIN_MS: u32 = 200;
     pub const PROBE_TIMEOUT_MAX_MS: u32 = 10_000;
-    pub const IDLE_TTL_MIN_SECS: u32 = 1;
+    pub const IDLE_TTL_MIN_MS: u32 = 1_000;
     pub const MAX_REQUESTS_MIN: u16 = 1;
     // Mux.Cool session IDs start at 1 and the current allocator never reuses them.
     pub const MAX_REQUESTS_MAX: u16 = u16::MAX;
@@ -3024,12 +2947,12 @@ impl Default for HopMux {
     fn default() -> Self {
         Self {
             concurrency: 1,
-            min_idle_workers: 0,
-            max_idle_workers: 2,
+            prewarm_workers: 0,
+            reuse_threshold: 2,
             max_probing_workers: 1,
-            probe_interval_secs: 5,
+            probe_interval_ms: 5_000,
             probe_timeout_ms: 2000,
-            idle_ttl_secs: 24,
+            idle_ttl_ms: 24_000,
             max_requests_per_worker: 128,
         }
     }
@@ -3037,33 +2960,10 @@ impl Default for HopMux {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HopPool {
-    /// One connection per stream, closed with it. The behavior of every hop before this
-    /// field existed, and still the default: pooling justifies a disruptive release only
-    /// where it has been measured to help.
+    /// One connection per stream, closed with it.
     #[default]
     None,
-    /// Idle connections are retained and reused by the next stream, one stream at a time.
-    ///
-    /// Measured against xray 26.4.25: 20 sequential streams used 1 connection, and 8
-    /// concurrent streams used 8. Retention is short, 16 to 32 seconds of idle rather than the
-    /// 300 of `connIdle`, so a relay idle for a minute pays the handshakes again. Mux.cool does
-    /// not probe an idle worker before selecting it: a half-dead TCP connection can therefore
-    /// stall the next stream until its connection timeout. This variant remains for authored
-    /// model compatibility and explicit use, but new console rules default to `None`.
-    Pool,
-    /// Up to `n` streams share one connection.
-    ///
-    /// This saves the most handshakes and costs stream isolation: the shared connection is
-    /// one TCP connection, so a loss affecting one stream delays every other stream on it.
-    /// On a lossy cross-border link the result can be worse than `None`.
-    ///
-    /// `n` is 2..=128. One is `Pool` and has its own variant. Above 128 xray clamps without
-    /// reporting, which `validate` rejects rather than reproduces: a number that reads one
-    /// way in the console and runs another on the machine is the failure the golden
-    /// artifacts exist to prevent.
-    Merge(u16),
-    /// Current Mux model. `None` follows `ModelSettings::relay_mux`; `Some` is one complete
-    /// per-edge override. New write paths use only this variant and `None`.
+    /// `None` follows `ModelSettings::relay_mux`; `Some` is one complete per-edge override.
     Mux(Option<HopMux>),
 }
 
@@ -3074,19 +2974,16 @@ impl Serialize for HopPool {
     {
         use serde::ser::SerializeMap;
 
-        let has_value = matches!(self, Self::Merge(_) | Self::Mux(Some(_)));
+        let has_value = matches!(self, Self::Mux(Some(_)));
         let mut map = serializer.serialize_map(Some(if has_value { 2 } else { 1 }))?;
         let tag = match self {
             Self::None => "none",
-            Self::Pool => "pool",
-            Self::Merge(_) => "merge",
             Self::Mux(_) => "mux",
         };
         map.serialize_entry("t", tag)?;
         match self {
-            Self::Merge(value) => map.serialize_entry("v", value)?,
             Self::Mux(Some(value)) => map.serialize_entry("v", value)?,
-            Self::None | Self::Pool | Self::Mux(None) => {}
+            Self::None | Self::Mux(None) => {}
         }
         map.end()
     }
@@ -3108,17 +3005,13 @@ impl<'de> Deserialize<'de> for HopPool {
         let repr = Repr::deserialize(deserializer)?;
         match (repr.t.as_str(), repr.v) {
             ("none", None) => Ok(Self::None),
-            ("pool", None) => Ok(Self::Pool),
-            ("merge", Some(value)) => serde_json::from_value(value)
-                .map(Self::Merge)
-                .map_err(serde::de::Error::custom),
             ("mux", None) => Ok(Self::Mux(None)),
             ("mux", Some(value)) => serde_json::from_value(value)
                 .map(|value| Self::Mux(Some(value)))
                 .map_err(serde::de::Error::custom),
-            (tag, _) if !matches!(tag, "none" | "pool" | "merge" | "mux") => Err(
-                serde::de::Error::unknown_variant(tag, &["none", "pool", "merge", "mux"]),
-            ),
+            (tag, _) if !matches!(tag, "none" | "mux") => {
+                Err(serde::de::Error::unknown_variant(tag, &["none", "mux"]))
+            }
             (tag, _) => Err(serde::de::Error::custom(format!(
                 "HopPool variant {tag} has an invalid v field"
             ))),
@@ -3126,24 +3019,12 @@ impl<'de> Deserialize<'de> for HopPool {
     }
 }
 
-impl HopPool {
-    /// The floor of `Merge`. The value below it belongs to `Pool`.
-    pub const MERGE_MIN: u16 = 2;
-    /// The ceiling xray enforces on `concurrency`.
-    pub const MERGE_MAX: u16 = 128;
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Forward {
         to: String,
-        #[serde(default)]
         dial: HopDial,
-        /// Absent on every rule written before this field existed, which is why it
-        /// defaults rather than being required. The default is the previous behavior, so
-        /// an old revision recompiles byte for byte.
-        #[serde(default)]
         pool: HopPool,
     },
     Egress {
@@ -3193,10 +3074,8 @@ pub fn is_valid_slug(value: &str) -> bool {
 ///
 /// The label serves three roles: an xray client's email, the key of a statistics counter
 /// (`user>>>{label}>>>traffic>>>uplink`), and the control plane's only means of attributing
-/// usage. The format therefore has exactly one definition. The compiler previously built it
-/// with `format!` here while the control plane assembled
-/// `user_id || '@' || tenant_id || '#' || ingress_id` in SQL when collecting counters, two
-/// independent copies where editing one made the usage records permanently unreconcilable.
+/// usage. The format therefore has exactly one definition shared by compilation and counter
+/// attribution; independent renderers could make usage records permanently unreconcilable.
 pub fn grant_label(user: &str, tenant: &str, ingress: &str) -> String {
     format!("{user}@{tenant}#{ingress}")
 }
@@ -3421,12 +3300,9 @@ mod transport_tests {
         }
     }
 
-    /// Every shape has to place the REALITY parameters under the same key names, because
-    /// everything downstream reads them by name from one `transport` object. This shipped broken
-    /// once: the XHTTP shape nested them under `reality` while the plain shape kept them at the
-    /// top level, so the console read `undefined` for `server_names` and threw on every edit of
-    /// an XHTTP ingress. Types, tests and the compiler all passed, because nothing compared the
-    /// two shapes against each other.
+    /// Every shape places the REALITY parameters under the same key names, because everything
+    /// downstream reads them by name from one `transport` object. Comparing the shapes directly
+    /// guards a contract that ordinary per-variant type checks cannot express.
     #[test]
     fn both_shapes_spell_the_reality_parameters_the_same_way() {
         let plain = serde_json::to_value(Transport::VlessReality(reality())).unwrap();
@@ -3487,6 +3363,22 @@ mod hop_mux_tests {
     use super::{HopMux, HopPool};
 
     #[test]
+    fn mux_rejects_unknown_fields() {
+        let value = serde_json::to_value(HopMux {
+            prewarm_workers: 3,
+            reuse_threshold: 7,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(value["prewarm_workers"], 3);
+        assert_eq!(value["reuse_threshold"], 7);
+        let mut invalid = value.clone();
+        invalid["unexpected"] = serde_json::json!(4);
+        assert!(serde_json::from_value::<HopMux>(invalid).is_err());
+        assert!(serde_json::from_value::<HopMux>(value).is_ok());
+    }
+
+    #[test]
     fn current_mux_follow_and_override_have_stable_wire_shapes() {
         let follow = serde_json::to_value(HopPool::Mux(None)).unwrap();
         assert_eq!(follow, serde_json::json!({ "t": "mux" }));
@@ -3514,6 +3406,10 @@ mod hop_mux_tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReverseHealth {
+    /// Whether a confirmed health-probe failure may terminate requests already carried by
+    /// the worker. Disabled by default: unhealthy workers stop accepting new requests and
+    /// drain existing ones before they are reclaimed.
+    pub disconnect_on_health_failure: bool,
     pub probe_interval_ms: u32,
     pub probe_timeout_ms: u32,
     pub confirm_timeout_ms: u32,
@@ -3523,12 +3419,12 @@ pub struct ReverseHealth {
     pub max_parallel_dials_per_pair: u32,
     pub dial_ready_timeout_ms: u32,
     pub reconnect_backoff_cap_ms: u32,
-    #[serde(default)]
     pub tuning: ReverseHealthTuning,
 }
 impl Default for ReverseHealth {
     fn default() -> Self {
         Self {
+            disconnect_on_health_failure: false,
             probe_interval_ms: 1000,
             probe_timeout_ms: 750,
             confirm_timeout_ms: 750,
@@ -3548,23 +3444,21 @@ impl ReverseHealth {
         if self.tuning.reconnect_backoff_base_ms > self.reconnect_backoff_cap_ms
             || self.tuning.max_healthy_workers < self.max_idle_ready_workers
             || self.tuning.spare_workers > self.max_idle_ready_workers
-            || !(100..=60000).contains(&self.probe_interval_ms)
-            || !(50..=10000).contains(&self.probe_timeout_ms)
+            || self.probe_interval_ms == 0
+            || self.probe_timeout_ms == 0
             || self.probe_timeout_ms >= self.probe_interval_ms
-            || !(50..=10000).contains(&self.confirm_timeout_ms)
+            || self.confirm_timeout_ms == 0
             || self.health_lease_ms
                 < self
                     .probe_interval_ms
                     .saturating_mul(100 + self.tuning.probe_jitter_percent)
                     / 100
                     + self.probe_timeout_ms
-            || self.health_lease_ms > 120000
-            || !(1..=8).contains(&self.min_healthy_workers)
+            || self.min_healthy_workers == 0
             || self.max_idle_ready_workers < self.min_healthy_workers
-            || self.max_idle_ready_workers > 16
-            || !(1..=8).contains(&self.max_parallel_dials_per_pair)
-            || !(200..=30000).contains(&self.dial_ready_timeout_ms)
-            || !(250..=30000).contains(&self.reconnect_backoff_cap_ms)
+            || self.max_parallel_dials_per_pair == 0
+            || self.dial_ready_timeout_ms == 0
+            || self.reconnect_backoff_cap_ms == 0
         {
             return Err("reverse health 参数超出范围，或探活超时/健康租约/备用连接数量不一致");
         };
@@ -3605,8 +3499,9 @@ impl ModelSettings {
     }
 }
 
-/// Optional as a group for compatibility with policies saved before tuning existed.
-/// Once supplied the group is complete, including for directional overrides.
+/// Required as a complete group whenever reverse health is present, including for directional
+/// overrides. Defaults are created at the owning settings level, never while decoding a partial
+/// policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReverseHealthTuning {
@@ -3617,6 +3512,8 @@ pub struct ReverseHealthTuning {
     pub max_sessions_per_worker: u32,
     pub reconnect_backoff_base_ms: u32,
     pub reconnect_stable_reset_ms: u32,
+    /// Xray supports an optional HTTP canary, but Brocade does not supply a canary URL or expose
+    /// these values in the settings page.
     pub canary_interval_ms: u32,
     pub canary_timeout_ms: u32,
     pub canary_successes: u32,
@@ -3641,20 +3538,13 @@ impl Default for ReverseHealthTuning {
 }
 impl ReverseHealthTuning {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !(0..=50).contains(&self.probe_jitter_percent)
-            || !(1..=8).contains(&self.recovery_successes)
-            || !(1..=8).contains(&self.spare_workers)
-            || !(1..=32).contains(&self.max_healthy_workers)
-            || !(1..=256).contains(&self.max_sessions_per_worker)
-            || !(50..=30000).contains(&self.reconnect_backoff_base_ms)
-            || !(1000..=300000).contains(&self.reconnect_stable_reset_ms)
-            || !(100..=60000).contains(&self.canary_interval_ms)
-            || !(50..=30000).contains(&self.canary_timeout_ms)
-            || !(1..=1000).contains(&self.canary_successes)
-            || !(0..=300000).contains(&self.canary_stable_window_ms)
-            || self.canary_timeout_ms >= self.canary_interval_ms
+        if self.probe_jitter_percent > 100
+            || self.recovery_successes == 0
+            || self.max_healthy_workers == 0
+            || self.max_sessions_per_worker > u32::from(u16::MAX)
+            || self.reconnect_backoff_base_ms == 0
         {
-            return Err("反向隧道高级参数超出范围，或业务探测超时不小于间隔");
+            return Err("反向隧道高级参数超出有效范围");
         }
         Ok(())
     }
@@ -3665,22 +3555,29 @@ mod reverse_tuning_tests {
     use super::*;
 
     #[test]
-    fn legacy_policy_defaults_only_the_new_group_and_round_trips_tuning() {
-        let mut old = serde_json::to_value(ReverseHealth::default()).unwrap();
-        old.as_object_mut().unwrap().remove("tuning");
-        let mut policy: ReverseHealth = serde_json::from_value(old.clone()).unwrap();
-        assert_eq!(policy.tuning, ReverseHealthTuning::default());
+    fn complete_policy_rejects_missing_fields_and_round_trips() {
+        let value = serde_json::to_value(ReverseHealth::default()).unwrap();
+        for field in ["tuning", "disconnect_on_health_failure"] {
+            let mut partial = value.clone();
+            partial.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ReverseHealth>(partial).is_err(),
+                "missing {field} was accepted"
+            );
+        }
+
+        let mut policy = ReverseHealth::default();
         policy.tuning.recovery_successes = 3;
         policy.tuning.probe_jitter_percent = 25;
         policy.tuning.max_sessions_per_worker = 4;
-        policy.tuning.canary_interval_ms = 2000;
         policy.validate().unwrap();
         assert_eq!(
             serde_json::from_value::<ReverseHealth>(serde_json::to_value(policy).unwrap()).unwrap(),
             policy
         );
-        old["tuning"] = serde_json::json!({"recovery_successes":3});
-        assert!(serde_json::from_value::<ReverseHealth>(old).is_err());
+        let mut partial_tuning = value;
+        partial_tuning["tuning"] = serde_json::json!({"recovery_successes":3});
+        assert!(serde_json::from_value::<ReverseHealth>(partial_tuning).is_err());
         policy.tuning.reconnect_backoff_base_ms = policy.reconnect_backoff_cap_ms + 1;
         assert!(policy.validate().is_err());
         policy.tuning = ReverseHealthTuning::default();
@@ -3690,13 +3587,36 @@ mod reverse_tuning_tests {
         policy.tuning.max_healthy_workers = policy.max_idle_ready_workers - 1;
         assert!(policy.validate().is_err());
         policy.tuning = ReverseHealthTuning::default();
-        policy.tuning.canary_timeout_ms = policy.tuning.canary_interval_ms;
-        assert!(policy.validate().is_err());
-        policy.tuning = ReverseHealthTuning::default();
         policy.health_lease_ms = 1800;
         policy.tuning.probe_jitter_percent = 0;
         policy.validate().unwrap();
         policy.tuning.probe_jitter_percent = 50;
         assert!(policy.validate().is_err());
+
+        let mut large = ReverseHealth {
+            min_healthy_workers: 100_000,
+            max_idle_ready_workers: 100_000,
+            max_parallel_dials_per_pair: 100_000,
+            tuning: ReverseHealthTuning {
+                spare_workers: 0,
+                max_healthy_workers: 100_000,
+                max_sessions_per_worker: u32::from(u16::MAX),
+                ..ReverseHealthTuning::default()
+            },
+            ..ReverseHealth::default()
+        };
+        large.validate().unwrap();
+        large.tuning.max_sessions_per_worker = u32::from(u16::MAX) + 1;
+        assert!(large.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod default_settings_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_mtu_defaults_to_ipv6_safe_minimum() {
+        assert_eq!(OverlaySettings::default().mtu, 1280);
     }
 }

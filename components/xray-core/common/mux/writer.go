@@ -144,10 +144,12 @@ func (w *Writer) Close() error {
 	if w.hasError {
 		meta.Option.Set(OptionError)
 	}
+	if writer, ok := w.writer.(interface{ WriteEndFrame(FrameMetadata) error }); ok {
+		return writer.WriteEndFrame(meta)
+	}
 
 	frame := buf.New()
 	common.Must(meta.WriteTo(frame))
 
-	w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
-	return nil
+	return w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
 }

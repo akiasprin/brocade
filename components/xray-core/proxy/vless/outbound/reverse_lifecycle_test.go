@@ -26,7 +26,7 @@ func TestReverseCloseBeforeDelayedStartCannotResurrect(t *testing.T) {
 		t.Fatal("closed reverse resurrected")
 	}
 }
-func TestReverseDialAdmissionPrioritizesMissingPairsAndIsBounded(t *testing.T) {
+func TestReverseDialAdmissionPrioritizesMissingPairsWithoutAnArtificialNodeCap(t *testing.T) {
 	a, b := &Reverse{}, &Reverse{}
 	a.reportDialDemand(2, 0, true)
 	b.reportDialDemand(0, 0, true)
@@ -40,15 +40,14 @@ func TestReverseDialAdmissionPrioritizesMissingPairsAndIsBounded(t *testing.T) {
 		t.Fatal("missing primary rejected")
 	}
 	releaseReverseDial()
-	acquired := 0
-	for a.acquireDial() {
-		acquired++
+	const attempts = 1024
+	for i := 0; i < attempts; i++ {
+		if !a.acquireDial() {
+			t.Fatalf("dial %d hit an artificial node cap", i+1)
+		}
 	}
-	for i := 0; i < acquired; i++ {
+	for i := 0; i < attempts; i++ {
 		releaseReverseDial()
-	}
-	if acquired != 32 {
-		t.Fatalf("node dial budget=%d", acquired)
 	}
 }
 
@@ -68,5 +67,11 @@ func TestReverseConfiguredCapacityAndBackoff(t *testing.T) {
 		if got := r.backoffBase(); got != want {
 			t.Fatalf("failures=%d base=%v want=%v", failures, got, want)
 		}
+	}
+	r.health.BackoffBase = time.Duration(^uint32(0)) * time.Millisecond
+	r.health.BackoffCap = r.health.BackoffBase
+	r.failures = 10
+	if got := r.backoffBase(); got != r.health.BackoffCap {
+		t.Fatalf("large backoff overflowed: %v", got)
 	}
 }

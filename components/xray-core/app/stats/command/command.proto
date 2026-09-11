@@ -86,9 +86,14 @@ message GetUsersStatsResponse {
 message ReverseHealthRequest {}
 message ReverseHealthResponse { bytes json = 1; }
 
+// Same snapshot/event contract as reverse health, for ordinary outbound Mux worker pools.
+message MuxRequest {}
+message MuxResponse { bytes json = 1; }
+
 service StatsService {
- rpc GetReverseHealthSnapshot(ReverseHealthRequest) returns (ReverseHealthResponse) {}
- rpc WatchReverseHealth(ReverseHealthRequest) returns (stream ReverseHealthResponse) {}
+  rpc GetReverseHealthSnapshot(ReverseHealthRequest) returns (ReverseHealthResponse) {}
+  rpc WatchReverseHealth(ReverseHealthRequest) returns (stream ReverseHealthResponse) {}
+  rpc GetMuxSnapshot(MuxRequest) returns (MuxResponse) {}
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
   rpc GetStatsOnline(GetStatsRequest) returns (GetStatsResponse) {}
   rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse) {}

@@ -64,6 +64,10 @@ func (m *SessionManager) Allocate(Strategy *ClientStrategy) *Session {
 }
 
 func (m *SessionManager) allocateLink(Strategy *ClientStrategy, link *transport.Link) *Session {
+	return m.allocateLinkWithLifecycle(Strategy, link, nil)
+}
+
+func (m *SessionManager) allocateLinkWithLifecycle(Strategy *ClientStrategy, link *transport.Link, lifecycle *sessionLifecycle) *Session {
 	m.Lock()
 	defer m.Unlock()
 
@@ -77,9 +81,10 @@ func (m *SessionManager) allocateLink(Strategy *ClientStrategy, link *transport.
 
 	m.count++
 	s := &Session{
-		ID:     m.count,
-		parent: m,
-		done:   done.New(),
+		ID:        m.count,
+		parent:    m,
+		done:      done.New(),
+		lifecycle: lifecycle,
 	}
 	if link != nil {
 		s.input = link.Reader
@@ -95,6 +100,9 @@ func (m *SessionManager) Add(s *Session) bool {
 
 	if m.closed {
 		return false
+	}
+	if s.lifecycle != nil && s.done == nil {
+		s.done = done.New()
 	}
 
 	m.count++
@@ -189,6 +197,7 @@ type Session struct {
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
+	lifecycle    *sessionLifecycle // Immutable after publication in the session map.
 }
 
 // Close closes all resources associated with this session.
@@ -214,6 +223,9 @@ func (s *Session) closeLocked() (bool, func()) {
 		return false, nil
 	}
 	s.closed = true
+	if s.lifecycle != nil {
+		s.lifecycle.startEnding()
+	}
 	if s.done != nil {
 		s.done.Close()
 	}

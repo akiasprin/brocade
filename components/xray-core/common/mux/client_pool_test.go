@@ -161,8 +161,8 @@ func (f *testWorkerFactory) count() int {
 
 func testPoolConfig() *WorkerPoolConfig {
 	return &WorkerPoolConfig{
-		MinIdleWorkers:    0,
-		MaxIdleWorkers:    2,
+		PrewarmWorkers:    0,
+		ReuseThreshold:    2,
 		MaxProbingWorkers: 1,
 		ProbeInterval:     5 * time.Second,
 		ProbeTimeout:      2 * time.Second,
@@ -483,7 +483,9 @@ func TestSessionCloseGapCannotBypassIdleTransition(t *testing.T) {
 		t.Fatal("closing worker accepted a request before completing its idle transition")
 	}
 	releaseOnce.Do(func() { close(releaseEmpty) })
-	waitForTest(t, "old worker idle", func() bool { return workerStateForTest(first) == workerIdleReady })
+	waitForTest(t, "old worker requires validation", func() bool { return workerStateForTest(first) == workerProbing })
+	first.acceptPong(pendingProbeForTest(first))
+	waitForTest(t, "old worker idle after Pong", func() bool { return workerStateForTest(first) == workerIdleReady })
 	_ = secondInput.Close()
 }
 
@@ -570,7 +572,7 @@ func TestPickerNeverReturnsProbingWorker(t *testing.T) {
 	}
 }
 
-func TestPickerPrefersActiveWorkerBeforeIdleReady(t *testing.T) {
+func TestPickerPrefersIdleReadyBeforeActiveCapacity(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
@@ -590,8 +592,64 @@ func TestPickerPrefersActiveWorkerBeforeIdleReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if chosen != active {
-		t.Fatalf("picker chose %p, want active worker %p", chosen, active)
+	if chosen != idle {
+		t.Fatalf("picker chose %p, want idle worker %p", chosen, idle)
+	}
+}
+
+func TestUnpooledPickerChoosesLeastLoadedWorker(t *testing.T) {
+	picker := &IncrementalWorkerPicker{}
+	heavy := newBlackholeWorker(t, nil, 8)
+	light := newBlackholeWorker(t, nil, 8)
+	middle := newBlackholeWorker(t, nil, 8)
+	picker.workers = []*ClientWorker{heavy, light, middle}
+	t.Cleanup(func() { picker.Close() })
+
+	for worker, sessions := range map[*ClientWorker]int{heavy: 3, light: 1, middle: 2} {
+		for range sessions {
+			if worker.sessionManager.Allocate(&worker.strategy) == nil {
+				t.Fatalf("failed to allocate session %d for worker %p", sessions, worker)
+			}
+		}
+	}
+
+	chosen, err := picker.PickAvailable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chosen != light {
+		t.Fatalf("picker chose worker with %d active sessions, want 1", chosen.ActiveConnections())
+	}
+}
+
+func TestPickerCountsReservationsWhenBalancing(t *testing.T) {
+	clock := newFakePoolClock()
+	cfg := testPoolConfig()
+	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
+		return newBlackholeWorker(t, cfg, 8), nil
+	}}
+	picker := newPoolPickerForTest(clock, cfg, factory)
+	first := newBlackholeWorker(t, cfg, 8)
+	second := newBlackholeWorker(t, cfg, 8)
+	addWorkerForTest(t, picker, first, workerActive, clock.Now())
+	addWorkerForTest(t, picker, second, workerActive, clock.Now())
+	for _, worker := range []*ClientWorker{first, second} {
+		if worker.sessionManager.Allocate(&worker.strategy) == nil {
+			t.Fatal("failed to seed active worker")
+		}
+	}
+	t.Cleanup(func() { picker.Close() })
+
+	chosen, err := picker.PickAvailable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := picker.PickAvailable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chosen == next {
+		t.Fatal("two pending dispatches chose the same worker instead of balancing reservations")
 	}
 }
 
@@ -674,7 +732,7 @@ func TestTransportClosePromotesQueuedProbe(t *testing.T) {
 	})
 }
 
-func TestMaxIdleEvictsOldestReadyWorker(t *testing.T) {
+func TestCapacityEvictsOldestReadyWorker(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
 	cfg.MaxProbingWorkers = 2
@@ -711,18 +769,18 @@ func TestMaxIdleEvictsOldestReadyWorker(t *testing.T) {
 	picker.access.Lock()
 	reserved, _ := picker.poolCountsLocked(nil)
 	picker.access.Unlock()
-	if reserved != cfg.MaxIdleWorkers {
-		t.Fatalf("reserved idle workers = %d, want %d", reserved, cfg.MaxIdleWorkers)
+	if reserved != cfg.ReuseThreshold {
+		t.Fatalf("reserved idle workers = %d, want %d", reserved, cfg.ReuseThreshold)
 	}
-	if got := picker.WorkerPoolStats().WorkerClosedMaxIdleTotal; got != 1 {
-		t.Fatalf("max-idle close count = %d, want 1", got)
+	if got := picker.WorkerPoolStats().WorkerClosedCapacityTotal; got != 1 {
+		t.Fatalf("capacity reclaim count = %d, want 1", got)
 	}
 }
 
 func TestLargeProbeLimitUsesActualWorkerCount(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MaxIdleWorkers = ^uint32(0)
+	cfg.ReuseThreshold = ^uint32(0)
 	cfg.MaxProbingWorkers = ^uint32(0)
 	if err := cfg.Validate(65535); err != nil {
 		t.Fatal(err)
@@ -773,7 +831,9 @@ func TestMaxRequestsClosesWorkerAfterLastSession(t *testing.T) {
 		inputWriter.Close()
 	}
 	dispatchAndFinish()
-	waitForTest(t, "first session ready after recent I/O", func() bool { return workerStateForTest(worker) == workerIdleReady })
+	waitForTest(t, "first session requires validation", func() bool { return workerStateForTest(worker) == workerProbing })
+	worker.acceptPong(pendingProbeForTest(worker))
+	waitForTest(t, "first session ready after Pong", func() bool { return workerStateForTest(worker) == workerIdleReady })
 	inputReader, inputWriter := pipe.New(pipe.WithoutSizeLimit())
 	_, outputWriter := pipe.New(pipe.WithoutSizeLimit())
 	if !worker.reserveForDispatch(workerIdleReady, false) {
@@ -790,6 +850,9 @@ func TestMaxRequestsClosesWorkerAfterLastSession(t *testing.T) {
 	}
 	inputWriter.Close()
 	waitForTest(t, "max requests close", worker.Closed)
+	if got := picker.WorkerPoolStats().WorkerClosedRequestsTotal; got != 1 {
+		t.Fatalf("request-limit close count = %d, want 1", got)
+	}
 }
 
 func Test24HourIdleTTLExpiresAtItsOriginalDeadline(t *testing.T) {
@@ -871,6 +934,44 @@ func TestIdleTTLIsNotExtendedByPong(t *testing.T) {
 	}
 }
 
+func TestHealthyPrewarmWorkerIsRetainedBeyondIdleTTL(t *testing.T) {
+	clock := newFakePoolClock()
+	cfg := testPoolConfig()
+	cfg.PrewarmWorkers = 1
+	cfg.ReuseThreshold = 1
+	created := make(chan *ClientWorker, 2)
+	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
+		worker := newBlackholeWorker(t, cfg, 1)
+		created <- worker
+		return worker, nil
+	}}
+	picker := newPoolPickerForTest(clock, cfg, factory)
+	picker.poolUsed = true
+	t.Cleanup(func() { picker.Close() })
+
+	picker.requestEnsurePrewarm()
+	worker := <-created
+	waitForTest(t, "initial prewarm validation", func() bool { return pendingProbeForTest(worker) != 0 })
+	worker.acceptPong(pendingProbeForTest(worker))
+	waitForTest(t, "initial prewarm ready", func() bool { return workerStateForTest(worker) == workerIdleReady })
+
+	// Healthy validation retains the explicitly requested warm reserve. Drive
+	// well beyond the configured idle TTL; periodic recreation would increase
+	// the factory count and the idle-TTL close counter.
+	for elapsed := time.Duration(0); elapsed <= 3*cfg.IdleTTL; elapsed += cfg.ProbeInterval {
+		clock.Advance(cfg.ProbeInterval)
+		waitForTest(t, "retained prewarm probe", func() bool { return workerStateForTest(worker) == workerProbing })
+		worker.acceptPong(pendingProbeForTest(worker))
+		waitForTest(t, "retained prewarm ready", func() bool { return workerStateForTest(worker) == workerIdleReady })
+	}
+	if worker.Closed() || factory.count() != 1 {
+		t.Fatalf("healthy prewarm worker rotated: closed=%v creates=%d", worker.Closed(), factory.count())
+	}
+	if got := picker.WorkerPoolStats().WorkerClosedIdleTTLTotal; got != 0 {
+		t.Fatalf("prewarm reserve produced %d idle-TTL closes", got)
+	}
+}
+
 func TestDefaultIdleProbeRateIsBounded(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
@@ -945,10 +1046,10 @@ func TestPooledWorkerExchangesProbeWithServer(t *testing.T) {
 	waitForTest(t, "server Pong", func() bool { return workerStateForTest(client) == workerIdleReady })
 }
 
-func TestMinIdlePrewarmsOnlyAfterUse(t *testing.T) {
+func TestPrewarmPrewarmsOnlyAfterUse(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MinIdleWorkers = 2
+	cfg.PrewarmWorkers = 2
 	cfg.MaxProbingWorkers = 2
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
 		return newBlackholeWorker(t, cfg, 1), nil
@@ -956,12 +1057,12 @@ func TestMinIdlePrewarmsOnlyAfterUse(t *testing.T) {
 	picker := newPoolPickerForTest(clock, cfg, factory)
 	t.Cleanup(func() { picker.Close() })
 
-	picker.requestEnsureMinIdle()
+	picker.requestEnsurePrewarm()
 	if factory.count() != 0 {
 		t.Fatal("unused outbound prewarmed workers")
 	}
 	picker.poolUsed = true
-	picker.requestEnsureMinIdle()
+	picker.requestEnsurePrewarm()
 	waitForTest(t, "two warm workers", func() bool {
 		picker.access.Lock()
 		count := len(picker.workers)
@@ -988,16 +1089,17 @@ func TestMinIdlePrewarmsOnlyAfterUse(t *testing.T) {
 		}
 		return true
 	})
-	if got := picker.WorkerPoolStats().WorkerCreatedWarmTotal; got != 2 {
-		t.Fatalf("warm worker count = %d, want 2", got)
+	stats := picker.WorkerPoolStats()
+	if stats.WorkerCreatedWarmTotal != 2 || stats.WorkerWarmReadyTotal != 2 {
+		t.Fatalf("warm worker stats = %+v, want 2 created and ready", stats)
 	}
 }
 
 func TestRepeatedWarmProbeTimeoutsRespectBackoffWithLargeMinimum(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MinIdleWorkers = 100000
-	cfg.MaxIdleWorkers = 100000
+	cfg.PrewarmWorkers = 100000
+	cfg.ReuseThreshold = 100000
 	cfg.MaxProbingWorkers = 1
 	created := make(chan *ClientWorker, 16)
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
@@ -1008,7 +1110,7 @@ func TestRepeatedWarmProbeTimeoutsRespectBackoffWithLargeMinimum(t *testing.T) {
 	picker := newPoolPickerForTest(clock, cfg, factory)
 	picker.poolUsed = true
 	t.Cleanup(func() { picker.Close() })
-	picker.requestEnsureMinIdle()
+	picker.requestEnsurePrewarm()
 
 	for attempt, delay := range []time.Duration{1, 2, 4, 8, 16, 30, 30} {
 		var worker *ClientWorker
@@ -1030,7 +1132,7 @@ func TestRepeatedWarmProbeTimeoutsRespectBackoffWithLargeMinimum(t *testing.T) {
 			return worker.Closed() && len(picker.workers) == 0 && !picker.warmRunning && picker.warmTimer != nil
 		})
 		clock.Advance(delay*time.Second - time.Nanosecond)
-		picker.requestEnsureMinIdle()
+		picker.requestEnsurePrewarm()
 		waitForTest(t, "backoff check", func() bool {
 			picker.access.Lock()
 			defer picker.access.Unlock()
@@ -1046,7 +1148,7 @@ func TestRepeatedWarmProbeTimeoutsRespectBackoffWithLargeMinimum(t *testing.T) {
 func TestWarmFailureUsesBackoff(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MinIdleWorkers = 1
+	cfg.PrewarmWorkers = 1
 	var fail atomic.Bool
 	fail.Store(true)
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
@@ -1058,9 +1160,12 @@ func TestWarmFailureUsesBackoff(t *testing.T) {
 	picker := newPoolPickerForTest(clock, cfg, factory)
 	picker.poolUsed = true
 	t.Cleanup(func() { picker.Close() })
-	picker.requestEnsureMinIdle()
+	picker.requestEnsurePrewarm()
 	waitForTest(t, "first failed warm dial", func() bool { return factory.count() == 1 && clock.pending() > 0 })
-	picker.requestEnsureMinIdle()
+	if got := picker.WorkerPoolStats().WorkerWarmFailedTotal; got != 1 {
+		t.Fatalf("warm failure count = %d, want 1", got)
+	}
+	picker.requestEnsurePrewarm()
 	if got := factory.count(); got != 1 {
 		t.Fatalf("backoff allowed %d immediate attempts", got)
 	}
@@ -1072,7 +1177,7 @@ func TestWarmFailureUsesBackoff(t *testing.T) {
 func TestDemandWorkerBreaksWarmBackoff(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MinIdleWorkers = 1
+	cfg.PrewarmWorkers = 1
 	var fail atomic.Bool
 	fail.Store(true)
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
@@ -1084,7 +1189,7 @@ func TestDemandWorkerBreaksWarmBackoff(t *testing.T) {
 	picker := newPoolPickerForTest(clock, cfg, factory)
 	picker.poolUsed = true
 	t.Cleanup(func() { picker.Close() })
-	picker.requestEnsureMinIdle()
+	picker.requestEnsurePrewarm()
 	waitForTest(t, "warm backoff", func() bool {
 		picker.access.Lock()
 		defer picker.access.Unlock()
@@ -1110,7 +1215,7 @@ func TestDemandWorkerBreaksWarmBackoff(t *testing.T) {
 func TestWarmTransportFailureUsesBackoff(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MinIdleWorkers = 1
+	cfg.PrewarmWorkers = 1
 	created := make(chan *ClientWorker, 2)
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
 		worker := newBlackholeWorker(t, cfg, 1)
@@ -1121,7 +1226,7 @@ func TestWarmTransportFailureUsesBackoff(t *testing.T) {
 	picker.poolUsed = true
 	t.Cleanup(func() { picker.Close() })
 
-	picker.requestEnsureMinIdle()
+	picker.requestEnsurePrewarm()
 	worker := <-created
 	waitForTest(t, "warm worker attach", func() bool { return workerStateForTest(worker) == workerWarmDialing })
 	worker.Close()
@@ -1130,12 +1235,58 @@ func TestWarmTransportFailureUsesBackoff(t *testing.T) {
 		defer picker.access.Unlock()
 		return len(picker.workers) == 0 && !picker.nextWarmAttempt.IsZero() && !picker.warmRunning && picker.warmTimer != nil
 	})
-	picker.requestEnsureMinIdle()
+	stats := picker.WorkerPoolStats()
+	if stats.WorkerWarmFailedTotal != 1 || stats.WorkerClosedProbeTotal != 1 || stats.WorkerClosedTransportTotal != 1 {
+		t.Fatalf("warm transport failure stats = %+v", stats)
+	}
+	picker.requestEnsurePrewarm()
 	if got := factory.count(); got != 1 {
 		t.Fatalf("transport failure backoff allowed %d immediate attempts", got)
 	}
 	clock.Advance(time.Second)
 	waitForTest(t, "warm retry after transport failure", func() bool { return factory.count() == 2 })
+}
+
+func TestIdleTransportCloseRefillsPrewarmWithoutDialBackoff(t *testing.T) {
+	clock := newFakePoolClock()
+	cfg := testPoolConfig()
+	cfg.PrewarmWorkers = 1
+	cfg.ReuseThreshold = 1
+	created := make(chan *ClientWorker, 3)
+	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
+		worker := newBlackholeWorker(t, cfg, 1)
+		created <- worker
+		return worker, nil
+	}}
+	picker := newPoolPickerForTest(clock, cfg, factory)
+	picker.poolUsed = true
+	t.Cleanup(func() { picker.Close() })
+
+	picker.requestEnsurePrewarm()
+	first := <-created
+	waitForTest(t, "first warm validation", func() bool { return pendingProbeForTest(first) != 0 })
+	first.acceptPong(pendingProbeForTest(first))
+	waitForTest(t, "first idle ready", func() bool { return workerStateForTest(first) == workerIdleReady })
+	first.Close()
+
+	var replacement *ClientWorker
+	select {
+	case replacement = <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle transport close was incorrectly held behind warm dial backoff")
+	}
+	waitForTest(t, "replacement validation", func() bool { return workerStateForTest(replacement) == workerWarmDialing })
+	picker.access.Lock()
+	nextAttempt := picker.nextWarmAttempt
+	picker.access.Unlock()
+	if !nextAttempt.IsZero() {
+		t.Fatalf("idle transport close advanced dial backoff to %s", nextAttempt)
+	}
+	stats := picker.WorkerPoolStats()
+	if stats.WorkerClosedTransportTotal != 1 || stats.WorkerClosedProbeTotal != 0 || stats.WorkerWarmFailedTotal != 0 {
+		t.Fatalf("idle transport close was misclassified: %+v", stats)
+	}
+	replacement.acceptPong(pendingProbeForTest(replacement))
 }
 
 func TestPoolCloseCancelsProbeTimers(t *testing.T) {
@@ -1160,7 +1311,7 @@ func TestPoolCloseCancelsProbeTimers(t *testing.T) {
 func TestDrainBeforeFirstPickClosesLazyPool(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MinIdleWorkers = 1
+	cfg.PrewarmWorkers = 1
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
 		return newBlackholeWorker(t, cfg, 1), nil
 	}}
@@ -1302,7 +1453,7 @@ func TestClientWorkerConcurrentDispatchHonorsConcurrency(t *testing.T) {
 func TestConcurrentRequestsBypassAllProbingWorkers(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
-	cfg.MaxIdleWorkers = 4
+	cfg.ReuseThreshold = 4
 	cfg.MaxProbingWorkers = 4
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
 		return newBlackholeWorker(t, cfg, 1), nil
@@ -1377,16 +1528,17 @@ func TestConcurrentRequestsBypassAllProbingWorkers(t *testing.T) {
 				open++
 			}
 		}
-		return reserved == cfg.MaxIdleWorkers && open == int(cfg.MaxIdleWorkers)
+		return reserved == cfg.ReuseThreshold && open == int(cfg.ReuseThreshold)
 	})
-	if got := picker.WorkerPoolStats().WorkerClosedMaxIdleTotal; got != requests {
-		t.Fatalf("burst max-idle closures = %d, want %d", got, requests)
+	if got := picker.WorkerPoolStats().WorkerClosedCapacityTotal; got != requests {
+		t.Fatalf("burst capacity reclaims = %d, want %d", got, requests)
 	}
 }
 
 func TestPickerCreatesSecondWorkerAtConcurrencyLimit(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()
+	cfg.ReuseThreshold = 1 // Reach the base before filling this worker's slots.
 	factory := &testWorkerFactory{create: func() (*ClientWorker, error) {
 		return newBlackholeWorker(t, cfg, 8), nil
 	}}

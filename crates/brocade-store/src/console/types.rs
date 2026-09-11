@@ -87,16 +87,8 @@ pub struct RemoveRetiredNodesResult {
     pub removed_chains: Vec<String>,
 }
 
-/// An empty JSON object counts as absent.
-///
-/// The `runtime_versions`, `spool_backlog`, and `geodata_observed` columns are all
-/// `NOT NULL DEFAULT '{}'`, so a newly enrolled machine is born with an empty object, while an
-/// older agent leaves NULL. The two mean the same thing — never reported — and the UI should
-/// not draw them two different ways.
-pub(crate) fn non_empty_json(
-    value: Option<Option<serde_json::Value>>,
-) -> Option<serde_json::Value> {
-    let value = value.flatten()?;
+/// An empty JSON object is the fresh-row sentinel for "not reported yet".
+pub(crate) fn non_empty_json(value: serde_json::Value) -> Option<serde_json::Value> {
     match &value {
         serde_json::Value::Object(map) if map.is_empty() => None,
         serde_json::Value::Null => None,
@@ -124,11 +116,12 @@ pub struct NodeAgentStateItem {
     pub token_last_used_at: Option<String>,
     pub token_revoked_at: Option<String>,
     pub agent_version: Option<String>,
-    /// Explicit wire compatibility, separate from the binary identity. `None` identifies an old
-    /// agent which predates protocol negotiation and is being offered a rescue self-update.
+    /// Explicit wire compatibility, separate from the binary identity. `None` means no protocol
+    /// has been reported yet; desired state stays isolated while the approved update path remains
+    /// available.
     pub agent_protocol_version: Option<i32>,
-    /// Runtime observations. `None` means this machine has never reported (an older
-    /// agent, or freshly enrolled and not yet due) — which must stay distinct from "reported
+    /// Runtime observations. `None` means this machine has never reported, which must stay
+    /// distinct from "reported
     /// zero": the UI shows an em dash, not 0, or the machine most worth worrying about displays
     /// as the healthiest.
     pub runtime_versions: Option<serde_json::Value>,
@@ -143,8 +136,8 @@ pub struct NodeAgentStateItem {
     pub geodata_observed: Option<serde_json::Value>,
     pub last_poll_at: Option<String>,
     pub last_usage_report_at: Option<String>,
-    /// Exact result of the last committed idempotent usage round. Empty means the machine has
-    /// never spoken protocol v3. The store may decorate the response with process-local findings;
+    /// Exact result of the last committed idempotent usage round. Empty means no usage round has
+    /// been accepted. The store may decorate the response with process-local findings;
     /// those fields are never written back to this JSON column.
     pub usage_last_result: Option<serde_json::Value>,
     pub usage_generation_id: Option<i64>,
@@ -643,8 +636,8 @@ pub struct UpsertFrontResult {
 /// for the same reason [`CreateRealityIngressRequest`] is not `Reality`: the REALITY keys are
 /// generated here and never accepted from a caller, so the request carries the overrides and
 /// this carries the shape.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum TransportRequest {
     #[default]
     VlessReality,
@@ -655,41 +648,6 @@ pub enum TransportRequest {
     VlessTlsXhttp {
         xhttp: Xhttp,
     },
-}
-
-impl<'de> Deserialize<'de> for TransportRequest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| serde::de::Error::custom("transport 必须是对象"))?;
-        let kind = object
-            .get("kind")
-            .and_then(Value::as_str)
-            .ok_or_else(|| serde::de::Error::custom("transport.kind 缺失"))?;
-        let xhttp = || {
-            object
-                .get("xhttp")
-                .cloned()
-                .ok_or_else(|| serde::de::Error::custom("transport.xhttp 缺失"))
-                .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))
-        };
-        match kind {
-            "vless-reality" => Ok(Self::VlessReality),
-            "vless-reality-xhttp" => Ok(Self::VlessRealityXhttp { xhttp: xhttp()? }),
-            // `fingerprint` and `alpn` were briefly accepted here. The custom decoder
-            // deliberately ignores those legacy keys so a stale browser can still save, while
-            // the typed request and every new response stop advertising them as managed state.
-            "vless-tls" => Ok(Self::VlessTls),
-            "vless-tls-xhttp" => Ok(Self::VlessTlsXhttp { xhttp: xhttp()? }),
-            other => Err(serde::de::Error::custom(format!(
-                "未知的 transport.kind: {other}"
-            ))),
-        }
-    }
 }
 
 /// What a caller asks an ingress to serve: either wire, or both.
@@ -719,7 +677,7 @@ pub struct VlessEncryptionRequest {
 }
 
 impl Default for WiresRequest {
-    /// A bare create with no `wires` gets what every ingress was before there was a choice.
+    /// The standard VLESS REALITY wire selected by the creation UI.
     fn default() -> Self {
         Self {
             vless_encryption: None,
@@ -806,9 +764,7 @@ pub struct CreateIngressRequest {
     #[serde(default)]
     pub front_id: Option<String>,
     pub reality: CreateRealityIngressRequest,
-    /// The whole shape of the wire. Absent means the plain shape, which is what every ingress
-    /// was before this field existed — so an older client's request keeps meaning what it meant.
-    #[serde(default)]
+    /// The complete wire shape requested for this ingress.
     pub wires: WiresRequest,
     /// The outward projection. Like the other fields in this request it overwrites wholesale:
     /// absent means neither family is projected.
@@ -816,12 +772,8 @@ pub struct CreateIngressRequest {
     /// A family's "no projection" is expressed by its whole absence (or `null`), not by an empty
     /// host. An empty host is turned back by `ingress.projection-blank` — an empty string left
     /// in the database can never afterwards be told apart from a half-filled one.
-    #[serde(default)]
     pub projection: Projection,
-    /// What this entrance refuses to carry. Absent means the four defaults on — a caller that does
-    /// not mention it gets the protected shape rather than the open one, which is the only way
-    /// round that is safe when the field is forgotten.
-    #[serde(default)]
+    /// What this entrance refuses to carry.
     pub guard: IngressGuard,
     #[serde(default)]
     pub note: Option<String>,
@@ -830,17 +782,11 @@ pub struct CreateIngressRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRealityIngressRequest {
-    /// Explicit provenance of the fallback target. Optional only for callers predating this
-    /// field; the write path infers global/custom from the submitted site in that case.
-    #[serde(default)]
-    pub fallback_mode: Option<RealityFallbackMode>,
-    /// Optional for old callers, which are placed on the balanced preset when written.
-    #[serde(default)]
-    pub fallback_limits: Option<RealityFallbackLimits>,
-    /// Whether the fallback may reach only the borrowed name. Absent means on, which is also what
-    /// the column defaults to: a caller predating this field is protected rather than exposed.
-    #[serde(default)]
-    pub fallback_guard: Option<bool>,
+    /// Explicit provenance of the fallback target.
+    pub fallback_mode: RealityFallbackMode,
+    pub fallback_limits: RealityFallbackLimits,
+    /// Whether the fallback may reach only the borrowed name.
+    pub fallback_guard: bool,
     /// Blank takes the site from the global settings (settings.reality_site). A value written
     /// here overrides it for this ingress — different ingresses borrowing different sites is a
     /// deliberately retained capability.
@@ -918,9 +864,23 @@ pub struct DeleteStepResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PruneChainResult {
     pub revision_id: u64,
-    /// The node ids of the steps removed. Empty means the chain had no stranded ones to begin
-    /// with, and the revision number falls back (the rollback logic in `commit_revision`).
+    /// The node ids of unreachable steps removed from the chain.
     pub removed_steps: Vec<String>,
+    /// The node ids whose relay inbound was removed because no final hop listens there.
+    pub cleared_hop_ins: Vec<String>,
+}
+
+/// The complete result of normalizing one chain after all of its rule tables have landed.
+#[derive(Debug, Default)]
+pub(crate) struct PruneChainOutcome {
+    pub removed_steps: Vec<String>,
+    pub cleared_hop_ins: Vec<String>,
+}
+
+impl PruneChainOutcome {
+    pub(crate) fn changed(&self) -> bool {
+        !self.removed_steps.is_empty() || !self.cleared_hop_ins.is_empty()
+    }
 }
 
 /// A cascading delete's result as written, used inside the transaction. `changed` feeds
@@ -1048,6 +1008,7 @@ mod tests {
     fn hysteria2_wires_request_has_a_typed_nested_payload() {
         let request: WiresRequest = serde_json::from_value(serde_json::json!({
             "hysteria2": {
+                "port": 30000,
                 "bandwidth": { "up": "20 mbps", "down": "100 mbps" },
                 "congestion": "brutal",
                 "obfs": { "kind": "salamander", "password": "secret" },
@@ -1065,8 +1026,13 @@ mod tests {
                 if password == "secret"
         ));
 
-        let missing = serde_json::from_value::<TransportRequest>(serde_json::json!({
-            "kind": "hysteria2"
+        let missing = serde_json::from_value::<WiresRequest>(serde_json::json!({
+            "hysteria2": {
+                "bandwidth": { "up": "20 mbps", "down": "100 mbps" },
+                "congestion": "brutal",
+                "obfs": null,
+                "masquerade": { "kind": "not-found" }
+            }
         }));
         assert!(
             missing.is_err(),
@@ -1075,18 +1041,13 @@ mod tests {
     }
 
     #[test]
-    fn stale_tls_client_overrides_are_ignored_by_the_request_decoder() {
-        let request: TransportRequest = serde_json::from_value(serde_json::json!({
+    fn transport_request_rejects_unknown_tls_fields() {
+        let request = serde_json::from_value::<TransportRequest>(serde_json::json!({
             "kind": "vless-tls-xhttp",
             "fingerprint": "none",
             "alpn": "http1",
             "xhttp": { "path": "/probe" }
-        }))
-        .unwrap();
-
-        let TransportRequest::VlessTlsXhttp { xhttp } = request else {
-            panic!("expected TLS + XHTTP")
-        };
-        assert_eq!(xhttp.path, "/probe");
+        }));
+        assert!(request.is_err());
     }
 }

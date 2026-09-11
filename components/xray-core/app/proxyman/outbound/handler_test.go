@@ -12,6 +12,7 @@ import (
 	"github.com/xtls/xray-core/app/proxyman"
 	. "github.com/xtls/xray-core/app/proxyman/outbound"
 	"github.com/xtls/xray-core/app/stats"
+	commonmux "github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
@@ -20,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/proxy/freedom"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	_ "github.com/xtls/xray-core/transport/internet/tcp"
 )
 
 func TestInterfaces(t *testing.T) {
@@ -90,11 +92,11 @@ func TestOutboundWithStatCounter(t *testing.T) {
 
 func TestHandlerRejectsInvalidMuxWorkerPoolProto(t *testing.T) {
 	validPool := &proxyman.WorkerPoolConfig{
-		MaxIdleWorkers:       2,
+		ReuseThreshold:       2,
 		MaxProbingWorkers:    1,
-		ProbeIntervalSecs:    5,
+		ProbeIntervalMs:      5000,
 		ProbeTimeoutMs:       2000,
-		IdleTtlSecs:          24,
+		IdleTtlMs:            24000,
 		MaxRequestsPerWorker: 128,
 	}
 	tests := map[string]*proxyman.MultiplexingConfig{
@@ -102,11 +104,11 @@ func TestHandlerRejectsInvalidMuxWorkerPoolProto(t *testing.T) {
 			Enabled:     true,
 			Concurrency: 1,
 			WorkerPool: &proxyman.WorkerPoolConfig{
-				MaxIdleWorkers:       2,
+				ReuseThreshold:       2,
 				MaxProbingWorkers:    1,
-				ProbeIntervalSecs:    5,
+				ProbeIntervalMs:      5000,
 				ProbeTimeoutMs:       5000,
-				IdleTtlSecs:          24,
+				IdleTtlMs:            24000,
 				MaxRequestsPerWorker: 128,
 			},
 		},
@@ -133,6 +135,45 @@ func TestHandlerRejectsInvalidMuxWorkerPoolProto(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandlerPublishesManagedMuxPoolForObservation(t *testing.T) {
+	v, _ := core.New(&core.Config{})
+	v.AddFeature((outbound.Manager)(new(Manager)))
+	ctx := context.WithValue(context.Background(), xrayKey, v)
+	handler, err := NewHandler(ctx, &core.OutboundHandlerConfig{
+		Tag: "out:app-a/chain-a>peer-a",
+		SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+			MultiplexSettings: &proxyman.MultiplexingConfig{
+				Enabled:     true,
+				Concurrency: 8,
+				WorkerPool: &proxyman.WorkerPoolConfig{
+					PrewarmWorkers:       1,
+					ReuseThreshold:       2,
+					MaxProbingWorkers:    1,
+					ProbeIntervalMs:      5000,
+					ProbeTimeoutMs:       2000,
+					IdleTtlMs:            24000,
+					MaxRequestsPerWorker: 128,
+				},
+			},
+		}),
+		ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = handler.Close() })
+
+	for _, pool := range commonmux.GetMuxSnapshot().Pools {
+		if pool.Pair == "out:app-a/chain-a>peer-a" && pool.Kind == "tcp" {
+			if pool.Config.Concurrency != 8 || pool.Config.PrewarmWorkers != 1 {
+				t.Fatalf("effective pool config = %+v", pool.Config)
+			}
+			return
+		}
+	}
+	t.Fatal("managed Mux pool was not published")
 }
 
 type drainingTestHandler struct {

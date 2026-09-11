@@ -12,11 +12,8 @@
 //!
 //! Those 19 outputs must not be hand-written. To change them, run
 //! `BROCADE_UPDATE_GOLDEN=1 cargo test -p brocade-core --test demo_raw`, then read the
-//! `git diff` file by file before committing. They were originally produced by a
-//! JavaScript-side demo implementation and compared byte for byte against Rust; that has
-//! since been removed (see OPENSOURCE_TODO.md §G), so their character now is a snapshot —
-//! able to catch unintended changes in the artifacts, unable to catch a misunderstanding of
-//! the specification itself.
+//! `git diff` file by file before committing. They are snapshot expectations: able to catch
+//! unintended artifact changes, while semantic behavior is covered by the focused tests.
 
 #![allow(dead_code)]
 
@@ -28,9 +25,9 @@ use std::{
 };
 
 use brocade_core::model::{
-    Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, Front, FrontStrategy, Grant,
-    HopDial, HopIn, HopPool, HopWire, Ingress, IngressWires, ModelSnapshot, Network, Node, Rule,
-    Step, Transport, User, WireGuardKeys,
+    Accept, Action, AppView, Chain, DestMatch, Dns, Front, FrontStrategy, Grant, HopDial, HopIn,
+    HopMux, HopPool, HopWire, Ingress, IngressWires, ModelSnapshot, Network, Node, Rule, Step,
+    Transport, User, WireGuardKeys,
 };
 use serde_json::Value;
 
@@ -69,15 +66,10 @@ fn model_node(node: &Value, system_nodes: &BTreeMap<String, SystemNodeFixture>) 
         id: id.to_owned(),
         tenant: str_value(&node["tenant"]).to_owned(),
         name: str_value(&node["name"]).to_owned(),
-        // In the baseline this field is still called `host`, its name before the
-        // dual-stack split. Both names are accepted, so that touching the baseline does not
-        // require changing the mapping in step. The demo has one address, so the v6 side is
-        // left empty and both NAT flags are false.
-        public_ipv4: optional_string(&node["public_ipv4"])
-            .or_else(|| optional_string(&node["host"])),
+        public_ipv4: optional_string(&node["public_ipv4"]),
         public_ipv6: optional_string(&node["public_ipv6"]),
-        public_ipv4_nat: bool_value(node.get("public_ipv4_nat").unwrap_or(&Value::Bool(false))),
-        public_ipv6_nat: bool_value(node.get("public_ipv6_nat").unwrap_or(&Value::Bool(false))),
+        public_ipv4_nat: bool_value(&node["public_ipv4_nat"]),
+        public_ipv6_nat: bool_value(&node["public_ipv6_nat"]),
         overlay_addr: system.overlay_addr,
         certificate_name: None,
         certificate_names: Vec::new(),
@@ -97,14 +89,14 @@ fn model_node(node: &Value, system_nodes: &BTreeMap<String, SystemNodeFixture>) 
             "servers" => Dns::Servers(string_array(&node["dns"]["v"])),
             value => panic!("unknown dns kind {value}"),
         },
-        // Absent from the baseline, which predates the field. Taking the default here is
-        // what keeps the golden artifacts byte-identical: it is the value the artifact
-        // layer used to hard-code.
-        domain_strategy: match node.get("domain_strategy") {
-            None => DomainStrategy::default(),
-            Some(value) => serde_json::from_value(value.clone())
-                .unwrap_or_else(|error| panic!("unknown domain strategy {value}: {error}")),
-        },
+        domain_strategy: serde_json::from_value(node["domain_strategy"].clone()).unwrap_or_else(
+            |error| {
+                panic!(
+                    "unknown domain strategy {}: {error}",
+                    node["domain_strategy"]
+                )
+            },
+        ),
     }
 }
 
@@ -285,12 +277,13 @@ fn model_action(value: &Value) -> Action {
             dial: HopDial::Overlay,
             pool: match optional_string(&value["pool"]) {
                 None => HopPool::None,
-                Some(spec) if spec == "pool" => HopPool::Pool,
-                Some(spec) => HopPool::Merge(
-                    spec.strip_prefix("merge:")
+                Some(spec) => HopPool::Mux(Some(HopMux {
+                    concurrency: spec
+                        .strip_prefix("mux:")
                         .and_then(|n| n.parse().ok())
                         .unwrap_or_else(|| panic!("unknown pool spec {spec}")),
-                ),
+                    ..HopMux::default()
+                })),
             },
         },
         "egress" => Action::Egress {

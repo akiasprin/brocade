@@ -41,6 +41,7 @@ import { useCrumb } from '../wm/crumb';
 import { isValidSlug } from './ports';
 import { SubscriptionViewer, type SubscriptionKind } from './subscription';
 import { draft } from '../draft';
+import { navigate } from '../forge/route';
 
 // 用户列表：一行一个用户，点击后就地展开。
 // 此处原为授权矩阵，行是用户、列是接入面。列数随数据增长：每个接入点一列，每个线路再加
@@ -1180,8 +1181,7 @@ function UserList({ drill, go, sheeted = false }: { drill: Drill; go: (d: Drill)
                   }
                   onClick={() => {
                     if (selfService) {
-                      wm.setFloor('desk');
-                      wm.open('tab:password', '改密码', { w: 460, h: 300 });
+                      navigate('password');
                     } else {
                       setPasswordUser(u);
                     }

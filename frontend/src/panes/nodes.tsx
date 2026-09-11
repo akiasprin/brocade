@@ -1,4 +1,3 @@
-import { ReverseHealthCard } from '../reverse-health';
 import { draft } from '../draft';
 import { Fragment, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import * as echarts from 'echarts/core';
@@ -37,6 +36,7 @@ import {
   setWireGuardLinkDisabled,
   updateNode,
   verifyDeployment,
+  AGENT_PROTOCOL_VERSION,
   type AgentLogLimits,
   type AgentLogLimitOverrides,
   type AgentLogPolicyNode,
@@ -56,7 +56,6 @@ import {
   type UsageNodeBucket,
 } from '../api';
 import { fetchPreviewStatus } from '../preview/api';
-import type { LinkIr } from '../topo/model';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
 import { can, isPublic, isVisitor, useSession } from '../session';
 import { Ago, Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
@@ -69,7 +68,6 @@ import { useAgentLiveness } from '../ui/agent-alive';
 import { pingLatencyMs, pingLatencyText, pingSampleText } from '../ui/ping-probe';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
-import { openTabByKey } from '../ui/topbar';
 import { RegionFlag } from '../ui/region-flag';
 import { navigate } from '../forge/route';
 import {
@@ -90,11 +88,14 @@ import { LoadCard, ThroughputChart, dur, iso, throughputAxis } from './telemetry
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import { ChainWizard } from './chain-wizard';
-import { ChainRulesPanel, IngressPortEditor } from './chains';
+import { ChainRulesPanel } from './chains';
 /* 日志上限的取值范围与设置页共用一份，见 settings.tsx 中该常量上的说明。 */
 import { LOG_MAX_MIB, LOG_MIN_MIB, validLogMib } from './settings';
 import { MachineEgressDnsRules, RuleDraftScope, isForwardTargetInChain } from './rules';
 import { chainSpine, fetchSnapshot, type SnapshotChain, type SnapshotIngress, type SnapshotStep } from '../api';
+import { MuxObservationCard } from '../mux-observation';
+import { NodeRealtimeProvider } from '../node-realtime';
+import { ReverseHealthCard } from '../reverse-health';
 import type { AppIr } from '../topo/model';
 
 // 纳管分两个阶段，中间是一次不可逆的写库：
@@ -437,8 +438,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     refetchInterval: 30_000,
   });
   // 各机器的近期负载。列表用它绘制 NIC 曲线，并决定状态灯的颜色与 title。
-  // 与上面两个查询一样独立：该端点不可用，或控制面版本尚不支持该端点时，
-  // 列表正常显示，状态点回退为只反映活性。
+  // 与上面两个查询一样独立：查询失败时列表正常显示，状态点回退为只反映活性。
   const load = useQuery({
     queryKey: ['node-load-list', 'windows', LIST_NIC_WINDOWS],
     queryFn: () => fetchNodeLoadListWindows(LIST_NIC_WINDOWS),
@@ -856,7 +856,7 @@ function NodeCard({
 }: {
   node: NodeAgentStateItem;
   isolatedNodeIds: ReadonlySet<string>;
-  /** 该机器的近期负载。undefined 表示尚未读取，或当前控制面版本没有该端点 */
+  /** 该机器的近期负载。undefined 表示尚未读取或查询失败。 */
   load?: NodeLoadView;
   /** 近一小时 Ping 读数；配置 TCP 目标后在卡片右下角替换 IP。 */
   pingProbe?: NodePingProbeView;
@@ -1852,45 +1852,18 @@ function WgTransportRow({
   // 接入面占用，且在 443 上运行非 TLS 服务会在主动探测下暴露。
   const [staged, setStaged] = useState<{ fake: boolean; port: number } | null>(null);
 
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled: canEdit });
-  const current = revisions.data?.current_revision;
-  const compile = useQuery({
-    queryKey: ['compile', current],
-    queryFn: () => fetchCompileView(current!),
-    enabled: canEdit && !!current,
-  });
+  /* 这行编辑的是节点声明的入站方式，必须读取节点模型本身。编译后的 `wrap.servers`
+     表示 phantun 服务实际部署在哪台机器：声明 fake TCP 的节点位于 NAT 后时，服务端会
+     借到可达的对端，拿它反推会把当前节点显示为 UDP、对端显示为 Phantun。
 
-  // 当前值取自编译结果而非 `node.wg_transport_kind`，原因与 OverlayRow 一致：
-  // `/nodes/agent-state` 是直连接口，不经过草稿预览，以它为数据源会导致选择 phantun、
-  // 写入草稿后该行显示回退为直接 UDP——改动已在草稿中而界面显示为未修改。
-  //
-  // 判定依据是是否存在与该机器相邻的链路将 phantun 服务端部署在该机器上。封装是链路属性
-  // （启用时两端同时启用），而 `servers` 的键正是被连接的一侧，即该行表示的入站方向。
-  // 地址中包含端口，可一并获取。
-  //
-  // 不存在相邻链路时回退到模型值，而不是判定为 UDP：该机器可能不在 overlay 中，
-  // 没有链路可供推断，此时显示「直接 UDP」相当于把无法推断当作推断结果。
-  const links = (compile.data?.system as { links?: LinkIr[] } | undefined)?.links;
-  const touching = links?.filter(link => link.a === node.node_id || link.b === node.node_id);
-  const served = touching
-    ?.map(link => (link.wrap?.t === 'fake_tcp' ? link.wrap.v?.servers?.[node.node_id] : undefined))
-    .find(Boolean);
-  const known = touching !== undefined && touching.length > 0;
-  const pendingTransport = useDraftNode(node.node_id)?.wg_transport;
-  const currentFake = pendingTransport
-    ? pendingTransport.t === 'fake_tcp'
-    : known
-      ? served !== undefined
-      : node.wg_transport_kind === 'fake_tcp';
-  const currentPort = pendingTransport
-    ? pendingTransport.t === 'fake_tcp'
-      ? pendingTransport.v.port
-      : null
-    : served
-      ? Number(served.split(':').pop()) || null
-      : known
-        ? null
-        : node.wg_fake_tcp_port;
+     优先读取同一节点尚未提交的 update_node，再读草稿预览快照；两者都没有时才回退到
+     agent-state。这样保存到草稿后不会弹回旧值，也不会把开关串到对端。 */
+  const draftNode = useDraftNode(node.node_id);
+  const snapshotTransport =
+    draftNode?.wireguard && 'transport' in draftNode.wireguard ? draftNode.wireguard.transport : undefined;
+  const transport = draftNode?.wg_transport ?? snapshotTransport;
+  const currentFake = transport ? transport.t === 'fake_tcp' : node.wg_transport_kind === 'fake_tcp';
+  const currentPort = transport ? (transport.t === 'fake_tcp' ? transport.v.port : null) : node.wg_fake_tcp_port;
 
   const fake = staged?.fake ?? currentFake;
   const port = staged?.port ?? currentPort ?? 39743;
@@ -1909,9 +1882,7 @@ function WgTransportRow({
     },
   });
 
-  const dependencyPending = revisions.isPending || (current != null && compile.isPending);
-  const dependencyError = revisions.error ?? compile.error;
-  const editingReady = canEdit && !dependencyPending && !dependencyError;
+  const editingReady = canEdit;
 
   /* 两档常驻，改了才出工具条，不再先点「改」把行切进编辑态。
      端口输入框只在选中 Phantun 时出现——直连 UDP 下它没有对应的配置项。 */
@@ -1935,7 +1906,6 @@ function WgTransportRow({
       </span>
       <span className="sub">Phantun 把 WireGuard 的 UDP 伪装成 TCP，用于 UDP 被限速的线路。</span>
       {fake && <span className="sub">使用高位端口。不要使用 443：容易与接入面冲突，也容易被探测。</span>}
-      {dependencyError && <ErrorBox error={dependencyError} />}
       {dirty && (
         <>
           <span className="sub" style={{ color: 'var(--gold)' }}>
@@ -2443,9 +2413,6 @@ export function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; can
             </div>
           </div>
         )}
-        <span className="sub">
-          保存到草稿后，需提交并发布才切换证书组；应用时会重启 Xray，现有连接会中断，用户需重新拉取订阅。
-        </span>
         {save.error && <ErrorBox error={save.error} />}
         {canEdit && dirty && (
           <div className="toolbar">
@@ -2789,7 +2756,7 @@ export function LogRetentionCard({ node, canEdit }: { node: NodeAgentStateItem; 
     <details className="panel config-panel node-log-retention">
       <summary>
         <PanelTitle of="artifacts">日志保留</PanelTitle>
-        <span className="hint">{overrideCount === 0 ? '全部继承' : `本机覆盖 ${overrideCount} 项`}</span>
+        <span className="hint">{overrideCount === 0 ? '与全局一致' : `本机覆盖 ${overrideCount} 项`}</span>
       </summary>
       <div className="fgrid one">
         <NodeLogLimitRow
@@ -3077,7 +3044,7 @@ type Finding = {
   chip: string;
   text: ReactNode;
   /** 只在详情页显示，不进入列表。列表用于定位存在问题的机器，而部分条目是说明而非问题——
-      例如「该版本 agent 不上报该字段」，它解释了相邻字段显示为「—」的原因，
+      例如「运行时观测尚未到达」，它解释了相邻字段显示为「—」的原因，
       但机器本身没有异常。不加区分时，刚纳管、尚未轮到上报的机器会在列表中显示警告标记，
       即把正常机器显示为异常，其后果与把异常机器显示为正常同样严重。 */
   detailOnly?: boolean;
@@ -3231,7 +3198,7 @@ export function runtimeFindings(
     });
   }
 
-  /* 旧版本 agent 不上报这几项。该条需要最后添加：它说明上面各项显示为「—」的原因。 */
+  /* 该条需要最后添加：它说明上面各项显示为「—」的原因。 */
   if (!node.runtime_versions && node.agent_version) {
     out.push({
       tone: 'warn',
@@ -3240,8 +3207,8 @@ export function runtimeFindings(
       chip: `agent ${node.agent_version.replace(/^brocade-agent\//, '').slice(0, 12)}`,
       text: (
         <>
-          还没收到这台的运行时观测：要么是刚纳管、还没轮到（周期 30 分钟）， 要么是这一版 agent <b>不上报</b>
-          。所以那几处是「—」不是 0。
+          还没收到这台的运行时观测：可能是刚纳管、还没轮到（周期 30 分钟），也可能是 Agent 协议尚未恢复。
+          所以那几处是「—」不是 0。
           {/* 「等待下次发布」的表述是错误的——发布只包含配置（wireguard.conf / xray.json / grants），
               不包含 agent 二进制。但升级 agent 同样无需登录机器：agent 每轮都会请求一次
               `/agent/v1/agent-release`（brocade-agent/src/selfupdate.rs），控制面按其上报的
@@ -3272,15 +3239,8 @@ function Findings({ list }: { list: Finding[] }) {
 
 /** agent 的标识：其二进制自身的 sha256，不是版本号。
  *
- * 替换手写版本号是因为该值不具备标识能力——发布 agent 时通常不会同步修改 workspace
- * 的版本号，因此从上次改动至今的每次构建都上报同一个值，而发布时需要确认的正是
- * 该机器是否已完成替换。
- *
  * 有两种来源和两种格式：poll 的 User-Agent 是 `brocade-agent/<sha>`，runtime 上报是裸 sha。
- * 两者都提取出 sha 后显示前 12 位（与 git 的惯例一致），完整值写入 title 以便完整比对。
- *
- * 无法识别为 sha 的按原样显示：旧版本 agent 上报的是 `0.1.0` 这类值，这些实例仍在运行，
- * 显示内容需要可读。 */
+ * 两者都提取出 sha 后显示前 12 位，完整值写入 title 以便完整比对。 */
 function agentIdent(raw: string | null | undefined) {
   if (!raw) return <span className="dim">—</span>;
   const bare = raw.replace(/^brocade-agent\//, '');
@@ -3297,16 +3257,21 @@ function agentIdent(raw: string | null | undefined) {
       </span>
     );
   return (
-    <span className="mono" title="这一版 agent 报的还是手写版本号，认不出是哪次构建，也不会自更新">
-      {bare}
+    <span className="hot" title={`无效的 Agent 构建标识：${bare}`}>
+      标识无效
     </span>
   );
 }
 
+function agentProtocol(version: number | null) {
+  if (version === AGENT_PROTOCOL_VERSION) return <>v{version}</>;
+  return <Hot>{version === null ? '未上报' : `v${version} · 不兼容`} · 等待救援更新</Hot>;
+}
+
 /** 该机器的当前负载。自行获取数据，与 UsageCard 结构相同——详情页不统一管理各卡的数据。
  *
- * 获取失败时整张卡不渲染（`retry: false` 且不提示）：该端点是后加的，未升级的控制面
- * 会返回 404，而这不是该机器的问题，不应在其详情页显示错误。 */
+ * 获取失败时整张卡不渲染（`retry: false` 且不提示）：负载查询失败不是该机器本身的
+ * 健康结论，不应在其详情页显示成机器错误。 */
 /* ── 网络吞吐面板：全机队 NIC 网卡汇总 对 XRAY 承载 ──
    机器列表页顶部的一张总览：把所有机器的网卡吞吐与被代理承载各自相加，画成上下镜像。
    接收在上、发送在下，零线居中；每侧 NIC 是描边外层、XRAY 是实心内层——两线之间的缝
@@ -4028,10 +3993,7 @@ function AgentCard({
           // 「构建」不等同于「版本」：该字段是二进制自身 sha256 的前 12 位。发布 agent 时
           // 需要比对的正是它——控制面上已批准的构建号与该机器实际运行的构建号。
           ['构建', agentIdent(node.agent_version)],
-          [
-            '协议',
-            node.agent_protocol_version === null ? <Hot>旧版 · 等待救援升级</Hot> : <>v{node.agent_protocol_version}</>,
-          ],
+          ['协议', agentProtocol(node.agent_protocol_version)],
           [
             '上报积压',
             node.spool_backlog ? (
@@ -4311,11 +4273,6 @@ function NodeChainRuleTree({
         showHeader={false}
         rootLabel={use.chain.name || use.chain.id}
         rootLabelTitle={`${use.appId} / ${use.chain.id}`}
-        rootSummary={
-          use.ingress?.node === nodeId ? (
-            <IngressPortEditor appId={use.appId} ingress={use.ingress} editable={!readOnly} compact />
-          ) : undefined
-        }
         readOnly={readOnly}
         settingsReadable={settingsReadable}
       />
@@ -4482,6 +4439,8 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
   });
   const revisionOf = (d: number) => deployments.data?.deployments.find(x => x.id === d)?.revision_id;
   const n = nodes.data?.nodes.find(x => x.node_id === id);
+  /* 反向隧道卡显示的是对端机器，名称与本页其他位置同源。 */
+  const nodeNameOf = (other: string) => nodes.data?.nodes.find(x => x.node_id === other)?.name || other;
   /* 签发的 node token 同样只显示一次 */
   const [issued, setIssued] = useState<{ token: string; install_command: string } | null>(null);
 
@@ -4671,6 +4630,14 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
       .filter((use): use is NodeChainUse => use !== null),
   );
   const machineEgressPolicies = (snapshot.data?.node_egress_dns ?? []).filter(policy => policy.node === id);
+  /* 反向标签里只有 app 和 chain 的 id，链名来自快照。app 段可缺省（见 parsePair），
+     此时在全部项目里按 chain id 查找；查不到的链只显示 id，不留空。 */
+  const chainNameOf = (appId: string | null, chainId: string) => {
+    const apps = snapshot.data?.snapshot.apps ?? [];
+    const app = appId ? apps.find(a => a.id === appId) : undefined;
+    const chains = app ? (app.chains ?? []) : apps.flatMap(a => a.chains ?? []);
+    return chains.find(chain => chain.id === chainId)?.name ?? null;
+  };
 
   // 规则页同时承载机器 DNS 策略和链路规则，所以没有加入链路的机器也保留这一页；两块
   // 各自显示空状态，不能再把“无链路”等同于“没有规则页面”。
@@ -4809,7 +4776,7 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
                       </>
                     )}
                     {n.lifecycle_deployment_id && (
-                      <button role="menuitem" onClick={() => openTabByKey('deploy')}>
+                      <button role="menuitem" onClick={() => navigate('deploy')}>
                         <Icon of="deploy" size={14} className="action-menu-icon" />
                         <span>
                           查看发布 #{n.lifecycle_deployment_id}
@@ -4829,7 +4796,6 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
 
   return (
     <NodeDetailLayout sheeted={sheeted} node={n} lamp={lamp} toolbar={detailToolbar}>
-      <ReverseHealthCard nodeId={id} />
       {n.operationally_isolated && (
         <div className="callout warn node-isolation-banner">
           <div className="node-isolation-copy">
@@ -4907,6 +4873,12 @@ function NodeDetail({ id, go, sheeted = false }: { id: string; go: (d: Drill) =>
             <ThroughputPanel nodeId={id} range={loadRange} linked={chartsLinked} />
             <PingProbePanel nodeId={id} range={loadRange} linked={chartsLinked} />
           </div>
+          {/* Mux 与反向隧道来自同一条节点实时流，只建立一个 EventSource。两张卡都只在对应
+              快照存在时渲染；计数基线留在浏览器内，不进入遥测历史或数据库。 */}
+          <NodeRealtimeProvider nodeId={id}>
+            <MuxObservationCard nodeId={id} nodeName={nodeNameOf} chainName={chainNameOf} />
+            <ReverseHealthCard nodeId={id} nodeName={nodeNameOf} chainName={chainNameOf} />
+          </NodeRealtimeProvider>
           {/* AGENT → HOST → CONFIG 是一组状态事实，合成一张整宽卡，见 RuntimeCard。 */}
           <RuntimeCard
             node={n}
@@ -5671,9 +5643,6 @@ function ProvisionInstall({
           disabled={target == null || probe?.state !== 'online'}
           title={probe?.state === 'online' ? '' : '等 agent 上线后再发布'}
           onClick={() => {
-            // 两套外壳各有一套机制：旧外壳（workbench）使用窗口和台面，新外壳使用 nav 和地址栏。
-            // navigate 会创建窗口、写入 drill 并更新地址栏。
-            openTabByKey('deploy');
             navigate('deploy', { p: 'plan', revision: target });
             go({ p: 'list' });
           }}

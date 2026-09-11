@@ -328,9 +328,8 @@ async fn upsert_host_facts(
     let json = serde_json::to_value(host).map_err(|error| {
         StoreError::InvalidData(format!("host facts not serializable: {error}"))
     })?;
-    // The row is created by enrollment, but an UPSERT rather than an UPDATE anyway: a machine
-    // provisioned by an older path may have no node_agent_state row, and losing every load report
-    // until somebody notices is a silent failure.
+    // Token enrollment normally creates the row first. Keeping this write atomic as an UPSERT
+    // also makes ingestion robust if initialization and the first report race.
     let result = sqlx::query(
         "INSERT INTO node_agent_state (node_id, load_host_facts, load_reported_at, load_clock_skew_secs)
          VALUES ($1, $2, to_timestamp($3), $4)
@@ -366,11 +365,13 @@ async fn replace_process_state(
         .execute(&mut **tx)
         .await?;
     for p in processes {
-        // An unknown process name would fail the CHECK and take the whole transaction — every
-        // sample in this round included. Skipping is right: a newer agent reporting a process
-        // this control plane has not heard of must not cost the readings that came with it.
+        // The protocol version pins this vocabulary, so an unknown process is malformed input
+        // rather than an extension that can be silently discarded.
         if !matches!(p.proc.as_str(), "xray" | "wg" | "phantun" | "agent") {
-            continue;
+            return Err(StoreError::InvalidData(format!(
+                "unknown managed process {:?}",
+                p.proc
+            )));
         }
         sqlx::query(
             "INSERT INTO node_process_state
@@ -428,10 +429,15 @@ pub async fn node_load_view(
     let (host, reported_at, clock_skew) = match facts {
         Some(row) => {
             let raw: Option<serde_json::Value> = row.try_get("load_host_facts")?;
-            // A blob that will not parse means an agent newer or older than this control plane.
-            // Treated as "no facts" rather than an error: the series alongside it is still good,
-            // and failing the whole read would blank a page over one field.
-            let host = raw.and_then(|v| serde_json::from_value::<HostFacts>(v).ok());
+            let host = raw
+                .map(|value| {
+                    serde_json::from_value::<HostFacts>(value).map_err(|error| {
+                        StoreError::InvalidData(format!(
+                            "node {node_id} has invalid stored host facts: {error}"
+                        ))
+                    })
+                })
+                .transpose()?;
             (
                 host,
                 row.try_get::<Option<i64>, _>("reported_at")?,

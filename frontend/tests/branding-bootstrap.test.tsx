@@ -14,10 +14,12 @@ window.matchMedia = ((query: string) => ({
 })) as unknown as typeof window.matchMedia;
 const { App } = await import('../src/app');
 const { initialBranding } = await import('../src/api');
+const { syncFavicon } = await import('../src/ui/branding');
 
 afterEach(() => {
   cleanup();
   document.getElementById('brocade-branding')?.remove();
+  document.querySelector<HTMLLinkElement>('link#brocade-favicon')?.remove();
   vi.unstubAllGlobals();
 });
 
@@ -51,6 +53,35 @@ describe('站点标题初始化', () => {
     expect(document.title).toBe('我的站点 | 跨境网络小管家');
     finish(Response.json({ site_name: '更新后的站点', icon_data_url: null }));
     await waitFor(() => expect(document.title).toBe('更新后的站点 | 跨境网络小管家'));
+  });
+
+  it('把站点图标同步为 favicon，并接受接口返回的新图标', async () => {
+    const favicon = document.createElement('link');
+    favicon.id = 'brocade-favicon';
+    favicon.rel = 'icon';
+    favicon.href = '/favicon.svg';
+    favicon.dataset.defaultHref = '/favicon.svg';
+    document.head.append(favicon);
+    const script = document.createElement('script');
+    script.id = 'brocade-branding';
+    script.type = 'application/json';
+    script.textContent = JSON.stringify({ site_name: '我的站点', icon_data_url: 'data:image/png;base64,aW5pdGlhbA==' });
+    document.head.append(script);
+    let finish!: (response: Response) => void;
+    const branding = new Promise<Response>(resolve => {
+      finish = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string) => (path === '/branding' ? branding : new Promise(() => {}))),
+    );
+
+    mount();
+    expect(favicon.getAttribute('href')).toBe('data:image/png;base64,aW5pdGlhbA==');
+    finish(Response.json({ site_name: '我的站点', icon_data_url: 'data:image/webp;base64,dXBkYXRlZA==' }));
+    await waitFor(() => expect(favicon.getAttribute('href')).toBe('data:image/webp;base64,dXBkYXRlZA=='));
+    syncFavicon(null);
+    expect(favicon.getAttribute('href')).toBe('/favicon.svg');
   });
 
   it('没有首页配置时保留中性标题，不用默认名称覆盖它', () => {

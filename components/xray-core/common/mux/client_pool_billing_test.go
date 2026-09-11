@@ -116,19 +116,25 @@ func TestMuxProbeDoesNotChangeUserTrafficCounters(t *testing.T) {
 
 	clock.Advance(cfg.ProbeInterval)
 	waitForTest(t, "periodic probe round trip", func() bool {
-		stats := picker.WorkerPoolStats()
 		// The peer's final End frame can arrive after local session closure.
-		// That is legitimate I/O and moves the deadline. Advance to that deadline
-		// while idle, but never advance an in-flight probe ahead of its real Pong.
-		if stats.ProbeSentTotal == 0 {
-			client.poolAccess.Lock()
-			due := client.nextProbeAt
-			ready := client.poolState == workerIdleReady
-			client.poolAccess.Unlock()
-			if ready && due.After(clock.Now()) {
-				clock.Advance(due.Sub(clock.Now()))
-			}
+		// Sample state and sent probes together: a stale counter snapshot must
+		// not advance past a first Pong that has already restored idle-ready.
+		client.poolAccess.Lock()
+		timer, scheduled := client.poolTimer.(*fakePoolTimer)
+		advance := client.poolState == workerIdleReady && client.poolProbes == 0 && scheduled
+		var due time.Time
+		if advance {
+			due = timer.at
 		}
+		client.poolAccess.Unlock()
+		if advance {
+			// A virtual jump can occur between schedulePoolTimerLocked's Now
+			// and AfterFunc calls. Drive the registered timer, which may then
+			// be later than nextProbeAt, including due-now callbacks installed
+			// after a previous Advance drained its list.
+			clock.Advance(max(time.Duration(0), due.Sub(clock.Now())))
+		}
+		stats := picker.WorkerPoolStats()
 		return stats.ProbeAckTotal == 1 && workerStateForTest(client) == workerIdleReady
 	})
 	if uplink.Value() != beforeUplink || downlink.Value() != beforeDownlink {

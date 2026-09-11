@@ -87,12 +87,12 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             anytls_padding_scheme,
             reverse_health, reverse_health_overrides,
             relay_mux_concurrency,
-            relay_mux_min_idle_workers,
-            relay_mux_max_idle_workers,
+            relay_mux_prewarm_workers,
+            relay_mux_reuse_threshold,
             relay_mux_max_probing_workers,
-            relay_mux_probe_interval_secs,
+            relay_mux_probe_interval_ms,
             relay_mux_probe_timeout_ms,
-            relay_mux_idle_ttl_secs,
+            relay_mux_idle_ttl_ms,
             relay_mux_max_requests_per_worker
          FROM control_state
          WHERE id = TRUE";
@@ -149,29 +149,29 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
                 "relay_mux_concurrency",
                 row.try_get("relay_mux_concurrency")?,
             )?,
-            min_idle_workers: u32_bigint_column(
-                "relay_mux_min_idle_workers",
-                row.try_get("relay_mux_min_idle_workers")?,
+            prewarm_workers: u32_bigint_column(
+                "relay_mux_prewarm_workers",
+                row.try_get("relay_mux_prewarm_workers")?,
             )?,
-            max_idle_workers: u32_bigint_column(
-                "relay_mux_max_idle_workers",
-                row.try_get("relay_mux_max_idle_workers")?,
+            reuse_threshold: u32_bigint_column(
+                "relay_mux_reuse_threshold",
+                row.try_get("relay_mux_reuse_threshold")?,
             )?,
             max_probing_workers: u32_bigint_column(
                 "relay_mux_max_probing_workers",
                 row.try_get("relay_mux_max_probing_workers")?,
             )?,
-            probe_interval_secs: u16_column(
-                "relay_mux_probe_interval_secs",
-                row.try_get("relay_mux_probe_interval_secs")?,
+            probe_interval_ms: u32_column(
+                "relay_mux_probe_interval_ms",
+                row.try_get("relay_mux_probe_interval_ms")?,
             )?,
             probe_timeout_ms: u32_column(
                 "relay_mux_probe_timeout_ms",
                 row.try_get("relay_mux_probe_timeout_ms")?,
             )?,
-            idle_ttl_secs: u32_bigint_column(
-                "relay_mux_idle_ttl_secs",
-                row.try_get("relay_mux_idle_ttl_secs")?,
+            idle_ttl_ms: u32_bigint_column(
+                "relay_mux_idle_ttl_ms",
+                row.try_get("relay_mux_idle_ttl_ms")?,
             )?,
             max_requests_per_worker: u16_column(
                 "relay_mux_max_requests_per_worker",
@@ -321,12 +321,12 @@ pub(crate) async fn update_settings_tx(
              overlay_disabled_links = $26,
              anytls_padding_scheme = $27,
              relay_mux_concurrency = $28,
-             relay_mux_min_idle_workers = $29,
-             relay_mux_max_idle_workers = $30,
+             relay_mux_prewarm_workers = $29,
+             relay_mux_reuse_threshold = $30,
              relay_mux_max_probing_workers = $31,
-             relay_mux_probe_interval_secs = $32,
+             relay_mux_probe_interval_ms = $32,
              relay_mux_probe_timeout_ms = $33,
-             relay_mux_idle_ttl_secs = $34,
+             relay_mux_idle_ttl_ms = $34,
              relay_mux_max_requests_per_worker = $35,
              port_vless_encryption_base = $36, reverse_health = $37, reverse_health_overrides = $38
          WHERE id = TRUE",
@@ -370,12 +370,12 @@ pub(crate) async fn update_settings_tx(
     .bind(serde_json::to_value(&settings.overlay.disabled_links)?)
     .bind(serde_json::to_value(&settings.anytls_padding_scheme)?)
     .bind(i32::from(settings.relay_mux.concurrency))
-    .bind(i64::from(settings.relay_mux.min_idle_workers))
-    .bind(i64::from(settings.relay_mux.max_idle_workers))
+    .bind(i64::from(settings.relay_mux.prewarm_workers))
+    .bind(i64::from(settings.relay_mux.reuse_threshold))
     .bind(i64::from(settings.relay_mux.max_probing_workers))
-    .bind(i32::from(settings.relay_mux.probe_interval_secs))
+    .bind(i32::try_from(settings.relay_mux.probe_interval_ms).unwrap_or(i32::MAX))
     .bind(i32::try_from(settings.relay_mux.probe_timeout_ms).unwrap_or(i32::MAX))
-    .bind(i64::from(settings.relay_mux.idle_ttl_secs))
+    .bind(i64::from(settings.relay_mux.idle_ttl_ms))
     .bind(i32::from(settings.relay_mux.max_requests_per_worker))
     .bind(i32::from(settings.ports.vless_encryption_base))
     .bind(serde_json::to_value(settings.reverse_health)?)
@@ -665,40 +665,42 @@ fn validate_relay_mux(mux: &HopMux) -> Result<()> {
     if !(HopMux::CONCURRENCY_MIN..=HopMux::CONCURRENCY_MAX).contains(&mux.concurrency) {
         return Err(invalid("concurrency", "必须在 1–128 之间"));
     }
-    if mux.max_idle_workers < HopMux::MAX_IDLE_MIN {
-        return Err(invalid("max_idle_workers", "必须至少为 1"));
+    if mux.reuse_threshold < HopMux::REUSE_THRESHOLD_MIN {
+        return Err(invalid("reuse_threshold", "必须至少为 1"));
     }
-    if mux.min_idle_workers > mux.max_idle_workers {
-        return Err(invalid("min_idle_workers", "不能大于 max_idle_workers"));
+    if mux.prewarm_workers > mux.reuse_threshold {
+        return Err(invalid("prewarm_workers", "不能大于 reuse_threshold"));
     }
-    if mux.max_probing_workers == 0 || mux.max_probing_workers > mux.max_idle_workers {
+    if mux.max_probing_workers == 0 || mux.max_probing_workers > mux.reuse_threshold {
         return Err(invalid(
             "max_probing_workers",
-            "必须在 1 与 max_idle_workers 之间",
+            "探活并发必须在 1 与 reuse_threshold 之间",
         ));
     }
-    if !(HopMux::PROBE_INTERVAL_MIN_SECS..=HopMux::PROBE_INTERVAL_MAX_SECS)
-        .contains(&mux.probe_interval_secs)
+    if !(HopMux::PROBE_INTERVAL_MIN_MS..=HopMux::PROBE_INTERVAL_MAX_MS)
+        .contains(&mux.probe_interval_ms)
     {
-        return Err(invalid("probe_interval_secs", "必须在 2–60 秒之间"));
+        return Err(invalid(
+            "probe_interval_ms",
+            "探活周期必须在 2000–60000 ms 之间",
+        ));
     }
     if !(HopMux::PROBE_TIMEOUT_MIN_MS..=HopMux::PROBE_TIMEOUT_MAX_MS)
         .contains(&mux.probe_timeout_ms)
-        || mux.probe_timeout_ms >= u32::from(mux.probe_interval_secs) * 1000
+        || mux.probe_timeout_ms >= mux.probe_interval_ms
     {
         return Err(invalid(
             "probe_timeout_ms",
-            "必须在 200–10000 毫秒之间，且小于 probe_interval_secs",
+            "探活超时必须在 200–10000 ms 之间，且小于 probe_interval_ms",
         ));
     }
-    if mux.idle_ttl_secs < HopMux::IDLE_TTL_MIN_SECS {
-        return Err(invalid("idle_ttl_secs", "必须为正整数秒"));
+    if mux.idle_ttl_ms < HopMux::IDLE_TTL_MIN_MS {
+        return Err(invalid("idle_ttl_ms", "超额空闲寿命必须不小于 1000 ms"));
     }
-    let rounded_timeout_secs = mux.probe_timeout_ms.saturating_add(999) / 1000;
-    if mux.idle_ttl_secs < u32::from(mux.probe_interval_secs).saturating_add(rounded_timeout_secs) {
+    if mux.idle_ttl_ms < mux.probe_interval_ms.saturating_add(mux.probe_timeout_ms) {
         return Err(invalid(
-            "idle_ttl_secs",
-            "必须覆盖一个探测间隔和向上取整后的探测超时",
+            "idle_ttl_ms",
+            "超额空闲寿命必须覆盖一个探活周期和探活超时",
         ));
     }
     if !(HopMux::MAX_REQUESTS_MIN..=HopMux::MAX_REQUESTS_MAX).contains(&mux.max_requests_per_worker)

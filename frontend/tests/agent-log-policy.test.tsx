@@ -40,12 +40,15 @@ function mounted(data = policy()) {
 }
 
 describe('Agent log policy inheritance', () => {
-  it('lists each independently capped log scope and updates the displayed limit with the input', () => {
+  it('lists each independently capped log scope without implementation details and updates the input', () => {
     const view = mounted();
     const scope = view.getByLabelText('日志额度作用范围');
-    expect(within(scope).getByText('独立 journal 命名空间')).toBeTruthy();
-    expect(within(scope).getByText('xray.log + xray.log.1')).toBeTruthy();
-    expect(within(scope).getByText('每个实例的 .log + .log.1')).toBeTruthy();
+    expect(within(scope).getByText('Agent')).toBeTruthy();
+    expect(within(scope).getByText('XRAY')).toBeTruthy();
+    expect(within(scope).getByText('Phantun')).toBeTruthy();
+    expect(within(scope).queryByText('独立 journal 命名空间')).toBeNull();
+    expect(within(scope).queryByText('xray.log + xray.log.1')).toBeNull();
+    expect(within(scope).queryByText('每个实例的 .log + .log.1')).toBeNull();
     expect((view.getByLabelText('全局 Agent 日志上限') as HTMLInputElement).value).toBe('100');
     expect((view.getByLabelText('全局 XRAY 日志上限') as HTMLInputElement).value).toBe('100');
     expect((view.getByLabelText('全局 Phantun 日志上限') as HTMLInputElement).value).toBe('100');
@@ -115,7 +118,7 @@ describe('Agent log policy inheritance', () => {
         <NodeLogPolicyRow editable node={policy().nodes[1]} global={policy().global} />
       </QueryClientProvider>,
     );
-    fireEvent.click(overridden.getByRole('button', { name: '全部继承' }));
+    fireEvent.click(overridden.getByRole('button', { name: '与全局一致' }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     const [clearUrl, clearInit] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(clearUrl).toBe('/agent-log-policy/nodes/sg');

@@ -246,46 +246,42 @@ fn validate_hop_mux(mux: &crate::model::HopMux, location: &str, diagnostics: &mu
     if !(HopMux::CONCURRENCY_MIN..=HopMux::CONCURRENCY_MAX).contains(&mux.concurrency) {
         invalid("concurrency", "复用流数量必须在 1–128 之间".to_owned());
     }
-    if mux.max_idle_workers < HopMux::MAX_IDLE_MIN {
-        invalid("max_idle_workers", "最大空闲连接必须至少为 1".to_owned());
+    if mux.reuse_threshold < HopMux::REUSE_THRESHOLD_MIN {
+        invalid("reuse_threshold", "复用阈值必须至少为 1".to_owned());
     }
-    if mux.min_idle_workers > mux.max_idle_workers {
-        invalid(
-            "min_idle_workers",
-            "最小空闲连接不能大于最大空闲连接".to_owned(),
-        );
+    if mux.prewarm_workers > mux.reuse_threshold {
+        invalid("prewarm_workers", "预热目标不能大于复用阈值".to_owned());
     }
-    if mux.max_probing_workers == 0 || mux.max_probing_workers > mux.max_idle_workers {
+    if mux.max_probing_workers == 0 || mux.max_probing_workers > mux.reuse_threshold {
         invalid(
             "max_probing_workers",
-            "同时探测连接必须在 1 与最大空闲连接之间".to_owned(),
+            "探活并发必须在 1 与复用阈值之间".to_owned(),
         );
     }
-    if !(HopMux::PROBE_INTERVAL_MIN_SECS..=HopMux::PROBE_INTERVAL_MAX_SECS)
-        .contains(&mux.probe_interval_secs)
+    if !(HopMux::PROBE_INTERVAL_MIN_MS..=HopMux::PROBE_INTERVAL_MAX_MS)
+        .contains(&mux.probe_interval_ms)
     {
         invalid(
-            "probe_interval_secs",
-            "探测间隔必须在 2–60 秒之间".to_owned(),
+            "probe_interval_ms",
+            "探活周期必须在 2000–60000 ms 之间".to_owned(),
         );
     }
     if !(HopMux::PROBE_TIMEOUT_MIN_MS..=HopMux::PROBE_TIMEOUT_MAX_MS)
         .contains(&mux.probe_timeout_ms)
-        || mux.probe_timeout_ms >= u32::from(mux.probe_interval_secs) * 1000
+        || mux.probe_timeout_ms >= mux.probe_interval_ms
     {
         invalid(
             "probe_timeout_ms",
-            "探测超时必须在 200–10000 毫秒之间，且小于探测间隔".to_owned(),
+            "探活超时必须在 200–10000 ms 之间，且小于探活周期".to_owned(),
         );
     }
-    if mux.idle_ttl_secs < HopMux::IDLE_TTL_MIN_SECS {
-        invalid("idle_ttl_secs", "空闲寿命必须为正整数秒".to_owned());
+    if mux.idle_ttl_ms < HopMux::IDLE_TTL_MIN_MS {
+        invalid("idle_ttl_ms", "超额空闲寿命必须不小于 1000 ms".to_owned());
     }
-    let rounded_timeout_secs = mux.probe_timeout_ms.saturating_add(999) / 1000;
-    if mux.idle_ttl_secs < u32::from(mux.probe_interval_secs).saturating_add(rounded_timeout_secs) {
+    if mux.idle_ttl_ms < mux.probe_interval_ms.saturating_add(mux.probe_timeout_ms) {
         invalid(
-            "idle_ttl_secs",
-            "空闲寿命必须覆盖一个探测间隔和向上取整后的探测超时".to_owned(),
+            "idle_ttl_ms",
+            "超额空闲寿命必须覆盖一个探活周期和探活超时".to_owned(),
         );
     }
     if !(HopMux::MAX_REQUESTS_MIN..=HopMux::MAX_REQUESTS_MAX).contains(&mux.max_requests_per_worker)
@@ -1566,9 +1562,6 @@ fn validate_projection(ingress: &Ingress, diagnostics: &mut Vec<Diagnostic>) {
                 format!("接入面 {} 的 {family} 投影端口是 0", ingress.id),
             ));
         }
-        // Independent download is an XHTTP setting, not part of the public address projection.
-        // Legacy nested values are ignored here and are migrated into Xhttp.download when the
-        // snapshot is materialized.
     }
 }
 
@@ -1724,17 +1717,6 @@ fn occupied_ingress_ports(ingress: &Ingress) -> Vec<OccupiedIngressPort> {
             .flatten()
             .map(|download| download.node_port())
             .collect::<Vec<_>>();
-        if download_ports.is_empty() {
-            download_ports = [
-                ingress.projection.v4.as_ref(),
-                ingress.projection.v6.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .filter_map(|endpoint| endpoint.download.as_ref())
-            .map(|download| download.node_port())
-            .collect();
-        }
         download_ports.sort_unstable();
         download_ports.dedup();
         occupied.extend(download_ports.into_iter().map(|port| OccupiedIngressPort {
@@ -2818,44 +2800,6 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
             ));
         }
 
-        // Keep accepting authored Pool values: changing them during compilation would make an
-        // old revision run differently without changing its model. It is nevertheless important
-        // that preview exposes why this is no longer the console default. In xray 26.4.25 the
-        // concurrency-one Mux.cool worker is selected without a health probe, so a half-dead idle
-        // TCP connection can stall the next stream until the connection timeout. Warn once per
-        // edge rather than once per routing rule that happens to point at it.
-        if *pool == HopPool::Pool
-            && !matches!(dial, HopDial::Reverse(_))
-            && !by_target.contains_key(to.as_str())
-        {
-            diagnostics.push(Diagnostic::warn(
-                "rule.pool-concurrency-one",
-                at.clone(),
-                format!(
-                    "{to} 的 Mux 复用流数量为 1；空闲连接复用前不探活，半失效连接可能卡到超时，遇到过卡顿请改为每次新建"
-                ),
-            ));
-        }
-
-        // Refused rather than clamped. xray caps `concurrency` at 128 and reads 0 as 8, so
-        // reproducing either would leave the console showing one number while the machine
-        // runs another.
-        if let HopPool::Merge(n) = pool {
-            if !(HopPool::MERGE_MIN..=HopPool::MERGE_MAX).contains(n) {
-                diagnostics.push(Diagnostic::error(
-                    "rule.pool-range",
-                    at.clone(),
-                    if *n < HopPool::MERGE_MIN {
-                        format!(
-                            "{to} 的 Mux 复用流数量为 {n}，最小值为 {}；数量 1 使用单独的兼容编码",
-                            HopPool::MERGE_MIN
-                        )
-                    } else {
-                        format!("{to} 的 Mux 复用流数量为 {n}，最多 {}", HopPool::MERGE_MAX)
-                    },
-                ));
-            }
-        }
         if let HopPool::Mux(Some(mux)) = pool {
             validate_hop_mux(mux, &format!("{at}.pool.v"), diagnostics);
         }

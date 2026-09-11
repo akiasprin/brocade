@@ -30,7 +30,7 @@ const MAX_FUTURE_CLOCK_SKEW_MILLIS: i64 = 10 * 60 * 1000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RealtimeBroadcast {
-    Sample(RealtimeSampleEvent),
+    Sample(Box<RealtimeSampleEvent>),
     Status(RealtimeNodeStatus),
 }
 
@@ -255,13 +255,15 @@ impl RealtimeService {
         let oldest = received_at_unix_millis
             - i64::try_from(RING_RETENTION.as_millis()).expect("retention fits i64");
         let ring = inner.rings.entry(node_id.to_owned()).or_default();
-        // Keep bulky worker state only on the newest ring entry; NIC history stays small.
+        // Keep bulky worker state only on the newest ring entry; NIC history stays small. Both
+        // worker reports are live diagnostics, not a second durable telemetry history.
         if let Some(previous) = ring.back_mut() {
             previous.sample.reverse_health = None;
+            previous.sample.mux = None;
         }
         ring.push_back(event.clone());
         trim_ring(ring, oldest);
-        let _ = self.events.send(RealtimeBroadcast::Sample(event));
+        let _ = self.events.send(RealtimeBroadcast::Sample(Box::new(event)));
         Ok(())
     }
 
@@ -339,6 +341,19 @@ impl RealtimeService {
                 service.stop_if_still_idle(node_id, generation).await;
             });
         }
+    }
+
+    /// How many browsers the control plane believes are watching this node. The Agent samples
+    /// only while this is above zero, so a lease that is released early silences a live view.
+    #[cfg(test)]
+    pub(crate) async fn watcher_count(&self, node_id: &str) -> usize {
+        self.inner
+            .lock()
+            .await
+            .watchers
+            .get(node_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     async fn stop_if_still_idle(&self, node_id: String, generation: u64) {
@@ -449,6 +464,7 @@ mod tests {
             rx_bytes_per_sec: 123,
             tx_bytes_per_sec: 45,
             reverse_health: None,
+            mux: None,
             has_gap: false,
         }
     }
@@ -514,6 +530,39 @@ mod tests {
         assert_eq!(snapshot.snapshots[0].samples.len(), 2);
         assert!(snapshot.snapshots[0].samples[0].sample.has_gap);
         assert!(snapshot.snapshots[0].samples[1].sample.has_gap);
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_ring_entry_keeps_mux_worker_state() {
+        let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
+        let _subscription = service.subscribe(["n1".to_owned()]).await;
+        let agent = service.register_agent("n1".to_owned()).await;
+        let report = || brocade_deployment::protocol::MuxReport {
+            boot_id: "boot".to_owned(),
+            sequence: 1,
+            sampled_at_unix_ms: unix_millis(),
+            pools: Vec::new(),
+            workers: Vec::new(),
+            events: Vec::new(),
+        };
+        let mut first = sample(1);
+        first.mux = Some(report());
+        service
+            .record_sample("n1", agent.session, first)
+            .await
+            .unwrap();
+        let mut second = sample(2);
+        second.mux = Some(report());
+        service
+            .record_sample("n1", agent.session, second)
+            .await
+            .unwrap();
+
+        let snapshot = service.subscribe(["n1".to_owned()]).await;
+        let samples = &snapshot.snapshots[0].samples;
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].sample.mux, None);
+        assert!(samples[1].sample.mux.is_some());
     }
 
     #[tokio::test]

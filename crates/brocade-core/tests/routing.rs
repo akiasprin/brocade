@@ -139,7 +139,6 @@ fn front_downstream_deliberately_ignores_subscription_projection() {
         .v4 = Some(ProjectionEndpoint {
         host: "custom-relay.example.net".to_owned(),
         port: 443,
-        download: None,
     });
     let doc = doc(vec![
         node("hk", Some("hk.example.net"), [10, 66, 0, 1], true),

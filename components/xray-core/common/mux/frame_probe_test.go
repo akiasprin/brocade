@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -188,6 +190,40 @@ func TestOrdinaryKeepAliveDoesNotReplyOrChangeProbe(t *testing.T) {
 	case <-pending:
 		t.Fatal("ordinary KeepAlive completed a probe")
 	default:
+	}
+}
+
+func TestClientProbeReplyDoesNotBlockSharedReceiveLoop(t *testing.T) {
+	closed := done.New()
+	blocked := newBlockingProbeWriter()
+	control := newHealthWriter(blocked, closed)
+	worker := &ClientWorker{
+		done:        closed,
+		link:        transport.Link{Writer: control},
+		poolControl: control,
+	}
+	t.Cleanup(func() { closed.Close() })
+
+	returned := make(chan error, 1)
+	go func() {
+		returned <- worker.handleStatueKeepAlive(&FrameMetadata{
+			SessionStatus: SessionStatusKeepAlive,
+			Option:        OptionProbe,
+			ProbeID:       42,
+		}, nil)
+	}()
+	select {
+	case err := <-returned:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe reply blocked the shared receive loop")
+	}
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("queued probe reply did not reach the writer")
 	}
 }
 

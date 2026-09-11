@@ -15,8 +15,6 @@ export interface PreviewStatus {
 
 export interface PreviewRuntime {
   container_name: string;
-  /** Backward-compatible alias for IPv4. */
-  ip: string;
   ipv4: string;
   ipv6: string;
   network: string;

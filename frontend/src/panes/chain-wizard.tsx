@@ -89,7 +89,7 @@ export const NEW_CHAIN_PROTOCOL_DEFAULTS = {
 
 export function newChainWires({
   vlessEncryption = false,
-  vlessEncryptionPort = 48000,
+  vlessEncryptionPort = 13800,
   vless,
   anytls,
   hysteria2,
@@ -308,7 +308,7 @@ export function ChainWizard({
   let encryptionPort = freePortAcross(
     taken,
     [head?.node_id ?? ''],
-    settings.data?.ports?.vless_encryption_base || 48000,
+    settings.data?.ports?.vless_encryption_base || 13800,
   );
   while (
     encryptionPort < 65536 &&
@@ -543,11 +543,23 @@ export function ChainWizard({
                 dest: customRealityDest.trim(),
                 server_names: customRealityServerNames,
                 fingerprint: customRealityFingerprint,
+                fallback_limits: { mode: 'off' },
+                fallback_guard: true,
               }
             : {
                 fallback_mode: (realityTarget || 'global-site') as Exclude<RealityFallbackMode, 'custom-site'>,
+                fallback_limits: { mode: 'off' },
+                fallback_guard: true,
               },
         wires,
+        projection: {},
+        guard: {
+          no_private: true,
+          no_bittorrent: true,
+          no_mail: true,
+          no_udp_amplification: true,
+          tcp_and_quic_only: false,
+        },
       });
 
       // 线性中继：每台转发给下一台，最后一台出网。

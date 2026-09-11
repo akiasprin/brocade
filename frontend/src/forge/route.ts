@@ -97,12 +97,10 @@ export function parse(hash: string): Loc | null {
 
   const drill: Drill = { p: spec.seg, ...spec.rest };
   const fields = spec.fields ?? [];
-  // 兼容旧的 #/users/user/<tenant>/<id> 书签，但恢复后下一次导航会写成只含用户名的新地址。
-  const values =
-    nav === 'users' && spec.seg === 'user' && rest.length > fields.length ? rest.slice(-fields.length) : rest;
-  // 缺少路径段时视为未下钻：地址可被手动修改，`#/deploy/detail` 不应渲染为
-  // id 为 undefined 的详情页。
-  if (values.length < fields.length) return { nav };
+  const values = rest;
+  // 路径段数量必须与当前路由表完全一致。手改出的缺段或多段地址都回到页面根部，
+  // 不把半个标识传给详情页。
+  if (values.length !== fields.length) return { nav };
   fields.forEach((f, i) => {
     const raw = values[i];
     if (!f.num) {

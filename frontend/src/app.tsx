@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchAuthState,
@@ -9,23 +9,11 @@ import {
   type BrandingSettings,
 } from './api';
 import { Login } from './ui/login';
-import { Topbar, openTab, visibleTabs } from './ui/topbar';
-import { WinLayer, useWm } from './ui/windows';
-import { Pane } from './panes';
-import { TopoCanvas } from './topo/canvas';
-import { ArtifactPanel } from './panes/artifact';
-import { artifactPanel } from './ui/artifact-panel';
 import { autoPublicSuppressed, enterPublic, suppressAutoPublic, SessionProvider, type Session } from './session';
-import { wm } from './wm/store';
 import { ForgeShell } from './forge/shell';
+import { syncFavicon } from './ui/branding';
 
 export type { Session } from './session';
-
-// 选择使用哪套外壳。
-// `forge` 是编译台（三栏：模型 / 对象 / 产物），当前的默认值。
-// `workbench` 是旧的工作台（浮动顶栏 + 可拖动窗口 + 拓扑台面），文件仍然保留，
-// 修改该行即可切换回去——本仓库没有版本控制，回退路径需保留在代码中。
-const SHELL: 'forge' | 'workbench' = 'forge';
 
 /**
  * cookie 中没有会话时的备用路径：控制面启用了 public 免密账户时，自动以访客身份登录。
@@ -83,7 +71,10 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (brandingQuery.data) document.title = `${brandingQuery.data.site_name} | 跨境网络小管家`;
+    if (brandingQuery.data) {
+      document.title = `${brandingQuery.data.site_name} | 跨境网络小管家`;
+      syncFavicon(brandingQuery.data.icon_data_url);
+    }
   }, [brandingQuery.data]);
 
   if (restoring || brandingQuery.isPending) return <div id="stage" />;
@@ -117,47 +108,7 @@ export function App() {
 
   return (
     <SessionProvider value={session}>
-      {SHELL === 'forge' ? (
-        <ForgeShell branding={branding} session={session} onLogout={onLogout} />
-      ) : (
-        <>
-          <div id="stage" />
-          <Workbench branding={branding} session={session} onLogout={onLogout} />
-        </>
-      )}
+      <ForgeShell branding={branding} session={session} onLogout={onLogout} />
     </SessionProvider>
-  );
-}
-
-function Workbench({
-  branding,
-  session,
-  onLogout,
-}: {
-  branding: BrandingSettings;
-  session: Session;
-  onLogout: () => void;
-}) {
-  useEffect(() => {
-    wm.init(session.who.operator_id);
-    const first = visibleTabs(session.who)[0];
-    if (first) openTab(first);
-  }, [session]);
-
-  const snap = useWm();
-  /* 面板展开时台面和画布需要让出宽度（不能被侧栏覆盖） */
-  const panel = useSyncExternalStore(artifactPanel.subscribe, artifactPanel.snapshot);
-  useEffect(() => {
-    document.body.classList.toggle('has-artpanel', panel.open);
-    return () => document.body.classList.remove('has-artpanel');
-  }, [panel.open]);
-
-  return (
-    <>
-      <Topbar branding={branding} who={session.who} onLogout={onLogout} />
-      {snap.floor === 'topo' && <TopoCanvas />}
-      <WinLayer render={win => <Pane win={win} />} />
-      <ArtifactPanel />
-    </>
   );
 }

@@ -12,31 +12,41 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 )
 
-// WorkerPoolConfig enables bounded idle workers with an application-level
-// Ping/Pong or recent connection I/O before offering an idle worker.
+// WorkerPoolConfig enables idle-first spreading with an application-level
+// Ping/Pong or recent received connection data before offering an idle worker.
+// Active workers also require a bounded bidirectional health lease. Neither
+// local writes nor passive reads can extend that lease; only matching Pong can.
+// IdleTTL reclaims capacity above PrewarmWorkers. A healthy, explicitly
+// requested prewarm reserve is retained instead of periodically torn down and
+// recreated at the same interval.
 type WorkerPoolConfig struct {
-	MinIdleWorkers    uint32
-	MaxIdleWorkers    uint32
+	PrewarmWorkers uint32 // Best-effort idle reserve within the total base budget.
+	// TOTAL worker reuse threshold: use idle,
+	// grow to base, reuse active slots, then overflow. Warm creation shares this
+	// budget. Overflow is reclaimed on return to idle, never by killing business.
+	ReuseThreshold    uint32
 	MaxProbingWorkers uint32
 	ProbeInterval     time.Duration
 	ProbeTimeout      time.Duration
 	IdleTTL           time.Duration
 }
 
+const maxWorkerPoolProbeInterval = 60 * time.Second
+
 func (c *WorkerPoolConfig) Validate(maxRequests uint32) error {
 	if c == nil {
 		return nil
 	}
-	if c.MaxIdleWorkers < 1 {
-		return errors.New("max idle workers must be at least 1")
+	if c.ReuseThreshold < 1 {
+		return errors.New("worker reuse threshold (reuseThreshold) must be at least 1")
 	}
-	if c.MinIdleWorkers > c.MaxIdleWorkers {
-		return errors.New("min idle workers must not exceed max idle workers")
+	if c.PrewarmWorkers > c.ReuseThreshold {
+		return errors.New("prewarm workers (prewarmWorkers) must not exceed worker reuse threshold (reuseThreshold)")
 	}
-	if c.MaxProbingWorkers < 1 || c.MaxProbingWorkers > c.MaxIdleWorkers {
-		return errors.New("max probing workers must be between 1 and max idle workers")
+	if c.MaxProbingWorkers < 1 || c.MaxProbingWorkers > c.ReuseThreshold {
+		return errors.New("max probing workers must be between 1 and worker reuse threshold (reuseThreshold)")
 	}
-	if c.ProbeInterval < 2*time.Second || c.ProbeInterval > 60*time.Second {
+	if c.ProbeInterval < 2*time.Second || c.ProbeInterval > maxWorkerPoolProbeInterval {
 		return errors.New("probe interval must be between 2 and 60 seconds")
 	}
 	if c.ProbeTimeout < 200*time.Millisecond || c.ProbeTimeout > 10*time.Second || c.ProbeTimeout >= c.ProbeInterval {
@@ -45,8 +55,7 @@ func (c *WorkerPoolConfig) Validate(maxRequests uint32) error {
 	if c.IdleTTL < time.Second {
 		return errors.New("idle TTL must be at least 1 second")
 	}
-	roundedTimeout := ((c.ProbeTimeout + time.Second - 1) / time.Second) * time.Second
-	if c.IdleTTL < c.ProbeInterval+roundedTimeout {
+	if c.IdleTTL < c.ProbeInterval+c.ProbeTimeout {
 		return errors.New("idle TTL must cover one probe interval and timeout")
 	}
 	if maxRequests < 1 || maxRequests > 65535 {
@@ -66,6 +75,34 @@ const (
 	workerDraining
 	workerClosed
 )
+
+func defaultPoolStateReason(state clientWorkerState) string {
+	switch state {
+	case workerIdleReady:
+		return "idle_ready"
+	case workerProbeQueued:
+		return "probe_queued"
+	case workerProbing:
+		return "probe_sent"
+	case workerWarmDialing:
+		return "initial_probe"
+	case workerDraining:
+		return "draining"
+	case workerClosed:
+		return "closed"
+	default:
+		return "serving"
+	}
+}
+
+// setPoolStateLocked is the only lifecycle state writer. Pairing state and reason under the same
+// lock prevents snapshots from inheriting an unrelated health or previous-transition reason.
+func (w *ClientWorker) setPoolStateLocked(state clientWorkerState, reason string) {
+	if reason == "" {
+		reason = defaultPoolStateReason(state)
+	}
+	w.poolState, w.poolReason = state, reason
+}
 
 type poolTimer interface {
 	Stop() bool
@@ -88,6 +125,7 @@ type probeRun struct {
 	id         uint64
 	generation uint64
 	result     <-chan struct{}
+	timeout    time.Duration
 }
 
 type probeOutcome uint8
@@ -124,13 +162,15 @@ func (w *ClientWorker) attachPool(owner *IncrementalWorkerPicker, state clientWo
 	w.poolAccess.Lock()
 	defer w.poolAccess.Unlock()
 	if w.Closed() {
-		w.poolState = workerClosed
+		w.setPoolStateLocked(workerClosed, "transport_closed")
 		return false
 	}
 	w.poolOwner = owner
 	w.poolClock = owner.clock
 	w.strategy.WorkerPool = owner.config
-	w.poolState = state
+	w.setPoolStateLocked(state, "")
+	w.healthLeaseUntil = now.Add(owner.config.healthLease())
+	w.healthNextProbe = now.Add(owner.jitterLocked(owner.config.ProbeInterval))
 	if state == workerWarmDialing {
 		w.idleSince = now
 	}
@@ -165,7 +205,7 @@ func (w *ClientWorker) schedulePoolTimerLocked(owner *IncrementalWorkerPicker, a
 
 func (w *ClientWorker) beginProbeLocked(state clientWorkerState) probeRun {
 	w.stopPoolTimerLocked()
-	w.poolState = state
+	w.setPoolStateLocked(state, "")
 	w.probeGeneration++
 	w.nextProbeID++
 	result := make(chan struct{}, 1)
@@ -177,11 +217,21 @@ func (w *ClientWorker) beginProbeLocked(state clientWorkerState) probeRun {
 		id:         w.pendingProbeID,
 		generation: w.probeGeneration,
 		result:     result,
+		timeout:    w.strategy.WorkerPool.ProbeTimeout,
 	}
 }
 
 func (w *ClientWorker) acceptPong(probeID uint64) {
 	w.poolAccess.Lock()
+	if w.healthProbeID != 0 && w.healthProbeID == probeID {
+		owner := w.poolOwner
+		w.acceptActivePongLocked(probeID)
+		w.poolAccess.Unlock()
+		if owner != nil {
+			owner.runActiveHealth()
+		}
+		return
+	}
 	defer w.poolAccess.Unlock()
 	if (w.poolState != workerProbing && w.poolState != workerWarmDialing) || w.pendingProbeID != probeID || w.pendingProbe == nil || w.pendingProbeAcked {
 		return
@@ -190,8 +240,25 @@ func (w *ClientWorker) acceptPong(probeID uint64) {
 	select {
 	case result <- struct{}{}:
 		w.pendingProbeAcked = true
+		w.poolAcks++
+		now := time.Now()
+		if w.poolClock != nil {
+			now = w.poolClock.Now()
+		}
+		w.lastProbeAck = now
+		w.healthLeaseUntil = now.Add(w.strategy.WorkerPool.healthLease())
+		w.healthNextProbe = now.Add(w.strategy.WorkerPool.ProbeInterval)
+		wasSuspect := w.healthState == poolHealthSuspect
+		w.healthState, w.healthReason = poolHealthReady, ""
+		if !w.pendingProbeSentAt.IsZero() {
+			w.lastProbeRTT = now.Sub(w.pendingProbeSentAt)
+		}
 		if w.poolOwner != nil {
 			w.poolOwner.poolStats.probeAck.Add(1)
+			if wasSuspect {
+				w.poolOwner.poolStats.healthRecovered.Add(1)
+				w.recordHealthEventLocked(w.poolOwner, "SUSPECT", "READY", "idle_revalidated")
+			}
 		}
 	default:
 	}
@@ -209,7 +276,7 @@ type poolActivityReader struct {
 func (r *poolActivityReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb, err := r.Reader.ReadMultiBuffer()
 	if !mb.IsEmpty() {
-		r.worker.recordIO()
+		r.worker.recordInboundActivity()
 	}
 	return mb, err
 }
@@ -217,47 +284,31 @@ func (r *poolActivityReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 func (r *poolActivityReader) Interrupt()   { common.Interrupt(r.Reader) }
 func (r *poolActivityReader) Close() error { return common.Close(r.Reader) }
 
-type poolActivityWriter struct {
-	buf.Writer
-	worker *ClientWorker
-}
-
-func (w *poolActivityWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	hasData := !mb.IsEmpty()
-	err := w.Writer.WriteMultiBuffer(mb)
-	if err == nil && hasData {
-		w.worker.recordIO()
-	}
-	return err
-}
-
-func (w *poolActivityWriter) Interrupt()   { common.Interrupt(w.Writer) }
-func (w *poolActivityWriter) Close() error { return common.Close(w.Writer) }
-
-// Track all completed non-empty Mux link reads and writes, including control
-// frames. Activity never acknowledges a probe or changes its timeout deadline.
-func (w *ClientWorker) recordIO() {
+// Track completed non-empty reads as remote activity for idle reuse. Writes are deliberately not
+// instrumented: the standard Writer is a local pipe, so a successful End, Ping or payload write
+// says nothing about peer liveness. Reads do not acknowledge a probe or renew its health lease.
+func (w *ClientWorker) recordInboundActivity() {
 	w.poolAccess.Lock()
 	owner := w.poolOwner
 	if w.poolClock == nil || w.Closed() || w.poolState == workerClosed {
 		w.poolAccess.Unlock()
 		return
 	}
-	w.lastIO = w.poolClock.Now()
-	refreshIdle := w.poolState == workerIdleReady || w.poolState == workerProbeQueued
+	w.lastRead = w.poolClock.Now()
+	refreshIdle := w.healthState == poolHealthReady && w.healthLeaseFreshLocked(w.lastRead) && (w.poolState == workerIdleReady || w.poolState == workerProbeQueued)
 	if refreshIdle {
 		// Publish freshness under the same lock used by timers and reservations.
 		// A timer that is already due must see the new deadline before it probes.
-		w.poolState = workerIdleReady
-		w.nextProbeAt = w.lastIO.Add(w.strategy.WorkerPool.ProbeInterval)
+		w.setPoolStateLocked(workerIdleReady, "remote_activity")
+		w.nextProbeAt = w.lastRead.Add(w.strategy.WorkerPool.ProbeInterval)
 	}
 	w.poolAccess.Unlock()
 	if refreshIdle && owner != nil {
-		owner.onIdleIO(w)
+		owner.onIdleRead(w)
 	}
 }
 
-func (p *IncrementalWorkerPicker) onIdleIO(w *ClientWorker) {
+func (p *IncrementalWorkerPicker) onIdleRead(w *ClientWorker) {
 	p.access.Lock()
 	defer p.access.Unlock()
 	w.poolAccess.Lock()
@@ -266,20 +317,20 @@ func (p *IncrementalWorkerPicker) onIdleIO(w *ClientWorker) {
 		return
 	}
 	now := p.nowLocked()
-	due := w.lastIO.Add(p.config.ProbeInterval)
+	due := w.lastRead.Add(p.config.ProbeInterval)
 	if !now.Before(due) || !now.Before(w.poolIdleDeadlineLocked(p.config)) {
 		return
 	}
-	w.poolState = workerIdleReady
+	w.setPoolStateLocked(workerIdleReady, "remote_activity")
 	w.nextProbeAt = due
-	w.schedulePoolTimerLocked(p, minTime(due, w.poolIdleDeadlineLocked(p.config)))
+	w.schedulePoolTimerLocked(p, minTime(minTime(due, w.healthLeaseUntil), w.poolIdleDeadlineLocked(p.config)))
 }
 
 func (w *ClientWorker) idleReadyFreshLocked(now time.Time) bool {
-	return now.Before(w.nextProbeAt) && now.Before(w.poolIdleDeadlineLocked(w.strategy.WorkerPool))
+	return w.healthState == poolHealthReady && w.healthLeaseFreshLocked(now) && now.Before(w.nextProbeAt) && now.Before(w.poolIdleDeadlineLocked(w.strategy.WorkerPool))
 }
 
-func (w *ClientWorker) markPoolClosedLocked() bool {
+func (w *ClientWorker) markPoolClosedLocked(reason string) bool {
 	if w.poolState == workerClosed {
 		return false
 	}
@@ -287,52 +338,52 @@ func (w *ClientWorker) markPoolClosedLocked() bool {
 	w.probeGeneration++
 	w.pendingProbe = nil
 	w.pendingProbeAcked = false
+	w.pendingProbeSentAt = time.Time{}
 	w.poolReservations = 0
-	w.poolState = workerClosed
+	w.setPoolStateLocked(workerClosed, reason)
+	w.healthProbeID = 0
 	return true
 }
 
-func (w *ClientWorker) closeForPool() {
+func (w *ClientWorker) closeForPool(reason string) {
 	w.poolAccess.Lock()
-	closeDone := w.markPoolClosedLocked()
+	closeDone := w.markPoolClosedLocked(reason)
 	w.poolAccess.Unlock()
 	if closeDone {
 		common.Must(w.done.Close())
 	}
 }
 
-func (w *ClientWorker) drainForPool(force bool) {
+func (w *ClientWorker) drainForPool(force bool) (clientWorkerState, clientWorkerState, uint32, bool) {
 	w.poolAccess.Lock()
+	previous := w.poolState
 	if w.poolState == workerClosed {
 		w.poolAccess.Unlock()
-		return
+		return previous, previous, 0, false
 	}
 	w.stopPoolTimerLocked()
 	w.probeGeneration++
 	w.pendingProbe = nil
 	w.pendingProbeAcked = false
 	w.poolReservations = 0
-	if !force && w.sessionManager.Size() > 0 {
-		w.poolState = workerDraining
+	w.healthProbeID = 0
+	active := uint32(w.sessionManager.Size())
+	if !force && (active > 0 || w.endingSessions.Load() != 0) {
+		w.setPoolStateLocked(workerDraining, "planned_rotation")
 		w.poolAccess.Unlock()
-		return
+		return previous, workerDraining, active, previous != workerDraining
 	}
-	w.poolState = workerClosed
+	w.setPoolStateLocked(workerClosed, "planned_rotation")
 	w.poolAccess.Unlock()
 	common.Must(w.done.Close())
+	return previous, workerClosed, active, true
 }
 
 func (w *ClientWorker) runProbe(run probeRun, owner *IncrementalWorkerPicker) {
 	now := owner.now()
 	w.poolAccess.Lock()
-	wait := owner.config.ProbeTimeout
-	outcomeOnTimer := probeTimedOut
-	if !w.idleSince.IsZero() {
-		if untilTTL := w.poolIdleDeadlineLocked(owner.config).Sub(now); untilTTL <= wait {
-			wait = untilTTL
-			outcomeOnTimer = probeIdleTTLExpired
-		}
-	}
+	w.pendingProbeSentAt = now
+	wait := run.timeout
 	w.poolAccess.Unlock()
 	if wait < 0 {
 		wait = 0
@@ -341,13 +392,16 @@ func (w *ClientWorker) runProbe(run probeRun, owner *IncrementalWorkerPicker) {
 	// can itself block when the underlying transport is half-open; the timeout
 	// callback closes the worker, whose monitor interrupts that blocked writer.
 	timer := owner.afterFunc(wait, func() {
-		owner.onProbeFinished(run, outcomeOnTimer)
+		owner.onProbeFinished(run, probeTimedOut)
 	})
 	defer timer.Stop()
 	if err := writeProbeFrame(w.link.Writer, run.id, false); err != nil {
 		owner.onProbeFinished(run, probeTransportFailed)
 		return
 	}
+	w.poolAccess.Lock()
+	w.poolProbes++
+	w.poolAccess.Unlock()
 	owner.poolStats.probeSent.Add(1)
 
 	select {
@@ -417,7 +471,9 @@ func (p *IncrementalWorkerPicker) poolCountsLocked(except *ClientWorker) (reserv
 		if worker == except {
 			continue
 		}
-		state, _ := worker.poolStateSnapshot()
+		worker.poolAccess.Lock()
+		state, activeProbe := worker.poolState, worker.healthProbeID != 0
+		worker.poolAccess.Unlock()
 		// done may close just before monitor reports the terminal state. Keep the
 		// reservation until that report is processed so warm failure backoff wins
 		// the race with the replenishment loop.
@@ -427,11 +483,43 @@ func (p *IncrementalWorkerPicker) poolCountsLocked(except *ClientWorker) (reserv
 		if isReservedIdleState(state) {
 			reserved++
 		}
-		if isProbingState(state) {
+		if isProbingState(state) || activeProbe {
 			probing++
 		}
 	}
 	return reserved, probing
+}
+
+// Caller holds p.access and, when except is non-nil, may also hold that
+// worker's poolAccess. The configured prewarm target is the number of healthy
+// idle carriers the operator explicitly asked to retain. Matching validation
+// therefore renews their idle epoch; excess idle carriers keep their original
+// deadline and are reclaimed normally.
+func (p *IncrementalWorkerPicker) withinPrewarmTargetLocked(except *ClientWorker) bool {
+	if p.config == nil || p.config.PrewarmWorkers == 0 {
+		return false
+	}
+	reserved, _ := p.poolCountsLocked(except)
+	return reserved < p.config.PrewarmWorkers
+}
+
+// Caller holds access. except avoids relocking onWorkerIdle's current worker.
+// Count unavailable/probing/draining workers and in-flight warm creation too;
+// they consume connections even when no business can be assigned to them.
+func (p *IncrementalWorkerPicker) poolWorkerCountLocked(except *ClientWorker) uint64 {
+	var count uint64
+	if p.warmCreating {
+		count++
+	}
+	for _, worker := range p.workers {
+		if worker == except {
+			continue
+		}
+		if state, _ := worker.poolStateSnapshot(); state != workerClosed {
+			count++
+		}
+	}
+	return count
 }
 
 func (p *IncrementalWorkerPicker) closeOldestIdleReadyLocked(except *ClientWorker) *ClientWorker {
@@ -456,7 +544,7 @@ func (p *IncrementalWorkerPicker) closeOldestIdleReadyLocked(except *ClientWorke
 		oldest.poolAccess.Unlock()
 		return nil
 	}
-	closeDone := oldest.markPoolClosedLocked()
+	closeDone := oldest.markPoolClosedLocked("capacity_reclaim")
 	oldest.poolAccess.Unlock()
 	if !closeDone {
 		return nil
@@ -472,7 +560,8 @@ func (p *IncrementalWorkerPicker) onWorkerUsed(worker *ClientWorker) {
 	}
 	p.poolUsed = true
 	p.access.Unlock()
-	p.requestEnsureMinIdle()
+	p.runActiveHealth()
+	p.requestEnsurePrewarm()
 }
 
 func (p *IncrementalWorkerPicker) onWorkerIdle(worker *ClientWorker) {
@@ -481,72 +570,106 @@ func (p *IncrementalWorkerPicker) onWorkerIdle(worker *ClientWorker) {
 
 	p.access.Lock()
 	p.initializePoolLocked()
-	if p.poolClosed || p.config == nil {
+	if worker.Closed() {
+		// The monitor owns terminal accounting. An End completion after failure
+		// must not relabel it as an idle transition or successful planned drain.
 		p.access.Unlock()
-		worker.closeForPool()
+		return
+	}
+	if p.poolClosed {
+		worker.poolAccess.Lock()
+		// Finishing one End can notify us while other sessions still run.
+		// Planned drain must wait for all business and all ending writes.
+		if worker.sessionManager.Size() != 0 || worker.poolReservations != 0 || worker.endingSessions.Load() != 0 {
+			worker.poolAccess.Unlock()
+			p.access.Unlock()
+			return
+		}
+		previousState := worker.poolState
+		closeDone := worker.markPoolClosedLocked("drain_complete")
+		worker.poolAccess.Unlock()
+		p.access.Unlock()
+		if closeDone {
+			common.Must(worker.done.Close())
+			recordMuxWorkerEvent(p, worker, observableWorkerState(previousState), "CLOSED", "drain_complete", 0)
+		}
+		return
+	}
+	if p.config == nil {
+		p.access.Unlock()
+		worker.closeForPool("closed")
 		return
 	}
 	now := p.nowLocked()
 	worker.poolAccess.Lock()
-	if worker.poolState == workerDraining && worker.sessionManager.Size() == 0 {
-		if worker.markPoolClosedLocked() {
+	if worker.poolState == workerDraining && worker.sessionManager.Size() == 0 && worker.poolReservations == 0 && worker.endingSessions.Load() == 0 {
+		if worker.markPoolClosedLocked("drain_complete") {
 			closeWorkers = append(closeWorkers, worker)
 		}
 		worker.poolAccess.Unlock()
 		p.access.Unlock()
 		for _, item := range closeWorkers {
 			common.Must(item.done.Close())
+			recordMuxWorkerEvent(p, item, "DRAINING", "CLOSED", "drain_complete", 0)
 		}
 		return
 	}
-	if worker.poolState != workerActive || worker.poolReservations != 0 || worker.sessionManager.Size() != 0 {
+	if worker.poolState != workerActive || worker.poolReservations != 0 || worker.sessionManager.Size() != 0 || worker.endingSessions.Load() != 0 {
 		worker.poolAccess.Unlock()
 		p.access.Unlock()
 		return
 	}
 	if worker.strategy.MaxConnection > 0 && worker.sessionManager.Count() >= int(worker.strategy.MaxConnection) {
-		if worker.markPoolClosedLocked() {
+		if worker.markPoolClosedLocked("request_limit") {
 			closeWorkers = append(closeWorkers, worker)
 		}
 		worker.poolAccess.Unlock()
 		p.access.Unlock()
 		for _, item := range closeWorkers {
 			common.Must(item.done.Close())
+			recordMuxWorkerEvent(p, item, "READY", "CLOSED", "request_limit", 0)
 		}
-		p.requestEnsureMinIdle()
+		p.requestEnsurePrewarm()
 		return
 	}
 
-	reserved, probing := p.poolCountsLocked(worker)
-	if reserved >= p.config.MaxIdleWorkers {
+	_, probing := p.poolCountsLocked(worker)
+	if p.poolWorkerCountLocked(worker)+1 > uint64(p.config.ReuseThreshold) {
 		if victim := p.closeOldestIdleReadyLocked(worker); victim != nil {
 			closeWorkers = append(closeWorkers, victim)
-			p.poolStats.workerClosedMaxIdle.Add(1)
-			reserved--
+			p.poolStats.workerClosedCapacity.Add(1)
 		} else {
-			if worker.markPoolClosedLocked() {
+			if worker.markPoolClosedLocked("capacity_reclaim") {
 				closeWorkers = append(closeWorkers, worker)
-				p.poolStats.workerClosedMaxIdle.Add(1)
+				p.poolStats.workerClosedCapacity.Add(1)
 			}
 			worker.poolAccess.Unlock()
 			p.access.Unlock()
 			for _, item := range closeWorkers {
 				common.Must(item.done.Close())
+				recordMuxWorkerEvent(p, item, "READY", "CLOSED", "capacity_reclaim", 0)
 			}
 			return
 		}
 	}
 	worker.idleSince = now
+	worker.healthProbeID = 0
 	worker.nextProbeAt = now
-	if !worker.lastIO.IsZero() && now.Before(worker.lastIO.Add(p.config.ProbeInterval)) {
-		worker.poolState = workerIdleReady
-		worker.nextProbeAt = worker.lastIO.Add(p.config.ProbeInterval)
-		worker.schedulePoolTimerLocked(p, minTime(worker.nextProbeAt, worker.poolIdleDeadlineLocked(p.config)))
+	// Keep local activity separate from remote evidence. In particular, the
+	// End frame written just before this callback must not renew idle reuse.
+	lastResponse := worker.lastRead
+	if worker.lastProbeAck.After(lastResponse) {
+		lastResponse = worker.lastProbeAck
+	}
+	if worker.healthState == poolHealthReady && worker.healthLeaseFreshLocked(now) && !lastResponse.IsZero() && now.Before(lastResponse.Add(p.config.ProbeInterval)) {
+		worker.setPoolStateLocked(workerIdleReady, "idle_ready")
+		worker.nextProbeAt = lastResponse.Add(p.config.ProbeInterval)
+		worker.schedulePoolTimerLocked(p, minTime(minTime(worker.nextProbeAt, worker.healthLeaseUntil), worker.poolIdleDeadlineLocked(p.config)))
 	} else if probing < p.config.MaxProbingWorkers {
 		started := worker.beginProbeLocked(workerProbing)
 		run = &started
 	} else {
-		worker.poolState = workerProbeQueued
+		worker.setPoolStateLocked(workerProbeQueued, "probe_queued")
 		worker.schedulePoolTimerLocked(p, worker.poolIdleDeadlineLocked(p.config))
 	}
 	worker.poolAccess.Unlock()
@@ -554,11 +677,12 @@ func (p *IncrementalWorkerPicker) onWorkerIdle(worker *ClientWorker) {
 
 	for _, item := range closeWorkers {
 		common.Must(item.done.Close())
+		recordMuxWorkerEvent(p, item, "READY", "CLOSED", "capacity_reclaim", 0)
 	}
 	if run != nil {
 		go worker.runProbe(*run, p)
 	}
-	p.requestEnsureMinIdle()
+	p.requestEnsurePrewarm()
 }
 
 func (p *IncrementalWorkerPicker) onWorkerTimer(worker *ClientWorker, token uint64) {
@@ -568,7 +692,7 @@ func (p *IncrementalWorkerPicker) onWorkerTimer(worker *ClientWorker, token uint
 	p.access.Lock()
 	if p.poolClosed || p.config == nil {
 		p.access.Unlock()
-		worker.closeForPool()
+		worker.closeForPool("planned_rotation")
 		return
 	}
 	now := p.nowLocked()
@@ -578,20 +702,25 @@ func (p *IncrementalWorkerPicker) onWorkerTimer(worker *ClientWorker, token uint
 		p.access.Unlock()
 		return
 	}
+	if !now.Before(worker.poolIdleDeadlineLocked(p.config)) && p.withinPrewarmTargetLocked(worker) {
+		// Do not rotate a healthy carrier solely to recreate the same configured
+		// prewarm reserve. A due health/validation probe still runs below.
+		worker.idleSince = now
+	}
 	if !now.Before(worker.poolIdleDeadlineLocked(p.config)) {
-		closeWorker = worker.markPoolClosedLocked()
+		closeWorker = worker.markPoolClosedLocked("idle_ttl")
 		if closeWorker {
 			p.poolStats.workerClosedIdleTTL.Add(1)
 		}
-	} else if worker.poolState == workerIdleReady && now.Before(worker.nextProbeAt) {
-		worker.schedulePoolTimerLocked(p, minTime(worker.nextProbeAt, worker.poolIdleDeadlineLocked(p.config)))
+	} else if worker.poolState == workerIdleReady && worker.idleReadyFreshLocked(now) {
+		worker.schedulePoolTimerLocked(p, minTime(minTime(worker.nextProbeAt, worker.healthLeaseUntil), worker.poolIdleDeadlineLocked(p.config)))
 	} else {
 		_, probing := p.poolCountsLocked(worker)
 		if probing < p.config.MaxProbingWorkers {
 			started := worker.beginProbeLocked(workerProbing)
 			run = &started
 		} else {
-			worker.poolState = workerProbeQueued
+			worker.setPoolStateLocked(workerProbeQueued, "probe_queued")
 			worker.schedulePoolTimerLocked(p, worker.poolIdleDeadlineLocked(p.config))
 		}
 	}
@@ -600,7 +729,8 @@ func (p *IncrementalWorkerPicker) onWorkerTimer(worker *ClientWorker, token uint
 
 	if closeWorker {
 		common.Must(worker.done.Close())
-		p.requestEnsureMinIdle()
+		recordMuxWorkerEvent(p, worker, "READY", "CLOSED", "idle_ttl", 0)
+		p.requestEnsurePrewarm()
 	}
 	if run != nil {
 		go worker.runProbe(*run, p)
@@ -642,28 +772,45 @@ func (p *IncrementalWorkerPicker) onProbeFinished(run probeRun, outcome probeOut
 	wasWarm := run.worker.poolState == workerWarmDialing
 	run.worker.pendingProbe = nil
 	run.worker.pendingProbeAcked = false
+	if !p.poolClosed && outcome == probeSucceeded && p.withinPrewarmTargetLocked(run.worker) {
+		// A matching Pong retains only the explicitly requested warm reserve.
+		// It never extends excess idle capacity.
+		run.worker.idleSince = now
+	}
 	if outcome == probeSucceeded && !now.Before(run.worker.poolIdleDeadlineLocked(p.config)) {
 		outcome = probeIdleTTLExpired
 	}
 	if p.poolClosed || outcome != probeSucceeded {
-		closeWorker = run.worker.markPoolClosedLocked()
+		if outcome == probeTimedOut {
+			run.worker.poolTimeouts++
+		}
+		if wasWarm && outcome != probeSucceeded {
+			p.poolStats.workerWarmFailed.Add(1)
+		}
+		closeReason := "planned_rotation"
 		switch outcome {
 		case probeTimedOut:
+			closeReason = "probe_timeout"
 			p.poolStats.probeTimeout.Add(1)
 			p.poolStats.workerClosedProbe.Add(1)
 			p.noteWarmFailureLocked(now)
 			logTimeout, suppressed = p.probeTimeoutLogLocked(now)
 		case probeTransportFailed:
+			closeReason = "transport_closed"
 			p.poolStats.workerClosedProbe.Add(1)
+			p.poolStats.workerClosedTransport.Add(1)
 			p.noteWarmFailureLocked(now)
 		case probeIdleTTLExpired:
+			closeReason = "idle_ttl"
 			p.poolStats.workerClosedIdleTTL.Add(1)
 		}
+		closeWorker = run.worker.markPoolClosedLocked(closeReason)
 	} else {
-		run.worker.poolState = workerIdleReady
+		run.worker.setPoolStateLocked(workerIdleReady, "probe_ack")
 		run.worker.nextProbeAt = now.Add(p.jitterLocked(p.config.ProbeInterval))
 		run.worker.schedulePoolTimerLocked(p, minTime(run.worker.nextProbeAt, run.worker.poolIdleDeadlineLocked(p.config)))
 		if wasWarm {
+			p.poolStats.workerWarmReady.Add(1)
 			p.warmFailures = 0
 			p.nextWarmAttempt = time.Time{}
 		}
@@ -673,8 +820,28 @@ func (p *IncrementalWorkerPicker) onProbeFinished(run probeRun, outcome probeOut
 		starts = append(starts, p.promoteQueuedLocked(now)...)
 	}
 	p.access.Unlock()
+	if wasWarm && outcome == probeSucceeded && !closeWorker {
+		recordMuxWorkerEvent(p, run.worker, "VALIDATING", "READY", "probe_ack", 0)
+	}
 
 	if closeWorker {
+		state := "DEAD"
+		reason := "transport_closed"
+		from := "READY"
+		if wasWarm {
+			from = "VALIDATING"
+		}
+		switch outcome {
+		case probeTimedOut:
+			reason = "probe_timeout"
+		case probeIdleTTLExpired:
+			state = "CLOSED"
+			reason = "idle_ttl"
+		case probeSucceeded:
+			state = "CLOSED"
+			reason = "planned_rotation"
+		}
+		recordMuxWorkerEvent(p, run.worker, from, state, reason, run.worker.ActiveConnections())
 		common.Must(run.worker.done.Close())
 	}
 	for _, next := range starts {
@@ -687,7 +854,7 @@ func (p *IncrementalWorkerPicker) onProbeFinished(run probeRun, outcome probeOut
 			errors.LogWarning(context.Background(), "mux worker probe timed out for outbound ", p.Tag, "; suppressed ", suppressed, " repeated warnings")
 		}
 	}
-	p.requestEnsureMinIdle()
+	p.requestEnsurePrewarm()
 }
 
 const probeTimeoutLogInterval = 30 * time.Second
@@ -721,27 +888,46 @@ func (p *IncrementalWorkerPicker) promoteQueuedLocked(now time.Time) []probeRun 
 		var candidate *ClientWorker
 		var oldest time.Time
 		for _, worker := range p.workers {
-			state, since := worker.poolStateSnapshot()
-			if state != workerProbeQueued || (candidate != nil && !since.Before(oldest)) {
+			worker.poolAccess.Lock()
+			worker.checkActiveHealthLocked(now)
+			due := worker.nextProbeAt
+			eligible := worker.poolState == workerProbeQueued
+			if worker.activeProbeDueLocked(now) {
+				eligible, due = true, worker.healthNextProbe
+			}
+			worker.poolAccess.Unlock()
+			if !eligible || (candidate != nil && !due.Before(oldest)) {
 				continue
 			}
 			candidate = worker
-			oldest = since
+			oldest = due
 		}
 		if candidate == nil {
 			break
 		}
 		candidate.poolAccess.Lock()
+		if candidate.activeProbeDueLocked(now) {
+			candidate.beginActiveProbeLocked(now)
+			candidate.poolAccess.Unlock()
+			available--
+			continue
+		}
 		if candidate.poolState != workerProbeQueued {
 			candidate.poolAccess.Unlock()
 			continue
 		}
+		if !now.Before(candidate.poolIdleDeadlineLocked(p.config)) && p.withinPrewarmTargetLocked(candidate) {
+			candidate.idleSince = now
+		}
 		if !now.Before(candidate.poolIdleDeadlineLocked(p.config)) {
-			closeDone := candidate.markPoolClosedLocked()
+			closeDone := candidate.markPoolClosedLocked("idle_ttl")
 			candidate.poolAccess.Unlock()
 			if closeDone {
 				p.poolStats.workerClosedIdleTTL.Add(1)
-				go common.Must(candidate.done.Close())
+				go func(worker *ClientWorker) {
+					recordMuxWorkerEvent(p, worker, "READY", "CLOSED", "idle_ttl", 0)
+					common.Must(worker.done.Close())
+				}(candidate)
 			}
 			continue
 		}
@@ -762,18 +948,25 @@ func (p *IncrementalWorkerPicker) noteWarmFailureLocked(now time.Time) {
 	p.nextWarmAttempt = now.Add(p.jitterLocked(seconds[idx] * time.Second))
 }
 
-func (p *IncrementalWorkerPicker) requestEnsureMinIdle() {
+func (p *IncrementalWorkerPicker) scheduleWarmRetryLocked(delay time.Duration) {
+	if p.warmTimer != nil {
+		p.warmTimer.Stop()
+	}
+	p.warmTimer = p.afterFuncLocked(delay, p.requestEnsurePrewarm)
+}
+
+func (p *IncrementalWorkerPicker) requestEnsurePrewarm() {
 	p.access.Lock()
-	if p.config == nil || p.poolClosed || !p.poolUsed || p.config.MinIdleWorkers == 0 || p.warmRunning {
+	if p.config == nil || p.poolClosed || !p.poolUsed || p.config.PrewarmWorkers == 0 || p.warmRunning {
 		p.access.Unlock()
 		return
 	}
 	p.warmRunning = true
 	p.access.Unlock()
-	go p.ensureMinIdle()
+	go p.ensurePrewarm()
 }
 
-func (p *IncrementalWorkerPicker) ensureMinIdle() {
+func (p *IncrementalWorkerPicker) ensurePrewarm() {
 	for {
 		p.access.Lock()
 		p.initializePoolLocked()
@@ -784,50 +977,55 @@ func (p *IncrementalWorkerPicker) ensureMinIdle() {
 		}
 		now := p.nowLocked()
 		reserved, probing := p.poolCountsLocked(nil)
-		if reserved >= p.config.MinIdleWorkers || reserved >= p.config.MaxIdleWorkers || probing >= p.config.MaxProbingWorkers {
+		if reserved >= p.config.PrewarmWorkers || p.poolWorkerCountLocked(nil) >= uint64(p.config.ReuseThreshold) || probing >= p.config.MaxProbingWorkers {
 			p.warmRunning = false
 			p.access.Unlock()
 			return
 		}
 		if now.Before(p.nextWarmAttempt) {
 			delay := p.nextWarmAttempt.Sub(now)
-			if p.warmTimer != nil {
-				p.warmTimer.Stop()
-			}
-			p.warmTimer = p.afterFuncLocked(delay, p.requestEnsureMinIdle)
+			p.scheduleWarmRetryLocked(delay)
 			p.warmRunning = false
 			p.access.Unlock()
 			return
 		}
+		p.warmCreating = true
 		p.access.Unlock()
 
 		worker, err := p.Factory.Create()
+		p.access.Lock()
+		p.warmCreating = false
 		if err != nil {
-			p.access.Lock()
+			p.poolStats.workerWarmFailed.Add(1)
+			if p.poolClosed {
+				p.warmRunning = false
+				p.access.Unlock()
+				return
+			}
 			p.noteWarmFailureLocked(p.nowLocked())
 			p.warmRunning = false
 			delay := p.nextWarmAttempt.Sub(p.nowLocked())
-			p.warmTimer = p.afterFuncLocked(delay, p.requestEnsureMinIdle)
+			p.scheduleWarmRetryLocked(delay)
 			p.access.Unlock()
 			errors.LogInfoInner(context.Background(), err, "failed to create warm mux worker")
 			return
 		}
 
-		p.access.Lock()
 		now = p.nowLocked()
 		reserved, probing = p.poolCountsLocked(nil)
-		if p.poolClosed || reserved >= p.config.MinIdleWorkers || reserved >= p.config.MaxIdleWorkers || probing >= p.config.MaxProbingWorkers {
+		if p.poolClosed || reserved >= p.config.PrewarmWorkers || p.poolWorkerCountLocked(nil) >= uint64(p.config.ReuseThreshold) || probing >= p.config.MaxProbingWorkers {
 			p.access.Unlock()
-			worker.closeForPool()
+			worker.closeForPool("capacity_reclaim")
 			continue
 		}
 		if !worker.attachPool(p, workerWarmDialing, now) {
+			p.poolStats.workerWarmFailed.Add(1)
 			p.noteWarmFailureLocked(now)
 			p.warmRunning = false
 			delay := p.nextWarmAttempt.Sub(now)
-			p.warmTimer = p.afterFuncLocked(delay, p.requestEnsureMinIdle)
+			p.scheduleWarmRetryLocked(delay)
 			p.access.Unlock()
-			worker.closeForPool()
+			worker.closeForPool("transport_closed")
 			return
 		}
 		p.workers = append(p.workers, worker)
@@ -836,18 +1034,31 @@ func (p *IncrementalWorkerPicker) ensureMinIdle() {
 		started := worker.beginProbeLocked(workerWarmDialing)
 		worker.poolAccess.Unlock()
 		p.access.Unlock()
+		recordMuxWorkerEvent(p, worker, "DIALING", "VALIDATING", "warm_created", 0)
 		go worker.runProbe(started, p)
 	}
 }
 
-func (p *IncrementalWorkerPicker) onWorkerClosed(worker *ClientWorker) {
+func (p *IncrementalWorkerPicker) onWorkerClosed(worker *ClientWorker, affectedSessions uint32) {
 	var starts []probeRun
+	var unregister bool
 
 	p.access.Lock()
 	worker.poolAccess.Lock()
 	previousState := worker.poolState
-	worker.markPoolClosedLocked()
+	reason := "transport_closed"
+	if worker.sessionEndTimedOut.Load() {
+		reason = "session_end_timeout"
+	}
+	worker.markPoolClosedLocked(reason)
 	worker.poolAccess.Unlock()
+	transportClosed := previousState != workerClosed
+	if transportClosed {
+		p.poolStats.workerClosedTransport.Add(1)
+		if previousState == workerWarmDialing {
+			p.poolStats.workerWarmFailed.Add(1)
+		}
+	}
 	for i, candidate := range p.workers {
 		if candidate == worker {
 			copy(p.workers[i:], p.workers[i+1:])
@@ -856,22 +1067,27 @@ func (p *IncrementalWorkerPicker) onWorkerClosed(worker *ClientWorker) {
 			break
 		}
 	}
-	if p.config != nil && !p.poolClosed && isReservedIdleState(previousState) {
-		if isProbingState(previousState) {
-			p.poolStats.workerClosedProbe.Add(1)
-		}
+	if p.config != nil && !p.poolClosed && isProbingState(previousState) {
+		p.poolStats.workerClosedProbe.Add(1)
 		p.noteWarmFailureLocked(p.nowLocked())
 	}
 	if p.config != nil && !p.poolClosed {
 		starts = append(starts, p.promoteQueuedLocked(p.nowLocked())...)
 	}
 	shouldRefill := p.config != nil && !p.poolClosed
+	unregister = p.poolClosed && len(p.workers) == 0
 	p.access.Unlock()
+	if transportClosed {
+		recordMuxWorkerEvent(p, worker, observableWorkerState(previousState), "DEAD", reason, affectedSessions)
+	}
 	for _, next := range starts {
 		go next.worker.runProbe(next, p)
 	}
 	if shouldRefill {
-		p.requestEnsureMinIdle()
+		p.requestEnsurePrewarm()
+	}
+	if unregister {
+		p.disableObservation()
 	}
 }
 
@@ -879,7 +1095,7 @@ func (p *IncrementalWorkerPicker) drainPool(force bool) error {
 	p.access.Lock()
 	// Pool configuration is normally materialized by the first PickAvailable.
 	// Drain can win the race against that first pick when an outbound is removed,
-	// so materialize it here as well before deciding this is a legacy picker.
+	// so materialize it here as well before deciding this picker is unpooled.
 	if p.config == nil {
 		p.config = p.Pool
 	}
@@ -892,6 +1108,11 @@ func (p *IncrementalWorkerPicker) drainPool(force bool) error {
 		return nil
 	}
 	p.poolClosed = true
+	p.activeHealthGeneration++
+	if p.activeHealthTimer != nil {
+		p.activeHealthTimer.Stop()
+		p.activeHealthTimer = nil
+	}
 	if p.warmTimer != nil {
 		p.warmTimer.Stop()
 		p.warmTimer = nil
@@ -900,9 +1121,21 @@ func (p *IncrementalWorkerPicker) drainPool(force bool) error {
 		common.Close(p.cleanupTask)
 	}
 	workers := append([]*ClientWorker(nil), p.workers...)
+	unregister := len(workers) == 0
 	p.access.Unlock()
 	for _, worker := range workers {
-		worker.drainForPool(force)
+		previousState, nextState, active, changed := worker.drainForPool(force)
+		if !changed {
+			continue
+		}
+		affected := uint32(0)
+		if nextState == workerClosed {
+			affected = active
+		}
+		recordMuxWorkerEvent(p, worker, observableWorkerState(previousState), observableWorkerState(nextState), "planned_rotation", affected)
+	}
+	if unregister {
+		p.disableObservation()
 	}
 	return nil
 }

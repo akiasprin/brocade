@@ -11,7 +11,7 @@ const ingress: SnapshotIngress = {
   node: 'node-1',
   bind: '0.0.0.0',
   port: 443,
-  projection: null,
+  projection: {},
   guard: {
     no_private: true,
     no_bittorrent: true,

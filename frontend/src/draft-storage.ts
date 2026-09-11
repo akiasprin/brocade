@@ -43,12 +43,10 @@ function readEntries(value: unknown): DraftEntry[] {
         !!entry &&
         typeof entry.key === 'string' &&
         typeof entry.label === 'string' &&
+        typeof entry.editId === 'string' &&
         !!entry.op &&
-        typeof entry.op.op === 'string' &&
-        entry.op.op !== 'swap_apps' &&
-        entry.op.op !== 'swap_chains',
-    )
-    .map(entry => ({ ...entry, editId: entry.editId ?? `legacy:${entry.key}` }));
+        typeof entry.op.op === 'string',
+    );
 }
 
 /** Immutable branch heads avoid localStorage's read/modify/write lost-update race. Two writes
@@ -61,19 +59,7 @@ export class DraftStorage {
     readonly owner: string,
     private readonly storage: Storage,
   ) {
-    this.prefix = `brocade-console:draft:v3:${owner}:`;
-    const migrated = `${this.prefix}migrated`;
-    if (storage.getItem(migrated) === null) {
-      let entries: DraftEntry[] = [];
-      try {
-        entries = readEntries(JSON.parse(storage.getItem(`brocade-console:draft:v2:${owner}`) ?? '[]'));
-      } catch {
-        /* Keep the original v2 value available for recovery. */
-      }
-      // A fixed migration ID makes simultaneous first loads import the same draft once.
-      storage.setItem(`${this.prefix}head:legacy`, JSON.stringify({ id: 'legacy', parents: [], entries }));
-      storage.setItem(migrated, '1');
-    }
+    this.prefix = `brocade-console:draft:v1:${owner}:`;
   }
 
   private records(kind: string): string[] {

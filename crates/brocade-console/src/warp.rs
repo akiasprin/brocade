@@ -209,14 +209,8 @@ async fn register_at(
 }
 
 fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
-    let mut value = serde_json::from_slice::<Value>(bytes)
+    let value = serde_json::from_slice::<Value>(bytes)
         .map_err(|error| format!("Cloudflare WARP 返回的不是有效 JSON：{error}"))?;
-    // Older compatible endpoints wrapped the same object in `result`; the current wgcf OpenAPI
-    // describes the direct form. Accepting both costs no ambiguity and makes provider rollbacks
-    // non-disruptive.
-    if let Some(result) = value.get_mut("result") {
-        value = result.take();
-    }
     let response = serde_json::from_value::<RegisterResponse>(value)
         .map_err(|error| format!("Cloudflare WARP 响应结构已变化：{error}"))?;
     let peer = response
@@ -949,18 +943,16 @@ mod tests {
     }
 
     #[test]
-    fn current_and_wrapped_registration_shapes_parse() {
-        let direct = registration_response();
-        for value in [direct.clone(), serde_json::json!({ "result": direct })] {
-            let registration = parse_registration(&serde_json::to_vec(&value).unwrap()).unwrap();
-            assert_eq!(registration.local_addresses[0], "172.16.0.2/32");
-            assert_eq!(registration.local_addresses[1], "2606:4700::1/128");
-            assert_eq!(registration.reserved, vec![168, 26, 21]);
-            assert_eq!(
-                registration.suggested_endpoint.as_deref(),
-                Some("162.159.193.1:2408")
-            );
-        }
+    fn registration_shape_parses() {
+        let registration =
+            parse_registration(&serde_json::to_vec(&registration_response()).unwrap()).unwrap();
+        assert_eq!(registration.local_addresses[0], "172.16.0.2/32");
+        assert_eq!(registration.local_addresses[1], "2606:4700::1/128");
+        assert_eq!(registration.reserved, vec![168, 26, 21]);
+        assert_eq!(
+            registration.suggested_endpoint.as_deref(),
+            Some("162.159.193.1:2408")
+        );
     }
 
     #[test]

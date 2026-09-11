@@ -33,7 +33,6 @@ fn parse_user_stats(output: &str, user_stat_prefix: &str) -> Result<UserStats, S
     let value: Value = serde_json::from_str(output.trim()).map_err(|error| error.to_string())?;
     let stats = value
         .get("stat")
-        .or_else(|| value.get("stats"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -97,25 +96,6 @@ mod tests {
         assert_eq!(
             stats.labels.get("alice@platform.acme#i-hk").copied(),
             Some(46)
-        );
-    }
-
-    #[test]
-    fn parse_user_stats_accepts_legacy_stats_field() {
-        let stats = parse_user_stats(
-            r#"{
-                "stats": [
-                    { "name": "user>>>alice@platform.acme#i-us>>>traffic>>>downlink", "value": 5 }
-                ]
-            }"#,
-            "alice@platform.acme#",
-        )
-        .unwrap();
-
-        assert_eq!(stats.total_bytes, 5);
-        assert_eq!(
-            stats.labels.get("alice@platform.acme#i-us").copied(),
-            Some(5)
         );
     }
 

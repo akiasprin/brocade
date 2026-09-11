@@ -2,9 +2,9 @@ use brocade_core::client_config::ClientProjectionDownloadEndpoint;
 use brocade_core::hash::sha256_hex;
 use brocade_core::model::{
     AnyTlsMasquerade, AppView, Dns, DomainStrategy, ExternalOutbound, HysteriaCongestion,
-    HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, ModelSnapshot, Node, Projection,
-    ProjectionDownloadEndpoint, ProjectionEndpoint, RealityFallbackLimits, RealityFallbackMode,
-    RealitySettings, RealitySite, Transport, XhttpDownload,
+    HysteriaMasquerade, HysteriaObfs, IngressWires, ModelSnapshot, Node,
+    ProjectionDownloadEndpoint, RealityFallbackLimits, RealityFallbackMode, RealitySettings,
+    RealitySite, Transport,
 };
 use brocade_deployment::plan::{
     grants_match, narrow_to_kind, plan_deployment as plan_snapshot_deployment,
@@ -425,9 +425,9 @@ pub async fn transition_node_status(
         false
     };
     // Repeating an ordinary status write is a no-op. Repeating retirement while its operational
-    // work order is missing or terminal is deliberately different: it is the repair path for a
-    // legacy retired_at backfill and for a canceled teardown, and reuses the same epoch rather
-    // than pretending that model intent changed again.
+    // work order is missing or terminal is deliberately different: it repairs a canceled or
+    // otherwise missing teardown and reuses the same epoch rather than pretending that model
+    // intent changed again.
     let repairs_missing_teardown = !changed
         && retiring
         && lifecycle_phase == NodeLifecyclePhase::Retiring.as_str()
@@ -1954,8 +1954,7 @@ pub async fn load_desired_for_node(
                 dt.node_id,
                 dts.wave,
                 dts.desired_structure,
-                dts.desired_grants,
-                d.revision_id
+                dts.desired_grants
          FROM active_deployment ad
          JOIN deployments d
            ON d.id = ad.id
@@ -1985,13 +1984,7 @@ pub async fn load_desired_for_node(
     };
 
     let desired_structure = row.try_get("desired_structure")?;
-    let grants = frozen_desired_grants(
-        pool,
-        row.try_get("desired_grants")?,
-        revision_to_u64(row.try_get("revision_id")?)?,
-        node_id,
-    )
-    .await?;
+    let grants: DesiredGrants = serde_json::from_value(row.try_get::<Value, _>("desired_grants")?)?;
     desired_deployment_from_structure(
         pool,
         row.try_get("deployment_id")?,
@@ -2187,8 +2180,7 @@ pub async fn claim_desired_for_node(
                 dt.node_id,
                 dts.wave,
                 dts.desired_structure,
-                dts.desired_grants,
-                d.revision_id
+                dts.desired_grants
          FROM active_deployment ad
          JOIN deployments d
            ON d.id = ad.id
@@ -2230,13 +2222,7 @@ pub async fn claim_desired_for_node(
     let node_id: String = row.try_get("node_id")?;
     let wave = row.try_get("wave")?;
     let desired_structure = row.try_get("desired_structure")?;
-    let grants = frozen_desired_grants_tx(
-        &mut tx,
-        row.try_get("desired_grants")?,
-        revision_to_u64(row.try_get("revision_id")?)?,
-        &node_id,
-    )
-    .await?;
+    let grants: DesiredGrants = serde_json::from_value(row.try_get::<Value, _>("desired_grants")?)?;
     let desired = desired_deployment_from_structure_tx(
         &mut tx,
         deployment_id,
@@ -3694,6 +3680,7 @@ fn ensure_restored_snapshot(
                 (
                     node.certificate_name.clone(),
                     node.certificate_names.clone(),
+                    node.certificate_track,
                 ),
             )
         })
@@ -3701,9 +3688,10 @@ fn ensure_restored_snapshot(
     let mut expected = target.clone();
     expected.revision = revision;
     for node in &mut expected.nodes {
-        if let Some((serving, slots)) = certificate_state.get(node.id.as_str()) {
+        if let Some((serving, slots, track)) = certificate_state.get(node.id.as_str()) {
             node.certificate_name = serving.clone();
             node.certificate_names = slots.clone();
+            node.certificate_track = *track;
         }
     }
     if expected == *restored {
@@ -3747,8 +3735,8 @@ async fn restore_settings_tx(
 ) -> Result<()> {
     // Settings have one canonical complete writer. Calling it here instead of repeating its
     // column list is what keeps a newly added setting from being silently omitted by rollback.
-    // The snapshot was produced by this same normalized path; if an old snapshot is no longer
-    // valid, failing the rollback is safer than restoring a shape which never existed.
+    // The snapshot was produced by this same normalized path; rejecting an invalid stored
+    // snapshot is safer than restoring a shape which cannot pass the current writer.
     settings::update_settings_tx(
         tx,
         &AdminContext::system_admin("system:rollback"),
@@ -3756,7 +3744,7 @@ async fn restore_settings_tx(
     )
     .await?;
 
-    // The overlay network predates ModelSettings and remains a top-level snapshot field.
+    // The overlay network is a top-level snapshot field rather than part of ModelSettings.
     sqlx::query(
         "UPDATE control_state
          SET overlay_cidr = $1::cidr
@@ -3946,6 +3934,22 @@ async fn restore_node_tx(
     .bind(conn_secs(node.connection.buffer_size_kb))
     .execute(&mut **tx)
     .await?;
+    if let Some(label_id) = &node.certificate_group_id {
+        sqlx::query(
+            "INSERT INTO node_cert_label (node_id, label_id)
+             VALUES ($1, $2)
+             ON CONFLICT (node_id) DO UPDATE SET label_id = EXCLUDED.label_id",
+        )
+        .bind(&node.id)
+        .bind(label_id)
+        .execute(&mut **tx)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM node_cert_label WHERE node_id = $1")
+            .bind(&node.id)
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 
@@ -4193,7 +4197,7 @@ async fn restore_app_tx(
             .and_then(|xhttp| xhttp.tuning.as_ref())
             .map(serde_json::to_value)
             .transpose()?;
-        let xhttp_download = restored_xhttp_download(ingress);
+        let xhttp_download = xhttp.and_then(|xhttp| xhttp.download.clone());
         let reality_split = matches!(ingress.wires.vless(), Some(Transport::VlessRealityXhttp(_)));
         let xhttp_download_v4 = xhttp_download
             .as_ref()
@@ -4223,7 +4227,7 @@ async fn restore_app_tx(
                     .map(i32::from)
             })
             .flatten();
-        let projection = projection_without_download(&ingress.projection);
+        let projection = &ingress.projection;
         let hysteria2 = ingress.wires.hysteria2();
         let quic = hysteria2.map(|h| h.quic).unwrap_or_default();
         let (hy2_masquerade_kind, hy2_masquerade_url) = match hysteria2.map(|h| &h.masquerade) {
@@ -4268,13 +4272,7 @@ async fn restore_app_tx(
                 hy2_up, hy2_down, hy2_congestion, hy2_obfs_password,
                 hy2_masquerade_kind, hy2_masquerade_url,
                 projection_v4_host, projection_v4_port,
-                projection_v4_download_host, projection_v4_download_port,
-                projection_v4_download_origin_port,
-                projection_v4_download_http_host, projection_v4_download_mux,
                 projection_v6_host, projection_v6_port,
-                projection_v6_download_host, projection_v6_download_port,
-                projection_v6_download_origin_port,
-                projection_v6_download_http_host, projection_v6_download_mux,
                 guard_no_private, guard_no_bittorrent, guard_no_mail,
                 guard_no_udp_amplification, guard_tcp_and_quic_only,
                 created_revision,
@@ -4301,16 +4299,15 @@ async fn restore_app_tx(
                 $17, $18, $19, $20,
                 $21, $22, $23,
                 $24, $25, $26, $27, $28, $29,
-                $30, $31, $32, $33, $34, $35, $36,
-                $37, $38, $39, $40, $41, $42, $43,
-                $44, $45, $46, $47, $48,
-                $49,
-                $50,
-                $51, $52, $53, $54,
-                $55, $56, $57, $58,
-                $59, $60, $61,
-                $62, $63, $64, $65, $66, $67, $68, $69, $70,
-                $71, $72, $73, $74, $75, $76, $77
+                $30, $31, $32, $33,
+                $34, $35, $36, $37, $38,
+                $39,
+                $40,
+                $41, $42, $43, $44,
+                $45, $46, $47, $48,
+                $49, $50, $51,
+                $52, $53, $54, $55, $56, $57, $58, $59, $60,
+                $61, $62, $63, $64, $65, $66, $67
              )",
         )
         .bind(&ingress.id)
@@ -4353,27 +4350,15 @@ async fn restore_app_tx(
         .bind(hy2_masquerade_url)
         .bind(projection.v4.as_ref().map(|to| to.host.clone()))
         .bind(projection.v4.as_ref().map(|to| i32::from(to.port)))
-        .bind(None::<String>)
-        .bind(None::<i32>)
-        .bind(None::<i32>)
-        .bind(None::<String>)
-        .bind(None::<i32>)
         .bind(projection.v6.as_ref().map(|to| to.host.clone()))
         .bind(projection.v6.as_ref().map(|to| i32::from(to.port)))
-        .bind(None::<String>)
-        .bind(None::<i32>)
-        .bind(None::<i32>)
-        .bind(None::<String>)
-        .bind(None::<i32>)
         .bind(ingress.guard.no_private)
         .bind(ingress.guard.no_bittorrent)
         .bind(ingress.guard.no_mail)
         .bind(ingress.guard.no_udp_amplification)
         .bind(ingress.guard.tcp_and_quic_only)
         .bind(revision_id)
-        /* 跟 console.rs 的那条 INSERT 同样的排法：新列接在 created_revision 后面，
-        前面 53 个占位符的编号一个都不动。回滚写的是快照里已经过校验的值，
-        窗口能装进 BIGINT——它当初就是从 BIGINT 读出来的。 */
+        /* 回滚写的是快照里已经过校验的值，窗口能装进 BIGINT。 */
         .bind(
             hysteria2
                 .map(|h| h.bbr_profile)
@@ -4623,39 +4608,6 @@ fn flow_column(flow: Option<String>, site_flow: &Option<String>) -> Option<Strin
     }
 }
 
-fn restored_xhttp_download(ingress: &Ingress) -> Option<XhttpDownload> {
-    let xhttp = ingress.wires.xhttp()?;
-    if let Some(download) = &xhttp.download {
-        return Some(download.clone());
-    }
-    let v4 = ingress
-        .projection
-        .v4
-        .as_ref()
-        .and_then(|endpoint| endpoint.download.clone());
-    let v6 = ingress
-        .projection
-        .v6
-        .as_ref()
-        .and_then(|endpoint| endpoint.download.clone());
-    (v4.is_some() || v6.is_some()).then_some(XhttpDownload { v4, v6 })
-}
-
-fn projection_without_download(projection: &Projection) -> Projection {
-    Projection {
-        v4: projection.v4.as_ref().map(|endpoint| ProjectionEndpoint {
-            host: endpoint.host.clone(),
-            port: endpoint.port,
-            download: None,
-        }),
-        v6: projection.v6.as_ref().map(|endpoint| ProjectionEndpoint {
-            host: endpoint.host.clone(),
-            port: endpoint.port,
-            download: None,
-        }),
-    }
-}
-
 fn client_download_json(download: &ProjectionDownloadEndpoint) -> Result<Value> {
     Ok(serde_json::to_value(ClientProjectionDownloadEndpoint {
         host: download.host.clone(),
@@ -4732,13 +4684,16 @@ fn anytls_reality_override_json(
     let mut stored = reality.clone();
     stored.flow = None;
     match stored.fallback_mode {
-        RealityFallbackMode::GlobalSite | RealityFallbackMode::NodeCertificate => {
-            // Node-certificate existed only in the first experimental snapshot shape. Restoring
-            // one moves AnyTLS to the supported global target rather than reviving that mode.
+        RealityFallbackMode::GlobalSite => {
             stored.fallback_mode = RealityFallbackMode::GlobalSite;
             stored.dest.clear();
             stored.server_names.clear();
             stored.fingerprint.clear();
+        }
+        RealityFallbackMode::NodeCertificate => {
+            return Err(StoreError::InvalidData(
+                "AnyTLS REALITY target must be global-site or custom-site".to_owned(),
+            ));
         }
         // Preserve explicit custom provenance even if its current values happen to equal the
         // global site. A later global edit must not change this AnyTLS target.
@@ -5243,18 +5198,11 @@ async fn desired_deployment_from_structure_connection(
 ) -> Result<NodeDesiredDeployment> {
     let mut artifacts = BTreeMap::new();
     for artifact in ConfigArtifact::ALL {
-        let desired =
-            if artifact.predates_records() && desired_structure.get(artifact.field()).is_none() {
-                DesiredArtifact::Unmanaged {
-                    reason: format!("这条发布记录早于 {}", artifact.field()),
-                }
-            } else {
-                load_artifact_from_metadata(
-                    &mut *connection,
-                    desired_structure_field(&desired_structure, artifact.field())?,
-                )
-                .await?
-            };
+        let desired = load_artifact_from_metadata(
+            &mut *connection,
+            desired_structure_field(&desired_structure, artifact.field())?,
+        )
+        .await?;
         artifacts.insert(artifact.field(), desired);
     }
     let mut take = |artifact: ConfigArtifact| {
@@ -5650,13 +5598,7 @@ fn reported_state_matches_desired(
     // deployment that moved nothing still reports success: the machine echoes back whatever it did
     // with the artifact nobody checks, the target goes green, and the plan asks for the same thing
     // again next round.
-    //
-    // A record predating an artifact has no field for it (see `predates_records`); there is nothing
-    // to hold the machine to, so it does not count against convergence.
     for artifact in ConfigArtifact::ALL {
-        if artifact.predates_records() && desired_structure.get(artifact.field()).is_none() {
-            continue;
-        }
         let metadata = desired_structure_field(desired_structure, artifact.field())?;
         if !artifact_state_matches_metadata(observed.artifact(artifact), metadata)? {
             return Ok(false);
@@ -6055,49 +5997,6 @@ fn artifact_metadata(artifact: &DesiredArtifact) -> Value {
             "reason": reason,
         }),
     }
-}
-
-async fn frozen_desired_grants(
-    pool: &PgPool,
-    stored: Option<Value>,
-    revision_id: u64,
-    node_id: &str,
-) -> Result<DesiredGrants> {
-    if let Some(stored) = stored {
-        return serde_json::from_value(stored).map_err(StoreError::from);
-    }
-    // Compatibility for a work order created before desired_grants was recorded.  Its own
-    // revision is still immutable and materialized, so reconstruct from that rather than silently
-    // folding today's permissions into yesterday's release.
-    let snapshot = materialize::load_snapshot(pool, Some(revision_id)).await?;
-    desired_grants_for_node(snapshot, node_id)
-}
-
-async fn frozen_desired_grants_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    stored: Option<Value>,
-    revision_id: u64,
-    node_id: &str,
-) -> Result<DesiredGrants> {
-    if let Some(stored) = stored {
-        return serde_json::from_value(stored).map_err(StoreError::from);
-    }
-    let snapshot = materialize::load_snapshot_tx(tx, Some(revision_id)).await?;
-    desired_grants_for_node(snapshot, node_id)
-}
-
-fn desired_grants_for_node(snapshot: ModelSnapshot, node_id: &str) -> Result<DesiredGrants> {
-    let plan = plan_snapshot_deployment(&snapshot, &[]).map_err(plan_error)?;
-    let target = plan
-        .targets
-        .into_iter()
-        .find(|target| target.node_id == node_id)
-        .ok_or_else(|| {
-            StoreError::InvalidData(format!(
-                "node {node_id} is not present in the deployment revision"
-            ))
-        })?;
-    Ok(target.desired.grants)
 }
 
 fn desired_structure_field<'a>(value: &'a Value, field: &str) -> Result<&'a Value> {

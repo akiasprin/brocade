@@ -234,7 +234,7 @@ pub struct CertificateOrder {
     pub domain_id: String,
     pub domain: String,
     pub label: String,
-    /// Exact SNI used by self-signed groups. Public-CA groups keep the legacy wildcard pair.
+    /// Exact SNI used by self-signed groups. Public-CA groups use their wildcard pair.
     pub certificate_name: Option<String>,
     pub acme_directory: String,
     pub acme_contact: Option<String>,
@@ -528,10 +528,31 @@ pub async fn upsert_cert_domain(
         _ => None,
     };
 
+    let mut tx = pool.begin().await?;
+    if let Some((domain_id, configured_directory)) = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, acme_directory FROM cert_domains WHERE domain = $1 FOR UPDATE",
+    )
+    .bind(&domain)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let changing_track =
+            CertificateSigningMethod::from_directory(&configured_directory) != input.signing_method;
+        let has_groups: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cert_labels WHERE domain_id = $1)")
+                .bind(&domain_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if changing_track && has_groups {
+            return Err(StoreError::InvalidData(
+                "已有证书组的签发类型不能直接切换；请新建独立证书域和证书组".to_owned(),
+            ));
+        }
+    }
+
     // Changing the directory invalidates the account: staging and production accounts are not
     // interchangeable, and keeping the old one would have the worker present a staging account to
     // production and fail in a way that reads as a permissions problem.
-    let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "INSERT INTO cert_domains (id, domain, dns_provider, dns_credential_sealed,
                                    acme_directory, acme_contact, renew_before_days)
@@ -643,8 +664,9 @@ pub async fn create_cert_label(
     create_cert_label_inner(pool, actor, domain_id, name, note, None, false).await
 }
 
-/// Creates a group from the console. Self-signed groups get one exact synthetic SNI by default;
-/// a custom exact SNI is accepted only on this explicit manual-create path.
+/// Creates a group from the console. Public-CA groups start empty and the issuance scan creates
+/// their first leaf. Self-signed groups start with their complete, fixed A/B pair; a custom exact
+/// SNI for slot A is accepted only on this explicit manual-create path.
 pub async fn create_cert_label_with_certificate_name(
     pool: &PgPool,
     actor: &AdminContext,
@@ -697,6 +719,7 @@ async fn create_cert_label_inner(
     };
     let id = generate_id()?;
     for _ in 0..4 {
+        let mut tx = pool.begin().await?;
         let label = generate_label()?;
         let result = sqlx::query(
             "INSERT INTO cert_labels (id, domain_id, label, name, note, certificate_name)
@@ -708,10 +731,34 @@ async fn create_cert_label_inner(
         .bind(name)
         .bind(note.map(str::trim).filter(|note| !note.is_empty()))
         .bind(&certificate_name)
-        .execute(pool)
+        .execute(&mut *tx)
         .await;
         match result {
-            Ok(_) => return Ok(id),
+            Ok(_) => {
+                if directory == SELF_SIGNED_DIRECTORY && synthesize_self_signed_name {
+                    let slot_a_name = certificate_name
+                        .as_deref()
+                        .expect("console self-signed groups always have a generated name");
+                    for (runtime_slot, certificate_name) in [
+                        ("a", slot_a_name.to_owned()),
+                        ("b", generate_synthetic_certificate_name()?),
+                    ] {
+                        sqlx::query(
+                            "INSERT INTO certificates
+                                 (id, label_id, origin, certificate_name, runtime_slot)
+                             VALUES ($1, $2, 'bootstrap', $3, $4)",
+                        )
+                        .bind(generate_id()?)
+                        .bind(&id)
+                        .bind(certificate_name)
+                        .bind(runtime_slot)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                tx.commit().await?;
+                return Ok(id);
+            }
             // Two unique constraints can fire here and they need opposite answers: a label
             // collision is ours to retry, a name collision is the operator's to fix.
             Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("23505") => {
@@ -720,6 +767,14 @@ async fn create_cert_label_inner(
                     .is_some_and(|name| name == "cert_labels_name_key")
                 {
                     return Err(StoreError::InvalidData(format!("证书组名 {name} 已经有了")));
+                }
+                if error
+                    .constraint()
+                    .is_some_and(|name| name == "cert_labels_certificate_name_key")
+                {
+                    return Err(StoreError::InvalidData(
+                        "这个自签证书名称已经在使用".to_owned(),
+                    ));
                 }
                 continue;
             }
@@ -1156,8 +1211,7 @@ pub(crate) async fn self_signed_certificate_pins(
         let domain: String = row.try_get("domain")?;
         let certificate_name: Option<String> = row.try_get("certificate_name")?;
         let peer_sha256: String = row.try_get("peer_sha256")?;
-        // A legacy pair can have reused one SNI for both leaves. Prefer the currently advertised
-        // leaf in that collision; newly generated pairs have one unique name per slot.
+        // Prefer the currently advertised leaf if both slots share one SNI.
         pins.entry(certificate_name_of(
             &label,
             &domain,
@@ -1309,23 +1363,11 @@ pub async fn request_spare_certificate(
         .fetch_one(&mut *tx)
         .await?
     } else {
-        sqlx::query_scalar(
-            "SELECT count(*) FROM certificates
-              WHERE label_id = $1 AND certificate_name IS NULL
-                AND status IN ('pending', 'ready', 'failed')",
-        )
-        .bind(label_id)
-        .fetch_one(&mut *tx)
-        .await?
+        0
     };
     if directory == SELF_SIGNED_DIRECTORY && count >= 1 {
         return Err(StoreError::InvalidData(
             "主备槽已经占满；请先停止并清理旧兼容证书，再生成下一张".to_owned(),
-        ));
-    }
-    if directory != SELF_SIGNED_DIRECTORY && count >= 1 {
-        return Err(StoreError::InvalidData(
-            "已经有一张待处理的公有 CA 备用证书；请先启用或清理".to_owned(),
         ));
     }
     let id = generate_id()?;
@@ -1927,12 +1969,18 @@ pub async fn record_certificate_failure(
 /// Public CA sends only the serving identity because same-name renewals are atomically replaced.
 /// Self-signed sends both fixed slots because different SNI and leaf pins need to overlap.
 pub async fn node_keys(pool: &PgPool, node_id: &str) -> Result<Vec<NodeCertificateMaterial>> {
-    let label: Option<String> = sqlx::query_scalar("SELECT label_id FROM node_cert_label WHERE node_id = $1")
-        .bind(node_id).fetch_optional(pool).await?;
+    let label: Option<String> =
+        sqlx::query_scalar("SELECT label_id FROM node_cert_label WHERE node_id = $1")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await?;
     keys_for_group(pool, label.as_deref()).await
 }
 
-async fn keys_for_group(pool: &PgPool, label_id: Option<&str>) -> Result<Vec<NodeCertificateMaterial>> {
+async fn keys_for_group(
+    pool: &PgPool,
+    label_id: Option<&str>,
+) -> Result<Vec<NodeCertificateMaterial>> {
     let rows = sqlx::query(
         "SELECT c.id, c.status, c.runtime_slot, c.certificate_name, c.acme_directory,
                 l.label, l.certificate_name AS group_certificate_name, d.domain,
@@ -1992,7 +2040,10 @@ async fn keys_for_group(pool: &PgPool, label_id: Option<&str>) -> Result<Vec<Nod
         .into_iter()
         .map(|(track, (mut slots, fallback))| {
             let fallback = fallback.ok_or_else(|| {
-                StoreError::InvalidData(format!("证书组 {} 的证书轨没有可用证书", label_id.unwrap_or_default()))
+                StoreError::InvalidData(format!(
+                    "证书组 {} 的证书轨没有可用证书",
+                    label_id.unwrap_or_default()
+                ))
             })?;
             Ok(match track {
                 CertificateTrack::PublicCa => NodeCertificateMaterial::PublicCa {
@@ -2037,7 +2088,11 @@ pub async fn cert_delta_for_node(
     certificate_delta(pool, node_id, materials).await
 }
 
-async fn certificate_delta(pool: &PgPool, node_id: &str, materials: Vec<NodeCertificateMaterial>) -> Result<Vec<NodeCertificateMaterial>> {
+async fn certificate_delta(
+    pool: &PgPool,
+    node_id: &str,
+    materials: Vec<NodeCertificateMaterial>,
+) -> Result<Vec<NodeCertificateMaterial>> {
     // Two kinds of absence are equivalent here: the node has never reported (no row), or it
     // explicitly reported that the certificate is absent (a row whose observed_sha256 is NULL).
     // Decode the nullable column first and then flatten the optional row; asking sqlx for String
@@ -2090,6 +2145,43 @@ fn slot_bundle_sha256_parts(cert_pem: &str, key_pem: &str) -> String {
     sha256_hex(bundle.as_bytes())
 }
 
+/// Certificate ownership follows the claimed configuration or the last successfully applied
+/// Xray configuration, never the current editable model. Same-group renewal remains live.
+pub(crate) async fn released_cert_delta(
+    pool: &PgPool,
+    node_id: &str,
+    deployment_id: Option<i64>,
+) -> Result<Vec<NodeCertificateMaterial>> {
+    let revision: Option<i64> = sqlx::query_scalar(
+        "SELECT d.revision_id FROM deployments d
+         JOIN deployment_targets t ON t.deployment_id = d.id
+         JOIN deployment_target_state s ON s.deployment_id = d.id AND s.node_id = t.node_id
+         JOIN node_lifecycle_state life ON life.node_id = t.node_id AND life.lifecycle_epoch = s.lifecycle_epoch
+         WHERE t.node_id = $1 AND d.kind = 'config'
+           AND s.desired_structure #>> '{xray,state}' = 'present'
+           AND (($2::bigint IS NOT NULL AND d.id = $2)
+                OR ($2::bigint IS NULL AND t.status = 'succeeded'))
+         ORDER BY d.id DESC LIMIT 1",
+    )
+    .bind(node_id)
+    .bind(deployment_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(revision) = revision else {
+        return Ok(Vec::new());
+    };
+    let snapshot = crate::materialize::load_immutable_snapshot(pool, revision as u64).await?;
+    let Some(node) = snapshot.nodes.iter().find(|node| node.id == node_id) else {
+        return Ok(Vec::new());
+    };
+    certificate_delta(
+        pool,
+        node_id,
+        keys_for_group(pool, node.certificate_group_id.as_deref()).await?,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2133,7 +2225,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_group_without_a_private_name_keeps_its_original_sni() {
+    fn a_public_ca_group_without_a_private_name_uses_its_label_domain() {
         assert_eq!(
             certificate_name_of("a1b2c3d4", "example.com", None),
             "a1b2c3d4.example.com"
@@ -2151,41 +2243,33 @@ mod tests {
     #[test]
     fn certificate_status_is_readable_only_by_admin_or_masked_roles() {
         assert!(require_certificate_status_reader(&AdminContext::system_admin("root")).is_ok());
-        assert!(
-            require_certificate_status_reader(&AdminContext::new(
-                "reviewer",
-                AdminRole::Readonly,
-                Some("platform".to_owned()),
-            ))
-            .is_ok()
-        );
-        assert!(
-            require_certificate_status_reader(&AdminContext::new(
-                "alice",
-                AdminRole::User,
-                Some("platform".to_owned()),
-            ))
-            .is_ok()
-        );
-        assert!(
-            require_certificate_status_reader(&AdminContext::new(
-                "editor",
-                AdminRole::Editor,
-                Some("platform".to_owned()),
-            ))
-            .is_err()
-        );
+        assert!(require_certificate_status_reader(&AdminContext::new(
+            "reviewer",
+            AdminRole::Readonly,
+            Some("platform".to_owned()),
+        ))
+        .is_ok());
+        assert!(require_certificate_status_reader(&AdminContext::new(
+            "alice",
+            AdminRole::User,
+            Some("platform".to_owned()),
+        ))
+        .is_ok());
+        assert!(require_certificate_status_reader(&AdminContext::new(
+            "editor",
+            AdminRole::Editor,
+            Some("platform".to_owned()),
+        ))
+        .is_err());
     }
 
     #[test]
     fn a_label_is_lowercase_hex_and_not_the_same_twice() {
         let first = generate_label().unwrap();
         assert_eq!(first.len(), LABEL_BYTES * 2);
-        assert!(
-            first
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-        );
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
         assert_ne!(first, generate_label().unwrap());
     }
 
@@ -2195,41 +2279,4 @@ mod tests {
         // again. Both would create a second row for the same domain.
         assert_eq!(normalize_domain("  Example.NET.  "), "example.net");
     }
-}
-
-/// Certificate ownership follows the claimed configuration or the last successfully applied
-/// Xray configuration, never the current editable model. Same-group renewal remains live.
-pub(crate) async fn released_cert_delta(
-    pool: &PgPool,
-    node_id: &str,
-    deployment_id: Option<i64>,
-) -> Result<Vec<NodeCertificateMaterial>> {
-    let revision: Option<i64> = sqlx::query_scalar(
-        "SELECT d.revision_id FROM deployments d
-         JOIN deployment_targets t ON t.deployment_id = d.id
-         JOIN deployment_target_state s ON s.deployment_id = d.id AND s.node_id = t.node_id
-         JOIN node_lifecycle_state life ON life.node_id = t.node_id AND life.lifecycle_epoch = s.lifecycle_epoch
-         WHERE t.node_id = $1 AND d.kind = 'config'
-           AND s.desired_structure #>> '{xray,state}' = 'present'
-           AND (($2::bigint IS NOT NULL AND d.id = $2)
-                OR ($2::bigint IS NULL AND t.status = 'succeeded'))
-         ORDER BY d.id DESC LIMIT 1"
-    ).bind(node_id).bind(deployment_id).fetch_optional(pool).await?;
-    let Some(revision) = revision else { return Ok(Vec::new()); };
-    let snapshot = crate::materialize::load_immutable_snapshot(pool, revision as u64).await?;
-    let Some(node) = snapshot.nodes.iter().find(|node| node.id == node_id) else { return Ok(Vec::new()); };
-    let mut label = node.certificate_group_id.clone();
-    // Legacy immutable snapshots predate the group ID. Resolve their frozen SNI, never the
-    // machine's mutable association, so an unpublished move cannot leak through this fallback.
-    if label.is_none() {
-        if let Some(name) = &node.certificate_name {
-            label = sqlx::query_scalar(
-                "SELECT l.id FROM cert_labels l JOIN cert_domains d ON d.id = l.domain_id
-                 LEFT JOIN certificates c ON c.label_id = l.id
-                 WHERE COALESCE(c.certificate_name, l.certificate_name, l.label || '.' || d.domain) = $1
-                 ORDER BY l.id LIMIT 1"
-            ).bind(name).fetch_optional(pool).await?;
-        }
-    }
-    certificate_delta(pool, node_id, keys_for_group(pool, label.as_deref()).await?).await
 }

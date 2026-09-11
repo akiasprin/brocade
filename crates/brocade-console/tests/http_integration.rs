@@ -4,7 +4,7 @@ use axum::{
     Router,
 };
 use brocade_console::http::{
-    admin_router, admin_router_with_wakes_and_realtime, agent_router, agent_router_with_origin,
+    admin_router, admin_router_with_services, agent_router, agent_router_with_origin,
     agent_router_with_origin_and_realtime, merged_router, with_console_static, EMBEDDED_XRAYS,
 };
 use brocade_console::realtime::{RealtimeBroadcast, RealtimeService};
@@ -145,29 +145,63 @@ async fn admin_app(db: &TestPg) -> (Router, String) {
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn initial_html_uses_current_branding_without_default_title_flash() {
-    let Some(db) = TestPg::start_if_enabled().await else { return; };
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
     db.store.migrate().await.unwrap();
     let app = brocade_console::http::with_console_branding(
-        with_console_static(admin_router(db.store.clone())), db.store.clone());
+        with_console_static(admin_router(db.store.clone())),
+        db.store.clone(),
+    );
     for (path, name) in [("/", "我的站点"), ("/index.html", "新站点 </script><b>&")] {
-        db.store.update_branding(&AdminContext::system_admin("test"), brocade_store::BrandingSettings {
-            site_name: name.to_owned(), icon_data_url: None,
-        }).await.unwrap();
-        let response = app.clone().oneshot(Request::get(path)
-            .header("accept-encoding", "gzip")
-            .header("if-modified-since", "Wed, 01 Jan 2099 00:00:00 GMT")
-            .body(Body::empty()).unwrap()).await.unwrap();
+        db.store
+            .update_branding(
+                &AdminContext::system_admin("test"),
+                brocade_store::BrandingSettings {
+                    site_name: name.to_owned(),
+                    icon_data_url: None,
+                },
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("accept-encoding", "gzip")
+                    .header("if-modified-since", "Wed, 01 Jan 2099 00:00:00 GMT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "no-cache");
         assert!(!response.headers().contains_key("content-encoding"));
-        let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
         assert!(!html.contains("<title>Brocade"));
         assert!(!html.contains("</script><b>"));
-        let raw = html.split("type=\"application/json\">").nth(1).unwrap().split("</script>").next().unwrap();
+        let raw = html
+            .split("type=\"application/json\">")
+            .nth(1)
+            .unwrap()
+            .split("</script>")
+            .next()
+            .unwrap();
         let bootstrap: Value = serde_json::from_str(raw).unwrap();
         assert_eq!(bootstrap["site_name"], name);
-        if path == "/" { assert!(html.contains("<title>我的站点 | 跨境网络小管家</title>")); }
-        else { assert!(html.contains("<title>新站点 &lt;/script&gt;&lt;b&gt;&amp; | 跨境网络小管家</title>")); }
+        if path == "/" {
+            assert!(html.contains("<title>我的站点 | 跨境网络小管家</title>"));
+        } else {
+            assert!(html
+                .contains("<title>新站点 &lt;/script&gt;&lt;b&gt;&amp; | 跨境网络小管家</title>"));
+        }
     }
 }
 
@@ -493,6 +527,7 @@ async fn realtime_websocket_authenticates_leases_and_forwards_a_sample() {
 
     let sample = brocade_deployment::protocol::AgentRealtimeSample {
         reverse_health: None,
+        mux: None,
         sequence: 1,
         sampled_at_unix_millis: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -545,7 +580,7 @@ async fn realtime_settings_and_sse_create_one_bounded_node_lease() {
         *agent.commands.borrow(),
         brocade_deployment::protocol::AgentRealtimeCommand::Stop
     );
-    let app = admin_router_with_wakes_and_realtime(
+    let app = admin_router_with_services(
         db.store.clone(),
         std::sync::Arc::new(tokio::sync::Notify::new()),
         std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -1544,7 +1579,7 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn http_agent_desired_authenticates_node_token_and_records_poll() {
+async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -1599,7 +1634,7 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
     let issued: IssuedNodeToken = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(issued.node_id, "n1");
 
-    let legacy = agent
+    let missing_protocol = agent
         .clone()
         .oneshot(
             Request::builder()
@@ -1611,31 +1646,30 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
         )
         .await
         .unwrap();
-    assert_eq!(legacy.status(), StatusCode::NO_CONTENT);
+    assert_eq!(missing_protocol.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        legacy.headers().get("x-brocade-log-max-mib").unwrap(),
-        "100"
-    );
-    assert_eq!(
-        legacy
+        missing_protocol
             .headers()
             .get("x-brocade-agent-journal-max-mib")
             .unwrap(),
         "100"
     );
     assert_eq!(
-        legacy.headers().get("x-brocade-xray-log-max-mib").unwrap(),
-        "100"
-    );
-    assert_eq!(
-        legacy
+        missing_protocol
             .headers()
-            .get("x-brocade-phantun-log-max-mib")
+            .get("x-brocade-xray-log-max-mib")
             .unwrap(),
         "100"
     );
     assert_eq!(
-        legacy
+        missing_protocol
+            .headers()
+            .get("x-brocade-phantun-log-max-mib")
+            .unwrap(),
+        "16"
+    );
+    assert_eq!(
+        missing_protocol
             .headers()
             .get("x-brocade-agent-upgrade-required")
             .unwrap(),
@@ -1672,10 +1706,6 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
         .unwrap();
     assert_eq!(desired.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        desired.headers().get("x-brocade-log-max-mib").unwrap(),
-        "100"
-    );
-    assert_eq!(
         desired
             .headers()
             .get("x-brocade-agent-journal-max-mib")
@@ -1691,7 +1721,14 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
             .headers()
             .get("x-brocade-phantun-log-max-mib")
             .unwrap(),
-        "100"
+        "16"
+    );
+    assert_eq!(
+        desired
+            .headers()
+            .get("x-brocade-agent-upgrade-required")
+            .unwrap(),
+        "1"
     );
     let protocol: Option<i32> = sqlx::query_scalar(
         "SELECT agent_protocol_version FROM node_agent_state WHERE node_id = 'n1'",
@@ -1701,8 +1738,116 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
     .unwrap();
     assert_eq!(protocol, Some(1));
 
+    // A protocol newer than this control plane is incompatible as well. Treating the version as
+    // a lower bound would let an unknown future contract claim current desired state.
+    let future_protocol = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/desired")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    (brocade_deployment::protocol::AGENT_PROTOCOL_VERSION + 1).to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(future_protocol.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        future_protocol
+            .headers()
+            .get("x-brocade-agent-upgrade-required")
+            .unwrap(),
+        "1"
+    );
+
+    // Isolation is not implicit release approval. Before an administrator stages this build for
+    // the node, the independent update channel remains quiet.
+    let update_before_approval = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/agent-release")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("x-brocade-arch", "x86_64")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_before_approval.status(), StatusCode::NO_CONTENT);
+
+    let approve = admin
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/agent-release")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "release_id": brocade_console::http::embedded_release_id(),
+                        "scope": "nodes",
+                        "nodes": ["n1"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK);
+
+    // The node deliberately omits the desired-state protocol header here. The self-update route
+    // must stay reachable so an isolated node can install the approved build without SSH.
+    let update = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/agent-release")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("x-brocade-arch", "x86_64")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    // Once running the current protocol, an otherwise idle node still receives 204, but no
+    // upgrade-required marker: it has rejoined the desired-state channel.
+    let current = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/desired")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::NO_CONTENT);
+    assert!(current
+        .headers()
+        .get("x-brocade-agent-upgrade-required")
+        .is_none());
+
     assert!(db.store.revoke_node_token("n1").await.unwrap());
     let revoked = agent
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -1715,6 +1860,20 @@ async fn http_agent_desired_authenticates_node_token_and_records_poll() {
         .await
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+
+    let revoked_update = agent
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/agent-release")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("x-brocade-arch", "x86_64")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked_update.status(), StatusCode::UNAUTHORIZED);
 
     let row = sqlx::query(
         "SELECT token_last_used_at IS NOT NULL AS used,
@@ -1930,9 +2089,9 @@ async fn http_deployment_detail_includes_raw_state_and_opt_in_content() {
     sqlx::query(
         "INSERT INTO deployment_target_state (
             deployment_id, node_id, wave, disruptive,
-            desired_structure, observed_before, observed_after, verdict
+            desired_structure, observed_before, observed_after, verdict, desired_grants
          )
-         VALUES ($1, 'n1', 0, FALSE, $2, $3, $4, $5)",
+         VALUES ($1, 'n1', 0, FALSE, $2, $3, $4, $5, $6)",
     )
     .bind(deployment_id)
     .bind(json!({
@@ -1955,6 +2114,7 @@ async fn http_deployment_detail_includes_raw_state_and_opt_in_content() {
         "desired_matched": true,
         "baseline_matched": null
     }))
+    .bind(json!({ "state": "present", "inbounds": [] }))
     .execute(db.pool())
     .await
     .unwrap();
@@ -2222,9 +2382,13 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     assert_eq!(target["dial_host"], "127.0.0.1");
     // The REALITY parameters must match the ingress's field for field; one differing and a different
     // path is what gets measured.
-    assert_eq!(target["reality"]["public_key"], "reality-public");
-    assert_eq!(target["reality"]["server_name"], "www.example.com");
-    assert_eq!(target["reality"]["flow"], "xtls-rprx-vision");
+    assert_eq!(target["security"]["type"], "reality");
+    assert_eq!(target["security"]["value"]["public_key"], "reality-public");
+    assert_eq!(
+        target["security"]["value"]["server_name"],
+        "www.example.com"
+    );
+    assert_eq!(target["security"]["value"]["flow"], "xtls-rprx-vision");
     // The credential derives from the ingress's private key and cannot be produced from the ingress
     // id alone — it is something that reaches the ingress.
     assert_eq!(
@@ -2446,10 +2610,47 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
         .expect("system clock before unix epoch")
         .as_secs() as i64
         - 60;
+    let usage_generation_id: i64 = sqlx::query_scalar(
+        "INSERT INTO usage_generations (node_id, bindings)
+         VALUES ('n1', $1)
+         RETURNING id",
+    )
+    .bind(json!({
+        "alice@platform.acme#ing-b2c3": {
+            "kind": "user",
+            "tenant_id": "platform.acme",
+            "user_id": "alice",
+            "ingress_id": "ing-b2c3",
+            "app_id": "app-a1b2",
+            "first_reading": "establish-baseline"
+        }
+    }))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO usage_generation_activations (node_id, generation_id, activated_at)
+         VALUES ('n1', $1, to_timestamp($2::double precision))",
+    )
+    .bind(usage_generation_id)
+    .bind(base - 1)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE node_agent_state SET usage_generation_id = $1 WHERE node_id = 'n1'")
+        .bind(usage_generation_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
     for (read_at, up, down) in [(base, 100_u64, 200_u64), (base + 60, 125, 260)] {
         let body = json!({
+            "agent_instance_id": "0123456789abcdef0123456789abcdef",
+            "sequence": if read_at == base { 1 } else { 2 },
+            "usage_generation_id": usage_generation_id,
             "read_at_unix_secs": read_at,
             "xray_started_at_unix_secs": base - 1000,
+            "xray_epoch": "boot-a:100",
+            "route": null,
             "counters": [{
                 "label": "alice@platform.acme#ing-b2c3",
                 "uplink_bytes": up,
@@ -2472,8 +2673,13 @@ async fn http_agent_usage_records_samples_and_admin_lists_them() {
         assert_eq!(response.status(), StatusCode::OK);
     }
     let future = json!({
+        "agent_instance_id": "0123456789abcdef0123456789abcdef",
+        "sequence": 3,
+        "usage_generation_id": usage_generation_id,
         "read_at_unix_secs": base + 3600,
         "xray_started_at_unix_secs": base,
+        "xray_epoch": "boot-a:100",
+        "route": null,
         "counters": []
     });
     let response = agent
@@ -2614,7 +2820,20 @@ async fn http_global_flow_flows_into_ingresses_that_do_not_override_it() {
             "node_id": "n-api",
             "bind": "0.0.0.0",
             "port": 443,
-            "reality": {}
+            "reality": {
+                "fallback_mode": "global-site",
+                "fallback_limits": { "mode": "balanced" },
+                "fallback_guard": true
+            },
+            "wires": { "vless": { "kind": "vless-reality" } },
+            "projection": {},
+            "guard": {
+                "no_private": true,
+                "no_bittorrent": true,
+                "no_mail": true,
+                "no_udp_amplification": true,
+                "tcp_and_quic_only": false
+            }
         }),
     )
     .await;
@@ -3606,10 +3825,22 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
             "bind": "0.0.0.0",
             "port": 443,
             "reality": {
+                "fallback_mode": "custom-site",
+                "fallback_limits": { "mode": "balanced" },
+                "fallback_guard": true,
                 "dest": "www.example.com:443",
                 "server_names": ["www.example.com"],
                 "fingerprint": "chrome",
                 "flow": "xtls-rprx-vision"
+            },
+            "wires": { "vless": { "kind": "vless-reality" } },
+            "projection": {},
+            "guard": {
+                "no_private": true,
+                "no_bittorrent": true,
+                "no_mail": true,
+                "no_udp_amplification": true,
+                "tcp_and_quic_only": false
             }
         }),
     )
@@ -3633,15 +3864,6 @@ async fn http_console_write_surface_updates_model_and_keeps_generated_secrets_se
             .len(),
         16
     );
-
-    let legacy_step = put_json(
-        &app,
-        &admin_token,
-        "/apps/app-a1b2/chains/chn-b2c3-d4e5/steps/n-api",
-        json!({ "rules": [] }),
-    )
-    .await;
-    assert_eq!(legacy_step.0, StatusCode::METHOD_NOT_ALLOWED);
 
     let step = apply_step_json(
         &app,
@@ -4296,10 +4518,22 @@ async fn http_console_resubmitting_a_write_verbatim_does_not_burn_a_revision() {
         "bind": "0.0.0.0",
         "port": 443,
         "reality": {
+            "fallback_mode": "custom-site",
+            "fallback_limits": { "mode": "balanced" },
+            "fallback_guard": true,
             "dest": "www.example.com:443",
             "server_names": ["www.example.com"],
             "fingerprint": "chrome",
             "flow": "xtls-rprx-vision"
+        },
+        "wires": { "vless": { "kind": "vless-reality" } },
+        "projection": {},
+        "guard": {
+            "no_private": true,
+            "no_bittorrent": true,
+            "no_mail": true,
+            "no_udp_amplification": true,
+            "tcp_and_quic_only": false
         }
     });
     let ingress = post_json(
@@ -4595,10 +4829,9 @@ async fn http_hop_in_round_trips_through_the_model_snapshot() {
 /// One relay serving two chains, each on its own transport layer — the entire reason relay ports hang
 /// off the chain.
 ///
-/// On the node it was one `hop_security` per machine and these two chains could only pick one; now
-/// one takes REALITY through censorship while the other runs unencrypted on a datacenter network for
-/// speed, both at once. Any segment of this dropping has the same symptom, configured and not in
-/// effect, while the artifacts look entirely correct.
+/// One chain takes REALITY through censorship while the other runs unencrypted on a datacenter
+/// network for speed, both at once. Any segment of this dropping has the same symptom, configured
+/// and not in effect, while the artifacts look entirely correct.
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
@@ -4655,10 +4888,22 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
                 "bind": "0.0.0.0",
                 "port": 443,
                 "reality": {
+                    "fallback_mode": "custom-site",
+                    "fallback_limits": { "mode": "balanced" },
+                    "fallback_guard": true,
                     "dest": "apps.apple.com:443",
                     "server_names": ["apps.apple.com"],
                     "fingerprint": "chrome",
                     "flow": "xtls-rprx-vision"
+                },
+                "wires": { "vless": { "kind": "vless-reality" } },
+                "projection": {},
+                "guard": {
+                    "no_private": true,
+                    "no_bittorrent": true,
+                    "no_mail": true,
+                    "no_udp_amplification": true,
+                    "tcp_and_quic_only": false
                 }
             }),
         )
@@ -4675,7 +4920,12 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
         json!({
             "rules": [{
                 "m": { "t": "any" },
-                "a": { "t": "forward", "to": "n-relay", "dial": { "t": "addr", "v": "10.0.0.9:8443" } }
+                "a": {
+                    "t": "forward",
+                    "to": "n-relay",
+                    "dial": { "t": "addr", "v": "10.0.0.9:8443" },
+                    "pool": { "t": "none" }
+                }
             }]
         }),
     )
@@ -4709,7 +4959,8 @@ async fn http_two_chains_on_one_relay_keep_separate_hop_inbounds() {
                 "a": {
                     "t": "forward",
                     "to": "n-relay",
-                    "dial": { "t": "addr", "v": "relay.sg.example:443" }
+                    "dial": { "t": "addr", "v": "relay.sg.example:443" },
+                    "pool": { "t": "none" }
                 }
             }]
         }),
@@ -4883,19 +5134,25 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
-    assert_eq!(body["domain"]["signing_method"], "self-signed");
-    assert_eq!(body["domain"]["acme_directory"], "self-signed");
-    assert_eq!(body["domain"]["has_credential"], false);
+    assert!(body["domain"].is_null(), "公有 CA 参数卡不应回显内部自签域");
     let text = body.to_string();
     assert!(!text.contains("BEGIN PRIVATE KEY"));
     assert!(!text.contains("BEGIN CERTIFICATE"));
 
-    let domain_id = body["domain"]["id"].as_str().unwrap();
+    let domain_id = db
+        .store
+        .cert_domains()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|domain| domain.signing_method == brocade_store::CertificateSigningMethod::SelfSigned)
+        .unwrap()
+        .id;
     let label_id = db
         .store
         .create_cert_label(
             &AdminContext::system_admin("test-admin"),
-            domain_id,
+            &domain_id,
             "Self-signed SNI",
             None,
         )
@@ -4975,39 +5232,29 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         &app,
         &token,
         "/certs/groups",
-        json!({"name": "Immediate issuance"}),
+        json!({"name": "Immediate issuance", "signing_method": "self-signed"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(created["processing"]["issued"], 1);
+    assert_eq!(created["processing"]["issued"], 2);
     assert_eq!(created["processing"]["failed"], 0);
     let id = created["id"].as_str().unwrap();
-    let issued: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM certificates WHERE label_id = $1 AND status = 'serving'",
-    )
-    .bind(id)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(issued, 1, "creation must finish issuance before returning");
-    let (status, spare) = post_json(
+    let states: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM certificates WHERE label_id = $1 ORDER BY status")
+            .bind(id)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(states, vec!["ready", "serving"]);
+    let (status, blocked_spare) = post_json(
         &app,
         &token,
         &format!("/certs/groups/{id}/spare"),
         json!({}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(spare["processing"]["issued"], 1);
-    let state: String = sqlx::query_scalar("SELECT status FROM certificates WHERE id = $1")
-        .bind(spare["id"].as_str().unwrap())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        state, "ready",
-        "spare issuance must finish before returning"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(blocked_spare.to_string().contains("主备槽已经占满"));
 
     let configured = app.clone().oneshot(Request::put("/certs/domain")
         .header("authorization", format!("Bearer {token}"))
@@ -5018,7 +5265,7 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         &app,
         &token,
         "/certs/groups",
-        json!({"name": "Missing credential"}),
+        json!({"name": "Missing credential", "signing_method": "public-ca"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -5026,6 +5273,30 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         blocked["processing"]["failed"], 1,
         "missing credentials must surface as a failed attempt, not a queue"
     );
+    let public_group_id = blocked["id"].as_str().unwrap();
+    let (first_status, first_extra) = post_json(
+        &app,
+        &token,
+        &format!("/certs/groups/{public_group_id}/spare"),
+        json!({}),
+    )
+    .await;
+    let (second_status, second_extra) = post_json(
+        &app,
+        &token,
+        &format!("/certs/groups/{public_group_id}/spare"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    assert_ne!(first_extra["id"], second_extra["id"]);
+    let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM certificates WHERE label_id = $1")
+        .bind(public_group_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained, 3, "公有证书组应保留多份独立申领记录");
     let retry = app
         .clone()
         .oneshot(
@@ -5046,8 +5317,8 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     .unwrap();
     assert_eq!(
         counts,
-        (1, 2),
-        "manual retry must reuse the failed request immediately"
+        (3, 9),
+        "manual retry must reuse every retained failed request immediately"
     );
 }
 
@@ -5175,7 +5446,12 @@ async fn request_json_with_token(
     let value = if bytes.is_empty() {
         json!(null)
     } else {
-        serde_json::from_slice(&bytes).unwrap()
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "{method} {uri} returned {status} with non-JSON body ({error}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
     };
     (status, value)
 }
@@ -5660,7 +5936,7 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
                 .header("authorization", format!("Bearer {token}"))
                 .header(
                     "x-brocade-protocol-version",
-                    brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION.to_string(),
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
                 );
             if let Some(arch) = arch {
                 request = request.header("x-brocade-arch", arch);
@@ -5785,23 +6061,9 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     let response = ask(issued.token.clone(), Some("x86_64")).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // A clearance naming a build this control plane does not have — which is exactly what a
-    // redeployed control plane looks like. It must serve nothing, or deploying the control plane
-    // would double as releasing whatever agent it happens to embed.
-    let response = release(json!({
-        "release_id": "0".repeat(64), "scope": "all", "nodes": []
-    }))
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let response = ask(issued.token.clone(), Some("x86_64")).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::NO_CONTENT,
-        "批准的不是这台控制面带的那一批，就该谁也不给"
-    );
-
-    // A legacy agent cannot consume desired state, so the same staged scope is allowed to rescue
-    // it with this control plane's embedded build even though the stored build id is stale.
+    // Desired-state protocol isolation must not cut off the separately approved self-update
+    // channel. A node unable to consume the current desired contract can still install the
+    // released Agent build and rejoin on the current protocol without an SSH session.
     let response = agent
         .clone()
         .oneshot(
@@ -5816,6 +6078,21 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    // A clearance naming a build this control plane does not have — which is exactly what a
+    // redeployed control plane looks like. It must serve nothing, or deploying the control plane
+    // would double as releasing whatever agent it happens to embed.
+    let response = release(json!({
+        "release_id": "0".repeat(64), "scope": "all", "nodes": []
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = ask(issued.token.clone(), Some("x86_64")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "批准的不是这台控制面带的那一批，就该谁也不给"
+    );
 
     // Pausing keeps the build id, so resuming does not mean choosing it again.
     let response = release(json!({ "release_id": available, "scope": "off", "nodes": [] })).await;
@@ -6009,7 +6286,7 @@ async fn insert_usage_model(pool: &PgPool) {
     .unwrap();
     sqlx::query(
         "INSERT INTO steps (chain_id, node_id, rules)
-         VALUES ('chn-b2c3-d4e5', 'n1', '[{\"match\":{\"t\":\"any\"},\"action\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
+         VALUES ('chn-b2c3-d4e5', 'n1', '[{\"m\":{\"t\":\"any\"},\"a\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
     )
     .execute(pool)
     .await

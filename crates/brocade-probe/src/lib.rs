@@ -41,7 +41,7 @@ use std::{
 };
 
 use brocade_deployment::protocol::{
-    E2eExitVerdict, E2eProbe, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
+    E2eExitVerdict, E2eProbe, E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
 };
 
 /// Ceiling on waiting for the started process to listen on its socks port. A cold
@@ -346,26 +346,31 @@ fn mismatch_detail(target: &E2eProbeTarget, verdict: E2eExitVerdict) -> Option<S
 /// dialed plain TCP at every target once, and an ingress carried inside HTTP was refused at
 /// the server's path check and reported down while it was carrying traffic perfectly well.
 fn client_config(target: &E2eProbeTarget, socks_port: u16, log_path: &str) -> String {
-    if let Some(hysteria) = &target.hysteria2 {
-        return hysteria_client_config(target, hysteria, socks_port, log_path);
+    match &target.security {
+        E2eProbeSecurity::Hysteria2(hysteria) => {
+            return hysteria_client_config(target, hysteria, socks_port, log_path);
+        }
+        E2eProbeSecurity::AnyTls { settings, reality } => {
+            return anytls_client_config(target, settings, reality.as_ref(), socks_port, log_path);
+        }
+        _ => {}
     }
-    if let Some(anytls) = &target.anytls {
-        return anytls_client_config(target, anytls, socks_port, log_path);
-    }
+    let (encryption, flow) = match &target.security {
+        E2eProbeSecurity::VlessEncryption { encryption } => (encryption.as_str(), None),
+        E2eProbeSecurity::Reality(reality) => ("none", reality.flow.as_deref()),
+        E2eProbeSecurity::Tls(tls) => ("none", tls.flow.as_deref()),
+        E2eProbeSecurity::AnyTls { .. } | E2eProbeSecurity::Hysteria2(_) => unreachable!(),
+    };
     let mut settings = serde_json::json!({
         "vnext": [{
             "address": target.dial_host,
             "port": target.port,
             "users": [{
                 "id": target.uuid,
-                "encryption": target.vless_encryption.as_deref().unwrap_or("none"),
+                "encryption": encryption,
             }],
         }],
     });
-    let flow = match &target.tls {
-        Some(tls) => tls.flow.as_deref(),
-        None => target.reality.flow.as_deref(),
-    };
     if let Some(flow) = flow {
         settings["vnext"][0]["users"][0]["flow"] = serde_json::json!(flow);
     }
@@ -404,6 +409,7 @@ fn client_config(target: &E2eProbeTarget, socks_port: u16, log_path: &str) -> St
 fn anytls_client_config(
     target: &E2eProbeTarget,
     anytls: &brocade_deployment::protocol::E2eProbeAnyTls,
+    reality: Option<&brocade_deployment::protocol::E2eProbeReality>,
     socks_port: u16,
     log_path: &str,
 ) -> String {
@@ -421,7 +427,17 @@ fn anytls_client_config(
     if let Some(value) = anytls.min_idle_session {
         settings["minIdleSession"] = serde_json::json!(value);
     }
-    let mut stream_settings = if target.reality.public_key.is_empty() {
+    let mut stream_settings = if let Some(reality) = reality {
+        serde_json::json!({
+            "security": "reality",
+            "realitySettings": {
+                "serverName": reality.server_name,
+                "fingerprint": reality.fingerprint,
+                "publicKey": reality.public_key,
+                "shortId": reality.short_id,
+            },
+        })
+    } else {
         let mut tls_settings = serde_json::json!({
             "serverName": anytls.server_name,
         });
@@ -431,16 +447,6 @@ fn anytls_client_config(
         serde_json::json!({
             "security": "tls",
             "tlsSettings": tls_settings,
-        })
-    } else {
-        serde_json::json!({
-            "security": "reality",
-            "realitySettings": {
-                "serverName": target.reality.server_name,
-                "fingerprint": target.reality.fingerprint,
-                "publicKey": target.reality.public_key,
-                "shortId": target.reality.short_id,
-            },
         })
     };
     stream_settings["sockopt"] = serde_json::json!({ "tcpFastOpen": true });
@@ -578,10 +584,10 @@ fn hysteria_client_config(
 /// The client half of what the ingress's own artifact says, assembled from the two axes the
 /// target names: which certificate to expect, and whether the stream is carried inside HTTP.
 fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
-    if target.vless_encryption.is_some() {
+    if matches!(&target.security, E2eProbeSecurity::VlessEncryption { .. }) {
         return serde_json::json!({ "network": "tcp", "security": "none" });
     }
-    let mut settings = match &target.tls {
+    let mut settings = match &target.security {
         // A certificate of the machine's own: nothing to configure but the name, which the
         // client checks the certificate against — so a wrong one fails here rather than at the
         // far end.
@@ -591,7 +597,7 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
         // certificate does not verify therefore fails here — correctly, because a subscriber's
         // client fails in the same place. Pinning the certificate (`pinnedPeerCertSha256`) is the
         // replacement. Self-signed certificates carry that digest in the frozen probe target.
-        Some(tls) => {
+        E2eProbeSecurity::Tls(tls) => {
             let mut tls_settings = serde_json::json!({
                 "serverName": tls.server_name,
             });
@@ -603,15 +609,18 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
                 "tlsSettings": tls_settings,
             })
         }
-        None => serde_json::json!({
+        E2eProbeSecurity::Reality(reality) => serde_json::json!({
             "security": "reality",
             "realitySettings": {
-                "serverName": target.reality.server_name,
-                "fingerprint": target.reality.fingerprint,
-                "publicKey": target.reality.public_key,
-                "shortId": target.reality.short_id,
+                "serverName": reality.server_name,
+                "fingerprint": reality.fingerprint,
+                "publicKey": reality.public_key,
+                "shortId": reality.short_id,
             },
         }),
+        E2eProbeSecurity::VlessEncryption { .. }
+        | E2eProbeSecurity::AnyTls { .. }
+        | E2eProbeSecurity::Hysteria2(_) => unreachable!(),
     };
     match &target.xhttp {
         None => settings["network"] = serde_json::json!("tcp"),
@@ -1115,7 +1124,6 @@ mod tests {
 
     fn target(expected: &[&str]) -> E2eProbeTarget {
         E2eProbeTarget {
-            vless_encryption: None,
             app_id: Some("app".to_owned()),
             chain_id: "c1".to_owned(),
             chain_name: "链".to_owned(),
@@ -1123,16 +1131,13 @@ mod tests {
             dial_host: "127.0.0.1".to_owned(),
             port: 8443,
             uuid: "u".to_owned(),
-            hysteria2: None,
-            anytls: None,
-            reality: brocade_deployment::protocol::E2eProbeReality {
+            security: E2eProbeSecurity::Reality(brocade_deployment::protocol::E2eProbeReality {
                 public_key: "pk".to_owned(),
                 short_id: "sid".to_owned(),
                 server_name: "example.com".to_owned(),
                 fingerprint: "chrome".to_owned(),
                 flow: Some("xtls-rprx-vision".to_owned()),
-            },
-            tls: None,
+            }),
             xhttp: None,
             expected_exit_ips: expected.iter().map(|value| (*value).to_owned()).collect(),
         }
@@ -1273,12 +1278,11 @@ mod tests {
     }
 
     /// A target presenting its own certificate must be verified against it, not against a
-    /// borrowed site's public key — and the REALITY block beside it is filler that has to stay
-    /// out of the client entirely.
+    /// borrowed site's public key.
     #[test]
     fn a_target_with_its_own_certificate_produces_a_tls_client() {
         let mut t = target(&[]);
-        t.tls = Some(brocade_deployment::protocol::E2eProbeTls {
+        t.security = E2eProbeSecurity::Tls(brocade_deployment::protocol::E2eProbeTls {
             server_name: "a1b2.example.net".to_owned(),
             pinned_peer_cert_sha256: Some(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -1308,22 +1312,18 @@ mod tests {
     #[test]
     fn an_anytls_target_produces_an_anytls_client() {
         let mut t = target(&[]);
-        t.reality = brocade_deployment::protocol::E2eProbeReality {
-            public_key: String::new(),
-            short_id: String::new(),
-            server_name: String::new(),
-            fingerprint: String::new(),
-            flow: None,
+        t.security = E2eProbeSecurity::AnyTls {
+            settings: brocade_deployment::protocol::E2eProbeAnyTls {
+                server_name: "anytls.example.net".to_owned(),
+                pinned_peer_cert_sha256: Some(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                ),
+                idle_session_check_interval_secs: Some(11),
+                idle_session_timeout_secs: Some(22),
+                min_idle_session: Some(3),
+            },
+            reality: None,
         };
-        t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
-            server_name: "anytls.example.net".to_owned(),
-            pinned_peer_cert_sha256: Some(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-            ),
-            idle_session_check_interval_secs: Some(11),
-            idle_session_timeout_secs: Some(22),
-            min_idle_session: Some(3),
-        });
         t.port = 19443;
         let out: serde_json::Value =
             serde_json::from_str(&client_config(&t, 1080, "/tmp/x")).unwrap();
@@ -1357,26 +1357,22 @@ mod tests {
             return;
         }
         let mut t = target(&[]);
-        t.reality = brocade_deployment::protocol::E2eProbeReality {
-            public_key: String::new(),
-            short_id: String::new(),
-            server_name: String::new(),
-            fingerprint: String::new(),
-            flow: None,
+        t.security = E2eProbeSecurity::AnyTls {
+            settings: brocade_deployment::protocol::E2eProbeAnyTls {
+                server_name: "private.apple.com".to_owned(),
+                pinned_peer_cert_sha256: Some(
+                    concat!(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,",
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    )
+                    .to_owned(),
+                ),
+                idle_session_check_interval_secs: None,
+                idle_session_timeout_secs: None,
+                min_idle_session: None,
+            },
+            reality: None,
         };
-        t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
-            server_name: "private.apple.com".to_owned(),
-            pinned_peer_cert_sha256: Some(
-                concat!(
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,",
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                )
-                .to_owned(),
-            ),
-            idle_session_check_interval_secs: None,
-            idle_session_timeout_secs: None,
-            min_idle_session: None,
-        });
         let config = client_config(&t, 1080, "/tmp/brocade-probe-test.log");
         let file = TempFile::write(&std::env::temp_dir(), &config, ".json").unwrap();
         let checked = Command::new(binary)
@@ -1388,7 +1384,7 @@ mod tests {
         if stdout.contains("unknown config id: anytls")
             || stderr.contains("unknown config id: anytls")
         {
-            eprintln!("skipping: installed xray predates AnyTLS");
+            eprintln!("skipping: installed xray does not support AnyTLS");
             return;
         }
         assert!(
@@ -1402,13 +1398,19 @@ mod tests {
     #[test]
     fn an_anytls_reality_target_produces_a_reality_client() {
         let mut t = target(&[]);
-        t.anytls = Some(brocade_deployment::protocol::E2eProbeAnyTls {
-            server_name: "example.com".to_owned(),
-            pinned_peer_cert_sha256: None,
-            idle_session_check_interval_secs: None,
-            idle_session_timeout_secs: None,
-            min_idle_session: None,
-        });
+        let E2eProbeSecurity::Reality(reality) = t.security.clone() else {
+            unreachable!()
+        };
+        t.security = E2eProbeSecurity::AnyTls {
+            settings: brocade_deployment::protocol::E2eProbeAnyTls {
+                server_name: "example.com".to_owned(),
+                pinned_peer_cert_sha256: None,
+                idle_session_check_interval_secs: None,
+                idle_session_timeout_secs: None,
+                min_idle_session: None,
+            },
+            reality: Some(reality),
+        };
         let out: serde_json::Value =
             serde_json::from_str(&client_config(&t, 1080, "/tmp/x")).unwrap();
         let stream = &out["outbounds"][0]["streamSettings"];
@@ -1424,7 +1426,7 @@ mod tests {
     #[test]
     fn a_hysteria2_target_produces_the_same_quic_client_shape_as_its_subscription() {
         let mut t = target(&[]);
-        t.hysteria2 = Some(brocade_deployment::protocol::E2eProbeHysteria2 {
+        t.security = E2eProbeSecurity::Hysteria2(brocade_deployment::protocol::E2eProbeHysteria2 {
             server_name: "hy2.example.net".to_owned(),
             pinned_peer_cert_sha256: Some(
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
@@ -1492,14 +1494,16 @@ mod tests {
     #[test]
     fn native_encryption_probe_uses_its_key_and_plain_tcp_transport() {
         let mut t = target(&[]);
-        t.vless_encryption = Some("mlkem768x25519plus.native.0rtt.public-key".to_owned());
-        t.reality.flow = None;
+        let encryption = "mlkem768x25519plus.native.0rtt.public-key";
+        t.security = E2eProbeSecurity::VlessEncryption {
+            encryption: encryption.to_owned(),
+        };
         let value: serde_json::Value =
             serde_json::from_str(&client_config(&t, 10800, "/tmp/probe-test.log")).unwrap();
         let outbound = &value["outbounds"][0];
         assert_eq!(
             outbound["settings"]["vnext"][0]["users"][0]["encryption"],
-            t.vless_encryption.unwrap()
+            encryption
         );
         assert_eq!(outbound["streamSettings"]["network"], "tcp");
         assert_eq!(outbound["streamSettings"]["security"], "none");

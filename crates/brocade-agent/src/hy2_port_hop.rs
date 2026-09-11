@@ -59,10 +59,8 @@ pub(crate) fn apply_content(content: &str) -> Result<(), String> {
 
 /// Whether the machine already matches this artifact text.
 ///
-/// The NOTRACK check rides along with the redirect comparison. A machine that upgrades its
-/// agent to a build with the raw chains would otherwise compare its old table — redirects
-/// identical, rules missing — and read as matched, so the new rules would wait for a manual
-/// `nft flush` that never comes.
+/// The NOTRACK check rides along with the redirect comparison. Redirects alone are incomplete:
+/// treating that table as matched would leave the missing rules waiting for a manual `nft flush`.
 pub(crate) fn matches_content(content: &str) -> bool {
     let mut wanted = parse(content)
         .unwrap_or_default()
@@ -322,13 +320,12 @@ mod tests {
         );
     }
 
-    /// The upgrade path `matches_content` exists for: the old table has the redirects the
-    /// artifact wants but none of the NOTRACK rules, and it must read as not matched so the
-    /// next convergence installs the full table.
+    /// A table with the redirects but none of the NOTRACK rules is incomplete and must trigger
+    /// convergence of the full table.
     #[test]
     fn a_table_missing_the_notrack_rules_does_not_read_as_present() {
-        let old_table = "table inet brocade_hy2_port_hop {\n  chain prerouting {\n    type nat hook prerouting priority dstnat; policy accept;\n    udp dport 50000-50009 redirect to :50000\n  }\n}";
-        assert!(!notrack_present(old_table), "{old_table:?}");
+        let incomplete = "table inet brocade_hy2_port_hop {\n  chain prerouting {\n    type nat hook prerouting priority dstnat; policy accept;\n    udp dport 50000-50009 redirect to :50000\n  }\n}";
+        assert!(!notrack_present(incomplete), "{incomplete:?}");
     }
 
     /// The printed form the parser has to accept: `nft` renders the written `icmpv6` as

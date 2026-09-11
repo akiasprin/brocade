@@ -43,8 +43,17 @@ const SESSION = {
 
 const HERE = 'hkg-01';
 const PEER = 'tyo-01';
+type WgTransport = { t: 'udp' } | { t: 'fake_tcp'; v: { port: number } };
+
+let committedTransports: Record<string, WgTransport> = {
+  [HERE]: { t: 'udp' },
+  [PEER]: { t: 'udp' },
+};
+let compilePhantunServer: string | null = null;
+let compileCalls = 0;
 
 function node(id: string, name: string): NodeAgentStateItem {
+  const transport = committedTransports[id] ?? { t: 'udp' };
   return {
     node_id: id,
     tenant_id: 'platform',
@@ -88,8 +97,8 @@ function node(id: string, name: string): NodeAgentStateItem {
     convergence_debt_failed: false,
     service_reentry_ready: false,
     service_reentry_blockers: [],
-    wg_transport_kind: 'udp',
-    wg_fake_tcp_port: null,
+    wg_transport_kind: transport.t,
+    wg_fake_tcp_port: transport.t === 'fake_tcp' ? transport.v.port : null,
     applied: null,
   };
 }
@@ -109,8 +118,8 @@ const committedSnapshot = (): {
     revision: 7,
     apps: [],
     nodes: [
-      { id: HERE, overlay: true },
-      { id: PEER, overlay: true },
+      { id: HERE, overlay: true, wireguard: { listen_port: 51820, transport: committedTransports[HERE] } },
+      { id: PEER, overlay: true, wireguard: { listen_port: 51820, transport: committedTransports[PEER] } },
     ],
     settings: { overlay: { keepalive_secs: 25, mtu: 1420, disabled_links: [] } },
   },
@@ -159,6 +168,32 @@ function stubFetch() {
       }
       if (path === '/links/mtu') {
         return json({ default_mtu: 1420, nodes: [], links: [] });
+      }
+      if (path === '/revisions?limit=50') {
+        return json({ current_revision: 7, revisions: [] });
+      }
+      if (path === '/compile/7') {
+        compileCalls += 1;
+        return json({
+          diagnostics: [],
+          summary: {},
+          system: {
+            nodes: [
+              { id: HERE, wireguard: {} },
+              { id: PEER, wireguard: {} },
+            ],
+            links: [
+              {
+                a: HERE,
+                b: PEER,
+                wrap: compilePhantunServer
+                  ? { t: 'fake_tcp', v: { servers: { [compilePhantunServer]: '203.0.113.10:39743' } } }
+                  : { t: 'udp' },
+              },
+            ],
+          },
+          apps: [],
+        });
       }
       if (path === '/model/preview') {
         previewCalls += 1;
@@ -209,21 +244,21 @@ function ShellDraftInvalidation() {
   return null;
 }
 
-function ConfigTab() {
+function ConfigTab({ nodeId = HERE }: { nodeId?: string }) {
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
-  const here = node(HERE, '香港 01');
+  const current = node(nodeId, nodeId === HERE ? '香港 01' : '东京 01');
   return (
     <>
       <WgCard
-        node={here}
+        node={current}
         listenPort={51820}
-        peers={[here, node(PEER, '东京 01')]}
+        peers={[node(HERE, '香港 01'), node(PEER, '东京 01')]}
         disabledLinks={snapshot.data?.snapshot.settings?.overlay.disabled_links ?? []}
         enabled
         canEdit
         onSaved={() => {}}
       />
-      <DnsCard node={here} canEdit onSaved={() => {}} />
+      <DnsCard node={current} canEdit onSaved={() => {}} />
     </>
   );
 }
@@ -231,6 +266,12 @@ function ConfigTab() {
 beforeEach(() => {
   snapshotCalls = 0;
   previewCalls = 0;
+  compileCalls = 0;
+  compilePhantunServer = null;
+  committedTransports = {
+    [HERE]: { t: 'udp' },
+    [PEER]: { t: 'udp' },
+  };
   draft.init(`discard-refresh-${Math.random()}`);
   draft.clear();
   stubFetch();
@@ -268,6 +309,50 @@ describe('丢弃草稿后禁 Peer 组合的显示', () => {
    OverlayRow / WgTransportRow / ConnectionCard 的注释都记录过这个坑并已改用
    compile / snapshot；MTU 这一行没有。 */
 describe('写草稿的行保存后是否保持新值', () => {
+  it('入站传输读取节点声明，不把 NAT 节点借到对端的 Phantun 服务当作对端设置', async () => {
+    committedTransports = {
+      [HERE]: { t: 'fake_tcp', v: { port: 39_743 } },
+      [PEER]: { t: 'udp' },
+    };
+    /* HERE 位于 NAT 后时，编译器会在 PEER 部署服务端；这是部署位置，不是 PEER 的设置。 */
+    compilePhantunServer = PEER;
+
+    render(<Harness />);
+    await waitFor(() => expect(compileCalls).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Phantun' }).getAttribute('aria-pressed')).toBe('true'));
+
+    cleanup();
+    const callsBeforePeer = compileCalls;
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionProvider value={SESSION}>
+          <ConfigTab nodeId={PEER} />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(compileCalls).toBeGreaterThan(callsBeforePeer));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '直连 UDP' }).getAttribute('aria-pressed')).toBe('true'),
+    );
+  });
+
+  it('入站传输保存到草稿后保持在当前节点的新值', async () => {
+    render(<Harness />);
+
+    const phantun = await screen.findByRole('button', { name: 'Phantun' });
+    fireEvent.click(phantun);
+    fireEvent.click(screen.getByText('保存到草稿'));
+
+    await waitFor(() =>
+      expect(draft.ops()).toContainEqual({
+        op: 'update_node',
+        node_id: HERE,
+        node: { wg_transport: { t: 'fake_tcp', v: { port: 39_743 } } },
+      }),
+    );
+    await waitFor(() => expect(phantun.getAttribute('aria-pressed')).toBe('true'));
+  });
+
   it('MTU 保存到草稿后输入框应保持新值', async () => {
     render(<Harness />);
 

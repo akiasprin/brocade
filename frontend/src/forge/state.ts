@@ -1,11 +1,5 @@
 // 编译台的外壳状态：当前所在页面、诊断气泡是否展开。
-//
-// v1 中此处保存的是左树的选中项。移除左树后，选路改由各页面自身的列表进入
-// （机器页点击行下钻，链路页点击链），该状态已保存在 wm.data.drill 中，
-// 外壳不再保存副本——同一状态保存两份会出现不一致。
-//
-// 产物栏的展开状态不在此处：它由 ui/artifact-panel.ts 管理，新旧外壳共用一份，
-// 且写入 localStorage。
+// 对象下钻保存在 wm.data.drill；产物栏状态由 ui/artifact-panel.ts 管理。
 
 import { useSyncExternalStore } from 'react';
 

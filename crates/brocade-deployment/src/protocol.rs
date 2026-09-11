@@ -6,15 +6,10 @@ use crate::plan::{
     NodeDesiredState, PlannedAction,
 };
 
-/// Wire contract spoken by this agent build. Desired state is withheld from older protocols so
-/// an agent never claims work whose fields or actions it cannot interpret.
-///
-/// Bumped with the `DesiredStateResponse` change: an older agent deserializes the whole
-/// response body as a `NodeDesiredDeployment`, and an enum-shaped body fails that outright —
-/// which is deliberate. An agent that silently ignored the `certificate` field would read as
-/// converged while never writing the file.
-pub const AGENT_PROTOCOL_VERSION: u32 = 5;
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 5;
+/// Wire contract spoken by this agent build. Desired state is withheld from incompatible
+/// protocols so an agent never claims work whose fields or actions it cannot interpret; the
+/// independently approved self-update endpoint remains available as the recovery path.
+pub const AGENT_PROTOCOL_VERSION: u32 = 6;
 
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
@@ -68,6 +63,8 @@ pub enum AgentRealtimeCommand {
 pub struct AgentRealtimeSample {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverse_health: Option<ReverseHealthReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux: Option<MuxReport>,
     pub sequence: u64,
     pub sampled_at_unix_millis: i64,
     pub elapsed_millis: u32,
@@ -130,7 +127,6 @@ pub struct NodeDesiredDeployment {
     pub node_id: String,
     /// Positive for work claimed from an isolation obligation. The report must echo it so an
     /// older in-flight result cannot settle a newer desired generation for the same node.
-    #[serde(default)]
     pub claim_generation: u64,
     pub wave: u32,
     pub actions: Vec<PlannedAction>,
@@ -138,7 +134,6 @@ pub struct NodeDesiredDeployment {
     /// only after the agent has converged the target, so a reading queued before a permission or
     /// topology change is never interpreted through the model that happened to be current when
     /// it was replayed.
-    #[serde(default)]
     pub usage_generation_id: Option<i64>,
     pub desired: NodeDesiredState,
     /// Where to fetch the phantun binaries.
@@ -151,7 +146,6 @@ pub struct NodeDesiredDeployment {
     ///
     /// Empty means the control plane has no distribution source configured and the agent can use
     /// only what the machine already holds. Absent, the agent reports an explicit error.
-    #[serde(default)]
     pub phantun_binary: Option<PhantunBinaries>,
 }
 
@@ -192,11 +186,8 @@ pub enum DesiredStateResponse {
 ///
 /// # Why three states rather than an `Option`
 ///
-/// `None` would carry two meanings, that the agent checked and found nothing and that the agent
-/// is too old to check, and the two require opposite responses. The first is a fault to report;
-/// the second is a machine that predates the feature, where reporting a fault would be incorrect.
-/// The default is `Unmanaged` for the same reason `ReportedNodeState::phantun` defaults that way:
-/// an older agent must not be classified as having lost something it never held.
+/// `None` would conflate an unmanaged certificate track with a managed track whose file is
+/// missing. The two require opposite responses, so the state is explicit.
 ///
 /// # Why only a digest
 ///
@@ -207,16 +198,14 @@ pub enum DesiredStateResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum CertificateObservation {
-    /// Not reported. An agent from before this existed, and nothing to conclude from it.
+    /// This node does not manage certificate material.
     #[default]
     Unmanaged,
     /// Both independent certificate tracks were inspected. Public CA uses one atomically replaced
     /// file; self-signed keeps two physical slots so old and new pinned identities can overlap.
     /// A missing digest means that file is absent or unreadable.
     Managed {
-        #[serde(default)]
         public_ca_sha256: Option<String>,
-        #[serde(default)]
         self_signed: CertificatePairObservation,
     },
 }
@@ -224,9 +213,7 @@ pub enum CertificateObservation {
 /// What is present in the self-signed track's two fixed runtime slots.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CertificatePairObservation {
-    #[serde(default)]
     pub slot_a_sha256: Option<String>,
-    #[serde(default)]
     pub slot_b_sha256: Option<String>,
 }
 
@@ -356,7 +343,6 @@ pub struct BinarySource {
 pub struct TargetConvergenceReport {
     pub deployment_id: i64,
     pub node_id: String,
-    #[serde(default)]
     pub claim_generation: u64,
     pub result: TargetApplyResult,
     pub observed_before: ReportedNodeState,
@@ -364,15 +350,12 @@ pub struct TargetConvergenceReport {
     pub error: Option<String>,
     /// Agent-clock instant immediately before applying the counter namespace change. It is the
     /// lower boundary for a newly authorized label whose first Xray counter starts at zero.
-    #[serde(default)]
     pub usage_activated_at_unix_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteIpReport {
-    #[serde(default)]
     pub ipv4: Option<String>,
-    #[serde(default)]
     pub ipv6: Option<String>,
 }
 
@@ -384,21 +367,11 @@ pub enum TargetApplyResult {
     FailedDirty,
 }
 
-fn unmanaged_state() -> AppliedArtifactState {
-    AppliedArtifactState::Unmanaged
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportedNodeState {
-    /// An older agent does not report this field. The Unmanaged default means the agent does not
-    /// manage the artifact rather than that the artifact is absent; the latter would make the
-    /// control plane classify it as drift and push an action every round that the agent never
-    /// performs.
-    #[serde(default = "unmanaged_state")]
     pub phantun: AppliedArtifactState,
     pub wireguard: AppliedArtifactState,
     pub xray: AppliedArtifactState,
-    #[serde(default = "unmanaged_state")]
     pub hy2_port_hop: AppliedArtifactState,
     pub grants: AppliedGrantsState,
 }
@@ -419,9 +392,7 @@ impl ReportedNodeState {
 /// Each .dat file's actual state. A missing file is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeodataObservation {
-    #[serde(default)]
     pub geoip: Option<GeodataFileState>,
-    #[serde(default)]
     pub geosite: Option<GeodataFileState>,
     /// Which directory it was read from. xray searches for assets in the order
     /// `XRAY_LOCATION_ASSET` → the executable's directory → `/usr/local/share/xray/` →
@@ -454,9 +425,7 @@ pub struct DeploymentCommandResult {
     pub deployment_id: i64,
     pub status: String,
     pub active: Option<bool>,
-    #[serde(default)]
     pub sync_deployment_id: Option<i64>,
-    #[serde(default)]
     pub rollback_deployment_id: Option<i64>,
 }
 
@@ -470,28 +439,21 @@ pub struct DeploymentListItem {
     pub id: i64,
     pub revision_id: u64,
     pub status: String,
-    #[serde(default = "waiting_activation")]
     pub activation_status: String,
-    #[serde(default = "converged_settlement")]
     pub settlement_status: String,
-    #[serde(default)]
     pub activated_at: Option<String>,
     pub active: Option<bool>,
     pub actor: Option<String>,
     // Configuration or grants. The two have to be distinguishable in the list, because they
     // differ in cost by an order of magnitude: restarting xray on three machines and adding one
     // account to a list must not appear the same.
-    #[serde(default)]
     pub kind: DeploymentKind,
     pub note: Option<String>,
     // Which version it changed from. Fixed at creation and never recomputed, because rollbacks
     // make a retrospective calculation incorrect. None means this kind has never been deployed
     // successfully.
-    #[serde(default)]
     pub base_revision_id: Option<u64>,
-    #[serde(default)]
     pub rollback_of_deployment_id: Option<i64>,
-    #[serde(default)]
     pub sync_of_deployment_id: Option<i64>,
     pub created_at: String,
     pub started_at: Option<String>,
@@ -500,16 +462,13 @@ pub struct DeploymentListItem {
     pub changed_targets: u64,
     pub skipped_targets: u64,
     pub failed_targets: u64,
-    #[serde(default)]
     pub debt_targets: u64,
     pub disruptive_targets: u64,
     pub max_wave: u32,
     // Waiting on an operator rather than on machines. A destructive wave requires a
     // confirmation before it continues, and the two kinds of pause are otherwise identical in
     // the list: the deployment shows as pushing and the header reports machines pending, with
-    // nothing indicating that the operator is the blocking party. Older data deserializes to
-    // false.
-    #[serde(default)]
+    // nothing indicating that the operator is the blocking party.
     pub awaiting_confirmation: bool,
 }
 
@@ -531,20 +490,15 @@ pub struct DeploymentDetail {
     pub id: i64,
     pub revision_id: u64,
     pub status: String,
-    #[serde(default = "waiting_activation")]
     pub activation_status: String,
-    #[serde(default = "converged_settlement")]
     pub settlement_status: String,
-    #[serde(default)]
     pub activated_at: Option<String>,
-    #[serde(default)]
     pub debt_targets: u64,
     pub active: Option<bool>,
     pub actor: Option<String>,
     pub note: Option<String>,
     // The detail page uses it as the baseline for artifact diffs. See the field of the same name
     // on DeploymentListItem.
-    #[serde(default)]
     pub base_revision_id: Option<u64>,
     pub warnings: Value,
     pub created_at: String,
@@ -552,7 +506,6 @@ pub struct DeploymentDetail {
     pub halted_at: Option<String>,
     pub finished_at: Option<String>,
     pub rollback_of_deployment_id: Option<i64>,
-    #[serde(default)]
     pub sync_of_deployment_id: Option<i64>,
     pub divergence_cleared_at: Option<String>,
     pub targets: Vec<DeploymentTargetDetail>,
@@ -570,14 +523,6 @@ pub struct DeploymentTargetDetail {
     pub observed_after: Option<Value>,
     pub verdict: Option<Value>,
     pub dispatched_at: Option<String>,
-}
-
-fn waiting_activation() -> String {
-    "waiting".to_owned()
-}
-
-fn converged_settlement() -> String {
-    "converged".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,17 +544,14 @@ pub struct NodeIsolationCommandResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentObservationRequest {
     pub deployment_id: i64,
-    #[serde(default)]
     pub claim_generation: u64,
     pub result: TargetApplyResult,
     pub observed_before: ReportedNodeState,
     pub observed_after: ReportedNodeState,
     pub error: Option<String>,
-    #[serde(default)]
-    pub route: Option<RouteIpReport>,
-    /// See [`TargetConvergenceReport::usage_activated_at_unix_secs`]. Optional for rolling
-    /// compatibility with agents that predate first-window accounting.
-    #[serde(default)]
+    pub route: RouteIpReport,
+    /// See [`TargetConvergenceReport::usage_activated_at_unix_secs`]. `None` means this work did
+    /// not change the authorized Xray counter namespace.
     pub usage_activated_at_unix_secs: Option<i64>,
 }
 
@@ -771,21 +713,16 @@ pub struct LinkHealthResult {
 pub struct UsageReportRequest {
     /// Stable across process restarts and regenerated only when the agent state directory is
     /// replaced. Together with `sequence` this is the idempotency key of a report.
-    #[serde(default)]
-    pub agent_instance_id: Option<String>,
+    pub agent_instance_id: String,
     /// Persisted before sampling. Gaps are allowed; reuse and reversal are not.
-    #[serde(default)]
-    pub sequence: Option<u64>,
+    pub sequence: u64,
     /// The frozen ownership map active when the counters were read.
-    #[serde(default)]
-    pub usage_generation_id: Option<i64>,
+    pub usage_generation_id: i64,
     pub read_at_unix_secs: i64,
     pub xray_started_at_unix_secs: i64,
     /// Boot time plus the serving process's exact start ticks. Unlike the rounded unix second,
     /// this changes for two Xray processes started within the same second.
-    #[serde(default)]
-    pub xray_epoch: Option<String>,
-    #[serde(default)]
+    pub xray_epoch: String,
     pub route: Option<RouteIpReport>,
     pub counters: Vec<UsageCounter>,
 }
@@ -800,14 +737,10 @@ pub struct UsageCounter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReportResult {
     pub node_id: String,
-    #[serde(default)]
-    pub agent_instance_id: Option<String>,
-    #[serde(default)]
-    pub sequence: Option<u64>,
-    #[serde(default)]
-    pub usage_generation_id: Option<i64>,
+    pub agent_instance_id: String,
+    pub sequence: u64,
+    pub usage_generation_id: i64,
     /// True when the control plane returned the durable result of an already committed report.
-    #[serde(default)]
     pub duplicate: bool,
     pub accepted_readings: u64,
     pub inserted_samples: u64,
@@ -826,7 +759,6 @@ pub struct UsageSampleList {
     /// combined into one list, summing by tenant would add link overhead to user bills, and
     /// nothing would report the error, because the bytes come from the same batch while the
     /// resources differ.
-    #[serde(default)]
     pub chain_samples: Vec<UsageChainSample>,
 }
 
@@ -991,9 +923,8 @@ impl E2eProbeTargetList {
 /// subscription (`brocade_core::physical::probe`); one differing parameter would measure a
 /// different path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct E2eProbeTarget {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vless_encryption: Option<String>,
     pub app_id: Option<String>,
     pub chain_id: String,
     pub chain_name: String,
@@ -1006,30 +937,11 @@ pub struct E2eProbeTarget {
     /// The probe credential. Derived from the ingress's private key (`model::probe_uuid`), and not
     /// stored by the control plane.
     pub uuid: String,
-    pub reality: E2eProbeReality,
-    /// Present for a Hysteria 2 ingress. It supersedes both `reality` and `tls` and lets an older
-    /// agent fail only this new target rather than reject the whole work list.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hysteria2: Option<E2eProbeHysteria2>,
-    /// Present for an AnyTLS ingress. It supersedes both `reality` and `tls` and carries the
-    /// certificate name used by the AnyTLS client. The AnyTLS server sends its padding scheme
-    /// during the session handshake, so no client-side padding copy is needed here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anytls: Option<E2eProbeAnyTls>,
-    /// Present when this ingress presents its own certificate, in which case `reality` above is
-    /// placeholder data and is ignored.
-    ///
-    /// Added alongside `reality` rather than replacing it, deliberately: the control plane and
-    /// the agents are upgraded at different times, and a machine running an older agent has to
-    /// keep probing the chains it already probes rather than fail on a field it cannot parse. An
-    /// older agent skips this field and builds a REALITY client for a TLS ingress, which fails,
-    /// but only for ingresses that cannot exist on a machine old enough to lack the field, since
-    /// presenting a certificate requires the agent that fetches one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<E2eProbeTls>,
+    /// Exactly one security/protocol shape. A tagged union prevents contradictory combinations
+    /// such as a TLS target carrying ignored REALITY credentials.
+    pub security: E2eProbeSecurity,
     /// Present when the ingress is carried inside HTTP, in which case the probe's client has to
-    /// be as well. Absent, the probe dials TCP, which is what it did for every target before this
-    /// field existed, and why an XHTTP ingress reported as down while carrying traffic normally.
+    /// be as well. Absent, the probe dials TCP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp: Option<E2eProbeXhttp>,
     /// Which machines this chain may exit from. The IP the endpoint saw must fall in this set to
@@ -1039,6 +951,22 @@ pub struct E2eProbeTarget {
     /// reported explicitly rather than counted as a pass; otherwise a misconfigured chain would
     /// report as healthy only because the check could not run.
     pub expected_exit_ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum E2eProbeSecurity {
+    VlessEncryption {
+        encryption: String,
+    },
+    Reality(E2eProbeReality),
+    Tls(E2eProbeTls),
+    AnyTls {
+        settings: E2eProbeAnyTls,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reality: Option<E2eProbeReality>,
+    },
+    Hysteria2(E2eProbeHysteria2),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1230,11 +1158,9 @@ pub struct E2eProbeResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRuntimeReport {
-    /// When this snapshot finished being collected on the node. Older agents omit it; the control
-    /// plane then falls back to receipt time. New agents supply it so a delayed older snapshot
-    /// cannot overwrite runtime state observed later.
-    #[serde(default)]
-    pub observed_at_unix_secs: Option<i64>,
+    /// When this snapshot finished being collected on the node. The source timestamp prevents a
+    /// delayed snapshot from overwriting runtime state observed later.
+    pub observed_at_unix_secs: i64,
     pub versions: NodeVersions,
     /// Which certificate this machine is actually holding.
     ///
@@ -1242,7 +1168,6 @@ pub struct NodeRuntimeReport {
     /// release. Reported through `ReportedNodeState` instead, a machine that does not deploy for
     /// a month would leave its certificate state unknown for a month, and the certificate is the
     /// only value here with an expiry.
-    #[serde(default)]
     pub certificate: CertificateObservation,
     /// The on-disk state of the rule databases (`geoip.dat` / `geosite.dat`).
     ///
@@ -1259,15 +1184,12 @@ pub struct NodeRuntimeReport {
     ///
     /// `None` means no asset directory was found, so this machine holds no .dat file. That is
     /// distinct from never having reported, which is the whole `NodeRuntimeReport` not arriving.
-    #[serde(default)]
     pub geodata: Option<GeodataObservation>,
     /// What the last local reconcile did. `None` where none ever ran.
-    #[serde(default)]
     pub local_reconcile: Option<LocalReconcileReport>,
     /// Latest verdict from the same WireGuard peer check used by the node health command and
-    /// watchdog. `None` identifies an older agent, or the few seconds before a new agent's first
-    /// watchdog round.
-    #[serde(default)]
+    /// watchdog. `None` covers the few seconds before the Agent's first watchdog round or a host
+    /// where the check cannot run.
     pub wireguard_health: Option<WireGuardHealth>,
     pub spool: SpoolBacklog,
 }
@@ -1282,17 +1204,9 @@ pub struct NodeRuntimeReport {
 /// value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeVersions {
-    /// The sha256 of the running agent binary, lowercase hex, rather than a version number.
-    ///
-    /// It was previously `CARGO_PKG_VERSION`, which identified nothing: the workspace version is
-    /// not incremented per deployment, so every build since it was last changed reported the same
-    /// string. Identifying the exact binary is what both self-update and a fleet rollout require,
-    /// so the field carries the value that provides it. The control plane computes its side at
-    /// compile time (`brocade-console/build.rs`), so the two compare directly.
-    ///
-    /// Two other values appear here. `unknown` means the agent could not read `/proc/self/exe`.
-    /// A value of the form `0.1.0` comes from an agent predating this change; old agents keep
-    /// reporting and their values still have to be interpreted.
+    /// The sha256 of the running Agent binary, lowercase hex. `unknown` means the Agent could not
+    /// read `/proc/self/exe`. The control plane computes its embedded build id at compile time
+    /// (`brocade-console/build.rs`), so rollout state can be compared directly.
     pub agent: String,
     /// The first line of `xray version`. Unreadable does not mean absent: the binary may simply
     /// not be on PATH.
@@ -1301,23 +1215,19 @@ pub struct NodeVersions {
     /// 2026-04-25 (XTLS/Xray-core#5992), and earlier versions ignore that section without
     /// reporting anything. Without this field, a machine whose .dat never updates and a machine
     /// that cannot reach the download source are indistinguishable in every other field.
-    #[serde(default)]
     pub xray: Option<String>,
-    #[serde(default)]
     pub phantun: Option<String>,
     /// `wg --version`. Below wireguard-tools 1.0.20200121 there is no `wg syncconf`, which is the
     /// only second-rung remedy that does not interrupt sessions. Without it, every drift
     /// escalates to restarting the interface, which drops every session on that machine.
-    #[serde(default)]
     pub wg_tools: Option<String>,
     /// `kernel` or `userspace`.
     ///
-    /// `None` means WireGuard is disabled locally, or an older agent could not observe it.
+    /// `None` means WireGuard is disabled locally or its backend could not be observed.
     ///
     /// Kernels 5.6 and above have WireGuard built in; without it `wg-quick` falls back to
     /// `wireguard-go` or `boringtun`. Their `wg show` output is identical while throughput
     /// differs by an order of magnitude, so the backend has to be queried explicitly.
-    #[serde(default)]
     pub wg_backend: Option<String>,
 }
 
@@ -1335,7 +1245,6 @@ pub struct LocalReconcileReport {
     pub actions: Vec<String>,
     /// Why the repair failed. A value here is more serious than a non-empty `actions`: that field
     /// means the state drifted and was repaired, this one means it drifted and was not.
-    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -1344,21 +1253,16 @@ pub struct LocalReconcileReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireGuardHealth {
     pub enabled: bool,
-    #[serde(default)]
     pub error: Option<String>,
-    #[serde(default)]
     pub peers: Vec<WireGuardPeerHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireGuardPeerHealth {
     pub peer_node_id: String,
-    #[serde(default)]
     pub overlay_ip: Option<String>,
-    #[serde(default)]
     pub handshake_age_secs: Option<i64>,
     pub status: WireGuardPeerStatus,
-    #[serde(default)]
     pub detail: Option<String>,
 }
 
@@ -1437,23 +1341,18 @@ pub struct LoadReportRequest {
 /// capacity is not a per-window value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFacts {
-    /// `/proc/sys/kernel/osrelease`. Nothing reported this previously, while two decisions depend
-    /// on it: WireGuard is in-kernel from 5.6, and BBR exists from 4.9. `NodeVersions` could
-    /// report kernel versus userspace but not which kernel, so the measurement and the conclusion
-    /// were separated.
+    /// `/proc/sys/kernel/osrelease`. Kept as a measurement rather than a derived verdict because
+    /// WireGuard backend and BBR capability decisions depend on the exact kernel.
     pub kernel: String,
-    /// Human-readable processor model. New agents read it from `/proc/cpuinfo`; an empty value is
-    /// valid for older agents and for architectures whose kernel exposes no model identity.
-    #[serde(default)]
+    /// Human-readable processor model read from `/proc/cpuinfo`; an empty value is valid on
+    /// architectures whose kernel exposes no model identity.
     pub cpu_model: String,
     pub cores: u32,
     /// Maximum frequency exposed by cpufreq, in MHz. Virtual machines commonly expose no cpufreq
     /// tree at all; `None` means unsupported, not a zero-frequency processor.
-    #[serde(default)]
     pub cpu_freq_max_mhz: Option<u64>,
     /// The common scaling governor across online CPUs. Empty/mixed governors are represented as
     /// `None`; this is a capability detail rather than an alarm.
-    #[serde(default)]
     pub cpu_governor: Option<String>,
     /// `/proc/sys/net/ipv4/tcp_congestion_control`. Do not assume this is cubic or bbr: low-cost
     /// VPS images often carry a patched kernel offering `bbrplus` or `bbr2`.
@@ -1473,34 +1372,25 @@ pub struct HostFacts {
     /// end-to-end path MTU reported by `LinkProbe`; both are needed to distinguish a bad local
     /// interface configuration from a smaller hop farther along the path.
     ///
-    /// `None` keeps reports from older agents and hosts with an unreadable sysfs usable.
-    #[serde(default)]
+    /// `None` means sysfs did not expose a readable MTU.
     pub nic_mtu: Option<u32>,
     pub mem_total_bytes: u64,
     /// The filesystem holding the state directory, which is where the spool is written.
     pub disk_total_bytes: u64,
     /// Identity of the filesystem whose capacity is reported above. Overlay/container filesystems
     /// do not always have a block device, so every field remains optional independently.
-    #[serde(default)]
     pub disk_mount: Option<String>,
-    #[serde(default)]
     pub disk_filesystem: Option<String>,
-    #[serde(default)]
     pub disk_device: Option<String>,
-    #[serde(default)]
     pub disk_read_only: Option<bool>,
     /// `nf_conntrack_max`. `None` means the module is not loaded, which is not a fault: a machine
     /// doing no NAT simply has no such table.
-    #[serde(default)]
     pub conntrack_max: Option<u64>,
     /// Kernel-selected anonymous local-port range after subtracting
     /// `ip_local_reserved_ports`. Stored with host facts for explanation; each network sample also
     /// carries the contemporaneous capacity so a later sysctl change cannot rewrite history.
-    #[serde(default)]
     pub ephemeral_port_low: Option<u16>,
-    #[serde(default)]
     pub ephemeral_port_high: Option<u16>,
-    #[serde(default)]
     pub ephemeral_port_capacity: Option<u64>,
     /// Whether the installer set the congestion control algorithm on this machine.
     ///
@@ -1557,9 +1447,7 @@ pub struct CpuDetailSample {
     pub pressure_some_pct: Option<f32>,
     /// I/O PSI over this exact window. Unlike `/proc/stat`'s iowait, PSI measures task stall time
     /// directly and is therefore the signal used for the UI's I/O-pressure diagnosis.
-    #[serde(default)]
     pub io_pressure_some_pct: Option<f32>,
-    #[serde(default)]
     pub io_pressure_full_pct: Option<f32>,
     pub procs_running: Option<u64>,
     pub procs_total: Option<u64>,
@@ -1616,7 +1504,6 @@ pub struct MemoryDetailSample {
 /// network filesystem may have no block-device row; that absence is represented by `None` rather
 /// than a fabricated idle disk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct DiskDetailSample {
     /// Contemporaneous capacity. HostFacts keeps the latest copy for the summary, while this copy
     /// prevents a later volume resize from rewriting historical utilization.
@@ -1648,7 +1535,6 @@ pub struct DiskDetailSample {
 /// UI from accidentally presenting a lifetime `TcpRetransSegs` counter as a current rate, or from
 /// averaging a current socket count that only has meaning at one instant.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct NetworkDetailSample {
     /// TCP sockets currently in ESTABLISHED or CLOSE-WAIT (`Tcp.CurrEstab`).
     pub tcp_curr_estab: Option<u64>,
@@ -1722,7 +1608,7 @@ pub struct LoadSample {
     /// this machine does, and folding it in would dress an oversold host up as a busy one.
     pub cpu_steal_pct: f32,
     pub load1: f32,
-    /// Absent on older agents. Missing and zero are intentionally distinct throughout the stack.
+    /// `None` means detailed CPU counters were unavailable; it is distinct from a zero reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_detail: Option<CpuDetailSample>,
 
@@ -1730,7 +1616,7 @@ pub struct LoadSample {
     /// small, so using it reports every healthy machine as low on memory.
     pub mem_available_bytes: u64,
     pub swap_used_bytes: u64,
-    /// Absent on older agents. Contains composition, reclaimability and pressure diagnostics.
+    /// Optional composition, reclaimability and pressure diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_detail: Option<MemoryDetailSample>,
     /// `/proc/vmstat`'s `oom_kill`, differenced. A non-zero value means the kernel killed a
@@ -1743,8 +1629,8 @@ pub struct LoadSample {
     /// The existing `dropped` counter only reports the loss after it happens.
     pub disk_free_bytes: u64,
     pub disk_inode_free_pct: f32,
-    /// Absent on older agents. Filesystems without a local block-device view still carry an
-    /// object whose device-specific fields are `None`, preserving capacity/inode drill-down.
+    /// Filesystems without a local block-device view still carry an object whose device-specific
+    /// fields are `None`, preserving capacity/inode drill-down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_detail: Option<DiskDetailSample>,
 
@@ -1756,9 +1642,8 @@ pub struct LoadSample {
     pub nic_tx_drop: u64,
     pub nic_err: u64,
 
-    #[serde(default)]
     pub conntrack_count: Option<u64>,
-    /// Absent on older agents. Socket levels plus differenced TCP/UDP kernel counters.
+    /// Optional socket levels plus differenced TCP/UDP kernel counters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_detail: Option<NetworkDetailSample>,
     pub uptime_secs: u64,
@@ -1776,19 +1661,14 @@ pub struct ProcessSample {
     /// `None` where the process is absent. For xray that means the machine is a wg-only relay,
     /// which is a role rather than a fault. wg is always `None`, because it is a kernel module
     /// and has no RSS.
-    #[serde(default)]
     pub rss_bytes: Option<u64>,
-    #[serde(default)]
     pub cpu_pct: Option<f32>,
     /// Unix seconds. A change means the process restarted, which nothing else reports, even
     /// though usage already tracks xray's start time for its own counter-reset check.
-    #[serde(default)]
     pub started_at_unix_secs: Option<i64>,
-    #[serde(default)]
     pub fds: Option<u64>,
     /// `RLIMIT_NOFILE`. Reaching it does not terminate xray; it makes xray refuse new
     /// connections, so the process stays up, the logs stay quiet, and users cannot connect.
-    #[serde(default)]
     pub fd_limit: Option<u64>,
 }
 
@@ -1799,10 +1679,9 @@ pub struct ProcessSample {
 /// already derives that pair from xray's outbound tags (`out:{app}/{chain}>{to}`, see
 /// `probe.rs::hop_of_tag`).
 ///
-/// Not `hop_label`, which was the first attempt and was incorrect. That label is
-/// `steps.accept_label`, an **inbound** identity: on the leg hk-01 → sg-02 the label belongs to
-/// sg-02 while the measurement is taken on hk-01, so the two never share a `node_id` and joining
-/// them aligns rows describing different machines.
+/// `hop_label` is deliberately not part of the key: it is `steps.accept_label`, an **inbound**
+/// identity. On the leg hk-01 → sg-02 the label belongs to sg-02 while the measurement is taken on
+/// hk-01, so the two never share a `node_id` and joining them would align different machines.
 ///
 /// Byte counts are deliberately absent: `link_health` already carries this hop's downlink for the
 /// same window, reported by the same agent in the same round. The console reads both and displays
@@ -1825,9 +1704,7 @@ pub struct HopLinkSample {
     /// `tcp_bbr_info`'s bw, converted from the kernel's bytes/sec to bits/sec. `None` on a machine
     /// not running BBR, because cubic keeps no bottleneck-bandwidth estimate. That is the second
     /// reason to enable BBR: throughput, and the availability of this measurement.
-    #[serde(default)]
     pub btlbw_p50_bps: Option<u64>,
-    #[serde(default)]
     pub btlbw_p90_bps: Option<u64>,
 
     /// The minimum across all connections rather than the mean: propagation delay is the smallest
@@ -1877,26 +1754,23 @@ pub struct NodeLoadView {
     pub node_id: String,
     /// For an absolute query, the exact half-open interval requested by the reader. For a latest
     /// window query, the extent of the returned samples (or zero when there are none). Charts use
-    /// this to keep missing time at its real position instead of moving an old row to the right
+    /// this to keep missing time at its real position instead of moving a stale row to the right
     /// edge and making stale telemetry look current.
     pub range_start_unix_secs: i64,
     pub range_end_unix_secs: i64,
     /// `None` means this machine has never reported, which is distinct from reporting zeros. The
-    /// UI has to state that explicitly: a newly enrolled machine, or one running an agent from
-    /// before this feature, is not a machine with a fault.
-    #[serde(default)]
+    /// UI has to state that explicitly: a newly enrolled machine with no sample is not a machine
+    /// with a fault.
     pub reported_at_unix_secs: Option<i64>,
     /// The reporting agent's clock minus the control plane's, in seconds, measured when the
     /// latest report arrived. It can only be measured at receipt — `read_at` reads the agent's
     /// clock, which is gone afterwards. Rounds past ±600s are rejected outright, so a stored
     /// value is always inside that range.
     pub clock_skew_secs: Option<i64>,
-    #[serde(default)]
     pub host: Option<HostFacts>,
     /// The newest stored sample, independent of the requested series. This lets the UI retain a
     /// machine's last known state when an absolute interval contains no samples; its timestamp is
     /// still authoritative and must not be presented as a reading from the requested interval.
-    #[serde(default)]
     pub latest_sample: Option<LoadSample>,
     /// Oldest first, so the UI can draw it left to right without sorting.
     pub series: Vec<LoadSample>,
@@ -2029,10 +1903,147 @@ mod tests {
         );
     }
 
-    /// The wire shape is the contract. The enum serializes tagged, so an older agent's
-    /// `NodeDesiredDeployment` parser fails loudly on it instead of silently skipping the
-    /// certificate — which is exactly what the protocol version gate exists to prevent. This
-    /// test pins the tag so a rename cannot slip in as a serde detail.
+    #[test]
+    fn realtime_samples_allow_absent_mux_group_but_require_a_complete_report() {
+        let nic_only: AgentRealtimeSample = serde_json::from_value(serde_json::json!({
+            "sequence": 1,
+            "sampled_at_unix_millis": 10,
+            "elapsed_millis": 1000,
+            "interface": "eth0",
+            "rx_bytes_per_sec": 1,
+            "tx_bytes_per_sec": 2,
+            "has_gap": false
+        }))
+        .unwrap();
+        assert_eq!(nic_only.mux, None);
+
+        let report: MuxReport = serde_json::from_value(serde_json::json!({
+            "boot_id": "9",
+            "sequence": 2,
+            "sampled_at_unix_ms": 10,
+            "pools": [{
+                "pool_id": "11", "pair": "out:app/chain>peer", "role": "dialer", "kind": "tcp",
+                "used": true, "draining": false,
+                "config": {
+                    "concurrency": 8, "prewarm_workers": 1, "reuse_threshold": 2,
+                    "max_probing_workers": 1, "probe_interval_ms": 5000,
+                    "probe_timeout_ms": 1000, "idle_ttl_ms": 60000,
+                    "max_sessions_per_worker": 100, "health_lease_ms": 15000,
+                    "confirm_timeout_ms": 4000, "recovery_successes": 2,
+                    "session_end_timeout_ms": 10000
+                },
+                "active_sessions": 1, "available_slots": 7, "ready_workers": 1, "total_workers": 1,
+                "dispatches": 3, "active_reuses": 1, "idle_reuses": 1, "demand_dials": 1,
+                "rejected_dispatches": 0, "probes": 2, "acks": 2, "timeouts": 0,
+                "workers_created_demand": 1, "workers_created_warm": 1,
+                "workers_warm_ready": 1, "workers_warm_failed": 0, "workers_closed_idle_ttl": 0,
+                "workers_closed_probe": 0, "workers_closed_capacity": 0, "workers_closed_requests": 0,
+                "workers_closed_transport": 0, "health_suspects": 3,
+                "health_recoveries": 1, "health_draining": 1,
+                "health_queue_failures": 2, "health_dial_throttled": 4
+            }],
+            "workers": [],
+            "events": []
+        }))
+        .unwrap();
+        assert_eq!(report.boot_id, "9");
+        assert_eq!(report.pools[0].available_slots, 7);
+        assert_eq!(report.pools[0].idle_reuses, 1);
+        assert_eq!(report.pools[0].config.health_lease_ms, 15000);
+        let mut wire = serde_json::to_value(&report).unwrap();
+        let worker = serde_json::json!({
+            "pool_id": "11", "worker_id": "18446744073709551614",
+            "pair": "out:app/chain>peer", "role": "dialer", "kind": "tcp",
+            "state": "SUSPECT", "reason": "health_lease_expired", "phase": "active",
+            "active_sessions": 1, "affected_sessions": 0, "available_slots": 0,
+            "lifetime_sessions": 10, "ack_age_ms": 15000, "rtt_ms": 80,
+            "probes": 5, "acks": 4, "timeouts": 1,
+            "lease_remaining_ms": 0, "control_queue_depth": 2, "queue_delay_ms": 30
+        });
+        wire["workers"] = serde_json::json!([worker.clone()]);
+        let mut event = worker;
+        event["sequence"] = 2.into();
+        event["at_unix_ms"] = 10.into();
+        event["from"] = "READY".into();
+        wire["events"] = serde_json::json!([event]);
+        // Agent and Console both decode/re-encode this typed report. Pin every new
+        // dimension through both hops instead of silently dropping it in serde.
+        let agent: MuxReport = serde_json::from_value(wire.clone()).unwrap();
+        let console: MuxReport =
+            serde_json::from_value(serde_json::to_value(agent).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(console).unwrap(), wire);
+
+        for pointer in [
+            "/pools/0/config/health_lease_ms",
+            "/pools/0/health_suspects",
+            "/workers/0/lease_remaining_ms",
+        ] {
+            let mut incomplete = wire.clone();
+            let (parent, field) = pointer.rsplit_once('/').unwrap();
+            incomplete
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<MuxReport>(incomplete).is_err(),
+                "missing {pointer} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_health_reports_require_current_worker_dimensions() {
+        let wire = serde_json::json!({
+            "canaries": [],
+            "boot_id": "9",
+            "sequence": 2,
+            "sampled_at_unix_ms": 10,
+            "workers": [{
+                "active_sessions": 1,
+                "affected_sessions": 0,
+                "control_queue_depth": 0,
+                "queue_delay_ms": 0,
+                "scheduler_lag_ms": 0,
+                "worker_id": "11",
+                "pair": "rev:portal:chain>peer",
+                "role": "portal",
+                "state": "READY",
+                "reason": "validated",
+                "ack_age_ms": 10,
+                "rtt_ms": 5,
+                "probes": 2,
+                "acks": 2,
+                "timeouts": 0,
+                "rejected_dispatches": 0
+            }],
+            "events": []
+        });
+        assert!(serde_json::from_value::<ReverseHealthReport>(wire.clone()).is_ok());
+        for pointer in [
+            "/canaries",
+            "/workers/0/active_sessions",
+            "/workers/0/scheduler_lag_ms",
+        ] {
+            let mut incomplete = wire.clone();
+            let (parent, field) = pointer.rsplit_once('/').unwrap();
+            incomplete
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<ReverseHealthReport>(incomplete).is_err(),
+                "missing {pointer} was accepted"
+            );
+        }
+    }
+
+    /// The wire shape is the contract. The tagged enum and protocol gate keep an incompatible
+    /// parser from silently skipping the certificate. This test pins the tag so a rename cannot
+    /// slip in as a serde detail.
     #[test]
     fn the_certificates_variant_serializes_as_a_tagged_enum() {
         let slot = NodeCertificateSlotMaterial {
@@ -2056,6 +2067,38 @@ mod tests {
     }
 
     #[test]
+    fn e2e_probe_security_is_one_explicit_tagged_shape() {
+        let current = serde_json::json!({
+            "app_id": "app",
+            "chain_id": "chain",
+            "chain_name": "Chain",
+            "ingress_id": "ingress",
+            "dial_host": "127.0.0.1",
+            "port": 443,
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "security": {
+                "type": "tls",
+                "value": {
+                    "server_name": "node.example.net",
+                    "pinned_peer_cert_sha256": null,
+                    "flow": null
+                }
+            },
+            "xhttp": null,
+            "expected_exit_ips": []
+        });
+        let target: E2eProbeTarget = serde_json::from_value(current.clone()).unwrap();
+        assert!(matches!(target.security, E2eProbeSecurity::Tls(_)));
+
+        let mut contradictory = current;
+        contradictory
+            .as_object_mut()
+            .unwrap()
+            .insert("reality".to_owned(), serde_json::json!({}));
+        assert!(serde_json::from_value::<E2eProbeTarget>(contradictory).is_err());
+    }
+
+    #[test]
     fn public_ca_material_has_one_current_certificate() {
         let certificate = NodeCertificateSlotMaterial {
             certificate_id: "cert-current".to_owned(),
@@ -2072,7 +2115,7 @@ mod tests {
     }
 
     #[test]
-    fn host_facts_from_an_older_agent_default_the_cpu_model() {
+    fn host_facts_round_trip_the_complete_current_shape() {
         let host = HostFacts {
             kernel: "6.8.0".to_owned(),
             cpu_model: "Neoverse-N1".to_owned(),
@@ -2103,30 +2146,13 @@ mod tests {
             wmem_max: 4096,
             somaxconn: 4096,
         };
-        let mut wire = serde_json::to_value(host).unwrap();
-        wire.as_object_mut().unwrap().remove("cpu_model");
-        wire.as_object_mut().unwrap().remove("cpu_freq_max_mhz");
-        wire.as_object_mut().unwrap().remove("cpu_governor");
-        wire.as_object_mut().unwrap().remove("disk_mount");
-        wire.as_object_mut().unwrap().remove("disk_filesystem");
-        wire.as_object_mut().unwrap().remove("disk_device");
-        wire.as_object_mut().unwrap().remove("disk_read_only");
-        wire.as_object_mut().unwrap().remove("ephemeral_port_low");
-        wire.as_object_mut().unwrap().remove("ephemeral_port_high");
-        wire.as_object_mut()
-            .unwrap()
-            .remove("ephemeral_port_capacity");
-        let parsed: HostFacts = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed.cpu_model, "");
-        assert_eq!(parsed.cpu_freq_max_mhz, None);
-        assert_eq!(parsed.cpu_governor, None);
-        assert_eq!(parsed.disk_mount, None);
-        assert_eq!(parsed.ephemeral_port_capacity, None);
-        assert_eq!(parsed.cores, 2);
+        let parsed: HostFacts =
+            serde_json::from_value(serde_json::to_value(&host).unwrap()).unwrap();
+        assert_eq!(parsed, host);
     }
 
     #[test]
-    fn load_samples_from_older_agents_have_no_deep_diagnostics() {
+    fn load_samples_allow_unavailable_deep_diagnostics() {
         let parsed: LoadSample = serde_json::from_value(serde_json::json!({
             "window_start_unix_secs": 100,
             "window_end_unix_secs": 130,
@@ -2158,7 +2184,7 @@ mod tests {
     }
 
     #[test]
-    fn network_detail_is_forward_compatible_with_partial_kernel_views() {
+    fn network_detail_represents_unavailable_kernel_counters_as_none() {
         let parsed: NetworkDetailSample = serde_json::from_value(serde_json::json!({
             "tcp_curr_estab": 12,
             "tcp_inuse": 18
@@ -2173,14 +2199,14 @@ mod tests {
     }
 
     #[test]
-    fn cpu_details_from_the_previous_agent_default_missing_io_pressure() {
+    fn cpu_details_round_trip_explicitly_unavailable_io_pressure() {
         let detail = CpuDetailSample {
             iowait_pct: 1.0,
             load5: 0.2,
             load15: 0.1,
             pressure_some_pct: Some(0.0),
-            io_pressure_some_pct: Some(2.0),
-            io_pressure_full_pct: Some(1.0),
+            io_pressure_some_pct: None,
+            io_pressure_full_pct: None,
             procs_running: Some(1),
             procs_total: Some(10),
             context_switches_per_sec: Some(100),
@@ -2190,27 +2216,19 @@ mod tests {
             frequency_mhz: None,
             cores: Vec::new(),
         };
-        let mut wire = serde_json::to_value(detail).unwrap();
-        wire.as_object_mut().unwrap().remove("io_pressure_some_pct");
-        wire.as_object_mut().unwrap().remove("io_pressure_full_pct");
-        let parsed: CpuDetailSample = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed.io_pressure_some_pct, None);
-        assert_eq!(parsed.io_pressure_full_pct, None);
+        let parsed: CpuDetailSample =
+            serde_json::from_value(serde_json::to_value(&detail).unwrap()).unwrap();
+        assert_eq!(parsed, detail);
     }
 }
 
 /// A current data-plane snapshot, with bounded recent transitions. Health is not a business canary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReverseHealthWorker {
-    #[serde(default)]
     pub active_sessions: u32,
-    #[serde(default)]
     pub affected_sessions: u32,
-    #[serde(default)]
     pub control_queue_depth: u32,
-    #[serde(default)]
     pub queue_delay_ms: i64,
-    #[serde(default)]
     pub scheduler_lag_ms: i64,
     pub worker_id: String,
     pub pair: String,
@@ -2234,7 +2252,6 @@ pub struct ReverseHealthEvent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReverseHealthReport {
-    #[serde(default)]
     pub canaries: Vec<ReverseCanaryReport>,
     pub boot_id: String,
     pub sequence: u64,
@@ -2243,9 +2260,107 @@ pub struct ReverseHealthReport {
     pub events: Vec<ReverseHealthEvent>,
 }
 
+/// Ordinary outbound Mux uses the same report/snapshot/event vocabulary as reverse health. Pool
+/// counters are cumulative for one Xray picker instance; the browser derives deltas from pool_id
+/// and never asks Xray to reset a data-plane counter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxPoolConfigReport {
+    pub concurrency: u32,
+    pub prewarm_workers: u32,
+    pub reuse_threshold: u32,
+    pub max_probing_workers: u32,
+    pub probe_interval_ms: i64,
+    pub probe_timeout_ms: i64,
+    pub idle_ttl_ms: i64,
+    pub max_sessions_per_worker: u32,
+    pub health_lease_ms: i64,
+    pub confirm_timeout_ms: i64,
+    pub recovery_successes: u32,
+    pub session_end_timeout_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxPoolReport {
+    pub pool_id: String,
+    pub pair: String,
+    pub role: String,
+    pub kind: String,
+    pub used: bool,
+    pub draining: bool,
+    pub config: MuxPoolConfigReport,
+    pub active_sessions: u32,
+    pub available_slots: u32,
+    pub ready_workers: u32,
+    pub total_workers: u32,
+    pub dispatches: u64,
+    pub active_reuses: u64,
+    pub idle_reuses: u64,
+    pub demand_dials: u64,
+    pub rejected_dispatches: u64,
+    pub probes: u64,
+    pub acks: u64,
+    pub timeouts: u64,
+    pub workers_created_demand: u64,
+    pub workers_created_warm: u64,
+    pub workers_warm_ready: u64,
+    pub workers_warm_failed: u64,
+    pub workers_closed_idle_ttl: u64,
+    pub workers_closed_probe: u64,
+    pub workers_closed_capacity: u64,
+    pub workers_closed_requests: u64,
+    pub workers_closed_transport: u64,
+    pub health_suspects: u64,
+    pub health_recoveries: u64,
+    pub health_draining: u64,
+    pub health_queue_failures: u64,
+    pub health_dial_throttled: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxWorkerReport {
+    pub pool_id: String,
+    pub worker_id: String,
+    pub pair: String,
+    pub role: String,
+    pub kind: String,
+    pub state: String,
+    pub reason: String,
+    pub phase: String,
+    pub active_sessions: u32,
+    pub affected_sessions: u32,
+    pub available_slots: u32,
+    pub lifetime_sessions: u32,
+    pub ack_age_ms: i64,
+    pub rtt_ms: i64,
+    pub probes: u64,
+    pub acks: u64,
+    pub timeouts: u64,
+    pub lease_remaining_ms: i64,
+    pub control_queue_depth: u32,
+    pub queue_delay_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxWorkerEvent {
+    pub sequence: u64,
+    pub at_unix_ms: i64,
+    pub from: String,
+    #[serde(flatten)]
+    pub worker: MuxWorkerReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxReport {
+    pub boot_id: String,
+    pub sequence: u64,
+    pub sampled_at_unix_ms: i64,
+    pub pools: Vec<MuxPoolReport>,
+    pub workers: Vec<MuxWorkerReport>,
+    pub events: Vec<MuxWorkerEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReverseCanaryReport {
-    #[serde(default)]
     pub freshness_budget_ms: i64,
     pub pair: String,
     pub state: String,

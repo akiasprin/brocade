@@ -91,9 +91,7 @@ pub struct QuotaEnforcementOutcome {
 // This month's consumption does not go through `list_monthly_usage_summary` here: that query
 // carries `coalesce(s.app_id, i.app_id)` and a LEFT JOIN on ingresses, serving someone opening a
 // page and wanting historical completeness; this one runs every 60 seconds and has to hit the
-// `usage_samples_by_user_app_window` index, so it uses the frozen column directly. 0002's
-// backfill already attributed every historical sample it could, and those it could not (whose
-// ingress was long deleted) belong to no view anyway.
+// `usage_samples_by_user_app_window` index, so it uses the frozen attribution column directly.
 //
 // Month boundaries follow the same convention as everywhere else: date_trunc at +08, decided
 // server-side.
@@ -114,8 +112,8 @@ const MONTH_USED_SQL: &str = "
 /// Account. Writes nothing.
 pub async fn plan_quota_enforcement(pool: &PgPool) -> Result<QuotaEnforcementPlan> {
     // To revoke: the quota is spent and they still hold unrevoked grants under this view. Grant
-    // presence is the source of truth. A surviving suspension record must not exempt a grant an
-    // operator or an old client put back; DELETE's rows_affected already gives idempotent counts.
+    // presence is the source of truth. A surviving suspension record must not exempt a grant
+    // restored by another writer; DELETE's rows_affected already gives idempotent counts.
     let suspend = sqlx::query(&format!(
         "WITH used AS ({MONTH_USED_SQL})
          SELECT g.tenant_id, g.user_id, g.app_id, g.ingress_id

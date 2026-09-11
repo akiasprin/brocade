@@ -86,7 +86,8 @@ pub enum PlannedAction {
 /// again. Naming them again is how one gets left out, and each omission fails silently in its
 /// own way: narrowing sends `Unmanaged` and the machine is never touched; storing skips the
 /// blob and the machine's own poll errors; judging ignores it and a release that changed
-/// nothing reports success. Port hopping shipped and hit all three at once.
+/// nothing reports success. Keeping the set centralized makes those omissions structurally
+/// testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigArtifact {
     Phantun,
@@ -116,17 +117,6 @@ impl ConfigArtifact {
             ConfigArtifact::WireGuard => "wireguard",
             ConfigArtifact::Xray => "xray",
         }
-    }
-
-    /// Whether a release record predating this artifact may leave it out.
-    ///
-    /// True for phantun and Hysteria 2's hop range, the two that arrived after release records
-    /// were already being written. Rolling back to a record written before they existed
-    /// must not suddenly touch them, so their absence reads as `Unmanaged` rather than as a
-    /// corrupt record. The other two have been in every record ever written, and their absence
-    /// is corruption — worth an error rather than a silent "not mine to manage".
-    pub fn predates_records(self) -> bool {
-        matches!(self, ConfigArtifact::Phantun | ConfigArtifact::Hy2PortHop)
     }
 }
 
@@ -159,11 +149,9 @@ pub struct NodeDesiredState {
     /// phantun client's local port, and with phantun not up the handshake packets go to a port
     /// nobody listens on — the symptom being "everything configured correctly, handshake simply
     /// will not complete". This is the convergence order.
-    #[serde(default = "unmanaged_artifact")]
     pub phantun: DesiredArtifact,
     pub wireguard: DesiredArtifact,
     pub xray: DesiredArtifact,
-    #[serde(default = "unmanaged_artifact_hop")]
     pub hy2_port_hop: DesiredArtifact,
     pub grants: DesiredGrants,
 }
@@ -187,25 +175,6 @@ impl NodeDesiredState {
             (ConfigArtifact::WireGuard, &mut self.wireguard),
             (ConfigArtifact::Xray, &mut self.xray),
         ]
-    }
-}
-
-/// An older agent's report has no phantun field, defaulting to "not mine to manage" rather than
-/// "absent" — the latter has the control plane judge it as drift and push an action every round
-/// that the agent will never perform.
-fn unmanaged_applied() -> AppliedArtifactState {
-    AppliedArtifactState::Unmanaged
-}
-
-fn unmanaged_artifact_hop() -> DesiredArtifact {
-    DesiredArtifact::Unmanaged {
-        reason: "agent does not report port hop".to_owned(),
-    }
-}
-
-fn unmanaged_artifact() -> DesiredArtifact {
-    DesiredArtifact::Unmanaged {
-        reason: "agent does not report phantun".to_owned(),
     }
 }
 
@@ -258,12 +227,7 @@ pub struct ObservedClient {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeAppliedState {
     pub node_id: String,
-    /// An older agent does not report this field, defaulting to Unmanaged — taken as "not mine to
-    /// manage" rather than "absent", since the latter has the control plane judge it as drift and
-    /// push an action every round that the agent will never perform.
-    #[serde(default = "unmanaged_applied")]
     pub phantun: AppliedArtifactState,
-    #[serde(default = "unmanaged_applied")]
     pub hy2_port_hop: AppliedArtifactState,
     pub wireguard: AppliedArtifactState,
     pub xray: AppliedArtifactState,
@@ -422,8 +386,7 @@ pub fn narrow_to_kind(mut plan: DeploymentPlan, kind: DeploymentKind) -> Deploym
 /// machine alone and reports `Unmanaged` back, and the control plane keeps the old applied state
 /// on the grounds that this deployment did not manage it (`upsert_node_applied_state`). The plan
 /// then asks for the same action again. What the operator sees is a machine permanently pending
-/// with every release succeeding and nothing on it ever changing — port hopping shipped gated on
-/// phantun's actions and did exactly that.
+/// with every release succeeding and nothing on it ever changing.
 fn narrow_config_desired(target: &mut PlannedTarget) {
     let manages_xray = target.actions.iter().any(|action| {
         matches!(

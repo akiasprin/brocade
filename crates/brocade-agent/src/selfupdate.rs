@@ -23,14 +23,15 @@
 //! 6. Stage next to the real binary and `rename` over it. Not `install`(1) and not writing in
 //!    place: opening a running executable for writing returns `ETXTBSY`. `rename` is atomic, and
 //!    the running process keeps its own inode until it exits.
-//! 7. Ask the main loop to exit. systemd's `Restart=always` starts the new one five seconds later.
+//! 7. Ask the main loop to exit. The installed service supervisor starts the new one five seconds
+//!    later (`Restart=always` on systemd, `supervise-daemon` on OpenRC).
 //!
 //! # This depends on something restarting the process
 //!
-//! Step 7 hands the last move to the supervisor, and the only supervisor `install.sh` writes is a
-//! systemd unit. Installed with `--service-mode foreground` — which is what the preview containers
-//! use (`brocade-preview`'s `provision.rs`) — nothing restarts it, so a self-update stops the agent
-//! and leaves it stopped.
+//! Step 7 hands the last move to the supervisor. `install.sh` writes either a systemd unit or an
+//! OpenRC service; both respawn the process. Installed with `--service-mode foreground` — which is
+//! what the preview containers use (`brocade-preview`'s `provision.rs`) — nothing restarts it, so a
+//! self-update stops the agent and leaves it stopped.
 //!
 //! Not guarded against here, because the agent cannot find out: the mode is a decision made by the
 //! installer, and nothing about it reaches the process (the env file carries only server, token,
@@ -115,18 +116,6 @@ pub(crate) fn selfupdate_cycle(options: &Options) -> Result<bool, String> {
     if response.status == 204 {
         return Ok(false);
     }
-    // 404 means this control plane has no such endpoint — it predates self-update. Not an error,
-    // and specifically not one to repeat every cycle: the state is legitimate and lasts as long as
-    // somebody leaves it there. Two ways to arrive at it, and the second is the common one:
-    //
-    //   - the control plane was rolled back to a build from before this feature
-    //   - a machine was installed with a newer agent than the control plane running the fleet
-    //
-    // Treated as an error, an agent in either state files a warning into journald every ten
-    // minutes forever, which trains whoever reads those logs to ignore this thread.
-    if response.status == 404 {
-        return Ok(false);
-    }
     if !(200..300).contains(&response.status) {
         return Err(format!(
             "问不到该装哪个 agent: HTTP {} {}",
@@ -162,7 +151,7 @@ pub(crate) fn selfupdate_cycle(options: &Options) -> Result<bool, String> {
     outcome?;
 
     println!(
-        "selfupdate: 已换上 {}，等这一轮收敛做完就退出，交给 systemd 拉起",
+        "selfupdate: 已换上 {}，等这一轮收敛做完就退出，交给服务管理器拉起",
         short(&wanted)
     );
     Ok(true)
@@ -236,10 +225,10 @@ fn fetch(url: &str, into: &Path) -> Result<(), String> {
 
 /// Run the candidate once, before it replaces anything.
 ///
-/// The test is that it can execute and knows the subcommand the systemd unit starts it with. It is
-/// fed a command that does not exist, because that makes it print what it does support without
-/// doing anything: `--server` and `--token` are supplied only because argument validation runs
-/// before command dispatch, and this points at a port nothing listens on.
+/// The test is that it can execute and knows the subcommand the service starts it with. It is fed a
+/// command that does not exist, because that makes it print what it does support without doing
+/// anything: `--server` and `--token` are supplied only because argument validation runs before
+/// command dispatch, and this points at a port nothing listens on.
 ///
 /// `install.sh` gates on the same output for the same reason; the two must keep agreeing, or a
 /// binary the installer would reject could still arrive this way.
@@ -269,7 +258,7 @@ fn probe(candidate: &Path) -> Result<(), String> {
     );
     if !said.contains("expected") || !said.contains("run") {
         return Err(format!(
-            "候选 agent 不认识 run 子命令，装上去 systemd 也起不来，没有安装。它说：{}",
+            "候选 agent 不认识 run 子命令，装上去服务也起不来，没有安装。它说：{}",
             said.trim()
         ));
     }
@@ -279,9 +268,10 @@ fn probe(candidate: &Path) -> Result<(), String> {
 /// The path of the running binary.
 ///
 /// Read through `/proc/self/exe` rather than `argv[0]`, which is whatever the caller chose and is
-/// a relative path under systemd. A path ending in ` (deleted)` means the file was already
-/// replaced and this process is the old one still running — there is nothing left to update, and
-/// writing to that literal path would create a file with a space and `(deleted)` in its name.
+/// possibly a relative path under a service manager. A path ending in ` (deleted)` means the file
+/// was already replaced and this process is the old one still running — there is nothing left to
+/// update, and writing to that literal path would create a file with a space and `(deleted)` in its
+/// name.
 fn self_path() -> Result<PathBuf, String> {
     let path = fs::read_link("/proc/self/exe")
         .map_err(|error| format!("读不了 /proc/self/exe: {error}"))?;
@@ -326,7 +316,7 @@ pub(crate) fn spawn_selfupdate(options: &Options, wants_exit: &Arc<AtomicBool>) 
         });
     if let Err(error) = spawned {
         // Not fatal. A machine that cannot self-update still converges, still reports, and still
-        // carries traffic; it merely has to be upgraded the old way.
+        // carries traffic; install.sh remains the manual recovery path.
         warn(format!(
             "selfupdate: 起不了自更新线程（{error}）；这台机器只能靠 install.sh 升级"
         ));
@@ -363,39 +353,6 @@ mod tests {
     #[test]
     fn a_binary_that_runs_but_is_not_an_agent_is_refused() {
         assert!(probe(Path::new("/bin/true")).is_err());
-    }
-
-    /// A control plane from before self-update answers 404, and that must stay quiet.
-    ///
-    /// Driven against a socket that accepts and answers a canned 404, so the real request path
-    /// runs. Asserted as `Ok(false)` rather than merely "no panic": the difference between this
-    /// and `Err` is a warning in journald every ten minutes for as long as the fleet is in that
-    /// state, which is what teaches people to stop reading this thread's logs.
-    #[test]
-    fn a_control_plane_without_the_endpoint_is_not_an_error() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 2048];
-            let _ = socket.read(&mut buffer);
-            let _ = socket.write_all(
-                b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
-            );
-        });
-
-        let options = Options {
-            command: "run".to_owned(),
-            server: format!("http://127.0.0.1:{port}"),
-            token: "probe".to_owned(),
-            state_dir: std::env::temp_dir().join("brocade-404-test"),
-            apply_mode: crate::options::ApplyMode::StateDir,
-        };
-        assert_eq!(selfupdate_cycle(&options), Ok(false), "404 不该报错");
-        server.join().unwrap();
     }
 
     /// The order the whole design rests on: verify, then execute, then install.

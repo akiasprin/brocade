@@ -897,7 +897,7 @@ fn processes(subs: &[Sub], raw: &Raw) -> Vec<ProcessSample> {
 /// What changes slowly. Read once per report rather than per sub-sample.
 pub(crate) fn host_facts(state_dir: &Path) -> HostFacts {
     let detected_nic = main_interface();
-    // Keep the historical display/qdisc fallback, but do not present eth0's MTU as the default
+    // Keep the display/qdisc fallback, but do not present eth0's MTU as the default
     // route's MTU when route discovery itself failed.
     let nic_mtu = detected_nic.as_deref().and_then(read_nic_mtu);
     let nic = detected_nic.unwrap_or_else(|| "eth0".to_owned());

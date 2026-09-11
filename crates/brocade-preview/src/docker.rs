@@ -20,9 +20,6 @@ pub(crate) const LABEL_ROLE: &str = "brocade.preview.role";
 pub(crate) const LABEL_IPV6: &str = "brocade.preview.ipv6";
 pub(crate) const LABEL_IPV4: &str = "brocade.preview.ipv4";
 
-/// `LABEL_IPV4`'s old name, still stamped on containers and read as a fallback.
-pub(crate) const LABEL_IP_LEGACY: &str = "brocade.preview.ip";
-
 /// A node container's name.
 ///
 /// Note that it shares a namespace with `CLIENT_CONTAINER` and `ECHO_CONTAINER`: a node_id of
@@ -91,13 +88,7 @@ pub(crate) async fn preview_container_by_ip(
         IpAddr::V6(ip) => format!("label={LABEL_IPV6}={ip}"),
     };
     let found = preview_container_by_label(config, label).await?;
-    if found.is_some() {
-        return Ok(found);
-    }
-    if let IpAddr::V4(ip) = ip {
-        return preview_container_by_label(config, format!("label={LABEL_IP_LEGACY}={ip}")).await;
-    }
-    Ok(None)
+    Ok(found)
 }
 
 async fn preview_container_by_label(

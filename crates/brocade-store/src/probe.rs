@@ -12,9 +12,10 @@ use brocade_core::{
 };
 use brocade_deployment::protocol::{
     E2eExitVerdict, E2eProbe, E2eProbeAnyTls, E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest,
-    E2eProbeResult, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList, E2eProbeTls, E2eProbeXhttp,
-    E2eProbeXhttpRange, E2eProbeXhttpXmux, LinkHealthRequest, LinkHealthResult, LinkProbeRequest,
-    LinkProbeResult, LinkProbeStatus, ProbeTarget, ProbeTargetList, ProbeTransport,
+    E2eProbeResult, E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
+    E2eProbeTls, E2eProbeXhttp, E2eProbeXhttpRange, E2eProbeXhttpXmux, LinkHealthRequest,
+    LinkHealthResult, LinkProbeRequest, LinkProbeResult, LinkProbeStatus, ProbeTarget,
+    ProbeTargetList, ProbeTransport,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -261,7 +262,7 @@ pub async fn link_mtu_view(pool: &PgPool, actor: &AdminContext) -> Result<LinkMt
         .fetch_one(pool)
         .await?
         .try_get::<i32, _>("overlay_mtu")?;
-    let default_mtu = u16::try_from(default_mtu).unwrap_or(1420);
+    let default_mtu = u16::try_from(default_mtu).unwrap_or(1280);
 
     // The node table is scoped strictly: this one answers whose MTU should change, the place to
     // change it is the node page, and the node page lists only machines in view anyway.
@@ -566,13 +567,85 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
             .targets
             .into_iter()
             .map(|target| E2eProbeTarget {
-                vless_encryption: match &target.security {
+                security: match &target.security {
                     ProbeSecurity::VlessEncryption {
                         public_key,
                         options,
                         ..
-                    } => Some(options.encryption(public_key)),
-                    _ => None,
+                    } => E2eProbeSecurity::VlessEncryption {
+                        encryption: options.encryption(public_key),
+                    },
+                    ProbeSecurity::Reality(reality) => E2eProbeSecurity::Reality(E2eProbeReality {
+                        public_key: reality.public_key.clone(),
+                        short_id: reality.short_id.clone(),
+                        server_name: reality.server_name.clone(),
+                        fingerprint: reality.fingerprint.clone(),
+                        flow: reality.flow.clone(),
+                    }),
+                    ProbeSecurity::Tls(tls) => E2eProbeSecurity::Tls(E2eProbeTls {
+                        server_name: tls.server_name.clone(),
+                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
+                        flow: tls.flow.clone(),
+                    }),
+                    ProbeSecurity::AnyTls(anytls) => E2eProbeSecurity::AnyTls {
+                        settings: E2eProbeAnyTls {
+                            server_name: anytls.server_name.clone(),
+                            pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
+                            idle_session_check_interval_secs: anytls
+                                .settings
+                                .idle_session_check_interval_secs,
+                            idle_session_timeout_secs: anytls.settings.idle_session_timeout_secs,
+                            min_idle_session: anytls.settings.min_idle_session,
+                        },
+                        reality: anytls.reality.as_ref().map(|reality| E2eProbeReality {
+                            public_key: reality.public_key.clone(),
+                            short_id: reality.short_id.clone(),
+                            server_name: reality.server_name.clone(),
+                            fingerprint: reality.fingerprint.clone(),
+                            flow: None,
+                        }),
+                    },
+                    ProbeSecurity::Hysteria2(hysteria) => {
+                        E2eProbeSecurity::Hysteria2(E2eProbeHysteria2 {
+                            server_name: hysteria.server_name.clone(),
+                            pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
+                            congestion: hysteria.settings.congestion.as_str().to_owned(),
+                            up: hysteria.settings.bandwidth.up.clone(),
+                            down: hysteria.settings.bandwidth.down.clone(),
+                            bbr_profile: (hysteria.settings.bbr_profile
+                                != brocade_core::model::HysteriaBbrProfile::default())
+                            .then(|| hysteria.settings.bbr_profile.as_str().to_owned()),
+                            init_stream_receive_window: hysteria
+                                .settings
+                                .quic
+                                .init_stream_receive_window,
+                            max_stream_receive_window: hysteria
+                                .settings
+                                .quic
+                                .max_stream_receive_window,
+                            init_connection_receive_window: hysteria
+                                .settings
+                                .quic
+                                .init_connection_receive_window,
+                            max_connection_receive_window: hysteria
+                                .settings
+                                .quic
+                                .max_connection_receive_window,
+                            max_idle_timeout_secs: hysteria.settings.quic.max_idle_timeout_secs,
+                            keep_alive_period_secs: hysteria.settings.quic.keep_alive_period_secs,
+                            disable_path_mtu_discovery: hysteria
+                                .settings
+                                .quic
+                                .disable_path_mtu_discovery,
+                            salamander_password: hysteria.settings.obfs.as_ref().map(|obfs| {
+                                match obfs {
+                                    brocade_core::model::HysteriaObfs::Salamander { password } => {
+                                        password.clone()
+                                    }
+                                }
+                            }),
+                        })
+                    }
                 },
                 app_id: target.app_id,
                 chain_id: target.chain_id,
@@ -581,100 +654,6 @@ pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeT
                 dial_host: target.dial_host,
                 port: target.port,
                 uuid: target.uuid,
-                reality: match &target.security {
-                    ProbeSecurity::Reality(reality) => E2eProbeReality {
-                        public_key: reality.public_key.clone(),
-                        short_id: reality.short_id.clone(),
-                        server_name: reality.server_name.clone(),
-                        fingerprint: reality.fingerprint.clone(),
-                        flow: reality.flow.clone(),
-                    },
-                    ProbeSecurity::AnyTls(anytls) if anytls.reality.is_some() => {
-                        let reality = anytls.reality.as_ref().unwrap();
-                        E2eProbeReality {
-                            public_key: reality.public_key.clone(),
-                            short_id: reality.short_id.clone(),
-                            server_name: reality.server_name.clone(),
-                            fingerprint: reality.fingerprint.clone(),
-                            flow: None,
-                        }
-                    }
-                    // Filler beside a `tls` block that supersedes it. Empty rather than absent
-                    // because the field is what an older agent parses, and one that cannot be
-                    // parsed costs that agent every other probe on the machine.
-                    ProbeSecurity::VlessEncryption { .. }
-                    | ProbeSecurity::Tls(_)
-                    | ProbeSecurity::AnyTls(_)
-                    | ProbeSecurity::Hysteria2(_) => E2eProbeReality {
-                        public_key: String::new(),
-                        short_id: String::new(),
-                        server_name: String::new(),
-                        fingerprint: String::new(),
-                        flow: None,
-                    },
-                },
-                hysteria2: match &target.security {
-                    ProbeSecurity::Hysteria2(hysteria) => Some(E2eProbeHysteria2 {
-                        server_name: hysteria.server_name.clone(),
-                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
-                        congestion: hysteria.settings.congestion.as_str().to_owned(),
-                        up: hysteria.settings.bandwidth.up.clone(),
-                        down: hysteria.settings.bandwidth.down.clone(),
-                        bbr_profile: (hysteria.settings.bbr_profile
-                            != brocade_core::model::HysteriaBbrProfile::default())
-                        .then(|| hysteria.settings.bbr_profile.as_str().to_owned()),
-                        init_stream_receive_window: hysteria
-                            .settings
-                            .quic
-                            .init_stream_receive_window,
-                        max_stream_receive_window: hysteria.settings.quic.max_stream_receive_window,
-                        init_connection_receive_window: hysteria
-                            .settings
-                            .quic
-                            .init_connection_receive_window,
-                        max_connection_receive_window: hysteria
-                            .settings
-                            .quic
-                            .max_connection_receive_window,
-                        max_idle_timeout_secs: hysteria.settings.quic.max_idle_timeout_secs,
-                        keep_alive_period_secs: hysteria.settings.quic.keep_alive_period_secs,
-                        disable_path_mtu_discovery: hysteria
-                            .settings
-                            .quic
-                            .disable_path_mtu_discovery,
-                        salamander_password: hysteria.settings.obfs.as_ref().map(
-                            |obfs| match obfs {
-                                brocade_core::model::HysteriaObfs::Salamander { password } => {
-                                    password.clone()
-                                }
-                            },
-                        ),
-                    }),
-                    _ => None,
-                },
-                anytls: match &target.security {
-                    ProbeSecurity::AnyTls(anytls) => Some(E2eProbeAnyTls {
-                        server_name: anytls.server_name.clone(),
-                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
-                        idle_session_check_interval_secs: anytls
-                            .settings
-                            .idle_session_check_interval_secs,
-                        idle_session_timeout_secs: anytls.settings.idle_session_timeout_secs,
-                        min_idle_session: anytls.settings.min_idle_session,
-                    }),
-                    _ => None,
-                },
-                tls: match &target.security {
-                    ProbeSecurity::VlessEncryption { .. }
-                    | ProbeSecurity::Reality(_)
-                    | ProbeSecurity::AnyTls(_)
-                    | ProbeSecurity::Hysteria2(_) => None,
-                    ProbeSecurity::Tls(tls) => Some(E2eProbeTls {
-                        server_name: tls.server_name.clone(),
-                        pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
-                        flow: tls.flow.clone(),
-                    }),
-                },
                 xhttp: target.xhttp.as_ref().map(|xhttp| E2eProbeXhttp {
                     path: xhttp.path.clone(),
                     host: xhttp.host.clone(),

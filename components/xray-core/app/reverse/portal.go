@@ -184,22 +184,33 @@ func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
 		return nil, errors.New("empty worker list")
 	}
 
-	var minIdx int = -1
-	var minConn uint32 = 9999
-	for i, w := range p.workers {
-		if w.draining.Load() {
-			continue
+	pick := func(allowDraining bool) int {
+		minIdx := -1
+		var minConn uint32
+		for i, w := range p.workers {
+			if w.draining.Load() && !allowDraining {
+				continue
+			}
+			if w.IsFull() {
+				continue
+			}
+			conn := w.client.ActiveConnections()
+			if minIdx == -1 || conn < minConn {
+				minConn = conn
+				minIdx = i
+			}
 		}
-		if w.IsFull() {
-			continue
-		}
-		conn := w.client.ActiveConnections()
-		if (conn > 0 && (minConn == 0 || conn < minConn)) || minIdx == -1 {
-			minConn = w.client.ActiveConnections()
-			minIdx = i
-		}
+		return minIdx
 	}
 
+	minIdx := pick(false)
+	if minIdx == -1 {
+		// The legacy reverse control stream announces rotation before its replacement
+		// can arrive. Keep that carrier available as a handoff fallback so a healthy
+		// tunnel never creates a window where every external connection is rejected.
+		// Health-managed workers still fail IsFull once they enter DRAINING.
+		minIdx = pick(true)
+	}
 	if minIdx != -1 {
 		return p.workers[minIdx].client, nil
 	}

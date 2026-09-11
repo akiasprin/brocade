@@ -1359,25 +1359,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The older singular `server` is accepted here as well, for the same reason as
-    /// on phantun's side: failing to read what was written before the upgrade would
-    /// empty this list with no error.
-    #[test]
-    fn the_old_singular_server_spelling_is_read_here_too() {
-        let dir = state_dir("via-phantun-old");
-        fs::write(
-            dir.join("phantun.json"),
-            json!({ "server": { "tcp_port": 39743, "peers": ["hk-01"] } }).to_string(),
-        )
-        .unwrap();
-
-        assert!(peers_via_phantun_server(&dir).contains("hk-01"));
-        let _ = fs::remove_dir_all(dir);
-    }
-
     /// Apply-time cleanup is narrower than "every peer with no Endpoint": normal
     /// passive WireGuard peers keep their learned public address, a healthy phantun
-    /// peer keeps its loopback address, and an old keepalive can be cleared without
+    /// peer keeps its loopback address, and a stale keepalive can be cleared without
     /// removing that healthy peer.
     #[test]
     fn apply_cleanup_selects_only_stale_phantun_passive_state() {

@@ -29,7 +29,7 @@ PHANTUN_CLIENT_URL=${BROCADE_PHANTUN_CLIENT_URL:-}
 PHANTUN_CLIENT_SHA=${BROCADE_PHANTUN_CLIENT_SHA256:-}
 APPLY_MODE=${BROCADE_AGENT_APPLY:-}
 if [ -n "$APPLY_MODE" ]; then APPLY_MODE_EXPLICIT=1; else APPLY_MODE_EXPLICIT=; fi
-SERVICE_MODE=${BROCADE_AGENT_SERVICE_MODE:-systemd}
+SERVICE_MODE=${BROCADE_AGENT_SERVICE_MODE:-auto}
 INSTALL_DIR=${BROCADE_AGENT_INSTALL_DIR:-/usr/local/bin}
 CONFIG_DIR=${BROCADE_AGENT_CONFIG_DIR:-/etc/brocade-agent}
 STATE_DIR=${BROCADE_AGENT_STATE_DIR:-/var/lib/brocade-agent}
@@ -57,7 +57,7 @@ usage() {
     echo "  token 轮换 / 机器重装用 --node-token（控制面重签时会给出这条完整命令）" >&2
     echo "  都不带 = 沿用机器上已有的 token，纯升级" >&2
     echo "         [--apply linux|state-dir]" >&2
-    echo "         [--service-mode systemd|foreground]" >&2
+    echo "         [--service-mode auto|systemd|openrc|foreground]" >&2
     echo "         [--agent-bin-url URL] [--agent-bin-sha256 SHA256]" >&2
     echo "         [--xray-bin-url URL] [--xray-bin-sha256 SHA256] [--xray-version TAG]" >&2
     echo "         [--phantun-server-url URL] [--phantun-server-sha256 SHA256]" >&2
@@ -65,7 +65,10 @@ usage() {
     echo >&2
     echo "  --apply linux      默认。把产物真的落到系统上：配 wg0、拉起 xray" >&2
     echo "  --apply state-dir  只把产物写进状态目录，不碰系统。lab 用，生产别用" >&2
-    echo "  --service-mode foreground  不写 systemd，直接 exec agent。preview 容器用" >&2
+    echo "  --service-mode auto        默认。自动选择 systemd 或 OpenRC" >&2
+    echo "  --service-mode systemd     强制写 systemd unit" >&2
+    echo "  --service-mode openrc      强制写 OpenRC service" >&2
+    echo "  --service-mode foreground  不写服务，直接 exec agent。preview 容器用" >&2
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -94,11 +97,7 @@ install_pkg() {
 }
 
 # Download, verify, install. **A failure at any step must not touch $dest.**
-#
-# This used to ignore curl's exit code and install the temporary file regardless. So one failed
-# download overwrote a perfectly good binary on the machine with 0 bytes, with `Exec format error
-# (os error 8)` as the symptom — it killed xray on jb-01 once. The last thing an installer should do
-# is install something broken, which is worse than installing nothing.
+# Installing nothing is safer than replacing a working binary with a partial download.
 fetch_binary() {
     url=$1
     want_sha=$2
@@ -189,12 +188,6 @@ verify_xray_pin() {
 }
 
 # geoip.dat / geosite.dat must be present, **regardless of whether a rule table uses them**.
-#
-# The two used to be coupled: the .dat files rode along with install_xray's download of the xray
-# release, so "there is already a working xray on the machine" meant the .dat files were never
-# installed at all. The preview containers were exactly this — xray baked into the image, the install
-# script returning immediately, and the .dat files never appearing.
-#
 # And missing .dat files are not a soft failure of rules not matching. `geosite:` is expanded at
 # **config parse time** into `ext:geosite.dat:` and the file read on the spot (infra/conf/router.go →
 # geodata.ParseDomainRules), and failing to read it gives:
@@ -426,9 +419,9 @@ case "$APPLY_MODE" in
         ;;
 esac
 case "$SERVICE_MODE" in
-    systemd|foreground) ;;
+    auto|systemd|openrc|foreground) ;;
     *)
-        echo "unknown --service-mode value: $SERVICE_MODE (expected systemd or foreground)" >&2
+        echo "unknown --service-mode value: $SERVICE_MODE (expected auto, systemd, openrc, or foreground)" >&2
         exit 2
         ;;
 esac
@@ -441,6 +434,38 @@ fi
 if ! have curl; then
     echo "curl is required" >&2
     exit 1
+fi
+
+# Resolve the default before enrollment consumes a one-time token. Failing here leaves the token
+# usable and avoids the old state where all files were installed but no init could start them.
+if [ "$SERVICE_MODE" = "auto" ]; then
+    if have systemctl && [ -d /run/systemd/system ]; then
+        SERVICE_MODE=systemd
+    elif have rc-service && have rc-update && have supervise-daemon && [ -x /sbin/openrc-run ]; then
+        SERVICE_MODE=openrc
+    else
+        echo "找不到受支持的服务管理器：需要 systemd，或带 supervise-daemon 的 OpenRC。" >&2
+        echo "容器内如有外部 supervisor，可显式使用 --service-mode foreground。" >&2
+        exit 1
+    fi
+fi
+if [ "$SERVICE_MODE" = "systemd" ]; then
+    if ! have systemctl || [ ! -d /run/systemd/system ]; then
+        echo "指定了 --service-mode systemd，但 systemd 没有在运行。" >&2
+        exit 1
+    fi
+fi
+if [ "$SERVICE_MODE" = "openrc" ]; then
+    missing_openrc=
+    for command in rc-service rc-update supervise-daemon; do
+        have "$command" || missing_openrc="$missing_openrc $command"
+    done
+    [ -x /sbin/openrc-run ] || missing_openrc="$missing_openrc /sbin/openrc-run"
+    if [ -n "$missing_openrc" ]; then
+        echo "指定了 --service-mode openrc，但缺少:$missing_openrc" >&2
+        echo "Alpine 上请先安装/恢复 openrc 包。" >&2
+        exit 1
+    fi
 fi
 
 install -d -m 0755 "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR"
@@ -556,9 +581,8 @@ fi
 # log in to.
 probe_out=$("$AGENT_BIN" --server http://127.0.0.1:1 --token probe __brocade_probe 2>&1 || true)
 if ! printf '%s' "$probe_out" | grep -qE 'expected[^|]*\brun\b'; then
-    # "It does not run" and "it is too old" are reported separately: where the control plane
-    # distributes an agent for one architecture only, installing it on an ARM machine yields an Exec
-    # format error, which has nothing to do with the version.
+    # Distinguish an executable/architecture failure from a command-contract mismatch so the
+    # operator gets the right repair instructions.
     case "$probe_out" in
         *"Exec format error"*|*"cannot execute"*|*"not found"*|"")
             echo "「$AGENT_BIN」跑不起来（本机架构 $(uname -m)）。" >&2
@@ -567,7 +591,7 @@ if ! printf '%s' "$probe_out" | grep -qE 'expected[^|]*\brun\b'; then
             echo "  cargo build --release --target <triple> -p brocade-agent" >&2
             ;;
         *)
-            echo "这个 brocade-agent 太旧，不支持 'run'（$AGENT_BIN）。" >&2
+            echo "这个 brocade-agent 不符合当前命令契约：缺少 'run'（$AGENT_BIN）。" >&2
             echo "unit 会用 'run' 启动，写下去只会起不来——先把二进制换掉：" >&2
             echo "  重跑本脚本并带上 --agent-bin-url <控制面地址>/brocade-agent" >&2
             echo "  或让控制面配好 BROCADE_AGENT_BIN_URL，脚本会自己去 \$SERVER/enroll/dist 取" >&2
@@ -669,7 +693,7 @@ chmod 0600 "$CONFIG_DIR/token" "$CONFIG_DIR/env"
 # 三种机器改不了，而且都是真实存在的：OpenVZ 和部分 LXC 的 sysctl 是只读的（低价 VPS
 # 里一抓一把）；4.9 以下的内核根本没有 BBR（CentOS 7 的 3.10 至今有人在跑）；
 # 极少数精简镜像没把 tcp_bbr 编进去。这三种情况下**继续装**——机器照样能跑 brocade，
-# 只是慢一点，而且慢一点比装不上强；这里保持兼容性的收益高于拒绝安装。
+# 只是慢一点；缺少这项可选优化不应阻止安装。
 tune_congestion() {
     # set -e 在被 `|| true` 包住的函数里不生效（见文件顶部），所以下面每一步自己判返回值。
     kernel=$(uname -r 2>/dev/null || echo 0.0)
@@ -862,7 +886,7 @@ tune_conntrack || true
 
 if [ "$SERVICE_MODE" = "foreground" ]; then
     echo "brocade-agent enrolled node $NODE_ID (apply=$APPLY_MODE, service=foreground)"
-    echo "foreground 模式不会写 systemd unit；当前进程会直接变成 brocade-agent run。" >&2
+    echo "foreground 模式不会写系统服务；当前进程会直接变成 brocade-agent run。" >&2
     # 自更新换完二进制会退出，指望 supervisor 把新的拉起来。这里没有 supervisor，所以
     # 那一步会把 agent 停在原地。preview 容器走的就是这条路，而 preview 的控制面不会
     # 批准任何 agent 发布，够不到那一步。
@@ -875,13 +899,14 @@ if [ "$SERVICE_MODE" = "foreground" ]; then
         "$AGENT_BIN" run
 fi
 
-if have systemctl; then
+LOG_NAMESPACE_LINE=
+AGENT_LOG_FILE=
+if [ "$SERVICE_MODE" = "systemd" ]; then
     # Give Brocade its own journal namespace so the bootstrap 100 MiB ceiling applies to this
     # agent, not to unrelated host services. The first authenticated poll replaces it with the
     # global/per-machine value from Settings. Namespaces landed in systemd 245; on an older host
     # retaining the global journal is safer than shrinking every service's logs to our limit.
     SYSTEMD_VERSION=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')
-    LOG_NAMESPACE_LINE=
     if [ -n "$SYSTEMD_VERSION" ] && [ "$SYSTEMD_VERSION" -ge 245 ] 2>/dev/null; then
         LOG_NAMESPACE_LINE=enabled
         install -d -m 0755 /etc/systemd/system/brocade-agent.service.d
@@ -927,32 +952,73 @@ KillMode=process
 [Install]
 WantedBy=multi-user.target
 EOF
-    # An earlier version split sampling into its own unit, which an upgrade must remove, or two
-    # processes read the counters at once
-    if [ -f /etc/systemd/system/brocade-agent-usage.service ]; then
-        systemctl disable --now brocade-agent-usage.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/brocade-agent-usage.service
-        echo "已移除旧的 brocade-agent-usage.service（采集已并进主进程）" >&2
-    fi
     systemctl daemon-reload
     if [ -n "$LOG_NAMESPACE_LINE" ]; then
         systemctl try-restart systemd-journald@brocade-agent.service >/dev/null 2>&1 || true
     fi
     systemctl enable brocade-agent.service
-    # A resident process does not pick up a replaced binary on its own and must restart; re-running
-    # the install script is the upgrade path.
+    # A resident process does not pick up a replaced binary on its own and must restart.
     systemctl restart brocade-agent.service
 else
-    # systemd only. OpenRC (Alpine), sysvinit, and procd (OpenWrt) are unsupported. This fails
-    # explicitly rather than printing a notice and carrying on: carrying on times out the self-check
-    # without fail, and what one sees is a failed self-check, worlds away from the real cause.
-    echo "找不到 systemctl。目前只支持 systemd 的机器。" >&2
-    echo "二进制和配置已经就位（$AGENT_BIN、$CONFIG_DIR/env），" >&2
-    echo "请自行用本机的 init 常驻这条命令：$AGENT_BIN run" >&2
-    exit 1
+    # OpenRC's supervise-daemon supplies the same property self-update relies on as systemd's
+    # Restart=always: after the resident process atomically replaces itself and exits 0, start the
+    # new inode five seconds later. Do not set stopgroup: Xray and Phantun are deliberately nohup'd
+    # data-plane children and must survive an Agent restart, matching KillMode=process above.
+    OPENRC_RUNNER="$CONFIG_DIR/run-openrc"
+    AGENT_LOG_FILE="$STATE_DIR/logs/agent.log"
+    AGENT_LOG_POLICY="$STATE_DIR/log-agent-journal-max-mib"
+
+    # EnvironmentFile is a systemd feature. The runner imports only the four names this installer
+    # writes, using `export "$line"` rather than sourcing the file as shell code. Besides accepting
+    # spaces and punctuation in values, this prevents a crafted --server value from becoming root
+    # shell syntax when OpenRC starts the service.
+    cat > "$OPENRC_RUNNER" <<EOF
+#!/bin/sh
+exec 2>&1
+env_file="$CONFIG_DIR/env"
+while IFS= read -r line || [ -n "\$line" ]; do
+    case "\$line" in
+        BROCADE_AGENT_SERVER=*|BROCADE_NODE_TOKEN_FILE=*|BROCADE_AGENT_STATE_DIR=*|BROCADE_AGENT_APPLY=*)
+            export "\$line"
+            ;;
+    esac
+done < "\$env_file"
+exec "$AGENT_BIN" run
+EOF
+    chmod 0700 "$OPENRC_RUNNER"
+
+    # One bounded sink receives the runner's merged stdout/stderr. It watches the same policy file
+    # populated from Settings as journald does on systemd, so Alpine does not gain an unbounded log
+    # merely because it has no journal namespace.
+    cat > /etc/init.d/brocade-agent <<EOF
+#!/sbin/openrc-run
+
+name="Brocade agent"
+description="Brocade node reconciliation agent"
+supervisor="supervise-daemon"
+command="$OPENRC_RUNNER"
+required_files="$AGENT_BIN $CONFIG_DIR/env $CONFIG_DIR/token $OPENRC_RUNNER"
+respawn_delay=5
+respawn_max=0
+retry="TERM/10/KILL/5"
+umask=077
+output_logger="$AGENT_BIN log-sink $AGENT_LOG_FILE $AGENT_LOG_POLICY"
+
+depend() {
+    need net
+    use dns logger
+    after firewall
+}
+EOF
+    chmod 0755 /etc/init.d/brocade-agent
+    rc-update add brocade-agent default
+    # A resident process does not pick up a replaced binary on its own. `restart` also starts a
+    # stopped OpenRC service.
+    rc-service brocade-agent restart
+    echo "OpenRC 日志：$AGENT_LOG_FILE" >&2
 fi
 
-echo "brocade-agent enrolled node $NODE_ID (apply=$APPLY_MODE)"
+echo "brocade-agent enrolled node $NODE_ID (apply=$APPLY_MODE, service=$SERVICE_MODE)"
 
 if [ "$APPLY_MODE" = "state-dir" ]; then
     echo
@@ -985,7 +1051,9 @@ done
     # installed the machine has only this terminal, and there is no reason to send them to
     # another.
     echo "自检没通过。最近的 agent 日志：" >&2
-    if have journalctl; then
+    if [ "$SERVICE_MODE" = "openrc" ]; then
+        tail -n 50 "$AGENT_LOG_FILE" >&2 || true
+    elif have journalctl; then
         if [ -n "$LOG_NAMESPACE_LINE" ]; then
             journalctl --namespace=brocade-agent -u brocade-agent -n 50 --no-pager >&2 || true
         else
