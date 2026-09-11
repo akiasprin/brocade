@@ -40,25 +40,31 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 
 ## 一键启动与临时 Tunnel
 
-发行包把 `brocade` 与 `brocade-console` 放在同一目录。无需 Docker，也无需预装 PostgreSQL：
+发行包把 `brocade`、`brocade-console` 与纯 POSIX `sh` 安装器放在同一目录。系统级安装执行：
 
 ```sh
-./brocade up
+sudo sh install.sh
 ```
 
-未设置 `DATABASE_URL` 时，launcher 会按当前 CPU 与 libc（x86_64/aarch64、GNU/musl）下载并校验固定的 PostgreSQL 17.11.0 运行时，在用户数据目录维护数据库；设置了 `DATABASE_URL` 则只连接外部数据库，绝不会因连接失败回退并新建空库。需要把选择写得更明确时，可使用 `--managed-db` 或 `--external-db`。PostgreSQL 不会由本项目编译或塞进 launcher；所选预编译归档自带匹配的共享库，并通过相对 RUNPATH 从自己的 `lib/` 加载。
+安装器先校验发行包与 CPU/libc 是否匹配，再通过 apt、apk、dnf、yum 或 zypper 补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建无登录权限的 `brocade` 服务账号，并原子安装两个二进制。musl 发行物由 CI 强制检查为无动态库依赖。纯 `sh` 只负责安装与宿主环境适配；启动期的锁、进程回收、数据库状态和 Tunnel 就绪判断仍由 Rust launcher 处理。它不会安装或编译 PostgreSQL，也不会预装 cloudflared。安装后无需 Docker：
+
+```sh
+sudo brocade up
+```
+
+未设置 `DATABASE_URL` 时，launcher 会按当前 CPU 与 libc（x86_64/aarch64、GNU/musl）下载并校验固定的 PostgreSQL 17.11.0 运行时，在用户数据目录维护数据库；设置了 `DATABASE_URL` 则只连接外部数据库，绝不会因连接失败回退并新建空库。需要把选择写得更明确时，可使用 `--managed-db` 或 `--external-db`。PostgreSQL 不会由本项目编译或塞进 launcher；所选预编译归档自带匹配的共享库，并通过相对 RUNPATH 从自己的 `lib/` 加载。这些 PG 私有库不能安全替换成发行版包：OpenSSL、ICU 与 libxml2 在不同 Debian、Ubuntu、Alpine 版本上的 SONAME 并不稳定，而数据目录必须继续由同一套 PG 版本读取。
 
 无需域名的临时公网入口是同一条启动命令的一个选项：
 
 ```sh
-./brocade up --tunnel
+sudo brocade up --tunnel
 ```
 
 首次启动先访问终端打印的本地地址创建管理员；完成初始化前 launcher 不会开放公网入口。随后它查询 Cloudflare 官方 latest stable release，校验官方 SHA-256 后把 `cloudflared` 缓存到用户缓存目录，再打印随机的 `https://*.trycloudflare.com` 地址。查询失败时只会回退到最近一个已验证缓存；不会执行 cloudflared 自更新，也不会把它打进 Brocade 发行包。需要可复现环境时使用 `--cloudflared-version VERSION`，已有受管安装时使用 `--cloudflared-bin PATH`。
 
 Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地址每次可能变化，并受 Cloudflare 的并发限制；正式部署仍应使用自己的域名、TLS 与受管 Tunnel/反向代理。Quick Tunnel 不支持 SSE，控制台会在实时流失败后自动切换到同权限、无缓存的短轮询接口。
 
-默认数据位于 `$XDG_DATA_HOME/brocade`（或 `~/.local/share/brocade`），下载缓存位于 `$XDG_CACHE_HOME/brocade`（或 `~/.cache/brocade`）。受管 PostgreSQL 不允许以 root 启动。完整参数见 `./brocade up --help`。
+系统安装器把数据和下载缓存分别放在 `/var/lib/brocade` 与 `/var/cache/brocade`；`sudo brocade` 会先降权到专用账号，PostgreSQL 和 Console 都不会以 root 运行。直接从解压目录执行时，默认仍为 `$XDG_DATA_HOME/brocade`（或 `~/.local/share/brocade`）与 `$XDG_CACHE_HOME/brocade`（或 `~/.cache/brocade`）。完整参数见 `brocade up --help`。
 
 ## 代码结构
 

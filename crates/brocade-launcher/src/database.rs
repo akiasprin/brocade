@@ -99,6 +99,7 @@ impl ManagedPostgres {
             if unsafe { libc::geteuid() } == 0 {
                 bail!("initdb 拒绝 root；请用专用普通用户运行 brocade up");
             }
+            ensure_current_user_record()?;
         }
 
         ensure_private_dir(data_root)?;
@@ -117,11 +118,11 @@ impl ManagedPostgres {
         let state_file = data_root.join("cluster-state");
         let previous_state = read_optional_private_text(&state_file)?;
         validate_state(previous_state.as_deref())?;
-        if (previous_state.is_some() || password_file.exists())
-            && !data.join("PG_VERSION").is_file()
-        {
-            bail!("已有 PostgreSQL 状态但 PGDATA 缺失或不完整；请恢复备份，不会创建空库替代");
-        }
+        validate_cluster_files(
+            previous_state.as_deref(),
+            password_file.exists(),
+            data.join("PG_VERSION").is_file(),
+        )?;
         validate_data_directory(&data)?;
         // Fetch the reproducible engine before writing any cluster state. A first-run network
         // failure must leave a virgin data directory retryable rather than looking like a
@@ -376,6 +377,67 @@ fn validate_state(state: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn validate_cluster_files(
+    state: Option<&str>,
+    password_exists: bool,
+    pg_version_exists: bool,
+) -> Result<()> {
+    if pg_version_exists || state == Some("initializing\n") {
+        // An interrupted first init is retryable only while PGDATA is absent or empty; the
+        // directory validator below rejects any ambiguous partial cluster before setup runs.
+        return Ok(());
+    }
+    if state.is_some_and(|value| value.starts_with("ready ")) {
+        bail!("已有 PostgreSQL 状态但 PGDATA 缺失或不完整；请恢复备份，不会创建空库替代");
+    }
+    if password_exists {
+        bail!("发现没有 cluster-state 的 PostgreSQL 密码；请恢复备份，不会创建空库替代");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_current_user_record() -> Result<()> {
+    use std::{io, mem::MaybeUninit, ptr};
+
+    let uid = unsafe { libc::geteuid() };
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut buffer_size = if suggested > 0 {
+        suggested as usize
+    } else {
+        16 * 1024
+    }
+    .clamp(1024, 1024 * 1024);
+    loop {
+        let mut record = MaybeUninit::<libc::passwd>::uninit();
+        let mut result = ptr::null_mut();
+        let mut buffer = vec![0_u8; buffer_size];
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE && buffer_size < 1024 * 1024 {
+            buffer_size = (buffer_size * 2).min(1024 * 1024);
+            continue;
+        }
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code))
+                .context("无法查询当前 UID 的系统用户记录");
+        }
+        if result.is_null() {
+            bail!(
+                "当前 UID {uid} 没有可解析的系统用户；请先运行 install.sh 或创建 /etc/passwd 账号"
+            );
+        }
+        return Ok(());
+    }
+}
+
 fn validate_data_directory(data: &Path) -> Result<()> {
     if !data.exists() {
         return Ok(());
@@ -493,5 +555,12 @@ mod tests {
         assert!(validate_state(Some("ready 123\n")).is_ok());
         assert!(validate_state(Some("ready nope\n")).is_err());
         assert!(validate_state(Some("unknown\n")).is_err());
+
+        assert!(validate_cluster_files(None, false, false).is_ok());
+        assert!(validate_cluster_files(Some("initializing\n"), true, false).is_ok());
+        assert!(validate_cluster_files(Some("ready 123\n"), true, false).is_err());
+        assert!(validate_cluster_files(None, true, false).is_err());
+        assert!(validate_cluster_files(Some("ready 123\n"), true, true).is_ok());
+        assert!(ensure_current_user_record().is_ok());
     }
 }

@@ -89,6 +89,9 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Check the POSIX installer
+        run: sh -n install.sh
+
       - name: Reject whitespace errors in this revision
         run: git diff --check HEAD^ HEAD
 
@@ -251,6 +254,16 @@ jobs:
             file -b "$bin"
             if [ "${{ matrix.libc }}" = gnu ]; then
               echo "highest glibc symbol required: $(readelf -V "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+              needed=$(readelf -d "$bin" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
+              unexpected=$(printf '%s\n' "$needed" | grep -Ev \
+                '^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|liblzma\.so\.5|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$' || true)
+              if [ -n "$unexpected" ]; then
+                printf 'GNU bundle contains a dependency install.sh does not own:\n%s\n' "$unexpected" >&2
+                exit 1
+              fi
+            elif readelf -d "$bin" 2>/dev/null | grep -q NEEDED; then
+              echo "musl bundle contains an unexpected dynamic library dependency: $bin" >&2
+              exit 1
             fi
           done
 
@@ -261,7 +274,9 @@ jobs:
           mkdir -p "$bundle"
           cp target/${{ matrix.triple }}/release/brocade "$bundle/"
           cp target/${{ matrix.triple }}/release/brocade-console "$bundle/"
-          (cd "$bundle" && sha256sum brocade brocade-console > SHA256SUMS)
+          cp install.sh "$bundle/"
+          printf '%s-%s\n' '${{ matrix.arch }}' '${{ matrix.libc }}' > "$bundle/BROCADE_PLATFORM"
+          (cd "$bundle" && sha256sum brocade brocade-console install.sh BROCADE_PLATFORM > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:
