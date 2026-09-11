@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    routing::{Accept, AppIr, AppNode, HopIn},
+    routing::{Accept, AppIr, AppNode, HopIn, Step},
     system::SystemIr,
 };
 
@@ -410,7 +410,20 @@ fn parse_listener_host(at: &str, raw: &str, diagnostics: &mut Vec<Diagnostic>) -
     Some(host.to_owned())
 }
 
-pub fn compile_hops(mut app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Diagnostic>) -> AppIr {
+pub fn compile_hops(app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Diagnostic>) -> AppIr {
+    let target_steps = app_ir.steps.clone();
+    compile_hops_with_targets(app_ir, &target_steps, sys, diagnostics)
+}
+
+/// Compile one project's outgoing hops while resolving listener ownership against the complete
+/// snapshot. Ordinary `Forward` targets remain project-local by construction; an explicit
+/// `ReuseListener` may point at a listener owned by another project.
+pub(crate) fn compile_hops_with_targets(
+    mut app_ir: AppIr,
+    target_steps: &[Step],
+    sys: &SystemIr,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> AppIr {
     let mut hops = BTreeMap::<(String, String, String, String), Hop>::new();
 
     for step in &app_ir.steps {
@@ -431,8 +444,7 @@ pub fn compile_hops(mut app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Dia
             } else {
                 format!("{}/{}->{}", step.chain, step.node, to)
             };
-            let target_step = app_ir
-                .steps
+            let target_step = target_steps
                 .iter()
                 .find(|candidate| candidate.chain == target_chain && candidate.node == to);
             let Some(target_step) = target_step else {

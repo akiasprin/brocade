@@ -55,6 +55,17 @@ pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<D
         "ModelSnapshot.apps",
         diagnostics,
     );
+    // ListenerRef resolves a chain without carrying its owning project. The database enforces this
+    // globally; keep the compiler boundary equally strict for imported and in-memory snapshots.
+    unique_by(
+        snapshot
+            .apps
+            .iter()
+            .flat_map(|app| app.chains.iter().map(|chain| chain.id.as_str())),
+        "id.dup",
+        "ModelSnapshot.chains",
+        diagnostics,
+    );
     for app in &snapshot.apps {
         validate_slug(&app.id, format!("app {}", app.id), diagnostics);
     }
@@ -1121,6 +1132,105 @@ pub fn validate_app_set(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
     validate_app_set_ports(apps, diagnostics);
     validate_app_set_labels(apps, diagnostics);
     validate_app_set_dns(apps, diagnostics);
+    validate_cross_app_listener_references(apps, diagnostics);
+}
+
+/// Cross-project listener references share the same globally unique chain identity as stored
+/// steps. Per-project validation cannot see the owner project, so tenant scope and cycles that
+/// cross that boundary are checked once the complete IR set is available.
+fn validate_cross_app_listener_references(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
+    let chain_owner = apps
+        .iter()
+        .enumerate()
+        .flat_map(|(app_index, app)| {
+            app.chains
+                .iter()
+                .map(move |chain| (chain.id.as_str(), (app_index, chain)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let steps = apps
+        .iter()
+        .flat_map(|app| app.steps.iter())
+        .map(|step| ((step.chain.as_str(), step.node.as_str()), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut reported_cycles = BTreeSet::new();
+
+    for (source_app_index, app) in apps.iter().enumerate() {
+        for step in &app.steps {
+            let Some((_, source_chain)) = chain_owner.get(step.chain.as_str()) else {
+                continue;
+            };
+            for rule in &step.rules {
+                let Action::ReuseListener { listener, .. } = &rule.action else {
+                    continue;
+                };
+                let Some((target_app_index, target_chain)) =
+                    chain_owner.get(listener.chain.as_str())
+                else {
+                    continue;
+                };
+                if *target_app_index == source_app_index {
+                    continue;
+                }
+
+                let location = format!(
+                    "{}/{}->listener:{}/{}",
+                    step.chain, step.node, listener.chain, listener.node
+                );
+                if !under(&source_chain.tenant, &target_chain.tenant) {
+                    diagnostics.push(Diagnostic::error(
+                        "tenant.scope",
+                        &location,
+                        format!(
+                            "链属于 {}，而引用的监听归属于 {}，不在可见范围内",
+                            source_chain.tenant, target_chain.tenant
+                        ),
+                    ));
+                }
+
+                if global_listener_reaches(
+                    &steps,
+                    (listener.chain.as_str(), listener.node.as_str()),
+                    (step.chain.as_str(), step.node.as_str()),
+                    &mut BTreeSet::new(),
+                ) && reported_cycles.insert(location.clone())
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "listener.cycle",
+                        location,
+                        "该监听子树能回到当前规则表，引用会形成跨项目环路",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn global_listener_reaches<'a>(
+    steps: &BTreeMap<(&'a str, &'a str), &'a super::routing::Step>,
+    at: (&'a str, &'a str),
+    wanted: (&str, &str),
+    seen: &mut BTreeSet<(String, String)>,
+) -> bool {
+    if at == wanted {
+        return true;
+    }
+    if !seen.insert((at.0.to_owned(), at.1.to_owned())) {
+        return false;
+    }
+    let Some(step) = steps.get(&at) else {
+        return false;
+    };
+    step.rules.iter().any(|rule| {
+        rule.action.forward_ref(&step.chain).is_some_and(|forward| {
+            global_listener_reaches(
+                steps,
+                (forward.target_chain, forward.target_node),
+                wanted,
+                seen,
+            )
+        })
+    })
 }
 
 /// A reverse hop's relay port cannot speak Shadowsocks 2022.
@@ -2839,7 +2949,7 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
 }
 
 fn validate_topology(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
-    let listener_roots = app
+    let mut listener_roots = app
         .steps
         .iter()
         .flat_map(|step| step.rules.iter())
@@ -2850,6 +2960,11 @@ fn validate_topology(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    listener_roots.extend(
+        app.listener_roots
+            .iter()
+            .map(|(chain, node)| (chain.as_str(), node.as_str())),
+    );
 
     for chain in &app.chains {
         // The head is the machine hosting the ingress. A chain with no ingress was

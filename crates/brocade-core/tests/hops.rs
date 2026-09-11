@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use brocade_core::{
+    compile::compile,
     ir::{
         hops::{compile_hops, HopDialWire, HopPath},
         routing::compile_app,
@@ -159,6 +160,221 @@ fn compile_hops_enters_a_listener_owned_by_another_chain() {
         .unwrap();
     assert_eq!(source.forward_outbounds.len(), 1);
     assert_eq!(source.forward_outbounds[0].tag, "out:app/lan~wan>sg");
+}
+
+#[test]
+fn compile_enters_and_keeps_a_listener_owned_by_another_app() {
+    let mut doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("jp", [10, 66, 0, 2], true),
+        node("sg", [10, 66, 0, 3], true),
+    ]);
+    let chain = |id: &str| Chain {
+        id: id.to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: id.to_owned(),
+        subscription_country: None,
+    };
+    let mut source_ingress = ingress("source-in", "hk");
+    source_ingress.chain = "source".to_owned();
+    let mut owner_ingress = ingress("owner-in", "jp");
+    owner_ingress.chain = "owner".to_owned();
+    doc.apps = vec![
+        AppView {
+            id: "source-app".to_owned(),
+            label: "来源项目".to_owned(),
+            chains: vec![chain("source")],
+            ingresses: vec![source_ingress],
+            fronts: Vec::new(),
+            steps: vec![step(
+                "source",
+                "hk",
+                vec![reuse_listener("owner", "sg")],
+                None,
+            )],
+            grants: Vec::new(),
+        },
+        AppView {
+            id: "owner-app".to_owned(),
+            label: "监听项目".to_owned(),
+            chains: vec![chain("owner")],
+            ingresses: vec![owner_ingress],
+            fronts: Vec::new(),
+            // sg is deliberately not reachable from the owner's user ingress. The cross-app
+            // reference is the second root that must keep this listener subtree alive.
+            steps: vec![
+                step("owner", "jp", vec![any_egress()], None),
+                step_hop(
+                    "owner",
+                    "sg",
+                    vec![any_egress()],
+                    Some(accept("uuid-shared", "owner@sg")),
+                    22001,
+                    HopWire::None,
+                ),
+            ],
+            grants: Vec::new(),
+        },
+    ];
+
+    let compiled = compile(&doc);
+    assert!(compiled.can_publish(), "{:#?}", compiled.diagnostics);
+    let apps = compiled.unpublishable_view().apps;
+    let source = apps
+        .iter()
+        .find(|app| app.app_id.as_deref() == Some("source-app"))
+        .unwrap();
+    let owner = apps
+        .iter()
+        .find(|app| app.app_id.as_deref() == Some("owner-app"))
+        .unwrap();
+    let hop = source
+        .hops
+        .iter()
+        .find(|hop| hop.chain == "source")
+        .unwrap();
+    assert_eq!(
+        (hop.target_chain.as_str(), hop.to.as_str()),
+        ("owner", "sg")
+    );
+    assert_eq!(hop.port, 22001);
+    assert!(owner
+        .steps
+        .iter()
+        .any(|step| step.chain == "owner" && step.node == "sg"));
+
+    let caller = compiled.project_node("hk").unwrap().xray.unwrap();
+    assert_eq!(
+        caller.forward_outbounds[0].tag,
+        "out:source-app/source~owner>sg"
+    );
+    let listener = compiled.project_node("sg").unwrap().xray.unwrap();
+    assert!(listener
+        .hop_inbounds
+        .iter()
+        .any(|inbound| inbound.tag == "in:hop:owner-app/owner" && inbound.port == 22001));
+
+    let probe = compiled.project_probe("hk").unwrap();
+    assert_eq!(probe.targets[0].exit_nodes, vec!["sg"]);
+}
+
+#[test]
+fn cross_app_listener_reference_cycle_blocks_publication() {
+    let mut doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("sg", [10, 66, 0, 2], true),
+    ]);
+    let chain = |id: &str| Chain {
+        id: id.to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: id.to_owned(),
+        subscription_country: None,
+    };
+    let mut source_ingress = ingress("source-in", "hk");
+    source_ingress.chain = "source".to_owned();
+    let mut owner_ingress = ingress("owner-in", "sg");
+    owner_ingress.chain = "owner".to_owned();
+    doc.apps = vec![
+        AppView {
+            id: "source-app".to_owned(),
+            label: "来源项目".to_owned(),
+            chains: vec![chain("source")],
+            ingresses: vec![source_ingress],
+            fronts: Vec::new(),
+            steps: vec![step_hop(
+                "source",
+                "hk",
+                vec![reuse_listener("owner", "sg")],
+                Some(accept("uuid-source", "source@hk")),
+                22000,
+                HopWire::None,
+            )],
+            grants: Vec::new(),
+        },
+        AppView {
+            id: "owner-app".to_owned(),
+            label: "监听项目".to_owned(),
+            chains: vec![chain("owner")],
+            ingresses: vec![owner_ingress],
+            fronts: Vec::new(),
+            steps: vec![step_hop(
+                "owner",
+                "sg",
+                vec![reuse_listener("source", "hk")],
+                Some(accept("uuid-owner", "owner@sg")),
+                22001,
+                HopWire::None,
+            )],
+            grants: Vec::new(),
+        },
+    ];
+
+    let compiled = compile(&doc);
+
+    assert!(!compiled.can_publish());
+    assert!(compiled.diagnostics.iter().any(|diagnostic| {
+        diagnostic.level == Level::Error
+            && diagnostic.code == "listener.cycle"
+            && diagnostic.location == "source/hk->listener:owner/sg"
+    }));
+}
+
+#[test]
+fn cross_app_listener_reference_obeys_tenant_scope() {
+    let mut sg = node("sg", [10, 66, 0, 2], true);
+    sg.tenant = "platform.other".to_owned();
+    let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true), sg]);
+    let chain = |id: &str, tenant: &str| Chain {
+        id: id.to_owned(),
+        tenant: tenant.to_owned(),
+        name: id.to_owned(),
+        subscription_country: None,
+    };
+    let mut source_ingress = ingress("source-in", "hk");
+    source_ingress.chain = "source".to_owned();
+    let mut owner_ingress = ingress("owner-in", "sg");
+    owner_ingress.chain = "owner".to_owned();
+    doc.apps = vec![
+        AppView {
+            id: "source-app".to_owned(),
+            label: "来源项目".to_owned(),
+            chains: vec![chain("source", "platform.acme")],
+            ingresses: vec![source_ingress],
+            fronts: Vec::new(),
+            steps: vec![step(
+                "source",
+                "hk",
+                vec![reuse_listener("owner", "sg")],
+                None,
+            )],
+            grants: Vec::new(),
+        },
+        AppView {
+            id: "owner-app".to_owned(),
+            label: "监听项目".to_owned(),
+            chains: vec![chain("owner", "platform.other")],
+            ingresses: vec![owner_ingress],
+            fronts: Vec::new(),
+            steps: vec![step_hop(
+                "owner",
+                "sg",
+                vec![any_egress()],
+                Some(accept("uuid-owner", "owner@sg")),
+                22001,
+                HopWire::None,
+            )],
+            grants: Vec::new(),
+        },
+    ];
+
+    let compiled = compile(&doc);
+
+    assert!(!compiled.can_publish());
+    assert!(compiled.diagnostics.iter().any(|diagnostic| {
+        diagnostic.level == Level::Error
+            && diagnostic.code == "tenant.scope"
+            && diagnostic.location == "source/hk->listener:owner/sg"
+    }));
 }
 
 #[test]

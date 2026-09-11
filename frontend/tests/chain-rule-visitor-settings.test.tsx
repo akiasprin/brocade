@@ -146,6 +146,13 @@ describe('访客查看链路规则', () => {
     expect(
       [...view.container.querySelectorAll('.chain-rule-node-head .m-hop > .mono')].map(node => node.textContent),
     ).toEqual(['—', '20000 / VLESS-NONE']);
+    const ownedListenerPanel = [...view.container.querySelectorAll<HTMLElement>('.hop-target-panel')].find(panel =>
+      panel.querySelector('.panel-title')?.textContent?.includes('本链监听'),
+    );
+    expect(ownedListenerPanel).toBeTruthy();
+    expect(ownedListenerPanel?.querySelector('.listener-reference-copy small')).toBeNull();
+    expect(ownedListenerPanel?.textContent).not.toContain('按规则地址直连');
+    expect(ownedListenerPanel?.textContent).not.toContain('仅经 Overlay 接入');
   });
 
   it('反向跳只在上游监听方显示一次端口', async () => {
@@ -190,5 +197,11 @@ describe('访客查看链路规则', () => {
     expect(
       [...view.container.querySelectorAll('.chain-rule-node-head .m-hop > .mono')].map(node => node.textContent),
     ).toEqual(['20002 / VLESS-ENCRY', '—']);
+    const reversePanel = [...view.container.querySelectorAll<HTMLElement>('.hop-target-panel')].find(panel =>
+      panel.querySelector('.panel-title')?.textContent?.includes('反向接入口'),
+    );
+    expect(reversePanel).toBeTruthy();
+    expect(reversePanel?.querySelector('.listener-reference-row.hop-target-row')).not.toBeNull();
+    expect(reversePanel?.querySelector('.listener-reference-copy small')).toBeNull();
   });
 });

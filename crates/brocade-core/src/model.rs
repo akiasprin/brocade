@@ -3079,10 +3079,11 @@ pub enum Action {
 
 /// Stable identity of one existing relay listener.
 ///
-/// Relay listeners currently live on `Step`, whose durable key is `(chain, node)`.  Referring to
-/// that key rather than to its port is important: changing a port or wire updates every caller,
-/// whereas a copied `host:port` would silently keep dialing the old socket.  It also distinguishes
-/// two listeners on the same machine that belong to different chains.
+/// Relay listeners currently live on `Step`, whose durable key is `(chain, node)`. Chain ids are
+/// globally unique, so the same identity also remains unambiguous when the owner belongs to another
+/// project. Referring to that key rather than to its port is important: changing a port or wire
+/// updates every caller, whereas a copied `host:port` would silently keep dialing the old socket.
+/// It also distinguishes two listeners on the same machine that belong to different chains.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerRef {

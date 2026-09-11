@@ -54,6 +54,12 @@ pub struct AppIr {
     pub ingresses: Vec<Ingress>,
     pub fronts: Vec<Front>,
     pub steps: Vec<Step>,
+    /// Additional roots kept alive because a reachable rule table references their listener.
+    ///
+    /// This is compiler bookkeeping, not wire output. In particular, a reference may originate
+    /// in another project, so inspecting only this AppIr's rules cannot reconstruct the set.
+    #[serde(skip)]
+    pub listener_roots: BTreeSet<(String, String)>,
     pub grants: Vec<Grant>,
     pub hops: Vec<super::hops::Hop>,
 }
@@ -208,6 +214,15 @@ pub fn compile_app(
     app: &model::AppView,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> AppIr {
+    compile_app_with_listener_roots(doc, app, None, diagnostics)
+}
+
+pub(crate) fn compile_app_with_listener_roots(
+    doc: &model::ModelSnapshot,
+    app: &model::AppView,
+    listener_roots: Option<&BTreeSet<(String, String)>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> AppIr {
     let chain_by_id = app
         .chains
         .iter()
@@ -270,6 +285,7 @@ pub fn compile_app(
         ingresses: Vec::new(),
         fronts: Vec::new(),
         steps: Vec::new(),
+        listener_roots: BTreeSet::new(),
         grants: Vec::new(),
         hops: Vec::new(),
     };
@@ -380,11 +396,23 @@ pub fn compile_app(
         })
         .collect::<BTreeSet<_>>();
     let front_downstream = front_downstream_hosts(&ir, &node_by_id);
-    let reused_listeners = reachable_reused_listeners(app, &chain_roots, &disabled_chains);
+    let local_listener_roots;
+    let reused_listeners = match listener_roots {
+        Some(listener_roots) => listener_roots,
+        None => {
+            local_listener_roots = reachable_reused_listeners(app, &chain_roots, &disabled_chains);
+            &local_listener_roots
+        }
+    };
+    ir.listener_roots = reused_listeners
+        .iter()
+        .filter(|(chain, _)| app.chains.iter().any(|candidate| candidate.id == *chain))
+        .cloned()
+        .collect();
     let compile_context = ChainCompileContext {
         front_via_chains: &front_via_chains,
         front_downstream: &front_downstream,
-        reused_listeners: &reused_listeners,
+        reused_listeners,
     };
 
     for chain in &app.chains {
@@ -464,25 +492,13 @@ fn chain_roots<'a>(
     app: &'a model::AppView,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> HashMap<&'a str, &'a model::Ingress> {
-    let mut roots = HashMap::<&str, &model::Ingress>::new();
+    let roots = selected_chain_roots(app);
     let mut ingresses_by_chain = BTreeMap::<&str, Vec<(&str, &str)>>::new();
     for ingress in &app.ingresses {
         ingresses_by_chain
             .entry(ingress.chain.as_str())
             .or_default()
             .push((ingress.node.as_str(), ingress.id.as_str()));
-        match roots.get_mut(ingress.chain.as_str()) {
-            Some(root)
-                if (ingress.id.as_str(), ingress.node.as_str())
-                    < (root.id.as_str(), root.node.as_str()) =>
-            {
-                *root = ingress;
-            }
-            Some(_) => {}
-            None => {
-                roots.insert(ingress.chain.as_str(), ingress);
-            }
-        }
     }
 
     let known_chains = app
@@ -512,6 +528,29 @@ fn chain_roots<'a>(
                     .join("、")
             ),
         ));
+    }
+    roots
+}
+
+/// Pick the same deterministic chain head used by [`chain_roots`] without emitting diagnostics.
+/// The snapshot-wide listener walk needs all heads before any one project is compiled; keeping the
+/// selection in one helper prevents a malformed multi-ingress chain from getting two different
+/// roots in those phases.
+fn selected_chain_roots(app: &model::AppView) -> HashMap<&str, &model::Ingress> {
+    let mut roots = HashMap::<&str, &model::Ingress>::new();
+    for ingress in &app.ingresses {
+        match roots.get_mut(ingress.chain.as_str()) {
+            Some(root)
+                if (ingress.id.as_str(), ingress.node.as_str())
+                    < (root.id.as_str(), root.node.as_str()) =>
+            {
+                *root = ingress;
+            }
+            Some(_) => {}
+            None => {
+                roots.insert(ingress.chain.as_str(), ingress);
+            }
+        }
     }
     roots
 }
@@ -611,6 +650,78 @@ fn reachable_reused_listeners(
                         reused.insert((listener.chain.clone(), listener.node.clone()));
                         if known_chains.contains(listener.chain.as_str())
                             && !disabled_chains.contains(listener.chain.as_str())
+                        {
+                            queue.push_back((listener.chain.clone(), listener.node.clone()));
+                        }
+                    }
+                    Action::Egress { .. } | Action::Proxy { .. } | Action::Block => {}
+                }
+            }
+        }
+    }
+    reused
+}
+
+/// Listener roots reached from every live ingress in the snapshot.
+///
+/// Chain ids are durable, globally unique store keys, so a `ListenerRef { chain, node }` remains
+/// unambiguous when its owner is in another project. The walk must nevertheless happen before
+/// compiling projects one by one: otherwise the target project's compiler cannot see an incoming
+/// reference from the source project and drops an otherwise orphaned listener subtree.
+pub(crate) fn reachable_listener_roots_across_apps(
+    doc: &model::ModelSnapshot,
+) -> BTreeSet<(String, String)> {
+    let retired = doc
+        .nodes
+        .iter()
+        .filter(|node| node.retired)
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut owners = BTreeMap::<&str, &model::AppView>::new();
+    let mut roots = BTreeMap::<&str, &model::Ingress>::new();
+    let mut disabled = BTreeSet::<&str>::new();
+
+    for app in &doc.apps {
+        let app_roots = selected_chain_roots(app);
+        let app_disabled = disabled_chains(app, &retired, &app_roots);
+        for chain in &app.chains {
+            // PostgreSQL makes chain ids globally unique. Keep the first occurrence deterministic
+            // for malformed in-memory snapshots; validation still reports the duplicate ids.
+            owners.entry(chain.id.as_str()).or_insert(app);
+            if app_disabled.contains(chain.id.as_str()) {
+                disabled.insert(chain.id.as_str());
+            }
+            if let Some(root) = app_roots.get(chain.id.as_str()) {
+                roots.entry(chain.id.as_str()).or_insert(*root);
+            }
+        }
+    }
+
+    let mut initial = roots
+        .iter()
+        .filter(|(chain, _)| !disabled.contains(**chain))
+        .map(|(chain, ingress)| ((*chain).to_owned(), ingress.node.clone()))
+        .collect::<Vec<_>>();
+    initial.sort();
+
+    let mut queue = VecDeque::from(initial);
+    let mut seen = BTreeSet::new();
+    let mut reused = BTreeSet::new();
+    while let Some((chain, node)) = queue.pop_front() {
+        if !seen.insert((chain.clone(), node.clone())) {
+            continue;
+        }
+        let Some(app) = owners.get(chain.as_str()).copied() else {
+            continue;
+        };
+        for step in steps_at(app, &chain, &node) {
+            for rule in &step.rules {
+                match &rule.action {
+                    Action::Forward { to, .. } => queue.push_back((chain.clone(), to.clone())),
+                    Action::ReuseListener { listener, .. } => {
+                        reused.insert((listener.chain.clone(), listener.node.clone()));
+                        if owners.contains_key(listener.chain.as_str())
+                            && !disabled.contains(listener.chain.as_str())
                         {
                             queue.push_back((listener.chain.clone(), listener.node.clone()));
                         }

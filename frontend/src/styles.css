@@ -4565,71 +4565,9 @@ input.f {
    子树边，不是普通字段；保留方向并允许横向滚动，手机上仍能看出「谁引用谁」。 */
 .listener-map {
   --listener-ref: var(--hue-3);
-  margin: 8px -12px 0;
-  border-top: 1px solid var(--line-soft);
+  margin: 0 -12px;
   border-bottom: 1px solid var(--line-soft);
   background: color-mix(in srgb, var(--sunk) 45%, transparent);
-}
-.listener-map-head,
-.listener-rule-editor-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  min-width: 0;
-  padding: 10px 12px;
-  background: color-mix(in srgb, var(--block) 74%, transparent);
-}
-.listener-map-head > span:first-child,
-.listener-rule-editor-head > span {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-}
-.listener-map-head b,
-.listener-rule-editor-head b {
-  flex: none;
-  color: var(--ink-2);
-  font-size: 12.5px;
-}
-.listener-map-head small,
-.listener-rule-editor-head small {
-  min-width: 0;
-  color: var(--ink-4);
-  font-size: 10.5px;
-  line-height: 1.4;
-}
-.listener-map-legend {
-  display: flex;
-  flex: none;
-  align-items: center;
-  gap: 12px;
-  color: var(--ink-4);
-  font-size: 10px;
-}
-.listener-map-legend i {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-style: normal;
-  white-space: nowrap;
-}
-.listener-map-legend i::before {
-  width: 13px;
-  height: 2px;
-  border-radius: 2px;
-  background: var(--ink-4);
-  content: '';
-}
-.listener-map-legend .reference::before {
-  background: var(--listener-ref);
-}
-.listener-map-legend .terminal::before {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--ok);
 }
 .listener-map-scroll {
   max-width: 100%;
@@ -4912,10 +4850,6 @@ input.f {
 }
 .listener-map-terminal.is-proxy::before {
   background: var(--gold);
-}
-.listener-rule-editor-head {
-  margin: 0 -12px;
-  border-bottom: 1px solid var(--line-soft);
 }
 /* ═══ XRAY 链路：一条链一张卡 ═══
    层级收敛为两级：卡片（一条链）→ 行（一台机器），展开的表单再降一级。
@@ -18796,6 +18730,51 @@ input.f.ing-pj-port {
   margin-bottom: 2px;
   background-color: var(--surface) !important;
 }
+.external-target-menu-nav {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 3px 3px 6px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.external-target-menu-nav > button {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.external-target-menu-nav > button:hover {
+  border-color: color-mix(in srgb, var(--action) 48%, var(--line));
+  background: var(--hover);
+  color: var(--action-hover);
+}
+.external-target-menu-nav > span {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.external-target-menu-nav b,
+.external-target-menu-nav small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.external-target-menu-nav b {
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+.external-target-menu-nav small {
+  color: var(--ink-4);
+  font-size: 9.5px;
+}
 .external-target-menu > button {
   display: grid;
   grid-template-columns: 48px minmax(0, 1fr) auto;
@@ -18890,6 +18869,11 @@ input.f.ing-pj-port {
   color: var(--action-hover);
   font-size: 12px;
   text-align: left;
+}
+.external-target-menu > button.external-target-custom {
+  border-color: color-mix(in srgb, var(--hue-3) 38%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 6%, var(--sheet));
+  color: var(--hue-3);
 }
 .external-target-new > span:first-child {
   font: 500 14px var(--mono);

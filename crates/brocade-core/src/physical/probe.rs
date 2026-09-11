@@ -19,7 +19,7 @@
 //! of them. Given a single value, a forking chain would be reliably misreported as
 //! exiting from the wrong place.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     ir::routing::{AppIr, AppNode},
@@ -196,7 +196,7 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
             .filter(|ingress| ingress.node == node_id)
         {
             let chain = app.chains.iter().find(|chain| chain.id == ingress.chain);
-            let exits = exit_nodes(app, &ingress.chain);
+            let exits = exit_nodes(apps, &ingress.chain, &ingress.node);
             let security = probe_security(ingress);
             let port = match &security {
                 ProbeSecurity::AnyTls(anytls) => anytls.settings.port,
@@ -255,17 +255,40 @@ fn dial_host(bind: &std::net::IpAddr) -> String {
 /// The test is an actual `Egress` in the rule table, not `node.egress_allowed` — the
 /// latter says the machine is permitted to exit, which differs from this chain
 /// exiting there: a relay cleared for egress may still only forward.
-fn exit_nodes(app: &AppIr, chain_id: &str) -> BTreeSet<String> {
-    app.steps
+fn exit_nodes(apps: &[AppIr], chain_id: &str, root: &str) -> BTreeSet<String> {
+    let steps = apps
         .iter()
-        .filter(|step| step.chain == chain_id)
-        .filter(|step| {
-            step.rules
-                .iter()
-                .any(|rule| matches!(rule.action, Action::Egress { .. } | Action::Proxy { .. }))
-        })
-        .map(|step| step.node.clone())
-        .collect()
+        .flat_map(|app| app.steps.iter())
+        .map(|step| ((step.chain.as_str(), step.node.as_str()), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut queue = VecDeque::from([(chain_id.to_owned(), root.to_owned())]);
+    let mut seen = BTreeSet::new();
+    let mut exits = BTreeSet::new();
+
+    while let Some((chain, node)) = queue.pop_front() {
+        if !seen.insert((chain.clone(), node.clone())) {
+            continue;
+        }
+        let Some(step) = steps.get(&(chain.as_str(), node.as_str())) else {
+            continue;
+        };
+        for rule in &step.rules {
+            match &rule.action {
+                Action::Egress { .. } | Action::Proxy { .. } => {
+                    exits.insert(node.clone());
+                }
+                action => {
+                    if let Some(forward) = action.forward_ref(&step.chain) {
+                        queue.push_back((
+                            forward.target_chain.to_owned(),
+                            forward.target_node.to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    exits
 }
 
 /// Addresses behind NAT do not count: that is not what the endpoint sees. Whether the exit goes

@@ -70,6 +70,8 @@ type TargetMenuPlacement = {
   maxHeight: number;
 };
 
+type TargetPickerView = { t: 'targets' } | { t: 'listener-chains' } | { t: 'listener-endpoints'; chain: string };
+
 const TARGET_MENU_EDGE = 10;
 const TARGET_MENU_GAP = 5;
 const TARGET_MENU_MAX_HEIGHT = 520;
@@ -1123,6 +1125,8 @@ export interface ForwardPeer {
 export interface ReusableListener {
   ref: ListenerRef;
   key: string;
+  appId: string;
+  appName: string;
   nodeName: string;
   ownerName: string;
   step: SnapshotStep;
@@ -1146,7 +1150,8 @@ export const actionListenerRef = (action: RuleAction, sourceChain: string): List
  * Disabled choices stay in the result so the UI can explain why a known port cannot be selected.
  */
 export function reusableListeners(args: {
-  app: SnapshotApp;
+  apps: SnapshotApp[];
+  sourceApp: string;
   sourceChain: string;
   sourceNode: string;
   sourceRules: Rule[];
@@ -1159,12 +1164,12 @@ export function reusableListeners(args: {
     retired_at: string | null;
   }[];
 }): ReusableListener[] {
-  const { app, sourceChain, sourceNode, sourceRules, sourceDrafts, nodes } = args;
+  const { apps, sourceApp, sourceChain, sourceNode, sourceRules, sourceDrafts, nodes } = args;
   const source = { chain: sourceChain, node: sourceNode };
   const sourceKey = listenerRefKey(source);
   const nodeOf = new Map(nodes.map(node => [node.node_id, node]));
-  const chainOf = new Map(app.chains.map(chain => [chain.id, chain]));
-  const sourceTenant = chainOf.get(sourceChain)?.tenant ?? '';
+  const chainOf = new Map(apps.flatMap(app => app.chains.map(chain => [chain.id, { app, chain }] as const)));
+  const sourceTenant = chainOf.get(sourceChain)?.chain.tenant ?? '';
   const rulesOf = (step: SnapshotStep) =>
     step.chain === sourceChain && step.node === sourceNode
       ? sourceRules
@@ -1173,8 +1178,9 @@ export function reusableListeners(args: {
         : step.rules;
 
   const graph = new Map<string, Set<string>>();
-  const stepOf = new Map(app.steps.map(step => [listenerRefKey({ chain: step.chain, node: step.node }), step]));
-  for (const step of app.steps) {
+  const allSteps = apps.flatMap(app => app.steps);
+  const stepOf = new Map(allSteps.map(step => [listenerRefKey({ chain: step.chain, node: step.node }), step]));
+  for (const step of allSteps) {
     const from = listenerRefKey({ chain: step.chain, node: step.node });
     for (const rule of rulesOf(step)) {
       const target = actionListenerRef(rule.a, step.chain);
@@ -1212,7 +1218,7 @@ export function reusableListeners(args: {
     return false;
   };
   const referenceCount = (wanted: ListenerRef) =>
-    app.steps.reduce(
+    allSteps.reduce(
       (count, step) =>
         count +
         rulesOf(step).filter(rule => {
@@ -1225,7 +1231,7 @@ export function reusableListeners(args: {
       0,
     );
 
-  return app.steps
+  return allSteps
     .filter((step): step is SnapshotStep & { hop_in: NonNullable<SnapshotStep['hop_in']>; accept: StepAccept } =>
       Boolean(step.hop_in && step.accept),
     )
@@ -1234,9 +1240,9 @@ export function reusableListeners(args: {
       const key = listenerRefKey(ref);
       const owner = chainOf.get(step.chain);
       const node = nodeOf.get(step.node);
-      const ownerHasIngress = app.ingresses.some(ingress => ingress.chain === step.chain);
+      const ownerHasIngress = owner?.app.ingresses.some(ingress => ingress.chain === step.chain) ?? false;
       const ownerHasRetiredMember = owner
-        ? chainMembers(app, owner.id).some(member => Boolean(nodeOf.get(member)?.retired_at))
+        ? chainMembers(owner.app, owner.chain.id).some(member => Boolean(nodeOf.get(member)?.retired_at))
         : false;
       const blocked =
         key === sourceKey
@@ -1249,7 +1255,7 @@ export function reusableListeners(args: {
                 ? '监听所属线路没有入口，当前不会运行'
                 : ownerHasRetiredMember
                   ? '监听所属线路含已退役机器，当前不会运行'
-                  : sourceTenant && !under(sourceTenant, owner.tenant)
+                  : sourceTenant && !under(sourceTenant, owner.chain.tenant)
                     ? '不在当前线路的可用范围内'
                     : reachesSource(key)
                       ? '引用后会形成环路'
@@ -1257,8 +1263,10 @@ export function reusableListeners(args: {
       return {
         ref,
         key,
+        appId: owner?.app.id ?? sourceApp,
+        appName: owner?.app.label || owner?.app.id || sourceApp,
         nodeName: node?.name || step.node,
-        ownerName: owner?.name || step.chain,
+        ownerName: owner?.chain.name || step.chain,
         step,
         local: step.node === sourceNode,
         references: referenceCount(ref),
@@ -1268,6 +1276,7 @@ export function reusableListeners(args: {
     .sort(
       (left, right) =>
         Number(right.local) - Number(left.local) ||
+        left.appName.localeCompare(right.appName, 'zh-CN') ||
         left.ownerName.localeCompare(right.ownerName, 'zh-CN') ||
         left.nodeName.localeCompare(right.nodeName, 'zh-CN') ||
         left.step.hop_in!.port - right.step.hop_in!.port,
@@ -1706,6 +1715,7 @@ function RuleEditorReady({
   const globalRelayMux = snapshot.data?.snapshot.settings?.relay_mux ?? DEFAULT_HOP_MUX;
   const [muxEditor, setMuxEditor] = useState<MuxEditorState | null>(null);
   const [targetPickerRule, setTargetPickerRule] = useState<number | null>(null);
+  const [targetPickerView, setTargetPickerView] = useState<TargetPickerView>({ t: 'targets' });
   const [targetQuery, setTargetQuery] = useState('');
   const targetPickerRoot = useRef<HTMLSpanElement>(null);
   const targetMenu = useRef<HTMLFieldSetElement>(null);
@@ -1768,7 +1778,14 @@ function RuleEditorReady({
       window.visualViewport?.removeEventListener('resize', place);
       window.visualViewport?.removeEventListener('scroll', place);
     };
-  }, [targetPickerRule, targetQuery, externalOutbounds.length, peers.length, app?.steps.length]);
+  }, [
+    targetPickerRule,
+    targetPickerView,
+    targetQuery,
+    externalOutbounds.length,
+    peers.length,
+    snapshot.data?.snapshot.apps,
+  ]);
   // 两份草稿（规则表、各转发目标的中转端口）默认由本组件持有；`shared` 非空时交由上层持有，
   // 因为同一台机器在树中出现两次时，两处编辑的必须是同一份——它们对应库中的同一条记录
   // （steps 主键为 chain_id + node_id）。
@@ -1828,9 +1845,11 @@ function RuleEditorReady({
     setDnsOrder(next);
   };
   const peerOf = (id: string) => peers.find(p => p.id === id) ?? null;
+  const snapshotApps = snapshot.data?.snapshot.apps ?? [];
   const listeners = app
     ? reusableListeners({
-        app,
+        apps: snapshotApps,
+        sourceApp: appId,
         sourceChain: chainId,
         sourceNode: nodeId,
         sourceRules: rules,
@@ -1857,10 +1876,13 @@ function RuleEditorReady({
   // 本链监听已经作为普通 Forward 目标列在下一组。若这里再以 ReuseListener 提供一次，
   // 同一个 (chain, node) 会出现两种动作形状；它们编译到同一 outbound，却永远是两种 dial，
   // 最终只能等编译器报 rule.forward-dial-conflict。跨链监听才需要显式引用身份。
-  const visibleListeners = listeners.filter(
+  const reusableListenerChoices = listeners.filter(listener => listener.ref.chain !== chainId);
+  const visibleListeners = reusableListenerChoices.filter(
     listener =>
-      listener.ref.chain !== chainId &&
+      (targetPickerView.t !== 'listener-endpoints' || listener.ref.chain === targetPickerView.chain) &&
       targetMatches(
+        listener.appId,
+        listener.appName,
         listener.ref.chain,
         listener.ref.node,
         listener.nodeName,
@@ -1869,6 +1891,33 @@ function RuleEditorReady({
         listener.blocked,
       ),
   );
+  const visibleListenerApps = snapshotApps.flatMap(candidateApp => {
+    const chains = candidateApp.chains.flatMap(candidateChain => {
+      if (candidateChain.id === chainId) return [];
+      const candidates = reusableListenerChoices.filter(listener => listener.ref.chain === candidateChain.id);
+      if (candidates.length === 0) return [];
+      const matches = targetMatches(candidateApp.id, candidateApp.label, candidateChain.id, candidateChain.name)
+        ? true
+        : candidates.some(listener =>
+            targetMatches(
+              listener.nodeName,
+              listener.ref.node,
+              String(listener.step.hop_in?.port ?? ''),
+              listener.blocked,
+            ),
+          );
+      return matches ? [{ chain: candidateChain, candidates }] : [];
+    });
+    return chains.length > 0 ? [{ app: candidateApp, chains }] : [];
+  });
+  const selectedListenerChain =
+    targetPickerView.t === 'listener-endpoints'
+      ? (snapshotApps
+          .flatMap(candidateApp =>
+            candidateApp.chains.map(candidateChain => ({ app: candidateApp, chain: candidateChain })),
+          )
+          .find(candidate => candidate.chain.id === targetPickerView.chain) ?? null)
+      : null;
   const visibleExternalOutbounds = externalOutbounds.filter(outbound =>
     targetMatches(outbound.id, outbound.name, outbound.address, externalProtocolLabel(outbound.protocol.t)),
   );
@@ -2220,6 +2269,7 @@ function RuleEditorReady({
     if (sameTarget?.a.t === 'forward') nextDial = sameTarget.a.dial ?? { t: 'overlay' };
     patch(ruleIndex, { ...rule, a: forwardAction(nextTo, nextDial, poolOf(nextTo)) });
     setTargetPickerRule(null);
+    setTargetPickerView({ t: 'targets' });
   };
 
   const selectListenerTarget = (ruleIndex: number, rule: Rule, listener: ReusableListener) => {
@@ -2233,11 +2283,13 @@ function RuleEditorReady({
       a: reuseListenerAction(listener.ref, dial, referencePoolOf(listener.ref)),
     });
     setTargetPickerRule(null);
+    setTargetPickerView({ t: 'targets' });
   };
 
   const selectExternalTarget = (ruleIndex: number, rule: Rule, outbound: string) => {
     patch(ruleIndex, { ...rule, a: { t: 'proxy', outbound } });
     setTargetPickerRule(null);
+    setTargetPickerView({ t: 'targets' });
   };
 
   // 删除规则时立即写入草稿，不等待末尾的「保存到草稿」。修改常处于中间状态（已选匹配条件
@@ -2386,6 +2438,7 @@ function RuleEditorReady({
                                 : { t: 'block' };
                           patch(i, { ...r, a });
                           setTargetPickerRule(t === 'forward' ? i : null);
+                          setTargetPickerView({ t: 'targets' });
                         }}
                       >
                         <option value="forward">转发给</option>
@@ -2409,6 +2462,11 @@ function RuleEditorReady({
                               if (opening) {
                                 const rect = event.currentTarget.getBoundingClientRect();
                                 setTargetMenuPlacement(placeTargetMenu(rect));
+                                setTargetPickerView(
+                                  r.a.t === 'reuse_listener'
+                                    ? { t: 'listener-endpoints', chain: r.a.listener.chain }
+                                    : { t: 'targets' },
+                                );
                               }
                               setTargetPickerRule(opening ? i : null);
                               if (opening) setTargetQuery('');
@@ -2441,147 +2499,250 @@ function RuleEditorReady({
                                   maxHeight: targetMenuPlacement.maxHeight,
                                 }}
                               >
-                                <input
-                                  className="f external-target-search"
-                                  placeholder="搜索监听端口、节点或代理出站"
-                                  value={targetQuery}
-                                  onChange={event => setTargetQuery(event.target.value)}
-                                />
-                                <span className="external-target-menu-label">可复用的其它线路监听端口</span>
-                                {visibleListeners.map(candidate => (
-                                  <button
-                                    type="button"
-                                    disabled={Boolean(candidate.blocked)}
-                                    title={candidate.blocked ?? '只保存引用；端口、安全参数和规则由源线路维护'}
-                                    className={
-                                      r.a.t === 'reuse_listener' && sameListener(r.a.listener, candidate.ref)
-                                        ? 'on'
-                                        : ''
-                                    }
-                                    key={`listener-${candidate.key}`}
-                                    onClick={() => selectListenerTarget(i, r, candidate)}
-                                  >
-                                    <span className="external-target-kind listener">
-                                      {candidate.local ? '本机' : '监听'}
-                                    </span>
-                                    <span className="external-target-copy">
-                                      <b>
-                                        {candidate.nodeName} · TCP {candidate.step.hop_in?.port}
-                                      </b>
-                                      <small>
-                                        {candidate.ownerName} · {candidate.step.rules.length} 条规则
-                                      </small>
-                                    </span>
-                                    <span className="external-target-where">
-                                      {candidate.blocked ?? `${candidate.references} 处引用`}
-                                    </span>
-                                  </button>
-                                ))}
-                                <span className="external-target-menu-label">本链已有监听节点</span>
-                                {[...visibleNextPeers, ...visibleInsidePeers].map(candidate => (
-                                  <button
-                                    type="button"
-                                    className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
-                                    key={candidate.id}
-                                    onClick={() => selectForwardTarget(i, r, candidate.id)}
-                                  >
-                                    <span className="external-target-kind">NODE</span>
-                                    <span className="external-target-copy">
-                                      <b>{candidate.name || '未命名节点'}</b>
-                                    </span>
-                                    <span className="external-target-where">
-                                      {candidate.where === 'next'
-                                        ? '当前下游'
-                                        : candidate.where === 'inside'
-                                          ? '链内其它节点'
-                                          : '主干之外'}
-                                    </span>
-                                  </button>
-                                ))}
-                                <span className="external-target-menu-label">在机器上新建本链监听</span>
-                                {visibleForkPeers.map(candidate => (
-                                  <button
-                                    type="button"
-                                    className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
-                                    key={`new-${candidate.id}`}
-                                    title="保存时在这台机器创建本链监听和一棵空规则子树"
-                                    onClick={() => selectForwardTarget(i, r, candidate.id)}
-                                  >
-                                    <span className="external-target-kind new-listener">新建</span>
-                                    <span className="external-target-copy">
-                                      <b>{candidate.name || '未命名节点'}</b>
-                                      <small>新端口 · 空规则子树</small>
-                                    </span>
-                                    <span className="external-target-where">加入本链</span>
-                                  </button>
-                                ))}
-                                {visibleBlockedPeers.length > 0 && (
-                                  <span className="external-target-menu-label">不可用的机器</span>
-                                )}
-                                {visibleBlockedPeers.map(candidate => (
-                                  <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
-                                    <span className="external-target-kind">NODE</span>
-                                    <span className="external-target-copy">
-                                      <b>{candidate.name || '未命名节点'}</b>
-                                    </span>
-                                    <span className="external-target-where">不能选</span>
-                                  </button>
-                                ))}
-                                <span className="external-target-menu-label">代理出站</span>
-                                {visibleExternalOutbounds.map(outbound => (
-                                  <span className="external-target-option" key={outbound.id}>
+                                {targetPickerView.t === 'targets' ? (
+                                  <>
+                                    <input
+                                      className="f external-target-search"
+                                      placeholder="搜索节点或代理出站"
+                                      value={targetQuery}
+                                      onChange={event => setTargetQuery(event.target.value)}
+                                    />
+                                    <span className="external-target-menu-label">本链已有监听节点</span>
+                                    {[...visibleNextPeers, ...visibleInsidePeers].map(candidate => (
+                                      <button
+                                        type="button"
+                                        className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
+                                        key={candidate.id}
+                                        onClick={() => selectForwardTarget(i, r, candidate.id)}
+                                      >
+                                        <span className="external-target-kind">NODE</span>
+                                        <span className="external-target-copy">
+                                          <b>{candidate.name || '未命名节点'}</b>
+                                        </span>
+                                        <span className="external-target-where">
+                                          {candidate.where === 'next'
+                                            ? '当前下游'
+                                            : candidate.where === 'inside'
+                                              ? '链内其它节点'
+                                              : '主干之外'}
+                                        </span>
+                                      </button>
+                                    ))}
+                                    <span className="external-target-menu-label">在机器上新建本链监听</span>
+                                    {visibleForkPeers.map(candidate => (
+                                      <button
+                                        type="button"
+                                        className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
+                                        key={`new-${candidate.id}`}
+                                        title="保存时在这台机器创建本链监听和一棵空规则子树"
+                                        onClick={() => selectForwardTarget(i, r, candidate.id)}
+                                      >
+                                        <span className="external-target-kind new-listener">新建</span>
+                                        <span className="external-target-copy">
+                                          <b>{candidate.name || '未命名节点'}</b>
+                                        </span>
+                                        <span className="external-target-where">加入本链</span>
+                                      </button>
+                                    ))}
+                                    {visibleBlockedPeers.length > 0 && (
+                                      <span className="external-target-menu-label">不可用的机器</span>
+                                    )}
+                                    {visibleBlockedPeers.map(candidate => (
+                                      <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
+                                        <span className="external-target-kind">NODE</span>
+                                        <span className="external-target-copy">
+                                          <b>{candidate.name || '未命名节点'}</b>
+                                        </span>
+                                        <span className="external-target-where">不能选</span>
+                                      </button>
+                                    ))}
+                                    <span className="external-target-menu-label">代理出站</span>
+                                    {visibleExternalOutbounds.map(outbound => (
+                                      <span className="external-target-option" key={outbound.id}>
+                                        <button
+                                          type="button"
+                                          className={`external-target-option-select${
+                                            r.a.t === 'proxy' && r.a.outbound === outbound.id ? ' on' : ''
+                                          }`}
+                                          onClick={() => selectExternalTarget(i, r, outbound.id)}
+                                        >
+                                          <span className="external-target-kind external">
+                                            {externalProtocolBadge(outbound.protocol.t)}
+                                          </span>
+                                          <span className="external-target-copy">
+                                            <b>{outbound.name}</b>
+                                          </span>
+                                          <span className="external-target-where">共享资源</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="external-target-manage"
+                                          aria-label={`打开隧道 ${outbound.name}`}
+                                          onClick={() => {
+                                            setTargetPickerRule(null);
+                                            navigate('tunnels', {
+                                              p: 'tunnel',
+                                              tenant: outbound.tenant,
+                                              id: outbound.id,
+                                            });
+                                          }}
+                                        >
+                                          查看
+                                        </button>
+                                      </span>
+                                    ))}
                                     <button
                                       type="button"
-                                      className={`external-target-option-select${
-                                        r.a.t === 'proxy' && r.a.outbound === outbound.id ? ' on' : ''
-                                      }`}
-                                      onClick={() => selectExternalTarget(i, r, outbound.id)}
-                                    >
-                                      <span className="external-target-kind external">
-                                        {externalProtocolBadge(outbound.protocol.t)}
-                                      </span>
-                                      <span className="external-target-copy">
-                                        <b>{outbound.name}</b>
-                                      </span>
-                                      <span className="external-target-where">共享资源</span>
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="external-target-manage"
-                                      aria-label={`打开隧道 ${outbound.name}`}
+                                      className="external-target-new"
+                                      aria-label="管理隧道"
                                       onClick={() => {
                                         setTargetPickerRule(null);
-                                        navigate('tunnels', {
-                                          p: 'tunnel',
-                                          tenant: outbound.tenant,
-                                          id: outbound.id,
-                                        });
+                                        navigate('tunnels');
                                       }}
                                     >
-                                      查看
+                                      <span>↗</span>
+                                      <b>管理隧道</b>
+                                      <span>新建、编辑和删除都在隧道页</span>
                                     </button>
-                                  </span>
-                                ))}
-                                <button
-                                  type="button"
-                                  className="external-target-new"
-                                  aria-label="管理隧道"
-                                  onClick={() => {
-                                    setTargetPickerRule(null);
-                                    navigate('tunnels');
-                                  }}
-                                >
-                                  <span>↗</span>
-                                  <b>管理隧道</b>
-                                  <span>新建、编辑和删除都在隧道页</span>
-                                </button>
-                                {visibleNextPeers.length +
-                                  visibleInsidePeers.length +
-                                  visibleForkPeers.length +
-                                  visibleBlockedPeers.length +
-                                  visibleListeners.length +
-                                  visibleExternalOutbounds.length ===
-                                  0 && <span className="external-target-empty">没有匹配项</span>}
+                                    <button
+                                      type="button"
+                                      className="external-target-new external-target-custom"
+                                      onClick={() => {
+                                        setTargetPickerView({ t: 'listener-chains' });
+                                        setTargetQuery('');
+                                      }}
+                                    >
+                                      <span>•••</span>
+                                      <b>自定义</b>
+                                      <span>复用已有监听</span>
+                                    </button>
+                                    {visibleNextPeers.length +
+                                      visibleInsidePeers.length +
+                                      visibleForkPeers.length +
+                                      visibleBlockedPeers.length +
+                                      visibleExternalOutbounds.length ===
+                                      0 && <span className="external-target-empty">没有匹配项</span>}
+                                  </>
+                                ) : targetPickerView.t === 'listener-chains' ? (
+                                  <>
+                                    <div className="external-target-menu-nav">
+                                      <button
+                                        type="button"
+                                        aria-label="返回目标列表"
+                                        onClick={() => {
+                                          setTargetPickerView({ t: 'targets' });
+                                          setTargetQuery('');
+                                        }}
+                                      >
+                                        ←
+                                      </button>
+                                      <span>
+                                        <b>自定义 · 复用已有监听</b>
+                                        <small>先选择 App 和链</small>
+                                      </span>
+                                    </div>
+                                    <input
+                                      autoFocus
+                                      className="f external-target-search"
+                                      placeholder="跨 App 搜索链、节点或端口"
+                                      value={targetQuery}
+                                      onChange={event => setTargetQuery(event.target.value)}
+                                    />
+                                    {visibleListenerApps.map(group => (
+                                      <Fragment key={group.app.id}>
+                                        <span className="external-target-menu-label">
+                                          APP · {group.app.label || group.app.id}
+                                        </span>
+                                        {group.chains.map(({ chain: candidateChain, candidates }) => (
+                                          <button
+                                            type="button"
+                                            key={candidateChain.id}
+                                            onClick={() => {
+                                              setTargetPickerView({
+                                                t: 'listener-endpoints',
+                                                chain: candidateChain.id,
+                                              });
+                                              setTargetQuery('');
+                                            }}
+                                          >
+                                            <span className="external-target-kind listener">链</span>
+                                            <span className="external-target-copy">
+                                              <b>{candidateChain.name || candidateChain.id}</b>
+                                              <small>{candidateChain.id}</small>
+                                            </span>
+                                            <span className="external-target-where">
+                                              {candidates.length} 个监听端点
+                                            </span>
+                                          </button>
+                                        ))}
+                                      </Fragment>
+                                    ))}
+                                    {visibleListenerApps.length === 0 && (
+                                      <span className="external-target-empty">没有匹配的链</span>
+                                    )}
+                                  </>
+                                ) : (
+                                  <>
+                                    <div className="external-target-menu-nav">
+                                      <button
+                                        type="button"
+                                        aria-label="返回链列表"
+                                        onClick={() => {
+                                          setTargetPickerView({ t: 'listener-chains' });
+                                          setTargetQuery('');
+                                        }}
+                                      >
+                                        ←
+                                      </button>
+                                      <span>
+                                        <b>{selectedListenerChain?.chain.name || targetPickerView.chain}</b>
+                                        <small>
+                                          {selectedListenerChain?.app.label ||
+                                            selectedListenerChain?.app.id ||
+                                            '未知 App'}
+                                        </small>
+                                      </span>
+                                    </div>
+                                    <input
+                                      autoFocus
+                                      className="f external-target-search"
+                                      placeholder="搜索监听端点、节点或端口"
+                                      value={targetQuery}
+                                      onChange={event => setTargetQuery(event.target.value)}
+                                    />
+                                    <span className="external-target-menu-label">链上监听端点</span>
+                                    {visibleListeners.map(candidate => (
+                                      <button
+                                        type="button"
+                                        disabled={Boolean(candidate.blocked)}
+                                        title={candidate.blocked ?? '只保存引用；端口、安全参数和规则由源线路维护'}
+                                        className={
+                                          r.a.t === 'reuse_listener' && sameListener(r.a.listener, candidate.ref)
+                                            ? 'on'
+                                            : ''
+                                        }
+                                        key={`listener-${candidate.key}`}
+                                        onClick={() => selectListenerTarget(i, r, candidate)}
+                                      >
+                                        <span className="external-target-kind listener">
+                                          {candidate.local ? '本机' : '监听'}
+                                        </span>
+                                        <span className="external-target-copy">
+                                          <b>
+                                            {candidate.nodeName} · TCP {candidate.step.hop_in?.port}
+                                          </b>
+                                          <small>{candidate.step.rules.length} 条规则</small>
+                                        </span>
+                                        <span className="external-target-where">
+                                          {candidate.blocked ?? `${candidate.references} 处引用`}
+                                        </span>
+                                      </button>
+                                    ))}
+                                    {visibleListeners.length === 0 && (
+                                      <span className="external-target-empty">这条链没有匹配的监听端点</span>
+                                    )}
+                                  </>
+                                )}
                               </fieldset>,
                               document.body,
                             )}
@@ -3048,72 +3209,83 @@ function RuleEditorReady({
           配置在此处而非对端页面，因为它属于该跳的组成部分。中转端口关联在
           `(chain, node)` 上，同一条链中多个上游连接同一目标时复用该入口配置。 */}
         {reverseTargets.length > 0 && (
-          <div className="panel" style={{ marginTop: 10 }}>
+          <div className="panel listener-reference-panel hop-target-panel" style={{ marginTop: 10 }}>
             <header>
               <PanelTitle of="ingress">反向接入口</PanelTitle>
               <span className="hint">
                 {reverseTargets.map(to => peerOf(to)?.name || to).join('、')} 从本机的这个端口接入
               </span>
             </header>
-            <div className="fgrid one">
-              <div className="row">
-                <span className="k auto">本机</span>
-                <span className="v">
-                  <span className="hop-in">
-                    <span className="hopfld">
-                      <span className="hopfld-lbl">端口配置</span>
+            <div className="listener-reference-list">
+              <div className="listener-reference-row hop-target-row">
+                <div className="listener-reference-main">
+                  <span className="external-target-kind node">反向</span>
+                  <span className="listener-reference-copy">
+                    <b title={nodeId}>
+                      {selfNode?.name || nodeId} · TCP {hopOf(nodeId).port || '未设置'}
+                    </b>
+                  </span>
+                </div>
+                <div className="listener-reference-facts hop-target-facts">
+                  <label className="hopfld hop-target-port">
+                    <small>本机端口</small>
+                    <input
+                      className="f mono"
+                      value={hopOf(nodeId).port}
+                      placeholder={String(hopBase)}
+                      onChange={event => setHopPort(nodeId, event.target.value)}
+                    />
+                  </label>
+                  <label className="hopfld hop-target-wire">
+                    <small>承载协议</small>
+                    <select
+                      className="f"
+                      value={hopOf(nodeId).kind}
+                      onChange={event =>
+                        patchHop(nodeId, { kind: event.target.value as ReturnType<typeof hopOf>['kind'] })
+                      }
+                    >
+                      {/* 该区块只在存在反向目标时渲染，因此该端口一定是反向接入使用的端口
+                        ——此处不提供 SS2022 选项。 */}
+                      {HOP_WIRE_OPTIONS.map(option => (
+                        <option key={option.kind} value={option.kind} disabled={!option.reverseOk}>
+                          {option.label}
+                          {option.reverseOk ? '' : ' — 反向隧道只有 VLESS 承载'}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                {hopOf(nodeId).kind === 'reality' && (
+                  <div className="hop-target-security">
+                    <label>
+                      <small>伪装目标</small>
                       <input
                         className="f mono"
-                        style={{ width: 90 }}
-                        value={hopOf(nodeId).port}
-                        placeholder={String(hopBase)}
-                        onChange={e => setHopPort(nodeId, e.target.value)}
+                        value={hopOf(nodeId).dest}
+                        placeholder="example.com:443"
+                        onChange={event => patchHop(nodeId, { dest: event.target.value })}
                       />
-                    </span>
-                    <span className="hopfld-sep" />
-                    <span className="hopfld">
-                      <span className="hopfld-lbl">协议</span>
-                      <select
-                        className="f"
-                        value={hopOf(nodeId).kind}
-                        onChange={e => patchHop(nodeId, { kind: e.target.value as ReturnType<typeof hopOf>['kind'] })}
-                      >
-                        {/* 该区块只在存在反向目标时渲染，因此该端口一定是反向接入使用的端口
-                          ——此处不提供 SS2022 选项。 */}
-                        {HOP_WIRE_OPTIONS.map(option => (
-                          <option key={option.kind} value={option.kind} disabled={!option.reverseOk}>
-                            {option.label}
-                            {option.reverseOk ? '' : ' — 反向隧道只有 VLESS 承载'}
-                          </option>
-                        ))}
-                      </select>
-                    </span>
-                    {hopOf(nodeId).kind === 'reality' && (
-                      <>
-                        <input
-                          className="f mono"
-                          style={{ width: 180 }}
-                          value={hopOf(nodeId).dest}
-                          placeholder="example.com:443"
-                          onChange={e => patchHop(nodeId, { dest: e.target.value })}
-                        />
-                        <input
-                          className="f mono"
-                          style={{ width: 180 }}
-                          value={hopOf(nodeId).names}
-                          placeholder="server_names"
-                          onChange={e => patchHop(nodeId, { names: e.target.value })}
-                        />
-                      </>
-                    )}
+                    </label>
+                    <label>
+                      <small>服务端名称</small>
+                      <input
+                        className="f mono"
+                        value={hopOf(nodeId).names}
+                        placeholder="server_names"
+                        onChange={event => patchHop(nodeId, { names: event.target.value })}
+                      />
+                    </label>
+                  </div>
+                )}
+                <p className="hop-target-note">
+                  <span>
+                    端口开在 {selfNode?.name || nodeId}，连接由{' '}
+                    {reverseTargets.map(to => peerOf(to)?.name || to).join('、')} 发起；同机各链端口必须错开。
                   </span>
-                  <span className="sub">
-                    该端口开在本机，<b>同一台机器上各条链必须错开</b>，冲突时编译会报 node.port-clash。
-                    {hopOf(nodeId).kind === 'none' && (
-                      <b style={{ color: 'var(--gold)' }}> 明文接入可能暴露 UUID 和目标地址。</b>
-                    )}
-                  </span>
-                </span>
+                  {hopOf(nodeId).kind === 'none' && <strong>明文接入可能暴露 UUID 和目标地址。</strong>}
+                  <span>发布会重启受影响的 Xray。</span>
+                </p>
               </div>
             </div>
           </div>
@@ -3145,9 +3317,6 @@ function RuleEditorReady({
                         <b title={to}>
                           {peerName} · TCP {h.port || '未设置'}
                         </b>
-                        <small>
-                          {dialedDirectly ? '按规则地址直连' : '仅经 Overlay 接入'} · {hopWireLabel(h.kind)}
-                        </small>
                       </span>
                     </div>
                     <div className="listener-reference-facts hop-target-facts">

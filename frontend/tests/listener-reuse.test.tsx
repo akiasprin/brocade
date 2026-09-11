@@ -154,7 +154,8 @@ describe('监听规则子树复用', () => {
       grants: [],
     };
     const candidates = reusableListeners({
-      app,
+      apps: [app],
+      sourceApp: app.id,
       sourceChain: 'source-chain',
       sourceNode: 'source',
       sourceRules,
@@ -195,24 +196,29 @@ describe('监听规则子树复用', () => {
       forwardRule('tail'),
     ]);
     const tail = listenerStep('owner', 'tail', 22001, [egressRule()]);
-    const app: SnapshotApp = {
-      id: 'app',
-      label: '项目',
-      chains: [chain('source-chain', '源线路'), chain('owner', '共享出口')],
-      ingresses: [ingress('source-in', 'source-chain', 'source'), ingress('owner-in', 'owner', 'owner-root')],
-      steps: [
-        source,
-        { chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] },
-        shared,
-        tail,
-      ],
+    const sourceApp: SnapshotApp = {
+      id: 'source-app',
+      label: '来源项目',
+      chains: [chain('source-chain', '源线路')],
+      ingresses: [ingress('source-in', 'source-chain', 'source')],
+      steps: [source],
+      fronts: [],
+      grants: [],
+    };
+    const ownerApp: SnapshotApp = {
+      id: 'owner-app',
+      label: '监听项目',
+      chains: [chain('owner', '共享出口')],
+      ingresses: [ingress('owner-in', 'owner', 'owner-root')],
+      steps: [{ chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] }, shared, tail],
       fronts: [],
       grants: [],
     };
     const view = render(
       <ListenerDecisionTree
-        app={app}
-        currentChain={app.chains[0]}
+        app={sourceApp}
+        apps={[sourceApp, ownerApp]}
+        currentChain={sourceApp.chains[0]}
         currentSteps={[source]}
         root="source"
         draftRules={{}}
@@ -229,7 +235,7 @@ describe('监听规则子树复用', () => {
     );
 
     expect(view.getByText('引用的监听子树')).toBeTruthy();
-    expect(view.getAllByText('归属：共享出口')).toHaveLength(2);
+    expect(view.getAllByText('归属：监听项目 / 共享出口')).toHaveLength(2);
     expect(view.getByText('域名后缀 · openai.com')).toBeTruthy();
     expect(view.getByText('GeoIP · cn')).toBeTruthy();
     expect(view.getByText('拒绝')).toBeTruthy();
@@ -396,17 +402,21 @@ describe('监听规则子树复用', () => {
       egressRule(),
     ]);
     const sameChain = listenerStep('source-chain', 'same-chain', 21001, [egressRule()]);
-    const app: SnapshotApp = {
-      id: 'app',
-      label: '项目',
-      chains: [chain('source-chain', '源线路'), chain('owner', '共享出口')],
-      ingresses: [ingress('source-in', 'source-chain', 'source'), ingress('owner-in', 'owner', 'owner-root')],
-      steps: [
-        source,
-        sameChain,
-        { chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] },
-        shared,
-      ],
+    const sourceApp: SnapshotApp = {
+      id: 'source-app',
+      label: '来源项目',
+      chains: [chain('source-chain', '源线路')],
+      ingresses: [ingress('source-in', 'source-chain', 'source')],
+      steps: [source, sameChain],
+      fronts: [],
+      grants: [],
+    };
+    const ownerApp: SnapshotApp = {
+      id: 'owner-app',
+      label: '监听项目',
+      chains: [chain('owner', '共享出口')],
+      ingresses: [ingress('owner-in', 'owner', 'owner-root')],
+      steps: [{ chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] }, shared],
       fronts: [],
       grants: [],
     };
@@ -414,7 +424,7 @@ describe('监听规则子树复用', () => {
       defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
     });
     client.setQueryData(['snapshot'], {
-      snapshot: { revision: 1, settings: {}, apps: [app], external_outbounds: [] },
+      snapshot: { revision: 1, settings: {}, apps: [sourceApp, ownerApp], external_outbounds: [] },
       node_egress_dns: [],
       redacted: false,
     } as unknown as ConsoleSnapshot);
@@ -435,7 +445,7 @@ describe('监听规则子树复用', () => {
         return new Response(
           JSON.stringify({
             snapshot: {
-              snapshot: { revision: 1, settings: {}, apps: [app], external_outbounds: [] },
+              snapshot: { revision: 1, settings: {}, apps: [sourceApp, ownerApp], external_outbounds: [] },
               node_egress_dns: [],
               redacted: false,
             },
@@ -451,7 +461,7 @@ describe('监听规则子树复用', () => {
     const view = render(
       <QueryClientProvider client={client}>
         <RuleEditor
-          appId="app"
+          appId="source-app"
           chainId="source-chain"
           nodeId="source"
           initial={source.rules}
@@ -468,11 +478,18 @@ describe('监听规则子树复用', () => {
     const action = row.querySelector('.rule-action-select');
     if (!(action instanceof HTMLSelectElement)) throw new Error('没有动作选择器');
     fireEvent.change(action, { target: { value: 'forward' } });
-    const choice = await view.findByRole('button', { name: /新加坡共享监听 · TCP 22000/ });
+    expect(view.queryByRole('button', { name: /新加坡共享监听 · TCP 22000/ })).toBeNull();
     expect(view.queryByRole('button', { name: /同链监听 · TCP 21001/ })).toBeNull();
-    const menu = choice.closest('.external-target-menu');
+    const custom = await view.findByRole('button', { name: /自定义.*复用已有监听/ });
+    const menu = custom.closest('.external-target-menu');
     expect(menu?.parentElement).toBe(document.body);
     expect(view.container.contains(menu)).toBe(false);
+    fireEvent.click(custom);
+    const crossAppSearch = view.getByPlaceholderText('跨 App 搜索链、节点或端口');
+    fireEvent.change(crossAppSearch, { target: { value: '监听项目' } });
+    const ownerChain = view.getByRole('button', { name: /共享出口.*1 个监听端点/ });
+    fireEvent.click(ownerChain);
+    const choice = await view.findByRole('button', { name: /新加坡共享监听 · TCP 22000/ });
     fireEvent.pointerDown(choice);
     expect(document.body.contains(choice)).toBe(true);
     fireEvent.click(choice);

@@ -1,8 +1,8 @@
 use crate::{
     diagnostic::{summarize_diagnostics, Diagnostic, DiagnosticSummary},
     ir::{
-        hops::compile_hops,
-        routing::{compile_app, AppIr},
+        hops::compile_hops_with_targets,
+        routing::{compile_app_with_listener_roots, reachable_listener_roots_across_apps, AppIr},
         system::{compile_system, SystemIr},
         validate::{validate_app, validate_app_set, validate_model_snapshot, validate_system},
     },
@@ -88,13 +88,26 @@ pub fn compile(snapshot: &ModelSnapshot) -> CompileOutput {
     let system = compile_system(snapshot, &mut diagnostics);
     validate_system(&system, &mut diagnostics);
 
-    let mut apps = Vec::new();
+    let listener_roots = reachable_listener_roots_across_apps(snapshot);
+    let mut routing_apps = Vec::new();
     // `ModelSnapshot.apps` is the operator-defined line order. The store materializes it from
     // `apps.position`, and historical snapshots preserve it as array order. Keep that one semantic
     // ordering fact in the IR; machine projections still canonicalize their own unordered sets.
     for app in &snapshot.apps {
-        let app_ir = compile_app(snapshot, app, &mut diagnostics);
-        let app_ir = compile_hops(app_ir, &system, &mut diagnostics);
+        routing_apps.push(compile_app_with_listener_roots(
+            snapshot,
+            app,
+            Some(&listener_roots),
+            &mut diagnostics,
+        ));
+    }
+    let target_steps = routing_apps
+        .iter()
+        .flat_map(|app| app.steps.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut apps = Vec::with_capacity(routing_apps.len());
+    for app_ir in routing_apps {
+        let app_ir = compile_hops_with_targets(app_ir, &target_steps, &system, &mut diagnostics);
         validate_app(&system, &app_ir, &mut diagnostics);
         apps.push(app_ir);
     }

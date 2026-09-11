@@ -1068,9 +1068,9 @@ fn xray_hop_inbounds(
             // computed result, because once relay ports moved onto the chain, whether any
             // peer dials this node from outside wg is no longer visible in the local
             // config and is known only to the dialer.
-            let arriving_hops = app
-                .hops
+            let arriving_hops = apps
                 .iter()
+                .flat_map(|candidate| candidate.hops.iter())
                 .filter(|hop| {
                     // The test is whether any peer enters this port from outside wg:
                     // (1) a peer dials this node directly (`Direct`), reaching one of

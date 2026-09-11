@@ -5485,6 +5485,7 @@ type ListenerTreeLink =
  */
 export function ListenerDecisionTree({
   app,
+  apps,
   currentChain,
   currentSteps,
   root,
@@ -5494,6 +5495,8 @@ export function ListenerDecisionTree({
   highlightedListener = null,
 }: {
   app: SnapshotApp | null;
+  /** Complete visible snapshot, so a reference can expand an owner in another App. */
+  apps?: SnapshotApp[];
   currentChain: SnapshotChain;
   currentSteps: SnapshotStep[];
   root: string | null;
@@ -5518,9 +5521,12 @@ export function ListenerDecisionTree({
 
   if (!root) return <Empty>这条链还没有入口，无法建立规则树。</Empty>;
 
-  const appChains = app?.chains ?? [currentChain];
-  const appSteps = app?.steps ?? currentSteps;
-  const chainNames = new Map(appChains.map(candidate => [candidate.id, candidate.name]));
+  const visibleApps = apps ?? (app ? [app] : []);
+  const appChains = visibleApps.flatMap(candidate => candidate.chains.map(chain => ({ app: candidate, chain })));
+  const appSteps = visibleApps.flatMap(candidate => candidate.steps);
+  const chainOwners = new Map(appChains.map(candidate => [candidate.chain.id, candidate]));
+  const chainNames = new Map(appChains.map(candidate => [candidate.chain.id, candidate.chain.name]));
+  if (!chainNames.has(currentChain.id)) chainNames.set(currentChain.id, currentChain.name);
   const steps = new Map<string, SnapshotStep>();
   for (const step of appSteps) steps.set(listenerRefKey({ chain: step.chain, node: step.node }), step);
   // The panel can already contain a freshly staged step while the shared snapshot query is
@@ -5531,7 +5537,9 @@ export function ListenerDecisionTree({
   // compiled fallback below render the real terminal. Treating it as a missing listener turns the
   // simplest valid chain into a red dangling-reference error.
   const rootKey = listenerRefKey({ chain: currentChain.id, node: root });
-  const rootHasIngress = app?.ingresses.some(ingress => ingress.chain === currentChain.id && ingress.node === root);
+  const rootHasIngress = visibleApps.some(candidate =>
+    candidate.ingresses.some(ingress => ingress.chain === currentChain.id && ingress.node === root),
+  );
   if (!steps.has(rootKey) && rootHasIngress) {
     steps.set(rootKey, { chain: currentChain.id, node: root, accept: null, hop_in: null, rules: [] });
   }
@@ -5561,7 +5569,7 @@ export function ListenerDecisionTree({
     }
   }
 
-  const ingresses = app?.ingresses ?? [];
+  const ingresses = visibleApps.flatMap(candidate => candidate.ingresses);
   const listenerSummary = (ref: ListenerRef, step: SnapshotStep, rootOccurrence: boolean): string => {
     const ownedIngresses = ingresses.filter(ingress => ingress.chain === ref.chain && ingress.node === ref.node);
     if (rootOccurrence && ownedIngresses.length > 0) {
@@ -5603,7 +5611,12 @@ export function ListenerDecisionTree({
     const nextPath = new Set(path);
     nextPath.add(key);
     const rules = effectiveRules(ref, step);
-    const owner = chainNames.get(ref.chain) || ref.chain;
+    const owner = chainOwners.get(ref.chain);
+    const ownerChainName = owner?.chain.name || ref.chain;
+    const ownerName =
+      owner && app && owner.app.id !== app.id
+        ? `${owner.app.label || owner.app.id} / ${ownerChainName}`
+        : ownerChainName;
     const references = referenceCounts.get(key) ?? 0;
     const isReference = link.kind === 'reference';
     const highlighted = isReference && key === highlightedKey;
@@ -5626,7 +5639,7 @@ export function ListenerDecisionTree({
             {localReference && <i>本机内部</i>}
             {references > 0 && <i>{references} 处复用</i>}
           </span>
-          <small title={ref.chain}>归属：{owner}</small>
+          <small title={ref.chain}>归属：{ownerName}</small>
           <code>{listenerSummary(ref, step, link.kind === 'root')}</code>
           <span className="listener-map-count">{rules.length} 条生效规则</span>
         </div>
@@ -5895,7 +5908,15 @@ export function ChainRulesPanel({
       }
     }
     const sources: { chain: string; node: string }[] = [];
-    for (const source of snapshotApp?.steps ?? steps) {
+    const sourcesByKey = new Map(
+      (snapshotForPorts.data?.snapshot.apps ?? [])
+        .flatMap(candidate => candidate.steps)
+        .map(source => [listenerRefKey({ chain: source.chain, node: source.node }), source] as const),
+    );
+    for (const source of steps) {
+      sourcesByKey.set(listenerRefKey({ chain: source.chain, node: source.node }), source);
+    }
+    for (const source of sourcesByKey.values()) {
       const rules = source.chain === chain.id ? (draftRules[source.node] ?? source.rules) : source.rules;
       for (const rule of rules) {
         if (
@@ -5953,9 +5974,12 @@ export function ChainRulesPanel({
   // `fetchCompileView` 在存在草稿时读取草稿的编译结果，未保存的改动同样计算正确。
   const compiledRules = useMemo(() => {
     const apps = (compiledForPorts.data?.apps as CompiledApp[] | undefined) ?? [];
-    const app = apps.find(a => (a.app_id ?? '') === appId);
-    return new Map((app?.steps ?? []).map(s => [listenerRefKey({ chain: s.chain, node: s.node }), s.rules ?? []]));
-  }, [compiledForPorts.data, appId]);
+    return new Map(
+      apps.flatMap(candidate =>
+        (candidate.steps ?? []).map(step => [listenerRefKey({ chain: step.chain, node: step.node }), step.rules ?? []]),
+      ),
+    );
+  }, [compiledForPorts.data]);
 
   const fallbackOf = (node: string) => {
     const written = draftRules[node] ?? stepOf(node)?.rules ?? [];
@@ -6183,19 +6207,9 @@ export function ChainRulesPanel({
         </div>
       )}
       <section className="listener-map">
-        <header className="listener-map-head">
-          <span>
-            <b>监听规则决策树</b>
-            <small>按规则顺序从左向右；紫色连线表示引用另一监听拥有的完整子树。</small>
-          </span>
-          <span className="listener-map-legend" aria-label="图例">
-            <i className="owned">本链转发</i>
-            <i className="reference">引用监听</i>
-            <i className="terminal">终点</i>
-          </span>
-        </header>
         <ListenerDecisionTree
           app={snapshotApp}
+          apps={snapshotForPorts.data?.snapshot.apps ?? []}
           currentChain={chain}
           currentSteps={steps}
           root={decisionRoot}
@@ -6205,12 +6219,6 @@ export function ChainRulesPanel({
           highlightedListener={highlightedListener}
         />
       </section>
-      <div className="listener-rule-editor-head">
-        <span>
-          <b>规则表编辑</b>
-          <small>新增规则时可选择新建本链下一跳，或直接引用机器中已有监听的规则子树。</small>
-        </span>
-      </div>
       <div className="chain-rule-tree">
         {tree}
         {orphanTree.length > 0 && (
