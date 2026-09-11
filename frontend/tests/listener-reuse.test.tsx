@@ -481,6 +481,7 @@ describe('监听规则子树复用', () => {
     expect(view.queryByRole('button', { name: /新加坡共享监听 · TCP 22000/ })).toBeNull();
     expect(view.queryByRole('button', { name: /同链监听 · TCP 21001/ })).toBeNull();
     const custom = await view.findByRole('button', { name: /自定义.*复用已有监听/ });
+    expect(custom.querySelector('.external-target-custom-icon svg')).not.toBeNull();
     const menu = custom.closest('.external-target-menu');
     expect(menu?.parentElement).toBe(document.body);
     expect(view.container.contains(menu)).toBe(false);

@@ -48,7 +48,7 @@ import {
   type XhttpMode,
 } from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
-import { PanelTitle } from '../ui/icons';
+import { Icon, PanelTitle } from '../ui/icons';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
 import { externalImportCanSave, serverNameAfterAddressChange, vlessEncryptionIsValid } from '../external-outbound';
 import {
@@ -2537,7 +2537,7 @@ function RuleEditorReady({
                                         title="保存时在这台机器创建本链监听和一棵空规则子树"
                                         onClick={() => selectForwardTarget(i, r, candidate.id)}
                                       >
-                                        <span className="external-target-kind new-listener">新建</span>
+                                        <span className="external-target-kind">NODE</span>
                                         <span className="external-target-copy">
                                           <b>{candidate.name || '未命名节点'}</b>
                                         </span>
@@ -2612,7 +2612,7 @@ function RuleEditorReady({
                                         setTargetQuery('');
                                       }}
                                     >
-                                      <span>•••</span>
+                                      <Icon of="link" size={12} className="external-target-custom-icon" />
                                       <b>自定义</b>
                                       <span>复用已有监听</span>
                                     </button>

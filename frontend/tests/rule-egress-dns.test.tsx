@@ -629,6 +629,17 @@ describe('machine-scoped egress DNS', () => {
         where: 'next',
         blocked: null,
       },
+      {
+        id: 'jp',
+        name: '东京节点',
+        public_ipv4: 'jp.example.net',
+        public_ipv6: null,
+        public_ipv4_nat: false,
+        public_ipv6_nat: false,
+        step: null,
+        where: 'outside',
+        blocked: null,
+      },
     ];
     const view = renderEditor(false, forwardRules, false, [], true, true, [], peers);
     const action = view.getByDisplayValue('转发给');
@@ -641,6 +652,9 @@ describe('machine-scoped egress DNS', () => {
     expect(document.activeElement).toBe(trigger);
     expect(view.getByPlaceholderText('搜索节点或代理出站').hasAttribute('autofocus')).toBe(false);
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    const newListener = view.getByRole('button', { name: /NODE.*东京节点.*加入本链/ });
+    expect(newListener.querySelector('.external-target-kind')?.textContent).toBe('NODE');
+    expect(newListener.querySelector('.new-listener')).toBeNull();
   });
 
   it('saves a policy edit without rewriting an unchanged chain rule', async () => {

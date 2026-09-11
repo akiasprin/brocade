@@ -15,4 +15,9 @@ test('目标菜单脱离卡片裁切，监听摘要保持两行并可圈出引�
   );
   assert.match(styles, /\.listener-reference-highlight-hitbox\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;/s);
   assert.match(styles, /\.listener-reference-panel\.hop-target-panel\s*\{[^}]*--listener-panel-accent:/s);
+  assert.match(styles, /\.hop-target-facts\s*\{[^}]*flex-wrap:\s*nowrap;/s);
+  assert.match(
+    styles,
+    /@container rules \(max-width:\s*820px\)[\s\S]*\.listener-reference-row:not\(\.hop-target-row\)\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/s,
+  );
 });
