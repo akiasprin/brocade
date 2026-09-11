@@ -151,7 +151,7 @@ jobs:
           node scripts/route-check.mjs
 
   build:
-    name: brocade-console (${{ matrix.arch }})
+    name: brocade bundle (${{ matrix.arch }}-${{ matrix.libc }})
     runs-on: ubuntu-latest
     strategy:
       # One architecture failing lets the other finish. Seeing both is what distinguishes a problem
@@ -160,12 +160,28 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            libc: gnu
             triple: x86_64-unknown-linux-gnu
           - arch: aarch64
+            libc: gnu
             triple: aarch64-unknown-linux-gnu
             # The control plane cross-compiling itself to aarch64 needs a linker. (The two agents
             # are built by build.rs with zig and rust-lld, and are unrelated to this.)
             apt: gcc-aarch64-linux-gnu
+          - arch: x86_64
+            libc: musl
+            triple: x86_64-unknown-linux-musl
+            zig_target: x86_64-linux-musl
+            cc_var: CC_x86_64_unknown_linux_musl
+            ar_var: AR_x86_64_unknown_linux_musl
+            linker_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+          - arch: aarch64
+            libc: musl
+            triple: aarch64-unknown-linux-musl
+            zig_target: aarch64-linux-musl
+            cc_var: CC_aarch64_unknown_linux_musl
+            ar_var: AR_aarch64_unknown_linux_musl
+            linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
     steps:
       - uses: actions/checkout@v4
 
@@ -208,7 +224,18 @@ jobs:
           # x86_64 leg simply never reads it. Interpolating it out of the matrix instead would give
           # the x86_64 leg an empty string — which tells cargo "the linker is empty", not "unset".
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target ${{ matrix.triple }} -p brocade-console
+          BROCADE_ZIG_TARGET: ${{ matrix.zig_target }}
+          MUSL_CC_VAR: ${{ matrix.cc_var }}
+          MUSL_AR_VAR: ${{ matrix.ar_var }}
+          MUSL_LINKER_VAR: ${{ matrix.linker_var }}
+        run: |
+          if [ "${{ matrix.libc }}" = musl ]; then
+            export "$MUSL_CC_VAR=$GITHUB_WORKSPACE/scripts/zig-cc"
+            export "$MUSL_AR_VAR=$GITHUB_WORKSPACE/scripts/zig-ar"
+            export "$MUSL_LINKER_VAR=rust-lld"
+          fi
+          cargo build --release --locked --target ${{ matrix.triple }} \
+            -p brocade-console -p brocade-launcher
 
       # Say what was actually produced. This binary carries both agents and the whole front end, so
       # the checksum belongs here to be compared against on the machine before anything is replaced.
@@ -216,14 +243,28 @@ jobs:
       # floor printed here, do not deploy it.
       - name: Report the artifact
         run: |
-          bin=target/${{ matrix.triple }}/release/brocade-console
-          ls -l "$bin"
-          sha256sum "$bin"
-          file -b "$bin"
-          echo "highest glibc symbol required: $(readelf -V "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          set -eu
+          out=target/${{ matrix.triple }}/release
+          for bin in "$out/brocade" "$out/brocade-console"; do
+            ls -l "$bin"
+            sha256sum "$bin"
+            file -b "$bin"
+            if [ "${{ matrix.libc }}" = gnu ]; then
+              echo "highest glibc symbol required: $(readelf -V "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+            fi
+          done
+
+      - name: Assemble the sibling bundle
+        run: |
+          set -eu
+          bundle=target/brocade-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          mkdir -p "$bundle"
+          cp target/${{ matrix.triple }}/release/brocade "$bundle/"
+          cp target/${{ matrix.triple }}/release/brocade-console "$bundle/"
+          (cd "$bundle" && sha256sum brocade brocade-console > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:
-          name: brocade-console-${{ matrix.arch }}
-          path: target/${{ matrix.triple }}/release/brocade-console
+          name: brocade-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          path: target/brocade-linux-${{ matrix.arch }}-${{ matrix.libc }}
           if-no-files-found: error

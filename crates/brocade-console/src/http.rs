@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
-    env,
+    env, fs,
     net::IpAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -105,22 +106,7 @@ pub const EMBEDDED_AGENTS: &[(&str, &[u8], &str)] = &[
     ),
 ];
 
-/// The Brocade Xray builds carried by this Console. They are compiled from the vendored source in
-/// `components/xray-core`; nodes never select or download a community release directly.
-pub const EMBEDDED_XRAYS: &[(&str, &[u8], &str)] = &[
-    (
-        "x86_64",
-        include_bytes!(concat!(env!("OUT_DIR"), "/xray-x86_64")),
-        env!("BROCADE_EMBEDDED_XRAY_SHA256_X86_64"),
-    ),
-    (
-        "aarch64",
-        include_bytes!(concat!(env!("OUT_DIR"), "/xray-aarch64")),
-        env!("BROCADE_EMBEDDED_XRAY_SHA256_AARCH64"),
-    ),
-];
-
-pub const BROCADE_XRAY_VERSION: &str = env!("BROCADE_EMBEDDED_XRAY_VERSION");
+pub use crate::embedded_xray::{BROCADE_XRAY_VERSION, EMBEDDED_XRAYS};
 
 fn embedded_agent(arch: &str) -> Option<(&'static [u8], &'static str)> {
     EMBEDDED_AGENTS
@@ -215,6 +201,10 @@ pub struct AppState {
     // Optional dedicated subscription origin. When absent, subscriptions follow the effective
     // Agent public URL, including a value changed live from the settings page.
     subscription_public_url_override: Option<String>,
+    // `brocade up --tunnel` publishes the ephemeral Quick Tunnel hostname atomically here after
+    // cloudflared is ready. Reading it per request lets one Console process follow a new random
+    // hostname without persisting that disposable value in PostgreSQL.
+    runtime_public_url_file: Option<PathBuf>,
     subscription_rate: Arc<Mutex<HashMap<String, SubscriptionRateWindow>>>,
     // A quota change wakes the enforcement loop immediately rather than waiting for its next
     // tick. Lowering a quota has to revoke immediately and raising one has to restore
@@ -263,8 +253,9 @@ impl AppState {
         Self::with_agent_origin(store, quota_wake, DEFAULT_AGENT_ORIGIN.to_owned())
     }
 
-    /// The distribution as it stands right now: what the console has stored, over the environment
-    /// this process started with, over the built-in default.
+    /// The distribution as it stands right now: a process-local launcher URL, over what the
+    /// console has stored, over the environment this process started with, over the built-in
+    /// default.
     ///
     /// Resolved per call rather than held on the state. The public Agent origin is editable from
     /// the settings page, and a copy taken at startup would delay an edit until restart. The Xray
@@ -276,16 +267,33 @@ impl AppState {
     async fn distribution(&self) -> Result<AgentDistribution, StoreError> {
         let stored = self.store.distribution().await?;
         let mut dist = self.dist.clone();
-        if let Some(url) = stored.agent_public_url {
-            dist.agent_public_url = url;
-        }
+        dist.agent_public_url = resolve_agent_public_url(
+            dist.agent_public_url,
+            stored.agent_public_url,
+            self.runtime_public_url(),
+        );
         Ok(dist)
+    }
+
+    fn runtime_public_url(&self) -> Option<String> {
+        let path = self.runtime_public_url_file.as_ref()?;
+        fs::read_to_string(path).ok().and_then(normalize_url)
     }
 
     /// The subscription face normally shares the site's public origin with the Agent face. A
     /// dedicated origin remains available for split deployments, but is an override rather than
     /// a second mandatory setting.
     async fn subscription_origin(&self) -> ApiResult<String> {
+        // A launcher URL must also outrank a deployment's dedicated origin: while Quick Tunnel is
+        // active, every URL shown by this process needs to be reachable through that same random
+        // hostname. The stored and environment settings take effect again as soon as the launcher
+        // file disappears.
+        if let Some(origin) = self
+            .runtime_public_url()
+            .and_then(normalize_subscription_origin)
+        {
+            return Ok(origin);
+        }
         let agent_public_url = self.distribution().await?.agent_public_url;
         resolve_subscription_origin(
             self.subscription_public_url_override.clone(),
@@ -340,10 +348,14 @@ impl AppState {
                 }
                 origin
             });
+        let runtime_public_url_file = env::var_os("BROCADE_RUNTIME_PUBLIC_URL_FILE")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
         Self {
             store,
             geoip: crate::geoip::GeoIpLookup::default(),
             subscription_public_url_override,
+            runtime_public_url_file,
             subscription_rate: Arc::new(Mutex::new(HashMap::new())),
             quota_wake,
             grants_wake: Arc::new(Notify::new()),
@@ -685,7 +697,8 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         || path.starts_with("/compile/")
         || path.starts_with("/load/nodes/")
         || path.starts_with("/ping-probe/nodes/")
-        || (path.starts_with("/realtime/nodes/") && path.ends_with("/events"))
+        || (path.starts_with("/realtime/nodes/")
+            && (path.ends_with("/events") || path.ends_with("/snapshot")))
         // The response is the credential-free Serving authorization matrix. Executing it is a
         // POST to the same path and remains closed by the method gate above.
         || is_user_grant_probe_plan_path(path)
@@ -843,6 +856,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/realtime/nodes/{node_id}/events",
             get(realtime_node_events),
+        )
+        .route(
+            "/realtime/nodes/{node_id}/snapshot",
+            get(realtime_node_snapshot),
         )
         // Active connection observation is operational state: agents read it immediately and it
         // never becomes part of a release revision.
@@ -1702,7 +1719,38 @@ async fn realtime_node_events(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let subscription = realtime_node_subscription(&state, &headers, node_id).await?;
+    Ok(realtime_stream_response(subscription))
+}
+
+/// A bounded fallback for proxies such as Cloudflare Quick Tunnel that do not carry SSE.
+///
+/// Each request briefly acquires the same demand lease as the stream. The realtime service's
+/// stop grace bridges normal two-second polling gaps, so the Agent keeps sampling while the page
+/// is visible without turning polling into a permanent fleet-wide workload.
+async fn realtime_node_snapshot(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let subscription = realtime_node_subscription(&state, &headers, node_id).await?;
+    let payload = json!({
+        "policy": &subscription.policy,
+        "nodes": &subscription.snapshots,
+    });
+    let mut response = Json(payload).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn realtime_node_subscription(
+    state: &AppState,
+    headers: &HeaderMap,
+    node_id: String,
+) -> ApiResult<crate::realtime::RealtimeSubscription> {
+    let admin = require_admin_context(state, headers, AdminPermission::Read).await?;
     let visible = state.store.list_node_agent_states(&admin).await?;
     let Some(node) = visible.nodes.iter().find(|node| node.node_id == node_id) else {
         return Err(ApiError::Store(StoreError::NotFound(format!(
@@ -1715,7 +1763,7 @@ async fn realtime_node_events(
             node.lifecycle_phase
         ))));
     }
-    realtime_events_response(&state, vec![node_id]).await
+    Ok(state.realtime.subscribe(vec![node_id]).await)
 }
 
 async fn realtime_fleet_events(
@@ -5016,6 +5064,17 @@ fn normalize_url(url: String) -> Option<String> {
     }
 }
 
+fn resolve_agent_public_url(
+    configured: String,
+    stored: Option<String>,
+    runtime: Option<String>,
+) -> String {
+    runtime
+        .and_then(normalize_url)
+        .or_else(|| stored.and_then(normalize_url))
+        .unwrap_or(configured)
+}
+
 fn normalize_subscription_origin(url: String) -> Option<String> {
     let url = normalize_url(url)?;
     if url.starts_with("https://")
@@ -5215,11 +5274,12 @@ mod tests {
     use super::{
         bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
         looks_like_uuid, public_ip_report_from_headers, public_may,
-        require_grant_probe_user_access, resolve_subscription_origin, route_from_headers,
-        safe_filename_slug, session_cookie, user_may, AgentDistribution, ApiError,
-        ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery, SubscriptionProtocol,
-        BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS,
-        EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
+        require_grant_probe_user_access, resolve_agent_public_url, resolve_subscription_origin,
+        route_from_headers, safe_filename_slug, session_cookie, user_may, AgentDistribution,
+        ApiError, ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery,
+        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
+        DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS, EMBEDDED_XRAYS, INSTALL_SCRIPT,
+        SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
 
@@ -5307,6 +5367,26 @@ mod tests {
         assert_eq!(
             resolve_subscription_origin(None, "http://console.example".to_owned()),
             None
+        );
+    }
+
+    #[test]
+    fn launcher_public_url_is_ephemeral_and_highest_precedence() {
+        assert_eq!(
+            resolve_agent_public_url(
+                "https://environment.example".to_owned(),
+                Some("https://stored.example/".to_owned()),
+                Some("https://random.trycloudflare.com/\n".to_owned()),
+            ),
+            "https://random.trycloudflare.com"
+        );
+        assert_eq!(
+            resolve_agent_public_url(
+                "https://environment.example".to_owned(),
+                Some("https://stored.example/".to_owned()),
+                None,
+            ),
+            "https://stored.example"
         );
     }
 
@@ -5493,6 +5573,7 @@ mod tests {
             "/users/platform.acme/alice/grant-probes",
             "/realtime/nodes/events",
             "/realtime/nodes/hk-01/events",
+            "/realtime/nodes/hk-01/snapshot",
         ] {
             assert!(public_may(&Method::GET, path), "should allow GET {path}");
         }

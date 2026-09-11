@@ -1,0 +1,17 @@
+#!/bin/sh
+# cc-rs supplies Rust's vendor-qualified target and removes libc headers for musl. Zig expects a
+# vendor-less target and supplies those headers itself, so normalize both details here.
+set -eu
+: "${BROCADE_ZIG_TARGET:?BROCADE_ZIG_TARGET is required}"
+n=$#
+i=0
+while [ "$i" -lt "$n" ]; do
+    argument=$1
+    shift
+    i=$((i + 1))
+    case "$argument" in
+        --target=*|-nostdlibinc) continue ;;
+    esac
+    set -- "$@" "$argument"
+done
+exec zig cc -target "$BROCADE_ZIG_TARGET" "$@"

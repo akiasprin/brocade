@@ -38,6 +38,28 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 
 节点日志默认有界：设置页配置全局上限（默认 100 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。systemd 节点使用独立 journald namespace；OpenRC（Alpine）节点写入 `$BROCADE_AGENT_STATE_DIR/logs/agent.log`；Agent 拉起的 Xray 与每个 Phantun 实例也分别写入该 `logs` 目录。每个日志项的当前段与前一段合计不超过生效上限，降低上限会在线截断已有分段，不重启 Xray/Phantun。systemd 上使用 `journalctl --namespace=brocade-agent -u brocade-agent` 查看 Agent 日志，OpenRC 上使用 `tail -n 100 $BROCADE_AGENT_STATE_DIR/logs/agent.log`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动。
 
+## 一键启动与临时 Tunnel
+
+发行包把 `brocade` 与 `brocade-console` 放在同一目录。无需 Docker，也无需预装 PostgreSQL：
+
+```sh
+./brocade up
+```
+
+未设置 `DATABASE_URL` 时，launcher 会按当前 CPU 与 libc（x86_64/aarch64、GNU/musl）下载并校验固定的 PostgreSQL 17.11.0 运行时，在用户数据目录维护数据库；设置了 `DATABASE_URL` 则只连接外部数据库，绝不会因连接失败回退并新建空库。需要把选择写得更明确时，可使用 `--managed-db` 或 `--external-db`。PostgreSQL 不会由本项目编译或塞进 launcher；所选预编译归档自带匹配的共享库，并通过相对 RUNPATH 从自己的 `lib/` 加载。
+
+无需域名的临时公网入口是同一条启动命令的一个选项：
+
+```sh
+./brocade up --tunnel
+```
+
+首次启动先访问终端打印的本地地址创建管理员；完成初始化前 launcher 不会开放公网入口。随后它查询 Cloudflare 官方 latest stable release，校验官方 SHA-256 后把 `cloudflared` 缓存到用户缓存目录，再打印随机的 `https://*.trycloudflare.com` 地址。查询失败时只会回退到最近一个已验证缓存；不会执行 cloudflared 自更新，也不会把它打进 Brocade 发行包。需要可复现环境时使用 `--cloudflared-version VERSION`，已有受管安装时使用 `--cloudflared-bin PATH`。
+
+Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地址每次可能变化，并受 Cloudflare 的并发限制；正式部署仍应使用自己的域名、TLS 与受管 Tunnel/反向代理。Quick Tunnel 不支持 SSE，控制台会在实时流失败后自动切换到同权限、无缓存的短轮询接口。
+
+默认数据位于 `$XDG_DATA_HOME/brocade`（或 `~/.local/share/brocade`），下载缓存位于 `$XDG_CACHE_HOME/brocade`（或 `~/.cache/brocade`）。受管 PostgreSQL 不允许以 root 启动。完整参数见 `./brocade up --help`。
+
 ## 代码结构
 
 | 组件                 | 职责                                                       |
@@ -45,6 +67,7 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 | `brocade-core`       | 纯函数编译器：模型快照 → IR → 节点产物                     |
 | `brocade-store`      | PostgreSQL 持久化：修订、草稿、发布、凭据、配额与用量      |
 | `brocade-console`    | 控制台 API、节点 API，以及内嵌的 Web 控制台与 agent 发行物 |
+| `brocade-launcher`   | 一键编排 Console、可选受管 PostgreSQL 与 Cloudflare Tunnel |
 | `brocade-deployment` | 发布计划和控制面—节点协议类型                              |
 | `brocade-agent`      | 节点侧收敛、观测、探测与用量采集                           |
 | `brocade-probe`      | Agent 与控制面共用的临时 Xray 客户端和端到端拨测执行器     |
@@ -69,10 +92,10 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 构建脚本会在开始阶段检查必要工具，并在缺失时报告对应的安装方式。标准发行构建为：
 
 ```sh
-cargo build --release --locked -p brocade-console
+cargo build --release --locked -p brocade-console -p brocade-launcher
 ```
 
-输出位于 `target/release/brocade-console`。构建脚本会执行 `npm ci` 与前端生产构建，并分别生成两种架构的 Agent 和 Brocade Xray。若前端已由其他流水线构建，可通过绝对路径指定待嵌入目录，从而跳过 npm：
+输出位于 `target/release/brocade-console` 与 `target/release/brocade`，部署 launcher 时应保持二者同目录。构建脚本会执行 `npm ci` 与前端生产构建，并分别生成两种架构的 Agent 和 Brocade Xray。若前端已由其他流水线构建，可通过绝对路径指定待嵌入目录，从而跳过 npm：
 
 ```sh
 BROCADE_CONSOLE_ASSETS_DIR=/absolute/path/to/frontend/dist \
@@ -156,24 +179,9 @@ sudo -u postgres createdb --owner=brocade brocade
 
 数据库迁移会在控制面启动时自动执行。若数据库不存在且角色具有 `CREATEDB` 权限，控制面也可以自动创建数据库；生产环境通常更适合预先创建数据库，并遵循最小权限原则。
 
-### 3. 安装控制面拨测所需的 Xray
+### 3. 控制面拨测 Xray
 
-用户页的「授权验证」由控制面使用当前 Serving 中的真实用户授权发起，因此控制面主机也必须安装与机队版本一致的 Brocade Xray。它只作为短生命周期的客户端执行，不运行常驻 Xray 服务。源码固定在仓库的 `components/xray-core/`，当前基线为 `v26.4.25`；部署流程不再下载社区 Xray。以下命令在构建机生成 `aarch64` 产物：
-
-```sh
-mkdir -p target/brocade-xray
-BROCADE_COMMIT=$(git rev-parse --short=7 HEAD)
-git status --porcelain | grep -q . && BROCADE_COMMIT="${BROCADE_COMMIT}-dirty"
-cd components/xray-core
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=local \
-  go build -mod=readonly -trimpath -buildvcs=false -gcflags=all=-l=4 \
-  -ldflags="-X github.com/xtls/xray-core/core.build=${BROCADE_COMMIT} -s -w -buildid=" \
-  -o ../../target/brocade-xray/xray-aarch64 ./main
-cd ../..
-target/brocade-xray/xray-aarch64 version | head -n 1
-```
-
-`x86_64` 构建将 `GOARCH` 改为 `amd64`，输出名改为 `xray-x86_64`。`brocade-console/build.rs` 会自动构建并内嵌这两个架构；上面的独立产物用于安装控制面自己的拨测 Xray，也可通过 `BROCADE_XRAY_BIN_X86_64` / `BROCADE_XRAY_BIN_AARCH64` 复用给 Console 构建。
+用户页的「授权验证」会使用当前 Serving 中的真实用户授权发起短生命周期拨测。Console 会把本次构建内嵌的对应架构 Brocade Xray 校验并原子写入 `BROCADE_CACHE_DIR`，无需再单独安装。`BROCADE_PROBE_XRAY_BIN` 只保留为显式运维覆盖；一旦设置，路径或版本错误会直接报告，不会静默回退。
 
 ### 4. 安装二进制与环境文件
 
@@ -193,8 +201,7 @@ ssh deploy@console.example.net \
 DATABASE_URL=postgres://brocade:CHANGE_ME@127.0.0.1:5432/brocade
 BROCADE_ADMIN_BIND=127.0.0.1:8080
 BROCADE_AGENT_PUBLIC_URL=https://console.example.net
-BROCADE_XRAY_VERSION=v26.4.25
-BROCADE_PROBE_XRAY_BIN=/opt/brocade/libexec/xray
+BROCADE_CACHE_DIR=/var/cache/brocade
 BROCADE_PROBE_RUNTIME_DIR=/run/brocade/probes
 ```
 
@@ -319,7 +326,6 @@ sudo install -d -o postgres -g postgres -m 0700 /var/backups/brocade
 sudo -u postgres pg_dump --format=custom \
   --file=/var/backups/brocade/before-upgrade.dump brocade
 sha256sum /opt/brocade/brocade-console
-/opt/brocade/libexec/xray version | head -n 1
 ```
 
 新二进制应先上传到临时路径，再原子替换并重启服务。上传阶段不会中断现有进程：
@@ -344,7 +350,6 @@ ssh deploy@console.example.net '
 
 ```sh
 sudo systemctl is-active brocade-console
-/opt/brocade/libexec/xray version | head -n 1
 sudo journalctl -u brocade-console -n 100 --no-pager
 curl --fail https://console.example.net/healthz
 ```

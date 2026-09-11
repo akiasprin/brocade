@@ -2,6 +2,7 @@ pub mod acme;
 pub mod assets;
 pub mod certs;
 pub mod dns;
+mod embedded_xray;
 pub mod geoip;
 mod grant_probe;
 pub mod http;

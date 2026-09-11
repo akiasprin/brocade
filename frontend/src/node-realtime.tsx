@@ -17,6 +17,12 @@ export interface NodeRealtimeState {
   connected: boolean;
 }
 
+interface NodeRealtimeSnapshot {
+  node_id?: string;
+  connected?: boolean;
+  samples: NodeRealtimeEvent[];
+}
+
 const NodeRealtimeContext = createContext<NodeRealtimeState | null>(null);
 
 function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
@@ -25,15 +31,55 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
   const [connectedNodeId, setConnectedNodeId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!nodeId || typeof EventSource === 'undefined') return;
-    let source: EventSource;
+    if (!nodeId) return;
+    let source: EventSource | undefined;
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    let pollAbort: AbortController | undefined;
+    let polling = false;
     let stopped = false;
-    const accept = (event: NodeRealtimeEvent) => {
+    const accept = (event: NodeRealtimeEvent, connected = true) => {
       setLast({ nodeId, event, arrived: Date.now() });
-      setConnectedNodeId(nodeId);
+      if (connected) setConnectedNodeId(nodeId);
+    };
+    const acceptSnapshot = (nodes: NodeRealtimeSnapshot[]) => {
+      const node = nodes.find(value => value.node_id === nodeId) ?? nodes[0];
+      setConnectedNodeId(node?.connected ? nodeId : null);
+      const sample = node?.samples.at(-1);
+      if (sample) accept(sample, false);
+    };
+    const poll = async () => {
+      if (stopped) return;
+      const abort = new AbortController();
+      pollAbort = abort;
+      try {
+        const response = await fetch(`/realtime/nodes/${encodeURIComponent(nodeId)}/snapshot`, {
+          credentials: 'include',
+          cache: 'no-store',
+          signal: abort.signal,
+        });
+        if (!response.ok) throw new Error(`realtime snapshot returned ${response.status}`);
+        const payload = (await response.json()) as { nodes?: NodeRealtimeSnapshot[] };
+        if (!Array.isArray(payload.nodes)) throw new Error('realtime snapshot has no nodes');
+        acceptSnapshot(payload.nodes);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) setConnectedNodeId(null);
+      } finally {
+        if (!stopped) pollTimer = setTimeout(() => void poll(), 2000);
+      }
+    };
+    const startPolling = () => {
+      if (stopped || polling) return;
+      polling = true;
+      source?.close();
+      setConnectedNodeId(null);
+      void poll();
     };
     const open = () => {
       if (stopped) return;
+      if (typeof EventSource === 'undefined') {
+        startPolling();
+        return;
+      }
       const opened = new EventSource(`/realtime/nodes/${encodeURIComponent(nodeId)}/events`, { withCredentials: true });
       source = opened;
       opened.addEventListener('sample', e => {
@@ -45,13 +91,7 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
       });
       opened.addEventListener('snapshot', e => {
         try {
-          const nodes = JSON.parse((e as MessageEvent).data).nodes as {
-            node_id?: string;
-            samples: NodeRealtimeEvent[];
-          }[];
-          const node = nodes.find(value => value.node_id === nodeId) ?? nodes[0];
-          const sample = node?.samples.at(-1);
-          if (sample) accept(sample);
+          acceptSnapshot(JSON.parse((e as MessageEvent).data).nodes as NodeRealtimeSnapshot[]);
         } catch {
           setConnectedNodeId(null);
         }
@@ -69,13 +109,17 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
         setConnectedNodeId(null);
         if (source === opened) open();
       });
-      opened.onerror = () => setConnectedNodeId(null);
+      opened.onerror = () => {
+        if (source === opened) startPolling();
+      };
     };
     open();
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => {
       stopped = true;
       source?.close();
+      pollAbort?.abort();
+      if (pollTimer) clearTimeout(pollTimer);
       clearInterval(timer);
     };
   }, [nodeId]);

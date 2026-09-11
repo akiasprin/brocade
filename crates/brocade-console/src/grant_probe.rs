@@ -86,11 +86,9 @@ struct ProbeJob {
 
 impl GrantProbeService {
     pub(crate) fn from_env() -> Self {
-        let binary = std::env::var("BROCADE_PROBE_XRAY_BIN")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/opt/brocade/libexec/xray"));
+        let binary = std::env::var_os("BROCADE_PROBE_XRAY_BIN")
+            .filter(|value| !value.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from);
         let expected = std::env::var("BROCADE_XRAY_VERSION")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -105,15 +103,50 @@ impl GrantProbeService {
                     PathBuf::from("/run/brocade/probes")
                 }
             });
-        let capability = inspect_runtime_dir(&runtime_dir)
-            .err()
-            .map(|reason| ProbeCapability {
-                available: false,
-                version: None,
-                reason: Some(reason),
-                concurrency: GLOBAL_CONCURRENCY,
-            })
-            .unwrap_or_else(|| inspect_xray(&binary, expected.as_deref()));
+        let cache_dir = std::env::var_os("BROCADE_CACHE_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| runtime_dir.clone());
+        Self::from_config(binary, expected, runtime_dir, cache_dir)
+    }
+
+    fn from_config(
+        binary: Option<PathBuf>,
+        expected: Option<String>,
+        runtime_dir: PathBuf,
+        cache_dir: PathBuf,
+    ) -> Self {
+        let prepared = inspect_runtime_dir(&runtime_dir).and_then(|()| match binary {
+            // An explicit path is authoritative. If it is bad, report it; silently switching to
+            // embedded Xray would make a deployment typo look healthy.
+            Some(binary) => Ok((binary, expected)),
+            None => {
+                crate::embedded_xray::prepare(&cache_dir, std::env::consts::ARCH).map(|binary| {
+                    (
+                        binary,
+                        Some(crate::embedded_xray::BROCADE_XRAY_VERSION.to_owned()),
+                    )
+                })
+            }
+        });
+        let (binary, capability) = match prepared {
+            Ok((binary, expected)) => {
+                let capability = inspect_xray(&binary, expected.as_deref());
+                (binary, capability)
+            }
+            Err(reason) => {
+                eprintln!("grant probe xray preparation failed: {reason}");
+                (
+                    PathBuf::new(),
+                    ProbeCapability {
+                        available: false,
+                        version: None,
+                        reason: Some(reason),
+                        concurrency: GLOBAL_CONCURRENCY,
+                    },
+                )
+            }
+        };
         Self::new(binary, runtime_dir, capability, Arc::new(default_run_probe))
     }
 
@@ -562,7 +595,28 @@ fn inspect_xray(path: &Path, expected: Option<&str>) -> ProbeCapability {
         .unwrap_or_default()
         .trim()
         .to_owned();
-    let actual = first.split_whitespace().nth(1).map(str::to_owned);
+    let mut fields = first.split_whitespace();
+    let actual = if fields.next() == Some("Xray") {
+        fields
+            .next()
+            .filter(|version| {
+                version
+                    .trim_start_matches('v')
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    if actual.is_none() {
+        return ProbeCapability {
+            available: false,
+            version: None,
+            reason: Some("Console 无法识别拨测 Xray 的版本".to_owned()),
+            concurrency: GLOBAL_CONCURRENCY,
+        };
+    }
     if let (Some(expected), Some(actual)) = (expected, actual.as_deref()) {
         if expected.trim_start_matches('v') != actual.trim_start_matches('v') {
             return ProbeCapability {
@@ -617,6 +671,60 @@ fn safe_result_detail(result: &E2eProbe) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_probe_is_available_without_an_installed_xray() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let cache = root.path().join("cache");
+        let service = GrantProbeService::from_config(None, None, runtime, cache.clone());
+        let capability = service.capability();
+        assert!(capability.available, "{:?}", capability.reason);
+        assert_eq!(
+            capability
+                .version
+                .as_deref()
+                .unwrap()
+                .trim_start_matches('v'),
+            crate::embedded_xray::BROCADE_XRAY_VERSION.trim_start_matches('v')
+        );
+        assert!(service.inner.xray_binary.starts_with(cache));
+        let (_, bytes, _) = crate::embedded_xray::EMBEDDED_XRAYS
+            .iter()
+            .find(|(arch, ..)| *arch == std::env::consts::ARCH)
+            .unwrap();
+        assert_eq!(std::fs::read(&service.inner.xray_binary).unwrap(), *bytes);
+    }
+
+    #[test]
+    fn explicit_probe_override_is_checked_and_never_falls_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom-xray");
+        let cache = root.path().join("cache");
+        let configured = || {
+            GrantProbeService::from_config(
+                Some(path.clone()),
+                Some("v26.4.25".to_owned()),
+                root.path().join("run"),
+                cache.clone(),
+            )
+        };
+        assert!(!configured().capability().available);
+        for (banner, available) in [
+            ("Xray 26.4.25", true),
+            ("Xray 1.2.3", false),
+            ("unknown", false),
+        ] {
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '{banner}\\n'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let service = configured();
+            assert_eq!(service.capability().available, available);
+            assert_eq!(service.inner.xray_binary, path);
+        }
+        assert!(!cache.exists());
+    }
 
     #[test]
     fn raw_probe_detail_is_never_returned() {

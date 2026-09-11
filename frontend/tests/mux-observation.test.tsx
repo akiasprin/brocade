@@ -264,6 +264,54 @@ it('shares one node realtime connection with the reverse-health card', () => {
   expect(screen.getByLabelText('Mux 连接复用')).toBeTruthy();
 });
 
+it('falls back to bounded snapshot polling when the tunnel cannot carry SSE', async () => {
+  const now = Date.now();
+  const request = vi.fn().mockResolvedValue({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      nodes: [
+        {
+          node_id: 'node-a',
+          connected: true,
+          samples: [
+            {
+              node_id: 'node-a',
+              received_at_unix_millis: now,
+              sample: {
+                sampled_at_unix_millis: now,
+                mux: {
+                  boot_id: '9',
+                  sequence: 3,
+                  sampled_at_unix_ms: now,
+                  pools: [pool()],
+                  workers: [worker],
+                  events: [],
+                },
+              },
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  vi.stubGlobal('fetch', request);
+
+  render(<MuxObservationCard nodeId="node-a" />);
+  await act(async () => {
+    Events.current.onerror?.();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(Events.current.closed).toBe(true);
+  expect(request).toHaveBeenCalledWith(
+    '/realtime/nodes/node-a/snapshot',
+    expect.objectContaining({ credentials: 'include' }),
+  );
+  expect(screen.getByLabelText('Mux 连接复用')).toBeTruthy();
+});
+
 it('parses ordinary outbound tags without guessing malformed values', () => {
   expect(parseMuxPair('out:app-a/jp-a>tyo-exit')).toEqual({ app: 'app-a', chain: 'jp-a', peer: 'tyo-exit' });
   expect(parseMuxPair('out:jp-a>tyo-exit')).toEqual({ app: null, chain: 'jp-a', peer: 'tyo-exit' });
