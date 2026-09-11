@@ -18854,20 +18854,29 @@ input.f.ing-pj-port {
 }
 .external-target-menu > button.external-target-new {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
   width: 100%;
-  margin-top: 2px;
+  margin-top: 3px;
   padding: 5px 7px;
-  border: 1px solid transparent;
+  border: 1px dashed color-mix(in srgb, var(--action) 42%, var(--line));
   border-radius: 5px;
-  background: transparent;
+  background: color-mix(in srgb, var(--action) 5%, var(--sheet));
   color: var(--action-hover);
   text-align: left;
 }
 .external-target-menu > button.external-target-custom {
+  border-color: color-mix(in srgb, var(--hue-3) 38%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 5%, var(--sheet));
   color: var(--hue-3);
+}
+.external-target-new-icon,
+.external-target-new-icon svg {
+  display: block;
+}
+.external-target-new-icon {
+  justify-self: center;
 }
 .external-target-empty {
   padding: 13px 8px;

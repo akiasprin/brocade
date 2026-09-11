@@ -481,6 +481,8 @@ describe('监听规则子树复用', () => {
     const manage = view.getByRole('button', { name: '管理隧道' });
     expect(custom.textContent).not.toContain('↗');
     expect(manage.textContent).not.toContain('↗');
+    expect(custom.querySelector('.external-target-new-icon')).not.toBeNull();
+    expect(manage.querySelector('.external-target-new-icon')).not.toBeNull();
     expect(custom.querySelector('.external-target-copy')).not.toBeNull();
     expect(manage.querySelector('.external-target-copy')).not.toBeNull();
     const menu = custom.closest('.external-target-menu');

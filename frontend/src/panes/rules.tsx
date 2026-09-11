@@ -48,7 +48,7 @@ import {
   type XhttpMode,
 } from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
-import { PanelTitle } from '../ui/icons';
+import { Icon, PanelTitle } from '../ui/icons';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
 import { externalImportCanSave, serverNameAfterAddressChange, vlessEncryptionIsValid } from '../external-outbound';
 import {
@@ -2630,6 +2630,7 @@ function RuleEditorReady({
                                         navigate('tunnels');
                                       }}
                                     >
+                                      <Icon of="tunnels" size={12} className="external-target-new-icon" />
                                       <span className="external-target-copy">
                                         <b>管理隧道</b>
                                       </span>
@@ -2643,6 +2644,7 @@ function RuleEditorReady({
                                         setTargetQuery('');
                                       }}
                                     >
+                                      <Icon of="tunnels" size={12} className="external-target-new-icon" />
                                       <span className="external-target-copy">
                                         <b>自定义</b>
                                       </span>
