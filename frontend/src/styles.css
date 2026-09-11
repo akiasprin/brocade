@@ -4616,6 +4616,24 @@ input.f {
   gap: 50px;
   width: max-content;
 }
+.listener-map-node.is-highlighted-subtree {
+  z-index: 2;
+  isolation: isolate;
+}
+.listener-map-node.is-highlighted-subtree::before {
+  position: absolute;
+  z-index: 0;
+  inset: -9px -11px;
+  border: 2px solid var(--listener-ref);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--listener-ref) 4%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--listener-ref) 10%, transparent);
+  content: '';
+  pointer-events: none;
+}
+.listener-map-node.is-highlighted-subtree > .listener-map-branches {
+  z-index: 1;
+}
 .listener-map-node:not(.has-branches) {
   display: block;
 }
@@ -18912,8 +18930,9 @@ input.f.ing-pj-port {
   gap: 9px;
   min-width: 0;
 }
-.listener-reference-main > span:last-child {
+.listener-reference-copy {
   display: grid;
+  flex: 1 1 auto;
   min-width: 0;
   gap: 2px;
 }
@@ -18930,6 +18949,15 @@ input.f.ing-pj-port {
   font-size: 9.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.listener-subtree-highlight {
+  flex: none;
+  white-space: nowrap;
+}
+.listener-subtree-highlight[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--hue-3) 52%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 12%, var(--block));
+  color: var(--hue-3);
 }
 .listener-reference-facts {
   display: flex;

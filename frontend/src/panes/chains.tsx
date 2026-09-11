@@ -5404,6 +5404,7 @@ export function ListenerDecisionTree({
   draftRules,
   compiledRules,
   nodeNames,
+  highlightedListener = null,
 }: {
   app: SnapshotApp | null;
   currentChain: SnapshotChain;
@@ -5412,13 +5413,27 @@ export function ListenerDecisionTree({
   draftRules: Record<string, Rule[]>;
   compiledRules: ListenerTreeRules;
   nodeNames: Map<string, string>;
+  highlightedListener?: ListenerRef | null;
 }) {
+  const treeViewport = useRef<HTMLDivElement>(null);
+  const highlightedKey = highlightedListener ? listenerRefKey(highlightedListener) : null;
+  useEffect(() => {
+    if (!highlightedKey) return;
+    const highlighted = treeViewport.current?.querySelector<HTMLElement>('.is-highlighted-subtree');
+    if (!highlighted || typeof highlighted.scrollIntoView !== 'function') return;
+    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    highlighted.scrollIntoView({
+      behavior: reducedMotion ? 'auto' : 'smooth',
+      block: 'center',
+      inline: 'center',
+    });
+  }, [highlightedKey]);
+
   if (!root) return <Empty>这条链还没有入口，无法建立规则树。</Empty>;
 
   const appChains = app?.chains ?? [currentChain];
   const appSteps = app?.steps ?? currentSteps;
   const chainNames = new Map(appChains.map(candidate => [candidate.id, candidate.name]));
-  const currentStepKeys = new Set(currentSteps.map(step => listenerRefKey({ chain: step.chain, node: step.node })));
   const steps = new Map<string, SnapshotStep>();
   for (const step of appSteps) steps.set(listenerRefKey({ chain: step.chain, node: step.node }), step);
   // The panel can already contain a freshly staged step while the shared snapshot query is
@@ -5438,8 +5453,9 @@ export function ListenerDecisionTree({
     ref: ListenerRef,
     step: SnapshotStep,
   ): { rule: Rule; generated: boolean; staged: boolean }[] => {
-    const usesLocalDraft =
-      ref.chain === currentChain.id && currentStepKeys.has(listenerRefKey(ref)) && Object.hasOwn(draftRules, ref.node);
+    // 草稿是当前链按 node 持有的权威编辑态。没有持久化 Step 的直出根也会在第一次选择动作时
+    // 产生草稿；若要求 currentSteps 已存在该键，决策图会一直显示旧的编译器兜底直到保存。
+    const usesLocalDraft = ref.chain === currentChain.id && Object.hasOwn(draftRules, ref.node);
     const written = usesLocalDraft ? draftRules[ref.node] : step.rules;
     const generated = compilerFallbackRules(written, compiledRules.get(listenerRefKey(ref)) ?? []);
     return [
@@ -5503,10 +5519,16 @@ export function ListenerDecisionTree({
     const owner = chainNames.get(ref.chain) || ref.chain;
     const references = referenceCounts.get(key) ?? 0;
     const isReference = link.kind === 'reference';
+    const highlighted = isReference && key === highlightedKey;
     const localReference = isReference && link.from.node === ref.node;
 
     return (
-      <div className={`listener-map-node${rules.length > 0 ? ' has-branches' : ''}`} key={pathKey}>
+      <div
+        className={`listener-map-node${rules.length > 0 ? ' has-branches' : ''}${
+          highlighted ? ' is-highlighted-subtree' : ''
+        }`}
+        key={pathKey}
+      >
         <div className={`listener-map-card${isReference ? ' is-reference' : ''}`}>
           <span className="listener-map-kicker">
             {link.kind === 'root' ? '链路入口' : isReference ? '引用的监听子树' : '本链监听'}
@@ -5573,7 +5595,7 @@ export function ListenerDecisionTree({
   };
 
   return (
-    <div className="listener-map-scroll" aria-label="监听端口规则决策树">
+    <div ref={treeViewport} className="listener-map-scroll" aria-label="监听端口规则决策树">
       <div className="listener-map-canvas">
         {renderListener({ chain: currentChain.id, node: root }, { kind: 'root' }, new Set(), 'root')}
       </div>
@@ -5752,6 +5774,11 @@ export function ChainRulesPanel({
   const [draftHops, setDraftHops] = useState<Record<string, HopsDraft>>({});
   const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
   const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
+  const [highlightedListener, setHighlightedListener] = useState<ListenerRef | null>(null);
+  const toggleHighlightedListener = (listener: ListenerRef) =>
+    setHighlightedListener(current =>
+      current && listenerRefKey(current) === listenerRefKey(listener) ? null : listener,
+    );
   const snapshotApp = snapshotForPorts.data?.snapshot.apps.find(candidate => candidate.id === appId) ?? null;
   const peersOf = (node: string) =>
     forwardPeers({
@@ -6029,6 +6056,8 @@ export function ChainRulesPanel({
                   rules: fallbackOf(node),
                   pending: revisionsForPorts.isPending || compiledForPorts.isLoading,
                 }}
+                highlightedListener={highlightedListener}
+                onHighlightListener={toggleHighlightedListener}
               />
             </div>
             {children.length > 0 && (
@@ -6086,6 +6115,7 @@ export function ChainRulesPanel({
           draftRules={draftRules}
           compiledRules={compiledRules}
           nodeNames={nameMap}
+          highlightedListener={highlightedListener}
         />
       </section>
       <div className="listener-rule-editor-head">

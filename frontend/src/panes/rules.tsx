@@ -1610,6 +1610,9 @@ type RuleEditorProps = {
   // RuleEditor 只负责把它按普通规则的列布局渲染成不可编辑行。
   fallback?: { rules: Rule[]; pending: boolean };
   onClose?: () => void;
+  /** 当前决策图中被圈出的监听子树；只改变视图，不打开或修改所有者规则。 */
+  highlightedListener?: ListenerRef | null;
+  onHighlightListener?: (listener: ListenerRef) => void;
   /* 由上层持有的共享草稿。不传入时由本组件自行管理（机器详情页中一台机器只出现一次，不需要共享）。 */
   shared?: {
     rules: Rule[];
@@ -1685,6 +1688,8 @@ function RuleEditorReady({
   hopIn: selfHopIn = null,
   fallback,
   onClose,
+  highlightedListener = null,
+  onHighlightListener,
   shared,
   ruleDrafts,
   saves = true,
@@ -2931,6 +2936,7 @@ function RuleEditorReady({
                   (rule): rule is Rule & { a: Extract<RuleAction, { t: 'reuse_listener' }> } =>
                     rule.a.t === 'reuse_listener' && sameListener(rule.a.listener, listener),
                 );
+                const highlighted = Boolean(highlightedListener && sameListener(highlightedListener, listener));
                 if (!target) {
                   return (
                     <div className="listener-reference-row missing" key={key}>
@@ -2955,7 +2961,7 @@ function RuleEditorReady({
                   <div className={`listener-reference-row${target.blocked ? ' blocked' : ''}`} key={key}>
                     <div className="listener-reference-main">
                       <span className="external-target-kind listener">{target.local ? '本机' : '引用'}</span>
-                      <span>
+                      <span className="listener-reference-copy">
                         <b>
                           {target.nodeName} · TCP {target.step.hop_in?.port}
                         </b>
@@ -2965,15 +2971,17 @@ function RuleEditorReady({
                             : `子树归属「${target.ownerName}」 · ${target.step.rules.length} 条规则 · 当前 ${target.references} 处引用`}
                         </small>
                       </span>
-                      <button
-                        type="button"
-                        className="btn sm"
-                        disabled={dirty}
-                        title={dirty ? '先保存当前规则，避免离开时丢失未写入草稿的修改' : '打开拥有这棵子树的线路'}
-                        onClick={() => navigate('chains', { p: 'chain', app: appId, chain: listener.chain })}
-                      >
-                        打开源规则
-                      </button>
+                      {onHighlightListener && (
+                        <button
+                          type="button"
+                          className="btn sm listener-subtree-highlight"
+                          aria-pressed={highlighted}
+                          title={highlighted ? '取消图中的规则子树高亮' : '在上方决策图中圈出这棵规则子树'}
+                          onClick={() => onHighlightListener(listener)}
+                        >
+                          高亮规则子树
+                        </button>
+                      )}
                     </div>
                     <div className="listener-reference-facts">
                       <span>

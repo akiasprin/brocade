@@ -217,6 +217,7 @@ describe('监听规则子树复用', () => {
         root="source"
         draftRules={{}}
         compiledRules={new Map()}
+        highlightedListener={{ chain: 'owner', node: 'source' }}
         nodeNames={
           new Map([
             ['source', '香港节点'],
@@ -237,9 +238,70 @@ describe('监听规则子树复用', () => {
     expect(view.getByText(/443 \/ VLESS/)).toBeTruthy();
     expect(view.getByText('22000 / VLESS-NONE')).toBeTruthy();
     expect(view.container.querySelectorAll('.listener-map-branch.is-reference')).toHaveLength(1);
+    const highlighted = view.container.querySelector('.listener-map-node.is-highlighted-subtree');
+    expect(highlighted).not.toBeNull();
+    expect(highlighted?.textContent).toContain('新加坡出口');
     expect(
       [...view.container.querySelectorAll('.listener-map-edge > span')].map(element => element.textContent),
     ).toEqual(['01', '01', '02', '01', '02']);
+  });
+
+  it('草稿在 Node、监听复用和各类终点间切换时立即重绘', () => {
+    const source = listenerStep('source-chain', 'source', 21000, [egressRule()]);
+    const next = listenerStep('source-chain', 'next', 21001, [egressRule()]);
+    const shared = listenerStep('owner', 'shared', 22000, [egressRule()]);
+    const app: SnapshotApp = {
+      id: 'app',
+      label: '项目',
+      chains: [chain('source-chain', '源线路'), chain('owner', '共享出口')],
+      ingresses: [ingress('source-in', 'source-chain', 'source'), ingress('owner-in', 'owner', 'owner-root')],
+      steps: [
+        source,
+        next,
+        { chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] },
+        shared,
+      ],
+      fronts: [],
+      grants: [],
+    };
+    const props = {
+      app,
+      currentChain: app.chains[0],
+      currentSteps: [source, next],
+      root: 'source',
+      compiledRules: new Map(),
+      nodeNames: new Map([
+        ['source', '香港入口'],
+        ['next', '日本 Node'],
+        ['shared', '新加坡共享监听'],
+        ['new-node', '待建 Node'],
+      ]),
+    };
+    const tree = (rules: Rule[]) => <ListenerDecisionTree {...props} draftRules={{ source: rules }} />;
+    const view = render(tree([forwardRule('next')]));
+
+    expect(view.getByText('本链监听')).toBeTruthy();
+    expect(view.getByText('日本 Node')).toBeTruthy();
+    expect(view.getByText('本机出网')).toBeTruthy();
+
+    view.rerender(tree([referenceRule('owner', 'shared')]));
+    expect(view.getByText('引用的监听子树')).toBeTruthy();
+    expect(view.getByText('新加坡共享监听')).toBeTruthy();
+
+    view.rerender(tree([{ m: { t: 'any' }, a: { t: 'proxy', outbound: 'warp' } }]));
+    expect(view.getByText('外部代理')).toBeTruthy();
+    expect(view.getByText('warp')).toBeTruthy();
+
+    view.rerender(tree([egressRule()]));
+    expect(view.getByText('本机出网')).toBeTruthy();
+    expect(view.queryByText('日本 Node')).toBeNull();
+
+    view.rerender(tree([{ m: { t: 'any' }, a: { t: 'block' } }]));
+    expect(view.getByText('拒绝')).toBeTruthy();
+
+    view.rerender(tree([forwardRule('new-node')]));
+    expect(view.getByText('待保存的新监听')).toBeTruthy();
+    expect(view.getByText('待建 Node')).toBeTruthy();
   });
 
   it('把草稿中新建但尚未保存的监听显示为待建立状态', () => {
@@ -300,6 +362,25 @@ describe('监听规则子树复用', () => {
     expect(view.getByText('本机出网')).toBeTruthy();
     expect(view.getByText('未命中以上规则')).toBeTruthy();
     expect(view.queryByText('找不到监听所有者')).toBeNull();
+
+    view.rerender(
+      <ListenerDecisionTree
+        app={app}
+        currentChain={app.chains[0]}
+        currentSteps={[]}
+        root="hk"
+        draftRules={{ hk: [{ m: { t: 'any' }, a: { t: 'block' } }] }}
+        compiledRules={
+          new Map([
+            [listenerRefKey({ chain: 'direct', node: 'hk' }), [{ dest_match: { t: 'any' }, action: egressRule().a }]],
+          ])
+        }
+        nodeNames={new Map([['hk', '香港节点']])}
+      />,
+    );
+    expect(view.getByText('拒绝')).toBeTruthy();
+    expect(view.queryByText('本机出网')).toBeNull();
+    expect(view.queryByText('编译器兜底')).toBeNull();
   });
 
   it('在草稿里只保存监听身份和承载选择，不复制目标端口和规则', async () => {
@@ -365,6 +446,7 @@ describe('监听规则子树复用', () => {
         );
       }),
     );
+    const onHighlightListener = vi.fn();
 
     const view = render(
       <QueryClientProvider client={client}>
@@ -377,6 +459,7 @@ describe('监听规则子树复用', () => {
           peers={[]}
           isForwardTarget={false}
           fallback={{ rules: [], pending: false }}
+          onHighlightListener={onHighlightListener}
         />
       </QueryClientProvider>,
     );
@@ -394,6 +477,11 @@ describe('监听规则子树复用', () => {
     expect(document.body.contains(choice)).toBe(true);
     fireEvent.click(choice);
     expect(view.getByText(/引用子树 · 共享出口/)).toBeTruthy();
+    expect(view.queryByRole('button', { name: '打开源规则' })).toBeNull();
+    const highlightButton = view.getByRole('button', { name: '高亮规则子树' });
+    expect(highlightButton.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(highlightButton);
+    expect(onHighlightListener).toHaveBeenCalledWith({ chain: 'owner', node: 'shared' });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => {
