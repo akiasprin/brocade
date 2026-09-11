@@ -12,7 +12,7 @@ import type {
 } from '../src/api';
 import { draft } from '../src/draft';
 import { ListenerDecisionTree } from '../src/panes/chains';
-import { RuleEditor, forwardPeers, reusableListeners } from '../src/panes/rules';
+import { RuleEditor, forwardPeers, listenerRefKey, reusableListeners } from '../src/panes/rules';
 
 const chain = (id: string, name: string, tenant = 'platform.acme'): SnapshotChain => ({ id, name, tenant });
 
@@ -267,6 +267,38 @@ describe('监听规则子树复用', () => {
 
     expect(view.getByText('待保存的新监听')).toBeTruthy();
     expect(view.getByText('保存到草稿后建立')).toBeTruthy();
+    expect(view.queryByText('找不到监听所有者')).toBeNull();
+  });
+
+  it('把没有持久化 Step 的直出入口展开为编译器默认出网', () => {
+    const app: SnapshotApp = {
+      id: 'app',
+      label: '项目',
+      chains: [chain('direct', '香港直出')],
+      ingresses: [ingress('direct-in', 'direct', 'hk')],
+      steps: [],
+      fronts: [],
+      grants: [],
+    };
+    const view = render(
+      <ListenerDecisionTree
+        app={app}
+        currentChain={app.chains[0]}
+        currentSteps={[]}
+        root="hk"
+        draftRules={{}}
+        compiledRules={
+          new Map([
+            [listenerRefKey({ chain: 'direct', node: 'hk' }), [{ dest_match: { t: 'any' }, action: egressRule().a }]],
+          ])
+        }
+        nodeNames={new Map([['hk', '香港节点']])}
+      />,
+    );
+
+    expect(view.getByText('链路入口')).toBeTruthy();
+    expect(view.getByText('本机出网')).toBeTruthy();
+    expect(view.getByText('未命中以上规则')).toBeTruthy();
     expect(view.queryByText('找不到监听所有者')).toBeNull();
   });
 

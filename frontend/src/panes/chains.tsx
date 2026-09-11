@@ -5424,6 +5424,15 @@ export function ListenerDecisionTree({
   // The panel can already contain a freshly staged step while the shared snapshot query is
   // refreshing.  Current-chain props win, and missing rows are added instead of disappearing.
   for (const step of currentSteps) steps.set(listenerRefKey({ chain: step.chain, node: step.node }), step);
+  // A direct chain deliberately stores no Step at its ingress node. The compiler still creates
+  // an IR Step there and appends its Egress/Block default, so mirror that virtual root and let the
+  // compiled fallback below render the real terminal. Treating it as a missing listener turns the
+  // simplest valid chain into a red dangling-reference error.
+  const rootKey = listenerRefKey({ chain: currentChain.id, node: root });
+  const rootHasIngress = app?.ingresses.some(ingress => ingress.chain === currentChain.id && ingress.node === root);
+  if (!steps.has(rootKey) && rootHasIngress) {
+    steps.set(rootKey, { chain: currentChain.id, node: root, accept: null, hop_in: null, rules: [] });
+  }
 
   const effectiveRules = (
     ref: ListenerRef,
