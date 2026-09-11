@@ -478,9 +478,13 @@ describe('监听规则子树复用', () => {
     fireEvent.click(choice);
     expect(view.getByText(/引用子树 · 共享出口/)).toBeTruthy();
     expect(view.queryByRole('button', { name: '打开源规则' })).toBeNull();
-    const highlightButton = view.getByRole('button', { name: '高亮规则子树' });
-    expect(highlightButton.getAttribute('aria-pressed')).toBe('false');
-    fireEvent.click(highlightButton);
+    expect(view.queryByText('高亮规则子树')).toBeNull();
+    const highlightHitbox = view.getByRole('button', {
+      name: '高亮 新加坡共享监听 的规则子树',
+    });
+    expect(highlightHitbox.closest('.listener-reference-row')).not.toBeNull();
+    expect(highlightHitbox.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(highlightHitbox);
     expect(onHighlightListener).toHaveBeenCalledWith({ chain: 'owner', node: 'shared' });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 

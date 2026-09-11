@@ -2958,7 +2958,28 @@ function RuleEditorReady({
                     value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                   });
                 return (
-                  <div className={`listener-reference-row${target.blocked ? ' blocked' : ''}`} key={key}>
+                  <div
+                    className={`listener-reference-row${target.blocked ? ' blocked' : ''}${
+                      onHighlightListener ? ' is-highlightable' : ''
+                    }${highlighted ? ' is-highlighted' : ''}`}
+                    key={key}
+                  >
+                    {onHighlightListener && (
+                      <span
+                        className="listener-reference-highlight-hitbox"
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`${highlighted ? '取消高亮' : '高亮'} ${target.nodeName} 的规则子树`}
+                        aria-pressed={highlighted}
+                        title={highlighted ? '取消图中的规则子树高亮' : '在决策图中圈出这棵规则子树'}
+                        onClick={() => onHighlightListener(listener)}
+                        onKeyDown={event => {
+                          if (event.key !== 'Enter' && event.key !== ' ') return;
+                          event.preventDefault();
+                          onHighlightListener(listener);
+                        }}
+                      />
+                    )}
                     <div className="listener-reference-main">
                       <span className="external-target-kind listener">{target.local ? '本机' : '引用'}</span>
                       <span className="listener-reference-copy">
@@ -2971,17 +2992,6 @@ function RuleEditorReady({
                             : `子树归属「${target.ownerName}」 · ${target.step.rules.length} 条规则 · 当前 ${target.references} 处引用`}
                         </small>
                       </span>
-                      {onHighlightListener && (
-                        <button
-                          type="button"
-                          className="btn sm listener-subtree-highlight"
-                          aria-pressed={highlighted}
-                          title={highlighted ? '取消图中的规则子树高亮' : '在上方决策图中圈出这棵规则子树'}
-                          onClick={() => onHighlightListener(listener)}
-                        >
-                          高亮规则子树
-                        </button>
-                      )}
                     </div>
                     <div className="listener-reference-facts">
                       <span>
@@ -2997,7 +3007,7 @@ function RuleEditorReady({
                         </b>
                       </span>
                       <label>
-                        <small>出站连接</small>
+                        <small>连接复用</small>
                         <select
                           className="f"
                           value={poolChoice(pool)}
@@ -3020,9 +3030,12 @@ function RuleEditorReady({
                     </div>
                     <p>
                       {target.local
-                        ? '同一 Agent 内经回环进入这个监听，不创建机器间链路。'
-                        : `保存的是 ${listener.chain}/${listener.node} 的引用，不复制目标配置。`}
-                      源监听改动会同时影响所有引用位置。
+                        ? '本机经回环进入该监听，不建立机器间链路。'
+                        : `只保存 ${listener.chain}/${listener.node} 的身份和拨号方式，不复制目标配置。`}
+                      目标监听的变更会作用于所有引用。
+                      {pool.t === 'mux'
+                        ? ' 同一规则表中指向该监听的规则共用此 Mux 池；“跟随全局”只继承参数。'
+                        : ' 当前每条业务流单独建连。'}
                     </p>
                   </div>
                 );
@@ -3107,19 +3120,17 @@ function RuleEditorReady({
         )}
 
         {normalTargets.length > 0 && (
-          <div className="panel" style={{ marginTop: 10 }}>
+          <div className="panel listener-reference-panel hop-target-panel" style={{ marginTop: 10 }}>
             <header>
-              {/* 标题由「转发目标的中转入口」改为当前名称：该表配置的一直是该跳的两端，
-                而原名称只涵盖对端一侧。加入连接复用配置后，不修改名称会导致
-                在「入口」标题下配置本机出站。 */}
-              <PanelTitle of="chains">这一跳</PanelTitle>
-              <span className="hint">对端在哪个端口接入、本机如何连接过去</span>
+              <PanelTitle of="chains">本链监听</PanelTitle>
+              <span className="hint">端口和协议属于目标监听；拨号和 Mux 属于当前链边</span>
             </header>
-            <div className="fgrid one">
+            <div className="listener-reference-list">
               {normalTargets.map(to => {
                 const h = hopOf(to);
                 const peer = peerOf(to);
                 const pool = poolOf(to);
+                const peerName = peer?.name || to;
                 // 是否有连接从 wg 之外直接连接它。该判定决定 inbound 绑定的地址——
                 // 存在直连时绑定 0.0.0.0，全部走 overlay 时才绑定 overlay 地址
                 // （physical/node.rs 的 listen 判定）。
@@ -3127,87 +3138,64 @@ function RuleEditorReady({
                   r => r.a.t === 'forward' && r.a.to === to && forwardDial(r.a).t !== 'overlay',
                 );
                 return (
-                  <div key={to} className="row">
-                    <span className="k auto" title={to}>
-                      {peer?.name || to}
-                    </span>
-                    <span className="v">
-                      <span className="hop-in">
-                        <span className="hopfld">
-                          <span className="hopfld-lbl">端口配置</span>
-                          {/* 走 overlay 时同样显示。该端口会被实际绑定：
-                            xray 的 inbound 需要监听一个端口，wg 只是封装了该跳，
-                            端口仍然存在。它同样参与端口冲突校验，修改后会重启 xray。
-                            此处此前显示为「已被 WireGuard 托管」，会被理解为不存在端口，
-                            在排查时会导致方向错误。 */}
-                          <input
-                            className="f mono"
-                            style={{ width: 90 }}
-                            value={h.port}
-                            placeholder={String(hopBase)}
-                            onChange={e => setHopPort(to, e.target.value)}
-                          />
-                          {!dialedDirectly && <span className="sub">监听 overlay 地址，wg 之外无法连接</span>}
-                        </span>
-                        <span className="hopfld-sep" />
-                        <span className="hopfld">
-                          <span className="hopfld-lbl">协议</span>
-                          <select
-                            className="f"
-                            value={h.kind}
-                            onChange={e => patchHop(to, { kind: e.target.value as typeof h.kind })}
-                          >
-                            {/* 转发目标的端口，四档均可选 */}
-                            {HOP_WIRE_OPTIONS.map(option => (
-                              <option key={option.kind} value={option.kind}>
-                                {option.label}
-                              </option>
-                            ))}
-                          </select>
-                        </span>
-                        {h.kind === 'reality' && (
-                          <>
-                            <input
-                              className="f mono"
-                              style={{ width: 180 }}
-                              value={h.dest}
-                              placeholder="example.com:443"
-                              onChange={e => patchHop(to, { dest: e.target.value })}
-                            />
-                            <input
-                              className="f mono"
-                              style={{ width: 180 }}
-                              value={h.names}
-                              placeholder="server_names"
-                              onChange={e => patchHop(to, { names: e.target.value })}
-                            />
-                          </>
-                        )}
-                        {/* 竖线右侧是本机出站配置，左侧是对端入口配置。反向目标不在该表中
-                          （它们由上方的「反向接入口」面板处理），因此此处无需判断
-                          是否可配置——不可配置的目标不会出现。 */}
-                        <span className="hopfld-sep" />
-                        <span className="hopfld">
-                          <span className="hopfld-lbl">出站连接</span>
-                          <select
-                            className="f"
-                            value={poolChoice(pool)}
-                            onChange={e => {
-                              const choice = e.target.value as PoolChoice;
-                              setPoolForTarget(to, choice === 'mux' ? { t: 'mux' } : { t: 'none' });
-                            }}
-                          >
-                            {POOL_ORDER.map(k => (
-                              <option key={k} value={k}>
-                                {POOL_LABEL[k]}
-                              </option>
-                            ))}
-                          </select>
-                        </span>
-                        {pool.t !== 'none' && (
-                          <span className="hopfld">
-                            <span className="hopfld-lbl">参数</span>
-                            <span className="st">{pool.t === 'mux' && !pool.v ? '跟随全局' : '单独配置'}</span>
+                  <div key={to} className="listener-reference-row hop-target-row">
+                    <div className="listener-reference-main">
+                      <span className="external-target-kind node">本链</span>
+                      <span className="listener-reference-copy">
+                        <b title={to}>
+                          {peerName} · TCP {h.port || '未设置'}
+                        </b>
+                        <small>
+                          {dialedDirectly ? '按规则地址直连' : '仅经 Overlay 接入'} · {hopWireLabel(h.kind)}
+                        </small>
+                      </span>
+                    </div>
+                    <div className="listener-reference-facts hop-target-facts">
+                      <label className="hopfld hop-target-port">
+                        <small>目标端口</small>
+                        <input
+                          className="f mono"
+                          value={h.port}
+                          placeholder={String(hopBase)}
+                          onChange={event => setHopPort(to, event.target.value)}
+                        />
+                      </label>
+                      <label className="hopfld hop-target-wire">
+                        <small>承载协议</small>
+                        <select
+                          className="f"
+                          value={h.kind}
+                          onChange={event => patchHop(to, { kind: event.target.value as typeof h.kind })}
+                        >
+                          {HOP_WIRE_OPTIONS.map(option => (
+                            <option key={option.kind} value={option.kind}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="hopfld hop-target-pool">
+                        <small>连接复用</small>
+                        <select
+                          className="f"
+                          value={poolChoice(pool)}
+                          onChange={event => {
+                            const choice = event.target.value as PoolChoice;
+                            setPoolForTarget(to, choice === 'mux' ? { t: 'mux' } : { t: 'none' });
+                          }}
+                        >
+                          {POOL_ORDER.map(choice => (
+                            <option key={choice} value={choice}>
+                              {POOL_LABEL[choice]}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      {pool.t === 'mux' && (
+                        <span className="hop-target-mux">
+                          <small>Mux 参数</small>
+                          <span>
+                            <b>{pool.v ? '单独配置' : '跟随全局'}</b>
                             {readOnly ? (
                               <span
                                 className="btn sm"
@@ -3216,8 +3204,8 @@ function RuleEditorReady({
                                 onClick={() =>
                                   setMuxEditor({
                                     to,
-                                    followGlobal: pool.t === 'mux' && !pool.v,
-                                    value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                    followGlobal: !pool.v,
+                                    value: pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   })
                                 }
                                 onKeyDown={event => {
@@ -3225,12 +3213,12 @@ function RuleEditorReady({
                                   event.preventDefault();
                                   setMuxEditor({
                                     to,
-                                    followGlobal: pool.t === 'mux' && !pool.v,
-                                    value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                    followGlobal: !pool.v,
+                                    value: pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   });
                                 }}
                               >
-                                查看
+                                查看参数
                               </span>
                             ) : (
                               <button
@@ -3239,36 +3227,50 @@ function RuleEditorReady({
                                 onClick={() =>
                                   setMuxEditor({
                                     to,
-                                    followGlobal: pool.t === 'mux' && !pool.v,
-                                    value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                    followGlobal: !pool.v,
+                                    value: pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   })
                                 }
                               >
-                                配置
+                                配置参数
                               </button>
                             )}
                           </span>
-                        )}
-                      </span>
-                      <span className="sub">
-                        {/* 该说明对两种连接方式都适用：走 overlay 的 inbound 同样需要绑定
-                          一个端口，同样会与该机器上的其他端口冲突。 */}
-                        端口为对端监听的端口，<b>同一台机器上各条链必须错开</b>，冲突时编译会报 node.port-clash。
-                        {/* 明文警告只针对直连：走 overlay 时 wg 已对该跳加密，
-                          内层不加密是合理的，再加一层会增加无效的 CPU 开销。 */}
-                        {dialedDirectly && h.kind === 'none' && (
-                          <b style={{ color: 'var(--gold)' }}> 明文直连可能暴露 UUID 和目标地址。</b>
-                        )}
-                      </span>
-                      {pool.t !== 'none' && (
-                        <span className="sub" style={{ color: 'var(--gold)' }}>
-                          Mux 复用可减少重复握手；探测中的连接不会承接新流。
                         </span>
                       )}
-                      {pool.t !== 'none' && (
-                        <span className="sub">修改该项会重写 xray.json 并重启 xray，这台机器上的所有连接会断开。</span>
-                      )}
-                    </span>
+                    </div>
+                    {h.kind === 'reality' && (
+                      <div className="hop-target-security">
+                        <label>
+                          <small>伪装目标</small>
+                          <input
+                            className="f mono"
+                            value={h.dest}
+                            placeholder="example.com:443"
+                            onChange={event => patchHop(to, { dest: event.target.value })}
+                          />
+                        </label>
+                        <label>
+                          <small>服务端名称</small>
+                          <input
+                            className="f mono"
+                            value={h.names}
+                            placeholder="server_names"
+                            onChange={event => patchHop(to, { names: event.target.value })}
+                          />
+                        </label>
+                      </div>
+                    )}
+                    <p className="hop-target-note">
+                      <span>{`端口开在 ${peerName}，连接由 ${selfNode?.name || nodeId} 发起；目标端口必须唯一。`}</span>
+                      <span>
+                        {pool.t === 'mux'
+                          ? '同一规则表中指向该监听的规则共用此 Mux 池；“跟随全局”只继承参数，不与其他边共池。'
+                          : '当前每条业务流单独建连。'}
+                      </span>
+                      {dialedDirectly && h.kind === 'none' && <strong>明文直连会暴露 UUID 和目标地址。</strong>}
+                      <span>发布会重启受影响的 Xray。</span>
+                    </p>
                   </div>
                 );
               })}

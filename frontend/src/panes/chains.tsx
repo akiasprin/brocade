@@ -367,6 +367,30 @@ function chainAccessLabel(ingress: SnapshotIngress | null): string {
   return labels.join(' + ') || '—';
 }
 
+type IngressProtocolPanelKind = 'vless' | 'encryption' | 'anytls' | 'hy2';
+
+/** 折叠标题只保留辨认协议实例所需的信息；详细参数留在展开后的表单。 */
+function ingressProtocolPanelSummary(ingress: SnapshotIngress, kind: IngressProtocolPanelKind): string {
+  if (kind === 'vless') {
+    const vless = ingress.wires.vless;
+    if (!vless) return '新协议 · 请完成配置';
+    const security = vless.kind.includes('reality') ? 'REALITY' : 'TLS';
+    return `TCP ${ingress.port} · ${security} · ${transportIsXhttp(vless.kind) ? 'XHTTP' : 'TCP'}`;
+  }
+  if (kind === 'encryption') {
+    const encryption = ingress.wires.vless_encryption;
+    return encryption ? `TCP ${encryption.port} · 原生加密` : '新协议 · 请完成配置';
+  }
+  if (kind === 'anytls') {
+    const anytls = ingress.wires.anytls;
+    return anytls ? `TCP ${anytls.port} · ${anytls.security === 'reality' ? 'REALITY' : 'TLS'}` : '新协议 · 请完成配置';
+  }
+  const hy2 = ingress.wires.hysteria2;
+  if (!hy2) return '新协议 · 请完成配置';
+  const ports = hy2.hop ? `${hy2.hop.start}–${hy2.hop.end}` : String(hy2.port);
+  return `UDP ${ports} · ${hy2.congestion.toUpperCase()}`;
+}
+
 function ChainExit({ probe }: { probe: E2eProbeItem | undefined }) {
   const code = probe?.status === 'ok' ? probe.exit_loc?.trim().toUpperCase() : null;
   const country = code && /^[A-Z]{2}$/.test(code) ? code : null;
@@ -637,7 +661,7 @@ function useImmediatePanelVisibility(storedVisible: boolean) {
     setPendingVisible(enabled);
   }, []);
 
-  return { visible, panelRef, preview };
+  return { visible, newlyAdded: pendingVisible === true && !storedVisible, panelRef, preview };
 }
 
 /** 行侧登记。`watch` 里放草稿的当前取值——它变了就要重新登记，否则面板拿到的
@@ -664,6 +688,9 @@ export function IngressPanel({
   editable,
   children,
   panelRef,
+  collapsible = false,
+  initiallyExpanded = false,
+  summary,
 }: {
   appId: string;
   ingress: SnapshotIngress;
@@ -671,6 +698,11 @@ export function IngressPanel({
   editable: boolean;
   children: React.ReactNode;
   panelRef?: Ref<HTMLElement>;
+  /** 协议参数卡可折叠；普通接入面板继续使用固定展开的公共卡壳。 */
+  collapsible?: boolean;
+  /** 仅在卡片首次挂载时读取。刚启用的协议传 true，已有协议传 false。 */
+  initiallyExpanded?: boolean;
+  summary?: string;
 }) {
   const qc = useQueryClient();
   const [entries, setEntries] = useState<Record<string, PanelEntry>>({});
@@ -688,6 +720,7 @@ export function IngressPanel({
 
   const pending = Object.values(entries);
   const blocked = pending.some(entry => entry.blocked);
+  const [expanded, setExpanded] = useState(initiallyExpanded);
   const save = useMutation({
     mutationFn: () => {
       const base = ingressUpsertBody(ingress);
@@ -706,32 +739,56 @@ export function IngressPanel({
     },
   });
 
+  const contents = (
+    <>
+      <dl className="kv form2 chain-face fill">{children}</dl>
+      {save.error && <ErrorBox error={save.error} />}
+      <footer className="config-panel-savebar">
+        <span className="sp" />
+        <button
+          type="button"
+          className="btn"
+          disabled={pending.length === 0 || save.isPending}
+          onClick={() => pending.forEach(entry => entry.reset())}
+        >
+          还原
+        </button>
+        <button
+          type="button"
+          className={pending.length > 0 && !blocked ? 'btn primary' : 'btn'}
+          disabled={!editable || pending.length === 0 || blocked || save.isPending}
+          title={blocked ? '有一项填得不对，先改好' : pending.length === 0 ? '没有未保存的修改' : ''}
+          onClick={() => save.mutate()}
+        >
+          {save.isPending ? '保存中…' : '保存'}
+        </button>
+      </footer>
+    </>
+  );
+
   return (
     <PanelSaveCtx.Provider value={put}>
-      <ConfigPanel title={title} icon="protocol" panelRef={panelRef}>
-        <dl className="kv form2 chain-face fill">{children}</dl>
-        {save.error && <ErrorBox error={save.error} />}
-        <footer className="config-panel-savebar">
-          <span className="sp" />
-          <button
-            type="button"
-            className="btn"
-            disabled={pending.length === 0 || save.isPending}
-            onClick={() => pending.forEach(entry => entry.reset())}
-          >
-            还原
-          </button>
-          <button
-            type="button"
-            className={pending.length > 0 && !blocked ? 'btn primary' : 'btn'}
-            disabled={!editable || pending.length === 0 || blocked || save.isPending}
-            title={blocked ? '有一项填得不对，先改好' : pending.length === 0 ? '没有未保存的修改' : ''}
-            onClick={() => save.mutate()}
-          >
-            {save.isPending ? '保存中…' : '保存'}
-          </button>
-        </footer>
-      </ConfigPanel>
+      {collapsible ? (
+        <details
+          className="panel config-panel ingress-protocol-panel"
+          open={expanded}
+          ref={panelRef as Ref<HTMLDetailsElement>}
+          onToggle={event => setExpanded(event.currentTarget.open)}
+        >
+          <summary>
+            <PanelTitle of="protocol">{title}</PanelTitle>
+            {summary && <span className="ingress-protocol-summary">{summary}</span>}
+            <span className="sp" />
+            {pending.length > 0 && <span className="st st-warn">未保存</span>}
+            <span className="ingress-protocol-toggle">{expanded ? '收起' : '展开'}</span>
+          </summary>
+          {contents}
+        </details>
+      ) : (
+        <ConfigPanel title={title} icon="protocol" panelRef={panelRef}>
+          {contents}
+        </ConfigPanel>
+      )}
     </PanelSaveCtx.Provider>
   );
 }
@@ -5166,11 +5223,15 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
               </ConfigPanel>
               {vlessPanel.visible && (
                 <IngressPanel
+                  key="vless"
                   appId={app}
                   ingress={ingress}
                   title="VLESS · TLS / REALITY"
                   editable={editable}
                   panelRef={vlessPanel.panelRef}
+                  collapsible
+                  initiallyExpanded={vlessPanel.newlyAdded}
+                  summary={ingressProtocolPanelSummary(ingress, 'vless')}
                 >
                   <IngressStreamRow
                     appId={app}
@@ -5186,22 +5247,30 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
               )}
               {encryptionPanel.visible && (
                 <IngressPanel
+                  key="encryption"
                   appId={app}
                   ingress={ingress}
                   title="VLESS · Encryption"
                   editable={editable}
                   panelRef={encryptionPanel.panelRef}
+                  collapsible
+                  initiallyExpanded={encryptionPanel.newlyAdded}
+                  summary={ingressProtocolPanelSummary(ingress, 'encryption')}
                 >
                   <IngressEncryptionRow ingress={ingress} editable={editable} />
                 </IngressPanel>
               )}
               {anyTlsPanel.visible && (
                 <IngressPanel
+                  key="anytls"
                   appId={app}
                   ingress={ingress}
                   title="AnyTLS"
                   editable={editable}
                   panelRef={anyTlsPanel.panelRef}
+                  collapsible
+                  initiallyExpanded={anyTlsPanel.newlyAdded}
+                  summary={ingressProtocolPanelSummary(ingress, 'anytls')}
                 >
                   <IngressStreamRow
                     appId={app}
@@ -5217,11 +5286,15 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
               )}
               {hy2Panel.visible && (
                 <IngressPanel
+                  key="hy2"
                   appId={app}
                   ingress={ingress}
                   title="Hysteria 2"
                   editable={editable}
                   panelRef={hy2Panel.panelRef}
+                  collapsible
+                  initiallyExpanded={hy2Panel.newlyAdded}
+                  summary={ingressProtocolPanelSummary(ingress, 'hy2')}
                 >
                   <IngressStreamRow
                     appId={app}

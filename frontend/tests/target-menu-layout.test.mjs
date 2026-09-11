@@ -11,6 +11,8 @@ test('目标菜单脱离卡片裁切，监听摘要保持两行并可圈出引�
   assert.match(styles, /\.listener-reference-copy\s*\{[^}]*display:\s*grid;[^}]*flex:\s*1 1 auto;/s);
   assert.match(
     styles,
-    /\.listener-map-node\.is-highlighted-subtree::before\s*\{[^}]*border:\s*2px solid var\(--listener-ref\);/s,
+    /\.listener-map-node\.is-highlighted-subtree::before\s*\{[^}]*border:\s*1px dashed var\(--listener-ref\);/s,
   );
+  assert.match(styles, /\.listener-reference-highlight-hitbox\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;/s);
+  assert.match(styles, /\.listener-reference-panel\.hop-target-panel\s*\{[^}]*--listener-panel-accent:/s);
 });

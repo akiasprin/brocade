@@ -251,12 +251,12 @@ function NewAnyTlsHarness({ anytlsBase, encryptionBase }: { anytlsBase: number; 
         />
       </IngressPanel>
       {anytlsVisible && (
-        <IngressPanel appId="app-1" ingress={value} title="AnyTLS 配置" editable>
+        <IngressPanel appId="app-1" ingress={value} title="AnyTLS 配置" editable collapsible initiallyExpanded>
           <IngressStreamRow appId="app-1" ingress={value} editable section="anytls" anytlsEnabled />
         </IngressPanel>
       )}
       {hy2Visible && (
-        <IngressPanel appId="app-1" ingress={value} title="Hysteria 2" editable>
+        <IngressPanel appId="app-1" ingress={value} title="Hysteria 2" editable collapsible initiallyExpanded>
           <IngressStreamRow appId="app-1" ingress={value} editable section="hy2" hy2Enabled />
         </IngressPanel>
       )}
@@ -301,13 +301,57 @@ function NewVlessHarness() {
         />
       </IngressPanel>
       {vlessVisible && (
-        <IngressPanel appId="app-1" ingress={value} title="VLESS" editable>
+        <IngressPanel appId="app-1" ingress={value} title="VLESS" editable collapsible initiallyExpanded>
           <IngressStreamRow appId="app-1" ingress={value} editable section="vless" vlessEnabled />
         </IngressPanel>
       )}
     </QueryClientProvider>
   );
 }
+
+describe('接入协议面板折叠', () => {
+  it('已有协议默认折叠，刚添加的协议默认展开', () => {
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const value = ingress('vless-reality');
+    const fields = (
+      <>
+        <dt>监听端口</dt>
+        <dd>443</dd>
+      </>
+    );
+    const view = render(
+      <QueryClientProvider client={client}>
+        <IngressPanel
+          appId="app-1"
+          ingress={value}
+          title="已有 VLESS"
+          editable
+          collapsible
+          summary="TCP 443 · REALITY · TCP"
+        >
+          {fields}
+        </IngressPanel>
+        <IngressPanel appId="app-1" ingress={value} title="新 AnyTLS" editable collapsible initiallyExpanded>
+          {fields}
+        </IngressPanel>
+      </QueryClientProvider>,
+    );
+
+    const existing = view.getByRole('heading', { name: '已有 VLESS', level: 4 }).closest('details');
+    const fresh = view.getByRole('heading', { name: '新 AnyTLS', level: 4 }).closest('details');
+    if (!(existing instanceof HTMLDetailsElement) || !(fresh instanceof HTMLDetailsElement)) {
+      throw new Error('协议配置没有使用可折叠面板');
+    }
+    expect(existing.open).toBe(false);
+    expect(fresh.open).toBe(true);
+    expect(existing.querySelector('summary')?.textContent).toContain('TCP 443 · REALITY · TCP');
+
+    const summary = existing.querySelector('summary');
+    if (!(summary instanceof HTMLElement)) throw new Error('协议面板没有折叠标题');
+    fireEvent.click(summary);
+    expect(existing.open).toBe(true);
+  });
+});
 
 afterEach(() => {
   cleanup();
