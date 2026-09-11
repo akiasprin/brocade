@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "brocade"
+name = "brocade-launcher"
 path = "src/main.rs"
 
 [dependencies]

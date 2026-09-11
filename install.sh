@@ -5,7 +5,7 @@ set -eu
 umask 077
 
 install_root=/opt/brocade
-launcher_path=$install_root/brocade
+launcher_path=$install_root/brocade-launcher
 console_path=$install_root/brocade-console
 command_path=/usr/local/bin/brocade
 service_user=brocade
@@ -45,7 +45,7 @@ esac
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限；请用 root 执行（有 sudo 时可执行 sudo sh install.sh）"
 
 script_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
-for required in brocade brocade-console BROCADE_PLATFORM SHA256SUMS; do
+for required in brocade-launcher brocade-console BROCADE_PLATFORM SHA256SUMS; do
     [ -f "$script_dir/$required" ] || die "发行包缺少 $required"
 done
 command -v sha256sum >/dev/null 2>&1 || die "系统缺少 sha256sum，无法先验证发行包"
@@ -167,7 +167,7 @@ install -d -o root -g root -m 0755 "$install_root"
 [ -d /usr/local/bin ] || install -d -o root -g root -m 0755 /usr/local/bin
 install -d -o "$service_user" -g "$service_group" -m 0700 "$data_root" "$cache_root"
 
-launcher_stage=$install_root/.brocade.$$
+launcher_stage=$install_root/.brocade-launcher.$$
 console_stage=$install_root/.brocade-console.$$
 command_stage=/usr/local/bin/.brocade.$$
 cleanup_staging() {
@@ -175,7 +175,7 @@ cleanup_staging() {
 }
 trap cleanup_staging 0 HUP INT TERM
 
-install -o root -g root -m 0755 "$script_dir/brocade" "$launcher_stage"
+install -o root -g root -m 0755 "$script_dir/brocade-launcher" "$launcher_stage"
 install -o root -g root -m 0755 "$script_dir/brocade-console" "$console_stage"
 
 # Compatibility-check untrusted executable bytes only after dropping to the dedicated account.
@@ -196,7 +196,7 @@ cat >"$command_stage" <<'EOF'
 #!/bin/sh
 set -eu
 service_user=brocade
-runtime=/opt/brocade/brocade
+runtime=/opt/brocade/brocade-launcher
 : "${BROCADE_DATA_DIR:=/var/lib/brocade}"
 : "${BROCADE_CACHE_DIR:=/var/cache/brocade}"
 export BROCADE_DATA_DIR BROCADE_CACHE_DIR

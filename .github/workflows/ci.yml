@@ -154,7 +154,7 @@ jobs:
           node scripts/route-check.mjs
 
   build:
-    name: brocade bundle (${{ matrix.arch }}-${{ matrix.libc }})
+    name: brocade dist (${{ matrix.arch }}-${{ matrix.libc }})
     runs-on: ubuntu-latest
     strategy:
       # One architecture failing lets the other finish. Seeing both is what distinguishes a problem
@@ -248,7 +248,7 @@ jobs:
         run: |
           set -eu
           out=target/${{ matrix.triple }}/release
-          for bin in "$out/brocade" "$out/brocade-console"; do
+          for bin in "$out/brocade-launcher" "$out/brocade-console"; do
             ls -l "$bin"
             sha256sum "$bin"
             file -b "$bin"
@@ -267,19 +267,31 @@ jobs:
             fi
           done
 
-      - name: Assemble the sibling bundle
+      - name: Assemble the versioned distribution
+        id: dist
         run: |
           set -eu
-          bundle=target/brocade-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c \
+            'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "brocade-launcher"))')
+          dist_root=target/dist
+          dist_name=brocade-dist-${version}-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          bundle=$dist_root/$dist_name
           mkdir -p "$bundle"
-          cp target/${{ matrix.triple }}/release/brocade "$bundle/"
+          cp target/${{ matrix.triple }}/release/brocade-launcher "$bundle/"
           cp target/${{ matrix.triple }}/release/brocade-console "$bundle/"
           cp install.sh "$bundle/"
           printf '%s-%s\n' '${{ matrix.arch }}' '${{ matrix.libc }}' > "$bundle/BROCADE_PLATFORM"
-          (cd "$bundle" && sha256sum brocade brocade-console install.sh BROCADE_PLATFORM > SHA256SUMS)
+          (cd "$bundle" && sha256sum brocade-launcher brocade-console install.sh BROCADE_PLATFORM > SHA256SUMS)
+          tar -C "$dist_root" -czf "$dist_root/$dist_name.tar.gz" "$dist_name"
+          (cd "$dist_root" && sha256sum "$dist_name.tar.gz" > "$dist_name.tar.gz.sha256")
+          echo "name=$dist_name" >> "$GITHUB_OUTPUT"
+          echo "archive=$dist_root/$dist_name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=$dist_root/$dist_name.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: brocade-linux-${{ matrix.arch }}-${{ matrix.libc }}
-          path: target/brocade-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          name: ${{ steps.dist.outputs.name }}
+          path: |
+            ${{ steps.dist.outputs.archive }}
+            ${{ steps.dist.outputs.checksum }}
           if-no-files-found: error

@@ -40,7 +40,18 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 
 ## 一键启动与临时 Tunnel
 
-发行包把 `brocade`、`brocade-console` 与纯 POSIX `sh` 安装器放在同一目录。系统级安装执行：
+CI 按版本、CPU 与 libc 生成 `brocade-dist-<version>-linux-<arch>-<libc>.tar.gz`。解压后的目录结构如下：
+
+```text
+brocade-dist-<version>-linux-x86_64-gnu/
+├── brocade-launcher
+├── brocade-console
+├── install.sh
+├── BROCADE_PLATFORM
+└── SHA256SUMS
+```
+
+CI 同时生成同名 `.tar.gz.sha256`，用于在解压前校验整个归档。其中发行物内的组件使用完整名称 `brocade-launcher`，安装后仍由简洁的 `brocade` 命令作为用户入口。系统级安装执行：
 
 ```sh
 sudo sh install.sh
@@ -101,7 +112,7 @@ Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地�
 cargo build --release --locked -p brocade-console -p brocade-launcher
 ```
 
-输出位于 `target/release/brocade-console` 与 `target/release/brocade`，部署 launcher 时应保持二者同目录。构建脚本会执行 `npm ci` 与前端生产构建，并分别生成两种架构的 Agent 和 Brocade Xray。若前端已由其他流水线构建，可通过绝对路径指定待嵌入目录，从而跳过 npm：
+输出位于 `target/release/brocade-console` 与 `target/release/brocade-launcher`，部署 launcher 时应保持二者同目录。构建脚本会执行 `npm ci` 与前端生产构建，并分别生成两种架构的 Agent 和 Brocade Xray。若前端已由其他流水线构建，可通过绝对路径指定待嵌入目录，从而跳过 npm：
 
 ```sh
 BROCADE_CONSOLE_ASSETS_DIR=/absolute/path/to/frontend/dist \
