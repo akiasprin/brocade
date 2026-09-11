@@ -2324,8 +2324,8 @@ async fn http_agent_link_probe_records_and_admin_reads_the_per_node_view() {
 /// the admin side reads them back.
 ///
 /// Three things show up only at this layer: whether the work list's probe credential really derives
-/// from the ingress's private key, whether `node_id` is taken from the token, and whether "connected
-/// but exited in the wrong place" is recorded faithfully.
+/// from the ingress's private key, whether `node_id` is taken from the token, and whether successful
+/// observations round-trip without turning optional exit metadata into a health verdict.
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_agent_e2e_probe_round_trips_through_both_faces() {
@@ -2404,9 +2404,8 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         .unwrap()
         .starts_with("http://"));
 
-    // (2) Report a "connected but exited in the wrong place". That outcome is the whole reason this
-    // feature exists, so it gets its own pass: it must be recorded as neither success nor
-    // failure.
+    // (2) Report a successful traversal. The exit address is informational and does not affect
+    // health: NAT, dynamic addresses and external proxy actions make that comparison unreliable.
     let probe_base = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
@@ -2421,8 +2420,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
             "ttfb_ms": 86,
             "exit_ip": "203.0.113.9",
             "exit_loc": "HK",
-            "exit_verdict": "mismatch",
-            "detail": "通了，但出口 IP 不在这条链的出口节点上"
+            "detail": null
         }]
     });
     let response = agent
@@ -2482,7 +2480,6 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     assert_eq!(chain["node_id"], "n1");
     assert_eq!(chain["status"], "ok");
     assert_eq!(chain["ttfb_ms"], 86);
-    assert_eq!(chain["exit_verdict"], "mismatch", "这一档不能被抹平成成功");
     assert_eq!(chain["exit_ip"], "203.0.113.9");
     assert_eq!(chain["samples"].as_array().unwrap().len(), 1);
 
@@ -2497,7 +2494,6 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
             "ttfb_ms": 10000,
             "exit_ip": null,
             "exit_loc": null,
-            "exit_verdict": "match",
             "detail": "等不到回应"
         }]
     });
@@ -2534,10 +2530,6 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
     let chain = &view["chains"][0];
     assert_eq!(chain["status"], "timeout");
     assert!(chain["ttfb_ms"].is_null(), "失败不该留下耗时：{chain}");
-    assert_eq!(
-        chain["exit_verdict"], "unknown",
-        "没通就谈不上出口核对，agent 报的 match 要被纠正"
-    );
     assert_eq!(chain["samples"].as_array().unwrap().len(), 2, "样本要累积");
 
     // (5) Rows whose chain is absent from the model are dropped rather than failing the batch —
@@ -2546,7 +2538,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         "probed_at_unix_secs": probe_base + 120,
         "chains": [{
             "app_id": "app-a1b2", "chain_id": "c-gone", "status": "ok", "ttfb_ms": 10,
-            "exit_ip": null, "exit_loc": null, "exit_verdict": "unknown", "detail": null
+            "exit_ip": null, "exit_loc": null, "detail": null
         }]
     });
     let response = agent

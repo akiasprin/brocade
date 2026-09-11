@@ -171,56 +171,6 @@ fn probe_identity_is_invisible_to_billing_and_subscriptions() {
     }
 }
 
-/// Expected exits are a set and the test is membership. A forking chain has several egress
-/// nodes, and given a single value it would be reliably misreported as exiting in the wrong
-/// place.
-#[test]
-fn expected_exits_cover_every_egress_node_of_the_chain() {
-    let output = compile(&demo_snapshot());
-    let ir = output.unpublishable_view();
-
-    let mut saw_multi = false;
-    for node_id in ["hk-01", "jp-01", "sg-01", "us-01"] {
-        for target in output.project_probe(node_id).unwrap().targets {
-            assert!(
-                !target.exit_nodes.is_empty(),
-                "{} 一个出口都没有",
-                target.chain_id
-            );
-            saw_multi |= target.exit_nodes.len() > 1;
-
-            // Membership is asserted in both directions. Present-when-it-should-be: one address
-            // missing and the probe reports the wrong exit whenever traffic happens to leave
-            // through that machine — a false alarm appearing in only some rounds. Absent-when-it
-            // -should-be: NAT on either family withdraws that machine's addresses entirely, and a
-            // one-way assertion would not notice a family creeping back in, which is the false
-            // accusation this rule exists to prevent (`physical/probe.rs::public_addresses`).
-            for exit in &target.exit_nodes {
-                let node = ir
-                    .apps
-                    .iter()
-                    .flat_map(|app| app.nodes.iter())
-                    .find(|node| node.id == *exit)
-                    .unwrap();
-                let behind_nat = (node.public_ipv4.is_some() && node.public_ipv4_nat)
-                    || (node.public_ipv6.is_some() && node.public_ipv6_nat);
-                for address in [node.public_ipv4.as_ref(), node.public_ipv6.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    assert_eq!(
-                        target.expected_exit_ips.contains(address),
-                        !behind_nat,
-                        "{} 的期望出口对 {exit} 的 {address} 判断错了（behind_nat={behind_nat}）",
-                        target.chain_id
-                    );
-                }
-            }
-        }
-    }
-    assert!(saw_multi, "演示里该有分叉链，否则这个测试没测到要害");
-}
-
 /// The UUID is derived from the private key, so knowing the ingress id alone does not yield
 /// it.
 #[test]

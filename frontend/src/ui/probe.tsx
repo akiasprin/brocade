@@ -2,17 +2,11 @@
 // 链路页的总览表、机器详情。判定分散实现时，同一条链在两个页面上会显示为不同的
 // 健康状态，无法确定以哪个为准。
 //
-// ## 使用四档而非两档的原因
-//
-// 「连通但出口 IP 不符」必须作为独立一档。它表示流量未穿过完整的链（通常从链头直接
-// 出网），而此时规则表合法、每一跳都连通、编译无警告——静态校验无法发现该情况。
-// 归入成功会隐藏该功能最需要报告的状态；归入失败会导致排查一条实际连通的链。
-//
-// 另有第五档「未探测」：它与探测后不通完全不同，合并后新建的链会持续显示为故障。
+// 未探测与探测后不通完全不同：合并后新建的链会持续显示为故障。
 
-import type { E2eExitVerdict, E2eProbeItem, E2eProbeSample, E2eProbeStatus } from '../api';
+import type { E2eProbeItem, E2eProbeSample, E2eProbeStatus } from '../api';
 
-export type ProbeTone = 'ok' | 'slow' | 'odd' | 'down' | 'none';
+export type ProbeTone = 'ok' | 'slow' | 'down' | 'none';
 
 // 超过该值标为黄色。它不表示故障，而表示需要关注——跨洲链路本身延迟较高，
 // 因此它只改变颜色，不改变结论。
@@ -43,16 +37,9 @@ const STATUS_TEXT: Record<E2eProbeStatus, string> = {
   unsupported: '探不了',
 };
 
-// 一句话的结论，给出状态和事实，不给出推断。
-//
-// 「连通，但出口 IP 显示是 1.2.3.4（SG）」——读取后可直接获得用于核对的信息。
-// 此处此前的表述是「已连通，但不是从该链的出口出网的」，那是一个推断结论：
-// 它已完成推理过程，而推理依据（IP 地址）被移到第二行。
-// 只提供结论时无法验证；提供 IP 时可自行查询该地址对应的机器。
-//
-// 推断和后续处理方式放在第二行（`ProbeBanner` 的 `why`），该处空间充足。
 function exitText(item: E2eProbeItem): string {
-  const ip = item.exit_ip ?? '?';
+  const ip = item.exit_ip;
+  if (!ip) return '';
   return item.exit_loc ? `${ip}（${item.exit_loc}）` : ip;
 }
 
@@ -63,16 +50,13 @@ export function headline(item: E2eProbeItem): string {
     // 与链本身的状态无关，合并后会导致排查一条正常的链。
     return item.status === 'unsupported' ? '探不了，这台机器上起不了探测' : `不通，${STATUS_TEXT[item.status]}`;
   }
-  if (item.exit_verdict === 'mismatch') {
-    return `连通，但出口 IP 显示是 ${exitText(item)}`;
-  }
-  return `连通，出口 IP 是 ${exitText(item)}`;
+  const exit = exitText(item);
+  return exit ? `连通，出口 IP 是 ${exit}` : '连通';
 }
 
 export function toneOf(item: E2eProbeItem | null | undefined): ProbeTone {
   if (!item) return 'none';
   if (item.status !== 'ok') return 'down';
-  if (item.exit_verdict === 'mismatch') return 'odd';
   return (item.ttfb_ms ?? 0) > SLOW_MS ? 'slow' : 'ok';
 }
 
@@ -141,25 +125,6 @@ export function ProbeSpark({ samples }: { samples: E2eProbeSample[] }) {
   );
 }
 
-/** 出口核对字段。三档各表示不同状态，不压缩为单一标记。
- *
- *  这是表格中的一格，只显示结论——具体的 IP 在相邻列中，
- *  同一张表内重复显示会占用一列宽度。悬停可查看完整说明。 */
-export function ExitVerdict({ item }: { item: E2eProbeItem }) {
-  const map: Record<E2eExitVerdict, { cls: string; text: string }> = {
-    match: { cls: 'st-succeeded', text: '一致' },
-    mismatch: { cls: 'st-gold', text: '对不上' },
-    unknown: { cls: 'st-skipped', text: '核对不了' },
-  };
-  if (item.status !== 'ok') return <span className="dim">—</span>;
-  const v = map[item.exit_verdict];
-  return (
-    <span className={`st ${v.cls}`} title={toneTitle(item)}>
-      {v.text}
-    </span>
-  );
-}
-
 // 链详情顶部的结论横幅，是进入该页后首先看到的内容。
 //
 // 它与本页的接入面、XRAY 链路使用同一结构（`.blk`：一条带底色的标题栏加下方内容），
@@ -172,9 +137,8 @@ export function ExitVerdict({ item }: { item: E2eProbeItem }) {
 // 右侧是火花线。延迟使用大号字体，因为它是本屏唯一需要与历史值比较的量，其余都是判定结果。
 export function ProbeBanner({ item }: { item: E2eProbeItem | null | undefined }) {
   const tone = toneOf(item);
-  // slow 与 ok 使用同一颜色：它表示延迟较高但结果正确，与出口不符不属于同一严重程度，
-  // 而延迟情况已由数值和火花线中的柱高表示。
-  const toneCls = tone === 'down' ? 'tone-err' : tone === 'odd' ? 'tone-odd' : 'tone-ok';
+  // slow 与 ok 使用同一颜色：延迟已由数值和火花线中的柱高表示。
+  const toneCls = tone === 'down' ? 'tone-err' : 'tone-ok';
   if (!item) {
     return (
       <div className="blk">
@@ -197,32 +161,10 @@ export function ProbeBanner({ item }: { item: E2eProbeItem | null | undefined })
   }
 
   /* 标题栏中的词是结论，正文第一行是事实。标题需要足够简短。 */
-  const verdict =
-    item.status !== 'ok'
-      ? STATUS_TEXT[item.status]
-      : item.exit_verdict === 'mismatch'
-        ? '出口对不上'
-        : item.exit_verdict === 'unknown'
-          ? '出口核对不了'
-          : '出口一致';
+  const verdict = item.status !== 'ok' ? STATUS_TEXT[item.status] : '连通';
 
-  // 上行是状态和事实（`headline`），下行是推断和后续处理方式。
-  // 顺序相反时需要先接受结论再查找依据。
   const why =
-    item.status !== 'ok'
-      ? (item.detail ?? '没有细节')
-      : item.exit_verdict === 'mismatch'
-        ? /* 只陈述事实，不推测原因。此处此前还有一句「检查链头的规则表是否遗漏转发，
-             流量可能在该处直接出网」——那只是**一种**可能，流量可能在任意一跳出网。
-             将推测表述为建议会导致优先排查一个未必相关的位置。 */
-          '这不是这条链的出口节点。'
-        : item.exit_verdict === 'unknown'
-          ? /* 三种情况都无法核对：出口位于 NAT 之后（v4 或 v6 任一在 NAT 后即无法核对，
-               因为从哪一族出网由落点和路由决定，探测不去猜）；模型中没有公网地址；
-               地址会变化（PPPoE 拨号、动态分配），模型中的值已过期。
-               最后一种更难发现——该字段有取值，但取值不正确。 */
-            '核对不了这个 IP 是不是这条链的出口：出口节点在 NAT 后面、没有公网地址，或地址会变。'
-          : '跟这条链的出口节点对得上。';
+    item.status !== 'ok' ? (item.detail ?? '没有细节') : '完整链路已完成探测请求；出口地址只作观测，不参与健康判定。';
 
   return (
     <div className={`blk ${toneCls}`}>

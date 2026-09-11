@@ -39,7 +39,7 @@ import { HopLinkTable } from './telemetry';
 import { FleetNetPanel } from './nodes';
 import { Ago, Empty, ErrorBox, Loading } from '../ui/bits';
 import { useNodeNames } from '../ui/node-name';
-import { ExitVerdict, ProbeBadge, ProbeSpark, toneOf } from '../ui/probe';
+import { ProbeBadge, ProbeSpark, toneOf } from '../ui/probe';
 
 const STATUS_LABEL: Record<string, string> = {
   ok: '探通',
@@ -115,61 +115,22 @@ function LinkQualitySection({ hops }: { hops: import('../api').HopLinkView[] }) 
   return <HopLinkTable hops={hops} nodeName={nodeName} />;
 }
 
-// 一句话的结论。它是本页最需要优先呈现的内容——此前它位于第三张表的第四列，
-// 只显示「对不上」，需要逐行查看才能定位。
-//
-// 三档分别表述，不合并：「不通」表示故障，「出口不符」表示连通但未穿过完整的链
-// （通常从链头直接出网），后者发生在每一跳都连通、编译无警告的情况下，
-// 是该类探测存在的主要原因。
 function E2eBand({ chains, pending }: { chains: E2eProbeItem[]; pending: boolean }) {
   if (pending || chains.length === 0) return null;
   const down = chains.filter(c => toneOf(c) === 'down');
-  const odd = chains.filter(c => c.status === 'ok' && c.exit_verdict === 'mismatch');
-  /* 出口 IP 只有一个取值时直接显示：多条链指向同一地址时，该地址本身即是排查线索。 */
-  const oddIps = [...new Set(odd.map(c => c.exit_ip).filter(Boolean))];
-  /* 「没有对不上的」不等于「都对得上」。出口机器带 NAT 时核对根本没跑，说成核对通过
-     就是把一次没做的检查报成做过了——而 NAT 恰恰是这里最常见的情形。 */
-  const unchecked = chains.filter(c => c.status === 'ok' && c.exit_verdict === 'unknown');
-
-  if (down.length === 0 && odd.length === 0) {
+  if (down.length === 0) {
     return (
       <div className="lk-band">
         <span className="lk-band-dot ok" />
-        <span className="lk-band-head">
-          {unchecked.length === 0
-            ? `${chains.length} 条链都通，出口也都对得上`
-            : `${chains.length} 条链都通，${
-                unchecked.length === chains.length ? '出口都' : `其中 ${unchecked.length} 条出口`
-              }核对不了`}
-        </span>
+        <span className="lk-band-head">{chains.length} 条链都通</span>
       </div>
     );
   }
   return (
-    <div className={`lk-band ${down.length ? 'bad' : 'warn'}`}>
-      <span className={`lk-band-dot ${down.length ? 'bad' : 'warn'}`} />
-      <span className="lk-band-head">
-        {down.length > 0
-          ? `${down.length} 条链不通`
-          : `${chains.length} 条链都通，但${odd.length === chains.length ? '出口全都' : `有 ${odd.length} 条出口`}对不上`}
-      </span>
-      <span className="lk-band-why">
-        {down.length > 0 ? (
-          <>断在这几条：{down.map(c => c.chain_name).join('、')}。</>
-        ) : (
-          <>
-            {oddIps.length === 1 ? (
-              <>
-                出口 IP 都是 <b className="mono">{oddIps[0]}</b>
-                {odd[0]?.exit_loc ? `（${odd[0].exit_loc}）` : ''}——那不是这些链的出口节点。
-              </>
-            ) : (
-              <>出口 IP 不是这些链的出口节点。</>
-            )}{' '}
-            流量多半从入口节点就直接出网了。每跳的计数器照样在涨、编译也没有警告， 所以只有这一格看得见。
-          </>
-        )}
-      </span>
+    <div className="lk-band bad">
+      <span className="lk-band-dot bad" />
+      <span className="lk-band-head">{down.length} 条链不通</span>
+      <span className="lk-band-why">断在这几条：{down.map(c => c.chain_name).join('、')}。</span>
     </div>
   );
 }
@@ -198,7 +159,6 @@ function E2eSection({ chains, pending, error }: { chains: E2eProbeItem[]; pendin
               <th>链</th>
               <th>入口节点</th>
               <th>出口地址</th>
-              <th>核对</th>
               <th>最近</th>
               <th>探于</th>
             </tr>
@@ -218,9 +178,6 @@ function E2eSection({ chains, pending, error }: { chains: E2eProbeItem[]; pendin
                 <td data-label="出口地址" className="mono dim">
                   {c.exit_ip ?? '—'}
                   {c.exit_loc && ` ${c.exit_loc}`}
-                </td>
-                <td data-label="核对">
-                  <ExitVerdict item={c} />
                 </td>
                 <td data-label="最近">
                   <ProbeSpark samples={c.samples} />

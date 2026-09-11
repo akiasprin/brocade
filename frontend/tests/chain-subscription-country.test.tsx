@@ -21,7 +21,6 @@ const probe = (country: string): E2eProbeItem => ({
   ttfb_ms: 30,
   exit_ip: '203.0.113.8',
   exit_loc: country,
-  exit_verdict: 'match',
   detail: null,
   probed_at: '2026-08-30T12:00:00Z',
   samples: [],

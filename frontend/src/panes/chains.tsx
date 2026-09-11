@@ -4345,7 +4345,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     if (r.disabled || !r.ingress) return 'bad';
     const probeTone = toneOf(probeOf.get(r.chain.id));
     if (probeTone === 'down') return 'bad';
-    if (probeTone === 'odd' || probeTone === 'slow') return 'warn';
+    if (probeTone === 'slow') return 'warn';
     if (probeTone === 'none' || r.users === 0) return 'idle';
     return 'ok';
   };

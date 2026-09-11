@@ -42,7 +42,7 @@ pub use branding::{BrandingSettings, DEFAULT_SITE_NAME};
 pub use brocade_deployment::protocol::{
     BinarySource, CreateDeploymentRequest, CreateDeploymentResult, CreateRollbackRequest,
     DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
-    DeploymentWaveConfirmationRequest, DeploymentWaveConfirmationResult, E2eExitVerdict, E2eProbe,
+    DeploymentWaveConfirmationRequest, DeploymentWaveConfirmationResult, E2eProbe,
     E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest, E2eProbeResult, E2eProbeStatus,
     E2eProbeTarget, E2eProbeTargetList, HopLinkList, HopLinkSample, HopLinkView, HostFacts,
     IsolateDeploymentTargetRequest, LinkHealth, LinkHealthRequest, LinkHealthResult, LinkProbe,

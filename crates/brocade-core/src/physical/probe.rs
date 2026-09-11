@@ -11,19 +11,9 @@
 //! and nowhere else can dial the port a user sees. The control plane least of all —
 //! it has no path to the data plane whatsoever.
 //!
-//! ## Expected exits are a set, not a single value
-//!
-//! A chain can fork: the rule table sends different traffic to different downstreams,
-//! yielding several egress nodes. A probe sends one request and leaves through only
-//! one of them, so the test is membership in that set rather than equality with one
-//! of them. Given a single value, a forking chain would be reliably misreported as
-//! exiting from the wrong place.
-
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
 use crate::{
-    ir::routing::{AppIr, AppNode},
-    model::{probe_uuid, Action, AnyTls, Hysteria2},
+    ir::routing::AppIr,
+    model::{probe_uuid, AnyTls, Hysteria2},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,14 +38,6 @@ pub struct ProbeChainTarget {
     /// The HTTP layer, if this ingress has one. A probe dialing plain TCP at an XHTTP ingress is
     /// refused at the path check and reports the chain down while it is carrying traffic.
     pub xhttp: Option<crate::model::Xhttp>,
-    /// Which machines this chain may exit from. A forking chain has several; see the
-    /// module header.
-    pub exit_nodes: Vec<String>,
-    /// Those machines' public addresses, both families included. The IP the endpoint
-    /// saw must fall in this set to agree. Empty means the check cannot be made — an
-    /// exit is behind NAT on either family, or has no public address — an outcome that
-    /// must say so explicitly rather than count as a pass.
-    pub expected_exit_ips: Vec<String>,
 }
 
 /// What the probe has to speak to be let in.
@@ -196,7 +178,6 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
             .filter(|ingress| ingress.node == node_id)
         {
             let chain = app.chains.iter().find(|chain| chain.id == ingress.chain);
-            let exits = exit_nodes(apps, &ingress.chain, &ingress.node);
             let security = probe_security(ingress);
             let port = match &security {
                 ProbeSecurity::AnyTls(anytls) => anytls.settings.port,
@@ -216,12 +197,6 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
                 uuid: probe_uuid(&ingress.identity.private_key, &ingress.id),
                 security,
                 xhttp: ingress.wires.xhttp().cloned(),
-                expected_exit_ips: exits
-                    .iter()
-                    .filter_map(|id| app.nodes.iter().find(|node| node.id == *id))
-                    .flat_map(public_addresses)
-                    .collect(),
-                exit_nodes: exits.into_iter().collect(),
             });
         }
     }
@@ -250,151 +225,8 @@ fn dial_host(bind: &std::net::IpAddr) -> String {
     }
 }
 
-/// Which machines on this chain egress.
-///
-/// The test is an actual `Egress` in the rule table, not `node.egress_allowed` — the
-/// latter says the machine is permitted to exit, which differs from this chain
-/// exiting there: a relay cleared for egress may still only forward.
-fn exit_nodes(apps: &[AppIr], chain_id: &str, root: &str) -> BTreeSet<String> {
-    let steps = apps
-        .iter()
-        .flat_map(|app| app.steps.iter())
-        .map(|step| ((step.chain.as_str(), step.node.as_str()), step))
-        .collect::<BTreeMap<_, _>>();
-    let mut queue = VecDeque::from([(chain_id.to_owned(), root.to_owned())]);
-    let mut seen = BTreeSet::new();
-    let mut exits = BTreeSet::new();
-
-    while let Some((chain, node)) = queue.pop_front() {
-        if !seen.insert((chain.clone(), node.clone())) {
-            continue;
-        }
-        let Some(step) = steps.get(&(chain.as_str(), node.as_str())) else {
-            continue;
-        };
-        for rule in &step.rules {
-            match &rule.action {
-                Action::Egress { .. } | Action::Proxy { .. } => {
-                    exits.insert(node.clone());
-                }
-                action => {
-                    if let Some(forward) = action.forward_ref(&step.chain) {
-                        queue.push_back((
-                            forward.target_chain.to_owned(),
-                            forward.target_node.to_owned(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    exits
-}
-
-/// Addresses behind NAT do not count: that is not what the endpoint sees. Whether the exit goes
-/// v4 or v6 is decided by the endpoint and by routing, and the probe does not guess — which is
-/// why NAT on *either* family disqualifies the machine entirely, its other family included.
-///
-/// Dropping only the NATed family used to look like the more precise choice, and it produced a
-/// false accusation: with v4 behind NAT and v6 native, the expectation held the v6 address alone,
-/// traffic leaving over v4 was seen by the endpoint as the NATed address, and matching it against
-/// a v6-only expectation yielded `Mismatch` — the verdict meaning "the traffic never reached this
-/// chain's exit", raised against a chain that is working. A check that cannot run has to say so,
-/// and an empty expectation is how `E2eExitVerdict::Unknown` is reached.
-fn public_addresses(node: &AppNode) -> Vec<String> {
-    // Tied to an address being present: the two flags default to false and carry no meaning for a
-    // family the machine does not have, so `public_ipv6_nat` left true beside an absent v6 address
-    // must not silently disable the check for a perfectly ordinary v4-only machine.
-    let behind_nat = (node.public_ipv4.is_some() && node.public_ipv4_nat)
-        || (node.public_ipv6.is_some() && node.public_ipv6_nat);
-    if behind_nat {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    if let Some(address) = node.public_ipv4.as_ref() {
-        out.push(address.clone());
-    }
-    if let Some(address) = node.public_ipv6.as_ref() {
-        out.push(address.clone());
-    }
-    out
-}
-
 fn sorted_apps(apps: &[AppIr]) -> Vec<&AppIr> {
     let mut apps = apps.iter().collect::<Vec<_>>();
     apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
     apps
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::{Dns, DomainStrategy, NodeConnection};
-
-    fn node(ipv4: Option<&str>, ipv4_nat: bool, ipv6: Option<&str>, ipv6_nat: bool) -> AppNode {
-        AppNode {
-            id: "sg-01".to_owned(),
-            tenant: "platform.acme".to_owned(),
-            name: "sg-01".to_owned(),
-            certificate_group_id: None,
-            certificate_track: None,
-            public_ipv4: ipv4.map(str::to_owned),
-            public_ipv6: ipv6.map(str::to_owned),
-            public_ipv4_nat: ipv4_nat,
-            public_ipv6_nat: ipv6_nat,
-            egress_allowed: true,
-            api_port: None,
-            dns: Dns::System,
-            domain_strategy: DomainStrategy::default(),
-            egress_dns: Vec::new(),
-            connection: NodeConnection::default(),
-        }
-    }
-
-    #[test]
-    fn a_machine_with_no_nat_offers_every_address_it_has() {
-        assert_eq!(
-            public_addresses(&node(
-                Some("203.0.113.9"),
-                false,
-                Some("2001:db8::9"),
-                false
-            )),
-            vec!["203.0.113.9".to_owned(), "2001:db8::9".to_owned()]
-        );
-    }
-
-    /// The whole point of the coarse rule. Keeping the native family and dropping only the NATed
-    /// one looks more precise and produces a false accusation: the expectation would hold the v6
-    /// address alone, traffic leaving over v4 is seen by the endpoint as the NATed v4 address, and
-    /// comparing the two yields `Mismatch` — the verdict that says the traffic never reached this
-    /// chain's exit, raised against a chain that works.
-    #[test]
-    fn nat_on_either_family_withdraws_the_other_family_too() {
-        assert!(
-            public_addresses(&node(Some("100.64.0.9"), true, Some("2001:db8::9"), false))
-                .is_empty(),
-            "v4 在 NAT 后，v6 也不能拿去核对"
-        );
-        assert!(
-            public_addresses(&node(Some("203.0.113.9"), false, Some("2001:db8::9"), true))
-                .is_empty(),
-            "v6 在 NAT 后，v4 也不能拿去核对"
-        );
-    }
-
-    /// The two flags default to false and mean nothing for a family the machine does not have, but
-    /// nothing in the schema stops one being left true beside an absent address. Read without that
-    /// guard, an ordinary v4-only machine would silently stop being checkable.
-    #[test]
-    fn a_nat_flag_beside_an_absent_address_disqualifies_nothing() {
-        assert_eq!(
-            public_addresses(&node(Some("203.0.113.9"), false, None, true)),
-            vec!["203.0.113.9".to_owned()]
-        );
-        assert_eq!(
-            public_addresses(&node(None, true, Some("2001:db8::9"), false)),
-            vec!["2001:db8::9".to_owned()]
-        );
-    }
 }

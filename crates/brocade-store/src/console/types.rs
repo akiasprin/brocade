@@ -161,10 +161,6 @@ pub struct NodeAgentStateItem {
     /// default action at a chain's end: a permitted end node gets `Egress`, one that is not gets
     /// `Block` plus a `step.no-egress` report.
     ///
-    /// Not the same as "this chain exits here" — that looks for an actual `Egress` in the rule
-    /// table (`exit_nodes` in physical/probe.rs). A relay cleared for egress may still only
-    /// forward.
-    ///
     /// Like `overlay` this is a model field rather than an observation the agent reports: the
     /// console reads the compiled view when editing this value (the one that goes through draft
     /// preview), and this copy is the fallback while compilation has not returned.

@@ -109,14 +109,6 @@ pub async fn user_grant_probe_plan(
                     ingress.id, ingress.chain
                 ))
             })?;
-        let expected_exit_ips = output
-            .project_probe(&ingress.node)?
-            .targets
-            .into_iter()
-            .find(|target| target.ingress_id == ingress.id)
-            .map(|target| target.expected_exit_ips)
-            .unwrap_or_default();
-
         let family = match entry.family {
             Some(IpFamily::V4) => "ipv4",
             Some(IpFamily::V6) => "ipv6",
@@ -251,7 +243,6 @@ pub async fn user_grant_probe_plan(
                     }),
                     mode: xhttp.mode.as_str().map(str::to_owned),
                 }),
-                expected_exit_ips,
             },
         });
     }

@@ -2686,8 +2686,8 @@ export function SettingsPane() {
                       的槽位。可用槽位用尽后允许突发扩容，超额 Worker 空闲后回收。
                     </p>
                     <p className="hint settings-parameter-note">
-                      预热只在复用阈值内尽力补足空闲连接，不保证业务繁忙时仍有空闲。健康探测会保留预热目标内
-                      的空闲 Worker；寿命只回收超出预热目标的空闲容量。
+                      预热只在复用阈值内尽力补足空闲连接，不保证业务繁忙时仍有空闲。 健康探测会保留预热目标内的空闲
+                      Worker；寿命只回收超出预热目标的空闲容量。
                     </p>
                     <p className="hint settings-parameter-note">
                       探活或收尾中的 Worker 不承接新流；End 写入使用独立 10 秒宽限，超时后只转为排空，
@@ -2835,7 +2835,7 @@ export function SettingsPane() {
                   <span className="hint">秒。默认 60，范围 15–86400</span>
                 </Fld>
                 <div className="guard">
-                  落点需为<b>明文 HTTP</b>，返回纯文本且包含 <code>ip=</code>。探测使用隐藏凭据，不占名额。
+                  落点需为<b>明文 HTTP</b>；2xx / 3xx 且能收到首字节即视为连通。探测使用隐藏凭据，不占名额。
                 </div>
               </Group>
             </Section>

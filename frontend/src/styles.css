@@ -5662,8 +5662,7 @@ h4.sec:first-of-type {
   padding: 12px 13px;
 }
 
-/* 语义状态。三档共用同一结构，只改变颜色：链路的三种状态是同一问题的三个答案，
-   使用三种不同形状会增加识别成本。底色以半透明方式叠加在内容区上，而不是混入
+/* 语义状态。连通和故障共用同一结构，只改变颜色。底色以半透明方式叠加在内容区上，而不是混入
    `--block`：亮色主题下 `--block` 本身是浅灰，混入少量金色后仍为灰色，
    与相邻块无法区分。 */
 .blk.tone-ok {
@@ -5673,14 +5672,6 @@ h4.sec:first-of-type {
 .blk.tone-ok .blk-hd {
   background: color-mix(in srgb, var(--ok) 16%, transparent);
   color: var(--ok);
-}
-.blk.tone-odd {
-  border-color: color-mix(in srgb, var(--gold) 34%, var(--line));
-  background: color-mix(in srgb, var(--gold) 11%, transparent);
-}
-.blk.tone-odd .blk-hd {
-  background: color-mix(in srgb, var(--gold) 20%, transparent);
-  color: var(--gold);
 }
 .blk.tone-err {
   border-color: color-mix(in srgb, var(--err) 34%, var(--line));
@@ -5718,9 +5709,6 @@ h4.sec:first-of-type {
 .sum-tot .u {
   font: 12px var(--mono);
   color: var(--ink-4);
-}
-.tone-odd .sum-tot .n {
-  color: var(--gold);
 }
 .sum-split {
   display: flex;
@@ -6083,20 +6071,10 @@ details.raw .tbl {
 .tone-ok .probe-lat .n {
   color: var(--ok);
 }
-.tone-odd .probe-lat .n {
-  color: var(--gold);
-}
 /* 不通和停用两档左侧显示的是文字而非数字，24px 字号是为数字设置的 */
 .tone-err .probe-lat .n {
   color: var(--err);
   font-size: 16px;
-}
-/* 火花线在着色底上需同步换色，否则会形成金色块上的一条灰线 */
-.tone-odd .spark i {
-  background: color-mix(in srgb, var(--gold) 45%, transparent);
-}
-.tone-odd .spark i.slow {
-  background: var(--gold);
 }
 .tone-ok .spark i {
   background: color-mix(in srgb, var(--ok) 45%, transparent);
@@ -14003,9 +13981,7 @@ h4.sec > .btn {
 /* ══════════════════════════════════════════════════════════════════════
    端到端探测
 
-   四档颜色对应 ui/probe.tsx 中的四种判定。关键是金色一档需要与绿色区分：
-   「连通但出口 IP 不符」是该功能最需要报告的状态，与成功状态外观相近会失去意义。
-   因此 odd 一档的点带一圈光晕——纵向扫视时颜色差异会被相邻的绿点削弱，形状差异不会。
+   颜色只表达连通、慢、不通和未探测；出口 IP 不参与健康判定。
    ══════════════════════════════════════════════════════════════════════ */
 .pb {
   display: inline-flex;
@@ -14048,12 +14024,6 @@ h4.sec > .btn {
   background: var(--gold);
 }
 .pb-slow .ms {
-  color: var(--gold);
-}
-.pb-odd .dot {
-  background: var(--gold);
-}
-.pb-odd .ms {
   color: var(--gold);
 }
 .pb-down .dot {

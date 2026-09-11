@@ -15,7 +15,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use brocade_deployment::protocol::{E2eExitVerdict, E2eProbe, E2eProbeStatus};
+use brocade_deployment::protocol::{E2eProbe, E2eProbeStatus};
 use brocade_probe::{ProbeCancellation, ProbeOptions};
 use brocade_store::{PgStore, StoreError, UserGrantProbePlan, UserGrantProbeTarget};
 use serde::Serialize;
@@ -452,8 +452,7 @@ impl GrantProbeService {
     }
 
     fn record_result(&self, job: &ProbeJob, target: &UserGrantProbeTarget, result: E2eProbe) {
-        let passed =
-            result.status == E2eProbeStatus::Ok && result.exit_verdict != E2eExitVerdict::Mismatch;
+        let passed = result.status == E2eProbeStatus::Ok;
         let detail = safe_result_detail(&result);
         self.finish_item(
             job,
@@ -656,11 +655,7 @@ fn inspect_runtime_dir(path: &Path) -> Result<(), String> {
 /// enough to tell an operator where to look next.
 fn safe_result_detail(result: &E2eProbe) -> Option<String> {
     match result.status {
-        E2eProbeStatus::Ok => match result.exit_verdict {
-            E2eExitVerdict::Mismatch => Some("链路可达，但出口与 Serving 预期不一致".to_owned()),
-            E2eExitVerdict::Unknown => Some("链路可达；该出口无法核对公网地址".to_owned()),
-            E2eExitVerdict::Match => None,
-        },
+        E2eProbeStatus::Ok => None,
         E2eProbeStatus::HandshakeFailed => Some("入口握手或用户认证失败".to_owned()),
         E2eProbeStatus::Timeout => Some("完整链路在时限内没有返回".to_owned()),
         E2eProbeStatus::ChainBroken => Some("握手后未能完成出口请求".to_owned()),
@@ -735,7 +730,6 @@ mod tests {
             ttfb_ms: None,
             exit_ip: Some("203.0.113.8".to_owned()),
             exit_loc: Some("ZZ".to_owned()),
-            exit_verdict: E2eExitVerdict::Unknown,
             detail: Some("uuid secret at 203.0.113.8 vendor-name".to_owned()),
         };
         let safe = safe_result_detail(&result).unwrap();
@@ -746,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_exit_is_not_an_authorization_pass() {
+    fn a_reachable_chain_has_no_failure_detail() {
         let result = E2eProbe {
             app_id: None,
             chain_id: "chain".to_owned(),
@@ -754,13 +748,9 @@ mod tests {
             ttfb_ms: Some(42),
             exit_ip: None,
             exit_loc: None,
-            exit_verdict: E2eExitVerdict::Mismatch,
             detail: None,
         };
-        assert_eq!(
-            safe_result_detail(&result).as_deref(),
-            Some("链路可达，但出口与 Serving 预期不一致")
-        );
+        assert_eq!(safe_result_detail(&result), None);
     }
 
     #[test]

@@ -41,7 +41,7 @@ use std::{
 };
 
 use brocade_deployment::protocol::{
-    E2eExitVerdict, E2eProbe, E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
+    E2eProbe, E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
 };
 
 /// Ceiling on waiting for the started process to listen on its socks port. A cold
@@ -209,7 +209,6 @@ fn probe_once(
         ttfb_ms: None,
         exit_ip: None,
         exit_loc: None,
-        exit_verdict: E2eExitVerdict::Unknown,
         detail,
     };
 
@@ -280,19 +279,15 @@ fn probe_once(
     });
 
     match outcome {
-        Ok(success) => {
-            let verdict = judge_exit(target, success.exit_ip.as_deref());
-            E2eProbe {
-                app_id: target.app_id.clone(),
-                chain_id: target.chain_id.clone(),
-                status: E2eProbeStatus::Ok,
-                ttfb_ms: Some(success.ttfb_ms),
-                exit_ip: success.exit_ip,
-                exit_loc: success.exit_loc,
-                exit_verdict: verdict,
-                detail: mismatch_detail(target, verdict),
-            }
-        }
+        Ok(success) => E2eProbe {
+            app_id: target.app_id.clone(),
+            chain_id: target.chain_id.clone(),
+            status: E2eProbeStatus::Ok,
+            ttfb_ms: Some(success.ttfb_ms),
+            exit_ip: success.exit_ip,
+            exit_loc: success.exit_loc,
+            detail: None,
+        },
         Err((status, detail)) => base(status, Some(detail)),
     }
 }
@@ -301,37 +296,6 @@ struct ProbeSuccess {
     ttfb_ms: u32,
     exit_ip: Option<String>,
     exit_loc: Option<String>,
-}
-
-/// Exit check: whether the IP the endpoint saw is among those this chain should
-/// have.
-///
-/// An empty expectation yields `Unknown`, not `Match` — it means no exit offers an
-/// address the endpoint could report, because one is behind NAT or has none at all.
-/// Counting it as a pass would show a misconfigured chain as healthy purely because
-/// it cannot be falsified.
-fn judge_exit(target: &E2eProbeTarget, exit_ip: Option<&str>) -> E2eExitVerdict {
-    if target.expected_exit_ips.is_empty() {
-        return E2eExitVerdict::Unknown;
-    }
-    match exit_ip {
-        None => E2eExitVerdict::Unknown,
-        Some(ip) if target.expected_exit_ips.iter().any(|want| want == ip) => E2eExitVerdict::Match,
-        Some(_) => E2eExitVerdict::Mismatch,
-    }
-}
-
-fn mismatch_detail(target: &E2eProbeTarget, verdict: E2eExitVerdict) -> Option<String> {
-    match verdict {
-        E2eExitVerdict::Mismatch => Some(format!(
-            "通了，但出口 IP 不在这条链的出口节点上（期望 {}）",
-            target.expected_exit_ips.join("、")
-        )),
-        E2eExitVerdict::Unknown if target.expected_exit_ips.is_empty() => {
-            Some("出口节点在 NAT 后面或没有公网地址，核对不了从哪儿出去的".to_owned())
-        }
-        _ => None,
-    }
 }
 
 // ── Client config ───────────────────────────────────────────────────────────
@@ -951,9 +915,8 @@ fn run_probe(
     }
     let ttfb_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
-    // Read the rest of the body — the exit IP is in it. Falling short is not a
-    // failure: TTFB is already taken and reachability already settled, and a
-    // missing exit IP only means the check cannot be made.
+    // Read the rest of the body for optional exit metadata. Falling short is not
+    // a failure: TTFB is already taken and reachability already settled.
     let mut body = Vec::from(&first[..read]);
     let mut chunk = [0_u8; 4096];
     while body.len() < 8192 {
@@ -1122,7 +1085,7 @@ mod tests {
         assert!(!ProbeOptions::default().without_warm_up().warm_up);
     }
 
-    fn target(expected: &[&str]) -> E2eProbeTarget {
+    fn target() -> E2eProbeTarget {
         E2eProbeTarget {
             app_id: Some("app".to_owned()),
             chain_id: "c1".to_owned(),
@@ -1139,7 +1102,6 @@ mod tests {
                 flow: Some("xtls-rprx-vision".to_owned()),
             }),
             xhttp: None,
-            expected_exit_ips: expected.iter().map(|value| (*value).to_owned()).collect(),
         }
     }
 
@@ -1193,34 +1155,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// "Cannot check" must be its own outcome. Counted as a pass, a misconfigured
-    /// chain shows as healthy purely because it cannot be falsified — the one
-    /// failure mode this feature must never have.
-    #[test]
-    fn empty_expectation_is_unknown_not_match() {
-        assert_eq!(
-            judge_exit(&target(&[]), Some("203.0.113.9")),
-            E2eExitVerdict::Unknown
-        );
-    }
-
-    #[test]
-    fn exit_matches_when_the_address_is_one_of_the_expected() {
-        let target = target(&["198.51.100.7", "2001:db8::7"]);
-        assert_eq!(
-            judge_exit(&target, Some("198.51.100.7")),
-            E2eExitVerdict::Match
-        );
-        assert_eq!(
-            judge_exit(&target, Some("2001:db8::7")),
-            E2eExitVerdict::Match
-        );
-        assert_eq!(
-            judge_exit(&target, Some("203.0.113.9")),
-            E2eExitVerdict::Mismatch
-        );
-    }
-
     /// The probe config must carry flow. It decides whether XTLS Vision is used,
     /// and those are two different data planes — omitted, the handshake still
     /// succeeds but a different path is being measured.
@@ -1229,7 +1163,7 @@ mod tests {
     /// carrying traffic.
     #[test]
     fn a_target_inside_http_produces_a_client_inside_http() {
-        let mut t = target(&[]);
+        let mut t = target();
         t.xhttp = Some(brocade_deployment::protocol::E2eProbeXhttp {
             path: "/probe".to_owned(),
             host: Some("upload.route.example".to_owned()),
@@ -1281,7 +1215,7 @@ mod tests {
     /// borrowed site's public key.
     #[test]
     fn a_target_with_its_own_certificate_produces_a_tls_client() {
-        let mut t = target(&[]);
+        let mut t = target();
         t.security = E2eProbeSecurity::Tls(brocade_deployment::protocol::E2eProbeTls {
             server_name: "a1b2.example.net".to_owned(),
             pinned_peer_cert_sha256: Some(
@@ -1311,7 +1245,7 @@ mod tests {
 
     #[test]
     fn an_anytls_target_produces_an_anytls_client() {
-        let mut t = target(&[]);
+        let mut t = target();
         t.security = E2eProbeSecurity::AnyTls {
             settings: brocade_deployment::protocol::E2eProbeAnyTls {
                 server_name: "anytls.example.net".to_owned(),
@@ -1356,7 +1290,7 @@ mod tests {
             eprintln!("skipping: place xray at .tools/xray");
             return;
         }
-        let mut t = target(&[]);
+        let mut t = target();
         t.security = E2eProbeSecurity::AnyTls {
             settings: brocade_deployment::protocol::E2eProbeAnyTls {
                 server_name: "private.apple.com".to_owned(),
@@ -1397,7 +1331,7 @@ mod tests {
 
     #[test]
     fn an_anytls_reality_target_produces_a_reality_client() {
-        let mut t = target(&[]);
+        let mut t = target();
         let E2eProbeSecurity::Reality(reality) = t.security.clone() else {
             unreachable!()
         };
@@ -1425,7 +1359,7 @@ mod tests {
 
     #[test]
     fn a_hysteria2_target_produces_the_same_quic_client_shape_as_its_subscription() {
-        let mut t = target(&[]);
+        let mut t = target();
         t.security = E2eProbeSecurity::Hysteria2(brocade_deployment::protocol::E2eProbeHysteria2 {
             server_name: "hy2.example.net".to_owned(),
             pinned_peer_cert_sha256: Some(
@@ -1493,7 +1427,7 @@ mod tests {
 
     #[test]
     fn native_encryption_probe_uses_its_key_and_plain_tcp_transport() {
-        let mut t = target(&[]);
+        let mut t = target();
         let encryption = "mlkem768x25519plus.native.0rtt.public-key";
         t.security = E2eProbeSecurity::VlessEncryption {
             encryption: encryption.to_owned(),
@@ -1516,8 +1450,7 @@ mod tests {
     #[test]
     fn client_config_carries_every_reality_parameter() {
         let config: serde_json::Value =
-            serde_json::from_str(&client_config(&target(&[]), 10800, "/tmp/probe-test.log"))
-                .unwrap();
+            serde_json::from_str(&client_config(&target(), 10800, "/tmp/probe-test.log")).unwrap();
         let out = &config["outbounds"][0];
         assert_eq!(
             out["settings"]["vnext"][0]["users"][0]["flow"],
@@ -1536,8 +1469,7 @@ mod tests {
     #[test]
     fn probe_inbound_never_listens_outside() {
         let config: serde_json::Value =
-            serde_json::from_str(&client_config(&target(&[]), 10800, "/tmp/probe-test.log"))
-                .unwrap();
+            serde_json::from_str(&client_config(&target(), 10800, "/tmp/probe-test.log")).unwrap();
         assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
     }
 
@@ -1549,7 +1481,6 @@ mod tests {
             ttfb_ms: None,
             exit_ip: None,
             exit_loc: None,
-            exit_verdict: E2eExitVerdict::Unknown,
             detail: None,
         }
     }
@@ -1576,7 +1507,7 @@ mod tests {
     #[test]
     fn probe_config_writes_its_log_to_a_file() {
         let config: serde_json::Value =
-            serde_json::from_str(&client_config(&target(&[]), 10800, "/tmp/x.log")).unwrap();
+            serde_json::from_str(&client_config(&target(), 10800, "/tmp/x.log")).unwrap();
         assert_eq!(config["log"]["error"], "/tmp/x.log");
         assert_eq!(config["log"]["loglevel"], "info");
         assert_eq!(config["log"]["access"], "none");
