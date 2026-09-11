@@ -18650,24 +18650,27 @@ input.f.ing-pj-port {
   color: var(--action);
 }
 .external-target-copy {
-  display: block;
+  display: grid;
+  gap: 1px;
   min-width: 0;
   line-height: 1.25;
   text-align: left;
 }
-.external-target-copy b {
+.external-target-copy b,
+.external-target-copy small {
+  display: block;
+  min-width: 0;
   overflow: hidden;
-  color: var(--ink);
-  font: 500 11.5px var(--sans);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.external-target-copy b {
+  color: var(--ink);
+  font: 500 11.5px var(--sans);
+}
 .external-target-copy small {
-  overflow: hidden;
   color: var(--ink-4);
   font: 9.5px var(--mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .external-target-chevron {
   color: var(--ink-4);
