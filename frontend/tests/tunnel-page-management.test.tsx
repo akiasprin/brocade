@@ -98,6 +98,7 @@ it('owns creation on the tunnel list page', () => {
   expect(view.getByRole('dialog', { name: '选择隧道类型' })).toBeTruthy();
   expect(view.getByRole('button', { name: /Cloudflare WARP/ })).toBeTruthy();
   expect(view.getByRole('button', { name: /导入或自定义配置/ })).toBeTruthy();
+  expect(view.getByText(/VLESS \/ Shadowsocks \/ SOCKS5/)).toBeTruthy();
 });
 
 it('owns editing, deletion and subscription-front selection on the tunnel detail page', () => {

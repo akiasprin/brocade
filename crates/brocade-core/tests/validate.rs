@@ -66,7 +66,7 @@ fn external_vless_requires_an_explicit_transport() {
 }
 
 #[test]
-fn external_shadowsocks_is_explicitly_ss2022_raw_with_a_sized_psk() {
+fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport() {
     let mut doc = doc(vec![node(
         "hk",
         "platform.acme",
@@ -117,19 +117,45 @@ fn external_shadowsocks_is_explicitly_ss2022_raw_with_a_sized_psk() {
     assert_has(
         &diagnostics,
         Level::Error,
-        "external-outbound.shadowsocks2022-method",
-    );
-    assert_has(
-        &diagnostics,
-        Level::Error,
         "external-outbound.shadowsocks2022-transport",
+    );
+    assert!(diagnostics.iter().all(|diagnostic| {
+        !matches!(
+            diagnostic.code,
+            "external-outbound.shadowsocks2022-method" | "external-outbound.shadowsocks2022-key"
+        )
+    }));
+
+    doc.external_outbounds[0].security = ExternalOutboundSecurity::None;
+    let mut classic = Vec::new();
+    let sys = compile_system(&doc, &mut classic);
+    let app_ir = compile_app(&doc, &app, &mut classic);
+    validate_app(&sys, &app_ir, &mut classic);
+    assert!(
+        classic.iter().all(|diagnostic| !diagnostic
+            .code
+            .starts_with("external-outbound.shadowsocks2022")),
+        "{classic:#?}"
+    );
+
+    doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Shadowsocks2022 {
+        credential: "ordinary-password".to_owned(),
+        method: "2022-blake3-aes-256-gcm".to_owned(),
+    };
+    let mut bad_ss2022 = Vec::new();
+    let sys = compile_system(&doc, &mut bad_ss2022);
+    let app_ir = compile_app(&doc, &app, &mut bad_ss2022);
+    validate_app(&sys, &app_ir, &mut bad_ss2022);
+    assert_has(
+        &bad_ss2022,
+        Level::Error,
+        "external-outbound.shadowsocks2022-key",
     );
 
     doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Shadowsocks2022 {
         credential: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
         method: "2022-blake3-aes-256-gcm".to_owned(),
     };
-    doc.external_outbounds[0].security = ExternalOutboundSecurity::None;
     let mut valid = Vec::new();
     let sys = compile_system(&doc, &mut valid);
     let app_ir = compile_app(&doc, &app, &mut valid);

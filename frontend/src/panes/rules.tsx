@@ -3660,7 +3660,7 @@ function externalProtocolLabel(protocol: ExternalOutboundProtocol['t']): string 
   return {
     anytls: 'AnyTLS',
     vless: 'VLESS',
-    shadowsocks2022: 'Shadowsocks 2022',
+    shadowsocks2022: 'Shadowsocks',
     socks5: 'SOCKS5',
     http_connect: 'HTTP CONNECT',
     wireguard: 'WireGuard',
@@ -3672,7 +3672,7 @@ function externalProtocolBadge(protocol: ExternalOutboundProtocol['t']): string 
   return {
     anytls: 'AnyTLS',
     vless: 'VLESS',
-    shadowsocks2022: 'SS2022',
+    shadowsocks2022: 'SS',
     socks5: 'SOCKS5',
     http_connect: 'HTTP',
     wireguard: 'WG',
@@ -3706,7 +3706,12 @@ function externalOutboundFacts(outbound: ExternalOutbound): {
     return { transport: 'TCP', security: externalSecurityLabel(outbound.security), credential: '密码 · 已密封' };
   }
   if (protocol.t === 'shadowsocks2022') {
-    return { transport: `RAW · ${protocol.v.method}`, security: 'SS2022', credential: 'PSK · 已密封' };
+    const ss2022 = protocol.v.method.startsWith('2022-');
+    return {
+      transport: `RAW · ${protocol.v.method}`,
+      security: ss2022 ? 'SS2022' : 'Shadowsocks',
+      credential: `${ss2022 ? 'PSK' : '密码'} · 已密封`,
+    };
   }
   if (protocol.t === 'wireguard') {
     return {
@@ -3755,6 +3760,16 @@ function externalObject(value: unknown): Record<string, unknown> | null {
 function externalString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
 }
+
+const SHADOWSOCKS_METHODS = [
+  'aes-256-gcm',
+  '2022-blake3-aes-128-gcm',
+  '2022-blake3-aes-256-gcm',
+  '2022-blake3-chacha20-poly1305',
+] as const;
+
+const shadowsocksMethodIsSupported = (method: string) =>
+  SHADOWSOCKS_METHODS.includes(method as (typeof SHADOWSOCKS_METHODS)[number]);
 
 function parseExternalXhttpMode(value: unknown, field: string): XhttpMode {
   if (value === undefined || value === null || value === '' || value === 'auto') return 'auto';
@@ -3862,9 +3877,11 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
     let userInfo = authority.slice(0, at);
     if (!userInfo.includes(':')) userInfo = decodeShareBase64(userInfo);
     const separator = userInfo.indexOf(':');
-    if (separator < 1) throw new Error('Shadowsocks 链接缺少加密方式或密钥');
-    const method = userInfo.slice(0, separator);
-    if (!method.startsWith('2022-blake3-')) throw new Error('这里只接受 Shadowsocks 2022 链接');
+    if (separator < 1) throw new Error('Shadowsocks 链接缺少加密方式或密码');
+    const method = decodeURIComponent(userInfo.slice(0, separator)).toLowerCase();
+    if (!shadowsocksMethodIsSupported(method)) {
+      throw new Error('Shadowsocks 仅支持 aes-256-gcm 和三种 SS2022 加密方式');
+    }
     const endpoint = new URL(`http://${authority.slice(at + 1)}`);
     return {
       address: endpoint.hostname,
@@ -3967,11 +3984,13 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
           : { t: 'none' },
     };
   }
-  throw new Error('支持 AnyTLS、VLESS、SS2022、SOCKS5 和 HTTP(S) 分享链接；WireGuard 请手动填写');
+  throw new Error('支持 AnyTLS、VLESS、Shadowsocks、SOCKS5 和 HTTP(S) 分享链接；WireGuard 请手动填写');
 }
 
-function ss2022KeyIsValid(method: string, credential: string): boolean {
+function shadowsocksCredentialIsValid(method: string, credential: string): boolean {
   if (credential === '<redacted>') return true;
+  if (!shadowsocksMethodIsSupported(method)) return false;
+  if (method === 'aes-256-gcm') return credential.trim().length > 0;
   const expected = method === '2022-blake3-aes-128-gcm' ? 16 : 32;
   return (
     !!credential &&
@@ -4337,7 +4356,7 @@ export function ExternalOutboundEditor({
     Number(port) <= 65535 &&
     (authenticatedProxy || !!credential.trim()) &&
     authPairValid &&
-    (protocolKind !== 'shadowsocks2022' || ss2022KeyIsValid(method, credential)) &&
+    (protocolKind !== 'shadowsocks2022' || shadowsocksCredentialIsValid(method, credential)) &&
     (protocolKind !== 'wireguard' ||
       (wireguardKeyIsValid(credential) &&
         wireguardKeyIsValid(peerPublicKey) &&
@@ -4719,7 +4738,9 @@ export function ExternalOutboundEditor({
                     {protocolKind === 'vless'
                       ? 'UUID'
                       : protocolKind === 'shadowsocks2022'
-                        ? '预共享密钥'
+                        ? method === 'aes-256-gcm'
+                          ? '密码'
+                          : '预共享密钥'
                         : protocolKind === 'wireguard'
                           ? '本地私钥'
                           : protocolKind === 'anytls'
@@ -4737,8 +4758,9 @@ export function ExternalOutboundEditor({
                     {existing && <span className="sub">保持 &lt;redacted&gt; 可沿用已密封的凭据。</span>}
                     {protocolKind === 'shadowsocks2022' && (
                       <span className="sub">
-                        Base64 编码的 {method === '2022-blake3-aes-128-gcm' ? 16 : 32} 字节 PSK；多用户服务端填写
-                        server-key:user-key。
+                        {method === 'aes-256-gcm'
+                          ? '普通 Shadowsocks 密码，按原样密封保存。'
+                          : `Base64 编码的 ${method === '2022-blake3-aes-128-gcm' ? 16 : 32} 字节 PSK；多用户服务端填写 server-key:user-key。`}
                       </span>
                     )}
                     {protocolKind === 'wireguard' && (
@@ -5079,7 +5101,15 @@ export function ExternalOutboundEditor({
                   <label className="row">
                     <span className="k">加密方式</span>
                     <span className="v">
-                      <select className="f mono" value={method} onChange={event => setMethod(event.target.value)}>
+                      <select
+                        className="f mono"
+                        value={method}
+                        onChange={event => {
+                          setMethod(event.target.value);
+                          if (event.target.value !== method && credential === '<redacted>') setCredential('');
+                        }}
+                      >
+                        <option value="aes-256-gcm">aes-256-gcm</option>
                         <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
                         <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
                         <option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>

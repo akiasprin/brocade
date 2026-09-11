@@ -150,6 +150,19 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             "unused-secret",
         ),
         ExternalOutbound {
+            id: "classic-ss".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "Shadowsocks 前置".to_owned(),
+            address: "ss.proxy.example".to_owned(),
+            port: 8388,
+            protocol: ExternalOutboundProtocol::Shadowsocks2022 {
+                credential: "classic-password".to_owned(),
+                method: "aes-256-gcm".to_owned(),
+            },
+            security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
             id: "warp".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Cloudflare WARP".to_owned(),
@@ -182,7 +195,11 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             via: vec!["i-front".to_owned()],
             // Include WARP deliberately: validation must reject it and projection must still
             // fail closed if a caller renders despite the diagnostic.
-            external_via: vec!["joined".to_owned(), "warp".to_owned()],
+            external_via: vec![
+                "joined".to_owned(),
+                "classic-ss".to_owned(),
+                "warp".to_owned(),
+            ],
             strategy: FrontStrategy::UrlTest,
         }],
         steps: Vec::new(),
@@ -204,8 +221,12 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
     assert!(clash.contains("name: \"供应商前置\""), "{clash}");
     assert!(clash.contains("server: joined.proxy.example"), "{clash}");
     assert!(clash.contains("password: joined-secret"), "{clash}");
+    assert!(clash.contains("name: \"Shadowsocks 前置\""), "{clash}");
+    assert!(clash.contains("server: ss.proxy.example"), "{clash}");
+    assert!(clash.contains("cipher: aes-256-gcm"), "{clash}");
+    assert!(clash.contains("password: classic-password"), "{clash}");
     assert!(
-        clash.contains("proxies: [\"香港入口\", \"供应商前置\"]"),
+        clash.contains("proxies: [\"香港入口\", \"供应商前置\", \"Shadowsocks 前置\"]"),
         "{clash}"
     );
     assert!(!clash.contains("unused.proxy.example"), "{clash}");

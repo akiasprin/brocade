@@ -225,8 +225,8 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             address: "ss.vendor.example".to_owned(),
             port: 8388,
             protocol: ExternalOutboundProtocol::Shadowsocks2022 {
-                credential: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
-                method: "2022-blake3-aes-256-gcm".to_owned(),
+                credential: "classic-password".to_owned(),
+                method: "aes-256-gcm".to_owned(),
             },
             security: ExternalOutboundSecurity::None,
             bindings: Vec::new(),
@@ -374,11 +374,8 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
     );
     let shadowsocks = outbound(&hk, "out:external/ss-edge");
     assert_eq!(shadowsocks["protocol"], "shadowsocks");
-    assert_eq!(shadowsocks["settings"]["method"], "2022-blake3-aes-256-gcm");
-    assert_eq!(
-        shadowsocks["settings"]["password"],
-        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-    );
+    assert_eq!(shadowsocks["settings"]["method"], "aes-256-gcm");
+    assert_eq!(shadowsocks["settings"]["password"], "classic-password");
     assert_eq!(shadowsocks["streamSettings"]["security"], "none");
     let wireguard = outbound(&hk, "out:external/wireguard-edge");
     assert_eq!(wireguard["protocol"], "wireguard");

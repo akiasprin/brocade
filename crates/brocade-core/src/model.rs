@@ -871,6 +871,9 @@ pub enum ExternalOutboundProtocol {
         /// The wire carrying VLESS.
         transport: ExternalVlessTransport,
     },
+    /// Shadowsocks tunnel settings. The variant name and serialized `shadowsocks2022` tag are
+    /// retained for stored-model compatibility, but `method` may also be a supported classic
+    /// Shadowsocks cipher such as `aes-256-gcm`.
     Shadowsocks2022 {
         credential: String,
         method: String,

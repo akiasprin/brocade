@@ -557,18 +557,19 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 }
             }
             ExternalOutboundProtocol::Shadowsocks2022 { credential, method } => {
-                let key_len = match method.as_str() {
+                let ss2022_key_len = match method.as_str() {
                     "2022-blake3-aes-128-gcm" => Some(16),
                     "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Some(32),
                     _ => None,
                 };
-                match key_len {
-                    None => diagnostics.push(Diagnostic::error(
+                match (method.as_str(), ss2022_key_len) {
+                    ("aes-256-gcm", _) => {}
+                    (_, None) => diagnostics.push(Diagnostic::error(
                         "external-outbound.shadowsocks2022-method",
                         &at,
-                        "外部 Shadowsocks 只支持 SS2022 的三种 2022-blake3-* 加密方式",
+                        "外部 Shadowsocks 支持 aes-256-gcm 及 SS2022 的三种 2022-blake3-* 加密方式",
                     )),
-                    Some(key_len) if !ss2022_credential_is_valid(credential, key_len) => {
+                    (_, Some(key_len)) if !ss2022_credential_is_valid(credential, key_len) => {
                         diagnostics.push(Diagnostic::error(
                             "external-outbound.shadowsocks2022-key",
                             &at,
@@ -577,7 +578,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                             ),
                         ));
                     }
-                    Some(_) => {}
+                    (_, Some(_)) => {}
                 }
             }
             ExternalOutboundProtocol::Socks5 {
@@ -845,7 +846,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 diagnostics.push(Diagnostic::error(
                     "external-outbound.shadowsocks2022-transport",
                     &at,
-                    "SS2022 代理出站只支持 RAW，不叠加 TLS 或 REALITY",
+                    "Shadowsocks 代理出站只支持 RAW，不叠加 TLS 或 REALITY",
                 ));
             }
             ExternalOutboundSecurity::Tls { .. } | ExternalOutboundSecurity::Reality { .. }

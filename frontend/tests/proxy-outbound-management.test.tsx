@@ -67,6 +67,34 @@ it('imports VLESS Encryption without requiring TLS', async () => {
     security: { t: 'none' },
   });
 });
+it('imports classic Shadowsocks AES-256-GCM with an ordinary password', async () => {
+  const view = editor();
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: {
+      value: 'ss://YWVzLTI1Ni1nY206Y2xhc3NpYy1zZWNyZXQ=@ss.example.com:8388#Classic%20SS',
+    },
+  });
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0]).toMatchObject({
+    name: 'Classic SS',
+    address: 'ss.example.com',
+    port: 8388,
+    protocol: {
+      t: 'shadowsocks2022',
+      v: { method: 'aes-256-gcm', credential: 'classic-secret' },
+    },
+    security: { t: 'none' },
+  });
+});
+it('offers classic and 2022 methods under the Shadowsocks manual protocol', () => {
+  const view = editor();
+  fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+  fireEvent.click(view.getByRole('button', { name: 'Shadowsocks' }));
+  expect(view.getByRole('option', { name: 'aes-256-gcm' })).toBeTruthy();
+  expect(view.getByRole('option', { name: '2022-blake3-aes-256-gcm' })).toBeTruthy();
+  expect(view.queryByRole('button', { name: 'Shadowsocks 2022' })).toBeNull();
+});
 it('offers native VLESS Encryption as a manual choice with no TLS fields', () => {
   const view = editor();
   fireEvent.click(view.getByRole('button', { name: '手动填写' }));

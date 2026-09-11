@@ -90,7 +90,7 @@ const protocolName = (tunnel: ExternalOutbound) =>
   ({
     anytls: 'AnyTLS',
     vless: 'VLESS',
-    shadowsocks2022: 'Shadowsocks 2022',
+    shadowsocks2022: 'Shadowsocks',
     socks5: 'SOCKS5',
     http_connect: 'HTTP CONNECT',
     wireguard: 'WireGuard',
@@ -216,7 +216,7 @@ function TunnelList({ go }: { go: (drill: Drill) => void }) {
               <Icon of="tunnels" size={25} />
             </span>
             <b>还没有隧道</b>
-            <p>导入 VLESS、SS2022、SOCKS5、HTTP CONNECT、WireGuard，或为每个出口节点申请独立 WARP 身份。</p>
+            <p>导入 VLESS、Shadowsocks、SOCKS5、HTTP CONNECT、WireGuard，或为每个出口节点申请独立 WARP 身份。</p>
             <button
               className="btn"
               disabled={!editable || tenantOptions.length === 0}
@@ -346,7 +346,7 @@ function TunnelList({ go }: { go: (drill: Drill) => void }) {
                   <span className="tunnel-kind-icon">↗</span>
                   <span>
                     <b>导入或自定义配置</b>
-                    <small>VLESS / SS2022 / SOCKS5 / HTTP / WireGuard</small>
+                    <small>VLESS / Shadowsocks / SOCKS5 / HTTP / WireGuard</small>
                   </span>
                 </button>
               </div>

@@ -1464,6 +1464,7 @@ export type ExternalOutboundProtocol =
         transport: ExternalVlessTransport;
       };
     }
+  /** The legacy discriminator also carries supported classic Shadowsocks methods. */
   | { t: 'shadowsocks2022'; v: { credential: string; method: string } }
   | { t: 'socks5'; v: { username?: string | null; credential: string } }
   | { t: 'http_connect'; v: { username?: string | null; credential: string } }

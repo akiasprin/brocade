@@ -234,6 +234,19 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            id: "ss-classic-external".to_owned(),
+            tenant: "platform".to_owned(),
+            name: "Shadowsocks AES-256-GCM".to_owned(),
+            address: "ss-classic.example.net".to_owned(),
+            port: 8389,
+            protocol: ExternalOutboundProtocol::Shadowsocks2022 {
+                credential: "classic-password".to_owned(),
+                method: "aes-256-gcm".to_owned(),
+            },
+            security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
             id: "wireguard-external".to_owned(),
             tenant: "platform".to_owned(),
             name: "WireGuard".to_owned(),
@@ -260,12 +273,13 @@ fn external_proxy_protocols_load_in_the_real_binary() {
         "xhttp-external",
         "http-external",
         "ss2022-external",
+        "ss-classic-external",
         "wireguard-external",
     ]
     .into_iter()
     .enumerate()
     .map(|(index, outbound)| Rule {
-        dest_match: if index == 5 {
+        dest_match: if outbound == "wireguard-external" {
             DestMatch::Any
         } else {
             DestMatch::DomainSuffix(vec![format!("case-{index}.example")])
