@@ -3,21 +3,24 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+const chains = readFileSync(new URL('../src/panes/chains.tsx', import.meta.url), 'utf8');
+const rules = readFileSync(new URL('../src/panes/rules.tsx', import.meta.url), 'utf8');
 
-test('目标菜单脱离卡片裁切，监听摘要保持两行并可圈出引用子树', () => {
+test('目标菜单脱离卡片裁切，监听编辑保持紧凑且不再显示决策图', () => {
   assert.match(styles, /\.external-target-menu\s*\{[^}]*position:\s*fixed;/s);
   assert.match(styles, /\.external-target-copy\s*\{[^}]*display:\s*grid;/s);
   assert.match(styles, /\.external-target-copy b,\s*\.external-target-copy small\s*\{[^}]*display:\s*block;/s);
   assert.match(styles, /\.listener-reference-copy\s*\{[^}]*display:\s*grid;[^}]*flex:\s*1 1 auto;/s);
-  assert.match(
-    styles,
-    /\.listener-map-node\.is-highlighted-subtree::before\s*\{[^}]*border:\s*1px dashed var\(--listener-ref\);/s,
-  );
-  assert.match(styles, /\.listener-reference-highlight-hitbox\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;/s);
   assert.match(styles, /\.listener-reference-panel\.hop-target-panel\s*\{[^}]*--listener-panel-accent:/s);
   assert.match(styles, /\.hop-target-facts\s*\{[^}]*flex-wrap:\s*nowrap;/s);
   assert.match(
     styles,
+    /\.hop-target-panel \.hop-target-facts > \.hopfld\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;/s,
+  );
+  assert.match(
+    styles,
     /@container rules \(max-width:\s*820px\)[\s\S]*\.listener-reference-row:not\(\.hop-target-row\)\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/s,
   );
+  assert.doesNotMatch(chains, /<section className="listener-map">/);
+  assert.doesNotMatch(rules, /listener-reference-highlight-hitbox/);
 });

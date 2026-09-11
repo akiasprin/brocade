@@ -5874,11 +5874,6 @@ export function ChainRulesPanel({
   const [draftHops, setDraftHops] = useState<Record<string, HopsDraft>>({});
   const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
   const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
-  const [highlightedListener, setHighlightedListener] = useState<ListenerRef | null>(null);
-  const toggleHighlightedListener = (listener: ListenerRef) =>
-    setHighlightedListener(current =>
-      current && listenerRefKey(current) === listenerRefKey(listener) ? null : listener,
-    );
   const snapshotApp = snapshotForPorts.data?.snapshot.apps.find(candidate => candidate.id === appId) ?? null;
   const peersOf = (node: string) =>
     forwardPeers({
@@ -6167,8 +6162,6 @@ export function ChainRulesPanel({
                   rules: fallbackOf(node),
                   pending: revisionsForPorts.isPending || compiledForPorts.isLoading,
                 }}
-                highlightedListener={highlightedListener}
-                onHighlightListener={toggleHighlightedListener}
               />
             </div>
             {children.length > 0 && (
@@ -6189,8 +6182,6 @@ export function ChainRulesPanel({
 
   const tree = rootNodes.map(root => renderNode(root, ['入口'], new Set()));
   const orphanTree = rows.flatMap(row => (rendered.has(row.node) ? [] : [renderNode(row.node, ['孤立'], new Set())]));
-  const decisionRoot = spine[0] ?? steps[0]?.node ?? null;
-
   return (
     <>
       {readOnly && portDependenciesError && <ErrorBox error={portDependenciesError} />}
@@ -6206,19 +6197,6 @@ export function ChainRulesPanel({
           )}
         </div>
       )}
-      <section className="listener-map">
-        <ListenerDecisionTree
-          app={snapshotApp}
-          apps={snapshotForPorts.data?.snapshot.apps ?? []}
-          currentChain={chain}
-          currentSteps={steps}
-          root={decisionRoot}
-          draftRules={draftRules}
-          compiledRules={compiledRules}
-          nodeNames={nameMap}
-          highlightedListener={highlightedListener}
-        />
-      </section>
       <div className="chain-rule-tree">
         {tree}
         {orphanTree.length > 0 && (

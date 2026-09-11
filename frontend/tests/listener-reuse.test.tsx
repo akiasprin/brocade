@@ -456,8 +456,6 @@ describe('监听规则子树复用', () => {
         );
       }),
     );
-    const onHighlightListener = vi.fn();
-
     const view = render(
       <QueryClientProvider client={client}>
         <RuleEditor
@@ -469,7 +467,6 @@ describe('监听规则子树复用', () => {
           peers={[]}
           isForwardTarget={false}
           fallback={{ rules: [], pending: false }}
-          onHighlightListener={onHighlightListener}
         />
       </QueryClientProvider>,
     );
@@ -481,7 +478,7 @@ describe('监听规则子树复用', () => {
     expect(view.queryByRole('button', { name: /新加坡共享监听 · TCP 22000/ })).toBeNull();
     expect(view.queryByRole('button', { name: /同链监听 · TCP 21001/ })).toBeNull();
     const custom = await view.findByRole('button', { name: /自定义.*复用已有监听/ });
-    expect(custom.querySelector('.external-target-custom-icon svg')).not.toBeNull();
+    expect(custom.querySelector('span')?.textContent).toBe('↗');
     const menu = custom.closest('.external-target-menu');
     expect(menu?.parentElement).toBe(document.body);
     expect(view.container.contains(menu)).toBe(false);
@@ -497,13 +494,7 @@ describe('监听规则子树复用', () => {
     expect(view.getByText(/引用子树 · 共享出口/)).toBeTruthy();
     expect(view.queryByRole('button', { name: '打开源规则' })).toBeNull();
     expect(view.queryByText('高亮规则子树')).toBeNull();
-    const highlightHitbox = view.getByRole('button', {
-      name: '高亮 新加坡共享监听 的规则子树',
-    });
-    expect(highlightHitbox.closest('.listener-reference-row')).not.toBeNull();
-    expect(highlightHitbox.getAttribute('aria-pressed')).toBe('false');
-    fireEvent.click(highlightHitbox);
-    expect(onHighlightListener).toHaveBeenCalledWith({ chain: 'owner', node: 'shared' });
+    expect(view.queryByRole('button', { name: /高亮 .*规则子树/ })).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => {

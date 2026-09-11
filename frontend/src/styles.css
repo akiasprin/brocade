@@ -18870,14 +18870,6 @@ input.f.ing-pj-port {
   background: color-mix(in srgb, var(--hue-3) 6%, var(--sheet));
   color: var(--hue-3);
 }
-.external-target-custom-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.external-target-custom-icon svg {
-  display: block;
-}
 .external-target-new > span:first-child {
   font: 500 14px var(--mono);
 }
@@ -18946,33 +18938,6 @@ input.f.ing-pj-port {
 }
 .listener-reference-row.blocked .listener-reference-main small {
   color: var(--err);
-}
-.listener-reference-row.is-highlighted {
-  border-color: color-mix(in srgb, var(--listener-panel-accent) 54%, var(--line));
-}
-.listener-reference-highlight-hitbox {
-  position: absolute;
-  z-index: 0;
-  inset: 0;
-  border: 0;
-  border-radius: inherit;
-  background: transparent;
-  cursor: pointer;
-}
-.listener-reference-highlight-hitbox:focus-visible {
-  outline: 2px solid var(--listener-panel-accent);
-  outline-offset: -3px;
-}
-.listener-reference-row.is-highlighted > .listener-reference-highlight-hitbox {
-  background: color-mix(in srgb, var(--listener-panel-accent) 5%, transparent);
-}
-.listener-reference-row.is-highlightable > :not(.listener-reference-highlight-hitbox) {
-  position: relative;
-  z-index: 1;
-  pointer-events: none;
-}
-.listener-reference-row.is-highlightable .listener-reference-facts :is(label, select, button, [role='button']) {
-  pointer-events: auto;
 }
 .listener-reference-row.missing > div {
   display: grid;
@@ -19047,9 +19012,14 @@ input.f.ing-pj-port {
   flex-wrap: nowrap;
 }
 .hop-target-panel .hop-target-facts > .hopfld {
-  display: grid;
-  align-items: initial;
-  gap: 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.hop-target-panel .hop-target-facts > .hopfld > small {
+  flex: none;
+  white-space: nowrap;
 }
 .hop-target-facts input.f,
 .hop-target-facts select.f {
@@ -19116,24 +19086,23 @@ input.f.ing-pj-port {
     flex-wrap: wrap;
   }
   .hop-target-row {
-    grid-template-columns: minmax(82px, 1fr) auto;
+    grid-template-columns: minmax(82px, 1fr) minmax(0, max-content);
     gap: 7px;
   }
   .hop-target-row .hop-target-facts {
+    min-width: 0;
+    overflow-x: auto;
     flex-wrap: nowrap;
     gap: 6px;
   }
-  .hop-target-facts .hop-target-port,
   .hop-target-facts .hop-target-port input.f {
     width: 56px;
     min-width: 56px;
   }
-  .hop-target-facts .hop-target-wire,
   .hop-target-facts .hop-target-wire select.f {
     width: 104px;
     min-width: 104px;
   }
-  .hop-target-facts .hop-target-pool,
   .hop-target-facts .hop-target-pool select.f {
     width: 76px;
     min-width: 76px;

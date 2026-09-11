@@ -48,7 +48,7 @@ import {
   type XhttpMode,
 } from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
-import { Icon, PanelTitle } from '../ui/icons';
+import { PanelTitle } from '../ui/icons';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
 import { externalImportCanSave, serverNameAfterAddressChange, vlessEncryptionIsValid } from '../external-outbound';
 import {
@@ -1619,9 +1619,6 @@ type RuleEditorProps = {
   // RuleEditor 只负责把它按普通规则的列布局渲染成不可编辑行。
   fallback?: { rules: Rule[]; pending: boolean };
   onClose?: () => void;
-  /** 当前决策图中被圈出的监听子树；只改变视图，不打开或修改所有者规则。 */
-  highlightedListener?: ListenerRef | null;
-  onHighlightListener?: (listener: ListenerRef) => void;
   /* 由上层持有的共享草稿。不传入时由本组件自行管理（机器详情页中一台机器只出现一次，不需要共享）。 */
   shared?: {
     rules: Rule[];
@@ -1697,8 +1694,6 @@ function RuleEditorReady({
   hopIn: selfHopIn = null,
   fallback,
   onClose,
-  highlightedListener = null,
-  onHighlightListener,
   shared,
   ruleDrafts,
   saves = true,
@@ -2612,7 +2607,7 @@ function RuleEditorReady({
                                         setTargetQuery('');
                                       }}
                                     >
-                                      <Icon of="link" size={12} className="external-target-custom-icon" />
+                                      <span>↗</span>
                                       <b>自定义</b>
                                       <span>复用已有监听</span>
                                     </button>
@@ -3097,7 +3092,6 @@ function RuleEditorReady({
                   (rule): rule is Rule & { a: Extract<RuleAction, { t: 'reuse_listener' }> } =>
                     rule.a.t === 'reuse_listener' && sameListener(rule.a.listener, listener),
                 );
-                const highlighted = Boolean(highlightedListener && sameListener(highlightedListener, listener));
                 if (!target) {
                   return (
                     <div className="listener-reference-row missing" key={key}>
@@ -3119,28 +3113,7 @@ function RuleEditorReady({
                     value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                   });
                 return (
-                  <div
-                    className={`listener-reference-row${target.blocked ? ' blocked' : ''}${
-                      onHighlightListener ? ' is-highlightable' : ''
-                    }${highlighted ? ' is-highlighted' : ''}`}
-                    key={key}
-                  >
-                    {onHighlightListener && (
-                      <span
-                        className="listener-reference-highlight-hitbox"
-                        role="button"
-                        tabIndex={0}
-                        aria-label={`${highlighted ? '取消高亮' : '高亮'} ${target.nodeName} 的规则子树`}
-                        aria-pressed={highlighted}
-                        title={highlighted ? '取消图中的规则子树高亮' : '在决策图中圈出这棵规则子树'}
-                        onClick={() => onHighlightListener(listener)}
-                        onKeyDown={event => {
-                          if (event.key !== 'Enter' && event.key !== ' ') return;
-                          event.preventDefault();
-                          onHighlightListener(listener);
-                        }}
-                      />
-                    )}
+                  <div className={`listener-reference-row${target.blocked ? ' blocked' : ''}`} key={key}>
                     <div className="listener-reference-main">
                       <span className="external-target-kind listener">{target.local ? '本机' : '引用'}</span>
                       <span className="listener-reference-copy">
