@@ -1724,8 +1724,9 @@ export interface SnapshotIngress {
   projection: IngressProjection;
   guard: IngressGuard;
   identity: {
-    public_key: string;
-    short_ids: string[];
+    /** Omitted from readonly and public visitor snapshots. */
+    public_key?: string;
+    short_ids?: string[];
   };
   /* 快照中的结构包含 REALITY 的生效参数，请求中的不包含（密钥由服务端生成，不接受调用方
    * 传入）。因此这两个类型结构相似但不相同。

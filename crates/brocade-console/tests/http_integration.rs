@@ -3603,10 +3603,27 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     assert_eq!(node["public_ipv4"], "***.net");
     assert_eq!(node["overlay_addr"], "10.66.***.***");
     assert_eq!(node["wireguard"]["listen_port"], "***");
+    assert!(
+        node["wireguard"].get("public_key").is_none(),
+        "readonly snapshot carried a WireGuard public key: {node}"
+    );
     assert_eq!(node["api_port"], "***");
     assert_eq!(
         node["certificate_name"], "***.io",
         "VLESS、AnyTLS 和 REALITY 共用的本机证书域名必须在服务端脱敏"
+    );
+    assert!(
+        node.get("certificate_names").is_none(),
+        "readonly snapshot carried the complete certificate name set: {node}"
+    );
+    let ingress = &snapshot.1["snapshot"]["apps"][0]["ingresses"][0];
+    assert!(
+        ingress["identity"].get("public_key").is_none(),
+        "readonly snapshot carried a REALITY public key: {ingress}"
+    );
+    assert!(
+        ingress["identity"].get("short_ids").is_none(),
+        "readonly snapshot carried REALITY short ids: {ingress}"
     );
     let user = &snapshot.1["snapshot"]["users"][0];
     assert_eq!(user["id"], "alice");
@@ -3699,6 +3716,22 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
         full.1["snapshot"]["nodes"][0]["certificate_name"], "a2335a6d.huacu.io",
         "管理员仍应看到完整证书域名"
     );
+    assert_eq!(
+        full.1["snapshot"]["nodes"][0]["wireguard"]["public_key"], "wg-public",
+        "管理员仍应看到连接配置所需的 WireGuard 公钥"
+    );
+    assert!(
+        full.1["snapshot"]["nodes"][0]["certificate_names"].is_array(),
+        "管理员仍应看到证书轮换名称集合"
+    );
+    assert_eq!(
+        full.1["snapshot"]["apps"][0]["ingresses"][0]["identity"]["public_key"],
+        "reality-public"
+    );
+    assert_eq!(
+        full.1["snapshot"]["apps"][0]["ingresses"][0]["identity"]["short_ids"][0],
+        "8337a0bf"
+    );
     assert!(
         full.1["snapshot"]["users"][0]["uuid"].is_string(),
         "credential masking must apply only to readonly responses"
@@ -3736,6 +3769,14 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
         visitor_certs.1["groups"][0]["certificates"][0]["sha256"],
         "***"
     );
+    let visitor_snapshot = get_json_with_cookie(&app, "/model/snapshot", &visitor_cookie).await;
+    assert_eq!(visitor_snapshot.0, StatusCode::OK);
+    let visitor_node = &visitor_snapshot.1["snapshot"]["nodes"][0];
+    let visitor_ingress = &visitor_snapshot.1["snapshot"]["apps"][0]["ingresses"][0];
+    assert!(visitor_node["wireguard"].get("public_key").is_none());
+    assert!(visitor_node.get("certificate_names").is_none());
+    assert!(visitor_ingress["identity"].get("public_key").is_none());
+    assert!(visitor_ingress["identity"].get("short_ids").is_none());
 
     // The compile view stays readable — it is the review surface: topology, chains,
     // diagnostics. Its addresses are masked like everything else.

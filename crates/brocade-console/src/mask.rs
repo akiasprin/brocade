@@ -118,9 +118,12 @@ const PROSE_HIDDEN: &str = "";
 const SECRET_KEYS: &[&str] = &[
     "acme_contact",
     "anytls_padding_scheme",
+    "certificate_names",
     "email",
     "login_enabled",
     "padding_scheme",
+    "public_key",
+    "short_ids",
     "telegram",
 ];
 
@@ -709,6 +712,46 @@ mod tests {
             value["ingresses"][0]["wires"]["anytls"]["masquerade"]["kind"],
             "not-found"
         );
+    }
+
+    #[test]
+    fn public_connection_identities_and_certificate_names_are_removed() {
+        let mut value = json!({
+            "nodes": [{
+                "id": "n1",
+                "wireguard": { "public_key": "wireguard-public" },
+                "certificate_name": "serving.example.com",
+                "certificate_names": ["serving.example.com", "ready.example.com"],
+            }],
+            "ingresses": [{
+                "identity": {
+                    "public_key": "reality-public",
+                    "short_ids": ["14da9f2e19ceb91b"],
+                },
+                "wires": {
+                    "vless_encryption": { "public_key": "encryption-public" },
+                },
+            }],
+        });
+
+        mask_json(&mut value);
+
+        let encoded = value.to_string();
+        for hidden in [
+            "wireguard-public",
+            "reality-public",
+            "14da9f2e19ceb91b",
+            "encryption-public",
+            "ready.example.com",
+        ] {
+            assert!(!encoded.contains(hidden), "{hidden} leaked in {encoded}");
+        }
+        assert!(value["nodes"][0]["wireguard"].get("public_key").is_none());
+        assert!(value["nodes"][0].get("certificate_names").is_none());
+        assert!(value["ingresses"][0]["identity"].get("short_ids").is_none());
+        // The single serving name remains useful in masked form; the complete rollover set does
+        // not cross the visitor boundary at all.
+        assert_eq!(value["nodes"][0]["certificate_name"], "***.com");
     }
 
     #[test]
