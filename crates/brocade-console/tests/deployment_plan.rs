@@ -3,8 +3,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use brocade_core::model::{
     Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, ExternalOutbound,
     ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding, Grant, HopDial, HopIn,
-    HopMux, HopPool, HopWire, Hysteria2, HysteriaPortHop, Ingress, IngressWires, ModelSnapshot,
-    Node, Rule, Step, Transport, User, WireGuardKeys,
+    HopMux, HopPool, HopWire, Hysteria2, HysteriaPortHop, Ingress, IngressWires, ListenerDial,
+    ListenerRef, ModelSnapshot, Node, Rule, Step, Transport, User, WireGuardKeys,
 };
 use brocade_deployment::plan::{
     narrow_to_kind, plan_deployment, AppliedArtifactState, AppliedGrantsState, DeploymentKind,
@@ -428,6 +428,148 @@ fn xray_structure_change_uses_canary_then_batch_wave() {
 }
 
 #[test]
+fn adding_a_listener_reference_publishes_the_owner_before_the_caller() {
+    let snapshot = listener_reference_snapshot(true);
+
+    let plan = plan_deployment(&snapshot, &[]).unwrap();
+
+    assert!(target(&plan, "zz-owner").wave < target(&plan, "aa-source").wave);
+    assert_eq!(target(&plan, "aa-source").prerequisites, ["zz-owner"]);
+}
+
+#[test]
+fn removing_the_last_listener_reference_publishes_the_caller_before_the_owner() {
+    let before = listener_reference_snapshot(true);
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    let mut after = listener_reference_snapshot(false);
+    after.revision += 1;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert!(target(&plan, "aa-source").wave < target(&plan, "zz-owner").wave);
+    assert_eq!(target(&plan, "zz-owner").prerequisites, ["aa-source"]);
+}
+
+#[test]
+fn removing_one_of_two_listeners_on_the_same_peer_still_publishes_the_caller_first() {
+    let before = listener_reference_same_peer_snapshot(true);
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    let mut after = listener_reference_same_peer_snapshot(false);
+    after.revision += 1;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert!(target(&plan, "aa-source").wave < target(&plan, "zz-owner").wave);
+    assert_eq!(target(&plan, "zz-owner").prerequisites, ["aa-source"]);
+}
+
+#[test]
+fn changing_a_reused_listener_endpoint_coordinates_both_machines_in_one_wave() {
+    let before = listener_reference_snapshot(true);
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    let mut after = before.clone();
+    after.revision += 1;
+    after.apps[0]
+        .steps
+        .iter_mut()
+        .find(|step| step.chain == "owner-chain" && step.node == "zz-owner")
+        .unwrap()
+        .hop_in
+        .as_mut()
+        .unwrap()
+        .port = 20_018;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    let source = target(&plan, "aa-source");
+    let owner = target(&plan, "zz-owner");
+    assert_eq!(source.wave, owner.wave, "端口切换没有无损的串行顺序");
+    assert_eq!(source.prerequisites, ["zz-owner"]);
+    assert_eq!(owner.prerequisites, ["aa-source"]);
+}
+
+#[test]
+fn removing_a_reference_orders_source_disable_before_owner_apply() {
+    let before = listener_reference_snapshot(true);
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    // Keep the authored reference row. Retiring its source chain removes the outbound only from
+    // the compiled desired Xray; release ordering must compare artifacts rather than mistake the
+    // now-unreachable stored rule for a live reference.
+    let mut after = before.clone();
+    after.revision += 1;
+    after
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "aa-source")
+        .unwrap()
+        .retired = true;
+    after
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "zz-owner")
+        .unwrap()
+        .dns = Dns::Servers(vec!["8.8.8.8".to_owned()]);
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert!(target(&plan, "aa-source")
+        .actions
+        .contains(&PlannedAction::DisableXray));
+    assert!(target(&plan, "aa-source").wave < target(&plan, "zz-owner").wave);
+    assert_eq!(target(&plan, "zz-owner").prerequisites, ["aa-source"]);
+}
+
+#[test]
+fn removing_a_reference_orders_source_apply_before_owner_disable() {
+    let before = listener_reference_snapshot(true);
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    let mut after = listener_reference_snapshot(false);
+    after.revision += 1;
+    after
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "zz-owner")
+        .unwrap()
+        .retired = true;
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert!(target(&plan, "zz-owner")
+        .actions
+        .contains(&PlannedAction::DisableXray));
+    assert!(target(&plan, "aa-source").wave < target(&plan, "zz-owner").wave);
+    assert_eq!(target(&plan, "zz-owner").prerequisites, ["aa-source"]);
+}
+
+#[test]
+fn removing_a_reference_orders_source_disable_before_owner_disable() {
+    let before = listener_reference_snapshot(true);
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    let mut after = listener_reference_snapshot(false);
+    after.revision += 1;
+    after.apps.clear();
+
+    let plan = plan_deployment(&after, &applied).unwrap();
+
+    assert_eq!(
+        target(&plan, "aa-source").actions,
+        [PlannedAction::DisableXray]
+    );
+    assert_eq!(
+        target(&plan, "zz-owner").actions,
+        [PlannedAction::DisableXray]
+    );
+    assert!(target(&plan, "aa-source").wave < target(&plan, "zz-owner").wave);
+    assert_eq!(target(&plan, "zz-owner").prerequisites, ["aa-source"]);
+}
+
+#[test]
 fn present_xray_to_disabled_gets_dedicated_wave() {
     let before = snapshot(
         vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
@@ -812,6 +954,18 @@ fn applied_from_plan(plan: &DeploymentPlan) -> Vec<NodeAppliedState> {
         .collect()
 }
 
+fn applied_with_running_xray(plan: &DeploymentPlan) -> Vec<NodeAppliedState> {
+    let mut applied = applied_from_plan(plan);
+    for state in &mut applied {
+        let DesiredArtifact::Present { content, .. } = &target(plan, &state.node_id).desired.xray
+        else {
+            continue;
+        };
+        state.running_xray = Some(content.clone());
+    }
+    applied
+}
+
 fn applied_artifact(desired: &DesiredArtifact) -> AppliedArtifactState {
     match desired {
         DesiredArtifact::Present { sha256, .. } => AppliedArtifactState::Present {
@@ -961,6 +1115,174 @@ fn relay_app(id: &str, from: &str, to: &str, pool: HopPool) -> AppView {
         ],
         grants: Vec::new(),
     }
+}
+
+fn listener_reference_snapshot(with_reference: bool) -> ModelSnapshot {
+    let listener_action = if with_reference {
+        Action::ReuseListener {
+            listener: ListenerRef {
+                chain: "owner-chain".to_owned(),
+                node: "zz-owner".to_owned(),
+            },
+            dial: ListenerDial::Overlay,
+            pool: HopPool::None,
+        }
+    } else {
+        Action::Egress { send_through: None }
+    };
+    let ingress = |id: &str, chain: &str, node: &str, port: u16| Ingress {
+        id: id.to_owned(),
+        chain: chain.to_owned(),
+        node: node.to_owned(),
+        bind: IpAddr::from(Ipv4Addr::UNSPECIFIED),
+        port,
+        front: None,
+        projection: Default::default(),
+        guard: brocade_core::model::IngressGuard::OPEN,
+        identity: brocade_core::model::IngressIdentity {
+            private_key: format!("priv-{id}"),
+            public_key: format!("pub-{id}"),
+            short_ids: vec!["0123abcd".to_owned()],
+        },
+        anytls_identity: None,
+        wires: IngressWires::Vless(Transport::VlessReality(
+            brocade_core::model::RealitySettings {
+                dest: "www.example.com:443".to_owned(),
+                server_names: vec!["www.example.com".to_owned()],
+                fingerprint: "chrome".to_owned(),
+                flow: Some("xtls-rprx-vision".to_owned()),
+                fallback_mode: Default::default(),
+                fallback_guard: true,
+                fallback_limits: Default::default(),
+            },
+        )),
+    };
+    let chain = |id: &str| Chain {
+        id: id.to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: id.to_owned(),
+        subscription_country: None,
+    };
+    snapshot(
+        vec![
+            node(
+                "aa-source",
+                "source.example.net",
+                [10, 66, 0, 1],
+                Dns::System,
+            ),
+            node("zz-owner", "owner.example.net", [10, 66, 0, 2], Dns::System),
+        ],
+        vec![AppView {
+            id: "listener-app".to_owned(),
+            label: "listener-app".to_owned(),
+            chains: vec![chain("source-chain"), chain("owner-chain")],
+            ingresses: vec![
+                ingress("source-in", "source-chain", "aa-source", 8443),
+                ingress("owner-in", "owner-chain", "zz-owner", 9443),
+            ],
+            fronts: Vec::new(),
+            steps: vec![
+                Step {
+                    chain: "source-chain".to_owned(),
+                    node: "aa-source".to_owned(),
+                    accept: None,
+                    hop_in: None,
+                    rules: vec![Rule {
+                        dest_match: DestMatch::Any,
+                        action: listener_action,
+                    }],
+                },
+                Step {
+                    chain: "owner-chain".to_owned(),
+                    node: "zz-owner".to_owned(),
+                    accept: Some(Accept {
+                        uuid: "uuid-owner".to_owned(),
+                        label: "owner@zz".to_owned(),
+                    }),
+                    hop_in: Some(HopIn {
+                        port: 20_017,
+                        security: HopWire::None,
+                    }),
+                    rules: vec![any_egress()],
+                },
+            ],
+            grants: Vec::new(),
+        }],
+    )
+}
+
+fn listener_reference_same_peer_snapshot(with_first_reference: bool) -> ModelSnapshot {
+    let mut snapshot = listener_reference_snapshot(true);
+    let app = &mut snapshot.apps[0];
+    app.chains.push(Chain {
+        id: "backup-chain".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "backup-chain".to_owned(),
+        subscription_country: None,
+    });
+    let mut backup_ingress = app
+        .ingresses
+        .iter()
+        .find(|ingress| ingress.chain == "owner-chain")
+        .unwrap()
+        .clone();
+    backup_ingress.id = "backup-in".to_owned();
+    backup_ingress.chain = "backup-chain".to_owned();
+    backup_ingress.port = 10_443;
+    app.ingresses.push(backup_ingress);
+    let mut backup_step = app
+        .steps
+        .iter()
+        .find(|step| step.chain == "owner-chain")
+        .unwrap()
+        .clone();
+    backup_step.chain = "backup-chain".to_owned();
+    backup_step.accept = Some(Accept {
+        uuid: "uuid-backup".to_owned(),
+        label: "backup@zz".to_owned(),
+    });
+    backup_step.hop_in = Some(HopIn {
+        port: 20_018,
+        security: HopWire::None,
+    });
+    app.steps.push(backup_step);
+
+    let source = app
+        .steps
+        .iter_mut()
+        .find(|step| step.chain == "source-chain")
+        .unwrap();
+    let backup = Rule {
+        dest_match: DestMatch::Any,
+        action: Action::ReuseListener {
+            listener: ListenerRef {
+                chain: "backup-chain".to_owned(),
+                node: "zz-owner".to_owned(),
+            },
+            dial: ListenerDial::Overlay,
+            pool: HopPool::None,
+        },
+    };
+    source.rules = if with_first_reference {
+        vec![
+            Rule {
+                dest_match: DestMatch::DomainSuffix(vec!["first.example".to_owned()]),
+                action: Action::ReuseListener {
+                    listener: ListenerRef {
+                        chain: "owner-chain".to_owned(),
+                        node: "zz-owner".to_owned(),
+                    },
+                    dial: ListenerDial::Overlay,
+                    pool: HopPool::None,
+                },
+            },
+            backup,
+        ]
+    } else {
+        vec![backup]
+    };
+    snapshot
 }
 
 fn node(id: &str, public_ipv4: &str, overlay: [u8; 4], dns: Dns) -> Node {

@@ -1,20 +1,27 @@
-use std::{collections::BTreeMap, net::Ipv6Addr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv6Addr,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     diagnostic::Diagnostic,
-    model::{Action, HopDial, HopPool, HopWire, IpFamily},
+    model::{HopDial, HopPool, HopWire, IpFamily, ListenerDial, RelayDialRef},
 };
 
 use super::{
-    routing::{Accept, AppIr, AppNode, HopIn, Step},
+    routing::{Accept, AppIr, AppNode, HopIn},
     system::SystemIr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hop {
+    /// The rule table that owns the outbound edge.
     pub chain: String,
+    /// The listener whose socket and rule table receive this edge.  Equal to `chain` for the
+    /// historical chain-local `Forward` action and different for a reused listener.
+    pub target_chain: String,
     pub app_id: Option<String>,
     pub from: String,
     pub to: String,
@@ -41,6 +48,10 @@ pub struct Hop {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HopPath {
+    /// Enter another listener owned by the same xray process over loopback.  It is kept distinct
+    /// from `Direct`: the socket must not be exposed on a public wildcard merely because a local
+    /// rule references it.
+    Local,
     /// Dial the peer's overlay address, wrapped in WireGuard.
     Overlay,
     /// Dial the address written on the chain, bypassing WireGuard.
@@ -119,7 +130,7 @@ fn dial_target(
     at: &str,
     from: &str,
     to: &str,
-    dial: &HopDial,
+    dial: RelayDialRef<'_>,
     entry_hop_in: &HopIn,
     ends: &HopEndpoints<'_>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -135,37 +146,41 @@ fn dial_target(
         // compile is all green, and traffic vanishes inside wg.
         // The port comes from the peer's own hop `hop_in.port` — on the overlay one
         // must dial whichever port the far side listens on.
-        HopDial::Overlay => match (ends.target_overlay, ends.source_on_overlay && ends.linked) {
-            (Some(addr), true) => Some((addr.to_string(), target_hop_in.port, HopPath::Overlay)),
-            (Some(_), false) if ends.source_on_overlay => {
-                diagnostics.push(Diagnostic::error(
-                    "hop.unreachable",
-                    at.to_owned(),
-                    format!(
-                        "{from} 与 {to} 都在 overlay 里，但两侧都没有可拨入的地址、\
-                         没有链路，这一跳没有 overlay 可走"
-                    ),
-                ));
-                None
+        RelayDialRef::Forward(HopDial::Overlay) | RelayDialRef::Listener(ListenerDial::Overlay) => {
+            match (ends.target_overlay, ends.source_on_overlay && ends.linked) {
+                (Some(addr), true) => {
+                    Some((addr.to_string(), target_hop_in.port, HopPath::Overlay))
+                }
+                (Some(_), false) if ends.source_on_overlay => {
+                    diagnostics.push(Diagnostic::error(
+                        "hop.unreachable",
+                        at.to_owned(),
+                        format!(
+                            "{from} 与 {to} 都在 overlay 里，但两侧都没有可拨入的地址、\
+                             没有链路，这一跳没有 overlay 可走"
+                        ),
+                    ));
+                    None
+                }
+                (Some(_), false) => {
+                    diagnostics.push(Diagnostic::error(
+                        "hop.unreachable",
+                        at.to_owned(),
+                        format!("{from} 不在 overlay 里，拨不到 {to} 的 overlay 地址"),
+                    ));
+                    None
+                }
+                (None, _) => {
+                    diagnostics.push(Diagnostic::error(
+                        "hop.unreachable",
+                        at.to_owned(),
+                        format!("{to} 不在 overlay 里，这一跳没有 overlay 可走"),
+                    ));
+                    None
+                }
             }
-            (Some(_), false) => {
-                diagnostics.push(Diagnostic::error(
-                    "hop.unreachable",
-                    at.to_owned(),
-                    format!("{from} 不在 overlay 里，拨不到 {to} 的 overlay 地址"),
-                ));
-                None
-            }
-            (None, _) => {
-                diagnostics.push(Diagnostic::error(
-                    "hop.unreachable",
-                    at.to_owned(),
-                    format!("{to} 不在 overlay 里，这一跳没有 overlay 可走"),
-                ));
-                None
-            }
-        },
-        HopDial::Addr(raw) => {
+        }
+        RelayDialRef::Forward(HopDial::Addr(raw)) => {
             let parsed = parse_addr(at, raw, diagnostics)?;
             if let Some(node) = ends.target {
                 if let Some((family, address)) = nat_public_match(node, &parsed.0) {
@@ -184,6 +199,39 @@ fn dial_target(
             }
             Some(parsed)
         }
+        RelayDialRef::Listener(ListenerDial::Public(family)) => {
+            let Some(node) = ends.target else {
+                diagnostics.push(Diagnostic::error(
+                    "hop.unreachable",
+                    at.to_owned(),
+                    format!("{to} 不在这个项目里，推不出监听的公网地址"),
+                ));
+                return None;
+            };
+            let Some(host) = dialable_public_host(node, *family) else {
+                diagnostics.push(Diagnostic::error(
+                    "hop.unreachable",
+                    at.to_owned(),
+                    format!("{to} 没有可拨入的{}，无法进入被引用监听", family.label()),
+                ));
+                return None;
+            };
+            Some((host.to_owned(), target_hop_in.port, HopPath::Direct))
+        }
+        RelayDialRef::Listener(ListenerDial::Addr(raw)) => {
+            let host = parse_listener_host(at, raw, diagnostics)?;
+            if let Some(node) = ends.target {
+                if let Some((family, address)) = nat_public_match(node, &host) {
+                    diagnostics.push(Diagnostic::error(
+                        "hop.nat-public",
+                        at.to_owned(),
+                        format!("NAT 公网地址不可直拨：{to} {family} {address}"),
+                    ));
+                    return None;
+                }
+            }
+            Some((host, target_hop_in.port, HopPath::Direct))
+        }
         // Reverse access: I do not dial it, it connects to me. So what resolves is the
         // address the peer dials me on, which is this machine's — the meaning of
         // `address`/`port` is the inverse of the other two variants, and
@@ -191,7 +239,7 @@ fn dial_target(
         // derived rather than written on the chain (the same reason as `Overlay`): what
         // the peer dials is me, and my address is a node property. The port comes from
         // this machine's `hop_in.port` on this chain.
-        HopDial::Reverse(family) => {
+        RelayDialRef::Forward(HopDial::Reverse(family)) => {
             let Some(node) = ends.source else {
                 diagnostics.push(Diagnostic::error(
                     "hop.unreachable",
@@ -331,25 +379,83 @@ fn parse_addr(
     Some((host.trim().to_owned(), port, HopPath::Direct))
 }
 
+/// Validate a listener reference's custom host without accepting a copied port.
+///
+/// Plain IPv6 is unambiguous because this field has no port. Brackets are rejected instead of
+/// normalized so the persisted representation has one stable form and a `host:port` typo never
+/// appears to work while silently discarding its port.
+fn parse_listener_host(at: &str, raw: &str, diagnostics: &mut Vec<Diagnostic>) -> Option<String> {
+    let host = raw.trim();
+    let mut bad = |why: &str| {
+        diagnostics.push(Diagnostic::error(
+            "listener.dial-malformed",
+            at.to_owned(),
+            format!("监听拨号主机无效：{host}（{why}）"),
+        ));
+        None
+    };
+
+    if host.is_empty() {
+        return bad("没有主机名");
+    }
+    if host.chars().any(char::is_whitespace) {
+        return bad("主机名不能包含空白");
+    }
+    if host.starts_with('[') || host.ends_with(']') {
+        return bad("这里只填写主机；IPv6 不加方括号");
+    }
+    if host.contains(':') && host.parse::<Ipv6Addr>().is_err() {
+        return bad("这里只填写主机，不带端口");
+    }
+    Some(host.to_owned())
+}
+
 pub fn compile_hops(mut app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Diagnostic>) -> AppIr {
-    let mut hops = BTreeMap::<(String, String, String), Hop>::new();
+    let mut hops = BTreeMap::<(String, String, String, String), Hop>::new();
 
     for step in &app_ir.steps {
         for rule in &step.rules {
-            let Action::Forward { to, dial, pool } = &rule.action else {
+            let Some(forward) = rule.action.forward_ref(&step.chain) else {
                 continue;
             };
+            let to = forward.target_node;
+            let target_chain = forward.target_chain;
+            let dial = forward.dial;
+            let pool = forward.pool;
 
-            let at = format!("{}/{}->{}", step.chain, step.node, to);
-            let target_step: Option<&Step> = app_ir
+            let at = if forward.reused {
+                format!(
+                    "{}/{}->listener:{}/{}",
+                    step.chain, step.node, target_chain, to
+                )
+            } else {
+                format!("{}/{}->{}", step.chain, step.node, to)
+            };
+            let target_step = app_ir
                 .steps
                 .iter()
-                .find(|candidate| candidate.chain == step.chain && candidate.node == *to);
-            let Some(accept) = target_step.and_then(|target| target.accept.as_ref()) else {
+                .find(|candidate| candidate.chain == target_chain && candidate.node == to);
+            let Some(target_step) = target_step else {
+                diagnostics.push(Diagnostic::error(
+                    if forward.reused {
+                        "listener.not-found"
+                    } else {
+                        "relay.no-accept"
+                    },
+                    format!("{target_chain}/{to}"),
+                    if forward.reused {
+                        format!("引用的监听不存在：{target_chain}/{to}")
+                    } else {
+                        format!("引用的中转节点不存在：{target_chain}/{to}")
+                    },
+                ));
+                continue;
+            };
+            let Some(accept) = target_step.accept.as_ref() else {
                 diagnostics.push(Diagnostic::error(
                     "relay.no-accept",
-                    format!("{}/{}", step.chain, to),
-                    format!("缺少接受凭据：{to}"),
+                    format!("{target_chain}/{to}"),
+                    format!("引用的监听缺少接受凭据：{target_chain}/{to}"),
                 ));
                 continue;
             };
@@ -362,16 +468,16 @@ pub fn compile_hops(mut app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Dia
             // is wanted is my own relay port on this chain. This is the only place
             // Reverse genuinely breaks symmetry; the edge direction, `Hop.from/to`, and
             // every test below stay as they were.
-            let reverse = matches!(dial, HopDial::Reverse(_));
-            let entry_step = if reverse { Some(step) } else { target_step };
-            let Some(entry_hop_in) = entry_step.and_then(|entry| entry.hop_in.as_ref()) else {
+            let reverse = dial.is_reverse();
+            let entry_step = if reverse { step } else { target_step };
+            let Some(entry_hop_in) = entry_step.hop_in.as_ref() else {
                 diagnostics.push(Diagnostic::error(
                     "relay.no-hop-in",
                     at.clone(),
                     if reverse {
                         format!("反向接入缺少中转口：{}/{}", step.node, step.chain)
                     } else {
-                        format!("缺少中转口：{to}/{}", step.chain)
+                        format!("缺少中转口：{to}/{target_chain}")
                     },
                 ));
                 continue;
@@ -392,27 +498,38 @@ pub fn compile_hops(mut app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Dia
             let target_overlay = sys
                 .nodes
                 .iter()
-                .find(|node| node.id == *to)
+                .find(|node| node.id == to)
                 .and_then(|node| node.overlay_addr);
             // Links are undirected, so both directions count.
             let linked = sys.links.iter().any(|link| {
-                (link.a == step.node && link.b == *to) || (link.a == *to && link.b == step.node)
+                (link.a == step.node && link.b == to) || (link.a == to && link.b == step.node)
             });
             let ends = HopEndpoints {
                 source: app_ir.nodes.iter().find(|node| node.id == step.node),
-                target: app_ir.nodes.iter().find(|node| node.id == *to),
+                target: app_ir.nodes.iter().find(|node| node.id == to),
                 target_overlay,
                 source_on_overlay,
                 linked,
             };
 
-            let key = (step.chain.clone(), step.node.clone(), to.clone());
+            let key = (
+                step.chain.clone(),
+                step.node.clone(),
+                target_chain.to_owned(),
+                to.to_owned(),
+            );
             if hops.contains_key(&key) {
                 continue;
             }
-            let Some((address, port, path)) =
+            let resolved = if forward.reused && step.node == to {
+                // Both listener and outbound belong to this xray. Loopback makes the reference
+                // enter the exact inbound (and therefore its own ordered rule table) without
+                // publishing the socket on a machine address or requiring an overlay self-link.
+                Some(("127.0.0.1".to_owned(), entry_hop_in.port, HopPath::Local))
+            } else {
                 dial_target(&at, &step.node, to, dial, entry_hop_in, &ends, diagnostics)
-            else {
+            };
+            let Some((address, port, path)) = resolved else {
                 continue;
             };
 
@@ -420,9 +537,10 @@ pub fn compile_hops(mut app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Dia
                 key,
                 Hop {
                     chain: step.chain.clone(),
+                    target_chain: target_chain.to_owned(),
                     app_id: step.app_id.clone(),
                     from: step.node.clone(),
-                    to: to.clone(),
+                    to: to.to_owned(),
                     link: link_key(&step.node, to),
                     address,
                     port,
@@ -445,6 +563,30 @@ pub fn compile_hops(mut app_ir: AppIr, sys: &SystemIr, diagnostics: &mut Vec<Dia
                     pool: if reverse { HopPool::None } else { *pool },
                 },
             );
+        }
+    }
+
+    // A public IPv6 arrival makes the target inbound listen on `[::]`. Keep a local reference on
+    // the same address family so it cannot depend on the host's dual-stack wildcard behaviour:
+    // some kernels accept 127.0.0.1 through `[::]`, while an IPv6-only socket correctly refuses
+    // it. Reverse hops name the listening endpoint in `from`; ordinary direct hops name it in
+    // `to`.
+    let ipv6_public_listeners = hops
+        .values()
+        .filter_map(|hop| {
+            if hop.address.parse::<Ipv6Addr>().is_err() {
+                return None;
+            }
+            match hop.path {
+                HopPath::Direct => Some((hop.target_chain.clone(), hop.to.clone())),
+                HopPath::Reverse => Some((hop.chain.clone(), hop.from.clone())),
+                HopPath::Local | HopPath::Overlay => None,
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    for hop in hops.values_mut().filter(|hop| hop.path == HopPath::Local) {
+        if ipv6_public_listeners.contains(&(hop.target_chain.clone(), hop.to.clone())) {
+            hop.address = Ipv6Addr::LOCALHOST.to_string();
         }
     }
 

@@ -34,10 +34,10 @@ use brocade_core::{
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
         ExternalWarpBinding, HopDial, HopEncryption, HopIn, HopMux, HopPool, HopWire, Hysteria2,
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
-        IngressWires, IpFamily, ModelSnapshot, Node, NodeEgressDnsPolicy,
-        ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
-        RealityFallbackMode, RealitySettings, RealityXhttp, Rule, Step, Tls, TlsXhttp, Transport,
-        User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
+        IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSnapshot, Node,
+        NodeEgressDnsPolicy, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
+        RealityFallbackLimits, RealityFallbackMode, RealitySettings, RealityXhttp, Rule, Step, Tls,
+        TlsXhttp, Transport, User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
     },
     physical::{node::project_node, user::project_user},
     Level,
@@ -450,6 +450,308 @@ fn generated_xray_configs_load_in_the_real_binary() {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+#[test]
+fn same_process_listener_reuse_loads_and_routes_real_traffic() {
+    let Some(binary) = xray_binary() else {
+        eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
+        return;
+    };
+    if Command::new("curl").arg("--version").output().is_err() {
+        eprintln!("跳过：没找到 curl");
+        return;
+    }
+    const USER_UUID: &str = "6f9d1a8e-2b3c-4d5e-8f70-1a2b3c4d5e6f";
+    let ports = free_tcp_ports(4);
+    let source_port = ports[0];
+    let owner_port = ports[1];
+    let listener_port = ports[2];
+    let socks_port = ports[3];
+
+    let (mut doc, base) = base_model(HopDial::Overlay, HopWire::None);
+    // Real execution happens without a WireGuard interface. Linux routes the whole 127/8 block
+    // to loopback, letting Xray bind the owner's ordinary overlay socket and its local-only copy
+    // at distinct exact addresses while exercising the generated two-inbound shape unchanged.
+    doc.overlay_cidr = Ipv4Net::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
+    doc.nodes.iter_mut().for_each(|node| {
+        node.overlay_addr = if node.id == "hk" {
+            Ipv4Addr::new(127, 0, 0, 2)
+        } else {
+            Ipv4Addr::new(127, 0, 0, 3)
+        };
+        node.api_port = None;
+    });
+    let mut source_ingress = base.ingresses[0].clone();
+    source_ingress.id = "i-source".to_owned();
+    source_ingress.chain = "c-source".to_owned();
+    source_ingress.node = "sg".to_owned();
+    source_ingress.port = source_port;
+    let mut owner_ingress = base.ingresses[0].clone();
+    owner_ingress.id = "i-owner".to_owned();
+    owner_ingress.chain = "c-owner".to_owned();
+    owner_ingress.node = "sg".to_owned();
+    owner_ingress.port = owner_port;
+    let app = AppView {
+        id: "relay".to_owned(),
+        label: "监听复用".to_owned(),
+        chains: vec![
+            Chain {
+                id: "c-source".to_owned(),
+                tenant: "platform".to_owned(),
+                name: "源线路".to_owned(),
+                subscription_country: None,
+            },
+            Chain {
+                id: "c-owner".to_owned(),
+                tenant: "platform".to_owned(),
+                name: "监听所有者".to_owned(),
+                subscription_country: None,
+            },
+        ],
+        ingresses: vec![source_ingress, owner_ingress],
+        fronts: Vec::new(),
+        steps: vec![
+            Step {
+                chain: "c-source".to_owned(),
+                node: "sg".to_owned(),
+                accept: None,
+                hop_in: None,
+                rules: vec![Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::Forward {
+                        to: "hk".to_owned(),
+                        dial: HopDial::Overlay,
+                        pool: HopPool::None,
+                    },
+                }],
+            },
+            Step {
+                chain: "c-source".to_owned(),
+                node: "hk".to_owned(),
+                accept: Some(Accept {
+                    uuid: USER_UUID.to_owned(),
+                    label: "c-source@hk".to_owned(),
+                }),
+                hop_in: Some(HopIn {
+                    port: source_port,
+                    security: HopWire::None,
+                }),
+                rules: vec![Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::ReuseListener {
+                        listener: ListenerRef {
+                            chain: "c-owner".to_owned(),
+                            node: "hk".to_owned(),
+                        },
+                        // Same-machine references are compiled to loopback regardless of this
+                        // transport choice; keeping the symbolic default on the model is stable.
+                        dial: ListenerDial::Overlay,
+                        pool: HopPool::None,
+                    },
+                }],
+            },
+            Step {
+                chain: "c-owner".to_owned(),
+                node: "sg".to_owned(),
+                accept: None,
+                hop_in: None,
+                rules: vec![Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::Forward {
+                        to: "hk".to_owned(),
+                        dial: HopDial::Overlay,
+                        pool: HopPool::None,
+                    },
+                }],
+            },
+            Step {
+                chain: "c-owner".to_owned(),
+                node: "hk".to_owned(),
+                accept: Some(Accept {
+                    uuid: "2c3b4d5e-6f70-4a8b-9c0d-1e2f3a4b5c6d".to_owned(),
+                    label: "c-owner@hk".to_owned(),
+                }),
+                hop_in: Some(HopIn {
+                    port: listener_port,
+                    security: HopWire::None,
+                }),
+                rules: vec![Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::Egress { send_through: None },
+                }],
+            },
+        ],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+
+    let mut hk_config = None;
+    for node_id in ["hk", "sg"] {
+        let config = json::xray(&xray::build(&project_node(
+            &sys,
+            std::slice::from_ref(&app_ir),
+            node_id,
+        )));
+        let path = std::env::temp_dir().join(format!("brocade-xray-listener-reuse-{node_id}.json"));
+        fs::write(&path, &config).unwrap();
+        let output = Command::new(&binary)
+            .args(["-test", "-c"])
+            .arg(&path)
+            .output()
+            .expect("跑不起来 xray");
+        let _ = fs::remove_file(&path);
+        assert!(
+            output.status.success(),
+            "listener reuse/{node_id} 的产物 xray 不认：\n{}\n{}\n----\n{config}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        if node_id == "hk" {
+            hk_config = Some(config);
+        }
+    }
+
+    let mut server: Value = serde_json::from_str(&hk_config.unwrap()).unwrap();
+    let terminal = server["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|outbound| outbound["tag"] == "out:egress")
+        .expect("被引用子树的终点");
+    terminal["protocol"] = json!("blackhole");
+    terminal["settings"] = json!({ "response": { "type": "http" } });
+
+    let dir = std::env::temp_dir().join(format!("brocade-listener-reuse-{source_port}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let server_log = dir.join("server.log");
+    let client_log = dir.join("client.log");
+    server["log"] = json!({ "loglevel": "info", "access": "none", "error": server_log });
+    let server_path = dir.join("server.json");
+    fs::write(&server_path, serde_json::to_string_pretty(&server).unwrap()).unwrap();
+    let client_path = dir.join("client.json");
+    fs::write(
+        &client_path,
+        serde_json::to_string_pretty(&json!({
+            "log": { "loglevel": "info", "access": "none", "error": client_log },
+            "inbounds": [{
+                "tag": "probe-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": { "auth": "noauth", "udp": false },
+            }],
+            "outbounds": [{
+                "tag": "probe-out",
+                "protocol": "vless",
+                "settings": { "vnext": [{
+                    "address": "127.0.0.2",
+                    "port": source_port,
+                    "users": [{ "id": USER_UUID, "encryption": "none" }],
+                }]},
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none",
+                },
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut server_process = Command::new(&binary)
+        .args(["run", "-c"])
+        .arg(&server_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let server_ready = (0..50).any(|_| {
+        if TcpStream::connect((Ipv4Addr::new(127, 0, 0, 2), source_port)).is_ok() {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    let mut client_process = server_ready.then(|| {
+        Command::new(&binary)
+            .args(["run", "-c"])
+            .arg(&client_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    });
+    let client_ready = client_process.as_ref().is_some_and(|_| {
+        (0..50).any(|_| {
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, socks_port)).is_ok() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(50));
+                false
+            }
+        })
+    });
+    let response = client_ready.then(|| {
+        Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--include",
+                "--max-time",
+                "5",
+                "--noproxy",
+                "",
+                "--socks5-hostname",
+            ])
+            .arg(format!("127.0.0.1:{socks_port}"))
+            .arg("http://93.184.216.34/")
+            .output()
+            .unwrap()
+    });
+    if let Some(process) = &mut client_process {
+        let _ = process.kill();
+        let _ = process.wait();
+    }
+    let _ = server_process.kill();
+    let _ = server_process.wait();
+    let server_log_text = fs::read_to_string(&server_log).unwrap_or_default();
+    let client_log_text = fs::read_to_string(&client_log).unwrap_or_default();
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        server_ready,
+        "server xray 没有监听源入口：{server_log_text}"
+    );
+    assert!(
+        client_ready,
+        "client xray 没有监听 SOCKS 入口：{client_log_text}"
+    );
+    let response = response.unwrap();
+    assert!(
+        response.status.success(),
+        "curl 失败：{}\nserver:\n{server_log_text}\nclient:\n{client_log_text}",
+        String::from_utf8_lossy(&response.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&response.stdout).starts_with("HTTP/1.1 403"),
+        "流量没有到达被引用子树的 HTTP blackhole：{}\nserver:\n{server_log_text}\nclient:\n{client_log_text}",
+        String::from_utf8_lossy(&response.stdout)
+    );
 }
 
 /// The share link's `extra`, put back through the binary that has to read it.
@@ -2318,16 +2620,13 @@ fn the_hop_health_observatory_actually_probes() {
     );
 }
 
-/// The tag the deployment template pins is the release these tests validate against.
+/// The vendored upstream baseline is the release these tests validate against.
 ///
-/// They are one decision seen from two sides: `console.env.example` says which xray every new
-/// machine installs, and `.tools/xray` is the build every assertion in this file is checked
-/// against. Letting them drift produces two failures that both pass CI — pinning a tag nothing
-/// has ever run, or validating a build nobody installs — and neither shows up until a machine in
-/// the field cannot carry traffic.
+/// They are one decision seen from two sides: `BROCADE_UPSTREAM.toml` records the fork's upstream
+/// base, and `.tools/xray` is the build every assertion in this file is checked against. Letting
+/// them drift means validating a build unrelated to the source baseline.
 ///
-/// The template rather than the database or the environment, because the template is the only
-/// copy under version control: the other two are per-deployment, and a test cannot see them.
+/// The environment template only documents an optional runtime override; it is not authoritative.
 ///
 /// Skipped without the binary, like the rest of this file.
 #[test]
@@ -2336,17 +2635,16 @@ fn the_pinned_tag_matches_the_binary_these_tests_use() {
         eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
         return;
     };
-    let template = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let baseline = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|path| path.parent())
         .expect("workspace root")
-        .join("console.env.example");
-    let text = fs::read_to_string(&template).expect("读得到 console.env.example");
+        .join("components/xray-core/BROCADE_UPSTREAM.toml");
+    let text = fs::read_to_string(&baseline).expect("读得到 BROCADE_UPSTREAM.toml");
     let pinned = text
         .lines()
-        .find_map(|line| line.strip_prefix("BROCADE_XRAY_VERSION="))
-        .map(str::trim)
-        .expect("console.env.example 里要有 BROCADE_XRAY_VERSION");
+        .find_map(|line| line.strip_prefix("tag = \"")?.strip_suffix('"'))
+        .expect("BROCADE_UPSTREAM.toml 里要有 tag");
 
     let output = Command::new(&binary)
         .arg("version")
@@ -2357,7 +2655,7 @@ fn the_pinned_tag_matches_the_binary_these_tests_use() {
     let expected = format!("Xray {} ", pinned.trim_start_matches('v'));
     assert!(
         reported.contains(&expected),
-        "console.env.example 钉的是 {pinned}，而 {} 报的是：{}",
+        "BROCADE_UPSTREAM.toml 钉的是 {pinned}，而 {} 报的是：{}",
         binary.display(),
         reported.lines().next().unwrap_or("")
     );

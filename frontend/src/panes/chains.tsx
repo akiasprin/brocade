@@ -11,6 +11,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type Ref,
+  type ReactNode,
 } from 'react';
 import { hopWireLabel } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -50,6 +51,7 @@ import {
   type SnapshotIngress,
   type E2eProbeItem,
   type E2eProbeSample,
+  type ListenerRef,
   type UpsertIngressBody,
   type SnapshotStep,
   type IngressProjection,
@@ -87,8 +89,10 @@ import { useCrumb } from '../wm/crumb';
 import {
   RuleDraftScope,
   RuleEditor,
+  actionListenerRef,
   forwardPeers,
   isForwardTargetInChain,
+  listenerRefKey,
   seedHops,
   type EgressDnsDraft,
   type EgressDnsOrderDraft,
@@ -306,14 +310,16 @@ const userKeysOf = (a: SnapshotApp, chainId: string) =>
 // 该反馈本身即为确认。顶栏草稿条会列出「删除链 xxx」，可逐条丢弃或全部丢弃，
 // 提交前可查看 diff。在此处增加确认拦截的是可随时撤销的操作，
 // 而不可逆的步骤在提交环节。操作后果写入 title——它需要在点击前被读到。
-function DelBtn({ title, onClick }: { title: string; onClick: () => void }) {
+function DelBtn({ title, onClick, disabled = false }: { title: string; onClick: () => void; disabled?: boolean }) {
   return (
     <button
       className="del-ctl"
       title={title}
       aria-label={title}
+      disabled={disabled}
       onClick={e => {
         e.stopPropagation();
+        if (disabled) return;
         onClick();
       }}
     >
@@ -4225,6 +4231,41 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
       row => row.chain.id,
     ),
   }));
+  const listenerChainReferences = snapshotApps.flatMap(app =>
+    app.steps.flatMap(source =>
+      source.rules.flatMap(rule =>
+        rule.a.t === 'reuse_listener' && rule.a.listener.chain !== source.chain
+          ? [
+              {
+                source: rowKey(app.id, source.chain),
+                target: rowKey(app.id, rule.a.listener.chain),
+                at: `${source.chain}/${source.node}`,
+              },
+            ]
+          : [],
+      ),
+    ),
+  );
+  const blockedPickedReferences = listenerChainReferences.filter(
+    reference => picked.has(reference.target) && !picked.has(reference.source),
+  );
+  const pickedDeletionOrder = () => {
+    const remaining = new Set([...picked].sort());
+    const ordered: string[] = [];
+    while (remaining.size > 0) {
+      const ready = [...remaining].filter(target =>
+        listenerChainReferences.every(reference => reference.target !== target || !remaining.has(reference.source)),
+      );
+      // Invalid drafts may contain a cross-chain cycle. Submission will still be compile-blocked,
+      // but deletion must terminate and give the store a deterministic order.
+      const batch = ready.length > 0 ? ready : [[...remaining].sort()[0]];
+      for (const key of batch) {
+        ordered.push(key);
+        remaining.delete(key);
+      }
+    }
+    return ordered;
+  };
 
   // 卡片颜色表示是否需要处理，而不是“有没有流量”。模型事实优先于探测结果：含退役成员或
   // 缺接入面时即使上一轮探测仍为成功，当前草稿中的链也已经不可用。模型正常后再看端到端
@@ -4282,10 +4323,17 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                   顶栏草稿条会逐条列出且提交前可预览，因此此处不再增加确认。 */}
               <button
                 className="btn danger"
-                disabled={picked.size === 0}
-                title={`删除选中的 ${picked.size} 条链：接入面和挂在下面的授权关系一起删。进草稿，提交才生效`}
+                disabled={picked.size === 0 || blockedPickedReferences.length > 0}
+                title={
+                  blockedPickedReferences.length > 0
+                    ? `不能删除：先同时选择引用方 ${[
+                        ...new Set(blockedPickedReferences.map(reference => reference.at)),
+                      ].join('、')}`
+                    : `删除选中的 ${picked.size} 条链：接入面和挂在下面的授权关系一起删。进草稿，提交才生效`
+                }
                 onClick={() => {
-                  for (const key of picked) {
+                  // 引用方先删、监听所有者后删，与服务端的引用保护约束一致。
+                  for (const key of pickedDeletionOrder()) {
                     const slash = key.indexOf('/');
                     deleteChain(key.slice(0, slash), key.slice(slash + 1));
                   }
@@ -4448,6 +4496,9 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                       const probe = probeOf.get(r.chain.id);
                       const key = rowKey(r.app.id, r.chain.id);
                       const checked = picked.has(key);
+                      const listenerReferenceCount = listenerChainReferences.filter(
+                        reference => reference.target === key,
+                      ).length;
                       const open = () => {
                         // 刚结束一次拖动排序：抬手后紧跟的 click 不应再打开这条链。
                         if (justDragged.current) {
@@ -4511,6 +4562,11 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                             <span className="chain-card-title">
                               <b>{r.chain.name || r.chain.id}</b>
                               {r.chain.name && r.chain.name !== r.chain.id && <span>{r.chain.id}</span>}
+                              {listenerReferenceCount > 0 && (
+                                <span title="其它线路正在引用这条链拥有的监听子树">
+                                  {listenerReferenceCount} 处监听引用
+                                </span>
+                              )}
                             </span>
                             <ChainLatency probe={probe} />
                           </header>
@@ -5264,6 +5320,248 @@ interface CompiledApp {
   steps?: { chain: string; node: string; rules?: CompiledRule[] }[];
 }
 
+type ListenerTreeRules = Map<string, CompiledRule[]>;
+
+function listenerMatchLabel(match: Rule['m']): string {
+  switch (match.t) {
+    case 'any':
+      return '未命中以上规则';
+    case 'sniffing_failed':
+      return '嗅探失败';
+    case 'front_downstream':
+      return '来自前置下游';
+    case 'network':
+      return `网络 = ${match.v.toUpperCase()}`;
+    case 'domain_suffix':
+      return `域名后缀 · ${match.v.join(' / ')}`;
+    case 'domain_keyword':
+      return `域名关键字 · ${match.v.join(' / ')}`;
+    case 'domain_regex':
+      return `域名正则 · ${match.v}`;
+    case 'geosite':
+      return `GeoSite · ${match.v.join(' / ')}`;
+    case 'ip_cidr':
+      return `IP · ${match.v.join(' / ')}`;
+    case 'geoip':
+      return `GeoIP · ${match.v.join(' / ')}`;
+    case 'port':
+      return `端口 · ${match.v.join(' / ')}`;
+    case 'all':
+      return match.v.map(listenerMatchLabel).join(' 且 ');
+  }
+}
+
+function listenerTerminal(action: Rule['a']): { title: string; detail: string; tone: string } | null {
+  if (action.t === 'egress') {
+    return {
+      title: '本机出网',
+      detail: action.send_through ? `源地址 ${action.send_through}` : '使用机器默认出口',
+      tone: 'egress',
+    };
+  }
+  if (action.t === 'proxy') return { title: '外部代理', detail: action.outbound, tone: 'proxy' };
+  if (action.t === 'block') return { title: '拒绝', detail: '终止这条流量', tone: 'block' };
+  return null;
+}
+
+function listenerRelayLabel(action: Rule['a'], local: boolean): string | null {
+  if (action.t !== 'forward' && action.t !== 'reuse_listener') return null;
+  const pool = action.pool.t === 'none' ? '每流新建' : `Mux c=${action.pool.v?.concurrency ?? '全局'}`;
+  if (local) return `本机回环 · ${pool}`;
+  if (action.t === 'reuse_listener') {
+    const dial =
+      action.dial.t === 'overlay'
+        ? 'Overlay'
+        : action.dial.t === 'public'
+          ? `公网 ${action.dial.v.toUpperCase()}`
+          : `自定义 ${action.dial.v || '未填写'}`;
+    return `${dial} · 端口跟随 · ${pool}`;
+  }
+  const dial =
+    action.dial.t === 'overlay'
+      ? 'Overlay'
+      : action.dial.t === 'reverse'
+        ? `反向 ${action.dial.v.toUpperCase()}`
+        : `直连 ${action.dial.v || '未填写'}`;
+  return `${dial} · ${pool}`;
+}
+
+type ListenerTreeLink =
+  { kind: 'root' } | { kind: 'forward'; from: ListenerRef } | { kind: 'reference'; from: ListenerRef };
+
+/**
+ * A read-only projection of the actual rule graph.  A referenced listener is expanded from its
+ * owner's step; no rules are copied into the source chain.  The editor below remains the mutation
+ * surface so an ordered rule table has one unambiguous place to reorder rows.
+ */
+export function ListenerDecisionTree({
+  app,
+  currentChain,
+  currentSteps,
+  root,
+  draftRules,
+  compiledRules,
+  nodeNames,
+}: {
+  app: SnapshotApp | null;
+  currentChain: SnapshotChain;
+  currentSteps: SnapshotStep[];
+  root: string | null;
+  draftRules: Record<string, Rule[]>;
+  compiledRules: ListenerTreeRules;
+  nodeNames: Map<string, string>;
+}) {
+  if (!root) return <Empty>这条链还没有入口，无法建立规则树。</Empty>;
+
+  const appChains = app?.chains ?? [currentChain];
+  const appSteps = app?.steps ?? currentSteps;
+  const chainNames = new Map(appChains.map(candidate => [candidate.id, candidate.name]));
+  const currentStepKeys = new Set(currentSteps.map(step => listenerRefKey({ chain: step.chain, node: step.node })));
+  const steps = new Map<string, SnapshotStep>();
+  for (const step of appSteps) steps.set(listenerRefKey({ chain: step.chain, node: step.node }), step);
+  // The panel can already contain a freshly staged step while the shared snapshot query is
+  // refreshing.  Current-chain props win, and missing rows are added instead of disappearing.
+  for (const step of currentSteps) steps.set(listenerRefKey({ chain: step.chain, node: step.node }), step);
+
+  const effectiveRules = (ref: ListenerRef, step: SnapshotStep): { rule: Rule; generated: boolean }[] => {
+    const written =
+      ref.chain === currentChain.id && currentStepKeys.has(listenerRefKey(ref))
+        ? (draftRules[ref.node] ?? step.rules)
+        : step.rules;
+    const generated = compilerFallbackRules(written, compiledRules.get(listenerRefKey(ref)) ?? []);
+    return [
+      ...written.map(rule => ({ rule, generated: false })),
+      ...generated.map(rule => ({ rule, generated: true })),
+    ];
+  };
+
+  const referenceCounts = new Map<string, number>();
+  for (const step of steps.values()) {
+    const ref = { chain: step.chain, node: step.node };
+    for (const { rule } of effectiveRules(ref, step)) {
+      if (rule.a.t !== 'reuse_listener') continue;
+      const key = listenerRefKey(rule.a.listener);
+      referenceCounts.set(key, (referenceCounts.get(key) ?? 0) + 1);
+    }
+  }
+
+  const ingresses = app?.ingresses ?? [];
+  const listenerSummary = (ref: ListenerRef, step: SnapshotStep, rootOccurrence: boolean): string => {
+    const ownedIngresses = ingresses.filter(ingress => ingress.chain === ref.chain && ingress.node === ref.node);
+    if (rootOccurrence && ownedIngresses.length > 0) {
+      return ownedIngresses.map(ingress => `${ingress.port} / ${chainAccessLabel(ingress)}`).join(' + ');
+    }
+    return step.hop_in ? `${step.hop_in.port} / ${hopWireLabel(step.hop_in.security.t)}` : '未配置监听端口';
+  };
+
+  const renderMissing = (ref: ListenerRef, pathKey: string) => (
+    <div className="listener-map-card is-missing" key={pathKey}>
+      <span className="listener-map-kicker">引用失效</span>
+      <b>{nodeNames.get(ref.node) || ref.node}</b>
+      <small>{chainNames.get(ref.chain) || ref.chain}</small>
+      <code>找不到监听所有者</code>
+    </div>
+  );
+
+  const renderListener = (ref: ListenerRef, link: ListenerTreeLink, path: Set<string>, pathKey: string): ReactNode => {
+    const key = listenerRefKey(ref);
+    const step = steps.get(key);
+    if (!step) return renderMissing(ref, pathKey);
+    if (path.has(key)) {
+      return (
+        <div className="listener-map-card is-cycle" key={pathKey}>
+          <span className="listener-map-kicker">循环引用</span>
+          <b>{nodeNames.get(ref.node) || ref.node}</b>
+          <small>{chainNames.get(ref.chain) || ref.chain}</small>
+          <code>此处停止展开</code>
+        </div>
+      );
+    }
+
+    const nextPath = new Set(path);
+    nextPath.add(key);
+    const rules = effectiveRules(ref, step);
+    const owner = chainNames.get(ref.chain) || ref.chain;
+    const references = referenceCounts.get(key) ?? 0;
+    const isReference = link.kind === 'reference';
+    const localReference = isReference && link.from.node === ref.node;
+
+    return (
+      <div className={`listener-map-node${rules.length > 0 ? ' has-branches' : ''}`} key={pathKey}>
+        <div className={`listener-map-card${isReference ? ' is-reference' : ''}`}>
+          <span className="listener-map-kicker">
+            {link.kind === 'root' ? '链路入口' : isReference ? '引用的监听子树' : '本链监听'}
+          </span>
+          <b title={ref.node}>{nodeNames.get(ref.node) || ref.node}</b>
+          <span className="listener-map-badges">
+            {isReference && <i>引用</i>}
+            {localReference && <i>本机内部</i>}
+            {references > 0 && <i>{references} 处复用</i>}
+          </span>
+          <small title={ref.chain}>归属：{owner}</small>
+          <code>{listenerSummary(ref, step, link.kind === 'root')}</code>
+          <span className="listener-map-count">{rules.length} 条生效规则</span>
+        </div>
+        {rules.length > 0 && (
+          <div className="listener-map-branches">
+            {rules.map(({ rule, generated }, index) => {
+              const target = actionListenerRef(rule.a, ref.chain);
+              const terminal = listenerTerminal(rule.a);
+              const relay = listenerRelayLabel(
+                rule.a,
+                rule.a.t === 'reuse_listener' && rule.a.listener.node === ref.node,
+              );
+              const branchKey = `${pathKey}/${index}`;
+              return (
+                <div
+                  className={`listener-map-branch${rule.a.t === 'reuse_listener' ? ' is-reference' : ''}`}
+                  key={branchKey}
+                >
+                  <div className="listener-map-edge">
+                    <span>{String(index + 1).padStart(2, '0')}</span>
+                    <b title={listenerMatchLabel(rule.m)}>{listenerMatchLabel(rule.m)}</b>
+                    <small>
+                      {generated
+                        ? '编译器兜底'
+                        : rule.a.t === 'reuse_listener'
+                          ? '引用监听'
+                          : rule.a.t === 'forward'
+                            ? '本链转发'
+                            : '终点动作'}
+                    </small>
+                    {relay && <code title={relay}>{relay}</code>}
+                  </div>
+                  {target ? (
+                    renderListener(
+                      target,
+                      { kind: rule.a.t === 'reuse_listener' ? 'reference' : 'forward', from: ref },
+                      nextPath,
+                      `${branchKey}/${listenerRefKey(target)}`,
+                    )
+                  ) : terminal ? (
+                    <div className={`listener-map-terminal is-${terminal.tone}`}>
+                      <span>{terminal.title}</span>
+                      <small>{terminal.detail}</small>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="listener-map-scroll" aria-label="监听端口规则决策树">
+      <div className="listener-map-canvas">
+        {renderListener({ chain: currentChain.id, node: root }, { kind: 'root' }, new Set(), 'root')}
+      </div>
+    </div>
+  );
+}
+
 export function compilerFallbackRules(written: Rule[], compiled: CompiledRule[]): Rule[] {
   if (written.at(-1)?.m.t === 'any') return [];
   const fallback = compiled.at(-1);
@@ -5296,6 +5594,9 @@ function chainRuleRows(spine: string[], steps: SnapshotStep[]): ChainRuleRow[] {
   for (const step of steps) {
     for (const rule of step.rules) {
       if (rule.a.t === 'forward' && rule.a.to) ensure(rule.a.to).targeted = true;
+      if (rule.a.t === 'reuse_listener' && rule.a.listener.chain === step.chain) {
+        ensure(rule.a.listener.node).targeted = true;
+      }
     }
   }
   return rows;
@@ -5432,7 +5733,50 @@ export function ChainRulesPanel({
   const [draftHops, setDraftHops] = useState<Record<string, HopsDraft>>({});
   const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
   const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
-  const peersOf = (node: string) => forwardPeers({ nodeId: node, spine, tenant: chain.tenant, steps, nodes });
+  const snapshotApp = snapshotForPorts.data?.snapshot.apps.find(candidate => candidate.id === appId) ?? null;
+  const peersOf = (node: string) =>
+    forwardPeers({
+      nodeId: node,
+      sourceChain: chain.id,
+      spine,
+      tenant: chain.tenant,
+      steps,
+      app: snapshotApp,
+      drafts: draftRules,
+      nodes,
+    });
+
+  // Deleting a node removes its whole Forward subtree. A listener reference is a durable edge
+  // from another rule table, so show the same protection the store enforces before the operator
+  // clicks × instead of waiting for draft submission to fail with a conflict.
+  const referencesBlockingRemoval = (node: string): { chain: string; node: string }[] => {
+    const subtree = new Set([node]);
+    const queue = [node];
+    while (queue.length > 0) {
+      const at = queue.shift()!;
+      const rules = draftRules[at] ?? stepOf(at)?.rules ?? [];
+      for (const rule of rules) {
+        if (rule.a.t !== 'forward' || subtree.has(rule.a.to)) continue;
+        subtree.add(rule.a.to);
+        queue.push(rule.a.to);
+      }
+    }
+    const sources: { chain: string; node: string }[] = [];
+    for (const source of snapshotApp?.steps ?? steps) {
+      const rules = source.chain === chain.id ? (draftRules[source.node] ?? source.rules) : source.rules;
+      for (const rule of rules) {
+        if (
+          rule.a.t !== 'reuse_listener' ||
+          rule.a.listener.chain !== chain.id ||
+          !subtree.has(rule.a.listener.node) ||
+          (source.chain === chain.id && subtree.has(source.node))
+        )
+          continue;
+        sources.push({ chain: source.chain, node: source.node });
+      }
+    }
+    return sources;
+  };
 
   // The folded port summary is a property of the row's machine, never of the edge used to arrive
   // there. Normal hops listen on `to`; reverse hops listen on `from`. Derive that ownership from
@@ -5440,8 +5784,11 @@ export function ChainRulesPanel({
   const hopListeners = new Set<string>();
   for (const candidate of steps) {
     for (const rule of draftRules[candidate.node] ?? candidate.rules) {
-      if (rule.a.t !== 'forward') continue;
-      hopListeners.add(rule.a.dial?.t === 'reverse' ? candidate.node : rule.a.to);
+      if (rule.a.t === 'forward') {
+        hopListeners.add(rule.a.dial?.t === 'reverse' ? candidate.node : rule.a.to);
+      } else if (rule.a.t === 'reuse_listener' && rule.a.listener.chain === chain.id) {
+        hopListeners.add(rule.a.listener.node);
+      }
     }
   }
 
@@ -5474,12 +5821,12 @@ export function ChainRulesPanel({
   const compiledRules = useMemo(() => {
     const apps = (compiledForPorts.data?.apps as CompiledApp[] | undefined) ?? [];
     const app = apps.find(a => (a.app_id ?? '') === appId);
-    return new Map((app?.steps ?? []).filter(s => s.chain === chain.id).map(s => [s.node, s.rules ?? []]));
-  }, [compiledForPorts.data, appId, chain.id]);
+    return new Map((app?.steps ?? []).map(s => [listenerRefKey({ chain: s.chain, node: s.node }), s.rules ?? []]));
+  }, [compiledForPorts.data, appId]);
 
   const fallbackOf = (node: string) => {
     const written = draftRules[node] ?? stepOf(node)?.rules ?? [];
-    const full = compiledRules.get(node) ?? [];
+    const full = compiledRules.get(listenerRefKey({ chain: chain.id, node })) ?? [];
     return compilerFallbackRules(written, full);
   };
 
@@ -5527,6 +5874,7 @@ export function ChainRulesPanel({
     const hopTitle = listensForHop ? `${nameOf(node)} 实际监听的中转端口与承载协议` : undefined;
     const hopSummary = listensForHop ? (step?.hop_in ? summarizeHopIn(step) : '未配置') : '—';
     const written = step?.rules.length ?? 0;
+    const blockingReferences = referencesBlockingRemoval(node);
 
     const badges = (
       <>
@@ -5553,6 +5901,14 @@ export function ChainRulesPanel({
         ))}
         {row?.spineIndex === null && !row?.targeted && row?.hasStep && <span className="st">规则节点</span>}
         {selected && node === selected && <span className="st st-succeeded">当前节点</span>}
+        {blockingReferences.length > 0 && (
+          <span
+            className="st st-gold"
+            title={`先移除引用：${blockingReferences.map(source => `${source.chain}/${source.node}`).join('、')}`}
+          >
+            被 {blockingReferences.length} 处引用
+          </span>
+        )}
       </>
     );
 
@@ -5593,7 +5949,14 @@ export function ChainRulesPanel({
           <span className="hopctl" onClick={e => e.stopPropagation()}>
             {onRemove && row?.spineIndex != null && row.spineIndex > 0 && (
               <DelBtn
-                title="从这条链移除这台机器，其整张规则表一并删除。写入草稿，提交后生效"
+                disabled={blockingReferences.length > 0}
+                title={
+                  blockingReferences.length > 0
+                    ? `无法移除：子树监听仍被 ${blockingReferences
+                        .map(source => `${source.chain}/${source.node}`)
+                        .join('、')} 引用`
+                    : '从这条链移除这台机器，其整张规则表一并删除。写入草稿，提交后生效'
+                }
                 onClick={() => onRemove(node)}
               />
             )}
@@ -5630,6 +5993,7 @@ export function ChainRulesPanel({
                   dnsOrder: draftDnsOrder[node] ?? null,
                   setDnsOrder: next => setDraftDnsOrder(prev => ({ ...prev, [node]: next })),
                 }}
+                ruleDrafts={draftRules}
                 peers={peersOf(node)}
                 isForwardTarget={isForwardTargetInChain({
                   nodeId: node,
@@ -5666,6 +6030,7 @@ export function ChainRulesPanel({
 
   const tree = rootNodes.map(root => renderNode(root, ['入口'], new Set()));
   const orphanTree = rows.flatMap(row => (rendered.has(row.node) ? [] : [renderNode(row.node, ['孤立'], new Set())]));
+  const decisionRoot = spine[0] ?? steps[0]?.node ?? null;
 
   return (
     <>
@@ -5682,6 +6047,34 @@ export function ChainRulesPanel({
           )}
         </div>
       )}
+      <section className="listener-map">
+        <header className="listener-map-head">
+          <span>
+            <b>监听规则决策树</b>
+            <small>按规则顺序从左向右；紫色连线表示引用另一监听拥有的完整子树。</small>
+          </span>
+          <span className="listener-map-legend" aria-label="图例">
+            <i className="owned">本链转发</i>
+            <i className="reference">引用监听</i>
+            <i className="terminal">终点</i>
+          </span>
+        </header>
+        <ListenerDecisionTree
+          app={snapshotApp}
+          currentChain={chain}
+          currentSteps={steps}
+          root={decisionRoot}
+          draftRules={draftRules}
+          compiledRules={compiledRules}
+          nodeNames={nameMap}
+        />
+      </section>
+      <div className="listener-rule-editor-head">
+        <span>
+          <b>规则表编辑</b>
+          <small>新增规则时可选择新建本链下一跳，或直接引用机器中已有监听的规则子树。</small>
+        </span>
+      </div>
       <div className="chain-rule-tree">
         {tree}
         {orphanTree.length > 0 && (
@@ -5722,6 +6115,9 @@ function chainRuleGraph(steps: SnapshotStep[], rows: ChainRuleRow[]): Map<string
   for (const step of steps) {
     for (const rule of step.rules) {
       if (rule.a.t === 'forward' && rule.a.to) addEdge(step.node, rule.a.to, summarizeEdge(rule));
+      if (rule.a.t === 'reuse_listener' && rule.a.listener.chain === step.chain) {
+        addEdge(step.node, rule.a.listener.node, summarizeEdge(rule));
+      }
     }
   }
   for (const edges of graph.values()) {
@@ -5738,18 +6134,20 @@ function summarize(r: Rule, nameOf: (id: string) => string = id => id): string {
   const a =
     r.a.t === 'forward'
       ? `→ ${nameOf(r.a.to ?? '')}`
-      : r.a.t === 'proxy'
-        ? `外部代理 ${r.a.outbound}`
-        : r.a.t === 'egress'
-          ? '从本机出网'
-          : '拒绝';
+      : r.a.t === 'reuse_listener'
+        ? `↪ ${nameOf(r.a.listener.node)}`
+        : r.a.t === 'proxy'
+          ? `外部代理 ${r.a.outbound}`
+          : r.a.t === 'egress'
+            ? '从本机出网'
+            : '拒绝';
   return `${m} ${a}`;
 }
 
 // 边上的标签只显示匹配条件本身（如 geosite=openai）。「任意」匹配不生成标签——
 // 全量转发的边是常态，标注「任意规则」不提供有效信息。
 function summarizeEdge(r: Rule): string {
-  return r.m.t === 'any' ? '' : summarize(r).replace(/ → .+$/, '');
+  return r.m.t === 'any' ? '' : summarize(r).replace(/ [→↪] .+$/, '');
 }
 
 function summarizeHopIn(step: SnapshotStep | null): string {

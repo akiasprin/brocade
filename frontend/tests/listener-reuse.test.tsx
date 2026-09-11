@@ -1,0 +1,345 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type {
+  ConsoleSnapshot,
+  NodeAgentStateItem,
+  Rule,
+  SnapshotApp,
+  SnapshotChain,
+  SnapshotIngress,
+  SnapshotStep,
+} from '../src/api';
+import { draft } from '../src/draft';
+import { ListenerDecisionTree } from '../src/panes/chains';
+import { RuleEditor, forwardPeers, reusableListeners } from '../src/panes/rules';
+
+const chain = (id: string, name: string, tenant = 'platform.acme'): SnapshotChain => ({ id, name, tenant });
+
+const ingress = (id: string, owner: string, node: string): SnapshotIngress => ({
+  id,
+  chain: owner,
+  node,
+  bind: '0.0.0.0',
+  port: 443,
+  projection: {},
+  guard: {
+    no_private: true,
+    no_bittorrent: true,
+    no_mail: true,
+    no_udp_amplification: true,
+    tcp_and_quic_only: false,
+  },
+  identity: { public_key: 'public', short_ids: ['0123abcd'] },
+  wires: { vless: { kind: 'vless-reality' } },
+});
+
+const egressRule = (): Rule => ({ m: { t: 'any' }, a: { t: 'egress', send_through: null } });
+const forwardRule = (to: string): Rule => ({
+  m: { t: 'any' },
+  a: { t: 'forward', to, dial: { t: 'overlay' }, pool: { t: 'none' } },
+});
+const referenceRule = (owner: string, node: string, match: Rule['m'] = { t: 'any' }): Rule => ({
+  m: match,
+  a: {
+    t: 'reuse_listener',
+    listener: { chain: owner, node },
+    dial: { t: 'overlay' },
+    pool: { t: 'none' },
+  },
+});
+
+const listenerStep = (owner: string, node: string, port: number, rules: Rule[]): SnapshotStep => ({
+  chain: owner,
+  node,
+  accept: { uuid: `uuid-${owner}-${node}`, label: `${owner}@${node}` },
+  hop_in: { port, security: { t: 'none' } },
+  rules,
+});
+
+const node = (node_id: string, name: string, tenant_id = 'platform.acme') => ({
+  node_id,
+  name,
+  tenant_id,
+  public_ipv4: `${node_id}.example.net`,
+  public_ipv6: null,
+  public_ipv4_nat: false,
+  public_ipv6_nat: false,
+  retired_at: null,
+});
+
+afterEach(() => {
+  cleanup();
+  draft.clear();
+  vi.unstubAllGlobals();
+});
+
+beforeEach(() => {
+  draft.init(`listener-reuse-${Math.random()}`);
+  draft.clear();
+});
+
+describe('监听规则子树复用', () => {
+  it('普通本链转发也会检查引用子树中的跨链回路', () => {
+    const source = listenerStep('source-chain', 'source', 21000, [egressRule()]);
+    const candidate = listenerStep('source-chain', 'candidate', 21001, [referenceRule('owner', 'shared')]);
+    const shared = listenerStep('owner', 'shared', 22000, [referenceRule('source-chain', 'source')]);
+    const app: SnapshotApp = {
+      id: 'app',
+      label: '项目',
+      chains: [chain('source-chain', '源线路'), chain('owner', '共享出口')],
+      ingresses: [ingress('source-in', 'source-chain', 'source'), ingress('owner-in', 'owner', 'owner-root')],
+      steps: [
+        source,
+        candidate,
+        { chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] },
+        shared,
+      ],
+      fronts: [],
+      grants: [],
+    };
+
+    const peers = forwardPeers({
+      nodeId: 'source',
+      sourceChain: 'source-chain',
+      spine: ['source'],
+      tenant: 'platform.acme',
+      steps: app.steps.filter(step => step.chain === 'source-chain'),
+      app,
+      nodes: [
+        node('source', '香港入口'),
+        node('candidate', '候选监听'),
+        node('owner-root', '共享入口'),
+        node('shared', '共享监听'),
+      ],
+    });
+
+    expect(peers.find(peer => peer.id === 'candidate')?.blocked).toContain('成环');
+  });
+
+  it('只列出现有监听，标出本机、引用数、作用域和环路原因', () => {
+    const sourceRules = [referenceRule('owner', 'source')];
+    const app: SnapshotApp = {
+      id: 'app',
+      label: '项目',
+      chains: [
+        chain('source-chain', '源线路'),
+        chain('owner', '共享出口', 'platform'),
+        chain('sibling', '其它租户', 'platform.other'),
+        chain('dormant', '未运行线路'),
+      ],
+      ingresses: [
+        ingress('source-in', 'source-chain', 'source'),
+        ingress('owner-in', 'owner', 'owner-root'),
+        ingress('sibling-in', 'sibling', 'sibling-root'),
+      ],
+      steps: [
+        listenerStep('source-chain', 'source', 21000, sourceRules),
+        {
+          chain: 'owner',
+          node: 'owner-root',
+          accept: null,
+          hop_in: null,
+          // This historical owned edge must not inflate the explicit-reference count.
+          rules: [forwardRule('source')],
+        },
+        listenerStep('owner', 'source', 22000, [egressRule()]),
+        listenerStep('owner', 'cycle', 22001, [referenceRule('source-chain', 'source')]),
+        listenerStep('owner', 'retired-tree', 22004, [forwardRule('retired-leaf')]),
+        listenerStep('owner', 'retired-leaf', 22005, [egressRule()]),
+        listenerStep('sibling', 'sibling-root', 22002, [egressRule()]),
+        listenerStep('dormant', 'dormant-node', 22003, [egressRule()]),
+      ],
+      fronts: [],
+      grants: [],
+    };
+    const candidates = reusableListeners({
+      app,
+      sourceChain: 'source-chain',
+      sourceNode: 'source',
+      sourceRules,
+      nodes: [
+        node('source', '香港入口'),
+        node('owner-root', '共享入口', 'platform'),
+        node('cycle', '环路监听', 'platform'),
+        node('retired-tree', '含退役节点的监听', 'platform'),
+        { ...node('retired-leaf', '已退役出口', 'platform'), retired_at: '2026-09-11T00:00:00Z' },
+        node('sibling-root', '其它监听', 'platform.other'),
+        node('dormant-node', '停用监听'),
+      ],
+    });
+
+    const self = candidates.find(candidate => candidate.ref.chain === 'source-chain')!;
+    const local = candidates.find(candidate => candidate.ref.chain === 'owner' && candidate.ref.node === 'source')!;
+    const cycle = candidates.find(candidate => candidate.ref.node === 'cycle')!;
+    const retiredTree = candidates.find(candidate => candidate.ref.node === 'retired-tree')!;
+    const sibling = candidates.find(candidate => candidate.ref.chain === 'sibling')!;
+    const dormant = candidates.find(candidate => candidate.ref.chain === 'dormant')!;
+    expect(self.blocked).toContain('自身');
+    expect(local.local).toBe(true);
+    expect(local.references).toBe(1);
+    expect(cycle.blocked).toContain('环路');
+    expect(retiredTree.blocked).toContain('已退役机器');
+    expect(sibling.blocked).toContain('可用范围');
+    expect(dormant.blocked).toContain('没有入口');
+    expect(candidates[0].local).toBe(true);
+  });
+
+  it('把引用边展开为所有者的真实规则子树，并保留规则顺序与终点', () => {
+    const source = listenerStep('source-chain', 'source', 21000, [
+      referenceRule('owner', 'source', { t: 'domain_suffix', v: ['openai.com'] }),
+      egressRule(),
+    ]);
+    const shared = listenerStep('owner', 'source', 22000, [
+      { m: { t: 'geoip', v: ['cn'] }, a: { t: 'block' } },
+      forwardRule('tail'),
+    ]);
+    const tail = listenerStep('owner', 'tail', 22001, [egressRule()]);
+    const app: SnapshotApp = {
+      id: 'app',
+      label: '项目',
+      chains: [chain('source-chain', '源线路'), chain('owner', '共享出口')],
+      ingresses: [ingress('source-in', 'source-chain', 'source'), ingress('owner-in', 'owner', 'owner-root')],
+      steps: [
+        source,
+        { chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] },
+        shared,
+        tail,
+      ],
+      fronts: [],
+      grants: [],
+    };
+    const view = render(
+      <ListenerDecisionTree
+        app={app}
+        currentChain={app.chains[0]}
+        currentSteps={[source]}
+        root="source"
+        draftRules={{}}
+        compiledRules={new Map()}
+        nodeNames={
+          new Map([
+            ['source', '香港节点'],
+            ['owner-root', '所有者入口'],
+            ['tail', '新加坡出口'],
+          ])
+        }
+      />,
+    );
+
+    expect(view.getByText('引用的监听子树')).toBeTruthy();
+    expect(view.getAllByText('归属：共享出口')).toHaveLength(2);
+    expect(view.getByText('域名后缀 · openai.com')).toBeTruthy();
+    expect(view.getByText('GeoIP · cn')).toBeTruthy();
+    expect(view.getByText('拒绝')).toBeTruthy();
+    expect(view.getAllByText('本机出网').length).toBeGreaterThan(0);
+    expect(view.getByText('本机内部')).toBeTruthy();
+    expect(view.getByText(/443 \/ VLESS/)).toBeTruthy();
+    expect(view.getByText('22000 / VLESS-NONE')).toBeTruthy();
+    expect(view.container.querySelectorAll('.listener-map-branch.is-reference')).toHaveLength(1);
+    expect(
+      [...view.container.querySelectorAll('.listener-map-edge > span')].map(element => element.textContent),
+    ).toEqual(['01', '01', '02', '01', '02']);
+  });
+
+  it('在草稿里只保存监听身份和承载选择，不复制目标端口和规则', async () => {
+    const source: SnapshotStep = {
+      chain: 'source-chain',
+      node: 'source',
+      accept: null,
+      hop_in: null,
+      rules: [egressRule()],
+    };
+    const shared = listenerStep('owner', 'shared', 22000, [
+      { m: { t: 'geoip', v: ['cn'] }, a: { t: 'block' } },
+      egressRule(),
+    ]);
+    const app: SnapshotApp = {
+      id: 'app',
+      label: '项目',
+      chains: [chain('source-chain', '源线路'), chain('owner', '共享出口')],
+      ingresses: [ingress('source-in', 'source-chain', 'source'), ingress('owner-in', 'owner', 'owner-root')],
+      steps: [
+        source,
+        { chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] },
+        shared,
+      ],
+      fronts: [],
+      grants: [],
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
+    });
+    client.setQueryData(['snapshot'], {
+      snapshot: { revision: 1, settings: {}, apps: [app], external_outbounds: [] },
+      node_egress_dns: [],
+      redacted: false,
+    } as unknown as ConsoleSnapshot);
+    client.setQueryData(['settings'], { ports: { hop_base: 20000 } });
+    client.setQueryData(['revisions'], { current_revision: null, revisions: [] });
+    client.setQueryData(['nodes'], {
+      nodes: [
+        { ...node('source', '香港入口'), egress_allowed: true },
+        { ...node('owner-root', '所有者入口'), egress_allowed: true },
+        { ...node('shared', '新加坡共享监听'), egress_allowed: true },
+      ] as NodeAgentStateItem[],
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) !== '/model/preview') throw new Error(`未预期的请求：${String(input)}`);
+        return new Response(
+          JSON.stringify({
+            snapshot: {
+              snapshot: { revision: 1, settings: {}, apps: [app], external_outbounds: [] },
+              node_egress_dns: [],
+              redacted: false,
+            },
+            compile: { diagnostics: [], summary: {}, system: { nodes: [] }, apps: [] },
+            artifacts: { revision: 1, artifacts: [] },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }),
+    );
+
+    const view = render(
+      <QueryClientProvider client={client}>
+        <RuleEditor
+          appId="app"
+          chainId="source-chain"
+          nodeId="source"
+          initial={source.rules}
+          accept={null}
+          peers={[]}
+          isForwardTarget={false}
+          fallback={{ rules: [], pending: false }}
+        />
+      </QueryClientProvider>,
+    );
+    const row = view.container.querySelector('.rule-table tbody tr');
+    if (!(row instanceof HTMLTableRowElement)) throw new Error('没有规则行');
+    const action = row.querySelector('.rule-action-select');
+    if (!(action instanceof HTMLSelectElement)) throw new Error('没有动作选择器');
+    fireEvent.change(action, { target: { value: 'forward' } });
+    const choice = await view.findByRole('button', { name: /新加坡共享监听 · TCP 22000/ });
+    fireEvent.click(choice);
+    expect(view.getByText(/引用子树 · 共享出口/)).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+
+    await waitFor(() => {
+      const op = draft.ops().find(candidate => candidate.op === 'put_step' && candidate.chain_id === 'source-chain');
+      expect(op?.op).toBe('put_step');
+      if (!op || op.op !== 'put_step') return;
+      expect(op.step.rules[0]).toEqual({
+        ...referenceRule('owner', 'shared'),
+        a: {
+          ...referenceRule('owner', 'shared').a,
+          dial: { t: 'public', v: 'v4' },
+        },
+      });
+      expect(JSON.stringify(op.step.rules[0])).not.toContain('22000');
+      expect(JSON.stringify(op.step.rules[0])).not.toContain('geoip');
+    });
+  });
+});

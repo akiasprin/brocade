@@ -7,11 +7,11 @@ use brocade_core::{
         ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
         ExternalVlessXhttp, ExternalVlessXhttpDownload, HopDial, HopMux, HopPool, Hysteria2,
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires,
-        IpFamily, ModelSettings, NodeConnection, OverlaySettings, PortSettings, Projection,
-        ProjectionDownloadEndpoint, ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits,
-        RealityFallbackMode, RealityFallbackRateLimit, RealitySettings, RealitySite, Rule,
-        Transport, WgTransport, Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux,
-        XhttpXmuxRange,
+        IpFamily, ListenerDial, ListenerRef, ModelSettings, NodeConnection, OverlaySettings,
+        PortSettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
+        RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealityFallbackRateLimit,
+        RealitySettings, RealitySite, Rule, Transport, WgTransport, Xhttp, XhttpDownload,
+        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
     physical::user::SubscriptionFilter,
 };
@@ -16943,6 +16943,166 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
     assert_eq!((c, i, g, s), (0, 0, 0, 0), "链、接入面、授权、成员行全清");
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn listener_references_preserve_and_protect_the_owned_subtree() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    for (id, ip, wg, port) in [
+        ("n2", "10.66.0.2", "wg-private-2", 51822),
+        ("n3", "10.66.0.3", "wg-private-3", 51823),
+    ] {
+        sqlx::query(
+            "INSERT INTO nodes (
+                id, tenant_id, name, public_ipv4, overlay_addr,
+                wg_private_key, wg_public_key, wg_listen_port,
+                api_port, overlay, egress_allowed, dns_kind, dns_servers
+             ) VALUES ($1, 'platform.acme', $1, $1 || '.example.net', $2::inet,
+                       $3, $3 || '-pub', $4,
+                       10100, TRUE, TRUE, 'servers', '[\"1.1.1.1\"]'::jsonb)",
+        )
+        .bind(id)
+        .bind(ip)
+        .bind(wg)
+        .bind(port)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let owner_chain = "chn-b2c3-d4e5";
+    db.store
+        .upsert_chain(
+            &system_admin(),
+            "app-main",
+            CreateChainRequest {
+                id: owner_chain.to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Listener owner".to_owned(),
+                subscription_country: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ingresses (
+            id, app_id, chain_id, node_id, bind, port, front_id, transport_kind,
+            reality_private_key, reality_public_key, reality_short_ids,
+            reality_dest, reality_server_names, reality_flow, reality_fallback_mode
+         ) VALUES (
+            'ing-b2c3', 'app-main', $1, 'n2', '0.0.0.0', 8444, NULL, 'vless-reality',
+            'reality-private', 'reality-public', '[\"8337a0bf\"]'::jsonb,
+            'www.example.com:443', '[\"www.example.com\"]'::jsonb,
+            'xtls-rprx-vision', 'custom-site'
+         )",
+    )
+    .bind(owner_chain)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let egress = |accept: bool, hop_in: bool| PutStepRequest {
+        accept: accept.then_some(StepAcceptRequest {
+            uuid: None,
+            label: None,
+        }),
+        hop_in: hop_in.then_some(HopInRequest {
+            port: 22003,
+            security: Some(HopWireRequest::Encryption),
+        }),
+        rules: vec![Rule {
+            dest_match: DestMatch::Any,
+            action: Action::Egress { send_through: None },
+        }],
+        note: None,
+    };
+    put_step_draft(&db, "app-main", owner_chain, "n2", egress(false, false)).await;
+    put_step_draft(&db, "app-main", owner_chain, "n3", egress(true, true)).await;
+    put_step_draft(
+        &db,
+        "app-main",
+        "chn-a1b2-c3d4",
+        "n1",
+        PutStepRequest {
+            accept: None,
+            hop_in: None,
+            rules: vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::ReuseListener {
+                    listener: ListenerRef {
+                        chain: owner_chain.to_owned(),
+                        node: "n3".to_owned(),
+                    },
+                    dial: ListenerDial::Overlay,
+                    pool: HopPool::None,
+                },
+            }],
+            note: None,
+        },
+    )
+    .await;
+
+    let compiled = compile(&db.store.materialize_snapshot(None).await.unwrap());
+    assert_eq!(compiled.summary.errors, 0, "{:#?}", compiled.diagnostics);
+
+    let pruned = db
+        .store
+        .prune_chain(&system_admin(), "app-main", owner_chain)
+        .await
+        .unwrap();
+    assert!(
+        !pruned.removed_steps.iter().any(|node| node == "n3"),
+        "外部引用是 owner 链的第二个根，不能被裁掉"
+    );
+    let kept: (Option<i32>, bool) = sqlx::query_as(
+        "SELECT hop_in_port, accept_uuid IS NOT NULL
+           FROM steps WHERE chain_id = $1 AND node_id = 'n3'",
+    )
+    .bind(owner_chain)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(kept, (Some(22003), true));
+
+    let delete_listener = db
+        .store
+        .delete_step(&system_admin(), "app-main", owner_chain, "n3")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&delete_listener, StoreError::Conflict(message) if message.contains("仍被引用")),
+        "{delete_listener:?}"
+    );
+    let delete_owner = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::DeleteChain {
+                app_id: "app-main".to_owned(),
+                chain_id: owner_chain.to_owned(),
+            }],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&delete_owner, StoreError::Conflict(message) if message.contains("其它线路引用")),
+        "{delete_owner:?}"
+    );
+
+    // Once the source rule releases the reference, ordinary pruning owns the lifecycle again.
+    put_step_draft(&db, "app-main", "chn-a1b2-c3d4", "n1", egress(false, false)).await;
+    let pruned = db
+        .store
+        .prune_chain(&system_admin(), "app-main", owner_chain)
+        .await
+        .unwrap();
+    assert!(pruned.removed_steps.iter().any(|node| node == "n3"));
+}
+
 /// Stranded steps are removed by `PruneChain` once the whole rule tree has landed.
 ///
 /// What this test watches is the order. The console saving a rule tree is a run of `PutStep`s
@@ -17694,15 +17854,17 @@ async fn vless_encryption_ingress_round_trips_with_configurable_port_and_stable_
         .execute(db.pool())
         .await
         .unwrap();
-    let mut settings = db.store.materialize_snapshot(None).await.unwrap().settings;
-    assert_eq!(settings.ports.vless_encryption_base, 13800);
-    settings.ports.vless_encryption_base = 49000;
+    let mut ports = db
+        .store
+        .materialize_snapshot(None)
+        .await
+        .unwrap()
+        .settings
+        .ports;
+    assert_eq!(ports.vless_encryption_base, 13800);
+    ports.vless_encryption_base = 49000;
     db.store
-        .apply_draft(
-            &system_admin(),
-            vec![ModelOp::UpdateSettings { settings }],
-            None,
-        )
+        .update_port_settings(&system_admin(), ports)
         .await
         .unwrap();
     assert_eq!(

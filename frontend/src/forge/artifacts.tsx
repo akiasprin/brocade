@@ -144,6 +144,7 @@ function nodeRoles(apps: SnapshotApp[], nodeId: string): string[] {
         if (s.node === nodeId && rule.a.t === 'egress') r.add('出口节点');
         if (s.node === nodeId && rule.a.t === 'proxy') r.add('外部代理');
         if (rule.a.t === 'forward' && (s.node === nodeId || rule.a.to === nodeId)) r.add('中转节点');
+        if (rule.a.t === 'reuse_listener' && (s.node === nodeId || rule.a.listener.node === nodeId)) r.add('中转节点');
       }
     }
   }

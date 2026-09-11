@@ -377,7 +377,9 @@ pub fn validate_system(sys: &SystemIr, diagnostics: &mut Vec<Diagnostic>) {
 /// overlay on one chain and dial bare on another, and testing by machine would collapse
 /// the two into one statement.
 ///
-/// The test is whether it passes through WireGuard, not whether I initiate it. Reverse
+/// The test is whether it passes through WireGuard or remains inside the process, not whether I
+/// initiate it. A local listener reference uses loopback and never crosses a trust boundary.
+/// Reverse
 /// access is on the public internet as well — `HopDial::Reverse` offers no "reverse
 /// over the overlay" combination, so it is as bare as direct dialing and only the
 /// initiator differs. Filtering on "is it Direct" misses the entire reverse family, and
@@ -385,10 +387,10 @@ pub fn validate_system(sys: &SystemIr, diagnostics: &mut Vec<Diagnostic>) {
 /// word.
 fn validate_hop_security(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
     for hop in &app.hops {
-        // Only the overlay variant is excluded: WireGuard already wraps that hop, so
-        // running unencrypted inside is correct and another layer would burn CPU for
-        // nothing.
-        if hop.path == HopPath::Overlay {
+        // WireGuard already wraps Overlay; Local never leaves the machine. Running another
+        // encryption layer for either is unnecessary, and the public-network warning would be
+        // actively misleading for 127.0.0.1.
+        if matches!(hop.path, HopPath::Overlay | HopPath::Local) {
             continue;
         }
         let at = format!("{}/{}->{}", hop.chain, hop.from, hop.to);
@@ -2781,18 +2783,28 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
     // Both fields describe the one outbound this edge compiles to, so both have to agree
     // across every rule pointing at the same target — two rules asking for different
     // connection handling are asking for two outbounds, and there is only ever one.
-    let mut by_target = BTreeMap::<&str, (&HopDial, &HopPool)>::new();
+    let mut by_target = BTreeMap::new();
 
     for rule in &step.rules {
-        let Action::Forward { to, dial, pool } = &rule.action else {
+        let Some(forward) = rule.action.forward_ref(&step.chain) else {
             continue;
         };
-        let at = format!("{}/{}->{}", step.chain, step.node, to);
+        let to = forward.target_node;
+        let dial = forward.dial;
+        let pool = forward.pool;
+        let at = if forward.reused {
+            format!(
+                "{}/{}->listener:{}/{}",
+                step.chain, step.node, forward.target_chain, to
+            )
+        } else {
+            format!("{}/{}->{}", step.chain, step.node, to)
+        };
 
         // Reverse has the peer open the connection; this machine holds a virtual outbound
         // onto a tunnel that is already up. There is nothing to pool, so a pool set here is
         // not a harmless leftover — it is a setting the operator believes is in effect.
-        if matches!(dial, HopDial::Reverse(_)) && *pool != HopPool::None {
+        if dial.is_reverse() && *pool != HopPool::None {
             diagnostics.push(Diagnostic::error(
                 "rule.pool-on-reverse",
                 at.clone(),
@@ -2804,7 +2816,8 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
             validate_hop_mux(mux, &format!("{at}.pool.v"), diagnostics);
         }
 
-        let Some((previous_dial, previous_pool)) = by_target.insert(to.as_str(), (dial, pool))
+        let Some((previous_dial, previous_pool)) =
+            by_target.insert((forward.target_chain, to), (dial, pool))
         else {
             continue;
         };
@@ -2826,6 +2839,18 @@ fn validate_forward_dials(step: &super::routing::Step, diagnostics: &mut Vec<Dia
 }
 
 fn validate_topology(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
+    let listener_roots = app
+        .steps
+        .iter()
+        .flat_map(|step| step.rules.iter())
+        .filter_map(|rule| match &rule.action {
+            Action::ReuseListener { listener, .. } => {
+                Some((listener.chain.as_str(), listener.node.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
     for chain in &app.chains {
         // The head is the machine hosting the ingress. A chain with no ingress was
         // already reported as `chain.no-ingress`, and the topology check has no starting
@@ -2852,12 +2877,12 @@ fn validate_topology(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             }
         }
 
-        // This guards `compile_chain_steps`'s invariant: it builds steps only for nodes
-        // reachable from the head by BFS, so every step but the head's should have an
-        // upstream. Reporting nothing today is correct; should compilation ever change to
-        // copy `app.steps` directly, this catches the orphan nodes that leak through.
+        // This guards `compile_chain_steps`'s invariant: every compiled step is reachable from
+        // either the user ingress or a listener-reference root. A reference is an incoming edge
+        // from another chain and therefore intentionally does not appear in this chain-local
+        // `incoming` table.
         for (node, sources) in &incoming {
-            if *node == root {
+            if *node == root || listener_roots.contains(&(chain.id.as_str(), *node)) {
                 continue;
             }
             if sources.is_empty() {
@@ -2871,20 +2896,29 @@ fn validate_topology(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
 
         let mut stack = BTreeSet::new();
         let mut visited = BTreeSet::new();
-        detect_cycle(
-            &chain.id,
-            root,
-            &steps,
-            &mut stack,
-            &mut visited,
-            diagnostics,
+        let mut roots = BTreeSet::from([root]);
+        roots.extend(
+            listener_roots
+                .iter()
+                .filter(|(owner_chain, _)| *owner_chain == chain.id)
+                .map(|(_, node)| *node),
         );
+        for entry in roots {
+            detect_cycle(
+                &chain.id,
+                entry,
+                &steps,
+                &mut stack,
+                &mut visited,
+                diagnostics,
+            );
+        }
 
         for step in &steps {
             let forwards = step
                 .rules
                 .iter()
-                .any(|rule| matches!(rule.action, Action::Forward { .. }));
+                .any(|rule| rule.action.forward_ref(&step.chain).is_some());
             if !forwards {
                 let terminal = step.rules.iter().any(|rule| {
                     matches!(
@@ -2902,6 +2936,70 @@ fn validate_topology(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             }
         }
     }
+
+    validate_listener_reference_cycles(app, diagnostics);
+}
+
+/// A chain-local cycle is diagnosed above using the historical `chain.cycle` code. A listener
+/// reference adds edges between those otherwise independent graphs, so every reused edge gets one
+/// reachability check back to its source. This catches A/one -> B/two -> A/one without changing
+/// the long-standing diagnostics for ordinary chains.
+fn validate_listener_reference_cycles(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
+    let mut reported = BTreeSet::new();
+    for step in &app.steps {
+        for rule in &step.rules {
+            let Action::ReuseListener { listener, .. } = &rule.action else {
+                continue;
+            };
+            let source = (step.chain.as_str(), step.node.as_str());
+            let target = (listener.chain.as_str(), listener.node.as_str());
+            if !listener_reaches(app, target, source, &mut BTreeSet::new()) {
+                continue;
+            }
+            let at = format!(
+                "{}/{}->listener:{}/{}",
+                step.chain, step.node, listener.chain, listener.node
+            );
+            if reported.insert(at.clone()) {
+                diagnostics.push(Diagnostic::error(
+                    "listener.cycle",
+                    at,
+                    "该监听子树能回到当前规则表，引用会形成跨线路环路",
+                ));
+            }
+        }
+    }
+}
+
+fn listener_reaches<'a>(
+    app: &'a AppIr,
+    at: (&'a str, &'a str),
+    wanted: (&str, &str),
+    seen: &mut BTreeSet<(String, String)>,
+) -> bool {
+    if at == wanted {
+        return true;
+    }
+    if !seen.insert((at.0.to_owned(), at.1.to_owned())) {
+        return false;
+    }
+    let Some(step) = app
+        .steps
+        .iter()
+        .find(|step| step.chain == at.0 && step.node == at.1)
+    else {
+        return false;
+    };
+    step.rules.iter().any(|rule| {
+        rule.action.forward_ref(&step.chain).is_some_and(|forward| {
+            listener_reaches(
+                app,
+                (forward.target_chain, forward.target_node),
+                wanted,
+                seen,
+            )
+        })
+    })
 }
 
 fn detect_cycle(
@@ -3267,6 +3365,32 @@ fn validate_tenants(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     ),
                 ));
             }
+
+            for rule in &step.rules {
+                let Action::ReuseListener { listener, .. } = &rule.action else {
+                    continue;
+                };
+                let Some(owner) = app
+                    .chains
+                    .iter()
+                    .find(|candidate| candidate.id == listener.chain)
+                else {
+                    continue;
+                };
+                if !under(&chain.tenant, &owner.tenant) {
+                    diagnostics.push(Diagnostic::error(
+                        "tenant.scope",
+                        format!(
+                            "{}/{}->listener:{}/{}",
+                            chain.id, step.node, listener.chain, listener.node
+                        ),
+                        format!(
+                            "链属于 {}，而引用的监听归属于 {}，不在可见范围内",
+                            chain.tenant, owner.tenant
+                        ),
+                    ));
+                }
+            }
         }
     }
 
@@ -3555,6 +3679,18 @@ fn front_verdict_inner(
                 }
                 Action::Forward { to, .. } => {
                     let verdict = front_verdict_inner(app, chain, to, host, seen);
+                    return if dynamic_before_decision {
+                        FrontVerdict {
+                            kind: FrontVerdictKind::Maybe,
+                            at: verdict.at,
+                        }
+                    } else {
+                        verdict
+                    };
+                }
+                Action::ReuseListener { listener, .. } => {
+                    let verdict =
+                        front_verdict_inner(app, &listener.chain, &listener.node, host, seen);
                     return if dynamic_before_decision {
                         FrontVerdict {
                             kind: FrontVerdictKind::Maybe,

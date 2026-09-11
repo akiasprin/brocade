@@ -380,6 +380,12 @@ pub fn compile_app(
         })
         .collect::<BTreeSet<_>>();
     let front_downstream = front_downstream_hosts(&ir, &node_by_id);
+    let reused_listeners = reachable_reused_listeners(app, &chain_roots, &disabled_chains);
+    let compile_context = ChainCompileContext {
+        front_via_chains: &front_via_chains,
+        front_downstream: &front_downstream,
+        reused_listeners: &reused_listeners,
+    };
 
     for chain in &app.chains {
         if disabled_chains.contains(chain.id.as_str()) {
@@ -403,10 +409,7 @@ pub fn compile_app(
             app,
             chain,
             root,
-            &FrontContext {
-                via_chains: &front_via_chains,
-                downstream: &front_downstream,
-            },
+            &compile_context,
             diagnostics,
             &mut ir.steps,
         );
@@ -565,6 +568,61 @@ fn chain_members(app: &model::AppView, chain_id: &str, root: &str) -> BTreeSet<S
     members
 }
 
+/// Listener roots reached by live user traffic.
+///
+/// Scanning every stored Step would let an already-orphaned source row keep an unrelated target
+/// subtree alive and turn the source's existing `step.unreachable` warning into a publish-blocking
+/// target error. Start at each live ingress instead and follow both owned and referenced edges.
+/// The walk also discovers references nested inside a referenced subtree.
+fn reachable_reused_listeners(
+    app: &model::AppView,
+    roots: &HashMap<&str, &model::Ingress>,
+    disabled_chains: &BTreeSet<&str>,
+) -> BTreeSet<(String, String)> {
+    let known_chains = app
+        .chains
+        .iter()
+        .map(|chain| chain.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut initial = app
+        .chains
+        .iter()
+        .filter(|chain| !disabled_chains.contains(chain.id.as_str()))
+        .filter_map(|chain| {
+            roots
+                .get(chain.id.as_str())
+                .map(|root| (chain.id.clone(), root.node.clone()))
+        })
+        .collect::<Vec<_>>();
+    initial.sort();
+
+    let mut queue = VecDeque::from(initial);
+    let mut seen = BTreeSet::new();
+    let mut reused = BTreeSet::new();
+    while let Some((chain, node)) = queue.pop_front() {
+        if !seen.insert((chain.clone(), node.clone())) {
+            continue;
+        }
+        for step in steps_at(app, &chain, &node) {
+            for rule in &step.rules {
+                match &rule.action {
+                    Action::Forward { to, .. } => queue.push_back((chain.clone(), to.clone())),
+                    Action::ReuseListener { listener, .. } => {
+                        reused.insert((listener.chain.clone(), listener.node.clone()));
+                        if known_chains.contains(listener.chain.as_str())
+                            && !disabled_chains.contains(listener.chain.as_str())
+                        {
+                            queue.push_back((listener.chain.clone(), listener.node.clone()));
+                        }
+                    }
+                    Action::Egress { .. } | Action::Proxy { .. } | Action::Block => {}
+                }
+            }
+        }
+    }
+    reused
+}
+
 /// All source fragments for one chain node, in model order.
 ///
 /// A fragment contributes rules to the node's one ordered rule table. Keeping this lookup shared
@@ -605,15 +663,17 @@ fn merge_step_field<'a, T: Clone + PartialEq + 'a>(
     }
 }
 
-// The two tables for front chains. Built once per app and passed down chain by
-// chain.
-struct FrontContext<'a> {
+// The tables shared by every chain compiled for one app. Building them once keeps
+// recursive listener discovery and front-rule expansion consistent across chains.
+struct ChainCompileContext<'a> {
     // Which chains some front references — a referenced chain denies by default, and
     // the dead-chain test must skip them.
-    via_chains: &'a BTreeSet<String>,
+    front_via_chains: &'a BTreeSet<String>,
     // Front chain → the downstream hosts it admits. Looked up by chain id while
     // expanding front rules.
-    downstream: &'a HashMap<String, BTreeSet<String>>,
+    front_downstream: &'a HashMap<String, BTreeSet<String>>,
+    // Listener roots reached through ReuseListener, including nested references.
+    reused_listeners: &'a BTreeSet<(String, String)>,
 }
 
 fn compile_chain_steps(
@@ -621,7 +681,7 @@ fn compile_chain_steps(
     app: &model::AppView,
     chain: &model::Chain,
     root: Option<&str>,
-    front: &FrontContext<'_>,
+    context: &ChainCompileContext<'_>,
     diagnostics: &mut Vec<Diagnostic>,
     out: &mut Vec<Step>,
 ) {
@@ -629,8 +689,26 @@ fn compile_chain_steps(
         return;
     };
 
-    let mut queue = VecDeque::from([root.to_owned()]);
-    let mut seen = BTreeSet::from([root.to_owned()]);
+    // A referenced listener is another root of this chain's stored rule forest. It remains owned
+    // by this chain, but need not also be reachable from the chain's user ingress: removing the
+    // owner's incoming edge must not make a subtree still used elsewhere disappear from the
+    // compiled artifacts. Stable ordering keeps the output independent of rule insertion order.
+    let primary_members = chain_members(app, &chain.id, root);
+    let mut roots = vec![root.to_owned()];
+    roots.extend(
+        context
+            .reused_listeners
+            .iter()
+            .filter(|(owner_chain, _)| owner_chain == &chain.id)
+            .map(|(_, node)| node.clone()),
+    );
+    roots.sort();
+    roots.dedup();
+    if let Some(index) = roots.iter().position(|node| node == root) {
+        roots.swap(0, index);
+    }
+    let mut queue = VecDeque::from(roots.clone());
+    let mut seen = roots.into_iter().collect::<BTreeSet<_>>();
     let mut made = BTreeSet::new();
     let mut steps = Vec::new();
     // Whether any member had a Block fallback appended by the compiler because of a
@@ -664,7 +742,7 @@ fn compile_chain_steps(
             chain,
             &node_id,
             &source_rules,
-            front.downstream,
+            context.front_downstream,
             diagnostics,
         );
         let at = format!("{}/{}", chain.id, node_id);
@@ -687,11 +765,11 @@ fn compile_chain_steps(
             node,
             chain,
             &node_id,
-            front.via_chains.contains(&chain.id),
+            context.front_via_chains.contains(&chain.id),
             diagnostics,
             &mut rules,
         );
-        if matches!(padded, Some(Action::Block)) {
+        if primary_members.contains(&node_id) && matches!(padded, Some(Action::Block)) {
             padded_block = true;
         }
 
@@ -713,7 +791,10 @@ fn compile_chain_steps(
                 }
             )
         });
-        let (accept, hop_in) = if node_id == *root {
+        let reused = context
+            .reused_listeners
+            .contains(&(chain.id.clone(), node_id.clone()));
+        let (accept, hop_in) = if node_id == *root && !reused {
             (None, reverse_upstream.then_some(source_hop_in).flatten())
         } else {
             (source_accept, source_hop_in)
@@ -773,20 +854,24 @@ fn compile_chain_steps(
     // Front chains do not participate: denying by default is their semantics, and
     // blocking everything is a legitimate intermediate state meaning "nothing has been
     // admitted yet" (already covered by the front.default-block warning).
-    if !front.via_chains.contains(&chain.id) && padded_block {
-        let alive = steps.iter().any(|step| {
-            step.rules.iter().any(|rule| {
-                matches!(
-                    &rule.action,
-                    Action::Egress { .. }
-                        | Action::Proxy { .. }
-                        | Action::Forward {
-                            dial: HopDial::Reverse(_),
-                            ..
-                        }
-                )
-            })
-        });
+    if !context.front_via_chains.contains(&chain.id) && padded_block {
+        let alive = steps
+            .iter()
+            .filter(|step| primary_members.contains(&step.node))
+            .any(|step| {
+                step.rules.iter().any(|rule| {
+                    matches!(
+                        &rule.action,
+                        Action::Egress { .. }
+                            | Action::Proxy { .. }
+                            | Action::ReuseListener { .. }
+                            | Action::Forward {
+                                dial: HopDial::Reverse(_),
+                                ..
+                            }
+                    )
+                })
+            });
         if !alive {
             diagnostics.push(Diagnostic::error(
                 "chain.no-egress-path",

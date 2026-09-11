@@ -131,10 +131,17 @@ pub(crate) fn hop_downlinks_from_stats(
     out
 }
 
-/// `out:{app}/{chain}>{to}` → (app/chain, to). `None` for anything else
-/// (egress/block).
+/// `out:{app}/{chain}>{to}` → (app/chain, to). Remote listener references use
+/// `out:{app}/{source-chain}~{listener-chain}>{to}`; the target-listener suffix distinguishes
+/// two ports on one peer in Xray while telemetry remains keyed to the source chain and peer node.
+/// A suffix ending in `@local` is a same-process loopback reference, not a link, and is omitted.
+/// `None` for anything else (egress/block/local listener).
 fn hop_of_tag(tag: &str) -> Option<(&str, &str)> {
-    tag.strip_prefix("out:")?.split_once('>')
+    let (chain, peer) = tag.strip_prefix("out:")?.split_once('>')?;
+    let Some((source, target)) = chain.split_once('~') else {
+        return Some((chain, peer));
+    };
+    (!target.ends_with("@local")).then_some((source, peer))
 }
 
 /// Compare this round's readings against the last to judge each hop's liveness.
@@ -151,28 +158,47 @@ pub(crate) fn judge_hops(now: BTreeMap<String, u64>, at: u64) -> Option<LinkHeal
     let (previous_at, previous) = previous?;
     let window_secs = at.saturating_sub(previous_at);
 
-    let hops = now
-        .iter()
-        .filter_map(|(tag, value)| {
-            let (chain_id, peer) = hop_of_tag(tag)?;
-            let before = previous.get(tag).copied().unwrap_or(0);
-            // A drop means xray restarted and the counter reset; this round has
-            // no trustworthy delta, so treat it as no data
-            let delta = value.saturating_sub(before);
-            Some(LinkHealth {
-                chain_id: chain_id.to_owned(),
-                peer_node_id: peer.to_owned(),
-                alive: delta > 0,
-                downlink_bytes: delta,
-            })
-        })
-        .collect::<Vec<_>>();
+    let hops = hop_health_deltas(&now, &previous);
 
     (!hops.is_empty()).then_some(LinkHealthRequest {
         checked_at_unix_secs: at as i64,
         window_secs,
         hops,
     })
+}
+
+/// Fold Xray's per-outbound counters into the control plane's per-chain/per-peer identity.
+///
+/// Listener references keep their target listener in the outbound tag, so two rules on one
+/// source chain may legitimately produce two counters for the same peer machine. Sending both
+/// rows would collide with the store's `(chain, peer)` key; keeping only one would make liveness
+/// depend on tag ordering. Sum their deltas and report one physical link instead.
+pub(crate) fn hop_health_deltas(
+    now: &BTreeMap<String, u64>,
+    previous: &BTreeMap<String, u64>,
+) -> Vec<LinkHealth> {
+    let mut totals = BTreeMap::<(String, String), u64>::new();
+    for (tag, value) in now {
+        let Some((chain_id, peer)) = hop_of_tag(tag) else {
+            continue;
+        };
+        let before = previous.get(tag).copied().unwrap_or(0);
+        // A drop means xray restarted and the counter reset; this round has no trustworthy delta,
+        // so treat that outbound as no data while retaining any sibling outbound's valid delta.
+        let delta = value.saturating_sub(before);
+        *totals
+            .entry((chain_id.to_owned(), peer.to_owned()))
+            .or_default() += delta;
+    }
+    totals
+        .into_iter()
+        .map(|((chain_id, peer_node_id), downlink_bytes)| LinkHealth {
+            chain_id,
+            peer_node_id,
+            alive: downlink_bytes > 0,
+            downlink_bytes,
+        })
+        .collect()
 }
 
 pub(crate) fn fetch_probe_targets(options: &Options) -> Result<ProbeTargetList, String> {

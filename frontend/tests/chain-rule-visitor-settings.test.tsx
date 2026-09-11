@@ -76,7 +76,7 @@ describe('访客查看链路规则', () => {
     );
 
     expect(view.queryByText('forbidden')).toBeNull();
-    expect(view.getByText('entry')).toBeTruthy();
+    expect(view.getAllByText('entry').length).toBeGreaterThan(0);
     await waitFor(() => expect(fetcher).not.toHaveBeenCalled());
   });
 

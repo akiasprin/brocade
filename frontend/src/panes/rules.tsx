@@ -10,11 +10,12 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { HOP_WIRE_OPTIONS } from '../ui/format';
+import { HOP_WIRE_OPTIONS, hopWireLabel } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCompileView,
   DEFAULT_HOP_MUX,
+  chainMembers,
   fetchNodes,
   fetchRevisions,
   fetchSettings,
@@ -36,6 +37,8 @@ import {
   type HopInRequest,
   type HopMux,
   type HopPool,
+  type ListenerDial,
+  type ListenerRef,
   type SnapshotStep,
   type SnapshotApp,
   type Rule,
@@ -56,9 +59,13 @@ import {
 } from '../reality';
 import { navigate } from '../forge/route';
 
+type RelayRuleAction = Extract<RuleAction, { t: 'forward' | 'reuse_listener' }>;
+
+const isRelayAction = (a: RuleAction): a is RelayRuleAction => a.t === 'forward' || a.t === 'reuse_listener';
+
 const forwardDial = (a: RuleAction): HopDial => (a.t === 'forward' ? a.dial : { t: 'overlay' });
 
-const forwardPool = (a: RuleAction): HopPool => (a.t === 'forward' ? a.pool : { t: 'none' });
+const forwardPool = (a: RuleAction): HopPool => (isRelayAction(a) ? a.pool : { t: 'none' });
 
 export type PoolChoice = 'none' | 'mux';
 export const POOL_ORDER: PoolChoice[] = ['none', 'mux'];
@@ -73,8 +80,18 @@ export const POOL_DEFAULT: HopPool = { t: 'none' };
 /* 新建转发规则的动作，四个建链入口共用同一份。分散定义时增加一档默认值需要修改四处，
    遗漏的一处不会报错，只是行为与其他位置不同。
    反向档固定为 none：本机不发起可复用的出站连接。 */
-export const forwardAction = (to: string, dial: HopDial, pool: HopPool = POOL_DEFAULT): RuleAction =>
-  ({ t: 'forward', to, dial, pool: dial.t === 'reverse' ? POOL_DEFAULT : pool });
+export const forwardAction = (to: string, dial: HopDial, pool: HopPool = POOL_DEFAULT): RuleAction => ({
+  t: 'forward',
+  to,
+  dial,
+  pool: dial.t === 'reverse' ? POOL_DEFAULT : pool,
+});
+
+export const reuseListenerAction = (
+  listener: ListenerRef,
+  dial: ListenerDial,
+  pool: HopPool = POOL_DEFAULT,
+): RuleAction => ({ t: 'reuse_listener', listener, dial, pool });
 
 // Mux.cool 的 concurrency。1 表示每条连接同时承载一条流，仍可复用空闲连接；
 // 大于 1 时多条流共享连接。界面不再把这两种数值拆成不同连接类型。
@@ -411,7 +428,7 @@ const supportsEgressDns = (match: DestMatch): boolean =>
   match.t === 'domain_suffix' || match.t === 'domain_keyword' || match.t === 'domain_regex' || match.t === 'geosite';
 
 const ruleActionTone = (action: RuleAction['t']): 'forward' | 'egress' | 'block' =>
-  action === 'proxy' ? 'forward' : action;
+  action === 'proxy' || action === 'reuse_listener' ? 'forward' : action;
 
 const egressDnsSelectorKey = (match: DestMatch): string => {
   if (match.t === 'domain_suffix' || match.t === 'domain_keyword' || match.t === 'geosite') {
@@ -976,6 +993,36 @@ export function hopDialOf(kind: DialKind, peer: PublicAddrs | null, port: number
   return host ? { t: 'addr', v: formatHostPort(host, port) } : { t: 'addr', v: `:${port}` };
 }
 
+export type ListenerDialKind = Exclude<DialKind, 'reverse_v4' | 'reverse_v6'>;
+export const LISTENER_DIAL_ORDER: ListenerDialKind[] = ['public_ipv4', 'public_ipv6', 'overlay', 'custom'];
+
+/** Convert a transport choice into a durable listener dial without copying address or port. */
+export function listenerDialOf(kind: ListenerDialKind): ListenerDial {
+  if (kind === 'overlay') return { t: 'overlay' };
+  if (kind === 'public_ipv4' || kind === 'public_ipv6') {
+    // Availability is checked before this function is called. Keeping the family symbolic is the
+    // important part: a later node-address change updates this reference instead of stranding it.
+    return { t: 'public', v: kind === 'public_ipv6' ? 'v6' : 'v4' };
+  }
+  return { t: 'addr', v: '' };
+}
+
+export function listenerDialKindOf(dial: ListenerDial): ListenerDialKind {
+  if (dial.t === 'overlay') return 'overlay';
+  if (dial.t === 'public') return dial.v === 'v6' ? 'public_ipv6' : 'public_ipv4';
+  return 'custom';
+}
+
+const listenerHostOf = (dial: ListenerDial) => (dial.t === 'addr' ? dial.v : '');
+
+function defaultListenerDial(peer: PublicAddrs | null): ListenerDial {
+  const kind =
+    LISTENER_DIAL_ORDER.filter(candidate => candidate !== 'custom').find(
+      candidate => !dialUnavailable(candidate, peer, null),
+    ) ?? 'overlay';
+  return listenerDialOf(kind);
+}
+
 // 该档当前是否可选。公网两档判断对端是否有该族的非 NAT 地址（本机连接对端），
 // 反向两档判断本机是否有（对端连接本机）。overlay 和自定义始终可选。
 export function dialUnavailable(kind: DialKind, peer: PublicAddrs | null, self: PublicAddrs | null): boolean {
@@ -1029,6 +1076,160 @@ export interface ForwardPeer {
   step: SnapshotStep | null;
   where: 'next' | 'outside' | 'inside';
   blocked: string | null;
+}
+
+export interface ReusableListener {
+  ref: ListenerRef;
+  key: string;
+  nodeName: string;
+  ownerName: string;
+  step: SnapshotStep;
+  local: boolean;
+  references: number;
+  blocked: string | null;
+}
+
+export const listenerRefKey = (listener: ListenerRef): string => `${listener.chain}\u0000${listener.node}`;
+
+/** Resolve both the historical same-chain edge and an explicit listener reference to one key. */
+export const actionListenerRef = (action: RuleAction, sourceChain: string): ListenerRef | null =>
+  action.t === 'forward'
+    ? { chain: sourceChain, node: action.to }
+    : action.t === 'reuse_listener'
+      ? action.listener
+      : null;
+
+/**
+ * Existing listener ports visible to one rule table, including cycle and tenant-scope verdicts.
+ * Disabled choices stay in the result so the UI can explain why a known port cannot be selected.
+ */
+export function reusableListeners(args: {
+  app: SnapshotApp;
+  sourceChain: string;
+  sourceNode: string;
+  sourceRules: Rule[];
+  /** Unsaved sibling rule tables in the source chain, keyed by node. */
+  sourceDrafts?: Record<string, Rule[]>;
+  nodes: {
+    node_id: string;
+    name: string;
+    tenant_id: string;
+    retired_at: string | null;
+  }[];
+}): ReusableListener[] {
+  const { app, sourceChain, sourceNode, sourceRules, sourceDrafts, nodes } = args;
+  const source = { chain: sourceChain, node: sourceNode };
+  const sourceKey = listenerRefKey(source);
+  const nodeOf = new Map(nodes.map(node => [node.node_id, node]));
+  const chainOf = new Map(app.chains.map(chain => [chain.id, chain]));
+  const sourceTenant = chainOf.get(sourceChain)?.tenant ?? '';
+  const rulesOf = (step: SnapshotStep) =>
+    step.chain === sourceChain && step.node === sourceNode
+      ? sourceRules
+      : step.chain === sourceChain
+        ? (sourceDrafts?.[step.node] ?? step.rules)
+        : step.rules;
+
+  const graph = new Map<string, Set<string>>();
+  const stepOf = new Map(app.steps.map(step => [listenerRefKey({ chain: step.chain, node: step.node }), step]));
+  for (const step of app.steps) {
+    const from = listenerRefKey({ chain: step.chain, node: step.node });
+    for (const rule of rulesOf(step)) {
+      const target = actionListenerRef(rule.a, step.chain);
+      if (!target) continue;
+      const edges = graph.get(from) ?? new Set<string>();
+      edges.add(listenerRefKey(target));
+      graph.set(from, edges);
+    }
+  }
+  const subtreeIssue = (start: string): string | null => {
+    const seen = new Set<string>();
+    const stack = [start];
+    while (stack.length > 0) {
+      const at = stack.pop()!;
+      if (seen.has(at)) continue;
+      seen.add(at);
+      const step = stepOf.get(at);
+      if (!step) return '监听子树包含不存在的规则节点';
+      const member = nodeOf.get(step.node);
+      if (member?.retired_at) return `监听子树包含已退役机器 ${member.name || member.node_id}`;
+      for (const next of graph.get(at) ?? []) stack.push(next);
+    }
+    return null;
+  };
+  const reachesSource = (from: string): boolean => {
+    const seen = new Set<string>();
+    const stack = [from];
+    while (stack.length > 0) {
+      const at = stack.pop()!;
+      if (at === sourceKey) return true;
+      if (seen.has(at)) continue;
+      seen.add(at);
+      for (const next of graph.get(at) ?? []) stack.push(next);
+    }
+    return false;
+  };
+  const referenceCount = (wanted: ListenerRef) =>
+    app.steps.reduce(
+      (count, step) =>
+        count +
+        rulesOf(step).filter(rule => {
+          return (
+            rule.a.t === 'reuse_listener' &&
+            rule.a.listener.chain === wanted.chain &&
+            rule.a.listener.node === wanted.node
+          );
+        }).length,
+      0,
+    );
+
+  return app.steps
+    .filter((step): step is SnapshotStep & { hop_in: NonNullable<SnapshotStep['hop_in']>; accept: StepAccept } =>
+      Boolean(step.hop_in && step.accept),
+    )
+    .map(step => {
+      const ref = { chain: step.chain, node: step.node };
+      const key = listenerRefKey(ref);
+      const owner = chainOf.get(step.chain);
+      const node = nodeOf.get(step.node);
+      const ownerHasIngress = app.ingresses.some(ingress => ingress.chain === step.chain);
+      const ownerHasRetiredMember = owner
+        ? chainMembers(app, owner.id).some(member => Boolean(nodeOf.get(member)?.retired_at))
+        : false;
+      const blocked =
+        key === sourceKey
+          ? '当前规则表不能引用自身'
+          : node?.retired_at
+            ? '监听所在机器已退役'
+            : !owner
+              ? '监听所属线路不存在'
+              : !ownerHasIngress
+                ? '监听所属线路没有入口，当前不会运行'
+                : ownerHasRetiredMember
+                  ? '监听所属线路含已退役机器，当前不会运行'
+                  : sourceTenant && !under(sourceTenant, owner.tenant)
+                    ? '不在当前线路的可用范围内'
+                    : reachesSource(key)
+                      ? '引用后会形成环路'
+                      : subtreeIssue(key);
+      return {
+        ref,
+        key,
+        nodeName: node?.name || step.node,
+        ownerName: owner?.name || step.chain,
+        step,
+        local: step.node === sourceNode,
+        references: referenceCount(ref),
+        blocked,
+      };
+    })
+    .sort(
+      (left, right) =>
+        Number(right.local) - Number(left.local) ||
+        left.ownerName.localeCompare(right.ownerName, 'zh-CN') ||
+        left.nodeName.localeCompare(right.nodeName, 'zh-CN') ||
+        left.step.hop_in!.port - right.step.hop_in!.port,
+    );
 }
 
 // 租户可见性：节点的租户必须是链的租户的祖先（validate.rs 的 under / tenant.scope）。
@@ -1106,10 +1307,13 @@ export function orphansAfter(args: {
 // * 判定结论：候选为入口之外的可见机器，并按「当前下游 / 链内其他 / 链外」分组显示。
 export function forwardPeers(args: {
   nodeId: string;
+  sourceChain: string;
   spine: string[];
   tenant: string;
   /* 该链的全部 step。包括本机的那条——计算其他节点的上游时会跳过它。 */
   steps: SnapshotStep[];
+  app?: SnapshotApp | null;
+  drafts?: Record<string, Rule[]>;
   nodes: {
     node_id: string;
     name: string;
@@ -1121,9 +1325,10 @@ export function forwardPeers(args: {
     retired_at: string | null;
   }[];
 }): ForwardPeer[] {
-  const { nodeId, spine, tenant, steps, nodes } = args;
+  const { nodeId, sourceChain, spine, tenant, steps, app, drafts, nodes } = args;
   const root = spine[0] ?? null;
   const currentStep = steps.find(s => s.node === nodeId) ?? null;
+  const currentRules = drafts?.[nodeId] ?? currentStep?.rules ?? [];
   const currentTargets = new Set<string>();
 
   // 链内包含的机器：主干节点、已有 step 的节点，以及被其他规则指向的节点。
@@ -1138,7 +1343,7 @@ export function forwardPeers(args: {
   const addCurrentTarget = (to: string | undefined) => {
     if (to) currentTargets.add(to);
   };
-  for (const r of currentStep?.rules ?? []) if (r.a.t === 'forward') addCurrentTarget(r.a.to);
+  for (const r of currentRules) if (r.a.t === 'forward') addCurrentTarget(r.a.to);
 
   const graph = new Map<string, Set<string>>();
   const addEdge = (from: string, to: string) => {
@@ -1147,8 +1352,17 @@ export function forwardPeers(args: {
     graph.set(from, edges);
   };
 
-  for (const s of others) {
-    for (const r of s.rules) if (r.a.t === 'forward' && r.a.to) addEdge(s.node, r.a.to);
+  const allSteps = new Map<string, SnapshotStep>();
+  for (const step of app?.steps ?? steps) allSteps.set(listenerRefKey({ chain: step.chain, node: step.node }), step);
+  for (const step of steps) allSteps.set(listenerRefKey({ chain: sourceChain, node: step.node }), step);
+  const sourceKey = listenerRefKey({ chain: sourceChain, node: nodeId });
+  for (const [from, step] of allSteps) {
+    if (from === sourceKey) continue;
+    const rules = step.chain === sourceChain ? (drafts?.[step.node] ?? step.rules) : step.rules;
+    for (const rule of rules) {
+      const target = actionListenerRef(rule.a, step.chain);
+      if (target) addEdge(from, listenerRefKey(target));
+    }
   }
 
   const reaches = (from: string, target: string): boolean => {
@@ -1178,7 +1392,7 @@ export function forwardPeers(args: {
           ? '不在当前线路的可用范围内'
           : n.node_id === root
             ? '链入口'
-            : reaches(n.node_id, nodeId)
+            : reaches(listenerRefKey({ chain: sourceChain, node: n.node_id }), sourceKey)
               ? '会成环'
               : null;
       return {
@@ -1365,6 +1579,8 @@ type RuleEditorProps = {
     dnsOrder: EgressDnsOrderDraft;
     setDnsOrder: (next: EgressDnsOrderDraft) => void;
   };
+  /** All unsaved rule tables in this chain, used to reject cycles before the tree is saved. */
+  ruleDrafts?: Record<string, Rule[]>;
   // 是否参与 RuleDraftScope 的批量保存。同一台机器在树中出现多次、共用一份草稿时，
   // 只由其中一处注册——两处都注册会将同一内容写入两次。
   saves?: boolean;
@@ -1428,6 +1644,7 @@ function RuleEditorReady({
   fallback,
   onClose,
   shared,
+  ruleDrafts,
   saves = true,
   readOnly = false,
 }: RuleEditorProps) {
@@ -1439,11 +1656,7 @@ function RuleEditorReady({
     outbound => chainTenant === outbound.tenant || chainTenant.startsWith(`${outbound.tenant}.`),
   );
   const globalRelayMux = snapshot.data?.snapshot.settings?.relay_mux ?? DEFAULT_HOP_MUX;
-  const [muxEditor, setMuxEditor] = useState<{
-    to: string;
-    followGlobal: boolean;
-    value: HopMux;
-  } | null>(null);
+  const [muxEditor, setMuxEditor] = useState<MuxEditorState | null>(null);
   const [targetPickerRule, setTargetPickerRule] = useState<number | null>(null);
   const [targetQuery, setTargetQuery] = useState('');
   const targetPickerRoot = useRef<HTMLSpanElement>(null);
@@ -1507,12 +1720,14 @@ function RuleEditorReady({
       window.visualViewport?.removeEventListener('resize', place);
       window.visualViewport?.removeEventListener('scroll', place);
     };
-  }, [targetPickerRule, targetQuery, externalOutbounds.length, peers.length]);
+  }, [targetPickerRule, targetQuery, externalOutbounds.length, peers.length, app?.steps.length]);
   // 两份草稿（规则表、各转发目标的中转端口）默认由本组件持有；`shared` 非空时交由上层持有，
   // 因为同一台机器在树中出现两次时，两处编辑的必须是同一份——它们对应库中的同一条记录
   // （steps 主键为 chain_id + node_id）。
   const ownRules = useState<Rule[]>(() => pinTerminalRules(initial));
   const [rules, setRules] = shared ? [shared.rules, shared.setRules] : ownRules;
+  const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const selfNode = nodeList.data?.nodes.find(n => n.node_id === nodeId);
   // Only local overrides live in the editor. The query remains the canonical baseline and is
   // replaced by the server-side draft preview after saving, so two chain pages never maintain
   // copied policy state of their own.
@@ -1565,6 +1780,18 @@ function RuleEditorReady({
     setDnsOrder(next);
   };
   const peerOf = (id: string) => peers.find(p => p.id === id) ?? null;
+  const listeners = app
+    ? reusableListeners({
+        app,
+        sourceChain: chainId,
+        sourceNode: nodeId,
+        sourceRules: rules,
+        sourceDrafts: ruleDrafts,
+        nodes: nodeList.data?.nodes ?? [],
+      })
+    : [];
+  const listenerOf = (listener: ListenerRef) =>
+    listeners.find(candidate => candidate.key === listenerRefKey(listener)) ?? null;
 
   // 下拉框按关系对可选目标分组；不可选的同样保留在列表中并说明原因，直接隐藏时
   // 该机器会从列表中消失，需要到其他位置查找。
@@ -1579,6 +1806,16 @@ function RuleEditorReady({
   const visibleInsidePeers = insidePeers.filter(peer => targetMatches(peer.id, peer.name));
   const visibleForkPeers = forkPeers.filter(peer => targetMatches(peer.id, peer.name));
   const visibleBlockedPeers = blockedPeers.filter(peer => targetMatches(peer.id, peer.name, peer.blocked));
+  const visibleListeners = listeners.filter(listener =>
+    targetMatches(
+      listener.ref.chain,
+      listener.ref.node,
+      listener.nodeName,
+      listener.ownerName,
+      String(listener.step.hop_in?.port ?? ''),
+      listener.blocked,
+    ),
+  );
   const visibleExternalOutbounds = externalOutbounds.filter(outbound =>
     targetMatches(outbound.id, outbound.name, outbound.address, externalProtocolLabel(outbound.protocol.t)),
   );
@@ -1594,6 +1831,13 @@ function RuleEditorReady({
     rules.some(r => r.a.t === 'forward' && r.a.to === to && forwardDial(r.a).t === 'reverse'),
   );
   const normalTargets = forwardTargets.filter(to => !reverseTargets.includes(to));
+  const referencedTargets = [
+    ...new Map(
+      rules.flatMap(rule =>
+        rule.a.t === 'reuse_listener' ? [[listenerRefKey(rule.a.listener), rule.a.listener] as const] : [],
+      ),
+    ).values(),
+  ];
 
   // 每个目标对应一份中转端口表单状态。初始值取自对端 step 上已有的配置。
   // 将 `seedHops` 提取并导出，是因为同一台机器可能在树中出现两次（分叉后汇合），
@@ -1604,8 +1848,6 @@ function RuleEditorReady({
   // 反向两档显示的是本机的对外地址（由编译器推导，此处只是同步显示）。
   // 查询键与其他位置一致，通常命中缓存。标记为 NAT 的不计入——该类地址无法接受反向接入，
   // 编译器的 `dialable_public_host` 判定相同，两处判定需保持一致。
-  const selfNodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
-  const selfNode = selfNodes.data?.nodes.find(n => n.node_id === nodeId);
   /* 本机的公网地址，反向两档判断对端能否连接本机时需要它。 */
   const selfAddrs = selfNode
     ? {
@@ -1862,6 +2104,31 @@ function RuleEditorReady({
     );
   };
 
+  const sameListener = (left: ListenerRef, right: ListenerRef) =>
+    left.chain === right.chain && left.node === right.node;
+  const referencePoolOf = (listener: ListenerRef): HopPool => {
+    const rule = rules.find(r => r.a.t === 'reuse_listener' && sameListener(r.a.listener, listener));
+    return rule ? forwardPool(rule.a) : { t: 'none' };
+  };
+  const setPoolForListener = (listener: ListenerRef, pool: HopPool) => {
+    setRules(
+      rules.map(rule =>
+        rule.a.t === 'reuse_listener' && sameListener(rule.a.listener, listener)
+          ? { ...rule, a: { ...rule.a, pool } }
+          : rule,
+      ),
+    );
+  };
+  const setDialForListener = (listener: ListenerRef, dial: ListenerDial, primaryIndex: number) => {
+    setRules(
+      rules.map((rule, index) =>
+        index === primaryIndex || (rule.a.t === 'reuse_listener' && sameListener(rule.a.listener, listener))
+          ? { ...rule, a: reuseListenerAction(listener, dial, forwardPool(rule.a)) }
+          : rule,
+      ),
+    );
+  };
+
   /* 判定实现在模块层的 `hopDialOf` 中，与建链向导共用同一份。 */
   const dialOf = (to: string, kind: DialKind): HopDial =>
     hopDialOf(kind, peerOf(to), Number(hopOf(to).port) || hopBase);
@@ -1869,6 +2136,14 @@ function RuleEditorReady({
   /* 判定实现在模块层的 `defaultHopDial` 中，与建链向导共用同一份。 */
   const defaultDial = (to: string): HopDial =>
     defaultHopDial({ peer: peerOf(to), self: selfAddrs, port: Number(hopOf(to).port) || hopBase });
+  const publicAddrsFor = (targetNode: string): PublicAddrs | null =>
+    peerOf(targetNode) ?? nodeList.data?.nodes.find(node => node.node_id === targetNode) ?? null;
+  const dialOfListener = (_listener: ListenerRef, kind: ListenerDialKind): ListenerDial => listenerDialOf(kind);
+  const defaultDialForListener = (listener: ListenerRef): ListenerDial => {
+    const target = listenerOf(listener);
+    if (target?.local) return { t: 'overlay' };
+    return defaultListenerDial(publicAddrsFor(listener.node));
+  };
 
   const defaultRuleAction = (): RuleAction =>
     defaultTarget ? forwardAction(defaultTarget, defaultDial(defaultTarget)) : { t: 'egress', send_through: null };
@@ -1880,6 +2155,10 @@ function RuleEditorReady({
     setDialForTarget(to, dial, i);
   };
 
+  const setReferenceDial = (i: number, listener: ListenerRef, kind: ListenerDialKind) => {
+    setDialForListener(listener, dialOfListener(listener, kind), i);
+  };
+
   const selectForwardTarget = (ruleIndex: number, rule: Rule, nextTo: string) => {
     const sameTarget = rules.find(
       (candidate, index) => index !== ruleIndex && candidate.a.t === 'forward' && candidate.a.to === nextTo,
@@ -1887,6 +2166,19 @@ function RuleEditorReady({
     let nextDial: HopDial = defaultDial(nextTo);
     if (sameTarget?.a.t === 'forward') nextDial = sameTarget.a.dial ?? { t: 'overlay' };
     patch(ruleIndex, { ...rule, a: forwardAction(nextTo, nextDial, poolOf(nextTo)) });
+    setTargetPickerRule(null);
+  };
+
+  const selectListenerTarget = (ruleIndex: number, rule: Rule, listener: ReusableListener) => {
+    const sameTarget = rules.find(
+      (candidate, index) =>
+        index !== ruleIndex && candidate.a.t === 'reuse_listener' && sameListener(candidate.a.listener, listener.ref),
+    );
+    const dial = sameTarget?.a.t === 'reuse_listener' ? sameTarget.a.dial : defaultDialForListener(listener.ref);
+    patch(ruleIndex, {
+      ...rule,
+      a: reuseListenerAction(listener.ref, dial, referencePoolOf(listener.ref)),
+    });
     setTargetPickerRule(null);
   };
 
@@ -1958,19 +2250,30 @@ function RuleEditorReady({
           <tbody>
             {rules.map((r, i) => {
               const kind = MATCH_KINDS.find(k => k.t === r.m.t);
-              const to = r.a.t === 'forward' ? r.a.to : '';
+              const to = r.a.t === 'forward' ? r.a.to : r.a.t === 'reuse_listener' ? r.a.listener.node : '';
+              const referenced = r.a.t === 'reuse_listener' ? listenerOf(r.a.listener) : null;
               const externalId = r.a.t === 'proxy' ? r.a.outbound : '';
               const dial = forwardDial(r.a);
               const peer = peerOf(to);
-              const dk = dialKindOf(dial, peer);
+              const targetAddrs = r.a.t === 'reuse_listener' ? publicAddrsFor(to) : peer;
+              const dk = r.a.t === 'reuse_listener' ? listenerDialKindOf(r.a.dial) : dialKindOf(dial, targetAddrs);
+              const customHost = r.a.t === 'reuse_listener' ? listenerHostOf(r.a.dial) : hostOf(dial);
               const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
               const targetBadge = external
                 ? externalProtocolBadge(external.protocol.t)
-                : r.a.t === 'forward'
-                  ? 'NODE'
-                  : '';
+                : r.a.t === 'reuse_listener'
+                  ? 'LISTENER'
+                  : r.a.t === 'forward'
+                    ? 'NODE'
+                    : '';
               const targetLabel =
-                external?.name || peer?.name || (r.a.t === 'proxy' ? '代理出站不可用' : to ? '内部节点不可用' : '');
+                external?.name ||
+                (r.a.t === 'reuse_listener'
+                  ? referenced
+                    ? `${referenced.nodeName} · TCP ${referenced.step.hop_in?.port}`
+                    : `${r.a.listener.chain}/${r.a.listener.node} · 引用不可用`
+                  : peer?.name) ||
+                (r.a.t === 'proxy' ? '代理出站不可用' : to ? '内部节点不可用' : '');
               return (
                 <Fragment key={i}>
                   <tr>
@@ -2013,9 +2316,9 @@ function RuleEditorReady({
                     <td className="rule-action-cell">
                       <select
                         className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)}`}
-                        value={r.a.t === 'proxy' ? 'forward' : r.a.t}
+                        value={r.a.t === 'proxy' || r.a.t === 'reuse_listener' ? 'forward' : r.a.t}
                         onChange={e => {
-                          const t = e.target.value as Exclude<RuleAction['t'], 'proxy'>;
+                          const t = e.target.value as 'forward' | 'egress' | 'block';
                           const a: RuleAction =
                             t === 'forward'
                               ? // dial 要显式写：不写的语义就是 overlay（模型里 HopDial
@@ -2036,14 +2339,17 @@ function RuleEditorReady({
                         <option value="egress">从本机出网</option>
                         <option value="block">拒绝</option>
                       </select>
-                      {(r.a.t === 'forward' || r.a.t === 'proxy') && (
+                      {(isRelayAction(r.a) || r.a.t === 'proxy') && (
                         <span
                           className="external-target-picker"
                           ref={targetPickerRule === i ? targetPickerRoot : undefined}
                         >
                           <button
                             type="button"
-                            className={`external-target-trigger${r.a.t === 'forward' ? ' node-target' : ''}`}
+                            className={`external-target-trigger${r.a.t === 'forward' ? ' node-target' : ''}${
+                              r.a.t === 'reuse_listener' ? ' listener-target' : ''
+                            }`}
+                            title={referenced?.blocked ?? undefined}
                             aria-expanded={targetPickerRule === i}
                             onClick={event => {
                               const opening = targetPickerRule !== i;
@@ -2068,6 +2374,13 @@ function RuleEditorReady({
                             <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
                             <span className="external-target-copy">
                               <b>{targetLabel || '选择内部节点或代理出站'}</b>
+                              {referenced && (
+                                <small>
+                                  {referenced.blocked
+                                    ? `不可发布 · ${referenced.blocked}`
+                                    : `引用子树 · ${referenced.ownerName} · ${referenced.references} 处使用`}
+                                </small>
+                              )}
                             </span>
                             <span className="external-target-chevron">⌄</span>
                           </button>
@@ -2079,12 +2392,40 @@ function RuleEditorReady({
                             >
                               <input
                                 className="f external-target-search"
-                                placeholder="搜索节点或代理出站"
+                                placeholder="搜索监听端口、节点或代理出站"
                                 value={targetQuery}
                                 onChange={event => setTargetQuery(event.target.value)}
                               />
-                              <span className="external-target-menu-label">Brocade 节点</span>
-                              {[...visibleNextPeers, ...visibleInsidePeers, ...visibleForkPeers].map(candidate => (
+                              <span className="external-target-menu-label">可复用的监听端口</span>
+                              {visibleListeners.map(candidate => (
+                                <button
+                                  type="button"
+                                  disabled={Boolean(candidate.blocked)}
+                                  title={candidate.blocked ?? '只保存引用；端口、安全参数和规则由源线路维护'}
+                                  className={
+                                    r.a.t === 'reuse_listener' && sameListener(r.a.listener, candidate.ref) ? 'on' : ''
+                                  }
+                                  key={`listener-${candidate.key}`}
+                                  onClick={() => selectListenerTarget(i, r, candidate)}
+                                >
+                                  <span className="external-target-kind listener">
+                                    {candidate.local ? '本机' : '监听'}
+                                  </span>
+                                  <span className="external-target-copy">
+                                    <b>
+                                      {candidate.nodeName} · TCP {candidate.step.hop_in?.port}
+                                    </b>
+                                    <small>
+                                      {candidate.ownerName} · {candidate.step.rules.length} 条规则
+                                    </small>
+                                  </span>
+                                  <span className="external-target-where">
+                                    {candidate.blocked ?? `${candidate.references} 处引用`}
+                                  </span>
+                                </button>
+                              ))}
+                              <span className="external-target-menu-label">本链已有监听节点</span>
+                              {[...visibleNextPeers, ...visibleInsidePeers].map(candidate => (
                                 <button
                                   type="button"
                                   className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
@@ -2104,6 +2445,26 @@ function RuleEditorReady({
                                   </span>
                                 </button>
                               ))}
+                              <span className="external-target-menu-label">在机器上新建本链监听</span>
+                              {visibleForkPeers.map(candidate => (
+                                <button
+                                  type="button"
+                                  className={r.a.t === 'forward' && r.a.to === candidate.id ? 'on' : ''}
+                                  key={`new-${candidate.id}`}
+                                  title="保存时在这台机器创建本链监听和一棵空规则子树"
+                                  onClick={() => selectForwardTarget(i, r, candidate.id)}
+                                >
+                                  <span className="external-target-kind new-listener">新建</span>
+                                  <span className="external-target-copy">
+                                    <b>{candidate.name || '未命名节点'}</b>
+                                    <small>新端口 · 空规则子树</small>
+                                  </span>
+                                  <span className="external-target-where">加入本链</span>
+                                </button>
+                              ))}
+                              {visibleBlockedPeers.length > 0 && (
+                                <span className="external-target-menu-label">不可用的机器</span>
+                              )}
                               {visibleBlockedPeers.map(candidate => (
                                 <button type="button" disabled key={candidate.id} title={candidate.blocked ?? ''}>
                                   <span className="external-target-kind">NODE</span>
@@ -2165,48 +2526,67 @@ function RuleEditorReady({
                                 visibleInsidePeers.length +
                                 visibleForkPeers.length +
                                 visibleBlockedPeers.length +
+                                visibleListeners.length +
                                 visibleExternalOutbounds.length ===
                                 0 && <span className="external-target-empty">没有匹配项</span>}
                             </span>
                           )}
                         </span>
                       )}
-                      {r.a.t === 'forward' && (
+                      {isRelayAction(r.a) && (
                         <>
-                          <select
-                            className="f"
-                            style={{ marginLeft: 6 }}
-                            value={dk}
-                            title="这一跳连接对端的哪个地址"
-                            onChange={e => setDial(i, to, e.target.value as DialKind)}
-                          >
-                            {/* 排列和可用性判定都在模块层（DIAL_ORDER / dialUnavailable），
-                            与默认档位的选择、建链向导的下拉框共用同一份。 */}
-                            {DIAL_ORDER.map(k => (
-                              <option key={k} value={k} disabled={dialUnavailable(k, peer, selfAddrs)}>
-                                {DIAL_LABEL[k]}
-                              </option>
-                            ))}
-                          </select>
+                          {r.a.t === 'reuse_listener' && referenced?.local ? (
+                            <span className="listener-local-route mono">
+                              本机内部 · 回环:{referenced.step.hop_in?.port}
+                            </span>
+                          ) : (
+                            <select
+                              className="f"
+                              style={{ marginLeft: 6 }}
+                              value={dk}
+                              title="这一跳连接目标监听的地址"
+                              onChange={e =>
+                                r.a.t === 'reuse_listener'
+                                  ? setReferenceDial(i, r.a.listener, e.target.value as ListenerDialKind)
+                                  : setDial(i, to, e.target.value as DialKind)
+                              }
+                            >
+                              {(r.a.t === 'reuse_listener' ? LISTENER_DIAL_ORDER : DIAL_ORDER).map(k => (
+                                <option
+                                  key={k}
+                                  value={k}
+                                  disabled={dialUnavailable(
+                                    k,
+                                    targetAddrs,
+                                    r.a.t === 'reuse_listener' ? null : selfAddrs,
+                                  )}
+                                >
+                                  {DIAL_LABEL[k]}
+                                </option>
+                              ))}
+                            </select>
+                          )}
                           {/* 前三档的地址由推导得出，只读；仅自定义档需要手动填写 */}
-                          {dk === 'overlay' ? (
+                          {r.a.t === 'reuse_listener' && referenced?.local ? null : dk === 'overlay' ? (
                             // 与公网两档一样直接显示地址。显示为「XX 的 overlay 地址」会要求
                             // 到其他位置查询该值——而它就在编译结果中，可直接获取。
                             // 获取失败只有一种情况：该机器尚未加入 overlay，这正是需要说明的内容。
                             <span className="mono dim" style={{ marginLeft: 6 }}>
                               {overlayOf(to) || (
-                                <span style={{ color: 'var(--gold)' }}>{peer?.name || to} 不在 overlay 里</span>
+                                <span style={{ color: 'var(--gold)' }}>
+                                  {referenced?.nodeName || peer?.name || to} 不在 overlay 里
+                                </span>
                               )}
                             </span>
                           ) : dk === 'public_ipv4' ? (
                             <span className="mono dim" style={{ marginLeft: 6 }}>
-                              {publicIpv4Of(peer) || (
+                              {publicIpv4Of(targetAddrs) || (
                                 <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv4</span>
                               )}
                             </span>
                           ) : dk === 'public_ipv6' ? (
                             <span className="mono dim" style={{ marginLeft: 6 }}>
-                              {publicIpv6Of(peer) || (
+                              {publicIpv6Of(targetAddrs) || (
                                 <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv6</span>
                               )}
                             </span>
@@ -2227,21 +2607,19 @@ function RuleEditorReady({
                                 className="f mono"
                                 style={{ marginLeft: 6, width: 150 }}
                                 placeholder="10.0.0.9 / 2001:db8::9"
-                                value={hostOf(dial)}
-                                onChange={e =>
-                                  setDialForTarget(
-                                    to,
-                                    {
-                                      t: 'addr',
-                                      v: formatHostPort(e.target.value, Number(hopOf(to).port) || hopBase),
-                                    },
-                                    i,
-                                  )
-                                }
+                                value={customHost}
+                                onChange={e => {
+                                  if (r.a.t === 'reuse_listener') {
+                                    setDialForListener(r.a.listener, { t: 'addr', v: e.target.value }, i);
+                                  } else {
+                                    const port = Number(hopOf(to).port) || hopBase;
+                                    setDialForTarget(to, { t: 'addr', v: formatHostPort(e.target.value, port) }, i);
+                                  }
+                                }}
                               />
-                              {natPublicHostOf(peer, hostOf(dial)) && (
+                              {natPublicHostOf(targetAddrs, customHost) && (
                                 <span className="sub" style={{ color: 'var(--gold)' }}>
-                                  该地址为 {natPublicHostOf(peer, hostOf(dial))} 且标记为经 NAT，编译会拒绝。
+                                  该地址为 {natPublicHostOf(targetAddrs, customHost)} 且标记为经 NAT，编译会拒绝。
                                 </span>
                               )}
                             </>
@@ -2372,15 +2750,22 @@ function RuleEditorReady({
               visibleFallbackRules.map((r, fallbackIndex) => {
                 const kind = MATCH_KINDS.find(candidate => candidate.t === r.m.t);
                 const value = matchValues(r.m);
-                const to = r.a.t === 'forward' ? r.a.to : '';
+                const to = r.a.t === 'forward' ? r.a.to : r.a.t === 'reuse_listener' ? r.a.listener.node : '';
+                const referenced = r.a.t === 'reuse_listener' ? listenerOf(r.a.listener) : null;
                 const externalId = r.a.t === 'proxy' ? r.a.outbound : '';
                 const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
                 const peer = peerOf(to);
-                const targetBadge = external ? externalProtocolBadge(external.protocol.t) : 'NODE';
+                const targetBadge = external
+                  ? externalProtocolBadge(external.protocol.t)
+                  : r.a.t === 'reuse_listener'
+                    ? 'LISTENER'
+                    : 'NODE';
                 const targetLabel =
-                  external?.name || peer?.name || (r.a.t === 'proxy' ? '代理出站不可用' : to || '内部节点不可用');
+                  external?.name ||
+                  (referenced ? `${referenced.nodeName} · TCP ${referenced.step.hop_in?.port}` : peer?.name) ||
+                  (r.a.t === 'proxy' ? '代理出站不可用' : to || '内部节点不可用');
                 const actionLabel =
-                  r.a.t === 'forward' || r.a.t === 'proxy' ? '转发给' : r.a.t === 'egress' ? '从本机出网' : '拒绝';
+                  isRelayAction(r.a) || r.a.t === 'proxy' ? '转发给' : r.a.t === 'egress' ? '从本机出网' : '拒绝';
                 return (
                   <tr
                     className="rule-fallback-row"
@@ -2401,7 +2786,7 @@ function RuleEditorReady({
                       >
                         {actionLabel}
                       </span>
-                      {(r.a.t === 'forward' || r.a.t === 'proxy') && (
+                      {(isRelayAction(r.a) || r.a.t === 'proxy') && (
                         <span className="external-target-picker">
                           <span className="external-target-trigger rule-readonly-target">
                             <span className={`external-target-kind${external ? ' external' : ''}`}>{targetBadge}</span>
@@ -2481,6 +2866,113 @@ function RuleEditorReady({
             </section>
           );
         })}
+
+        {referencedTargets.length > 0 && (
+          <div className="panel listener-reference-panel" style={{ marginTop: 10 }}>
+            <header>
+              <PanelTitle of="chains">引用监听</PanelTitle>
+              <span className="hint">这里只配置本机到目标的承载；端口、安全参数和下游规则均由源监听维护</span>
+            </header>
+            <div className="listener-reference-list">
+              {referencedTargets.map(listener => {
+                const target = listenerOf(listener);
+                const pool = referencePoolOf(listener);
+                const key = listenerRefKey(listener);
+                const referenceRule = rules.find(
+                  (rule): rule is Rule & { a: Extract<RuleAction, { t: 'reuse_listener' }> } =>
+                    rule.a.t === 'reuse_listener' && sameListener(rule.a.listener, listener),
+                );
+                if (!target) {
+                  return (
+                    <div className="listener-reference-row missing" key={key}>
+                      <div>
+                        <b className="mono">
+                          {listener.chain}/{listener.node}
+                        </b>
+                        <small>源监听不存在或当前不可见，编译会阻止发布</small>
+                      </div>
+                    </div>
+                  );
+                }
+                const openMux = () =>
+                  setMuxEditor({
+                    to: key,
+                    listener,
+                    targetName: `${target.nodeName} · TCP ${target.step.hop_in?.port}`,
+                    followGlobal: pool.t === 'mux' && !pool.v,
+                    value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
+                  });
+                return (
+                  <div className={`listener-reference-row${target.blocked ? ' blocked' : ''}`} key={key}>
+                    <div className="listener-reference-main">
+                      <span className="external-target-kind listener">{target.local ? '本机' : '引用'}</span>
+                      <span>
+                        <b>
+                          {target.nodeName} · TCP {target.step.hop_in?.port}
+                        </b>
+                        <small>
+                          {target.blocked
+                            ? `不可发布 · ${target.blocked}`
+                            : `子树归属「${target.ownerName}」 · ${target.step.rules.length} 条规则 · 当前 ${target.references} 处引用`}
+                        </small>
+                      </span>
+                      <button
+                        type="button"
+                        className="btn sm"
+                        disabled={dirty}
+                        title={dirty ? '先保存当前规则，避免离开时丢失未写入草稿的修改' : '打开拥有这棵子树的线路'}
+                        onClick={() => navigate('chains', { p: 'chain', app: appId, chain: listener.chain })}
+                      >
+                        打开源规则
+                      </button>
+                    </div>
+                    <div className="listener-reference-facts">
+                      <span>
+                        <small>安全</small>
+                        <b>{hopWireLabel(target.step.hop_in?.security.t ?? 'none')}</b>
+                      </span>
+                      <span>
+                        <small>连接</small>
+                        <b>
+                          {target.local
+                            ? '本机回环'
+                            : DIAL_LABEL[listenerDialKindOf(referenceRule?.a.dial ?? { t: 'overlay' })]}
+                        </b>
+                      </span>
+                      <label>
+                        <small>出站连接</small>
+                        <select
+                          className="f"
+                          value={poolChoice(pool)}
+                          onChange={event =>
+                            setPoolForListener(listener, event.target.value === 'mux' ? { t: 'mux' } : { t: 'none' })
+                          }
+                        >
+                          {POOL_ORDER.map(choice => (
+                            <option key={choice} value={choice}>
+                              {POOL_LABEL[choice]}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      {pool.t === 'mux' && (
+                        <button type="button" className="btn sm" onClick={openMux}>
+                          {readOnly ? '查看参数' : '配置参数'}
+                        </button>
+                      )}
+                    </div>
+                    <p>
+                      {target.local
+                        ? '同一 Agent 内经回环进入这个监听，不创建机器间链路。'
+                        : `保存的是 ${listener.chain}/${listener.node} 的引用，不复制目标配置。`}
+                      源监听改动会同时影响所有引用位置。
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* 该跳在对端一侧的配置：使用哪个端口、如何加密。
           配置在此处而非对端页面，因为它属于该跳的组成部分。中转端口关联在
@@ -2668,8 +3160,7 @@ function RuleEditorReady({
                                   setMuxEditor({
                                     to,
                                     followGlobal: pool.t === 'mux' && !pool.v,
-                                    value:
-                                      pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                    value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   })
                                 }
                                 onKeyDown={event => {
@@ -2678,8 +3169,7 @@ function RuleEditorReady({
                                   setMuxEditor({
                                     to,
                                     followGlobal: pool.t === 'mux' && !pool.v,
-                                    value:
-                                      pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                    value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   });
                                 }}
                               >
@@ -2693,8 +3183,7 @@ function RuleEditorReady({
                                   setMuxEditor({
                                     to,
                                     followGlobal: pool.t === 'mux' && !pool.v,
-                                    value:
-                                      pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
+                                    value: pool.t === 'mux' && pool.v ? { ...pool.v } : { ...globalRelayMux },
                                   })
                                 }
                               >
@@ -2759,17 +3248,18 @@ function RuleEditorReady({
       </fieldset>
       {muxEditor && (
         <MuxConfigDrawer
-          targetName={peerOf(muxEditor.to)?.name || muxEditor.to}
+          targetName={muxEditor.targetName || peerOf(muxEditor.to)?.name || muxEditor.to}
           globalValue={globalRelayMux}
           state={muxEditor}
           readOnly={readOnly}
           onChange={setMuxEditor}
           onClose={() => setMuxEditor(null)}
           onApply={() => {
-            setPoolForTarget(
-              muxEditor.to,
-              muxEditor.followGlobal ? { t: 'mux' } : { t: 'mux', v: { ...muxEditor.value } },
-            );
+            const pool = muxEditor.followGlobal
+              ? { t: 'mux' as const }
+              : { t: 'mux' as const, v: { ...muxEditor.value } };
+            if (muxEditor.listener) setPoolForListener(muxEditor.listener, pool);
+            else setPoolForTarget(muxEditor.to, pool);
             setMuxEditor(null);
           }}
         />
@@ -2778,7 +3268,13 @@ function RuleEditorReady({
   );
 }
 
-type MuxEditorState = { to: string; followGlobal: boolean; value: HopMux };
+type MuxEditorState = {
+  to: string;
+  listener?: ListenerRef;
+  targetName?: string;
+  followGlobal: boolean;
+  value: HopMux;
+};
 
 function MuxConfigDrawer({
   targetName,
@@ -2887,8 +3383,8 @@ function MuxConfigDrawer({
             的槽位。可用槽位用尽后允许突发扩容，超额 Worker 空闲后回收。
           </p>
           <p className="note">
-            预热只在复用阈值内尽力补足空闲连接，不保证业务繁忙时仍有空闲。健康探测会保留预热目标内
-            的空闲 Worker；寿命只回收超出预热目标的空闲容量。
+            预热只在复用阈值内尽力补足空闲连接，不保证业务繁忙时仍有空闲。健康探测会保留预热目标内 的空闲
+            Worker；寿命只回收超出预热目标的空闲容量。
           </p>
           <p className="note">
             探活或收尾中的 Worker 不承接新流；End 写入使用独立 10 秒宽限，超时后只转为排空，

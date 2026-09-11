@@ -53,6 +53,13 @@ pub struct PlannedTarget {
     pub status: PlannedTargetStatus,
     pub wave: u32,
     pub disruptive: bool,
+    /// Machines whose Xray change must converge before this target's Xray change.
+    ///
+    /// Listener references use this for two safe transitions: create/update the owned listener
+    /// before a caller starts dialing it, and remove the caller before the last owned listener is
+    /// closed. It is planning metadata only; the persisted wave remains the execution contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prerequisites: Vec<String>,
     pub actions: Vec<PlannedAction>,
     pub desired: NodeDesiredState,
 }
@@ -364,6 +371,8 @@ pub fn narrow_to_kind(mut plan: DeploymentPlan, kind: DeploymentKind) -> Deploym
         DeploymentKind::Grants => {
             plan.targets.retain(can_sync_grants_now);
             for target in &mut plan.targets {
+                target.prerequisites.clear();
+                target.wave = 0;
                 target.desired.phantun = untouched("权限单不碰 phantun");
                 target.desired.hy2_port_hop = untouched("权限单不碰端口跳转");
                 target.desired.wireguard = untouched("权限单不碰 wireguard");
@@ -374,7 +383,9 @@ pub fn narrow_to_kind(mut plan: DeploymentPlan, kind: DeploymentKind) -> Deploym
             }
         }
     }
-    assign_waves(&mut plan.targets);
+    if kind == DeploymentKind::Config {
+        assign_waves(&mut plan.targets);
+    }
     plan.summary = summarize_targets(&plan.targets);
     plan
 }
@@ -502,6 +513,7 @@ pub fn plan_deployment(
     plan.targets.retain(|target| {
         !retired.contains(target.node_id.as_str()) || target.status == PlannedTargetStatus::Pending
     });
+    assign_listener_reference_prerequisites(&mut plan.targets, applied);
     assign_waves(&mut plan.targets);
     plan.summary = summarize_targets(&plan.targets);
     Ok(plan)
@@ -567,12 +579,14 @@ pub fn plan_forced_deployment(
                 status,
                 wave: 0,
                 disruptive,
+                prerequisites: Vec::new(),
                 actions,
                 desired,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
     targets.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    assign_listener_reference_prerequisites(&mut targets, applied);
     assign_waves(&mut targets);
     let summary = summarize_targets(&targets);
 
@@ -613,6 +627,7 @@ pub fn plan_desired_deployment(
                 status,
                 wave: 0,
                 disruptive,
+                prerequisites: Vec::new(),
                 actions,
                 desired,
             }
@@ -1087,7 +1102,166 @@ fn was_ours_and_running(applied: Option<&AppliedArtifactState>) -> bool {
     )
 }
 
+/// Add cross-machine ordering constraints for listener-reference transitions.
+///
+/// A current reference means target before source. A reference visible in the proven running
+/// Xray but absent from the desired model means source before target, so the old caller stops
+/// dialing before the listener may close. Constraints are needed only when both Xray artifacts
+/// actually change; an unchanged prerequisite is already converged.
+fn assign_listener_reference_prerequisites(
+    targets: &mut [PlannedTarget],
+    applied: &[NodeAppliedState],
+) {
+    for target in targets.iter_mut() {
+        target.prerequisites.clear();
+    }
+    let changing_xray = targets
+        .iter()
+        .filter(|target| {
+            target.status == PlannedTargetStatus::Pending
+                && target.actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlannedAction::ApplyXray | PlannedAction::DisableXray
+                    )
+                })
+        })
+        .map(|target| target.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    // Keep the complete logical edge identity and the generated outbound. Collapsing this to
+    // `(source machine, target machine)` loses a removal when two listener ports on the same peer
+    // are referenced and only one is released. Read the desired Xray rather than raw authored
+    // rules: a rule can remain stored after its source becomes unreachable or its chain is retired,
+    // while compilation correctly removes the outbound. Treating that stale row as current would
+    // hide a real removal and could close the listener before the old caller stops dialing it.
+    let current = targets
+        .iter()
+        .flat_map(desired_listener_reference_pairs)
+        .collect::<BTreeMap<_, _>>();
+    let running = applied
+        .iter()
+        .flat_map(running_listener_reference_pairs)
+        .collect::<BTreeMap<_, _>>();
+
+    let removed = running
+        .keys()
+        .filter(|identity| !current.contains_key(*identity))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let added = current
+        .keys()
+        .filter(|identity| !running.contains_key(*identity))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut requires = BTreeSet::<(String, String)>::new();
+    // A new caller waits for an owner that also changes. If the owner is unchanged, the listener
+    // is already converged and no extra wave is needed.
+    for (_, source, _, target) in added {
+        if changing_xray.contains(&source) && changing_xray.contains(&target) {
+            requires.insert((source, target));
+        }
+    }
+    // A listener owner being removed waits for every proven old caller to stop using it.
+    for (_, source, _, target) in removed {
+        if changing_xray.contains(&source) && changing_xray.contains(&target) {
+            requires.insert((target, source));
+        }
+    }
+    // A stable identity whose generated outbound changed is an endpoint transition (port,
+    // address, credential, wire, or pool). Neither serial order is gap-free: caller-first dials
+    // the new endpoint too early, owner-first closes the old endpoint too early. Keep both edges;
+    // wave assignment recognizes the physical SCC and ships the pair together. A stable,
+    // byte-identical outbound needs no ordering merely because both machines have unrelated Xray
+    // edits — the listener is already live.
+    for (identity @ (_, source, _, target), desired_outbound) in &current {
+        let Some(running_outbound) = running.get(identity) else {
+            continue;
+        };
+        if desired_outbound == running_outbound
+            || !changing_xray.contains(source)
+            || !changing_xray.contains(target)
+        {
+            continue;
+        }
+        requires.insert((source.clone(), target.clone()));
+        requires.insert((target.clone(), source.clone()));
+    }
+
+    let index = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.node_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    for (dependent, prerequisite) in requires {
+        let Some(dependent) = index.get(&dependent).copied() else {
+            continue;
+        };
+        targets[dependent].prerequisites.push(prerequisite);
+    }
+    for target in targets.iter_mut() {
+        target.prerequisites.sort();
+        target.prerequisites.dedup();
+    }
+}
+
+/// Read the cross-machine listener references from a proven running Xray configuration.
+///
+/// The target listener appears between `~` and `>` in the outbound tag. Its machine is the part
+/// after `>`; `@local` never crosses a machine and therefore creates no release dependency.
+fn running_listener_reference_pairs(
+    state: &NodeAppliedState,
+) -> Vec<((String, String, String, String), String)> {
+    let Some(running) = state.running_xray.as_deref() else {
+        return Vec::new();
+    };
+    listener_reference_pairs(running, &state.node_id)
+}
+
+fn desired_listener_reference_pairs(
+    target: &PlannedTarget,
+) -> Vec<((String, String, String, String), String)> {
+    let DesiredArtifact::Present { content, .. } = &target.desired.xray else {
+        return Vec::new();
+    };
+    listener_reference_pairs(content, &target.node_id)
+}
+
+fn listener_reference_pairs(
+    xray: &str,
+    source_node: &str,
+) -> Vec<((String, String, String, String), String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(xray) else {
+        return Vec::new();
+    };
+    let Some(outbounds) = value.get("outbounds").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    outbounds
+        .iter()
+        .filter_map(|outbound| {
+            let tag = outbound.get("tag").and_then(serde_json::Value::as_str)?;
+            let (source_route, peer) = tag.strip_prefix("out:")?.split_once('>')?;
+            let (source_route, listener) = source_route.split_once('~')?;
+            (!listener.ends_with("@local") && !peer.is_empty()).then(|| {
+                (
+                    (
+                        source_route.to_owned(),
+                        source_node.to_owned(),
+                        listener.to_owned(),
+                        peer.to_owned(),
+                    ),
+                    outbound.to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn assign_waves(targets: &mut [PlannedTarget]) {
+    for target in targets.iter_mut() {
+        target.wave = 0;
+    }
     let xray_apply_targets = targets
         .iter()
         .enumerate()
@@ -1096,22 +1270,12 @@ fn assign_waves(targets: &mut [PlannedTarget]) {
                 && !target.actions.contains(&PlannedAction::DisableXray))
             .then_some(index)
         })
-        .collect::<Vec<_>>();
-
-    if let Some((canary, rest)) = xray_apply_targets.split_first() {
-        targets[*canary].wave = 1;
-        for index in rest {
-            targets[*index].wave = 2;
-        }
-    }
-
-    let high_risk_start_wave = match xray_apply_targets.len() {
-        0 => 1,
-        1 => 2,
-        _ => 3,
-    };
-    // Only a disable that really drops something claims an exclusive wave; disabling a service
-    // that never ran travels in an ordinary one (see `is_disruptive`).
+        .collect::<BTreeSet<_>>();
+    // A real disable owns a wave too. It participates in this same dependency graph because
+    // removing a listener reference can require a caller's DisableXray to finish before the
+    // owner's ApplyXray/DisableXray. Keeping disables in a separate tail would invert that edge.
+    // An idempotent disable against Unknown stays in wave zero, as before: it cannot be the
+    // source of a proven running reference.
     let high_risk_targets = targets
         .iter()
         .enumerate()
@@ -1121,11 +1285,133 @@ fn assign_waves(targets: &mut [PlannedTarget]) {
                     || target.actions.contains(&PlannedAction::DisableXray)))
             .then_some(index)
         })
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let ordered_targets = xray_apply_targets
+        .union(&high_risk_targets)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let by_node = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.node_id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let incoming = ordered_targets
+        .iter()
+        .map(|index| {
+            let prerequisites = targets[*index]
+                .prerequisites
+                .iter()
+                .filter_map(|node| by_node.get(node.as_str()).copied())
+                .filter(|prerequisite| ordered_targets.contains(prerequisite))
+                .collect::<BTreeSet<_>>();
+            (*index, prerequisites)
+        })
+        .collect::<BTreeMap<_, _>>();
 
-    for (offset, index) in high_risk_targets.into_iter().enumerate() {
-        targets[index].wave = high_risk_start_wave + offset as u32;
+    let mut remaining = ordered_targets;
+    let mut wave = 1;
+    let mut canary = true;
+    while !remaining.is_empty() {
+        let ready = remaining
+            .iter()
+            .copied()
+            .filter(|index| {
+                incoming[index]
+                    .iter()
+                    .all(|prerequisite| !remaining.contains(prerequisite))
+            })
+            .collect::<Vec<_>>();
+        let selected = if !ready.is_empty() {
+            let regular = ready
+                .iter()
+                .copied()
+                .filter(|index| !high_risk_targets.contains(index))
+                .collect::<Vec<_>>();
+            if !regular.is_empty() {
+                if canary {
+                    vec![regular[0]]
+                } else {
+                    regular
+                }
+            } else {
+                // A disruptive disable remains exclusive whenever the dependency graph permits
+                // it. There is no benefit to batching independent destructive changes.
+                vec![ready[0]]
+            }
+        } else {
+            // Physical machines can form a dependency SCC even while rule tables remain acyclic
+            // (two unrelated trees may reuse listeners in opposite directions). No serial order
+            // can satisfy that SCC, so deploy one source component together, then continue with
+            // the downstream components instead of letting wave assignment loop forever.
+            source_dependency_component(&remaining, &incoming)
+        };
+        if selected
+            .iter()
+            .any(|index| xray_apply_targets.contains(index))
+        {
+            canary = false;
+        }
+        for index in selected {
+            targets[index].wave = wave;
+            remaining.remove(&index);
+        }
+        wave += 1;
     }
+}
+
+/// One source strongly-connected component in the still-unassigned dependency graph.
+fn source_dependency_component(
+    remaining: &BTreeSet<usize>,
+    incoming: &BTreeMap<usize, BTreeSet<usize>>,
+) -> Vec<usize> {
+    let outgoing = remaining
+        .iter()
+        .map(|index| (*index, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = outgoing;
+    for (node, prerequisites) in incoming {
+        if !remaining.contains(node) {
+            continue;
+        }
+        for prerequisite in prerequisites {
+            if remaining.contains(prerequisite) {
+                outgoing.entry(*prerequisite).or_default().insert(*node);
+            }
+        }
+    }
+    let reaches = |start: usize, wanted: usize| {
+        let mut seen = BTreeSet::new();
+        let mut queue = vec![start];
+        while let Some(at) = queue.pop() {
+            if at == wanted {
+                return true;
+            }
+            if !seen.insert(at) {
+                continue;
+            }
+            queue.extend(outgoing.get(&at).into_iter().flatten().copied());
+        }
+        false
+    };
+
+    for candidate in remaining {
+        let component = remaining
+            .iter()
+            .copied()
+            .filter(|other| reaches(*candidate, *other) && reaches(*other, *candidate))
+            .collect::<BTreeSet<_>>();
+        let has_external_prerequisite = component.iter().any(|node| {
+            incoming[node].iter().any(|prerequisite| {
+                remaining.contains(prerequisite) && !component.contains(prerequisite)
+            })
+        });
+        if !has_external_prerequisite {
+            return component.into_iter().collect();
+        }
+    }
+    // Every finite graph has a source SCC. Keep a defensive escape hatch for malformed planning
+    // metadata rather than hanging release creation.
+    remaining.iter().next().copied().into_iter().collect()
 }
 
 /// Counts the plan's targets the way every reader of a plan needs them counted.

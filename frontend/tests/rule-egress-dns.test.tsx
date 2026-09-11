@@ -639,7 +639,7 @@ describe('machine-scoped egress DNS', () => {
     trigger.focus();
     fireEvent.click(trigger);
     expect(document.activeElement).toBe(trigger);
-    expect(view.getByPlaceholderText('搜索节点或代理出站').hasAttribute('autofocus')).toBe(false);
+    expect(view.getByPlaceholderText('搜索监听端口、节点或代理出站').hasAttribute('autofocus')).toBe(false);
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
   });
 

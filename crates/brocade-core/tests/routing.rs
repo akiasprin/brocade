@@ -550,6 +550,9 @@ fn match_summary(dest_match: &IrMatch) -> String {
 fn action_summary(action: &Action) -> String {
     match action {
         Action::Forward { to, .. } => format!("forward:{to}"),
+        Action::ReuseListener { listener, .. } => {
+            format!("reuse-listener:{}/{}", listener.chain, listener.node)
+        }
         Action::Egress { .. } => "egress".to_owned(),
         Action::Proxy { outbound } => format!("proxy:{outbound}"),
         Action::Block => "block".to_owned(),

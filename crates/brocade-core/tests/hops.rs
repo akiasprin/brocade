@@ -1,15 +1,17 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use brocade_core::{
     ir::{
         hops::{compile_hops, HopDialWire, HopPath},
         routing::compile_app,
         system::compile_system,
+        validate::validate_app,
     },
     model::{
         Accept, Action, AppView, Chain, DestMatch, DisabledWireGuardLink, Dns, DomainStrategy,
         HopDial, HopEncryption, HopIn, HopPool, HopWire, Ingress, IngressWires, IpFamily,
-        ModelSnapshot, Node, Reality, Rule, Step, Transport, User, WireGuardKeys,
+        ListenerDial, ListenerRef, ModelSnapshot, Node, Reality, Rule, Step, Transport, User,
+        WireGuardKeys,
     },
     Level,
 };
@@ -113,6 +115,364 @@ fn compile_hops_lets_each_chain_have_its_own_inbound_on_the_same_relay() {
 
     // The material differs — precisely what relay ports on the node cannot do.
     assert_ne!(lan.security, wan.security);
+}
+
+#[test]
+fn compile_hops_enters_a_listener_owned_by_another_chain() {
+    let doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("jp", [10, 66, 0, 2], true),
+        node("sg", [10, 66, 0, 3], true),
+    ]);
+    let app = app_two_chains(vec![
+        step("lan", "hk", vec![reuse_listener("wan", "sg")], None),
+        step("wan", "jp", vec![any_egress()], None),
+        step_hop(
+            "wan",
+            "sg",
+            vec![any_egress()],
+            Some(accept("uuid-shared", "wan@sg")),
+            22001,
+            HopWire::None,
+        ),
+    ]);
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+    let app_ir = compile_hops(app_ir, &sys, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert!(
+        diagnostics.iter().all(|item| item.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let hop = app_ir.hops.iter().find(|hop| hop.chain == "lan").unwrap();
+    assert_eq!(hop.target_chain, "wan");
+    assert_eq!(hop.to, "sg");
+    assert_eq!(hop.address, "10.66.0.3");
+    assert_eq!(hop.port, 22001);
+    assert_eq!(hop.path, HopPath::Overlay);
+    assert_eq!(hop.credential.uuid, "uuid-shared");
+
+    let source = brocade_core::physical::node::project_node(&sys, &[app_ir], "hk")
+        .xray
+        .unwrap();
+    assert_eq!(source.forward_outbounds.len(), 1);
+    assert_eq!(source.forward_outbounds[0].tag, "out:app/lan~wan>sg");
+}
+
+#[test]
+fn listener_reference_public_dial_follows_the_owner_address_and_port() {
+    let doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("jp", [10, 66, 0, 2], true),
+        node("sg", [10, 66, 0, 3], true),
+    ]);
+    let app = app_two_chains(vec![
+        step(
+            "lan",
+            "hk",
+            vec![reuse_listener_dial(
+                "wan",
+                "sg",
+                ListenerDial::Public(IpFamily::V4),
+            )],
+            None,
+        ),
+        step("wan", "jp", vec![any_egress()], None),
+        step_hop(
+            "wan",
+            "sg",
+            vec![any_egress()],
+            Some(accept("uuid-public", "wan@sg")),
+            23117,
+            HopWire::None,
+        ),
+    ]);
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let hop = app_ir.hops.iter().find(|hop| hop.chain == "lan").unwrap();
+    assert_eq!(hop.address, "sg.example.net");
+    assert_eq!(hop.port, 23117);
+    assert_eq!(hop.path, HopPath::Direct);
+}
+
+#[test]
+fn listener_reference_custom_dial_accepts_only_a_host_and_uses_the_owner_port() {
+    let doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("jp", [10, 66, 0, 2], true),
+        node("sg", [10, 66, 0, 3], true),
+    ]);
+    let app = app_two_chains(vec![
+        step(
+            "lan",
+            "hk",
+            vec![reuse_listener_dial(
+                "wan",
+                "sg",
+                ListenerDial::Addr("10.0.0.9".to_owned()),
+            )],
+            None,
+        ),
+        step("wan", "jp", vec![any_egress()], None),
+        step_hop(
+            "wan",
+            "sg",
+            vec![any_egress()],
+            Some(accept("uuid-custom", "wan@sg")),
+            23118,
+            HopWire::None,
+        ),
+    ]);
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let hop = app_ir.hops.iter().find(|hop| hop.chain == "lan").unwrap();
+    assert_eq!(hop.address, "10.0.0.9");
+    assert_eq!(hop.port, 23118);
+
+    let malformed = app_two_chains(vec![
+        step(
+            "lan",
+            "hk",
+            vec![reuse_listener_dial(
+                "wan",
+                "sg",
+                ListenerDial::Addr("10.0.0.9:8443".to_owned()),
+            )],
+            None,
+        ),
+        step("wan", "jp", vec![any_egress()], None),
+        step_hop(
+            "wan",
+            "sg",
+            vec![any_egress()],
+            Some(accept("uuid-custom", "wan@sg")),
+            23118,
+            HopWire::None,
+        ),
+    ]);
+    let mut malformed_diagnostics = Vec::new();
+    let malformed_ir = compile_hops(
+        compile_app(&doc, &malformed, &mut malformed_diagnostics),
+        &sys,
+        &mut malformed_diagnostics,
+    );
+    assert!(malformed_ir.hops.iter().all(|hop| hop.chain != "lan"));
+    assert!(malformed_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "listener.dial-malformed"));
+}
+
+#[test]
+fn listener_reference_reports_a_missing_owner_key_precisely() {
+    let doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("jp", [10, 66, 0, 2], true),
+    ]);
+    let app = app_two_chains(vec![
+        step(
+            "lan",
+            "hk",
+            vec![reuse_listener("missing-chain", "jp")],
+            None,
+        ),
+        step("wan", "jp", vec![any_egress()], None),
+    ]);
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+
+    assert!(app_ir.hops.is_empty());
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "listener.not-found" && diagnostic.location == "missing-chain/jp"
+    }));
+}
+
+#[test]
+fn same_machine_listener_reference_uses_loopback_and_keeps_the_owner_rules() {
+    let doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true),
+        node("jp", [10, 66, 0, 2], true),
+    ]);
+    let app = app_two_chains(vec![
+        step("lan", "hk", vec![reuse_listener("wan", "hk")], None),
+        step("wan", "jp", vec![any_egress()], None),
+        step_hop(
+            "wan",
+            "hk",
+            vec![any_egress()],
+            Some(accept("uuid-local", "wan@hk")),
+            22002,
+            HopWire::None,
+        ),
+    ]);
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+    let app_ir = compile_hops(app_ir, &sys, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert!(
+        diagnostics.iter().all(|item| item.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let local = app_ir.hops.iter().find(|hop| hop.chain == "lan").unwrap();
+    assert_eq!(local.target_chain, "wan");
+    assert_eq!(local.address, "127.0.0.1");
+    assert_eq!(local.port, 22002);
+    assert_eq!(local.path, HopPath::Local);
+
+    let xray = brocade_core::physical::node::project_node(&sys, &[app_ir], "hk")
+        .xray
+        .unwrap();
+    let inbound = xray
+        .hop_inbounds
+        .iter()
+        .find(|inbound| inbound.chain == "wan")
+        .unwrap();
+    assert_eq!(inbound.listen, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(inbound.port, 22002);
+    assert_eq!(xray.forward_outbounds.len(), 1);
+    assert_eq!(xray.forward_outbounds[0].tag, "out:app/lan~wan@local>hk");
+    assert!(xray.routing_rules.iter().any(|rule| {
+        matches!(
+            &rule.selector,
+            brocade_core::physical::node::XrayRuleSelector::Users(users)
+                if users == &["wan@hk".to_owned()]
+        ) && rule.outbound_tag.starts_with("out:egress")
+    }));
+}
+
+#[test]
+fn a_locally_reused_overlay_listener_keeps_exact_bind_addresses() {
+    let doc = doc(vec![
+        node("jp", [10, 66, 0, 2], true),
+        node("sg", [10, 66, 0, 3], true),
+    ]);
+    let mut app = app_two_chains(vec![
+        step("lan", "sg", vec![reuse_listener("wan", "sg")], None),
+        step("wan", "jp", vec![forward("sg")], None),
+        step_hop(
+            "wan",
+            "sg",
+            vec![any_egress()],
+            Some(accept("uuid-both", "wan@sg")),
+            22003,
+            HopWire::None,
+        ),
+    ]);
+    app.ingresses[0].node = "sg".to_owned();
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+    let app_ir = compile_hops(app_ir, &sys, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert!(
+        diagnostics.iter().all(|item| item.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let xray = brocade_core::physical::node::project_node(&sys, &[app_ir], "sg")
+        .xray
+        .unwrap();
+    let listeners = xray
+        .hop_inbounds
+        .iter()
+        .filter(|inbound| inbound.chain == "wan")
+        .map(|inbound| (inbound.tag.as_str(), inbound.listen))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listeners,
+        vec![
+            ("in:hop:app/wan", "10.66.0.3".parse().unwrap()),
+            ("in:hop:app/wan:local", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ]
+    );
+    assert!(
+        listeners
+            .iter()
+            .all(|(_, listen)| *listen != IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        "本机引用不能把 overlay 专用端口扩大到所有网卡"
+    );
+}
+
+#[test]
+fn a_local_reference_uses_ipv6_loopback_when_the_listener_has_a_public_ipv6_arrival() {
+    let mut doc = doc(vec![
+        node("jp", [10, 66, 0, 2], true),
+        node("sg", [10, 66, 0, 3], true),
+    ]);
+    doc.nodes
+        .iter_mut()
+        .find(|node| node.id == "sg")
+        .unwrap()
+        .public_ipv6 = Some("2001:db8::3".to_owned());
+    let mut app = app_two_chains(vec![
+        step("lan", "sg", vec![reuse_listener("wan", "sg")], None),
+        step(
+            "wan",
+            "jp",
+            vec![forward_addr("sg", "[2001:db8::3]:22004")],
+            None,
+        ),
+        step_hop(
+            "wan",
+            "sg",
+            vec![any_egress()],
+            Some(accept("uuid-v6-local", "wan@sg")),
+            22004,
+            HopWire::None,
+        ),
+    ]);
+    app.ingresses[0].node = "sg".to_owned();
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert!(
+        diagnostics.iter().all(|item| item.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let local = app_ir
+        .hops
+        .iter()
+        .find(|hop| hop.chain == "lan" && hop.path == HopPath::Local)
+        .unwrap();
+    assert_eq!(local.address, Ipv6Addr::LOCALHOST.to_string());
+    let xray = brocade_core::physical::node::project_node(&sys, &[app_ir], "sg")
+        .xray
+        .unwrap();
+    let listeners = xray
+        .hop_inbounds
+        .iter()
+        .filter(|inbound| inbound.chain == "wan")
+        .collect::<Vec<_>>();
+    assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0].listen, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
 }
 
 #[test]
@@ -728,6 +1088,14 @@ fn compile_hops_reverse_keeps_the_edge_but_dials_the_upstream() {
     // clients and recognizes that reverse connection
     assert_eq!(hop.credential.uuid, "uuid-sg");
     assert_eq!(hop.credential.label, "c@sg");
+    let upstream = brocade_core::physical::node::project_node(&sys, &[rir], "hk")
+        .xray
+        .unwrap();
+    assert_eq!(
+        upstream.hop_inbounds[0].listen,
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        "反向下游从公网接入，不能把上游端口只绑在 overlay"
+    );
 }
 
 // The family is chosen explicitly with no fallback to the other. `node()` in these tests
@@ -924,7 +1292,7 @@ fn ingress(id: &str, node: &str) -> Ingress {
         identity: brocade_core::model::IngressIdentity {
             private_key: format!("priv-{id}"),
             public_key: format!("pub-{id}"),
-            short_ids: vec![format!("sid-{id}")],
+            short_ids: vec!["0123abcd".to_owned()],
         },
         anytls_identity: None,
         wires: IngressWires::Vless(Transport::VlessReality(
@@ -972,6 +1340,24 @@ fn forward_dial(to: &str, dial: HopDial) -> Rule {
         dest_match: DestMatch::Any,
         action: Action::Forward {
             to: to.to_owned(),
+            dial,
+            pool: HopPool::None,
+        },
+    }
+}
+
+fn reuse_listener(chain: &str, node: &str) -> Rule {
+    reuse_listener_dial(chain, node, ListenerDial::Overlay)
+}
+
+fn reuse_listener_dial(chain: &str, node: &str, dial: ListenerDial) -> Rule {
+    Rule {
+        dest_match: DestMatch::Any,
+        action: Action::ReuseListener {
+            listener: ListenerRef {
+                chain: chain.to_owned(),
+                node: node.to_owned(),
+            },
             dial,
             pool: HopPool::None,
         },

@@ -3386,8 +3386,9 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
                 .uri("/users/platform.acme/alice/grant-probes")
                 .header("cookie", &cookie)
                 .header("content-type", "application/json")
-                // An invalid frozen id stops before any network activity if the local probe
-                // runtime is available; without Xray the capability gate returns unavailable.
+                // An invalid frozen id stops before any network activity if a Serving plan is
+                // available. Without Xray the capability gate returns unavailable; an unsettled
+                // publication is rejected by the earlier publication gate.
                 .body(Body::from(
                     json!({ "item_ids": ["not-in-plan"] }).to_string(),
                 ))
@@ -3395,12 +3396,13 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
         )
         .await
         .unwrap();
+    let own_probe_status = own_probe.status();
     assert!(
         matches!(
-            own_probe.status(),
-            StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE
+            own_probe_status,
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
         ),
-        "the user's own probe must pass authorization without starting network work"
+        "the user's own probe must pass authorization without starting network work; got {own_probe_status}"
     );
     let another_users_probe = app
         .clone()

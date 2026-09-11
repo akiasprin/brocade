@@ -4232,7 +4232,8 @@ function chainUseOf(args: {
   if (hostsIngress || spineIndex === 0) roles.push('入口节点');
   else if (spineIndex > 0 && spineIndex === spine.length - 1) roles.push('出口节点');
   else if (spineIndex > 0) roles.push('中转节点');
-  if (ownStep && downstreams.size > 0 && spineIndex < 0) roles.push('中转节点');
+  if (ownStep && (downstreams.size > 0 || ownStep.rules.some(rule => rule.a.t === 'reuse_listener')) && spineIndex < 0)
+    roles.push('中转节点');
   if (ownStep && roles.length === 0) roles.push('规则节点');
 
   return {

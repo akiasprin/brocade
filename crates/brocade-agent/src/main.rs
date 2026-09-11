@@ -3867,18 +3867,52 @@ mod tests {
                 "outbound>>>out:relay/c-relay>sg-01>>>traffic>>>downlink",
                 900,
             ),
+            stat(
+                "outbound>>>out:relay/c-source~c-owner>jp-01>>>traffic>>>downlink",
+                450,
+            ),
+            // Same-process listener references have an outbound counter, but they are not a
+            // machine link. Reporting this would be rejected as a self peer by the store.
+            stat(
+                "outbound>>>out:relay/c-source~c-owner@local>hk-01>>>traffic>>>downlink",
+                300,
+            ),
             stat("outbound>>>out:relay/c-relay>sg-01>>>traffic>>>uplink", 120),
             stat("outbound>>>out:egress>>>traffic>>>downlink", 999_999),
             stat("outbound>>>out:block>>>traffic>>>downlink", 0),
         ]);
         assert_eq!(
             parsed.keys().collect::<Vec<_>>(),
-            ["out:relay/c-relay>sg-01"]
+            [
+                "out:relay/c-relay>sg-01",
+                "out:relay/c-source~c-owner>jp-01"
+            ]
         );
         assert_eq!(
             parsed["out:relay/c-relay>sg-01"], 900,
             "只取 downlink，不要 uplink"
         );
+        assert_eq!(parsed["out:relay/c-source~c-owner>jp-01"], 450);
+    }
+
+    #[test]
+    fn listener_outbound_counters_to_the_same_peer_are_aggregated() {
+        let previous = BTreeMap::from([
+            ("out:relay/c-source~c-owner-a>jp-01".to_owned(), 100),
+            ("out:relay/c-source~c-owner-b>jp-01".to_owned(), 200),
+        ]);
+        let now = BTreeMap::from([
+            ("out:relay/c-source~c-owner-a>jp-01".to_owned(), 150),
+            ("out:relay/c-source~c-owner-b>jp-01".to_owned(), 270),
+        ]);
+
+        let hops = crate::probe::hop_health_deltas(&now, &previous);
+
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].chain_id, "relay/c-source");
+        assert_eq!(hops[0].peer_node_id, "jp-01");
+        assert_eq!(hops[0].downlink_bytes, 120);
+        assert!(hops[0].alive);
     }
 
     /// The suggestion is the path MTU minus wg's encapsulation overhead, and the

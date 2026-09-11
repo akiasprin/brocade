@@ -408,3 +408,33 @@ fn hop_dial_wire_format_is_stable() {
         );
     }
 }
+
+/// Listener references deliberately have a smaller dialing model: neither a copied port nor
+/// reverse establishment is valid. Pin its public-address family and custom-host wire shapes.
+#[test]
+fn listener_dial_wire_format_is_stable() {
+    use brocade_core::model::{IpFamily, ListenerDial};
+    let cases = [
+        (ListenerDial::Overlay, r#"{"t":"overlay"}"#),
+        (
+            ListenerDial::Public(IpFamily::V4),
+            r#"{"t":"public","v":"v4"}"#,
+        ),
+        (
+            ListenerDial::Public(IpFamily::V6),
+            r#"{"t":"public","v":"v6"}"#,
+        ),
+        (
+            ListenerDial::Addr("relay.internal".to_owned()),
+            r#"{"t":"addr","v":"relay.internal"}"#,
+        ),
+    ];
+    for (value, wire) in cases {
+        assert_eq!(serde_json::to_string(&value).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_str::<ListenerDial>(wire).unwrap(),
+            value,
+            "{wire}"
+        );
+    }
+}

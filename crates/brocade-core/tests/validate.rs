@@ -14,10 +14,11 @@ use brocade_core::{
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
         ExternalWarpBinding, Front, FrontStrategy, Grant, HopDial, HopIn, HopMux, HopPool, HopWire,
         Hysteria2, HysteriaBandwidth, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, Ingress,
-        IngressWires, IpFamily, ModelSettings, ModelSnapshot, Node, NodeEgressDnsPolicy,
-        OverlaySettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
-        RealityClientPolicy, RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls,
-        Transport, User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
+        IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSettings, ModelSnapshot, Node,
+        NodeEgressDnsPolicy, OverlaySettings, Projection, ProjectionDownloadEndpoint,
+        ProjectionEndpoint, Reality, RealityClientPolicy, RealityFallbackMode, RealitySite,
+        RealityXhttp, Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp, XhttpDownload,
+        XhttpMode, XhttpXmux,
     },
     Diagnostic, Level,
 };
@@ -32,6 +33,23 @@ fn egress_rejects_unknown_fields() {
         "resolution": { "address": "192.0.2.53", "port": 53 }
     }));
     assert!(result.is_err());
+}
+
+#[test]
+fn listener_reference_has_an_explicit_owner_key_on_the_wire() {
+    let value = serde_json::json!({
+        "t": "reuse_listener",
+        "listener": { "chain": "owner", "node": "sg" },
+        "dial": { "t": "overlay" },
+        "pool": { "t": "none" }
+    });
+    let action = serde_json::from_value::<Action>(value.clone()).unwrap();
+    assert!(matches!(
+        &action,
+        Action::ReuseListener { listener, .. }
+            if listener.chain == "owner" && listener.node == "sg"
+    ));
+    assert_eq!(serde_json::to_value(action).unwrap(), value);
 }
 
 #[test]
@@ -3496,6 +3514,139 @@ fn validate_reality_split_requires_a_certificate_and_a_distinct_port() {
     assert_has(&diagnostics, Level::Error, "node.port-clash");
 }
 
+#[test]
+fn a_referenced_detached_listener_is_a_valid_second_root_of_its_owner_chain() {
+    let mut snapshot = doc(vec![
+        node(
+            "source",
+            "platform.acme",
+            Some("source.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "owner-root",
+            "platform.acme",
+            Some("owner.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+        node(
+            "shared",
+            "platform.acme",
+            Some("shared.example.net"),
+            [10, 66, 0, 3],
+            true,
+        ),
+    ]);
+    snapshot.apps = vec![AppView {
+        id: "app".to_owned(),
+        label: "App".to_owned(),
+        chains: vec![chain("source-chain"), chain("owner-chain")],
+        ingresses: vec![
+            ingress("source-in", "source-chain", "source", None),
+            ingress("owner-in", "owner-chain", "owner-root", None),
+        ],
+        fronts: Vec::new(),
+        steps: vec![
+            step(
+                "source-chain",
+                "source",
+                vec![reuse_listener("owner-chain", "shared")],
+                None,
+            ),
+            step("owner-chain", "owner-root", vec![any_egress()], None),
+            step(
+                "owner-chain",
+                "shared",
+                vec![any_egress()],
+                Some(Accept {
+                    uuid: "uuid-shared".to_owned(),
+                    label: "owner-chain@shared".to_owned(),
+                }),
+            ),
+        ],
+        grants: Vec::new(),
+    }];
+
+    let output = compile(&snapshot);
+    assert!(output.can_publish(), "{:#?}", output.diagnostics);
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "chain.unreachable"),
+        "引用入口不能被当作链内孤儿：{:#?}",
+        output.diagnostics
+    );
+}
+
+#[test]
+fn listener_references_cannot_form_a_cross_chain_cycle() {
+    let mut snapshot = doc(vec![
+        node(
+            "a",
+            "platform.acme",
+            Some("a.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "b",
+            "platform.acme",
+            Some("b.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    snapshot.apps = vec![AppView {
+        id: "app".to_owned(),
+        label: "App".to_owned(),
+        chains: vec![chain("a-chain"), chain("b-chain")],
+        ingresses: vec![
+            ingress("a-in", "a-chain", "a", None),
+            ingress("b-in", "b-chain", "b", None),
+        ],
+        fronts: Vec::new(),
+        steps: vec![
+            step(
+                "a-chain",
+                "a",
+                vec![reuse_listener("b-chain", "b")],
+                Some(Accept {
+                    uuid: "uuid-a".to_owned(),
+                    label: "a-chain@a".to_owned(),
+                }),
+            ),
+            step(
+                "b-chain",
+                "b",
+                vec![reuse_listener("a-chain", "a")],
+                Some(Accept {
+                    uuid: "uuid-b".to_owned(),
+                    label: "b-chain@b".to_owned(),
+                }),
+            ),
+        ],
+        grants: Vec::new(),
+    }];
+
+    let output = compile(&snapshot);
+    assert_has(&output.diagnostics, Level::Error, "listener.cycle");
+    assert!(!output.can_publish());
+}
+
+#[test]
+fn a_listener_reference_cannot_represent_reverse_dialing() {
+    let result = serde_json::from_value::<Action>(serde_json::json!({
+        "t": "reuse_listener",
+        "listener": { "chain": "b-chain", "node": "b" },
+        "dial": { "t": "reverse", "v": "v4" },
+        "pool": { "t": "none" }
+    }));
+    assert!(result.is_err());
+}
+
 fn assert_has(diagnostics: &[Diagnostic], level: Level, code: &'static str) {
     assert!(
         diagnostics
@@ -3648,6 +3799,20 @@ fn forward(to: &str) -> Rule {
         action: Action::Forward {
             to: to.to_owned(),
             dial: HopDial::Overlay,
+            pool: HopPool::None,
+        },
+    }
+}
+
+fn reuse_listener(chain: &str, node: &str) -> Rule {
+    Rule {
+        dest_match: DestMatch::Any,
+        action: Action::ReuseListener {
+            listener: ListenerRef {
+                chain: chain.to_owned(),
+                node: node.to_owned(),
+            },
+            dial: ListenerDial::Overlay,
             pool: HopPool::None,
         },
     }

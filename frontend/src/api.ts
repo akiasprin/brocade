@@ -560,6 +560,8 @@ export interface PlannedTarget {
   status: 'pending' | 'deferred' | 'skipped';
   wave: number;
   disruptive: boolean;
+  /** Machines whose listener-reference transition must converge before this change. */
+  prerequisites?: string[];
   actions: PlannedAction[];
 }
 export interface DeploymentPlan {
@@ -1349,6 +1351,11 @@ export type HopDial =
   // 地址族需要显式指定：两个族的可达性相互独立，不做自动选择。
   | { t: 'reverse'; v: 'v4' | 'v6' };
 
+// 引用监听只描述如何到达拥有者机器；端口始终取被引用 Step 的 hop_in.port。
+// 公网档保存地址族而非当前 IP，因此节点换地址后不会把旧 IP 悄悄变成自定义地址。
+// 自定义档也只保存主机，不允许携带端口；反向接入无法进入目标监听，类型上不提供。
+export type ListenerDial = { t: 'overlay' } | { t: 'public'; v: 'v4' | 'v6' } | { t: 'addr'; v: string };
+
 // 该跳发起的连接的使用方式。
 //
 // 只对本机发起的跳有效。reverse 是对端连接本机，本机没有可复用的出站连接——该档位
@@ -1422,9 +1429,21 @@ export function hopMuxError(value: HopMux): string | null {
 
 export type RuleAction =
   | { t: 'forward'; to: string; dial: HopDial; pool: HopPool }
+  | {
+      t: 'reuse_listener';
+      listener: ListenerRef;
+      dial: ListenerDial;
+      pool: HopPool;
+    }
   | { t: 'egress'; send_through?: string | null }
   | { t: 'proxy'; outbound: string }
   | { t: 'block' };
+
+/** A relay listener's durable owner key. Port and wire stay on the referenced SnapshotStep. */
+export interface ListenerRef {
+  chain: string;
+  node: string;
+}
 
 export interface EgressDnsResolution {
   address: string;

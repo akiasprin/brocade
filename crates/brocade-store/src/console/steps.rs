@@ -168,6 +168,30 @@ pub(crate) async fn delete_whole_chain_tx(
     let chain_tenant = chain_tenant_tx(tx, app_id, chain_id).await?;
     actor.require_tenant_access(&chain_tenant, "chain")?;
 
+    let references = listener_references_tx(tx).await?;
+    let external = references
+        .iter()
+        .filter(|reference| {
+            reference.target_chain == chain_id && reference.source_chain != chain_id
+        })
+        .collect::<Vec<_>>();
+    if !external.is_empty() {
+        return Err(StoreError::Conflict(format!(
+            "链 {chain_id} 仍拥有被其它线路引用的监听：{}；请先移除这些引用",
+            external
+                .iter()
+                .map(|reference| format!(
+                    "{}/{} → {}/{}",
+                    reference.source_chain,
+                    reference.source_node,
+                    reference.target_chain,
+                    reference.target_node
+                ))
+                .collect::<Vec<_>>()
+                .join("、")
+        )));
+    }
+
     // Record the chain's member list first — after the CASCADE it cannot be queried.
     let removed_steps = sqlx::query("SELECT node_id FROM steps WHERE chain_id = $1")
         .bind(chain_id)
@@ -222,6 +246,31 @@ pub(crate) async fn delete_subtree_tx(
 
     // (1) The deleted node and its subtree (everything reachable along Forwards).
     let subtree = forward_subtree(&steps, node_id);
+    let references = listener_references_tx(tx).await?;
+    let external = references
+        .iter()
+        .filter(|reference| {
+            reference.target_chain == chain_id
+                && subtree.contains(&reference.target_node)
+                && !(reference.source_chain == chain_id && subtree.contains(&reference.source_node))
+        })
+        .collect::<Vec<_>>();
+    if !external.is_empty() {
+        return Err(StoreError::Conflict(format!(
+            "监听子树 {chain_id}/{node_id} 仍被引用：{}；请先移除这些引用",
+            external
+                .iter()
+                .map(|reference| format!(
+                    "{}/{} → {}/{}",
+                    reference.source_chain,
+                    reference.source_node,
+                    reference.target_chain,
+                    reference.target_node
+                ))
+                .collect::<Vec<_>>()
+                .join("、")
+        )));
+    }
     outcome.removed_steps.extend(subtree.iter().cloned());
     for member in &subtree {
         let affected = sqlx::query("DELETE FROM steps WHERE chain_id = $1 AND node_id = $2")
@@ -321,7 +370,17 @@ pub(crate) async fn prune_unreachable_tx(
         steps.push((node, rules));
     }
 
-    let reachable = forward_subtree(&steps, &head);
+    let mut reachable = forward_subtree(&steps, &head);
+    // A listener reference is a second root of the owner chain's rule forest. Its source may live
+    // on another chain, so chain-local indegree cannot see it. Preserve both the referenced Step
+    // and everything it reaches through ordinary owned Forward edges.
+    for reference in listener_references_tx(tx)
+        .await?
+        .into_iter()
+        .filter(|reference| reference.target_chain == chain_id)
+    {
+        reachable.extend(forward_subtree(&steps, &reference.target_node));
+    }
     let mut removed = Vec::new();
     for (node, _) in &steps {
         if reachable.contains(node) {
@@ -434,6 +493,14 @@ async fn clear_unused_hop_ins_tx(
     }
 
     let listeners = hop_listener_nodes(&steps);
+    let mut listeners = listeners;
+    listeners.extend(
+        listener_references_tx(tx)
+            .await?
+            .into_iter()
+            .filter(|reference| reference.target_chain == chain_id)
+            .map(|reference| reference.target_node),
+    );
     let mut cleared = Vec::new();
     for node in configured.difference(&listeners) {
         let affected = sqlx::query(
@@ -497,6 +564,45 @@ pub(crate) fn forward_subtree(steps: &[(String, Vec<Rule>)], from: &str) -> BTre
 
 pub(crate) fn forward_to_subtree(rule: &Rule, subtree: &BTreeSet<String>) -> bool {
     matches!(&rule.action, Action::Forward { to, .. } if subtree.contains(to))
+}
+
+#[derive(Debug)]
+struct ListenerReference {
+    source_chain: String,
+    source_node: String,
+    target_chain: String,
+    target_node: String,
+}
+
+/// References are stored inside the ordered JSON rule tables, so PostgreSQL cannot enforce their
+/// lifecycle with a foreign key. Resolve them under the same control-state transaction as delete
+/// and prune operations: checking before acquiring that lock would leave a race in which a caller
+/// adds a reference between the check and the delete.
+async fn listener_references_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Vec<ListenerReference>> {
+    let rows = sqlx::query("SELECT chain_id, node_id, rules FROM steps ORDER BY chain_id, node_id")
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut references = Vec::new();
+    for row in rows {
+        let source_chain = row.try_get::<String, _>("chain_id")?;
+        let source_node = row.try_get::<String, _>("node_id")?;
+        let rules = serde_json::from_value::<Vec<Rule>>(row.try_get("rules")?)
+            .map_err(|error| StoreError::InvalidData(format!("steps 规则解不开：{error}")))?;
+        references.extend(rules.into_iter().filter_map(|rule| {
+            let Action::ReuseListener { listener, .. } = rule.action else {
+                return None;
+            };
+            Some(ListenerReference {
+                source_chain: source_chain.clone(),
+                source_node: source_node.clone(),
+                target_chain: listener.chain,
+                target_node: listener.node,
+            })
+        }));
+    }
+    Ok(references)
 }
 
 /// Resolve a request's `hop_in` into `(port, transport jsonb)`.

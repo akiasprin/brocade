@@ -198,8 +198,9 @@ pub struct XrayPlan {
     /// inherit any chain rule's source address or outbound context.
     pub egress_dns: Vec<XrayEgressDnsPlan>,
     pub inbounds: Vec<XrayIngressPlan>,
-    /// The relay inbounds on this machine, one per chain. A relay serving two chains
-    /// has two entries here, with independent ports and wire formats.
+    /// The relay inbounds on this machine, normally one per chain. A relay serving two chains
+    /// has independent ports and wire formats; a locally reused overlay listener has a second
+    /// loopback-bound entry for the same owned listener.
     pub hop_inbounds: Vec<XrayHopInboundPlan>,
     pub forward_outbounds: Vec<XrayForwardOutboundPlan>,
     pub egress_outbounds: Vec<XrayEgressOutboundPlan>,
@@ -1034,7 +1035,9 @@ pub fn reality_fallback_limits(
     })
 }
 
-/// The relay inbounds on this machine, one per chain.
+/// The relay inbounds on this machine, normally one per chain. A listener reached both over the
+/// overlay and from another rule table in the same Xray gets a second loopback-bound copy: opening
+/// two exact addresses is narrower than widening an overlay-only socket to `0.0.0.0`.
 fn xray_hop_inbounds(
     system_node: Option<&SystemNode>,
     apps: &[AppIr],
@@ -1065,7 +1068,7 @@ fn xray_hop_inbounds(
             // computed result, because once relay ports moved onto the chain, whether any
             // peer dials this node from outside wg is no longer visible in the local
             // config and is known only to the dialer.
-            let direct_hops = app
+            let arriving_hops = app
                 .hops
                 .iter()
                 .filter(|hop| {
@@ -1079,29 +1082,49 @@ fn xray_hop_inbounds(
                     // the downstream and the downstream does not listen. Testing `to`
                     // alone misses the upstream, and the symptom is a tunnel that never
                     // establishes while both sides' configs appear correct.
-                    hop.chain == step.chain
-                        && ((hop.to == node_id && hop.path == HopPath::Direct)
-                            || (hop.from == node_id && hop.path == HopPath::Reverse))
+                    (hop.target_chain == step.chain
+                        && hop.to == node_id
+                        && matches!(
+                            hop.path,
+                            HopPath::Local | HopPath::Overlay | HopPath::Direct
+                        ))
+                        || (hop.chain == step.chain
+                            && hop.from == node_id
+                            && hop.path == HopPath::Reverse)
                 })
                 .collect::<Vec<_>>();
-            let dialed_directly = !direct_hops.is_empty();
-            let dialed_directly_v6 = direct_hops
+            let dialed_directly = arriving_hops
                 .iter()
-                .any(|hop| hop.address.parse::<Ipv6Addr>().is_ok());
-            let listen = match (
+                .any(|hop| matches!(hop.path, HopPath::Direct | HopPath::Reverse));
+            let dialed_directly_v6 = arriving_hops.iter().any(|hop| {
+                matches!(hop.path, HopPath::Direct | HopPath::Reverse)
+                    && hop.address.parse::<Ipv6Addr>().is_ok()
+            });
+            let dialed_locally = arriving_hops.iter().any(|hop| hop.path == HopPath::Local);
+            let dialed_over_overlay = arriving_hops.iter().any(|hop| hop.path == HopPath::Overlay);
+            let listens = match (
                 dialed_directly,
                 dialed_directly_v6,
+                dialed_locally,
+                dialed_over_overlay,
                 system_node.overlay_addr,
             ) {
-                (true, true, _) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                (true, false, _) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                (false, _, Some(overlay)) => IpAddr::V4(overlay),
+                (true, true, _, _, _) => vec![(IpAddr::V6(Ipv6Addr::UNSPECIFIED), false)],
+                (true, false, _, _, _) => vec![(IpAddr::V4(Ipv4Addr::UNSPECIFIED), false)],
+                // Keep both sockets on exact addresses. The tags must differ, but routing selects
+                // relay traffic by credential label, so both copies enter the same ordered table.
+                (false, _, true, true, Some(overlay)) => vec![
+                    (IpAddr::V4(overlay), false),
+                    (IpAddr::V4(Ipv4Addr::LOCALHOST), true),
+                ],
+                (false, _, true, _, _) => vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), false)],
+                (false, _, false, _, Some(overlay)) => vec![(IpAddr::V4(overlay), false)],
                 // No peer dials directly and the node is not on the overlay, so this
                 // inbound is unreachable. A machine present in `SystemIr` is either on
                 // the backbone or has a chain opening a port on it, so reaching this arm
                 // means no hop on this chain compiled; a diagnostic was already reported
                 // above.
-                (false, _, None) => continue,
+                (false, _, false, _, None) => continue,
             };
 
             // This port's usual clients are the upstreams that dial this node, sharing
@@ -1134,18 +1157,26 @@ fn xray_hop_inbounds(
                 continue;
             }
 
-            plans.push(XrayHopInboundPlan {
-                chain: step.chain.clone(),
-                tag: hop_inbound_tag(app, &step.chain),
-                listen,
-                port: hop_in.port,
-                security: hop_in.security.clone(),
-                clients,
-                sniff: step
-                    .rules
-                    .iter()
-                    .any(|rule| rule.dest_match.requests_sniffing_failure_state()),
-            });
+            let base_tag = hop_inbound_tag(app, &step.chain);
+            let sniff = step
+                .rules
+                .iter()
+                .any(|rule| rule.dest_match.requests_sniffing_failure_state());
+            for (listen, local_copy) in listens {
+                plans.push(XrayHopInboundPlan {
+                    chain: step.chain.clone(),
+                    tag: if local_copy {
+                        format!("{base_tag}:local")
+                    } else {
+                        base_tag.clone()
+                    },
+                    listen,
+                    port: hop_in.port,
+                    security: hop_in.security.clone(),
+                    clients: clients.clone(),
+                    sniff,
+                });
+            }
         }
     }
 
@@ -1159,13 +1190,15 @@ fn xray_forward_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayForwardOutbo
     for app in sorted_apps(apps) {
         for step in app.steps.iter().filter(|step| step.node == node_id) {
             for rule in &step.rules {
-                let Action::Forward { to, .. } = &rule.action else {
+                let Some(forward) = rule.action.forward_ref(&step.chain) else {
                     continue;
                 };
-                let hop = app
-                    .hops
-                    .iter()
-                    .find(|hop| hop.chain == step.chain && hop.from == node_id && hop.to == *to);
+                let hop = app.hops.iter().find(|hop| {
+                    hop.chain == step.chain
+                        && hop.from == node_id
+                        && hop.target_chain == forward.target_chain
+                        && hop.to == forward.target_node
+                });
                 // On the reverse variant this node does not dial the peer; the traffic
                 // goes to the portal (see `action_tag`). Emitting an outbound here would
                 // leave an undialable tag in the artifacts, because its address is this
@@ -1174,7 +1207,7 @@ fn xray_forward_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayForwardOutbo
                 if hop.map(|hop| hop.path) == Some(HopPath::Reverse) {
                     continue;
                 }
-                let tag = forward_tag(app, &step.chain, to);
+                let tag = forward_action_tag(app, &step.chain, node_id, forward);
                 outbounds
                     .entry(tag.clone())
                     .or_insert_with(|| XrayForwardOutboundPlan {
@@ -1602,20 +1635,27 @@ fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<Xray
 
     for app in sorted_apps(apps) {
         for step in app.steps.iter().filter(|step| step.node == node_id) {
-            let selector = if let Some(accept) = &step.accept {
-                XrayRuleSelector::Users(vec![accept.label.clone()])
-            } else {
-                let inbound_tags = app
-                    .ingresses
-                    .iter()
-                    .filter(|ingress| ingress.chain == step.chain && ingress.node == node_id)
-                    .flat_map(|ingress| ingress_inbound_tags(app, ingress))
-                    .collect::<Vec<_>>();
-                if inbound_tags.is_empty() {
-                    continue;
-                }
-                XrayRuleSelector::InboundTags(inbound_tags)
-            };
+            // A chain head historically had no relay credential, so these two selectors were
+            // mutually exclusive. Reusing a head's explicit hop listener makes it both a user
+            // ingress and a relay destination: emit the same ordered table for both entry paths.
+            // Choosing `Users` and dropping the inbound tags would make every ordinary user on
+            // that chain fall through Xray's routing table as soon as another chain referenced it.
+            let mut selectors = Vec::new();
+            if let Some(accept) = &step.accept {
+                selectors.push(XrayRuleSelector::Users(vec![accept.label.clone()]));
+            }
+            let inbound_tags = app
+                .ingresses
+                .iter()
+                .filter(|ingress| ingress.chain == step.chain && ingress.node == node_id)
+                .flat_map(|ingress| ingress_inbound_tags(app, ingress))
+                .collect::<Vec<_>>();
+            if !inbound_tags.is_empty() {
+                selectors.push(XrayRuleSelector::InboundTags(inbound_tags));
+            }
+            if selectors.is_empty() {
+                continue;
+            }
 
             // An ordinary ingress selects on the credential that arrived. Reverse access's
             // downstream has a second entry path: the portal pushes traffic along the
@@ -1623,7 +1663,6 @@ fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<Xray
             // identity, so a `Users` rule cannot select it, this machine's whole rule
             // table falls through, and the traffic has no outbound. An identical set of
             // rules is therefore emitted again, keyed by the bridge's inbound tag.
-            let mut selectors = vec![selector];
             for hop in app.hops.iter().filter(|hop| {
                 hop.chain == step.chain && hop.to == node_id && hop.path == HopPath::Reverse
             }) {
@@ -1777,20 +1816,25 @@ fn sorted_apps(apps: &[AppIr]) -> Vec<&AppIr> {
 
 fn action_tag(app: &AppIr, chain: &str, node: &str, rule: &Rule) -> String {
     match &rule.action {
-        Action::Forward { to, .. } => {
+        Action::Forward { .. } | Action::ReuseListener { .. } => {
+            let forward = rule
+                .action
+                .forward_ref(chain)
+                .expect("matched forwarding action");
             // Reverse traffic goes to the portal rather than to an outbound. An outbound
             // dials, whereas this hop's connection was established by the peer, and the
             // artifacts hold no address that would reach it.
             let reverse = app.hops.iter().any(|hop| {
                 hop.chain == chain
                     && hop.from == node
-                    && hop.to == *to
+                    && hop.target_chain == forward.target_chain
+                    && hop.to == forward.target_node
                     && hop.path == HopPath::Reverse
             });
             if reverse {
-                reverse_portal_tag(app, chain, to)
+                reverse_portal_tag(app, chain, forward.target_node)
             } else {
-                forward_tag(app, chain, to)
+                forward_action_tag(app, chain, node, forward)
             }
         }
         Action::Egress { send_through } => egress_dns_resolution(app, node, &rule.dest_match)
@@ -1909,6 +1953,33 @@ fn forward_tag(app: &AppIr, chain: &str, to: &str) -> String {
     match app.app_id.as_deref() {
         Some(app_id) => format!("out:{app_id}/{chain}>{to}"),
         None => format!("out:{chain}>{to}"),
+    }
+}
+
+fn forward_action_tag(
+    app: &AppIr,
+    source_chain: &str,
+    source_node: &str,
+    forward: crate::model::ForwardActionRef<'_>,
+) -> String {
+    if !forward.reused {
+        return forward_tag(app, source_chain, forward.target_node);
+    }
+    // `~` and `@` are outside the model slug alphabet, so both boundaries are unambiguous. The
+    // agent strips the target-listener suffix when reporting remote link health. A local listener
+    // reference carries an explicit marker and is omitted there: link_health rejects self peers,
+    // and a loopback socket is not a machine-to-machine link.
+    let target = if source_node == forward.target_node {
+        format!("{}@local", forward.target_chain)
+    } else {
+        forward.target_chain.to_owned()
+    };
+    match app.app_id.as_deref() {
+        Some(app_id) => format!(
+            "out:{app_id}/{source_chain}~{target}>{}",
+            forward.target_node
+        ),
+        None => format!("out:{source_chain}~{target}>{}", forward.target_node),
     }
 }
 

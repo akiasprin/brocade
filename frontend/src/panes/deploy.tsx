@@ -697,6 +697,7 @@ function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
   const nameOf = useNodeNames();
   if (targets.length === 0) return <Empty>这次没有目标：所有机器的产物都没变。</Empty>;
   const waves = [...new Set(targets.filter(t => t.status !== 'skipped').map(t => t.wave))].sort((a, b) => a - b);
+  const waveOf = new Map(targets.filter(t => t.status !== 'skipped').map(t => [t.node_id, t.wave]));
   return (
     <>
       {waves.map(w => {
@@ -721,6 +722,23 @@ function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
                           {a}
                         </span>
                       ))}
+                      {(t.prerequisites ?? []).map(node => {
+                        const sameWave = waveOf.get(node) === t.wave;
+                        return (
+                          <span
+                            key={`wait:${node}`}
+                            className="st st-gold"
+                            style={{ fontSize: '10.5px' }}
+                            title={
+                              sameWave
+                                ? `引用监听：${node} 与本机属于同一个依赖环，同波协同切换`
+                                : `引用监听：先等 ${node} 收敛`
+                            }
+                          >
+                            {sameWave ? '同波协同' : '先等'} {nameOf(node)}
+                          </span>
+                        );
+                      })}
                     </td>
                     <td className="dim" style={{ fontSize: 12 }}>
                       {t.actions.map(a => ACTION_NOTE[a]).join('；')}

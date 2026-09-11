@@ -142,7 +142,72 @@ fn mark_isolated_targets(plan: &mut DeploymentPlan, isolated: &BTreeSet<String>)
             target.status = PlannedTargetStatus::Deferred;
         }
     }
+    defer_listener_dependents(plan, false);
     plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
+}
+
+/// A caller must not move ahead when the listener it depends on cannot move in this deployment.
+///
+/// `missing_is_out_of_scope` covers tenant scoping, where the prerequisite target was removed from
+/// the visible plan. Otherwise prerequisites are present but may have been deferred by an
+/// operational isolation. Iterate to a fixed point so a chain of references is deferred all the
+/// way back to its first caller.
+fn defer_listener_dependents(plan: &mut DeploymentPlan, missing_is_out_of_scope: bool) {
+    loop {
+        let status = plan
+            .targets
+            .iter()
+            .map(|target| (target.node_id.as_str(), target.status))
+            .collect::<BTreeMap<_, _>>();
+        let newly_deferred = plan
+            .targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                if target.status != PlannedTargetStatus::Pending {
+                    return None;
+                }
+                let blocked = target.prerequisites.iter().any(|prerequisite| {
+                    status
+                        .get(prerequisite.as_str())
+                        .map_or(missing_is_out_of_scope, |status| {
+                            *status == PlannedTargetStatus::Deferred
+                        })
+                });
+                blocked.then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if newly_deferred.is_empty() {
+            break;
+        }
+        for index in newly_deferred {
+            let location = plan.targets[index].node_id.clone();
+            plan.targets[index].status = PlannedTargetStatus::Deferred;
+            let code = if missing_is_out_of_scope {
+                "listener.prerequisite-out-of-scope"
+            } else {
+                "listener.prerequisite-deferred"
+            };
+            if plan
+                .warnings
+                .iter()
+                .any(|warning| warning.code == code && warning.location == location)
+            {
+                continue;
+            }
+            plan.warnings.push(PlanDiagnostic {
+                code: code.to_owned(),
+                location,
+                message: if missing_is_out_of_scope {
+                    "引用的监听需要先在本次租户范围之外的机器发布；当前机器已延后，请由上级管理员发布"
+                        .to_owned()
+                } else {
+                    "引用监听的前置机器已隔离或延后；当前机器同步延后，避免先拨到尚未就绪的监听"
+                        .to_owned()
+                },
+            });
+        }
+    }
 }
 
 /// Works out, for each machine, the text of the xray config it is running.
@@ -2830,6 +2895,7 @@ pub async fn isolate_deployment_target(
                 status: PlannedTargetStatus::Deferred,
                 wave: desired.wave,
                 disruptive: false,
+                prerequisites: Vec::new(),
                 actions: desired.actions,
                 desired: desired.desired,
             }
@@ -3385,6 +3451,7 @@ async fn scope_plan(
     plan.targets
         .retain(|target| accessible_nodes.contains(&target.node_id));
     retain_visible_warnings(&mut plan.warnings, &accessible_nodes);
+    defer_listener_dependents(&mut plan, true);
     plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
     Ok(plan)
 }
@@ -6390,10 +6457,16 @@ pub async fn discard_pending_changes(
 
 #[cfg(test)]
 mod tests {
-    use super::{flow_column, preserve_immediate_fields, strip_commit_prefix};
+    use super::{
+        defer_listener_dependents, flow_column, preserve_immediate_fields, strip_commit_prefix,
+    };
     use brocade_core::{
         client_config::SubscriptionClientConfig,
         model::{AppView, Chain, ModelSettings, ModelSnapshot, User},
+    };
+    use brocade_deployment::plan::{
+        DeploymentPlan, DesiredArtifact, DesiredGrants, NodeDesiredState, PlanSummary,
+        PlannedAction, PlannedTarget, PlannedTargetStatus,
     };
 
     fn app(id: &str, label: &str, chains: Vec<Chain>) -> AppView {
@@ -6433,6 +6506,91 @@ mod tests {
             external_outbounds: Vec::new(),
             apps,
         }
+    }
+
+    fn planned_target(
+        node_id: &str,
+        status: PlannedTargetStatus,
+        prerequisites: &[&str],
+    ) -> PlannedTarget {
+        let disabled = || DesiredArtifact::Disabled {
+            reason: "test".to_owned(),
+        };
+        PlannedTarget {
+            node_id: node_id.to_owned(),
+            status,
+            wave: 1,
+            disruptive: false,
+            prerequisites: prerequisites
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            actions: vec![PlannedAction::ApplyXray],
+            desired: NodeDesiredState {
+                phantun: disabled(),
+                wireguard: disabled(),
+                xray: disabled(),
+                hy2_port_hop: disabled(),
+                grants: DesiredGrants::Disabled {
+                    reason: "test".to_owned(),
+                },
+            },
+        }
+    }
+
+    fn dependency_plan(targets: Vec<PlannedTarget>) -> DeploymentPlan {
+        DeploymentPlan {
+            revision: 1,
+            targets,
+            summary: PlanSummary {
+                total_targets: 0,
+                changed_targets: 0,
+                skipped_targets: 0,
+                deferred_targets: 0,
+                disruptive_targets: 0,
+                max_wave: 0,
+            },
+            warnings: Vec::new(),
+            base_revision_id: None,
+        }
+    }
+
+    #[test]
+    fn listener_caller_is_deferred_when_its_owner_is_outside_tenant_scope() {
+        let mut plan = dependency_plan(vec![planned_target(
+            "caller",
+            PlannedTargetStatus::Pending,
+            &["owner"],
+        )]);
+
+        defer_listener_dependents(&mut plan, true);
+
+        assert_eq!(plan.targets[0].status, PlannedTargetStatus::Deferred);
+        assert_eq!(plan.warnings[0].code, "listener.prerequisite-out-of-scope");
+        assert_eq!(plan.warnings[0].location, "caller");
+    }
+
+    #[test]
+    fn an_isolated_listener_defers_every_transitive_caller() {
+        let mut plan = dependency_plan(vec![
+            planned_target("owner", PlannedTargetStatus::Deferred, &[]),
+            planned_target("middle", PlannedTargetStatus::Pending, &["owner"]),
+            planned_target("caller", PlannedTargetStatus::Pending, &["middle"]),
+        ]);
+
+        defer_listener_dependents(&mut plan, false);
+
+        assert!(plan
+            .targets
+            .iter()
+            .all(|target| target.status == PlannedTargetStatus::Deferred));
+        assert_eq!(
+            plan.warnings
+                .iter()
+                .filter(|warning| warning.code == "listener.prerequisite-deferred")
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -2884,6 +2884,31 @@ pub enum HopDial {
     Reverse(IpFamily),
 }
 
+/// How a listener reference reaches the machine that owns the listener.
+///
+/// Unlike [`HopDial`], this never stores a port. A listener reference names a concrete
+/// `(chain, node)` listener, so its current `hop_in.port` is authoritative and must change for
+/// every caller atomically with that listener. Public addresses are symbolic for the same reason:
+/// selecting an address family follows the owning node's current address instead of turning an
+/// old address into an accidental custom endpoint after the node changes.
+///
+/// Reverse dialing is intentionally not representable. It would create a socket on the caller
+/// rather than enter the referenced listener and therefore would not be listener reuse.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "t", content = "v", rename_all = "snake_case")]
+pub enum ListenerDial {
+    /// Dial the owning node's overlay address and the referenced listener's current port.
+    #[default]
+    Overlay,
+    /// Dial the owning node's current public address in this family and the referenced port.
+    Public(IpFamily),
+    /// Dial this custom host and the referenced listener's current port.
+    ///
+    /// This is a host only, without brackets or a port. IPv6 literals are stored in their plain
+    /// form (for example `2001:db8::1`).
+    Addr(String),
+}
+
 /// An address family. Where one has to be selected, it is selected explicitly; see the
 /// note on `HopDial::Reverse`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3027,6 +3052,19 @@ pub enum Action {
         dial: HopDial,
         pool: HopPool,
     },
+    /// Enter an existing relay listener and continue with the rule table owned by that listener.
+    ///
+    /// `Forward` is the original, chain-local edge: its target is another node's `Step` in the
+    /// same chain.  Reusing a listener is deliberately a separate action rather than overloading
+    /// `Forward.to` with a second identifier syntax.  Historical revisions therefore keep their
+    /// exact meaning, while a reference makes both halves of its identity explicit.  The port,
+    /// wire material, credential and downstream rules remain owned by the referenced Step and are
+    /// never copied into the caller.
+    ReuseListener {
+        listener: ListenerRef,
+        dial: ListenerDial,
+        pool: HopPool,
+    },
     Egress {
         #[serde(default)]
         send_through: Option<IpAddr>,
@@ -3037,6 +3075,75 @@ pub enum Action {
         outbound: String,
     },
     Block,
+}
+
+/// Stable identity of one existing relay listener.
+///
+/// Relay listeners currently live on `Step`, whose durable key is `(chain, node)`.  Referring to
+/// that key rather than to its port is important: changing a port or wire updates every caller,
+/// whereas a copied `host:port` would silently keep dialing the old socket.  It also distinguishes
+/// two listeners on the same machine that belong to different chains.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerRef {
+    pub chain: String,
+    pub node: String,
+}
+
+/// The common view of the two model actions that create a relay edge.
+///
+/// Keeping target resolution here prevents topology, hop compilation and artifact projection from
+/// each inventing their own interpretation of a listener reference.  Callers that specifically
+/// need to distinguish an owned edge from a reused listener can inspect `reused`.
+#[derive(Debug, Clone, Copy)]
+pub struct ForwardActionRef<'a> {
+    pub target_chain: &'a str,
+    pub target_node: &'a str,
+    pub dial: RelayDialRef<'a>,
+    pub pool: &'a HopPool,
+    pub reused: bool,
+}
+
+/// A borrowed, typed view of the two relay dialing models.
+///
+/// Keeping the variants distinct prevents listener references from inheriting `HopDial` states
+/// that contradict their identity, most importantly a copied target port or reverse dialing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayDialRef<'a> {
+    Forward(&'a HopDial),
+    Listener(&'a ListenerDial),
+}
+
+impl RelayDialRef<'_> {
+    pub fn is_reverse(self) -> bool {
+        matches!(self, Self::Forward(HopDial::Reverse(_)))
+    }
+}
+
+impl Action {
+    pub fn forward_ref<'a>(&'a self, source_chain: &'a str) -> Option<ForwardActionRef<'a>> {
+        match self {
+            Self::Forward { to, dial, pool } => Some(ForwardActionRef {
+                target_chain: source_chain,
+                target_node: to,
+                dial: RelayDialRef::Forward(dial),
+                pool,
+                reused: false,
+            }),
+            Self::ReuseListener {
+                listener,
+                dial,
+                pool,
+            } => Some(ForwardActionRef {
+                target_chain: &listener.chain,
+                target_node: &listener.node,
+                dial: RelayDialRef::Listener(dial),
+                pool,
+                reused: true,
+            }),
+            Self::Egress { .. } | Self::Proxy { .. } | Self::Block => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

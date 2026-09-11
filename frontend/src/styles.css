@@ -4522,6 +4522,338 @@ input.f {
 .chain-rules-table tr[aria-current='true'] td {
   background: var(--action-wash);
 }
+/* ═══ 监听规则决策树 ═══
+   规则的执行方向固定为从左到右。这里故意不在窄屏时改成纵向列表：监听引用是一个
+   子树边，不是普通字段；保留方向并允许横向滚动，手机上仍能看出「谁引用谁」。 */
+.listener-map {
+  --listener-ref: var(--hue-3);
+  margin: 8px -12px 0;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--sunk) 45%, transparent);
+}
+.listener-map-head,
+.listener-rule-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--block) 74%, transparent);
+}
+.listener-map-head > span:first-child,
+.listener-rule-editor-head > span {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.listener-map-head b,
+.listener-rule-editor-head b {
+  flex: none;
+  color: var(--ink-2);
+  font-size: 12.5px;
+}
+.listener-map-head small,
+.listener-rule-editor-head small {
+  min-width: 0;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+.listener-map-legend {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.listener-map-legend i {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.listener-map-legend i::before {
+  width: 13px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ink-4);
+  content: '';
+}
+.listener-map-legend .reference::before {
+  background: var(--listener-ref);
+}
+.listener-map-legend .terminal::before {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.listener-map-scroll {
+  max-width: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 18px 20px 20px;
+  scrollbar-gutter: stable;
+  touch-action: pan-x pan-y;
+}
+.listener-map-canvas {
+  display: inline-flex;
+  min-width: 100%;
+  width: max-content;
+  align-items: center;
+  padding-right: 18px;
+}
+.listener-map-node {
+  position: relative;
+  display: grid;
+  grid-template-columns: 214px max-content;
+  align-items: center;
+  gap: 50px;
+  width: max-content;
+}
+.listener-map-node:not(.has-branches) {
+  display: block;
+}
+.listener-map-card {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 8px;
+  box-sizing: border-box;
+  width: 214px;
+  min-height: 92px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-left: 3px solid color-mix(in srgb, var(--action) 72%, var(--line));
+  border-radius: 8px;
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
+}
+.listener-map-card.is-reference {
+  border-color: color-mix(in srgb, var(--listener-ref) 42%, var(--line));
+  border-left-color: var(--listener-ref);
+  background: color-mix(in srgb, var(--listener-ref) 5%, var(--card));
+}
+.listener-map-card.is-missing,
+.listener-map-card.is-cycle {
+  border-color: color-mix(in srgb, var(--err) 48%, var(--line));
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 6%, var(--card));
+}
+.listener-map-card > .listener-map-kicker {
+  grid-column: 1 / -1;
+  color: var(--action);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+.listener-map-card.is-reference > .listener-map-kicker {
+  color: var(--listener-ref);
+}
+.listener-map-card:is(.is-missing, .is-cycle) > .listener-map-kicker {
+  color: var(--err);
+}
+.listener-map-card > b {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-map-card > small {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-map-card > code {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-2);
+  font: 10.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-map-badges {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+}
+.listener-map-badges i {
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--listener-ref) 12%, transparent);
+  color: var(--listener-ref);
+  font-size: 8.5px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.listener-map-count {
+  grid-column: 1 / -1;
+  color: var(--ink-4);
+  font-size: 9.5px;
+}
+.listener-map-node.has-branches > .listener-map-card::after {
+  position: absolute;
+  top: 50%;
+  right: -26px;
+  width: 25px;
+  height: 1px;
+  background: color-mix(in srgb, var(--ink-4) 58%, var(--line));
+  content: '';
+}
+.listener-map-branches {
+  position: relative;
+  display: grid;
+  gap: 14px;
+}
+.listener-map-branches::before {
+  position: absolute;
+  top: 45px;
+  bottom: 45px;
+  left: -25px;
+  width: 1px;
+  background: color-mix(in srgb, var(--ink-4) 58%, var(--line));
+  content: '';
+}
+.listener-map-branch {
+  position: relative;
+  display: grid;
+  grid-template-columns: 176px max-content;
+  align-items: center;
+  gap: 44px;
+  width: max-content;
+  min-height: 92px;
+}
+.listener-map-branch::before {
+  position: absolute;
+  top: 50%;
+  left: -25px;
+  width: 25px;
+  height: 1px;
+  background: color-mix(in srgb, var(--ink-4) 58%, var(--line));
+  content: '';
+}
+.listener-map-edge {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 2px 5px;
+  width: 176px;
+  padding: 7px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--sheet);
+}
+.listener-map-edge::after {
+  position: absolute;
+  top: 50%;
+  right: -45px;
+  width: 44px;
+  height: 1px;
+  background: color-mix(in srgb, var(--ink-4) 58%, var(--line));
+  content: '';
+}
+.listener-map-branch.is-reference > .listener-map-edge {
+  border-color: color-mix(in srgb, var(--listener-ref) 34%, var(--line));
+  background: color-mix(in srgb, var(--listener-ref) 5%, var(--sheet));
+}
+.listener-map-branch.is-reference > .listener-map-edge::after {
+  height: 2px;
+  background: var(--listener-ref);
+}
+.listener-map-edge > span {
+  grid-row: 1 / 4;
+  color: var(--ink-4);
+  font: 9.5px var(--mono);
+}
+.listener-map-edge > b {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 10.5px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-map-edge > small {
+  color: var(--ink-4);
+  font-size: 9.5px;
+}
+.listener-map-edge > code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font: 8.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-map-branch.is-reference > .listener-map-edge > small {
+  color: var(--listener-ref);
+}
+.listener-map-terminal {
+  position: relative;
+  display: grid;
+  gap: 3px;
+  width: 154px;
+  min-height: 54px;
+  align-content: center;
+  padding: 8px 10px 8px 13px;
+  border: 1px solid var(--line);
+  border-radius: 999px 8px 8px 999px;
+  background: var(--block);
+}
+.listener-map-terminal::before {
+  position: absolute;
+  top: 50%;
+  left: 5px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--ok);
+  content: '';
+  transform: translateY(-50%);
+}
+.listener-map-terminal > span {
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 600;
+}
+.listener-map-terminal > small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-map-terminal.is-block {
+  border-color: color-mix(in srgb, var(--err) 35%, var(--line));
+}
+.listener-map-terminal.is-block::before {
+  background: var(--err);
+}
+.listener-map-terminal.is-proxy::before {
+  background: var(--gold);
+}
+.listener-rule-editor-head {
+  margin: 0 -12px;
+  border-bottom: 1px solid var(--line-soft);
+}
 /* ═══ XRAY 链路：一条链一张卡 ═══
    层级收敛为两级：卡片（一条链）→ 行（一台机器），展开的表单再降一级。
    原实现为内容区 → 链块 → 树面板 → 行 → 表单，五层背景各有自己的边框和圆角，
@@ -18270,6 +18602,21 @@ input.f.ing-pj-port {
   background: color-mix(in srgb, var(--action) 10%, transparent);
   color: var(--action);
 }
+.external-target-trigger.listener-target {
+  border-color: color-mix(in srgb, var(--hue-3) 48%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 8%, var(--sunk));
+}
+.external-target-trigger.listener-target .external-target-kind,
+.external-target-kind.listener {
+  border-color: color-mix(in srgb, var(--hue-3) 46%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 11%, transparent);
+  color: var(--hue-3);
+}
+.external-target-kind.new-listener {
+  border-color: color-mix(in srgb, var(--gold) 46%, var(--line));
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+  color: var(--gold);
+}
 .external-target-trigger:hover,
 .external-target-trigger[aria-expanded='true'] {
   border-color: color-mix(in srgb, var(--action) 55%, var(--line));
@@ -18498,6 +18845,133 @@ input.f.ing-pj-port {
   color: var(--ink-4);
   font-size: 11px;
   text-align: center;
+}
+
+.listener-local-route {
+  display: inline-flex;
+  align-items: center;
+  min-height: 27px;
+  margin-left: 6px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--hue-3) 34%, var(--line));
+  border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--hue-3) 7%, var(--sunk));
+  color: var(--hue-3);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.listener-reference-panel {
+  overflow: hidden;
+  border-color: color-mix(in srgb, var(--hue-3) 28%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 3%, var(--block));
+}
+.listener-reference-panel > header .hint {
+  margin-left: 8px;
+  color: var(--ink-4);
+  font-size: 10px;
+  font-weight: 400;
+}
+.listener-reference-list {
+  display: grid;
+  gap: 8px;
+}
+.listener-reference-row {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) auto;
+  gap: 7px 18px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--hue-3) 20%, var(--line-soft));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--sunk) 72%, transparent);
+}
+.listener-reference-row.missing {
+  border-color: color-mix(in srgb, var(--err) 36%, var(--line));
+}
+.listener-reference-row.blocked {
+  border-color: color-mix(in srgb, var(--err) 36%, var(--line));
+  background: color-mix(in srgb, var(--err) 5%, var(--sunk));
+}
+.listener-reference-row.blocked .listener-reference-main small {
+  color: var(--err);
+}
+.listener-reference-row.missing > div {
+  display: grid;
+  gap: 3px;
+}
+.listener-reference-row.missing small {
+  color: var(--err);
+  font-size: 10px;
+}
+.listener-reference-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.listener-reference-main > span:last-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.listener-reference-main b {
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-reference-main small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.listener-reference-facts {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 14px;
+}
+.listener-reference-facts > span,
+.listener-reference-facts > label {
+  display: grid;
+  gap: 3px;
+  min-width: 66px;
+}
+.listener-reference-facts small {
+  color: var(--ink-4);
+  font-size: 8.5px;
+  font-weight: 400;
+}
+.listener-reference-facts b {
+  color: var(--ink-2);
+  font-size: 10.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.listener-reference-facts select.f {
+  min-width: 98px;
+  height: 27px;
+  font-size: 10.5px;
+}
+.listener-reference-row > p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--ink-4);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+@container rules (max-width: 820px) {
+  .listener-reference-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .listener-reference-facts {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
 }
 
 /* 资源摘要紧贴规则表，明确展示它是该规则引用的 outbound，而不是下一跳节点。 */
