@@ -314,6 +314,7 @@ describe('监听规则子树复用', () => {
       { m: { t: 'geoip', v: ['cn'] }, a: { t: 'block' } },
       egressRule(),
     ]);
+    const sameChain = listenerStep('source-chain', 'same-chain', 21001, [egressRule()]);
     const app: SnapshotApp = {
       id: 'app',
       label: '项目',
@@ -321,6 +322,7 @@ describe('监听规则子树复用', () => {
       ingresses: [ingress('source-in', 'source-chain', 'source'), ingress('owner-in', 'owner', 'owner-root')],
       steps: [
         source,
+        sameChain,
         { chain: 'owner', node: 'owner-root', accept: null, hop_in: null, rules: [egressRule()] },
         shared,
       ],
@@ -340,6 +342,7 @@ describe('监听规则子树复用', () => {
     client.setQueryData(['nodes'], {
       nodes: [
         { ...node('source', '香港入口'), egress_allowed: true },
+        { ...node('same-chain', '同链监听'), egress_allowed: true },
         { ...node('owner-root', '所有者入口'), egress_allowed: true },
         { ...node('shared', '新加坡共享监听'), egress_allowed: true },
       ] as NodeAgentStateItem[],
@@ -383,6 +386,7 @@ describe('监听规则子树复用', () => {
     if (!(action instanceof HTMLSelectElement)) throw new Error('没有动作选择器');
     fireEvent.change(action, { target: { value: 'forward' } });
     const choice = await view.findByRole('button', { name: /新加坡共享监听 · TCP 22000/ });
+    expect(view.queryByRole('button', { name: /同链监听 · TCP 21001/ })).toBeNull();
     const menu = choice.closest('.external-target-menu');
     expect(menu?.parentElement).toBe(document.body);
     expect(view.container.contains(menu)).toBe(false);

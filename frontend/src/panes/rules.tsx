@@ -1849,15 +1849,20 @@ function RuleEditorReady({
   const visibleInsidePeers = insidePeers.filter(peer => targetMatches(peer.id, peer.name));
   const visibleForkPeers = forkPeers.filter(peer => targetMatches(peer.id, peer.name));
   const visibleBlockedPeers = blockedPeers.filter(peer => targetMatches(peer.id, peer.name, peer.blocked));
-  const visibleListeners = listeners.filter(listener =>
-    targetMatches(
-      listener.ref.chain,
-      listener.ref.node,
-      listener.nodeName,
-      listener.ownerName,
-      String(listener.step.hop_in?.port ?? ''),
-      listener.blocked,
-    ),
+  // 本链监听已经作为普通 Forward 目标列在下一组。若这里再以 ReuseListener 提供一次，
+  // 同一个 (chain, node) 会出现两种动作形状；它们编译到同一 outbound，却永远是两种 dial，
+  // 最终只能等编译器报 rule.forward-dial-conflict。跨链监听才需要显式引用身份。
+  const visibleListeners = listeners.filter(
+    listener =>
+      listener.ref.chain !== chainId &&
+      targetMatches(
+        listener.ref.chain,
+        listener.ref.node,
+        listener.nodeName,
+        listener.ownerName,
+        String(listener.step.hop_in?.port ?? ''),
+        listener.blocked,
+      ),
   );
   const visibleExternalOutbounds = externalOutbounds.filter(outbound =>
     targetMatches(outbound.id, outbound.name, outbound.address, externalProtocolLabel(outbound.protocol.t)),
@@ -2437,7 +2442,7 @@ function RuleEditorReady({
                                   value={targetQuery}
                                   onChange={event => setTargetQuery(event.target.value)}
                                 />
-                                <span className="external-target-menu-label">可复用的监听端口</span>
+                                <span className="external-target-menu-label">可复用的其它线路监听端口</span>
                                 {visibleListeners.map(candidate => (
                                   <button
                                     type="button"
