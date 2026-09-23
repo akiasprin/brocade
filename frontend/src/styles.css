@@ -20496,27 +20496,31 @@ h4.sec > .btn {
   background: color-mix(in srgb, var(--err) 8%, transparent);
 }
 
-/* 接入面投影：地址和端口是同一地址的两部分，中间用冒号连接，与 host:port 的书写形式一致。
-   窄屏下端口换到下一行——390 宽度下一行无法容纳域名加端口。 */
+/* 地址族的开关与编辑器共用固定列，切换模式不改变列宽；标签借用上方表单的标签留白。
+   按面板实际宽度折行，让桌面双栏和移动端都保持与地区输入框对齐。 */
 .client-projection-groups {
+  --projection-label-width: 72px;
+  --projection-control-offset: calc(var(--projection-label-width) + 14px);
+  container: client-projection / inline-size;
   display: flex;
   flex-direction: column;
-  margin: 2px 0 10px;
+  margin: 9px 0 10px;
   border-top: 1px solid var(--line-soft);
 }
 .client-projection-group {
-  padding-top: 8px;
+  padding: 12px 0 14px;
 }
 .client-projection-group + .client-projection-group {
-  margin-top: 4px;
   border-top: 1px solid var(--line-soft);
+}
+.client-projection-group:last-child {
+  padding-bottom: 6px;
 }
 .client-projection-group > header {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 0 3px;
+  gap: 9px;
+  margin-bottom: 10px;
 }
 .client-projection-group > header b {
   color: var(--ink-2);
@@ -20531,58 +20535,97 @@ h4.sec > .btn {
   margin: 0;
 }
 .config-panel .client-projection-family-grid {
-  grid-template-columns: repeat(2, 220px);
+  grid-template-columns: repeat(2, minmax(0, 242px));
   justify-content: start;
-  gap: 0 20px;
+  gap: 14px 18px;
+  padding-left: var(--projection-control-offset);
 }
 .client-projection-family {
-  display: grid;
-  grid-template-columns: 52px minmax(0, 1fr);
-  gap: 0 10px;
-  width: 220px;
+  position: relative;
   min-width: 0;
 }
 .config-panel .client-projection-family :is(dt, dd) {
+  padding: 0;
   border-bottom: 0;
 }
-.client-projection-family .ing-pj {
-  /* The editor uses the full, fixed family width. It therefore does not resize either grid track
-     when “转换” is opened, while the host still gets more room than the toggle column alone. */
-  width: calc(100% + 62px);
-  margin-left: -62px;
+.config-panel .client-projection-family dt {
+  position: absolute;
+  left: calc(-1 * var(--projection-control-offset));
+  width: var(--projection-label-width);
+  color: var(--ink-3);
+  font: 11.5px/var(--ctl-h) var(--mono);
 }
-.ing-pj {
+.client-projection-mode {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 14px;
+  min-height: var(--ctl-h);
+}
+.client-projection-dirty {
+  width: 4px;
+  height: 4px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--gold);
+}
+.client-projection-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 68px;
+  gap: 8px;
   width: 100%;
-  margin-top: 6px;
+  margin-top: 8px;
 }
-.ing-pj > input.f {
+.client-projection-editor > label {
+  display: grid;
+  gap: 4px;
   min-width: 0;
+  font-size: 10px;
+  color: var(--ink-4);
 }
-input.f.ing-pj-port {
-  flex: 0 0 86px;
+.client-projection-editor input.f {
+  min-width: 0;
+  width: 100%;
+  padding-inline: 7px;
+  font-size: 11.5px;
 }
-@media (max-width: 760px) {
+.client-projection-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 8px;
+}
+.client-projection-summary code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+  font: 11.5px var(--mono);
+}
+.client-projection-summary .btn {
+  flex: none;
+  padding-inline: 8px;
+  font-size: 11.5px;
+}
+.config-panel-savebar .client-projection-pending {
+  margin: 0;
+  color: var(--gold);
+}
+@container client-projection (max-width: 440px) {
   .config-panel .client-projection-family-grid {
     grid-template-columns: minmax(0, 1fr);
-    gap: 0;
   }
-  .client-projection-family {
-    width: 100%;
+}
+@media (max-width: 820px) {
+  .config-panel .client-projection-family dt {
+    /* SegSwitch's shared touch target is 44px plus its outer border. */
+    line-height: 46px;
   }
-  .client-projection-family + .client-projection-family {
-    border-top: 1px solid var(--line-soft);
-  }
-  .ing-pj {
-    flex-wrap: wrap;
-  }
-  .ing-pj > .dim {
-    display: none;
-  }
-  input.f.ing-pj-port {
-    flex: 0 0 110px;
+  .client-projection-editor input.f {
+    /* Preserve the shared iOS focus-zoom safeguard despite the compact desktop field style. */
+    font-size: 16px;
   }
 }
 

@@ -1,6 +1,6 @@
 import { StrictMode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CompileView, ConsoleSnapshot, SnapshotApp, Whoami } from '../src/api';
 import { draft } from '../src/draft';
@@ -147,6 +147,66 @@ afterEach(() => {
   clients.splice(0).forEach(client => client.clear());
   draft.clear();
   vi.unstubAllGlobals();
+});
+
+describe('客户端配置面板', () => {
+  it('保存栏始终占位，校验两个地址族并合并为同一份草稿', async () => {
+    draft.init('client-projection-panel-test');
+    const { mount } = setup();
+    const projection = {
+      v4: { host: 'edge.example.com', port: 443 },
+      v6: { host: '2001:db8::20', port: 443 },
+    };
+    const preview = {
+      snapshot: {
+        ...snapshot,
+        snapshot: {
+          ...snapshot.snapshot,
+          apps: [{ ...app, ingresses: [{ ...app.ingresses[0], projection }] }],
+        },
+      },
+      compile: compiled,
+      artifacts: { revision: 7, artifacts: [] },
+    };
+    const fetch = globalThis.fetch;
+    vi.stubGlobal('fetch', (path: string, init?: RequestInit) =>
+      path === '/model/preview' ? Promise.resolve(Response.json(preview)) : fetch(path, init),
+    );
+    const view = mount();
+    const title = await view.findByRole('heading', { name: '客户端配置' });
+    const panel = within(title.closest('section')!);
+    const save = panel.getByRole('button', { name: '保存' }) as HTMLButtonElement;
+    const reset = panel.getByRole('button', { name: '还原' }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(reset.disabled).toBe(true);
+
+    for (const toggle of panel.getAllByRole('button', { name: '转换' })) fireEvent.click(toggle);
+    expect(save.disabled).toBe(true);
+    expect(reset.disabled).toBe(false);
+    fireEvent.change(panel.getByRole('textbox', { name: /IPv4 地址或域名$/ }), {
+      target: { value: 'edge.example.com' },
+    });
+    expect(save.disabled).toBe(true);
+    fireEvent.change(panel.getByRole('textbox', { name: /IPv6 地址或域名$/ }), {
+      target: { value: '2001:db8::20' },
+    });
+    expect(panel.getByText('2 项更改待保存')).toBeTruthy();
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
+    expect(draft.ops()[0]).toMatchObject({
+      op: 'upsert_ingress',
+      app_id: 'app-1',
+      ingress: {
+        projection,
+      },
+    });
+    await waitFor(() => expect(panel.queryByRole('textbox')).toBeNull());
+    expect(panel.getByRole('button', { name: '保存' })).toBe(save);
+    await waitFor(() => expect(save.disabled).toBe(true));
+    expect(panel.getByText('edge.example.com:443')).toBeTruthy();
+    expect(panel.getByText('[2001:db8::20]:443')).toBeTruthy();
+  });
 });
 
 describe('链详情统一等待首屏依赖', () => {

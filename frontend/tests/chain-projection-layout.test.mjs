@@ -12,10 +12,22 @@ test('client mappings group protocols and place IPv4 and IPv6 side by side', () 
   assert.match(source, /className="client-projection-family"/);
   assert.match(
     styles,
-    /\.config-panel \.client-projection-family-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, 220px\);[\s\S]*?justify-content:\s*start/,
+    /\.config-panel \.client-projection-family-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 242px\)\);[^}]*justify-content:\s*start/,
   );
-  assert.match(styles, /\.client-projection-family\s*\{[\s\S]*?width:\s*220px/);
-  assert.match(styles, /\.client-projection-family \.ing-pj\s*\{[\s\S]*?width:\s*calc\(100% \+ 62px\)/);
   assert.doesNotMatch(source, /使用机器公网地址/);
   assert.doesNotMatch(source, /<em>:\{ingress\.port\}<\/em>/);
+});
+
+test('conversion controls and editors share the form alignment without extending hit areas into the next family', () => {
+  assert.match(styles, /\.client-projection-groups\s*\{[^}]*container:\s*client-projection \/ inline-size/);
+  assert.match(
+    styles,
+    /\.config-panel \.client-projection-family-grid\s*\{[^}]*padding-left:\s*var\(--projection-control-offset\)/,
+  );
+  assert.match(styles, /\.client-projection-editor\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 68px/);
+  assert.doesNotMatch(styles, /\.client-projection-editor\s*\{[^}]*(?:margin-left|width:\s*calc)/);
+  assert.match(
+    styles,
+    /@container client-projection \(max-width: 440px\)\s*\{\s*\.config-panel \.client-projection-family-grid\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/,
+  );
 });

@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SnapshotIngress } from '../src/api';
 import {
@@ -29,20 +29,31 @@ const ingress: SnapshotIngress = {
   wires: { vless: { kind: 'vless-reality' } },
 };
 
-function ProjectionHarness({ onReport }: { onReport: (handle: ProjectionHandle) => void }) {
+function ProjectionHarness({
+  onReport,
+  source = ingress,
+  family = 'v4',
+  saving = false,
+}: {
+  onReport: (handle: ProjectionHandle) => void;
+  source?: SnapshotIngress;
+  family?: 'v4' | 'v6';
+  saving?: boolean;
+}) {
   const [client] = useState(
     () =>
       new QueryClient({
         defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
       }),
   );
-  const { onV4Handle } = useProjectionHandles();
+  const { registrars } = useProjectionHandles();
+  const register = registrars[`vless:${family}`];
   const reportHandle = useCallback(
     (handle: ProjectionHandle) => {
       onReport(handle);
-      onV4Handle(handle);
+      register(handle);
     },
-    [onReport, onV4Handle],
+    [onReport, register],
   );
 
   return (
@@ -50,12 +61,13 @@ function ProjectionHarness({ onReport }: { onReport: (handle: ProjectionHandle) 
       <dl>
         <IngressProjectionRow
           appId="app-1"
-          ingress={ingress}
+          ingress={source}
           protocol="vless"
-          family="v4"
+          family={family}
           node={{ public_ipv4: '192.0.2.1', public_ipv6: null }}
           editable
           onHandle={reportHandle}
+          saving={saving}
         />
       </dl>
     </QueryClientProvider>
@@ -117,5 +129,57 @@ describe('projection handle registration', () => {
       v4: { host: 'legacy.edge.example', port: 10443 },
       anytls: { v4: null },
     });
+  });
+
+  it('opens a saved editor without marking it dirty, tracks real changes, and restores the summary', async () => {
+    const reports = vi.fn<(handle: ProjectionHandle) => void>();
+    const source = { ...ingress, projection: { v4: { host: 'edge.example.com', port: 10443 } } };
+    const view = render(<ProjectionHarness source={source} onReport={reports} />);
+    const latest = () => reports.mock.lastCall![0];
+
+    expect(view.getByText('edge.example.com:10443')).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '编辑' }));
+    await waitFor(() => expect(latest()).toMatchObject({ dirty: false, editing: true, blocked: false }));
+    expect(latest().apply(source.projection)).toEqual(source.projection);
+    const port = view.getByRole('textbox', { name: 'VLESS · TLS / REALITY IPv4 端口' });
+    fireEvent.change(port, { target: { value: '2443' } });
+    await waitFor(() => expect(latest()).toMatchObject({ dirty: true, editing: true, blocked: false }));
+    expect(latest().apply(source.projection).v4?.port).toBe(2443);
+    fireEvent.change(port, { target: { value: '10443' } });
+    await waitFor(() => expect(latest()).toMatchObject({ dirty: false, editing: true, blocked: false }));
+    act(() => latest().reset());
+    expect(view.queryByRole('textbox')).toBeNull();
+    expect(view.getByText('edge.example.com:10443')).toBeTruthy();
+    expect(latest()).toMatchObject({ dirty: false, editing: false, blocked: false });
+  });
+
+  it('discards a new conversion when returning to default and blocks invalid ports', async () => {
+    const reports = vi.fn<(handle: ProjectionHandle) => void>();
+    const view = render(<ProjectionHarness onReport={reports} />);
+    fireEvent.click(view.getByRole('button', { name: '转换' }));
+    fireEvent.change(view.getByRole('textbox', { name: 'VLESS · TLS / REALITY IPv4 地址或域名' }), {
+      target: { value: 'edge.example.com' },
+    });
+    fireEvent.change(view.getByRole('textbox', { name: 'VLESS · TLS / REALITY IPv4 端口' }), {
+      target: { value: '65536' },
+    });
+    await waitFor(() => expect(reports.mock.lastCall![0]).toMatchObject({ dirty: true, blocked: true }));
+    fireEvent.click(view.getByRole('button', { name: '默认' }));
+    await waitFor(() =>
+      expect(reports.mock.lastCall![0]).toMatchObject({ dirty: false, editing: false, blocked: false }),
+    );
+    expect(view.queryByRole('textbox')).toBeNull();
+  });
+
+  it('formats a saved IPv6 endpoint unambiguously and freezes controls while saving', () => {
+    const reports = vi.fn<(handle: ProjectionHandle) => void>();
+    const source = { ...ingress, projection: { v6: { host: '2001:db8::20', port: 10443 } } };
+    const view = render(<ProjectionHarness source={source} family="v6" onReport={reports} />);
+    expect(view.getByText('[2001:db8::20]:10443')).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '编辑' }));
+    view.rerender(<ProjectionHarness source={source} family="v6" onReport={reports} saving />);
+    for (const input of view.getAllByRole('textbox')) expect((input as HTMLInputElement).disabled).toBe(true);
+    expect((view.getByRole('button', { name: '默认' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((view.getByRole('button', { name: '转换' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

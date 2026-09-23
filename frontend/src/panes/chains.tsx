@@ -3680,6 +3680,7 @@ export function IngressStreamRow({
 
 export type ProjectionHandle = {
   dirty: boolean;
+  editing: boolean;
   blocked: boolean;
   apply: (projection: IngressProjection) => IngressProjection;
   save: () => void;
@@ -3709,6 +3710,7 @@ export function useProjectionHandles() {
   return {
     projHandles,
     projDirty: Object.values(projHandles).some(handle => handle.dirty),
+    projEditing: Object.values(projHandles).some(handle => handle.editing),
     projBlocked: Object.values(projHandles).some(handle => handle.blocked),
     registrars,
     onV4Handle: registrars['vless:v4'],
@@ -3724,6 +3726,7 @@ export function IngressProjectionRow({
   node,
   editable,
   onHandle,
+  saving = false,
 }: {
   appId: string;
   ingress: SnapshotIngress;
@@ -3732,6 +3735,7 @@ export function IngressProjectionRow({
   node?: { public_ipv4: string | null; public_ipv6: string | null };
   editable: boolean;
   onHandle?: (h: ProjectionHandle) => void;
+  saving?: boolean;
 }) {
   const qc = useQueryClient();
   const current = effectiveProjectionEndpoint(ingress, protocol, family);
@@ -3740,6 +3744,7 @@ export function IngressProjectionRow({
 
   const publicAddr = family === 'v4' ? node?.public_ipv4 : node?.public_ipv6;
   const label = family === 'v4' ? 'IPv4' : 'IPv6';
+  const fieldLabel = `${projectionProtocolLabel(protocol)} ${label}`;
 
   const port = Number(draft?.port ?? '');
   const valid =
@@ -3786,10 +3791,17 @@ export function IngressProjectionRow({
     },
   });
   const mutateProjection = save.mutate;
+  const pending = saving || save.isPending;
 
   const managed = onHandle !== undefined;
   const on = draft !== null || (current !== null && !disabledDraft);
-  const dirty = disabledDraft || draft !== null;
+  const editing = draft !== null;
+  const dirty =
+    disabledDraft ||
+    (draft !== null && (!current || !valid || draft.host.trim() !== current.host || port !== current.port));
+  const currentAddress = current
+    ? `${current.host.includes(':') && !current.host.startsWith('[') ? `[${current.host}]` : current.host}:${current.port}`
+    : '';
   const doSave = useCallback(() => {
     if (managed) {
       if (disabledDraft) mutateProjection(null);
@@ -3809,12 +3821,13 @@ export function IngressProjectionRow({
   const handle = useMemo<ProjectionHandle>(
     () => ({
       dirty,
+      editing,
       blocked: dirty && !disabledDraft && !valid,
       apply: applyProjection,
       save: doSave,
       reset: resetProjection,
     }),
-    [applyProjection, disabledDraft, dirty, doSave, resetProjection, valid],
+    [applyProjection, disabledDraft, dirty, doSave, editing, resetProjection, valid],
   );
   useEffect(() => {
     onHandle?.(handle);
@@ -3822,55 +3835,68 @@ export function IngressProjectionRow({
 
   return (
     <>
-      <dt>{label} 地址</dt>
+      <dt>{label}</dt>
       <dd>
-        <SegSwitch
-          checked={on}
-          disabled={!editable || save.isPending}
-          onChange={next => {
-            if (next) {
-              setDisabledDraft(false);
-              setDraft({
-                host: current?.host ?? '',
-                port: String(current?.port ?? projectionListenPort(ingress, protocol)),
-              });
-            } else if (current) {
-              setDraft(null);
-              if (managed) setDisabledDraft(true);
-              else save.mutate(null);
-            } else {
-              setDraft(null);
-              setDisabledDraft(false);
-            }
-          }}
-          off="默认"
-          on="转换"
-        />
+        <div className="client-projection-mode">
+          <SegSwitch
+            checked={on}
+            disabled={!editable || pending}
+            ariaLabel={`${fieldLabel} 地址转换`}
+            onChange={next => {
+              if (next) {
+                setDisabledDraft(false);
+                setDraft({
+                  host: current?.host ?? '',
+                  port: String(current?.port ?? projectionListenPort(ingress, protocol)),
+                });
+              } else if (current) {
+                setDraft(null);
+                if (managed) setDisabledDraft(true);
+                else save.mutate(null);
+              } else {
+                setDraft(null);
+                setDisabledDraft(false);
+              }
+            }}
+            off="默认"
+            on="转换"
+          />
+          {dirty && <span className="client-projection-dirty" title="未保存" />}
+        </div>
         {draft ? (
-          <div className="ing-pj">
-            <input
-              className="f mono"
-              value={draft.host}
-              placeholder="地址或域名"
-              onChange={e => setDraft({ ...draft, host: e.target.value })}
-            />
-            <span className="dim">:</span>
-            <input
-              className="f mono ing-pj-port"
-              value={draft.port}
-              inputMode="numeric"
-              onChange={e => setDraft({ ...draft, port: e.target.value })}
-            />
+          <div className="client-projection-editor">
+            <label>
+              <span>地址或域名</span>
+              <input
+                className="f mono"
+                aria-label={`${fieldLabel} 地址或域名`}
+                value={draft.host}
+                placeholder="地址或域名"
+                autoComplete="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                disabled={!editable || pending}
+                onChange={e => setDraft({ ...draft, host: e.target.value })}
+              />
+            </label>
+            <label>
+              <span>端口</span>
+              <input
+                className="f mono"
+                aria-label={`${fieldLabel} 端口`}
+                value={draft.port}
+                inputMode="numeric"
+                disabled={!editable || pending}
+                onChange={e => setDraft({ ...draft, port: e.target.value })}
+              />
+            </label>
           </div>
         ) : on && current ? (
-          <>
-            <span className="mono">
-              {current.host}:{current.port}
-            </span>
+          <div className="client-projection-summary">
+            <code title={currentAddress}>{currentAddress}</code>
             <button
               className="btn"
-              style={{ marginLeft: 8 }}
-              disabled={!editable || save.isPending}
+              disabled={!editable || pending}
               onClick={() => {
                 setDisabledDraft(false);
                 setDraft({ host: current.host, port: String(current.port) });
@@ -3878,7 +3904,7 @@ export function IngressProjectionRow({
             >
               编辑
             </button>
-          </>
+          </div>
         ) : !publicAddr ? (
           <div className="note">机器无公网 {label}，不生成此条订阅</div>
         ) : null}
@@ -5043,7 +5069,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const encryptionPanel = useImmediatePanelVisibility(!!ingress?.wires.vless_encryption);
   const anyTlsPanel = useImmediatePanelVisibility(!!ingress?.wires.anytls);
   const hy2Panel = useImmediatePanelVisibility(!!ingress?.wires.hysteria2);
-  const { projHandles, projDirty, projBlocked, registrars: projectionRegistrars } = useProjectionHandles();
+  const { projHandles, projDirty, projEditing, projBlocked, registrars: projectionRegistrars } = useProjectionHandles();
   const bindDirty = pendingBind !== null && pendingBind !== ingress?.bind;
   useUnsavedChanges(bindDirty, `${c?.name || chain} 的绑定地址`);
   useUnsavedChanges(projDirty, `${c?.name || chain} 的客户端入口地址`);
@@ -5272,6 +5298,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                               node={nodes.data?.nodes.find(n => n.node_id === ingress.node)}
                               editable={editable}
                               onHandle={projectionRegistrars[key]}
+                              saving={saveProjections.isPending}
                             />
                           </div>
                         );
@@ -5287,24 +5314,28 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                 用于修改客户端入口地址配置。不影响服务端监听。
               </div>
               {saveProjections.error && <ErrorBox error={saveProjections.error} />}
-              {projDirty && (
-                <div className="toolbar">
-                  <button
-                    className="btn"
-                    disabled={saveProjections.isPending}
-                    onClick={() => Object.values(projHandles).forEach(h => h.reset())}
-                  >
-                    还原
-                  </button>
-                  <button
-                    className={!projBlocked ? 'btn primary' : 'btn'}
-                    disabled={!editable || projBlocked || saveProjections.isPending}
-                    onClick={() => saveProjections.mutate()}
-                  >
-                    {saveProjections.isPending ? '保存中…' : '保存'}
-                  </button>
-                </div>
-              )}
+              <div className="toolbar config-panel-savebar">
+                {projDirty && (
+                  <span className="note client-projection-pending">
+                    {Object.values(projHandles).filter(handle => handle.dirty).length} 项更改待保存
+                  </span>
+                )}
+                <span className="sp" />
+                <button
+                  className="btn primary"
+                  disabled={!editable || !projDirty || projBlocked || saveProjections.isPending}
+                  onClick={() => saveProjections.mutate()}
+                >
+                  {saveProjections.isPending ? '保存中…' : '保存'}
+                </button>
+                <button
+                  className="btn"
+                  disabled={(!projDirty && !projEditing) || saveProjections.isPending}
+                  onClick={() => Object.values(projHandles).forEach(h => h.reset())}
+                >
+                  还原
+                </button>
+              </div>
             </ConfigPanel>
           )}
 
