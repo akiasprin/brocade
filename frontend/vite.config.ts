@@ -102,6 +102,10 @@ function pingMockPlugin(): Plugin {
           response.end(JSON.stringify({ nodes: [] }));
           return;
         }
+        if (url.pathname === '/ping-probe/nodes/latest') {
+          response.end(JSON.stringify({ interval_secs: 60, nodes: [] }));
+          return;
+        }
         const prefix = '/ping-probe/nodes/';
         if (url.pathname.startsWith(prefix)) {
           const nodeId = decodeURIComponent(url.pathname.slice(prefix.length));

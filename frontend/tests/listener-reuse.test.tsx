@@ -294,9 +294,9 @@ describe('监听规则子树复用', () => {
     expect(view.getByText('引用的监听子树')).toBeTruthy();
     expect(view.getByText('新加坡共享监听')).toBeTruthy();
 
-    view.rerender(tree([{ m: { t: 'any' }, a: { t: 'proxy', outbound: 'warp' } }]));
+    view.rerender(tree([{ m: { t: 'any' }, a: { t: 'proxy', outbound: 'warp-8f3a-2d71' } }]));
     expect(view.getByText('外部代理')).toBeTruthy();
-    expect(view.getByText('warp')).toBeTruthy();
+    expect(view.getByText('warp-8f3a-2d71')).toBeTruthy();
 
     view.rerender(tree([egressRule()]));
     expect(view.getByText('本机出网')).toBeTruthy();
@@ -489,7 +489,7 @@ describe('监听规则子树复用', () => {
     expect(menu?.parentElement).toBe(document.body);
     expect(view.container.contains(menu)).toBe(false);
     fireEvent.click(custom);
-    const crossAppSearch = view.getByPlaceholderText('跨 App 搜索链、节点或端口');
+    const crossAppSearch = view.getByPlaceholderText('跨 App 搜索链、机器或端口');
     fireEvent.change(crossAppSearch, { target: { value: '监听项目' } });
     const ownerChain = view.getByRole('button', { name: /共享出口.*1 个监听端点/ });
     fireEvent.click(ownerChain);

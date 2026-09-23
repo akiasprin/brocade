@@ -1,24 +1,24 @@
 use brocade_core::client_config::{ClientProjectionDownloadEndpoint, SubscriptionClientConfig};
 use brocade_core::hash::sha256_hex;
 use brocade_core::model::{
-    AnyTlsMasquerade, AppView, Dns, DomainStrategy, ExternalOutbound, HysteriaCongestion,
-    HysteriaMasquerade, HysteriaObfs, IngressWires, ModelSnapshot, Node,
-    ProjectionDownloadEndpoint, RealityFallbackLimits, RealityFallbackMode, RealitySettings,
-    RealitySite, Transport,
+    Action, AnyTlsMasquerade, AppView, Dns, DomainStrategy, ExternalOutbound,
+    ExternalOutboundProtocol, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires,
+    ModelSnapshot, Node, ProjectionDownloadEndpoint, RealityFallbackLimits, RealityFallbackMode,
+    RealitySettings, RealitySite, Transport,
 };
 use brocade_deployment::plan::{
     grants_match, narrow_to_kind, plan_deployment as plan_snapshot_deployment,
     plan_desired_deployment, plan_forced_deployment as plan_forced_snapshot_deployment,
     AppliedArtifactState, AppliedGrantsState, ConfigArtifact, DeploymentKind, DeploymentPlan,
     DesiredArtifact, DesiredGrants, NodeAppliedState, NodeDesiredState, ObservedInbound,
-    PlanDiagnostic, PlannedTarget, PlannedTargetStatus,
+    PlanDiagnostic, PlannedAction, PlannedTarget, PlannedTargetStatus,
 };
 use brocade_deployment::protocol::{
     CreateDeploymentRequest, CreateDeploymentResult, CreateRollbackRequest,
     DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
     DeploymentTargetDetail, DeploymentWaveConfirmationResult, IsolateDeploymentTargetRequest,
-    NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState,
-    TargetApplyResult, TargetConvergenceReport,
+    IsolateNodeRequest, NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult,
+    ReportedNodeState, TargetApplyResult, TargetConvergenceReport, MIN_AGENT_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
@@ -30,6 +30,13 @@ use crate::{
 };
 
 const DISPATCH_LEASE_INTERVAL: &str = "15 minutes";
+const VPNGATE_NODE_INELIGIBLE_WARNING: &str = "vpngate.node-ineligible";
+// Rows cannot lock the absence of either a future deployment target or a future isolation row.
+// Every transaction that creates deployment targets or changes operational isolation therefore
+// takes this application-owned lock before its first business row lock. The automatic grants path
+// uses a separate guard transaction so its Repeatable Read snapshot starts only after this lock is
+// held.
+const DEPLOYMENT_ISOLATION_LOCK_KEY: i64 = 0x6272_6f63_6973_6f6c;
 
 struct CanceledDeployment {
     status: String,
@@ -93,9 +100,184 @@ async fn plan_deployment_unscoped(pool: &PgPool, revision_id: u64) -> Result<Dep
     let snapshot = load_snapshot_for_deployment(pool, revision_id).await?;
     let mut applied = load_applied_states(pool).await?;
     attach_running_xray(pool, &mut applied).await?;
-    let plan = plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?;
+    let mut plan = plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?;
+    let serving_revision = sqlx::query_scalar::<_, i64>(
+        "SELECT topology_revision_id FROM subscription_serving_state WHERE id = TRUE",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let serving_snapshot = match serving_revision {
+        Some(serving_revision) => {
+            Some(load_snapshot_for_deployment(pool, revision_to_u64(serving_revision)?).await?)
+        }
+        None => None,
+    };
+    mark_vpngate_policy_changes(&mut plan, serving_snapshot.as_ref(), &snapshot);
     let terminal = terminal_lifecycle_nodes(pool).await?;
-    Ok(without_terminal_lifecycle_targets(plan, &terminal))
+    let mut plan = without_terminal_lifecycle_targets(plan, &terminal);
+    annotate_vpngate_node_eligibility(pool, &mut plan, serving_snapshot.as_ref(), &snapshot)
+        .await?;
+    Ok(plan)
+}
+
+type VpngatePolicyIdentity = (String, String, Option<String>, Vec<String>, u32, u64, u8);
+
+fn vpngate_policies_by_node(
+    snapshot: &ModelSnapshot,
+) -> BTreeMap<String, BTreeSet<VpngatePolicyIdentity>> {
+    let outbounds = snapshot
+        .external_outbounds
+        .iter()
+        .map(|outbound| (outbound.id.as_str(), &outbound.protocol))
+        .collect::<BTreeMap<_, _>>();
+    let mut policies = BTreeMap::<String, BTreeSet<VpngatePolicyIdentity>>::new();
+    for step in snapshot.apps.iter().flat_map(|app| &app.steps) {
+        for rule in &step.rules {
+            let Action::Proxy { outbound } = &rule.action else {
+                continue;
+            };
+            let Some(ExternalOutboundProtocol::Vpngate {
+                country_code,
+                server_id,
+                server_ids,
+                max_connect_ms,
+                min_download_bps,
+                max_candidates,
+            }) = outbounds.get(outbound.as_str()).copied()
+            else {
+                continue;
+            };
+            let mut manual_ids = server_ids.clone();
+            manual_ids.sort();
+            policies.entry(step.node.clone()).or_default().insert((
+                outbound.clone(),
+                country_code.clone(),
+                server_id.clone(),
+                manual_ids,
+                *max_connect_ms,
+                *min_download_bps,
+                *max_candidates,
+            ));
+        }
+    }
+    policies
+}
+
+/// Add a non-disruptive release fence when stable VPN Gate intent changes without changing any
+/// Xray bytes. The runtime worker reads only the serving revision, so skipping this target would
+/// leave it pinned to the previous country or measurement policy forever.
+fn mark_vpngate_policy_changes(
+    plan: &mut DeploymentPlan,
+    serving: Option<&ModelSnapshot>,
+    target: &ModelSnapshot,
+) {
+    let before = serving.map(vpngate_policies_by_node).unwrap_or_default();
+    let after = vpngate_policies_by_node(target);
+    for target in &mut plan.targets {
+        if before.get(&target.node_id) == after.get(&target.node_id) {
+            continue;
+        }
+        if !target.actions.contains(&PlannedAction::SyncVpngate) {
+            target.actions.push(PlannedAction::SyncVpngate);
+        }
+        if target.status == PlannedTargetStatus::Skipped {
+            target.status = PlannedTargetStatus::Pending;
+        }
+    }
+    plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
+}
+
+fn vpngate_nodes_requiring_capability(
+    plan: &DeploymentPlan,
+    serving: Option<&ModelSnapshot>,
+    target: &ModelSnapshot,
+) -> BTreeSet<String> {
+    let before = serving.map(vpngate_policies_by_node).unwrap_or_default();
+    let after = vpngate_policies_by_node(target);
+    plan.targets
+        .iter()
+        .filter(|planned| {
+            after
+                .get(&planned.node_id)
+                .is_some_and(|policies| !policies.is_empty())
+                && before.get(&planned.node_id) != after.get(&planned.node_id)
+        })
+        .map(|planned| planned.node_id.clone())
+        .collect()
+}
+
+/// Attach an operator-readable preview warning for every machine that would newly receive or
+/// change VPN Gate intent without proving it can run OpenVPN. Removal remains allowed: it is the
+/// recovery path after OpenVPN has been uninstalled.
+async fn annotate_vpngate_node_eligibility(
+    pool: &PgPool,
+    plan: &mut DeploymentPlan,
+    serving: Option<&ModelSnapshot>,
+    target: &ModelSnapshot,
+) -> Result<()> {
+    let required = vpngate_nodes_requiring_capability(plan, serving, target);
+    if required.is_empty() {
+        return Ok(());
+    }
+    let node_ids = required.iter().cloned().collect::<Vec<_>>();
+    let rows = sqlx::query(
+        "SELECT node_id, agent_protocol_version,
+                runtime_reported_at IS NOT NULL AS runtime_reported,
+                COALESCE(runtime_reported_at >= now() - interval '2 minutes', FALSE) AS runtime_fresh,
+                NULLIF(BTRIM(runtime_versions->>'openvpn'), '') AS openvpn
+           FROM node_agent_state
+          WHERE node_id = ANY($1)",
+    )
+    .bind(&node_ids)
+    .fetch_all(pool)
+    .await?;
+    let observed = rows
+        .into_iter()
+        .map(|row| {
+            let node_id = row.try_get::<String, _>("node_id")?;
+            let values = (
+                row.try_get::<Option<i32>, _>("agent_protocol_version")?,
+                row.try_get::<bool, _>("runtime_reported")?,
+                row.try_get::<bool, _>("runtime_fresh")?,
+                row.try_get::<Option<String>, _>("openvpn")?,
+            );
+            Ok((node_id, values))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let minimum_protocol = i32::try_from(MIN_AGENT_PROTOCOL_VERSION)
+        .expect("Agent protocol version is deliberately within PostgreSQL INTEGER");
+
+    for node_id in required {
+        let reason = match observed.get(&node_id) {
+            None | Some((_, false, _, _)) => {
+                Some("尚未上报运行时能力；安装新版 Agent 并等待一次运行时上报".to_owned())
+            }
+            Some((protocol, _, _, _))
+                if protocol.is_none_or(|version| version < minimum_protocol) =>
+            {
+                Some(format!(
+                    "Agent 协议为 {}，需要升级到 v{MIN_AGENT_PROTOCOL_VERSION} 或更高版本",
+                    protocol.map_or_else(|| "未知".to_owned(), |value| format!("v{value}"))
+                ))
+            }
+            Some((_, _, false, _)) => {
+                Some("最近 2 分钟没有运行时上报，暂不能确认 OpenVPN 能力".to_owned())
+            }
+            Some((_, _, true, None)) => Some(
+                "未安装或无法执行 OpenVPN；用 Agent 安装器的 --enable-openvpn 补齐后重试"
+                    .to_owned(),
+            ),
+            Some((_, _, true, Some(_))) => None,
+        };
+        if let Some(reason) = reason {
+            plan.warnings.push(PlanDiagnostic {
+                code: VPNGATE_NODE_INELIGIBLE_WARNING.to_owned(),
+                location: node_id,
+                message: reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn terminal_lifecycle_nodes<'e, E>(executor: E) -> Result<BTreeSet<String>>
@@ -144,6 +326,14 @@ fn mark_isolated_targets(plan: &mut DeploymentPlan, isolated: &BTreeSet<String>)
     }
     defer_listener_dependents(plan, false);
     plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
+}
+
+async fn lock_deployment_isolation_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(DEPLOYMENT_ISOLATION_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// A caller must not move ahead when the listener it depends on cannot move in this deployment.
@@ -296,6 +486,7 @@ pub async fn create_deployment(
     }
 
     let mut tx = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut tx).await?;
     let isolated = isolated_node_ids(&mut *tx).await?;
     mark_isolated_targets(&mut plan, &isolated);
 
@@ -324,6 +515,21 @@ pub async fn create_deployment(
             reused: true,
             plan,
         });
+    }
+
+    if request.kind == DeploymentKind::Config {
+        let blockers = plan
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == VPNGATE_NODE_INELIGIBLE_WARNING)
+            .map(|warning| format!("{}：{}", warning.location, warning.message))
+            .collect::<Vec<_>>();
+        if !blockers.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "VPN Gate 发布被阻止；{}",
+                blockers.join("；")
+            )));
+        }
     }
 
     // Single-flight is per kind: while somebody is pushing xray in waves (confirming each,
@@ -432,6 +638,7 @@ pub async fn transition_node_status(
     };
 
     let mut tx = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut tx).await?;
     // Report, retry, cancel and rollback all lock the deployment row before any target or
     // lifecycle row. Preserve that global order here too: changing the epoch first and only then
     // waiting for an in-flight report's deployment row forms the inverse lock order and lets a
@@ -445,6 +652,10 @@ pub async fn transition_node_status(
     )
     .fetch_all(&mut *tx)
     .await?;
+    if retiring {
+        crate::xray_release::cancel_for_node_lifecycle_tx(&mut tx, node_id, actor.operator_id())
+            .await?;
+    }
     let uncertain_obligations = sqlx::query(
         "SELECT source_deployment_id, kind
            FROM node_convergence_obligations
@@ -620,6 +831,7 @@ pub async fn abandon_node(
         ));
     }
     let mut tx = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut tx).await?;
     // Same lock order as report/cancel: deployment, then lifecycle/target.
     let active_ids = sqlx::query_scalar::<_, i64>(
         "SELECT id
@@ -630,6 +842,8 @@ pub async fn abandon_node(
     )
     .fetch_all(&mut *tx)
     .await?;
+    crate::xray_release::cancel_for_node_lifecycle_tx(&mut tx, node_id, actor.operator_id())
+        .await?;
     let lifecycle_epoch = crate::lifecycle::abandon_tx(&mut tx, node_id).await?;
     let mut canceled_deployment_ids = Vec::new();
     for deployment_id in active_ids {
@@ -721,6 +935,22 @@ async fn insert_lifecycle_deployment_tx(
 /// list back. Once a target has been dispatched its snapshot is immutable; an xray-changing target
 /// in that state is returned as a conflict and the durable job retries immediately after it lands.
 pub(crate) async fn create_automatic_grants_deployment(
+    pool: &PgPool,
+    actor: &AdminContext,
+    revision_id: u64,
+    note: &str,
+) -> Result<AutomaticGrantsDeploymentResult> {
+    // Holding this in a separate transaction is intentional. Taking the advisory lock as the
+    // first statement inside the Repeatable Read transaction would establish its snapshot before
+    // a concurrent isolator finished, so it could still miss the isolation after waiting.
+    let mut isolation_guard = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut isolation_guard).await?;
+    let result = create_automatic_grants_deployment_locked(pool, actor, revision_id, note).await;
+    isolation_guard.commit().await?;
+    result
+}
+
+async fn create_automatic_grants_deployment_locked(
     pool: &PgPool,
     actor: &AdminContext,
     revision_id: u64,
@@ -1318,6 +1548,7 @@ pub async fn create_rollback_deployment(
     }
 
     let mut tx = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut tx).await?;
 
     if let Some(existing) = sqlx::query(
         "SELECT id, revision_id, status, rollback_of_deployment_id
@@ -1439,11 +1670,16 @@ pub async fn list_deployments(
     actor: &AdminContext,
     limit: u32,
     kind: Option<DeploymentKind>,
+    active_only: bool,
 ) -> Result<DeploymentList> {
     let limit = i64::from(limit.clamp(1, 200));
     let kind = kind.map(DeploymentKind::as_str);
+    // `active_only` selects one of two stable SQL texts instead of becoming a bind condition.
+    // That lets PostgreSQL prove `d.active` at plan time and keep using the partial
+    // `deployments_single_flight` index even after the prepared statement adopts a generic plan.
+    // The replacement is an internal constant, never request text.
     let rows = if actor.is_system_admin() {
-        sqlx::query(
+        let sql =
             "SELECT d.id,
                     d.revision_id,
                     d.status,
@@ -1513,21 +1749,26 @@ pub async fn list_deployments(
              LEFT JOIN deployment_target_state dts
                ON dts.deployment_id = dt.deployment_id
               AND dts.node_id = dt.node_id
-             WHERE $2::text IS NULL OR d.kind = $2
+             WHERE ($2::text IS NULL OR d.kind = $2)
+               __ACTIVE_FILTER__
              GROUP BY d.id
              ORDER BY d.id DESC
-             LIMIT $1",
-        )
-        .bind(limit)
-        .bind(kind)
-        .fetch_all(pool)
-        .await?
+             LIMIT $1"
+                .replace(
+                    "__ACTIVE_FILTER__",
+                    if active_only { "AND d.active" } else { "" },
+                );
+        sqlx::query(&sql)
+            .bind(limit)
+            .bind(kind)
+            .fetch_all(pool)
+            .await?
     } else {
         let tenant_scope = require_actor_tenant_scope(actor)?;
         let tenant_pattern = actor
             .tenant_scope_like_pattern()
             .ok_or_else(|| StoreError::Forbidden("admin context has no tenant_scope".to_owned()))?;
-        sqlx::query(
+        let sql =
             "SELECT d.id,
                     d.revision_id,
                     d.status,
@@ -1601,16 +1842,21 @@ pub async fn list_deployments(
               AND dts.node_id = dt.node_id
              WHERE (n.tenant_id = $2 OR n.tenant_id LIKE $3 ESCAPE '\\')
                AND ($4::text IS NULL OR d.kind = $4)
+               __ACTIVE_FILTER__
              GROUP BY d.id
              ORDER BY d.id DESC
-             LIMIT $1",
-        )
-        .bind(limit)
-        .bind(tenant_scope)
-        .bind(tenant_pattern)
-        .bind(kind)
-        .fetch_all(pool)
-        .await?
+             LIMIT $1"
+                .replace(
+                    "__ACTIVE_FILTER__",
+                    if active_only { "AND d.active" } else { "" },
+                );
+        sqlx::query(&sql)
+            .bind(limit)
+            .bind(tenant_scope)
+            .bind(tenant_pattern)
+            .bind(kind)
+            .fetch_all(pool)
+            .await?
     };
 
     let deployments = rows
@@ -2727,12 +2973,39 @@ pub async fn isolate_deployment_target(
     node_id: &str,
     request: IsolateDeploymentTargetRequest,
 ) -> Result<NodeIsolationCommandResult> {
+    isolate_node_inner(
+        pool,
+        actor,
+        node_id,
+        Some((deployment_id, request.expected_target_status)),
+        request.acknowledge_uncertain,
+    )
+    .await
+}
+
+pub async fn isolate_node(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: IsolateNodeRequest,
+) -> Result<NodeIsolationCommandResult> {
+    isolate_node_inner(pool, actor, node_id, None, request.acknowledge_uncertain).await
+}
+
+async fn isolate_node_inner(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    expected_target: Option<(i64, String)>,
+    acknowledge_uncertain: bool,
+) -> Result<NodeIsolationCommandResult> {
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
-            "only system-admin can isolate deployment targets".to_owned(),
+            "only system-admin can isolate nodes".to_owned(),
         ));
     }
     let mut tx = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut tx).await?;
     let rows = sqlx::query(
         "SELECT d.id AS deployment_id,
                 d.revision_id,
@@ -2760,20 +3033,21 @@ pub async fn isolate_deployment_target(
     .bind(node_id)
     .fetch_all(&mut *tx)
     .await?;
-    let selected = rows
-        .iter()
-        .find(|row| row.try_get::<i64, _>("deployment_id").ok() == Some(deployment_id))
-        .ok_or_else(|| {
-            StoreError::NotFound(format!(
-                "active deployment target {deployment_id}/{node_id}"
-            ))
-        })?;
-    let selected_status: String = selected.try_get("target_status")?;
-    if selected_status != request.expected_target_status {
-        return Err(StoreError::Conflict(format!(
-            "target {deployment_id}/{node_id} changed from {} to {selected_status}",
-            request.expected_target_status
-        )));
+    if let Some((deployment_id, expected_target_status)) = expected_target {
+        let selected = rows
+            .iter()
+            .find(|row| row.try_get::<i64, _>("deployment_id").ok() == Some(deployment_id))
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "active deployment target {deployment_id}/{node_id}"
+                ))
+            })?;
+        let selected_status: String = selected.try_get("target_status")?;
+        if selected_status != expected_target_status {
+            return Err(StoreError::Conflict(format!(
+                "target {deployment_id}/{node_id} changed from {expected_target_status} to {selected_status}"
+            )));
+        }
     }
     let uncertain = rows.iter().any(|row| {
         row.try_get::<String, _>("target_status")
@@ -2784,7 +3058,7 @@ pub async fn isolate_deployment_target(
                 )
             })
     });
-    if uncertain && !request.acknowledge_uncertain {
+    if uncertain && !acknowledge_uncertain {
         return Err(StoreError::Conflict(
             "target state is uncertain; acknowledge_uncertain is required".to_owned(),
         ));
@@ -2980,6 +3254,7 @@ pub async fn restore_node_service(
         ));
     }
     let mut tx = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut tx).await?;
     let row = sqlx::query(
         "SELECT lifecycle.phase,
                 lifecycle.lifecycle_epoch,
@@ -3174,6 +3449,7 @@ pub async fn cancel_deployment_and_rollback(
 
     let idempotency_key = format!("system:cancel-and-rollback:{deployment_id}");
     let mut tx = pool.begin().await?;
+    lock_deployment_isolation_tx(&mut tx).await?;
 
     if let Some(existing) = sqlx::query(
         "SELECT id, rollback_of_deployment_id
@@ -3721,6 +3997,7 @@ fn preserve_immediate_fields(
     target.settings.ports = current.settings.ports;
     target.settings.probe = current.settings.probe.clone();
     target.users = current.users.clone();
+    client.apply_fronts(&mut target);
 
     let app_rank = client
         .app_order
@@ -4442,7 +4719,8 @@ async fn restore_app_tx(
                 anytls_masquerade_headers, anytls_masquerade_status_code,
                 anytls_security, anytls_reality,
                 anytls_reality_private_key, anytls_reality_public_key,
-                anytls_reality_short_ids, vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options
+                anytls_reality_short_ids, vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options,
+                protocol_projection
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
@@ -4461,7 +4739,7 @@ async fn restore_app_tx(
                 $45, $46, $47, $48,
                 $49, $50, $51,
                 $52, $53, $54, $55, $56, $57, $58, $59, $60,
-                $61, $62, $63, $64, $65, $66, $67
+                $61, $62, $63, $64, $65, $66, $67, $68
              )",
         )
         .bind(&ingress.id)
@@ -4562,6 +4840,7 @@ async fn restore_app_tx(
         .bind(ingress.wires.vless_encryption().map(|wire| &wire.private_key))
         .bind(ingress.wires.vless_encryption().map(|wire| &wire.public_key))
         .bind(serde_json::to_value(ingress.wires.vless_encryption().map(|wire| wire.options.clone()).unwrap_or_default())?)
+        .bind(serde_json::to_value(projection)?)
         .execute(&mut **tx)
         .await?;
 
@@ -6458,11 +6737,16 @@ pub async fn discard_pending_changes(
 #[cfg(test)]
 mod tests {
     use super::{
-        defer_listener_dependents, flow_column, preserve_immediate_fields, strip_commit_prefix,
+        defer_listener_dependents, flow_column, mark_vpngate_policy_changes,
+        preserve_immediate_fields, strip_commit_prefix, vpngate_nodes_requiring_capability,
     };
     use brocade_core::{
         client_config::SubscriptionClientConfig,
-        model::{AppView, Chain, ModelSettings, ModelSnapshot, User},
+        model::{
+            Action, AppView, Chain, DestMatch, ExternalOutbound, ExternalOutboundProtocol,
+            ExternalOutboundSecurity, Front, FrontStrategy, ModelSettings, ModelSnapshot, Rule,
+            Step, User,
+        },
     };
     use brocade_deployment::plan::{
         DeploymentPlan, DesiredArtifact, DesiredGrants, NodeDesiredState, PlanSummary,
@@ -6555,6 +6839,113 @@ mod tests {
         }
     }
 
+    fn vpngate_snapshot(revision: u64, server_id: Option<&str>) -> ModelSnapshot {
+        let mut app = app("app", "VPN Gate", Vec::new());
+        app.steps.push(Step {
+            chain: "chain".to_owned(),
+            node: "edge".to_owned(),
+            accept: None,
+            hop_in: None,
+            rules: vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Proxy {
+                    outbound: "vpngate-1111-1111".to_owned(),
+                },
+            }],
+        });
+        let mut snapshot = snapshot(revision, ModelSettings::default(), vec![app], Vec::new());
+        snapshot.external_outbounds.push(ExternalOutbound {
+            id: "vpngate-1111-1111".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "VPN Gate Japan".to_owned(),
+            address: brocade_core::model::VPNGATE_MANAGED_ADDRESS.to_owned(),
+            port: brocade_core::model::VPNGATE_MANAGED_PORT,
+            protocol: ExternalOutboundProtocol::Vpngate {
+                country_code: "JP".to_owned(),
+                server_id: server_id.map(str::to_owned),
+                server_ids: Vec::new(),
+                max_connect_ms: 15_000,
+                min_download_bps: 1_000_000,
+                max_candidates: if server_id.is_some() { 1 } else { 16 },
+            },
+            security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
+        });
+        snapshot
+    }
+
+    #[test]
+    fn vpngate_policy_only_change_is_a_non_disruptive_release_target() {
+        let serving = vpngate_snapshot(1, None);
+        let target = vpngate_snapshot(2, Some("public-vpn-121"));
+        let mut skipped = planned_target("edge", PlannedTargetStatus::Skipped, &[]);
+        skipped.actions.clear();
+        let mut plan = dependency_plan(vec![skipped]);
+
+        mark_vpngate_policy_changes(&mut plan, Some(&serving), &target);
+
+        assert_eq!(plan.targets[0].status, PlannedTargetStatus::Pending);
+        assert_eq!(plan.targets[0].actions, vec![PlannedAction::SyncVpngate]);
+        assert!(!plan.targets[0].disruptive);
+        assert_eq!(plan.summary.changed_targets, 1);
+        assert_eq!(plan.summary.disruptive_targets, 0);
+    }
+
+    #[test]
+    fn vpngate_manual_membership_changes_are_release_intent_but_order_is_not() {
+        let serving = vpngate_snapshot(1, None);
+        let mut target = vpngate_snapshot(2, None);
+        if let ExternalOutboundProtocol::Vpngate {
+            server_ids,
+            max_candidates,
+            ..
+        } = &mut target.external_outbounds[0].protocol
+        {
+            *server_ids = vec!["vpn-b".to_owned(), "vpn-a".to_owned()];
+            *max_candidates = 2;
+        }
+        let mut skipped = planned_target("edge", PlannedTargetStatus::Skipped, &[]);
+        skipped.actions.clear();
+        let mut plan = dependency_plan(vec![skipped]);
+        mark_vpngate_policy_changes(&mut plan, Some(&serving), &target);
+        assert_eq!(plan.targets[0].actions, vec![PlannedAction::SyncVpngate]);
+        assert_eq!(
+            vpngate_nodes_requiring_capability(&plan, Some(&serving), &target),
+            ["edge".to_owned()].into_iter().collect()
+        );
+        let mut reordered = target.clone();
+        if let ExternalOutboundProtocol::Vpngate { server_ids, .. } =
+            &mut reordered.external_outbounds[0].protocol
+        {
+            server_ids.reverse();
+        }
+        assert_eq!(
+            super::vpngate_policies_by_node(&target),
+            super::vpngate_policies_by_node(&reordered)
+        );
+    }
+
+    #[test]
+    fn only_new_or_changed_vpngate_intent_requires_a_capable_node() {
+        let serving = vpngate_snapshot(1, None);
+        let changed = vpngate_snapshot(2, Some("public-vpn-121"));
+        let unchanged = vpngate_snapshot(3, None);
+        let mut removed = vpngate_snapshot(4, None);
+        removed.external_outbounds.clear();
+        let plan = dependency_plan(vec![planned_target(
+            "edge",
+            PlannedTargetStatus::Pending,
+            &[],
+        )]);
+
+        assert_eq!(
+            vpngate_nodes_requiring_capability(&plan, Some(&serving), &changed),
+            ["edge".to_owned()].into_iter().collect()
+        );
+        assert!(vpngate_nodes_requiring_capability(&plan, Some(&serving), &unchanged).is_empty());
+        assert!(vpngate_nodes_requiring_capability(&plan, Some(&serving), &removed).is_empty());
+    }
+
     #[test]
     fn listener_caller_is_deferred_when_its_owner_is_outside_tenant_scope() {
         let mut plan = dependency_plan(vec![planned_target(
@@ -6612,7 +7003,7 @@ mod tests {
             tenant: "platform.acme".to_owned(),
             uuid: "00000000-0000-4000-8000-000000000002".to_owned(),
         };
-        let target = snapshot(
+        let mut target = snapshot(
             4,
             old_settings,
             vec![
@@ -6629,7 +7020,15 @@ mod tests {
             ],
             vec![old_user],
         );
-        let current = snapshot(
+        target.apps[1].fronts.push(Front {
+            id: "front-old".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "旧前置组".to_owned(),
+            via: Vec::new(),
+            external_via: Vec::new(),
+            strategy: FrontStrategy::Select,
+        });
+        let mut current = snapshot(
             9,
             current_settings.clone(),
             vec![
@@ -6647,6 +7046,14 @@ mod tests {
             ],
             vec![current_user.clone()],
         );
+        current.apps[0].fronts.push(Front {
+            id: "front-current".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "当前前置组".to_owned(),
+            via: Vec::new(),
+            external_via: Vec::new(),
+            strategy: FrontStrategy::Fallback,
+        });
 
         let client = SubscriptionClientConfig::from_snapshot(&current);
         let mut current_after_pending_delete = current;
@@ -6667,6 +7074,14 @@ mod tests {
             vec!["app-a", "app-b", "removed-app"]
         );
         assert_eq!(restored.apps[0].label, "新 A");
+        assert_eq!(
+            restored.apps[0]
+                .fronts
+                .iter()
+                .map(|front| (front.id.as_str(), front.name.as_str(), front.strategy))
+                .collect::<Vec<_>>(),
+            vec![("front-current", "当前前置组", FrontStrategy::Fallback)]
+        );
         assert_eq!(
             restored.apps[0]
                 .chains

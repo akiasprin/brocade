@@ -51,7 +51,8 @@
           "http",
           "quic"
         ],
-        "enabled": true
+        "enabled": true,
+        "routeOnly": true
       },
       "streamSettings": {
         "network": "tcp",

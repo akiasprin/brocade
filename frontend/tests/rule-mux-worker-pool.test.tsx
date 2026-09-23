@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConsoleSnapshot, HopMux, HopPool, NodeAgentStateItem, Rule } from '../src/api';
 import { DEFAULT_HOP_MUX, hopMuxError } from '../src/api';
 import { draft } from '../src/draft';
@@ -200,7 +200,8 @@ describe('规则页 Mux Worker 池', () => {
     await waitFor(() => expect(savedPools()).toEqual([{ t: 'mux' }, { t: 'mux' }]));
   });
 
-  it('参数只在右侧抽屉出现，单独配置先复制当前全局值，取消不改草稿', () => {
+  it('参数只在右侧抽屉出现，单独配置先复制当前全局值，取消不改草稿', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     const view = renderEditor({ t: 'mux' });
 
     expect(view.container.querySelector('.mux-drawer-grid')).toBeNull();
@@ -214,8 +215,9 @@ describe('规则页 Mux Worker 池', () => {
     fireEvent.change(muxField(dialog, '复用流数量'), { target: { value: '8' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
 
+    await waitFor(() => expect(document.body.querySelector('.dialog-layer')).toBeNull());
+    expect(confirm).not.toHaveBeenCalled();
     expect(view.getByText('跟随全局')).toBeTruthy();
-    expect(view.queryByRole('dialog')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '配置参数' }));
     dialog = view.getByRole('dialog', { name: '配置 新加坡中继 的 Mux' });
     expect(muxField(dialog, '复用流数量').value).toBe('7');
@@ -251,6 +253,7 @@ describe('规则页 Mux Worker 池', () => {
   });
 
   it('交叉约束非法时禁止应用，切回每次新建会删除整个 Mux 子对象', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     const view = renderEditor({ t: 'mux' });
     fireEvent.click(view.getByRole('button', { name: '配置参数' }));
     const dialog = view.getByRole('dialog', { name: '配置 新加坡中继 的 Mux' });
@@ -260,6 +263,8 @@ describe('规则页 Mux Worker 池', () => {
     expect(within(dialog).getByText('预热目标不能大于复用阈值')).toBeTruthy();
     expect((within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+    await waitFor(() => expect(document.body.querySelector('.dialog-layer')).toBeNull());
+    expect(confirm).not.toHaveBeenCalled();
 
     fireEvent.change(connectionSelect(view), { target: { value: 'none' } });
     expect(view.queryByText('跟随全局')).toBeNull();

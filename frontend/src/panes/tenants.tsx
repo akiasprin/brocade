@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createTenant, fetchNodes, fetchOperators, fetchTenants, type AdminOperator } from '../api';
 import { can, useSession } from '../session';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
+import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 
 const tenantInScope = (tenantId: string, scope: string) =>
   tenantId === scope || (tenantId.startsWith(scope) && tenantId[scope.length] === '.');
@@ -25,6 +26,16 @@ export function TenantsPane() {
   const [name, setName] = useState('');
   const [creating, setCreating] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
+  const createGuardScope = 'tenant:create';
+  const createDirty = creating && (id !== '' || name !== '');
+  useUnsavedChanges(createDirty, '新租户表单', createGuardScope);
+
+  const closeCreate = () => {
+    if (!confirmDiscardChanges(createGuardScope)) return;
+    setId('');
+    setName('');
+    setCreating(false);
+  };
 
   const create = useMutation({
     mutationFn: () => createTenant({ id: id.trim(), name: name.trim() || id.trim() }),
@@ -37,7 +48,7 @@ export function TenantsPane() {
     },
   });
 
-  if (tenants.isPending) return <Loading />;
+  if (tenants.isPending) return <Loading variant="panel" />;
   if (tenants.error) return <ErrorBox error={tenants.error} />;
 
   const list = [...tenants.data.tenants].sort((a, b) => a.id.localeCompare(b.id));
@@ -53,8 +64,8 @@ export function TenantsPane() {
         <h4>租户</h4>
         <span className="sub">路径即前缀，前缀即可见范围</span>
         <span className="sp" />
-        <button className="btn" disabled={!editable} onClick={() => setCreating(!creating)}>
-          {creating ? '收起' : '＋ 建租户'}
+        <button className="btn" disabled={!editable} onClick={() => (creating ? closeCreate() : setCreating(true))}>
+          {creating ? '取消新建' : '＋ 建租户'}
         </button>
       </div>
 
@@ -125,7 +136,7 @@ export function TenantsPane() {
             <tr>
               <th>租户路径</th>
               <th>名称</th>
-              <th>节点</th>
+              <th>机器</th>
               <th>用户</th>
               <th>管理员</th>
             </tr>
@@ -161,7 +172,7 @@ export function TenantsPane() {
                   <td className="d2" data-label="名称">
                     {t.name}
                   </td>
-                  <td className="mono" data-label="节点">
+                  <td className="mono" data-label="机器">
                     <span className="cnt">{t.node_count}</span>
                   </td>
                   <td className="mono" data-label="用户">
@@ -190,7 +201,9 @@ export function TenantsPane() {
                               {reach.map(admin => (
                                 <span className="chip" key={admin.id}>
                                   {admin.display_name || admin.id}
-                                  <span className="r">{admin.role === 'system-admin' ? '全局管理员' : admin.tenant_scope}</span>
+                                  <span className="r">
+                                    {admin.role === 'system-admin' ? '全局管理员' : admin.tenant_scope}
+                                  </span>
                                 </span>
                               ))}
                             </div>

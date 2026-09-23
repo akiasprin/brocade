@@ -133,7 +133,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
     ]);
     doc.external_outbounds = vec![
         ExternalOutbound {
-            id: "vendor-edge".to_owned(),
+            id: "custom-1111-1111".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "供应商边缘".to_owned(),
             address: "edge.vendor.example".to_owned(),
@@ -153,7 +153,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "xhttp-edge".to_owned(),
+            id: "custom-2222-2222".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "XHTTP 边缘".to_owned(),
             address: "upload.vendor.example".to_owned(),
@@ -190,7 +190,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "socks-edge".to_owned(),
+            id: "custom-3333-3333".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "SOCKS5 边缘".to_owned(),
             address: "socks.vendor.example".to_owned(),
@@ -203,7 +203,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "http-edge".to_owned(),
+            id: "custom-4444-4444".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "HTTP CONNECT 边缘".to_owned(),
             address: "http.vendor.example".to_owned(),
@@ -219,7 +219,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "ss-edge".to_owned(),
+            id: "custom-5555-5555".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "SS 边缘".to_owned(),
             address: "ss.vendor.example".to_owned(),
@@ -232,7 +232,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "wireguard-edge".to_owned(),
+            id: "custom-6666-6666".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "WireGuard 边缘".to_owned(),
             address: "wg.vendor.example".to_owned(),
@@ -266,37 +266,37 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                     Rule {
                         dest_match: DestMatch::DomainSuffix(vec!["openai.com".to_owned()]),
                         action: Action::Proxy {
-                            outbound: "vendor-edge".to_owned(),
+                            outbound: "custom-1111-1111".to_owned(),
                         },
                     },
                     Rule {
                         dest_match: DestMatch::DomainSuffix(vec!["xhttp.example".to_owned()]),
                         action: Action::Proxy {
-                            outbound: "xhttp-edge".to_owned(),
+                            outbound: "custom-2222-2222".to_owned(),
                         },
                     },
                     Rule {
                         dest_match: DestMatch::DomainSuffix(vec!["example.net".to_owned()]),
                         action: Action::Proxy {
-                            outbound: "socks-edge".to_owned(),
+                            outbound: "custom-3333-3333".to_owned(),
                         },
                     },
                     Rule {
                         dest_match: DestMatch::DomainSuffix(vec!["example.org".to_owned()]),
                         action: Action::Proxy {
-                            outbound: "http-edge".to_owned(),
+                            outbound: "custom-4444-4444".to_owned(),
                         },
                     },
                     Rule {
                         dest_match: DestMatch::DomainSuffix(vec!["wireguard.example".to_owned()]),
                         action: Action::Proxy {
-                            outbound: "wireguard-edge".to_owned(),
+                            outbound: "custom-6666-6666".to_owned(),
                         },
                     },
                     Rule {
                         dest_match: DestMatch::Any,
                         action: Action::Proxy {
-                            outbound: "ss-edge".to_owned(),
+                            outbound: "custom-5555-5555".to_owned(),
                         },
                     },
                 ],
@@ -326,7 +326,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
         std::slice::from_ref(&app_ir),
         "hk",
     )));
-    let external = outbound(&hk, "out:external/vendor-edge");
+    let external = outbound(&hk, "out:external/custom-1111-1111");
     assert_eq!(external["protocol"], "vless");
     assert_eq!(external["settings"]["address"], "edge.vendor.example");
     assert_eq!(external["settings"]["id"], "external-uuid");
@@ -336,7 +336,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
         external["streamSettings"]["realitySettings"]["publicKey"],
         "reality-public-key"
     );
-    let xhttp = outbound(&hk, "out:external/xhttp-edge");
+    let xhttp = outbound(&hk, "out:external/custom-2222-2222");
     assert_eq!(xhttp["protocol"], "vless");
     assert_eq!(xhttp["streamSettings"]["network"], "xhttp");
     assert_eq!(
@@ -358,12 +358,12 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
     assert_eq!(download["security"], "tls");
     assert_eq!(download["xhttpSettings"]["path"], "/external-download");
     assert_eq!(download["xhttpSettings"]["xmux"]["maxConcurrency"], 2);
-    let socks = outbound(&hk, "out:external/socks-edge");
+    let socks = outbound(&hk, "out:external/custom-3333-3333");
     assert_eq!(socks["protocol"], "socks");
     assert_eq!(socks["settings"]["user"], "proxy-user");
     assert_eq!(socks["settings"]["pass"], "proxy-password");
     assert_eq!(socks["streamSettings"]["security"], "none");
-    let http = outbound(&hk, "out:external/http-edge");
+    let http = outbound(&hk, "out:external/custom-4444-4444");
     assert_eq!(http["protocol"], "http");
     assert!(http["settings"].get("user").is_none());
     assert!(http["settings"].get("pass").is_none());
@@ -372,12 +372,12 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
         http["streamSettings"]["tlsSettings"]["serverName"],
         "http.vendor.example"
     );
-    let shadowsocks = outbound(&hk, "out:external/ss-edge");
+    let shadowsocks = outbound(&hk, "out:external/custom-5555-5555");
     assert_eq!(shadowsocks["protocol"], "shadowsocks");
     assert_eq!(shadowsocks["settings"]["method"], "aes-256-gcm");
     assert_eq!(shadowsocks["settings"]["password"], "classic-password");
     assert_eq!(shadowsocks["streamSettings"]["security"], "none");
-    let wireguard = outbound(&hk, "out:external/wireguard-edge");
+    let wireguard = outbound(&hk, "out:external/custom-6666-6666");
     assert_eq!(wireguard["protocol"], "wireguard");
     assert_eq!(
         wireguard["settings"]["peers"][0]["endpoint"],
@@ -390,14 +390,107 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
         .as_array()
         .unwrap()
         .iter()
-        .any(|rule| { rule["outboundTag"] == "out:external/vendor-edge" }));
+        .any(|rule| { rule["outboundTag"] == "out:external/custom-1111-1111" }));
 
     let sg = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "sg")));
     assert!(!sg["outbounds"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|candidate| { candidate["tag"] == "out:external/vendor-edge" }));
+        .any(|candidate| { candidate["tag"] == "out:external/custom-1111-1111" }));
+}
+
+#[test]
+fn managed_vpngate_pools_lower_to_deterministic_local_socks_endpoints() {
+    let mut doc = doc(vec![
+        node("hk", [10, 66, 0, 1], true, Dns::System),
+        node("sg", [10, 66, 0, 2], true, Dns::System),
+    ]);
+    let pool = |id: &str, country_code: &str| ExternalOutbound {
+        id: id.to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: format!("VPN Gate {country_code}"),
+        address: "managed.vpngate.invalid".to_owned(),
+        port: 1,
+        protocol: ExternalOutboundProtocol::Vpngate {
+            country_code: country_code.to_owned(),
+            server_id: None,
+            server_ids: Vec::new(),
+            max_connect_ms: 15_000,
+            min_download_bps: 1_000_000,
+            max_candidates: 10,
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: Vec::new(),
+    };
+    // Deliberately reverse source order: runtime slots follow the stable outbound tag, not input
+    // or rule order, so recompiling an identical snapshot always produces identical endpoints.
+    doc.external_outbounds = vec![
+        pool("vpngate-2222-2222", "US"),
+        pool("vpngate-1111-1111", "JP"),
+    ];
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk")],
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![
+                Rule {
+                    dest_match: DestMatch::DomainSuffix(vec!["example.jp".to_owned()]),
+                    action: Action::Proxy {
+                        outbound: "vpngate-1111-1111".to_owned(),
+                    },
+                },
+                Rule {
+                    dest_match: DestMatch::Any,
+                    action: Action::Proxy {
+                        outbound: "vpngate-2222-2222".to_owned(),
+                    },
+                },
+            ],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.iter().all(|item| item.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+
+    let hk = parse_xray(&xray::build(&project_node(
+        &sys,
+        std::slice::from_ref(&app_ir),
+        "hk",
+    )));
+    let jp = outbound(&hk, "out:external/vpngate-1111-1111");
+    let us = outbound(&hk, "out:external/vpngate-2222-2222");
+    assert_eq!(jp["protocol"], "socks");
+    assert_eq!(jp["settings"]["address"], "169.254.240.2");
+    assert_eq!(jp["settings"]["port"], 1080);
+    assert_eq!(us["settings"]["address"], "169.254.240.6");
+    assert_eq!(us["settings"]["port"], 1080);
+    assert_eq!(jp["streamSettings"]["security"], "none");
+
+    let sg = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "sg")));
+    assert!(sg["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|candidate| !candidate["tag"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("out:external/vpngate-")));
 }
 
 #[test]
@@ -434,7 +527,7 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
         reserved: vec![1, 2, 3],
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "warp".to_owned(),
+        id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "Cloudflare WARP".to_owned(),
         address: "engage.cloudflareclient.com".to_owned(),
@@ -456,7 +549,7 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
     let proxy_rule = || Rule {
         dest_match: DestMatch::Any,
         action: Action::Proxy {
-            outbound: "warp".to_owned(),
+            outbound: "warp-8f3a-2d71".to_owned(),
         },
     };
     let app = AppView {
@@ -520,8 +613,8 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
         std::slice::from_ref(&app_ir),
         "sg",
     )));
-    let hk_warp = outbound(&hk, "out:external/warp");
-    let sg_warp = outbound(&sg, "out:external/warp");
+    let hk_warp = outbound(&hk, "out:external/warp-8f3a-2d71");
+    let sg_warp = outbound(&sg, "out:external/warp-8f3a-2d71");
     assert_eq!(hk_warp["protocol"], "wireguard");
     assert_eq!(sg_warp["protocol"], "wireguard");
     assert_eq!(hk_warp["settings"]["secretKey"], private_hk);
@@ -559,7 +652,7 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|candidate| candidate["tag"] == "out:external/warp")
+            .filter(|candidate| candidate["tag"] == "out:external/warp-8f3a-2d71")
             .count(),
         1,
         "同一租户隧道被多个项目引用时，一台机器只能生成一个 Xray outbound"
@@ -595,7 +688,7 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
         "{ipv4_diagnostics:#?}"
     );
     let ipv4 = parse_xray(&xray::build(&project_node(&ipv4_sys, &[ipv4_app], "hk")));
-    let ipv4_warp = outbound(&ipv4, "out:external/warp");
+    let ipv4_warp = outbound(&ipv4, "out:external/warp-8f3a-2d71");
     assert_eq!(
         ipv4_warp["settings"]["address"],
         serde_json::json!(["172.16.0.2/32"]),
@@ -965,6 +1058,7 @@ fn a_hysteria2_ingress_writes_h3_and_its_quic_parameters() {
 
     assert_eq!(face["protocol"], "hysteria");
     assert_eq!(face["settings"]["version"], 2);
+    assert_eq!(face["sniffing"]["routeOnly"], true);
     // The account list is empty here as it is everywhere: users are pushed into the running
     // process, never written into the config.
     assert_eq!(face["settings"]["clients"], serde_json::json!([]));
@@ -1043,6 +1137,7 @@ fn an_anytls_ingress_writes_a_distinct_tls_listener_and_server_settings() {
     assert_eq!(vless["port"], 443);
     assert_eq!(anytls["protocol"], "anytls");
     assert_eq!(anytls["port"], 19443);
+    assert_eq!(anytls["sniffing"]["routeOnly"], true);
     assert_eq!(anytls["settings"]["users"], serde_json::json!([]));
     assert_eq!(
         anytls["settings"]["paddingScheme"],
@@ -2189,6 +2284,7 @@ fn project_node_merges_xray_structure_from_all_app_views() {
         0
     );
     assert_eq!(value["inbounds"][1]["sniffing"]["enabled"], true);
+    assert_eq!(value["inbounds"][1]["sniffing"]["routeOnly"], true);
 
     assert_eq!(
         tags(value["outbounds"].as_array().unwrap()),
@@ -2451,6 +2547,7 @@ fn sniffing_failure_rule_opts_relay_into_sniffing_and_can_route_to_local_egress(
         serde_json::json!({
             "enabled": true,
             "destOverride": ["http", "tls", "quic"],
+            "routeOnly": true,
         })
     );
     assert_eq!(
@@ -3177,48 +3274,6 @@ fn public_hop_fixture(security: HopWire) -> (brocade_core::ir::system::SystemIr,
 }
 
 #[test]
-fn unexpanded_front_downstream_renders_as_never_match() {
-    let doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
-    let app = AppView {
-        id: "front".to_owned(),
-        label: "前置".to_owned(),
-        chains: vec![chain("c-front")],
-        ingresses: vec![ingress("i-front", "c-front", "hk")],
-        fronts: Vec::new(),
-        steps: vec![step(
-            "c-front",
-            "hk",
-            vec![Rule {
-                dest_match: DestMatch::FrontDownstream,
-                action: Action::Egress { send_through: None },
-            }],
-            None,
-        )],
-        grants: Vec::new(),
-    };
-    let mut diagnostics = Vec::new();
-    let sys = compile_system(&doc, &mut diagnostics);
-    let app_ir = compile_hops(
-        compile_app(&doc, &app, &mut diagnostics),
-        &sys,
-        &mut diagnostics,
-    );
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.level == Level::Error && diagnostic.code == "rule.front-scope"
-    }));
-
-    let plan = project_node(&sys, &[app_ir], "hk");
-    let artifact = xray::build(&plan);
-    let value = parse_xray(&artifact);
-
-    assert!(value["routing"]["rules"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|rule| rule["domain"] == serde_json::json!(["full:invalid.brocade.never-match"])));
-}
-
-#[test]
 fn unrepresentable_all_match_renders_as_never_match() {
     let doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
     let app = AppView {
@@ -3588,7 +3643,7 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
     ] {
         let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
         doc.external_outbounds = vec![ExternalOutbound {
-            id: "proxy".to_owned(),
+            id: "custom-7777-7777".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Proxy".to_owned(),
             address: "edge.example.com".to_owned(),
@@ -3610,7 +3665,7 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
                 vec![Rule {
                     dest_match: DestMatch::Any,
                     action: Action::Proxy {
-                        outbound: "proxy".to_owned(),
+                        outbound: "custom-7777-7777".to_owned(),
                     },
                 }],
                 None,
@@ -3627,7 +3682,7 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
             "{diagnostics:?}"
         );
         let config = parse_xray(&xray::build(&project_node(&sys, &[ir], "hk")));
-        let proxy = outbound(&config, "out:external/proxy");
+        let proxy = outbound(&config, "out:external/custom-7777-7777");
         assert_eq!(proxy["protocol"], name);
         assert_eq!(proxy["settings"]["address"], "edge.example.com");
         if name == "anytls" {

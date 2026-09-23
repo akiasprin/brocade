@@ -9,8 +9,9 @@ use brocade_core::model::{
 use brocade_deployment::plan::{DesiredArtifact, DesiredGrants, NodeDesiredState, PlannedAction};
 
 use brocade_deployment::protocol::{
-    UsageChainSample, UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries,
-    UsageNodeSeriesList, UsageReportRequest, UsageReportResult, UsageSample, UsageSampleList,
+    UsageChainSample, UsageDailyRow, UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket,
+    UsageNodeSeries, UsageNodeSeriesList, UsageReportRequest, UsageReportResult, UsageSample,
+    UsageSampleList,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +23,10 @@ use crate::{AdminContext, Result, StoreError};
 /// count. Beyond it the whole round is refused — the window boundary decides which month these
 /// bytes land in, and month boundaries are where bills divide.
 const MAX_CLOCK_SKEW_SECS: i64 = 600;
+
+/// Bound each hourly detail cleanup so an older installation does not create one large DELETE,
+/// WAL burst, and autovacuum debt when it first receives the retention policy.
+const USAGE_SAMPLE_PRUNE_BATCH_ROWS: i64 = 50_000;
 
 /// Process-local observations for counters which are absent from the reporting generation.
 ///
@@ -1039,14 +1044,17 @@ async fn list_usage_node_series_selected(
     // Month boundaries follow list_monthly_usage_summary: calendar months at +08, decided
     // server-side and never sent by the UI. wall_start is the human-facing wall-clock string,
     // inst_start carries the offset and is used only for filtering.
-    let (wall_month_start, inst_month_start): (String, String) = sqlx::query_as(
-        "SELECT to_char(date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong'),
+    let (wall_month_start, inst_month_start, inst_month_end): (String, String, String) =
+        sqlx::query_as(
+            "SELECT to_char(date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong'),
                         'YYYY-MM-DD HH24:MI:SS'),
                 (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                 AT TIME ZONE 'Asia/Hong_Kong')::text",
-    )
-    .fetch_one(pool)
-    .await?;
+                 AT TIME ZONE 'Asia/Hong_Kong')::text,
+                ((date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
+                  + INTERVAL '1 month') AT TIME ZONE 'Asia/Hong_Kong')::text",
+        )
+        .fetch_one(pool)
+        .await?;
 
     let (since, until): (String, String) = match selection {
         UsageSeriesSelection::Recent(window_secs) => {
@@ -1106,24 +1114,25 @@ async fn list_usage_node_series_selected(
     .fetch_all(pool)
     .await?;
 
+    // Month totals have day-level resolution and therefore come from the durable rollup written
+    // in the same transaction as each detail sample. Scanning both 30-second detail tables here
+    // made the fleet endpoint grow linearly with every report ever received.
     let month_rows = sqlx::query(
         "SELECT node_id,
-                coalesce(sum(uplink_bytes) FILTER (WHERE kind = 'user'), 0)::bigint
-                    AS user_uplink_bytes,
-                coalesce(sum(downlink_bytes) FILTER (WHERE kind = 'user'), 0)::bigint
-                    AS user_downlink_bytes,
-                coalesce(sum(uplink_bytes) FILTER (WHERE kind = 'relay'), 0)::bigint
-                    AS relay_uplink_bytes,
-                coalesce(sum(downlink_bytes) FILTER (WHERE kind = 'relay'), 0)::bigint
-                    AS relay_downlink_bytes,
+                coalesce(sum(user_uplink_bytes), 0)::bigint AS user_uplink_bytes,
+                coalesce(sum(user_downlink_bytes), 0)::bigint AS user_downlink_bytes,
+                coalesce(sum(relay_uplink_bytes), 0)::bigint AS relay_uplink_bytes,
+                coalesce(sum(relay_downlink_bytes), 0)::bigint AS relay_downlink_bytes,
                 bool_or(has_gap) AS has_gap
-         FROM node_usage_windows
-         WHERE window_start >= $1::timestamptz
-           AND ($2::text IS NULL OR tenant_id = $2 OR tenant_id LIKE $3 ESCAPE '\\')
-           AND ($4::text IS NULL OR node_id = $4)
+         FROM usage_node_rollups
+         WHERE period_start >= $1::timestamptz
+           AND period_start < $2::timestamptz
+           AND ($3::text IS NULL OR tenant_id = $3 OR tenant_id LIKE $4 ESCAPE '\\')
+           AND ($5::text IS NULL OR node_id = $5)
          GROUP BY node_id",
     )
     .bind(&inst_month_start)
+    .bind(&inst_month_end)
     .bind(tenant_scope)
     .bind(&tenant_pattern)
     .bind(node_id)
@@ -1227,6 +1236,60 @@ pub async fn prune_usage_readings(pool: &PgPool, retain_days: u32) -> Result<u64
     Ok(result.rows_affected())
 }
 
+/// Delete accounting detail only after its daily machine and user projections are durable.
+///
+/// The UI asks detail tables for at most one 24-hour interval. Seven days leaves enough evidence
+/// for incident reconstruction while keeping both append-only tables bounded. One chunk per table
+/// and hour lets an installation catch up without a long transaction or a sudden WAL spike.
+pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
+    let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
+    let mut tx = pool.begin().await?;
+    let user_rows = sqlx::query_scalar::<_, i64>(
+        "WITH expired AS MATERIALIZED (
+             SELECT ctid
+               FROM usage_samples
+              WHERE window_end < now() - make_interval(days => $1)
+              ORDER BY window_end
+              LIMIT $2
+         ), deleted AS (
+             DELETE FROM usage_samples history
+              USING expired
+              WHERE history.ctid = expired.ctid
+              RETURNING 1
+         )
+         SELECT count(*) FROM deleted",
+    )
+    .bind(retain_days)
+    .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
+    .fetch_one(&mut *tx)
+    .await?;
+    let chain_rows = sqlx::query_scalar::<_, i64>(
+        "WITH expired AS MATERIALIZED (
+             SELECT ctid
+               FROM usage_chain_samples
+              WHERE window_end < now() - make_interval(days => $1)
+              ORDER BY window_end
+              LIMIT $2
+         ), deleted AS (
+             DELETE FROM usage_chain_samples history
+              USING expired
+              WHERE history.ctid = expired.ctid
+              RETURNING 1
+         )
+         SELECT count(*) FROM deleted",
+    )
+    .bind(retain_days)
+    .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let removed = user_rows
+        .checked_add(chain_rows)
+        .ok_or_else(|| StoreError::InvalidData("usage sample prune count overflow".to_owned()))?;
+    u64::try_from(removed)
+        .map_err(|_| StoreError::InvalidData("negative usage sample prune count".to_owned()))
+}
+
 pub async fn list_usage_samples(
     pool: &PgPool,
     actor: &AdminContext,
@@ -1325,13 +1388,35 @@ pub async fn list_usage_samples(
 
 /// The calendar-month rollup: one row per user across all their access points (usage_samples
 /// writes only granted rows, so a per-user sum is naturally the traffic of their view's access
-/// points). Months are the calendar months of the control plane's local zone (+08), decided
-/// server-side and never sent by the UI. Tenant-subtree scoping matches
+/// points). Months are calendar months in the control plane's local zone (+08). The UI selects
+/// only a bounded offset and never supplies timestamp boundaries. Tenant-subtree scoping matches
 /// list_usage_samples.
 pub async fn list_monthly_usage_summary(
     pool: &PgPool,
     actor: &AdminContext,
 ) -> Result<UsageMonthlySummary> {
+    list_monthly_usage_summary_for_offset(pool, actor, 0).await
+}
+
+/// The selected calendar-month rollup. The public console deliberately exposes only the current
+/// and immediately preceding month: those are the two browsing states in the UI, and bounding the
+/// offset prevents this detail-table query from becoming an unrestricted historical export.
+pub async fn list_monthly_usage_summary_for_offset(
+    pool: &PgPool,
+    actor: &AdminContext,
+    month_offset: i16,
+) -> Result<UsageMonthlySummary> {
+    if !(-1..=0).contains(&month_offset) {
+        return Err(StoreError::InvalidData(
+            "usage month_offset must be -1 or 0".to_owned(),
+        ));
+    }
+    // Reports keep arriving while this read runs. Both aggregations must observe one snapshot or
+    // the headline total can briefly disagree with the sum of the daily bars.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let tenant_scope = actor.tenant_scope();
     let tenant_pattern = actor.tenant_scope_like_pattern();
     // Month boundaries need two representations:
@@ -1343,41 +1428,40 @@ pub async fn list_monthly_usage_summary(
     //    filter samples.
     let (wall_start, wall_end, inst_start, inst_end): (String, String, String, String) =
         sqlx::query_as(
-            "SELECT to_char(date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong'),
+            "WITH selected AS (
+                 SELECT date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
+                        + make_interval(months => $1) AS month_start
+             )
+             SELECT to_char(month_start,
                         'YYYY-MM-DD HH24:MI:SS'),
-                to_char(date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                        + INTERVAL '1 month', 'YYYY-MM-DD HH24:MI:SS'),
-                (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                 AT TIME ZONE 'Asia/Hong_Kong')::text,
-                ((date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                  + INTERVAL '1 month') AT TIME ZONE 'Asia/Hong_Kong')::text",
+                    to_char(month_start + INTERVAL '1 month', 'YYYY-MM-DD HH24:MI:SS'),
+                    (month_start AT TIME ZONE 'Asia/Hong_Kong')::text,
+                    ((month_start + INTERVAL '1 month') AT TIME ZONE 'Asia/Hong_Kong')::text
+             FROM selected",
         )
-        .fetch_one(pool)
+        .bind(i32::from(month_offset))
+        .fetch_one(&mut *tx)
         .await?;
-    // View attribution prefers the sample's own column (frozen at insert), falling back to
-    // deriving it through a JOIN only for older samples. LEFT JOIN rather than INNER: where the
-    // frozen column has a value, the group still resolves even after the ingress was deleted —
-    // INNER would discard those samples entirely, presenting as consumption inexplicably losing
-    // a chunk.
+    // Daily rollups carry the same frozen app attribution as the detail samples. The ingestion
+    // transaction updates both atomically, so the page scans at most one row per user/view/day
+    // instead of every 30-second window twice.
     let rows = sqlx::query(
         "WITH monthly AS (
              SELECT s.tenant_id,
                     s.user_id,
-                    coalesce(s.app_id, i.app_id) AS app_id,
+                    s.app_id,
                     sum(s.uplink_bytes)::bigint AS uplink_bytes,
                     sum(s.downlink_bytes)::bigint AS downlink_bytes,
                     bool_or(s.has_gap) AS has_gap
-             FROM usage_samples s
-             LEFT JOIN ingresses i ON i.id = s.ingress_id
-             WHERE s.window_start >= $1::timestamptz
-               AND s.window_start < $2::timestamptz
-               AND coalesce(s.app_id, i.app_id) IS NOT NULL
+             FROM usage_rollups s
+             WHERE s.period_start >= $1::timestamptz
+               AND s.period_start < $2::timestamptz
                AND (
                     $3::text IS NULL
                     OR s.tenant_id = $3
                     OR s.tenant_id LIKE $4 ESCAPE '\\'
                )
-             GROUP BY s.tenant_id, s.user_id, coalesce(s.app_id, i.app_id)
+             GROUP BY s.tenant_id, s.user_id, s.app_id
          )
          SELECT monthly.tenant_id, monthly.user_id, monthly.app_id,
                 monthly.uplink_bytes, monthly.downlink_bytes, monthly.has_gap
@@ -1390,7 +1474,7 @@ pub async fn list_monthly_usage_summary(
     .bind(&inst_end)
     .bind(tenant_scope)
     .bind(&tenant_pattern)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let views = rows
@@ -1407,10 +1491,51 @@ pub async fn list_monthly_usage_summary(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Daily composition uses the exact same attribution and filtering boundary as the view
+    // totals above. `window_start` decides both the month and local day; a 30-second sample is
+    // never split across two labels. Empty dates are omitted and filled by the UI from the
+    // returned calendar bounds.
+    let day_rows = sqlx::query(
+        "SELECT to_char(date_trunc('day', s.period_start AT TIME ZONE 'Asia/Hong_Kong'),
+                        'YYYY-MM-DD') AS day,
+                sum(s.uplink_bytes)::bigint AS uplink_bytes,
+                sum(s.downlink_bytes)::bigint AS downlink_bytes,
+                bool_or(s.has_gap) AS has_gap
+         FROM usage_rollups s
+         WHERE s.period_start >= $1::timestamptz
+           AND s.period_start < $2::timestamptz
+           AND (
+                $3::text IS NULL
+                OR s.tenant_id = $3
+                OR s.tenant_id LIKE $4 ESCAPE '\\'
+           )
+         GROUP BY date_trunc('day', s.period_start AT TIME ZONE 'Asia/Hong_Kong')
+         ORDER BY date_trunc('day', s.period_start AT TIME ZONE 'Asia/Hong_Kong')",
+    )
+    .bind(&inst_start)
+    .bind(&inst_end)
+    .bind(tenant_scope)
+    .bind(&tenant_pattern)
+    .fetch_all(&mut *tx)
+    .await?;
+    let days = day_rows
+        .iter()
+        .map(|row| {
+            Ok(UsageDailyRow {
+                day: row.try_get("day")?,
+                uplink_bytes: i64_to_u64("uplink_bytes", row.try_get("uplink_bytes")?)?,
+                downlink_bytes: i64_to_u64("downlink_bytes", row.try_get("downlink_bytes")?)?,
+                has_gap: row.try_get("has_gap")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tx.commit().await?;
+
     Ok(UsageMonthlySummary {
         month_start: wall_start,
         month_end: wall_end,
         views,
+        days,
     })
 }
 
@@ -1675,20 +1800,68 @@ async fn insert_usage_sample(
     // against at the time. Derived on demand, a quota's numerator would jump wholesale to the new
     // view the instant the model changed.
     // An ingress that cannot be found leaves NULL, and the query side falls back to a JOIN.
-    let result = sqlx::query(
-        "INSERT INTO usage_samples (
-            window_start, window_end, node_id,
-            tenant_id, user_id, ingress_id, app_id, grant_label,
-            uplink_bytes, downlink_bytes, has_gap,
-            revision_id, deployment_id, generation_id
+    let inserted = sqlx::query_scalar::<_, i32>(
+        "WITH inserted AS (
+             INSERT INTO usage_samples (
+                window_start, window_end, node_id,
+                tenant_id, user_id, ingress_id, app_id, grant_label,
+                uplink_bytes, downlink_bytes, has_gap,
+                revision_id, deployment_id, generation_id
+             )
+             VALUES (
+                to_timestamp($1::double precision),
+                to_timestamp($2::double precision),
+                $3, $4, $5, $6,
+                $7, $8, $9, $10, $11, $12, $13, $14
+             )
+             ON CONFLICT (node_id, grant_label, window_start, window_end) DO NOTHING
+             RETURNING tenant_id, node_id, user_id, app_id, window_start,
+                       uplink_bytes, downlink_bytes, has_gap
+         ), rolled AS (
+             INSERT INTO usage_rollups (
+                tenant_id, user_id, app_id, period_start, period_end,
+                uplink_bytes, downlink_bytes, has_gap, updated_at
+             )
+             SELECT tenant_id, user_id, app_id,
+                    date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                        AT TIME ZONE 'Asia/Hong_Kong',
+                    (date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
+                    uplink_bytes, downlink_bytes, has_gap, now()
+               FROM inserted
+              WHERE app_id IS NOT NULL
+             ON CONFLICT (tenant_id, user_id, app_id, period_start, period_end)
+             DO UPDATE SET
+                uplink_bytes = usage_rollups.uplink_bytes + EXCLUDED.uplink_bytes,
+                downlink_bytes = usage_rollups.downlink_bytes + EXCLUDED.downlink_bytes,
+                has_gap = usage_rollups.has_gap OR EXCLUDED.has_gap,
+                updated_at = now()
+             RETURNING 1
+         ), node_rolled AS (
+             INSERT INTO usage_node_rollups (
+                tenant_id, node_id, period_start, period_end,
+                user_uplink_bytes, user_downlink_bytes,
+                relay_uplink_bytes, relay_downlink_bytes,
+                has_gap, updated_at
+             )
+             SELECT tenant_id, node_id,
+                    date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                        AT TIME ZONE 'Asia/Hong_Kong',
+                    (date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
+                    uplink_bytes, downlink_bytes, 0, 0, has_gap, now()
+               FROM inserted
+             ON CONFLICT (tenant_id, node_id, period_start, period_end)
+             DO UPDATE SET
+                user_uplink_bytes = usage_node_rollups.user_uplink_bytes
+                    + EXCLUDED.user_uplink_bytes,
+                user_downlink_bytes = usage_node_rollups.user_downlink_bytes
+                    + EXCLUDED.user_downlink_bytes,
+                has_gap = usage_node_rollups.has_gap OR EXCLUDED.has_gap,
+                updated_at = now()
+             RETURNING 1
          )
-         VALUES (
-            to_timestamp($1::double precision),
-            to_timestamp($2::double precision),
-            $3, $4, $5, $6,
-            $7, $8, $9, $10, $11, $12, $13, $14
-         )
-         ON CONFLICT (node_id, grant_label, window_start, window_end) DO NOTHING",
+         SELECT 1 FROM inserted",
     )
     .bind(sample.window_start_unix_secs)
     .bind(sample.window_end_unix_secs)
@@ -1704,9 +1877,9 @@ async fn insert_usage_sample(
     .bind(sample.revision_id)
     .bind(sample.deployment_id)
     .bind(sample.generation_id)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    Ok(inserted.is_some())
 }
 
 async fn insert_chain_sample(
@@ -1720,19 +1893,47 @@ async fn insert_chain_sample(
     // the portal machine while the hop is forwarded by the bridge. The raw reading is still
     // recorded against whoever read it (differences must be taken against one source), and only
     // this step, turning it into accounting, attributes it to the hop's owner.
-    let result = sqlx::query(
-        "INSERT INTO usage_chain_samples (
-            window_start, window_end, node_id,
-            tenant_id, app_id, chain_id, hop_label,
-            uplink_bytes, downlink_bytes, has_gap,
-            revision_id, deployment_id, generation_id
+    let inserted = sqlx::query_scalar::<_, i32>(
+        "WITH inserted AS (
+             INSERT INTO usage_chain_samples (
+                window_start, window_end, node_id,
+                tenant_id, app_id, chain_id, hop_label,
+                uplink_bytes, downlink_bytes, has_gap,
+                revision_id, deployment_id, generation_id
+             )
+             VALUES (
+                to_timestamp($1::double precision),
+                to_timestamp($2::double precision),
+                $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+             )
+             ON CONFLICT (node_id, hop_label, window_start, window_end) DO NOTHING
+             RETURNING tenant_id, node_id, window_start,
+                       uplink_bytes, downlink_bytes, has_gap
+         ), rolled AS (
+             INSERT INTO usage_node_rollups (
+                tenant_id, node_id, period_start, period_end,
+                user_uplink_bytes, user_downlink_bytes,
+                relay_uplink_bytes, relay_downlink_bytes,
+                has_gap, updated_at
+             )
+             SELECT tenant_id, node_id,
+                    date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                        AT TIME ZONE 'Asia/Hong_Kong',
+                    (date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
+                    0, 0, uplink_bytes, downlink_bytes, has_gap, now()
+               FROM inserted
+             ON CONFLICT (tenant_id, node_id, period_start, period_end)
+             DO UPDATE SET
+                relay_uplink_bytes = usage_node_rollups.relay_uplink_bytes
+                    + EXCLUDED.relay_uplink_bytes,
+                relay_downlink_bytes = usage_node_rollups.relay_downlink_bytes
+                    + EXCLUDED.relay_downlink_bytes,
+                has_gap = usage_node_rollups.has_gap OR EXCLUDED.has_gap,
+                updated_at = now()
+             RETURNING 1
          )
-         VALUES (
-            to_timestamp($1::double precision),
-            to_timestamp($2::double precision),
-            $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
-         )
-         ON CONFLICT (node_id, hop_label, window_start, window_end) DO NOTHING",
+         SELECT 1 FROM inserted",
     )
     .bind(sample.window_start_unix_secs)
     .bind(sample.window_end_unix_secs)
@@ -1747,9 +1948,9 @@ async fn insert_chain_sample(
     .bind(sample.revision_id)
     .bind(sample.deployment_id)
     .bind(sample.generation_id)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    Ok(inserted.is_some())
 }
 
 fn u64_to_i64(field: &str, value: u64) -> Result<i64> {

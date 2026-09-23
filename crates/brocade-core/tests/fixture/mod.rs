@@ -258,7 +258,6 @@ fn model_match(value: &Value) -> DestMatch {
             "udp" => DestMatch::Network(Network::Udp),
             value => panic!("unknown network {value}"),
         },
-        "front_downstream" => DestMatch::FrontDownstream,
         value => panic!("unknown match kind {value}"),
     }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { orderForPointer, type OrderSlot } from '../src/panes/chains';
+import { canStartOrderDrag, orderForPointer, type OrderSlot } from '../src/panes/chains';
 
 const slots: OrderSlot[] = [
   { id: 'a', left: 0, top: 0, width: 100, height: 80 },
@@ -25,5 +25,22 @@ describe('线路拖拽槽位判定', () => {
   it('四列换行后仍按二维槽位定位，并补偿自动滚动造成的视口位移', () => {
     expect(orderForPointer(['a', 'b', 'c', 'd'], 'b', slots, 50, 132)).toEqual(['a', 'c', 'd', 'b']);
     expect(orderForPointer(['a', 'b', 'c', 'd'], 'b', slots, 50, 112, 20)).toEqual(['a', 'c', 'd', 'b']);
+  });
+});
+
+describe('线路卡指针分流', () => {
+  it('整卡排序同时要求鼠标事件和支持悬停的精细指针', () => {
+    expect(canStartOrderDrag('mouse', false, true)).toBe(true);
+    expect(canStartOrderDrag('mouse', false, false)).toBe(false);
+    expect(canStartOrderDrag('touch', false, true)).toBe(false);
+    expect(canStartOrderDrag('pen', false, true)).toBe(false);
+    expect(canStartOrderDrag('', false, true)).toBe(false);
+  });
+
+  it('显式抓手接受所有指针类型', () => {
+    expect(canStartOrderDrag('mouse', true, false)).toBe(true);
+    expect(canStartOrderDrag('touch', true, false)).toBe(true);
+    expect(canStartOrderDrag('pen', true, false)).toBe(true);
+    expect(canStartOrderDrag('', true, false)).toBe(true);
   });
 });

@@ -72,7 +72,7 @@ describe('WARP exit stack settings', () => {
     expect(warpIpStackOf(protocol({ allowed_ips: ['::/0'] }))).toBe('ipv6');
   });
 
-  it('keeps the create endpoint fields independently addressable', () => {
+  it('keeps its random generated id hidden', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const view = render(
       <QueryClientProvider client={client}>
@@ -80,15 +80,24 @@ describe('WARP exit stack settings', () => {
       </QueryClientProvider>,
     );
 
-    expect(view.getByDisplayValue('cloudflare-warp')).toBeTruthy();
+    expect(view.queryByText('资源 ID')).toBeNull();
+    expect(view.queryByDisplayValue(/^warp-[0-9a-f]{4}-[0-9a-f]{4}$/)).toBeNull();
+    const create = view.getByRole('button', { name: '创建到草稿' }) as HTMLButtonElement;
+    expect(create.disabled).toBe(false);
     expect(view.getByRole('textbox', { name: 'Endpoint 地址' })).toBeTruthy();
     expect(view.getByRole('spinbutton', { name: 'Endpoint 端口' })).toBeTruthy();
+    fireEvent.click(create);
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
+    const operation = draft.ops()[0];
+    expect(operation?.op).toBe('upsert_external_outbound');
+    if (operation?.op !== 'upsert_external_outbound') throw new Error('expected a tunnel draft operation');
+    expect(operation.outbound.id).toMatch(/^warp-[0-9a-f]{4}-[0-9a-f]{4}$/);
   });
 
   it('makes the stack and Keepalive editable after the tunnel is created', async () => {
     draft.clear();
     const tunnel: ExternalOutbound = {
-      id: 'warp',
+      id: 'warp-8f3a-2d71',
       tenant: 'platform',
       name: 'Cloudflare WARP',
       address: 'engage.cloudflareclient.com',
@@ -154,7 +163,7 @@ describe('WARP exit stack settings', () => {
       <QueryClientProvider client={client}>
         <WarpBindingCard
           tenantId="platform"
-          outboundId="warp"
+          outboundId="warp-8f3a-2d71"
           binding={{
             node: 'hk',
             device_id: 'device-hk',
@@ -174,7 +183,7 @@ describe('WARP exit stack settings', () => {
     );
     const card = within(view.container);
 
-    fireEvent.click(card.getByRole('button', { name: '设置' }));
+    fireEvent.click(view.container.querySelector('.warp-binding-card') as HTMLElement);
     const save = card.getByRole('button', { name: '保存' }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     expect(save.title).toBe('没有修改');
@@ -215,7 +224,7 @@ describe('WARP exit stack settings', () => {
       <QueryClientProvider client={client}>
         <WarpBindingCard
           tenantId="platform"
-          outboundId="warp"
+          outboundId="warp-8f3a-2d71"
           binding={{
             node: 'hk',
             device_id: 'device-hk',
@@ -235,8 +244,8 @@ describe('WARP exit stack settings', () => {
     );
     const card = within(view.container);
 
-    fireEvent.click(card.getByRole('button', { name: '设置' }));
-    fireEvent.click(card.getByRole('button', { name: '注销并移除' }));
+    fireEvent.click(view.container.querySelector('.warp-binding-card') as HTMLElement);
+    fireEvent.click(card.getByRole('button', { name: '注销身份' }));
     expect(fetchMock).not.toHaveBeenCalled();
     expect(card.getByText('注销这台机器的 Cloudflare 身份？')).toBeTruthy();
     expect(card.getByText(/历史修订也不能恢复这个身份/)).toBeTruthy();
@@ -244,7 +253,7 @@ describe('WARP exit stack settings', () => {
     fireEvent.click(card.getByRole('button', { name: '确认注销并移除' }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('/tenants/platform/tunnels/warp/warp-bindings/hk');
+    expect(url).toBe('/tenants/platform/tunnels/warp-8f3a-2d71/warp-bindings/hk');
     expect(init.method).toBe('DELETE');
     expect(init.body).toBeUndefined();
     vi.unstubAllGlobals();
@@ -256,7 +265,7 @@ describe('WARP exit stack settings', () => {
       <QueryClientProvider client={client}>
         <WarpBindingCard
           tenantId="platform"
-          outboundId="warp"
+          outboundId="warp-8f3a-2d71"
           binding={{
             node: 'hk',
             device_id: 'device-hk',
@@ -277,8 +286,8 @@ describe('WARP exit stack settings', () => {
     );
     const card = within(view.container);
 
-    fireEvent.click(card.getByRole('button', { name: '设置' }));
-    const remove = card.getByRole('button', { name: '注销并移除' }) as HTMLButtonElement;
+    fireEvent.click(view.container.querySelector('.warp-binding-card') as HTMLElement);
+    const remove = card.getByRole('button', { name: '注销身份' }) as HTMLButtonElement;
     expect(remove.disabled).toBe(true);
     expect(card.getByText(/请先解除引用并完成发布/)).toBeTruthy();
   });

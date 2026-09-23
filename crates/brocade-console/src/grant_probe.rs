@@ -10,21 +10,91 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use brocade_deployment::protocol::{E2eProbe, E2eProbeStatus};
 use brocade_probe::{ProbeCancellation, ProbeOptions};
-use brocade_store::{PgStore, StoreError, UserGrantProbePlan, UserGrantProbeTarget};
+use brocade_store::{
+    FrontCombinationProbeMember, FrontCombinationProbePlan, FrontCombinationProbeTarget, PgStore,
+    StoreError, UserGrantProbePlan, UserGrantProbeTarget,
+};
 use serde::Serialize;
 use tokio::sync::{broadcast, Semaphore};
 
 const GLOBAL_CONCURRENCY: usize = 30;
 const FINISHED_TTL: Duration = Duration::from_secs(10 * 60);
+const FRONT_RESULT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-type RunProbe = dyn Fn(UserGrantProbeTarget, String, u64, ProbeOptions) -> E2eProbe + Send + Sync;
+static GLOBAL_PROBE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn global_probe_semaphore() -> Arc<Semaphore> {
+    GLOBAL_PROBE_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(GLOBAL_CONCURRENCY)))
+        .clone()
+}
+
+#[derive(Clone)]
+enum ProbeWorkItem {
+    Grant(Box<UserGrantProbeTarget>),
+    Front(Box<FrontCombinationProbeTarget>),
+}
+
+impl ProbeWorkItem {
+    fn id(&self) -> &str {
+        match self {
+            Self::Grant(item) => &item.id,
+            Self::Front(item) => &item.id,
+        }
+    }
+
+    fn snapshot(&self) -> ProbeItemSnapshot {
+        match self {
+            Self::Grant(item) => ProbeItemSnapshot {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                app_id: item.app_id.clone(),
+                app_name: item.app_name.clone(),
+                chain_id: item.chain_id.clone(),
+                ingress_id: item.ingress_id.clone(),
+                family: item.family,
+                protocol: item.protocol,
+                member_id: None,
+                member_name: None,
+                member_family: None,
+                member_protocol: None,
+                status: "waiting",
+                ttfb_ms: None,
+                detail: None,
+            },
+            Self::Front(item) => ProbeItemSnapshot {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                app_id: item.app_id.clone(),
+                app_name: item.app_name.clone(),
+                chain_id: item.target.chain_id.clone(),
+                ingress_id: item.target_id.clone(),
+                family: item.target_family,
+                protocol: item.target_protocol,
+                member_id: Some(item.member_id.clone()),
+                member_name: Some(item.member_name.clone()),
+                member_family: Some(item.member_family),
+                member_protocol: Some(item.member_protocol),
+                status: "waiting",
+                ttfb_ms: None,
+                detail: None,
+            },
+        }
+    }
+
+    fn is_front(&self) -> bool {
+        matches!(self, Self::Front(_))
+    }
+}
+
+type RunProbe = dyn Fn(ProbeWorkItem, String, u64, ProbeOptions) -> E2eProbe + Send + Sync;
 
 #[derive(Clone)]
 pub(crate) struct GrantProbeService {
@@ -52,10 +122,13 @@ pub(crate) struct ProbeCapability {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProbeJobSnapshot {
     pub id: String,
+    pub kind: &'static str,
     pub tenant_id: String,
     pub user_id: String,
     pub serving_revision: u64,
     pub serving_generation: u64,
+    pub client_snapshot_id: Option<u64>,
+    pub timeout_secs: u64,
     pub status: &'static str,
     pub message: Option<String>,
     pub created_at_unix_secs: u64,
@@ -73,12 +146,21 @@ pub(crate) struct ProbeItemSnapshot {
     pub ingress_id: String,
     pub family: &'static str,
     pub protocol: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_family: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_protocol: Option<&'static str>,
     pub status: &'static str,
     pub ttfb_ms: Option<u32>,
     pub detail: Option<String>,
 }
 
 struct ProbeJob {
+    scope_key: String,
     cancellation: ProbeCancellation,
     snapshot: Mutex<ProbeJobSnapshot>,
     events: broadcast::Sender<ProbeJobSnapshot>,
@@ -160,7 +242,7 @@ impl GrantProbeService {
             inner: Arc::new(GrantProbeServiceInner {
                 jobs: Mutex::new(HashMap::new()),
                 sequence: AtomicU64::new(0),
-                semaphore: Arc::new(Semaphore::new(GLOBAL_CONCURRENCY)),
+                semaphore: global_probe_semaphore(),
                 xray_binary: binary,
                 runtime_dir,
                 capability,
@@ -171,6 +253,14 @@ impl GrantProbeService {
 
     pub(crate) fn capability(&self) -> ProbeCapability {
         self.inner.capability.clone()
+    }
+
+    pub(crate) fn xray_binary(&self) -> PathBuf {
+        self.inner.xray_binary.clone()
+    }
+
+    pub(crate) fn runtime_dir(&self) -> PathBuf {
+        self.inner.runtime_dir.clone()
     }
 
     pub(crate) async fn start_for_user(
@@ -190,14 +280,6 @@ impl GrantProbeService {
                     .unwrap_or_else(|| "Console 拨测组件不可用".to_owned()),
             ));
         }
-        self.reap_finished();
-        // Reject a second active round before consuming the plan. This is intentionally keyed by
-        // the user, not the operator: two operators pressing at once should observe one test, not
-        // double the user's measured traffic.
-        if let Some(job) = self.find_active(tenant_id, user_id) {
-            return Ok((snapshot(&job), true));
-        }
-
         let selected_ids =
             validate_selection(selected, plan.items.iter().map(|item| item.id.as_str()))?;
         let targets = plan
@@ -205,9 +287,97 @@ impl GrantProbeService {
             .iter()
             .filter(|item| selected_ids.is_empty() || selected_ids.contains(&item.id))
             .cloned()
+            .map(|item| ProbeWorkItem::Grant(Box::new(item)))
             .collect::<Vec<_>>();
         if targets.is_empty() {
             return Err(StoreError::InvalidData("没有可拨测的生效授权".to_owned()));
+        }
+        self.start_work(
+            store,
+            format!("grant:{tenant_id}:{user_id}"),
+            "grant",
+            tenant_id,
+            user_id,
+            plan.serving_revision,
+            plan.serving_generation,
+            None,
+            plan.endpoint_url,
+            plan.timeout_secs,
+            targets,
+            false,
+        )
+    }
+
+    pub(crate) async fn start_for_front(
+        &self,
+        store: PgStore,
+        tenant_id: &str,
+        user_id: &str,
+        plan: FrontCombinationProbePlan,
+    ) -> Result<(ProbeJobSnapshot, bool), StoreError> {
+        if !self.inner.capability.available {
+            return Err(StoreError::Unavailable(
+                self.inner
+                    .capability
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "Console 拨测组件不可用".to_owned()),
+            ));
+        }
+        let first = plan
+            .items
+            .first()
+            .ok_or_else(|| StoreError::InvalidData("没有可执行的链式代理组合".to_owned()))?;
+        let scope_key = format!(
+            "front:{tenant_id}:{user_id}:{}:{}:{}:{}",
+            first.app_id, first.front_id, first.member_id, first.target_id
+        );
+        let targets = plan
+            .items
+            .iter()
+            .cloned()
+            .map(|item| ProbeWorkItem::Front(Box::new(item)))
+            .collect();
+        self.start_work(
+            store,
+            scope_key,
+            "front-combination",
+            tenant_id,
+            user_id,
+            plan.serving_revision,
+            plan.serving_generation,
+            Some(plan.client_snapshot_id),
+            plan.endpoint_url,
+            plan.timeout_secs,
+            targets,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_work(
+        &self,
+        store: PgStore,
+        scope_key: String,
+        kind: &'static str,
+        tenant_id: &str,
+        user_id: &str,
+        serving_revision: u64,
+        serving_generation: u64,
+        client_snapshot_id: Option<u64>,
+        endpoint_url: String,
+        timeout_secs: u64,
+        targets: Vec<ProbeWorkItem>,
+        reuse_finished: bool,
+    ) -> Result<(ProbeJobSnapshot, bool), StoreError> {
+        self.reap_finished();
+        if let Some(job) = self.find_active(&scope_key) {
+            return Ok((snapshot(&job), true));
+        }
+        if reuse_finished {
+            if let Some(job) = self.find_recent_completed(&scope_key, serving_generation) {
+                return Ok((snapshot(&job), true));
+            }
         }
 
         let now = unix_now();
@@ -216,36 +386,24 @@ impl GrantProbeService {
             now,
             self.inner.sequence.fetch_add(1, Ordering::Relaxed) & 0xffff
         );
-        let items = targets
-            .iter()
-            .map(|item| ProbeItemSnapshot {
-                id: item.id.clone(),
-                name: item.name.clone(),
-                app_id: item.app_id.clone(),
-                app_name: item.app_name.clone(),
-                chain_id: item.chain_id.clone(),
-                ingress_id: item.ingress_id.clone(),
-                family: item.family,
-                protocol: item.protocol,
-                status: "waiting",
-                ttfb_ms: None,
-                detail: None,
-            })
-            .collect();
         let initial = ProbeJobSnapshot {
             id: id.clone(),
+            kind,
             tenant_id: tenant_id.to_owned(),
             user_id: user_id.to_owned(),
-            serving_revision: plan.serving_revision,
-            serving_generation: plan.serving_generation,
+            serving_revision,
+            serving_generation,
+            client_snapshot_id,
+            timeout_secs,
             status: "running",
             message: None,
             created_at_unix_secs: now,
             finished_at_unix_secs: None,
-            items,
+            items: targets.iter().map(ProbeWorkItem::snapshot).collect(),
         };
         let (events, _) = broadcast::channel(32);
         let job = Arc::new(ProbeJob {
+            scope_key: scope_key.clone(),
             cancellation: ProbeCancellation::default(),
             snapshot: Mutex::new(initial),
             events,
@@ -255,13 +413,13 @@ impl GrantProbeService {
             if let Some(existing) = jobs
                 .values()
                 .find(|existing| {
-                    let state = existing
-                        .snapshot
-                        .lock()
-                        .expect("grant probe snapshot poisoned");
-                    state.tenant_id == tenant_id
-                        && state.user_id == user_id
-                        && state.finished_at_unix_secs.is_none()
+                    existing.scope_key == scope_key
+                        && existing
+                            .snapshot
+                            .lock()
+                            .expect("grant probe snapshot poisoned")
+                            .finished_at_unix_secs
+                            .is_none()
                 })
                 .cloned()
             {
@@ -269,7 +427,14 @@ impl GrantProbeService {
             }
             jobs.insert(id, job.clone());
         }
-        self.spawn_job(store, job.clone(), plan, targets);
+        self.spawn_job(
+            store,
+            job.clone(),
+            endpoint_url,
+            timeout_secs,
+            serving_generation,
+            targets,
+        );
         Ok((snapshot(&job), false))
     }
 
@@ -277,22 +442,23 @@ impl GrantProbeService {
         &self,
         store: PgStore,
         job: Arc<ProbeJob>,
-        plan: UserGrantProbePlan,
-        targets: Vec<UserGrantProbeTarget>,
+        endpoint_url: String,
+        timeout_secs: u64,
+        serving_generation: u64,
+        targets: Vec<ProbeWorkItem>,
     ) {
         let service = self.clone();
         tokio::spawn(async move {
             let mut joins = tokio::task::JoinSet::new();
-            let timeout_secs = plan.timeout_secs;
-            let serving_generation = plan.serving_generation;
             for target in targets {
                 let service = service.clone();
                 let store = store.clone();
                 let job = job.clone();
-                let endpoint = plan.endpoint_url.clone();
+                let endpoint = endpoint_url.clone();
                 joins.spawn(async move {
+                    let target_id = target.id().to_owned();
                     if job.cancellation.is_cancelled() {
-                        service.finish_item(&job, &target.id, "canceled", None, None);
+                        service.finish_item(&job, &target_id, "canceled", None, None);
                         return;
                     }
                     let permit = match service.inner.semaphore.clone().acquire_owned().await {
@@ -300,7 +466,7 @@ impl GrantProbeService {
                         Err(_) => {
                             service.finish_item(
                                 &job,
-                                &target.id,
+                                &target_id,
                                 "failed",
                                 None,
                                 Some("拨测调度器已关闭".to_owned()),
@@ -310,10 +476,10 @@ impl GrantProbeService {
                     };
                     if job.cancellation.is_cancelled() {
                         drop(permit);
-                        service.finish_item(&job, &target.id, "canceled", None, None);
+                        service.finish_item(&job, &target_id, "canceled", None, None);
                         return;
                     }
-                    service.set_item_running(&job, &target.id);
+                    service.set_item_running(&job, &target_id);
                     let options = ProbeOptions::new(
                         service.inner.xray_binary.clone(),
                         job.cancellation.clone(),
@@ -327,7 +493,7 @@ impl GrantProbeService {
                     .await;
                     drop(permit);
                     if job.cancellation.is_cancelled() {
-                        service.finish_item(&job, &target.id, "canceled", None, None);
+                        service.finish_item(&job, &target_id, "canceled", None, None);
                         return;
                     }
                     match store
@@ -343,7 +509,7 @@ impl GrantProbeService {
                             eprintln!("grant probe serving generation check failed: {error}");
                             service.finish_item(
                                 &job,
-                                &target.id,
+                                &target_id,
                                 "failed",
                                 None,
                                 Some("暂时无法确认 Serving 状态".to_owned()),
@@ -352,10 +518,12 @@ impl GrantProbeService {
                         }
                     }
                     match result {
-                        Ok(result) => service.record_result(&job, &target, result),
+                        Ok(result) => {
+                            service.record_result(&job, &target_id, target.is_front(), result)
+                        }
                         Err(_) => service.finish_item(
                             &job,
-                            &target.id,
+                            &target_id,
                             "failed",
                             None,
                             Some("拨测执行线程异常结束".to_owned()),
@@ -410,7 +578,7 @@ impl GrantProbeService {
         Some(out)
     }
 
-    fn find_active(&self, tenant: &str, user: &str) -> Option<Arc<ProbeJob>> {
+    fn find_active(&self, scope_key: &str) -> Option<Arc<ProbeJob>> {
         self.inner
             .jobs
             .lock()
@@ -418,11 +586,33 @@ impl GrantProbeService {
             .values()
             .find(|job| {
                 let state = job.snapshot.lock().expect("grant probe snapshot poisoned");
-                state.tenant_id == tenant
-                    && state.user_id == user
-                    && state.finished_at_unix_secs.is_none()
+                job.scope_key == scope_key && state.finished_at_unix_secs.is_none()
             })
             .cloned()
+    }
+
+    fn find_recent_completed(
+        &self,
+        scope_key: &str,
+        serving_generation: u64,
+    ) -> Option<Arc<ProbeJob>> {
+        let now = unix_now();
+        self.inner
+            .jobs
+            .lock()
+            .expect("grant probe jobs poisoned")
+            .values()
+            .filter_map(|job| {
+                let state = job.snapshot.lock().expect("grant probe snapshot poisoned");
+                let finished = state.finished_at_unix_secs?;
+                (job.scope_key == scope_key
+                    && state.serving_generation == serving_generation
+                    && state.status == "completed"
+                    && now.saturating_sub(finished) < FRONT_RESULT_CACHE_TTL.as_secs())
+                .then_some((finished, job.clone()))
+            })
+            .max_by_key(|(finished, _)| *finished)
+            .map(|(_, job)| job)
     }
 
     fn set_item_running(&self, job: &ProbeJob, id: &str) {
@@ -451,12 +641,16 @@ impl GrantProbeService {
         });
     }
 
-    fn record_result(&self, job: &ProbeJob, target: &UserGrantProbeTarget, result: E2eProbe) {
+    fn record_result(&self, job: &ProbeJob, id: &str, is_front: bool, result: E2eProbe) {
         let passed = authorization_probe_passed(&result);
-        let detail = safe_result_detail(&result);
+        let detail = if is_front {
+            safe_front_result_detail(&result)
+        } else {
+            safe_result_detail(&result)
+        };
         self.finish_item(
             job,
-            &target.id,
+            id,
             if passed { "passed" } else { "failed" },
             result.ttfb_ms,
             detail,
@@ -521,12 +715,39 @@ impl GrantProbeService {
 }
 
 fn default_run_probe(
-    target: UserGrantProbeTarget,
+    target: ProbeWorkItem,
     endpoint: String,
     timeout: u64,
     options: ProbeOptions,
 ) -> E2eProbe {
-    brocade_probe::probe_one_with_options(&target.target, &endpoint, timeout, &options)
+    match target {
+        ProbeWorkItem::Grant(target) => {
+            brocade_probe::probe_one_with_options(&target.target, &endpoint, timeout, &options)
+        }
+        ProbeWorkItem::Front(target) => {
+            let target = *target;
+            match target.member {
+                FrontCombinationProbeMember::Internal(member) => {
+                    brocade_probe::probe_chained_with_options(
+                        &member,
+                        &target.target,
+                        &endpoint,
+                        timeout,
+                        &options,
+                    )
+                }
+                FrontCombinationProbeMember::External(member) => {
+                    brocade_probe::probe_chained_external_with_options(
+                        &member,
+                        &target.target,
+                        &endpoint,
+                        timeout,
+                        &options,
+                    )
+                }
+            }
+        }
+    }
 }
 
 fn snapshot(job: &ProbeJob) -> ProbeJobSnapshot {
@@ -660,6 +881,16 @@ fn safe_result_detail(result: &E2eProbe) -> Option<String> {
         E2eProbeStatus::Timeout => Some("完整链路在时限内没有返回".to_owned()),
         E2eProbeStatus::ChainBroken => Some("握手后未能完成出口请求".to_owned()),
         E2eProbeStatus::Unsupported => Some("Console 拨测执行器无法完成该项目".to_owned()),
+    }
+}
+
+fn safe_front_result_detail(result: &E2eProbe) -> Option<String> {
+    match result.status {
+        E2eProbeStatus::Ok => None,
+        E2eProbeStatus::HandshakeFailed => Some("前置成员或目标入口的握手/用户认证失败".to_owned()),
+        E2eProbeStatus::Timeout => Some("成员 → 目标 → 互联网在时限内没有返回".to_owned()),
+        E2eProbeStatus::ChainBroken => Some("组合握手后未能完成目标链路的出口请求".to_owned()),
+        E2eProbeStatus::Unsupported => Some("Console 无法执行该协议组合".to_owned()),
     }
 }
 

@@ -1,5 +1,26 @@
 //! The agent's runtime options, read from the command line and the environment.
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, time::Duration};
+
+const DEFAULT_VPNGATE_STATS_WINDOW_SECS: u64 = 15 * 60;
+const MIN_VPNGATE_STATS_WINDOW_SECS: u64 = 60;
+const MAX_VPNGATE_STATS_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+/// The installer places Agent and Xray beside each other. An explicit value wins, while deriving
+/// the sibling keeps already-enrolled machines upgradeable after they receive an Agent with Xray
+/// rollout support but before anyone has re-run the installer to add the new environment entry.
+pub(crate) fn xray_binary_path() -> PathBuf {
+    if let Some(path) = env::var_os("BROCADE_XRAY_BIN").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(sibling) = fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("xray")))
+        .filter(|path| path.is_file())
+    {
+        return sibling;
+    }
+    PathBuf::from("xray")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Options {
@@ -8,6 +29,7 @@ pub(crate) struct Options {
     pub(crate) token: String,
     pub(crate) state_dir: PathBuf,
     pub(crate) apply_mode: ApplyMode,
+    pub(crate) vpngate_stats_window: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +64,10 @@ impl Options {
             .map(|value| parse_apply_mode(&value))
             .transpose()?
             .unwrap_or(ApplyMode::StateDir);
+        let mut vpngate_stats_window = env_value("BROCADE_VPNGATE_STATS_WINDOW_SECS")
+            .map(|value| parse_vpngate_stats_window(&value))
+            .transpose()?
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_VPNGATE_STATS_WINDOW_SECS));
 
         let mut i = 0;
         while i < args.len() {
@@ -75,6 +101,13 @@ impl Options {
                         args.get(i).ok_or("--apply requires state-dir or linux")?,
                     )?;
                 }
+                "--vpngate-stats-window-secs" => {
+                    i += 1;
+                    vpngate_stats_window = parse_vpngate_stats_window(
+                        args.get(i)
+                            .ok_or("--vpngate-stats-window-secs requires a value")?,
+                    )?;
+                }
                 value if value.starts_with("--") => {
                     return Err(format!("unknown option {value}"));
                 }
@@ -95,6 +128,7 @@ impl Options {
             )?)?,
             state_dir,
             apply_mode,
+            vpngate_stats_window,
         })
     }
 }
@@ -133,6 +167,20 @@ fn parse_apply_mode(value: &str) -> Result<ApplyMode, String> {
             "unknown apply mode {value}; expected state-dir or linux"
         )),
     }
+}
+
+fn parse_vpngate_stats_window(value: &str) -> Result<Duration, String> {
+    let seconds = value.parse::<u64>().map_err(|_| {
+        format!(
+            "BROCADE_VPNGATE_STATS_WINDOW_SECS/--vpngate-stats-window-secs must be an integer between {MIN_VPNGATE_STATS_WINDOW_SECS} and {MAX_VPNGATE_STATS_WINDOW_SECS}"
+        )
+    })?;
+    if !(MIN_VPNGATE_STATS_WINDOW_SECS..=MAX_VPNGATE_STATS_WINDOW_SECS).contains(&seconds) {
+        return Err(format!(
+            "BROCADE_VPNGATE_STATS_WINDOW_SECS/--vpngate-stats-window-secs must be between {MIN_VPNGATE_STATS_WINDOW_SECS} and {MAX_VPNGATE_STATS_WINDOW_SECS} seconds"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 #[cfg(test)]
@@ -175,6 +223,7 @@ mod tests {
         assert_eq!(options.command, "apply-once");
         assert_eq!(options.apply_mode, ApplyMode::StateDir);
         assert_eq!(options.state_dir, PathBuf::from("./brocade-agent-state"));
+        assert_eq!(options.vpngate_stats_window.as_secs(), 15 * 60);
     }
 
     /// The default apply mode only writes state_dir and does not touch the
@@ -213,12 +262,15 @@ mod tests {
                 "/tmp/cli",
                 "--apply",
                 "linux",
+                "--vpngate-stats-window-secs",
+                "1200",
             ]),
             env(&[
                 ("BROCADE_AGENT_SERVER", "http://env"),
                 ("BROCADE_NODE_TOKEN", "env-token"),
                 ("BROCADE_AGENT_STATE_DIR", "/tmp/env"),
                 ("BROCADE_AGENT_APPLY", "state-dir"),
+                ("BROCADE_VPNGATE_STATS_WINDOW_SECS", "300"),
             ]),
         )
         .unwrap();
@@ -228,6 +280,7 @@ mod tests {
         assert_eq!(options.token, "cli-token");
         assert_eq!(options.state_dir, PathBuf::from("/tmp/cli"));
         assert_eq!(options.apply_mode, ApplyMode::Linux);
+        assert_eq!(options.vpngate_stats_window.as_secs(), 1200);
     }
 
     /// Everything can come from the environment — the install script's path.
@@ -239,6 +292,7 @@ mod tests {
                 ("BROCADE_AGENT_SERVER", "http://env"),
                 ("BROCADE_NODE_TOKEN", "env-token"),
                 ("BROCADE_AGENT_STATE_DIR", "/var/lib/brocade"),
+                ("BROCADE_VPNGATE_STATS_WINDOW_SECS", "600"),
             ]),
         )
         .unwrap();
@@ -246,6 +300,22 @@ mod tests {
         assert_eq!(options.server, "http://env");
         assert_eq!(options.token, "env-token");
         assert_eq!(options.state_dir, PathBuf::from("/var/lib/brocade"));
+        assert_eq!(options.vpngate_stats_window.as_secs(), 600);
+    }
+
+    #[test]
+    fn vpngate_stats_window_rejects_invalid_or_unbounded_values() {
+        for value in ["not-a-number", "0", "59", "86401"] {
+            let error = Options::parse_with_env(
+                args(&["--server", "http://c", "--token", "t"]),
+                env(&[("BROCADE_VPNGATE_STATS_WINDOW_SECS", value)]),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("BROCADE_VPNGATE_STATS_WINDOW_SECS"),
+                "value {value}: {error}"
+            );
+        }
     }
 
     /// systemd's `Environment=BROCADE_NODE_TOKEN=` leaves an empty value. Empty
@@ -374,6 +444,10 @@ mod tests {
             ("--token-file", "--token-file requires a value"),
             ("--state-dir", "--state-dir requires a value"),
             ("--apply", "--apply requires state-dir or linux"),
+            (
+                "--vpngate-stats-window-secs",
+                "--vpngate-stats-window-secs requires a value",
+            ),
         ] {
             let error = Options::parse_with_env(args(&[missing]), env(&[])).unwrap_err();
             assert_eq!(error, expected);

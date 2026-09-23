@@ -1,3 +1,5 @@
+import { fileBytes } from '../ui/format';
+
 // 行级 diff。产物在几十到几百行，LCS 的 O(n·m) 复杂度可以满足；
 // 遇到超大文件时退化为整体替换，接受 diff 效果下降以避免界面阻塞。
 
@@ -110,8 +112,5 @@ export const artifactFile = (kind: string) => ARTIFACT_META[kind]?.file ?? kind;
 export const artifactFmt = (kind: string) => ARTIFACT_META[kind]?.fmt ?? '';
 
 export function fmtBytes(n: number | null): string {
-  if (n == null) return '—';
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return fileBytes(n);
 }

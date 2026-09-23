@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use brocade_core::{compile::compile, model::ModelSnapshot};
+use brocade_core::model::ModelSnapshot;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -17,6 +17,7 @@ use crate::{Result, StoreError};
 pub(crate) struct SubscriptionServingProjection {
     pub(crate) snapshot: ModelSnapshot,
     _generation: u64,
+    client_snapshot_id: u64,
     unavailable_reason: Option<String>,
 }
 
@@ -30,6 +31,10 @@ impl SubscriptionServingProjection {
 
     pub(crate) fn generation(&self) -> u64 {
         self._generation
+    }
+
+    pub(crate) fn client_snapshot_id(&self) -> u64 {
+        self.client_snapshot_id
     }
 }
 
@@ -110,6 +115,7 @@ pub(crate) async fn load_subscription_serving_projection(
     Ok(SubscriptionServingProjection {
         snapshot,
         _generation: revision_to_u64("subscription generation", row.try_get("generation")?)?,
+        client_snapshot_id: revision_to_u64("client_snapshot_id", client_snapshot_id)?,
         unavailable_reason,
     })
 }
@@ -513,7 +519,7 @@ async fn validate_effective_combination_tx(
         crate::materialize::load_immutable_snapshot_tx(tx, permissions_revision).await?;
     let composed = crate::subscription_client::compose(topology, &permissions, client)?;
     let effective = overlay_isolated_nodes(composed, isolated_nodes);
-    compile(&effective)
+    crate::compile_cache::compile_incremental(&effective)
         .ensure_publishable()
         .map_err(|blocked| {
             StoreError::InvalidData(format!(

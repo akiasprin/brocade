@@ -7,12 +7,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use brocade_deployment::protocol::{
-    NodePingProbeList, NodePingProbeView, PingProbePoint, PingProbeReportRequest,
-    PingProbeReportResult, PingProbeSettings, PingProbeTarget, PingProbeTargetSeries,
+    NodePingProbeLatestList, NodePingProbeLatestView, NodePingProbeList, NodePingProbeView,
+    PingProbePoint, PingProbeReportRequest, PingProbeReportResult, PingProbeSettings,
+    PingProbeTarget, PingProbeTargetLatest, PingProbeTargetSeries,
 };
 use sqlx::{PgPool, Row};
 
 use crate::{admin::tenant_filter, AdminContext, Result, StoreError};
+
+// The primary key is (node_id, target, probed_at). Ask for each requested pair explicitly so each
+// LATERAL arm is a bounded reverse index scan. DISTINCT ON would sort the entire retained table to
+// produce the same handful of rows.
+const LATEST_NODE_SAMPLES_SQL: &str = "SELECT requested_node.node_id, requested_target.target,
+            extract(epoch FROM latest.probed_at)::bigint AS probed_at,
+            latest.attempted, latest.latency_us
+       FROM unnest($1::text[]) AS requested_node(node_id)
+       CROSS JOIN unnest($2::text[]) AS requested_target(target)
+       JOIN LATERAL (
+            SELECT sample.probed_at, sample.attempted, sample.latency_us
+              FROM node_ping_probe_samples sample
+             WHERE sample.node_id = requested_node.node_id
+               AND sample.target = requested_target.target
+             ORDER BY sample.probed_at DESC
+             LIMIT 1
+       ) latest ON TRUE
+      ORDER BY requested_node.node_id, requested_target.target";
 
 const MAX_CLOCK_SKEW_SECS: i64 = 600;
 const MAX_TARGETS: usize = 32;
@@ -23,7 +42,51 @@ const MAX_TIMEOUT_MS: u32 = 120_000;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_ADDRESS_CHARS: usize = 512;
 const MAX_READ_WINDOW_SECS: u32 = 7 * 86_400;
-const RETAIN_SECS: i64 = 7 * 86_400;
+
+/// The chart reads every retained PING point, but repeated object keys account for most of the
+/// row-oriented JSON. Parallel arrays preserve the exact samples while writing the target
+/// metadata and field names once.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodePingProbeColumnarView {
+    pub node_id: String,
+    pub targets: Vec<PingProbeTargetColumnarSeries>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PingProbeTargetColumnarSeries {
+    pub name: String,
+    pub address: String,
+    pub probed_at_unix_secs: Vec<i64>,
+    pub attempted: Vec<bool>,
+    pub latency_us: Vec<Option<u32>>,
+}
+
+pub fn columnar_view(view: NodePingProbeView) -> NodePingProbeColumnarView {
+    NodePingProbeColumnarView {
+        node_id: view.node_id,
+        targets: view
+            .targets
+            .into_iter()
+            .map(|target| {
+                let mut probed_at_unix_secs = Vec::with_capacity(target.samples.len());
+                let mut attempted = Vec::with_capacity(target.samples.len());
+                let mut latency_us = Vec::with_capacity(target.samples.len());
+                for sample in target.samples {
+                    probed_at_unix_secs.push(sample.probed_at_unix_secs);
+                    attempted.push(sample.attempted);
+                    latency_us.push(sample.latency_us);
+                }
+                PingProbeTargetColumnarSeries {
+                    name: target.name,
+                    address: target.address,
+                    probed_at_unix_secs,
+                    attempted,
+                    latency_us,
+                }
+            })
+            .collect(),
+    }
+}
 
 pub async fn load_settings(pool: &PgPool) -> Result<PingProbeSettings> {
     let row = sqlx::query(
@@ -156,15 +219,6 @@ pub async fn record_report(
         }
     }
 
-    // Observation history is diagnostic rather than accounting. Bound it opportunistically on
-    // writes so a forgotten installation cannot grow this table forever.
-    sqlx::query(
-        "DELETE FROM node_ping_probe_samples
-          WHERE probed_at < now() - make_interval(secs => $1::double precision)",
-    )
-    .bind(RETAIN_SECS)
-    .execute(&mut *tx)
-    .await?;
     tx.commit().await?;
 
     Ok(PingProbeReportResult {
@@ -173,6 +227,23 @@ pub async fn record_report(
         skipped_samples,
         unknown_targets,
     })
+}
+
+/// Drop expired PING history from the control-plane maintenance loop.
+///
+/// This used to run after every report. At a ten-second interval that meant one global retention
+/// scan per Agent report even though almost every scan deleted nothing. An hourly pass keeps the
+/// same retention boundary while removing that work from the ingestion transaction.
+pub async fn prune_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
+    let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
+    Ok(sqlx::query(
+        "DELETE FROM node_ping_probe_samples
+          WHERE probed_at < now() - make_interval(days => $1)",
+    )
+    .bind(retain_days)
+    .execute(pool)
+    .await?
+    .rows_affected())
 }
 
 pub async fn node_view(
@@ -232,33 +303,101 @@ pub async fn list_nodes(
     window_secs: u32,
 ) -> Result<NodePingProbeList> {
     let settings = load_settings(pool).await?;
-    let filter = tenant_filter(actor);
-    let (scope, pattern) = split_filter(&filter);
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM nodes
-         WHERE retired_at IS NULL
-           AND ($1::text IS NULL OR tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\')
-         ORDER BY id",
-    )
-    .bind(scope)
-    .bind(pattern)
-    .fetch_all(pool)
-    .await?;
-    let mut nodes = Vec::with_capacity(ids.len());
-    for id in ids {
-        nodes.push(
-            read_node(
-                pool,
-                &id,
-                &settings.targets,
-                settings.timeout_ms,
-                bounded_window(window_secs),
-                None,
-            )
-            .await?,
-        );
+    let ids = scoped_live_node_ids(pool, actor).await?;
+    let mut points = BTreeMap::<(String, String), Vec<PingProbePoint>>::new();
+    if !ids.is_empty() {
+        let rows = sqlx::query(
+            "SELECT node_id, target,
+                    extract(epoch FROM probed_at)::bigint AS probed_at,
+                    attempted, latency_us
+               FROM node_ping_probe_samples
+              WHERE node_id = ANY($1::text[])
+                AND probed_at >= now() - make_interval(secs => $2::double precision)
+              ORDER BY node_id, target, probed_at ASC",
+        )
+        .bind(&ids)
+        .bind(i32::try_from(bounded_window(window_secs)).expect("bounded window fits i32"))
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            let node_id: String = row.try_get("node_id")?;
+            let target: String = row.try_get("target")?;
+            points
+                .entry((node_id, target))
+                .or_default()
+                .push(point_from_row(&row, settings.timeout_ms)?);
+        }
     }
+    let nodes = ids
+        .into_iter()
+        .map(|node_id| NodePingProbeView {
+            targets: settings
+                .targets
+                .iter()
+                .map(|target| PingProbeTargetSeries {
+                    name: target.name.clone(),
+                    address: target.address.clone(),
+                    samples: points
+                        .remove(&(node_id.clone(), target.address.clone()))
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            node_id,
+        })
+        .collect();
     Ok(NodePingProbeList { nodes })
+}
+
+/// The machine list needs only the newest observation for each configured target. Fetching a
+/// history window here used to perform one query per machine and ship every point to the browser,
+/// where the whole window was reduced to one card statistic. Keep the history
+/// endpoint for a machine detail chart; this path has a fixed query count and bounded response.
+pub async fn list_latest_nodes(
+    pool: &PgPool,
+    actor: &AdminContext,
+) -> Result<NodePingProbeLatestList> {
+    let settings = load_settings(pool).await?;
+    let ids = scoped_live_node_ids(pool, actor).await?;
+    let addresses = settings
+        .targets
+        .iter()
+        .map(|target| target.address.clone())
+        .collect::<Vec<_>>();
+    let mut latest = BTreeMap::<(String, String), PingProbePoint>::new();
+    if !ids.is_empty() && !addresses.is_empty() {
+        let rows = sqlx::query(LATEST_NODE_SAMPLES_SQL)
+            .bind(&ids)
+            .bind(&addresses)
+            .fetch_all(pool)
+            .await?;
+        for row in rows {
+            let node_id: String = row.try_get("node_id")?;
+            let target: String = row.try_get("target")?;
+            latest.insert(
+                (node_id, target),
+                point_from_row(&row, settings.timeout_ms)?,
+            );
+        }
+    }
+    let nodes = ids
+        .into_iter()
+        .map(|node_id| NodePingProbeLatestView {
+            targets: settings
+                .targets
+                .iter()
+                .map(|target| PingProbeTargetLatest {
+                    name: target.name.clone(),
+                    address: target.address.clone(),
+                    latest: latest.remove(&(node_id.clone(), target.address.clone())),
+                })
+                .collect(),
+            node_id,
+        })
+        .collect();
+    Ok(NodePingProbeLatestList {
+        interval_secs: settings.interval_secs,
+        nodes,
+    })
 }
 
 async fn read_node(
@@ -292,25 +431,12 @@ async fn read_node(
     let mut points = BTreeMap::<String, Vec<PingProbePoint>>::new();
     for row in rows {
         let target: String = row.try_get("target")?;
-        let attempted: bool = row.try_get("attempted")?;
-        let latency_us = successful_latency_us(
-            row.try_get::<Option<i32>, _>("latency_us")?
-                .map(|value| {
-                    u32::try_from(value).map_err(|_| {
-                        StoreError::InvalidData("negative PING latency in database".into())
-                    })
-                })
-                .transpose()?,
-            attempted,
-            timeout_ms,
-        );
         // Apply the current policy to historical rows too. Lowering the timeout must not leave
         // old, now-invalid latency points visible until retention expires.
-        points.entry(target).or_default().push(PingProbePoint {
-            probed_at_unix_secs: row.try_get("probed_at")?,
-            attempted,
-            latency_us,
-        });
+        points
+            .entry(target)
+            .or_default()
+            .push(point_from_row(&row, timeout_ms)?);
     }
     Ok(NodePingProbeView {
         node_id: node_id.to_owned(),
@@ -323,6 +449,41 @@ async fn read_node(
             })
             .collect(),
     })
+}
+
+fn point_from_row(row: &sqlx::postgres::PgRow, timeout_ms: u32) -> Result<PingProbePoint> {
+    let attempted: bool = row.try_get("attempted")?;
+    let latency_us = successful_latency_us(
+        row.try_get::<Option<i32>, _>("latency_us")?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    StoreError::InvalidData("negative PING latency in database".into())
+                })
+            })
+            .transpose()?,
+        attempted,
+        timeout_ms,
+    );
+    Ok(PingProbePoint {
+        probed_at_unix_secs: row.try_get("probed_at")?,
+        attempted,
+        latency_us,
+    })
+}
+
+async fn scoped_live_node_ids(pool: &PgPool, actor: &AdminContext) -> Result<Vec<String>> {
+    let filter = tenant_filter(actor);
+    let (scope, pattern) = split_filter(&filter);
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM nodes
+         WHERE retired_at IS NULL
+           AND ($1::text IS NULL OR tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\')
+         ORDER BY id",
+    )
+    .bind(scope)
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?)
 }
 
 fn empty_view(node_id: &str, targets: &[PingProbeTarget]) -> NodePingProbeView {
@@ -551,5 +712,48 @@ mod tests {
 
         assert!(validate_settings(&settings(5)).is_ok());
         assert!(validate_settings(&settings(4)).is_err());
+    }
+
+    #[test]
+    fn latest_fleet_query_bounds_each_primary_key_probe() {
+        assert!(LATEST_NODE_SAMPLES_SQL.contains("JOIN LATERAL"));
+        assert!(LATEST_NODE_SAMPLES_SQL.contains("LIMIT 1"));
+        assert!(!LATEST_NODE_SAMPLES_SQL.contains("DISTINCT ON"));
+    }
+
+    #[test]
+    fn columnar_view_keeps_exact_ping_order_and_states() {
+        let view = NodePingProbeView {
+            node_id: "n1".to_owned(),
+            targets: vec![PingProbeTargetSeries {
+                name: "target".to_owned(),
+                address: "icmp://example.test".to_owned(),
+                samples: vec![
+                    PingProbePoint {
+                        probed_at_unix_secs: 10,
+                        attempted: true,
+                        latency_us: Some(12_345),
+                    },
+                    PingProbePoint {
+                        probed_at_unix_secs: 20,
+                        attempted: true,
+                        latency_us: None,
+                    },
+                    PingProbePoint {
+                        probed_at_unix_secs: 30,
+                        attempted: false,
+                        latency_us: None,
+                    },
+                ],
+            }],
+        };
+
+        let compact = columnar_view(view);
+        assert_eq!(compact.targets[0].probed_at_unix_secs, vec![10, 20, 30]);
+        assert_eq!(compact.targets[0].attempted, vec![true, true, false]);
+        assert_eq!(
+            compact.targets[0].latency_us,
+            vec![Some(12_345), None, None]
+        );
     }
 }

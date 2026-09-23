@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
-    env, fs,
+    env, fmt, fs,
     net::IpAddr,
     path::PathBuf,
     sync::{
@@ -15,10 +15,10 @@ use tokio::sync::{broadcast, Notify};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         ws::{Message as WebSocketMessage, WebSocket},
-        Path, Query, Request, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, Request, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
@@ -35,27 +35,38 @@ use brocade_core::{
 use brocade_deployment::plan::DeploymentKind;
 use brocade_deployment::protocol::{
     AgentObservationRequest, AgentRealtimeSample, DeploymentWaveConfirmationRequest,
-    NodeRuntimeReport, RouteIpReport, TargetConvergenceReport,
-    UpdateRealtimeTelemetryPolicyRequest, UsageReportRequest,
+    NodePublicIpObservation, NodeRuntimeReport, RouteIpReport, TargetConvergenceReport,
+    UpdateRealtimeTelemetryPolicyRequest, UsageReportRequest, VpngateCatalogSyncAssignment,
+    VpngateCatalogSyncFailure, VpngateIpIntelligenceAssignment, VpngateIpIntelligenceReport,
+    VpngatePoolReport, VpngateProbeReport, VpngateReconcileReport, XrayReleaseOffer,
+    XrayReleaseReport,
 };
 use brocade_store::{
     AbandonNodeRequest, AdminContext, AdminLoginRequest, AdminRole, AgentRelease,
     AuthenticatedAdmin, AuthenticatedNode, BinarySource, BrandingSettings,
-    ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest,
-    CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
-    CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DistributionSettings,
-    E2eProbeRequest, IsolateDeploymentTargetRequest, LinkHealthRequest, LinkProbeRequest,
-    LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
-    PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
-    ProvisionedNode, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
-    RemoveWarpBindingRequest, SetUserAppQuotaRequest, SetUserPasswordRequest, StoreError,
-    SystemInitRequest, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
-    UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
-    UpdateWarpBindingRequest, VerifyDeploymentRequest, PUBLIC_OPERATOR_ID,
+    ChangeAdminPasswordRequest, ConsoleInitialData, CreateAdminOperatorRequest, CreateAppRequest,
+    CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest,
+    CreateIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
+    CreateXrayReleaseRequest, DeleteFrontRequest, DistributionSettings, E2eProbeItem,
+    E2eProbeRequest, IsolateDeploymentTargetRequest, IsolateNodeRequest, LinkHealthRequest,
+    LinkProbeRequest, LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore,
+    PhantunBinaries, PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest,
+    ProvisionNodeResult, ProvisionedNode, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
+    RemoveWarpBindingRequest, RequestVpngatePoolSwitch, SetUserAppQuotaRequest,
+    SetUserPasswordRequest, StoreError, SystemInitRequest, TunnelProbeSource,
+    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    UpdateNodeStatusRequest, UpdateNodeTrafficRequest, UpdateTunnelProbePolicy,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateVpngateCatalogSettings,
+    UpdateVpngateIntelligenceCredentials, UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode,
+    UpdateWarpBindingRequest, VerifyDeploymentRequest, VpngateAdmissionPolicy,
+    VpngateIntelligencePolicy, VpngateProbeNodeOrigin, VpngateServerPageRequest, VpngateSyncClaim,
+    XrayBuildInfo, XrayReleaseArtifact, XrayReleaseSummary, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tower_http::services::ServeDir;
 
 const ADMIN_SESSION_COOKIE: &str = "brocade_session";
@@ -72,6 +83,57 @@ const AGENT_ARCH_HEADER: &str = "x-brocade-arch";
 const AGENT_PROTOCOL_HEADER: &str = "x-brocade-protocol-version";
 const SUBSCRIPTION_RATE_PER_MINUTE: u32 = 60;
 const SUBSCRIPTION_CACHE_CONTROL: &str = "no-store, no-cache, max-age=0, must-revalidate";
+const XRAY_HISTORY_PAGE_SIZE: u32 = 20;
+pub const BOOTSTRAP_TOKEN_MIN_BYTES: usize = 32;
+pub const BOOTSTRAP_TOKEN_MAX_BYTES: usize = 512;
+
+/// Verifier for the one credential which may create the first system administrator.
+///
+/// Only the digest is retained in request state. The plaintext comes from process configuration,
+/// is presented once by the operator, and never crosses into the Store or its audit records.
+#[derive(Clone)]
+pub struct BootstrapCredential {
+    sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+pub struct BootstrapCredentialError(&'static str);
+
+impl fmt::Display for BootstrapCredentialError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for BootstrapCredentialError {}
+
+impl BootstrapCredential {
+    pub fn new(secret: &str) -> Result<Self, BootstrapCredentialError> {
+        if secret.trim() != secret {
+            return Err(BootstrapCredentialError(
+                "BROCADE_BOOTSTRAP_TOKEN cannot have leading or trailing whitespace",
+            ));
+        }
+        if secret.len() < BOOTSTRAP_TOKEN_MIN_BYTES {
+            return Err(BootstrapCredentialError(
+                "BROCADE_BOOTSTRAP_TOKEN must be at least 32 bytes",
+            ));
+        }
+        if secret.len() > BOOTSTRAP_TOKEN_MAX_BYTES {
+            return Err(BootstrapCredentialError(
+                "BROCADE_BOOTSTRAP_TOKEN must be at most 512 bytes",
+            ));
+        }
+        Ok(Self {
+            sha256: Sha256::digest(secret.as_bytes()).into(),
+        })
+    }
+
+    fn verifies(&self, candidate: &str) -> bool {
+        let candidate: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+        bool::from(self.sha256.ct_eq(&candidate))
+    }
+}
 
 tokio::task_local! {
     /// The result of the single authentication lookup performed at the admin-router boundary.
@@ -148,6 +210,23 @@ pub fn embedded_release_id() -> &'static str {
     })
 }
 
+/// The identity of the architecture set of Xray binaries carried by this Console. A database row
+/// naming any other value is intentionally inert after a Console redeploy until an administrator
+/// creates a new release.
+pub fn embedded_xray_release_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let mut hasher = Sha256::new();
+        for (arch, _, sha) in EMBEDDED_XRAYS {
+            hasher.update(arch.as_bytes());
+            hasher.update(b"\n");
+            hasher.update(sha.as_bytes());
+            hasher.update(b"\n");
+        }
+        hex_lower(&hasher.finalize())
+    })
+}
+
 /// Everything the install command assembles from: the agent surface's public address, and the two
 /// binaries the control plane distributes itself. Unrelated to store, and separated out so that
 /// install_command can be tested without a database.
@@ -196,6 +275,7 @@ impl AgentDistribution {
 #[derive(Clone)]
 pub struct AppState {
     store: PgStore,
+    bootstrap_credential: Option<BootstrapCredential>,
     geoip: crate::geoip::GeoIpLookup,
     dist: AgentDistribution,
     // Optional dedicated subscription origin. When absent, subscriptions follow the effective
@@ -228,12 +308,60 @@ pub struct AppState {
     // One process-local live channel shared by the admin and Agent route trees. It contains no
     // durable samples; persistence is limited to the policy stored by PgStore.
     realtime: crate::realtime::RealtimeService,
+    // Long-lived HTTP bodies and upgraded connections must end when the process begins draining.
+    // The listener lifecycle still owns a hard deadline, so forgetting to observe this signal in
+    // a future endpoint cannot make shutdown unbounded.
+    shutdown: crate::lifecycle::ShutdownSignal,
 }
 
 #[derive(Clone, Copy)]
 struct SubscriptionRateWindow {
     minute: u64,
     requests: u32,
+}
+
+/// Process-local services attached to the administrative route tree.
+///
+/// Grouping them keeps router construction explicit without making every new service another
+/// positional argument. Durable state remains in [`PgStore`], which is passed separately.
+pub struct ConsoleServices {
+    quota_wake: Arc<Notify>,
+    grants_wake: Arc<Notify>,
+    cert_wake: Arc<Notify>,
+    geoip: crate::geoip::GeoIpLookup,
+    realtime: crate::realtime::RealtimeService,
+    bootstrap_credential: Option<BootstrapCredential>,
+    shutdown: crate::lifecycle::ShutdownSignal,
+}
+
+impl ConsoleServices {
+    pub fn new(
+        quota_wake: Arc<Notify>,
+        grants_wake: Arc<Notify>,
+        cert_wake: Arc<Notify>,
+        geoip: crate::geoip::GeoIpLookup,
+        realtime: crate::realtime::RealtimeService,
+    ) -> Self {
+        Self {
+            quota_wake,
+            grants_wake,
+            cert_wake,
+            geoip,
+            realtime,
+            bootstrap_credential: None,
+            shutdown: crate::lifecycle::ShutdownSignal::new(),
+        }
+    }
+
+    pub fn and_bootstrap_credential(mut self, credential: Option<BootstrapCredential>) -> Self {
+        self.bootstrap_credential = credential;
+        self
+    }
+
+    pub fn and_shutdown(mut self, shutdown: crate::lifecycle::ShutdownSignal) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
 }
 
 /// Where the agent face is assumed to be when `BROCADE_AGENT_PUBLIC_URL` says nothing.
@@ -328,6 +456,16 @@ impl AppState {
         self
     }
 
+    pub fn and_shutdown(mut self, shutdown: crate::lifecycle::ShutdownSignal) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    fn and_bootstrap_credential(mut self, credential: Option<BootstrapCredential>) -> Self {
+        self.bootstrap_credential = credential;
+        self
+    }
+
     pub fn with_agent_origin(
         store: PgStore,
         quota_wake: Arc<Notify>,
@@ -353,6 +491,7 @@ impl AppState {
             .map(PathBuf::from);
         Self {
             store,
+            bootstrap_credential: None,
             geoip: crate::geoip::GeoIpLookup::default(),
             subscription_public_url_override,
             runtime_public_url_file,
@@ -365,6 +504,7 @@ impl AppState {
             cert_wake: Arc::new(Notify::new()),
             grant_probes: crate::grant_probe::GrantProbeService::from_env(),
             realtime: crate::realtime::RealtimeService::new(Default::default()),
+            shutdown: crate::lifecycle::ShutdownSignal::new(),
             dist: AgentDistribution {
                 agent_public_url,
                 agent_binary_url: env::var("BROCADE_AGENT_BIN_URL")
@@ -542,21 +682,27 @@ pub fn admin_router(store: PgStore) -> Router {
     admin_router_with_state(AppState::new(store))
 }
 
-/// Build the administrative face with every process-local worker service.
-pub fn admin_router_with_services(
+/// Build the administrative face with an explicit first-run credential.
+///
+/// The ordinary embedding constructor fails closed for `/auth/init`; a caller which needs to
+/// initialize a fresh database must opt in by supplying a validated credential.
+pub fn admin_router_with_bootstrap_credential(
     store: PgStore,
-    quota_wake: Arc<Notify>,
-    grants_wake: Arc<Notify>,
-    cert_wake: Arc<Notify>,
-    geoip: crate::geoip::GeoIpLookup,
-    realtime: crate::realtime::RealtimeService,
+    credential: BootstrapCredential,
 ) -> Router {
+    admin_router_with_state(AppState::new(store).and_bootstrap_credential(Some(credential)))
+}
+
+/// Build the administrative face with every process-local worker service.
+pub fn admin_router_with_services(store: PgStore, services: ConsoleServices) -> Router {
     admin_router_with_state(
-        AppState::with_quota_wake(store, quota_wake)
-            .and_grants_wake(grants_wake)
-            .and_cert_wake(cert_wake)
-            .and_geoip(geoip)
-            .and_realtime(realtime),
+        AppState::with_quota_wake(store, services.quota_wake)
+            .and_grants_wake(services.grants_wake)
+            .and_cert_wake(services.cert_wake)
+            .and_geoip(services.geoip)
+            .and_realtime(services.realtime)
+            .and_shutdown(services.shutdown)
+            .and_bootstrap_credential(services.bootstrap_credential),
     )
 }
 
@@ -577,18 +723,16 @@ pub fn merged_router_with_wakes(
 
 pub fn merged_router_with_wakes_and_realtime(
     store: PgStore,
-    quota_wake: Arc<Notify>,
-    grants_wake: Arc<Notify>,
-    cert_wake: Arc<Notify>,
-    geoip: crate::geoip::GeoIpLookup,
     agent_origin: String,
-    realtime: crate::realtime::RealtimeService,
+    services: ConsoleServices,
 ) -> Router {
-    let state = AppState::with_agent_origin(store, quota_wake, agent_origin)
-        .and_grants_wake(grants_wake)
-        .and_cert_wake(cert_wake)
-        .and_geoip(geoip)
-        .and_realtime(realtime);
+    let state = AppState::with_agent_origin(store, services.quota_wake, agent_origin)
+        .and_grants_wake(services.grants_wake)
+        .and_cert_wake(services.cert_wake)
+        .and_geoip(services.geoip)
+        .and_realtime(services.realtime)
+        .and_shutdown(services.shutdown)
+        .and_bootstrap_credential(services.bootstrap_credential);
     admin_router_with_state(state.clone()).merge(agent_routes().with_state(state))
 }
 
@@ -654,8 +798,8 @@ fn self_route_may_hold_secrets(method: &axum::http::Method, path: &str) -> bool 
 ///
 /// The list covers what the visitor-facing pages read: the model, the machines' agent state
 /// and load, the per-machine traffic series, hop quality, the current revision's compile
-/// output, and the read side of users, tenants, quotas and usage. Sensitive fields are removed
-/// centrally by the response masking layer.
+/// output, the read side of users, tenants, quotas and usage, and the VPN Gate catalogue and
+/// runtime evidence. Sensitive fields are removed centrally by the response masking layer.
 /// Write methods never match: the method check above closes every non-GET to the public
 /// account, and the deployments, settings, operator and artifact routes are excluded
 /// entirely.
@@ -671,11 +815,15 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
     const PUBLIC_PATHS: &[&str] = &[
         "/healthz",
         "/auth/state",
+        "/agent-log-policy",
+        "/node-traffic",
         "/branding",
         "/certs",
+        "/bootstrap",
         "/whoami",
         "/model/snapshot",
         "/nodes/agent-state",
+        "/notifications",
         "/revisions",
         "/load/nodes",
         "/ping-probe/nodes",
@@ -690,6 +838,8 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/usage/samples",
         "/usage/monthly-summary",
         "/realtime/nodes/events",
+        "/vpngate",
+        "/vpngate/runtimes",
     ];
     PUBLIC_PATHS.contains(&path)
         // `/compile/{revision}` and `/load/nodes/{node_id}`: the id is a path segment, so these
@@ -697,11 +847,36 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         || path.starts_with("/compile/")
         || path.starts_with("/load/nodes/")
         || path.starts_with("/ping-probe/nodes/")
+        || is_node_public_ip_history_path(path)
         || (path.starts_with("/realtime/nodes/")
             && (path.ends_with("/events") || path.ends_with("/snapshot")))
+        || is_vpngate_country_servers_path(path)
         // The response is the credential-free Serving authorization matrix. Executing it is a
         // POST to the same path and remains closed by the method gate above.
         || is_user_grant_probe_plan_path(path)
+        || is_tunnel_probe_view_path(path)
+}
+
+fn is_node_public_ip_history_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/nodes/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(node), Some("public-ip-history"), None) if !node.is_empty()
+    )
+}
+
+fn is_vpngate_country_servers_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/vpngate/countries/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(country), Some("servers"), None) if !country.is_empty()
+    )
 }
 
 fn user_may(method: &axum::http::Method, path: &str) -> bool {
@@ -709,7 +884,8 @@ fn user_may(method: &axum::http::Method, path: &str) -> bool {
         || self_route_may_hold_secrets(method, path)
         || (method == axum::http::Method::POST && path == "/admin/password")
         || (method == axum::http::Method::GET && path == "/grant-probes/capability")
-        || (method == axum::http::Method::POST && is_user_grant_probe_plan_path(path))
+        || (method == axum::http::Method::POST
+            && (is_user_grant_probe_plan_path(path) || is_user_front_probe_path(path)))
         || ((method == axum::http::Method::GET || method == axum::http::Method::DELETE)
             && is_grant_probe_job_path(path))
         || (method == axum::http::Method::GET && is_grant_probe_events_path(path))
@@ -723,6 +899,18 @@ fn is_user_grant_probe_plan_path(path: &str) -> bool {
     matches!(
         (parts.next(), parts.next(), parts.next(), parts.next()),
         (Some(tenant), Some(user), Some("grant-probes"), None) if !tenant.is_empty() && !user.is_empty()
+    )
+}
+
+fn is_user_front_probe_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/users/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(tenant), Some(user), Some("front-probes"), None)
+            if !tenant.is_empty() && !user.is_empty()
     )
 }
 
@@ -742,6 +930,18 @@ fn is_grant_probe_events_path(path: &str) -> bool {
     matches!(
         (parts.next(), parts.next(), parts.next()),
         (Some(id), Some("events"), None) if !id.is_empty()
+    )
+}
+
+fn is_tunnel_probe_view_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/tenants/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(tenant), Some("tunnels"), Some(outbound), Some("probe"), None)
+            if !tenant.is_empty() && !outbound.is_empty()
     )
 }
 
@@ -793,7 +993,19 @@ async fn admin_auth_context(
     }
 
     match authenticate_admin(&state, request.headers()).await {
-        Ok(admin) => REQUEST_ADMIN.scope(Some(admin), next.run(request)).await,
+        Ok(authentication) => {
+            let mut response = REQUEST_ADMIN
+                .scope(Some(authentication.admin), next.run(request))
+                .await;
+            if let Some(token) = authentication.refreshed_session_token {
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&session_cookie(&token))
+                        .expect("generated admin session token must form a valid cookie header"),
+                );
+            }
+            response
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -843,6 +1055,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
         .route("/visitor-access", put(set_visitor_access))
+        .route("/bootstrap", get(bootstrap))
         .route("/whoami", get(whoami))
         // Public read: the login page must know its name and mark before a session exists. Writes
         // still require a system administrator in the handler below.
@@ -886,6 +1099,10 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/agent-log-policy/nodes/{node_id}",
             put(update_node_log_policy),
         )
+        // Physical interface accounting is live operational state. Policy and calibration apply
+        // immediately and never create a model revision or deployment.
+        .route("/node-traffic", get(get_node_traffic))
+        .route("/node-traffic/nodes/{node_id}", put(update_node_traffic))
         // Alongside /distribution and for the same reason: no revision and no release. Separate
         // from it because the two are read on different schedules by different callers.
         // distribution is read when an operator installs a machine; this one is read on every
@@ -893,6 +1110,24 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/agent-release",
             get(get_agent_release).put(update_agent_release),
+        )
+        .route(
+            "/xray-releases",
+            get(list_xray_releases).post(create_xray_release),
+        )
+        .route("/xray-releases/history", get(list_xray_release_history))
+        .route("/xray-releases/{release_id}", get(get_xray_release))
+        .route(
+            "/xray-releases/{release_id}/confirm",
+            post(confirm_xray_release),
+        )
+        .route(
+            "/xray-releases/{release_id}/cancel",
+            post(cancel_xray_release),
+        )
+        .route(
+            "/xray-releases/{release_id}/targets/{node_id}/retry",
+            post(retry_xray_release_target),
         )
         // Certificates. The same family as the two above, with no revision and no release, but
         // with a worker behind them, which is why there is a third route: `scan` asks that worker
@@ -925,6 +1160,11 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/model/preview/artifact", post(preview_draft_artifact))
         .route("/compile/{revision_id}", get(compile_revision))
         .route("/nodes/agent-state", get(node_agent_state))
+        .route("/notifications", get(machine_notifications))
+        .route(
+            "/nodes/{node_id}/public-ip-history",
+            get(node_public_ip_history),
+        )
         .route("/artifacts/index", get(artifact_index))
         .route(
             "/artifacts/content/{target_kind}/{target_id}/{artifact_kind}",
@@ -964,6 +1204,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/nodes", delete(remove_retired_nodes))
         .route("/nodes/{node_id}", put(update_node))
         .route("/nodes/{node_id}/status", put(update_node_status))
+        .route("/nodes/{node_id}/isolate", post(isolate_node))
         .route("/nodes/{node_id}/lifecycle/abandon", post(abandon_node))
         .route(
             "/nodes/{node_id}/restore-service",
@@ -1001,12 +1242,70 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/users/{tenant_id}/{user_id}/grant-probes",
             get(user_grant_probe_plan).post(start_user_grant_probe),
         )
+        .route(
+            "/users/{tenant_id}/{user_id}/front-probes",
+            post(start_front_combination_probe),
+        )
         .route("/grant-probes/capability", get(grant_probe_capability))
         .route(
             "/grant-probes/{probe_id}",
             get(grant_probe_status).delete(cancel_grant_probe),
         )
         .route("/grant-probes/{probe_id}/events", get(grant_probe_events))
+        .route("/tunnel-probes", get(list_tunnel_probes))
+        .route("/tunnel-probes/capability", get(tunnel_probe_capability))
+        .route(
+            "/tunnel-probe-runs/{run_id}",
+            get(tunnel_probe_run).delete(cancel_tunnel_probe),
+        )
+        .route(
+            "/tenants/{tenant_id}/tunnels/{outbound_id}/probe",
+            get(tunnel_probe_view),
+        )
+        .route(
+            "/tenants/{tenant_id}/tunnels/{outbound_id}/probe-runs",
+            post(start_tunnel_probe),
+        )
+        .route(
+            "/tenants/{tenant_id}/tunnels/{outbound_id}/probe-policy",
+            put(update_tunnel_probe_policy),
+        )
+        .route("/vpngate", get(vpngate_overview))
+        .route("/vpngate/runtimes", get(vpngate_runtimes))
+        .route(
+            "/vpngate/runtimes/{node_id}/{outbound_id}/switch",
+            post(switch_vpngate_runtime),
+        )
+        .route("/vpngate/settings", put(update_vpngate_settings))
+        .route(
+            "/vpngate/admission-policy",
+            put(update_vpngate_admission_policy),
+        )
+        .route(
+            "/vpngate/intelligence-policy",
+            put(update_vpngate_intelligence_policy),
+        )
+        .route(
+            "/vpngate/intelligence-credentials",
+            put(update_vpngate_intelligence_credentials),
+        )
+        .route(
+            "/vpngate/intelligence-refresh",
+            post(start_vpngate_intelligence_refresh),
+        )
+        .route("/vpngate/sync", post(start_vpngate_sync))
+        .route(
+            "/vpngate/probe-nodes/{node_id}",
+            put(update_vpngate_probe_node),
+        )
+        .route(
+            "/vpngate/intelligence-nodes/{node_id}",
+            put(update_vpngate_intelligence_node),
+        )
+        .route(
+            "/vpngate/countries/{country_code}/servers",
+            get(vpngate_country_servers),
+        )
         .route("/grants", post(upsert_grant))
         .route("/grants/automation", get(grant_automation_status))
         .route("/quotas", get(list_user_app_quotas).put(set_user_app_quota))
@@ -1023,6 +1322,11 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/apps/{app_id}/chains", post(upsert_chain))
         .route("/apps/{app_id}/chains/order", put(reorder_chains))
         .route("/apps/{app_id}/fronts", post(upsert_front))
+        .route("/apps/{app_id}/front-analysis", post(front_route_analysis))
+        .route(
+            "/apps/{app_id}/fronts/{front_id}",
+            get(front_client_config_state).delete(delete_front),
+        )
         .route("/apps/{app_id}/ingresses", post(upsert_ingress))
         .route(
             "/apps/{app_id}/chains/{chain_id}/steps/{node_id}",
@@ -1059,8 +1363,16 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/usage/node-series", get(list_usage_node_series))
         .route("/usage/monthly-summary", get(usage_monthly_summary))
         .route("/load/nodes", get(load_nodes))
+        .route("/load/nodes/nic", get(load_node_nic))
+        .route("/load/nodes/{node_id}/overview", get(load_node_overview))
+        .route("/load/nodes/{node_id}/metrics", get(load_node_metrics))
         .route("/load/nodes/{node_id}", get(load_node))
         .route("/ping-probe/nodes", get(ping_probe_nodes))
+        .route("/ping-probe/nodes/latest", get(latest_ping_probe_nodes))
+        .route(
+            "/ping-probe/nodes/{node_id}/series",
+            get(ping_probe_node_series),
+        )
         .route("/ping-probe/nodes/{node_id}", get(ping_probe_node))
         // Under /links rather than /load: this is a property of a hop, and it sits next to
         // link_health and path MTU both in meaning and on the page that renders it.
@@ -1106,8 +1418,23 @@ pub fn agent_router_with_origin_and_realtime(
     agent_origin: String,
     realtime: crate::realtime::RealtimeService,
 ) -> Router {
+    agent_router_with_origin_realtime_and_shutdown(
+        store,
+        agent_origin,
+        realtime,
+        crate::lifecycle::ShutdownSignal::new(),
+    )
+}
+
+pub fn agent_router_with_origin_realtime_and_shutdown(
+    store: PgStore,
+    agent_origin: String,
+    realtime: crate::realtime::RealtimeService,
+    shutdown: crate::lifecycle::ShutdownSignal,
+) -> Router {
     let state = AppState::with_agent_origin(store, Arc::new(Notify::new()), agent_origin)
-        .and_realtime(realtime);
+        .and_realtime(realtime)
+        .and_shutdown(shutdown);
     agent_routes()
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -1146,9 +1473,50 @@ fn agent_routes() -> Router<AppState> {
         )
         .route("/agent/v1/enroll", post(agent_enroll))
         .route("/agent/v1/desired", get(agent_desired))
+        .route(
+            "/agent/v1/public-ip-observation",
+            post(agent_public_ip_observation),
+        )
+        .route("/agent/v1/vpngate/desired", get(agent_vpngate_desired))
+        .route(
+            "/agent/v1/vpngate/intelligence-assignment",
+            get(agent_vpngate_intelligence_assignment),
+        )
+        .route(
+            "/agent/v1/vpngate/catalogue-assignment",
+            get(agent_vpngate_catalogue_assignment),
+        )
+        .route(
+            "/agent/v1/vpngate/catalogue-report",
+            post(agent_vpngate_catalogue_report).layer(DefaultBodyLimit::max(
+                crate::vpngate::MAX_CATALOG_UPLOAD_BYTES,
+            )),
+        )
+        .route(
+            "/agent/v1/vpngate/catalogue-failure",
+            post(agent_vpngate_catalogue_failure),
+        )
+        .route("/agent/v1/vpngate/report", post(agent_vpngate_report))
+        .route(
+            "/agent/v1/vpngate/reconcile-report",
+            post(agent_vpngate_reconcile_report),
+        )
+        .route(
+            "/agent/v1/vpngate/probe-report",
+            post(agent_vpngate_probe_report),
+        )
+        .route(
+            "/agent/v1/vpngate/intelligence-report",
+            post(agent_vpngate_intelligence_report),
+        )
         .route("/agent/v1/observation", post(agent_observation))
         .route("/agent/v1/runtime", post(agent_runtime))
         .route("/agent/v1/agent-release", get(agent_release))
+        .route("/agent/v1/xray-release", get(agent_xray_release))
+        .route(
+            "/agent/v1/xray-release/report",
+            post(agent_xray_release_report),
+        )
         .route("/agent/v1/usage", post(agent_usage))
         .route("/agent/v1/load", post(agent_load))
         .route("/agent/v1/realtime", get(agent_realtime))
@@ -1459,8 +1827,25 @@ struct InitAdminHttpResponse {
 
 async fn auth_init(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<SystemInitRequest>,
 ) -> ApiResult<Response> {
+    // Preserve the established duplicate-init response without asking for a credential which no
+    // longer has any authority. The Store repeats this check under its exclusive table lock, so
+    // concurrent first requests still have exactly one winner.
+    if state.store.admin_auth_state().await?.initialized {
+        return Err(StoreError::Forbidden("admin has already been initialized".to_owned()).into());
+    }
+    let credential = state
+        .bootstrap_credential
+        .as_ref()
+        .ok_or(ApiError::Unavailable(
+            "initialization is disabled until BROCADE_BOOTSTRAP_TOKEN is configured",
+        ))?;
+    let presented = bearer_token(&headers).ok_or(ApiError::Unauthorized)?;
+    if !credential.verifies(presented) {
+        return Err(ApiError::Unauthorized);
+    }
     let result = state.store.init_system(request).await?;
     let cookie = session_cookie(&result.session.token);
     Ok((
@@ -1528,6 +1913,33 @@ async fn whoami(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
         admin,
     })
     .into_response())
+}
+
+/// The authenticated identity and only the inventory needed to shape first-frame list loading.
+/// Model data remains on its existing endpoints; this response must stay cheap enough to precede
+/// mounting the application shell on a cold start.
+#[derive(Debug, Serialize)]
+struct BootstrapHttpResponse {
+    who: WhoamiHttpResponse,
+    initial: ConsoleInitialData,
+}
+
+async fn bootstrap(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let admin = require_admin(&state, &headers, AdminPermission::Read).await?;
+    let actor = AdminContext::from_authenticated(&admin);
+    let initial = state.store.console_initial_data(&actor).await?;
+    let mut response = Json(BootstrapHttpResponse {
+        who: WhoamiHttpResponse {
+            masked_assets: role_masks_assets(admin.role),
+            admin,
+        },
+        initial,
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1693,6 +2105,43 @@ async fn node_agent_state(
     Ok(Json(result).into_response())
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct NotificationListQuery {
+    limit: Option<u32>,
+}
+
+async fn machine_notifications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NotificationListQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let events = state
+        .store
+        .machine_events(&admin, query.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(events).into_response())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PublicIpHistoryQuery {
+    days: Option<u32>,
+}
+
+async fn node_public_ip_history(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<PublicIpHistoryQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let history = state
+        .store
+        .node_public_ip_history(&admin, &node_id, query.days.unwrap_or(14))
+        .await?;
+    Ok(Json(history).into_response())
+}
+
 async fn get_realtime_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1723,8 +2172,13 @@ async fn realtime_node_events(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let subscription = realtime_node_subscription(&state, &headers, node_id).await?;
-    Ok(realtime_stream_response(subscription))
+    let (subscription, mask_assets) = realtime_node_subscription(&state, &headers, node_id).await?;
+    Ok(realtime_stream_response(
+        subscription,
+        state.shutdown,
+        mask_assets,
+        RealtimeStreamMode::Node,
+    ))
 }
 
 /// A bounded fallback for proxies such as Cloudflare Quick Tunnel that do not carry SSE.
@@ -1737,7 +2191,7 @@ async fn realtime_node_snapshot(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let subscription = realtime_node_subscription(&state, &headers, node_id).await?;
+    let (subscription, _) = realtime_node_subscription(&state, &headers, node_id).await?;
     let payload = json!({
         "policy": &subscription.policy,
         "nodes": &subscription.snapshots,
@@ -1753,7 +2207,7 @@ async fn realtime_node_subscription(
     state: &AppState,
     headers: &HeaderMap,
     node_id: String,
-) -> ApiResult<crate::realtime::RealtimeSubscription> {
+) -> ApiResult<(crate::realtime::RealtimeSubscription, bool)> {
     let admin = require_admin_context(state, headers, AdminPermission::Read).await?;
     let visible = state.store.list_node_agent_states(&admin).await?;
     let Some(node) = visible.nodes.iter().find(|node| node.node_id == node_id) else {
@@ -1767,7 +2221,10 @@ async fn realtime_node_subscription(
             node.lifecycle_phase
         ))));
     }
-    Ok(state.realtime.subscribe(vec![node_id]).await)
+    Ok((
+        state.realtime.subscribe(vec![node_id]).await,
+        role_masks_assets(admin.role()),
+    ))
 }
 
 async fn realtime_fleet_events(
@@ -1783,21 +2240,100 @@ async fn realtime_fleet_events(
         .filter(|node| node.lifecycle_phase == "active")
         .map(|node| node.node_id)
         .collect::<Vec<_>>();
-    realtime_events_response(&state, nodes).await
+    realtime_events_response(&state, nodes, role_masks_assets(admin.role())).await
 }
 
-async fn realtime_events_response(state: &AppState, nodes: Vec<String>) -> ApiResult<Response> {
+async fn realtime_events_response(
+    state: &AppState,
+    nodes: Vec<String>,
+    mask_assets: bool,
+) -> ApiResult<Response> {
     Ok(realtime_stream_response(
         state.realtime.subscribe(nodes).await,
+        state.shutdown.clone(),
+        mask_assets,
+        RealtimeStreamMode::Fleet,
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealtimeStreamMode {
+    /// A machine page needs worker diagnostics, but their freshness budget is much looser than
+    /// the one-second NIC rate. Complete snapshots are therefore capped at one per five seconds.
+    Node,
+    /// The global header consumes only NIC rates. Worker snapshots can be hundreds of kilobytes
+    /// and are never useful to that consumer.
+    Fleet,
+}
+
+const REALTIME_DIAGNOSTICS_INTERVAL_MILLIS: i64 = 5_000;
+
+fn omit_realtime_diagnostics(value: &mut Value, mark_unchanged: bool) {
+    let Some(sample) = value.get_mut("sample").and_then(Value::as_object_mut) else {
+        return;
+    };
+    sample.remove("reverse_health");
+    sample.remove("mux");
+    sample.remove("vpngate");
+    if mark_unchanged {
+        sample.insert("diagnostics_unchanged".to_owned(), Value::Bool(true));
+    } else {
+        sample.remove("diagnostics_unchanged");
+    }
+}
+
+fn omit_snapshot_diagnostics(value: &mut Value) {
+    let Some(nodes) = value.get_mut("nodes").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for node in nodes {
+        let Some(samples) = node.get_mut("samples").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for sample in samples {
+            omit_realtime_diagnostics(sample, false);
+        }
+    }
+}
+
+fn diagnostics_due(last_sent: &mut HashMap<String, i64>, node_id: &str, received_at: i64) -> bool {
+    if last_sent.get(node_id).is_some_and(|previous| {
+        received_at >= *previous
+            && received_at.saturating_sub(*previous) < REALTIME_DIAGNOSTICS_INTERVAL_MILLIS
+    }) {
+        return false;
+    }
+    last_sent.insert(node_id.to_owned(), received_at);
+    true
 }
 
 /// Split out from the handler so the regression test can hold a real response body without an
 /// `AppState`: the property under test is that holding the body holds the demand lease.
-fn realtime_stream_response(subscription: crate::realtime::RealtimeSubscription) -> Response {
+fn realtime_stream_response(
+    subscription: crate::realtime::RealtimeSubscription,
+    shutdown: crate::lifecycle::ShutdownSignal,
+    mask_assets: bool,
+    mode: RealtimeStreamMode,
+) -> Response {
+    let mut diagnostics_sent_at = HashMap::new();
+    if mode == RealtimeStreamMode::Node {
+        for node in &subscription.snapshots {
+            if let Some(latest) = node.samples.last() {
+                diagnostics_sent_at.insert(node.node_id.clone(), latest.received_at_unix_millis);
+            }
+        }
+    }
+    let mut initial_value =
+        json!({ "policy": subscription.policy, "nodes": subscription.snapshots });
+    if mode == RealtimeStreamMode::Fleet {
+        omit_snapshot_diagnostics(&mut initial_value);
+    }
+    if mask_assets {
+        mask_realtime_vpngate(&mut initial_value);
+    }
     let initial = Event::default()
         .event("snapshot")
-        .json_data(json!({ "policy": subscription.policy, "nodes": subscription.snapshots }))
+        .json_data(initial_value)
         .expect("realtime snapshot is JSON serializable");
 
     let stream = async_stream::stream! {
@@ -1814,12 +2350,35 @@ fn realtime_stream_response(subscription: crate::realtime::RealtimeSubscription)
         let mut subscription = subscription;
         yield Ok::<Event, Infallible>(initial);
         loop {
-            match subscription.events.recv().await {
+            let received = tokio::select! {
+                event = subscription.events.recv() => event,
+                _ = shutdown.requested() => break,
+            };
+            match received {
                 Ok(event) if subscription.visible_nodes.contains(event.node_id()) => {
-                    let (name, value) = match event {
-                        crate::realtime::RealtimeBroadcast::Sample(value) => ("sample", json!(value)),
+                    let (name, mut value) = match event {
+                        crate::realtime::RealtimeBroadcast::Sample(value) => {
+                            let omit = mode == RealtimeStreamMode::Fleet
+                                || value.sample.diagnostics_unchanged
+                                || !diagnostics_due(
+                                    &mut diagnostics_sent_at,
+                                    &value.node_id,
+                                    value.received_at_unix_millis,
+                                );
+                            let mut serialized = json!(value);
+                            if omit {
+                                omit_realtime_diagnostics(
+                                    &mut serialized,
+                                    mode == RealtimeStreamMode::Node,
+                                );
+                            }
+                            ("sample", serialized)
+                        }
                         crate::realtime::RealtimeBroadcast::Status(value) => ("status", json!(value)),
                     };
+                    if mask_assets {
+                        mask_realtime_vpngate(&mut value);
+                    }
                     let event = Event::default()
                         .event(name)
                         .json_data(value)
@@ -1851,6 +2410,26 @@ fn realtime_stream_response(subscription: crate::realtime::RealtimeSubscription)
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
+}
+
+fn mask_realtime_vpngate(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                mask_realtime_vpngate(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if key == "vpngate" && !value.is_null() {
+                    crate::mask::mask_json(value);
+                } else {
+                    mask_realtime_vpngate(value);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn artifact_index(
@@ -2054,6 +2633,28 @@ async fn update_node_log_policy(
     Ok(Json(state.store.agent_log_policy(&admin).await?).into_response())
 }
 
+async fn get_node_traffic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.node_traffic(&admin).await?).into_response())
+}
+
+async fn update_node_traffic(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateNodeTrafficRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .update_node_traffic(&admin, &node_id, request)
+        .await?;
+    Ok(Json(state.store.node_traffic(&admin).await?).into_response())
+}
+
 /// The recorded clearance, plus what this control plane is actually able to serve.
 ///
 /// `available_release_id` is required. A clearance naming any other build serves nothing, which
@@ -2115,6 +2716,104 @@ async fn agent_release_response(state: &AppState) -> Result<AgentReleaseHttpResp
         agent_version: build.version,
         build_commit: build.commit,
     })
+}
+
+#[derive(Debug, Serialize)]
+struct XrayReleaseHttpResponse {
+    available_release_id: &'static str,
+    available_xrays: Vec<XrayReleaseArtifact>,
+    xray_version: &'static str,
+    console_version: &'static str,
+    build_commit: &'static str,
+    /// Compact history is cheap to poll while a release is active. `releases` deliberately carries
+    /// only the newest target ledger and omits append-only events; full audit detail has its own
+    /// read endpoint.
+    history: Vec<XrayReleaseSummary>,
+    next_history_before_id: Option<i64>,
+    releases: Vec<brocade_store::XrayRelease>,
+}
+
+#[derive(Debug, Serialize)]
+struct XrayReleaseHistoryHttpResponse {
+    history: Vec<XrayReleaseSummary>,
+    next_history_before_id: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct XrayReleaseHistoryQuery {
+    before_id: Option<i64>,
+}
+
+fn embedded_xray_artifacts() -> Vec<XrayReleaseArtifact> {
+    EMBEDDED_XRAYS
+        .iter()
+        .map(|(arch, _, sha256)| XrayReleaseArtifact {
+            arch: (*arch).to_owned(),
+            sha256: (*sha256).to_owned(),
+        })
+        .collect()
+}
+
+async fn xray_release_response(state: &AppState) -> Result<XrayReleaseHttpResponse, StoreError> {
+    let page = xray_release_history_page(state, None).await?;
+    let history = page.history;
+    let releases = match history.first() {
+        Some(latest) => vec![state.store.xray_release_overview(latest.id).await?],
+        None => Vec::new(),
+    };
+    Ok(XrayReleaseHttpResponse {
+        available_release_id: embedded_xray_release_id(),
+        available_xrays: embedded_xray_artifacts(),
+        xray_version: BROCADE_XRAY_VERSION,
+        console_version: env!("CARGO_PKG_VERSION"),
+        build_commit: env!("BROCADE_AGENT_COMMIT"),
+        history,
+        next_history_before_id: page.next_history_before_id,
+        releases,
+    })
+}
+
+async fn xray_release_history_page(
+    state: &AppState,
+    before_id: Option<i64>,
+) -> Result<XrayReleaseHistoryHttpResponse, StoreError> {
+    let mut history = state
+        .store
+        .list_xray_release_summaries(XRAY_HISTORY_PAGE_SIZE + 1, before_id)
+        .await?;
+    let has_more = history.len() > XRAY_HISTORY_PAGE_SIZE as usize;
+    history.truncate(XRAY_HISTORY_PAGE_SIZE as usize);
+    let next_history_before_id = has_more.then(|| history.last().expect("nonempty page").id);
+    Ok(XrayReleaseHistoryHttpResponse {
+        history,
+        next_history_before_id,
+    })
+}
+
+async fn list_xray_release_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<XrayReleaseHistoryQuery>,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(xray_release_history_page(&state, query.before_id).await?).into_response())
+}
+
+async fn list_xray_releases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(xray_release_response(&state).await?).into_response())
+}
+
+async fn get_xray_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(release_id): Path<i64>,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.xray_release(release_id).await?).into_response())
 }
 
 async fn get_agent_release(
@@ -2386,6 +3085,64 @@ async fn update_agent_release(
     // Read back rather than echo: the store trims and de-duplicates the node list, and the page
     // must show what took effect.
     Ok(Json(agent_release_response(&state).await?).into_response())
+}
+
+async fn create_xray_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateXrayReleaseRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let artifacts = embedded_xray_artifacts();
+    state
+        .store
+        .create_xray_release(
+            &admin,
+            request,
+            XrayBuildInfo {
+                release_id: embedded_xray_release_id(),
+                version: BROCADE_XRAY_VERSION,
+                artifacts: &artifacts,
+            },
+        )
+        .await?;
+    Ok(Json(xray_release_response(&state).await?).into_response())
+}
+
+async fn confirm_xray_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(release_id): Path<i64>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .confirm_xray_release(&admin, release_id, embedded_xray_release_id())
+        .await?;
+    Ok(Json(xray_release_response(&state).await?).into_response())
+}
+
+async fn cancel_xray_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(release_id): Path<i64>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state.store.cancel_xray_release(&admin, release_id).await?;
+    Ok(Json(xray_release_response(&state).await?).into_response())
+}
+
+async fn retry_xray_release_target(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((release_id, node_id)): Path<(i64, String)>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .retry_xray_release_target(&admin, release_id, &node_id, embedded_xray_release_id())
+        .await?;
+    Ok(Json(xray_release_response(&state).await?).into_response())
 }
 
 async fn update_settings(
@@ -2684,6 +3441,8 @@ struct ListDeploymentsQuery {
     // because the list is a read-only endpoint and a 400 over a mistyped filter reads as an
     // outage.
     kind: Option<String>,
+    #[serde(default)]
+    active_only: bool,
 }
 
 async fn list_deployments(
@@ -2695,7 +3454,7 @@ async fn list_deployments(
     let kind = query.kind.as_deref().and_then(DeploymentKind::parse);
     let result = state
         .store
-        .list_deployments(&admin, query.limit.unwrap_or(50), kind)
+        .list_deployments(&admin, query.limit.unwrap_or(50), kind, query.active_only)
         .await?;
     Ok(Json(result).into_response())
 }
@@ -2828,6 +3587,17 @@ async fn isolate_deployment_target(
         .store
         .isolate_deployment_target(&admin, deployment_id, &node_id, request)
         .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn isolate_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<IsolateNodeRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let result = state.store.isolate_node(&admin, &node_id, request).await?;
     Ok(Json(result).into_response())
 }
 
@@ -3379,6 +4149,17 @@ struct StartGrantProbeResponse {
     reused: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartFrontCombinationProbeRequest {
+    app_id: String,
+    front_id: String,
+    member_id: String,
+    target_id: String,
+    expected_serving_generation: u64,
+    expected_client_snapshot_id: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct GrantProbePlanResponse {
     serving_revision: u64,
@@ -3505,6 +4286,48 @@ async fn start_user_grant_probe(
         .into_response())
 }
 
+async fn start_front_combination_probe(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<StartFrontCombinationProbeRequest>,
+) -> ApiResult<Response> {
+    let admin = require_grant_probe_context(&state, &headers).await?;
+    require_grant_probe_user_access(&admin, &tenant_id, &user_id)?;
+    let plan = state
+        .store
+        .front_combination_probe_plan(
+            &admin,
+            &tenant_id,
+            &user_id,
+            &request.app_id,
+            &request.front_id,
+            &request.member_id,
+            &request.target_id,
+        )
+        .await?;
+    if plan.serving_generation != request.expected_serving_generation
+        || plan.client_snapshot_id != request.expected_client_snapshot_id
+    {
+        return Err(ApiError::Store(StoreError::Conflict(
+            "链式代理 Serving 已变化，请刷新矩阵后重试".to_owned(),
+        )));
+    }
+    let (job, reused) = state
+        .grant_probes
+        .start_for_front(state.store.clone(), &tenant_id, &user_id, plan)
+        .await?;
+    Ok((
+        if reused {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(StartGrantProbeResponse { job, reused }),
+    )
+        .into_response())
+}
+
 async fn grant_probe_status(
     State(state): State<AppState>,
     Path(probe_id): Path<String>,
@@ -3548,14 +4371,26 @@ async fn grant_probe_events(
         .subscribe(&probe_id)
         .ok_or_else(|| ApiError::Store(StoreError::NotFound(format!("grant probe {probe_id}"))))?;
     require_grant_probe_user_access(&admin, &initial.tenant_id, &initial.user_id)?;
-    let first = tokio_stream::once(Ok::<Event, Infallible>(probe_sse_event(&initial)));
-    let updates = BroadcastStream::new(receiver).filter_map(|message| match message {
-        Ok(snapshot) => Some(Ok::<Event, Infallible>(probe_sse_event(&snapshot))),
-        // A lagged browser does not need every intermediate frame: each event is a complete
-        // snapshot, and the next one catches it up. A closed sender ends the stream naturally.
-        Err(_) => None,
-    });
-    let mut response = Sse::new(first.chain(updates))
+    let shutdown = state.shutdown.clone();
+    let stream = async_stream::stream! {
+        yield Ok::<Event, Infallible>(probe_sse_event(&initial));
+        let mut updates = BroadcastStream::new(receiver);
+        loop {
+            let message = tokio::select! {
+                message = updates.next() => message,
+                _ = shutdown.requested() => break,
+            };
+            match message {
+                Some(Ok(snapshot)) => yield Ok(probe_sse_event(&snapshot)),
+                // A lagged browser does not need every intermediate frame: each event is a
+                // complete snapshot, and the next one catches it up.
+                Some(Err(_)) => {}
+                // A closed sender ends the stream naturally.
+                None => break,
+            }
+        }
+    };
+    let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
         .into_response();
     // This endpoint normally passes through nginx's generic location, whose response buffering
@@ -3577,6 +4412,307 @@ fn probe_sse_event(snapshot: &crate::grant_probe::ProbeJobSnapshot) -> Event {
         serde_json::to_string(snapshot)
             .unwrap_or_else(|_| r#"{"status":"failed","message":"结果无法编码"}"#.to_owned()),
     )
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TunnelProbeWindowQuery {
+    window_secs: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartTunnelProbeRequest {
+    #[serde(default)]
+    source: TunnelProbeSource,
+    #[serde(default)]
+    ops: Vec<ModelOp>,
+}
+
+#[derive(Debug, Serialize)]
+struct StartTunnelProbeResponse {
+    run: brocade_store::TunnelProbeRun,
+    reused: bool,
+}
+
+async fn tunnel_probe_capability(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.grant_probes.capability()).into_response())
+}
+
+async fn list_tunnel_probes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.tunnel_probes(&admin).await?).into_response())
+}
+
+async fn tunnel_probe_view(
+    State(state): State<AppState>,
+    Path((tenant_id, outbound_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<TunnelProbeWindowQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let view = state
+        .store
+        .tunnel_probe_view(
+            &admin,
+            &tenant_id,
+            &outbound_id,
+            query.window_secs.unwrap_or(86_400),
+        )
+        .await?;
+    Ok(Json(view).into_response())
+}
+
+async fn start_tunnel_probe(
+    State(state): State<AppState>,
+    Path((tenant_id, outbound_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<StartTunnelProbeRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let capability = state.grant_probes.capability();
+    if !capability.available {
+        return Err(ApiError::Store(StoreError::Unavailable(
+            capability
+                .reason
+                .unwrap_or_else(|| "Console 拨测组件不可用".to_owned()),
+        )));
+    }
+    let (run, reused) = state
+        .store
+        .start_tunnel_probe_from(
+            &admin,
+            &tenant_id,
+            &outbound_id,
+            request.source,
+            request.ops,
+        )
+        .await?;
+    Ok((
+        if reused {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(StartTunnelProbeResponse { run, reused }),
+    )
+        .into_response())
+}
+
+async fn update_tunnel_probe_policy(
+    State(state): State<AppState>,
+    Path((tenant_id, outbound_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateTunnelProbePolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let policy = state
+        .store
+        .update_tunnel_probe_policy(&admin, &tenant_id, &outbound_id, request)
+        .await?;
+    Ok(Json(policy).into_response())
+}
+
+async fn tunnel_probe_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<i64>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.tunnel_probe_run(&admin, run_id).await?).into_response())
+}
+
+async fn cancel_tunnel_probe(
+    State(state): State<AppState>,
+    Path(run_id): Path<i64>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(state.store.cancel_tunnel_probe_run(&admin, run_id).await?).into_response())
+}
+
+async fn vpngate_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let _admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.vpngate_overview().await?).into_response())
+}
+
+async fn vpngate_country_servers(
+    State(state): State<AppState>,
+    Path(country_code): Path<String>,
+    Query(mut query): Query<VpngateServerPageRequest>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    // Server-side search must not become an oracle for fields that the readonly public response
+    // masks. Ignore the term for that identity and return the ordinary masked page.
+    if role_masks_assets(admin.role()) && !query.search.trim().is_empty() {
+        query.search.clear();
+    }
+    Ok(Json(
+        state
+            .store
+            .vpngate_country_server_page(&country_code, query)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn vpngate_runtimes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let observed = state.realtime.vpngate_selections().await;
+    Ok(Json(
+        state
+            .store
+            .vpngate_runtime_views_observed(&admin, &observed)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn switch_vpngate_runtime(
+    State(state): State<AppState>,
+    Path((node_id, outbound_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<RequestVpngatePoolSwitch>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let observed = state.realtime.vpngate_selections().await;
+    let selected = observed
+        .iter()
+        .find(|selection| selection.node_id == node_id && selection.outbound_id == outbound_id);
+    let result = state
+        .store
+        .request_vpngate_pool_switch(&admin, &node_id, &outbound_id, request, selected)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(result)).into_response())
+}
+
+async fn update_vpngate_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateVpngateCatalogSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_catalog_settings(&admin, request)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn update_vpngate_admission_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<VpngateAdmissionPolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_admission_policy(&admin, policy)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn update_vpngate_intelligence_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<VpngateIntelligencePolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_intelligence_policy(&admin, policy)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn update_vpngate_intelligence_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateVpngateIntelligenceCredentials>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_intelligence_credentials(&admin, request)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn start_vpngate_intelligence_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .request_vpngate_intelligence_refresh(&admin)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn start_vpngate_sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    state.store.request_vpngate_sync(&admin).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))).into_response())
+}
+
+async fn update_vpngate_probe_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateVpngateProbeNode>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_probe_node(&admin, &node_id, request)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn update_vpngate_intelligence_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateVpngateIntelligenceNode>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_intelligence_node(&admin, &node_id, request)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn upsert_grant(
@@ -3908,6 +5044,48 @@ async fn upsert_front(
     Ok(Json(result).into_response())
 }
 
+async fn front_client_config_state(
+    State(state): State<AppState>,
+    Path((app_id, front_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .front_client_config_state(&admin, &app_id, &front_id)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn front_route_analysis(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateFrontRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .front_route_analysis(&admin, &app_id, request)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn delete_front(
+    State(state): State<AppState>,
+    Path((app_id, front_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteFrontRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let result = state
+        .store
+        .delete_front(&admin, &app_id, &front_id, request)
+        .await?;
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
 async fn upsert_ingress(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -4015,20 +5193,10 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             .record_node_route_ips(&node.node_id, route)
             .await?;
     }
-    if let Some(detected) = public_ip_report_from_headers(&headers, route.as_ref()) {
-        if let Some(revision) = state
-            .store
-            .autofill_node_public_ips(&node.node_id, &detected)
-            .await?
-        {
-            eprintln!(
-                "node {}: 上线自动补全公网 IP（修订 {revision}）",
-                node.node_id
-            );
-        }
-    }
 
-    if protocol_version != Some(brocade_deployment::protocol::AGENT_PROTOCOL_VERSION) {
+    if protocol_version
+        .is_none_or(|version| version < brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION)
+    {
         let mut response = StatusCode::NO_CONTENT.into_response();
         response.headers_mut().insert(
             "x-brocade-agent-upgrade-required",
@@ -4079,6 +5247,20 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
         },
     };
     Ok(with_agent_log_policy(response, log_limits))
+}
+
+async fn agent_public_ip_observation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(observation): Json<NodePublicIpObservation>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    let result = state
+        .store
+        .record_node_public_ip(&node.node_id, &observation)
+        .await?;
+    Ok(Json(result).into_response())
 }
 
 fn with_agent_log_policy(
@@ -4162,6 +5344,57 @@ async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> Api
     .into_response())
 }
 
+/// Offer only the current Console's immutable Xray release and only to an open target wave. The
+/// bytes remain on the public distribution route because they are not secret; this authenticated
+/// endpoint is the authority deciding whether one root Agent may install them now.
+async fn agent_xray_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    if node.lifecycle_phase != NodeLifecyclePhase::Active {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let Some(arch) = headers
+        .get(AGENT_ARCH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|arch| !arch.is_empty())
+    else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let Some(assignment) = state
+        .store
+        .claim_xray_release(&node.node_id, arch, embedded_xray_release_id())
+        .await?
+    else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let dist = state.distribution().await?;
+    Ok(Json(XrayReleaseOffer {
+        release_id: assignment.release_id,
+        attempt: assignment.attempt,
+        version: assignment.version,
+        url: format!("{}/brocade-xray/{arch}", dist.agent_public_url),
+        sha256: assignment.sha256,
+        previous_sha256: assignment.previous_sha256,
+    })
+    .into_response())
+}
+
+async fn agent_xray_release_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<XrayReleaseReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    let accepted = state
+        .store
+        .report_xray_release(&node.node_id, &report)
+        .await?;
+    Ok(Json(json!({ "accepted": accepted })).into_response())
+}
+
 fn agent_protocol_version(headers: &HeaderMap) -> Option<u32> {
     headers
         .get(AGENT_PROTOCOL_HEADER)?
@@ -4172,10 +5405,264 @@ fn agent_protocol_version(headers: &HeaderMap) -> Option<u32> {
         .ok()
 }
 
+fn agent_protocol_is_compatible(headers: &HeaderMap) -> bool {
+    agent_protocol_version(headers)
+        .is_some_and(|version| version >= brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION)
+}
+
 /// The runtime reconcile. Low-frequency, at probing's cadence, and separate from observations: an
 /// observation carries a `deployment_id` and exists only during a release, whereas versions,
 /// local reconciles and backlog matter most when nothing is being released. A machine that has
 /// not deployed for a month is the one most likely to have drifted undetected.
+async fn agent_vpngate_desired(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if !agent_protocol_is_compatible(&headers) {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().insert(
+            "x-brocade-agent-upgrade-required",
+            HeaderValue::from_static("1"),
+        );
+        return Ok(response);
+    }
+    let probe_nodes = state.store.vpngate_usable_probe_node_addresses().await?;
+    let addresses = probe_nodes
+        .iter()
+        .map(|probe_node| probe_node.public_ipv4.clone())
+        .collect::<Vec<_>>();
+    let settings = state.store.settings().await?;
+    let countries = state
+        .geoip
+        .countries(&settings.geodata.geoip_url, &addresses)
+        .await;
+    let origins = probe_nodes
+        .into_iter()
+        .filter_map(|probe_node| {
+            countries
+                .get(&probe_node.public_ipv4)
+                .map(|country_code| VpngateProbeNodeOrigin {
+                    node_id: probe_node.node_id,
+                    country_code: country_code.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    match state
+        .store
+        .vpngate_agent_desired_with_probe_origins(&node.node_id, &origins)
+        .await?
+    {
+        Some(desired) => Ok(Json(desired).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+async fn agent_vpngate_intelligence_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if !agent_protocol_is_compatible(&headers) {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().insert(
+            "x-brocade-agent-upgrade-required",
+            HeaderValue::from_static("1"),
+        );
+        return Ok(response);
+    }
+    match state
+        .store
+        .claim_vpngate_exit_intelligence(&node.node_id)
+        .await?
+    {
+        Some(claim) => Ok(Json(VpngateIpIntelligenceAssignment {
+            exit_ip: claim.exit_ip,
+            lease_generation: claim.lease_generation,
+            proxycheck_api_key: claim.proxycheck_api_key,
+        })
+        .into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+async fn agent_vpngate_catalogue_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if !agent_protocol_is_compatible(&headers) {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().insert(
+            "x-brocade-agent-upgrade-required",
+            HeaderValue::from_static("1"),
+        );
+        return Ok(response);
+    }
+    match state
+        .store
+        .claim_vpngate_catalog_sync(&node.node_id)
+        .await?
+    {
+        Some(claim) => Ok(Json(VpngateCatalogSyncAssignment {
+            run_id: claim.run_id,
+            lease_generation: claim.lease_generation,
+            source_url: claim.source_url,
+        })
+        .into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VpngateCatalogueReportQuery {
+    run_id: u64,
+    lease_generation: u64,
+}
+
+async fn agent_vpngate_catalogue_report(
+    State(state): State<AppState>,
+    Query(query): Query<VpngateCatalogueReportQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if !agent_protocol_is_compatible(&headers) {
+        return Ok(StatusCode::CONFLICT.into_response());
+    }
+    let claim = VpngateSyncClaim {
+        run_id: query.run_id,
+        lease_generation: query.lease_generation,
+        // Report identity comes from the query and authenticated node. The source URL was needed
+        // only by the collector and is deliberately not trusted when the snapshot comes back.
+        source_url: String::new(),
+    };
+    let batch = match crate::vpngate::parse_compressed_feed(&body) {
+        Ok(batch) => batch,
+        Err(error) => {
+            state
+                .store
+                .fail_vpngate_sync(&node.node_id, &claim, error.code(), &error.to_string())
+                .await?;
+            return Ok(Json(json!({ "accepted": false })).into_response());
+        }
+    };
+    let accepted = batch.servers.len();
+    match state
+        .store
+        .complete_vpngate_sync(&node.node_id, &claim, batch)
+        .await
+    {
+        Ok(()) => Ok(Json(json!({ "accepted": true, "servers": accepted })).into_response()),
+        Err(error) => {
+            let detail = format!("catalogue commit rejected: {error}");
+            state
+                .store
+                .fail_vpngate_sync(&node.node_id, &claim, "catalogue-commit-rejected", &detail)
+                .await?;
+            Ok(Json(json!({ "accepted": false })).into_response())
+        }
+    }
+}
+
+async fn agent_vpngate_catalogue_failure(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<VpngateCatalogSyncFailure>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if !agent_protocol_is_compatible(&headers) {
+        return Ok(StatusCode::CONFLICT.into_response());
+    }
+    state
+        .store
+        .fail_vpngate_sync(
+            &node.node_id,
+            &VpngateSyncClaim {
+                run_id: report.run_id,
+                lease_generation: report.lease_generation,
+                source_url: String::new(),
+            },
+            &report.code,
+            &report.detail,
+        )
+        .await?;
+    Ok(Json(json!({ "accepted": true })).into_response())
+}
+
+async fn agent_vpngate_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<VpngatePoolReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if !agent_protocol_is_compatible(&headers) {
+        return Ok(StatusCode::CONFLICT.into_response());
+    }
+    Ok(Json(
+        state
+            .store
+            .record_vpngate_agent_report(&node.node_id, report)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn agent_vpngate_reconcile_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<VpngateReconcileReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if !agent_protocol_is_compatible(&headers) {
+        return Ok(StatusCode::CONFLICT.into_response());
+    }
+    Ok(Json(
+        state
+            .store
+            .record_vpngate_reconcile_report(&node.node_id, report)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn agent_vpngate_probe_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<VpngateProbeReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    Ok(Json(
+        state
+            .store
+            .record_vpngate_probe_report(&node.node_id, report)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn agent_vpngate_intelligence_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<VpngateIpIntelligenceReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    state
+        .store
+        .record_vpngate_ip_intelligence_report(&node.node_id, &report)
+        .await?;
+    Ok(Json(json!({ "accepted": true })).into_response())
+}
+
 async fn agent_runtime(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4186,6 +5673,12 @@ async fn agent_runtime(
         .store
         .record_node_runtime(&node.node_id, &request)
         .await?;
+    if let Some(reading) = &request.traffic {
+        state
+            .store
+            .record_node_traffic(&node.node_id, request.observed_at_unix_secs, reading)
+            .await?;
+    }
     // Separate from `record_node_runtime`: that call writes the versions and process values a
     // node reports about itself, while this compares against something the control plane issued.
     // Keeping them apart lets a node with no certificate row, enrolled since the last scan,
@@ -4368,13 +5861,14 @@ async fn agent_realtime(
     require_active_agent(&node)?;
     let node_id = node.node_id;
     let store = state.store.clone();
+    let shutdown = state.shutdown.clone();
     Ok(websocket
         // The complete sample is well below one KiB. Bound allocation before parsing so an
         // authenticated but compromised node cannot make this process buffer a giant frame.
         .max_frame_size(512 * 1024)
         .max_message_size(512 * 1024)
         .on_upgrade(move |socket| {
-            serve_agent_realtime(state.realtime, store, node_id, token, socket)
+            serve_agent_realtime(state.realtime, store, node_id, token, shutdown, socket)
         })
         .into_response())
 }
@@ -4384,6 +5878,7 @@ async fn serve_agent_realtime(
     store: PgStore,
     node_id: String,
     token: String,
+    shutdown: crate::lifecycle::ShutdownSignal,
     mut socket: WebSocket,
 ) {
     let mut session = realtime.register_agent(node_id.clone()).await;
@@ -4401,7 +5896,14 @@ async fn serve_agent_realtime(
         realtime.unregister_agent(&node_id, session_id).await;
         return;
     }
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    // `interval` ticks immediately. That first empty Ping can race the demand command sent when a
+    // subscriber arrives, making a freshly connected Agent observe control traffic out of order.
+    // The initial command above already proves the socket is writable, so the first heartbeat is
+    // due only after one complete idle interval.
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(20),
+        Duration::from_secs(20),
+    );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut reauthenticate = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(60),
@@ -4411,6 +5913,10 @@ async fn serve_agent_realtime(
 
     loop {
         tokio::select! {
+            _ = shutdown.requested() => {
+                let _ = socket.send(WebSocketMessage::Close(None)).await;
+                break;
+            }
             changed = session.commands.changed() => {
                 if changed.is_err() { break; }
                 let command = *session.commands.borrow_and_update();
@@ -4571,9 +6077,78 @@ async fn agent_e2e_probe(
 /// The end-to-end probe overview. It requires only Read rather than system-admin as MTU does: a
 /// chain is the tenant's own, whether their chain works is a fact they should see, and store
 /// filters by tenant_scope already.
-async fn e2e_probes(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+#[derive(Debug, Default, Deserialize)]
+struct E2eProbeViewQuery {
+    format: Option<E2eProbeViewFormat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum E2eProbeViewFormat {
+    #[serde(rename = "columnar-v1")]
+    ColumnarV1,
+}
+
+fn legacy_e2e_probe_view(chains: &[E2eProbeItem]) -> Result<Value, StoreError> {
+    let mut value = serde_json::to_value(chains).map_err(|error| {
+        StoreError::InvalidData(format!("could not serialize end-to-end probes: {error}"))
+    })?;
+    let items = value.as_array_mut().ok_or_else(|| {
+        StoreError::InvalidData("end-to-end probe view did not serialize as an array".to_owned())
+    })?;
+
+    for (item, chain) in items.iter_mut().zip(chains) {
+        let samples = &chain.samples;
+        let count = samples.probed_at_unix_secs.len();
+        if samples.status.len() != count || samples.ttfb_ms.len() != count {
+            return Err(StoreError::InvalidData(format!(
+                "end-to-end sample columns have different lengths for chain {}",
+                chain.chain_id
+            )));
+        }
+
+        let mut legacy = Vec::with_capacity(count);
+        for index in 0..count {
+            let timestamp = OffsetDateTime::from_unix_timestamp(samples.probed_at_unix_secs[index])
+                .map_err(|error| {
+                    StoreError::InvalidData(format!(
+                        "invalid end-to-end sample timestamp for chain {}: {error}",
+                        chain.chain_id
+                    ))
+                })?;
+            let probed_at = timestamp.format(&Rfc3339).map_err(|error| {
+                StoreError::InvalidData(format!(
+                    "could not format end-to-end sample timestamp for chain {}: {error}",
+                    chain.chain_id
+                ))
+            })?;
+            legacy.push(json!({
+                "probed_at": probed_at,
+                "status": &samples.status[index],
+                "ttfb_ms": samples.ttfb_ms[index],
+            }));
+        }
+
+        let object = item.as_object_mut().ok_or_else(|| {
+            StoreError::InvalidData(
+                "end-to-end probe item did not serialize as an object".to_owned(),
+            )
+        })?;
+        object.insert("samples".to_owned(), Value::Array(legacy));
+    }
+    Ok(value)
+}
+
+async fn e2e_probes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<E2eProbeViewQuery>,
+) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    Ok(Json(json!({ "chains": state.store.e2e_probes(&admin).await? })).into_response())
+    let chains = state.store.e2e_probes(&admin).await?;
+    if query.format == Some(E2eProbeViewFormat::ColumnarV1) {
+        return Ok(Json(json!({ "chains": chains })).into_response());
+    }
+    Ok(Json(json!({ "chains": legacy_e2e_probe_view(&chains)? })).into_response())
 }
 
 // These two read properties of the backbone (per-hop liveness, path MTU) that cannot be split along
@@ -4601,6 +6176,28 @@ async fn load_nodes(
     Ok(Json(result).into_response())
 }
 
+/// Lightweight NIC history for machine overview cards. Deep host and process telemetry remains on
+/// `/load/nodes`; sending it here made the overview response grow by hundreds of kilobytes.
+async fn load_node_nic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LoadQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let selection = load_selection(query, LIST_LOAD_MAX_RANGE_SECS, LIST_LOAD_MAX_WINDOWS)?;
+    let LoadSeriesQuery::LatestWindows { windows } = selection else {
+        return Err(StoreError::InvalidData(
+            "the machine NIC overview accepts only a windows selection".to_owned(),
+        )
+        .into());
+    };
+    let result = state
+        .store
+        .list_node_nic(&admin, windows, LIST_LOAD_MAX_SAMPLES_PER_NODE)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
 async fn load_node(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4612,6 +6209,57 @@ async fn load_node(
     let result = state
         .store
         .node_load_view(&admin, &node_id, selection, DETAIL_LOAD_MAX_SAMPLES)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn load_node_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    Query(query): Query<LoadQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let selection = load_selection(query, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS)?;
+    let result = state
+        .store
+        .node_load_columnar_overview(&admin, &node_id, selection, DETAIL_LOAD_MAX_SAMPLES)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn load_node_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    Query(query): Query<LoadMetricQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let selection = load_selection(
+        LoadQuery {
+            start_unix_secs: query.start_unix_secs,
+            end_unix_secs: query.end_unix_secs,
+            windows: query.windows,
+        },
+        DETAIL_LOAD_MAX_RANGE_SECS,
+        DETAIL_LOAD_MAX_WINDOWS,
+    )?;
+    let metrics = query
+        .metrics
+        .split(',')
+        .map(str::trim)
+        .filter(|metric| !metric.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let result = state
+        .store
+        .node_load_metrics(
+            &admin,
+            &node_id,
+            selection,
+            DETAIL_LOAD_MAX_SAMPLES,
+            &metrics,
+        )
         .await?;
     Ok(Json(result).into_response())
 }
@@ -4635,6 +6283,14 @@ async fn ping_probe_nodes(
             .await?,
     )
     .into_response())
+}
+
+async fn latest_ping_probe_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.list_latest_node_ping_probes(&admin).await?).into_response())
 }
 
 async fn ping_probe_node(
@@ -4672,6 +6328,45 @@ async fn ping_probe_node(
     Ok(Json(result).into_response())
 }
 
+async fn ping_probe_node_series(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    Query(query): Query<PingProbeQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = match (
+        query.start_unix_secs,
+        query.end_unix_secs,
+        query.window_secs,
+    ) {
+        (Some(start), Some(end), None) => {
+            validate_telemetry_range(start, end, DETAIL_LOAD_MAX_RANGE_SECS)?;
+            state
+                .store
+                .node_ping_probe_columnar_view_range(&admin, &node_id, start, end)
+                .await?
+        }
+        (None, None, window) => {
+            state
+                .store
+                .node_ping_probe_columnar_view(
+                    &admin,
+                    &node_id,
+                    window.unwrap_or(86_400).min(7 * 86_400),
+                )
+                .await?
+        }
+        _ => {
+            return Err(StoreError::InvalidData(
+                "provide either window_secs or both PING range boundaries".to_owned(),
+            )
+            .into());
+        }
+    };
+    Ok(Json(result).into_response())
+}
+
 /// Per-hop link quality, optionally narrowed to one chain.
 async fn link_quality(
     State(state): State<AppState>,
@@ -4691,6 +6386,14 @@ struct LoadQuery {
     start_unix_secs: Option<i64>,
     end_unix_secs: Option<i64>,
     windows: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LoadMetricQuery {
+    start_unix_secs: Option<i64>,
+    end_unix_secs: Option<i64>,
+    windows: Option<u32>,
+    metrics: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4862,10 +6565,21 @@ async fn list_usage_node_series(
 async fn usage_monthly_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<UsageMonthlyQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    let result = state.store.list_monthly_usage_summary(&admin).await?;
+    let result = state
+        .store
+        .list_monthly_usage_summary_for_offset(&admin, query.month_offset.unwrap_or(0))
+        .await?;
     Ok(Json(result).into_response())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UsageMonthlyQuery {
+    /// The usage page intentionally has two independent views rather than a comparison mode.
+    /// Zero selects the current +08 calendar month and -1 selects the preceding month.
+    month_offset: Option<i16>,
 }
 
 async fn authenticate_agent(store: &PgStore, headers: &HeaderMap) -> ApiResult<AuthenticatedNode> {
@@ -4927,24 +6641,39 @@ async fn require_admin(
     }
 }
 
+struct AdminAuthentication {
+    admin: AuthenticatedAdmin,
+    refreshed_session_token: Option<String>,
+}
+
 async fn authenticate_admin(
     state: &AppState,
     headers: &HeaderMap,
-) -> ApiResult<AuthenticatedAdmin> {
+) -> ApiResult<AdminAuthentication> {
     if let Some(token) = bearer_token(headers) {
-        return state
+        let admin = state
             .store
             .authenticate_admin_token(token)
             .await?
-            .ok_or(ApiError::Unauthorized);
+            .ok_or(ApiError::Unauthorized)?;
+        return Ok(AdminAuthentication {
+            admin,
+            refreshed_session_token: None,
+        });
     }
 
-    let token = admin_session_cookie(headers).ok_or(ApiError::Unauthorized)?;
-    state
+    let token = admin_session_cookie(headers)
+        .ok_or(ApiError::Unauthorized)?
+        .to_owned();
+    let authentication = state
         .store
-        .authenticate_admin_session(token)
+        .authenticate_admin_session_with_refresh(&token)
         .await?
-        .ok_or(ApiError::Unauthorized)
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(AdminAuthentication {
+        admin: authentication.admin,
+        refreshed_session_token: authentication.refreshed.then_some(token),
+    })
 }
 
 fn admin_has_permission(role: AdminRole, permission: AdminPermission) -> bool {
@@ -4996,33 +6725,6 @@ fn route_from_headers(headers: &HeaderMap) -> Option<RouteIpReport> {
         ipv6: route_header(headers, ROUTE_IPV6_HEADER, RouteHeaderFamily::V6),
     };
     (route.ipv4.is_some() || route.ipv6.is_some()).then_some(route)
-}
-
-fn public_ip_report_from_headers(
-    headers: &HeaderMap,
-    route: Option<&RouteIpReport>,
-) -> Option<RouteIpReport> {
-    let mut report = route.cloned().unwrap_or(RouteIpReport {
-        ipv4: None,
-        ipv6: None,
-    });
-    let source = headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .and_then(brocade_store::public_route_ip)
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(',').next())
-                .and_then(brocade_store::public_route_ip)
-        });
-    match source {
-        Some(IpAddr::V4(ip)) => report.ipv4 = Some(ip.to_string()),
-        Some(IpAddr::V6(ip)) => report.ipv6 = Some(ip.to_string()),
-        None => {}
-    }
-    (report.ipv4.is_some() || report.ipv6.is_some()).then_some(report)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5320,21 +7022,56 @@ mod tests {
     use axum::extract::Path;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    use brocade_store::{
-        AdminContext, AdminRole, AgentLogLimits, AuthenticatedAdmin, RouteIpReport, StoreError,
-    };
+    use brocade_store::{AdminContext, AdminRole, AgentLogLimits, AuthenticatedAdmin, StoreError};
 
     use super::{
         bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
-        looks_like_uuid, public_ip_report_from_headers, public_may,
-        require_grant_probe_user_access, resolve_agent_public_url, resolve_subscription_origin,
-        route_from_headers, safe_filename_slug, session_cookie, user_may, AgentDistribution,
-        ApiError, ArtifactContentQuery, InstallCredential, IpFamily, LoadQuery,
-        SubscriptionProtocol, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
+        looks_like_uuid, public_may, require_grant_probe_user_access, resolve_agent_public_url,
+        resolve_subscription_origin, route_from_headers, safe_filename_slug, session_cookie,
+        user_may, AgentDistribution, ApiError, ArtifactContentQuery, BootstrapCredential,
+        InstallCredential, IpFamily, LoadQuery, SubscriptionProtocol, BOOTSTRAP_TOKEN_MAX_BYTES,
+        BOOTSTRAP_TOKEN_MIN_BYTES, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
         DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS, EMBEDDED_XRAYS, INSTALL_SCRIPT,
         SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
+    use tokio_stream::StreamExt;
+
+    #[test]
+    fn fleet_realtime_projection_removes_diagnostics_from_every_snapshot_sample() {
+        let mut payload = serde_json::json!({
+            "nodes": [{
+                "samples": [{
+                    "sample": {
+                        "rx_bytes_per_sec": 12,
+                        "reverse_health": {"workers": [1]},
+                        "mux": {"workers": [1]},
+                        "vpngate": {"pools": [1]},
+                        "diagnostics_unchanged": false
+                    }
+                }]
+            }]
+        });
+
+        super::omit_snapshot_diagnostics(&mut payload);
+
+        let sample = &payload["nodes"][0]["samples"][0]["sample"];
+        assert_eq!(sample["rx_bytes_per_sec"], 12);
+        assert!(sample.get("reverse_health").is_none());
+        assert!(sample.get("mux").is_none());
+        assert!(sample.get("vpngate").is_none());
+        assert!(sample.get("diagnostics_unchanged").is_none());
+    }
+
+    #[test]
+    fn node_realtime_projection_caps_complete_diagnostics_without_clock_lockout() {
+        let mut sent = std::collections::HashMap::new();
+        assert!(super::diagnostics_due(&mut sent, "n1", 10_000));
+        assert!(!super::diagnostics_due(&mut sent, "n1", 14_999));
+        assert!(super::diagnostics_due(&mut sent, "n1", 15_000));
+        // A wall-clock correction must not suppress diagnostics until the old timestamp catches up.
+        assert!(super::diagnostics_due(&mut sent, "n1", 12_000));
+    }
 
     /// The live view is demand-driven: the Agent samples only while the control plane counts at
     /// least one watching browser, and the count is held by a lease inside the SSE response body.
@@ -5350,8 +7087,12 @@ mod tests {
         let realtime = crate::realtime::RealtimeService::new(Default::default());
         let _agent = realtime.register_agent("n1".to_owned()).await;
 
-        let response =
-            super::realtime_stream_response(realtime.subscribe(vec!["n1".to_owned()]).await);
+        let response = super::realtime_stream_response(
+            realtime.subscribe(vec!["n1".to_owned()]).await,
+            crate::lifecycle::ShutdownSignal::new(),
+            false,
+            super::RealtimeStreamMode::Node,
+        );
         // 让任何已经排上的释放任务先跑完，再断言——否则「还没来得及释放」会被误读成「没释放」。
         for _ in 0..8 {
             tokio::task::yield_now().await;
@@ -5374,6 +7115,62 @@ mod tests {
             realtime.watcher_count("n1").await,
             0,
             "响应体丢弃后租约必须释放，否则没人看的机器会一直采样"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_live_stream_ends_and_releases_its_lease_when_shutdown_starts() {
+        let realtime = crate::realtime::RealtimeService::new(Default::default());
+        let _agent = realtime.register_agent("n1".to_owned()).await;
+        let shutdown = crate::lifecycle::ShutdownSignal::new();
+        let response = super::realtime_stream_response(
+            realtime.subscribe(vec!["n1".to_owned()]).await,
+            shutdown.clone(),
+            false,
+            super::RealtimeStreamMode::Node,
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .expect("the stream should send its initial snapshot")
+            .expect("the stream should contain its initial snapshot")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&initial).contains("event: snapshot"));
+
+        shutdown.request();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while body.next().await.is_some() {}
+        })
+        .await
+        .expect("the SSE body must reach EOF instead of waiting for systemd's stop timeout");
+        for _ in 0..8 {
+            if realtime.watcher_count("n1").await == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(realtime.watcher_count("n1").await, 0);
+    }
+
+    #[test]
+    fn realtime_masking_hides_vpngate_servers_without_rewriting_mux_diagnostics() {
+        let mut value = serde_json::json!({
+            "sample": {
+                "mux": { "events": [{ "reason": "transport_closed" }] },
+                "vpngate": {
+                    "backends": [{ "server_id": "vpn-secret", "reason": "egress_unreachable" }]
+                }
+            }
+        });
+        super::mask_realtime_vpngate(&mut value);
+        assert_ne!(
+            value["sample"]["vpngate"]["backends"][0]["server_id"],
+            "vpn-secret"
+        );
+        assert_eq!(
+            value["sample"]["mux"]["events"][0]["reason"],
+            "transport_closed"
         );
     }
 
@@ -5604,20 +7401,27 @@ mod tests {
         use axum::http::Method;
         for path in [
             "/branding",
+            "/agent-log-policy",
+            "/node-traffic",
             "/certs",
+            "/bootstrap",
             "/whoami",
             "/model/snapshot",
             "/nodes/agent-state",
+            "/notifications",
             "/revisions",
             "/compile/77",
             "/load/nodes",
+            "/load/nodes/nic",
             "/load/nodes/hk-01",
             "/ping-probe/nodes",
+            "/ping-probe/nodes/latest",
             "/ping-probe/nodes/hk-01",
             "/usage/node-series",
             "/links/quality",
             "/links/health",
             "/probes/e2e",
+            "/tenants/platform.acme/tunnels/custom-1111-1111/probe",
             "/tenants",
             "/users",
             "/quotas",
@@ -5627,6 +7431,10 @@ mod tests {
             "/realtime/nodes/events",
             "/realtime/nodes/hk-01/events",
             "/realtime/nodes/hk-01/snapshot",
+            "/nodes/hk-01/public-ip-history",
+            "/vpngate",
+            "/vpngate/runtimes",
+            "/vpngate/countries/JP/servers",
         ] {
             assert!(public_may(&Method::GET, path), "should allow GET {path}");
         }
@@ -5638,6 +7446,9 @@ mod tests {
             "/distribution",
             "/admin/operators",
             "/artifacts/index",
+            "/vpngate/settings",
+            "/vpngate/countries/JP/servers/extra",
+            "/nodes/hk-01/public-ip-history/extra",
         ] {
             assert!(!public_may(&Method::GET, path), "should refuse GET {path}");
         }
@@ -5646,9 +7457,32 @@ mod tests {
         // Every other write, including on a path whose GET is allowed.
         assert!(!public_may(&Method::POST, "/model/apply"));
         assert!(!public_may(&Method::PUT, "/branding"));
+        assert!(!public_may(&Method::PUT, "/agent-log-policy"));
+        assert!(!public_may(&Method::PUT, "/node-traffic/nodes/hk-01"));
         assert!(!public_may(&Method::PUT, "/nodes/hk-01"));
+        assert!(!public_may(&Method::PUT, "/vpngate/settings"));
+        assert!(!public_may(&Method::PUT, "/vpngate/admission-policy"));
+        assert!(!public_may(&Method::PUT, "/vpngate/intelligence-policy"));
+        assert!(!public_may(&Method::POST, "/vpngate/intelligence-refresh"));
+        assert!(!public_may(&Method::POST, "/vpngate/sync"));
+        assert!(!public_may(&Method::PUT, "/vpngate/probe-nodes/hk-01"));
+        assert!(!public_may(
+            &Method::PUT,
+            "/vpngate/intelligence-nodes/hk-01"
+        ));
         assert!(!public_may(&Method::POST, "/nodes/provision"));
         assert!(!public_may(&Method::POST, "/revisions"));
+        assert!(!public_may(
+            &Method::POST,
+            "/tenants/platform.acme/tunnels/custom-1111-1111/probe-runs"
+        ));
+        assert!(!public_may(
+            &Method::PUT,
+            "/tenants/platform.acme/tunnels/custom-1111-1111/probe-policy"
+        ));
+        assert!(!public_may(&Method::GET, "/tunnel-probe-runs/42"));
+        assert!(!public_may(&Method::GET, "/tunnel-probes"));
+        assert!(!public_may(&Method::GET, "/tunnel-probes/capability"));
         assert!(!public_may(
             &Method::POST,
             "/users/platform.acme/alice/grant-probes"
@@ -5659,6 +7493,14 @@ mod tests {
             "/users/platform.acme/alice/grant-probes/p1"
         ));
         assert!(!public_may(&Method::GET, "/users//alice/grant-probes"));
+        assert!(!public_may(
+            &Method::GET,
+            "/tenants//tunnels/custom-1111-1111/probe"
+        ));
+        assert!(!public_may(
+            &Method::GET,
+            "/tenants/platform.acme/tunnels/custom-1111-1111/probe/extra"
+        ));
     }
 
     #[test]
@@ -5685,9 +7527,18 @@ mod tests {
             &Method::POST,
             "/users/platform.acme/alice/grant-probes"
         ));
+        assert!(user_may(
+            &Method::POST,
+            "/users/platform.acme/alice/front-probes"
+        ));
         assert!(user_may(&Method::GET, "/grant-probes/p1"));
         assert!(user_may(&Method::DELETE, "/grant-probes/p1"));
         assert!(user_may(&Method::GET, "/grant-probes/p1/events"));
+        assert!(!user_may(&Method::GET, "/tunnel-probes"));
+        assert!(user_may(
+            &Method::GET,
+            "/tenants/platform.acme/tunnels/custom-1111-1111/probe"
+        ));
 
         assert!(!user_may(
             &Method::POST,
@@ -5702,6 +7553,15 @@ mod tests {
         assert!(!user_may(&Method::POST, "/grant-probes/capability"));
         assert!(!user_may(&Method::DELETE, "/grant-probes/p1/events"));
         assert!(!user_may(&Method::GET, "/grant-probes/p1/extra"));
+        assert!(!user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/front-probes"
+        ));
+        assert!(!user_may(
+            &Method::POST,
+            "/tenants/platform.acme/tunnels/custom-1111-1111/probe-runs"
+        ));
+        assert!(!user_may(&Method::DELETE, "/tunnel-probe-runs/42"));
 
         let actor = AdminContext::from_authenticated(&AuthenticatedAdmin {
             operator_id: "platform.acme/alice".to_owned(),
@@ -5741,11 +7601,20 @@ mod tests {
     #[test]
     fn install_script_preserves_mode_and_installs_binaries_atomically() {
         assert!(INSTALL_SCRIPT.contains("BROCADE_AGENT_APPLY=//p"));
+        assert!(INSTALL_SCRIPT.contains("BROCADE_XRAY_BIN=$XRAY_BIN"));
+        assert!(
+            INSTALL_SCRIPT.contains("BROCADE_VPNGATE_STATS_WINDOW_SECS=$VPNGATE_STATS_WINDOW_SECS")
+        );
+        assert!(INSTALL_SCRIPT.contains("BROCADE_VPNGATE_STATS_WINDOW_SECS=//p"));
         assert!(INSTALL_SCRIPT.contains("install_binary_atomic"));
         assert!(INSTALL_SCRIPT.contains("mv -f \"$stage\" \"$dest\""));
         assert!(INSTALL_SCRIPT.contains("-H \"@$auth_header\""));
         assert!(!INSTALL_SCRIPT.contains("-H \"Authorization: Bearer $ENROLL_TOKEN\""));
         assert!(INSTALL_SCRIPT.contains("net.ipv4.tcp_fastopen = 3"));
+        assert!(INSTALL_SCRIPT.contains("ENABLE_VPNGATE=${BROCADE_ENABLE_VPNGATE:-0}"));
+        assert!(INSTALL_SCRIPT.contains("--enable-openvpn)"));
+        assert!(!INSTALL_SCRIPT.contains("--enable-vpngate"));
+        assert!(INSTALL_SCRIPT.contains("if [ \"$ENABLE_VPNGATE\" = \"1\" ]; then"));
     }
 
     #[test]
@@ -5759,6 +7628,8 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("rc-service brocade-agent restart"));
         assert!(INSTALL_SCRIPT.contains("output_logger=\"$AGENT_BIN log-sink"));
         assert!(INSTALL_SCRIPT.contains("export \"\\$line\""));
+        assert!(INSTALL_SCRIPT.contains("BROCADE_XRAY_BIN=*|"));
+        assert!(INSTALL_SCRIPT.contains("BROCADE_VPNGATE_STATS_WINDOW_SECS=*)"));
         assert!(!INSTALL_SCRIPT.contains("目前只支持 systemd"));
     }
 
@@ -5800,7 +7671,7 @@ mod tests {
         assert!(upstream.contains("sniffing_failure_routing = true"));
         assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"b4f0898\""));
         assert!(build_script.contains("core.build={build_id}"));
-        assert!(build_script.contains("fn repository_build_id"));
+        assert!(!build_script.contains("fn repository_build_id"));
         assert!(!build_script.contains("core.build=brocade"));
         assert!(!INSTALL_SCRIPT.contains("brocade-$XRAY_VERSION"));
         assert!(INSTALL_SCRIPT.contains("xray_bin_url_$XRAY_ARCH"));
@@ -5885,7 +7756,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn embedded_xray_banner_keeps_upstream_shape_and_names_brocade_commit() {
+    fn embedded_xray_banner_keeps_upstream_shape_and_names_the_pinned_baseline() {
         use std::os::unix::fs::PermissionsExt;
 
         let host_arch = std::env::consts::ARCH;
@@ -5893,11 +7764,11 @@ mod tests {
             .iter()
             .find(|(arch, _, _)| *arch == host_arch)
             .unwrap_or_else(|| panic!("没有可在当前 {host_arch} 主机执行的内嵌 Xray"));
-        let path = std::env::temp_dir().join(format!(
-            "brocade-xray-banner-{}-{}",
-            std::process::id(),
-            env!("BROCADE_EMBEDDED_XRAY_BUILD_ID")
-        ));
+        // A deterministic /tmp filename survives a killed test and can collide with another test
+        // process after PID reuse, leaving Linux to reject execution with ETXTBSY. An owned
+        // directory gives every invocation a fresh inode and cleans it on every exit path.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xray");
         std::fs::write(&path, bytes).unwrap();
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -5907,7 +7778,6 @@ mod tests {
             .arg("version")
             .output()
             .unwrap();
-        let _ = std::fs::remove_file(&path);
         assert!(output.status.success());
 
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -5918,7 +7788,7 @@ mod tests {
             first_line.starts_with(&format!(
                 "Xray {version} (Xray, Penetrates Everything.) {build_id} (go"
             )),
-            "Xray banner 没有保留上游格式或没有显示 Brocade 提交号：{first_line}"
+            "Xray banner 没有保留上游格式或没有显示钉住的上游基线：{first_line}"
         );
     }
 
@@ -6193,6 +8063,17 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_credential_keeps_only_a_bounded_constant_time_verifier() {
+        let secret = "b".repeat(BOOTSTRAP_TOKEN_MIN_BYTES);
+        let credential = BootstrapCredential::new(&secret).unwrap();
+        assert!(credential.verifies(&secret));
+        assert!(!credential.verifies(&"c".repeat(BOOTSTRAP_TOKEN_MIN_BYTES)));
+        assert!(BootstrapCredential::new(&"b".repeat(BOOTSTRAP_TOKEN_MIN_BYTES - 1)).is_err());
+        assert!(BootstrapCredential::new(&"b".repeat(BOOTSTRAP_TOKEN_MAX_BYTES + 1)).is_err());
+        assert!(BootstrapCredential::new(&format!(" {secret}")).is_err());
+    }
+
+    #[test]
     fn route_headers_accept_matching_ip_families() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -6207,32 +8088,6 @@ mod tests {
         let route = route_from_headers(&headers).unwrap();
         assert_eq!(route.ipv4.as_deref(), Some("198.51.100.10"));
         assert_eq!(route.ipv6.as_deref(), Some("2001:db8::10"));
-    }
-
-    #[test]
-    fn reverse_proxy_source_wins_for_public_ip_autofill_but_private_source_does_not() {
-        let route = RouteIpReport {
-            ipv4: Some("8.8.8.8".to_owned()),
-            ipv6: None,
-        };
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", HeaderValue::from_static("172.93.186.36"));
-        assert_eq!(
-            public_ip_report_from_headers(&headers, Some(&route))
-                .unwrap()
-                .ipv4
-                .as_deref(),
-            Some("172.93.186.36")
-        );
-
-        headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.8"));
-        assert_eq!(
-            public_ip_report_from_headers(&headers, Some(&route))
-                .unwrap()
-                .ipv4
-                .as_deref(),
-            Some("8.8.8.8")
-        );
     }
 
     #[test]

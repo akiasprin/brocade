@@ -335,7 +335,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({
-                "tag": "out:external/warp",
+                "tag": "out:external/warp-8f3a-2d71",
                 "protocol": "wireguard",
                 "settings": {
                     "secretKey": "private-key",
@@ -352,7 +352,7 @@ mod tests {
             {
                 "type": "field",
                 "ruleTag": "r:g2:001",
-                "outboundTag": "out:external/warp"
+                "outboundTag": "out:external/warp-8f3a-2d71"
             }
         ]);
         let with_wireguard = serde_json::to_string(&with_wireguard).unwrap();
@@ -371,7 +371,7 @@ mod tests {
     fn an_unchanged_wireguard_outbound_does_not_block_a_rule_only_swap() {
         let mut before: Value = serde_json::from_str(&base()).unwrap();
         before["outbounds"].as_array_mut().unwrap().push(json!({
-            "tag": "out:external/warp",
+            "tag": "out:external/warp-8f3a-2d71",
             "protocol": "wireguard",
             "settings": { "secretKey": "private-key" }
         }));

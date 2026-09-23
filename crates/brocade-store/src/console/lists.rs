@@ -5,6 +5,108 @@ use sqlx::{PgPool, Row};
 use super::*;
 use crate::{AdminContext, Result, StoreError};
 
+/// Read the identity-scoped counts that determine the first-frame list skeletons.
+///
+/// Keep this as one statement so both counts describe one PostgreSQL statement snapshot. The
+/// query mirrors `scope_snapshot`: a scoped viewer sees a project when it owns a visible chain or
+/// front, while a system administrator also sees projects which are still empty.
+pub async fn console_initial_data(
+    pool: &PgPool,
+    actor: &AdminContext,
+) -> Result<ConsoleInitialData> {
+    let rows = if actor.is_system_admin() {
+        sqlx::query(
+            "WITH node_total AS (
+                SELECT count(*)::bigint AS node_count FROM nodes
+             ), chain_groups AS (
+                SELECT a.id AS group_id,
+                       a.position,
+                       count(c.id)::bigint AS member_count
+                  FROM apps a
+                  LEFT JOIN chains c ON c.app_id = a.id
+                 GROUP BY a.id, a.position
+             )
+             SELECT node_total.node_count,
+                    chain_groups.group_id,
+                    chain_groups.member_count
+               FROM node_total
+               LEFT JOIN chain_groups ON TRUE
+              ORDER BY chain_groups.position, chain_groups.group_id",
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        let scope = require_actor_tenant_scope(actor)?;
+        let pattern = actor
+            .tenant_scope_like_pattern()
+            .ok_or_else(|| StoreError::Forbidden("admin context has no tenant_scope".to_owned()))?;
+        sqlx::query(
+            "WITH node_total AS (
+                SELECT count(*)::bigint AS node_count
+                  FROM nodes n
+                 WHERE n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\'
+             ), chain_groups AS (
+                SELECT a.id AS group_id,
+                       a.position,
+                       count(c.id)::bigint AS member_count
+                  FROM apps a
+                  LEFT JOIN chains c
+                    ON c.app_id = a.id
+                   AND (c.tenant_id = $1 OR c.tenant_id LIKE $2 ESCAPE '\\')
+                 WHERE EXISTS (
+                           SELECT 1
+                             FROM chains visible_chain
+                            WHERE visible_chain.app_id = a.id
+                              AND (
+                                  visible_chain.tenant_id = $1
+                                  OR visible_chain.tenant_id LIKE $2 ESCAPE '\\'
+                              )
+                       )
+                    OR EXISTS (
+                           SELECT 1
+                             FROM fronts visible_front
+                            WHERE visible_front.app_id = a.id
+                              AND (
+                                  visible_front.tenant_id = $1
+                                  OR visible_front.tenant_id LIKE $2 ESCAPE '\\'
+                              )
+                       )
+                 GROUP BY a.id, a.position
+             )
+             SELECT node_total.node_count,
+                    chain_groups.group_id,
+                    chain_groups.member_count
+               FROM node_total
+               LEFT JOIN chain_groups ON TRUE
+              ORDER BY chain_groups.position, chain_groups.group_id",
+        )
+        .bind(scope)
+        .bind(pattern)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let first = rows.first().ok_or_else(|| {
+        StoreError::InvalidData("initial data query returned no aggregate row".to_owned())
+    })?;
+    let node_count = i64_to_u64(first.try_get("node_count")?, "node_count")?;
+    let mut chain_group_count = Vec::new();
+    for row in &rows {
+        let Some(group_id) = row.try_get::<Option<String>, _>("group_id")? else {
+            continue;
+        };
+        chain_group_count.push((
+            group_id,
+            i64_to_u64(row.try_get("member_count")?, "member_count")?,
+        ));
+    }
+
+    Ok(ConsoleInitialData {
+        node_count,
+        chain_group_count,
+    })
+}
+
 pub(crate) async fn list_tenants(pool: &PgPool, actor: &AdminContext) -> Result<TenantList> {
     let rows = if actor.is_system_admin() {
         sqlx::query(

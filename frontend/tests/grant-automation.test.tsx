@@ -17,10 +17,21 @@ const healthy: GrantAutomationStatus = {
 afterEach(cleanup);
 
 describe('permission automation status', () => {
-  it('replaces the duplicated convergence revision with one compact healthy readout', () => {
-    const view = render(<RuntimeCrumbStatus state={compactGrantAutomation(healthy, false, false)} revision={582} />);
-    expect(view.container.textContent).toBe('同步正常R582');
-    expect(view.container.textContent?.match(/582/g)).toHaveLength(1);
+  it('keeps the healthy idle state out of the breadcrumb', () => {
+    const view = render(<RuntimeCrumbStatus state={compactGrantAutomation(healthy, false, false)} />);
+    expect(view.container.textContent).toBe('');
+  });
+
+  it('keeps transient background checks out of the breadcrumb', () => {
+    const view = render(<RuntimeCrumbStatus state={{ text: '检查中', tone: 'normal' }} />);
+    expect(view.container.textContent).toBe('');
+  });
+
+  it('shows the revision only with an active deployment state', () => {
+    const view = render(
+      <RuntimeCrumbStatus state={{ text: '发布 #42 · 进行中', tone: 'hot' }} revision={582} />,
+    );
+    expect(view.container.textContent).toBe('发布 #42 · 进行中R582');
   });
 
   it('shows retry progress compactly and keeps the planning error in hover detail', () => {
@@ -38,9 +49,9 @@ describe('permission automation status', () => {
       false,
       false,
     );
-    const view = render(<RuntimeCrumbStatus state={state} revision={582} />);
+    const view = render(<RuntimeCrumbStatus state={state} />);
 
-    expect(view.container.textContent).toBe('权限重试 27R582');
+    expect(view.container.textContent).toBe('权限重试 27');
     expect(view.getByTitle(/最多已试 841 次/).title).toContain('历史快照无法读取');
   });
 

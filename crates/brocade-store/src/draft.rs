@@ -36,9 +36,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::console::{
     ArtifactContent, ArtifactIndex, CompileView, ConsoleSnapshot, CreateAppRequest,
-    CreateChainRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
-    CreateTenantRequest, CreateUserRequest, PutStepRequest, UpdateNodeRequest,
-    UpdateNodeStatusRequest, UpdateUserStatusRequest, UpsertExternalOutboundRequest,
+    CreateChainRequest, CreateGrantRequest, CreateIngressRequest, CreateTenantRequest,
+    CreateUserRequest, PutStepRequest, UpdateNodeRequest, UpdateNodeStatusRequest,
+    UpdateUserStatusRequest, UpsertExternalOutboundRequest,
 };
 use crate::{AdminContext, Result, StoreError};
 
@@ -84,10 +84,6 @@ pub enum ModelOp {
     UpsertChain {
         app_id: String,
         chain: CreateChainRequest,
-    },
-    UpsertFront {
-        app_id: String,
-        front: CreateFrontRequest,
     },
     CreateIngress {
         app_id: String,
@@ -193,7 +189,6 @@ impl ModelOp {
             ModelOp::CreateChain { app_id, chain } | ModelOp::UpsertChain { app_id, chain } => {
                 format!("链 {app_id}/{}", chain.id)
             }
-            ModelOp::UpsertFront { app_id, front } => format!("前置组 {app_id}/{}", front.id),
             ModelOp::CreateIngress { app_id, ingress }
             | ModelOp::UpsertIngress { app_id, ingress } => {
                 format!("接入面 {app_id}/{}", ingress.id)
@@ -307,11 +302,6 @@ async fn apply_op(
         }
         ModelOp::UpsertChain { app_id, chain } => {
             c::upsert_chain_tx(tx, actor, revision_id, &app_id, chain)
-                .await?
-                .1
-        }
-        ModelOp::UpsertFront { app_id, front } => {
-            c::upsert_front_tx(tx, actor, revision_id, &app_id, front)
                 .await?
                 .1
         }
@@ -446,6 +436,9 @@ pub async fn apply_ops(
             changed += 1;
         }
     }
+    if crate::console::prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await? {
+        changed += 1;
+    }
     let revision_id =
         crate::console::commit_revision(&mut tx, revision_id, previous, changed > 0).await?;
     let mut client_config =
@@ -470,16 +463,17 @@ pub async fn preview_ops(
     ops: Vec<ModelOp>,
 ) -> Result<DraftPreview> {
     let snapshot = draft_snapshot(pool, actor, ops).await?;
+    let output = crate::compile_cache::compile_snapshot(&snapshot).await?;
     Ok(DraftPreview {
-        compile: crate::console::compile_view_of(&snapshot)?,
-        artifacts: crate::console::artifact_index_of(&snapshot)?,
+        compile: crate::console::compile_view_from_output(&snapshot, &output)?,
+        artifacts: crate::console::artifact_index_from_output(&snapshot, &output)?,
         snapshot: crate::console::snapshot_view(snapshot)?,
     })
 }
 
 /// Run a draft into a transaction, read the snapshot, roll back. Not one byte in the database
 /// changes.
-async fn draft_snapshot(
+pub(crate) async fn draft_snapshot(
     pool: &PgPool,
     actor: &AdminContext,
     ops: Vec<ModelOp>,
@@ -496,6 +490,7 @@ async fn draft_snapshot(
     for op in ops {
         apply_op(&mut tx, actor, revision_id, op).await?;
     }
+    crate::console::prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await?;
     let snapshot = crate::materialize::load_current_snapshot_tx(&mut tx).await?;
     // Read and discard. Not a commit — a preview is read-only in meaning, whatever write
     // permissions the caller holds.

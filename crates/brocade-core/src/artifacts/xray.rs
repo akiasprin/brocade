@@ -1565,7 +1565,6 @@ fn put_match(dest_match: &DestMatch, condition: &mut XrayMatchCondition) {
                 put_match(value, condition);
             }
         }
-        DestMatch::FrontDownstream => put_never(condition),
     }
 }
 
@@ -1590,8 +1589,7 @@ fn collect_match_slots(dest_match: &DestMatch, slots: &mut MatchSlots) -> bool {
         DestMatch::DomainSuffix(_)
         | DestMatch::DomainKeyword(_)
         | DestMatch::DomainRegex(_)
-        | DestMatch::Geosite(_)
-        | DestMatch::FrontDownstream => slots.put(MatchSlot::Domain),
+        | DestMatch::Geosite(_) => slots.put(MatchSlot::Domain),
         DestMatch::IpCidr(_) | DestMatch::Geoip(_) => slots.put(MatchSlot::Ip),
         DestMatch::Port(_) | DestMatch::PortExcept(_) => slots.put(MatchSlot::Port),
         DestMatch::Network(_) => slots.put(MatchSlot::Network),

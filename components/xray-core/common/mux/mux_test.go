@@ -1,6 +1,8 @@
 package mux_test
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"testing"
 
@@ -192,5 +194,57 @@ func TestReaderWriter(t *testing.T) {
 		if err == nil {
 			t.Error("nil error")
 		}
+	}
+}
+
+func TestPacketReaderWriterPreservesLargeDatagrams(t *testing.T) {
+	for _, size := range []int32{buf.Size + 1, buf.MaxPacketSize} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			container := &buf.MultiBufferContainer{}
+			defer container.Close()
+			destination := net.UDPDestination(net.DomainAddress("example.com"), 53)
+			writer := NewWriter(1, destination, container, protocol.TransferTypePacket, [8]byte{}, &session.Inbound{})
+			payload := make([]byte, size)
+			for i := range payload {
+				payload[i] = byte((i*31 + i/251) % 251)
+			}
+			packet := buf.NewWithSize(size)
+			copy(packet.Extend(size), payload)
+			if err := writer.WriteMultiBuffer(buf.MultiBuffer{packet}); err != nil {
+				t.Fatal(err)
+			}
+
+			reader := &buf.BufferedReader{Reader: container}
+			var meta FrameMetadata
+			if err := meta.Unmarshal(reader, false); err != nil {
+				t.Fatal(err)
+			}
+			if meta.SessionStatus != SessionStatusNew || meta.SessionID != 1 || meta.Target.String() != destination.String() {
+				t.Fatalf("unexpected packet metadata: %+v", meta)
+			}
+			decoded, err := NewPacketReader(reader, &destination).ReadMultiBuffer()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer buf.ReleaseMulti(decoded)
+			if len(decoded) != 1 || !bytes.Equal(decoded[0].Bytes(), payload) {
+				t.Fatalf("decoded packet length = %d, want %d", decoded.Len(), len(payload))
+			}
+		})
+	}
+}
+
+func TestPacketWriterRejectsPayloadAboveWireLimit(t *testing.T) {
+	container := &buf.MultiBufferContainer{}
+	defer container.Close()
+	destination := net.UDPDestination(net.DomainAddress("example.com"), 53)
+	writer := NewWriter(1, destination, container, protocol.TransferTypePacket, [8]byte{}, &session.Inbound{})
+	packet := buf.NewWithSize(buf.MaxPacketSize + 1)
+	packet.Extend(buf.MaxPacketSize + 1)
+	if err := writer.WriteMultiBuffer(buf.MultiBuffer{packet}); err == nil {
+		t.Fatal("oversized packet was encoded with a truncated uint16 length")
+	}
+	if !container.MultiBuffer.IsEmpty() {
+		t.Fatal("oversized packet emitted a partial frame")
 	}
 }

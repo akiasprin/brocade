@@ -1,12 +1,17 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+import type { VpngateRealtimeReport } from './vpngate-realtime';
 
 export interface NodeRealtimeEvent {
   node_id?: string;
   received_at_unix_millis: number;
   sample: {
+    /** Heavy worker reports are a lower-frequency delta; absent fields retain the last complete
+     * report only when this flag is true. Without the flag, absence authoritatively clears it. */
+    diagnostics_unchanged?: boolean;
     sampled_at_unix_millis: number;
     reverse_health?: unknown;
     mux?: unknown;
+    vpngate?: VpngateRealtimeReport | null;
   };
 }
 
@@ -25,6 +30,17 @@ interface NodeRealtimeSnapshot {
 
 const NodeRealtimeContext = createContext<NodeRealtimeState | null>(null);
 
+/** Merge only an explicitly marked diagnostics delta. A complete event with absent diagnostics
+ * must clear old state, otherwise removing a worker pool would leave a ghost card indefinitely. */
+export function mergeNodeRealtimeEvent(
+  previous: NodeRealtimeEvent | undefined,
+  event: NodeRealtimeEvent,
+): NodeRealtimeEvent {
+  return event.sample.diagnostics_unchanged && previous
+    ? { ...event, sample: { ...previous.sample, ...event.sample } }
+    : event;
+}
+
 function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
   const [last, setLast] = useState<{ nodeId: string; event: NodeRealtimeEvent; arrived: number } | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -38,7 +54,11 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
     let polling = false;
     let stopped = false;
     const accept = (event: NodeRealtimeEvent, connected = true) => {
-      setLast({ nodeId, event, arrived: Date.now() });
+      setLast(previous => {
+        const previousEvent = previous?.nodeId === nodeId ? previous.event : undefined;
+        const merged = mergeNodeRealtimeEvent(previousEvent, event);
+        return { nodeId, event: merged, arrived: Date.now() };
+      });
       if (connected) setConnectedNodeId(nodeId);
     };
     const acceptSnapshot = (nodes: NodeRealtimeSnapshot[]) => {

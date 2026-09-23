@@ -1642,16 +1642,58 @@ fn ephemeral_port_range(low: u16, high: u16, reserved: &str) -> EphemeralPortRan
 /// Summing every interface would count wg0 and any tun on top of the physical one, reporting a
 /// machine's own traffic two or three times.
 pub(crate) fn main_interface() -> Option<String> {
-    let route = fs::read_to_string("/proc/net/route").ok()?;
-    for line in route.lines().skip(1) {
-        let mut f = line.split_whitespace();
-        let iface = f.next()?;
-        let destination = f.next()?;
-        if destination == "00000000" {
-            return Some(iface.to_owned());
-        }
+    let ipv4 = fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let ipv6 = fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+    main_interface_from(&ipv4, &ipv6)
+}
+
+fn main_interface_from(ipv4: &str, ipv6: &str) -> Option<String> {
+    let mut candidates = ipv4
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
+                return None;
+            }
+            let flags = u32::from_str_radix(fields[3], 16).ok()?;
+            if flags & 1 == 0 {
+                return None;
+            }
+            let metric = fields[6].parse::<u64>().ok()?;
+            Some((metric, fields[0].to_owned()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    if let Some((_, interface)) = candidates.into_iter().next() {
+        return Some(interface);
     }
-    None
+
+    // IPv6-only hosts have no row in /proc/net/route. The kernel's ipv6_route fields are
+    // destination, prefix, source, prefix, next-hop, metric(hex), ref, use, flags, interface.
+    let mut candidates = ipv6
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 10
+                || fields[0] != "00000000000000000000000000000000"
+                || fields[1] != "00"
+            {
+                return None;
+            }
+            let flags = u32::from_str_radix(fields[8], 16).ok()?;
+            if flags & 1 == 0 {
+                return None;
+            }
+            let metric = u64::from_str_radix(fields[5], 16).ok()?;
+            Some((metric, fields[9].to_owned()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, interface)| interface)
 }
 
 fn read_net() -> NetCounters {
@@ -2010,6 +2052,23 @@ mod tests {
                         cpu0 500 50 250 4000 25 10 40 0 0 0\n\
                         btime 1700000000\n\
                         processes 12345\n";
+
+    #[test]
+    fn default_route_uses_lowest_up_ipv4_metric() {
+        let routes = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+                      eth0 00000000 0100000A 0003 0 0 100 00000000 0 0 0\n\
+                      ens5 00000000 0100000A 0003 0 0 10 00000000 0 0 0\n\
+                      down0 00000000 00000000 0000 0 0 1 00000000 0 0 0\n";
+        assert_eq!(main_interface_from(routes, "").as_deref(), Some("ens5"));
+    }
+
+    #[test]
+    fn ipv6_default_route_is_the_automatic_fallback() {
+        let routes = "00000000000000000000000000000000 00 \
+                      00000000000000000000000000000000 00 \
+                      fe800000000000000000000000000001 00000020 00000000 00000000 00000003 eth9\n";
+        assert_eq!(main_interface_from("", routes).as_deref(), Some("eth9"));
+    }
 
     #[test]
     fn folds_nice_into_user_and_irq_into_system_but_keeps_softirq_apart() {

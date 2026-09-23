@@ -73,5 +73,13 @@ func makeSniffDecision(request session.SniffingRequest, original net.Destination
 }
 
 func logSniffDecision(ctx context.Context, request session.SniffingRequest, original net.Destination, result SniffResult, err error, reason, applied string, elapsed time.Duration) {
-	errors.LogDebug(ctx, makeSniffDecision(request, original, result, err, reason, applied, elapsed))
+	decision := makeSniffDecision(request, original, result, err, reason, applied, elapsed)
+	// Generated Brocade configs normally run at warning level. Surface exactly the case that
+	// setSniffingState exposes to the xray.sniffing=failed routing fallback, while keeping ordinary
+	// successful decisions at Debug so every HTTP, TLS, and QUIC connection does not flood the log.
+	if request.Enabled && original.Address.Family().IsIP() && (err != nil || reason != "accepted") {
+		errors.LogWarning(ctx, decision)
+		return
+	}
+	errors.LogDebug(ctx, decision)
 }

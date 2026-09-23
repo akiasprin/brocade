@@ -1,6 +1,7 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ApiError } from './api';
 import { App } from './app';
 import './styles.css';
 
@@ -18,6 +19,11 @@ const queryClient = new QueryClient({
       staleTime: 5_000,
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,
+      // A rejected permission or malformed request will not become valid on its fourth attempt.
+      // Keep two retries for transient network/server failures; polling queries get another chance
+      // at their own interval as well.
+      retry: (failureCount, error) =>
+        !(error instanceof ApiError && error.status >= 400 && error.status < 500) && failureCount < 2,
     },
   },
 });

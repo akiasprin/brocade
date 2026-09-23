@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useLayoutEffect } from 'react';
 import { wm, type CrumbSeg, type Win } from './store';
 
 // 将当前所在层级同步给外壳顶部的面包屑。
@@ -10,7 +10,10 @@ import { wm, type CrumbSeg, type Win } from './store';
 export function useCrumb(win: Win, segs: CrumbSeg[]) {
   /* 依赖使用序列化后的值：`segs` 每次渲染都是新数组，按引用比较会导致每帧都写入一次。 */
   const key = JSON.stringify(segs);
-  useEffect(() => {
+  // The shell and pane must settle in the same paint. A passive effect updates the breadcrumb one
+  // frame after the drill body, which also makes a running View Transition capture stale chrome
+  // and produces a small second jump as the window is measured again.
+  useLayoutEffect(() => {
     if (JSON.stringify(win.data.crumb ?? []) === key) return;
     wm.patchData(win.id, { crumb: JSON.parse(key) as CrumbSeg[] });
   }, [win.id, key, win.data.crumb]);

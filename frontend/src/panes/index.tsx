@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { lazy, useMemo, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   fetchCompileView,
@@ -8,46 +8,128 @@ import {
   visibleDiagnostics,
   type DiagNames,
 } from '../api';
-import { Empty, ErrorBox, Loading } from '../ui/bits';
+import { Empty, ErrorBox, Loading, LoadingBoundary, type LoadingVariant } from '../ui/bits';
 import { DiagTable } from '../ui/diag-table';
+import { useSession } from '../session';
 import type { Win } from '../wm/store';
-import { NodesPane } from './nodes';
-import { DeployPane } from './deploy';
-import { UsersPane } from './users';
-import { PasswordPane } from './password';
-import { UsagePane } from './usage';
-import { SettingsPane } from './settings';
-import { InspectPane } from './inspect';
-import { ChainsPane } from './chains';
-import { TunnelsPane } from './tunnels';
+
+const NodesPane = lazy(() => import('./nodes').then(module => ({ default: module.NodesPane })));
+const DeployPane = lazy(() => import('./deploy').then(module => ({ default: module.DeployPane })));
+const UsersPane = lazy(() => import('./users').then(module => ({ default: module.UsersPane })));
+const PasswordPane = lazy(() => import('./password').then(module => ({ default: module.PasswordPane })));
+const UsagePane = lazy(() => import('./usage').then(module => ({ default: module.UsagePane })));
+const SettingsPane = lazy(() => import('./settings').then(module => ({ default: module.SettingsPane })));
+const InspectPane = lazy(() => import('./inspect').then(module => ({ default: module.InspectPane })));
+const ChainsPane = lazy(() => import('./chains').then(module => ({ default: module.ChainsPane })));
+const TunnelsPane = lazy(() => import('./tunnels').then(module => ({ default: module.TunnelsPane })));
+
+type PaneLoadingProps = {
+  variant: LoadingVariant;
+  sheeted?: boolean;
+  userDetail?: boolean;
+};
+
+const drillPage = (data: Record<string, unknown>): string | undefined => {
+  const drill = data.drill;
+  if (!drill || typeof drill !== 'object' || !('p' in drill)) return undefined;
+  return typeof drill.p === 'string' ? drill.p : undefined;
+};
+
+const ROUTE_IDENTITY_FIELDS = ['id', 'node', 'app', 'chain', 'revision'] as const;
+
+/**
+ * The loading latch belongs to one routed surface, not to the whole top-level pane. Steps, tabs and
+ * generated idempotency keys deliberately stay out of this identity: changing those must preserve
+ * the mounted surface, while entering another list/detail/form location starts a new cold read.
+ */
+export function paneLoadingRouteKey(paneKey: string, data: Record<string, unknown> = {}): string {
+  // 用户页是常驻的主从双栏：列表、详情以及不同用户都复用同一批查询和同一张页面。
+  // 选择用户只应替换详情区域；若把用户 ID 算进边界身份，路由更新会让整页短暂退回
+  // loading guard，生产环境的空加载面就表现为一次全页闪烁。
+  if (paneKey === 'tab:users') return JSON.stringify([paneKey, 'master-detail']);
+
+  const drill = data.drill;
+  if (!drill || typeof drill !== 'object') return JSON.stringify([paneKey, 'list']);
+  const record = drill as Record<string, unknown>;
+  const page = typeof record.p === 'string' && record.p !== 'list' ? record.p : 'list';
+  const identity = ROUTE_IDENTITY_FIELDS.flatMap(field => {
+    const value = record[field];
+    return typeof value === 'string' || typeof value === 'number' ? [[field, value] as const] : [];
+  });
+  return JSON.stringify([paneKey, page, ...identity]);
+}
+
+function paneLoadingProps(paneKey: string, data: Record<string, unknown> = {}, bare = false): PaneLoadingProps {
+  const page = drillPage(data);
+  switch (paneKey) {
+    case 'tab:nodes':
+      if (page === 'node') return { variant: 'detail', sheeted: bare };
+      if (page && page !== 'list') return { variant: 'form' };
+      return { variant: 'nodes', sheeted: bare };
+    case 'tab:chains':
+      return { variant: page === 'chain' ? 'chain-detail' : page === 'new' ? 'form' : 'chains' };
+    case 'tab:tunnels':
+      if (page === 'vpngate') return { variant: 'vpngate', sheeted: true };
+      return page && page !== 'list' ? { variant: 'config-detail', sheeted: true } : { variant: 'tunnels' };
+    case 'tab:users':
+      return { variant: 'users', sheeted: bare, userDetail: page === 'user' };
+    case 'tab:usage':
+      return { variant: 'usage' };
+    case 'tab:settings':
+      return { variant: 'settings' };
+    case 'tab:deploy':
+      return { variant: page === 'plan' ? 'plan' : page === 'detail' ? 'deployment' : 'deploy' };
+    case 'diag':
+      return { variant: 'table' };
+    default:
+      return { variant: paneKey.startsWith('insp:') ? 'table' : 'panel', sheeted: bare };
+  }
+}
 
 export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
+  const { initial } = useSession();
+  let content: ReactNode;
   switch (win.key) {
     case 'tab:nodes':
-      return <NodesPane win={win} bare={bare} />;
+      content = <NodesPane win={win} bare={bare} />;
+      break;
     case 'tab:chains':
-      return <ChainsPane win={win} />;
+      content = <ChainsPane win={win} />;
+      break;
     case 'tab:tunnels':
-      return <TunnelsPane win={win} />;
+      content = <TunnelsPane win={win} />;
+      break;
     case 'tab:deploy':
-      return <DeployPane win={win} />;
+      content = <DeployPane win={win} />;
+      break;
     case 'tab:users':
-      return <UsersPane win={win} bare={bare} />;
+      content = <UsersPane win={win} bare={bare} />;
+      break;
     case 'tab:usage':
-      return <UsagePane />;
+      content = <UsagePane />;
+      break;
     case 'tab:settings':
-      return <SettingsPane />;
+      content = <SettingsPane />;
+      break;
     case 'tab:password':
-      return <PasswordPane />;
+      content = <PasswordPane />;
+      break;
     case 'diag':
-      return <DiagPane />;
+      content = <DiagPane />;
+      break;
     default: {
       /* 检视窗的 key 形如 insp:node:hk-01 */
       const [tag, kind, ...rest] = win.key.split(':');
-      if (tag === 'insp') return <InspectPane kind={kind} id={rest.join(':')} />;
-      return <Empty>这个面还没做。</Empty>;
+      content = tag === 'insp' ? <InspectPane kind={kind} id={rest.join(':')} /> : <Empty>这个面还没做。</Empty>;
     }
   }
+  const loading = paneLoadingProps(win.key, win.data, bare);
+  const fallback = <Loading {...loading} initial={initial} />;
+  return (
+    <LoadingBoundary fallback={fallback} variant={loading.variant} routeKey={paneLoadingRouteKey(win.key, win.data)}>
+      {content}
+    </LoadingBoundary>
+  );
 }
 
 export function DiagPane() {
@@ -70,7 +152,7 @@ export function DiagPane() {
     return { node: id => nodes.get(id), chain: id => chains.get(id) };
   }, [nodeList.data, snapshot.data]);
 
-  if (revisions.isPending || (current != null && compile.isPending)) return <Loading />;
+  if (revisions.isPending || (current != null && compile.isPending)) return <Loading variant="table" />;
   if (revisions.error || compile.error) return <ErrorBox error={revisions.error ?? compile.error} />;
   if (!current) return <Empty>还没有可诊断的修订。</Empty>;
   if (!compile.data) return <ErrorBox error={new Error('编译结果没有返回内容')} />;

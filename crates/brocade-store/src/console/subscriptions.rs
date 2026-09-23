@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 
 use brocade_core::{
     artifacts::subscription,
-    compile::compile,
     format::yaml,
     model::IpFamily,
     physical::user::{project_user, SubscriptionFilter},
@@ -302,12 +301,14 @@ async fn build_dynamic_clash(
     template: DynamicClashTemplate,
     hide_reason: bool,
 ) -> Result<DynamicClashSubscription> {
-    let output = compile(snapshot);
-    let mut plan = output.project_user(tenant_id, user_id).map_err(|blocked| {
-        StoreError::InvalidData(format!(
-            "cannot project user {tenant_id}/{user_id}: {blocked:?}"
-        ))
-    })?;
+    let output = crate::compile_cache::compile_incremental(snapshot);
+    let mut plan = crate::compile_cache::project_user(&output, tenant_id, user_id)
+        .map(|plan| plan.as_ref().clone())
+        .map_err(|blocked| {
+            StoreError::InvalidData(format!(
+                "cannot project user {tenant_id}/{user_id}: {blocked:?}"
+            ))
+        })?;
     if plan.entries.is_empty() {
         let authorized = snapshot.apps.iter().any(|app| {
             app.grants
@@ -387,12 +388,12 @@ async fn subscription_usage(
              SELECT coalesce(sum(s.uplink_bytes), 0)::bigint AS upload_bytes,
                     coalesce(sum(s.downlink_bytes), 0)::bigint AS download_bytes,
                     coalesce(bool_or(s.has_gap), false) AS has_gap
-             FROM usage_samples s, bounds b
+             FROM usage_rollups s, bounds b
              WHERE s.tenant_id = $1
                AND s.user_id = $2
                AND s.app_id = ANY($3::text[])
-               AND s.window_start >= b.month_start
-               AND s.window_start < b.month_end
+               AND s.period_start >= b.month_start
+               AND s.period_start < b.month_end
          ), limits AS (
              SELECT count(*)::bigint AS limited_count,
                     coalesce(sum(q.limit_bytes), 0)::bigint AS total_bytes

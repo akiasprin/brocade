@@ -83,6 +83,7 @@ impl Default for GeoIpLookup {
     fn default() -> Self {
         Self {
             http: reqwest::Client::builder()
+                .use_rustls_tls()
                 .timeout(DOWNLOAD_TIMEOUT)
                 .user_agent(concat!("brocade-console/", env!("CARGO_PKG_VERSION")))
                 .build()

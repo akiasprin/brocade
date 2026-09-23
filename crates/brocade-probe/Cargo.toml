@@ -7,5 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+brocade-core = { path = "../brocade-core" }
 brocade-deployment = { path = "../brocade-deployment" }
 serde_json = "1"
+
+[dev-dependencies]
+sha2 = "0.10"

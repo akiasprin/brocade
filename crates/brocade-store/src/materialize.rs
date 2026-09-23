@@ -14,7 +14,8 @@ use brocade_core::model::{
     NodeConnection, OverlaySettings, PortSettings, ProbeSettings, Projection,
     ProjectionDownloadEndpoint, ProjectionEndpoint, RealityClientPolicy, RealityFallbackLimits,
     RealityFallbackMode, RealitySettings, RealitySite, RealityXhttp, Rule, Step, Tls, TlsXhttp,
-    Transport, User, WireGuardKeys, Xhttp, XhttpMode,
+    Transport, User, WireGuardKeys, Xhttp, XhttpMode, VPNGATE_DEFAULT_MAX_CONNECT_MS,
+    VPNGATE_DEFAULT_MIN_DOWNLOAD_BPS,
 };
 use ipnet::Ipv4Net;
 use serde_json::Value;
@@ -346,7 +347,8 @@ fn decode_stored_snapshot(mut snapshot: Value, revision: u64) -> Result<ModelSna
 /// Historical snapshots remain fully compilable, but their proxy credentials must not turn the
 /// JSONB history table into a plaintext secret archive. The model's tagged protocol enum places
 /// the shared credential at `protocol.v.credential`; only that narrowly identified field is
-/// transformed, leaving ordinary ids and labels untouched.
+/// transformed, leaving ordinary ids and labels untouched. Managed WARP and VPN Gate outbounds
+/// intentionally have no resource-level credential.
 pub(crate) fn seal_snapshot_external_credentials(snapshot: &mut Value) -> Result<()> {
     transform_snapshot_external_credentials(snapshot, |context, credential| {
         crate::secrets::seal(context, credential)
@@ -390,7 +392,10 @@ fn transform_snapshot_external_credentials(
                 &credential,
             )?;
             *outbound.pointer_mut("/protocol/v/credential").unwrap() = Value::String(transformed);
-        } else if outbound.pointer("/protocol/t").and_then(Value::as_str) != Some("warp") {
+        } else if !matches!(
+            outbound.pointer("/protocol/t").and_then(Value::as_str),
+            Some("warp" | "vpngate")
+        ) {
             return Err(invalid_error(format!(
                 "external outbound snapshot {tenant}/{id} is missing credential"
             )));
@@ -889,9 +894,9 @@ fn external_outbound_from_row(
     let id = text(row, "id")?;
     let tenant = text(row, "tenant_id")?;
     let stored_protocol = text(row, "protocol")?;
-    // WARP credentials belong to each machine binding, not to the tenant resource. Its
-    // resource-level credential is therefore an empty sentinel.
-    let credential = if stored_protocol == "warp" {
+    // WARP credentials belong to each machine binding, while VPN Gate profiles come from the
+    // retained managed catalogue. Neither has a tenant resource-level credential.
+    let credential = if matches!(stored_protocol.as_str(), "warp" | "vpngate") {
         String::new()
     } else {
         crate::secrets::open(
@@ -996,6 +1001,53 @@ fn external_outbound_from_row(
                 })?,
             domain_strategy: external_option_string(&options, "domain_strategy", &tenant, &id)?,
             workers: external_option_u16(&options, "workers", &tenant, &id)?,
+        },
+        "vpngate" => ExternalOutboundProtocol::Vpngate {
+            country_code: external_option_string(&options, "country_code", &tenant, &id)?,
+            server_ids: match options.get("server_ids") {
+                None => Vec::new(),
+                Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                    StoreError::InvalidData(format!("VPN Gate manual pool {tenant}/{id}: {error}"))
+                })?,
+            },
+            server_id: options
+                .get("server_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // Pre-release VPN Gate rows used one synthetic `min_quality` knob. There is no honest
+            // lossless conversion from a blended score to independent measurements, so old rows
+            // receive the documented raw defaults until they are next saved. Snapshot output and
+            // every new write contain only the three explicit gates below.
+            max_connect_ms: u32::try_from(external_option_u64_or(
+                &options,
+                "max_connect_ms",
+                VPNGATE_DEFAULT_MAX_CONNECT_MS.into(),
+                &tenant,
+                &id,
+            )?)
+            .map_err(|_| {
+                invalid_error(format!(
+                    "external_outbounds.protocol_options.max_connect_ms 超出 u32（{tenant}/{id}）"
+                ))
+            })?,
+            min_download_bps: external_option_u64_or(
+                &options,
+                "min_download_bps",
+                VPNGATE_DEFAULT_MIN_DOWNLOAD_BPS,
+                &tenant,
+                &id,
+            )?,
+            max_candidates: u8::try_from(external_option_u16(
+                &options,
+                "max_candidates",
+                &tenant,
+                &id,
+            )?)
+            .map_err(|_| {
+                invalid_error(format!(
+                    "external_outbounds.protocol_options.max_candidates 超出 u8（{tenant}/{id}）"
+                ))
+            })?,
         },
         protocol => return invalid(format!("unknown external outbound protocol {protocol}")),
     };
@@ -1145,6 +1197,23 @@ fn external_option_u16(options: &Value, key: &str, tenant: &str, id: &str) -> Re
             "external_outbounds.protocol_options 的 {key} 超出 u16（{tenant}/{id}）"
         ))
     })
+}
+
+fn external_option_u64_or(
+    options: &Value,
+    key: &str,
+    default: u64,
+    tenant: &str,
+    id: &str,
+) -> Result<u64> {
+    match options.get(key) {
+        None => Ok(default),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            invalid_error(format!(
+                "external_outbounds.protocol_options 的 {key} 不是非负整数（{tenant}/{id}）"
+            ))
+        }),
+    }
 }
 
 async fn load_apps(pool: &PgPool, site: &RealitySite) -> Result<Vec<AppView>> {
@@ -1385,6 +1454,7 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             guard_no_udp_amplification, guard_tcp_and_quic_only, \
             projection_v4_host, projection_v4_port, \
             projection_v6_host, projection_v6_port, \
+            protocol_projection, \
             client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
@@ -1432,6 +1502,7 @@ async fn load_ingresses_tx(
             guard_no_udp_amplification, guard_tcp_and_quic_only, \
             projection_v4_host, projection_v4_port, \
             projection_v6_host, projection_v6_port, \
+            protocol_projection, \
             client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
@@ -1723,10 +1794,7 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
         identity,
         anytls_identity: anytls_identity_from_row(row)?,
         wires,
-        projection: Projection {
-            v4: projection_endpoint(row, "v4")?,
-            v6: projection_endpoint(row, "v6")?,
-        },
+        projection: projection_from_row(row)?,
         guard: IngressGuard {
             no_private: row.try_get("guard_no_private")?,
             no_bittorrent: row.try_get("guard_no_bittorrent")?,
@@ -1886,6 +1954,19 @@ fn projection_endpoint(
             "ingresses.{host_column}/{port_column} 只填了一半"
         ))),
     }
+}
+
+/// Read the split mapping while keeping the legacy VLESS columns authoritative. Historical rows
+/// have no JSON value and therefore retain the old shared-host behavior in `physical::user`.
+fn projection_from_row(row: &sqlx::postgres::PgRow) -> Result<Projection> {
+    let mut projection: Projection = row
+        .try_get::<Option<serde_json::Value>, _>("protocol_projection")?
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    projection.v4 = projection_endpoint(row, "v4")?;
+    projection.v6 = projection_endpoint(row, "v6")?;
+    Ok(projection)
 }
 
 async fn load_steps(pool: &PgPool, app_id: &str) -> Result<Vec<Step>> {
@@ -2204,10 +2285,6 @@ mod tests {
                 "a": { "t": "egress", "send_through": "10.66.0.4" }
             },
             {
-                "m": { "t": "front_downstream" },
-                "a": { "t": "block" }
-            },
-            {
                 "m": { "t": "sniffing_failed" },
                 "a": { "t": "block" }
             },
@@ -2238,10 +2315,6 @@ mod tests {
                     action: Action::Egress {
                         send_through: Some("10.66.0.4".parse().unwrap()),
                     },
-                },
-                Rule {
-                    dest_match: DestMatch::FrontDownstream,
-                    action: Action::Block,
                 },
                 Rule {
                     dest_match: DestMatch::SniffingFailed,

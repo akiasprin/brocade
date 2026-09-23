@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostFacts, LoadSample, NodeLoadView } from '../src/api';
@@ -15,21 +15,34 @@ import {
 
 const chartMock = vi.hoisted(() => ({
   setOption: vi.fn(),
+  showLoading: vi.fn(),
+  hideLoading: vi.fn(),
   connect: vi.fn(),
 }));
 
 vi.mock('echarts/core', () => ({
   use: vi.fn(),
   connect: chartMock.connect,
-  init: vi.fn(() => ({ setOption: chartMock.setOption, resize: vi.fn(), dispose: vi.fn(), group: '' })),
+  init: vi.fn(() => ({
+    setOption: chartMock.setOption,
+    showLoading: chartMock.showLoading,
+    hideLoading: chartMock.hideLoading,
+    resize: vi.fn(),
+    dispose: vi.fn(),
+    group: '',
+  })),
 }));
 vi.mock('echarts/charts', () => ({ LineChart: {} }));
 vi.mock('echarts/components', () => ({ GridComponent: {}, MarkLineComponent: {}, TooltipComponent: {} }));
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 let LoadCard: typeof import('../src/panes/telemetry').LoadCard;
+let downsampleKpiSeries: typeof import('../src/panes/telemetry').downsampleKpiSeries;
+let HostCard: typeof import('../src/panes/nodes').HostCard;
 let NicWave: typeof import('../src/panes/nodes').NicWave;
 let ThroughputPanel: typeof import('../src/panes/nodes').ThroughputPanel;
+let PingLatencyChart: typeof import('../src/panes/node-observation-charts').PingLatencyChart;
+let ObservationChartLoading: typeof import('../src/panes/node-observation-charts').ObservationChartLoading;
 
 beforeAll(async () => {
   vi.stubGlobal(
@@ -43,15 +56,35 @@ beforeAll(async () => {
       disconnect() {}
     },
   );
-  ({ LoadCard } = await import('../src/panes/telemetry'));
-  ({ NicWave, ThroughputPanel } = await import('../src/panes/nodes'));
+  ({ LoadCard, downsampleKpiSeries } = await import('../src/panes/telemetry'));
+  ({ HostCard, NicWave, ThroughputPanel } = await import('../src/panes/nodes'));
+  ({ PingLatencyChart, ObservationChartLoading } = await import('../src/panes/node-observation-charts'));
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 beforeEach(() => {
   chartMock.setOption.mockClear();
+  chartMock.showLoading.mockClear();
+  chartMock.hideLoading.mockClear();
   chartMock.connect.mockClear();
+});
+
+it('uses the deep-metric ECharts loading treatment for regular observation charts', () => {
+  render(<ObservationChartLoading />);
+
+  expect(chartMock.showLoading).toHaveBeenCalledWith(
+    'default',
+    expect.objectContaining({
+      text: '加载中…',
+      maskColor: 'transparent',
+      spinnerRadius: 8,
+      lineWidth: 2,
+    }),
+  );
 });
 
 const host: HostFacts = {
@@ -263,6 +296,57 @@ function renderThroughput(value: NodeLoadView, linked = false, range: LoadRange 
 }
 
 describe('deep host telemetry', () => {
+  it('downsamples only KPI spark data while retaining endpoints, extrema and a gap marker', () => {
+    const series = Array.from({ length: 1_000 }, (_, index) => {
+      const point = sample(false);
+      point.window_start_unix_secs = index * 30;
+      point.window_end_unix_secs = (index + 1) * 30;
+      point.cpu_user_pct = index === 417 ? 0 : index === 418 ? 100 : 20 + (index % 5);
+      point.has_gap = index === 700;
+      return point;
+    });
+
+    const sampled = downsampleKpiSeries(series, point => point.cpu_user_pct);
+
+    expect(sampled.length).toBeLessThanOrEqual(160);
+    expect(sampled[0]).toBe(series[0]);
+    expect(sampled.at(-1)).toBe(series.at(-1));
+    expect(sampled).toContain(series[417]);
+    expect(sampled).toContain(series[418]);
+    expect(sampled).toContain(series[700]);
+    expect(series).toHaveLength(1_000);
+  });
+
+  it('keeps long host facts in wide cells with their complete values available', () => {
+    const cpuModel = 'Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz';
+    const value: NodeLoadView = {
+      ...report(),
+      host: {
+        ...host,
+        cpu_model: cpuModel,
+        cores: 1,
+        os_pretty: 'Debian GNU/Linux 13 (trixie)',
+        virt: 'KVM',
+        kernel: '6.12.0-amd64',
+        arch: 'x86_64',
+        rmem_max: 128 * 1024 ** 2,
+        wmem_max: 128 * 1024 ** 2,
+      },
+    };
+
+    const view = render(<HostCard load={value} />);
+    const cell = (label: string) => view.getByText(label).closest('.nd-rt-c');
+
+    expect(cell('CPU')?.classList.contains('w3')).toBe(true);
+    expect(cell('发行版')?.classList.contains('w3')).toBe(true);
+    expect(cell('内核')?.classList.contains('w3')).toBe(true);
+    expect(cell('收发缓冲')?.classList.contains('w2')).toBe(true);
+    expect(view.getByTitle(`${cpuModel} · 1 核`)).toBeTruthy();
+    expect(view.getByTitle('Debian GNU/Linux 13 (trixie) · KVM')).toBeTruthy();
+    expect(view.getByTitle('6.12.0-amd64 · x86_64')).toBeTruthy();
+    expect(view.getByTitle('128.0 MiB / 128.0 MiB')).toBeTruthy();
+  });
+
   it('fills a node card from its first through last drawable window while retaining internal gaps', () => {
     const value = report();
     value.series = Array.from({ length: 7 }, (_, index) => {
@@ -401,12 +485,102 @@ describe('deep host telemetry', () => {
     expect(view.getByText('还没有负载读数。')).toBeTruthy();
   });
 
+  it('mounts every deep EChart immediately and requests ten metrics per parallel batch', async () => {
+    const value = report();
+    value.series = value.series.map(entry => ({
+      ...entry,
+      cpu_detail: null,
+      memory_detail: null,
+      disk_detail: null,
+      network_detail: null,
+    }));
+    let resolveFetch!: (response: Response) => void;
+    const pendingResponse = new Promise<Response>(resolve => {
+      resolveFetch = resolve;
+    });
+    const requestedBatches: string[][] = [];
+    const metricResponse = (metrics: string[]) =>
+      Response.json({
+        node_id: 'n1',
+        range_start_unix_secs: 0,
+        range_end_unix_secs: 130,
+        window_end_unix_secs: [130],
+        has_gap: [false],
+        metrics: Object.fromEntries(
+          metrics.map(metric => [
+            metric === 'cpu.cores.busy_pct' ? 'cpu.core.0.busy_pct' : metric,
+            [metric.includes('iowait') ? 0.3 : 0],
+          ]),
+        ),
+      });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(input => {
+      const url = String(input);
+      const metrics = new URL(url, 'https://console.test').searchParams.get('metrics')?.split(',') ?? [];
+      requestedBatches.push(metrics);
+      return requestedBatches.length === 1 ? pendingResponse : Promise.resolve(metricResponse(metrics));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <LoadCard report={value} metricRangeKey="1h" />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+
+    expect(view.getByText('CPU 时间占比')).toBeTruthy();
+    expect(view.getByText('CPU 与 I/O 压力')).toBeTruthy();
+    expect(view.getByText('负载与运行队列')).toBeTruthy();
+    expect(view.getByText('调度与网络事件速率')).toBeTruthy();
+    expect(view.getByText('Cgroup 限流时间')).toBeTruthy();
+    expect(view.getByText('逐核繁忙度 · 2 核')).toBeTruthy();
+    expect(view.container.querySelectorAll('.history-chart-card[aria-busy="true"]')).toHaveLength(6);
+    expect(chartMock.showLoading).toHaveBeenCalledTimes(6);
+    expect(chartMock.setOption).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/load/nodes/n1/metrics?');
+    expect(requestedBatches.every(metrics => metrics.length <= 10)).toBe(true);
+    expect(requestedBatches[0]).toContain('cpu.load5');
+    expect(requestedBatches[0]).toHaveLength(10);
+    expect(requestedBatches[1]).toContain('cpu.throttled_usec');
+    expect(requestedBatches[1]).toContain('cpu.cores.busy_pct');
+
+    await waitFor(() =>
+      expect(
+        chartMock.setOption.mock.calls.find(([option]) =>
+          option.series?.some((line: { name: string }) => line.name === '每窗口 throttled'),
+        ),
+      ).toBeTruthy(),
+    );
+    expect(view.container.querySelectorAll('.history-chart-card[aria-busy="true"]')).toHaveLength(4);
+
+    resolveFetch(metricResponse(requestedBatches[0]));
+
+    await waitFor(() =>
+      expect(
+        chartMock.setOption.mock.calls.find(([option]) =>
+          option.series?.some((line: { name: string }) => line.name === '用户态'),
+        ),
+      ).toBeTruthy(),
+    );
+    expect(view.container.querySelectorAll('.history-chart-card[aria-busy="true"]')).toHaveLength(0);
+    expect(chartMock.hideLoading).toHaveBeenCalled();
+    const cpuChart = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === '用户态'),
+    )?.[0];
+    expect(cpuChart.series[0].data).toHaveLength(1);
+    fetchMock.mockRestore();
+  });
+
   it('starts collapsed and switches between complete CPU, memory, disk and network histories', () => {
     const view = render(<LoadCard report={report()} />);
     expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
     expect(view.queryByRole('region', { name: '内存 30 MINUTES 数值' })).toBeNull();
 
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+    const detailMotion = view.container.querySelector('.kpi-detail-motion');
+    expect(detailMotion?.getAttribute('data-motion-state')).toBe('entering');
+    expect(detailMotion?.getAttribute('aria-hidden')).toBeNull();
     expect(view.getByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeTruthy();
     expect(view.queryByText('CPU · 30 MINUTES')).toBeNull();
     expect(view.queryByText(/30 秒窗口 · 缺口断线/)).toBeNull();
@@ -455,6 +629,21 @@ describe('deep host telemetry', () => {
     expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
   });
 
+  it('keeps the expanded KPI content mounted but inert while it collapses', async () => {
+    const view = render(<LoadCard report={report()} />);
+    const cpu = view.getByRole('button', { name: /CPU/ });
+
+    fireEvent.click(cpu);
+    await act(async () => Promise.resolve());
+    fireEvent.click(cpu);
+
+    const detailMotion = view.container.querySelector('.kpi-detail-motion');
+    expect(detailMotion?.getAttribute('data-motion-state')).toBe('exiting');
+    expect(detailMotion?.getAttribute('aria-hidden')).toBe('true');
+    expect(detailMotion?.hasAttribute('inert')).toBe(true);
+    expect(view.queryByRole('region', { name: 'CPU 30 MINUTES 数值' })).toBeNull();
+  });
+
   it('moves history units into titles except for percentages, and keeps units on standalone readings', () => {
     const view = render(<LoadCard report={report()} />);
 
@@ -490,7 +679,7 @@ describe('deep host telemetry', () => {
     expect(view.getByLabelText('连接与套接字 图例').textContent).toContain('TCP 已建立 0.0820 k');
   });
 
-  it('keeps the network throughput legend and metadata in the dedicated throughput panel', () => {
+  it('keeps the network throughput legend and metadata in the dedicated throughput panel', async () => {
     const value = reportWith(sample => {
       sample.nic_rx_drop = 15;
     });
@@ -499,7 +688,7 @@ describe('deep host telemetry', () => {
     const header = view.getByText('网卡流量').parentElement;
 
     expect(legend.tagName).toBe('FOOTER');
-    expect(view.container.querySelector('.ndtp-ec')).toBeTruthy();
+    await waitFor(() => expect(view.container.querySelector('.ndtp-ec')).toBeTruthy());
     expect(header?.textContent).toContain('接收丢弃 15 · eth0 · MTU 1500');
     expect(header?.textContent).not.toContain('上报');
     expect(legend.textContent).not.toContain('接收丢弃');
@@ -531,6 +720,43 @@ describe('deep host telemetry', () => {
     const view = render(<LoadCard report={report()} linked />);
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
     expect(chartMock.connect).toHaveBeenCalledWith('nd-cpu-history-n1');
+  });
+
+  it('sweeps Ping data in once and keeps later sample updates stable', () => {
+    const ping = {
+      node_id: 'n1',
+      targets: [
+        {
+          name: '测试落点',
+          address: 'icmp://192.0.2.1',
+          samples: [{ probed_at_unix_secs: 100, attempted: true, latency_us: 12_000 }],
+        },
+      ],
+    };
+    const view = render(<PingLatencyChart view={ping} bounds={{ startUnixSecs: 0, endUnixSecs: 130 }} />);
+    const initial = chartMock.setOption.mock.calls.at(-1)?.[0];
+
+    expect(initial.animation).toBe(true);
+    expect(initial.animationThreshold).toBe(10_000);
+    expect(initial.animationDuration).toBe(360);
+
+    view.rerender(
+      <PingLatencyChart
+        view={{
+          ...ping,
+          targets: [
+            {
+              ...ping.targets[0],
+              samples: [...ping.targets[0].samples, { probed_at_unix_secs: 110, attempted: true, latency_us: 13_000 }],
+            },
+          ],
+        }}
+        bounds={{ startUnixSecs: 0, endUnixSecs: 130 }}
+      />,
+    );
+    const updated = chartMock.setOption.mock.calls.at(-1)?.[0];
+    expect(updated.animation).toBe(false);
+    expect(updated.animationDuration).toBe(0);
   });
 
   it('does not render the host summary strip', () => {
@@ -584,6 +810,11 @@ describe('deep host telemetry', () => {
       option.series?.some((line: { name: string }) => line.name === '用户态'),
     )?.[0];
     expect(chart).toBeTruthy();
+    expect(chart.animation).toBe(true);
+    expect(chart.animationThreshold).toBe(10_000);
+    expect(chart.animationDuration).toBe(360);
+    expect(chart.animationEasing).toBe('cubicInOut');
+    expect(chart.animationDurationUpdate).toBe(0);
     expect(chart.color.slice(0, 6)).toEqual(['#3e8fb0', '#e99cd3', '#8bbe95', '#7da1e3', '#ea9a97', '#9ccfd8']);
     expect(chart.xAxis.splitLine.show).toBe(true);
     expect(chart.yAxis.splitLine.show).toBe(true);
@@ -612,6 +843,15 @@ describe('deep host telemetry', () => {
       { seriesName: '高值', color: '#222', value: [130_000, 2], dataIndex: 0 },
     ]);
     expect(tooltip.indexOf('高值')).toBeLessThan(tooltip.indexOf('低值'));
+
+    const updated = report();
+    updated.series = updated.series.map(entry => ({ ...entry, cpu_user_pct: entry.cpu_user_pct + 1 }));
+    view.rerender(<LoadCard report={updated} />);
+    const updatedChart = chartMock.setOption.mock.calls
+      .filter(([option]) => option.series?.some((line: { name: string }) => line.name === '用户态'))
+      .at(-1)?.[0];
+    expect(updatedChart.animation).toBe(false);
+    expect(updatedChart.animationDuration).toBe(0);
   });
 
   it('keeps old-agent KPI values but disables unavailable drill-downs', () => {
@@ -697,14 +937,15 @@ describe('deep host telemetry', () => {
     expect(network.series[1].data).toEqual([[10_030_000, 200]]);
   });
 
-  it('keeps the last NIC reading visible when the absolute interval is empty', () => {
+  it('replaces stale throughput readings when the selected interval has no Agent samples', () => {
     const value = report();
     value.series = [];
     const view = renderThroughput(value);
 
-    expect(view.getByText(/最后样本/)).toBeTruthy();
-    expect(view.getByLabelText('网卡流量图例').textContent).toContain('接收 100');
-    expect(view.getByLabelText('网卡流量图例').textContent).toContain('发送 200');
+    expect(view.getAllByText('尚无 Agent 上报样本。')).toHaveLength(2);
+    expect(view.queryByText(/最后样本/)).toBeNull();
+    expect(view.container.querySelector('.ndtp-ec')).toBeNull();
+    expect(chartMock.setOption).not.toHaveBeenCalled();
   });
 
   it('does not treat a gap-marked last sample as a valid NIC rate', () => {

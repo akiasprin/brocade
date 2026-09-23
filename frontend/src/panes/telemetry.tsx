@@ -7,7 +7,8 @@
  * 时间统一使用 unix 秒（服务端两侧共用同一组结构体，见 api.ts 的说明），因此传给
  * `Ago` 之前需要转换为 ISO —— `iso()` 即用于该转换。
  */
-import { memo, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { Fragment, memo, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { useQueries } from '@tanstack/react-query';
 import * as echarts from 'echarts/core';
 import { LineChart } from 'echarts/charts';
 import { GridComponent, MarkLineComponent, TooltipComponent } from 'echarts/components';
@@ -21,20 +22,25 @@ import {
   observeAxisLine,
   observeAxisTick,
   observeBpsReading,
-  observeBpsUnit,
   observeBytesUnit,
   observeColors,
   observeCountUnit,
   observeMsUnit,
   observeMinorTick,
   observeNumberUnit,
+  observeLoadingOptions,
   observeSeriesLine,
   observeTimeInterval,
   observeValueAxis,
 } from '../ui/observe-chart';
 import type { ObserveAxisUnit, ObserveValueAxis } from '../ui/observe-chart';
+import { echartsEntranceAnimation, useEchartsViewportEntry } from '../ui/echarts-motion';
+import { dur, iso, throughputAxis } from './telemetry-format';
+
+export { dur, iso, throughputAxis } from './telemetry-format';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
+import { usePresence } from '../ui/presence';
 import type {
   CpuDetailSample,
   DiskDetailSample,
@@ -42,8 +48,10 @@ import type {
   LoadSample,
   MemoryDetailSample,
   NetworkDetailSample,
+  NodeLoadMetricView,
   NodeLoadView,
 } from '../api';
+import { fetchNodeLoadMetrics } from '../api';
 
 // 与 nodes.tsx 的 FleetNetChart 共用同一套注册；echarts.use 对重复注册幂等，
 // 但本模块独立使用 echarts，需要自己声明所依赖的组件。
@@ -51,9 +59,6 @@ echarts.use([LineChart, GridComponent, MarkLineComponent, TooltipComponent, Canv
 
 /** canvas 里字体要给具体栈，不能写 var(--mono)。 */
 const TP_MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
-
-/** unix 秒转 ISO。`Ago` 接受 ISO 字符串，而协议中统一使用秒。nodes.tsx 的 HOST 卡复用 */
-export const iso = (secs: number) => new Date(secs * 1000).toISOString();
 
 /* ── 格式化 ──────────────────────────────────────────────────
  * 带宽使用 1000 进制（Mbit/s 是网络领域的常用单位），字节使用 ui/format 的 1024 进制。
@@ -72,15 +77,6 @@ export const bps = (n: number | null): string => (n === null ? '—' : observeBp
 const ms = (us: number): string => (us >= 10_000 ? `${Math.round(us / 1000)} ms` : `${(us / 1000).toFixed(1)} ms`);
 
 const pct = (n: number, digits = 0): string => `${n.toFixed(digits)}%`;
-
-/** 时长格式化——用于 uptime 和进程启动时刻。Ago 接受 ISO 字符串，此处接受秒数。
-    nodes.tsx 的 AGENT 卡（agent 进程已运行）复用。 */
-export function dur(secs: number): string {
-  if (secs < 60) return `${Math.round(secs)} 秒`;
-  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)} 小时`;
-  return `${Math.floor(secs / 86400)} 天`;
-}
 
 /** 一条判定。
  *
@@ -579,21 +575,6 @@ function congestionFindings(r: NodeLoadView): Finding[] {
  * - 两条线都使用「淡化 + 正常 + 中」填充；填充不是流向主次，不改变数据口径。
  * - 缺口（has_gap / null）断开不连接。 */
 
-/** 吞吐值轴的量程与单位。刻度由 ThroughputChart 画，单位由 ThroughputPanel 写在标题栏里
- *  （`网卡流量 (Mbit/s)`），两处都走这个函数取值——峰值只算一遍，量纲不可能对不上。 */
-export function throughputAxis(
-  rx: (number | null)[],
-  tx: (number | null)[],
-): { axis: ObserveValueAxis; unit: ObserveAxisUnit } {
-  const peak = Math.max(
-    ...rx.filter((value): value is number => value !== null),
-    ...tx.filter((value): value is number => value !== null),
-    1,
-  );
-  const axis = observeValueAxis(peak);
-  return { axis, unit: observeBpsUnit(axis) };
-}
-
 export function ThroughputChart({
   timesUnixSecs,
   rangeStartUnixSecs,
@@ -620,6 +601,8 @@ export function ThroughputChart({
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
   const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
   const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
+  const enteredViewport = useEchartsViewportEntry(elRef);
+  const hasRenderedData = useRef(false);
   // 最近一次真正写入实例的输入签名。父组件可能因无关状态每秒重渲染（LoadCard 的相对
   // 时间标签由 useNow 驱动），传入身份新但值相同的数组；若仅凭数组身份就重设 option，
   // notMerge 会销毁悬停中的 tooltip DOM——值未变时必须跳过。
@@ -644,7 +627,7 @@ export function ThroughputChart({
   // 数据或主题变化时重设 option。数据角色色从 :root 的 CSS 令牌读。
   useEffect(() => {
     const chart = chartRef.current;
-    if (!chart) return;
+    if (!chart || !enteredViewport) return;
     const sig = JSON.stringify([
       timesUnixSecs,
       rangeStartUnixSecs,
@@ -701,7 +684,7 @@ export function ThroughputChart({
 
     chart.setOption(
       {
-        animation: false,
+        ...echartsEntranceAnimation(!hasRenderedData.current),
         color: colors,
         grid: { left: 10, right: 14, top: 10, bottom: 10, containLabel: true },
         textStyle: { fontFamily: TP_MONO },
@@ -766,9 +749,22 @@ export function ThroughputChart({
       },
       true,
     );
+    hasRenderedData.current = true;
     // connect 按组联动所有已建实例；任一图重设 option 后重连一次，保证最新成员都在组内。
     if (group) echarts.connect(group);
-  }, [timesUnixSecs, rangeStartUnixSecs, rangeEndUnixSecs, rx, tx, rxName, txName, group, themeName, paletteKey]);
+  }, [
+    enteredViewport,
+    group,
+    paletteKey,
+    rangeEndUnixSecs,
+    rangeStartUnixSecs,
+    rx,
+    rxName,
+    themeName,
+    timesUnixSecs,
+    tx,
+    txName,
+  ]);
 
   return <div ref={elRef} className="ndtp-ec" />;
 }
@@ -850,6 +846,8 @@ function HistoryChart({
   max,
   threshold,
   wide = false,
+  loading = false,
+  ready = true,
 }: {
   title: string;
   samples: LoadSample[];
@@ -861,12 +859,16 @@ function HistoryChart({
   max?: number;
   threshold?: { value: number; label: string };
   wide?: boolean;
+  loading?: boolean;
+  ready?: boolean;
 } & HistoryFormatProps) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
   const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
   const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
   const lastSig = useRef<string | null>(null);
+  const hasRenderedData = useRef(false);
+  const enteredViewport = useEchartsViewportEntry(elRef);
   const observedPeak = historyObservedPeak(lines, threshold);
   const valueAxis = max === undefined ? observeValueAxis(observedPeak) : null;
   // 显式 max 的容量/连接图仍需要一个完整轴描述来选整卡单位；这只决定显示档位，实际轴上界
@@ -893,7 +895,20 @@ function HistoryChart({
 
   useEffect(() => {
     const chart = chartRef.current;
-    if (!chart) return;
+    const el = elRef.current;
+    if (!chart || !el) return;
+    if (!loading) {
+      chart.hideLoading();
+      return;
+    }
+    const css = getComputedStyle(el);
+    const cv = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
+    chart.showLoading('default', observeLoadingOptions(cv));
+  }, [loading, paletteKey, themeName]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !ready || !enteredViewport) return;
     const times = samples.map(sample => sample.window_end_unix_secs);
     const sig = JSON.stringify([times, lines, title, max, threshold, group, unit?.name, themeName, paletteKey]);
     if (sig === lastSig.current) return;
@@ -936,9 +951,11 @@ function HistoryChart({
         second: '2-digit',
         hour12: false,
       });
+    // 首次拿到数据时让 ECharts 用折线自己的裁剪动画从时间轴左端扫入。后续实时轮询、
+    // 主题切换和窗口内数据刷新都直接更新，避免每 10 秒重新播放整段历史。
     chart.setOption(
       {
-        animation: false,
+        ...echartsEntranceAnimation(!hasRenderedData.current),
         color: colors,
         grid: {
           left: 10,
@@ -1051,14 +1068,17 @@ function HistoryChart({
       },
       true,
     );
+    hasRenderedData.current = true;
     if (group) echarts.connect(group);
   }, [
     axisText,
+    enteredViewport,
     group,
     lines,
     max,
     paletteKey,
     readValue,
+    ready,
     samples,
     themeName,
     threshold,
@@ -1076,11 +1096,14 @@ function HistoryChart({
   };
   const renderHeaderReading = (reading: HistoryHeaderReading | undefined) =>
     typeof reading === 'function' ? reading(readValue) : reading;
-  const renderedMeta = renderHeaderReading(meta);
+  const renderedMeta = ready ? renderHeaderReading(meta) : undefined;
   const renderedCurrent = renderHeaderReading(current);
 
   return (
-    <section className={`history-chart-card history-chart-card-${variant}${wide ? ' history-chart-card-wide' : ''}`}>
+    <section
+      className={`history-chart-card history-chart-card-${variant}${wide ? ' history-chart-card-wide' : ''}`}
+      aria-busy={loading || undefined}
+    >
       <header className="history-chart-cap">
         <b>{title}</b>
         {unit?.name && <span className="chart-unit">({unit.name})</span>}
@@ -1090,7 +1113,7 @@ function HistoryChart({
       <div ref={elRef} className="history-chart" />
       <footer className="history-chart-legend" aria-label={`${title} 图例`}>
         {lines.map((line, index) => {
-          const value = latest(line.values);
+          const value = ready ? latest(line.values) : null;
           const color = `var(${historyLineColorVar(line, index)})`;
           return (
             <span key={line.name} className={line.area ? 'area' : line.dashed ? 'dashed' : undefined}>
@@ -1107,14 +1130,371 @@ function HistoryChart({
 const historyValues = (samples: LoadSample[], read: (sample: LoadSample) => number | null): (number | null)[] =>
   samples.map(sample => (sample.has_gap ? null : read(sample)));
 
+type LoadDetail = 'cpu' | 'memory' | 'disk' | 'network';
+
+/** Each entry groups the selectors consumed by one or two adjacent ECharts. Base fields already
+ * live in the overview response and therefore do not appear again here. Groups are packed into
+ * requests below; they are not themselves network request boundaries. */
+const DETAIL_METRIC_GROUPS: Record<LoadDetail, readonly (readonly string[])[]> = {
+  cpu: [
+    ['cpu.iowait_pct', 'cpu.pressure_some_pct', 'cpu.io_pressure_some_pct', 'cpu.io_pressure_full_pct'],
+    [
+      'cpu.load5',
+      'cpu.load15',
+      'cpu.procs_running',
+      'cpu.context_switches_per_sec',
+      'cpu.net_rx_softirqs_per_sec',
+      'cpu.net_tx_softirqs_per_sec',
+    ],
+    ['cpu.throttled_usec', 'cpu.cores.busy_pct'],
+  ],
+  memory: [
+    [
+      'memory.available_min_bytes',
+      'memory.anon_bytes',
+      'memory.shmem_bytes',
+      'memory.kernel_other_bytes',
+      'memory.file_cache_bytes',
+      'memory.free_bytes',
+      'memory.pressure_some_pct',
+      'memory.pressure_full_pct',
+    ],
+    [
+      'memory.buffers_bytes',
+      'memory.kernel_reclaimable_bytes',
+      'memory.slab_unreclaimable_bytes',
+      'memory.unevictable_bytes',
+      'memory.mlocked_bytes',
+      'memory.gup_pinned_bytes',
+      'memory.swap_cached_bytes',
+      'memory.dirty_bytes',
+      'memory.writeback_bytes',
+    ],
+    ['memory.swap_in_bytes', 'memory.swap_out_bytes', 'memory.major_faults', 'memory.direct_reclaim_pages'],
+  ],
+  disk: [
+    ['disk.total_bytes', 'disk.busy_pct', 'disk.pressure_some_pct', 'disk.pressure_full_pct'],
+    ['disk.total_bytes', 'disk.read_bps', 'disk.write_bps'],
+    ['disk.read_iops', 'disk.write_iops', 'disk.read_await_ms', 'disk.write_await_ms'],
+    ['disk.queue_depth', 'disk.in_flight'],
+  ],
+  network: [
+    [
+      'network.tcp_curr_estab',
+      'network.tcp_time_wait',
+      'network.tcp_orphan',
+      'network.udp_inuse',
+      'network.ephemeral_port_capacity',
+      'network.tcp_ephemeral_top_target_v4',
+      'network.tcp_ephemeral_top_target_v6',
+    ],
+    [
+      'network.tcp_ephemeral_inuse_v4',
+      'network.tcp_ephemeral_time_wait_v4',
+      'network.tcp_ephemeral_inuse_v6',
+      'network.tcp_ephemeral_time_wait_v6',
+      'network.tcp_inuse',
+    ],
+    [
+      'network.tcp_active_opens',
+      'network.tcp_passive_opens',
+      'network.tcp_attempt_fails',
+      'network.tcp_estab_resets',
+      'network.tcp_retrans_segs',
+      'network.tcp_syn_retrans',
+      'network.tcp_timeouts',
+      'network.tcp_in_errors',
+      'network.tcp_out_resets',
+    ],
+    [
+      'network.tcp_listen_overflows',
+      'network.tcp_listen_drops',
+      'network.udp_in_errors',
+      'network.udp_no_ports',
+      'network.udp_rcvbuf_errors',
+      'network.udp_sndbuf_errors',
+      'network.tcp_mem_bytes',
+      'network.udp_mem_bytes',
+    ],
+  ],
+};
+
+const METRICS_PER_BATCH = 10;
+
+type MetricBatchPlan = {
+  batches: string[][];
+  /** For each logical chart group, the request batch that contains all of its selectors. */
+  groupBatchIndices: number[];
+};
+
+/** Pack whole chart groups into requests of at most ten distinct selectors. Keeping a group whole
+ * means a chart never renders against a partially returned metric set. */
+function planMetricBatches(groups: readonly (readonly string[])[]): MetricBatchPlan {
+  const batches: string[][] = [];
+  const groupBatchIndices: number[] = [];
+  for (const group of groups) {
+    if (group.length > METRICS_PER_BATCH) throw new Error(`单组深度指标超过 ${METRICS_PER_BATCH} 项`);
+    const current = batches.at(-1);
+    const additions = group.filter(metric => !current?.includes(metric));
+    if (!current || current.length + additions.length > METRICS_PER_BATCH) {
+      batches.push([...new Set(group)]);
+    } else {
+      current.push(...additions);
+    }
+    groupBatchIndices.push(batches.length - 1);
+  }
+  return { batches, groupBatchIndices };
+}
+
+const DETAIL_METRIC_PLANS: Record<LoadDetail, MetricBatchPlan> = {
+  cpu: planMetricBatches(DETAIL_METRIC_GROUPS.cpu),
+  memory: planMetricBatches(DETAIL_METRIC_GROUPS.memory),
+  disk: planMetricBatches(DETAIL_METRIC_GROUPS.disk),
+  network: planMetricBatches(DETAIL_METRIC_GROUPS.network),
+};
+
+type MetricGroupState = { ready: boolean; loading: boolean };
+const READY_METRIC_GROUP: MetricGroupState = { ready: true, loading: false };
+const metricGroupState = (states: readonly MetricGroupState[] | undefined, index: number): MetricGroupState =>
+  states?.[index] ?? READY_METRIC_GROUP;
+
+const metricAt = (view: NodeLoadMetricView, metric: string, index: number): number | null =>
+  view.metrics[metric]?.[index] ?? null;
+
+function mergeMetricViews(views: NodeLoadMetricView[]): NodeLoadMetricView | null {
+  const first = views[0];
+  if (!first) return null;
+  const windowEnd = [...new Set(views.flatMap(view => view.window_end_unix_secs))].sort((left, right) => left - right);
+  const indexByWindowEnd = new Map(windowEnd.map((value, index) => [value, index]));
+  const hasGap = new Array<boolean>(windowEnd.length).fill(false);
+  const metrics: Record<string, Array<number | null>> = {};
+  for (const view of views) {
+    view.window_end_unix_secs.forEach((value, sourceIndex) => {
+      const targetIndex = indexByWindowEnd.get(value);
+      if (targetIndex !== undefined) hasGap[targetIndex] ||= view.has_gap[sourceIndex] ?? false;
+    });
+    for (const [metric, values] of Object.entries(view.metrics)) {
+      const aligned = metrics[metric] ?? new Array<number | null>(windowEnd.length).fill(null);
+      view.window_end_unix_secs.forEach((value, sourceIndex) => {
+        const targetIndex = indexByWindowEnd.get(value);
+        if (targetIndex !== undefined) aligned[targetIndex] = values[sourceIndex] ?? null;
+      });
+      metrics[metric] = aligned;
+    }
+  }
+  return {
+    ...first,
+    range_start_unix_secs: Math.min(...views.map(view => view.range_start_unix_secs)),
+    range_end_unix_secs: Math.max(...views.map(view => view.range_end_unix_secs)),
+    window_end_unix_secs: windowEnd,
+    has_gap: hasGap,
+    metrics,
+  };
+}
+
+function emptyMetricView(report: NodeLoadView): NodeLoadMetricView {
+  return {
+    node_id: report.node_id,
+    range_start_unix_secs: report.range_start_unix_secs,
+    range_end_unix_secs: report.range_end_unix_secs,
+    window_end_unix_secs: report.series.map(sample => sample.window_end_unix_secs),
+    has_gap: report.series.map(sample => sample.has_gap),
+    metrics: {},
+  };
+}
+
+/** Rebuild only the legacy in-memory shape consumed by the chart definitions. Missing fields are
+ * placeholders and never render before their batch is ready; the API response itself remains a
+ * compact column store rather than repeating these objects for every sample. */
+function hydrateMetricReport(report: NodeLoadView, view: NodeLoadMetricView, detail: LoadDetail): NodeLoadView {
+  const coreIds = Object.keys(view.metrics)
+    .map(metric => /^cpu\.core\.(\d+)\.busy_pct$/.exec(metric)?.[1])
+    .filter((cpu): cpu is string => cpu !== undefined)
+    .map(Number)
+    .sort((left, right) => left - right);
+  const metricIndexByWindowEnd = new Map(view.window_end_unix_secs.map((windowEnd, index) => [windowEnd, index]));
+  const series = report.series.map((sample): LoadSample => {
+    const index = metricIndexByWindowEnd.get(sample.window_end_unix_secs) ?? -1;
+    if (detail === 'cpu') {
+      const cpu_detail: CpuDetailSample = {
+        iowait_pct: metricAt(view, 'cpu.iowait_pct', index) ?? 0,
+        load5: metricAt(view, 'cpu.load5', index) ?? 0,
+        load15: metricAt(view, 'cpu.load15', index) ?? 0,
+        pressure_some_pct: metricAt(view, 'cpu.pressure_some_pct', index),
+        io_pressure_some_pct: metricAt(view, 'cpu.io_pressure_some_pct', index),
+        io_pressure_full_pct: metricAt(view, 'cpu.io_pressure_full_pct', index),
+        procs_running: metricAt(view, 'cpu.procs_running', index),
+        procs_total: null,
+        context_switches_per_sec: metricAt(view, 'cpu.context_switches_per_sec', index),
+        net_rx_softirqs_per_sec: metricAt(view, 'cpu.net_rx_softirqs_per_sec', index),
+        net_tx_softirqs_per_sec: metricAt(view, 'cpu.net_tx_softirqs_per_sec', index),
+        throttled_usec: metricAt(view, 'cpu.throttled_usec', index),
+        frequency_mhz: null,
+        cores: coreIds.map(cpu => ({
+          cpu,
+          user_pct: metricAt(view, `cpu.core.${cpu}.busy_pct`, index) ?? 0,
+          system_pct: 0,
+          softirq_pct: 0,
+          iowait_pct: 0,
+          steal_pct: 0,
+        })),
+      };
+      return { ...sample, cpu_detail };
+    }
+    if (detail === 'memory') {
+      const memory_detail: MemoryDetailSample = {
+        available_min_bytes: metricAt(view, 'memory.available_min_bytes', index) ?? 0,
+        free_bytes: metricAt(view, 'memory.free_bytes', index) ?? 0,
+        anon_bytes: metricAt(view, 'memory.anon_bytes', index) ?? 0,
+        file_cache_bytes: metricAt(view, 'memory.file_cache_bytes', index) ?? 0,
+        shmem_bytes: metricAt(view, 'memory.shmem_bytes', index) ?? 0,
+        kernel_other_bytes: metricAt(view, 'memory.kernel_other_bytes', index) ?? 0,
+        buffers_bytes: metricAt(view, 'memory.buffers_bytes', index) ?? 0,
+        kernel_reclaimable_bytes: metricAt(view, 'memory.kernel_reclaimable_bytes', index) ?? 0,
+        slab_unreclaimable_bytes: metricAt(view, 'memory.slab_unreclaimable_bytes', index) ?? 0,
+        unevictable_bytes: metricAt(view, 'memory.unevictable_bytes', index) ?? 0,
+        mlocked_bytes: metricAt(view, 'memory.mlocked_bytes', index) ?? 0,
+        dirty_bytes: metricAt(view, 'memory.dirty_bytes', index) ?? 0,
+        writeback_bytes: metricAt(view, 'memory.writeback_bytes', index) ?? 0,
+        swap_total_bytes: 0,
+        swap_cached_bytes: metricAt(view, 'memory.swap_cached_bytes', index) ?? 0,
+        zswap_bytes: null,
+        zswapped_bytes: null,
+        gup_pinned_bytes: metricAt(view, 'memory.gup_pinned_bytes', index),
+        swap_in_bytes: metricAt(view, 'memory.swap_in_bytes', index) ?? 0,
+        swap_out_bytes: metricAt(view, 'memory.swap_out_bytes', index) ?? 0,
+        pressure_some_pct: metricAt(view, 'memory.pressure_some_pct', index),
+        pressure_full_pct: metricAt(view, 'memory.pressure_full_pct', index),
+        major_faults: metricAt(view, 'memory.major_faults', index) ?? 0,
+        direct_reclaim_pages: metricAt(view, 'memory.direct_reclaim_pages', index) ?? 0,
+      };
+      return { ...sample, memory_detail };
+    }
+    if (detail === 'disk') {
+      const disk_detail: DiskDetailSample = {
+        total_bytes: metricAt(view, 'disk.total_bytes', index),
+        inode_total: null,
+        inode_free: null,
+        read_bps: metricAt(view, 'disk.read_bps', index),
+        write_bps: metricAt(view, 'disk.write_bps', index),
+        read_iops: metricAt(view, 'disk.read_iops', index),
+        write_iops: metricAt(view, 'disk.write_iops', index),
+        read_await_ms: metricAt(view, 'disk.read_await_ms', index),
+        write_await_ms: metricAt(view, 'disk.write_await_ms', index),
+        busy_pct: metricAt(view, 'disk.busy_pct', index),
+        queue_depth: metricAt(view, 'disk.queue_depth', index),
+        in_flight: metricAt(view, 'disk.in_flight', index),
+        pressure_some_pct: metricAt(view, 'disk.pressure_some_pct', index),
+        pressure_full_pct: metricAt(view, 'disk.pressure_full_pct', index),
+      };
+      return { ...sample, disk_detail };
+    }
+    const network_detail: NetworkDetailSample = {
+      tcp_curr_estab: metricAt(view, 'network.tcp_curr_estab', index),
+      tcp_inuse: metricAt(view, 'network.tcp_inuse', index),
+      tcp_time_wait: metricAt(view, 'network.tcp_time_wait', index),
+      tcp_orphan: metricAt(view, 'network.tcp_orphan', index),
+      tcp_alloc: null,
+      tcp_mem_bytes: metricAt(view, 'network.tcp_mem_bytes', index),
+      udp_inuse: metricAt(view, 'network.udp_inuse', index),
+      udp_mem_bytes: metricAt(view, 'network.udp_mem_bytes', index),
+      ephemeral_port_capacity: metricAt(view, 'network.ephemeral_port_capacity', index),
+      tcp_ephemeral_inuse_v4: metricAt(view, 'network.tcp_ephemeral_inuse_v4', index),
+      tcp_ephemeral_inuse_v6: metricAt(view, 'network.tcp_ephemeral_inuse_v6', index),
+      tcp_ephemeral_time_wait_v4: metricAt(view, 'network.tcp_ephemeral_time_wait_v4', index),
+      tcp_ephemeral_time_wait_v6: metricAt(view, 'network.tcp_ephemeral_time_wait_v6', index),
+      tcp_ephemeral_top_target_v4: metricAt(view, 'network.tcp_ephemeral_top_target_v4', index),
+      tcp_ephemeral_top_target_v6: metricAt(view, 'network.tcp_ephemeral_top_target_v6', index),
+      tcp_active_opens: metricAt(view, 'network.tcp_active_opens', index),
+      tcp_passive_opens: metricAt(view, 'network.tcp_passive_opens', index),
+      tcp_attempt_fails: metricAt(view, 'network.tcp_attempt_fails', index),
+      tcp_estab_resets: metricAt(view, 'network.tcp_estab_resets', index),
+      tcp_retrans_segs: metricAt(view, 'network.tcp_retrans_segs', index),
+      tcp_syn_retrans: metricAt(view, 'network.tcp_syn_retrans', index),
+      tcp_in_errors: metricAt(view, 'network.tcp_in_errors', index),
+      tcp_out_resets: metricAt(view, 'network.tcp_out_resets', index),
+      tcp_timeouts: metricAt(view, 'network.tcp_timeouts', index),
+      tcp_listen_overflows: metricAt(view, 'network.tcp_listen_overflows', index),
+      tcp_listen_drops: metricAt(view, 'network.tcp_listen_drops', index),
+      udp_in_errors: metricAt(view, 'network.udp_in_errors', index),
+      udp_no_ports: metricAt(view, 'network.udp_no_ports', index),
+      udp_rcvbuf_errors: metricAt(view, 'network.udp_rcvbuf_errors', index),
+      udp_sndbuf_errors: metricAt(view, 'network.udp_sndbuf_errors', index),
+    };
+    return { ...sample, network_detail };
+  });
+  return { ...report, series };
+}
+
+function DeepMetricHistory({
+  detail,
+  report,
+  label,
+  linked,
+  rangeKey: observationRangeKey,
+  live,
+}: {
+  detail: LoadDetail;
+  report: NodeLoadView;
+  label: string;
+  linked: boolean;
+  rangeKey: string | number;
+  live: boolean;
+}) {
+  const plan = DETAIL_METRIC_PLANS[detail];
+  const queries = useQueries({
+    // 每批最多十项指标；选中类别的所有批次同时发出。图表容器不等待这些查询，某一批
+    // 返回后只唤醒依赖该批指标的图表。
+    queries: plan.batches.map((metrics, batch) => ({
+      queryKey: ['node-load-metrics', report.node_id, observationRangeKey, detail, batch, metrics.join(',')],
+      queryFn: () =>
+        fetchNodeLoadMetrics(report.node_id, report.range_start_unix_secs, report.range_end_unix_secs, metrics),
+      retry: false,
+      refetchInterval: live ? 10_000 : false,
+    })),
+  });
+  const readyViews = queries.flatMap(query => (query.data ? [query.data] : []));
+  const batchStates = queries.map(query => ({
+    ready: Boolean(query.data),
+    loading: !query.data && query.isFetching,
+  }));
+  const metricStates = plan.groupBatchIndices.map(batch => batchStates[batch] ?? READY_METRIC_GROUP);
+  const merged = mergeMetricViews(readyViews);
+  const hydrated = hydrateMetricReport(report, merged ?? emptyMetricView(report), detail);
+  const failed = queries.find(query => query.error);
+
+  return (
+    <>
+      {detail === 'cpu' && <CpuHistory report={hydrated} label={label} linked={linked} metricStates={metricStates} />}
+      {detail === 'memory' && (
+        <MemoryHistory report={hydrated} label={label} linked={linked} metricStates={metricStates} />
+      )}
+      {detail === 'disk' && <DiskHistory report={hydrated} label={label} linked={linked} metricStates={metricStates} />}
+      {detail === 'network' && (
+        <NetworkHistory report={hydrated} label={label} linked={linked} metricStates={metricStates} />
+      )}
+      {failed && (
+        <div className="callout err" role="alert">
+          深度图表读取失败。
+          <button className="btn sm" type="button" onClick={() => void failed.refetch()}>
+            重试
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
 const CpuHistory = memo(function CpuHistory({
   report,
   label,
   linked,
+  metricStates,
 }: {
   report: NodeLoadView;
   label: string;
   linked: boolean;
+  metricStates?: readonly MetricGroupState[];
 }) {
   const samples = report.series;
   const group = linked ? `nd-cpu-history-${report.node_id}` : undefined;
@@ -1130,11 +1510,17 @@ const CpuHistory = memo(function CpuHistory({
     last.cpu_softirq_pct +
     (last.cpu_detail?.iowait_pct ?? 0) +
     last.cpu_steal_pct;
+  const primaryState = metricGroupState(metricStates, 0);
+  const schedulerState = metricGroupState(metricStates, 1);
+  const cgroupState = metricGroupState(metricStates, 2);
+  const visibleCoreCount = coreIds.length || report.host?.cores || 0;
   return (
     <section className="observe-history" aria-label={`CPU ${label} 数值`}>
       <div className="history-primary">
         <HistoryChart
           title="CPU 时间占比"
+          loading={primaryState.loading}
+          ready={primaryState.ready}
           samples={samples}
           group={group}
           formatValue={value => pct(value, 1)}
@@ -1188,6 +1574,8 @@ const CpuHistory = memo(function CpuHistory({
         />
         <HistoryChart
           title="CPU 与 I/O 压力"
+          loading={primaryState.loading}
+          ready={primaryState.ready}
           samples={samples}
           group={group}
           formatValue={value => pct(value, 2)}
@@ -1214,6 +1602,8 @@ const CpuHistory = memo(function CpuHistory({
       <div className="history-grid">
         <HistoryChart
           title="负载与运行队列"
+          loading={schedulerState.loading}
+          ready={schedulerState.ready}
           samples={samples}
           group={group}
           formatValue={value => value.toFixed(2)}
@@ -1229,6 +1619,8 @@ const CpuHistory = memo(function CpuHistory({
         />
         <HistoryChart
           title="调度与网络事件速率"
+          loading={schedulerState.loading}
+          ready={schedulerState.ready}
           samples={samples}
           group={group}
           valueUnit={historyCountRateUnit}
@@ -1249,6 +1641,8 @@ const CpuHistory = memo(function CpuHistory({
         />
         <HistoryChart
           title="Cgroup 限流时间"
+          loading={cgroupState.loading}
+          ready={cgroupState.ready}
           samples={samples}
           group={group}
           valueUnit={historyMsUnit}
@@ -1261,9 +1655,11 @@ const CpuHistory = memo(function CpuHistory({
             },
           ]}
         />
-        {coreIds.length > 0 && (
+        {(!cgroupState.ready || coreIds.length > 0) && (
           <HistoryChart
-            title={`逐核繁忙度 · ${coreIds.length} 核`}
+            title={`逐核繁忙度 · ${visibleCoreCount} 核`}
+            loading={cgroupState.loading}
+            ready={cgroupState.ready}
             samples={samples}
             group={group}
             formatValue={value => pct(value, 1)}
@@ -1286,10 +1682,12 @@ const MemoryHistory = memo(function MemoryHistory({
   report,
   label,
   linked,
+  metricStates,
 }: {
   report: NodeLoadView;
   label: string;
   linked: boolean;
+  metricStates?: readonly MetricGroupState[];
 }) {
   const samples = report.series;
   const group = linked ? `nd-memory-history-${report.node_id}` : undefined;
@@ -1297,11 +1695,16 @@ const MemoryHistory = memo(function MemoryHistory({
     sample.memory_detail ? read(sample.memory_detail) : null;
   const last = samples[samples.length - 1];
   const memTotal = report.host?.mem_total_bytes ?? 0;
+  const primaryState = metricGroupState(metricStates, 0);
+  const cacheState = metricGroupState(metricStates, 1);
+  const pagingState = metricGroupState(metricStates, 2);
   return (
     <section className="observe-history" aria-label={`内存 ${label} 数值`}>
       <div className="history-primary">
         <HistoryChart
           title="容量构成"
+          loading={primaryState.loading}
+          ready={primaryState.ready}
           samples={samples}
           group={group}
           valueUnit={historyBytesUnit}
@@ -1352,6 +1755,8 @@ const MemoryHistory = memo(function MemoryHistory({
         />
         <HistoryChart
           title="内存压力"
+          loading={primaryState.loading}
+          ready={primaryState.ready}
           samples={samples}
           group={group}
           formatValue={value => pct(value, 2)}
@@ -1373,11 +1778,16 @@ const MemoryHistory = memo(function MemoryHistory({
       <div className="history-grid">
         <HistoryChart
           title="内核缓存与固定页"
+          loading={cacheState.loading}
+          ready={cacheState.ready}
           samples={samples}
           group={group}
           valueUnit={historyBytesUnit}
           lines={[
-            { name: 'Buffers', values: historyValues(samples, sample => detail(sample, value => value.buffers_bytes)) },
+            {
+              name: 'Buffers',
+              values: historyValues(samples, sample => detail(sample, value => value.buffers_bytes)),
+            },
             {
               name: 'KReclaimable',
               values: historyValues(samples, sample => detail(sample, value => value.kernel_reclaimable_bytes)),
@@ -1390,7 +1800,10 @@ const MemoryHistory = memo(function MemoryHistory({
               name: 'Unevictable',
               values: historyValues(samples, sample => detail(sample, value => value.unevictable_bytes)),
             },
-            { name: 'Mlocked', values: historyValues(samples, sample => detail(sample, value => value.mlocked_bytes)) },
+            {
+              name: 'Mlocked',
+              values: historyValues(samples, sample => detail(sample, value => value.mlocked_bytes)),
+            },
             {
               name: 'GUP pinned',
               values: historyValues(samples, sample => detail(sample, value => value.gup_pinned_bytes)),
@@ -1399,6 +1812,8 @@ const MemoryHistory = memo(function MemoryHistory({
         />
         <HistoryChart
           title="Swap、脏页与回写"
+          loading={cacheState.loading}
+          ready={cacheState.ready}
           samples={samples}
           group={group}
           valueUnit={historyBytesUnit}
@@ -1417,6 +1832,8 @@ const MemoryHistory = memo(function MemoryHistory({
         />
         <HistoryChart
           title="Swap I/O"
+          loading={pagingState.loading}
+          ready={pagingState.ready}
           samples={samples}
           group={group}
           valueUnit={historyBytesUnit}
@@ -1427,6 +1844,8 @@ const MemoryHistory = memo(function MemoryHistory({
         />
         <HistoryChart
           title="缺页与直接回收"
+          loading={pagingState.loading}
+          ready={pagingState.ready}
           samples={samples}
           group={group}
           valueUnit={historyCountUnit}
@@ -1450,10 +1869,12 @@ const DiskHistory = memo(function DiskHistory({
   report,
   label,
   linked,
+  metricStates,
 }: {
   report: NodeLoadView;
   label: string;
   linked: boolean;
+  metricStates?: readonly MetricGroupState[];
 }) {
   const samples = report.series;
   const host = report.host;
@@ -1464,11 +1885,17 @@ const DiskHistory = memo(function DiskHistory({
   const last = samples[samples.length - 1];
   const totalNow = total(last);
   const diskUsed = totalNow > 0 ? Math.max(0, totalNow - last.disk_free_bytes) : null;
+  const primaryState = metricGroupState(metricStates, 0);
+  const throughputState = metricGroupState(metricStates, 1);
+  const latencyState = metricGroupState(metricStates, 2);
+  const queueState = metricGroupState(metricStates, 3);
   return (
     <section className="observe-history" aria-label={`磁盘 ${label} 数值`}>
       <div className="history-primary">
         <HistoryChart
           title="容量"
+          loading={primaryState.loading}
+          ready={primaryState.ready}
           samples={samples}
           group={group}
           valueUnit={historyBytesUnit}
@@ -1499,6 +1926,8 @@ const DiskHistory = memo(function DiskHistory({
         />
         <HistoryChart
           title="设备繁忙与 I/O 压力"
+          loading={primaryState.loading}
+          ready={primaryState.ready}
           samples={samples}
           group={group}
           formatValue={value => pct(value, 2)}
@@ -1525,6 +1954,8 @@ const DiskHistory = memo(function DiskHistory({
       <div className="history-grid">
         <HistoryChart
           title="容量与 inode"
+          loading={throughputState.loading}
+          ready={throughputState.ready}
           samples={samples}
           group={group}
           formatValue={value => pct(value, 2)}
@@ -1544,6 +1975,8 @@ const DiskHistory = memo(function DiskHistory({
         />
         <HistoryChart
           title="块设备吞吐"
+          loading={throughputState.loading}
+          ready={throughputState.ready}
           samples={samples}
           group={group}
           valueUnit={historyByteRateUnit}
@@ -1554,6 +1987,8 @@ const DiskHistory = memo(function DiskHistory({
         />
         <HistoryChart
           title="块设备 IOPS"
+          loading={latencyState.loading}
+          ready={latencyState.ready}
           samples={samples}
           group={group}
           valueUnit={historyPerSecondUnit}
@@ -1564,6 +1999,8 @@ const DiskHistory = memo(function DiskHistory({
         />
         <HistoryChart
           title="完成延迟"
+          loading={latencyState.loading}
+          ready={latencyState.ready}
           samples={samples}
           group={group}
           valueUnit={historyMsUnit}
@@ -1580,6 +2017,8 @@ const DiskHistory = memo(function DiskHistory({
         />
         <HistoryChart
           title="队列"
+          loading={queueState.loading}
+          ready={queueState.ready}
           samples={samples}
           group={group}
           formatValue={value => value.toFixed(2)}
@@ -1603,10 +2042,12 @@ const NetworkHistory = memo(function NetworkHistory({
   report,
   label,
   linked,
+  metricStates,
 }: {
   report: NodeLoadView;
   label: string;
   linked: boolean;
+  metricStates?: readonly MetricGroupState[];
 }) {
   const samples = report.series;
   const group = linked ? `nd-network-history-${report.node_id}` : undefined;
@@ -1634,11 +2075,17 @@ const NetworkHistory = memo(function NetworkHistory({
     return Math.max(0, sample.conntrack_count - known);
   };
   const hasPortPressure = samples.some(sample => sample.network_detail?.ephemeral_port_capacity != null);
+  const primaryState = metricGroupState(metricStates, 0);
+  const snapshotState = metricGroupState(metricStates, 1);
+  const lifecycleState = metricGroupState(metricStates, 2);
+  const resourceState = metricGroupState(metricStates, 3);
   return (
     <section className="observe-history" aria-label={`网络 ${label} 数值`}>
       <div className="history-primary">
         <HistoryChart
           title="连接与套接字"
+          loading={primaryState.loading}
+          ready={primaryState.ready}
           samples={samples}
           group={group}
           valueUnit={historyCountUnit}
@@ -1710,9 +2157,11 @@ const NetworkHistory = memo(function NetworkHistory({
               : []),
           ]}
         />
-        {hasPortPressure && (
+        {(!primaryState.ready || hasPortPressure) && (
           <HistoryChart
             title="出站端口压力（估算）· 最繁忙目标"
+            loading={primaryState.loading}
+            ready={primaryState.ready}
             samples={samples}
             group={group}
             formatValue={value => pct(value, 2)}
@@ -1734,9 +2183,11 @@ const NetworkHistory = memo(function NetworkHistory({
         )}
       </div>
       <div className="history-grid">
-        {hasPortPressure && (
+        {(!snapshotState.ready || hasPortPressure) && (
           <HistoryChart
             title="出站临时端口套接字"
+            loading={snapshotState.loading}
+            ready={snapshotState.ready}
             samples={samples}
             group={group}
             valueUnit={historyCountUnit}
@@ -1762,18 +2213,25 @@ const NetworkHistory = memo(function NetworkHistory({
         )}
         <HistoryChart
           title="连接快照"
+          loading={snapshotState.loading}
+          ready={snapshotState.ready}
           samples={samples}
           group={group}
           valueUnit={historyCountUnit}
           lines={[
             { name: 'Conntrack', values: historyValues(samples, sample => sample.conntrack_count) },
-            { name: 'TCP in-use', values: historyValues(samples, sample => detail(sample, value => value.tcp_inuse)) },
+            {
+              name: 'TCP in-use',
+              values: historyValues(samples, sample => detail(sample, value => value.tcp_inuse)),
+            },
           ]}
         />
-        {hasDeep && (
+        {(!lifecycleState.ready || !resourceState.ready || hasDeep) && (
           <>
             <HistoryChart
               title="TCP 连接生命周期"
+              loading={lifecycleState.loading}
+              ready={lifecycleState.ready}
               samples={samples}
               group={group}
               valueUnit={historyCountUnit}
@@ -1798,6 +2256,8 @@ const NetworkHistory = memo(function NetworkHistory({
             />
             <HistoryChart
               title="TCP 重传与异常"
+              loading={lifecycleState.loading}
+              ready={lifecycleState.ready}
               samples={samples}
               group={group}
               valueUnit={historyCountUnit}
@@ -1810,7 +2270,10 @@ const NetworkHistory = memo(function NetworkHistory({
                   name: 'SYN 重传',
                   values: historyValues(samples, sample => detail(sample, value => value.tcp_syn_retrans)),
                 },
-                { name: '超时', values: historyValues(samples, sample => detail(sample, value => value.tcp_timeouts)) },
+                {
+                  name: '超时',
+                  values: historyValues(samples, sample => detail(sample, value => value.tcp_timeouts)),
+                },
                 {
                   name: '接收错误',
                   values: historyValues(samples, sample => detail(sample, value => value.tcp_in_errors)),
@@ -1823,6 +2286,8 @@ const NetworkHistory = memo(function NetworkHistory({
             />
             <HistoryChart
               title="监听队列与 UDP 丢弃"
+              loading={resourceState.loading}
+              ready={resourceState.ready}
               samples={samples}
               group={group}
               valueUnit={historyCountUnit}
@@ -1855,6 +2320,8 @@ const NetworkHistory = memo(function NetworkHistory({
             />
             <HistoryChart
               title="套接字资源"
+              loading={resourceState.loading}
+              ready={resourceState.ready}
               samples={samples}
               group={group}
               valueUnit={historyBytesUnit}
@@ -1875,6 +2342,45 @@ const NetworkHistory = memo(function NetworkHistory({
     </section>
   );
 });
+
+const KPI_SPARK_MAX_POINTS = 160;
+
+/** Only the tiny KPI SVG is sampled. Each time bucket keeps its endpoints, extrema and one gap or
+ * invalid marker, so spikes and discontinuities remain visible. The original array continues to
+ * feed every ECharts instance unchanged. */
+export function downsampleKpiSeries(
+  series: LoadSample[],
+  valueOf: (sample: LoadSample) => number | null,
+  maxPoints = KPI_SPARK_MAX_POINTS,
+): LoadSample[] {
+  const limit = Math.max(5, Math.floor(maxPoints));
+  if (series.length <= limit) return series;
+
+  const bucketCount = Math.max(1, Math.floor(limit / 5));
+  const selected = new Set<number>();
+  for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+    const start = Math.floor((bucket * series.length) / bucketCount);
+    const end = Math.max(start + 1, Math.floor(((bucket + 1) * series.length) / bucketCount));
+    let minIndex: number | null = null;
+    let maxIndex: number | null = null;
+    let markerIndex: number | null = null;
+    for (let index = start; index < end; index += 1) {
+      const value = valueOf(series[index]);
+      if (series[index].has_gap || value === null || !Number.isFinite(value)) {
+        markerIndex ??= index;
+        continue;
+      }
+      if (minIndex === null || value < (valueOf(series[minIndex]) ?? Number.POSITIVE_INFINITY)) minIndex = index;
+      if (maxIndex === null || value > (valueOf(series[maxIndex]) ?? Number.NEGATIVE_INFINITY)) maxIndex = index;
+    }
+    selected.add(start);
+    selected.add(end - 1);
+    if (minIndex !== null) selected.add(minIndex);
+    if (maxIndex !== null) selected.add(maxIndex);
+    if (markerIndex !== null) selected.add(markerIndex);
+  }
+  return [...selected].sort((left, right) => left - right).map(index => series[index]);
+}
 
 /** KPI 芯片右下角的迷你趋势线。复用 trendPaths + metricDomain，与既有的指标卡曲线同口径；
  * 面积铺到 viewBox 底部（小图无网格，收在 PLOT_BOTTOM 会留一条空缝）。 */
@@ -1902,8 +2408,9 @@ function Spark({
     .filter(sample => !sample.has_gap)
     .map(valueOf)
     .filter((n): n is number => n !== null);
+  const sampledSeries = downsampleKpiSeries(series, valueOf);
   const paths = trendPaths(
-    series,
+    sampledSeries,
     valueOf,
     domain ?? metricDomain(values, percent),
     PLOT_H,
@@ -1943,14 +2450,25 @@ const LoadDashboard = memo(function LoadDashboard({
   report,
   historyLabel,
   linked,
+  metricRangeKey,
+  metricLive,
 }: {
   report: NodeLoadView;
   historyLabel: string;
   linked: boolean;
+  metricRangeKey: string | number;
+  metricLive: boolean;
 }) {
   const series = report.series;
   const last = report.latest_sample ?? series[series.length - 1];
-  const [openDetail, setOpenDetail] = useState<'cpu' | 'memory' | 'disk' | 'network' | null>(null);
+  const [detail, setDetail] = useState<{ open: LoadDetail | null; rendered: LoadDetail | null }>({
+    open: null,
+    rendered: null,
+  });
+  const detailPresence = usePresence(detail.open !== null, 160);
+  const openDetail = detail.open;
+  const toggleDetail = (next: LoadDetail) =>
+    setDetail(current => (current.open === next ? { ...current, open: null } : { open: next, rendered: next }));
   if (!last) return null;
   const host = report.host;
   const cpu = (sample: LoadSample) => sample.cpu_user_pct + sample.cpu_sys_pct + sample.cpu_softirq_pct;
@@ -1966,17 +2484,58 @@ const LoadDashboard = memo(function LoadDashboard({
   const uptime = uptimeLabel(last.uptime_secs);
   const ctMax = host?.conntrack_max ?? null;
   const ctRatio = last.conntrack_count !== null && ctMax !== null && ctMax > 0 ? last.conntrack_count / ctMax : null;
-  const hasCpuHistory = series.some(sample => sample.cpu_detail);
-  const hasMemoryHistory = series.some(sample => sample.memory_detail);
-  const hasDiskHistory = series.some(sample => sample.disk_detail);
-  const hasNetworkHistory = series.some(sample => sample.conntrack_count !== null || sample.network_detail);
+  const hasCpuHistory = Boolean(last.cpu_detail);
+  const hasMemoryHistory = Boolean(last.memory_detail);
+  const hasDiskHistory = Boolean(last.disk_detail);
+  const hasNetworkHistory = last.conntrack_count !== null || Boolean(last.network_detail);
+  const cpuDetailTitle = hasCpuHistory
+    ? `${openDetail === 'cpu' ? '收起' : '展开'} ${historyLabel} CPU 曲线`
+    : '所选区间没有 CPU 深度数据';
+  const memoryDetailTitle = hasMemoryHistory
+    ? `${openDetail === 'memory' ? '收起' : '展开'} ${historyLabel} 内存曲线`
+    : '所选区间没有内存深度数据';
+  const diskDetailTitle = hasDiskHistory
+    ? `${openDetail === 'disk' ? '收起' : '展开'} ${historyLabel} 磁盘曲线`
+    : '所选区间没有磁盘深度数据';
+  const networkDetailTitle = hasNetworkHistory
+    ? `${openDetail === 'network' ? '收起' : '展开'} ${historyLabel} 连接表与网络曲线`
+    : '当前尚无连接表或网络深度数据';
   const sparkRange = {
     rangeStartUnixSecs: report.range_start_unix_secs,
     rangeEndUnixSecs: report.range_end_unix_secs,
   };
+  const renderedAvailable =
+    (detail.rendered === 'cpu' && hasCpuHistory) ||
+    (detail.rendered === 'memory' && hasMemoryHistory) ||
+    (detail.rendered === 'disk' && hasDiskHistory) ||
+    (detail.rendered === 'network' && hasNetworkHistory);
+  const localDetailAvailable =
+    (detail.rendered === 'cpu' && series.some(sample => sample.cpu_detail)) ||
+    (detail.rendered === 'memory' && series.some(sample => sample.memory_detail)) ||
+    (detail.rendered === 'disk' && series.some(sample => sample.disk_detail)) ||
+    (detail.rendered === 'network' && series.some(sample => sample.network_detail));
+  const renderedHistory =
+    detail.rendered && renderedAvailable && !localDetailAvailable ? (
+      <DeepMetricHistory
+        detail={detail.rendered}
+        report={report}
+        label={historyLabel}
+        linked={linked}
+        rangeKey={metricRangeKey}
+        live={metricLive}
+      />
+    ) : detail.rendered === 'cpu' && localDetailAvailable ? (
+      <CpuHistory report={report} label={historyLabel} linked={linked} />
+    ) : detail.rendered === 'memory' && localDetailAvailable ? (
+      <MemoryHistory report={report} label={historyLabel} linked={linked} />
+    ) : detail.rendered === 'disk' && localDetailAvailable ? (
+      <DiskHistory report={report} label={historyLabel} linked={linked} />
+    ) : detail.rendered === 'network' && localDetailAvailable ? (
+      <NetworkHistory report={report} label={historyLabel} linked={linked} />
+    ) : null;
 
   return (
-    <>
+    <div className="load-dashboard-stack">
       {/* KPI 芯片带：CPU/内存/磁盘/负载 征收成标题下一条带（各带迷你趋势线）；已运行、连接表
           是标量，只给读数不给趋势线。金/红语气由阈值算出，spark 用 currentColor 随之变色。 */}
       <div className="kpi-band">
@@ -1984,9 +2543,10 @@ const LoadDashboard = memo(function LoadDashboard({
           type="button"
           className={`kpi kpi-expand ${openDetail === 'cpu' ? 'open' : ''}`}
           aria-expanded={openDetail === 'cpu'}
+          aria-label={cpuDetailTitle}
           disabled={!hasCpuHistory}
-          title={hasCpuHistory ? `展开 ${historyLabel} CPU 曲线` : '所选区间没有 CPU 深度数据'}
-          onClick={() => setOpenDetail(value => (value === 'cpu' ? null : 'cpu'))}
+          title={cpuDetailTitle}
+          onClick={() => toggleDetail('cpu')}
         >
           <span className="kpi-l">CPU</span>
           <span className="kpi-v">
@@ -2009,9 +2569,10 @@ const LoadDashboard = memo(function LoadDashboard({
           type="button"
           className={`kpi kpi-expand ${openDetail === 'memory' ? 'open' : ''}`}
           aria-expanded={openDetail === 'memory'}
+          aria-label={memoryDetailTitle}
           disabled={!hasMemoryHistory}
-          title={hasMemoryHistory ? `展开 ${historyLabel} 内存曲线` : '所选区间没有内存深度数据'}
-          onClick={() => setOpenDetail(value => (value === 'memory' ? null : 'memory'))}
+          title={memoryDetailTitle}
+          onClick={() => toggleDetail('memory')}
         >
           <span className="kpi-l">内存</span>
           <span className="kpi-v">
@@ -2024,9 +2585,10 @@ const LoadDashboard = memo(function LoadDashboard({
           type="button"
           className={`kpi kpi-expand ${openDetail === 'disk' ? 'open' : ''}`}
           aria-expanded={openDetail === 'disk'}
+          aria-label={diskDetailTitle}
           disabled={!hasDiskHistory}
-          title={hasDiskHistory ? `展开 ${historyLabel} 磁盘曲线` : '所选区间没有磁盘深度数据'}
-          onClick={() => setOpenDetail(value => (value === 'disk' ? null : 'disk'))}
+          title={diskDetailTitle}
+          onClick={() => toggleDetail('disk')}
         >
           <span className="kpi-l">磁盘</span>
           <span className="kpi-v">
@@ -2039,9 +2601,10 @@ const LoadDashboard = memo(function LoadDashboard({
           type="button"
           className={`kpi kpi-expand ${openDetail === 'network' ? 'open' : ''}`}
           aria-expanded={openDetail === 'network'}
+          aria-label={networkDetailTitle}
           disabled={!hasNetworkHistory}
-          title={hasNetworkHistory ? `展开 ${historyLabel} 网络曲线` : '当前尚无连接表或网络深度数据'}
-          onClick={() => setOpenDetail(value => (value === 'network' ? null : 'network'))}
+          title={networkDetailTitle}
+          onClick={() => toggleDetail('network')}
         >
           <span className="kpi-l">连接表</span>
           <span className="kpi-v">
@@ -2067,15 +2630,21 @@ const LoadDashboard = memo(function LoadDashboard({
         </div>
       </div>
 
-      {openDetail === 'cpu' && hasCpuHistory && <CpuHistory report={report} label={historyLabel} linked={linked} />}
-      {openDetail === 'memory' && hasMemoryHistory && (
-        <MemoryHistory report={report} label={historyLabel} linked={linked} />
+      {detailPresence.present && detail.rendered && renderedHistory && (
+        <div
+          className="kpi-detail-motion"
+          data-motion-state={detailPresence.phase}
+          aria-hidden={openDetail === null ? true : undefined}
+          inert={openDetail === null}
+        >
+          <div className="kpi-detail-motion-clip">
+            <div className="kpi-detail-motion-content" key={detail.rendered}>
+              {renderedHistory}
+            </div>
+          </div>
+        </div>
       )}
-      {openDetail === 'disk' && hasDiskHistory && <DiskHistory report={report} label={historyLabel} linked={linked} />}
-      {openDetail === 'network' && hasNetworkHistory && (
-        <NetworkHistory report={report} label={historyLabel} linked={linked} />
-      )}
-    </>
+    </div>
   );
 });
 
@@ -2083,10 +2652,14 @@ export function LoadCard({
   report,
   historyLabel = '30 MINUTES',
   linked = false,
+  metricRangeKey = `${report.range_start_unix_secs}-${report.range_end_unix_secs}`,
+  metricLive = false,
 }: {
   report: NodeLoadView;
   historyLabel?: string;
   linked?: boolean;
+  metricRangeKey?: string | number;
+  metricLive?: boolean;
 }) {
   const latest = report.latest_sample ?? report.series[report.series.length - 1];
   if (!latest) {
@@ -2104,7 +2677,13 @@ export function LoadCard({
           所选时间范围内没有负载读数。以下为最后一次状态，采样于 <Ago at={iso(latest.window_end_unix_secs)} />。
         </p>
       )}
-      <LoadDashboard report={report} historyLabel={historyLabel} linked={linked} />
+      <LoadDashboard
+        report={report}
+        historyLabel={historyLabel}
+        linked={linked}
+        metricRangeKey={metricRangeKey}
+        metricLive={metricLive}
+      />
     </div>
   );
 }
@@ -2213,7 +2792,15 @@ export function hopFindings(view: HopLinkView, sameChain: HopLinkView[]): Findin
  *
  * 该表回答此前无法回答的三个问题：链路的瓶颈位于哪一跳、速度下降是本端还是线路导致、
  * 应调整哪台机器的缓冲区。 */
-export function HopLinkTable({ hops, nodeName }: { hops: HopLinkView[]; nodeName: (id: string) => string }) {
+export function HopLinkTable({
+  hops,
+  nodeName,
+  title = 'LINK QUALITY',
+}: {
+  hops: HopLinkView[];
+  nodeName: (id: string) => string;
+  title?: string;
+}) {
   const byChain = new Map<string, HopLinkView[]>();
   for (const v of hops) {
     const list = byChain.get(v.sample.chain_id) ?? [];
@@ -2227,9 +2814,9 @@ export function HopLinkTable({ hops, nodeName }: { hops: HopLinkView[]; nodeName
   const rowKey = (v: HopLinkView) => `${v.node_id}>${v.sample.chain_id}>${v.sample.peer_node_id}`;
 
   return (
-    <div className="panel">
+    <div className="panel titled">
       <header>
-        <PanelTitle of="chains">LINK QUALITY</PanelTitle>
+        <PanelTitle of="chains">{title}</PanelTitle>
         <span className="sp" />
         <span className="hint">来自真实转发流量，不额外发起探测</span>
       </header>
@@ -2255,8 +2842,8 @@ export function HopLinkTable({ hops, nodeName }: { hops: HopLinkView[]; nodeName
         </thead>
         <tbody>
           {[...byChain.entries()].map(([chainId, list]) => (
-            <>
-              <tr key={chainId} className="thop-chain">
+            <Fragment key={chainId}>
+              <tr className="thop-chain">
                 <td colSpan={6}>
                   <span className="mono dim">{chainId}</span>
                 </td>
@@ -2344,7 +2931,7 @@ export function HopLinkTable({ hops, nodeName }: { hops: HopLinkView[]; nodeName
                   </tr>
                 );
               })}
-            </>
+            </Fragment>
           ))}
         </tbody>
       </table>

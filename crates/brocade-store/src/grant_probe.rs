@@ -7,8 +7,9 @@
 use std::collections::BTreeMap;
 
 use brocade_core::{
-    compile::compile,
-    model::{HysteriaBbrProfile, HysteriaObfs, IpFamily},
+    model::{
+        ExternalOutbound, ExternalOutboundProtocol, HysteriaBbrProfile, HysteriaObfs, IpFamily,
+    },
     physical::user::UserSecurityPlan,
 };
 use brocade_deployment::protocol::{
@@ -43,6 +44,47 @@ pub struct UserGrantProbeTarget {
     pub target: E2eProbeTarget,
 }
 
+/// One executable variant of a pinned Front matrix cell. A logical ingress can project more
+/// than one family/protocol entry, so the complete cell is the Cartesian product of the user's
+/// effective member and target entries rather than one guessed representative connection.
+#[derive(Debug, Clone)]
+pub struct FrontCombinationProbeTarget {
+    pub id: String,
+    pub name: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub front_id: String,
+    pub front_name: String,
+    pub member_id: String,
+    pub member_name: String,
+    pub member_family: &'static str,
+    pub member_protocol: &'static str,
+    pub target_id: String,
+    pub target_name: String,
+    pub target_family: &'static str,
+    pub target_protocol: &'static str,
+    pub member: FrontCombinationProbeMember,
+    pub target: E2eProbeTarget,
+}
+
+/// Server-side material for the first hop. Internal members use the selected user's grant;
+/// external members use the tunnel already embedded in the same Serving client snapshot.
+#[derive(Debug, Clone)]
+pub enum FrontCombinationProbeMember {
+    Internal(E2eProbeTarget),
+    External(ExternalOutbound),
+}
+
+#[derive(Debug, Clone)]
+pub struct FrontCombinationProbePlan {
+    pub serving_generation: u64,
+    pub serving_revision: u64,
+    pub client_snapshot_id: u64,
+    pub endpoint_url: String,
+    pub timeout_secs: u64,
+    pub items: Vec<FrontCombinationProbeTarget>,
+}
+
 pub async fn user_grant_probe_plan(
     pool: &PgPool,
     actor: &AdminContext,
@@ -64,8 +106,10 @@ pub async fn user_grant_probe_plan(
         return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
     }
 
-    let output = compile(&serving.snapshot);
-    let user = output.project_user(&tenant_id, &user_id)?;
+    let output = crate::compile_cache::compile_incremental(&serving.snapshot);
+    let user = crate::compile_cache::project_user(&output, &tenant_id, &user_id)?
+        .as_ref()
+        .clone();
     if user.entries.is_empty() {
         return Err(StoreError::NotFound(format!(
             "user {tenant_id}/{user_id} has no effective serving grants"
@@ -258,6 +302,203 @@ pub async fn user_grant_probe_plan(
         timeout_secs: u64::from(serving.snapshot.settings.probe.timeout_secs),
         items,
     })
+}
+
+/// Freeze a real, subscriber-visible probe plan for one member × target Front cell.
+///
+/// The request supplies only resource ids. Addresses, credentials and transport settings are
+/// selected from the immutable Serving projection and never accepted from the browser. Loading
+/// the user plan and Front ownership separately is safe only when both reads name the same
+/// Serving generation; a concurrent activation otherwise returns a conflict instead of mixing
+/// credentials from one generation with membership from another.
+#[allow(clippy::too_many_arguments)]
+pub async fn front_combination_probe_plan(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+    app_id: &str,
+    front_id: &str,
+    member_id: &str,
+    target_id: &str,
+) -> Result<FrontCombinationProbePlan> {
+    let app_id = required_text(app_id, "app_id")?;
+    let front_id = required_text(front_id, "front_id")?;
+    let member_id = required_text(member_id, "member_id")?;
+    let target_id = required_text(target_id, "target_id")?;
+    if member_id == target_id {
+        return Err(StoreError::InvalidData(
+            "前置成员和目标入口不能是同一个入口".to_owned(),
+        ));
+    }
+
+    let user_plan = user_grant_probe_plan(pool, actor, tenant_id, user_id).await?;
+    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
+    serving.ensure_available()?;
+    if serving.generation() != user_plan.serving_generation {
+        return Err(StoreError::Conflict(
+            "Serving 在生成组合拨测计划时发生变化，请重试".to_owned(),
+        ));
+    }
+    let app = serving
+        .snapshot
+        .apps
+        .iter()
+        .find(|app| app.id == app_id)
+        .ok_or_else(|| StoreError::NotFound(format!("app {app_id}")))?;
+    let front = app
+        .fronts
+        .iter()
+        .find(|front| front.id == front_id)
+        .ok_or_else(|| StoreError::NotFound(format!("front {front_id}")))?;
+    actor.require_tenant_access(&front.tenant, "front combination probe")?;
+    let is_internal_member = front.via.iter().any(|id| id == &member_id);
+    let is_external_member = front.external_via.iter().any(|id| id == &member_id);
+    if is_internal_member && is_external_member {
+        return Err(StoreError::InvalidData(format!(
+            "前置组 {front_id} 的内部入口与外部隧道使用了相同 id {member_id}"
+        )));
+    }
+    if !is_internal_member && !is_external_member {
+        return Err(StoreError::Conflict(format!(
+            "资源 {member_id} 已不是前置组 {front_id} 的成员，请刷新页面"
+        )));
+    }
+    let target_ingress = app
+        .ingresses
+        .iter()
+        .find(|ingress| ingress.id == target_id)
+        .ok_or_else(|| StoreError::NotFound(format!("ingress {target_id}")))?;
+    if target_ingress.front.as_deref() != Some(front_id.as_str()) {
+        return Err(StoreError::Conflict(format!(
+            "入口 {target_id} 已不是前置组 {front_id} 的目标，请刷新页面"
+        )));
+    }
+
+    let targets = user_plan
+        .items
+        .iter()
+        .filter(|item| item.app_id == app_id && item.ingress_id == target_id)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err(StoreError::InvalidData(format!(
+            "所选用户当前没有目标入口 {target_id} 的生效授权，无法复现其订阅路径"
+        )));
+    }
+
+    const MAX_VARIANTS: usize = 64;
+    let app_name = if app.label.is_empty() {
+        app.id.clone()
+    } else {
+        app.label.clone()
+    };
+    let mut items = Vec::new();
+    if is_internal_member {
+        let members = user_plan
+            .items
+            .iter()
+            .filter(|item| item.app_id == app_id && item.ingress_id == member_id)
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return Err(StoreError::InvalidData(format!(
+                "所选用户当前没有成员入口 {member_id} 的生效授权，无法复现其订阅路径"
+            )));
+        }
+        let variant_count = members.len().saturating_mul(targets.len());
+        if variant_count > MAX_VARIANTS {
+            return Err(StoreError::InvalidData(format!(
+                "组合拨测会产生 {variant_count} 个协议变体，超过上限 {MAX_VARIANTS}"
+            )));
+        }
+        items.reserve(variant_count);
+        for member in members {
+            for target in &targets {
+                items.push(FrontCombinationProbeTarget {
+                    id: format!("{}=>{}", member.id, target.id),
+                    name: format!("{} → {}", member.name, target.name),
+                    app_id: app.id.clone(),
+                    app_name: app_name.clone(),
+                    front_id: front.id.clone(),
+                    front_name: front.name.clone(),
+                    member_id: member.ingress_id.clone(),
+                    member_name: member.name.clone(),
+                    member_family: member.family,
+                    member_protocol: member.protocol,
+                    target_id: target.ingress_id.clone(),
+                    target_name: target.name.clone(),
+                    target_family: target.family,
+                    target_protocol: target.protocol,
+                    member: FrontCombinationProbeMember::Internal(member.target.clone()),
+                    target: target.target.clone(),
+                });
+            }
+        }
+    } else {
+        let member = serving
+            .snapshot
+            .external_outbounds
+            .iter()
+            .find(|outbound| outbound.id == member_id)
+            .ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "外部隧道 {member_id} 尚未进入当前 Serving，请刷新页面"
+                ))
+            })?;
+        if targets.len() > MAX_VARIANTS {
+            return Err(StoreError::InvalidData(format!(
+                "组合拨测会产生 {} 个协议变体，超过上限 {MAX_VARIANTS}",
+                targets.len()
+            )));
+        }
+        let member_name = if member.name.is_empty() {
+            member.id.clone()
+        } else {
+            member.name.clone()
+        };
+        let member_protocol = external_protocol_name(&member.protocol);
+        items.reserve(targets.len());
+        for target in &targets {
+            items.push(FrontCombinationProbeTarget {
+                id: format!("external:{}=>{}", member.id, target.id),
+                name: format!("{} → {}", member_name, target.name),
+                app_id: app.id.clone(),
+                app_name: app_name.clone(),
+                front_id: front.id.clone(),
+                front_name: front.name.clone(),
+                member_id: member.id.clone(),
+                member_name: member_name.clone(),
+                member_family: "tunnel",
+                member_protocol,
+                target_id: target.ingress_id.clone(),
+                target_name: target.name.clone(),
+                target_family: target.family,
+                target_protocol: target.protocol,
+                member: FrontCombinationProbeMember::External(member.clone()),
+                target: target.target.clone(),
+            });
+        }
+    }
+    Ok(FrontCombinationProbePlan {
+        serving_generation: user_plan.serving_generation,
+        serving_revision: user_plan.serving_revision,
+        client_snapshot_id: serving.client_snapshot_id(),
+        endpoint_url: user_plan.endpoint_url,
+        timeout_secs: user_plan.timeout_secs,
+        items,
+    })
+}
+
+fn external_protocol_name(protocol: &ExternalOutboundProtocol) -> &'static str {
+    match protocol {
+        ExternalOutboundProtocol::Anytls { .. } => "anytls",
+        ExternalOutboundProtocol::Vless { .. } => "vless",
+        ExternalOutboundProtocol::Shadowsocks2022 { .. } => "shadowsocks",
+        ExternalOutboundProtocol::Socks5 { .. } => "socks5",
+        ExternalOutboundProtocol::HttpConnect { .. } => "http-connect",
+        ExternalOutboundProtocol::Wireguard { .. } => "wireguard",
+        ExternalOutboundProtocol::Warp { .. } => "warp",
+        ExternalOutboundProtocol::Vpngate { .. } => "vpngate",
+    }
 }
 
 async fn self_signed_certificate_pin(pool: &PgPool, node_id: &str) -> Result<Option<String>> {

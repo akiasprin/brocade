@@ -17,10 +17,11 @@ pub use types::*;
 
 use brocade_core::{
     artifacts::{grants, hy2_port_hop, phantun, subscription, wireguard, xray},
-    client_config::ClientProjectionDownloadEndpoint,
-    compile::compile,
+    client_config::{ClientFront, ClientProjectionDownloadEndpoint},
+    compile::CompileOutput,
     format::{ini, json as json_format, uri, yaml},
     hash::sha256_hex,
+    ir::front::analyze_front_routes,
     model::{
         Action, AnyTlsMasquerade, AnyTlsSecurity, AppView, Chain, Dns, DomainStrategy,
         ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalWarpBinding, Front, Grant,
@@ -86,11 +87,15 @@ pub async fn compile_view(
     actor: &AdminContext,
     revision: Option<u64>,
 ) -> Result<CompileView> {
-    compile_view_of(&load_scoped_snapshot(pool, actor, revision).await?)
+    let snapshot = load_scoped_snapshot(pool, actor, revision).await?;
+    let output = crate::compile_cache::compile_snapshot(&snapshot).await?;
+    compile_view_from_output(&snapshot, &output)
 }
 
-pub(crate) fn compile_view_of(snapshot: &ModelSnapshot) -> Result<CompileView> {
-    let output = compile(snapshot);
+pub(crate) fn compile_view_from_output(
+    snapshot: &ModelSnapshot,
+    output: &CompileOutput,
+) -> Result<CompileView> {
     // The compile inspector must show the partial IR that produced diagnostics even when the
     // model cannot publish. Calling this explicitly keeps that exception visible; artifacts and
     // agent work lists go through CompileOutput's gated projectors.
@@ -103,7 +108,7 @@ pub(crate) fn compile_view_of(snapshot: &ModelSnapshot) -> Result<CompileView> {
     Ok(CompileView {
         revision: snapshot.revision,
         summary: output.summary,
-        diagnostics: output.diagnostics,
+        diagnostics: output.diagnostics.clone(),
         system,
         apps,
         redacted: true,
@@ -218,21 +223,19 @@ async fn ensure_default_warp_for_tenant_tx(
     .await
 }
 
-/// Prefer a semantic id in logs and raw snapshots. Very long tenant paths, or an id already used
-/// by an unrelated external target, fall back to a stable short digest. The database remains the
-/// final collision authority and every fallback is checked before it is returned.
+/// Allocate an opaque WARP id. The tenant stays in the authorization boundary and never leaks into
+/// the resource id or browser route; the database remains the final collision authority.
 async fn allocate_default_warp_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     tenant_id: &str,
 ) -> Result<String> {
-    let readable = format!("warp.{tenant_id}");
-    if readable.len() <= 32 && external_outbound_id_available_tx(tx, &readable).await? {
-        return Ok(readable);
-    }
-
-    for attempt in 0..64_u8 {
-        let digest = sha256_hex(format!("default-warp:{tenant_id}:{attempt}").as_bytes());
-        let candidate = format!("warp-{}", &digest[..12]);
+    for _ in 0..64 {
+        let mut random = [0_u8; 4];
+        getrandom::fill(&mut random)?;
+        let candidate = format!(
+            "warp-{:02x}{:02x}-{:02x}{:02x}",
+            random[0], random[1], random[2], random[3]
+        );
         if external_outbound_id_available_tx(tx, &candidate).await? {
             return Ok(candidate);
         }
@@ -844,6 +847,64 @@ pub(crate) async fn delete_external_outbound_tx(
     )
 }
 
+/// Remove VPN Gate pools after the final model state no longer references them.
+///
+/// Unlike custom tunnels, VPN Gate outbounds are implementation resources created while saving a
+/// rule selection. They must therefore follow their references instead of becoming a second
+/// operator-managed inventory. Call this only after every operation in a draft has landed: while
+/// moving a reference between rule tables, an intermediate state may temporarily reference the
+/// pool from neither table.
+pub(crate) async fn prune_unreferenced_vpngate_outbounds_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+) -> Result<bool> {
+    let tenant_scope = actor.tenant_scope();
+    let tenant_pattern = actor.tenant_scope_like_pattern();
+    Ok(sqlx::query(
+        "DELETE FROM external_outbounds AS outbound
+          WHERE outbound.protocol = 'vpngate'
+            AND ($1::text IS NULL
+                 OR outbound.tenant_id = $1
+                 OR outbound.tenant_id LIKE $2 ESCAPE '\\')
+            AND NOT EXISTS (
+                SELECT 1 FROM steps
+                CROSS JOIN LATERAL jsonb_array_elements(steps.rules) AS item(rule)
+                 WHERE COALESCE(item.rule->'action', item.rule->'a')->>'t' = 'proxy'
+                   AND COALESCE(item.rule->'action', item.rule->'a')->>'outbound' = outbound.id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM front_external_vias
+                 WHERE front_external_vias.outbound_id = outbound.id
+            )",
+    )
+    .bind(tenant_scope)
+    .bind(tenant_pattern)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+fn validate_external_outbound_id(id: &str, protocol: &str) -> Result<()> {
+    let message = match protocol {
+        "warp" if !brocade_core::model::is_valid_warp_tunnel_id(id) => {
+            Some("WARP tunnel id must use warp-<4 lowercase hex>-<4 lowercase hex>")
+        }
+        "vpngate" if !brocade_core::model::is_valid_vpngate_tunnel_id(id) => {
+            Some("VPN Gate tunnel id must use vpngate-<4 lowercase hex>-<4 lowercase hex>")
+        }
+        "warp" | "vpngate" => None,
+        _ if !brocade_core::model::is_valid_custom_tunnel_id(id) => {
+            Some("custom tunnel id must use custom-<4 lowercase hex>-<4 lowercase hex>")
+        }
+        _ => None,
+    };
+    match message {
+        Some(message) => Err(StoreError::InvalidData(message.to_owned())),
+        None => Ok(()),
+    }
+}
+
 pub(crate) async fn upsert_external_outbound_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
@@ -865,7 +926,9 @@ pub(crate) async fn upsert_external_outbound_tx(
         ExternalOutboundProtocol::HttpConnect { .. } => "http_connect",
         ExternalOutboundProtocol::Wireguard { .. } => "wireguard",
         ExternalOutboundProtocol::Warp { .. } => "warp",
+        ExternalOutboundProtocol::Vpngate { .. } => "vpngate",
     };
+    validate_external_outbound_id(&id, requested_protocol)?;
 
     let existing = sqlx::query(
         "SELECT tenant_id, credential_sealed, protocol FROM external_outbounds WHERE id = $1 FOR UPDATE",
@@ -885,7 +948,7 @@ pub(crate) async fn upsert_external_outbound_tx(
     // WARP has no resource-level credential: its private key and provider token are generated per
     // machine binding and sealed in external_outbound_bindings, so this column carries an empty
     // sentinel for the protocol.
-    let credential_sealed = if requested_protocol == "warp" {
+    let credential_sealed = if matches!(requested_protocol, "warp" | "vpngate") {
         String::new()
     } else if credential == "<redacted>" {
         let existing = existing.as_ref().ok_or_else(|| {
@@ -962,6 +1025,21 @@ pub(crate) async fn upsert_external_outbound_tx(
             "no_kernel_tun": no_kernel_tun,
             "domain_strategy": domain_strategy,
             "workers": workers,
+        }),
+        ExternalOutboundProtocol::Vpngate {
+            country_code,
+            server_id,
+            server_ids,
+            max_connect_ms,
+            min_download_bps,
+            max_candidates,
+        } => json!({
+            "country_code": country_code,
+            "server_id": server_id,
+            "server_ids": server_ids,
+            "max_connect_ms": max_connect_ms,
+            "min_download_bps": min_download_bps,
+            "max_candidates": max_candidates,
         }),
     };
     let security = serde_json::to_value(request.security)?;
@@ -1586,38 +1664,45 @@ pub(crate) async fn upsert_chain_tx(
     .bind(&id)
     .fetch_optional(&mut **tx)
     .await?;
-    let existing_app = existing
-        .as_ref()
-        .map(|row| row.try_get::<String, _>("app_id"))
-        .transpose()?;
-    let position = match (&existing, existing_app.as_deref()) {
-        (Some(row), Some(current_app)) if current_app == app_id => row.try_get("position")?,
-        _ => new_chain_position_tx(tx, &app_id).await?,
+    if let Some(row) = existing.as_ref() {
+        let existing_app = row.try_get::<String, _>("app_id")?;
+        let existing_tenant = row.try_get::<String, _>("tenant_id")?;
+        // Authorize the owner already stored under this globally unique id before comparing any
+        // caller-supplied ownership. Otherwise a scoped editor can claim an unseen chain by
+        // presenting the same id with a tenant it does control.
+        actor.require_tenant_access(&existing_tenant, "chain")?;
+        if existing_app != app_id {
+            return Err(StoreError::Unsupported(format!(
+                "chain {id} already belongs to app {existing_app}"
+            )));
+        }
+        if existing_tenant != tenant_id {
+            return Err(StoreError::Unsupported(
+                "an existing chain cannot be moved to another tenant; create a new chain instead"
+                    .to_owned(),
+            ));
+        }
+    }
+    let position = match &existing {
+        Some(row) => row.try_get("position")?,
+        None => new_chain_position_tx(tx, &app_id).await?,
     };
     let head_changed = match existing {
         Some(row) => {
-            let changed = row.try_get::<String, _>("app_id")? != app_id
-                || row.try_get::<String, _>("tenant_id")? != tenant_id
-                || row.try_get::<String, _>("name")? != name
+            let changed = row.try_get::<String, _>("name")? != name
                 || row.try_get::<Option<String>, _>("subscription_country")?
                     != subscription_country;
             if changed {
                 sqlx::query(
                     "UPDATE chains
-                     SET app_id = $2,
-                         tenant_id = $3,
-                         name = $4,
-                         subscription_country = $5,
-                         position = $6,
-                         created_revision = COALESCE(created_revision, $7)
+                     SET name = $2,
+                         subscription_country = $3,
+                         created_revision = COALESCE(created_revision, $4)
                      WHERE id = $1",
                 )
                 .bind(&id)
-                .bind(&app_id)
-                .bind(&tenant_id)
                 .bind(&name)
                 .bind(&subscription_country)
-                .bind(position)
                 .bind(revision_id)
                 .execute(&mut **tx)
                 .await?;
@@ -1813,6 +1898,73 @@ fn complete_order(ids: Vec<String>, current: &[String], resource: &str) -> Resul
     Ok(ids)
 }
 
+#[derive(Debug, Clone)]
+struct PreparedFrontRequest {
+    app_id: String,
+    id: String,
+    tenant_id: String,
+    name: String,
+    strategy: brocade_core::model::FrontStrategy,
+    via: Vec<String>,
+    external_via: Vec<String>,
+    targets: Vec<String>,
+}
+
+async fn prepare_front_request_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    app_id: &str,
+    request: CreateFrontRequest,
+) -> Result<PreparedFrontRequest> {
+    let app_id = required_text(app_id, "app_id")?;
+    let id = required_slug(request.id, "front id")?;
+    let tenant_id = required_text(request.tenant_id, "tenant_id")?;
+    let name = required_text(request.name, "front name")?;
+    actor.require_tenant_access(&tenant_id, "front")?;
+    let via = normalize_id_list(request.via, "front via")?;
+    let external_via = normalize_id_list(request.external_via, "front external via")?;
+    let mut targets = normalize_id_list(request.targets, "front target")?;
+    ensure_unique_ids(&via, "front via")?;
+    ensure_unique_ids(&external_via, "front external via")?;
+    ensure_unique_ids(&targets, "front target")?;
+    let via_ids = via.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if let Some(overlap) = targets
+        .iter()
+        .find(|target| via_ids.contains(target.as_str()))
+    {
+        return Err(StoreError::InvalidData(format!(
+            "ingress {overlap} cannot be both a Front member and target"
+        )));
+    }
+    if !targets.is_empty() && via.is_empty() && external_via.is_empty() {
+        return Err(StoreError::InvalidData(
+            "a Front with targets requires at least one member".to_owned(),
+        ));
+    }
+    targets.sort();
+    ensure_app_exists_tx(tx, &app_id).await?;
+    ensure_existing_front_owner(tx, actor, &app_id, &tenant_id, &id).await?;
+    ensure_tenant_exists_tx(tx, &tenant_id).await?;
+    ensure_ingresses_in_app_tx(tx, &app_id, &via).await?;
+    ensure_ingresses_in_app_tx(tx, &app_id, &targets).await?;
+    for target in &targets {
+        let target_tenant = ingress_tenant_tx(tx, &app_id, target).await?;
+        actor.require_tenant_access(&target_tenant, "front target")?;
+    }
+    ensure_external_outbounds_for_tenant_tx(tx, &tenant_id, &external_via).await?;
+
+    Ok(PreparedFrontRequest {
+        app_id,
+        id,
+        tenant_id,
+        name,
+        strategy: request.strategy,
+        via,
+        external_via,
+        targets,
+    })
+}
+
 pub async fn upsert_front(
     pool: &PgPool,
     actor: &AdminContext,
@@ -1824,12 +1976,201 @@ pub async fn upsert_front(
     });
     let mut tx = pool.begin().await?;
     let previous = lock_control_state(&mut tx).await?;
+    if request.expected_revision != previous {
+        return Err(StoreError::Conflict(format!(
+            "front editor read revision {}, but current revision is {previous}",
+            request.expected_revision
+        )));
+    }
     let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
-    let (front, changed) = upsert_front_tx(&mut tx, actor, revision_id, app_id, request).await?;
-    let revision_id = commit_revision(&mut tx, revision_id, previous, changed).await?;
+    let (front, targets, changed) =
+        upsert_front_tx(&mut tx, actor, revision_id, app_id, request).await?;
+    let pruned_vpngate = prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await?;
+    let model_changed = changed || pruned_vpngate;
+    let revision_id = commit_revision(&mut tx, revision_id, previous, model_changed).await?;
+    let mut client_config =
+        crate::subscription_client::commit_result_tx(&mut tx, revision_id).await?;
+    if !model_changed {
+        client_config.status = crate::ClientConfigCommitStatus::Unchanged;
+    }
     tx.commit().await?;
 
-    Ok(UpsertFrontResult { revision_id, front })
+    Ok(UpsertFrontResult {
+        revision_id,
+        front,
+        targets,
+        client_config,
+    })
+}
+
+pub async fn front_client_config_state(
+    pool: &PgPool,
+    actor: &AdminContext,
+    app_id: &str,
+    front_id: &str,
+) -> Result<FrontClientConfigState> {
+    let mut tx = pool.begin().await?;
+    let tenant = sqlx::query_scalar::<_, String>(
+        "SELECT tenant_id FROM fronts WHERE app_id = $1 AND id = $2",
+    )
+    .bind(app_id)
+    .bind(front_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("front {app_id}/{front_id}")))?;
+    actor.require_tenant_access(&tenant, "front")?;
+
+    let state = crate::subscription_client::current_state_tx(&mut tx).await?;
+    let pending_prefix = format!("front:{front_id}:");
+    let target_prefixes = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM ingresses WHERE app_id = $1 AND front_id = $2 ORDER BY id",
+    )
+    .bind(app_id)
+    .bind(front_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|id| format!("ingress:{id}:"))
+    .collect::<Vec<_>>();
+    let pending_topology = state
+        .pending_topology
+        .into_iter()
+        .filter(|item| {
+            item.starts_with(&pending_prefix)
+                || target_prefixes
+                    .iter()
+                    .any(|prefix| item.starts_with(prefix))
+        })
+        .collect();
+    tx.commit().await?;
+    Ok(FrontClientConfigState {
+        front_id: front_id.to_owned(),
+        head_snapshot_id: state.head_snapshot_id,
+        serving_snapshot_id: state.serving_snapshot_id,
+        topology_revision_id: state.topology_revision_id,
+        permissions_revision_id: state.permissions_revision_id,
+        serving_generation: state.serving_generation,
+        active: state.serving_snapshot_id == Some(state.head_snapshot_id),
+        pending_topology,
+    })
+}
+
+pub async fn front_route_analysis(
+    pool: &PgPool,
+    actor: &AdminContext,
+    app_id: &str,
+    request: CreateFrontRequest,
+) -> Result<FrontRouteAnalysisView> {
+    let mut tx = pool.begin().await?;
+    // Keep the model revision, client head and serving tuple in one database snapshot. If a
+    // concurrent write lands afterwards, the editor's expected_revision makes the real save
+    // conflict instead of applying a preview made from mixed versions.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+    let current_revision = i64_to_u64(
+        sqlx::query_scalar::<_, i64>("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(&mut *tx)
+            .await?,
+        "current_revision",
+    )?;
+    if request.expected_revision != current_revision {
+        return Err(StoreError::Conflict(format!(
+            "front analysis read revision {}, but current revision is {current_revision}",
+            request.expected_revision
+        )));
+    }
+    let prepared = prepare_front_request_tx(&mut tx, actor, app_id, request).await?;
+    let state = crate::subscription_client::current_state_tx(&mut tx).await?;
+    let client =
+        crate::subscription_client::load_client_snapshot_tx(&mut tx, state.head_snapshot_id)
+            .await?;
+    let mut proposed = client.config;
+    proposed.replace_front(
+        prepared.id.clone(),
+        ClientFront {
+            app_id: prepared.app_id.clone(),
+            tenant: prepared.tenant_id.clone(),
+            name: prepared.name.clone(),
+            strategy: prepared.strategy,
+            via: prepared.via.clone(),
+            external_via: prepared.external_via.clone(),
+        },
+        &prepared.targets,
+    );
+
+    let (analysis, pending_topology) = match state.topology_revision_id {
+        Some(topology_revision_id) => {
+            let topology =
+                crate::materialize::load_immutable_snapshot_tx(&mut tx, topology_revision_id)
+                    .await?;
+            let pending = proposed.pending_topology(&topology);
+            let permissions_revision_id = state.permissions_revision_id.ok_or_else(|| {
+                StoreError::InvalidData(
+                    "subscription serving topology has no permissions revision".to_owned(),
+                )
+            })?;
+            let permissions =
+                crate::materialize::load_immutable_snapshot_tx(&mut tx, permissions_revision_id)
+                    .await?;
+            let composed = crate::subscription_client::compose(topology, &permissions, &proposed)?;
+            let compiled = crate::compile_cache::compile_incremental(&composed);
+            let view = compiled.unpublishable_view();
+            let app = view
+                .apps
+                .iter()
+                .find(|candidate| candidate.app_id.as_deref() == Some(prepared.app_id.as_str()));
+            (
+                analyze_front_routes(
+                    Some(view.system),
+                    app,
+                    &prepared.id,
+                    &prepared.via,
+                    &prepared.external_via,
+                    &prepared.targets,
+                ),
+                filter_front_pending(pending, &prepared.id, &prepared.targets),
+            )
+        }
+        None => (
+            analyze_front_routes(
+                None,
+                None,
+                &prepared.id,
+                &prepared.via,
+                &prepared.external_via,
+                &prepared.targets,
+            ),
+            vec![format!("front:{}:app", prepared.id)],
+        ),
+    };
+    tx.commit().await?;
+
+    Ok(FrontRouteAnalysisView {
+        base_client_snapshot_id: state.head_snapshot_id,
+        topology_revision_id: state.topology_revision_id,
+        permissions_revision_id: state.permissions_revision_id,
+        serving_generation: state.serving_generation,
+        pending_topology,
+        analysis,
+    })
+}
+
+fn filter_front_pending(pending: Vec<String>, front_id: &str, targets: &[String]) -> Vec<String> {
+    let front_prefix = format!("front:{front_id}:");
+    let target_prefixes = targets
+        .iter()
+        .map(|id| format!("ingress:{id}:"))
+        .collect::<Vec<_>>();
+    pending
+        .into_iter()
+        .filter(|item| {
+            item.starts_with(&front_prefix)
+                || target_prefixes
+                    .iter()
+                    .any(|prefix| item.starts_with(prefix))
+        })
+        .collect()
 }
 
 pub(crate) async fn upsert_front_tx(
@@ -1838,43 +2179,42 @@ pub(crate) async fn upsert_front_tx(
     revision_id: u64,
     app_id: &str,
     request: CreateFrontRequest,
-) -> Result<(Front, bool)> {
-    let app_id = required_text(app_id, "app_id")?;
-    let id = required_slug(request.id, "front id")?;
-    let tenant_id = required_text(request.tenant_id, "tenant_id")?;
-    let name = required_text(request.name, "front name")?;
-    actor.require_tenant_access(&tenant_id, "front")?;
-    let via = normalize_id_list(request.via, "front via")?;
-    let external_via = normalize_id_list(request.external_via, "front external via")?;
-    let strategy = request.strategy.as_str();
-    ensure_app_exists_tx(tx, &app_id).await?;
-    ensure_tenant_exists_tx(tx, &tenant_id).await?;
-    ensure_ingresses_in_app_tx(tx, &app_id, &via).await?;
-    ensure_external_outbounds_for_tenant_tx(tx, &tenant_id, &external_via).await?;
+) -> Result<(Front, Vec<String>, bool)> {
+    let prepared = prepare_front_request_tx(tx, actor, app_id, request).await?;
+    let PreparedFrontRequest {
+        app_id,
+        id,
+        tenant_id,
+        name,
+        strategy,
+        via,
+        external_via,
+        targets,
+    } = prepared;
+    let strategy_name = strategy.as_str();
     let head_changed = sqlx::query(
         "INSERT INTO fronts (id, app_id, tenant_id, name, strategy, created_revision)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (id) DO UPDATE SET
-            app_id = EXCLUDED.app_id,
-            tenant_id = EXCLUDED.tenant_id,
             name = EXCLUDED.name,
             strategy = EXCLUDED.strategy,
             created_revision = COALESCE(fronts.created_revision, EXCLUDED.created_revision)
-         WHERE ROW(fronts.app_id, fronts.tenant_id, fronts.name, fronts.strategy)
+         WHERE ROW(fronts.name, fronts.strategy)
             IS DISTINCT FROM
-            ROW(EXCLUDED.app_id, EXCLUDED.tenant_id, EXCLUDED.name, EXCLUDED.strategy)",
+            ROW(EXCLUDED.name, EXCLUDED.strategy)",
     )
     .bind(&id)
     .bind(&app_id)
     .bind(&tenant_id)
     .bind(&name)
-    .bind(strategy)
+    .bind(strategy_name)
     .bind(u64_to_i64(revision_id, "revision_id")?)
     .execute(&mut **tx)
     .await?
     .rows_affected()
         > 0;
     let via_changed = replace_front_via(tx, &id, &via).await?;
+    let targets_changed = replace_front_targets(tx, &app_id, &id, &via, &targets).await?;
     let external_via_changed = replace_front_external_via(tx, &id, &external_via).await?;
 
     Ok((
@@ -1884,10 +2224,67 @@ pub(crate) async fn upsert_front_tx(
             name,
             via,
             external_via,
-            strategy: request.strategy,
+            strategy,
         },
-        head_changed || via_changed || external_via_changed,
+        targets,
+        head_changed || via_changed || targets_changed || external_via_changed,
     ))
+}
+
+pub async fn delete_front(
+    pool: &PgPool,
+    actor: &AdminContext,
+    app_id: &str,
+    front_id: &str,
+    request: DeleteFrontRequest,
+) -> Result<DeleteFrontResult> {
+    let app_id = required_text(app_id, "app_id")?;
+    let front_id = required_slug(front_id.to_owned(), "front id")?;
+    let mut tx = pool.begin().await?;
+    let previous = lock_control_state(&mut tx).await?;
+    if request.expected_revision != previous {
+        return Err(StoreError::Conflict(format!(
+            "front editor read revision {}, but current revision is {previous}",
+            request.expected_revision
+        )));
+    }
+    let tenant = sqlx::query_scalar::<_, String>(
+        "SELECT tenant_id FROM fronts WHERE app_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(&app_id)
+    .bind(&front_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("front {app_id}/{front_id}")))?;
+    actor.require_tenant_access(&tenant, "front")?;
+    let revision_id = insert_revision(
+        &mut tx,
+        actor.operator_id(),
+        &format!("delete front {app_id}/{front_id}"),
+    )
+    .await?;
+    sqlx::query("UPDATE ingresses SET front_id = NULL WHERE app_id = $1 AND front_id = $2")
+        .bind(&app_id)
+        .bind(&front_id)
+        .execute(&mut *tx)
+        .await?;
+    let removed = sqlx::query("DELETE FROM fronts WHERE app_id = $1 AND id = $2")
+        .bind(&app_id)
+        .bind(&front_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        > 0;
+    let pruned_vpngate = prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await?;
+    let revision_id =
+        commit_revision(&mut tx, revision_id, previous, removed || pruned_vpngate).await?;
+    let client_config = crate::subscription_client::commit_result_tx(&mut tx, revision_id).await?;
+    tx.commit().await?;
+    Ok(DeleteFrontResult {
+        revision_id,
+        removed,
+        client_config,
+    })
 }
 
 pub async fn upsert_ingress(
@@ -1925,11 +2322,19 @@ pub(crate) async fn upsert_ingress_tx(
     let chain_id = required_text(request.chain_id, "chain_id")?;
     let node_id = required_text(request.node_id, "node_id")?;
     ensure_nonzero_port(request.port, "port")?;
-    let front_id = optional_owned_text(request.front_id);
     let mut reality = normalize_reality_request(request.reality)?;
     let projection = Projection {
         v4: normalized_projection(request.projection.v4, "projection v4")?,
         v6: normalized_projection(request.projection.v6, "projection v6")?,
+        vless_encryption: normalized_protocol_projection(
+            request.projection.vless_encryption,
+            "VLESS Encryption projection",
+        )?,
+        anytls: normalized_protocol_projection(request.projection.anytls, "AnyTLS projection")?,
+        hysteria2: normalized_protocol_projection(
+            request.projection.hysteria2,
+            "Hysteria 2 projection",
+        )?,
     };
     // The site default must be read inside the transaction: during a batch commit an earlier
     // operation may have just changed the global REALITY site, reading from the pool would take
@@ -1960,10 +2365,11 @@ pub(crate) async fn upsert_ingress_tx(
     validate_model_id("ingress", &id)?;
     validate_model_id_pair(&id, &chain_id)?;
     ensure_node_exists_tx(tx, &node_id).await?;
-    if let Some(front_id) = &front_id {
-        ensure_front_in_app_tx(tx, &app_id, front_id).await?;
-    }
-    ensure_existing_ingress_same_app(tx, &app_id, &id).await?;
+    // Front target ownership is client configuration and can only be changed by the atomic Front
+    // API. A machine ingress edit must retain the value which is current when this transaction
+    // holds the model lock; otherwise an older browser draft can rewind an immediately saved
+    // chained-proxy target.
+    let front_id = lock_existing_ingress_owner(tx, actor, &app_id, &chain_tenant, &id).await?;
     let keypair = generate_reality_keypair()?;
     let short_id = generate_reality_short_id()?;
     let server_names = serde_json::to_value(&reality.server_names)?;
@@ -2126,7 +2532,8 @@ pub(crate) async fn upsert_ingress_tx(
             anytls_security, anytls_reality,
             anytls_reality_private_key, anytls_reality_public_key,
             anytls_reality_short_ids,
-            vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options
+            vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options,
+            protocol_projection
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
@@ -2144,15 +2551,13 @@ pub(crate) async fn upsert_ingress_tx(
             $45, $46, $47, $48,
             $49, $50, $51,
             $52, $53, $54, $55, $56, $57, $58, $59, $60,
-            $61, $62, $63, $64, $65, $66, $67
+            $61, $62, $63, $64, $65, $66, $67, $68
          )
          ON CONFLICT (id) DO UPDATE SET
-            app_id = EXCLUDED.app_id,
             chain_id = EXCLUDED.chain_id,
             node_id = EXCLUDED.node_id,
             bind = EXCLUDED.bind,
             port = EXCLUDED.port,
-            front_id = EXCLUDED.front_id,
             reality_dest = EXCLUDED.reality_dest,
             reality_server_names = EXCLUDED.reality_server_names,
             reality_flow = EXCLUDED.reality_flow,
@@ -2176,6 +2581,7 @@ pub(crate) async fn upsert_ingress_tx(
             projection_v4_port = EXCLUDED.projection_v4_port,
             projection_v6_host = EXCLUDED.projection_v6_host,
             projection_v6_port = EXCLUDED.projection_v6_port,
+            protocol_projection = EXCLUDED.protocol_projection,
             guard_no_private = EXCLUDED.guard_no_private,
             guard_no_bittorrent = EXCLUDED.guard_no_bittorrent,
             guard_no_mail = EXCLUDED.guard_no_mail,
@@ -2219,8 +2625,8 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.anytls_reality_short_ids
             ),
             created_revision = COALESCE(ingresses.created_revision, EXCLUDED.created_revision)
-         WHERE ROW(ingresses.app_id, ingresses.chain_id, ingresses.node_id, ingresses.bind,
-                   ingresses.port, ingresses.front_id, ingresses.reality_dest,
+         WHERE ROW(ingresses.chain_id, ingresses.node_id, ingresses.bind,
+                   ingresses.port, ingresses.reality_dest,
                    ingresses.reality_server_names, ingresses.reality_flow,
                    ingresses.reality_fallback_mode,
                    ingresses.reality_fallback_limits, ingresses.reality_fallback_guard,
@@ -2247,8 +2653,8 @@ pub(crate) async fn upsert_ingress_tx(
                    ingresses.anytls_masquerade_headers, ingresses.anytls_masquerade_status_code,
                    ingresses.anytls_security, ingresses.anytls_reality)
             IS DISTINCT FROM
-            ROW(EXCLUDED.app_id, EXCLUDED.chain_id, EXCLUDED.node_id, EXCLUDED.bind,
-                EXCLUDED.port, EXCLUDED.front_id, EXCLUDED.reality_dest,
+            ROW(EXCLUDED.chain_id, EXCLUDED.node_id, EXCLUDED.bind,
+                EXCLUDED.port, EXCLUDED.reality_dest,
                 EXCLUDED.reality_server_names, EXCLUDED.reality_flow,
                 EXCLUDED.reality_fallback_mode,
                 EXCLUDED.reality_fallback_limits, EXCLUDED.reality_fallback_guard,
@@ -2276,6 +2682,7 @@ pub(crate) async fn upsert_ingress_tx(
                 EXCLUDED.anytls_security, EXCLUDED.anytls_reality)
             OR ingresses.vless_encryption_port IS DISTINCT FROM EXCLUDED.vless_encryption_port
             OR ingresses.vless_encryption_options IS DISTINCT FROM EXCLUDED.vless_encryption_options
+            OR ingresses.protocol_projection IS DISTINCT FROM EXCLUDED.protocol_projection
             OR (EXCLUDED.vless_encryption_port IS NOT NULL AND ingresses.vless_encryption_private_key IS NULL)
             OR (EXCLUDED.anytls_enabled AND ingresses.anytls_reality_private_key IS NULL)
          RETURNING reality_private_key,
@@ -2368,6 +2775,7 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(encryption_keypair.as_ref().map(|keypair| &keypair.private_key))
     .bind(encryption_keypair.as_ref().map(|keypair| &keypair.public_key))
     .bind(serde_json::to_value(encryption.map(|settings| settings.options.clone()).unwrap_or_default())?)
+    .bind(serde_json::to_value(&projection)?)
     .fetch_optional(&mut **tx)
     .await?;
     let client_changed = sqlx::query(
@@ -2735,12 +3143,36 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.wg_transport,
                 s.route_ipv4,
                 s.route_ipv6,
+                p4.current_ip AS observed_public_ipv4,
+                p4.country_code AS observed_public_ipv4_country,
+                p4.since_at::text AS observed_public_ipv4_since_at,
+                p4.last_seen_at::text AS observed_public_ipv4_last_seen_at,
+                p4.candidate_ip AS observed_public_ipv4_candidate,
+                p4.candidate_first_seen_at::text AS observed_public_ipv4_candidate_since_at,
+                p4.candidate_observations AS observed_public_ipv4_candidate_observations,
+                p6.current_ip AS observed_public_ipv6,
+                p6.country_code AS observed_public_ipv6_country,
+                p6.since_at::text AS observed_public_ipv6_since_at,
+                p6.last_seen_at::text AS observed_public_ipv6_last_seen_at,
+                p6.candidate_ip AS observed_public_ipv6_candidate,
+                p6.candidate_first_seen_at::text AS observed_public_ipv6_candidate_since_at,
+                p6.candidate_observations AS observed_public_ipv6_candidate_observations,
                 s.token_prefix,
                 s.token_created_at::text AS token_created_at,
                 s.token_last_used_at::text AS token_last_used_at,
                 s.token_revoked_at::text AS token_revoked_at,
                 s.agent_version,
                 s.agent_protocol_version,
+                vpn.node_id IS NOT NULL AS vpngate_probe_enabled,
+                vpn.workers AS vpngate_probe_workers,
+                probe.last_received_at::text AS vpngate_probe_reported_at,
+                COALESCE(
+                    vpn.node_id IS NOT NULL
+                    AND GREATEST(vpn.selected_at, COALESCE(probe.last_received_at, vpn.selected_at))
+                        < now() - interval '30 minutes',
+                    FALSE
+                ) AS vpngate_probe_data_stale,
+                intel.node_id IS NOT NULL AS vpngate_intelligence_enabled,
                 COALESCE(s.runtime_versions, '{}'::jsonb) AS runtime_versions,
                 COALESCE(s.spool_backlog, '{}'::jsonb) AS spool_backlog,
                 s.last_local_reconcile,
@@ -2765,9 +3197,18 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 a.observed_at::text AS observed_at
          FROM nodes n
          LEFT JOIN node_agent_state s ON s.node_id = n.id
+         LEFT JOIN node_public_ip_state p4 ON p4.node_id = n.id AND p4.family = 4
+         LEFT JOIN node_public_ip_state p6 ON p6.node_id = n.id AND p6.family = 6
          LEFT JOIN node_applied_state a ON a.node_id = n.id
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
          LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
+         LEFT JOIN vpngate_probe_nodes vpn ON vpn.node_id = n.id
+         LEFT JOIN vpngate_intelligence_nodes intel ON intel.node_id = n.id
+         LEFT JOIN LATERAL (
+             SELECT MAX(sample.received_at) AS last_received_at
+               FROM vpngate_candidate_probe_latest sample
+              WHERE sample.node_id = n.id
+         ) probe ON vpn.node_id IS NOT NULL
          LEFT JOIN LATERAL (
              SELECT count(*) FILTER (
                         WHERE o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')
@@ -2814,12 +3255,36 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.wg_transport,
                 s.route_ipv4,
                 s.route_ipv6,
+                p4.current_ip AS observed_public_ipv4,
+                p4.country_code AS observed_public_ipv4_country,
+                p4.since_at::text AS observed_public_ipv4_since_at,
+                p4.last_seen_at::text AS observed_public_ipv4_last_seen_at,
+                p4.candidate_ip AS observed_public_ipv4_candidate,
+                p4.candidate_first_seen_at::text AS observed_public_ipv4_candidate_since_at,
+                p4.candidate_observations AS observed_public_ipv4_candidate_observations,
+                p6.current_ip AS observed_public_ipv6,
+                p6.country_code AS observed_public_ipv6_country,
+                p6.since_at::text AS observed_public_ipv6_since_at,
+                p6.last_seen_at::text AS observed_public_ipv6_last_seen_at,
+                p6.candidate_ip AS observed_public_ipv6_candidate,
+                p6.candidate_first_seen_at::text AS observed_public_ipv6_candidate_since_at,
+                p6.candidate_observations AS observed_public_ipv6_candidate_observations,
                 s.token_prefix,
                 s.token_created_at::text AS token_created_at,
                 s.token_last_used_at::text AS token_last_used_at,
                 s.token_revoked_at::text AS token_revoked_at,
                 s.agent_version,
                 s.agent_protocol_version,
+                vpn.node_id IS NOT NULL AS vpngate_probe_enabled,
+                vpn.workers AS vpngate_probe_workers,
+                probe.last_received_at::text AS vpngate_probe_reported_at,
+                COALESCE(
+                    vpn.node_id IS NOT NULL
+                    AND GREATEST(vpn.selected_at, COALESCE(probe.last_received_at, vpn.selected_at))
+                        < now() - interval '30 minutes',
+                    FALSE
+                ) AS vpngate_probe_data_stale,
+                intel.node_id IS NOT NULL AS vpngate_intelligence_enabled,
                 COALESCE(s.runtime_versions, '{}'::jsonb) AS runtime_versions,
                 COALESCE(s.spool_backlog, '{}'::jsonb) AS spool_backlog,
                 s.last_local_reconcile,
@@ -2844,9 +3309,18 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 a.observed_at::text AS observed_at
          FROM nodes n
          LEFT JOIN node_agent_state s ON s.node_id = n.id
+         LEFT JOIN node_public_ip_state p4 ON p4.node_id = n.id AND p4.family = 4
+         LEFT JOIN node_public_ip_state p6 ON p6.node_id = n.id AND p6.family = 6
          LEFT JOIN node_applied_state a ON a.node_id = n.id
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
          LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
+         LEFT JOIN vpngate_probe_nodes vpn ON vpn.node_id = n.id
+         LEFT JOIN vpngate_intelligence_nodes intel ON intel.node_id = n.id
+         LEFT JOIN LATERAL (
+             SELECT MAX(sample.received_at) AS last_received_at
+               FROM vpngate_candidate_probe_latest sample
+              WHERE sample.node_id = n.id
+         ) probe ON vpn.node_id IS NOT NULL
          LEFT JOIN LATERAL (
              SELECT count(*) FILTER (
                         WHERE o.status IN ('pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty')
@@ -2872,6 +3346,34 @@ fn node_conn_column(row: &sqlx::postgres::PgRow, column: &str) -> Result<Option<
                 .map_err(|_| StoreError::InvalidData(format!("nodes.{column} 是负数")))
         })
         .transpose()
+}
+
+fn node_public_ip_state_from_row(
+    row: &sqlx::postgres::PgRow,
+    prefix: &str,
+) -> Result<Option<crate::NodePublicIpStateView>> {
+    let current_column = prefix.to_owned();
+    let Some(current_ip) = row.try_get::<Option<String>, _>(current_column.as_str())? else {
+        return Ok(None);
+    };
+    let column = |suffix: &str| format!("{prefix}_{suffix}");
+    let country = column("country");
+    let since_at = column("since_at");
+    let last_seen_at = column("last_seen_at");
+    let candidate = column("candidate");
+    let candidate_since_at = column("candidate_since_at");
+    let candidate_observations = column("candidate_observations");
+    Ok(Some(crate::NodePublicIpStateView {
+        current_ip,
+        country_code: row.try_get(country.as_str())?,
+        since_at: row.try_get(since_at.as_str())?,
+        last_seen_at: row.try_get(last_seen_at.as_str())?,
+        candidate_ip: row.try_get(candidate.as_str())?,
+        candidate_first_seen_at: row.try_get(candidate_since_at.as_str())?,
+        candidate_observations: row
+            .try_get::<Option<i32>, _>(candidate_observations.as_str())?
+            .unwrap_or_default(),
+    }))
 }
 
 fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentStateItem> {
@@ -2967,20 +3469,29 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         public_ipv6_nat: row.try_get("public_ipv6_nat")?,
         route_ipv4: row.try_get("route_ipv4")?,
         route_ipv6: row.try_get("route_ipv6")?,
+        observed_public_ipv4: node_public_ip_state_from_row(row, "observed_public_ipv4")?,
+        observed_public_ipv6: node_public_ip_state_from_row(row, "observed_public_ipv6")?,
         token_prefix: row.try_get("token_prefix")?,
         token_created_at: row.try_get("token_created_at")?,
         token_last_used_at: row.try_get("token_last_used_at")?,
         token_revoked_at: row.try_get("token_revoked_at")?,
         agent_version: row.try_get("agent_version")?,
         agent_protocol_version: row.try_get("agent_protocol_version")?,
+        vpngate_probe_enabled: row.try_get("vpngate_probe_enabled")?,
+        vpngate_probe_workers: row.try_get("vpngate_probe_workers")?,
+        vpngate_probe_reported_at: row.try_get("vpngate_probe_reported_at")?,
+        vpngate_probe_data_stale: row.try_get("vpngate_probe_data_stale")?,
+        vpngate_intelligence_enabled: row.try_get("vpngate_intelligence_enabled")?,
         // A newly enrolled machine starts with an empty object until its first runtime report.
         runtime_versions: non_empty_json(row.try_get("runtime_versions")?),
         spool_backlog: non_empty_json(row.try_get("spool_backlog")?),
         last_local_reconcile: row.try_get("last_local_reconcile")?,
         wireguard_health: non_empty_json(row.try_get("wireguard_health")?),
         runtime_reported_at: row.try_get("runtime_reported_at")?,
+        runtime_report_fresh: row.try_get("reentry_runtime_fresh")?,
         geodata_observed: non_empty_json(row.try_get("geodata_observed")?),
         last_poll_at: row.try_get("last_poll_at")?,
+        desired_poll_fresh: row.try_get("reentry_poll_fresh")?,
         last_usage_report_at: row.try_get("last_usage_report_at")?,
         usage_last_result: non_empty_json(row.try_get("usage_last_result")?),
         usage_generation_id: row.try_get("usage_generation_id")?,
@@ -3431,6 +3942,25 @@ async fn ensure_ingress_in_app_tx(
         .ok_or_else(|| StoreError::NotFound(format!("ingress {app_id}/{ingress_id}")))
 }
 
+async fn ingress_tenant_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: &str,
+    ingress_id: &str,
+) -> Result<String> {
+    sqlx::query_scalar(
+        "SELECT chains.tenant_id
+           FROM ingresses
+           JOIN chains ON chains.app_id = ingresses.app_id
+                      AND chains.id = ingresses.chain_id
+          WHERE ingresses.app_id = $1 AND ingresses.id = $2",
+    )
+    .bind(app_id)
+    .bind(ingress_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("ingress {app_id}/{ingress_id}")))
+}
+
 async fn ensure_ingresses_in_app_tx(
     tx: &mut Transaction<'_, Postgres>,
     app_id: &str,
@@ -3442,40 +3972,78 @@ async fn ensure_ingresses_in_app_tx(
     Ok(())
 }
 
-async fn ensure_front_in_app_tx(
+async fn ensure_existing_front_owner(
     tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
     app_id: &str,
+    tenant_id: &str,
     front_id: &str,
 ) -> Result<()> {
-    let exists = sqlx::query("SELECT 1 FROM fronts WHERE app_id = $1 AND id = $2")
-        .bind(app_id)
-        .bind(front_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .is_some();
-    exists
-        .then_some(())
-        .ok_or_else(|| StoreError::NotFound(format!("front {app_id}/{front_id}")))
-}
-
-async fn ensure_existing_ingress_same_app(
-    tx: &mut Transaction<'_, Postgres>,
-    app_id: &str,
-    ingress_id: &str,
-) -> Result<()> {
-    let app = sqlx::query("SELECT app_id FROM ingresses WHERE id = $1")
-        .bind(ingress_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(|row| row.try_get::<String, _>("app_id"))
-        .transpose()?;
-    if app.as_deref().is_some_and(|existing| existing != app_id) {
+    let existing = sqlx::query_as::<_, (String, String)>(
+        "SELECT app_id, tenant_id FROM fronts WHERE id = $1 FOR UPDATE",
+    )
+    .bind(front_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((existing_app, existing_tenant)) = existing else {
+        return Ok(());
+    };
+    // Check the resource that already owns this globally unique id before comparing or changing
+    // any caller-supplied ownership fields. Otherwise a scoped editor could rename an unseen
+    // Front into its own tenant simply by guessing the id.
+    actor.require_tenant_access(&existing_tenant, "front")?;
+    if existing_app != app_id {
         return Err(StoreError::Unsupported(format!(
-            "ingress {ingress_id} already belongs to app {}",
-            app.unwrap()
+            "front {front_id} already belongs to app {existing_app}"
         )));
     }
+    if existing_tenant != tenant_id {
+        return Err(StoreError::Unsupported(
+            "an existing front cannot be moved to another tenant; create a new front instead"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+/// Lock an ingress's stable ownership and return its client-owned Front attachment.
+///
+/// The requested chain has already been authorized by the caller. This separately authorizes the
+/// existing chain tenant so a globally unique ingress id cannot be used to replace a hidden
+/// tenant's row. Moving between chains remains supported only within the same tenant.
+async fn lock_existing_ingress_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    app_id: &str,
+    tenant_id: &str,
+    ingress_id: &str,
+) -> Result<Option<String>> {
+    let existing = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT ingresses.app_id, chains.tenant_id, ingresses.front_id
+           FROM ingresses
+           JOIN chains ON chains.id = ingresses.chain_id
+          WHERE ingresses.id = $1
+          FOR UPDATE OF ingresses",
+    )
+    .bind(ingress_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((existing_app, existing_tenant, front_id)) = existing else {
+        return Ok(None);
+    };
+    actor.require_tenant_access(&existing_tenant, "ingress")?;
+    if existing_app != app_id {
+        return Err(StoreError::Unsupported(format!(
+            "ingress {ingress_id} already belongs to app {existing_app}"
+        )));
+    }
+    if existing_tenant != tenant_id {
+        return Err(StoreError::Unsupported(
+            "an existing ingress cannot be moved to another tenant; create a new ingress instead"
+                .to_owned(),
+        ));
+    }
+    Ok(front_id)
 }
 
 pub(crate) async fn existing_step_accept_uuid(
@@ -3540,6 +4108,75 @@ async fn replace_front_via(
         .await?;
     }
     Ok(true)
+}
+
+/// Replace all subscription targets for one Front and enforce the one-layer client graph.
+async fn replace_front_targets(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: &str,
+    front_id: &str,
+    via: &[String],
+    targets: &[String],
+) -> Result<bool> {
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT id
+           FROM ingresses
+          WHERE app_id = $1 AND front_id = $2
+          ORDER BY id
+          FOR UPDATE",
+    )
+    .bind(app_id)
+    .bind(front_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let changed = existing != targets;
+    if changed {
+        sqlx::query("UPDATE ingresses SET front_id = NULL WHERE app_id = $1 AND front_id = $2")
+            .bind(app_id)
+            .bind(front_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    for ingress_id in via {
+        let parent = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT front_id FROM ingresses WHERE app_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(app_id)
+        .bind(ingress_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if let Some(parent) = parent {
+            return Err(StoreError::InvalidData(format!(
+                "Front member {ingress_id} is already a target of Front {parent}; chained proxy currently supports one layer"
+            )));
+        }
+    }
+    for ingress_id in targets {
+        let member_of = sqlx::query_scalar::<_, String>(
+            "SELECT front_id FROM front_vias WHERE ingress_id = $1 ORDER BY front_id LIMIT 1",
+        )
+        .bind(ingress_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(member_of) = member_of {
+            return Err(StoreError::InvalidData(format!(
+                "Front target {ingress_id} is already a member of Front {member_of}; chained proxy currently supports one layer"
+            )));
+        }
+    }
+
+    if changed {
+        for ingress_id in targets {
+            sqlx::query("UPDATE ingresses SET front_id = $1 WHERE app_id = $2 AND id = $3")
+                .bind(front_id)
+                .bind(app_id)
+                .bind(ingress_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    Ok(changed)
 }
 
 async fn ensure_external_outbounds_for_tenant_tx(
@@ -3798,6 +4435,17 @@ fn normalize_id_list(values: Vec<String>, field: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn ensure_unique_ids(values: &[String], field: &str) -> Result<()> {
+    let unique = values.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if unique.len() == values.len() {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!(
+            "{field} contains duplicate ids"
+        )))
+    }
+}
+
 fn normalize_user_status(value: &str) -> Result<&'static str> {
     match value.trim() {
         "active" => Ok("active"),
@@ -3869,6 +4517,20 @@ fn normalized_projection(
     }))
 }
 
+fn normalized_protocol_projection(
+    projection: Option<brocade_core::model::ProtocolProjection>,
+    context: &str,
+) -> Result<Option<brocade_core::model::ProtocolProjection>> {
+    projection
+        .map(|projection| {
+            Ok(brocade_core::model::ProtocolProjection {
+                v4: normalized_projection(projection.v4, &format!("{context} v4"))?,
+                v6: normalized_projection(projection.v6, &format!("{context} v6"))?,
+            })
+        })
+        .transpose()
+}
+
 /// The column holds `DomainStrategy`'s serde spelling, which is what the CHECK constraint
 /// lists too. Going through serde rather than a match keeps the two in step.
 fn domain_strategy_column(strategy: DomainStrategy) -> Result<String> {
@@ -3937,5 +4599,18 @@ mod model_id_tests {
     fn requires_the_chain_to_carry_its_ingress_token() {
         assert!(validate_model_id_pair("ing-8f3a", "chn-8f3a-2d71").is_ok());
         assert!(validate_model_id_pair("ing-8f3a", "chn-a410-2d71").is_err());
+    }
+
+    #[test]
+    fn tunnel_id_prefix_must_match_the_protocol_kind() {
+        assert!(validate_external_outbound_id("custom-8f3a-2d71", "vless").is_ok());
+        assert!(validate_external_outbound_id("warp-8f3a-2d71", "warp").is_ok());
+        assert!(validate_external_outbound_id("vpngate-8f3a-2d71", "vpngate").is_ok());
+
+        assert!(validate_external_outbound_id("tunnel-8f3a-2d71", "vless").is_err());
+        assert!(validate_external_outbound_id("vendor-edge", "socks5").is_err());
+        assert!(validate_external_outbound_id("vpngate-jp", "vpngate").is_err());
+        assert!(validate_external_outbound_id("warp-platform", "warp").is_err());
+        assert!(validate_external_outbound_id("vpngate-8f3a-2d71", "wireguard").is_err());
     }
 }

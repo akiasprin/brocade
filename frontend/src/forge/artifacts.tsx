@@ -22,6 +22,8 @@ import {
 } from '../api';
 import { artifactPanel } from '../ui/artifact-panel';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
+import { Icon } from '../ui/icons';
+import type { PresencePhase } from '../ui/presence';
 import { artifactFile, artifactFmt, countChanges, diffLines, fmtBytes, highlight } from './diff';
 
 export const entryId = (a: ArtifactIndexEntry) => `${a.target_kind}/${a.target_id}/${a.artifact_kind}`;
@@ -46,11 +48,14 @@ export function useRevisionDiff(revision: number | undefined, base: number | nul
     queryKey: ['artifact-index', revision],
     queryFn: () => fetchArtifactIndex(revision),
     enabled: revision != null,
+    // A committed revision is immutable; its index never becomes stale.
+    staleTime: Infinity,
   });
   const there = useQuery({
     queryKey: ['artifact-index', base],
     queryFn: () => fetchArtifactIndex(base ?? undefined),
     enabled: base != null,
+    staleTime: Infinity,
   });
 
   return useMemo(() => {
@@ -83,21 +88,22 @@ export function useRevisionDiff(revision: number | undefined, base: number | nul
 export function useChangedArtifacts(
   revision: number | undefined,
   prev: number | undefined,
-  options: { compareClean?: boolean } = {},
+  options: { compareClean?: boolean; enabled?: boolean } = {},
 ) {
   const draftVer = useSyncExternalStore(draft.subscribe, draft.version);
   const dirty = !draft.isEmpty();
   const base = dirty ? revision : options.compareClean ? prev : undefined;
+  const enabled = options.enabled ?? true;
 
   const here = useQuery({
     queryKey: ['artifact-index', 'view', revision, draftVer],
     queryFn: () => fetchArtifactIndexView(revision),
-    enabled: revision != null,
+    enabled: enabled && revision != null,
   });
   const there = useQuery({
     queryKey: ['artifact-index', base],
     queryFn: () => fetchArtifactIndex(base),
-    enabled: base != null,
+    enabled: enabled && base != null,
   });
 
   return useMemo(() => {
@@ -109,7 +115,7 @@ export function useChangedArtifacts(
         changed: new Set<string>(),
         known: false,
         dirty,
-        pending: (revision != null && here.isPending) || (base != null && there.isPending),
+        pending: enabled && ((revision != null && here.isPending) || (base != null && there.isPending)),
         error: here.error ?? there.error,
       };
     }
@@ -118,10 +124,10 @@ export function useChangedArtifacts(
       changed: changedBetween(list, there.data.artifacts),
       known: true,
       dirty,
-      pending: (revision != null && here.isPending) || there.isPending,
+      pending: enabled && ((revision != null && here.isPending) || there.isPending),
       error: here.error ?? there.error,
     };
-  }, [here.data, here.isPending, here.error, there.data, there.isPending, there.error, revision, base, dirty]);
+  }, [here.data, here.isPending, here.error, there.data, there.isPending, there.error, revision, base, dirty, enabled]);
 }
 
 /** 影响范围：发生变化的 node 类产物涉及的机器数量。 */
@@ -162,12 +168,14 @@ export function ArtifactRail({
   compareClean,
   apps,
   onClose,
+  motionState,
 }: {
   revision: number | undefined;
   prev: number | undefined;
   compareClean: boolean;
   apps: SnapshotApp[];
   onClose: () => void;
+  motionState: PresencePhase;
 }) {
   const panel = useSyncExternalStore(artifactPanel.subscribe, artifactPanel.snapshot);
   const { list, changed, dirty, pending, error } = useChangedArtifacts(revision, prev, { compareClean });
@@ -216,7 +224,13 @@ export function ArtifactRail({
   };
 
   return (
-    <aside className="fg-rail" ref={rail}>
+    <aside
+      className="fg-rail"
+      ref={rail}
+      data-motion-state={motionState}
+      aria-hidden={motionState === 'exiting' || undefined}
+      inert={motionState === 'exiting'}
+    >
       <div className="fg-hs" title="拖动改宽度" onPointerDown={onDrag} />
       <div className="fg-rsh">
         产物 · {dirty ? '草稿预览' : '当前修订'}
@@ -225,14 +239,14 @@ export function ArtifactRail({
           {!pending && baseRevision != null && changed.size ? ` · 比修订 ${baseRevision} ${changed.size} 变` : ''}
         </span>
         <button className="x" title="关闭产物栏" aria-label="关闭产物栏" onClick={onClose}>
-          ×
+          <Icon of="close" size={13} />
         </button>
       </div>
 
       <div className="fg-artbody">
         <div className="fg-arttree">
           {error && <ErrorBox error={error} />}
-          {!error && pending && <Loading />}
+          {!error && pending && <Loading variant="tree" />}
           {GROUPS.map(g => {
             const mine = list.filter(a => a.target_kind === g.kind);
             if (!mine.length) return null;
@@ -350,7 +364,7 @@ function ArtifactBody({
       <>
         {bar}
         <div className="fg-code">
-          <Loading />
+          <Loading variant="code" />
         </div>
       </>
     );

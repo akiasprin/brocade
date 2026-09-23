@@ -1,7 +1,9 @@
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { cleanup, render, screen, within } from '@testing-library/react';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { NodeAgentStateItem } from '../src/api';
 
 let runtimeFindings: typeof import('../src/panes/nodes').runtimeFindings;
+let AppliedCard: typeof import('../src/panes/nodes').AppliedCard;
 
 beforeAll(async () => {
   vi.stubGlobal(
@@ -12,8 +14,10 @@ beforeAll(async () => {
       removeEventListener: vi.fn(),
     })),
   );
-  ({ runtimeFindings } = await import('../src/panes/nodes'));
+  ({ AppliedCard, runtimeFindings } = await import('../src/panes/nodes'));
 });
+
+afterEach(cleanup);
 
 function node(overlay: boolean, appliedState: string = 'present'): NodeAgentStateItem {
   return {
@@ -138,5 +142,25 @@ describe('usage runtime findings', () => {
 
     const finding = runtimeFindings(value).find(item => item.chip === '未归属流量 1 项');
     expect(finding?.tone).toBe('warn');
+  });
+});
+
+describe('OpenVPN runtime status', () => {
+  it.each([
+    ['OpenVPN 2.6.12 x86_64-pc-linux-gnu', 'OPENVPN 已应用'],
+    [null, 'OPENVPN 已关闭'],
+  ])('renders %s as an extension chip in the CONFIG band', (openvpn, title) => {
+    const value = node(false);
+    value.runtime_versions = { ...value.runtime_versions!, openvpn };
+    render(<AppliedCard node={value} revisionOf={() => undefined} />);
+
+    const configBand = screen.getByText('CONFIG').closest('section');
+    expect(configBand).not.toBeNull();
+    expect(within(configBand!).getByText('扩展应用')).toBeTruthy();
+    expect(within(configBand!).getByText('来自').parentElement?.classList.contains('w2')).toBe(false);
+    expect(within(configBand!).getByText('产物').parentElement?.classList.contains('w3')).toBe(true);
+    const chip = within(configBand!).getByText('OPENVPN');
+    expect(chip.classList.contains('nd-rt-chip')).toBe(true);
+    expect(chip.getAttribute('title')).toBe(title);
   });
 });

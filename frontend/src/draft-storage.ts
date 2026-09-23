@@ -37,16 +37,15 @@ export function afterSubmission(entries: readonly DraftEntry[], submitted: reado
 
 function readEntries(value: unknown): DraftEntry[] {
   if (!Array.isArray(value)) return [];
-  return value
-    .filter(
-      (entry): entry is DraftEntry =>
-        !!entry &&
-        typeof entry.key === 'string' &&
-        typeof entry.label === 'string' &&
-        typeof entry.editId === 'string' &&
-        !!entry.op &&
-        typeof entry.op.op === 'string',
-    );
+  return value.filter(
+    (entry): entry is DraftEntry =>
+      !!entry &&
+      typeof entry.key === 'string' &&
+      typeof entry.label === 'string' &&
+      typeof entry.editId === 'string' &&
+      !!entry.op &&
+      typeof entry.op.op === 'string',
+  );
 }
 
 /** Immutable branch heads avoid localStorage's read/modify/write lost-update race. Two writes

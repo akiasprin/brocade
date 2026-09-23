@@ -16,7 +16,7 @@ FROM ubuntu:24.04
 # 「需要 nft（nftables）来给 phantun 配 NAT」。
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      wireguard-tools bash iproute2 iptables nftables \
+      wireguard-tools openvpn bash iproute2 iptables nftables \
       curl dnsutils tcpdump jq procps ca-certificates unzip wget \
       iputils-ping tzdata \
  && rm -rf /var/lib/apt/lists/*

@@ -99,6 +99,27 @@ func TestGenerateRecordPayloadSizes(t *testing.T) {
 	}
 }
 
+func BenchmarkGenerateRecordPayloadSizes(b *testing.B) {
+	scheme, err := newPaddingScheme(defaultPaddingScheme)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("allocated-result", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = scheme.GenerateRecordPayloadSizes(2)
+		}
+	})
+	b.Run("write-path-scratch", func(b *testing.B) {
+		var scratch [16]int
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = scheme.appendRecordPayloadSizes(scratch[:0], 2)
+		}
+	})
+}
+
 func TestSessionPacketPaddingStopsAtConfiguredLimit(t *testing.T) {
 	scheme, err := parsePaddingScheme("stop=3\n1=64-64\n2=96-96")
 	if err != nil {
@@ -145,7 +166,7 @@ func TestPaddingSizeAndWasteFrameBoundaries(t *testing.T) {
 	if got := getPadding0Size(scheme); got != 64 {
 		t.Fatalf("padding size = %d, want 64", got)
 	}
-	scheme.scheme["0"] = "65536-65536"
+	scheme.records[0] = []paddingRange{{minSize: maxFramePayload + 1, maxSize: maxFramePayload + 1}}
 	if got := getPadding0Size(scheme); got != 30 {
 		t.Fatalf("defensive oversized packet 0 fallback = %d, want 30", got)
 	}

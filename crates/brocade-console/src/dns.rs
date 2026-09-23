@@ -116,6 +116,7 @@ impl Cloudflare {
     /// the zone fails here, before an order has been opened and before any rate limit is spent.
     pub async fn connect(token: &str, domain: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
+            .use_rustls_tls()
             .timeout(Duration::from_secs(20))
             .user_agent("brocade-console")
             .build()

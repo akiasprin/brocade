@@ -16,8 +16,8 @@ use super::types::{
 };
 use super::{
     chain_tenant_tx, commit_revision, ensure_node_exists_tx, existing_step_accept_uuid,
-    insert_revision, lock_control_state, normalize_step_accept, note_or, required_text,
-    resolve_hop_security, u64_to_i64,
+    insert_revision, lock_control_state, normalize_step_accept, note_or,
+    prune_unreferenced_vpngate_outbounds_tx, required_text, resolve_hop_security, u64_to_i64,
 };
 use crate::{AdminContext, Result, StoreError};
 
@@ -112,7 +112,14 @@ pub async fn delete_step(
     let previous = lock_control_state(&mut tx).await?;
     let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
     let outcome = delete_step_tx(&mut tx, actor, revision_id, app_id, chain_id, node_id).await?;
-    let revision_id = commit_revision(&mut tx, revision_id, previous, outcome.changed).await?;
+    let pruned_vpngate = prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await?;
+    let revision_id = commit_revision(
+        &mut tx,
+        revision_id,
+        previous,
+        outcome.changed || pruned_vpngate,
+    )
+    .await?;
     tx.commit().await?;
 
     Ok(DeleteStepResult {
@@ -423,7 +430,14 @@ pub async fn prune_chain(
     let previous = lock_control_state(&mut tx).await?;
     let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
     let outcome = prune_chain_tx(&mut tx, actor, app_id, chain_id).await?;
-    let revision_id = commit_revision(&mut tx, revision_id, previous, outcome.changed()).await?;
+    let pruned_vpngate = prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await?;
+    let revision_id = commit_revision(
+        &mut tx,
+        revision_id,
+        previous,
+        outcome.changed() || pruned_vpngate,
+    )
+    .await?;
     tx.commit().await?;
 
     Ok(PruneChainResult {

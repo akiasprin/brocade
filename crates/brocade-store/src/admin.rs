@@ -16,6 +16,7 @@ use crate::{
     Result, StoreError,
 };
 
+/// Maximum time between successful cookie-authenticated requests before a session expires.
 pub const ADMIN_SESSION_TTL_SECONDS: i32 = 12 * 60 * 60;
 const ADMIN_LAST_USED_TOUCH_SECONDS: i32 = 60;
 const MIN_ADMIN_PASSWORD_LEN: usize = 8;
@@ -172,6 +173,13 @@ pub struct AuthenticatedAdmin {
     pub token_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_user: Option<AuthenticatedUser>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminSessionAuthentication {
+    pub admin: AuthenticatedAdmin,
+    /// The durable expiry moved forward, so the HTTP boundary must renew the browser cookie too.
+    pub refreshed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1034,6 +1042,15 @@ pub async fn authenticate_admin_session(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<AuthenticatedAdmin>> {
+    Ok(authenticate_admin_session_with_refresh(pool, token)
+        .await?
+        .map(|authentication| authentication.admin))
+}
+
+pub async fn authenticate_admin_session_with_refresh(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<AdminSessionAuthentication>> {
     let token = token.trim();
     if token.is_empty() {
         return Ok(None);
@@ -1056,15 +1073,16 @@ pub async fn authenticate_admin_session(
     .fetch_optional(pool)
     .await?;
 
-    let touch_last_used = row
-        .as_ref()
-        .map(|row| row.try_get::<bool, _>("touch_last_used"))
-        .transpose()?
-        .unwrap_or(false);
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let touch_last_used = row.try_get::<bool, _>("touch_last_used")?;
+    let mut refreshed = false;
     if touch_last_used {
-        sqlx::query(
+        refreshed = sqlx::query(
             "UPDATE admin_sessions
-             SET last_used_at = now()
+             SET last_used_at = now(),
+                 expires_at = now() + ($3::int * interval '1 second')
              WHERE token_hash = $1
                AND revoked_at IS NULL
                AND expires_at > now()
@@ -1073,20 +1091,23 @@ pub async fn authenticate_admin_session(
         )
         .bind(&token_hash)
         .bind(ADMIN_LAST_USED_TOUCH_SECONDS)
+        .bind(ADMIN_SESSION_TTL_SECONDS)
         .execute(pool)
-        .await?;
+        .await?
+        .rows_affected()
+            > 0;
     }
 
-    row.map(|row| {
-        Ok(AuthenticatedAdmin {
+    Ok(Some(AdminSessionAuthentication {
+        admin: AuthenticatedAdmin {
             operator_id: row.try_get("id")?,
             role: parse_admin_role(row.try_get("role")?)?,
             tenant_scope: row.try_get("tenant_scope")?,
             token_prefix: None,
             self_user: authenticated_user_from_row(&row)?,
-        })
-    })
-    .transpose()
+        },
+        refreshed,
+    }))
 }
 
 pub async fn revoke_admin_session(pool: &PgPool, token: &str) -> Result<bool> {

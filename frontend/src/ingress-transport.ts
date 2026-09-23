@@ -10,13 +10,21 @@ export function transportKindFor(security: IngressSecurity, xhttp: boolean): Tra
 /** Keep the public address projection stable across transport changes. Independent XHTTP download
  * settings belong to the XHTTP transport and are handled by that editor. */
 export function projectionForTransport(projection: IngressProjection, _kind: TransportKind): IngressProjection {
-  return Object.fromEntries(
-    (['v4', 'v6'] as const).flatMap(family => {
-      const endpoint = projection[family];
-      if (!endpoint) return [];
-      return [[family, { host: endpoint.host, port: endpoint.port }]];
-    }),
-  );
+  const copyPair = (pair: Pick<IngressProjection, 'v4' | 'v6'> | null | undefined) =>
+    pair
+      ? Object.fromEntries(
+          (['v4', 'v6'] as const).flatMap(family => {
+            const endpoint = pair[family];
+            return endpoint ? [[family, { host: endpoint.host, port: endpoint.port }]] : [];
+          }),
+        )
+      : pair;
+  const next: IngressProjection = { ...copyPair(projection) };
+  const protocols = ['vless_encryption', 'anytls', 'hysteria2'] as const;
+  protocols.forEach(protocol => {
+    if (projection[protocol] !== undefined) next[protocol] = copyPair(projection[protocol]);
+  });
+  return next;
 }
 
 /** Xray rejects downloadSettings with stream-one at config-build time. */

@@ -20,6 +20,7 @@ const who = {
   token_prefix: null,
   masked_assets: false,
 };
+const initial = { node_count: 0, chain_group_count: [] };
 const clients: QueryClient[] = [];
 function client() {
   const qc = new QueryClient({
@@ -62,7 +63,7 @@ it('submission preserves edits added after the request was sent', async () => {
   );
   render(
     <QueryClientProvider client={client()}>
-      <SessionProvider value={{ who }}>
+      <SessionProvider value={{ who, initial }}>
         <DraftBar current={1} />
       </SessionProvider>
     </QueryClientProvider>,
@@ -160,6 +161,28 @@ const ROUTES: Record<string, () => unknown> = {
     nodes: [],
   }),
   '/ping-probe/settings': () => ({ targets: [], interval_secs: 60, timeout_ms: 420 }),
+  '/tunnel-probes': () => ({
+    origin: 'console',
+    endpoint_url: 'http://cp.cloudflare.com/cdn-cgi/trace',
+    retention_days: 7,
+    items: [],
+  }),
+  '/tunnel-probes/capability': () => ({ available: true, version: '26.4.25', reason: null, concurrency: 30 }),
+  '/vpngate': () => ({
+    manual_pools_supported: true,
+    status: {},
+    countries: [],
+    admission_policy: {
+      minimum_successful_sources: 1,
+      country_policy: 'any_match',
+      risk_decision_policy: 'all_available_pass',
+      provider_rules: [
+        { provider: 'proxycheck', maximum_score: 80 },
+        { provider: 'ffraud', maximum_score: 80 },
+        { provider: 'iplogs', maximum_score: 80 },
+      ],
+    },
+  }),
   '/links/mtu': () => ({ default_mtu: 1420, nodes: [], links: [] }),
   '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),
 };
@@ -178,6 +201,9 @@ it('branding save preserves further typing while the request is pending', async 
     '/distribution': 'distribution',
     '/agent-log-policy': 'agent-log-policy',
     '/ping-probe/settings': 'ping-probe-settings',
+    '/tunnel-probes': 'tunnel-probes',
+    '/tunnel-probes/capability': 'tunnel-probe-capability',
+    '/vpngate': 'vpngate',
   };
   for (const [path, key] of Object.entries(keys)) qc.setQueryData([key], ROUTES[path]());
   qc.setQueryData(['nodes'], { nodes: [] });
@@ -187,7 +213,7 @@ it('branding save preserves further typing while the request is pending', async 
   vi.stubGlobal('fetch', fetch);
   const view = render(
     <QueryClientProvider client={qc}>
-      <SessionProvider value={{ who }}>
+      <SessionProvider value={{ who, initial }}>
         <SettingsPane />
       </SessionProvider>
     </QueryClientProvider>,
@@ -256,6 +282,9 @@ it('committing settings draft keeps the new baseline and refreshes settings', as
     '/distribution': 'distribution',
     '/agent-log-policy': 'agent-log-policy',
     '/ping-probe/settings': 'ping-probe-settings',
+    '/tunnel-probes': 'tunnel-probes',
+    '/tunnel-probes/capability': 'tunnel-probe-capability',
+    '/vpngate': 'vpngate',
   };
   for (const [path, key] of Object.entries(keys)) qc.setQueryData([key], ROUTES[path]());
   qc.setQueryData(['nodes'], { nodes: [] });
@@ -277,7 +306,7 @@ it('committing settings draft keeps the new baseline and refreshes settings', as
   vi.stubGlobal('fetch', fetch);
   const view = render(
     <QueryClientProvider client={qc}>
-      <SessionProvider value={{ who }}>
+      <SessionProvider value={{ who, initial }}>
         <DraftBar current={7} />
         <SettingsPane />
       </SessionProvider>
@@ -302,6 +331,9 @@ function settingsClient() {
     '/distribution': 'distribution',
     '/agent-log-policy': 'agent-log-policy',
     '/ping-probe/settings': 'ping-probe-settings',
+    '/tunnel-probes': 'tunnel-probes',
+    '/tunnel-probes/capability': 'tunnel-probe-capability',
+    '/vpngate': 'vpngate',
   };
   for (const [path, key] of Object.entries(keys)) qc.setQueryData([key], ROUTES[path]());
   qc.setQueryData(['nodes'], { nodes: [] });
@@ -311,7 +343,7 @@ function settingsClient() {
 function mountSettings(qc: QueryClient) {
   return render(
     <QueryClientProvider client={qc}>
-      <SessionProvider value={{ who }}>
+      <SessionProvider value={{ who, initial }}>
         <SettingsPane />
       </SessionProvider>
     </QueryClientProvider>,

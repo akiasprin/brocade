@@ -26,7 +26,7 @@ func readMultiBufferExact(br *buf.BufferedReader, length int) (buf.MultiBuffer, 
 	if length <= 0 {
 		return nil, nil
 	}
-	mb := make(buf.MultiBuffer, 0, (length+buf.Size-1)/buf.Size)
+	var mb buf.MultiBuffer
 	remaining := int32(length)
 	readAny := false
 
@@ -34,9 +34,15 @@ func readMultiBufferExact(br *buf.BufferedReader, length int) (buf.MultiBuffer, 
 		part, err := br.ReadAtMost(remaining)
 		partLen := part.Len()
 		if partLen > 0 {
-			mb, _ = buf.MergeMulti(mb, part)
 			remaining -= partLen
 			readAny = true
+			if remaining == 0 && mb == nil {
+				return part, nil
+			}
+			if mb == nil {
+				mb = make(buf.MultiBuffer, 0, (length+buf.Size-1)/buf.Size)
+			}
+			mb, _ = buf.MergeMulti(mb, part)
 		}
 		if remaining == 0 {
 			return mb, nil
@@ -50,6 +56,7 @@ func readMultiBufferExact(br *buf.BufferedReader, length int) (buf.MultiBuffer, 
 			return nil, err
 		}
 		if partLen == 0 {
+			buf.ReleaseMulti(part)
 			buf.ReleaseMulti(mb)
 			return nil, io.ErrNoProgress
 		}

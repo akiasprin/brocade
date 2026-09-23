@@ -61,6 +61,11 @@ pub(crate) async fn start_node_container(
             address.ipv6.to_string(),
             "--cap-add".to_owned(),
             "NET_ADMIN".to_owned(),
+            // Managed VPN Gate exits create named network namespaces so an untrusted OpenVPN
+            // profile can never replace the container's own default route. Creating the bind
+            // mount under /run/netns needs SYS_ADMIN in addition to NET_ADMIN.
+            "--cap-add".to_owned(),
+            "SYS_ADMIN".to_owned(),
             // phantun opens a TUN device, and a container has no /dev/net/tun node by default.
             // NET_ADMIN grants the ability to configure networking, not the presence of that
             // character device — without it phantun panics on startup (opening /dev/net/tun yields

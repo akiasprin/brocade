@@ -7,7 +7,7 @@ import { ExternalOutboundEditor, TunnelDeleteDialog } from '../src/panes/rules';
 
 const encryption = `mlkem768x25519plus.native.1rtt.${'A'.repeat(43)}`;
 const outbound: ExternalOutbound = {
-  id: 'vendor',
+  id: 'custom-1111-1111',
   tenant: 'platform',
   name: '供应商',
   address: 'example.com',
@@ -31,12 +31,37 @@ function editor() {
   );
   return { ...view, saved };
 }
-it('generates an opaque tunnel id for a new outbound', () => {
+it('keeps the generated tunnel id out of the editor', async () => {
+  const view = editor();
+  expect(view.queryByText('出站 ID')).toBeNull();
+  fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+  expect(view.queryByText('资源 ID')).toBeNull();
+  fireEvent.click(view.getByRole('button', { name: '粘贴分享链接' }));
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: { value: 'anytls://secret@example.com' },
+  });
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0].id).toMatch(/^custom-[0-9a-f]{4}-[0-9a-f]{4}$/);
+});
+it('orders secure tunnel protocols before generic proxies', () => {
   const view = editor();
   fireEvent.click(view.getByRole('button', { name: '手动填写' }));
-  expect((view.getByDisplayValue(/^tunnel-[0-9a-f]{4}-[0-9a-f]{4}$/) as HTMLInputElement).value).toMatch(
-    /^tunnel-[0-9a-f]{4}-[0-9a-f]{4}$/,
-  );
+  const protocolNames = new Set([
+    'VLESS Encryption',
+    'VLESS',
+    'AnyTLS',
+    'Shadowsocks',
+    'WireGuard',
+    'SOCKS5',
+    'HTTP CONNECT',
+  ]);
+  expect(
+    view
+      .getAllByRole('button')
+      .map(button => button.textContent)
+      .filter((name): name is string => name !== null && protocolNames.has(name)),
+  ).toEqual(['VLESS Encryption', 'VLESS', 'AnyTLS', 'Shadowsocks', 'WireGuard', 'SOCKS5', 'HTTP CONNECT']);
 });
 it('imports AnyTLS with encoded password, IPv6, SNI and default port into the draft', async () => {
   const view = editor();
@@ -74,6 +99,14 @@ it('imports VLESS Encryption without requiring TLS', async () => {
     security: { t: 'none' },
   });
 });
+it('rejects transport security layered over VLESS Encryption', () => {
+  const view = editor();
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: { value: `vless://uuid@example.com:8443?encryption=${encryption}&security=tls&type=tcp#Encrypted` },
+  });
+  expect(view.getByText('VLESS Encryption 不叠加 TLS 或 REALITY 传输安全')).toBeTruthy();
+  expect(view.getByRole('button', { name: '创建并选中' }).hasAttribute('disabled')).toBe(true);
+});
 it('imports classic Shadowsocks AES-256-GCM with an ordinary password', async () => {
   const view = editor();
   fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
@@ -110,6 +143,7 @@ it('offers classic and 2022 methods under the Shadowsocks manual protocol', () =
     expect(view.getByRole('option', { name: method })).toBeTruthy();
   }
   expect(view.queryByText('安全层')).toBeNull();
+  expect(view.queryByText('传输安全')).toBeNull();
   expect(view.queryByRole('button', { name: 'Shadowsocks 2022' })).toBeNull();
 });
 it('offers native VLESS Encryption as a manual choice with no TLS fields', () => {
@@ -120,7 +154,10 @@ it('offers native VLESS Encryption as a manual choice with no TLS fields', () =>
   expect(view.getByLabelText('VLESS Encryption 参数').getAttribute('aria-invalid')).toBe('true');
   fireEvent.change(view.getByLabelText('VLESS Encryption 参数'), { target: { value: encryption } });
   expect(view.getByLabelText('VLESS Encryption 参数').getAttribute('aria-invalid')).toBe('false');
-  expect(view.queryByText('Server Name')).toBeNull();
+  expect(view.queryByText('传输安全')).toBeNull();
+  fireEvent.click(view.getByRole('button', { name: 'VLESS' }));
+  expect(view.queryByLabelText('VLESS Encryption 参数')).toBeNull();
+  expect(view.getByText('传输安全')).toBeTruthy();
   fireEvent.click(view.getByRole('button', { name: 'AnyTLS' }));
   expect(view.getByRole('button', { name: 'AnyTLS' }).getAttribute('aria-pressed')).toBe('true');
   expect(view.queryByLabelText('VLESS Encryption 参数')).toBeNull();
@@ -132,7 +169,11 @@ it('deletes an unused resource through a reversible draft', async () => {
   fireEvent.click(view.getByRole('button', { name: '删除隧道' }));
   await waitFor(() => expect(closed).toHaveBeenCalled());
   expect(deleted).toHaveBeenCalledOnce();
-  expect(draft.snapshot()[0].op).toEqual({ op: 'delete_external_outbound', tenant_id: 'platform', id: 'vendor' });
+  expect(draft.snapshot()[0].op).toEqual({
+    op: 'delete_external_outbound',
+    tenant_id: 'platform',
+    id: 'custom-1111-1111',
+  });
 });
 it('shows rule and front references and blocks deletion', () => {
   const app: SnapshotApp = {
@@ -156,14 +197,4 @@ it('shows rule and front references and blocks deletion', () => {
   expect(view.getByText('线路 / 链 / hk / 规则 1')).toBeTruthy();
   expect(view.getByText('线路 / 前置组 前置')).toBeTruthy();
   expect(view.getByRole('button', { name: '删除隧道' }).hasAttribute('disabled')).toBe(true);
-});
-it('moves deletion after earlier reference-removal operations when replacing an upsert', () => {
-  draft.push({ op: 'upsert_external_outbound', outbound: { ...outbound, tenant_id: outbound.tenant } });
-  draft.push({
-    op: 'upsert_front',
-    app_id: 'a',
-    front: { id: 'f', tenant_id: 'platform', name: 'front', strategy: 'select', via: [], external_via: [] },
-  });
-  draft.push({ op: 'delete_external_outbound', tenant_id: outbound.tenant, id: outbound.id });
-  expect(draft.snapshot().map(entry => entry.op.op)).toEqual(['upsert_front', 'delete_external_outbound']);
 });

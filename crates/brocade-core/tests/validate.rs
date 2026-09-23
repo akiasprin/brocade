@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use brocade_core::{
     compile::compile,
     ir::{
+        front::{analyze_front_routes, FrontRouteStatus},
         routing::compile_app,
         system::compile_system,
         validate::{validate_app, validate_app_set, validate_model_snapshot, validate_system},
@@ -86,7 +87,7 @@ fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport(
             vec![Rule {
                 dest_match: DestMatch::Any,
                 action: Action::Proxy {
-                    outbound: "ss".to_owned(),
+                    outbound: "custom-1111-1111".to_owned(),
                 },
             }],
             None,
@@ -94,7 +95,7 @@ fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport(
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "ss".to_owned(),
+        id: "custom-1111-1111".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "SS".to_owned(),
         address: "ss.example.net".to_owned(),
@@ -200,7 +201,7 @@ fn managed_warp_runtime_overrides_are_validated() {
             vec![Rule {
                 dest_match: DestMatch::Any,
                 action: Action::Proxy {
-                    outbound: "warp".to_owned(),
+                    outbound: "warp-8f3a-2d71".to_owned(),
                 },
             }],
             None,
@@ -208,7 +209,7 @@ fn managed_warp_runtime_overrides_are_validated() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "warp".to_owned(),
+        id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "Cloudflare WARP".to_owned(),
         address: "engage.cloudflareclient.com".to_owned(),
@@ -255,6 +256,275 @@ fn managed_warp_runtime_overrides_are_validated() {
 }
 
 #[test]
+fn managed_vpngate_pool_is_node_only_and_validates_its_selection_policy() {
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    doc.external_outbounds = vec![ExternalOutbound {
+        id: "vpngate-1111-1111".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "VPN Gate 日本".to_owned(),
+        address: "operator.example.net".to_owned(),
+        port: 443,
+        protocol: ExternalOutboundProtocol::Vpngate {
+            country_code: "jp".to_owned(),
+            server_id: Some(" bad\nserver ".to_owned()),
+            server_ids: Vec::new(),
+            max_connect_ms: 0,
+            min_download_bps: 10_000_000_001,
+            max_candidates: 0,
+        },
+        security: ExternalOutboundSecurity::Tls {
+            server_name: "operator.example.net".to_owned(),
+            fingerprint: "chrome".to_owned(),
+        },
+        bindings: Vec::new(),
+    }];
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: vec![Front {
+            id: "f".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "链式代理".to_owned(),
+            via: Vec::new(),
+            external_via: vec!["vpngate-1111-1111".to_owned()],
+            strategy: FrontStrategy::UrlTest,
+        }],
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Proxy {
+                    outbound: "vpngate-1111-1111".to_owned(),
+                },
+            }],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+    for code in [
+        "external-outbound.vpngate-country",
+        "external-outbound.vpngate-connect-time",
+        "external-outbound.vpngate-download-speed",
+        "external-outbound.vpngate-candidates",
+        "external-outbound.vpngate-server",
+        "external-outbound.vpngate-pinned-candidates",
+        "external-outbound.vpngate-endpoint",
+        "external-outbound.raw-transport",
+        "front.vpngate-managed-runtime",
+    ] {
+        assert_has(&diagnostics, Level::Error, code);
+    }
+}
+
+#[test]
+fn managed_vpngate_pool_rejects_the_reserved_unknown_region() {
+    let mut model = doc(Vec::new());
+    model.external_outbounds.push(ExternalOutbound {
+        id: "vpngate-1111-1111".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "unknown region".to_owned(),
+        address: "managed.vpngate.invalid".to_owned(),
+        port: 1,
+        protocol: ExternalOutboundProtocol::Vpngate {
+            country_code: "ZZ".to_owned(),
+            server_id: None,
+            server_ids: Vec::new(),
+            max_connect_ms: 15_000,
+            min_download_bps: 1_000_000,
+            max_candidates: 10,
+        },
+        security: ExternalOutboundSecurity::None,
+        bindings: Vec::new(),
+    });
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&model, &mut diagnostics);
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "test".to_owned(),
+        chains: Vec::new(),
+        ingresses: Vec::new(),
+        fronts: Vec::new(),
+        steps: Vec::new(),
+        grants: Vec::new(),
+    };
+    let app_ir = compile_app(&model, &app, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert_has(
+        &diagnostics,
+        Level::Error,
+        "external-outbound.vpngate-country",
+    );
+}
+
+#[test]
+fn vpngate_manual_pool_validates_members_and_keeps_legacy_defaults() {
+    let legacy = serde_json::json!({"t": "vpngate", "v": {"country_code": "JP"}});
+    let protocol: ExternalOutboundProtocol = serde_json::from_value(legacy).unwrap();
+    let ExternalOutboundProtocol::Vpngate { server_ids, .. } = &protocol else {
+        panic!("VPN Gate protocol")
+    };
+    assert!(server_ids.is_empty());
+    let mut model = doc(Vec::new());
+    model.external_outbounds.push(ExternalOutbound {
+        id: "vpngate-1111-1111".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "manual".to_owned(),
+        address: "managed.vpngate.invalid".to_owned(),
+        port: 1,
+        protocol,
+        security: ExternalOutboundSecurity::None,
+        bindings: Vec::new(),
+    });
+    for (ids, pinned, count, error) in [
+        (vec!["vpn-a", "vpn-b"], None, 2, None),
+        (
+            vec!["vpn-a", "vpn-a"],
+            None,
+            2,
+            Some("external-outbound.vpngate-manual-pool"),
+        ),
+        (
+            vec!["vpn-a"],
+            Some("vpn-b"),
+            1,
+            Some("external-outbound.vpngate-manual-pool"),
+        ),
+        (
+            vec!["vpn-a"],
+            None,
+            2,
+            Some("external-outbound.vpngate-manual-pool"),
+        ),
+        (
+            vec![" bad\n"],
+            None,
+            1,
+            Some("external-outbound.vpngate-server"),
+        ),
+        (
+            (0..11).map(|_| "vpn-a").collect(),
+            None,
+            10,
+            Some("external-outbound.vpngate-manual-pool"),
+        ),
+    ] {
+        if let ExternalOutboundProtocol::Vpngate {
+            server_ids,
+            server_id,
+            max_candidates,
+            ..
+        } = &mut model.external_outbounds[0].protocol
+        {
+            *server_ids = ids.into_iter().map(str::to_owned).collect();
+            *server_id = pinned.map(str::to_owned);
+            *max_candidates = count;
+        }
+        let mut diagnostics = Vec::new();
+        let sys = compile_system(&model, &mut diagnostics);
+        let app = AppView {
+            id: "app".to_owned(),
+            label: "test".to_owned(),
+            chains: Vec::new(),
+            ingresses: Vec::new(),
+            fronts: Vec::new(),
+            steps: Vec::new(),
+            grants: Vec::new(),
+        };
+        let app_ir = compile_app(&model, &app, &mut diagnostics);
+        validate_app(&sys, &app_ir, &mut diagnostics);
+        if let Some(code) = error {
+            assert_has(&diagnostics, Level::Error, code);
+        } else {
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|d| !d.code.starts_with("external-outbound.vpngate")),
+                "{diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vpngate_runtime_limit_is_per_referencing_node_not_the_global_catalogue() {
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    doc.external_outbounds = (0..17)
+        .map(|index| ExternalOutbound {
+            id: format!("vpngate-{index:04x}-0000"),
+            tenant: "platform.acme".to_owned(),
+            name: format!("VPN Gate {index}"),
+            address: "managed.vpngate.invalid".to_owned(),
+            port: 1,
+            protocol: ExternalOutboundProtocol::Vpngate {
+                country_code: "JP".to_owned(),
+                server_id: None,
+                server_ids: Vec::new(),
+                max_connect_ms: 15_000,
+                min_download_bps: 1_000_000,
+                max_candidates: 10,
+            },
+            security: ExternalOutboundSecurity::None,
+            bindings: Vec::new(),
+        })
+        .collect();
+
+    let mut unused = Vec::new();
+    validate_model_snapshot(&doc, &mut unused);
+    assert!(unused
+        .iter()
+        .all(|diagnostic| diagnostic.code != "external-outbound.vpngate-pool-limit"));
+
+    doc.apps.push(AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: Vec::new(),
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            (0..17)
+                .map(|index| Rule {
+                    dest_match: DestMatch::DomainKeyword(vec![format!("site-{index}")]),
+                    action: Action::Proxy {
+                        outbound: format!("vpngate-{index:04x}-0000"),
+                    },
+                })
+                .collect(),
+            None,
+        )],
+        grants: Vec::new(),
+    });
+    let mut referenced = Vec::new();
+    validate_model_snapshot(&doc, &mut referenced);
+    assert_has(
+        &referenced,
+        Level::Error,
+        "external-outbound.vpngate-pool-limit",
+    );
+}
+
+#[test]
 fn external_tunnel_visibility_follows_tenant_ancestry() {
     let mut doc = doc(vec![node(
         "hk",
@@ -275,7 +545,7 @@ fn external_tunnel_visibility_follows_tenant_ancestry() {
             vec![Rule {
                 dest_match: DestMatch::Any,
                 action: Action::Proxy {
-                    outbound: "shared".to_owned(),
+                    outbound: "custom-2222-2222".to_owned(),
                 },
             }],
             None,
@@ -283,7 +553,7 @@ fn external_tunnel_visibility_follows_tenant_ancestry() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "shared".to_owned(),
+        id: "custom-2222-2222".to_owned(),
         tenant: "platform".to_owned(),
         name: "共享出口".to_owned(),
         address: "proxy.example.net".to_owned(),
@@ -336,7 +606,7 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
             vec![Rule {
                 dest_match: DestMatch::Any,
                 action: Action::Proxy {
-                    outbound: "external".to_owned(),
+                    outbound: "custom-3333-3333".to_owned(),
                 },
             }],
             None,
@@ -344,7 +614,7 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "external".to_owned(),
+        id: "custom-3333-3333".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External XHTTP".to_owned(),
         address: "upload.example.net".to_owned(),
@@ -455,7 +725,7 @@ fn external_socks_auth_and_wireguard_shape_are_validated() {
             vec![Rule {
                 dest_match: DestMatch::Any,
                 action: Action::Proxy {
-                    outbound: "external".to_owned(),
+                    outbound: "custom-3333-3333".to_owned(),
                 },
             }],
             None,
@@ -463,7 +733,7 @@ fn external_socks_auth_and_wireguard_shape_are_validated() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "external".to_owned(),
+        id: "custom-3333-3333".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External".to_owned(),
         address: "proxy.example.net".to_owned(),
@@ -2397,7 +2667,7 @@ fn validate_app_set_reports_cross_view_hop_in_port_collisions() {
 }
 
 #[test]
-fn validate_app_reports_front_open_default() {
+fn validate_app_allows_front_member_chain_to_use_ordinary_egress() {
     let app = AppView {
         id: "app".to_owned(),
         label: "应用".to_owned(),
@@ -2445,7 +2715,12 @@ fn validate_app_reports_front_open_default() {
 
     validate_app(&sys, &app_ir, &mut diagnostics);
 
-    assert_has(&diagnostics, Level::Error, "front.via-open");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "front.via-open"),
+        "前置组不应改写或限制服务端链路：{diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -2478,6 +2753,44 @@ fn validate_app_reports_tenant_scope_and_bad_dns_form() {
 
     assert_has(&diagnostics, Level::Error, "tenant.scope");
     assert_has(&diagnostics, Level::Error, "node.dns-form");
+}
+
+#[test]
+fn validate_app_reports_a_front_target_outside_its_tenant_branch() {
+    let app = front_app(Vec::new(), Vec::new());
+    let mut diagnostics = Vec::new();
+    let doc = doc(vec![
+        node(
+            "hk",
+            "platform",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform",
+            Some("us.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    let sys = compile_system(&doc, &mut diagnostics);
+    let mut app_ir = compile_app(&doc, &app, &mut diagnostics);
+    app_ir
+        .ingresses
+        .iter_mut()
+        .find(|ingress| ingress.id == "i-us")
+        .unwrap()
+        .tenant = "platform.beta".to_owned();
+
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "tenant.scope"
+            && diagnostic.location == "f/i-us"
+            && diagnostic.message.contains("目标")
+    }));
 }
 
 #[test]
@@ -2814,14 +3127,547 @@ fn validate_app_reports_front_blocked_and_unproven_paths() {
 }
 
 #[test]
-fn validate_app_reports_front_grant_without_via_grant_and_via_without_egress() {
+fn front_reachability_uses_the_endpoint_published_to_subscribers() {
+    let doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("unused-node-address.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    let mut app = front_app(
+        vec![step(
+            "c-front",
+            "hk",
+            vec![
+                Rule {
+                    dest_match: DestMatch::DomainSuffix(vec![
+                        "PUBLISHED-EDGE.EXAMPLE.NET".to_owned()
+                    ]),
+                    action: Action::Block,
+                },
+                any_egress(),
+            ],
+            None,
+        )],
+        Vec::new(),
+    );
+    app.ingresses[1].projection = Projection {
+        v4: Some(ProjectionEndpoint {
+            host: "published-edge.example.net".to_owned(),
+            port: 9443,
+        }),
+        v6: None,
+        ..Projection::default()
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    let blocked = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "front.blocked")
+        .unwrap_or_else(|| panic!("投影端点没有参与前置路由判定：{diagnostics:#?}"));
+    assert!(
+        blocked.message.contains("published-edge.example.net"),
+        "{blocked:#?}"
+    );
+    assert!(!blocked.message.contains("unused-node-address.example.net"));
+}
+
+#[test]
+fn front_analysis_uses_the_published_port_when_evaluating_the_member_chain() {
     let mut doc = doc(vec![
         node(
             "hk",
             "platform.acme",
             Some("hk.example.net"),
             [10, 66, 0, 1],
-            false,
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("unused-node-address.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    let mut app = front_app(
+        vec![
+            step(
+                "c-front",
+                "hk",
+                vec![
+                    Rule {
+                        dest_match: DestMatch::Port(vec!["9443".to_owned()]),
+                        action: Action::Block,
+                    },
+                    any_egress(),
+                ],
+                None,
+            ),
+            step("c-us", "us", vec![any_egress()], None),
+        ],
+        Vec::new(),
+    );
+    app.ingresses[1].projection = Projection {
+        v4: Some(ProjectionEndpoint {
+            host: "published-edge.example.net".to_owned(),
+            port: 9443,
+        }),
+        v6: None,
+        ..Projection::default()
+    };
+    doc.apps = vec![app];
+
+    let compiled = compile(&doc);
+    assert_has(&compiled.diagnostics, Level::Error, "front.blocked");
+    let app = &compiled.unpublishable_view().apps[0];
+    let analysis = analyze_front_routes(
+        Some(compiled.unpublishable_view().system),
+        Some(app),
+        "f",
+        &["i-front".to_owned()],
+        &[],
+        &["i-us".to_owned()],
+    );
+    assert_eq!(analysis.cells[0].relay.status, FrontRouteStatus::Blocked);
+    assert_eq!(
+        analysis.cells[0].endpoints[0].endpoint,
+        "published-edge.example.net:9443/tcp"
+    );
+    assert_eq!(analysis.cells[0].relay.selector.as_deref(), Some("port"));
+}
+
+#[test]
+fn front_analysis_applies_member_ingress_guards_before_chain_rules() {
+    let mut base_doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("us.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    base_doc.overlay_cidr = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 16).unwrap();
+    base_doc.nodes[0].overlay_addr = Ipv4Addr::new(100, 64, 0, 1);
+    base_doc.nodes[1].overlay_addr = Ipv4Addr::new(100, 64, 0, 2);
+    base_doc.nodes[1].certificate_name = Some("us.example.net".to_owned());
+    let base_app = front_app(
+        vec![
+            step("c-front", "hk", vec![any_egress()], None),
+            step("c-us", "us", vec![any_egress()], None),
+        ],
+        Vec::new(),
+    );
+    let analyze = |app: AppView| {
+        let mut doc = base_doc.clone();
+        doc.apps = vec![app];
+        let compiled = compile(&doc);
+        assert_has(&compiled.diagnostics, Level::Error, "front.blocked");
+        let view = compiled.unpublishable_view();
+        analyze_front_routes(
+            Some(view.system),
+            Some(&view.apps[0]),
+            "f",
+            &["i-front".to_owned()],
+            &[],
+            &["i-us".to_owned()],
+        )
+    };
+
+    let mut mail = base_app.clone();
+    mail.ingresses[0].guard.no_mail = true;
+    mail.ingresses[1].projection.v4 = Some(ProjectionEndpoint {
+        host: "mail-edge.example.net".to_owned(),
+        port: 587,
+    });
+    let mail = analyze(mail);
+    assert_eq!(mail.cells[0].relay.status, FrontRouteStatus::Blocked);
+    assert_eq!(
+        mail.cells[0].endpoints[0].decision.selector.as_deref(),
+        Some("ingress-guard:no-mail")
+    );
+    assert_eq!(mail.cells[0].endpoints[0].decision.rule_index, None);
+
+    let mut private = base_app.clone();
+    private.ingresses[0].guard.no_private = true;
+    private.ingresses[1].projection.v4 = Some(ProjectionEndpoint {
+        host: "100.64.23.45".to_owned(),
+        port: 443,
+    });
+    let private = analyze(private);
+    assert_eq!(private.cells[0].relay.status, FrontRouteStatus::Blocked);
+    assert_eq!(
+        private.cells[0].endpoints[0].decision.selector.as_deref(),
+        Some("ingress-guard:no-private")
+    );
+
+    let mut amplification = base_app.clone();
+    amplification.ingresses[0].guard.no_udp_amplification = true;
+    amplification.ingresses[1].wires = IngressWires::Hysteria2(Hysteria2 {
+        port: 53,
+        ..Hysteria2::default()
+    });
+    let amplification = analyze(amplification);
+    assert_eq!(
+        amplification.cells[0].relay.status,
+        FrontRouteStatus::Blocked
+    );
+    assert_eq!(
+        amplification.cells[0].endpoints[0]
+            .decision
+            .selector
+            .as_deref(),
+        Some("ingress-guard:no-udp-amplification")
+    );
+
+    let mut udp = base_app;
+    udp.ingresses[0].guard.tcp_and_quic_only = true;
+    udp.ingresses[1].wires = IngressWires::Hysteria2(Hysteria2 {
+        port: 8443,
+        ..Hysteria2::default()
+    });
+    let udp = analyze(udp);
+    assert_eq!(udp.cells[0].relay.status, FrontRouteStatus::Blocked);
+    assert_eq!(
+        udp.cells[0].endpoints[0].decision.selector.as_deref(),
+        Some("ingress-guard:tcp-and-quic-only")
+    );
+}
+
+#[test]
+fn front_analysis_includes_an_xhttp_download_socket_in_the_relay_decision() {
+    let mut doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("us.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    let mut app = front_app(
+        vec![
+            step(
+                "c-front",
+                "hk",
+                vec![
+                    Rule {
+                        dest_match: DestMatch::DomainSuffix(
+                            vec!["download.example.net".to_owned()],
+                        ),
+                        action: Action::Block,
+                    },
+                    any_egress(),
+                ],
+                None,
+            ),
+            step("c-us", "us", vec![any_egress()], None),
+        ],
+        Vec::new(),
+    );
+    let reality = app.ingresses[1].wires.reality().unwrap().clone();
+    app.ingresses[1].wires = IngressWires::Vless(Transport::VlessRealityXhttp(RealityXhttp {
+        reality,
+        xhttp: Xhttp {
+            path: "/split".to_owned(),
+            host: None,
+            xmux: None,
+            tuning: None,
+            mode: XhttpMode::Auto,
+            download: Some(XhttpDownload {
+                v4: Some(ProjectionDownloadEndpoint {
+                    host: "download.example.net".to_owned(),
+                    port: 8443,
+                    origin_port: Some(9443),
+                    http_host: None,
+                    mux: None,
+                }),
+                v6: None,
+            }),
+        },
+    }));
+    app.ingresses[1].wires.set_flow(None);
+    app.ingresses[1].projection.v4 = Some(ProjectionEndpoint {
+        host: "upload.example.net".to_owned(),
+        port: 443,
+    });
+    doc.apps = vec![app];
+
+    let compiled = compile(&doc);
+    assert_has(&compiled.diagnostics, Level::Error, "front.blocked");
+    let app = &compiled.unpublishable_view().apps[0];
+    let analysis = analyze_front_routes(
+        Some(compiled.unpublishable_view().system),
+        Some(app),
+        "f",
+        &["i-front".to_owned()],
+        &[],
+        &["i-us".to_owned()],
+    );
+    let download = analysis.cells[0]
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.endpoint == "download.example.net:8443/tcp")
+        .unwrap_or_else(|| panic!("missing download endpoint: {analysis:#?}"));
+    assert_eq!(download.decision.status, FrontRouteStatus::Blocked);
+    assert_eq!(
+        analysis.cells[0].relay.status,
+        FrontRouteStatus::Blocked,
+        "one blocked socket must block the complete member/target combination"
+    );
+}
+
+#[test]
+fn front_analysis_blocks_a_target_whose_landing_chain_cannot_reach_the_internet() {
+    let mut doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("us.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    doc.apps = vec![front_app(
+        vec![
+            step("c-front", "hk", vec![any_egress()], None),
+            step("c-us", "us", vec![any_block()], None),
+        ],
+        Vec::new(),
+    )];
+
+    let compiled = compile(&doc);
+    assert_has(
+        &compiled.diagnostics,
+        Level::Error,
+        "front.target-no-egress",
+    );
+    let app = &compiled.unpublishable_view().apps[0];
+    let analysis = analyze_front_routes(
+        Some(compiled.unpublishable_view().system),
+        Some(app),
+        "f",
+        &["i-front".to_owned()],
+        &[],
+        &["i-us".to_owned()],
+    );
+    let cell = &analysis.cells[0];
+    assert_eq!(cell.relay.status, FrontRouteStatus::Reachable);
+    assert_eq!(cell.landing.status, FrontRouteStatus::Blocked);
+    assert_eq!(cell.combined.status, FrontRouteStatus::Blocked);
+    assert_eq!(cell.landing.chain_id.as_deref(), Some("c-us"));
+    assert_eq!(cell.landing.node_id.as_deref(), Some("us"));
+    assert_eq!(cell.landing.rule_index, Some(1));
+    assert!(analysis.blocking);
+}
+
+#[test]
+fn front_analysis_keeps_conditional_landing_routes_visible_without_calling_them_reachable() {
+    let mut doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("us.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    doc.apps = vec![front_app(
+        vec![
+            step("c-front", "hk", vec![any_egress()], None),
+            step(
+                "c-us",
+                "us",
+                vec![
+                    Rule {
+                        dest_match: DestMatch::DomainSuffix(vec!["blocked.example".to_owned()]),
+                        action: Action::Block,
+                    },
+                    any_egress(),
+                ],
+                None,
+            ),
+        ],
+        Vec::new(),
+    )];
+
+    let compiled = compile(&doc);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "front.target-no-egress"),
+        "条件路由不能被误报成完全阻断：{:#?}",
+        compiled.diagnostics
+    );
+    assert_has(&compiled.diagnostics, Level::Info, "front.target-unproven");
+    let app = &compiled.unpublishable_view().apps[0];
+    let analysis = analyze_front_routes(
+        Some(compiled.unpublishable_view().system),
+        Some(app),
+        "f",
+        &["i-front".to_owned()],
+        &[],
+        &["i-us".to_owned()],
+    );
+    assert_eq!(
+        analysis.cells[0].combined.status,
+        FrontRouteStatus::Conditional
+    );
+    assert!(!analysis.blocking);
+}
+
+#[test]
+fn front_analysis_proves_a_landing_block_when_every_dynamic_branch_blocks() {
+    let mut doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("us.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    doc.apps = vec![front_app(
+        vec![
+            step("c-front", "hk", vec![any_egress()], None),
+            step(
+                "c-us",
+                "us",
+                vec![
+                    Rule {
+                        dest_match: DestMatch::Geosite(vec!["private".to_owned()]),
+                        action: Action::Block,
+                    },
+                    any_block(),
+                ],
+                None,
+            ),
+        ],
+        Vec::new(),
+    )];
+
+    let compiled = compile(&doc);
+    assert_has(
+        &compiled.diagnostics,
+        Level::Error,
+        "front.target-no-egress",
+    );
+    let app = &compiled.unpublishable_view().apps[0];
+    let analysis = analyze_front_routes(
+        Some(compiled.unpublishable_view().system),
+        Some(app),
+        "f",
+        &["i-front".to_owned()],
+        &[],
+        &["i-us".to_owned()],
+    );
+    assert_eq!(analysis.cells[0].landing.status, FrontRouteStatus::Blocked);
+    assert!(analysis.blocking);
+}
+
+#[test]
+fn validate_app_set_rejects_colliding_and_reserved_mihomo_names() {
+    let mut doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
+        ),
+        node(
+            "us",
+            "platform.acme",
+            Some("us.example.net"),
+            [10, 66, 0, 2],
+            true,
+        ),
+    ]);
+    doc.users.push(user("platform.acme", "alice"));
+    let mut app = front_app(
+        vec![step("c-front", "hk", vec![any_egress()], None)],
+        vec![grant("alice", "i-front"), grant("alice", "i-us")],
+    );
+    app.fronts[0].name = "c-front".to_owned();
+    doc.apps = vec![app.clone()];
+
+    let colliding = compile(&doc);
+    assert_has(
+        &colliding.diagnostics,
+        Level::Error,
+        "subscription.name-collision",
+    );
+
+    app.fronts[0].name = "DIRECT".to_owned();
+    doc.apps = vec![app];
+    let reserved = compile(&doc);
+    assert_has(
+        &reserved.diagnostics,
+        Level::Error,
+        "subscription.name-reserved",
+    );
+}
+
+#[test]
+fn validate_app_omits_front_target_without_via_grant_instead_of_blocking_publish() {
+    let mut doc = doc(vec![
+        node(
+            "hk",
+            "platform.acme",
+            Some("hk.example.net"),
+            [10, 66, 0, 1],
+            true,
         ),
         node(
             "us",
@@ -2833,7 +3679,7 @@ fn validate_app_reports_front_grant_without_via_grant_and_via_without_egress() {
     ]);
     doc.users.push(user("platform.acme", "alice"));
     let app = front_app(
-        vec![step("c-front", "hk", vec![any_block()], None)],
+        vec![step("c-front", "hk", vec![any_egress()], None)],
         vec![grant("alice", "i-us")],
     );
     let mut diagnostics = Vec::new();
@@ -2842,8 +3688,19 @@ fn validate_app_reports_front_grant_without_via_grant_and_via_without_egress() {
 
     validate_app(&sys, &app_ir, &mut diagnostics);
 
-    assert_has(&diagnostics, Level::Error, "front.grant-via");
-    assert_has(&diagnostics, Level::Error, "front.via-no-egress");
+    assert_has(&diagnostics, Level::Info, "front.grant-via");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level != Level::Error),
+        "缺少成员授权只裁掉该用户的目标，不应阻断保存：{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "front.via-no-egress"),
+        "成员能否到达目标由整条服务端链路判断，而不是入口机器的 egress 标志：{diagnostics:#?}"
+    );
 }
 
 /// Decommissioning a machine that hosts front ingresses must not deadlock the release.
@@ -3301,6 +4158,7 @@ fn validate_app_rejects_a_projection_that_is_switched_on_but_blank() {
             host: "v6.acc.example.net".to_owned(),
             port: 0,
         }),
+        ..Projection::default()
     };
     let app = AppView {
         id: "app".to_owned(),
@@ -3341,6 +4199,7 @@ fn validate_app_stays_quiet_about_a_filled_in_projection() {
             port: 20443,
         }),
         v6: None,
+        ..Projection::default()
     };
     let app = AppView {
         id: "app".to_owned(),
@@ -4153,7 +5012,7 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
         steps: vec![],
     };
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "proxy".to_owned(),
+        id: "custom-4444-4444".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "Proxy".to_owned(),
         address: "edge.example.com".to_owned(),
@@ -4198,6 +5057,18 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
             value == "none"
         );
     }
+
+    doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Vless {
+        credential: "uuid".to_owned(),
+        encryption: format!("mlkem768x25519plus.native.1rtt.{}", "A".repeat(43)),
+        flow: None,
+        transport: ExternalVlessTransport::Raw,
+    };
+    doc.external_outbounds[0].security = ExternalOutboundSecurity::Tls {
+        server_name: "edge.example.com".to_owned(),
+        fingerprint: "chrome".to_owned(),
+    };
+    assert!(codes(&doc).contains(&"external-outbound.vless-encryption-security"));
 }
 
 #[test]

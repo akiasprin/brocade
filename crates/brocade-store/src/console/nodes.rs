@@ -132,7 +132,9 @@ pub async fn remove_retired_nodes(
         removed_chains.push(chain_id);
     }
 
-    // Release work and its convergence rows go first because both may point at usage generations.
+    // Model-release work and its convergence rows go first because both may point at usage
+    // generations. Xray binary-release targets are intentionally different: their node_id is an
+    // immutable audit snapshot and survives this deletion.
     // Usage rows are accounting/history but the explicit "remove machine" action removes the
     // machine's complete footprint; retaining them would keep RESTRICT references and make the
     // visible removal lie about what is still stored.
@@ -153,6 +155,10 @@ pub async fn remove_retired_nodes(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM usage_chain_samples WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_node_rollups WHERE node_id = ANY($1)")
         .bind(&node_ids)
         .execute(&mut *tx)
         .await?;

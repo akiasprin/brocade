@@ -13,11 +13,12 @@ use crate::{
         system::{Dial, Link, LinkWrap, SystemIr, SystemNode},
     },
     model::{
-        Action, AnyTls, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback,
-        EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
+        vpngate_runtime_peer, Action, AnyTls, Dns, DomainStrategy, EgressDnsAddressStrategy,
+        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, ExternalOutboundProtocol,
         ExternalOutboundSecurity, GeodataSettings, HopPool, HopWire, IngressGuard, Network,
         RealityClientPolicy, RealityFallbackLimits, RealityFallbackRateLimit, RealitySettings,
-        Transport, Xhttp,
+        Transport, Xhttp, INGRESS_GUARD_AMPLIFICATION_PORTS, INGRESS_GUARD_MAIL_PORTS,
+        VPNGATE_RUNTIME_SOCKS_PORT,
     },
 };
 
@@ -451,6 +452,136 @@ pub struct GrantClientPlan {
 
 pub fn build_node_plan(sys: &SystemIr, node_id: &str) -> NodePlan {
     project_node(sys, &[], node_id)
+}
+
+/// Keep only the application IR that can contribute to one machine projection.  The returned
+/// shells preserve project identity while unrelated chains disappear, giving callers a stable
+/// content key without reimplementing projection dependencies outside the compiler.
+pub fn scope_node_apps(apps: &[AppIr], node_id: &str) -> Vec<AppIr> {
+    apps.iter()
+        .map(|app| {
+            let ingresses = app
+                .ingresses
+                .iter()
+                .filter(|ingress| ingress.node == node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let ingress_ids = ingresses
+                .iter()
+                .map(|ingress| ingress.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let steps = app
+                .steps
+                .iter()
+                .filter(|step| step.node == node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let hops = app
+                .hops
+                .iter()
+                .filter(|hop| hop.from == node_id || hop.to == node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut chain_ids = ingresses
+                .iter()
+                .map(|ingress| ingress.chain.as_str())
+                .chain(steps.iter().map(|step| step.chain.as_str()))
+                .chain(
+                    hops.iter()
+                        .flat_map(|hop| [hop.chain.as_str(), hop.target_chain.as_str()]),
+                )
+                .collect::<BTreeSet<_>>();
+            // A target listener's Step is kept in its owning project, while the arriving Hop may
+            // live in another project.  Retain the listener's chain shell for stable tag/rank
+            // derivation even when this app contributes no local edge.
+            for hop in apps
+                .iter()
+                .flat_map(|candidate| candidate.hops.iter())
+                .filter(|hop| hop.to == node_id || hop.from == node_id)
+            {
+                if app.steps.iter().any(|step| {
+                    step.node == node_id
+                        && (step.chain == hop.chain || step.chain == hop.target_chain)
+                }) {
+                    chain_ids.insert(hop.chain.as_str());
+                    chain_ids.insert(hop.target_chain.as_str());
+                }
+            }
+            let grants = app
+                .grants
+                .iter()
+                .filter(|grant| ingress_ids.contains(grant.ingress.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let users = app
+                .users
+                .iter()
+                .filter(|user| {
+                    grants
+                        .iter()
+                        .any(|grant| grant.tenant == user.tenant && grant.user == user.id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let outbound_ids = steps
+                .iter()
+                .flat_map(|step| step.rules.iter())
+                .filter_map(|rule| match &rule.action {
+                    Action::Proxy { outbound } => Some(outbound.as_str()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let external_outbounds = app
+                .external_outbounds
+                .iter()
+                .filter(|outbound| outbound_ids.contains(outbound.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let nodes = app
+                .nodes
+                .iter()
+                .filter(|node| node.id == node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let chains = app
+                .chains
+                .iter()
+                .filter(|chain| chain_ids.contains(chain.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let listener_roots = app
+                .listener_roots
+                .iter()
+                .filter(|(chain, node)| chain_ids.contains(chain.as_str()) && node == node_id)
+                .cloned()
+                .collect();
+            let tenants = nodes
+                .iter()
+                .map(|node| node.tenant.clone())
+                .chain(users.iter().map(|user| user.tenant.clone()))
+                .chain(chains.iter().map(|chain| chain.tenant.clone()))
+                .chain(ingresses.iter().map(|ingress| ingress.tenant.clone()))
+                .chain(grants.iter().map(|grant| grant.tenant.clone()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            AppIr {
+                revision: 0,
+                app_id: app.app_id.clone(),
+                tenants,
+                nodes,
+                users,
+                external_outbounds,
+                chains,
+                ingresses,
+                fronts: Vec::new(),
+                steps,
+                listener_roots,
+                grants,
+                hops,
+            }
+        })
+        .collect()
 }
 
 pub fn project_node(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> NodePlan {
@@ -1575,7 +1706,19 @@ fn xray_external_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayExternalOut
         }
     }
 
-    outbounds.into_values().collect()
+    let mut plans = outbounds.into_values().collect::<Vec<_>>();
+    let mut vpngate_slot = 0;
+    for plan in &mut plans {
+        if !matches!(plan.protocol, ExternalOutboundProtocol::Vpngate { .. }) {
+            continue;
+        }
+        if let Some(peer) = vpngate_runtime_peer(vpngate_slot) {
+            plan.address = peer.to_string();
+            plan.port = VPNGATE_RUNTIME_SOCKS_PORT;
+        }
+        vpngate_slot += 1;
+    }
+    plans
 }
 
 fn warp_local_addresses(addresses: &[String], domain_strategy: &str) -> Vec<String> {
@@ -1874,11 +2017,12 @@ fn guard_matches(guard: &IngressGuard, overlay: ipnet::Ipv4Net) -> Vec<DestMatch
     if guard.no_mail {
         // Submission and SMTPS alongside 25. Blocking only 25 moves the abuse to 587 with no
         // other effect.
-        matches.push(DestMatch::Port(vec![
-            "25".to_owned(),
-            "465".to_owned(),
-            "587".to_owned(),
-        ]));
+        matches.push(DestMatch::Port(
+            INGRESS_GUARD_MAIL_PORTS
+                .iter()
+                .map(|port| port.to_string())
+                .collect(),
+        ));
     }
     if guard.no_udp_amplification {
         // UDP only: 53 over TCP is ordinary DNS that a client may legitimately use, and 389 over
@@ -1886,7 +2030,7 @@ fn guard_matches(guard: &IngressGuard, overlay: ipnet::Ipv4Net) -> Vec<DestMatch
         matches.push(DestMatch::All(vec![
             DestMatch::Network(Network::Udp),
             DestMatch::Port(
-                AMPLIFICATION_PORTS
+                INGRESS_GUARD_AMPLIFICATION_PORTS
                     .iter()
                     .map(|port| port.to_string())
                     .collect(),
@@ -1901,10 +2045,6 @@ fn guard_matches(guard: &IngressGuard, overlay: ipnet::Ipv4Net) -> Vec<DestMatch
     }
     matches
 }
-
-/// The UDP services used for reflection attacks: chargen, DNS, NTP, SNMP, CLDAP, SSDP,
-/// memcached. Each answers a small request with a large reply, which is what makes it usable.
-const AMPLIFICATION_PORTS: [u16; 7] = [19, 53, 123, 161, 389, 1900, 11211];
 
 fn ingress_tag(app: &AppIr, ingress: &str) -> String {
     match app.app_id.as_deref() {

@@ -14,8 +14,8 @@ use crate::{
     model::{
         AnyTlsSecurity, ExternalOutbound, FrontStrategy, Hysteria2, HysteriaBandwidth,
         HysteriaCongestion, HysteriaObfs, Ingress, ModelSnapshot, Node, Projection,
-        ProjectionDownloadEndpoint, ProjectionEndpoint, Transport, XhttpMode, XhttpTuning,
-        XhttpXmux,
+        ProjectionDownloadEndpoint, ProjectionEndpoint, ProtocolProjection, Transport, XhttpMode,
+        XhttpTuning, XhttpXmux,
     },
 };
 
@@ -28,6 +28,11 @@ pub struct SubscriptionClientConfig {
     pub app_order: Vec<String>,
     pub chain_order: BTreeMap<String, Vec<String>>,
     pub chains: BTreeMap<String, ClientChain>,
+    /// Projects whose complete Front collection is owned by this checkpoint. Keeping this
+    /// separate from `fronts` makes deleting the last Front unambiguous, while projects absent
+    /// from a newer structural topology keep their last serving client configuration until that
+    /// topology is actually released.
+    pub front_apps: BTreeSet<String>,
     pub fronts: BTreeMap<String, ClientFront>,
     pub ingresses: BTreeMap<String, ClientIngress>,
     /// Stored as a sorted vector so the existing credential sealing machinery can transform the
@@ -46,14 +51,23 @@ pub struct ClientChain {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientFront {
+    pub app_id: String,
+    pub tenant: String,
     pub name: String,
     pub strategy: FrontStrategy,
+    pub via: Vec<String>,
     pub external_via: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientIngress {
+    /// Whether this ingress still exists in desired state. A removed ingress may retain an older
+    /// projection solely so a still-serving or rollback topology remains usable.
+    pub desired: bool,
+    /// Client-only attachment to a Front. `None` is meaningful: it immediately removes
+    /// `dialer-proxy` from this ingress without waiting for a machine release.
+    pub front: Option<String>,
     /// Contract computed from the latest desired revision in which this ingress exists. Older
     /// candidates remain below solely for serving rollback.
     pub desired_contract: String,
@@ -65,10 +79,17 @@ pub struct ClientIngress {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientProjection {
+    /// Legacy fields and the VLESS mapping for new checkpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v4: Option<ClientProjectionEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v6: Option<ClientProjectionEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vless_encryption: Option<ClientProtocolProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls: Option<ClientProtocolProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hysteria2: Option<ClientProtocolProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +116,15 @@ pub struct ClientProjection {
 pub struct ClientProjectionEndpoint {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientProtocolProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v4: Option<ClientProjectionEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6: Option<ClientProjectionEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +237,34 @@ impl SubscriptionClientConfig {
         Self::advance(None, snapshot)
     }
 
+    /// Apply one complete Front editor document to a cloned client checkpoint.
+    ///
+    /// This is the in-memory counterpart of the Store's atomic Front write. It exists so a route
+    /// preview can be compiled against the serving topology before any database row changes. The
+    /// next committed checkpoint is still derived from the full desired snapshot by [`Self::advance`].
+    pub fn replace_front(&mut self, id: String, front: ClientFront, targets: &[String]) {
+        self.front_apps.insert(front.app_id.clone());
+        for ingress in self
+            .ingresses
+            .values_mut()
+            .filter(|ingress| ingress.desired)
+        {
+            if ingress.front.as_deref() == Some(&id) {
+                ingress.front = None;
+            }
+        }
+        for target in targets {
+            if let Some(ingress) = self
+                .ingresses
+                .get_mut(target)
+                .filter(|ingress| ingress.desired)
+            {
+                ingress.front = Some(id.clone());
+            }
+        }
+        self.fronts.insert(id, front);
+    }
+
     /// Carry the previous manifest forward and replace only resources present in `desired`.
     /// Structural deletion remains topology-owned; newly created resources are harmless because
     /// [`Self::apply`] only traverses resources found in the serving topology.
@@ -218,7 +276,19 @@ impl SubscriptionClientConfig {
             desired.apps.iter().map(|app| app.id.as_str()),
         );
 
+        for ingress in next.ingresses.values_mut() {
+            ingress.desired = false;
+        }
+        let desired_app_ids = desired
+            .apps
+            .iter()
+            .map(|app| app.id.as_str())
+            .collect::<BTreeSet<_>>();
+        next.fronts
+            .retain(|_, front| !desired_app_ids.contains(front.app_id.as_str()));
+
         for app in &desired.apps {
+            next.front_apps.insert(app.id.clone());
             let old_order = next.chain_order.get(&app.id).cloned().unwrap_or_default();
             next.chain_order.insert(
                 app.id.clone(),
@@ -237,8 +307,11 @@ impl SubscriptionClientConfig {
                 next.fronts.insert(
                     front.id.clone(),
                     ClientFront {
+                        app_id: app.id.clone(),
+                        tenant: front.tenant.clone(),
                         name: front.name.clone(),
                         strategy: front.strategy,
+                        via: front.via.clone(),
                         external_via: front.external_via.clone(),
                     },
                 );
@@ -246,6 +319,8 @@ impl SubscriptionClientConfig {
             for ingress in &app.ingresses {
                 let contract = topology_contract_hash(&desired.nodes, &app.id, ingress);
                 let client = next.ingresses.entry(ingress.id.clone()).or_default();
+                client.desired = true;
+                client.front.clone_from(&ingress.front);
                 client.desired_contract.clone_from(&contract);
                 client
                     .projections
@@ -278,8 +353,9 @@ impl SubscriptionClientConfig {
             ));
         }
 
-        let nodes = &topology.nodes;
         reorder_by_id(&mut topology.apps, &self.app_order, |app| &app.id);
+        self.apply_fronts(&mut topology);
+        let nodes = &topology.nodes;
 
         for app in &mut topology.apps {
             if let Some(order) = self.chain_order.get(&app.id) {
@@ -291,13 +367,6 @@ impl SubscriptionClientConfig {
                     chain
                         .subscription_country
                         .clone_from(&client.subscription_country);
-                }
-            }
-            for front in &mut app.fronts {
-                if let Some(client) = self.fronts.get(&front.id) {
-                    front.name.clone_from(&client.name);
-                    front.strategy = client.strategy;
-                    front.external_via.clone_from(&client.external_via);
                 }
             }
             for ingress in &mut app.ingresses {
@@ -363,6 +432,66 @@ impl SubscriptionClientConfig {
         Ok(topology)
     }
 
+    /// Replace the client-owned Front collection and target attachments on a serving topology.
+    ///
+    /// Internal members which are not part of that topology are deliberately omitted rather than
+    /// becoming dangling references. [`Self::pending_topology`] reports them, and they join the
+    /// group automatically when a compatible topology is released.
+    pub fn apply_fronts(&self, topology: &mut ModelSnapshot) {
+        for app in &mut topology.apps {
+            if !self.front_apps.contains(&app.id) {
+                continue;
+            }
+            let serving_ingresses = app
+                .ingresses
+                .iter()
+                .map(|ingress| ingress.id.as_str())
+                .collect::<BTreeSet<_>>();
+            app.fronts = self
+                .fronts
+                .iter()
+                .filter(|(_, front)| front.app_id == app.id)
+                .map(|(id, front)| crate::model::Front {
+                    id: id.clone(),
+                    tenant: front.tenant.clone(),
+                    name: front.name.clone(),
+                    via: front
+                        .via
+                        .iter()
+                        .filter(|id| serving_ingresses.contains(id.as_str()))
+                        .cloned()
+                        .collect(),
+                    external_via: front.external_via.clone(),
+                    strategy: front.strategy,
+                })
+                .collect();
+            let front_ids = app
+                .fronts
+                .iter()
+                .map(|front| front.id.as_str())
+                .collect::<BTreeSet<_>>();
+            for ingress in &mut app.ingresses {
+                if let Some(client) = self.ingresses.get(&ingress.id).filter(|item| item.desired) {
+                    ingress.front = client
+                        .front
+                        .as_ref()
+                        .filter(|id| front_ids.contains(id.as_str()))
+                        .cloned();
+                } else if ingress
+                    .front
+                    .as_ref()
+                    .is_some_and(|id| !front_ids.contains(id.as_str()))
+                {
+                    // A structurally removed ingress can remain in the serving topology until its
+                    // machine release. Preserve its old attachment only while that Front still
+                    // exists; otherwise a direct Front deletion would leave a dangling reference
+                    // and make the client-only checkpoint impossible to activate.
+                    ingress.front = None;
+                }
+            }
+        }
+    }
+
     /// Stable resource labels for client candidates which do not match the current topology.
     pub fn pending_topology(&self, topology: &ModelSnapshot) -> Vec<String> {
         let nodes = &topology.nodes;
@@ -378,7 +507,7 @@ impl SubscriptionClientConfig {
                 })
             })
             .collect::<BTreeMap<_, _>>();
-        serving
+        let mut pending = serving
             .into_iter()
             .filter_map(|(id, contract)| {
                 self.ingresses
@@ -386,7 +515,47 @@ impl SubscriptionClientConfig {
                     .is_some_and(|item| item.desired_contract != contract)
                     .then(|| format!("ingress:{id}:projection"))
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let serving_apps = topology
+            .apps
+            .iter()
+            .map(|app| (app.id.as_str(), app))
+            .collect::<BTreeMap<_, _>>();
+        let serving_ingresses = topology
+            .apps
+            .iter()
+            .flat_map(|app| app.ingresses.iter().map(|ingress| ingress.id.as_str()))
+            .collect::<BTreeSet<_>>();
+        for (front_id, front) in &self.fronts {
+            let Some(app) = serving_apps.get(front.app_id.as_str()) else {
+                pending.push(format!("front:{front_id}:app"));
+                continue;
+            };
+            let app_ingresses = app
+                .ingresses
+                .iter()
+                .map(|ingress| ingress.id.as_str())
+                .collect::<BTreeSet<_>>();
+            for via in &front.via {
+                if !app_ingresses.contains(via.as_str()) {
+                    pending.push(format!("front:{front_id}:via:{via}"));
+                }
+            }
+        }
+        for (ingress_id, ingress) in &self.ingresses {
+            if ingress.desired
+                && ingress.front.is_some()
+                && !serving_ingresses.contains(ingress_id.as_str())
+            {
+                pending.push(format!(
+                    "front:{}:target:{ingress_id}",
+                    ingress.front.as_deref().expect("checked Some front")
+                ));
+            }
+        }
+        pending.sort();
+        pending.dedup();
+        pending
     }
 
     fn empty() -> Self {
@@ -395,6 +564,7 @@ impl SubscriptionClientConfig {
             app_order: Vec::new(),
             chain_order: BTreeMap::new(),
             chains: BTreeMap::new(),
+            front_apps: BTreeSet::new(),
             fronts: BTreeMap::new(),
             ingresses: BTreeMap::new(),
             external_outbounds: Vec::new(),
@@ -417,6 +587,21 @@ impl From<&Ingress> for ClientProjection {
                 .v6
                 .as_ref()
                 .map(ClientProjectionEndpoint::from),
+            vless_encryption: value
+                .projection
+                .vless_encryption
+                .as_ref()
+                .map(ClientProtocolProjection::from),
+            anytls: value
+                .projection
+                .anytls
+                .as_ref()
+                .map(ClientProtocolProjection::from),
+            hysteria2: value
+                .projection
+                .hysteria2
+                .as_ref()
+                .map(ClientProtocolProjection::from),
             xhttp_host: xhttp.and_then(|xhttp| xhttp.host.clone()),
             xhttp_xmux: xhttp.and_then(|xhttp| xhttp.xmux.clone()),
             xhttp_download_v4: xhttp
@@ -449,6 +634,15 @@ impl From<&ProjectionEndpoint> for ClientProjectionEndpoint {
     }
 }
 
+impl From<&ProtocolProjection> for ClientProtocolProjection {
+    fn from(value: &ProtocolProjection) -> Self {
+        Self {
+            v4: value.v4.as_ref().map(ClientProjectionEndpoint::from),
+            v6: value.v6.as_ref().map(ClientProjectionEndpoint::from),
+        }
+    }
+}
+
 impl From<&ProjectionDownloadEndpoint> for ClientProjectionDownloadEndpoint {
     fn from(value: &ProjectionDownloadEndpoint) -> Self {
         Self {
@@ -472,6 +666,21 @@ impl ClientProjection {
                 .v6
                 .as_ref()
                 .map(ClientProjectionEndpoint::to_model)
+                .transpose()?,
+            vless_encryption: self
+                .vless_encryption
+                .as_ref()
+                .map(ClientProtocolProjection::to_model)
+                .transpose()?,
+            anytls: self
+                .anytls
+                .as_ref()
+                .map(ClientProtocolProjection::to_model)
+                .transpose()?,
+            hysteria2: self
+                .hysteria2
+                .as_ref()
+                .map(ClientProtocolProjection::to_model)
                 .transpose()?,
         })
     }
@@ -532,6 +741,23 @@ impl ClientProjectionEndpoint {
         Ok(ProjectionEndpoint {
             host: self.host.clone(),
             port: self.port,
+        })
+    }
+}
+
+impl ClientProtocolProjection {
+    fn to_model(&self) -> Result<ProtocolProjection, String> {
+        Ok(ProtocolProjection {
+            v4: self
+                .v4
+                .as_ref()
+                .map(ClientProjectionEndpoint::to_model)
+                .transpose()?,
+            v6: self
+                .v6
+                .as_ref()
+                .map(ClientProjectionEndpoint::to_model)
+                .transpose()?,
         })
     }
 }

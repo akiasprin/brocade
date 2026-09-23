@@ -24,7 +24,7 @@ const probe = (country: string): E2eProbeItem => ({
   exit_verdict: 'match',
   detail: null,
   probed_at: '2026-08-30T12:00:00Z',
-  samples: [],
+  samples: { probed_at_unix_secs: [], status: [], ttfb_ms: [] },
 });
 
 const writes: { path: string; body: unknown }[] = [];

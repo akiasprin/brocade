@@ -6,7 +6,6 @@
 
 use brocade_core::{
     client_config::{SubscriptionClientConfig, SUBSCRIPTION_CLIENT_CONFIG_SCHEMA},
-    compile::compile,
     hash::sha256_hex,
     model::ModelSnapshot,
 };
@@ -24,7 +23,7 @@ pub(crate) struct LoadedClientSnapshot {
     stored_document: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClientConfigCommitStatus {
     Unchanged,
@@ -32,12 +31,22 @@ pub enum ClientConfigCommitStatus {
     AwaitingFirstTopology,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConfigCommitResult {
     pub snapshot_id: u64,
     pub status: ClientConfigCommitStatus,
     pub serving_generation: Option<u64>,
     pub pending_topology: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentClientConfigState {
+    pub(crate) head_snapshot_id: u64,
+    pub(crate) serving_snapshot_id: Option<u64>,
+    pub(crate) topology_revision_id: Option<u64>,
+    pub(crate) permissions_revision_id: Option<u64>,
+    pub(crate) serving_generation: Option<u64>,
+    pub(crate) pending_topology: Vec<String>,
 }
 
 /// Initialize the subscription checkpoint on an empty database and verify durable state on
@@ -252,12 +261,25 @@ pub(crate) async fn validate_revision_combination_tx(
     let permissions =
         crate::materialize::load_immutable_snapshot_tx(tx, permissions_revision).await?;
     let composed = compose(topology, &permissions, client)?;
-    compile(&composed).ensure_publishable().map_err(|blocked| {
-        StoreError::InvalidData(format!(
-            "subscription client config is invalid with {context}: {:?}",
-            blocked.diagnostics
-        ))
-    })?;
+    crate::compile_cache::compile_incremental(&composed)
+        .ensure_publishable()
+        .map_err(|blocked| {
+            let errors = blocked
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.level == brocade_core::Level::Error)
+                .map(|diagnostic| {
+                    format!(
+                        "{} [{}]: {}",
+                        diagnostic.location, diagnostic.code, diagnostic.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            StoreError::InvalidData(format!(
+                "subscription client config is invalid with {context}: {errors}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -321,6 +343,68 @@ pub(crate) async fn commit_result_tx(
     Ok(ClientConfigCommitResult {
         snapshot_id,
         status,
+        serving_generation,
+        pending_topology,
+    })
+}
+
+/// Read the durable client head and the tuple currently used by subscription serving.
+///
+/// The editor uses this after a reload; returning only the most recent mutation result would make
+/// generation and pending-topology state disappear as soon as the component unmounted.
+pub(crate) async fn current_state_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<CurrentClientConfigState> {
+    let row = sqlx::query(
+        "SELECT client.head_snapshot_id,
+                serving.client_snapshot_id AS serving_client_snapshot_id,
+                serving.topology_revision_id,
+                serving.permissions_revision_id,
+                serving.generation
+           FROM subscription_client_state client
+           LEFT JOIN subscription_serving_state serving ON serving.id = TRUE
+          WHERE client.id = TRUE",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let head_snapshot_id = to_u64(
+        "head_snapshot_id",
+        row.try_get::<Option<i64>, _>("head_snapshot_id")?
+            .ok_or_else(|| {
+                StoreError::InvalidData("subscription client head is empty".to_owned())
+            })?,
+    )?;
+    let serving_snapshot_id = row
+        .try_get::<Option<i64>, _>("serving_client_snapshot_id")?
+        .map(|id| to_u64("serving_client_snapshot_id", id))
+        .transpose()?;
+    let topology_revision_id = row
+        .try_get::<Option<i64>, _>("topology_revision_id")?
+        .map(|id| to_u64("topology_revision_id", id))
+        .transpose()?;
+    let permissions_revision_id = row
+        .try_get::<Option<i64>, _>("permissions_revision_id")?
+        .map(|id| to_u64("permissions_revision_id", id))
+        .transpose()?;
+    let serving_generation = row
+        .try_get::<Option<i64>, _>("generation")?
+        .map(|generation| to_u64("subscription generation", generation))
+        .transpose()?;
+    let pending_topology = match topology_revision_id {
+        Some(topology_revision_id) => {
+            let client = load_client_snapshot_tx(tx, head_snapshot_id).await?;
+            let topology =
+                crate::materialize::load_immutable_snapshot_tx(tx, topology_revision_id).await?;
+            client.config.pending_topology(&topology)
+        }
+        None => Vec::new(),
+    };
+
+    Ok(CurrentClientConfigState {
+        head_snapshot_id,
+        serving_snapshot_id,
+        topology_revision_id,
+        permissions_revision_id,
         serving_generation,
         pending_topology,
     })
@@ -532,6 +616,7 @@ fn encode_document(
         if matches!(
             outbound.protocol,
             brocade_core::model::ExternalOutboundProtocol::Warp { .. }
+                | brocade_core::model::ExternalOutboundProtocol::Vpngate { .. }
         ) {
             continue;
         }

@@ -79,6 +79,10 @@ pub enum PlannedAction {
     ApplyHy2PortHop,
     ApplyWireGuard,
     ApplyXray,
+    /// Advance the published VPN Gate selection policy after the node has acknowledged the
+    /// configuration release. Profiles and probe results remain operational state fetched by the
+    /// independent runtime worker; this action is only the release fence for stable model intent.
+    SyncVpngate,
     SyncGrants,
     DisablePhantun,
     DisableHy2PortHop,
@@ -145,7 +149,7 @@ impl PlannedAction {
                 Some(ConfigArtifact::WireGuard)
             }
             PlannedAction::ApplyXray | PlannedAction::DisableXray => Some(ConfigArtifact::Xray),
-            PlannedAction::SyncGrants => None,
+            PlannedAction::SyncVpngate | PlannedAction::SyncGrants => None,
         }
     }
 }
@@ -1063,7 +1067,9 @@ fn is_disruptive(
             was_ours_and_running(applied.map(|state| &state.hy2_port_hop))
         }
         PlannedAction::DisablePhantun => was_ours_and_running(applied.map(|state| &state.phantun)),
-        PlannedAction::ApplyWireGuard | PlannedAction::SyncGrants => false,
+        PlannedAction::ApplyWireGuard | PlannedAction::SyncVpngate | PlannedAction::SyncGrants => {
+            false
+        }
     }
 }
 

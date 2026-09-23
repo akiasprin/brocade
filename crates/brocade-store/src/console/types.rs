@@ -30,6 +30,17 @@ pub struct ConsoleSnapshot {
     pub redacted: bool,
 }
 
+/// The small, identity-scoped inventory needed to shape the first loading surface.
+///
+/// `chain_group_count` deliberately uses tuples: on the wire each item is
+/// `[group_id, member_count]`, preserving both the real group order and empty groups without
+/// sending the model snapshot before the application has mounted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleInitialData {
+    pub node_count: u64,
+    pub chain_group_count: Vec<(String, u64)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleEgressDnsPolicy {
     pub node: String,
@@ -111,6 +122,10 @@ pub struct NodeAgentStateItem {
     pub public_ipv6_nat: bool,
     pub route_ipv4: Option<String>,
     pub route_ipv6: Option<String>,
+    /// Direct CGI Trace observations. Kept separate from the configured public addresses and the
+    /// kernel route source above: the three answer different questions.
+    pub observed_public_ipv4: Option<crate::NodePublicIpStateView>,
+    pub observed_public_ipv6: Option<crate::NodePublicIpStateView>,
     pub token_prefix: Option<String>,
     pub token_created_at: Option<String>,
     pub token_last_used_at: Option<String>,
@@ -120,6 +135,27 @@ pub struct NodeAgentStateItem {
     /// has been reported yet; desired state stays isolated while the approved update path remains
     /// available.
     pub agent_protocol_version: Option<i32>,
+    /// Whether this machine is in the operator-selected set that probes the shared VPN Gate
+    /// catalogue. Nodes that actually consume a pool still validate their own route even
+    /// when they are not in this extra measurement set.
+    #[serde(default)]
+    pub vpngate_probe_enabled: bool,
+    /// Configured catalogue probe concurrency for this selected machine. `None` means the machine
+    /// is not in the probe set.
+    #[serde(default)]
+    pub vpngate_probe_workers: Option<i32>,
+    /// Most recent time the Console accepted catalogue-probe samples from this machine.
+    /// This is receipt time on the Console, so a skewed Agent clock cannot hide a stalled worker.
+    #[serde(default)]
+    pub vpngate_probe_reported_at: Option<String>,
+    /// The selected machine has produced no accepted catalogue-probe samples for thirty minutes.
+    #[serde(default)]
+    pub vpngate_probe_data_stale: bool,
+    /// Whether this machine may collect the upstream catalogue and lease globally deduplicated
+    /// three-provider exit-IP intelligence jobs. Unlike catalogue probing, neither requires
+    /// OpenVPN.
+    #[serde(default)]
+    pub vpngate_intelligence_enabled: bool,
     /// Runtime observations. `None` means this machine has never reported, which must stay
     /// distinct from "reported
     /// zero": the UI shows an em dash, not 0, or the machine most worth worrying about displays
@@ -129,12 +165,15 @@ pub struct NodeAgentStateItem {
     pub last_local_reconcile: Option<serde_json::Value>,
     pub wireguard_health: Option<serde_json::Value>,
     pub runtime_reported_at: Option<String>,
+    /// Server-clock eligibility for disruptive operational releases.
+    pub runtime_report_fresh: bool,
     /// On-disk observations of the two `.dat` files. In the same row as `runtime_versions`
     /// (`node_agent_state`) — it is a periodic observation, not an artifact of a release; hung
     /// off releases, a machine that does not ship for a month leaves its rule-database state
     /// unknown for a month.
     pub geodata_observed: Option<serde_json::Value>,
     pub last_poll_at: Option<String>,
+    pub desired_poll_fresh: bool,
     pub last_usage_report_at: Option<String>,
     /// Exact result of the last committed idempotent usage round. Empty means no usage round has
     /// been accepted. The store may decorate the response with process-local findings;
@@ -613,6 +652,9 @@ pub struct UpsertChainResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateFrontRequest {
+    /// Revision observed by the editor. A Front save replaces complete ordered member and target
+    /// collections, so accepting a stale document would silently discard another operator's edit.
+    pub expected_revision: u64,
     pub id: String,
     pub tenant_id: String,
     pub name: String,
@@ -620,6 +662,8 @@ pub struct CreateFrontRequest {
     pub via: Vec<String>,
     #[serde(default)]
     pub external_via: Vec<String>,
+    /// Complete set of subscription ingresses which should reference this Front.
+    pub targets: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -628,6 +672,45 @@ pub struct CreateFrontRequest {
 pub struct UpsertFrontResult {
     pub revision_id: u64,
     pub front: Front,
+    pub targets: Vec<String>,
+    pub client_config: crate::ClientConfigCommitResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontClientConfigState {
+    pub front_id: String,
+    pub head_snapshot_id: u64,
+    pub serving_snapshot_id: Option<u64>,
+    pub topology_revision_id: Option<u64>,
+    pub permissions_revision_id: Option<u64>,
+    pub serving_generation: Option<u64>,
+    pub active: bool,
+    pub pending_topology: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontRouteAnalysisView {
+    /// Durable client checkpoint the proposed editor document was overlaid on. The preview itself
+    /// is not persisted and therefore has no new snapshot id.
+    pub base_client_snapshot_id: u64,
+    pub topology_revision_id: Option<u64>,
+    pub permissions_revision_id: Option<u64>,
+    pub serving_generation: Option<u64>,
+    pub pending_topology: Vec<String>,
+    pub analysis: brocade_core::ir::front::FrontRouteAnalysis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteFrontRequest {
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteFrontResult {
+    pub revision_id: u64,
+    pub removed: bool,
+    pub client_config: crate::ClientConfigCommitResult,
 }
 
 /// The wire shape a caller asks for.
@@ -761,13 +844,13 @@ pub struct CreateIngressRequest {
     pub node_id: String,
     pub bind: IpAddr,
     pub port: u16,
-    #[serde(default)]
-    pub front_id: Option<String>,
     pub reality: CreateRealityIngressRequest,
     /// The complete wire shape requested for this ingress.
     pub wires: WiresRequest,
-    /// The outward projection. Like the other fields in this request it overwrites wholesale:
-    /// absent means neither family is projected.
+    /// The complete outward projection for every protocol. Like the other fields in this request
+    /// it overwrites wholesale. The root pair belongs to VLESS; the remaining protocol pairs are
+    /// independent. Missing per-protocol pairs are accepted only for compatibility with the
+    /// historical shared-address shape.
     ///
     /// A family's "no projection" is expressed by its whole absence (or `null`), not by an empty
     /// host. An empty host is turned back by `ingress.projection-blank` — an empty string left
@@ -1038,6 +1121,38 @@ mod tests {
             missing.is_err(),
             "missing settings must not silently use defaults"
         );
+    }
+
+    #[test]
+    fn ingress_request_cannot_assign_a_chained_proxy_target() {
+        let mut request = serde_json::json!({
+            "id": "ing-a1b2",
+            "chain_id": "chn-a1b2-c3d4",
+            "node_id": "n1",
+            "bind": "0.0.0.0",
+            "port": 443,
+            "reality": {
+                "fallback_mode": "global-site",
+                "fallback_limits": { "mode": "off" },
+                "fallback_guard": true
+            },
+            "wires": { "vless": { "kind": "vless-reality" } },
+            "projection": {},
+            "guard": {
+                "no_private": false,
+                "no_bittorrent": false,
+                "no_mail": false,
+                "no_udp_amplification": false,
+                "tcp_and_quic_only": false
+            }
+        });
+        assert!(serde_json::from_value::<CreateIngressRequest>(request.clone()).is_ok());
+
+        request
+            .as_object_mut()
+            .expect("test request is an object")
+            .insert("front_id".to_owned(), serde_json::json!("front-a1b2"));
+        assert!(serde_json::from_value::<CreateIngressRequest>(request).is_err());
     }
 
     #[test]

@@ -28,6 +28,12 @@ ModelSnapshot → 中间表示（IR）→ 节点产物 → 期望状态 → Agen
 
 配置发布与授权发布相互独立。前者可能改写配置并重启服务，后者只更新运行中的访问主体，因此具有不同的风险和执行代价。回滚不会修改既有修订，而是以历史修订为目标创建一次新的发布，以保留完整的因果记录。
 
+system-admin 可直接从机器详情的更多操作中隔离 active 机器，无需等待某次发布出现目标行。隔离会立即把机器从服务视图和可接入节点中摘除；若机器同时处于一个或多个发布中，相关目标会在同一事务中转为隔离待补偿，已经下发或失败的现场状态会标记为不确定并重新生成完整期望。Agent 在隔离期间仍领取并收敛最新债务；只有债务清零、轮询与运行上报新鲜且各运行组件均已确认后，机器详情才允许人工恢复服务。
+
+Xray 可执行文件同样不属于模型修订。发布页会为它单独创建不可变记录：冻结当前 Console 内嵌的双架构摘要与每台机器更新前摘要，先只开放一台尚未安装目标字节的灰度机器；只有它真实启动新 Xray 后才允许人工确认，后续按设定的批大小逐波开放，不会一次唤醒整个机队。Agent 在带每机抖动的后台周期中下载，并用大小上限、摘要、版本及当前配置预检；随后在每次收敛尝试结束的安全边界原子替换并重启，即使旧 Xray 正因读不懂新配置而使该轮收敛失败，也不会形成升级依赖环。健康检查失败时恢复冻结的旧二进制。失败会熔断发布；领取后失联的目标在租约到期后也可由操作者重试，所有动作和结果保留在事件记录中。节点离开 active 生命周期会原子取消包含它的发布，机器以后被永久删除也不会抹掉二进制发布审计。部署新 Console 本身不会自动更新节点 Xray；如需回退，部署携带旧 Xray 的 Console 后创建一条新的发布，而不是改写历史记录。
+
+现有机队第一次启用该能力时，应先通过同页的 Agent 版本卡发布支持 Xray 更新的新 Agent。节点只有在上报受管路径摘要后才可加入 Xray 发布；运行中摘要与路径摘要不一致的节点也会被拒绝，需先完成本地收敛。灰度机器还必须正在运行这份受管 Xray，未启用 Xray 的节点仍可放入后续安装波次，但不能充当启动验证。安装器会把确定的 Xray 路径写入 `BROCADE_XRAY_BIN`；兼容旧安装时，新 Agent 会优先识别自身同目录下的 `xray`。
+
 ### 节点自治与观测
 
 agent 接收期望状态，而非待执行的命令序列。它将期望状态与本机实际状态比较，仅在存在偏差时执行操作，并将收敛结果回报控制面。最近一次期望状态会保存在节点本地，因此控制面暂时不可达时，节点仍能发现并修正本机漂移。
@@ -36,7 +42,33 @@ agent 接收期望状态，而非待执行的命令序列。它将期望状态�
 
 实时网卡速率是第三条独立通道：Agent 主动维持到控制面的 WebSocket，无浏览器查看时只保活、不采样；查看机器或机器总览时，控制面下发临时租约并按全局 1/2/5 秒配置采样，最后一个查看者离开 15 秒后停止。控制面只保留每台机器最近 120 秒、最多 600 点的内存环，进程重启即可丢失，不写数据库、不进入离线重放，也不改变诊断和用量的 30 秒口径。浏览器仅通过控制面的 SSE 读取数据，永远不连接 Agent，也不会收到节点地址或节点令牌。
 
+机器配置中的「流量统计」另行记录默认路由网卡的累计接收与发送字节，并与 Xray 用户/中继用量同时展示。Agent 每 10 秒把逻辑累计值原子写入私有状态文件，进程重启沿用原值；整机重启时保留累计值并接入新 boot 的内核计数。异常断电、网卡替换、计数倒退或状态文件丢失时不会猜测缺少的字节，而是把该边界标为缺口；控制面跨 UTC 日期长时间失联时，绝对累计值仍会补回，但无法精确拆分到可能经过的重置边界，也会标出缺口，供操作者以当前总量校准建立新锚点。月度或年度重置均以 UTC+0 的 00:00 为界；当月不存在所选日期时取月末。重置策略与校准属于运行态账务设置，不进入模型修订，也不触发发布。
+
 节点日志默认有界：设置页配置全局上限（默认 100 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。systemd 节点使用独立 journald namespace；OpenRC（Alpine）节点写入 `$BROCADE_AGENT_STATE_DIR/logs/agent.log`；Agent 拉起的 Xray 与每个 Phantun 实例也分别写入该 `logs` 目录。每个日志项的当前段与前一段合计不超过生效上限，降低上限会在线截断已有分段，不重启 Xray/Phantun。systemd 上使用 `journalctl --namespace=brocade-agent -u brocade-agent` 查看 Agent 日志，OpenRC 上使用 `tail -n 100 $BROCADE_AGENT_STATE_DIR/logs/agent.log`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动。
+
+机器公网 IP 观测复用设置页的端到端探测落点。Agent 按同一间隔并行强制 IPv4、IPv6 直连该 CGI Trace 地址，从 `ip=`/`loc=` 取得两族事实，再分别上报 Console；没有 IPv6 不会阻塞或清空 IPv4。它不使用 Agent 请求的 `X-Real-IP`、`X-Forwarded-For` 或 Cloudflare 代理地址，也不把内核默认路由的 `src` 当作 NAT 后公网地址。配置中的公网地址、默认路由源地址和实际公网观测分别存放；首次观测立即生效，后续变更须跨至少 10 秒连续确认两次。稳定样本只刷新最后观测时间，变更事件保留 90 天，机器详情默认展示最近 14 天。
+
+机器通知同样以控制面确认的状态转换为准：新 Agent 身份第一次轮询或离线后恢复产生上线事件，连续 90 秒没有期望状态轮询产生下线事件，公网 IP 只有在上述双样本确认完成后才产生变化事件。事件与 Webhook 投递状态分别持久化；设置 `BROCADE_NOTIFICATION_WEBHOOK_URL` 后，Console 以 JSON POST 投递，非 2xx、超时与连接失败均按指数退避重试，进程重启后继续。没有配置 Webhook 时仍可通过 `/notifications` 读取最近事件，待投递行随 90 天事件保留期一并清理。Webhook URL 可能带凭据，错误日志不会输出它。
+
+VPN Gate 是节点的可选能力，普通 Agent 安装不会安装 OpenVPN。在纳管向导的「安装 Agent」阶段选择安装 OpenVPN 扩展，展示和复制的安装命令都会追加 `--enable-openvpn`；也可手动追加该参数。该选择只影响安装命令，不写入登记配置或产生修订；命令过期、已兑换时不可更改，上线后显示 Agent 实际上报的安装状态。安装器会补齐 OpenVPN 与隔离命名空间所需的 iptables。Agent 每 30 秒上报 `openvpn --version` 的首行，但不会启用系统级 OpenVPN 常驻服务；只有已发布规则实际引用地区池或固定节点时，才在独立 netns 中按需启动进程。OpenVPN 服务端推送的 DNS 由 Agent 的 namespace-aware up/down hook 写入 `/etc/netns/<name>/resolv.conf`，不会把 netns 内的接口序号交给宿主机 systemd-resolved。机器详情的 CONFIG 运行状态显示「已安装 / 未安装」，完整版本及当前池状态在 VPN Gate 的观测页查看。没有最新兼容上报、未安装 OpenVPN、已隔离或非 active 的机器不会列为可接入节点；控制面也会在发布预览中提示并拒绝把新增或变更的 VPN Gate 规则发布到该机器。每轮运行时收敛完成后，Agent 会可靠上报包含零个池在内的完整池集合；Console 只在集合与当前期望拓扑完全一致时更新状态，并删除该机器未再上报的旧池指针。卸载后的空期望状态因此会同时清理旧进程、命名空间和「承载机器」状态，历史拨测证据继续保留。
+
+VPN Gate 上游目录由设置页「情报任务」中选定的「情报执行 Agent」集合分布式采集；同一组选定机器也承担出口 IP 情报查询。上游会按请求出口返回显著不同的节点集合，因此每台已选 Agent 都有独立周期和租约，并压缩传输自己网络视角下的有界原文；Console 不访问上游，而是在服务端统一校验、清洗，保留每台采集者的最新完整快照，再按服务器 ID 和配置摘要合并去重后更新候选目录。某台采集失败只保留它的上次成功视角，不会让最后一个上报者覆盖其它地域，也不会作为整个目录的前端错误；失败运行和采集者错误仍保留供审计。采集者身份、原文摘要、行数和逐节点观测保留在同步记录中。共享目录拨测与采集、IP 情报及实际出口运行分别使用独立循环：system-admin 在 VPN Gate 的「目录采集」页另外选择承担 OpenVPN 目录拨测的 Agent 子集。控制面用本地 GeoIP 数据把拨测任务按大洲就近放置：亚洲目录优先亚洲机器，美洲目录优先美洲机器；欧洲、非洲和大洋洲没有本洲机器时交给相邻区域。同一区域不再按服务器 ID 固定分片；每台机器按自己的最后拨测时间独立遍历完整区域目录，因此同一个节点会获得来自不同网络出口的多份真实样本，一台机器失败或离线也不会阻塞其它机器。GeoIP 尚未加载时暂时使用完整队列，避免冷启动让拨测停摆。每台机器都持续遍历完整累积区域目录，而不只扫描模型已配置的地区或当前候选节点；各自选择最久未测的有界批次，避免小地区被反复测量时大地区仍有节点从未覆盖。并发拨测使用彼此隔离的 OpenVPN worker，并把下载测速限制为 2 路，防止测速流量互相挤压；实际并发不会超过 Agent 上报的 128 worker 能力和该机器自己的有界配置。Agent 上报后立即领取下一批，因此完整目录不会变成节点上的无界任务队列。上游的保留未知地区代码 `ZZ` 不进入目录展示、拨测任务或规则目标。每个地区最多 16 个通过硬门槛的入口进入实际候选池，但该上限不裁剪其它地区的目录展示和拨测覆盖面。`current` 表示节点是否出现在任一采集机器的最新完整快照中；快照中暂时消失的历史节点仍属于目录，并可凭合格的最新拨测证据进入自动池或手动池。是否加入共享拨测集合不会改变已发布线路；真正引用该出口的每台机器仍会在本机复核实际出口和性能。访客可以读取目录、候选证据和运行结论；服务器地址、主机名、手动节点标识、验证出口和错误详情统一在服务端响应边界脱敏，目录同步和拨测机器设置仍只允许有权限的操作者修改。
+
+VPN Gate 候选不使用 Brocade 合成的“综合质量分”。Agent 先完成 OpenVPN 拨测并上报建连耗时、实测下载速率和两次独立查询一致的实际出口 IP；只有成功拨通并发现的出口 IP 才会进入情报队列。当前目录、自动池和手动池只读取每个拨测 Agent 对候选的最新投影；高频原始拨测行仅保留 24 小时供故障复盘，清理它们不会让仍然新鲜的候选退出池。控制面把出口 IP 全局去重并租给设置页选中的一台 Agent，Agent 通过独立于 OpenVPN 目录拨测的工作循环持续领取，长时间运行的隧道批次不会阻塞情报查询。默认只在出口 IP 首次出现时查询；相同 IP 不做固定周期复查。设置页可以改为定期刷新，但无论哪种模式，只有最后成功拨通发生在配置窗口内（默认 72 小时）的出口才会领取任务。长期不可拨、从未拨通或仅存于历史记录中的 IP 会保留审计证据，但不会继续消耗第三方查询。操作者也可以手动把当前仍可拨的出口重新加入队列。
+
+承担任务的 Agent 并行查询 ProxyCheck v3、FFraud 与 IPLogs，分别保留三家的地区、0–100 来源分数、ISP 和网络类型（机房、家宽、商宽、移动网络、中继或未知）。任一来源成功即可形成可用证据，地区结论按来源保留，不要求三家一致；全部来源失败会保留上次成功情报并退避重试。拨测失败同样不会删除或隐藏历史情报：观测页把最新拨测结果与最后成功出口、最后成功情报分别展示。设置页分别配置每家来源自己的分数阈值，并配置最少成功来源数、地区匹配方式以及“任一来源通过”或“所有可用来源通过”；系统只组合来源的通过/拒绝结论，绝不比较或聚合不同口径的原始分数。情报只对完全相同的出口 IP 生效，出口变化立即回到待查询状态。情报是否复查与旧情报是否准入是两套独立策略；默认继续使用最近一次成功结果，也可选择超过指定期限后仅标记陈旧或禁止准入。地区、来源风险、建连和下载仍是独立准入门槛，不加权也不相互补偿；修改准入规则会立即重新评估已保存的原始情报，无需重新查询。共享候选节点在完全相同的来源集合内以逐来源的 Pareto 支配关系分层；不同来源集合互不可比，不同来源的原始分数绝不相加，情报来源数量也不形成排名。候选先按 Pareto 层排序，同层再按全局下载速率和建连耗时稳定排序；全局性能只取每台 Agent 对该节点最新的新鲜样本后再聚合，Agent 覆盖数、累计拨测次数和运行时长均不参与排名。实际出口池再应用自身配置的门槛。
+
+已验证出口的任一 IP 情报来源将 ISP 识别为 OPTAGE 或 Chubu Telecommunications Company, Inc. 时，该节点不进入 VPN Gate 的候选、候补或实际下发池（包括手动选择）；目录和拨测证据仍保留。ISP 尚无情报时不凭主机名推断。
+
+外部隧道的资源 ID 是不承载业务语义的随机标识：手工隧道使用 `custom-xxxx-xxxx`，WARP 使用 `warp-xxxx-xxxx`，VPN Gate 地区池或固定节点使用 `vpngate-xxxx-xxxx`，其中 `x` 是小写十六进制。地区、节点、租户和展示名称只保存在各自字段中，旧前缀或语义化 ID 不再接受。
+
+VPN Gate 出口直接在规则的目标菜单选择：`VPN Gate → 地区` 使用自动维护的地区池；展开该地区节点列表可勾选 1–16 个节点组成手动池。手动池只在所选节点间切换，节点退役或不满足准入门槛时不会补入其它节点。隧道页只负责目录观测与采集，不再要求先创建独立出站。选择和规则一起保存到变更集，提交并发布后生效；底层继续复用可审计的出站引用，兼容历史 `server_id` 固定节点。一批模型操作全部落地后，控制面会在同一事务中删除已经没有规则或前置组引用的 VPN Gate 派生出口；自定义隧道仍可作为未引用资源保留，历史观测也不依赖派生出口继续存在。手动池使用 `server_ids` 模型字段，需部署对应新版 Console；Agent 收到的是最多 16 个的有界候选列表。
+
+每个实际出口池在 Agent 上维持一个主用和一个热备 OpenVPN namespace，稳定 SOCKS 地址由原子路由规则指向当前主用。Agent 每 5 秒通过两个独立 HTTPS 目标并行检查真实出口；进程退出或 SOCKS 不可达立即切换，出口连续两轮不可达时切换，因此探测与路由替换的预算小于 30 秒。Agent 在池内保存自己最近一段时间的成功端到端样本，按窗口内平均下载速率降序、平均建连耗时升序选择候选；有本机统计的候选始终先于无统计候选，样本数本身不参与排名。全部候选均无本机统计时使用系统随机源打散顺序，使不同机器不会因为拿到相同名单而集中到同一首节点。窗口默认 15 分钟，可用 Agent 环境变量 `BROCADE_VPNGATE_STATS_WINDOW_SECS` 或安装参数 `--vpngate-stats-window-secs` 配置为 60–86400 秒；窗口外样本和配置摘要已变化的样本不会参与选择。主用变化时，Agent 会随收敛摘要重新携带窗口内最新的本机完整样本；若没有可复用样本，则保持路由切换的快速路径，并让新主用在下一轮约 5 秒后优先进行完整拨测。失效槽位会从剩余候选中补齐；全部候选均失败时按 10 秒到 5 分钟的有界指数退避重试，不形成无界任务队列。目录 OpenVPN 拨测运行在独立线程，不会阻塞主备探活。节点页通过既有按需实时通道展示池状态、主备角色、失败原因、连续失败、探活/切换/补位计数和最近 32 条状态事件；持久化运行摘要仍只在状态变化时上报。该实时形状从 Agent 协议 v16 开始提供。
+
+VPN Gate 观测页的「规则与承载机器」也使用同一实时通道显示主用、备用、就绪备用数和主备切换次数；超过 15 秒未更新时标记为过期。出口、风险、建连和单流性能优先按实时主用节点读取该承载机器的拨测证据，主用切换后不会继续显示旧节点的指标。新主用的本机样本尚未到达时，页面可暂用该候选在共享目录拨测中的最新成功结果，并明确标为「候选参考」；本机证据到达后自动替换，不把参考值冒充为当前机器实测。
+
+自动池可以从 VPN Gate 观测页手动切换。控制面优先用新鲜实时主用校验切换目标，实时观测不可用时沿用可靠上报的运行摘要；确认期间主用变化会要求重新确认，过期实时状态禁止点击切换。控制面记录一次性请求并由承载机器执行：优先切到已经验证的热备，没有热备时先验证另一候选；只有稳定 SOCKS 路由成功指向替代节点后才确认成功。旧主节点随后停止并进入 10 分钟冷却，冷却状态保存在 Agent 本地，重启或暂时失联也不会提前重新选中；没有合格替代时保持现状并返回失败，不中断当前出口，也不创建模型修订或重启主 Xray。
 
 ## 一键启动与临时 Tunnel
 
@@ -71,7 +103,7 @@ sudo brocade up
 sudo brocade up --tunnel
 ```
 
-首次启动先访问终端打印的本地地址创建管理员；完成初始化前 launcher 不会开放公网入口。随后它查询 Cloudflare 官方 latest stable release，校验官方 SHA-256 后把 `cloudflared` 缓存到用户缓存目录，再打印随机的 `https://*.trycloudflare.com` 地址。查询失败时只会回退到最近一个已验证缓存；不会执行 cloudflared 自更新，也不会把它打进 Brocade 发行包。需要可复现环境时使用 `--cloudflared-version VERSION`，已有受管安装时使用 `--cloudflared-bin PATH`。
+首次启动时，launcher 会生成 32 字节随机初始化凭据，写入终端提示的 `0600` 私有文件；在页面中粘贴该凭据后文件会被删除，凭据也因系统已经初始化而失去权限。凭据值不会写入日志。使用 `--tunnel` 时，一次性凭据会先保护初始化接口，launcher 再建立 Tunnel 并把随机的 `https://*.trycloudflare.com` 地址明确打印为“初始化地址”，所以通过 SSH 安装的操作者不需要访问服务器的回环地址。若不希望初始化凭据经过 Cloudflare，可在浏览器所在电脑建立 `ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>` 转发，再打开 `http://127.0.0.1:8080`；系统安装版凭据可用 `sudo cat /var/lib/brocade/bootstrap-token` 读取。随后 launcher 查询 Cloudflare 官方 latest stable release，校验官方 SHA-256 后缓存 `cloudflared`。查询失败时只会回退到最近一个已验证缓存；不会执行 cloudflared 自更新，也不会把它打进 Brocade 发行包。需要可复现环境时使用 `--cloudflared-version VERSION`，已有受管安装时使用 `--cloudflared-bin PATH`。
 
 Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地址每次可能变化，并受 Cloudflare 的并发限制；正式部署仍应使用自己的域名、TLS 与受管 Tunnel/反向代理。Quick Tunnel 不支持 SSE，控制台会在实时流失败后自动切换到同权限、无缓存的短轮询接口。
 
@@ -92,7 +124,7 @@ Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地�
 | `frontend`           | React + Vite 控制台                                        |
 | `components/xray-core` | Brocade Xray fork 源码；当前钉在官方 `v26.4.25` 基线     |
 
-生产构建会把前端资源以及 `x86_64`、`aarch64` 两种架构的静态 Agent 和 Brocade Xray 一并嵌入 `brocade-console`。因此，控制面部署只需分发一个二进制文件，前端、API 与节点发行物也不会因独立部署而发生版本漂移。
+生产构建会把前端资源以及 `x86_64`、`aarch64` 两种架构的静态 Agent 和 Brocade Xray 一并嵌入 `brocade-console`。因此，控制面部署只需分发一个二进制文件，前端、API 与节点发行物也不会因独立部署而发生版本漂移。Xray 的发布身份取自实际内嵌字节；构建时关闭 Go VCS 元数据并使用钉住的上游基线作为 banner build id，避免 README 或前端提交制造一次没有数据面变化的 Xray 发布。
 
 ## 构建与验证
 
@@ -140,6 +172,9 @@ PostgreSQL 集成测试由 testcontainers 启动临时数据库，必须显式�
 ```sh
 BROCADE_RUN_PG_TESTS=1 \
   cargo test -p brocade-store --test pg_integration --locked -- --ignored
+
+BROCADE_RUN_PG_TESTS=1 \
+  cargo test -p brocade-store --test tunnel_probe_pg --locked -- --ignored
 
 BROCADE_RUN_PG_TESTS=1 \
   cargo test -p brocade-console --test http_integration --locked -- --ignored
@@ -198,7 +233,9 @@ sudo -u postgres createdb --owner=brocade brocade
 
 ### 3. 控制面拨测 Xray
 
-用户页的「授权验证」会使用当前 Serving 中的真实用户授权发起短生命周期拨测。Console 会把本次构建内嵌的对应架构 Brocade Xray 校验并原子写入 `BROCADE_CACHE_DIR`，无需再单独安装。`BROCADE_PROBE_XRAY_BIN` 只保留为显式运维覆盖；一旦设置，路径或版本错误会直接报告，不会静默回退。
+用户页的「授权验证」会使用当前 Serving 中的真实用户授权发起短生命周期拨测；隧道详情页的手动拨测可选择当前 Serving 或点击时的完整草稿，设置页的定时监测则始终只列出并监测 Console 能执行的 Serving 出口。它们都由 Console 机器发起，并强制流量只经过所选外部出口。Serving 任务引用不可变发布快照；草稿任务只把所选出口加密冻结到任务中，并在任务结束时清除密文，不会创建模型修订。公共落点和超时同样在入队时冻结，结果与定时策略持久化到 PostgreSQL；Console 重启或多实例抢占不会重复执行同一任务。草稿结果会进入最近记录，但不参与 Serving 健康、趋势或告警。定时任务采用稳定抖动且不补跑错过的周期，记录保留 7 天。WARP 因身份按节点分配，在 Console 拥有独立身份前不会出现在定时监测列表；VPN Gate 由引用它的节点 Agent 实拨，同样只在自己的观测页展示。
+
+公共落点只支持明文 HTTP。Console 会先解析并拒绝回环、私网、链路本地、文档和其它非公网地址，再把已批准的 IP 固定写入 SOCKS 请求，避免 DNS 重绑定；原始主机名仅保留在 HTTP `Host` 头。Console 会把本次构建内嵌的对应架构 Brocade Xray 校验并原子写入 `BROCADE_CACHE_DIR`，无需再单独安装。`BROCADE_PROBE_XRAY_BIN` 只保留为显式运维覆盖；一旦设置，路径或版本错误会直接报告，不会静默回退。
 
 ### 4. 安装二进制与环境文件
 
@@ -216,6 +253,7 @@ ssh deploy@console.example.net \
 
 ```dotenv
 DATABASE_URL=postgres://brocade:CHANGE_ME@127.0.0.1:5432/brocade
+BROCADE_BOOTSTRAP_TOKEN=CHANGE_ME
 BROCADE_ADMIN_BIND=127.0.0.1:8080
 BROCADE_AGENT_PUBLIC_URL=https://console.example.net
 BROCADE_CACHE_DIR=/var/cache/brocade
@@ -228,11 +266,16 @@ BROCADE_PROBE_RUNTIME_DIR=/run/brocade/probes
 sudo install -o root -g root -m 0600 /dev/null /opt/brocade/console.env
 sudoedit /opt/brocade/console.env
 sudo sh -c 'printf "BROCADE_SECRET_KEY=%s\n" "$(openssl rand -base64 32)" >> /opt/brocade/console.env'
+sudo sh -c 'printf "BROCADE_BOOTSTRAP_TOKEN=%s\n" "$(openssl rand -base64 32)" >> /opt/brocade/console.env'
 sudo chown root:root /opt/brocade/console.env
 sudo chmod 0600 /opt/brocade/console.env
 ```
 
-该密钥用于密封 DNS 凭据和证书私钥；丢失后，数据库中的既有密文无法恢复，因此应与数据库备份一同保管。对已有部署重新执行生成命令会改变密钥，使既有密文失效；该步骤只应在首次部署或明确执行密钥轮换时运行。
+`BROCADE_SECRET_KEY` 用于密封 DNS 凭据和证书私钥；丢失后，数据库中的既有密文无法恢复，因此应与数据库备份一同保管。对已有部署重新执行生成命令会改变密钥，使既有密文失效；该步骤只应在首次部署或明确执行密钥轮换时运行。
+
+`BROCADE_BOOTSTRAP_TOKEN` 只授权一次 `/auth/init`。首次打开页面时从这个 root 可读的环境文件复制该值；初始化成功后删除这一行并重启服务。直接运行 `brocade-console` 而不是 launcher 时，若未设置该变量，控制面仍提供健康检查和初始化页面，但初始化请求会以 503 失败。
+
+浏览器登录会话以 12 小时无活动为过期界线，而不是从登录时刻计算固定期限。已打开的控制台每 5 分钟发送一次轻量保活；其它已认证请求也会延长服务端期限并同步续写 Cookie。关闭页面或设备休眠后若连续 12 小时没有成功请求，会话仍会正常过期；重置密码和主动退出仍会立即撤销对应会话。
 
 若数据库密码包含 `@`、`:`、`/` 等 URI 保留字符，必须先对用户名或密码部分进行百分号编码，再写入 `DATABASE_URL`。
 
@@ -272,7 +315,7 @@ ProtectSystem=strict
 WantedBy=multi-user.target
 ```
 
-控制面会在 `BROCADE_CACHE_DIR` 中保存 GeoIP 数据库缓存。`CacheDirectory=brocade` 由 systemd 创建并授予服务账号写权限，因此无需放宽 `/opt/brocade` 的文件权限。授权拨测的临时配置包含真实用户凭据，只会以 `0600` 写入 `RuntimeDirectory` 下的 `probes` 子目录，任务结束后删除；该目录本身由控制面收紧为 `0700`。
+控制面会在 `BROCADE_CACHE_DIR` 中保存 GeoIP 数据库缓存。`CacheDirectory=brocade` 由 systemd 创建并授予服务账号写权限，因此无需放宽 `/opt/brocade` 的文件权限。授权与隧道拨测的临时配置包含真实凭据，只会以 `0600` 写入 `RuntimeDirectory` 下的 `probes` 子目录，任务结束后删除；该目录本身由控制面收紧为 `0700`。数据库只保存脱敏后的配置指纹与归类结果，不保存 Xray 原始日志。
 
 加载并启动服务：
 
@@ -304,6 +347,10 @@ server {
 server {
     listen 443 ssl;
     server_name console.example.net;
+
+    # Selected Agents gzip VPN Gate snapshots before upload. The application decompresses with a
+    # separate 16 MiB ceiling and accepts this larger body only on the catalogue-report route.
+    client_max_body_size 4m;
 
     ssl_certificate /etc/letsencrypt/live/console.example.net/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/console.example.net/privkey.pem;
@@ -371,7 +418,7 @@ sudo journalctl -u brocade-console -n 100 --no-pager
 curl --fail https://console.example.net/healthz
 ```
 
-登录控制台后，用户页「授权验证」不应显示“Console 未安装或无法执行拨测 Xray”。拨测使用真实用户凭据和真实完整链路，产生的少量流量会正常计入该用户用量；浏览器只提交 Serving 条目的不透明 ID，不能指定目标地址或凭据。
+登录控制台后，用户页「授权验证」与隧道详情页「线路拨测」均不应显示“Console 未安装或无法执行拨测 Xray”。授权拨测使用真实用户凭据和真实完整链路，产生的少量流量会正常计入该用户用量；隧道拨测固定从 Console 发出。拨测 Serving 时浏览器只提交条目的不透明 ID；拨测草稿时浏览器提交现有草稿操作，服务端在授权事务中生成并冻结出口，浏览器仍不能直接指定探测落点或后台执行配置。
 
 常用诊断命令如下：
 
@@ -400,4 +447,7 @@ npm run build
 
 ## 许可证
 
-本项目采用 Apache License 2.0，详见 [LICENSE](LICENSE)。
+Brocade 自有代码采用 Apache License 2.0，详见 [LICENSE](LICENSE)。仓库内维护的
+`components/xray-core` 是基于 XTLS/Xray-core 的 fork，继续遵循 MPL-2.0；其许可证与固定的
+上游基线分别见 [components/xray-core/LICENSE](components/xray-core/LICENSE) 和
+[components/xray-core/BROCADE_UPSTREAM.toml](components/xray-core/BROCADE_UPSTREAM.toml)。

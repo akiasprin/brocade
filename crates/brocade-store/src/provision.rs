@@ -391,6 +391,7 @@ async fn issue_node_token_in_tx(
     .bind(token_prefix)
     .fetch_one(&mut **tx)
     .await?;
+    crate::notifications::initialize_waiting(tx, node_id).await?;
 
     Ok(IssuedNodeToken {
         node_id: row.try_get("node_id")?,

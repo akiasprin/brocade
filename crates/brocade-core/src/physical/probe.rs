@@ -232,6 +232,103 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
     ProbePlan { targets }
 }
 
+/// Retain only chains headed by `node_id` and the nodes their exit analysis can reach.  This is a
+/// projection input, not a second compiler path: [`project_probe`] consumes the returned IR with
+/// exactly the same logic as a complete application set.
+pub fn scope_probe_apps(apps: &[AppIr], node_id: &str) -> Vec<AppIr> {
+    let initial = apps
+        .iter()
+        .flat_map(|app| app.ingresses.iter())
+        .filter(|ingress| ingress.node == node_id)
+        .map(|ingress| (ingress.chain.clone(), ingress.node.clone()))
+        .collect::<Vec<_>>();
+    let step_by_location = apps
+        .iter()
+        .flat_map(|app| app.steps.iter())
+        .map(|step| ((step.chain.as_str(), step.node.as_str()), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut queue = VecDeque::from(initial);
+    let mut locations = BTreeSet::new();
+    while let Some((chain, node)) = queue.pop_front() {
+        if !locations.insert((chain.clone(), node.clone())) {
+            continue;
+        }
+        let Some(step) = step_by_location.get(&(chain.as_str(), node.as_str())) else {
+            continue;
+        };
+        for rule in &step.rules {
+            if let Some(forward) = rule.action.forward_ref(&step.chain) {
+                queue.push_back((
+                    forward.target_chain.to_owned(),
+                    forward.target_node.to_owned(),
+                ));
+            }
+        }
+    }
+    let chain_ids = locations
+        .iter()
+        .map(|(chain, _)| chain.as_str())
+        .collect::<BTreeSet<_>>();
+    let node_ids = locations
+        .iter()
+        .map(|(_, node)| node.as_str())
+        .collect::<BTreeSet<_>>();
+
+    apps.iter()
+        .map(|app| {
+            let chains = app
+                .chains
+                .iter()
+                .filter(|chain| chain_ids.contains(chain.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let ingresses = app
+                .ingresses
+                .iter()
+                .filter(|ingress| {
+                    ingress.node == node_id && chain_ids.contains(ingress.chain.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let steps = app
+                .steps
+                .iter()
+                .filter(|step| chain_ids.contains(step.chain.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let nodes = app
+                .nodes
+                .iter()
+                .filter(|node| node_ids.contains(node.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let tenants = nodes
+                .iter()
+                .map(|node| node.tenant.clone())
+                .chain(chains.iter().map(|chain| chain.tenant.clone()))
+                .chain(ingresses.iter().map(|ingress| ingress.tenant.clone()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            AppIr {
+                revision: 0,
+                app_id: app.app_id.clone(),
+                tenants,
+                nodes,
+                users: Vec::new(),
+                external_outbounds: Vec::new(),
+                chains,
+                ingresses,
+                fronts: Vec::new(),
+                steps,
+                listener_roots: BTreeSet::new(),
+                grants: Vec::new(),
+                hops: Vec::new(),
+            }
+        })
+        .collect()
+}
+
 /// Which address to dial the local ingress on.
 ///
 /// Bound to `0.0.0.0` / `::`, use loopback — that binding accepts any address,

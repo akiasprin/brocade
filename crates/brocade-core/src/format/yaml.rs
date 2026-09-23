@@ -820,6 +820,9 @@ fn push_anytls_proxy(
     if let Some(value) = anytls.settings.min_idle_session {
         lines.push(format!("    min-idle-session: {value}"));
     }
+    if let Some(front_name) = &entry.front_name {
+        lines.push(format!("    dialer-proxy: {}", yaml_quote(front_name)));
+    }
 }
 
 fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProxy) {
@@ -962,6 +965,11 @@ fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProx
         }
         ExternalOutboundProtocol::Warp { .. } => {
             unreachable!("WARP has no user-scoped identity and is rejected from Clash fronts")
+        }
+        ExternalOutboundProtocol::Vpngate { .. } => {
+            unreachable!(
+                "VPN Gate profiles stay on managed nodes and are rejected from Clash fronts"
+            )
         }
     }
 }

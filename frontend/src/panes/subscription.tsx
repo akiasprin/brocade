@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchArtifactContent,
@@ -15,7 +15,10 @@ import {
   type ClashSubscriptionInfo,
 } from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
-import { copyText } from '../ui/platform';
+import { CopyButton } from '../ui/copy-button';
+import { DialogClose, DialogLayer } from '../ui/dialog';
+import { bytes } from '../ui/format';
+import { Icon } from '../ui/icons';
 
 export type SubscriptionKind = 'uri' | 'clash';
 
@@ -89,16 +92,6 @@ export function SubscriptionViewer({
   );
 }
 
-function useEscape(onClose: () => void) {
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-}
-
 /* The VLESS entry keeps the existing address-list interaction, while the server narrows both
  * protocol and address family so every tab remains an exact view of the current artifact. */
 function VlessAddresses({
@@ -115,7 +108,6 @@ function VlessAddresses({
   const [family, setFamily] = useState<FamilyPick>('both');
   const [protocol, setProtocol] = useState<ProtocolPick>('both');
   const [allowInsecure, setAllowInsecure] = useState(false);
-  useEscape(onClose);
 
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), refetchInterval: 10_000 });
   const revision = revisions.data?.current_revision;
@@ -149,9 +141,9 @@ function VlessAddresses({
     .every(line => line.startsWith('#'));
 
   return (
-    <div className="confirm-mask" onClick={onClose}>
-      <div className="sub-card" onClick={event => event.stopPropagation()} role="dialog" aria-modal="true">
-        <SubscriptionHead user={user} suffix="uri.txt" onClose={onClose} />
+    <DialogLayer label={`${user} 的订阅地址`} onClose={onClose}>
+      <div className="dialog-surface sub-card">
+        <SubscriptionHead user={user} suffix="uri.txt" />
         <div className="cfg-main">
           <div className="sub-filterbar">
             <SubscriptionTabs
@@ -172,11 +164,7 @@ function VlessAddresses({
                 value={family}
                 onChange={setFamily}
               />
-              {text && (
-                <button className="sub-copy" onClick={() => void copyText(text)}>
-                  复制
-                </button>
-              )}
+              {text && <CopyButton className="sub-copy" text={text} />}
             </div>
             {protocol !== 'vless' && (
               <div className={allowInsecure ? 'sub-insecure on' : 'sub-insecure'}>
@@ -203,7 +191,7 @@ function VlessAddresses({
             )}
           </div>
           {!revision || content.isPending ? (
-            <Loading />
+            <Loading variant="code" />
           ) : content.error ? (
             <ErrorBox error={content.error} />
           ) : (
@@ -227,7 +215,7 @@ function VlessAddresses({
           )}
         </div>
       </div>
-    </div>
+    </DialogLayer>
   );
 }
 
@@ -247,7 +235,6 @@ function ClashSubscription({
   const [template, setTemplate] = useState<ClashTemplatePick>('standard');
   const [revealed, setRevealed] = useState(false);
   const qc = useQueryClient();
-  useEscape(onClose);
   const queryKey = ['clash-subscription', tenant, user] as const;
   const subscription = useQuery({
     queryKey,
@@ -276,18 +263,12 @@ function ClashSubscription({
   const actionError = issueHaitun.error ?? revokeHaitun.error;
 
   return (
-    <div className="confirm-mask" onClick={onClose}>
-      <div
-        className="sub-card clash-card"
-        onClick={event => event.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-label={`${user} 的 Clash 订阅地址`}
-      >
-        <SubscriptionHead user={user} suffix="Clash" onClose={onClose} />
+    <DialogLayer label={`${user} 的 Clash 订阅地址`} onClose={onClose}>
+      <div className="dialog-surface sub-card clash-card">
+        <SubscriptionHead user={user} suffix="Clash" />
         {subscription.isPending ? (
           <div className="clash-state">
-            <Loading />
+            <Loading variant="code" />
           </div>
         ) : subscription.error ? (
           <div className="clash-state">
@@ -385,9 +366,7 @@ function ClashSubscription({
                   <button type="button" onClick={() => setRevealed(current => !current)}>
                     {revealed ? '隐藏' : '显示'}
                   </button>
-                  <button type="button" onClick={() => void copyText(selectedUrl)}>
-                    复制
-                  </button>
+                  <CopyButton text={selectedUrl} />
                 </div>
               </div>
             )}
@@ -395,7 +374,7 @@ function ClashSubscription({
             <div className="clash-meta">
               <span>
                 <small>剩余流量</small>
-                <b>{value.remaining_bytes === null ? '不限量' : formatBytes(value.remaining_bytes)}</b>
+                <b>{value.remaining_bytes === null ? '不限量' : bytes(value.remaining_bytes)}</b>
               </span>
               <span>
                 <small>重置时间</small>
@@ -418,11 +397,11 @@ function ClashSubscription({
           </div>
         ) : null}
       </div>
-    </div>
+    </DialogLayer>
   );
 }
 
-function SubscriptionHead({ user, suffix, onClose }: { user: string; suffix: string; onClose: () => void }) {
+function SubscriptionHead({ user, suffix }: { user: string; suffix: string }) {
   return (
     <div className="sub-head">
       <span className="fw-kind">订阅</span>
@@ -430,9 +409,9 @@ function SubscriptionHead({ user, suffix, onClose }: { user: string; suffix: str
         {user}
         <span className="dim"> · {suffix}</span>
       </span>
-      <button title="关闭" onClick={onClose}>
-        ✕
-      </button>
+      <DialogClose title="关闭" aria-label="关闭">
+        <Icon of="close" size={14} />
+      </DialogClose>
     </div>
   );
 }
@@ -452,17 +431,6 @@ function withSubscriptionProtocol(url: string, protocol: ProtocolPick): string {
   const selected = new URL(url);
   selected.searchParams.set('protocol', protocol);
   return selected.toString();
-}
-
-function formatBytes(bytes: number): string {
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
 function formatResetAt(value: string): string {

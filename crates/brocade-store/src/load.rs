@@ -10,7 +10,7 @@
 //! diagnostics. A node that lies about its CPU wastes an operator's afternoon, while a node that
 //! lies about its counters takes revenue.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brocade_deployment::protocol::{
     CpuDetailSample, DiskDetailSample, HopLinkList, HopLinkSample, HopLinkView, HostFacts,
@@ -20,6 +20,126 @@ use brocade_deployment::protocol::{
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{admin::tenant_filter, AdminContext, Result, StoreError};
+
+/// The machine overview draws only its short NIC sparkline. Keeping that response separate from
+/// [`NodeLoadView`] avoids serialising every CPU, memory, disk and socket detail for every card.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodeNicSample {
+    pub window_start_unix_secs: i64,
+    pub window_end_unix_secs: i64,
+    pub has_gap: bool,
+    pub nic_rx_bps: u64,
+    pub nic_tx_bps: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodeNicView {
+    pub node_id: String,
+    pub series: Vec<NodeNicSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodeNicList {
+    pub nodes: Vec<NodeNicView>,
+}
+
+/// Exact, column-oriented samples for a bounded set of detail-chart metrics.
+///
+/// The ordinary overview deliberately omits the four deep JSON objects. A detail expansion asks
+/// for the fields used by at most two charts, and this shape writes the shared time axis once
+/// instead of repeating timestamps and JSON field names for every line.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct NodeLoadMetricView {
+    pub node_id: String,
+    pub range_start_unix_secs: i64,
+    pub range_end_unix_secs: i64,
+    pub window_end_unix_secs: Vec<i64>,
+    pub has_gap: Vec<bool>,
+    pub metrics: BTreeMap<String, Vec<Option<f64>>>,
+}
+
+/// Transport form of the initial machine observation. Every ECharts sample is retained; only the
+/// JSON layout changes from repeated row objects to parallel columns. Deep objects stay solely in
+/// `latest_sample` as capability/current-state facts and are fetched historically in chart pairs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct NodeLoadOverviewView {
+    pub node_id: String,
+    pub range_start_unix_secs: i64,
+    pub range_end_unix_secs: i64,
+    pub reported_at_unix_secs: Option<i64>,
+    pub clock_skew_secs: Option<i64>,
+    pub host: Option<HostFacts>,
+    pub latest_sample: Option<LoadSample>,
+    pub series: NodeLoadOverviewSeries,
+    pub processes: Vec<ProcessSample>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct NodeLoadOverviewSeries {
+    pub window_start_unix_secs: Vec<i64>,
+    pub window_end_unix_secs: Vec<i64>,
+    pub has_gap: Vec<bool>,
+    pub cpu_user_pct: Vec<f32>,
+    pub cpu_sys_pct: Vec<f32>,
+    pub cpu_softirq_pct: Vec<f32>,
+    pub cpu_peak_pct: Vec<f32>,
+    pub cpu_steal_pct: Vec<f32>,
+    pub load1: Vec<f32>,
+    pub mem_available_bytes: Vec<u64>,
+    pub swap_used_bytes: Vec<u64>,
+    pub oom_kills: Vec<u64>,
+    pub disk_free_bytes: Vec<u64>,
+    pub disk_inode_free_pct: Vec<f32>,
+    pub nic_rx_bps: Vec<u64>,
+    pub nic_tx_bps: Vec<u64>,
+    pub nic_rx_drop: Vec<u64>,
+    pub nic_tx_drop: Vec<u64>,
+    pub nic_err: Vec<u64>,
+    pub conntrack_count: Vec<Option<u64>>,
+    pub uptime_secs: Vec<u64>,
+}
+
+pub fn columnar_overview(view: NodeLoadView) -> NodeLoadOverviewView {
+    let mut series = NodeLoadOverviewSeries::default();
+    for sample in view.series {
+        series
+            .window_start_unix_secs
+            .push(sample.window_start_unix_secs);
+        series
+            .window_end_unix_secs
+            .push(sample.window_end_unix_secs);
+        series.has_gap.push(sample.has_gap);
+        series.cpu_user_pct.push(sample.cpu_user_pct);
+        series.cpu_sys_pct.push(sample.cpu_sys_pct);
+        series.cpu_softirq_pct.push(sample.cpu_softirq_pct);
+        series.cpu_peak_pct.push(sample.cpu_peak_pct);
+        series.cpu_steal_pct.push(sample.cpu_steal_pct);
+        series.load1.push(sample.load1);
+        series.mem_available_bytes.push(sample.mem_available_bytes);
+        series.swap_used_bytes.push(sample.swap_used_bytes);
+        series.oom_kills.push(sample.oom_kills);
+        series.disk_free_bytes.push(sample.disk_free_bytes);
+        series.disk_inode_free_pct.push(sample.disk_inode_free_pct);
+        series.nic_rx_bps.push(sample.nic_rx_bps);
+        series.nic_tx_bps.push(sample.nic_tx_bps);
+        series.nic_rx_drop.push(sample.nic_rx_drop);
+        series.nic_tx_drop.push(sample.nic_tx_drop);
+        series.nic_err.push(sample.nic_err);
+        series.conntrack_count.push(sample.conntrack_count);
+        series.uptime_secs.push(sample.uptime_secs);
+    }
+    NodeLoadOverviewView {
+        node_id: view.node_id,
+        range_start_unix_secs: view.range_start_unix_secs,
+        range_end_unix_secs: view.range_end_unix_secs,
+        reported_at_unix_secs: view.reported_at_unix_secs,
+        clock_skew_secs: view.clock_skew_secs,
+        host: view.host,
+        latest_sample: view.latest_sample,
+        series,
+        processes: view.processes,
+    }
+}
 
 // Scoping matters here even though telemetry is an operator's view: a tenant-admin is an operator
 // of *their* branch, and without `tenant_filter` they would read the CPU, memory and link quality
@@ -400,6 +520,582 @@ pub async fn node_load_view(
     selection: LoadSeriesQuery,
     max_samples: u32,
 ) -> Result<NodeLoadView> {
+    node_load_view_inner(
+        pool,
+        actor,
+        node_id,
+        selection,
+        max_samples,
+        LoadDetailColumns::ALL,
+    )
+    .await
+}
+
+/// Overview data keeps every base sample needed by the visible KPI and NIC ECharts, but strips
+/// deep CPU/memory/disk/network objects from the history. `latest_sample` remains complete so the
+/// current reading and capability flags do not require a second request.
+pub async fn node_load_overview(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    selection: LoadSeriesQuery,
+    max_samples: u32,
+) -> Result<NodeLoadView> {
+    node_load_view_inner(
+        pool,
+        actor,
+        node_id,
+        selection,
+        max_samples,
+        LoadDetailColumns::NONE,
+    )
+    .await
+}
+
+/// Return exact retained points for the metric selectors requested by a pair of charts.
+///
+/// The selector allow-list is intentionally closed. Besides preventing SQL-shaped input from
+/// becoming part of a future dynamic query, it keeps the frontend/backend contract auditable.
+/// Values are column-oriented; `has_gap` is shared by every column and remains authoritative.
+pub async fn node_load_metrics(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    selection: LoadSeriesQuery,
+    max_samples: u32,
+    metric_ids: &[String],
+) -> Result<NodeLoadMetricView> {
+    const MAX_METRICS_PER_BATCH: usize = 16;
+    if metric_ids.is_empty() || metric_ids.len() > MAX_METRICS_PER_BATCH {
+        return Err(StoreError::InvalidData(format!(
+            "load metric batch must contain 1–{MAX_METRICS_PER_BATCH} selectors"
+        )));
+    }
+
+    let metric_ids = metric_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for metric_id in &metric_ids {
+        if *metric_id != "cpu.cores.busy_pct" && load_metric_series(&[], metric_id).is_none() {
+            return Err(StoreError::InvalidData(format!(
+                "unknown load metric selector: {metric_id}"
+            )));
+        }
+    }
+    let detail_columns = LoadDetailColumns::for_metrics(&metric_ids);
+    let view =
+        node_load_view_inner(pool, actor, node_id, selection, max_samples, detail_columns).await?;
+    let mut metrics = BTreeMap::new();
+    for metric_id in metric_ids {
+        if metric_id == "cpu.cores.busy_pct" {
+            let core_ids = view
+                .series
+                .iter()
+                .flat_map(|sample| sample.cpu_detail.iter())
+                .flat_map(|detail| detail.cores.iter().map(|core| core.cpu))
+                .collect::<BTreeSet<_>>();
+            for cpu in core_ids {
+                metrics.insert(
+                    format!("cpu.core.{cpu}.busy_pct"),
+                    metric_series(&view.series, |sample| {
+                        sample
+                            .cpu_detail
+                            .as_ref()?
+                            .cores
+                            .iter()
+                            .find(|core| core.cpu == cpu)
+                            .map(|core| {
+                                f64::from(core.user_pct + core.system_pct + core.softirq_pct)
+                            })
+                    }),
+                );
+            }
+            continue;
+        }
+        let values = load_metric_series(&view.series, metric_id)
+            .expect("metric selector validated before querying");
+        metrics.insert(metric_id.to_owned(), values);
+    }
+    Ok(NodeLoadMetricView {
+        node_id: view.node_id,
+        range_start_unix_secs: view.range_start_unix_secs,
+        range_end_unix_secs: view.range_end_unix_secs,
+        window_end_unix_secs: view
+            .series
+            .iter()
+            .map(|sample| sample.window_end_unix_secs)
+            .collect(),
+        has_gap: view.series.iter().map(|sample| sample.has_gap).collect(),
+        metrics,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadDetailColumns {
+    cpu: bool,
+    memory: bool,
+    disk: bool,
+    network: bool,
+}
+
+impl LoadDetailColumns {
+    const ALL: Self = Self {
+        cpu: true,
+        memory: true,
+        disk: true,
+        network: true,
+    };
+    const NONE: Self = Self {
+        cpu: false,
+        memory: false,
+        disk: false,
+        network: false,
+    };
+
+    fn for_metrics(metric_ids: &BTreeSet<&str>) -> Self {
+        Self {
+            cpu: metric_ids.iter().any(|metric| metric.starts_with("cpu.")),
+            memory: metric_ids
+                .iter()
+                .any(|metric| metric.starts_with("memory.")),
+            disk: metric_ids.iter().any(|metric| metric.starts_with("disk.")),
+            network: metric_ids
+                .iter()
+                .any(|metric| metric.starts_with("network.")),
+        }
+    }
+
+    fn select_sql(self) -> String {
+        fn column(included: bool, name: &str) -> String {
+            if included {
+                name.to_owned()
+            } else {
+                format!("NULL::jsonb AS {name}")
+            }
+        }
+        [
+            column(self.cpu, "cpu_detail"),
+            column(self.memory, "memory_detail"),
+            column(self.disk, "disk_detail"),
+            column(self.network, "network_detail"),
+        ]
+        .join(", ")
+    }
+}
+
+fn metric_series(
+    samples: &[LoadSample],
+    read: impl Fn(&LoadSample) -> Option<f64>,
+) -> Vec<Option<f64>> {
+    samples.iter().map(read).collect()
+}
+
+#[allow(clippy::too_many_lines)]
+fn load_metric_series(samples: &[LoadSample], metric_id: &str) -> Option<Vec<Option<f64>>> {
+    let values = match metric_id {
+        "cpu.user_pct" => metric_series(samples, |sample| Some(f64::from(sample.cpu_user_pct))),
+        "cpu.sys_pct" => metric_series(samples, |sample| Some(f64::from(sample.cpu_sys_pct))),
+        "cpu.softirq_pct" => {
+            metric_series(samples, |sample| Some(f64::from(sample.cpu_softirq_pct)))
+        }
+        "cpu.peak_pct" => metric_series(samples, |sample| Some(f64::from(sample.cpu_peak_pct))),
+        "cpu.steal_pct" => metric_series(samples, |sample| Some(f64::from(sample.cpu_steal_pct))),
+        "cpu.iowait_pct" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()
+                .map(|detail| f64::from(detail.iowait_pct))
+        }),
+        "cpu.pressure_some_pct" => metric_series(samples, |sample| {
+            sample.cpu_detail.as_ref()?.pressure_some_pct.map(f64::from)
+        }),
+        "cpu.io_pressure_some_pct" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()?
+                .io_pressure_some_pct
+                .map(f64::from)
+        }),
+        "cpu.io_pressure_full_pct" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()?
+                .io_pressure_full_pct
+                .map(f64::from)
+        }),
+        "load.1" => metric_series(samples, |sample| Some(f64::from(sample.load1))),
+        "cpu.load5" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()
+                .map(|detail| f64::from(detail.load5))
+        }),
+        "cpu.load15" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()
+                .map(|detail| f64::from(detail.load15))
+        }),
+        "cpu.procs_running" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()?
+                .procs_running
+                .map(|value| value as f64)
+        }),
+        "cpu.context_switches_per_sec" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()?
+                .context_switches_per_sec
+                .map(|value| value as f64)
+        }),
+        "cpu.net_rx_softirqs_per_sec" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()?
+                .net_rx_softirqs_per_sec
+                .map(|value| value as f64)
+        }),
+        "cpu.net_tx_softirqs_per_sec" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()?
+                .net_tx_softirqs_per_sec
+                .map(|value| value as f64)
+        }),
+        "cpu.throttled_usec" => metric_series(samples, |sample| {
+            sample
+                .cpu_detail
+                .as_ref()?
+                .throttled_usec
+                .map(|value| value as f64)
+        }),
+        "memory.anon_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.anon_bytes as f64)
+        }),
+        "memory.shmem_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.shmem_bytes as f64)
+        }),
+        "memory.kernel_other_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.kernel_other_bytes as f64)
+        }),
+        "memory.file_cache_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.file_cache_bytes as f64)
+        }),
+        "memory.free_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.free_bytes as f64)
+        }),
+        "memory.available_min_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.available_min_bytes as f64)
+        }),
+        "memory.pressure_some_pct" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()?
+                .pressure_some_pct
+                .map(f64::from)
+        }),
+        "memory.pressure_full_pct" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()?
+                .pressure_full_pct
+                .map(f64::from)
+        }),
+        "memory.buffers_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.buffers_bytes as f64)
+        }),
+        "memory.kernel_reclaimable_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.kernel_reclaimable_bytes as f64)
+        }),
+        "memory.slab_unreclaimable_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.slab_unreclaimable_bytes as f64)
+        }),
+        "memory.unevictable_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.unevictable_bytes as f64)
+        }),
+        "memory.mlocked_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.mlocked_bytes as f64)
+        }),
+        "memory.gup_pinned_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()?
+                .gup_pinned_bytes
+                .map(|value| value as f64)
+        }),
+        "memory.swap_used_bytes" => {
+            metric_series(samples, |sample| Some(sample.swap_used_bytes as f64))
+        }
+        "memory.swap_cached_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.swap_cached_bytes as f64)
+        }),
+        "memory.dirty_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.dirty_bytes as f64)
+        }),
+        "memory.writeback_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.writeback_bytes as f64)
+        }),
+        "memory.swap_in_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.swap_in_bytes as f64)
+        }),
+        "memory.swap_out_bytes" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.swap_out_bytes as f64)
+        }),
+        "memory.major_faults" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.major_faults as f64)
+        }),
+        "memory.direct_reclaim_pages" => metric_series(samples, |sample| {
+            sample
+                .memory_detail
+                .as_ref()
+                .map(|detail| detail.direct_reclaim_pages as f64)
+        }),
+        "disk.free_bytes" => metric_series(samples, |sample| Some(sample.disk_free_bytes as f64)),
+        "disk.inode_free_pct" => metric_series(samples, |sample| {
+            Some(f64::from(sample.disk_inode_free_pct))
+        }),
+        "disk.total_bytes" => metric_series(samples, |sample| {
+            sample
+                .disk_detail
+                .as_ref()?
+                .total_bytes
+                .map(|value| value as f64)
+        }),
+        "disk.busy_pct" => metric_series(samples, |sample| {
+            sample.disk_detail.as_ref()?.busy_pct.map(f64::from)
+        }),
+        "disk.pressure_some_pct" => metric_series(samples, |sample| {
+            sample
+                .disk_detail
+                .as_ref()?
+                .pressure_some_pct
+                .map(f64::from)
+        }),
+        "disk.pressure_full_pct" => metric_series(samples, |sample| {
+            sample
+                .disk_detail
+                .as_ref()?
+                .pressure_full_pct
+                .map(f64::from)
+        }),
+        "disk.read_bps" => metric_series(samples, |sample| {
+            sample
+                .disk_detail
+                .as_ref()?
+                .read_bps
+                .map(|value| value as f64)
+        }),
+        "disk.write_bps" => metric_series(samples, |sample| {
+            sample
+                .disk_detail
+                .as_ref()?
+                .write_bps
+                .map(|value| value as f64)
+        }),
+        "disk.read_iops" => metric_series(samples, |sample| {
+            sample.disk_detail.as_ref()?.read_iops.map(f64::from)
+        }),
+        "disk.write_iops" => metric_series(samples, |sample| {
+            sample.disk_detail.as_ref()?.write_iops.map(f64::from)
+        }),
+        "disk.read_await_ms" => metric_series(samples, |sample| {
+            sample.disk_detail.as_ref()?.read_await_ms.map(f64::from)
+        }),
+        "disk.write_await_ms" => metric_series(samples, |sample| {
+            sample.disk_detail.as_ref()?.write_await_ms.map(f64::from)
+        }),
+        "disk.queue_depth" => metric_series(samples, |sample| {
+            sample.disk_detail.as_ref()?.queue_depth.map(f64::from)
+        }),
+        "disk.in_flight" => metric_series(samples, |sample| {
+            sample
+                .disk_detail
+                .as_ref()?
+                .in_flight
+                .map(|value| value as f64)
+        }),
+        "network.conntrack_count" => metric_series(samples, |sample| {
+            sample.conntrack_count.map(|value| value as f64)
+        }),
+        "network.tcp_curr_estab" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_curr_estab
+                .map(|value| value as f64)
+        }),
+        "network.tcp_inuse" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_inuse
+                .map(|value| value as f64)
+        }),
+        "network.tcp_time_wait" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_time_wait
+                .map(|value| value as f64)
+        }),
+        "network.tcp_orphan" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_orphan
+                .map(|value| value as f64)
+        }),
+        "network.udp_inuse" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .udp_inuse
+                .map(|value| value as f64)
+        }),
+        "network.ephemeral_port_capacity" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .ephemeral_port_capacity
+                .map(|value| value as f64)
+        }),
+        "network.tcp_ephemeral_inuse_v4" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_ephemeral_inuse_v4
+                .map(|value| value as f64)
+        }),
+        "network.tcp_ephemeral_inuse_v6" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_ephemeral_inuse_v6
+                .map(|value| value as f64)
+        }),
+        "network.tcp_ephemeral_time_wait_v4" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_ephemeral_time_wait_v4
+                .map(|value| value as f64)
+        }),
+        "network.tcp_ephemeral_time_wait_v6" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_ephemeral_time_wait_v6
+                .map(|value| value as f64)
+        }),
+        "network.tcp_ephemeral_top_target_v4" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_ephemeral_top_target_v4
+                .map(|value| value as f64)
+        }),
+        "network.tcp_ephemeral_top_target_v6" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .tcp_ephemeral_top_target_v6
+                .map(|value| value as f64)
+        }),
+        "network.tcp_active_opens" => network_metric(samples, |detail| detail.tcp_active_opens),
+        "network.tcp_passive_opens" => network_metric(samples, |detail| detail.tcp_passive_opens),
+        "network.tcp_attempt_fails" => network_metric(samples, |detail| detail.tcp_attempt_fails),
+        "network.tcp_estab_resets" => network_metric(samples, |detail| detail.tcp_estab_resets),
+        "network.tcp_retrans_segs" => network_metric(samples, |detail| detail.tcp_retrans_segs),
+        "network.tcp_syn_retrans" => network_metric(samples, |detail| detail.tcp_syn_retrans),
+        "network.tcp_timeouts" => network_metric(samples, |detail| detail.tcp_timeouts),
+        "network.tcp_in_errors" => network_metric(samples, |detail| detail.tcp_in_errors),
+        "network.tcp_out_resets" => network_metric(samples, |detail| detail.tcp_out_resets),
+        "network.tcp_listen_overflows" => {
+            network_metric(samples, |detail| detail.tcp_listen_overflows)
+        }
+        "network.tcp_listen_drops" => network_metric(samples, |detail| detail.tcp_listen_drops),
+        "network.udp_in_errors" => network_metric(samples, |detail| detail.udp_in_errors),
+        "network.udp_no_ports" => network_metric(samples, |detail| detail.udp_no_ports),
+        "network.udp_rcvbuf_errors" => network_metric(samples, |detail| detail.udp_rcvbuf_errors),
+        "network.udp_sndbuf_errors" => network_metric(samples, |detail| detail.udp_sndbuf_errors),
+        "network.tcp_mem_bytes" => network_metric(samples, |detail| detail.tcp_mem_bytes),
+        "network.udp_mem_bytes" => network_metric(samples, |detail| detail.udp_mem_bytes),
+        _ => return None,
+    };
+    Some(values)
+}
+
+fn network_metric(
+    samples: &[LoadSample],
+    read: impl Fn(&NetworkDetailSample) -> Option<u64>,
+) -> Vec<Option<f64>> {
+    metric_series(samples, |sample| {
+        read(sample.network_detail.as_ref()?).map(|value| value as f64)
+    })
+}
+
+async fn node_load_view_inner(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    selection: LoadSeriesQuery,
+    max_samples: u32,
+    detail_columns: LoadDetailColumns,
+) -> Result<NodeLoadView> {
     // Scope check first, and as an early return rather than a filter woven through the three
     // queries below: out of scope means this machine does not exist as far as this operator is
     // concerned, and an empty view says exactly that without leaking whether the id is real.
@@ -429,15 +1125,7 @@ pub async fn node_load_view(
     let (host, reported_at, clock_skew) = match facts {
         Some(row) => {
             let raw: Option<serde_json::Value> = row.try_get("load_host_facts")?;
-            let host = raw
-                .map(|value| {
-                    serde_json::from_value::<HostFacts>(value).map_err(|error| {
-                        StoreError::InvalidData(format!(
-                            "node {node_id} has invalid stored host facts: {error}"
-                        ))
-                    })
-                })
-                .transpose()?;
+            let host = stored_host_facts(node_id, raw)?;
             (
                 host,
                 row.try_get::<Option<i64>, _>("reported_at")?,
@@ -453,17 +1141,19 @@ pub async fn node_load_view(
     // Epochs extracted in SQL rather than read as timestamps and converted here: the alternative
     // is a chrono dependency on this crate for one field, and the neighbouring queries
     // (`load_reported_at`, `started_at`) already do it this way.
-    let mut samples_query = sqlx::QueryBuilder::<Postgres>::new(
+    let detail_columns = detail_columns.select_sql();
+    let samples_select = format!(
         "SELECT extract(epoch FROM window_start)::bigint AS window_start_secs,
                 extract(epoch FROM window_end)::bigint AS window_end_secs,
-                has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1, cpu_detail,
-                mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
-                disk_free_bytes, disk_inode_free_pct, disk_detail,
+                has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1,
+                mem_available_bytes, swap_used_bytes, oom_kills,
+                disk_free_bytes, disk_inode_free_pct,
                 nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
-                conntrack_count, network_detail, uptime_secs
+                conntrack_count, uptime_secs, {detail_columns}
          FROM node_load_samples
-         WHERE node_id = ",
+         WHERE node_id = "
     );
+    let mut samples_query = sqlx::QueryBuilder::<Postgres>::new(&samples_select);
     samples_query.push_bind(node_id);
     match selection {
         LoadSeriesQuery::Absolute {
@@ -553,21 +1243,249 @@ pub async fn list_node_load(
 ) -> Result<NodeLoadList> {
     let filter = tenant_filter(actor);
     let (scope, pattern) = split_filter(&filter);
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM nodes
-         WHERE retired_at IS NULL
-           AND ($1::text IS NULL OR tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\')
-         ORDER BY id",
+    let fact_rows = sqlx::query(
+        "SELECT n.id AS node_id, s.load_host_facts,
+                extract(epoch FROM s.load_reported_at)::bigint AS reported_at,
+                s.load_clock_skew_secs
+           FROM nodes n
+           LEFT JOIN node_agent_state s ON s.node_id = n.id
+          WHERE n.retired_at IS NULL
+            AND ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\')
+          ORDER BY n.id",
     )
     .bind(scope)
     .bind(pattern)
     .fetch_all(pool)
     .await?;
-    let mut nodes = Vec::with_capacity(ids.len());
-    for id in ids {
-        nodes.push(node_load_view(pool, actor, &id, selection, max_samples_per_node).await?);
+    let mut nodes = BTreeMap::<String, NodeLoadView>::new();
+    for row in fact_rows {
+        let node_id: String = row.try_get("node_id")?;
+        let raw: Option<serde_json::Value> = row.try_get("load_host_facts")?;
+        let (range_start_unix_secs, range_end_unix_secs) = selection.response_range(&[]);
+        nodes.insert(
+            node_id.clone(),
+            NodeLoadView {
+                node_id: node_id.clone(),
+                range_start_unix_secs,
+                range_end_unix_secs,
+                reported_at_unix_secs: row.try_get("reported_at")?,
+                clock_skew_secs: row.try_get("load_clock_skew_secs")?,
+                host: stored_host_facts(&node_id, raw)?,
+                latest_sample: None,
+                series: Vec::new(),
+                processes: Vec::new(),
+            },
+        );
     }
-    Ok(NodeLoadList { nodes })
+    if nodes.is_empty() {
+        return Ok(NodeLoadList { nodes: Vec::new() });
+    }
+    let ids = nodes.keys().cloned().collect::<Vec<_>>();
+    let limit = match selection {
+        LoadSeriesQuery::Absolute { .. } => max_samples_per_node,
+        LoadSeriesQuery::LatestWindows { windows } => windows.min(max_samples_per_node),
+    };
+
+    // One bounded index probe per machine preserves the per-machine cap without ranking the whole
+    // telemetry table. The primary key starts with (node_id, window_start), so PostgreSQL can read
+    // each machine backwards and stop after `limit` rows.
+    let mut samples_query = sqlx::QueryBuilder::<Postgres>::new(
+        "SELECT requested.node_id,
+                extract(epoch FROM sample.window_start)::bigint AS window_start_secs,
+                extract(epoch FROM sample.window_end)::bigint AS window_end_secs,
+                sample.has_gap, sample.cpu_user_pct, sample.cpu_sys_pct,
+                sample.cpu_softirq_pct, sample.cpu_peak_pct, sample.cpu_steal_pct,
+                sample.load1, sample.cpu_detail,
+                sample.mem_available_bytes, sample.swap_used_bytes, sample.memory_detail,
+                sample.oom_kills, sample.disk_free_bytes, sample.disk_inode_free_pct,
+                sample.disk_detail, sample.nic_rx_bps, sample.nic_tx_bps,
+                sample.nic_rx_drop, sample.nic_tx_drop, sample.nic_err,
+                sample.conntrack_count, sample.network_detail, sample.uptime_secs
+           FROM unnest(",
+    );
+    samples_query.push_bind(ids.clone()).push(
+        "::text[]) AS requested(node_id)
+           JOIN LATERAL (
+                SELECT window_start, window_end,
+                       has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct,
+                       cpu_steal_pct, load1, cpu_detail,
+                       mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
+                       disk_free_bytes, disk_inode_free_pct, disk_detail,
+                       nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
+                       conntrack_count, network_detail, uptime_secs
+                  FROM node_load_samples
+                 WHERE node_id = requested.node_id",
+    );
+    if let LoadSeriesQuery::Absolute {
+        start_unix_secs,
+        end_unix_secs,
+    } = selection
+    {
+        samples_query
+            .push(" AND window_end > to_timestamp(")
+            .push_bind(start_unix_secs)
+            .push(") AND window_start < to_timestamp(")
+            .push_bind(end_unix_secs)
+            .push(')');
+    }
+    samples_query
+        .push(" ORDER BY window_start DESC LIMIT ")
+        .push_bind(i64::from(limit))
+        .push(") sample ON TRUE ORDER BY requested.node_id, sample.window_start");
+    for row in samples_query.build().fetch_all(pool).await? {
+        let node_id: String = row.try_get("node_id")?;
+        if let Some(view) = nodes.get_mut(&node_id) {
+            view.series.push(load_sample_from_row(&row)?);
+        }
+    }
+
+    for view in nodes.values_mut() {
+        (view.range_start_unix_secs, view.range_end_unix_secs) =
+            selection.response_range(&view.series);
+        if matches!(selection, LoadSeriesQuery::LatestWindows { .. }) {
+            view.latest_sample = view.series.last().cloned();
+        }
+    }
+
+    if matches!(selection, LoadSeriesQuery::Absolute { .. }) {
+        let latest_rows = sqlx::query(
+            "SELECT requested.node_id,
+                    extract(epoch FROM sample.window_start)::bigint AS window_start_secs,
+                    extract(epoch FROM sample.window_end)::bigint AS window_end_secs,
+                    sample.has_gap, sample.cpu_user_pct, sample.cpu_sys_pct,
+                    sample.cpu_softirq_pct, sample.cpu_peak_pct, sample.cpu_steal_pct,
+                    sample.load1, sample.cpu_detail,
+                    sample.mem_available_bytes, sample.swap_used_bytes, sample.memory_detail,
+                    sample.oom_kills, sample.disk_free_bytes, sample.disk_inode_free_pct,
+                    sample.disk_detail, sample.nic_rx_bps, sample.nic_tx_bps,
+                    sample.nic_rx_drop, sample.nic_tx_drop, sample.nic_err,
+                    sample.conntrack_count, sample.network_detail, sample.uptime_secs
+               FROM unnest($1::text[]) AS requested(node_id)
+               JOIN LATERAL (
+                    SELECT window_start, window_end,
+                           has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct,
+                           cpu_steal_pct, load1, cpu_detail,
+                           mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
+                           disk_free_bytes, disk_inode_free_pct, disk_detail,
+                           nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
+                           conntrack_count, network_detail, uptime_secs
+                      FROM node_load_samples
+                     WHERE node_id = requested.node_id
+                     ORDER BY window_start DESC
+                     LIMIT 1
+               ) sample ON TRUE
+              ORDER BY requested.node_id",
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?;
+        for row in latest_rows {
+            let node_id: String = row.try_get("node_id")?;
+            if let Some(view) = nodes.get_mut(&node_id) {
+                view.latest_sample = Some(load_sample_from_row(&row)?);
+            }
+        }
+    }
+
+    let process_rows = sqlx::query(
+        "SELECT node_id, proc, rss_bytes, cpu_pct,
+                extract(epoch FROM started_at)::bigint AS started_at, fds, fd_limit
+           FROM node_process_state
+          WHERE node_id = ANY($1::text[])
+          ORDER BY node_id, proc",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    for row in process_rows {
+        let node_id: String = row.try_get("node_id")?;
+        if let Some(view) = nodes.get_mut(&node_id) {
+            view.processes.push(process_from_row(&row)?);
+        }
+    }
+    Ok(NodeLoadList {
+        nodes: nodes.into_values().collect(),
+    })
+}
+
+/// Every live machine's newest NIC windows for the overview cards.
+pub async fn list_node_nic(
+    pool: &PgPool,
+    actor: &AdminContext,
+    windows: u32,
+    max_samples_per_node: u32,
+) -> Result<NodeNicList> {
+    let filter = tenant_filter(actor);
+    let (scope, pattern) = split_filter(&filter);
+    let limit = windows.min(max_samples_per_node);
+    let rows = sqlx::query(
+        "SELECT n.id AS node_id,
+                extract(epoch FROM sample.window_start)::bigint AS window_start_secs,
+                extract(epoch FROM sample.window_end)::bigint AS window_end_secs,
+                sample.has_gap, sample.nic_rx_bps, sample.nic_tx_bps
+           FROM nodes n
+           LEFT JOIN LATERAL (
+                SELECT window_start, window_end, has_gap, nic_rx_bps, nic_tx_bps
+                  FROM node_load_samples
+                 WHERE node_id = n.id
+                 ORDER BY window_start DESC
+                 LIMIT $3
+           ) sample ON TRUE
+          WHERE n.retired_at IS NULL
+            AND ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\')
+          ORDER BY n.id, sample.window_start",
+    )
+    .bind(scope)
+    .bind(pattern)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?;
+
+    let mut nodes = BTreeMap::<String, NodeNicView>::new();
+    for row in rows {
+        let node_id: String = row.try_get("node_id")?;
+        let view = nodes.entry(node_id.clone()).or_insert_with(|| NodeNicView {
+            node_id,
+            series: Vec::new(),
+        });
+        let Some(window_start_unix_secs) = row.try_get::<Option<i64>, _>("window_start_secs")?
+        else {
+            continue;
+        };
+        let window_end_unix_secs = row
+            .try_get::<Option<i64>, _>("window_end_secs")?
+            .ok_or_else(|| StoreError::InvalidData("NIC sample has no window end".to_owned()))?;
+        let has_gap = row
+            .try_get::<Option<bool>, _>("has_gap")?
+            .ok_or_else(|| StoreError::InvalidData("NIC sample has no gap marker".to_owned()))?;
+        let nic_rx_bps = row
+            .try_get::<Option<i64>, _>("nic_rx_bps")?
+            .ok_or_else(|| StoreError::InvalidData("NIC sample has no receive rate".to_owned()))?;
+        let nic_tx_bps = row
+            .try_get::<Option<i64>, _>("nic_tx_bps")?
+            .ok_or_else(|| StoreError::InvalidData("NIC sample has no transmit rate".to_owned()))?;
+        view.series.push(NodeNicSample {
+            window_start_unix_secs,
+            window_end_unix_secs,
+            has_gap,
+            nic_rx_bps: i64_to_u64("nic_rx_bps", nic_rx_bps)?,
+            nic_tx_bps: i64_to_u64("nic_tx_bps", nic_tx_bps)?,
+        });
+    }
+    Ok(NodeNicList {
+        nodes: nodes.into_values().collect(),
+    })
+}
+
+fn stored_host_facts(node_id: &str, raw: Option<serde_json::Value>) -> Result<Option<HostFacts>> {
+    raw.map(|value| {
+        serde_json::from_value::<HostFacts>(value).map_err(|error| {
+            StoreError::InvalidData(format!(
+                "node {node_id} has invalid stored host facts: {error}"
+            ))
+        })
+    })
+    .transpose()
 }
 
 async fn node_in_scope(pool: &PgPool, actor: &AdminContext, node_id: &str) -> Result<bool> {
@@ -1065,5 +1983,84 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(sample.disk_free_bytes, 2048);
+    }
+
+    #[test]
+    fn metric_projection_preserves_every_retained_point() {
+        let first = sample();
+        let mut second = sample();
+        second.window_end_unix_secs = 160;
+        second.cpu_detail.as_mut().unwrap().iowait_pct = 2.5;
+        let samples = vec![first, second];
+
+        assert_eq!(
+            load_metric_series(&samples, "cpu.iowait_pct"),
+            Some(vec![Some(f64::from(0.1_f32)), Some(2.5)])
+        );
+        assert_eq!(
+            load_metric_series(&samples, "cpu.user_pct"),
+            Some(vec![Some(10.0), Some(10.0)])
+        );
+    }
+
+    #[test]
+    fn metric_projection_rejects_unknown_selectors() {
+        assert_eq!(load_metric_series(&[sample()], "cpu.not-a-field"), None);
+    }
+
+    #[test]
+    fn metric_batches_read_only_their_deep_json_families() {
+        let metrics = BTreeSet::from([
+            "cpu.iowait_pct",
+            "cpu.pressure_some_pct",
+            "network.tcp_curr_estab",
+        ]);
+
+        assert_eq!(
+            LoadDetailColumns::for_metrics(&metrics),
+            LoadDetailColumns {
+                cpu: true,
+                memory: false,
+                disk: false,
+                network: true,
+            }
+        );
+    }
+
+    #[test]
+    fn overview_columns_preserve_every_sample_in_order() {
+        let first = sample();
+        let mut second = sample();
+        second.window_start_unix_secs = 130;
+        second.window_end_unix_secs = 160;
+        second.has_gap = true;
+        second.cpu_user_pct = 22.0;
+        second.nic_rx_bps = 4_096;
+        let view = NodeLoadView {
+            node_id: "n1".to_owned(),
+            range_start_unix_secs: 100,
+            range_end_unix_secs: 160,
+            reported_at_unix_secs: Some(160),
+            clock_skew_secs: Some(0),
+            host: None,
+            latest_sample: Some(second.clone()),
+            series: vec![first, second],
+            processes: Vec::new(),
+        };
+
+        let overview = columnar_overview(view);
+
+        assert_eq!(overview.series.window_end_unix_secs, vec![130, 160]);
+        assert_eq!(overview.series.has_gap, vec![false, true]);
+        assert_eq!(overview.series.cpu_user_pct, vec![10.0, 22.0]);
+        assert_eq!(overview.series.nic_rx_bps, vec![0, 4_096]);
+        assert_eq!(
+            overview
+                .latest_sample
+                .as_ref()
+                .and_then(|sample| sample.cpu_detail.as_ref())
+                .map(|detail| detail.cores.len()),
+            Some(1)
+        );
     }
 }

@@ -164,13 +164,18 @@ fn observe_wg_backend(state_dir: &Path) -> Option<String> {
 }
 
 fn observe_versions(state_dir: &Path) -> NodeVersions {
+    let xray = crate::options::xray_binary_path();
     NodeVersions {
         // The sha256 of the running binary rather than `CARGO_PKG_VERSION`: nobody bumps a
         // workspace version on the way to a node, so that number claimed every build since it was
         // last touched was the same thing. See `identity.rs`.
         agent: crate::identity::self_identity().to_owned(),
-        xray: first_line(run_command("xray", &["version"]).ok()),
+        xray: first_line(run_command(&xray.to_string_lossy(), &["version"]).ok()),
+        xray_installed_sha256: crate::installed_xray_sha256(),
+        xray_running_sha256: crate::running_xray_sha256(),
         phantun: first_line(run_command("phantun-client", &["--version"]).ok()),
+        openvpn: first_line(run_command("openvpn", &["--version"]).ok()),
+        vpngate_catalog_probe_workers: Some(crate::vpngate::CATALOG_PROBE_WORKERS),
         wg_tools: first_line(run_command("wg", &["--version"]).ok()),
         // Whether the kernel module is present decides between the in-kernel
         // path and a fallback to wireguard-go / boringtun. Their `wg show`
@@ -201,6 +206,13 @@ pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeRepo
         geodata,
         local_reconcile,
         wireguard_health: wireguard_health_snapshot(state_dir),
+        traffic: match crate::traffic::sample(state_dir) {
+            Ok(reading) => Some(reading),
+            Err(error) => {
+                eprintln!("traffic: {error}");
+                None
+            }
+        },
         spool,
     })
 }
@@ -479,6 +491,7 @@ mod tests {
             token: "t".to_owned(),
             state_dir: state_dir.to_path_buf(),
             apply_mode: ApplyMode::StateDir,
+            vpngate_stats_window: std::time::Duration::from_secs(900),
         }
     }
 

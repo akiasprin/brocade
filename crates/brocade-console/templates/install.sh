@@ -30,6 +30,13 @@ PHANTUN_CLIENT_SHA=${BROCADE_PHANTUN_CLIENT_SHA256:-}
 APPLY_MODE=${BROCADE_AGENT_APPLY:-}
 if [ -n "$APPLY_MODE" ]; then APPLY_MODE_EXPLICIT=1; else APPLY_MODE_EXPLICIT=; fi
 SERVICE_MODE=${BROCADE_AGENT_SERVICE_MODE:-auto}
+ENABLE_VPNGATE=${BROCADE_ENABLE_VPNGATE:-0}
+if [ -n "${BROCADE_VPNGATE_STATS_WINDOW_SECS:-}" ]; then
+    VPNGATE_STATS_WINDOW_EXPLICIT=1
+else
+    VPNGATE_STATS_WINDOW_EXPLICIT=
+fi
+VPNGATE_STATS_WINDOW_SECS=${BROCADE_VPNGATE_STATS_WINDOW_SECS:-900}
 INSTALL_DIR=${BROCADE_AGENT_INSTALL_DIR:-/usr/local/bin}
 CONFIG_DIR=${BROCADE_AGENT_CONFIG_DIR:-/etc/brocade-agent}
 STATE_DIR=${BROCADE_AGENT_STATE_DIR:-/var/lib/brocade-agent}
@@ -58,6 +65,8 @@ usage() {
     echo "  都不带 = 沿用机器上已有的 token，纯升级" >&2
     echo "         [--apply linux|state-dir]" >&2
     echo "         [--service-mode auto|systemd|openrc|foreground]" >&2
+    echo "         [--enable-openvpn]" >&2
+    echo "         [--vpngate-stats-window-secs SECONDS]" >&2
     echo "         [--agent-bin-url URL] [--agent-bin-sha256 SHA256]" >&2
     echo "         [--xray-bin-url URL] [--xray-bin-sha256 SHA256] [--xray-version TAG]" >&2
     echo "         [--phantun-server-url URL] [--phantun-server-sha256 SHA256]" >&2
@@ -69,6 +78,8 @@ usage() {
     echo "  --service-mode systemd     强制写 systemd unit" >&2
     echo "  --service-mode openrc      强制写 OpenRC service" >&2
     echo "  --service-mode foreground  不写服务，直接 exec agent。preview 容器用" >&2
+    echo "  --enable-openvpn            安装 OpenVPN/iptables；默认不安装，普通 Agent 不受影响" >&2
+    echo "  --vpngate-stats-window-secs 本机 VPN Gate 性能统计窗口；默认 900，范围 60–86400 秒" >&2
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -335,6 +346,15 @@ while [ "$#" -gt 0 ]; do
             SERVICE_MODE=${2:-}
             shift 2
             ;;
+        --enable-openvpn)
+            ENABLE_VPNGATE=1
+            shift
+            ;;
+        --vpngate-stats-window-secs)
+            VPNGATE_STATS_WINDOW_SECS=${2:-}
+            VPNGATE_STATS_WINDOW_EXPLICIT=1
+            shift 2
+            ;;
         --agent-bin-url)
             AGENT_BIN_URL=${2:-}
             shift 2
@@ -393,6 +413,12 @@ fi
 if [ -z "$APPLY_MODE_EXPLICIT" ] && [ -r "$CONFIG_DIR/env" ]; then
     APPLY_MODE=$(sed -n 's/^BROCADE_AGENT_APPLY=//p' "$CONFIG_DIR/env" | tail -n 1)
 fi
+if [ -z "$VPNGATE_STATS_WINDOW_EXPLICIT" ] && [ -r "$CONFIG_DIR/env" ]; then
+    inherited_vpngate_stats_window=$(sed -n 's/^BROCADE_VPNGATE_STATS_WINDOW_SECS=//p' "$CONFIG_DIR/env" | tail -n 1)
+    if [ -n "$inherited_vpngate_stats_window" ]; then
+        VPNGATE_STATS_WINDOW_SECS=$inherited_vpngate_stats_window
+    fi
+fi
 [ -n "$APPLY_MODE" ] || APPLY_MODE=linux
 # Re-running this script on an already enrolled machine is an upgrade: replace the binaries, fill in
 # the dependencies, refresh the env and the unit, and require no further enrollment token (it is
@@ -425,6 +451,23 @@ case "$SERVICE_MODE" in
         exit 2
         ;;
 esac
+case "$ENABLE_VPNGATE" in
+    0|1) ;;
+    *)
+        echo "BROCADE_ENABLE_VPNGATE must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+case "$VPNGATE_STATS_WINDOW_SECS" in
+    ''|*[!0-9]*)
+        echo "BROCADE_VPNGATE_STATS_WINDOW_SECS must be an integer between 60 and 86400" >&2
+        exit 2
+        ;;
+esac
+if [ "$VPNGATE_STATS_WINDOW_SECS" -lt 60 ] || [ "$VPNGATE_STATS_WINDOW_SECS" -gt 86400 ]; then
+    echo "BROCADE_VPNGATE_STATS_WINDOW_SECS must be between 60 and 86400 seconds" >&2
+    exit 2
+fi
 
 SERVER=$(printf '%s' "$SERVER" | sed 's:/*$::')
 if [ "$(id -u)" != "0" ]; then
@@ -627,6 +670,25 @@ if [ "$APPLY_MODE" = "linux" ]; then
         echo "installing nftables ..." >&2
         install_pkg nftables || true
     fi
+    # OpenVPN is deliberately not part of a normal Agent installation. A machine opts into the
+    # capability explicitly; once installed, the Agent reports the exact version and the control
+    # plane may offer it VPN Gate work. Failure is fatal only for this explicit opt-in.
+    if [ "$ENABLE_VPNGATE" = "1" ]; then
+        if ! have openvpn; then
+            echo "installing openvpn for managed VPN Gate exits ..." >&2
+            install_pkg openvpn || {
+                echo "无法安装 openvpn；这台机器不会加入 VPN Gate 接入节点" >&2
+                exit 1
+            }
+        fi
+        if ! have iptables; then
+            echo "installing iptables for managed VPN Gate namespace NAT ..." >&2
+            install_pkg iptables || {
+                echo "无法安装 iptables；VPN Gate 隔离命名空间无法联网" >&2
+                exit 1
+            }
+        fi
+    fi
 
     missing=
     for c in wg wg-quick ip pgrep pkill; do
@@ -645,6 +707,10 @@ if [ "$APPLY_MODE" = "linux" ]; then
     # model gives this machine fake TCP. Said here all the same: the alternative to hearing it now is
     # hearing it from a node that has already been enrolled and cannot bring its tunnel up.
     have nft || echo "nft（nftables）没装上；这台若要用伪 TCP 或 Hysteria 2 端口跳转，规则配不上" >&2
+    if [ "$ENABLE_VPNGATE" = "1" ]; then
+        have openvpn || { echo "--enable-openvpn 需要 openvpn" >&2; exit 1; }
+        have iptables || { echo "--enable-openvpn 需要 iptables" >&2; exit 1; }
+    fi
 else
     if [ -n "$XRAY_BIN_URL" ]; then
         fetch_binary "$XRAY_BIN_URL" "$XRAY_BIN_SHA256" "$XRAY_BIN" || exit 1
@@ -677,6 +743,8 @@ BROCADE_AGENT_SERVER=$SERVER
 BROCADE_NODE_TOKEN_FILE=$CONFIG_DIR/token
 BROCADE_AGENT_STATE_DIR=$STATE_DIR
 BROCADE_AGENT_APPLY=$APPLY_MODE
+BROCADE_XRAY_BIN=$XRAY_BIN
+BROCADE_VPNGATE_STATS_WINDOW_SECS=$VPNGATE_STATS_WINDOW_SECS
 EOF
 chmod 0600 "$CONFIG_DIR/token" "$CONFIG_DIR/env"
 
@@ -896,6 +964,8 @@ if [ "$SERVICE_MODE" = "foreground" ]; then
         BROCADE_NODE_TOKEN_FILE="$CONFIG_DIR/token" \
         BROCADE_AGENT_STATE_DIR="$STATE_DIR" \
         BROCADE_AGENT_APPLY="$APPLY_MODE" \
+        BROCADE_XRAY_BIN="$XRAY_BIN" \
+        BROCADE_VPNGATE_STATS_WINDOW_SECS="$VPNGATE_STATS_WINDOW_SECS" \
         "$AGENT_BIN" run
 fi
 
@@ -968,7 +1038,7 @@ else
     AGENT_LOG_FILE="$STATE_DIR/logs/agent.log"
     AGENT_LOG_POLICY="$STATE_DIR/log-agent-journal-max-mib"
 
-    # EnvironmentFile is a systemd feature. The runner imports only the four names this installer
+    # EnvironmentFile is a systemd feature. The runner imports only the six names this installer
     # writes, using `export "$line"` rather than sourcing the file as shell code. Besides accepting
     # spaces and punctuation in values, this prevents a crafted --server value from becoming root
     # shell syntax when OpenRC starts the service.
@@ -978,7 +1048,7 @@ exec 2>&1
 env_file="$CONFIG_DIR/env"
 while IFS= read -r line || [ -n "\$line" ]; do
     case "\$line" in
-        BROCADE_AGENT_SERVER=*|BROCADE_NODE_TOKEN_FILE=*|BROCADE_AGENT_STATE_DIR=*|BROCADE_AGENT_APPLY=*)
+        BROCADE_AGENT_SERVER=*|BROCADE_NODE_TOKEN_FILE=*|BROCADE_AGENT_STATE_DIR=*|BROCADE_AGENT_APPLY=*|BROCADE_XRAY_BIN=*|BROCADE_VPNGATE_STATS_WINDOW_SECS=*)
             export "\$line"
             ;;
     esac

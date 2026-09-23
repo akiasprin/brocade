@@ -31,6 +31,13 @@ for DIR in $(find * -type d ! -path "*.git*" ! -path "*vendor*" ! -path "*extern
   fi
 done
 
+# Covered subprocesses emit Go's binary integration-coverage data because the
+# Xray CLI exits through os.Exit. Convert it before merging ordinary package
+# profiles; -test.coverprofile cannot flush from that exit path.
+if find "${XRAY_COV}" -name 'covcounters.*' -print -quit | grep -q .; then
+  go tool covdata textfmt -i="${XRAY_COV}" -o="${XRAY_COV}/scenario-subprocess.out" || FAIL=1
+fi
+
 for OUT_FILE in $(find ${XRAY_COV} -name "*.out"); do
   echo "Merging file ${OUT_FILE}"
   cat ${OUT_FILE} | grep -v "mode: set" >> ${COVERAGE_FILE}

@@ -5,12 +5,15 @@ import { draft } from '../src/draft';
 import { DraftBar } from '../src/forge/draft-bar';
 import { SessionProvider } from '../src/session';
 
+const initial = { node_count: 0, chain_group_count: [] };
+
 function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <SessionProvider
         value={{
+          initial,
           who: {
             operator_id: 'test-editor',
             role: 'editor',

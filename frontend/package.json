@@ -9,9 +9,10 @@
     "preview": "vite preview",
     "lint": "eslint src",
     "lint:strict": "eslint src --max-warnings 0",
-    "test": "npm run test:unit && npm run test:ports && npm run test:react",
+    "test": "npm run test:unit && npm run test:ports && npm run test:routes && npm run test:react",
     "test:unit": "node --test tests/*.test.mjs",
     "test:ports": "node scripts/ports-check.mjs",
+    "test:routes": "node scripts/route-check.mjs && node scripts/route-drive.mjs",
     "test:react": "tsc --noEmit -p tsconfig.test.json && vitest run --config vitest.config.ts",
     "format": "prettier --write src",
     "format:check": "prettier --check src"
@@ -24,7 +25,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.63.0",
     "@testing-library/react": "^16.3.2",
+    "@types/node": "^22.20.2",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.1.0",

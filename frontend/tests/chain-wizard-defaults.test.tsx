@@ -1,11 +1,22 @@
 import { describe, expect, it } from 'vitest';
-import { NEW_CHAIN_PROTOCOL_DEFAULTS, defaultListenerHopWire, newChainWires } from '../src/panes/chain-wizard';
+import {
+  NEW_CHAIN_PROTOCOL_DEFAULTS,
+  customHopHostError,
+  defaultListenerHopWire,
+  entryTcpPortCollision,
+  newChainWires,
+} from '../src/panes/chain-wizard';
 import { defaultHopWire, defaultHopWireForListener, seedHopIn, seedHops, type ForwardPeer } from '../src/panes/rules';
 import type { HopDial, Rule } from '../src/api';
 
 describe('建链向导协议默认值', () => {
   it('默认开启所有接入协议并填入 AnyTLS 连接复用参数', () => {
-    expect(NEW_CHAIN_PROTOCOL_DEFAULTS).toEqual({ vless: true, anytls: true, hysteria2: true });
+    expect(NEW_CHAIN_PROTOCOL_DEFAULTS).toEqual({
+      vless: true,
+      vlessEncryption: false,
+      anytls: true,
+      hysteria2: true,
+    });
 
     const wires = newChainWires({
       ...NEW_CHAIN_PROTOCOL_DEFAULTS,
@@ -37,6 +48,49 @@ describe('建链向导协议默认值', () => {
     });
     expect(wires).toEqual({ vless: { kind: 'vless-reality' }, anytls: null, hysteria2: null });
   });
+
+  it('展开卡片编辑的 Padding 和 Hysteria 带宽进入对应协议，而不影响其他协议', () => {
+    const wires = newChainWires({
+      vless: true,
+      anytls: true,
+      hysteria2: true,
+      anytlsPort: 14443,
+      anytlsPaddingScheme: ['stop=4', '0=20-30'],
+      hy2Start: 30000,
+      hy2End: 30099,
+      hy2Up: '200 mbps',
+      hy2Down: '500 mbps',
+    });
+    expect(wires.anytls?.padding_scheme).toEqual(['stop=4', '0=20-30']);
+    expect(wires.hysteria2?.bandwidth).toEqual({ up: '200 mbps', down: '500 mbps' });
+    expect(wires.vless).toEqual({ kind: 'vless-reality' });
+  });
+});
+
+describe('建链向导提交前校验', () => {
+  it('拒绝同一入口上共用 TCP 端口的接入协议', () => {
+    expect(
+      entryTcpPortCollision([
+        { label: 'VLESS · REALITY', port: 14443 },
+        { label: 'AnyTLS', port: 14443 },
+      ]),
+    ).toBe('VLESS · REALITY 与 AnyTLS 不能共用 TCP 14443');
+    expect(
+      entryTcpPortCollision([
+        { label: 'VLESS · REALITY', port: 13443 },
+        { label: 'AnyTLS', port: 14443 },
+      ]),
+    ).toBeNull();
+  });
+
+  it('自定义一跳只接收主机，不把端口或路径重复拼进地址', () => {
+    expect(customHopHostError('')).toBe('填写自定义主机地址');
+    expect(customHopHostError('edge.internal')).toBeNull();
+    expect(customHopHostError('2001:db8::9')).toBeNull();
+    expect(customHopHostError('[2001:db8::9]')).toBeNull();
+    expect(customHopHostError('edge.internal:443')).toContain('IPv6 地址无效');
+    expect(customHopHostError('edge.internal/path')).toContain('不要带端口、路径或空格');
+  });
 });
 
 it('可单独启用 VLESS Encryption，默认 13800 或使用配置的分配端口', () => {
@@ -56,6 +110,10 @@ it('可单独启用 VLESS Encryption，默认 13800 或使用配置的分配端�
     vless_encryption: { port: 13800 },
   });
   expect(newChainWires({ ...options, vlessEncryptionPort: 49002 }).vless_encryption).toEqual({ port: 49002 });
+  expect(newChainWires({ ...options, vlessEncryptionProfile: 'native' }).vless_encryption).toMatchObject({
+    port: 13800,
+    options: { appearance: 'native', ticket_lifetime: '600s' },
+  });
 });
 
 describe('链路承载协议默认值', () => {

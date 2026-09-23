@@ -72,6 +72,7 @@ pub async fn issue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNode
     .bind(token_prefix)
     .fetch_one(&mut *tx)
     .await?;
+    crate::notifications::initialize_waiting(&mut tx, node_id).await?;
     tx.commit().await?;
 
     Ok(IssuedNodeToken {
@@ -170,26 +171,90 @@ pub async fn record_node_poll(
     agent_version: Option<&str>,
     protocol_version: Option<i32>,
 ) -> Result<()> {
-    let result = sqlx::query(
-        "UPDATE node_agent_state
-         SET last_poll_at = now(),
-             agent_version = COALESCE($2, agent_version),
-             agent_protocol_version = COALESCE($3, agent_protocol_version)
-         WHERE node_id = $1
-           AND token_hash IS NOT NULL
-           AND token_revoked_at IS NULL",
+    let mut tx = pool.begin().await?;
+    let phase = sqlx::query_scalar::<_, String>(
+        "UPDATE node_agent_state AS agent
+            SET last_poll_at = now(),
+                agent_version = COALESCE($2, agent.agent_version),
+                agent_protocol_version = COALESCE($3, agent.agent_protocol_version)
+           FROM node_lifecycle_state AS lifecycle
+          WHERE agent.node_id = $1
+            AND lifecycle.node_id = agent.node_id
+            AND agent.token_hash IS NOT NULL
+            AND agent.token_revoked_at IS NULL
+      RETURNING lifecycle.phase",
     )
     .bind(node_id)
     .bind(agent_version)
     .bind(protocol_version)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    if result.rows_affected() == 0 {
+    let Some(phase) = phase else {
         return Err(StoreError::Unauthorized(format!(
             "node {node_id} does not have an active node token"
         )));
+    };
+    // A retiring Agent continues polling until teardown converges, but that is not a machine
+    // coming online again. Presence notifications describe active service only.
+    if phase != NodeLifecyclePhase::Active.as_str() {
+        tx.commit().await?;
+        return Ok(());
     }
+
+    let server_now: i64 =
+        sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp())::bigint")
+            .fetch_one(&mut *tx)
+            .await?;
+    let presence = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM node_presence_state WHERE node_id = $1 FOR UPDATE",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match presence.as_deref() {
+        // A pre-feature database or direct test fixture has no row. Establish its baseline without
+        // sending a fleet-wide "online" storm during rollout.
+        None => {
+            sqlx::query(
+                "INSERT INTO node_presence_state (node_id, status, since_at)
+                 VALUES ($1, 'online', to_timestamp($2))",
+            )
+            .bind(node_id)
+            .bind(server_now as f64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Some("waiting" | "offline") => {
+            let previous = presence.as_deref().unwrap_or("offline");
+            sqlx::query(
+                "UPDATE node_presence_state
+                    SET status = 'online', since_at = to_timestamp($2)
+                  WHERE node_id = $1",
+            )
+            .bind(node_id)
+            .bind(server_now as f64)
+            .execute(&mut *tx)
+            .await?;
+            crate::notifications::insert_machine_event(
+                &mut tx,
+                node_id,
+                "node_online",
+                None,
+                Some(previous),
+                Some("online"),
+                server_now,
+            )
+            .await?;
+        }
+        Some("online") => {}
+        Some(other) => {
+            return Err(StoreError::InvalidData(format!(
+                "node {node_id} has invalid presence status {other}"
+            )))
+        }
+    }
+    tx.commit().await?;
 
     Ok(())
 }
@@ -244,58 +309,6 @@ fn public_ipv6(value: &str) -> Option<String> {
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
         || ip.to_ipv4_mapped().is_some();
     (!excluded).then(|| ip.to_string())
-}
-
-/// Fills only address families which the operator left blank. The write is model state: it gets
-/// its own revision and snapshot so subscriptions and future releases see the same address as the
-/// node list. Repeated heartbeats and later route changes are intentionally no-ops.
-pub async fn autofill_node_public_ips(
-    pool: &PgPool,
-    node_id: &str,
-    report: &RouteIpReport,
-) -> Result<Option<u64>> {
-    let ipv4 = report.ipv4.as_deref().and_then(public_ipv4);
-    let ipv6 = report.ipv6.as_deref().and_then(public_ipv6);
-    if ipv4.is_none() && ipv6.is_none() {
-        return Ok(None);
-    }
-
-    let mut tx = pool.begin().await?;
-    let previous = crate::console::lock_control_state(&mut tx).await?;
-    let row = sqlx::query("SELECT public_ipv4, public_ipv6 FROM nodes WHERE id = $1 FOR UPDATE")
-        .bind(node_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
-    let current_ipv4: Option<String> = row.try_get("public_ipv4")?;
-    let current_ipv6: Option<String> = row.try_get("public_ipv6")?;
-    let fill_ipv4 = current_ipv4.is_none().then_some(ipv4).flatten();
-    let fill_ipv6 = current_ipv6.is_none().then_some(ipv6).flatten();
-    if fill_ipv4.is_none() && fill_ipv6.is_none() {
-        tx.commit().await?;
-        return Ok(None);
-    }
-
-    let revision_id = crate::console::insert_revision(
-        &mut tx,
-        &format!("agent:{node_id}"),
-        &format!("auto-detect public IP for {node_id}"),
-    )
-    .await?;
-    sqlx::query(
-        "UPDATE nodes
-            SET public_ipv4 = COALESCE(public_ipv4, $2),
-                public_ipv6 = COALESCE(public_ipv6, $3)
-          WHERE id = $1",
-    )
-    .bind(node_id)
-    .bind(fill_ipv4)
-    .bind(fill_ipv6)
-    .execute(&mut *tx)
-    .await?;
-    let revision_id = crate::console::commit_revision(&mut tx, revision_id, previous, true).await?;
-    tx.commit().await?;
-    Ok(Some(revision_id))
 }
 
 pub fn public_route_ip(value: &str) -> Option<IpAddr> {

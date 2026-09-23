@@ -2,8 +2,11 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchNodes, fetchRevisions, fetchTenants } from '../api';
 import { useAgentLiveness } from '../ui/agent-alive';
-import { ErrorBox, Loading } from '../ui/bits';
-import { navigate } from '../forge/route';
+import { ErrorBox, Loading, SegSwitch } from '../ui/bits';
+import { navigate, returnTo } from '../forge/route';
+import { nodeIdError } from '../provision-form';
+import { WizardHeader, WizardSummary, WizardSummaryItem } from '../ui/wizard';
+import { useUnsavedChanges } from '../ui/navigation-guard';
 import {
   fetchPreviewNodeLogs,
   previewProvisionNode,
@@ -17,8 +20,8 @@ import type { Drill } from '../panes/nodes';
 //
 // 与生产流程（panes/nodes.tsx 的 Provision）版面结构相同、流程不同：
 //
-// - 版面：两种状态，不使用步骤条——机器尚未入库（一张表单），机器已入库但尚未上线
-//   （容器执行脚本加一个状态指示）。使用同一套 `.wz-*` 组件。
+// - 版面：机器尚未入库时填写一张表单；创建后显示容器安装日志与上线状态。页头沿用
+//   生产流程的进度语义和 `.wz-*` 组件，让相同阶段在两种环境中处于相同位置。
 // - 流程存在实际差异，不是重复实现：此处不填写公网 IP（容器 IP 由 preview 分配）、
 //   安装由容器自动执行生产环境的安装脚本（显示日志，而非提供命令供手动执行）、
 //   末尾增加一步订阅验证。
@@ -26,6 +29,14 @@ import type { Drill } from '../panes/nodes';
 // 两侧共用的判断只有一项：agent 是否上线——两者读取同一份 `/nodes/agent-state`。
 export type PreviewWizDrill =
   { p: 'provision'; step: number } | { p: 'install'; node: string; step: number; result?: PreviewProvisionNodeResult };
+
+const PREVIEW_FORM_DEFAULTS = {
+  id: '',
+  name: '',
+  public_ipv4_nat: false,
+  public_ipv6_nat: false,
+  egress_allowed: true,
+};
 
 export function PreviewProvision({
   drill,
@@ -47,11 +58,17 @@ export function PreviewProvision({
 // preview 与生产环境的界面越接近，越需要有位置标明当前处于 preview 环境。
 function PreviewBanner({ status }: { status: PreviewStatus }) {
   return (
-    <div className="callout blue" style={{ marginBottom: 14 }}>
-      <b>Preview 模式</b>：自动分配容器 IP，在 Docker 容器里跑生产安装脚本。
-      <div className="note mono" style={{ marginTop: 5 }}>
-        {status.network} · {status.subnet} · {status.subnet_ipv6} · {status.node_image} · agent{' '}
-        {status.agent_binary_ready ? 'ready' : 'auto-build'}
+    <div className="callout blue wz-preview-banner">
+      <div>
+        <b>Preview 模式</b>
+        <span>自动分配容器地址，并在 Docker 中执行生产安装脚本。</span>
+      </div>
+      <div className="wz-preview-meta">
+        <span>网络 {status.network}</span>
+        <span>IPv4 {status.subnet}</span>
+        <span>IPv6 {status.subnet_ipv6}</span>
+        <span>镜像 {status.node_image}</span>
+        <span>Agent {status.agent_binary_ready ? '已就绪' : '自动构建'}</span>
       </div>
     </div>
   );
@@ -64,19 +81,20 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
   const options = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
   const existingNodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const defaultTenant = options.length === 1 ? options[0].id : '';
-  const [form, setForm] = useState({
-    id: '',
-    name: '',
-    public_ipv4_nat: false,
-    public_ipv6_nat: false,
-    egress_allowed: true,
-  });
+  const [form, setForm] = useState(() => ({ ...PREVIEW_FORM_DEFAULTS }));
+  const [attempted, setAttempted] = useState(false);
   const tenantId = defaultTenant;
+  const guardScope = 'preview-node-provision';
+  const dirty = JSON.stringify(form) !== JSON.stringify(PREVIEW_FORM_DEFAULTS);
+  const clearUnsavedChanges = useUnsavedChanges(dirty, 'Preview 纳管表单', guardScope);
 
-  /* id 是 slug，与服务端 brocade_core::model::is_valid_slug 使用同一规则。 */
-  const SLUG_RE = /^[a-z0-9._-]{1,32}$/;
-  const idInvalid = form.id !== '' && !SLUG_RE.test(form.id);
-  const idTaken = form.id.trim() !== '' && (existingNodes.data?.nodes ?? []).some(n => n.node_id === form.id.trim());
+  const idError = nodeIdError(form.id, new Set((existingNodes.data?.nodes ?? []).map(node => node.node_id)));
+  const tenantError =
+    options.length === 0
+      ? '当前账号没有可用于创建预览机器的租户'
+      : options.length > 1
+        ? '当前流程要求恰好一个可见租户，请先收窄账号范围'
+        : null;
 
   const provision = useMutation({
     mutationFn: () =>
@@ -92,53 +110,88 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
     onSuccess: next => {
       qc.invalidateQueries({ queryKey: ['nodes'] });
       qc.invalidateQueries({ queryKey: ['revisions'] });
+      clearUnsavedChanges();
       go({ p: 'install', node: next.node.id, step: 2, result: next });
     },
   });
 
-  if (tenants.isPending || existingNodes.isPending) return <Loading />;
+  if (tenants.isPending || existingNodes.isPending) return <Loading variant="form" />;
   if (tenants.error || existingNodes.error) return <ErrorBox error={tenants.error ?? existingNodes.error} />;
 
-  const ready = !!form.id.trim() && !idInvalid && !idTaken && !!tenantId;
+  const blocker = idError ?? tenantError;
+  const ready = !blocker && !!tenantId;
 
   return (
     <form
       className="wz"
       onSubmit={e => {
         e.preventDefault();
+        setAttempted(true);
+        if (!ready || provision.isPending) return;
         provision.mutate();
       }}
     >
-      <div className="chain-hd">
-        <b>纳管向导</b>
-        <span className="subid mono">新容器</span>
-      </div>
+      <WizardHeader
+        eyebrow="机器 / Preview 纳管"
+        title="创建预览机器"
+        context="新容器"
+        description="登记机器身份后，Preview 会创建容器并自动运行生产安装脚本。"
+        stages={[
+          { label: '登记配置', state: 'current' },
+          { label: '启动容器', state: 'next' },
+          { label: '上线验证', state: 'next' },
+        ]}
+        aside={<span className="wz-mode preview">Docker Preview</span>}
+      />
 
       <PreviewBanner status={status} />
 
+      <WizardSummary label="预览机器配置摘要">
+        <WizardSummaryItem label="名称">{form.name.trim() || form.id.trim() || '待填写'}</WizardSummaryItem>
+        <WizardSummaryItem label="IPv4">{form.public_ipv4_nat ? 'NAT' : '直连'}</WizardSummaryItem>
+        <WizardSummaryItem label="IPv6">{form.public_ipv6_nat ? 'NAT' : '直连'}</WizardSummaryItem>
+        <WizardSummaryItem label="出网">{form.egress_allowed ? '允许' : '禁止'}</WizardSummaryItem>
+      </WizardSummary>
+
+      <h4 className="sec">
+        基本信息
+        <span className="rule" />
+      </h4>
+
       <div className="wz-fields">
         <div className="wz-fld">
-          <label>机器 ID</label>
+          <label htmlFor="preview-node-id">机器 ID</label>
           <input
+            id="preview-node-id"
             className="f mono"
             value={form.id}
             placeholder="hk-01"
+            autoFocus
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+            aria-invalid={!!idError && (attempted || !!form.id)}
+            aria-describedby="preview-node-id-note"
             onChange={e => setForm({ ...form, id: e.target.value })}
           />
-          {idInvalid ? (
-            <p className="note warn">只能使用 a-z 0-9 . _ -，最长 32 个字符。</p>
-          ) : idTaken ? (
-            <p className="note warn">该 ID 已存在。</p>
+          {idError && (attempted || !!form.id) ? (
+            <p className="note warn" id="preview-node-id-note">
+              {idError}。
+            </p>
           ) : (
-            <p className="note">唯一键，创建后不可修改。容器名由它派生。</p>
+            <p className="note" id="preview-node-id-note">
+              唯一键，创建后不可修改。容器名由它派生。
+            </p>
           )}
         </div>
         <div className="wz-fld">
-          <label>机器名称</label>
+          <label htmlFor="preview-node-name">机器名称</label>
           <input
+            id="preview-node-name"
             className="f"
             value={form.name}
             placeholder="香港入口"
+            autoComplete="off"
             onChange={e => setForm({ ...form, name: e.target.value })}
           />
           <p className="note">列表和拓扑图上显示的名称，可随时修改</p>
@@ -165,11 +218,12 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
           <span className="attrs">
             <span className="attr">
               <span className="k">可达</span>
-              <SegSw
+              <SegSwitch
                 checked={form.public_ipv4_nat}
                 onChange={v => setForm({ ...form, public_ipv4_nat: v })}
                 off="直连"
                 on="经 NAT"
+                ariaLabel="预览机器 IPv4 可达方式"
               />
             </span>
             <span className="attr">
@@ -191,11 +245,12 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
           <span className="attrs">
             <span className="attr">
               <span className="k">可达</span>
-              <SegSw
+              <SegSwitch
                 checked={form.public_ipv6_nat}
                 onChange={v => setForm({ ...form, public_ipv6_nat: v })}
                 off="直连"
                 on="经 NAT"
+                ariaLabel="预览机器 IPv6 可达方式"
               />
             </span>
             <span className="attr">
@@ -214,11 +269,12 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
         <div className="wz-fld">
           <label>出网</label>
           <div>
-            <SegSw
+            <SegSwitch
               checked={form.egress_allowed}
               onChange={v => setForm({ ...form, egress_allowed: v })}
               off="禁止"
               on="允许"
+              ariaLabel="预览机器出网权限"
             />
           </div>
           <p className="note">禁止时它只能作为中转节点，指向它的本机出网规则会在编译时被拒绝。</p>
@@ -233,11 +289,21 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
       {provision.error && <ErrorBox error={provision.error} />}
 
       <div className="wz-foot">
+        <span className="wz-submit-note" id="preview-submit-note" aria-live="polite">
+          <b>{blocker ? '还不能创建' : '准备就绪'}</b>
+          <small>{blocker ?? '将创建机器记录、Preview 容器与一版修订。'}</small>
+        </span>
         <span className="sp" />
-        <button type="button" className="btn" onClick={() => go({ p: 'list' })}>
+        <button type="button" className="btn" disabled={provision.isPending} onClick={() => returnTo('nodes')}>
           取消
         </button>
-        <button className="btn primary" type="submit" disabled={!ready || provision.isPending}>
+        <button
+          className="btn primary"
+          type="submit"
+          disabled={!ready || provision.isPending}
+          aria-describedby="preview-submit-note"
+          aria-busy={provision.isPending}
+        >
           {provision.isPending ? '启动中…' : '创建 preview 容器'}
         </button>
       </div>
@@ -275,27 +341,44 @@ function PreviewInstall({
   const target = result?.revision_id ?? current;
   // 上线判定与纳管流程使用同一个 hook：token 被使用 → agent 启动 → 首次 desired 心跳。
   const probe = useAgentLiveness(nodeRow);
+  const online = probe?.state === 'online';
+  const redeemed = probe?.state === 'polling' || online;
 
   const [userId, setUserId] = useState('');
   const verify = useMutation({
     mutationFn: () => previewVerifySubscription({ tenant_id: tenant, user_id: userId }),
   });
 
-  if (nodes.isPending || revisions.isPending) return <Loading />;
+  if (nodes.isPending || revisions.isPending) return <Loading variant="form" />;
   if (nodes.error || revisions.error) return <ErrorBox error={nodes.error ?? revisions.error} />;
 
   return (
     <>
-      <div className="chain-hd">
-        <b>纳管向导</b>
-        <span className="subid mono">
-          {nodeLabel} / {node}
-        </span>
-      </div>
+      <WizardHeader
+        eyebrow="机器 / Preview 纳管"
+        title={online ? '预览机器已上线' : '启动并验证'}
+        context={`${nodeLabel} / ${node}`}
+        description="容器正在执行生产安装脚本；上线后可用真实订阅做一次端到端验证。"
+        stages={[
+          { label: '登记配置', state: 'done' },
+          { label: '启动容器', state: redeemed ? 'done' : 'current' },
+          { label: '上线验证', state: online ? 'done' : redeemed ? 'current' : 'next' },
+        ]}
+        aside={<span className="wz-mode preview">Docker Preview</span>}
+      />
 
       <PreviewBanner status={status} />
 
-      <div className="wz-hops">
+      <WizardSummary label="预览纳管状态摘要">
+        <WizardSummaryItem label="机器">{nodeLabel}</WizardSummaryItem>
+        <WizardSummaryItem label="容器">{logs.data?.container_name || '启动中'}</WizardSummaryItem>
+        <WizardSummaryItem label="Agent">{online ? '在线' : redeemed ? '等待心跳' : '安装中'}</WizardSummaryItem>
+        <WizardSummaryItem label="订阅验证">
+          {verify.data ? (verify.data.ok ? '通过' : '未通过') : '尚未执行'}
+        </WizardSummaryItem>
+      </WizardSummary>
+
+      <div className="wz-hops wz-flow" aria-live="polite">
         <div className="wz-hop">
           <span className="idx">01</span>
           <span className="who">
@@ -313,7 +396,7 @@ function PreviewInstall({
                 {logs.data.install_log || logs.data.container_log || '暂无日志'}
               </pre>
             ) : (
-              <Loading />
+              <Loading variant="code" />
             )}
           </span>
         </div>
@@ -371,12 +454,15 @@ function PreviewInstall({
           </span>
           <span className="attrs">
             <span className="attr">
-              <span className="k">用户</span>
+              <label className="k" htmlFor="preview-verify-user">
+                用户
+              </label>
               <input
-                className="f mono"
-                style={{ width: 150 }}
+                id="preview-verify-user"
+                className="f mono wz-user-input"
                 value={userId}
                 placeholder="alice"
+                autoComplete="off"
                 onChange={e => setUserId(e.target.value)}
               />
             </span>
@@ -391,50 +477,29 @@ function PreviewInstall({
       {verify.data && !verify.data.ok && <pre className="code">{JSON.stringify(verify.data, null, 2)}</pre>}
 
       <div className="wz-foot">
+        <span className="wz-submit-note" aria-live="polite">
+          <b>{online ? '预览机器已就绪' : redeemed ? '正在等待 Agent' : '容器正在安装'}</b>
+          <small>{online ? '可先验证订阅，也可以直接查看发布计划。' : '日志和上线状态每 3 秒自动刷新。'}</small>
+        </span>
         <span className="sp" />
-        <button className="btn" onClick={() => go({ p: 'list' })}>
+        <button type="button" className="btn" onClick={() => returnTo('nodes')}>
           回机器列表
         </button>
-        <button className="btn" onClick={() => go({ p: 'node', id: node })}>
+        <button type="button" className="btn" onClick={() => go({ p: 'node', id: node })}>
           看{nodeLabel}
         </button>
         <button
+          type="button"
           className="btn primary"
           disabled={target == null || probe?.state !== 'online'}
           title={probe?.state === 'online' ? '' : '等 agent 上线后再发布'}
           onClick={() => {
             navigate('deploy', { p: 'plan', revision: target });
-            go({ p: 'list' });
           }}
         >
           {probe?.state === 'online' ? `去发布 · 计划预览（修订 ${target ?? '…'}）` : '等 agent 上线…'}
         </button>
       </div>
     </>
-  );
-}
-
-// 分段控件。生产流程使用 panes/nodes.tsx 中的 SegSwitch——该组件未导出，
-// 而为一个十行的组件将其提取到公共模块并在两处引入，成本高于在此保留一份。
-// 外观由 .segsw 决定，两处一致。
-function SegSw({
-  checked,
-  onChange,
-  off,
-  on,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  off: string;
-  on: string;
-}) {
-  return (
-    <span className="segsw" role="group">
-      {([false, true] as const).map(v => (
-        <button key={String(v)} type="button" aria-pressed={checked === v} onClick={() => onChange(v)}>
-          {v ? on : off}
-        </button>
-      ))}
-    </span>
   );
 }

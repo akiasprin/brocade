@@ -44,12 +44,15 @@ export function compactGrantAutomation(
 }
 
 export function RuntimeCrumbStatus({ state, revision }: { state: RuntimeCrumbState; revision?: number }) {
+  // 健康的空闲态无需反复占用面包屑；修订号只跟随正在执行的发布显示。
+  if (state.text === '检查中' || (state.text === '同步正常' && revision == null)) return null;
+
   return (
     <>
       <span className={`fg-blast${state.tone === 'normal' ? '' : ` ${state.tone}`}`} title={state.title}>
         {state.text}
       </span>
-      <span className="fg-meta">R{revision ?? '…'}</span>
+      {revision != null && <span className="fg-meta">R{revision}</span>}
     </>
   );
 }

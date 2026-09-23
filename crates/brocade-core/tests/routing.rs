@@ -1,12 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use brocade_core::{
-    compile::compile,
     ir::routing::{compile_app, DestMatch as IrMatch},
     model::{
         Accept, Action, AppView, Chain, DestMatch as ModelMatch, Dns, DomainStrategy, Front,
         FrontStrategy, Grant, HopDial, HopIn, HopPool, HopWire, Ingress, IngressWires,
-        ModelSnapshot, Node, ProjectionEndpoint, Rule, Step, Transport, User, WireGuardKeys,
+        ModelSnapshot, Node, Rule, Step, Transport, User, WireGuardKeys,
     },
     Level,
 };
@@ -74,161 +73,29 @@ fn compile_app_does_not_invent_forward_edges() {
 }
 
 #[test]
-fn front_downstream_expands_to_sorted_domain_and_ip_rules() {
-    let app = front_app(vec![step(
-        "c-front",
-        "hk",
-        vec![Rule {
-            dest_match: ModelMatch::FrontDownstream,
-            action: Action::Egress { send_through: None },
-        }],
-        None,
-    )]);
+fn front_membership_does_not_change_server_routing() {
+    let app = front_app(Vec::new());
     let doc = doc(vec![
         node("hk", Some("hk.example.net"), [10, 66, 0, 1], true),
-        node("us", Some("us1.example.net"), [10, 66, 0, 2], true),
+        node("us", Some("us.example.net"), [10, 66, 0, 2], true),
         node("au", Some("203.0.113.7"), [10, 66, 0, 3], true),
     ]);
     let mut diagnostics = Vec::new();
 
     let ir = compile_app(&doc, &app, &mut diagnostics);
 
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == "front.default-block"));
-    assert_eq!(
-        rule_summary(&ir, "c-front", "hk"),
-        [
-            "domain_suffix:us1.example.net -> egress",
-            "ip_cidr:203.0.113.7 -> egress",
-            "any -> block",
-        ]
-    );
-    assert!(
-        !ir.ingresses
-            .iter()
-            .find(|ingress| ingress.id == "i-front")
-            .unwrap()
-            .sniff
-    );
+    assert_eq!(rule_summary(&ir, "c-front", "hk"), ["any -> egress"]);
     assert!(
         ir.ingresses
             .iter()
-            .find(|ingress| ingress.id == "i-us")
+            .find(|ingress| ingress.id == "i-front")
             .unwrap()
-            .sniff
+            .sniff,
+        "前置组成员必须沿用普通入口的机器配置"
     );
-}
-
-#[test]
-fn front_downstream_deliberately_ignores_subscription_projection() {
-    let mut app = front_app(vec![step(
-        "c-front",
-        "hk",
-        vec![Rule {
-            dest_match: ModelMatch::FrontDownstream,
-            action: Action::Egress { send_through: None },
-        }],
-        None,
-    )]);
-    app.ingresses
-        .iter_mut()
-        .find(|ingress| ingress.id == "i-us")
-        .unwrap()
-        .projection
-        .v4 = Some(ProjectionEndpoint {
-        host: "custom-relay.example.net".to_owned(),
-        port: 443,
-    });
-    let doc = doc(vec![
-        node("hk", Some("hk.example.net"), [10, 66, 0, 1], true),
-        node("us", Some("us.example.net"), [10, 66, 0, 2], true),
-        node("au", Some("203.0.113.7"), [10, 66, 0, 3], true),
-    ]);
-    let mut diagnostics = Vec::new();
-
-    let ir = compile_app(&doc, &app, &mut diagnostics);
-
-    assert_eq!(
-        rule_summary(&ir, "c-front", "hk"),
-        [
-            "domain_suffix:us.example.net -> egress",
-            "ip_cidr:203.0.113.7 -> egress",
-            "any -> block",
-        ]
-    );
-    assert!(
-        rule_summary(&ir, "c-front", "hk")
-            .iter()
-            .all(|rule| !rule.contains("custom-relay.example.net")),
-        "Projection 只写订阅，不应进入 FrontDownstream 展开"
-    );
-}
-
-#[test]
-fn empty_front_downstream_reports_error_and_keeps_safe_error_match() {
-    let mut app = front_app(vec![step(
-        "c-front",
-        "hk",
-        vec![Rule {
-            dest_match: ModelMatch::FrontDownstream,
-            action: Action::Block,
-        }],
-        None,
-    )]);
-    // Expansion targets are the exits with a non-empty front: remove them all and the group
-    // name has no reachable host under it
-    for ingress in &mut app.ingresses {
-        ingress.front = None;
-    }
-    let doc = doc(vec![
-        node("hk", Some("hk.example.net"), [10, 66, 0, 1], true),
-        node("us", Some("us1.example.net"), [10, 66, 0, 2], true),
-        node("au", Some("203.0.113.7"), [10, 66, 0, 3], true),
-    ]);
-    let mut diagnostics = Vec::new();
-
-    let ir = compile_app(&doc, &app, &mut diagnostics);
-
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.level == Level::Error && diagnostic.code == "rule.front-scope"
-    }));
-    assert_eq!(
-        rule_summary(&ir, "c-front", "hk"),
-        ["front_downstream -> block", "any -> block"]
-    );
-}
-
-#[test]
-fn nested_front_downstream_blocks_publish_instead_of_becoming_a_dead_rule() {
-    let app = front_app(vec![step(
-        "c-front",
-        "hk",
-        vec![Rule {
-            dest_match: ModelMatch::All(vec![
-                ModelMatch::FrontDownstream,
-                ModelMatch::Port(vec!["443".to_owned()]),
-            ]),
-            action: Action::Egress { send_through: None },
-        }],
-        None,
-    )]);
-    let mut snapshot = doc(vec![
-        node("hk", Some("hk.example.net"), [10, 66, 0, 1], true),
-        node("us", Some("us.example.net"), [10, 66, 0, 2], true),
-        node("au", Some("203.0.113.7"), [10, 66, 0, 3], true),
-    ]);
-    snapshot.apps = vec![app];
-
-    let output = compile(&snapshot);
-
-    assert!(!output.can_publish(), "嵌套规则不能进入发布：{output:#?}");
-    assert!(output.diagnostics.iter().any(|diagnostic| {
-        diagnostic.level == Level::Error
-            && diagnostic.code == "rule.front-scope"
-            && diagnostic.message.contains("不能嵌套在 All 中")
-    }));
-    assert!(output.project_node("hk").is_err());
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.code.starts_with("front.default")));
 }
 
 #[test]
@@ -542,7 +409,6 @@ fn match_summary(dest_match: &IrMatch) -> String {
         IrMatch::Any => "any".to_owned(),
         IrMatch::DomainSuffix(values) => format!("domain_suffix:{}", values.join(",")),
         IrMatch::IpCidr(values) => format!("ip_cidr:{}", values.join(",")),
-        IrMatch::FrontDownstream => "front_downstream".to_owned(),
         other => format!("{other:?}"),
     }
 }

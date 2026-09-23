@@ -98,6 +98,22 @@ func TestReadMultiBufferExactReusesCompleteBuffers(t *testing.T) {
 	}
 }
 
+func BenchmarkReadMultiBufferExactBuffered(b *testing.B) {
+	reader := &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(nil))}
+	b.ReportAllocs()
+	b.SetBytes(1024)
+	for b.Loop() {
+		input := buf.New()
+		input.Extend(1024)
+		reader.Buffer = buf.MultiBuffer{input}
+		result, err := readMultiBufferExact(reader, 1024)
+		if err != nil {
+			b.Fatal(err)
+		}
+		buf.ReleaseMulti(result)
+	}
+}
+
 func TestDiscardBytesAndReadText(t *testing.T) {
 	payload := []byte("discard-mehello-world")
 	reader := &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(payload))}

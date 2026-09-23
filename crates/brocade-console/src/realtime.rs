@@ -11,9 +11,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use brocade_core::model::VPNGATE_MAX_CANDIDATES;
 use brocade_deployment::protocol::{
     AgentRealtimeCommand, AgentRealtimeSample, RealtimeNodeSnapshot, RealtimeSampleEvent,
-    RealtimeTelemetryPolicy,
+    RealtimeTelemetryPolicy, VpngateBackendRole,
 };
 use serde::Serialize;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -26,6 +27,11 @@ const MAX_INTERFACE_CHARS: usize = 32;
 const MIN_ELAPSED_MILLIS: u32 = 100;
 const MAX_ELAPSED_MILLIS: u32 = 60_000;
 const MAX_FUTURE_CLOCK_SKEW_MILLIS: i64 = 10 * 60 * 1000;
+const MAX_VPNGATE_POOLS: usize = 16;
+const MAX_VPNGATE_BACKENDS: usize = MAX_VPNGATE_POOLS * 2;
+const MAX_VPNGATE_EVENTS: usize = 32;
+const MAX_VPNGATE_REPORT_BYTES: usize = 128 * 1024;
+const VPNGATE_LIVE_MAX_AGE_MILLIS: i64 = 15_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -247,23 +253,40 @@ impl RealtimeService {
         }
         agent.last_sequence = Some(sample.sequence);
 
-        let event = RealtimeSampleEvent {
+        let mut stored_event = RealtimeSampleEvent {
             node_id: node_id.to_owned(),
             received_at_unix_millis,
             sample,
         };
+        // The broadcast keeps the Agent's delta shape. The ring, however, is also the initial
+        // state for a newly opened browser, so its newest entry must always be self-contained.
+        // Clone before enriching it: diagnostics-unchanged samples are tiny, while a complete
+        // diagnostic refresh already required one clone for ring + broadcast in the old path.
+        let broadcast_event = stored_event.clone();
         let oldest = received_at_unix_millis
             - i64::try_from(RING_RETENTION.as_millis()).expect("retention fits i64");
         let ring = inner.rings.entry(node_id.to_owned()).or_default();
-        // Keep bulky worker state only on the newest ring entry; NIC history stays small. Both
-        // worker reports are live diagnostics, not a second durable telemetry history.
+        // Keep bulky worker state only on the newest ring entry; NIC history stays small. Move
+        // the previous snapshot forward for an Agent delta instead of cloning it every second.
         if let Some(previous) = ring.back_mut() {
-            previous.sample.reverse_health = None;
-            previous.sample.mux = None;
+            if stored_event.sample.diagnostics_unchanged {
+                stored_event.sample.reverse_health = previous.sample.reverse_health.take();
+                stored_event.sample.mux = previous.sample.mux.take();
+                stored_event.sample.vpngate = previous.sample.vpngate.take();
+            } else {
+                previous.sample.reverse_health = None;
+                previous.sample.mux = None;
+                previous.sample.vpngate = None;
+            }
         }
-        ring.push_back(event.clone());
+        // A snapshot is authoritative, never a delta. If the first event after reconnect was an
+        // invalid delta there is no previous state to preserve, so it correctly becomes empty.
+        stored_event.sample.diagnostics_unchanged = false;
+        ring.push_back(stored_event);
         trim_ring(ring, oldest);
-        let _ = self.events.send(RealtimeBroadcast::Sample(Box::new(event)));
+        let _ = self
+            .events
+            .send(RealtimeBroadcast::Sample(Box::new(broadcast_event)));
         Ok(())
     }
 
@@ -318,6 +341,51 @@ impl RealtimeService {
                 nodes: ordered,
             },
         }
+    }
+
+    /// Live roles take precedence over a reconcile summary that may still be in transit. Use
+    /// only connected, actively sampled nodes and a fresh supervisor report; never persist this
+    /// diagnostic snapshot as a substitute for the reliable reconciliation path.
+    pub async fn vpngate_selections(&self) -> Vec<brocade_store::VpngateRuntimeSelection> {
+        let inner = self.inner.lock().await;
+        let now = unix_millis();
+        let mut selections = Vec::new();
+        for (node_id, agent) in &inner.agents {
+            if !agent.active || agent.last_sequence.is_none() {
+                continue;
+            }
+            let Some(event) = inner.rings.get(node_id).and_then(|ring| ring.back()) else {
+                continue;
+            };
+            let Some(report) = event.sample.vpngate.as_ref() else {
+                continue;
+            };
+            if now.saturating_sub(event.received_at_unix_millis) > VPNGATE_LIVE_MAX_AGE_MILLIS
+                || event
+                    .sample
+                    .sampled_at_unix_millis
+                    .saturating_sub(report.sampled_at_unix_millis)
+                    > VPNGATE_LIVE_MAX_AGE_MILLIS
+            {
+                continue;
+            }
+            for pool in &report.pools {
+                let selected = report.backends.iter().find(|backend| {
+                    backend.outbound_id == pool.outbound_id
+                        && backend.role == VpngateBackendRole::Active
+                        && Some(backend.slot) == pool.active_slot
+                });
+                selections.push(brocade_store::VpngateRuntimeSelection {
+                    node_id: node_id.clone(),
+                    outbound_id: pool.outbound_id.clone(),
+                    selected_server_id: selected.map(|backend| backend.server_id.clone()),
+                });
+            }
+        }
+        selections.sort_by(|left, right| {
+            (&left.node_id, &left.outbound_id).cmp(&(&right.node_id, &right.outbound_id))
+        });
+        selections
     }
 
     async fn release(&self, nodes: Vec<String>) {
@@ -412,6 +480,11 @@ fn send_status(
 }
 
 fn validate_sample(sample: &AgentRealtimeSample) -> Result<(), &'static str> {
+    if sample.diagnostics_unchanged
+        && (sample.reverse_health.is_some() || sample.mux.is_some() || sample.vpngate.is_some())
+    {
+        return Err("unchanged diagnostics sample carries a report");
+    }
     let interface_chars = sample.interface.chars().count();
     if interface_chars == 0 || interface_chars > MAX_INTERFACE_CHARS {
         return Err("interface name has an invalid length");
@@ -431,6 +504,26 @@ fn validate_sample(sample: &AgentRealtimeSample) -> Result<(), &'static str> {
         || sample.sampled_at_unix_millis > now.saturating_add(MAX_FUTURE_CLOCK_SKEW_MILLIS)
     {
         return Err("sample timestamp is invalid");
+    }
+    if let Some(vpngate) = sample.vpngate.as_ref() {
+        if vpngate.boot_id.is_empty()
+            || vpngate.boot_id.chars().count() > 128
+            || vpngate.pools.len() > MAX_VPNGATE_POOLS
+            || vpngate.backends.len() > MAX_VPNGATE_BACKENDS
+            || vpngate.events.len() > MAX_VPNGATE_EVENTS
+            || vpngate
+                .pools
+                .iter()
+                .any(|pool| pool.candidate_count > VPNGATE_MAX_CANDIDATES)
+        {
+            return Err("VPN Gate realtime report exceeds its bounds");
+        }
+        if serde_json::to_vec(vpngate)
+            .map(|body| body.len() > MAX_VPNGATE_REPORT_BYTES)
+            .unwrap_or(true)
+        {
+            return Err("VPN Gate realtime report is too large");
+        }
     }
     Ok(())
 }
@@ -457,6 +550,7 @@ mod tests {
 
     fn sample(sequence: u64) -> AgentRealtimeSample {
         AgentRealtimeSample {
+            diagnostics_unchanged: false,
             sequence,
             sampled_at_unix_millis: unix_millis(),
             elapsed_millis: 1000,
@@ -465,8 +559,76 @@ mod tests {
             tx_bytes_per_sec: 45,
             reverse_health: None,
             mux: None,
+            vpngate: None,
             has_gap: false,
         }
+    }
+
+    #[tokio::test]
+    async fn vpngate_selection_uses_only_a_fresh_active_backend_from_the_current_session() {
+        let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
+        let _subscription = service.subscribe(["n1".to_owned()]).await;
+        let agent = service.register_agent("n1".to_owned()).await;
+        let mut live = sample(1);
+        live.vpngate = Some(serde_json::from_value(serde_json::json!({
+            "boot_id": "boot", "sequence": 1, "sampled_at_unix_millis": live.sampled_at_unix_millis,
+            "pools": [{
+                "outbound_id": "pool", "country_code": "US", "state": "healthy", "active_slot": 1,
+                "ready_standbys": 1, "candidate_count": 16, "consecutive_failures": 0,
+                "probes": 20, "probe_failures": 2, "failovers": 8, "refill_attempts": 3,
+                "refill_failures": 1
+            }],
+            "backends": [
+                {"outbound_id": "pool", "slot": 0, "role": "standby", "state": "healthy", "server_id": "old",
+                 "consecutive_failures": 0, "backoff_remaining_millis": 0},
+                {"outbound_id": "pool", "slot": 1, "role": "active", "state": "healthy", "server_id": "new",
+                 "consecutive_failures": 0, "backoff_remaining_millis": 0}
+            ],
+            "events": []
+        })).unwrap());
+        service
+            .record_sample("n1", agent.session, live.clone())
+            .await
+            .unwrap();
+        let selections = service.vpngate_selections().await;
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].selected_server_id.as_deref(), Some("new"));
+
+        service
+            .inner
+            .lock()
+            .await
+            .rings
+            .get_mut("n1")
+            .unwrap()
+            .back_mut()
+            .unwrap()
+            .received_at_unix_millis -= VPNGATE_LIVE_MAX_AGE_MILLIS + 1;
+        assert!(service.vpngate_selections().await.is_empty());
+
+        live.sequence = 2;
+        live.vpngate.as_mut().unwrap().sampled_at_unix_millis -= VPNGATE_LIVE_MAX_AGE_MILLIS + 1;
+        service
+            .record_sample("n1", agent.session, live.clone())
+            .await
+            .unwrap();
+        assert!(service.vpngate_selections().await.is_empty());
+
+        live.sequence = 3;
+        live.vpngate.as_mut().unwrap().sampled_at_unix_millis = live.sampled_at_unix_millis;
+        live.vpngate.as_mut().unwrap().pools[0].active_slot = None;
+        service
+            .record_sample("n1", agent.session, live)
+            .await
+            .unwrap();
+        assert!(service.vpngate_selections().await[0]
+            .selected_server_id
+            .is_none());
+
+        service.unregister_agent("n1", agent.session).await;
+        assert!(service.vpngate_selections().await.is_empty());
+        let _new_agent = service.register_agent("n1".to_owned()).await;
+        assert!(service.vpngate_selections().await.is_empty());
     }
 
     #[tokio::test]
@@ -533,7 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_newest_ring_entry_keeps_mux_worker_state() {
+    async fn only_the_newest_ring_entry_keeps_bulky_runtime_state() {
         let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
         let _subscription = service.subscribe(["n1".to_owned()]).await;
         let agent = service.register_agent("n1".to_owned()).await;
@@ -547,12 +709,20 @@ mod tests {
         };
         let mut first = sample(1);
         first.mux = Some(report());
+        first.vpngate = Some(brocade_deployment::protocol::VpngateRealtimeReport {
+            boot_id: "boot".to_owned(),
+            sequence: 1,
+            sampled_at_unix_millis: unix_millis(),
+            pools: Vec::new(),
+            backends: Vec::new(),
+            events: Vec::new(),
+        });
         service
             .record_sample("n1", agent.session, first)
             .await
             .unwrap();
         let mut second = sample(2);
-        second.mux = Some(report());
+        second.diagnostics_unchanged = true;
         service
             .record_sample("n1", agent.session, second)
             .await
@@ -562,7 +732,10 @@ mod tests {
         let samples = &snapshot.snapshots[0].samples;
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].sample.mux, None);
+        assert_eq!(samples[0].sample.vpngate, None);
         assert!(samples[1].sample.mux.is_some());
+        assert!(samples[1].sample.vpngate.is_some());
+        assert!(!samples[1].sample.diagnostics_unchanged);
     }
 
     #[tokio::test]

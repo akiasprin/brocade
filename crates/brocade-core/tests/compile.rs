@@ -611,10 +611,9 @@ fn an_open_entrance_adds_no_rules() {
     assert_eq!(xray.routing_rules.len(), 1, "只该有链路自己那一条");
 }
 
-/// Blocking BitTorrent behind a front is refused rather than compiled into a rule that matches
-/// nothing — the failure would otherwise be invisible and in the unsafe direction.
+/// Client-side Front membership must not disable machine-side sniffing or its ingress guards.
 #[test]
-fn blocking_torrents_needs_an_entrance_that_sniffs() {
+fn front_membership_keeps_ingress_sniffing_for_guards() {
     let mut snapshot = snapshot(vec![node("hk", [10, 66, 0, 1], Dns::System)]);
     let mut project = app("a", "c-a", "i-a", 443, any_egress());
     project.ingresses[0].guard = IngressGuard {
@@ -636,11 +635,15 @@ fn blocking_torrents_needs_an_entrance_that_sniffs() {
         output
             .diagnostics
             .iter()
-            .any(|d| d.code == "ingress.guard-needs-sniffing"),
+            .all(|d| d.code != "ingress.guard-needs-sniffing"),
         "{:#?}",
         output.diagnostics
     );
-    assert!(!output.can_publish(), "拦不住却显示已开启，不能让它发布");
+    assert!(output.can_publish());
+    assert!(
+        output.unpublishable_view().apps[0].ingresses[0].sniff,
+        "前置组只控制客户端拨号，不得改变服务端入口"
+    );
 }
 
 fn any_egress() -> Rule {

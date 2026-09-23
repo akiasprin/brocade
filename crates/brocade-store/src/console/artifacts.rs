@@ -1,29 +1,50 @@
 //! Artifact index and contents. Artifacts are a pure function of the snapshot — computed on
 //! demand rather than looked up, which is how a draft can have artifacts too.
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
 use brocade_core::artifacts::hy2_port_hop::Hy2PortHopArtifact;
 use brocade_core::format::uri::UriRenderOptions;
-use brocade_core::{model::ModelSnapshot, physical::user::SubscriptionFilter};
+use brocade_core::{
+    compile::CompileOutput, model::ModelSnapshot, physical::user::SubscriptionFilter,
+};
 use sqlx::PgPool;
 
 use super::*;
 use crate::{AdminContext, Result, StoreError};
+
+const NODE_ARTIFACT_INDEX_CACHE_CAPACITY: usize = 128;
+const USER_ARTIFACT_INDEX_CACHE_CAPACITY: usize = 256;
+
+fn node_artifact_indexes() -> &'static crate::compile_cache::StageMemo<Vec<ArtifactIndexEntry>> {
+    static CACHE: OnceLock<crate::compile_cache::StageMemo<Vec<ArtifactIndexEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| crate::compile_cache::StageMemo::new(NODE_ARTIFACT_INDEX_CACHE_CAPACITY))
+}
+
+fn user_artifact_indexes() -> &'static crate::compile_cache::StageMemo<Vec<ArtifactIndexEntry>> {
+    static CACHE: OnceLock<crate::compile_cache::StageMemo<Vec<ArtifactIndexEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| crate::compile_cache::StageMemo::new(USER_ARTIFACT_INDEX_CACHE_CAPACITY))
+}
 
 pub async fn artifact_index(
     pool: &PgPool,
     actor: &AdminContext,
     revision: Option<u64>,
 ) -> Result<ArtifactIndex> {
-    artifact_index_of(&load_scoped_snapshot(pool, actor, revision).await?)
+    let snapshot = load_scoped_snapshot(pool, actor, revision).await?;
+    let output = crate::compile_cache::compile_snapshot(&snapshot).await?;
+    artifact_index_from_output(&snapshot, &output)
 }
 
 /// Artifacts are a pure function of the snapshot — computed on demand rather than looked up.
 /// That is how a draft can have them too: the preview reads the snapshot inside the
 /// transaction it is about to roll back, and recomputing here yields "what this run of edits
 /// would turn the artifacts into" (`draft.rs`).
-pub(crate) fn artifact_index_of(snapshot: &ModelSnapshot) -> Result<ArtifactIndex> {
-    let output = compile(snapshot);
+pub(crate) fn artifact_index_from_output(
+    snapshot: &ModelSnapshot,
+    output: &CompileOutput,
+) -> Result<ArtifactIndex> {
     let mut artifacts = Vec::new();
 
     if output.summary.can_publish {
@@ -31,95 +52,24 @@ pub(crate) fn artifact_index_of(snapshot: &ModelSnapshot) -> Result<ArtifactInde
         // contract sent to their agent. Runtime planning drops them only after that contract has
         // converged; artifact preview remains a pure function of the revision.
         for node in &snapshot.nodes {
-            if let Ok(plan) = output.project_node(&node.id) {
-                let phantun = phantun::build(&plan);
-                match &phantun {
-                    brocade_core::artifacts::phantun::PhantunArtifact::Config(_) => {
-                        push_node_artifact(
-                            &mut artifacts,
-                            &node.id,
-                            "phantun",
-                            json_format::phantun(&phantun),
-                        );
-                    }
-                    brocade_core::artifacts::phantun::PhantunArtifact::Disabled { .. } => {
-                        push_disabled_artifact(&mut artifacts, "node", &node.id, "phantun");
-                    }
-                }
-
-                let wireguard = wireguard::build(&plan);
-                match &wireguard {
-                    brocade_core::artifacts::wireguard::WireGuardArtifact::Config(_) => {
-                        push_node_artifact(
-                            &mut artifacts,
-                            &node.id,
-                            "wireguard",
-                            ini::wireguard(&wireguard),
-                        );
-                    }
-                    brocade_core::artifacts::wireguard::WireGuardArtifact::Disabled { .. } => {
-                        push_disabled_artifact(&mut artifacts, "node", &node.id, "wireguard");
-                    }
-                }
-
-                let hy2_hop = hy2_port_hop::build(&plan);
-                match &hy2_hop {
-                    Hy2PortHopArtifact::Config(_) => {
-                        let text = json_format::hy2_port_hop(&hy2_hop);
-                        push_node_artifact(&mut artifacts, &node.id, "hy2_port_hop", text);
-                    }
-                    Hy2PortHopArtifact::Disabled { .. } => {
-                        push_disabled_artifact(&mut artifacts, "node", &node.id, "hy2_port_hop");
-                    }
-                }
-
-                let xray = xray::build(&plan);
-                let xray_present = matches!(
-                    &xray,
-                    brocade_core::artifacts::xray::XrayArtifact::Config(_)
-                );
-                match &xray {
-                    brocade_core::artifacts::xray::XrayArtifact::Config(_) => {
-                        push_node_artifact(
-                            &mut artifacts,
-                            &node.id,
-                            "xray",
-                            json_format::xray(&xray),
-                        );
-                    }
-                    brocade_core::artifacts::xray::XrayArtifact::Disabled { .. } => {
-                        push_disabled_artifact(&mut artifacts, "node", &node.id, "xray");
-                    }
-                }
-
-                if xray_present {
-                    push_node_artifact(
-                        &mut artifacts,
-                        &node.id,
-                        "grants",
-                        json_format::grant_sync_batch(&grants::build(&plan)),
-                    );
-                } else {
-                    push_disabled_artifact(&mut artifacts, "node", &node.id, "grants");
-                }
+            if let Ok((projection_key, plan)) =
+                crate::compile_cache::project_node_with_key(output, &node.id)
+            {
+                let entries = node_artifact_indexes().get_or_insert_with(projection_key, || {
+                    node_artifact_index_entries(&node.id, &plan)
+                });
+                artifacts.extend(entries.iter().cloned());
             }
         }
 
         for user in &snapshot.users {
-            if let Ok(plan) = output.project_user(&user.tenant, &user.id) {
-                let subscription = subscription::build(&plan);
-                push_user_artifact(
-                    &mut artifacts,
-                    &format!("{}:{}", user.tenant, user.id),
-                    "uri",
-                    uri::subscription(&subscription),
-                );
-                push_user_artifact(
-                    &mut artifacts,
-                    &format!("{}:{}", user.tenant, user.id),
-                    "clash",
-                    yaml::clash_subscription(&subscription),
-                );
+            if let Ok((projection_key, plan)) =
+                crate::compile_cache::project_user_with_key(output, &user.tenant, &user.id)
+            {
+                let entries = user_artifact_indexes().get_or_insert_with(projection_key, || {
+                    user_artifact_index_entries(&user.tenant, &user.id, &plan)
+                });
+                artifacts.extend(entries.iter().cloned());
             }
         }
     }
@@ -141,6 +91,102 @@ pub(crate) fn artifact_index_of(snapshot: &ModelSnapshot) -> Result<ArtifactInde
         revision: snapshot.revision,
         artifacts,
     })
+}
+
+fn node_artifact_index_entries(
+    node_id: &str,
+    plan: &brocade_core::physical::node::NodePlan,
+) -> Vec<ArtifactIndexEntry> {
+    let mut artifacts = Vec::new();
+    let phantun = phantun::build(plan);
+    match &phantun {
+        brocade_core::artifacts::phantun::PhantunArtifact::Config(_) => {
+            push_node_artifact(
+                &mut artifacts,
+                node_id,
+                "phantun",
+                json_format::phantun(&phantun),
+            );
+        }
+        brocade_core::artifacts::phantun::PhantunArtifact::Disabled { .. } => {
+            push_disabled_artifact(&mut artifacts, "node", node_id, "phantun");
+        }
+    }
+
+    let wireguard = wireguard::build(plan);
+    match &wireguard {
+        brocade_core::artifacts::wireguard::WireGuardArtifact::Config(_) => {
+            push_node_artifact(
+                &mut artifacts,
+                node_id,
+                "wireguard",
+                ini::wireguard(&wireguard),
+            );
+        }
+        brocade_core::artifacts::wireguard::WireGuardArtifact::Disabled { .. } => {
+            push_disabled_artifact(&mut artifacts, "node", node_id, "wireguard");
+        }
+    }
+
+    let hy2_hop = hy2_port_hop::build(plan);
+    match &hy2_hop {
+        Hy2PortHopArtifact::Config(_) => {
+            let text = json_format::hy2_port_hop(&hy2_hop);
+            push_node_artifact(&mut artifacts, node_id, "hy2_port_hop", text);
+        }
+        Hy2PortHopArtifact::Disabled { .. } => {
+            push_disabled_artifact(&mut artifacts, "node", node_id, "hy2_port_hop");
+        }
+    }
+
+    let xray = xray::build(plan);
+    let xray_present = matches!(
+        &xray,
+        brocade_core::artifacts::xray::XrayArtifact::Config(_)
+    );
+    match &xray {
+        brocade_core::artifacts::xray::XrayArtifact::Config(_) => {
+            push_node_artifact(&mut artifacts, node_id, "xray", json_format::xray(&xray));
+        }
+        brocade_core::artifacts::xray::XrayArtifact::Disabled { .. } => {
+            push_disabled_artifact(&mut artifacts, "node", node_id, "xray");
+        }
+    }
+
+    if xray_present {
+        push_node_artifact(
+            &mut artifacts,
+            node_id,
+            "grants",
+            json_format::grant_sync_batch(&grants::build(plan)),
+        );
+    } else {
+        push_disabled_artifact(&mut artifacts, "node", node_id, "grants");
+    }
+    artifacts
+}
+
+fn user_artifact_index_entries(
+    tenant: &str,
+    user_id: &str,
+    plan: &brocade_core::physical::user::UserPlan,
+) -> Vec<ArtifactIndexEntry> {
+    let mut artifacts = Vec::new();
+    let subscription = subscription::build(plan);
+    let user_key = format!("{tenant}:{user_id}");
+    push_user_artifact(
+        &mut artifacts,
+        &user_key,
+        "uri",
+        uri::subscription(&subscription),
+    );
+    push_user_artifact(
+        &mut artifacts,
+        &user_key,
+        "clash",
+        yaml::clash_subscription(&subscription),
+    );
+    artifacts
 }
 
 pub async fn artifact_content(
@@ -258,7 +304,7 @@ fn artifact_content_of_with_policy(
     let target_kind = required_text(target_kind, "target_kind")?;
     let target_id = required_text(target_id, "target_id")?;
     let artifact_kind = required_text(artifact_kind, "artifact_kind")?;
-    let output = compile(snapshot);
+    let output = crate::compile_cache::compile_incremental(snapshot);
     output.ensure_publishable().map_err(|blocked| {
         StoreError::InvalidData(format!("revision is not publishable: {blocked:?}"))
     })?;
@@ -266,9 +312,10 @@ fn artifact_content_of_with_policy(
     match (target_kind.as_str(), artifact_kind.as_str()) {
         ("node", "phantun") => {
             ensure_node_visible(snapshot, &target_id)?;
-            let plan = output.project_node(&target_id).map_err(|blocked| {
-                StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
-            })?;
+            let plan =
+                crate::compile_cache::project_node(&output, &target_id).map_err(|blocked| {
+                    StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
+                })?;
             let artifact = phantun::build(&plan);
             match &artifact {
                 brocade_core::artifacts::phantun::PhantunArtifact::Config(_) => {
@@ -293,9 +340,10 @@ fn artifact_content_of_with_policy(
         }
         ("node", "wireguard") => {
             ensure_node_visible(snapshot, &target_id)?;
-            let plan = output.project_node(&target_id).map_err(|blocked| {
-                StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
-            })?;
+            let plan =
+                crate::compile_cache::project_node(&output, &target_id).map_err(|blocked| {
+                    StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
+                })?;
             let artifact = wireguard::build(&plan);
             match &artifact {
                 brocade_core::artifacts::wireguard::WireGuardArtifact::Config(_) => {
@@ -320,9 +368,10 @@ fn artifact_content_of_with_policy(
         }
         ("node", "hy2_port_hop") => {
             ensure_node_visible(snapshot, &target_id)?;
-            let plan = output.project_node(&target_id).map_err(|blocked| {
-                StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
-            })?;
+            let plan =
+                crate::compile_cache::project_node(&output, &target_id).map_err(|blocked| {
+                    StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
+                })?;
             let artifact = hy2_port_hop::build(&plan);
             match &artifact {
                 Hy2PortHopArtifact::Config(_) => artifact_content_from_text(
@@ -343,9 +392,10 @@ fn artifact_content_of_with_policy(
         }
         ("node", "xray") => {
             ensure_node_visible(snapshot, &target_id)?;
-            let plan = output.project_node(&target_id).map_err(|blocked| {
-                StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
-            })?;
+            let plan =
+                crate::compile_cache::project_node(&output, &target_id).map_err(|blocked| {
+                    StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
+                })?;
             let artifact = xray::build(&plan);
             match &artifact {
                 brocade_core::artifacts::xray::XrayArtifact::Config(_) => {
@@ -370,9 +420,10 @@ fn artifact_content_of_with_policy(
         }
         ("node", "grants") => {
             ensure_node_visible(snapshot, &target_id)?;
-            let plan = output.project_node(&target_id).map_err(|blocked| {
-                StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
-            })?;
+            let plan =
+                crate::compile_cache::project_node(&output, &target_id).map_err(|blocked| {
+                    StoreError::InvalidData(format!("cannot project node {target_id}: {blocked:?}"))
+                })?;
             let xray = xray::build(&plan);
             if matches!(xray, brocade_core::artifacts::xray::XrayArtifact::Config(_)) {
                 artifact_content_from_text(
@@ -395,11 +446,13 @@ fn artifact_content_of_with_policy(
         ("user", "uri") | ("user", "clash") => {
             let (tenant_id, user_id) = split_user_target(&target_id)?;
             ensure_user_visible(snapshot, tenant_id, user_id)?;
-            let mut plan = output.project_user(tenant_id, user_id).map_err(|blocked| {
-                StoreError::InvalidData(format!(
-                    "cannot project user {tenant_id}/{user_id}: {blocked:?}"
-                ))
-            })?;
+            let mut plan = crate::compile_cache::project_user(&output, tenant_id, user_id)
+                .map(|plan| plan.as_ref().clone())
+                .map_err(|blocked| {
+                    StoreError::InvalidData(format!(
+                        "cannot project user {tenant_id}/{user_id}: {blocked:?}"
+                    ))
+                })?;
             plan.retain_filter(policy.filter);
             let mut subscription = subscription::build(&plan);
             subscription.mark_self_signed(policy.self_signed_names);

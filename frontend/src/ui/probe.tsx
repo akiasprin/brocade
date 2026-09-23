@@ -10,7 +10,7 @@
 //
 // 另有第五档「未探测」：它与探测后不通完全不同，合并后新建的链会持续显示为故障。
 
-import type { E2eExitVerdict, E2eProbeItem, E2eProbeSample, E2eProbeStatus } from '../api';
+import type { E2eExitVerdict, E2eProbeItem, E2eProbeSampleSeries, E2eProbeStatus } from '../api';
 
 export type ProbeTone = 'ok' | 'slow' | 'odd' | 'down' | 'none';
 
@@ -42,6 +42,61 @@ const STATUS_TEXT: Record<E2eProbeStatus, string> = {
   timeout: '超时',
   unsupported: '探不了',
 };
+
+const PROVIDER_SHORT = { proxycheck: 'PC', ffraud: 'FF', iplogs: 'IL' } as const;
+const PROVIDER_NAME = { proxycheck: 'ProxyCheck', ffraud: 'FFraud', iplogs: 'IPLogs' } as const;
+const NETWORK_TYPE = {
+  datacenter: '机房',
+  residential: '家宽',
+  business: '商宽',
+  mobile: '移动网络',
+  relay: '转发网络',
+  unknown: '类型未知',
+} as const;
+
+function ExitIntelligence({ item }: { item: E2eProbeItem }) {
+  if (item.status !== 'ok' || !item.exit_ip) return null;
+  const intelligence = item.exit_intelligence;
+  if (!intelligence) {
+    return (
+      <span className="probe-intel" aria-label="IP 情报">
+        <span className="probe-intel-label">IP 情报</span>
+        <span className="dim">暂无记录</span>
+      </span>
+    );
+  }
+
+  const scores = intelligence.scores.map(score => `${PROVIDER_SHORT[score.provider]} ${score.score}`).join(' · ');
+  const knownTypes = [
+    ...new Set(
+      intelligence.networks
+        .map(network => network.network_type)
+        .filter(networkType => networkType !== 'unknown')
+        .map(networkType => NETWORK_TYPE[networkType]),
+    ),
+  ];
+  const isps = [
+    ...new Set(intelligence.networks.map(network => network.isp).filter((isp): isp is string => Boolean(isp))),
+  ];
+  const network = [isps.join(' / '), (knownTypes.length ? knownTypes : [NETWORK_TYPE.unknown]).join(' / ')]
+    .filter(Boolean)
+    .join(' · ');
+  const detail = [
+    ...intelligence.scores.map(score => `${PROVIDER_NAME[score.provider]} ${score.score} / 100`),
+    ...intelligence.networks.map(
+      item => `${PROVIDER_NAME[item.provider]}：${item.isp ?? 'ISP 未知'} · ${NETWORK_TYPE[item.network_type]}`,
+    ),
+    `更新 ${intelligence.verified_at.slice(0, 19)}`,
+  ].join('\n');
+
+  return (
+    <span className="probe-intel" aria-label="IP 情报" title={detail}>
+      <span className="probe-intel-label">IP 情报</span>
+      <span className="probe-intel-scores mono">{scores || '暂无评分'}</span>
+      <span className="probe-intel-network">{network}</span>
+    </span>
+  );
+}
 
 // 一句话的结论，给出状态和事实，不给出推断。
 //
@@ -117,23 +172,30 @@ export function ProbeBadge({ item, size }: { item: E2eProbeItem | null | undefin
 //
 // 它在总览页的作用高于单条链的页面：横向对比多条链可直接看出某条链从第几次开始变慢，
 // 该情况通常由某次发布导致而非网络原因。该判断在单条链的页面上无法得出。
-export function ProbeSpark({ samples }: { samples: E2eProbeSample[] }) {
-  if (samples.length === 0) return <span className="dim">—</span>;
-  const shown = samples.slice(-SPARK_BARS);
+export function ProbeSpark({ samples }: { samples: E2eProbeSampleSeries }) {
+  const count = samples.probed_at_unix_secs.length;
+  if (count === 0) return <span className="dim">—</span>;
+  const shown = Array.from(
+    { length: Math.min(SPARK_BARS, count) },
+    (_, index) => count - Math.min(SPARK_BARS, count) + index,
+  );
   // 按最慢的一次归一化，且只看画出来的这些。拿整个六小时窗口的峰值归一化时，六小时前的
   // 一次尖峰会把最近二十次全压到贴底的平线——而这条线正是用来看最近这二十次的波动的。
-  const peak = Math.max(...shown.map(s => s.ttfb_ms ?? 0), 1);
+  const peak = Math.max(...shown.map(index => samples.ttfb_ms[index] ?? 0), 1);
   return (
     <span className="spark" title={`最近 ${shown.length} 次`}>
-      {shown.map(s => {
-        const failed = s.status !== 'ok';
-        const height = failed ? 100 : Math.max(12, ((s.ttfb_ms ?? 0) / peak) * 100);
+      {shown.map(index => {
+        const status = samples.status[index];
+        const ttfb = samples.ttfb_ms[index];
+        const probedAt = samples.probed_at_unix_secs[index];
+        const failed = status !== 'ok';
+        const height = failed ? 100 : Math.max(12, ((ttfb ?? 0) / peak) * 100);
         return (
           <i
-            key={s.probed_at}
-            className={failed ? 'down' : (s.ttfb_ms ?? 0) > SLOW_MS ? 'slow' : ''}
+            key={`${probedAt}-${index}`}
+            className={failed ? 'down' : (ttfb ?? 0) > SLOW_MS ? 'slow' : ''}
             style={{ height: `${height}%` }}
-            title={`${s.probed_at.slice(0, 19)} · ${failed ? STATUS_TEXT[s.status] : `${s.ttfb_ms}ms`}`}
+            title={`${new Date(probedAt * 1_000).toLocaleString()} · ${failed ? STATUS_TEXT[status] : `${ttfb}ms`}`}
           />
         );
       })}
@@ -245,6 +307,7 @@ export function ProbeBanner({ item }: { item: E2eProbeItem | null | undefined })
               {why}
               <span className="when">{item.probed_at.slice(0, 19)}</span>
             </span>
+            <ExitIntelligence item={item} />
           </span>
           <span className="probe-rt">
             <ProbeSpark samples={item.samples} />

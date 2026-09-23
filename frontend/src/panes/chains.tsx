@@ -46,16 +46,18 @@ import {
   upsertChain,
   upsertIngress,
   type Rule,
+  type ExternalOutbound,
   type SnapshotApp,
   type SnapshotChain,
   type SnapshotIngress,
   type E2eProbeItem,
-  type E2eProbeSample,
   type ListenerRef,
   type UpsertIngressBody,
   type SnapshotStep,
   type IngressProjection,
+  type ProjectionProtocol,
   type ProjectionEndpoint,
+  type ProtocolProjection,
   type RealityFallbackMode,
   type CertificateTrack,
   type Wires,
@@ -77,14 +79,22 @@ import {
 } from '../reality-fallback';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 import { can, isPublic, useSession } from '../session';
-import { Empty, ErrorBox, Loading, SegSwitch } from '../ui/bits';
-import { FLAG_SHEET } from '../ui/flags';
+import { Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
+import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
+import {
+  SUBSCRIPTION_COUNTRY_CODES,
+  SUBSCRIPTION_COUNTRY_CODE_SET,
+  subscriptionCountryLabel,
+  subscriptionFlag,
+} from '../ui/subscription-country';
+export { subscriptionFlag } from '../ui/subscription-country';
 import { RegionFlag } from '../ui/region-flag';
 import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
+import { navigate, returnTo } from '../forge/route';
 import { ProbeBanner, byChain, toneOf, toneTitle } from '../ui/probe';
 import { appId as randomAppId } from '../model-id';
-import { wm, type CrumbSeg, type Win } from '../wm/store';
+import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import {
   RuleDraftScope,
@@ -238,52 +248,38 @@ const crumbOf = (d: Drill, chainName: (app: string, chain: string) => string): C
 
 export function ChainsPane({ win }: { win: Win }) {
   const drill = (win.data.drill as Drill | undefined) ?? { p: 'list' };
-  const go = (d: Drill) => wm.setData(win.id, { ...win.data, drill: d });
+  const go = (d: Drill) => navigate('chains', d);
   // 面包屑用链名。snapshot 在列表页已拉取，通常命中缓存；名称缺失或未加载时回退到链 id。
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const chainName = (app: string, chain: string) =>
     snapshot.data?.snapshot.apps.find(a => a.id === app)?.chains.find(c => c.id === chain)?.name || chain;
   useCrumb(win, crumbOf(drill, chainName));
   if (drill.p === 'chain') return <ChainDetail app={drill.app} chain={drill.chain} />;
-  if (drill.p === 'new') return <NewChain app={drill.app} go={go} />;
+  if (drill.p === 'new') return <NewChain app={drill.app} />;
   return <ChainList go={go} />;
 }
 
 // 建链页。项目由路由传入（入口是该项目的「＋ 新建链」），
 // 链头由向导中路径的第一行指定。
-function NewChain({ app, go }: { app: string; go: (d: Drill) => void }) {
+function NewChain({ app }: { app: string }) {
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
-  const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const a = snapshot.data?.snapshot.apps.find(x => x.id === app);
-  const usable = (nodeList.data?.nodes ?? []).filter(n => !n.retired_at);
 
-  if (snapshot.isPending || nodeList.isPending) return <Loading />;
-  if (snapshot.error || nodeList.error) return <ErrorBox error={snapshot.error ?? nodeList.error} />;
+  if (snapshot.isPending) return <Loading variant="form" />;
+  if (snapshot.error) return <ErrorBox error={snapshot.error} />;
   if (!a) return <ErrorBox error={new Error(`没有这条线路：${app}`)} />;
 
   return (
-    <>
-      <div className="chain-hd">
-        <b>建链向导</b>
-        <span className="subid mono">
-          {a.label || a.id} / {a.id}
-        </span>
-      </div>
-      {usable.length === 0 ? (
-        <div className="callout">还没有机器。先去「机器」里加一台——入口节点就是接入面所在那台。</div>
-      ) : (
-        <ChainWizard
-          fixedApp={{ id: a.id, label: a.label }}
-          onDone={() => {
-            qc.invalidateQueries({ queryKey: ['snapshot'] });
-            qc.invalidateQueries({ queryKey: ['revisions'] });
-            qc.invalidateQueries({ queryKey: ['compile'] });
-            go({ p: 'list' });
-          }}
-        />
-      )}
-    </>
+    <ChainWizard
+      fixedApp={{ id: a.id, label: a.label }}
+      onDone={() => {
+        qc.invalidateQueries({ queryKey: ['snapshot'] });
+        qc.invalidateQueries({ queryKey: ['revisions'] });
+        qc.invalidateQueries({ queryKey: ['compile'] });
+        returnTo('chains');
+      }}
+    />
   );
 }
 
@@ -408,7 +404,11 @@ function ChainLatency({ probe }: { probe: E2eProbeItem | undefined }) {
      抖动。窗口与下方曲线相同（samples 的近 6 小时），只计入成功的样本——失败样本的耗时
      是超时时间，与链路速度无关。当前不通时仍显示「不通」：此刻没有延迟可言，历史均值
      会把一个进行中的故障读成正常。 */
-  const valid = (probe?.samples ?? []).map(probeValue).filter((v): v is number => v != null);
+  const valid = probe
+    ? probe.samples.ttfb_ms.filter(
+        (value, index): value is number => value != null && probe.samples.status[index] === 'ok',
+      )
+    : [];
   const avg = valid.length > 0 ? Math.round(valid.reduce((sum, v) => sum + v, 0) / valid.length) : null;
   const shown = avg ?? probe?.ttfb_ms ?? null;
   const ok = probe?.status === 'ok' && shown != null;
@@ -433,20 +433,8 @@ function ChainLatency({ probe }: { probe: E2eProbeItem | undefined }) {
 }
 
 type LatencyPoint = { x: number; y: number; value: number | null };
-const PROBE_HISTORY_MS = 6 * 60 * 60 * 1000;
+const PROBE_HISTORY_SECS = 6 * 60 * 60;
 const PROBE_PLOT_HEIGHT = 36;
-
-/** PostgreSQL's timestamptz text can contain microseconds and a short `+08` offset. Normalize
- * both forms before handing it to Date.parse so Chromium, Safari and Firefox place a sample on
- * the same six-hour axis. */
-function probeTimeMs(value: string): number {
-  const normalized = value
-    .trim()
-    .replace(' ', 'T')
-    .replace(/(\.\d{3})\d+/, '$1')
-    .replace(/([+-]\d{2})$/, '$1:00');
-  return Date.parse(normalized);
-}
 
 /** A bounded curve between probe samples. Both control points keep an endpoint's y coordinate,
  * so a segment cannot overshoot its two measurements. Failed samples are excluded from the
@@ -463,14 +451,10 @@ function latencyCurve(points: LatencyPoint[]): string {
   return d;
 }
 
-function probeValue(sample: E2eProbeSample): number | null {
-  return sample.status === 'ok' && sample.ttfb_ms != null ? sample.ttfb_ms : null;
-}
-
 function ProbeLatencyPlot({ probe }: { probe: E2eProbeItem | undefined }) {
-  const samples = probe?.samples ?? [];
+  const samples = probe?.samples;
   const exit = <ChainExit probe={probe} />;
-  if (samples.length === 0) {
+  if (!samples || samples.probed_at_unix_secs.length === 0) {
     return (
       // 只留文案，不画基线。容器仍占满 52px：同一行的链路卡高度必须一致。
       // 下面「探过但每次都不通」那一档仍然画线——那条红色虚线是读数，不是占位。
@@ -481,7 +465,9 @@ function ProbeLatencyPlot({ probe }: { probe: E2eProbeItem | undefined }) {
     );
   }
 
-  const values = samples.map(probeValue);
+  const values = samples.ttfb_ms.map((value, index) =>
+    samples.status[index] === 'ok' && value != null ? value : null,
+  );
   const valid = values.filter((value): value is number => value != null);
   const failures = values.length - valid.length;
   // 「落点首字节」而不是「出网延迟」：「出网」在本产品里指 Egress 那一跳（rules.tsx 的
@@ -505,17 +491,11 @@ function ProbeLatencyPlot({ probe }: { probe: E2eProbeItem | undefined }) {
   const min = Math.min(...valid);
   const max = Math.max(...valid);
   const range = max - min;
-  const sampleTimes = samples.map(sample => probeTimeMs(sample.probed_at));
-  const finiteTimes = sampleTimes.filter(Number.isFinite);
-  const windowEnd = finiteTimes.length > 0 ? Math.max(...finiteTimes) : NaN;
-  const windowStart = windowEnd - PROBE_HISTORY_MS;
+  const windowEnd = Math.max(...samples.probed_at_unix_secs);
+  const windowStart = windowEnd - PROBE_HISTORY_SECS;
   const points = values.map<LatencyPoint>((value, index) => ({
     value,
-    x: Number.isFinite(sampleTimes[index])
-      ? Math.min(100, Math.max(0, ((sampleTimes[index] - windowStart) / PROBE_HISTORY_MS) * 100))
-      : values.length === 1
-        ? 100
-        : (index / (values.length - 1)) * 100,
+    x: Math.min(100, Math.max(0, ((samples.probed_at_unix_secs[index] - windowStart) / PROBE_HISTORY_SECS) * 100)),
     y: value == null ? 29 : range === 0 ? 14 : 4 + ((max - value) / range) * 20,
   }));
 
@@ -526,6 +506,11 @@ function ProbeLatencyPlot({ probe }: { probe: E2eProbeItem | undefined }) {
     if (index === 0 || points[index - 1].value == null) groups.push([]);
     groups.at(-1)?.push(point);
   }
+  const curveGroups = groups.map(group => ({
+    curve: latencyCurve(group),
+    first: group[0],
+    last: group.at(-1) as LatencyPoint,
+  }));
 
   const downPaths: string[] = [];
   for (let index = 0; index < points.length; index += 1) {
@@ -567,20 +552,15 @@ function ProbeLatencyPlot({ probe }: { probe: E2eProbeItem | undefined }) {
     <div className="history-plot chain-latency-plot">
       <span className="plot-graph">
         <svg viewBox="0 0 100 36" preserveAspectRatio="none" role="img" aria-label={aria}>
-          {groups.map((group, index) => {
-            const curve = latencyCurve(group);
-            const first = group[0];
-            const last = group.at(-1) as LatencyPoint;
-            return (
-              <path
-                key={`area-${index}`}
-                className="area"
-                d={`${curve} L${last.x.toFixed(2)} 36 L${first.x.toFixed(2)} 36Z`}
-              />
-            );
-          })}
-          {groups.map((group, index) => (
-            <path key={`line-${index}`} className="line" d={latencyCurve(group)} />
+          {curveGroups.map(({ curve, first, last }, index) => (
+            <path
+              key={`area-${index}`}
+              className="area"
+              d={`${curve} L${last.x.toFixed(2)} 36 L${first.x.toFixed(2)} 36Z`}
+            />
+          ))}
+          {curveGroups.map(({ curve }, index) => (
+            <path key={`line-${index}`} className="line" d={curve} />
           ))}
           {downPaths.map((path, index) => (
             <path key={`down-${index}`} className="down-line" d={path} />
@@ -720,6 +700,7 @@ export function IngressPanel({
 
   const pending = Object.values(entries);
   const blocked = pending.some(entry => entry.blocked);
+  useUnsavedChanges(pending.length > 0, `${title}配置`);
   const [expanded, setExpanded] = useState(initiallyExpanded);
   const save = useMutation({
     mutationFn: () => {
@@ -861,6 +842,7 @@ export function IngressPortEditor({
     { apply: body => ({ ...body, port: parsed }), reset: () => setDraftPort(null) },
     parsed,
   );
+  useUnsavedChanges(dirty && !inPanel, '接入端口');
   const nameOf = useNodeNames();
   const save = useMutation({
     mutationFn: () => {
@@ -880,7 +862,7 @@ export function IngressPortEditor({
     editable &&
     (snapshot.isPending || nodeList.isPending || revisions.isPending || (current != null && compiled.isPending))
   )
-    return <Loading />;
+    return <Loading variant="control" />;
   const dependencyError = snapshot.error ?? nodeList.error ?? revisions.error ?? compiled.error;
   if (editable && dependencyError) return <ErrorBox error={dependencyError} />;
 
@@ -1296,6 +1278,7 @@ export function IngressGuardBlock({
   const [draft, setDraft] = useState<IngressGuard | null>(null);
   const form = draft ?? stored;
   const dirty = (Object.keys(stored) as (keyof IngressGuard)[]).some(key => form[key] !== stored[key]);
+  useUnsavedChanges(dirty, `${ingress.id} 的安全策略`);
   const save = useMutation({
     mutationFn: () => {
       const base = ingressUpsertBody(ingress);
@@ -1309,10 +1292,6 @@ export function IngressGuardBlock({
     },
   });
   const set = (key: keyof IngressGuard, value: boolean) => setDraft({ ...form, [key]: value });
-
-  /* 使用前置代理的入口不做协议嗅探，「禁 BT」在该场景下不会生效——编译器会直接拒绝
-   * （`ingress.guard-needs-sniffing`）。此处提前说明，避免保存后才在诊断中发现。 */
-  const fronted = !!ingress.front;
 
   const SWITCHES: { key: keyof IngressGuard; name: string; why: string; expr: string; danger?: boolean }[] = [
     {
@@ -1378,12 +1357,6 @@ export function IngressGuardBlock({
             <span>
               <b className={row.danger && form[row.key] ? 'bad' : undefined}>{row.name}</b>
               <span className="note">{row.why}</span>
-              {row.key === 'no_bittorrent' && form.no_bittorrent && fronted && (
-                <span className="note bad">
-                  这个接入面有前置代理、不做协议嗅探，该项无法拦截任何流量。编译会以{' '}
-                  <span className="mono">ingress.guard-needs-sniffing</span> 阻止发布。
-                </span>
-              )}
             </span>
           </label>
         ))}
@@ -1593,6 +1566,72 @@ function IngressRealityLimitsRow({
  * xray 自身不拦截该组合——其配置检查会通过，但运行时所有连接都会被拒绝。 */
 type ProjectionFamily = 'v4' | 'v6';
 const PROJECTION_FAMILIES = ['v4', 'v6'] as const;
+const PROJECTION_PROTOCOLS = ['vless', 'vless_encryption', 'anytls', 'hysteria2'] as const;
+
+function projectionListenPort(ingress: SnapshotIngress, protocol: ProjectionProtocol): number {
+  switch (protocol) {
+    case 'vless':
+      return ingress.port;
+    case 'vless_encryption':
+      return ingress.wires.vless_encryption?.port ?? ingress.port;
+    case 'anytls':
+      return ingress.wires.anytls?.port ?? ingress.port;
+    case 'hysteria2':
+      return ingress.wires.hysteria2?.port ?? ingress.port;
+  }
+}
+
+function explicitProtocolProjection(
+  projection: IngressProjection,
+  protocol: ProjectionProtocol,
+): ProtocolProjection | null | undefined {
+  return protocol === 'vless' ? projection : projection[protocol];
+}
+
+/** Resolve the historical shared mapping exactly as the Rust subscriber projector does. */
+export function effectiveProjectionEndpoint(
+  ingress: SnapshotIngress,
+  protocol: ProjectionProtocol,
+  family: ProjectionFamily,
+): ProjectionEndpoint | null {
+  const specific = explicitProtocolProjection(ingress.projection, protocol);
+  if (protocol === 'vless' || specific != null) return specific?.[family] ?? null;
+  const legacy = ingress.projection[family];
+  return legacy ? { host: legacy.host, port: projectionListenPort(ingress, protocol) } : null;
+}
+
+export function withProjectionEndpoint(
+  projection: IngressProjection,
+  protocol: ProjectionProtocol,
+  family: ProjectionFamily,
+  endpoint: ProjectionEndpoint | null,
+): IngressProjection {
+  if (protocol === 'vless') return { ...projection, [family]: endpoint };
+  return {
+    ...projection,
+    [protocol]: { ...(projection[protocol] ?? {}), [family]: endpoint },
+  };
+}
+
+function activeProjectionProtocols(ingress: SnapshotIngress): ProjectionProtocol[] {
+  return PROJECTION_PROTOCOLS.filter(protocol => {
+    if (protocol === 'vless') return !!ingress.wires.vless;
+    return !!ingress.wires[protocol];
+  });
+}
+
+function projectionProtocolLabel(protocol: ProjectionProtocol): string {
+  switch (protocol) {
+    case 'vless':
+      return 'VLESS · TLS / REALITY';
+    case 'vless_encryption':
+      return 'VLESS · Encryption';
+    case 'anytls':
+      return 'AnyTLS';
+    case 'hysteria2':
+      return 'Hysteria 2';
+  }
+}
 
 type XmuxDraft = {
   maxConcurrency: string;
@@ -1820,14 +1859,16 @@ function IngressHy2PortRow({
 
       <dt>端口跳跃</dt>
       <dd>
-        <div className="segsw" role="group">
-          <button type="button" aria-pressed={!hop} disabled={!editable} onClick={() => toggleHop(false)}>
-            关
-          </button>
-          <button type="button" aria-pressed={!!hop} disabled={!editable} onClick={() => toggleHop(true)}>
-            开
-          </button>
-        </div>
+        <SegmentedControl
+          value={!!hop}
+          options={[
+            { value: false, label: '关' },
+            { value: true, label: '开' },
+          ]}
+          disabled={!editable}
+          ariaLabel="端口跳跃"
+          onChange={toggleHop}
+        />
         {hop && (
           <>
             <div className="toolbar" style={{ margin: '8px 0 0', gap: 6 }}>
@@ -2224,8 +2265,8 @@ export function IngressStreamRow({
         anytls: next.anytls ?? null,
         hysteria2: next.hysteria2 ?? null,
       };
-      const base = ingressUpsertBody(ingress);
-      return upsertIngress(appId, { ...base, wires }, base);
+      const base = ingressUpsertBody(ingress, { wires });
+      return upsertIngress(appId, base, base);
     },
     onSuccess: async () => {
       setDraftPath(null);
@@ -2281,8 +2322,8 @@ export function IngressStreamRow({
     if (hasDownload && next !== storedKind) {
       const message = transportIsXhttp(next)
         ? next === 'vless-reality-xhttp'
-          ? '独立下载将从纯订阅投影变成节点 TLS 下载前置，需要发布并重启 xray。继续切换吗？'
-          : '独立下载将变成纯订阅投影，节点 TLS 下载前置会被移除。继续切换吗？'
+          ? '独立下载将从纯订阅投影变成机器 TLS 下载前置，需要发布并重启 xray。继续切换吗？'
+          : '独立下载将变成纯订阅投影，机器 TLS 下载前置会被移除。继续切换吗？'
         : '目标传输不支持独立下载，继续会移除现有下载线路。继续切换吗？';
       if (!window.confirm(message)) return;
     }
@@ -2652,7 +2693,7 @@ export function IngressStreamRow({
   const dependencyError =
     portSettings.error ?? streamSnapshot.error ?? streamNodes.error ?? streamRevisions.error ?? streamCompiled.error;
   if (editable && dependencyPending) {
-    return section === 'protocols' ? <Loading /> : null;
+    return section === 'protocols' ? <Loading variant="rows" /> : null;
   }
   if (editable && dependencyError) {
     return section === 'protocols' ? <ErrorBox error={dependencyError} /> : null;
@@ -3562,7 +3603,7 @@ export function IngressStreamRow({
                       </div>
                       {splitReality && (
                         <div className="ing-pj">
-                          <span className="dim">节点实际监听端口</span>
+                          <span className="dim">机器实际监听端口</span>
                           <input
                             className="f mono ing-pj-port"
                             value={draft.originPort ?? draft.port}
@@ -3607,10 +3648,10 @@ export function IngressStreamRow({
               const publicHost = family === 'v4' ? node?.public_ipv4 : node?.public_ipv6;
               const publicNat = family === 'v4' ? node?.public_ipv4_nat : node?.public_ipv6_nat;
               return !!ingress.projection?.[family] || (!!publicHost && !publicNat);
-            }) && <div className="note">节点没有可用的 IPv4 或 IPv6 公网入口，无法生成独立下载订阅。</div>}
+            }) && <div className="note">机器没有可用的 IPv4 或 IPv6 公网入口，无法生成独立下载订阅。</div>}
             {downloadBad && (
               <div className="note bad">
-                独立下载的地址、端口、REALITY 节点实际监听端口和 XMUX 必须填写有效值；XMUX 范围为 2–128。
+                独立下载的地址、端口、REALITY 机器实际监听端口和 XMUX 必须填写有效值；XMUX 范围为 2–128。
               </div>
             )}
             {splitReality && hasDownload && (
@@ -3646,26 +3687,39 @@ export type ProjectionHandle = {
 };
 
 export function useProjectionHandles() {
-  const [projHandles, setProjHandles] = useState<Partial<Record<ProjectionFamily, ProjectionHandle>>>({});
+  type ProjectionHandleKey = `${ProjectionProtocol}:${ProjectionFamily}`;
+  const [projHandles, setProjHandles] = useState<Partial<Record<ProjectionHandleKey, ProjectionHandle>>>({});
 
-  const register = useCallback((family: ProjectionFamily, handle: ProjectionHandle) => {
-    setProjHandles(previous => (previous[family] === handle ? previous : { ...previous, [family]: handle }));
+  const register = useCallback((key: ProjectionHandleKey, handle: ProjectionHandle) => {
+    setProjHandles(previous => (previous[key] === handle ? previous : { ...previous, [key]: handle }));
   }, []);
-  const onV4Handle = useCallback((handle: ProjectionHandle) => register('v4', handle), [register]);
-  const onV6Handle = useCallback((handle: ProjectionHandle) => register('v6', handle), [register]);
+  const registrars = useMemo(
+    () =>
+      Object.fromEntries(
+        PROJECTION_PROTOCOLS.flatMap(protocol =>
+          PROJECTION_FAMILIES.map(family => {
+            const key: ProjectionHandleKey = `${protocol}:${family}`;
+            return [key, (handle: ProjectionHandle) => register(key, handle)];
+          }),
+        ),
+      ) as Record<ProjectionHandleKey, (handle: ProjectionHandle) => void>,
+    [register],
+  );
 
   return {
     projHandles,
     projDirty: Object.values(projHandles).some(handle => handle.dirty),
     projBlocked: Object.values(projHandles).some(handle => handle.blocked),
-    onV4Handle,
-    onV6Handle,
+    registrars,
+    onV4Handle: registrars['vless:v4'],
+    onV6Handle: registrars['vless:v6'],
   };
 }
 
 export function IngressProjectionRow({
   appId,
   ingress,
+  protocol,
   family,
   node,
   editable,
@@ -3673,13 +3727,14 @@ export function IngressProjectionRow({
 }: {
   appId: string;
   ingress: SnapshotIngress;
+  protocol: ProjectionProtocol;
   family: 'v4' | 'v6';
   node?: { public_ipv4: string | null; public_ipv6: string | null };
   editable: boolean;
   onHandle?: (h: ProjectionHandle) => void;
 }) {
   const qc = useQueryClient();
-  const current = ingress.projection?.[family] ?? null;
+  const current = effectiveProjectionEndpoint(ingress, protocol, family);
   const [draft, setDraft] = useState<{ host: string; port: string } | null>(null);
   const [disabledDraft, setDisabledDraft] = useState(false);
 
@@ -3702,20 +3757,25 @@ export function IngressProjectionRow({
 
   const applyProjection = useCallback(
     (projection: IngressProjection): IngressProjection => {
-      if (disabledDraft) return { ...projection, [family]: null };
-      if (!draft || !valid) return projection;
-      return {
-        ...projection,
-        [family]: { host: draft.host.trim(), port },
-      };
+      if (disabledDraft) return withProjectionEndpoint(projection, protocol, family, null);
+      if (draft && valid) {
+        return withProjectionEndpoint(projection, protocol, family, { host: draft.host.trim(), port });
+      }
+      // Even an unchanged row is applied when the panel saves. This expands a historical shared
+      // mapping into an explicit per-protocol rule before another protocol is edited.
+      return withProjectionEndpoint(projection, protocol, family, current);
     },
-    [disabledDraft, draft, family, port, valid],
+    [current, disabledDraft, draft, family, port, protocol, valid],
   );
 
   const save = useMutation({
     mutationFn: (next: ProjectionEndpoint | null) => {
       const base = ingressUpsertBody(ingress);
-      return upsertIngress(appId, { ...base, projection: { ...(base.projection ?? {}), [family]: next } }, base);
+      return upsertIngress(
+        appId,
+        { ...base, projection: withProjectionEndpoint(base.projection ?? {}, protocol, family, next) },
+        base,
+      );
     },
     onSuccess: () => {
       setDraft(null);
@@ -3772,7 +3832,7 @@ export function IngressProjectionRow({
               setDisabledDraft(false);
               setDraft({
                 host: current?.host ?? '',
-                port: String(current?.port ?? ingress.port),
+                port: String(current?.port ?? projectionListenPort(ingress, protocol)),
               });
             } else if (current) {
               setDraft(null);
@@ -3819,20 +3879,9 @@ export function IngressProjectionRow({
               编辑
             </button>
           </>
-        ) : (
-          <div className="note">
-            {publicAddr ? (
-              <>
-                使用机器公网地址{' '}
-                <span className="mono">
-                  {publicAddr}:{ingress.port}
-                </span>
-              </>
-            ) : (
-              <>机器无公网 {label}，不生成此条订阅</>
-            )}
-          </div>
-        )}
+        ) : !publicAddr ? (
+          <div className="note">机器无公网 {label}，不生成此条订阅</div>
+        ) : null}
         {save.error && <ErrorBox error={save.error} />}
       </dd>
     </>
@@ -3899,6 +3948,12 @@ export function orderForPointer(
   return moveOrder(baseline, active, target);
 }
 
+/** Whole-card dragging is restricted to a real fine-pointer surface. Some phone WebViews report
+ * compatibility mouse events, so `pointerType === 'mouse'` alone is not enough to protect taps. */
+export function canStartOrderDrag(pointerType: string, onGrip: boolean, finePointer: boolean): boolean {
+  return onGrip || (pointerType === 'mouse' && finePointer);
+}
+
 // 拖到视口上下缘时要滚动的容器：从被拖元素向上找第一个真正能纵向滚动的祖先，
 // 找不到就用整个窗口（本站是固定顶栏 + 文档滚动）。
 function findScrollParent(el: HTMLElement | null): HTMLElement | Window {
@@ -3926,7 +3981,10 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const probes = useQuery({
     queryKey: ['e2e-probes'],
     queryFn: () => fetchE2eProbes(),
-    refetchInterval: 30_000,
+    // This request is independent of the model and machine summaries. Starting all three together
+    // avoids adding their network latency in series; React Query still shares one cached series
+    // with the detail and link pages.
+    refetchInterval: 60_000,
   });
   const probeOf = byChain(probes.data?.chains);
 
@@ -3959,6 +4017,21 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const [orderError, setOrderError] = useState<unknown>(null);
   const [orderDrag, setOrderDragState] = useState<OrderDrag | null>(null);
   const orderDragRef = useRef<OrderDrag | null>(null);
+  const createGuardScope = 'chains:create-group';
+  const renameGuardScope = renaming ? `chains:rename-group:${renaming.id}` : 'chains:rename-group';
+  const creatingDirty = creating !== null && creating.label !== '';
+  const renamedApp = renaming ? (snapshot.data?.snapshot.apps ?? []).find(app => app.id === renaming.id) : undefined;
+  const renamingDirty =
+    renaming !== null && renamedApp !== undefined && renaming.label !== (renamedApp.label || renamedApp.id);
+  useUnsavedChanges(creatingDirty, '新线路分组', createGuardScope);
+  useUnsavedChanges(renamingDirty, `${renamedApp?.label ?? '线路分组'}的名称`, renameGuardScope);
+
+  const cancelCreating = () => {
+    if (confirmDiscardChanges(createGuardScope)) setCreating(null);
+  };
+  const cancelRenaming = () => {
+    if (confirmDiscardChanges(renameGuardScope)) setRenaming(null);
+  };
   // FLIP 用：`.chain-sections` 容器、上一帧各卡片的位置、以及「这一帧要不要播动画」的开关。
   const sectionsRef = useRef<HTMLDivElement | null>(null);
   const flipRects = useRef<Map<string, DOMRect>>(new Map());
@@ -4049,7 +4122,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   };
 
   // 整卡拖拽 · 幽灵跟随 · 实时平滑重排。
-  // - chains 从卡面任意处发起（触摸除外——触摸留给页面滚动，仅抓手可拖）；apps 仍从抓手发起。
+  // - 链只允许 fine-pointer 鼠标从卡面起拖；触控即使模拟成 mouse 也留给滚动/点击。
   // - 越过 4px 阈值才真正开始，阈值之内的按下仍是一次点击（打开这条链）。
   // - app 起拖后切为紧凑行列表并卸载链卡；链拖拽保持卡片网格。两者均保留清晰的原位内容。
   // - 抬起一枚跟随光标的克隆体作幽灵；落点只按起拖时固定下来的槽位判定。
@@ -4058,8 +4131,9 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     justDragged.current = false;
     if (!owner || selecting || event.button !== 0) return;
     const onGrip = !!(event.target as HTMLElement).closest('.order-grip');
-    // 触摸时卡面留给页面滚动，只有抓手能发起拖动；鼠标与触控笔整卡可拖。
-    if (event.pointerType === 'touch' && !onGrip) return;
+    // 明确抓手始终可拖；整张链卡还必须运行在支持悬停的精细指针设备上。
+    const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+    if (!canStartOrderDrag(event.pointerType, onGrip, finePointer)) return;
     // 此处不 preventDefault：按下若未越过阈值仍是一次点击（打开这条链），而在部分实现里
     // 取消 pointerdown 会连带吞掉紧随的 click。文本选区改由越阈后 start() 清除、并靠
     // `.chain-order-dragging` 的 user-select:none 兜住。
@@ -4264,11 +4338,12 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   });
 
   const beginCreate = () => {
+    if (!confirmDiscardChanges(renameGuardScope)) return;
     create.reset();
     setCreating({ id: randomAppId(new Set(appsNow().map(app => app.id))), label: '' });
   };
 
-  if (snapshot.isPending || nodeList.isPending) return <Loading />;
+  if (snapshot.isPending || nodeList.isPending) return <Loading variant="chains" />;
   if (snapshot.error || nodeList.error) return <ErrorBox error={snapshot.error ?? nodeList.error} />;
 
   // 含退役节点即视为停用（与编译器判定一致）。列表不依赖编译结果——草稿或未发布时
@@ -4350,7 +4425,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     return 'ok';
   };
   const chainToneTitle = (r: (typeof rows)[number]) => {
-    if (r.disabled) return '含退役节点，整链停用';
+    if (r.disabled) return '含退役机器，整链停用';
     if (!r.ingress) return '缺接入面：没有入口，这条链无法接入';
     const probe = probeOf.get(r.chain.id);
     const probeTone = toneOf(probe);
@@ -4360,31 +4435,16 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     return `${r.users} 人在用`;
   };
 
-  const brokenCount = rows.filter(r => chainTone(r) === 'bad').length;
-
   return (
     <div className="cardpage chain-cardpage">
       <section className="panel titled chain-list-panel">
-        {/* 标题栏结构与机器页一致：标题 + 计数 + 右端一组读数 + 一个主按钮。
-          机器页右端是「＋ 纳管节点」，此处是「＋ 新建分组」——两页标题结构相同，
-          缺少按钮的一页会被理解为不支持新建。
-
-          因此按钮不按角色隐藏，只按角色禁用：此前整组包在 `owner &&` 里，readonly 和
-          public 看到的线路页标题栏右端是空的，而机器页和用户页是灰按钮，同一个台面上
-          三页的标题栏各一种形态。 */}
+        {/* 主操作与机器页保持同一位置。按钮不按角色隐藏，只按角色禁用：此前整组包在
+          `owner &&` 里，readonly 和 public 看到的线路页标题栏右端是空的，而机器页和
+          用户页是灰按钮，同一个台面上三页的标题栏各一种形态。 */}
         <header>
           <ListIcon of="chains" />
           <h4>线路</h4>
-          <span className="hint">{groups.length} 个</span>
-          <span className="rd">
-            <b>{rows.length}</b> 条链
-            {brokenCount > 0 && (
-              <>
-                {' '}
-                · <i>{brokenCount}</i> 不通
-              </>
-            )}
-          </span>
+          <span className="sp" />
           {selecting ? (
             <>
               <button className="btn" onClick={exitSelect}>
@@ -4448,12 +4508,12 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                 // 而留空可直接表明该字段需要填写。提交时留空则回退为 ID（见 create）。
                 placeholder="分组名称，比如：「三网优化」"
                 onChange={e => setCreating({ ...creating, label: e.target.value })}
-                onKeyDown={e => e.key === 'Escape' && setCreating(null)}
+                onKeyDown={e => e.key === 'Escape' && cancelCreating()}
               />
               <button className="btn primary" disabled={create.isPending}>
                 {create.isPending ? '创建中…' : '创建'}
               </button>
-              <button type="button" className="btn ghost" onClick={() => setCreating(null)}>
+              <button type="button" className="btn" onClick={cancelCreating}>
                 取消
               </button>
             </div>
@@ -4466,7 +4526,17 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
         )}
 
         {groups.length === 0 ? (
-          <Empty>还没有分组。用右上角「＋ 新建分组」建一个。</Empty>
+          <EmptyState
+            icon="chains"
+            title="还没有线路分组"
+            action={
+              <button className="btn primary" disabled={!!creating || !owner} onClick={beginCreate}>
+                创建第一个线路分组
+              </button>
+            }
+          >
+            分组是线路的计费单元；同类链放在同一个分组里。
+          </EmptyState>
         ) : (
           <div className={`chain-sections${orderDrag?.kind === 'apps' ? ' app-order-dragging' : ''}`} ref={sectionsRef}>
             {groups.map((g, gi) => (
@@ -4514,12 +4584,12 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                         autoFocus
                         value={renaming.label}
                         onChange={e => setRenaming({ ...renaming, label: e.target.value })}
-                        onKeyDown={e => e.key === 'Escape' && setRenaming(null)}
+                        onKeyDown={e => e.key === 'Escape' && cancelRenaming()}
                       />
                       <button className="btn primary" disabled={rename.isPending}>
                         {rename.isPending ? '保存中…' : '保存'}
                       </button>
-                      <button type="button" className="btn" onClick={() => setRenaming(null)}>
+                      <button type="button" className="btn" onClick={cancelRenaming}>
                         取消
                       </button>
                       {rename.error && <ErrorBox error={rename.error} />}
@@ -4534,6 +4604,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                           className="chain-section-name"
                           title="点一下改线路名"
                           onClick={() => {
+                            if (!confirmDiscardChanges(renameGuardScope)) return;
                             rename.reset();
                             setRenaming({ id: g.app.id, label: g.app.label || g.app.id });
                           }}
@@ -4583,13 +4654,12 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                         <div
                           role="button"
                           tabIndex={0}
+                          data-route-focus={`chain:${key}`}
                           key={key}
                           className={`chain-card tone-${tone}${r.disabled ? ' off' : ''}${checked ? ' picked' : ''}${orderDrag?.kind === 'chains' && orderDrag.active === r.chain.id ? ' order-drag-active' : ''}`}
                           data-order-kind="chain"
                           data-order-app={g.app.id}
                           data-order-id={r.chain.id}
-                          // 桌面端整卡即拖动区域，越过 4px 阈值才起拖，之内仍是一次点击。
-                          // 触摸时卡面优先用于滚动，不显示额外的六点抓手占用标题空间。
                           onPointerDown={event =>
                             beginOrderDrag(event, {
                               kind: 'chains',
@@ -4678,7 +4748,8 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
 // 一条链的路径图：入口在左，一跳一格，末尾是出网。
 // 与原先的标记序列相比，差异是跳与跳之间用连线相接——中间的实线加箭头表示流量方向，
 // 而间隙中放一个 → 会被读作两个并列标签之间的分隔符。
-// 入口一格带端口（客户端连接的位置）。
+// 入口只显示机器。一个入口可以同时发布 VLESS、VLESS Encryption、AnyTLS 和 Hysteria 2，
+// 单独拿 VLESS 端口放在线路总览里会被误读成整条线路唯一的接入端口。
 function ChainPath({
   spine,
   retired,
@@ -4712,14 +4783,13 @@ function ChainPath({
             title={n}
           >
             {nameOf(n)}
-            {i === 0 && ingress && <em>:{ingress.port}</em>}
           </span>
         </span>
       ))}
       {showTail && (
         <span className="cp-tail">
           {disabled
-            ? '含退役节点，整链停用'
+            ? '含退役机器，整链停用'
             : !ingress
               ? '缺接入面'
               : spine.length === 1
@@ -4842,29 +4912,14 @@ export function ChainTitle({ appId, chain, editable }: { appId: string; chain: S
         {save.isPending && <span className="subid">保存中…</span>}
       </div>
       {/* 只在编辑状态下显示退出方式。非编辑状态下该说明不提供信息，且占用首屏空间。 */}
-      {draft !== null && <div className="note chain-rename-tip">回车或点击别处保存，Esc 撤销</div>}
+      {draft !== null && (
+        <div className="note chain-rename-tip">
+          <span>回车或点击别处保存，Esc 撤销</span>
+        </div>
+      )}
       {save.error && <ErrorBox error={save.error} />}
     </>
   );
-}
-
-const SUBSCRIPTION_COUNTRY_CODES = FLAG_SHEET.flatMap(line =>
-  Array.from({ length: line.length / 2 }, (_, index) => line.slice(index * 2, index * 2 + 2).toUpperCase()),
-);
-const SUBSCRIPTION_COUNTRY_CODE_SET = new Set(SUBSCRIPTION_COUNTRY_CODES);
-const SUBSCRIPTION_COUNTRY_NAMES = new Intl.DisplayNames(['zh-Hans'], { type: 'region' });
-
-/** The compact regional-indicator prefix used in generated subscription node names. */
-export function subscriptionFlag(code: string): string {
-  return SUBSCRIPTION_COUNTRY_CODE_SET.has(code)
-    ? Array.from(code, letter => String.fromCodePoint(127462 + letter.charCodeAt(0) - 65)).join('')
-    : '';
-}
-
-function subscriptionCountryLabel(code: string): string {
-  const name = SUBSCRIPTION_COUNTRY_NAMES.of(code);
-  const flag = subscriptionFlag(code);
-  return `${flag ? `${flag} ` : ''}${name && name !== code ? `${code} · ${name}` : code}`;
 }
 
 export function ChainSubscriptionCountryRow({
@@ -4959,10 +5014,20 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const settingsReadable = !isPublic(who);
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  // 协议默认值、端口占用和规则补全必须在首屏一起就绪，不能等子面板挂载后再取数。
+  // 与协议区、规则树共用查询键，延续同一份 detail 骨架；有缓存的后台刷新不进入等待态。
+  const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings, enabled: settingsReadable });
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
+  const current = revisions.data?.current_revision;
+  const compiled = useQuery({
+    queryKey: ['compile', current],
+    queryFn: () => fetchCompileView(current!),
+    enabled: !!current,
+  });
   const probes = useQuery({
     queryKey: ['e2e-probes'],
     queryFn: () => fetchE2eProbes(),
-    refetchInterval: 30_000,
+    refetchInterval: 60_000,
   });
   const nameOf = useNodeNames();
 
@@ -4978,7 +5043,10 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const encryptionPanel = useImmediatePanelVisibility(!!ingress?.wires.vless_encryption);
   const anyTlsPanel = useImmediatePanelVisibility(!!ingress?.wires.anytls);
   const hy2Panel = useImmediatePanelVisibility(!!ingress?.wires.hysteria2);
-  const { projHandles, projDirty, projBlocked, onV4Handle, onV6Handle } = useProjectionHandles();
+  const { projHandles, projDirty, projBlocked, registrars: projectionRegistrars } = useProjectionHandles();
+  const bindDirty = pendingBind !== null && pendingBind !== ingress?.bind;
+  useUnsavedChanges(bindDirty, `${c?.name || chain} 的绑定地址`);
+  useUnsavedChanges(projDirty, `${c?.name || chain} 的客户端入口地址`);
 
   // 更换入口即将接入面迁移到另一台机器（链头随之改变，订阅链接也会变化）。
   // 编辑器第 0 位固定为入口，因此该操作只能在接入面区块执行。
@@ -5017,9 +5085,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     mutationFn: () => {
       if (!ingress) throw new Error('这条链没有接入面');
       const base = ingressUpsertBody(ingress);
-      const projection = Object.values(projHandles)
-        .filter(handle => handle.dirty)
-        .reduce((next, handle) => handle.apply(next), base.projection ?? {});
+      const projection = Object.values(projHandles).reduce((next, handle) => handle.apply(next), base.projection ?? {});
       return upsertIngress(app, { ...base, projection }, base);
     },
     onSuccess: async () => {
@@ -5030,7 +5096,20 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     },
   });
 
-  if (snapshot.isPending || nodes.isPending) return <Loading />;
+  const initialDependencyError =
+    (settingsReadable && !settings.data && settings.error) ||
+    (!revisions.data && revisions.error) ||
+    (current != null && !compiled.data && compiled.error);
+  if (initialDependencyError) return <ErrorBox error={initialDependencyError} />;
+  if (
+    snapshot.isPending ||
+    nodes.isPending ||
+    (settingsReadable && settings.isPending) ||
+    revisions.isPending ||
+    (current != null && compiled.isPending) ||
+    probes.isPending
+  )
+    return <Loading variant="chain-detail" />;
   if (snapshot.error || nodes.error) return <ErrorBox error={snapshot.error ?? nodes.error} />;
   if (!a || !c) return <ErrorBox error={new Error(`没有这条链：${app}/${chain}`)} />;
 
@@ -5047,10 +5126,9 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const probe = byChain(probes.data?.chains).get(chain);
 
   return (
-    // 外层不是空片段而是一个具名容器：这一页的内容是一列配置卡，纸只承担页面框，不再
-    // 兼任卡片的底。外壳按 `.fg-sheet:has(> .chain-detailpage)` 把亮色的纸压到台面档，
-    // 卡片才比它所落的面亮一档（论证见 styles.css 末尾「亮色详情页」一节）。
-    <div className="chain-detailpage">
+    // 线路详情自己拥有唯一一张页面纸，不再依赖工作区额外包一层通用纸。亮色下这张纸
+    // 压到台面档，配置卡才比它所落的面亮一档（论证见 styles.css 末尾「亮色详情页」一节）。
+    <div className="fg-sheet chain-detailpage">
       {/* 「主干」一节已移除：主干由规则表派生（chainSpine 沿 any→Forward 遍历得出），
           而规则树本身按跳排列，两者表达同一内容。添加一跳和重排都在规则表中完成
           （修改转发目标即为重排），删除收入规则树每行的 hover 状态。 */}
@@ -5079,9 +5157,9 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     <span className="n">停用</span>
                   </span>
                   <span className="probe-say">
-                    <span className="l1">链上有退役节点：{retiredHops.map(nameOf).join('、')}</span>
+                    <span className="l1">链上有退役机器：{retiredHops.map(nameOf).join('、')}</span>
                     <span className="l2">
-                      入口不渲染、整链不编译，发布不受影响。把退役节点移出链（或让它复出）后自动恢复。
+                      入口不渲染、整链不编译，发布不受影响。把退役机器移出链（或让它复出）后自动恢复。
                     </span>
                   </span>
                 </div>
@@ -5171,23 +5249,37 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             <ConfigPanel title="客户端配置" icon="client">
               <dl className="kv form2 chain-face">
                 <ChainSubscriptionCountryRow appId={app} chain={c} probe={probe} editable={editable} />
-                <IngressProjectionRow
-                  appId={app}
-                  ingress={ingress}
-                  family="v4"
-                  node={nodes.data?.nodes.find(n => n.node_id === ingress.node)}
-                  editable={editable}
-                  onHandle={onV4Handle}
-                />
-                <IngressProjectionRow
-                  appId={app}
-                  ingress={ingress}
-                  family="v6"
-                  node={nodes.data?.nodes.find(n => n.node_id === ingress.node)}
-                  editable={editable}
-                  onHandle={onV6Handle}
-                />
               </dl>
+              <div className="client-projection-groups">
+                {activeProjectionProtocols(ingress).map(protocol => (
+                  <section className="client-projection-group" key={protocol}>
+                    <header>
+                      <b>{projectionProtocolLabel(protocol)}</b>
+                      <span className="mono">
+                        {protocol === 'hysteria2' ? 'UDP' : 'TCP'} {projectionListenPort(ingress, protocol)}
+                      </span>
+                    </header>
+                    <dl className="kv form2 chain-face client-projection-family-grid">
+                      {PROJECTION_FAMILIES.map(family => {
+                        const key = `${protocol}:${family}` as const;
+                        return (
+                          <div className="client-projection-family" key={family}>
+                            <IngressProjectionRow
+                              appId={app}
+                              ingress={ingress}
+                              protocol={protocol}
+                              family={family}
+                              node={nodes.data?.nodes.find(n => n.node_id === ingress.node)}
+                              editable={editable}
+                              onHandle={projectionRegistrars[key]}
+                            />
+                          </div>
+                        );
+                      })}
+                    </dl>
+                  </section>
+                ))}
+              </div>
               {/* 投影的说明只需一次，因此写在面板级而非每行。
                   此前该说明位于每个地址族的开关下方，只在启用时显示——而最需要该说明的
                   情况正是两个族都关闭、界面上只剩两个「不投影」时。 */}
@@ -5428,8 +5520,6 @@ function listenerMatchLabel(match: Rule['m']): string {
       return '未命中以上规则';
     case 'sniffing_failed':
       return '嗅探失败';
-    case 'front_downstream':
-      return '来自前置下游';
     case 'network':
       return `网络 = ${match.v.toUpperCase()}`;
     case 'domain_suffix':
@@ -5756,6 +5846,23 @@ function chainRuleRows(spine: string[], steps: SnapshotStep[]): ChainRuleRow[] {
   return rows;
 }
 
+/** Overlay local rule-table edits on the snapshot so the tree follows the form immediately.
+ * A newly targeted machine does not have a persisted step yet; retaining a virtual step lets its
+ * own draft table participate in the graph without pretending that accept/hop credentials exist. */
+export function effectiveChainRuleSteps(
+  chainId: string,
+  steps: SnapshotStep[],
+  drafts: Record<string, Rule[]>,
+): SnapshotStep[] {
+  const effective = new Map(
+    steps.map(step => [step.node, drafts[step.node] ? { ...step, rules: drafts[step.node] } : step] as const),
+  );
+  for (const [node, rules] of Object.entries(drafts)) {
+    if (!effective.has(node)) effective.set(node, { chain: chainId, node, accept: null, hop_in: null, rules });
+  }
+  return [...effective.values()];
+}
+
 export function defaultChainRuleOccurrence(
   spine: string[],
   steps: SnapshotStep[],
@@ -5798,6 +5905,7 @@ export function ChainRulesPanel({
   rootLabelTitle,
   readOnly = false,
   settingsReadable = true,
+  loadingFallback,
 }: {
   appId: string;
   chain: SnapshotChain;
@@ -5830,9 +5938,22 @@ export function ChainRulesPanel({
   readOnly?: boolean;
   /** False only for the passwordless public visitor, whose route allow-list excludes settings. */
   settingsReadable?: boolean;
+  /** Machine detail coordinates both rule cards under one empty boundary instead of showing a nested skeleton. */
+  loadingFallback?: ReactNode;
 }) {
-  const rows = chainRuleRows(spine, steps);
-  const graph = chainRuleGraph(steps, rows);
+  // 同一机器可能在树中出现多次，编辑态必须由 panel 持有；同时以这份草稿驱动树，
+  // 否则删除或新增下一跳后要等到保存、重新请求快照才会改变层级。
+  const [draftRules, setDraftRules] = useState<Record<string, Rule[]>>({});
+  const [draftOutbounds, setDraftOutbounds] = useState<Record<string, ExternalOutbound[]>>({});
+  const [draftHops, setDraftHops] = useState<Record<string, HopsDraft>>({});
+  const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
+  const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
+  const effectiveSteps = useMemo(
+    () => effectiveChainRuleSteps(chain.id, steps, draftRules),
+    [chain.id, draftRules, steps],
+  );
+  const rows = chainRuleRows(spine, effectiveSteps);
+  const graph = chainRuleGraph(effectiveSteps, rows);
   /* 中转端口的默认值需要选择未占用的端口。与接入面处共用同一份判定（ports.ts）。 */
   const snapshotForPorts = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodesForPorts = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
@@ -5880,13 +6001,6 @@ export function ChainRulesPanel({
 
   // 默认全部折叠：此前每层内联一整张 RuleEditor，四台机器即四张叠放的表单，超出一屏，
   // 且树的结构被表单遮盖。折叠后每台机器收为一行摘要，缩进保留，结构可直接识别。
-  // 同一台机器在树中可能出现两次（分叉后汇合），而库中只有一条记录（steps 主键为
-  // chain_id + node_id），因此两处编辑的必须是同一份草稿，由此处持有。分别持有会导致
-  // 两份 draft 相互覆盖——RuleDraftScope 逐个 handle 保存，后保存的生效。
-  const [draftRules, setDraftRules] = useState<Record<string, Rule[]>>({});
-  const [draftHops, setDraftHops] = useState<Record<string, HopsDraft>>({});
-  const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
-  const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
   const snapshotApp = snapshotForPorts.data?.snapshot.apps.find(candidate => candidate.id === appId) ?? null;
   const peersOf = (node: string) =>
     forwardPeers({
@@ -5894,7 +6008,7 @@ export function ChainRulesPanel({
       sourceChain: chain.id,
       spine,
       tenant: chain.tenant,
-      steps,
+      steps: effectiveSteps,
       app: snapshotApp,
       drafts: draftRules,
       nodes,
@@ -5921,7 +6035,7 @@ export function ChainRulesPanel({
         .flatMap(candidate => candidate.steps)
         .map(source => [listenerRefKey({ chain: source.chain, node: source.node }), source] as const),
     );
-    for (const source of steps) {
+    for (const source of effectiveSteps) {
       sourcesByKey.set(listenerRefKey({ chain: source.chain, node: source.node }), source);
     }
     for (const source of sourcesByKey.values()) {
@@ -5944,8 +6058,8 @@ export function ChainRulesPanel({
   // there. Normal hops listen on `to`; reverse hops listen on `from`. Derive that ownership from
   // the complete effective rule tree so a stale `step.hop_in` cannot masquerade as a live socket.
   const hopListeners = new Set<string>();
-  for (const candidate of steps) {
-    for (const rule of draftRules[candidate.node] ?? candidate.rules) {
+  for (const candidate of effectiveSteps) {
+    for (const rule of candidate.rules) {
       if (rule.a.t === 'forward') {
         hopListeners.add(rule.a.dial?.t === 'reverse' ? candidate.node : rule.a.to);
       } else if (rule.a.t === 'reuse_listener' && rule.a.listener.chain === chain.id) {
@@ -5958,7 +6072,7 @@ export function ChainRulesPanel({
   // 同一台机器在树中出现两次时，点击哪一处展开哪一处。另一处不同步展开——
   // 两份相同的表单同时显示时无法确定正在编辑哪一份，而它们本就是同一份数据。
   // 另一处改为高亮显示（见 .same-open），表示该机器在其他位置已展开。
-  const defaultOccurrence = defaultOpenSelected ? defaultChainRuleOccurrence(spine, steps, selected) : null;
+  const defaultOccurrence = defaultOpenSelected ? defaultChainRuleOccurrence(spine, effectiveSteps, selected) : null;
   const defaultKey = defaultOccurrence ? `${selected ?? ''}:${defaultOccurrence}` : null;
   const [open, setOpen] = useState<Set<string>>(() => new Set(defaultOccurrence ? [defaultOccurrence] : []));
   const lastDefaultKey = useRef(defaultKey);
@@ -6038,7 +6152,7 @@ export function ChainRulesPanel({
     const listensForHop = hopListeners.has(node);
     const hopTitle = listensForHop ? `${nameOf(node)} 实际监听的中转端口与承载协议` : undefined;
     const hopSummary = listensForHop ? (step?.hop_in ? summarizeHopIn(step) : '未配置') : '—';
-    const written = step?.rules.length ?? 0;
+    const written = (draftRules[node] ?? step?.rules ?? []).length;
     const blockingReferences = referencesBlockingRemoval(node);
 
     const badges = (
@@ -6150,6 +6264,8 @@ export function ChainRulesPanel({
                 // 但读写同一份数据——库中只有一条记录。
                 shared={{
                   rules: draftRules[node] ?? step?.rules ?? [],
+                  outbounds: draftOutbounds[node] ?? [],
+                  setOutbounds: next => setDraftOutbounds(prev => ({ ...prev, [node]: next })),
                   setRules: next => setDraftRules(prev => ({ ...prev, [node]: next })),
                   hops:
                     draftHops[node] ??
@@ -6167,7 +6283,7 @@ export function ChainRulesPanel({
                 peers={peersOf(node)}
                 isForwardTarget={isForwardTargetInChain({
                   nodeId: node,
-                  steps,
+                  steps: effectiveSteps,
                 })}
                 /* 整条链的当前状态和链头：保存时据此计算不再被任何规则指向的节点，一并移除 */
                 steps={steps}
@@ -6195,7 +6311,7 @@ export function ChainRulesPanel({
 
   // 可编辑态必须等端口起点和占用表完整后再构造 RuleEditor 的共享草稿。否则这里先用
   // 20000/空占用表 seed，子组件随后即使拿到真实设置也只会收到已经冻结的默认值。
-  if (portDependenciesPending) return <Loading />;
+  if (portDependenciesPending) return loadingFallback === undefined ? <Loading variant="editor" /> : loadingFallback;
   if (!readOnly && portDependenciesError) return <ErrorBox error={portDependenciesError} />;
 
   const tree = rootNodes.map(root => renderNode(root, ['入口'], new Set()));

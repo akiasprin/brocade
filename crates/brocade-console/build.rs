@@ -233,7 +233,11 @@ fn main() {
 
     let workspace = workspace_root();
     let xray_source = workspace.join(XRAY_SOURCE_DIR);
-    let xray_build_id = repository_build_id(&workspace);
+    // Keep repository metadata out of Xray's bytes. The executable sha256 is its release identity;
+    // putting the workspace HEAD in the banner would make a README or front-end commit produce a
+    // fleet-wide Xray update with no data-plane change. The imported upstream baseline preserves
+    // Xray's banner shape, while Console build metadata is exposed alongside the digest.
+    let xray_build_id = XRAY_UPSTREAM_BUILD.to_owned();
     watch_tree(&xray_source);
 
     describe_build();
@@ -705,33 +709,6 @@ fn build_xray(
         );
     }
     output
-}
-
-/// Keep Xray's upstream banner shape while identifying the Brocade source revision that produced
-/// the embedded binary. A tarball build has no repository metadata and falls back to the imported
-/// upstream baseline.
-fn repository_build_id(workspace: &Path) -> String {
-    let commit = Command::new("git")
-        .args(["rev-parse", "--short=7", "HEAD"])
-        .current_dir(workspace)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .filter(|value| !value.is_empty());
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(workspace)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .is_some_and(|out| !out.stdout.is_empty());
-
-    match (commit, dirty) {
-        (Some(commit), true) => format!("{commit}-dirty"),
-        (Some(commit), false) => commit,
-        (None, _) => XRAY_UPSTREAM_BUILD.to_owned(),
-    }
 }
 
 fn build_agent(out_dir: &Path, target: &Target, zig: Option<&Path>) -> PathBuf {

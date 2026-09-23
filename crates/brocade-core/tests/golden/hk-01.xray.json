@@ -63,7 +63,8 @@
           "http",
           "quic"
         ],
-        "enabled": true
+        "enabled": true,
+        "routeOnly": true
       },
       "streamSettings": {
         "network": "tcp",
@@ -115,7 +116,13 @@
         "decryption": "none"
       },
       "sniffing": {
-        "enabled": false
+        "destOverride": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "enabled": true,
+        "routeOnly": true
       },
       "streamSettings": {
         "network": "tcp",
@@ -172,7 +179,8 @@
           "http",
           "quic"
         ],
-        "enabled": true
+        "enabled": true,
+        "routeOnly": true
       },
       "streamSettings": {
         "network": "tcp",
@@ -229,7 +237,8 @@
           "http",
           "quic"
         ],
-        "enabled": true
+        "enabled": true,
+        "routeOnly": true
       },
       "streamSettings": {
         "network": "tcp",

@@ -1,5 +1,5 @@
-//go:build !coverage
-// +build !coverage
+//go:build !coverage && !race
+// +build !coverage,!race
 
 package scenarios
 

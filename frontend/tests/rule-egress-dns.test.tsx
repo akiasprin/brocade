@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConsoleSnapshot, NodeAgentStateItem, Rule } from '../src/api';
 import { draft } from '../src/draft';
 import { MachineEgressDnsRules, RuleEditor, type ForwardPeer } from '../src/panes/rules';
+import { confirmDiscardChanges } from '../src/ui/navigation-guard';
 
 const initial: Rule[] = [
   {
@@ -23,6 +24,7 @@ const resolution = {
 afterEach(() => {
   cleanup();
   draft.clear();
+  vi.restoreAllMocks();
 });
 
 function renderEditor(
@@ -164,6 +166,46 @@ function renderMachineRules(
 }
 
 describe('machine-scoped egress DNS', () => {
+  it('does not report a read-only rule table as an unsaved local edit', () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    renderEditor(
+      false,
+      [
+        { m: { t: 'any' }, a: { t: 'block' } },
+        { m: { t: 'domain_suffix', v: ['netflix.com'] }, a: { t: 'egress', send_through: null } },
+      ],
+      true,
+    );
+
+    expect(confirmDiscardChanges()).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('moves an edited rule into the browser draft on navigation without prompting', () => {
+    draft.init('rule-navigation-autosave-test');
+    draft.clear();
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const view = renderEditor(false, initial, false, []);
+    const match = view.container.querySelector<HTMLInputElement>('td.rule-match-cell input')!;
+
+    fireEvent.change(match, { target: { value: 'disneyplus.com' } });
+
+    expect(confirmDiscardChanges()).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(draft.ops()).toEqual([
+      {
+        op: 'put_step',
+        app_id: 'video',
+        chain_id: 'stream',
+        node_id: 'hk',
+        step: {
+          rules: [{ m: { t: 'domain_suffix', v: ['disneyplus.com'] }, a: { t: 'egress', send_through: null } }],
+        },
+      },
+      { op: 'prune_chain', app_id: 'video', chain_id: 'stream' },
+    ]);
+  });
+
   it('offers a safe sniffing fallback and pins it immediately before Any', () => {
     const view = renderEditor(
       false,
@@ -650,7 +692,7 @@ describe('machine-scoped egress DNS', () => {
     trigger.focus();
     fireEvent.click(trigger);
     expect(document.activeElement).toBe(trigger);
-    expect(view.getByPlaceholderText('搜索节点或代理出站').hasAttribute('autofocus')).toBe(false);
+    expect(view.getByPlaceholderText('搜索机器或代理出站').hasAttribute('autofocus')).toBe(false);
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
     const newListener = view.getByRole('button', { name: /NODE.*东京节点.*加入本链/ });
     expect(newListener.querySelector('.external-target-kind')?.textContent).toBe('NODE');

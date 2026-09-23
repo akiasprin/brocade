@@ -59,8 +59,11 @@ const HOST_KEYS: &[&str] = &[
     "exit_ip",
     "expected_exit_ips",
     "host",
+    "hostname",
+    "ip",
     "ipv4",
     "ipv6",
+    "latest_exit_ip",
     "names",
     "overlay_addr",
     "peer_endpoint",
@@ -68,7 +71,14 @@ const HOST_KEYS: &[&str] = &[
     "public_ipv6",
     "server_name",
     "server_names",
+    "server_id",
+    "server_ids",
     "servers",
+    "selected_hostname",
+    "selected_server_id",
+    "switch_previous_hostname",
+    "switch_previous_server_id",
+    "switch_selected_server_id",
     "sni",
 ];
 
@@ -92,6 +102,9 @@ const PROSE_KEYS: &[&str] = &[
     "details",
     "error",
     "last_error",
+    "last_error_detail",
+    "latest_error_detail",
+    "switch_error_detail",
     "message",
     "note",
     "notes",
@@ -163,6 +176,19 @@ pub fn mask_json(value: &mut Value) {
         }
         Value::Array(items) => items.iter_mut().for_each(mask_json),
         Value::Object(map) => {
+            // VPN Gate uses the provider hostname itself as the catalogue row's `id`. Generic
+            // `id` values are ordinary model identities and must remain readable, so recognize
+            // this response shape before masking that one field. `hostname`, `ip` and every
+            // selected-server reference are handled by HOST_KEYS below.
+            if map.contains_key("catalog_speed_bps")
+                && map.contains_key("vpn_sessions")
+                && map.contains_key("hostname")
+                && map.contains_key("ip")
+            {
+                if let Some(Value::String(id)) = map.get_mut("id") {
+                    *id = mask_host_value(id);
+                }
+            }
             // A certificate group's `label` and `domain` are deliberately separate fields, but
             // keeping the former while masking only the latter lets a viewer reconstruct the
             // exact SNI. Match the certificate-group shape rather than the generic key name:
@@ -448,6 +474,70 @@ mod tests {
         assert_eq!(mask_endpoint("sg-01.example.net:443"), "***.net:***");
         // A bare v6 address is not a host:port, however many colons it has
         assert_eq!(mask_endpoint("2001:db8::1"), "2001:db8:***");
+    }
+
+    #[test]
+    fn vpngate_catalogue_keeps_evidence_but_masks_dialable_server_identity() {
+        let mut value = json!({
+            "status": {
+                "source_url": "https://www.vpngate.net/api/iphone/",
+                "last_error_code": "fetch-failed",
+                "last_error_detail": "dial 192.0.2.8 while refreshing provider catalogue"
+            },
+            "servers": [{
+                "id": "vpn123.opengw.net",
+                "hostname": "vpn123.opengw.net",
+                "ip": "192.0.2.10",
+                "country_code": "JP",
+                "catalog_speed_bps": 30000000,
+                "vpn_sessions": 4,
+                "latest_exit_ip": "198.51.100.20",
+                "latest_ip_scores": [
+                    { "provider": "proxycheck", "score": 8 },
+                    { "provider": "ffraud", "score": 6 },
+                    { "provider": "iplogs", "score": 7 }
+                ],
+                "latest_ip_networks": [
+                    { "provider": "proxycheck", "isp": "Example Business Broadband", "network_type": "business" }
+                ],
+                "latest_error_detail": "route via 198.51.100.20 failed"
+            }],
+            "runtime": {
+                "selected_server_id": "vpn123.opengw.net",
+                "selected_hostname": "vpn123.opengw.net",
+                "latest_exit_ip": "198.51.100.20"
+            },
+            "configured_pool": {
+                "server_id": "vpn123.opengw.net",
+                "server_ids": ["vpn123.opengw.net", "vpn456.opengw.net"]
+            }
+        });
+
+        mask_json(&mut value);
+
+        assert_eq!(value["status"]["source_url"], "https://***.net/api/iphone/");
+        assert_eq!(value["status"]["last_error_code"], "fetch-failed");
+        assert_eq!(value["status"]["last_error_detail"], "");
+        assert_eq!(value["servers"][0]["id"], "***.net");
+        assert_eq!(value["servers"][0]["hostname"], "***.net");
+        assert_eq!(value["servers"][0]["ip"], "192.0.***.***");
+        assert_eq!(value["servers"][0]["latest_exit_ip"], "198.51.***.***");
+        assert_eq!(value["servers"][0]["latest_error_detail"], "");
+        assert_eq!(value["runtime"]["selected_server_id"], "***.net");
+        assert_eq!(value["runtime"]["selected_hostname"], "***.net");
+        assert_eq!(value["runtime"]["latest_exit_ip"], "198.51.***.***");
+        assert_eq!(value["configured_pool"]["server_id"], "***.net");
+        assert_eq!(
+            value["configured_pool"]["server_ids"],
+            json!(["***.net", "***.net"])
+        );
+        assert_eq!(value["servers"][0]["catalog_speed_bps"], 30_000_000);
+        assert_eq!(value["servers"][0]["vpn_sessions"], 4);
+        assert_eq!(value["servers"][0]["latest_ip_scores"][0]["score"], 8);
+        assert_eq!(
+            value["servers"][0]["latest_ip_networks"][0]["isp"],
+            "Example Business Broadband"
+        );
     }
 
     /// REALITY's borrowed site is a host too, and the settings page is where a reviewer

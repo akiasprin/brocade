@@ -1,4 +1,4 @@
-import { Fragment, useState, useSyncExternalStore } from 'react';
+import { Fragment, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   discardPendingChanges,
@@ -21,18 +21,21 @@ import {
   type DeploymentTargetDetail,
   type PlannedAction,
   type PlannedTarget,
+  type RevisionListItem,
 } from '../api';
 import { draft } from '../draft';
-import { AgentReleaseSection } from './agent-release';
+import { AgentReleaseSection, useAgentSummary, type AgentSummary } from './agent-release';
+import { XrayReleaseSection, useXraySummary, type XraySummary } from './xray-release';
 import { entryId, useRevisionDiff } from '../forge/artifacts';
 import { artifactFile, artifactFmt, countChanges, diffLines, highlight } from '../forge/diff';
 import { can, useSession } from '../session';
-import { Ago, Confirm, Empty, ErrorBox, Loading, STATUS_TEXT, Status } from '../ui/bits';
-import { PanelTitle } from '../ui/icons';
+import { Ago, Confirm, Empty, ErrorBox, Loading, STATUS_TEXT, Status, type LoadingVariant } from '../ui/bits';
+import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { randomKey } from '../ui/platform';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
+import { navigate, returnTo } from '../forge/route';
 
 type Drill =
   | { p: 'list' }
@@ -42,17 +45,113 @@ type Drill =
   | { p: 'detail'; id: number };
 
 /* 动作决定是否具有破坏性，破坏性决定波次划分 */
-const ACTION_NOTE: Record<PlannedAction, string> = {
-  'apply-phantun': '同步 phantun · fake TCP 封装进程变更',
-  'apply-hy2-port-hop': '装端口跳跃 · 只改 nft，进程不动，没人掉线',
-  'sync-grants': '同步授权 · 进程不动，没人掉线',
-  'apply-wire-guard': '同步 WireGuard · 已有链路不断',
-  'apply-xray': '重写 xray · 重启，断这台上所有连接',
-  'disable-phantun': '停用 phantun · 依赖 fake TCP 的链路会断',
-  'disable-hy2-port-hop': '撤端口跳跃 · 客户端只剩落点那一个口能连',
-  'disable-wire-guard': '停用 WireGuard · 经过它的链路全断',
-  'disable-xray': '停用 xray · 这台上所有连接断',
+const ACTION_LABEL: Record<PlannedAction, string> = {
+  'apply-phantun': '更新 Phantun',
+  'apply-hy2-port-hop': '更新端口跳跃',
+  'sync-grants': '同步授权',
+  'apply-wire-guard': '更新 WireGuard',
+  'apply-xray': '更新 Xray',
+  'disable-phantun': '停用 Phantun',
+  'disable-hy2-port-hop': '停用端口跳跃',
+  'disable-wire-guard': '停用 WireGuard',
+  'disable-xray': '停用 Xray',
 };
+
+const ACTION_NOTE: Record<PlannedAction, string> = {
+  'apply-phantun': '同步 fake TCP 封装进程',
+  'apply-hy2-port-hop': '只调整 nft，进程不停',
+  'sync-grants': '热更新访问名单，连接不中断',
+  'apply-wire-guard': '同步隧道配置，已有链路不中断',
+  'apply-xray': '重写配置并重启，当前连接会中断',
+  'disable-phantun': '依赖 fake TCP 的链路会中断',
+  'disable-hy2-port-hop': '客户端将只能连接固定落点端口',
+  'disable-wire-guard': '经过该隧道的链路会中断',
+  'disable-xray': '该机器上的所有连接会中断',
+};
+
+type DeploymentStage = 'config' | 'verify' | 'rollout' | 'stop';
+
+interface DeploymentStep<T> {
+  wave: number;
+  targets: T[];
+  stage: DeploymentStage;
+  title: string;
+  step: number;
+  steps: number;
+  disruptive: boolean;
+  needsConfirmation: boolean;
+}
+
+/**
+ * `wave` is the persisted execution contract, not product language. Turn it into the three
+ * operator-facing stages without changing the IDs sent back to the confirmation endpoint.
+ */
+function deploymentSteps<T extends { wave: number; disruptive: boolean }>(
+  targets: T[],
+  actions: (target: T) => readonly string[],
+): DeploymentStep<T>[] {
+  const waves = [...new Set(targets.map(target => target.wave))].sort((a, b) => a - b);
+  const targetsIn = (wave: number) => targets.filter(target => target.wave === wave);
+  const xrayWaves = waves.filter(wave => targetsIn(wave).some(target => actions(target).includes('apply-xray')));
+  const firstXray = xrayWaves[0] ?? -1;
+  const verificationWave = xrayWaves.length > 1 && targetsIn(firstXray).length === 1 ? firstXray : undefined;
+  const stopWaves = waves.filter(wave => {
+    if (wave === 0) return false;
+    return targetsIn(wave).every(target => {
+      const names = actions(target);
+      return !names.includes('apply-xray') && (names.includes('disable-xray') || names.includes('disable-wire-guard'));
+    });
+  });
+  const rolloutWaves = waves.filter(wave => wave !== 0 && wave !== verificationWave && !stopWaves.includes(wave));
+
+  return waves.map(wave => {
+    const inWave = targetsIn(wave);
+    const stage: DeploymentStage =
+      wave === 0 ? 'config' : wave === verificationWave ? 'verify' : stopWaves.includes(wave) ? 'stop' : 'rollout';
+    const stageWaves = stage === 'stop' ? stopWaves : stage === 'rollout' ? rolloutWaves : [wave];
+    return {
+      wave,
+      targets: inWave,
+      stage,
+      title:
+        stage === 'config'
+          ? '更新机器配置'
+          : stage === 'verify'
+            ? '发布验证'
+            : stage === 'stop'
+              ? '停用服务'
+              : '全量发布',
+      step: stageWaves.indexOf(wave) + 1,
+      steps: stageWaves.length,
+      disruptive: inWave.some(target => target.disruptive),
+      needsConfirmation: inWave.some(
+        target =>
+          target.disruptive &&
+          (wave > 1 || actions(target).includes('disable-xray') || actions(target).includes('disable-wire-guard')),
+      ),
+    };
+  });
+}
+
+const stageCount = <T,>(steps: DeploymentStep<T>[]) => new Set(steps.map(step => step.stage)).size;
+
+const confirmationSummary = <T,>(steps: DeploymentStep<T>[]) => {
+  const gated = steps.filter(step => step.needsConfirmation);
+  const rollout = gated.filter(step => step.stage === 'rollout').length;
+  return [
+    ...new Set(gated.filter(step => step.stage !== 'rollout').map(step => step.title)),
+    ...(rollout ? [`全量发布的 ${rollout} 个步骤`] : []),
+  ].join('、');
+};
+
+function deploymentStepAction<T extends { node_id: string }>(
+  step: DeploymentStep<T>,
+  nameOf: (nodeId: string) => string,
+) {
+  if (step.stage !== 'rollout') return `开始${step.title}`;
+  const names = step.targets.map(target => nameOf(target.node_id));
+  return names.length === 1 ? `更新${names[0]}` : `更新这 ${names.length} 台机器`;
+}
 
 // 失败处理建议：deployment target 的 error 是 agent 侧的自由文本（服务端没有结构化
 // 错误码，deployment.rs 原样透传 agent 的 report.error），只能按子串匹配推断。
@@ -70,7 +169,7 @@ const FAILURE_GUIDES: { re: RegExp; guide: string }[] = [
   {
     re: /desired request failed: HTTP 4|probe targets request failed: HTTP 4|link probe failed: HTTP 4/,
     guide:
-      '控制面拒了这台的请求。最常见是 node token 失效或权限不够——到节点页「重签 token」再重试；不是的话，agent 日志里有那条请求的完整响应。',
+      '控制面拒了这台的请求。最常见是 node token 失效或权限不够——到机器页「重签 token」再重试；不是的话，agent 日志里有那条请求的完整响应。',
   },
   {
     re: /HTTP 5\d\d/,
@@ -118,46 +217,41 @@ const crumbOf = (d: Drill): CrumbSeg[] => {
 export function DeployPane({ win }: { win: Win }) {
   const { who } = useSession();
   const drill = (win.data.drill as Drill | undefined) ?? { p: 'list' };
-  const go = (d: Drill) => wm.setData(win.id, { ...win.data, drill: d });
+  const go = (d: Drill) => navigate('deploy', d);
   useCrumb(win, crumbOf(drill));
 
   if (drill.p === 'plan') {
-    /* 从其他位置进入的预览（如纳管向导）没有携带幂等键，此处补全一次并写入窗口状态 */
-    if (!drill.key) {
-      const key = randomKey();
-      wm.setData(win.id, { ...win.data, drill: { ...drill, key } });
-      return <Loading />;
-    }
-    return <PlanPreview revision={drill.revision} idempotencyKey={drill.key} go={go} />;
+    return <PlanRoute win={win} drill={drill} go={go} />;
   }
   // key 按 deployment 确定：Detail 中的 ask / confirmedWave 是该条发布的状态，
   // 切换发布（如回滚跳转到新工单）时应重置，不能带入下一条。
   if (drill.p === 'detail') return <Detail key={drill.id} id={drill.id} go={go} />;
 
-  /* 顶层两段并排，版式与设置页共用（.cardpage / .duo）。目录取消了：两段而已，
-     一列目录占掉的宽度比它省下的滚动还多。下钻页（计划预览、发布详情）自带标题栏。
-
-     配置发布在左：它是这一页的主任务——产生工单、分波推送、要人确认，进行中的发布还会
-     置顶为一张卡。agent 更新在右：批准之后机器自行替换，不产生工单，看一眼台数即可。
-     两段各自的读数写在自己的标题栏里（「N 台待发布 · 修订 N」「vX 可发 · N 台未替换」），
-     此前那两枚挂在目录条目上的角标因此没有丢。 */
+  // 发布流水：整页一条时间轴，未发布的修订、进行中的变更单、已发布的单据与软件发布同流。
+  // 页标题由面板抬头承担（与机器、用量页一致），不再单列一个页头。
   return (
-    <div className="cardpage">
-      <div className="duo">
-        <div className="col">
-          <ConfigSection go={go} />
-        </div>
-        <div className="col">
-          <AgentReleaseSection editable={can(who.role, 'system')} />
-        </div>
-      </div>
+    <div className="cardpage cg-flow">
+      <ConfigSection go={go} editable={can(who.role, 'system')} />
     </div>
   );
+}
+
+function PlanRoute({ win, drill, go }: { win: Win; drill: Extract<Drill, { p: 'plan' }>; go: (d: Drill) => void }) {
+  const [generatedKey] = useState(() => drill.key ?? randomKey());
+  useEffect(() => {
+    // A render can be abandoned under concurrent React. Only publish the generated idempotency key
+    // after commit; StrictMode may repeat this effect, but both writes carry the same key.
+    if (!drill.key) wm.setData(win.id, { ...win.data, drill: { ...drill, key: generatedKey } });
+  }, [drill, generatedKey, win.data, win.id]);
+
+  if (!drill.key) return <Loading variant="plan" />;
+  return <PlanPreview revision={drill.revision} idempotencyKey={drill.key} go={go} />;
 }
 
 // 协议中的取值是 config / grants，界面按发起方式表述：变更单由人工发起，需要关注分波和确认；
 // 自动化授权单由权限操作或配额执行自动发起，只增删运行时的名单。
 const KIND_LABEL = { all: '全部', config: '变更单', grants: '自动化授权单' } as const;
+const HISTORY_PREVIEW_COUNT = 12;
 
 // 发布列表通常由服务端按 id 倒序返回，但基线判定不能依赖调用方排序。回滚也会产生更大的
 // 修订号，因此比较的是 deployment id（实际发生顺序），返回该次发布引用的修订。
@@ -169,8 +263,251 @@ export function latestSuccessfulRevision(items: DeploymentListItem[]): number | 
   return latest?.revision_id ?? null;
 }
 
-function ConfigSection({ go }: { go: (d: Drill) => void }) {
+function RevisionTrail({ revisions, base }: { revisions: RevisionListItem[]; base: number | null }) {
+  if (revisions.length === 0 && base == null) return null;
+  return (
+    <ol className="cg-revs" aria-label="待发布修订">
+      {revisions.map(revision => (
+        <li key={revision.id}>
+          <span className="dot" />
+          <span className="rev">R{revision.id}</span>
+          <span className="msg">{revision.note || '未填写修订说明'}</span>
+          <span className="by">
+            {revision.author || '系统'} · <When at={revision.created_at} />
+          </span>
+        </li>
+      ))}
+      {base != null && (
+        <li className="base">
+          <span className="dot" />
+          <span className="rev">R{base}</span>
+          <span className="msg">已发布的运行基线</span>
+          <span className="by" />
+        </li>
+      )}
+    </ol>
+  );
+}
+
+/* ══ 发布流水 ═════════════════════════════════════════════════════════════════
+   整页一条时间轴：未发布的修订 → 进行中的变更单 → 已发布的单据。软件发布也是发布，
+   与变更单、自动化授权单排在同一条流里，不再各占一张卡；抬头之下一行是两样软件的读数
+   与操作，展开的机器选择在流水之上另起一块。
+   稿件：mockups/deploy-redesign.html 的方案 B，稿件里的私有前缀在这里统一写作 cgf-。 */
+
+type FlowTone = 'ok' | 'warn' | 'err' | 'run' | 'idle';
+
+// 结果图标落在时间轴的圆点位置。成功是常态，只画图标不写字；失败、取消、待补偿、
+// 等确认才在右侧出状态文字。
+const TONE_ICON: Record<FlowTone, IconName> = {
+  ok: 'check',
+  warn: 'clock',
+  err: 'close',
+  run: 'clock',
+  idle: 'dash',
+};
+
+function deploymentTone(item: DeploymentListItem): FlowTone {
+  if (item.failed_targets > 0 || item.status === 'halted') return 'err';
+  if (item.awaiting_confirmation || item.settlement_status === 'debt') return 'warn';
+  if (item.status === 'running' || item.status === 'planned') return 'run';
+  if (item.activation_status === 'activated' || item.status === 'succeeded') return 'ok';
+  return 'idle';
+}
+
+// 已生效且已收敛的单据不写状态文字——它是这张表里最常见的一行，写出来只是把同一句话
+// 重复几十遍。其余取值（待生效、等确认、待补偿、失败、取消）都需要读者看到。
+const settledRecord = (item: DeploymentListItem) =>
+  item.activation_status === 'activated' && item.settlement_status === 'converged';
+
+function FlowRow({
+  tone,
+  icon,
+  at,
+  muted = false,
+  title,
+  tags,
+  state,
+  meta,
+  hint,
+  onOpen,
+  focusKey,
+}: {
+  tone: FlowTone;
+  icon?: IconName;
+  at: string;
+  muted?: boolean;
+  title: ReactNode;
+  tags?: ReactNode;
+  state?: ReactNode;
+  meta: ReactNode;
+  hint?: string;
+  onOpen?: () => void;
+  focusKey?: string;
+}) {
+  return (
+    <li
+      className={`cgf-row ${tone}${muted ? ' muted' : ''}`}
+      role={onOpen ? 'button' : undefined}
+      tabIndex={onOpen ? 0 : undefined}
+      data-route-focus={focusKey}
+      title={hint}
+      onClick={onOpen}
+      onKeyDown={event => {
+        if (!onOpen || event.target !== event.currentTarget) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+    >
+      <When at={at} className="cgf-time" />
+      <span className="cgf-node">
+        <Icon of={icon ?? TONE_ICON[tone]} size={11} />
+      </span>
+      <span className="cgf-main">
+        <b>{title}</b>
+        {tags}
+      </span>
+      {state ? <span className={`cgf-state ${tone}`}>{state}</span> : <span />}
+      <span className="cgf-meta">{meta}</span>
+    </li>
+  );
+}
+
+// 流内分组：未发布 / 进行中 / 已发布。第一格空出时刻与图标两列，标题与记录正文对齐。
+function FlowGroup({
+  label,
+  tone,
+  meta,
+  action,
+}: {
+  label: string;
+  tone?: 'warn';
+  meta: ReactNode;
+  action?: ReactNode;
+}) {
+  return (
+    <li className="cgf-group">
+      <span />
+      <b className={tone}>{label}</b>
+      <span className="cgf-gmeta">{meta}</span>
+      {action}
+    </li>
+  );
+}
+
+// 软件读数行：一样软件一格，读数之后是把机器推到这个版本的操作。
+// 需要处理时（有机器待替换、有发布正在推）整格着金色。
+function SoftwareStrip({
+  agent,
+  xray,
+  editable,
+  onOpen,
+}: {
+  agent: AgentSummary;
+  xray: XraySummary;
+  editable: boolean;
+  onOpen: (which: 'agent' | 'xray') => void;
+}) {
+  const agentWaiting = agent.waiting.length;
+  return (
+    <div className="cgf-soft">
+      <div className={agentWaiting ? 'cgf-soft-item warn' : 'cgf-soft-item'}>
+        <span className="cgf-soft-ic">
+          <Icon of="agent" size={13} />
+        </span>
+        <b>Agent</b>
+        <code>{agent.version ? `v${agent.version}` : '—'}</code>
+        <small title={agentWaiting ? `待替换：${agent.waiting.join('、')}` : undefined}>
+          {agent.approved === 0
+            ? '未批准，机器不会自行更新'
+            : agentWaiting
+              ? `${agent.replaced}/${agent.approved} 台已替换`
+              : `${agent.scopeLabel} 已替换`}
+        </small>
+        <button className="btn" type="button" onClick={() => onOpen('agent')}>
+          {editable ? '批准' : '查看'}
+        </button>
+      </div>
+      <div className={xray.activeId ? 'cgf-soft-item warn' : 'cgf-soft-item'}>
+        <span className="cgf-soft-ic">
+          <Icon of="xray" size={13} />
+        </span>
+        <b>Xray</b>
+        <code>{xray.version ?? '—'}</code>
+        <small title={xray.others || undefined}>
+          {xray.activeId
+            ? `发布 #${xray.activeId} 进行中`
+            : xray.reported === 0
+              ? '尚未上报'
+              : `${xray.onVersion}/${xray.reported} 台在跑`}
+        </small>
+        <button className="btn" type="button" onClick={() => onOpen('xray')}>
+          {editable ? '选择机器' : '查看'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// 已发布一段里的条目：配置与授权单来自 deployments，软件发布来自各自的接口，
+// 合流后按时间倒序，再按天分组。
+type FlowEntry =
+  | { at: string; sort: number; kind: 'deployment'; item: DeploymentListItem }
+  | { at: string; sort: number; kind: 'agent'; version: string | null; by: string | null; scope: string }
+  | {
+      at: string;
+      sort: number;
+      kind: 'xray';
+      id: number;
+      version: string;
+      tone: FlowTone;
+      statusText: string;
+      by: string;
+      done: number;
+      total: number;
+    };
+
+const timeOf = (at: string) => Date.parse(at.endsWith('Z') || at.includes('+') ? at : `${at}Z`);
+
+const XRAY_TONE: Record<string, FlowTone> = { succeeded: 'ok', halted: 'err', canceled: 'idle', running: 'run' };
+
+function softwareEntries(agent: AgentSummary, xray: XraySummary): FlowEntry[] {
+  const entries: FlowEntry[] = [];
+  if (agent.event) {
+    entries.push({
+      at: agent.event.at,
+      sort: timeOf(agent.event.at),
+      kind: 'agent',
+      version: agent.event.version,
+      by: agent.event.by,
+      scope: agent.event.scope,
+    });
+  }
+  for (const release of xray.events) {
+    entries.push({
+      at: release.at,
+      sort: timeOf(release.at),
+      kind: 'xray',
+      id: release.id,
+      version: release.version,
+      tone: XRAY_TONE[release.status] ?? 'idle',
+      statusText: release.statusText,
+      by: release.by,
+      done: release.done,
+      total: release.total,
+    });
+  }
+  return entries;
+}
+
+function ConfigSection({ go, editable }: { go: (d: Drill) => void; editable: boolean }) {
   const [kind, setKind] = useState<'all' | 'config' | 'grants'>('all');
+  const [historyExpanded, setHistoryExpanded] = useState(false);
+  // 软件的机器选择在流水之上展开；读数行就是它收起时的样子，因此这里控制展开状态。
+  const [software, setSoftware] = useState<'agent' | 'xray' | null>(null);
+  useSyncExternalStore(draft.subscribe, draft.version);
 
   // ForgeShell 全局轮询 ['deployments']（顶栏需要常驻显示发布状态），
   // 因此不筛选时与其使用同一查询键共享缓存，筛选时使用独立的键。
@@ -194,151 +531,269 @@ function ConfigSection({ go }: { go: (d: Drill) => void }) {
     queryFn: () => verifyDeployment({ revision_id: current! }),
     enabled: current != null,
   });
+  // 两个读数与展开后的机器表读同一组查询，不产生额外请求。
+  const agent = useAgentSummary();
+  const xray = useXraySummary();
 
   // 历史、当前活动单和当前修订共同决定本段按钮是否可用。缺一项时继续渲染会把“未知”
   // 误当成“没有活动发布”或“已收敛”。
-  if (list.isPending || all.isPending || revisions.isPending) return <Loading />;
+  if (list.isPending || all.isPending || revisions.isPending) return <Loading variant="panel" rows={7} />;
   if (list.error || all.error || revisions.error) {
     return <ErrorBox error={list.error ?? all.error ?? revisions.error} />;
   }
 
   const items = list.data.deployments;
   const activeOf = (k: 'config' | 'grants') => (all.data?.deployments ?? []).find(d => d.active && d.kind === k);
-  return (
-    <section className="panel titled" id="dp-config">
-      <header>
-        <PanelTitle of="deploy">配置发布</PanelTitle>
-        {/* 段抬头的读数：进入本段首先需要了解的是待发布的机器数量。
-            两类发布的忙闲状态排在其后——它们已有更显著的表达方式（进行中的发布会
-            置顶为一张卡），此处只在确实有进行中的发布时才显示。 */}
-        <span className="hint">
-          {current == null ? (
-            '还没有可发布修订'
-          ) : verify.error ? (
-            '待发布状态读取失败'
-          ) : verify.data?.summary.changed_targets ? (
-            <>
-              <b>{verify.data.summary.changed_targets} 台</b> 待发布
-              {current != null && ` · 修订 ${current}`}
-            </>
-          ) : verify.isPending ? (
-            '检查待发布…'
-          ) : (
-            `已收敛${current != null ? ` · 修订 ${current}` : ''}`
-          )}
-          {(['config', 'grants'] as const).map(k => {
-            const on = activeOf(k);
-            return on ? (
-              <span key={k} style={{ marginLeft: 12, color: 'var(--gold)' }}>
-                {k === 'config' ? '变更单' : '自动化授权单'} #{on.id} 进行中
-              </span>
-            ) : null;
-          })}
-        </span>
-        <span className="sp" />
-        {/* 筛选。默认为「全部」——按时间顺序查看历史记录是主要用法，
-            按类型筛选只在查找特定类型时使用。
-            使用下拉框而非一排按钮：三个按钮中有两个始终未选中，占用的宽度与真正需要
-            点击的主操作相同；而该行右端才是本页的主要操作。 */}
-        <select
-          /* `words`：此处内容是中文词语而非取值，使用 sans——等宽字体的中文字形比相邻按钮窄一档 */
-          className="f words"
-          value={kind}
-          aria-label="按类型筛选"
-          onChange={e => setKind(e.target.value as 'all' | 'config' | 'grants')}
-        >
-          {(['all', 'config', 'grants'] as const).map(k => (
-            <option key={k} value={k}>
-              {KIND_LABEL[k]}
-            </option>
-          ))}
-        </select>
-        <PlanButton
-          pending={current == null || verify.isPending || !!verify.error}
-          changed={verify.data?.summary.changed_targets}
-          onClick={() => go({ p: 'plan', key: randomKey() })}
-        />
-      </header>
-      {verify.error && <ErrorBox error={verify.error} />}
-      {/* 进行中的发布置顶：本页的三项内容中只有它有时效性。
-          它同时保留在下方的历史记录中——历史记录按时间排列，此处表示当前状态。 */}
-      {items
-        .filter(d => d.active)
-        .map(d => (
-          <LiveDeployment key={`live-${d.id}`} item={d} go={go} />
-        ))}
+  const activeConfig = activeOf('config');
+  const changedTargets = verify.data?.summary.changed_targets;
+  const configHistory = (all.data?.deployments ?? []).filter(item => item.kind === 'config');
+  const publishedBase = latestSuccessfulRevision(configHistory);
+  const coveredRevision = activeConfig?.revision_id ?? publishedBase;
+  const pendingRevisions = revisions.data.revisions.filter(
+    revision =>
+      revision.has_snapshot &&
+      revision.status !== 'aborted' &&
+      revision.id > (coveredRevision ?? 0) &&
+      revision.id <= revisions.data.current_revision,
+  );
+  const draftDirty = !draft.isEmpty();
+  const historyCounts = (key: 'all' | 'config' | 'grants') =>
+    key === 'all'
+      ? (all.data?.deployments.length ?? 0)
+      : (all.data?.deployments ?? []).filter(item => item.kind === key).length;
 
-      {/* 筛选后为空与确实没有任何记录是两种情况，不应都提示去执行计划预览 */}
-      {items.length === 0 ? (
-        <Empty>
-          {kind === 'grants'
-            ? '还没有自动化授权单。修改授权、停用或启用用户、轮换 UUID，以及额度自动调整都会落在这里。'
-            : kind === 'config'
-              ? '还没有变更单。'
-              : '还没有发布记录。'}
-        </Empty>
-      ) : (
-        <div className="dp-list">
-          {items.map((d, i) => {
-            // 按天分组：连续列出时，「25 分钟前」和「4 小时前」之间是否跨天无法判断。
-            // 组标题只在跨天的那一行出现。
-            const day = dayKey(d.created_at);
-            const newDay = i === 0 || day !== dayKey(items[i - 1].created_at);
-            // 同一修订发布过多次时标出次序。列表按时间倒序排列，
-            // 因此需要向后统计（更早的记录）。
-            const tries = items.filter(x => x.revision_id === d.revision_id && x.kind === d.kind);
-            const nth = tries.length > 1 ? tries.length - tries.indexOf(d) : 0;
-            const written = d.note;
-            return (
-              <Fragment key={d.id}>
-                {newDay && <div className="dp-day">{day}</div>}
-                <div
-                  role="button"
-                  tabIndex={0}
-                  className="dp-row"
-                  onClick={() => go({ p: 'detail', id: d.id })}
-                  onKeyDown={e => {
-                    if (e.target !== e.currentTarget) return;
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      go({ p: 'detail', id: d.id });
-                    }
-                  }}
-                >
-                  {/* 编号移至最左作为标识——此前它位于副标题中且字号最小，而主位显示的是
-                      「console · 修订 N」：发起方全表相同，修订号重复显示。 */}
-                  <span className="id">#{d.id}</span>
-                  <span className="what">
-                    <b>{written ?? `修订 ${d.revision_id}`}</b>
-                    <span className="sub">
-                      {written ? `修订 ${d.revision_id}` : ''}
-                      {nth > 1 ? `${written ? ' · ' : ''}第 ${nth} 次` : ''}
-                    </span>
-                    {/* 自动化授权单单独标记：它不重启进程、不重建隧道，代价比变更单低一个数量级。
-                        变更单是常态，不加标记。 */}
-                    {d.kind === 'grants' && (
-                      <span className="st st-skipped" title="后台自己发的：只同步名单，不重启进程、不断线">
-                        自动化授权
-                      </span>
+  // 进行中的单据单独成组，已发布一段里不再重复它。
+  const actives = (all.data?.deployments ?? []).filter(d => d.active);
+  const finished = items.filter(item => !item.active);
+  const visibleItems = historyExpanded ? finished : finished.slice(0, HISTORY_PREVIEW_COUNT);
+  const hiddenItems = finished.length - visibleItems.length;
+
+  // 软件发布只在不筛选时进入流水，并且不早于已展开的那段时间——否则一条半年前的批准
+  // 会吊在最近十几条单据的下面。
+  const floor = visibleItems.length
+    ? timeOf(visibleItems[visibleItems.length - 1].created_at)
+    : Number.NEGATIVE_INFINITY;
+  const stream: FlowEntry[] = [
+    ...visibleItems.map(item => ({
+      at: item.created_at,
+      sort: timeOf(item.created_at),
+      kind: 'deployment' as const,
+      item,
+    })),
+    ...(kind === 'all' ? softwareEntries(agent, xray).filter(entry => entry.sort >= floor) : []),
+  ].sort((left, right) => right.sort - left.sort);
+
+  return (
+    <>
+      {software === 'agent' && <AgentReleaseSection editable={editable} open onClose={() => setSoftware(null)} />}
+      {software === 'xray' && <XrayReleaseSection editable={editable} open onClose={() => setSoftware(null)} />}
+
+      <section className="panel titled cgf" data-page-title="true" id="cg-config">
+        <header>
+          <ListIcon of="deploy" />
+          <h4>发布</h4>
+          {/* 线上是最近一次成功发布的修订；进行中的变更单还没生效，不能算作线上。 */}
+          <span className="rd">
+            线上 <b>{publishedBase == null ? '—' : `R${publishedBase}`}</b> · 当前{' '}
+            <b className={pendingRevisions.length ? 'warn' : undefined}>{current == null ? '—' : `R${current}`}</b>
+          </span>
+          <span className="sp" />
+          <div className="segsw cgf-kind" role="group" aria-label="按类型筛选">
+            {(['all', 'config', 'grants'] as const).map(key => (
+              <button
+                key={key}
+                type="button"
+                aria-pressed={kind === key}
+                onClick={() => {
+                  setKind(key);
+                  setHistoryExpanded(false);
+                }}
+              >
+                {KIND_LABEL[key]}
+                <small>{historyCounts(key)}</small>
+              </button>
+            ))}
+          </div>
+        </header>
+
+        {verify.error && <ErrorBox error={verify.error} />}
+
+        <SoftwareStrip agent={agent} xray={xray} editable={editable} onOpen={setSoftware} />
+
+        <div className="cgf-well">
+          <ol className="cgf-list">
+            <FlowGroup
+              label="未发布"
+              tone={pendingRevisions.length ? 'warn' : undefined}
+              meta={
+                pendingRevisions.length ? (
+                  <>
+                    {pendingRevisions.length} 个修订
+                    {coveredRevision != null && current != null && ` · R${coveredRevision} → R${current}`}
+                    {/* 修订数与按钮各自成立却读起来矛盾：提交过修订，但它们不改变任何机器的产物
+                        （只动了没有授权出去的用户、只改了未被引用的线路）。这里写明，否则
+                        「7 个修订」紧挨着「无待发布变更」会被当成故障。 */}
+                    {changedTargets === 0 && !draftDirty
+                      ? ' · 产物与线上一致，无需下发'
+                      : changedTargets
+                        ? ` · 影响 ${changedTargets} 台机器`
+                        : ''}
+                    {activeConfig ? ` · 变更单 #${activeConfig.id} 结束后可发布` : ''}
+                  </>
+                ) : draftDirty ? (
+                  '草稿还有未提交的修改，提交后才会出现在这里'
+                ) : (
+                  '所有已提交的修订都已发布'
+                )
+              }
+              action={
+                <PlanButton
+                  pending={current == null || verify.isPending || !!verify.error}
+                  changed={changedTargets}
+                  onClick={() => go({ p: 'plan', key: randomKey() })}
+                />
+              }
+            />
+            {pendingRevisions.map(revision => (
+              <FlowRow
+                key={`r${revision.id}`}
+                tone="idle"
+                muted
+                at={revision.created_at}
+                title={revision.note || '未填写修订说明'}
+                meta={
+                  <>
+                    R{revision.id} · {revision.author || '系统'}
+                  </>
+                }
+              />
+            ))}
+            {draftDirty && pendingRevisions.length > 0 && (
+              <li className="cgf-hint">
+                <span />
+                <span className="cg-lamp warn" />
+                <span>草稿还有未提交的修改，不会计入这次发布预览。</span>
+              </li>
+            )}
+
+            {actives.map(item => (
+              <LiveDeployment key={`live-${item.id}`} item={item} go={go} />
+            ))}
+
+            <FlowGroup
+              label="已发布"
+              meta={
+                finished.length === 0
+                  ? '还没有发布记录'
+                  : `最近 ${visibleItems.length} 条${kind === 'all' && stream.length > visibleItems.length ? ' · 含软件发布' : ''}`
+              }
+            />
+            {finished.length === 0 ? (
+              <li className="cgf-empty">
+                <Empty>
+                  {kind === 'grants'
+                    ? '还没有自动化授权单。修改授权、停用或启用用户、轮换 UUID，以及额度自动调整都会落在这里。'
+                    : kind === 'config'
+                      ? '还没有变更单。'
+                      : '还没有发布记录。'}
+                </Empty>
+              </li>
+            ) : (
+              stream.map((entry, index) => {
+                const day = dayKey(entry.at);
+                const newDay = index === 0 || day !== dayKey(stream[index - 1].at);
+                return (
+                  <Fragment key={entry.kind === 'deployment' ? `d${entry.item.id}` : `${entry.kind}${entry.at}`}>
+                    {newDay && (
+                      <li className="cgf-day">
+                        <span>{day}</span>
+                      </li>
                     )}
-                    {d.rollback_of_deployment_id != null && (
-                      <span className="st st-warn">回滚到 #{d.rollback_of_deployment_id}</span>
+                    {entry.kind === 'deployment' ? (
+                      <RecordRow item={entry.item} items={finished} go={go} />
+                    ) : entry.kind === 'agent' ? (
+                      <FlowRow
+                        tone="ok"
+                        icon="agent"
+                        at={entry.at}
+                        title={`批准 Agent${entry.version ? ` v${entry.version}` : ''}`}
+                        tags={<em className="cgf-tag">软件</em>}
+                        meta={[entry.scope, entry.by].filter(Boolean).join(' · ')}
+                      />
+                    ) : (
+                      <FlowRow
+                        tone={entry.tone}
+                        icon="xray"
+                        at={entry.at}
+                        title={`Xray 发布 #${entry.id} → ${entry.version}`}
+                        tags={<em className="cgf-tag">软件</em>}
+                        state={entry.tone === 'ok' ? undefined : entry.statusText}
+                        meta={`${entry.done}/${entry.total} 台 · ${entry.by}`}
+                      />
                     )}
-                    {d.sync_of_deployment_id != null && (
-                      <span className="st st-gold">补推 #{d.sync_of_deployment_id}</span>
-                    )}
-                  </span>
-                  <span className="stat">
-                    <DeployStatus item={d} />
-                  </span>
-                  <When at={d.created_at} />
-                </div>
-              </Fragment>
-            );
-          })}
+                  </Fragment>
+                );
+              })
+            )}
+          </ol>
+
+          {finished.length > HISTORY_PREVIEW_COUNT && (
+            <div className="cgf-more">
+              <button
+                className="btn"
+                type="button"
+                aria-expanded={historyExpanded}
+                onClick={() => setHistoryExpanded(expanded => !expanded)}
+              >
+                {historyExpanded ? `收起到最近 ${HISTORY_PREVIEW_COUNT} 条` : `查看其余 ${hiddenItems} 条`}
+              </button>
+            </div>
+          )}
         </div>
-      )}
-    </section>
+      </section>
+    </>
+  );
+}
+
+// 单据一行。同一修订发布过多次时标出次序：列表按时间倒序排列，因此向后统计（更早的记录）。
+function RecordRow({
+  item,
+  items,
+  go,
+}: {
+  item: DeploymentListItem;
+  items: DeploymentListItem[];
+  go: (d: Drill) => void;
+}) {
+  const tries = items.filter(x => x.revision_id === item.revision_id && x.kind === item.kind);
+  const nth = tries.length > 1 ? tries.length - tries.indexOf(item) : 0;
+  const tone = deploymentTone(item);
+  return (
+    <FlowRow
+      tone={tone}
+      at={item.created_at}
+      muted={item.kind === 'grants'}
+      focusKey={`deployment:${item.id}`}
+      hint={item.awaiting_confirmation ? `${item.status}：发布步骤在等人确认` : item.status}
+      title={item.note ?? `修订 ${item.revision_id}`}
+      tags={
+        <>
+          {item.kind === 'grants' && <em className="cgf-tag">自动化授权</em>}
+          {item.rollback_of_deployment_id != null && (
+            <em className="cgf-tag warn">回滚到 #{item.rollback_of_deployment_id}</em>
+          )}
+          {item.sync_of_deployment_id != null && <em className="cgf-tag warn">补推 #{item.sync_of_deployment_id}</em>}
+        </>
+      }
+      state={settledRecord(item) ? undefined : <DeployStatus item={item} />}
+      meta={
+        <>
+          #{item.id} · R{item.revision_id}
+          {nth > 1 ? ` · 第 ${nth} 次` : ''} · {item.changed_targets} 台{item.actor ? ` · ${item.actor}` : ''}
+        </>
+      }
+      onOpen={() => go({ p: 'detail', id: item.id })}
+    />
   );
 }
 
@@ -358,12 +813,12 @@ function PlanButton({
   const nothing = !dirty && changed === 0;
   return (
     <button
-      className="btn primary"
+      className={`btn${nothing ? '' : ' primary'}`}
       disabled={pending || nothing}
       title={nothing ? '所有机器的产物都已经是当前修订的样子' : dirty ? '预览的是已提交的修订，不含草稿' : ''}
       onClick={onClick}
     >
-      {nothing ? '无变更' : '计划预览'}
+      {nothing ? '无待发布变更' : '审阅变更'}
     </button>
   );
 }
@@ -395,41 +850,18 @@ function DeployStatus({ item }: { item: DeploymentListItem }) {
             : item.status === 'canceled' && item.failed_targets > 0
               ? '失败后取消'
               : (STATUS_TEXT[item.status] ?? item.status);
-  const cls =
-    item.activation_status === 'activated' && item.settlement_status !== 'converged'
-      ? 'st-gold'
-      : item.activation_status === 'activated'
-        ? 'st-succeeded'
-        : item.status === 'succeeded' && item.activation_status === 'waiting'
-          ? 'st-gold'
-          : item.failed_targets > 0
-            ? 'st-halted'
-            : item.awaiting_confirmation
-              ? 'st-gold'
-              : item.status === 'succeeded'
-                ? 'st-succeeded'
-                : item.status === 'running'
-                  ? 'st-gold'
-                  : '';
-  return (
-    <span
-      className={`st ${cls}`}
-      title={item.awaiting_confirmation ? `${item.status}：破坏性波次在等人确认` : item.status}
-    >
-      {text}
-    </span>
-  );
+  return text;
 }
 
 // 时间只占一行。绝对时间不再单独显示为一行小字：那会使每行高度增加一档，而该表的作用
 // 在于一屏可浏览的记录数量。日期由上方按天分组的组标题表示，同一天内的具体时刻
 // 写入 title（由 `Ago` 提供）——排查时悬停即可查看。
-function When({ at }: { at: string }) {
+function When({ at, className = 'cgo-when' }: { at: string; className?: string }) {
   const t = Date.parse(at.endsWith('Z') || at.includes('+') ? at : `${at}Z`);
   const d = new Date(t);
   const pad = (n: number) => String(n).padStart(2, '0');
   return (
-    <span className="dp-when" title={Number.isNaN(t) ? at : d.toLocaleString()}>
+    <span className={className} title={Number.isNaN(t) ? at : d.toLocaleString()}>
       {Number.isNaN(t) ? at : `${pad(d.getHours())}:${pad(d.getMinutes())}`}
     </span>
   );
@@ -452,33 +884,100 @@ function dayKey(at: string): string {
     : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-// 进行中的发布：置顶为一张卡。
-// 本页的三项内容中只有它有时效性——当前是否有发布在执行。卡片中显示波次，
-// 波次才表示实际的分段推进（一波收敛后才推送下一波）。
+// 进行中的变更单：流水里单独一组——组头是这张单据与下一步操作，其下是分阶段步骤条。
+// 步骤条按 wave 分段，一段收敛后才推送下一段；需要人工确认的那一段停在这里等按钮。
 function LiveDeployment({ item, go }: { item: DeploymentListItem; go: (d: Drill) => void }) {
-  const waves = Math.max(1, item.max_wave + 1);
-  const done = Math.max(0, Math.min(item.max_wave, waves - 1));
+  const { who } = useSession();
+  const nameOf = useNodeNames();
+  const qc = useQueryClient();
+  const [ask, setAsk] = useState(false);
+  const detail = useQuery({
+    queryKey: ['deployment', item.id, who.role === 'system-admin'],
+    queryFn: () => fetchDeployment(item.id, '', who.role === 'system-admin'),
+    enabled: item.kind === 'config' && Boolean(item.active),
+  });
+  const confirm = useMutation({
+    mutationFn: (wave: number) => confirmWave(item.id, wave),
+    onSuccess: () => {
+      setAsk(false);
+      qc.invalidateQueries({ queryKey: ['deployment', item.id] });
+      qc.invalidateQueries({ queryKey: ['deployments'] });
+    },
+  });
+  // 隔离的机器不参与本次发布（详情页把它们单列一段），步骤条按实际会执行的机器分段，
+  // 否则含隔离机器的那一段永远不会变成「已完成」。
+  const targets =
+    detail.data?.targets.filter(target => target.status !== 'skipped' && target.status !== 'deferred') ?? [];
+  const steps = deploymentSteps(targets, actionsOf);
+  const live = targets.filter(target => LIVE_TARGET.has(target.status));
+  const openWave = live.length ? Math.min(...live.map(target => target.wave)) : null;
+  const openStep = steps.find(step => step.wave === openWave);
+  const action = openStep ? deploymentStepAction(openStep, nameOf) : '继续发布';
+  const kindLabel = item.kind === 'grants' ? '自动化授权单' : '变更单';
   return (
-    <div className="dp-live">
-      <div className="h">
-        <b>
-          #{item.id} · 修订 {item.revision_id}
-        </b>
-        <DeployStatus item={item} />
-        <span className="note">
-          第 {done + 1} 波 / 共 {waves} 波
-        </span>
-        <span className="sp" />
-        <button className="btn sm" onClick={() => go({ p: 'detail', id: item.id })}>
-          看详情
-        </button>
-      </div>
-      <div className="waves">
-        {Array.from({ length: waves }, (_, i) => (
-          <i key={i} className={i < done ? 'done' : i === done ? 'now' : ''} />
-        ))}
-      </div>
-    </div>
+    <>
+      <FlowGroup
+        label="进行中"
+        tone="warn"
+        meta={
+          <>
+            {kindLabel} #{item.id}
+            {item.note ? ` · ${item.note}` : ''} · R{item.base_revision_id ?? '—'} → R{item.revision_id} ·{' '}
+            {item.changed_targets} 台{item.actor ? ` · ${item.actor}` : ''}
+          </>
+        }
+        action={
+          item.awaiting_confirmation && openStep ? (
+            <button
+              className="btn primary"
+              type="button"
+              disabled={!can(who.role, 'publish') || confirm.isPending}
+              onClick={() => setAsk(true)}
+            >
+              {action}
+            </button>
+          ) : (
+            <button className="btn" type="button" onClick={() => go({ p: 'detail', id: item.id })}>
+              看详情
+            </button>
+          )
+        }
+      />
+      {steps.length > 0 && (
+        <li className="cgf-steps">
+          <ol className="cgf-track" aria-label="发布步骤">
+            {steps.map((step, index) => {
+              const done = step.targets.every(target => target.status === 'succeeded');
+              const open = step.wave === openWave;
+              const tone = done ? 'ok' : !open ? '' : item.awaiting_confirmation ? 'wait' : 'run';
+              const names = step.targets.map(target => nameOf(target.node_id));
+              return (
+                <li key={step.wave} className={tone}>
+                  <span className="bar" />
+                  <span className="name">
+                    {done ? <Icon of="check" size={11} /> : open ? <Icon of="clock" size={11} /> : <em>{index + 1}</em>}
+                    {step.steps > 1 ? `${step.title} ${step.step}/${step.steps}` : step.title}
+                  </span>
+                  <span className="target">
+                    {names.length > 2 ? `${names.length} 台机器` : names.join('、')}
+                    {open && item.awaiting_confirmation ? ' · 等待确认' : ''}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+        </li>
+      )}
+      {ask && openStep && (
+        <Confirm
+          title={`${action}？`}
+          body={<WaveSummary targets={openStep.targets} nameOf={nameOf} />}
+          confirmLabel="确认并开始"
+          onConfirm={() => confirm.mutate(openStep.wave)}
+          onCancel={() => setAsk(false)}
+        />
+      )}
+    </>
   );
 }
 
@@ -496,6 +995,7 @@ function PlanPreview({
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   /* picked 只在重新预览当前修订时设置：用户操作优先于从路由传入的 revision 参数 */
   const [picked, setPicked] = useState<number | undefined>(undefined);
+  const [note, setNote] = useState('');
   const target = picked ?? revision ?? revisions.data?.current_revision;
   const stale = revisions.data && target !== revisions.data.current_revision;
 
@@ -505,6 +1005,9 @@ function PlanPreview({
     enabled: !!target,
     retry: false,
   });
+  // Artifact indexes are part of the plan's initial review surface. Start them alongside the plan
+  // request and keep the real plan root unmounted until both the target and its baseline are known.
+  const artifactDiff = useRevisionDiff(target, plan.data?.base_revision_id);
 
   // 撤销该版本需要检查是否已有发布引用它——服务端会拒绝，但按钮本身不应显示：
   // 点击后必然报错的按钮比不提供该按钮更容易造成困惑。查询键与发布列表相同，
@@ -528,7 +1031,7 @@ function PlanPreview({
       ])
         qc.invalidateQueries({ queryKey: key });
       /* 返回列表：预览的修订已被撤销，停留在本页显示的是一份已不存在的计划。 */
-      go({ p: 'list' });
+      returnTo('deploy');
     },
   });
   // 基线为最近一次成功发布对应的修订。按发布 id 排序（即时间顺序），不按修订号排序：
@@ -551,12 +1054,11 @@ function PlanPreview({
 
   const create = useMutation({
     mutationFn: () =>
-      // 不填写 note：服务端会按「该修订的变更内容 · 机器数」生成备注
-      // （store 的 `default_note`）。在此填写只能生成「console · 修订 71」——
-      // 编号已显示在右侧，而变更内容需要查询修订备注，该数据在服务端。
+      // 空备注不发送，让服务端继续生成「修订内容 · 机器数」；只有操作者实际填写时才覆盖。
       createDeployment({
         revision_id: target!,
         idempotency_key: idempotencyKey,
+        ...(note.trim() ? { note: note.trim() } : {}),
       }),
     onSuccess: res => {
       qc.invalidateQueries({ queryKey: ['deployments'] });
@@ -565,192 +1067,355 @@ function PlanPreview({
     },
   });
 
-  if (revisions.isPending || deployments.isPending || !target || plan.isPending) return <Loading />;
-  if (revisions.error || deployments.error) {
-    return <ErrorBox error={revisions.error ?? deployments.error} />;
+  if (revisions.error || deployments.error || plan.error || artifactDiff.error) {
+    return <ErrorBox error={revisions.error ?? deployments.error ?? plan.error ?? artifactDiff.error} />;
   }
+  const artifactsPending =
+    target != null && (artifactDiff.pending || (plan.data?.base_revision_id != null && !artifactDiff.known));
+  if (revisions.isPending || deployments.isPending || (target != null && plan.isPending) || artifactsPending)
+    return <Loading variant="plan" />;
+  if (!target) return <Empty>还没有可预览的修订。</Empty>;
+  if (!plan.data) return <Loading variant="plan" />;
+
+  const data = plan.data;
+  const actingTargets = data.targets.filter(t => t.status !== 'skipped');
+  const activeTargets = data.targets.filter(t => t.status === 'pending');
+  const steps = deploymentSteps(activeTargets, target => target.actions);
+  const stages = stageCount(steps);
+  const confirmations = confirmationSummary(steps);
+  const baseline = data.base_revision_id;
+  const includedRevisions = revisions.data.revisions.filter(
+    item => item.id > (baseline ?? 0) && item.id <= target && item.status !== 'aborted',
+  );
+  const defaultNote = `${includedRevisions.at(0)?.note || `修订 ${target}`} · ${data.summary.changed_targets} 台`;
 
   return (
-    <>
-      {plan.error ? (
-        <ErrorBox error={plan.error} />
-      ) : (
-        <>
-          <div className="chipline" style={{ marginBottom: 8 }}>
-            <span className="st">total {plan.data.summary.total_targets}</span>
-            <span className="st st-gold">changed {plan.data.summary.changed_targets}</span>
-            <span className="st st-skipped">skipped {plan.data.summary.skipped_targets}</span>
-            <span className={`st ${plan.data.summary.disruptive_targets ? 'st-warn' : ''}`}>
-              disruptive {plan.data.summary.disruptive_targets}
+    <div className="nd-sheet nd-page cg-page">
+      <div className="fg-sheet nd-paper">
+        <header className="nd-page-head cg-head">
+          <div className="nd-page-identity">
+            <span className="cg-plate">
+              <Icon of="deploy" size={18} />
             </span>
-            <span className="st">max_wave {plan.data.summary.max_wave}</span>
-          </div>
-          {plan.data.warnings.map((w, i) => (
-            <div key={i} className="callout">
-              <span className="mono" style={{ color: 'var(--warn)' }}>
-                {w.code}
-              </span>{' '}
-              · <span className="mono dim">{w.location}</span>
-              <br />
-              <span className="note">{w.message}</span>
-            </div>
-          ))}
-          <PlanTargets targets={plan.data.targets} />
-          <div className="wavehead" style={{ marginTop: 14 }}>
-            <span>
-              {plan.data.base_revision_id == null
-                ? '变更内容 · 第一次发布（全部新建）'
-                : plan.data.base_revision_id === target
-                  ? '运行状态更新'
-                  : `变更内容 · 跟修订 ${plan.data.base_revision_id} 比`}
-            </span>
-            <span className="rule" />
-          </div>
-          <ArtifactChanges
-            revision={target}
-            base={plan.data.base_revision_id}
-            targets={plan.data.targets.filter(t => t.status !== 'skipped')}
-          />
-          {stale ? (
-            <div className="callout warn">
-              配置已更新到修订 <b className="mono">{revisions.data?.current_revision}</b>，这份预览仍是修订{' '}
-              <b className="mono">{target}</b>，不能再创建发布。
-              <div className="toolbar">
-                <span className="sp" />
-                <button className="btn" onClick={() => setPicked(revisions.data?.current_revision)}>
-                  重新预览当前修订
-                </button>
+            <div className="nd-ident-text">
+              <div className="nd-ident-row">
+                <h1 className="nd-id nd-name">创建变更单</h1>
+                <span className={`st ${stale ? 'st-warn' : 'st-pending'}`}>{stale ? '预览已过期' : '预览'}</span>
               </div>
+              <span className="nd-ident-meta">
+                {baseline == null ? '空白环境' : `R${baseline}`} → R{target} · {includedRevisions.length} 个修订
+              </span>
             </div>
-          ) : (
-            <div className="callout">
-              创建时，系统会再次检查当前配置是否仍为修订 {target}。如果配置已更新，本次创建将取消，请重新预览。
-            </div>
-          )}
-          <div className="toolbar">
-            <span className="sp" />
-            {/* 查看 diff 后判断该批改动有误的操作在本页完成，不应要求退出后另行查找。
-                撤销的是上方 diff 的全部内容，撤销后待发布内容归零——退出预览只是关闭页面，
-                改动仍保留在模型中等待发布。 */}
-            {canAbort && (
-              <button
-                className="btn danger"
-                disabled={abort.isPending}
-                title={`丢弃上面这些改动：模型退回已发布的修订 ${publishedBase}，一台机器都不用动`}
-                onClick={() => setAskAbort(true)}
-              >
-                {abort.isPending ? '撤销中…' : '撤销计划'}
-              </button>
-            )}
-            <button
-              className="btn primary"
-              disabled={
-                !can(who.role, 'publish') ||
-                create.isPending ||
-                /* 判定与服务端一致：机器均在线且产物无变化时同样无法创建发布。 */
-                plan.data.summary.changed_targets === 0 ||
-                !!stale
-              }
-              title={
-                stale
-                  ? '预览的修订不是当前修订，服务端会拒'
-                  : plan.data.summary.changed_targets === 0
-                    ? '一台都不用动'
-                    : ''
-              }
-              onClick={() => create.mutate()}
-            >
-              {create.isPending ? '创建中…' : '创建变更单'}
-            </button>
           </div>
-          {askAbort && target != null && publishedBase != null && (
-            <Confirm
-              title="撤销这次计划？"
-              body={
-                <>
-                  丢弃<b>上面这份 diff 的全部内容</b>——从已发布的修订 <b className="mono">{publishedBase}</b> 到现在的{' '}
-                  <b className="mono">{target}</b> 之间 <b>{target - publishedBase}</b>{' '}
-                  版改动，一次全撤。不是只撤最后一次提交。
-                  <br />
-                  这些改动一次都没发下去过，机器上跑的仍是修订 {publishedBase} 的产物——
-                  所以撤它不动任何机器，模型退回去就已经收敛，待发的变更归零。
-                  <br />
-                  撤完会记一个新修订号（内容等于修订 {publishedBase}），被丢掉的那些在历史里 标成 aborted。
-                </>
-              }
-              confirmLabel="撤销计划"
-              onConfirm={() => {
-                setAskAbort(false);
-                abort.mutate(target);
-              }}
-              onCancel={() => setAskAbort(false)}
+          <ol className="cg-steps" aria-label="发布流程">
+            <li className="current">
+              <i>1</i>
+              <span>审阅计划</span>
+            </li>
+            <li>
+              <i>2</i>
+              <span>执行发布</span>
+            </li>
+            <li>
+              <i>3</i>
+              <span>生效</span>
+            </li>
+          </ol>
+        </header>
+
+        <div className="nd-paper-body cg-body">
+          <main className="cg-main">
+            {data.warnings.length > 0 && (
+              <section className="panel config-panel cg-sec cg-warning-section">
+                <header>
+                  <PanelTitle of="warn">发布前提醒</PanelTitle>
+                  <span className="cg-meta">{data.warnings.length} 项</span>
+                </header>
+                <div className="cg-warning-list">
+                  {data.warnings.map((warning, index) => (
+                    <article key={`${warning.code}:${warning.location}:${index}`}>
+                      <span className="cg-warning-code">{warning.code}</span>
+                      <div>
+                        <b>{warning.location}</b>
+                        <p>{warning.message}</p>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            <section className="panel config-panel cg-sec">
+              <header>
+                <PanelTitle of="deploy">执行计划</PanelTitle>
+                <span className="cg-meta">
+                  <span>
+                    <b>{activeTargets.length}</b> 台 · <b>{stages}</b> 个发布阶段
+                    {confirmations ? ` · ${steps.filter(step => step.needsConfirmation).length} 步需确认` : ''}
+                  </span>
+                </span>
+              </header>
+              <div className="cgr-notice">
+                <span className="cg-lamp idle" />
+                <span>
+                  <b>创建时，系统会再次检查当前配置。</b>如果配置已更新，本次创建将取消，请重新预览。
+                </span>
+              </div>
+              <PlanTargets targets={data.targets} />
+            </section>
+
+            <section className="panel config-panel cg-sec cg-artifact-review">
+              <header>
+                <PanelTitle of="artifacts">{baseline === target ? '运行状态产物' : '产物差异'}</PanelTitle>
+                <span className="cg-meta">{baseline == null ? '全部新建' : `R${baseline} → R${target}`}</span>
+              </header>
+              <ArtifactChanges revision={target} base={baseline} targets={actingTargets} loadingVariant="plan" />
+            </section>
+
+            {(create.error || abort.error) && <ErrorBox error={create.error ?? abort.error} />}
+          </main>
+
+          <aside className="cg-aside" aria-label="变更单摘要">
+            <section className="panel config-panel cg-sec">
+              <header>
+                <PanelTitle of="settings">摘要</PanelTitle>
+              </header>
+              <dl className="cg-kv">
+                <dt>运行基线</dt>
+                <dd>{baseline == null ? '空白环境' : `R${baseline}`}</dd>
+                <dt>发布目标</dt>
+                <dd className="act">R{target}</dd>
+                <dt>变更机器</dt>
+                <dd>{data.summary.changed_targets} 台</dd>
+                <dt>中断连接</dt>
+                <dd className={data.summary.disruptive_targets ? 'warn' : 'dim'}>
+                  {data.summary.disruptive_targets ? `${data.summary.disruptive_targets} 台` : '无'}
+                </dd>
+                <dt>需确认</dt>
+                <dd className={confirmations ? 'warn' : 'dim'}>{confirmations || '无'}</dd>
+                {data.summary.deferred_targets > 0 && (
+                  <>
+                    <dt>上线后补偿</dt>
+                    <dd>{data.summary.deferred_targets} 台</dd>
+                  </>
+                )}
+                {data.summary.skipped_targets > 0 && (
+                  <>
+                    <dt>产物未变</dt>
+                    <dd className="dim">{data.summary.skipped_targets} 台</dd>
+                  </>
+                )}
+              </dl>
+              <div className="cgo-label">
+                <b>包含的修订</b>
+                <span>{includedRevisions.length} 个</span>
+              </div>
+              <RevisionTrail revisions={includedRevisions} base={baseline} />
+            </section>
+          </aside>
+        </div>
+
+        <footer className={`cg-foot ${stale ? 'is-stale' : ''}`} aria-label="创建发布单">
+          <div className="cg-foot-state" aria-live="polite">
+            <span className={`cg-lamp ${stale ? 'err' : 'ok'}`} />
+            <span>
+              <b>{stale ? `当前配置已更新到 R${revisions.data.current_revision}` : '创建变更单'}</b>
+              <small>
+                {stale
+                  ? `这份预览仍是 R${target}，请重新生成计划。`
+                  : `R${target} 为当前修订 · 共 ${stages} 个发布阶段 · ${confirmations ? `${confirmations}开始前需要确认` : '全程自动执行'}`}
+              </small>
+            </span>
+          </div>
+          <label className="cg-note">
+            <span>备注</span>
+            <input
+              className="f"
+              value={note}
+              placeholder={defaultNote}
+              disabled={!!stale}
+              onChange={event => setNote(event.target.value)}
             />
+          </label>
+          {stale && (
+            <button className="btn" onClick={() => setPicked(revisions.data.current_revision)}>
+              重新预览
+            </button>
           )}
-          {(create.error || abort.error) && <ErrorBox error={create.error ?? abort.error} />}
-        </>
+          {canAbort && (
+            <button className="btn danger" disabled={abort.isPending} onClick={() => setAskAbort(true)}>
+              {abort.isPending ? '撤销中…' : '撤销计划'}
+            </button>
+          )}
+          <button
+            className="btn primary"
+            disabled={!can(who.role, 'publish') || create.isPending || data.summary.changed_targets === 0 || !!stale}
+            title={stale ? '预览已经过期' : data.summary.changed_targets === 0 ? '没有需要更新的机器' : ''}
+            onClick={() => create.mutate()}
+          >
+            {create.isPending ? '创建中…' : '创建变更单'}
+          </button>
+        </footer>
+      </div>
+
+      {askAbort && target != null && publishedBase != null && (
+        <Confirm
+          title="撤销这次计划？"
+          body={
+            <>
+              丢弃<b>上面这份 diff 的全部内容</b>——从已发布的修订 <b className="mono">{publishedBase}</b> 到现在的{' '}
+              <b className="mono">{target}</b> 之间 <b>{target - publishedBase}</b>{' '}
+              版改动，一次全撤。不是只撤最后一次提交。
+              <br />
+              这些改动一次都没发下去过，机器上跑的仍是修订 {publishedBase} 的产物——
+              所以撤它不动任何机器，模型退回去就已经收敛，待发的变更归零。
+              <br />
+              撤完会记一个新修订号（内容等于修订 {publishedBase}），被丢掉的那些在历史里 标成 aborted。
+            </>
+          }
+          confirmLabel="撤销计划"
+          onConfirm={() => {
+            setAskAbort(false);
+            abort.mutate(target);
+          }}
+          onCancel={() => setAskAbort(false)}
+        />
       )}
-    </>
+    </div>
   );
 }
 
 function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
   const nameOf = useNodeNames();
-  if (targets.length === 0) return <Empty>这次没有目标：所有机器的产物都没变。</Empty>;
-  const waves = [...new Set(targets.filter(t => t.status !== 'skipped').map(t => t.wave))].sort((a, b) => a - b);
-  const waveOf = new Map(targets.filter(t => t.status !== 'skipped').map(t => [t.node_id, t.wave]));
-  return (
+  const activeTargets = targets.filter(target => target.status === 'pending');
+  const deferredTargets = targets.filter(target => target.status === 'deferred');
+  const skippedTargets = targets.filter(target => target.status === 'skipped');
+  if (activeTargets.length === 0 && deferredTargets.length === 0 && skippedTargets.length === 0)
+    return <Empty>这次没有目标：所有机器的产物都没变。</Empty>;
+  const steps = deploymentSteps(activeTargets, target => target.actions);
+  const waveOf = new Map(activeTargets.map(target => [target.node_id, target.wave]));
+  const groups = steps.reduce<{ stage: DeploymentStage; title: string; steps: DeploymentStep<PlannedTarget>[] }[]>(
+    (result, step) => {
+      const previous = result.at(-1);
+      if (previous?.stage === step.stage) previous.steps.push(step);
+      else result.push({ stage: step.stage, title: step.title, steps: [step] });
+      return result;
+    },
+    [],
+  );
+
+  const targetRows = (stepTargets: PlannedTarget[]) => (
     <>
-      {waves.map(w => {
-        const inWave = targets.filter(t => t.status !== 'skipped' && t.wave === w);
-        const disruptive = inWave.some(t => t.disruptive);
-        return (
-          <div key={w}>
-            <div className="wavehead">
-              <span>
-                wave {w} · {disruptive ? '破坏性 · 灰度发布，一台一波' : '不掉线，一波推完'}
-              </span>
-              <span className="rule" />
-            </div>
-            <table className="tbl dp-wave">
-              <tbody>
-                {inWave.map(t => (
-                  <tr key={t.node_id}>
-                    <td title={t.node_id}>{nameOf(t.node_id)}</td>
-                    <td>
-                      {t.actions.map(a => (
-                        <span key={a} className="st" style={{ fontSize: '10.5px' }}>
-                          {a}
-                        </span>
-                      ))}
-                      {(t.prerequisites ?? []).map(node => {
-                        const sameWave = waveOf.get(node) === t.wave;
-                        return (
-                          <span
-                            key={`wait:${node}`}
-                            className="st st-gold"
-                            style={{ fontSize: '10.5px' }}
-                            title={
-                              sameWave
-                                ? `引用监听：${node} 与本机属于同一个依赖环，同波协同切换`
-                                : `引用监听：先等 ${node} 收敛`
-                            }
-                          >
-                            {sameWave ? '同波协同' : '先等'} {nameOf(node)}
-                          </span>
-                        );
-                      })}
-                    </td>
-                    <td className="dim" style={{ fontSize: 12 }}>
-                      {t.actions.map(a => ACTION_NOTE[a]).join('；')}
-                    </td>
-                  </tr>
+      {stepTargets.map(target => (
+        <div className="cgr-row" key={target.node_id}>
+          <span className={`cg-lamp ${target.status === 'deferred' ? 'defer' : target.disruptive ? 'warn' : 'ok'}`} />
+          <span className="cgo-main">
+            <b title={target.node_id}>{nameOf(target.node_id)}</b>
+            <small>
+              {[target.node_id, ...target.actions.map(action => ACTION_LABEL[action])].join(' · ')}
+              {(target.prerequisites ?? []).map(node => {
+                const sameStep = waveOf.get(node) === target.wave;
+                return (
+                  <em
+                    key={`wait:${node}`}
+                    className="dep"
+                    title={sameStep ? `与 ${node} 协同切换` : `等待 ${node} 收敛后再执行`}
+                  >
+                    {' · '}
+                    {sameStep ? '协同切换' : '先等'} {nameOf(node)}
+                  </em>
+                );
+              })}
+            </small>
+          </span>
+          <span className={`cgr-effect ${target.disruptive ? 'risk' : ''}`}>
+            {target.status === 'deferred'
+              ? '机器已隔离，恢复服务后补发'
+              : target.actions.map(action => ACTION_NOTE[action]).join('；')}
+          </span>
+        </div>
+      ))}
+    </>
+  );
+
+  const facts = (groupSteps: DeploymentStep<PlannedTarget>[]) => {
+    const count = groupSteps.reduce((total, step) => total + step.targets.length, 0);
+    const disruptive = groupSteps.some(step => step.disruptive);
+    const gated = groupSteps.filter(step => step.needsConfirmation).length;
+    return (
+      <span className="cgr-facts">
+        {count} 台 · {disruptive ? <em className="warn">中断连接</em> : '连接保持'} ·{' '}
+        {gated ? <em className="warn">{gated > 1 ? `${gated} 步需确认` : '需确认'}</em> : '自动下发'}
+      </span>
+    );
+  };
+
+  return (
+    <div className="cgr-waves">
+      {groups.map(group => {
+        const label =
+          group.stage === 'config'
+            ? '自动执行'
+            : group.stage === 'verify'
+              ? '先更新 1 台'
+              : group.stage === 'rollout'
+                ? '按依赖顺序更新其余机器'
+                : '';
+        if (group.stage === 'rollout' && group.steps.length > 1) {
+          return (
+            <div className="cgr-group cgr-stage" key={`${group.stage}:${group.steps[0].wave}`}>
+              <div className="cgr-head">
+                <b>{group.title}</b>
+                <span className="lbl">{label}</span>
+                {facts(group.steps)}
+              </div>
+              <div className="cgr-stage-steps">
+                {group.steps.map(step => (
+                  <div className="cgr-stage-step" key={step.wave}>
+                    <div className="cgr-step-head">
+                      <b>
+                        步骤 {step.step}/{step.steps}
+                      </b>
+                      {facts([step])}
+                    </div>
+                    {targetRows(step.targets)}
+                  </div>
                 ))}
-              </tbody>
-            </table>
+              </div>
+            </div>
+          );
+        }
+        const step = group.steps[0];
+        return (
+          <div className="cgr-group" key={`${group.stage}:${step.wave}`}>
+            <div className="cgr-head">
+              <b>{group.title}</b>
+              {label && <span className="lbl">{label}</span>}
+              {facts(group.steps)}
+            </div>
+            {targetRows(step.targets)}
           </div>
         );
       })}
-    </>
+      {deferredTargets.length > 0 && (
+        <div className="cgr-group">
+          <div className="cgr-head">
+            <b>隔离待补偿</b>
+            <span className="cgr-facts">{deferredTargets.length} 台 · 不参与本次发布</span>
+          </div>
+          {targetRows(deferredTargets)}
+        </div>
+      )}
+      {skippedTargets.length > 0 && (
+        <div className="cgr-group">
+          <div className="cgr-head">
+            <b>产物未变</b>
+            <span className="cgr-facts">{skippedTargets.length} 台 · 跳过</span>
+          </div>
+          <div className="cgr-names">{skippedTargets.map(target => nameOf(target.node_id)).join(' · ')}</div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -762,18 +1427,20 @@ export function ArtifactChanges({
   revision,
   base,
   targets,
+  loadingVariant = 'table',
 }: {
   revision: number;
   base: number | null;
   // 详情页传入 DeploymentTargetDetail[]，预览页传入 PlannedTarget[]——只需要 node_id。
   // 本次发布的目标机器由调用方确定，此处只负责比较产物。
   targets: { node_id: string }[];
+  loadingVariant?: LoadingVariant;
 }) {
   const nameOf = useNodeNames();
   const { list, changed, known, pending, error } = useRevisionDiff(revision, base);
 
   if (error) return <ErrorBox error={error} />;
-  if (pending || (base != null && !known)) return <Loading />;
+  if (pending || (base != null && !known)) return <Loading variant={loadingVariant} />;
 
   // 按机器筛选而非按产物类型筛选：这些机器上与基线不同的全部列出，包括 grants.json-rpc。
   // 它是运行时的名单，两类发布都可能包含——重启 xray 后需要重新加载该名单。
@@ -785,56 +1452,101 @@ export function ArtifactChanges({
   // 一个用户对应 clash 和 uri 两份，显示为「2 份变更」会被理解为涉及两个用户。
   const subscriptionChanges = list.filter(a => a.target_kind === 'user' && (base == null || changed.has(entryId(a))));
   const usersWithSubscriptionChanges = [...new Set(subscriptionChanges.map(a => a.target_id))];
+  const nodesWithChanges = [...new Set(nodeChanges.map(a => a.target_id))];
+  const groups: ArtifactBrowserGroup[] = [
+    ...nodesWithChanges.map(node => ({
+      key: `node:${node}`,
+      name: nameOf(node),
+      entries: nodeChanges.filter(entry => entry.target_id === node),
+      changeLabel: base == null ? '新建' : '变更',
+    })),
+    ...usersWithSubscriptionChanges.map(userKey => ({
+      key: `user:${userKey}`,
+      name: `用户 ${userKey.split(':').at(-1)}`,
+      entries: subscriptionChanges.filter(entry => entry.target_id === userKey),
+      changeLabel: base == null ? '新建' : '变更',
+    })),
+  ];
 
   return (
     <>
-      {nodeChanges.length === 0 ? (
-        <div className="callout">
-          {base === revision && targets.length > 0
-            ? '证书等运行状态已经变化，需要重新下发；创建后可在发布详情中查看实际文件记录'
-            : base == null
-              ? '第一次发布没有可新建的机器产物'
-              : `与修订 ${base} 相比，上方 ${targets.length} 台机器的产物没有变化`}
-          。
+      {nodeChanges.length === 0 && (
+        <div className="cgr-notice">
+          <span className="cg-lamp idle" />
+          <span>
+            {base === revision && targets.length > 0
+              ? '证书等运行状态已经变化，需要重新下发；创建后可在发布详情中查看实际文件记录'
+              : base == null
+                ? '第一次发布没有可新建的机器产物'
+                : `与修订 ${base} 相比，上方 ${targets.length} 台机器的产物没有变化`}
+            。
+          </span>
         </div>
-      ) : (
-        [...new Set(nodeChanges.map(a => a.target_id))].map(node => (
-          <TargetDiff
-            key={node}
-            name={nameOf(node)}
-            targetId={node}
-            entries={nodeChanges.filter(a => a.target_id === node)}
-            revision={revision}
-            base={base}
-          />
-        ))
       )}
       {usersWithSubscriptionChanges.length > 0 && (
-        <>
-          <div className="wavehead" style={{ marginTop: 14 }}>
-            <span>
-              用户订阅{base == null ? '新建' : '变更'} · {usersWithSubscriptionChanges.length} 人
-            </span>
-            <span className="rule" />
-          </div>
-          {usersWithSubscriptionChanges.map(userKey => (
-            <TargetDiff
-              key={userKey}
-              name={`用户 ${userKey.split(':').at(-1)}`}
-              targetId={userKey}
-              entries={subscriptionChanges.filter(a => a.target_id === userKey)}
-              revision={revision}
-              base={base}
-              defaultOpen={usersWithSubscriptionChanges.length === 1}
-            />
-          ))}
-        </>
+        <div className="cgr-notice">
+          <span className="cg-lamp ok" />
+          <span>
+            用户订阅{base == null ? '新建' : '变更'} · {usersWithSubscriptionChanges.length} 人
+          </span>
+        </div>
       )}
+      {groups.length > 0 && <RevisionArtifactBrowser groups={groups} revision={revision} base={base} />}
     </>
   );
 }
 
 type RecordedArtifact = { state?: string; sha256?: string; content?: string };
+type ArtifactBrowserGroup = {
+  key: string;
+  name: string;
+  entries: ArtifactIndexEntry[];
+  changeLabel: string;
+};
+
+function RevisionArtifactBrowser({
+  groups,
+  revision,
+  base,
+}: {
+  groups: ArtifactBrowserGroup[];
+  revision: number;
+  base: number | null;
+}) {
+  const entries = groups.flatMap(group => group.entries.map(entry => ({ group, entry })));
+  const [picked, setPicked] = useState(() => (entries[0] ? entryId(entries[0].entry) : ''));
+  const selected = entries.find(item => entryId(item.entry) === picked) ?? entries[0];
+  if (!selected) return null;
+  return (
+    <div className="cg-files">
+      <div className="cg-tree" aria-label="产物文件">
+        {groups.map(group => (
+          <div key={group.key}>
+            <div className="cg-tree-group">
+              <b>{group.name}</b>
+              <span>
+                {group.entries.length} 份{group.changeLabel}
+              </span>
+            </div>
+            {group.entries.map(entry => (
+              <button
+                className="cg-tree-file"
+                type="button"
+                key={entryId(entry)}
+                aria-current={entryId(selected.entry) === entryId(entry)}
+                onClick={() => setPicked(entryId(entry))}
+              >
+                <span className="nm">{artifactFile(entry.artifact_kind)}</span>
+                <span className="cg-fstate">{base == null ? '新增' : '修改'}</span>
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+      <FileDiff entry={selected.entry} groupName={selected.group.name} revision={revision} base={base} />
+    </div>
+  );
+}
 
 function artifactRecord(value: unknown, key: string): RecordedArtifact | undefined {
   if (!value || typeof value !== 'object') return undefined;
@@ -842,50 +1554,189 @@ function artifactRecord(value: unknown, key: string): RecordedArtifact | undefin
   return artifact && typeof artifact === 'object' ? (artifact as RecordedArtifact) : undefined;
 }
 
+interface RecordedGrantClient {
+  email: string;
+  uuid: string;
+  flow: string | null;
+}
+
+interface RecordedGrantChange extends RecordedGrantClient {
+  key: string;
+  tag: string;
+  change: 'added' | 'removed' | 'updated';
+}
+
+/** Read only the fields needed for a safe historical comparison. UUID participates in equality
+ * but is never rendered: it is a credential, whereas email and inbound tag are operational labels. */
+function recordedGrantClients(value: unknown): Map<string, RecordedGrantClient & { tag: string }> | null {
+  if (!value || typeof value !== 'object') return null;
+  const grants = (value as Record<string, unknown>).grants;
+  if (!grants || typeof grants !== 'object') return null;
+  const state = (grants as Record<string, unknown>).state;
+  if (state === 'disabled') return new Map();
+  if (state !== 'present') return null;
+  const inbounds = (grants as Record<string, unknown>).inbounds;
+  if (!Array.isArray(inbounds)) return null;
+
+  const clients = new Map<string, RecordedGrantClient & { tag: string }>();
+  for (const inbound of inbounds) {
+    if (!inbound || typeof inbound !== 'object') return null;
+    const tag = (inbound as Record<string, unknown>).tag;
+    const entries = (inbound as Record<string, unknown>).clients;
+    if (typeof tag !== 'string' || !Array.isArray(entries)) return null;
+    for (const client of entries) {
+      if (!client || typeof client !== 'object') return null;
+      const row = client as Record<string, unknown>;
+      if (typeof row.email !== 'string' || typeof row.uuid !== 'string') return null;
+      const flow = typeof row.flow === 'string' ? row.flow : null;
+      clients.set(`${tag}\u0000${row.email}`, { tag, email: row.email, uuid: row.uuid, flow });
+    }
+  }
+  return clients;
+}
+
+function hasRecordedAction(value: unknown, action: string): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const actions = (value as Record<string, unknown>).actions;
+  return Array.isArray(actions) && actions.includes(action);
+}
+
+function recordedGrantChanges(target: DeploymentTargetDetail): RecordedGrantChange[] | null {
+  if (!hasRecordedAction(target.desired_structure, 'sync-grants')) return null;
+  const before = recordedGrantClients(target.observed_before);
+  const after = recordedGrantClients(target.observed_after);
+  if (!before || !after) return [];
+
+  return [...new Set([...before.keys(), ...after.keys()])]
+    .sort((left, right) => left.localeCompare(right))
+    .flatMap<RecordedGrantChange>(key => {
+      const previous = before.get(key);
+      const current = after.get(key);
+      if (!previous && current) return [{ ...current, key, change: 'added' as const }];
+      if (previous && !current) return [{ ...previous, key, change: 'removed' as const }];
+      if (previous && current && (previous.uuid !== current.uuid || previous.flow !== current.flow)) {
+        return [{ ...current, key, change: 'updated' as const }];
+      }
+      return [];
+    });
+}
+
+function RecordedGrantChanges({ groups }: { groups: { key: string; name: string; changes: RecordedGrantChange[] }[] }) {
+  return (
+    <div className="cgr-waves cg-grant-changes" aria-label="运行时授权变更">
+      {groups.map(group => (
+        <section className="cgr-group" key={group.key}>
+          <div className="cgr-head">
+            <b>{group.name}</b>
+            <span className="cgr-facts">{group.changes.length} 项授权变更</span>
+          </div>
+          {group.changes.map(change => {
+            const label = change.change === 'added' ? '新增' : change.change === 'removed' ? '移除' : '更新';
+            const tone = change.change === 'added' ? 'ok' : change.change === 'removed' ? 'err' : 'warn';
+            return (
+              <div className="cgr-row" key={change.key}>
+                <span className={`cg-lamp ${tone}`} />
+                <span className="cgo-main">
+                  <b>{change.email}</b>
+                  <small>{change.tag}</small>
+                </span>
+                <span className={`cgr-effect ${tone}`}>{label}</span>
+              </div>
+            );
+          })}
+        </section>
+      ))}
+    </div>
+  );
+}
+
 /** 同修订也可能因证书等运行状态产生不同产物，历史详情必须使用发布时保存的内容。 */
 export function RecordedArtifactChanges({ targets }: { targets: DeploymentTargetDetail[] }) {
   const nameOf = useNodeNames();
+  const groups = targets.map(target => ({
+    key: target.node_id,
+    name: nameOf(target.node_id),
+    grantChanges: recordedGrantChanges(target),
+    files: ['phantun', 'wireguard', 'xray', 'hy2_port_hop'].flatMap(kind => {
+      const after = artifactRecord(target.desired_structure, kind);
+      const before = artifactRecord(target.observed_before, kind);
+      if (!after || after.state === 'unmanaged') return [];
+      if (before && after.state === 'present' && before.state === 'present' && after.sha256 === before.sha256)
+        return [];
+      if (before?.state === 'absent' && after.state === 'disabled') return [];
+      return [{ key: `${target.node_id}:${kind}`, kind, before, after }];
+    }),
+  }));
+  const files = groups.flatMap(group => group.files.map(file => ({ group, file })));
+  const grantGroups = groups.flatMap(group =>
+    group.grantChanges && group.grantChanges.length > 0
+      ? [{ key: group.key, name: group.name, changes: group.grantChanges }]
+      : [],
+  );
+  const hasGrantSync = groups.some(group => group.grantChanges !== null);
+  const [picked, setPicked] = useState(() => files[0]?.file.key ?? '');
+  const selected = files.find(item => item.file.key === picked) ?? files[0];
+
   return (
     <>
-      {targets.map(target => {
-        const files = ['phantun', 'wireguard', 'xray', 'hy2_port_hop'].flatMap(kind => {
-          const after = artifactRecord(target.desired_structure, kind);
-          const before = artifactRecord(target.observed_before, kind);
-          if (!after || after.state === 'unmanaged') return [];
-          if (before && after.state === 'present' && before.state === 'present' && after.sha256 === before.sha256)
-            return [];
-          if (before?.state === 'absent' && after.state === 'disabled') return [];
-          return [{ kind, before, after }];
-        });
-        return (
-          <div className="dp-node" key={target.node_id}>
-            <div className="dp-nodehead">
-              <span className="nm">{nameOf(target.node_id)}</span>
-            </div>
-            {files.length === 0 ? (
-              <div className="note">没有文件内容变化；本次执行的同步或重应用操作见上方动作记录。</div>
-            ) : (
-              files.map(({ kind, before, after }) => (
-                <details className="dp-file" key={kind} open={before?.state === 'absent'}>
-                  <summary className="cfg-bar">
-                    <span className="cfg-file">{artifactFile(kind)}</span>
-                  </summary>
-                  <RecordedFileDiff kind={kind} before={before} after={after} />
-                </details>
-              ))
-            )}
+      {selected && (
+        <div className="cg-files is-compact">
+          <div className="cg-tree" aria-label="发布时保存的产物文件">
+            {groups.map(group => (
+              <div key={group.key}>
+                <div className="cg-tree-group">
+                  <b>{group.name}</b>
+                  <span>{group.files.length} 份变更</span>
+                </div>
+                {group.files.map(file => (
+                  <button
+                    className="cg-tree-file"
+                    type="button"
+                    key={file.key}
+                    aria-current={selected.file.key === file.key}
+                    onClick={() => setPicked(file.key)}
+                  >
+                    <span className="nm">{artifactFile(file.kind)}</span>
+                    <span
+                      className={`cg-fstate ${file.before?.state === 'absent' ? 'new' : file.after.state === 'disabled' ? 'warn' : ''}`}
+                    >
+                      {file.before?.state === 'absent' ? '新增' : file.after.state === 'disabled' ? '停用' : '修改'}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ))}
           </div>
-        );
-      })}
+          <RecordedFileDiff
+            groupName={selected.group.name}
+            kind={selected.file.kind}
+            before={selected.file.before}
+            after={selected.file.after}
+          />
+        </div>
+      )}
+      {grantGroups.length > 0 && <RecordedGrantChanges groups={grantGroups} />}
+      {!selected && grantGroups.length === 0 && (
+        <div className="cgr-notice">
+          <span className="cg-lamp idle" />
+          <span>
+            {hasGrantSync
+              ? '授权名单已同步，但机器没有提供可比较的执行前后记录。'
+              : '没有文件内容变化；本次执行的重应用操作见上方动作记录。'}
+          </span>
+        </div>
+      )}
     </>
   );
 }
 
 function RecordedFileDiff({
+  groupName,
   kind,
   before,
   after,
 }: {
+  groupName: string;
   kind: string;
   before: RecordedArtifact | undefined;
   after: RecordedArtifact;
@@ -894,15 +1745,18 @@ function RecordedFileDiff({
   const afterText = after.state === 'disabled' ? '' : after.content;
   if (beforeText === undefined || afterText === undefined) {
     return (
-      <div className="note">
-        {before === undefined
-          ? '执行前状态尚未记录，暂不能比较。'
-          : '记录中的原文不可用或当前账号无权查看，暂不能显示逐行差异。'}
-        <div>
-          执行前：<code>{before?.sha256 ?? before?.state ?? '未知'}</code>
-        </div>
-        <div>
-          本次目标：<code>{after.sha256 ?? after.state}</code>
+      <div className="cg-viewer">
+        <ArtifactViewerHead groupName={groupName} kind={kind} state="不可比较" />
+        <div className="note cg-artifact-unavailable">
+          {before === undefined
+            ? '执行前状态尚未记录，暂不能比较。'
+            : '记录中的原文不可用或当前账号无权查看，暂不能显示逐行差异。'}
+          <div>
+            执行前：<code>{before?.sha256 ?? before?.state ?? '未知'}</code>
+          </div>
+          <div>
+            本次目标：<code>{after.sha256 ?? after.state}</code>
+          </div>
         </div>
       </div>
     );
@@ -915,11 +1769,14 @@ function RecordedFileDiff({
         : diffLines(beforeText, afterText);
   const counts = countChanges(ops);
   return (
-    <>
-      <div className="fg-delta">
-        <span className="add">+{counts.add}</span> <span className="del">−{counts.del}</span>
-      </div>
-      <div className="fg-code dp-diff">
+    <div className="cg-viewer">
+      <ArtifactViewerHead
+        groupName={groupName}
+        kind={kind}
+        state={before?.state === 'absent' ? '新增' : after.state === 'disabled' ? '停用' : '修改'}
+        counts={counts}
+      />
+      <div className="fg-code cg-diff">
         <table>
           <tbody>
             {collapseContext(ops, 3).map((row, i) =>
@@ -941,59 +1798,48 @@ function RecordedFileDiff({
           </tbody>
         </table>
       </div>
-    </>
-  );
-}
-
-/* 每台机器或每位用户一个折叠块，内容按需拉取。 */
-function TargetDiff({
-  name,
-  targetId,
-  entries,
-  revision,
-  base,
-  defaultOpen,
-}: {
-  name: string;
-  targetId: string;
-  entries: ArtifactIndexEntry[];
-  revision: number;
-  base: number | null;
-  defaultOpen?: boolean;
-}) {
-  // 首次发布没有旧内容可对照，完整的新建内容就是 diff 本身，因此默认展开。
-  const [open, setOpen] = useState(() => defaultOpen ?? base == null);
-  return (
-    <div className="dp-node">
-      <button className="dp-nodehead" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <span className="tw">{open ? '▾' : '▸'}</span>
-        <span className="nm" title={targetId}>
-          {name}
-        </span>
-        <span className="files">
-          {entries.map(e => (
-            <span key={e.artifact_kind} className="st">
-              {artifactFile(e.artifact_kind)}
-            </span>
-          ))}
-        </span>
-        <span className="sp" />
-        <span className="note">
-          {entries.length} 份{base == null ? '新建' : '变更'}
-        </span>
-      </button>
-      {open && (
-        <div className="dp-nodebody">
-          {entries.map(e => (
-            <FileDiff key={entryId(e)} entry={e} revision={revision} base={base} />
-          ))}
-        </div>
-      )}
     </div>
   );
 }
 
-function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revision: number; base: number | null }) {
+function ArtifactViewerHead({
+  groupName,
+  kind,
+  state,
+  counts,
+}: {
+  groupName: string;
+  kind: string;
+  state: string;
+  counts?: { add: number; del: number };
+}) {
+  return (
+    <div className="cg-viewer-head">
+      <span className="path">
+        {groupName} / <b>{artifactFile(kind)}</b>
+      </span>
+      <span className="sp" />
+      {counts && (
+        <span className="fg-delta">
+          <span className="add">+{counts.add}</span> <span className="del">−{counts.del}</span>
+        </span>
+      )}
+      <span className="cg-fstate">{state}</span>
+    </div>
+  );
+}
+
+function FileDiff({
+  entry,
+  groupName,
+  revision,
+  base,
+}: {
+  entry: ArtifactIndexEntry;
+  groupName: string;
+  revision: number;
+  base: number | null;
+}) {
   const key = [entry.target_kind, entry.target_id, entry.artifact_kind] as const;
   const here = useQuery({
     queryKey: ['artifact', revision, ...key],
@@ -1006,26 +1852,17 @@ function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revisi
   });
 
   const fmt = artifactFmt(entry.artifact_kind);
-  const head = (extra?: React.ReactNode) => (
-    <div className="cfg-bar">
-      <span className="cfg-file">{artifactFile(entry.artifact_kind)}</span>
-      <span className="cfg-sp" />
-      {extra}
-      <span className={`cfg-fmt ${fmt}`}>{fmt}</span>
-    </div>
-  );
-
   if (here.isPending || (base != null && there.isPending))
     return (
-      <div className="dp-file">
-        {head()}
-        <Loading />
+      <div className="cg-viewer">
+        <ArtifactViewerHead groupName={groupName} kind={entry.artifact_kind} state={base == null ? '新增' : '修改'} />
+        <Loading variant="code" />
       </div>
     );
   if (here.error || (base != null && there.error))
     return (
-      <div className="dp-file">
-        {head()}
+      <div className="cg-viewer">
+        <ArtifactViewerHead groupName={groupName} kind={entry.artifact_kind} state={base == null ? '新增' : '修改'} />
         <ErrorBox error={here.error ?? there.error} />
       </div>
     );
@@ -1040,13 +1877,14 @@ function FileDiff({ entry, revision, base }: { entry: ArtifactIndexEntry; revisi
   const shown = base == null ? ops : collapseContext(ops, 3);
 
   return (
-    <div className="dp-file">
-      {head(
-        <span className="fg-delta" style={{ marginRight: 6 }}>
-          <span className="add">+{counts.add}</span> <span className="del">−{counts.del}</span>
-        </span>,
-      )}
-      <div className="fg-code dp-diff">
+    <div className="cg-viewer">
+      <ArtifactViewerHead
+        groupName={groupName}
+        kind={entry.artifact_kind}
+        state={base == null ? '新增' : '修改'}
+        counts={counts}
+      />
+      <div className="fg-code cg-diff">
         <table>
           <tbody>
             {shown.map((row, i) =>
@@ -1109,14 +1947,6 @@ const actionsOf = (t: DeploymentTargetDetail): string[] => {
   return Array.isArray(actions) ? (actions as string[]) : [];
 };
 
-// 服务端只接受当前打开的那一波的确认，且只有满足以下条件的波次才接受确认
-// （brocade-store::deployment 的 confirm SQL）：具有破坏性，且 wave > 1 或包含停用动作。
-// 前端使用同一规则，避免渲染出点击后必然返回 400 的按钮。
-const waveNeedsConfirm = (targets: DeploymentTargetDetail[], wave: number) =>
-  targets.some(
-    t => t.disruptive && (wave > 1 || actionsOf(t).some(a => a === 'disable-xray' || a === 'disable-wire-guard')),
-  );
-
 /* 待确认的危险操作。确认框渲染在页面底部，同时只显示一个。 */
 type Ask =
   | { kind: 'halt' }
@@ -1126,6 +1956,129 @@ type Ask =
   | { kind: 'wave'; wave: number };
 
 const ISOLATABLE_TARGET = new Set(['pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty']);
+
+function DeploymentStages({
+  steps,
+  openWave,
+  halted,
+  publisher,
+  system,
+  retryPending,
+  retryingNode,
+  onRetry,
+  onIsolate,
+}: {
+  steps: DeploymentStep<DeploymentTargetDetail>[];
+  openWave: number | null;
+  halted: boolean;
+  publisher: boolean;
+  system: boolean;
+  retryPending: boolean;
+  retryingNode: string | undefined;
+  onRetry: (nodeId: string) => void;
+  onIsolate: (target: DeploymentTargetDetail) => void;
+}) {
+  const groups = steps.reduce<
+    { stage: DeploymentStage; title: string; steps: DeploymentStep<DeploymentTargetDetail>[] }[]
+  >((result, step) => {
+    const previous = result.at(-1);
+    if (previous?.stage === step.stage) previous.steps.push(step);
+    else result.push({ stage: step.stage, title: step.title, steps: [step] });
+    return result;
+  }, []);
+
+  const stateOf = (step: DeploymentStep<DeploymentTargetDetail>) => {
+    const isOpen = openWave === step.wave;
+    const canConfirm = isOpen && !halted && step.needsConfirmation;
+    const queued = openWave !== null && step.wave > openWave;
+    const succeeded = step.targets.every(target => target.status === 'succeeded');
+    const failed = step.targets.some(target => target.status.startsWith('failed'));
+    return {
+      isOpen,
+      tone: failed ? 'err' : canConfirm ? 'warn' : succeeded ? 'ok' : '',
+      label: succeeded
+        ? '已完成'
+        : failed
+          ? '执行失败'
+          : canConfirm
+            ? '等待确认'
+            : isOpen && !halted
+              ? '进行中 · 等待 Agent'
+              : queued
+                ? '等待前一步完成'
+                : halted
+                  ? '已停止'
+                  : '等待执行',
+    };
+  };
+  const targetRows = (step: DeploymentStep<DeploymentTargetDetail>) => (
+    <>
+      {step.targets.map(target => (
+        <TargetRow
+          key={target.node_id}
+          t={target}
+          publisher={publisher}
+          system={system}
+          retryPending={retryPending}
+          retrying={retryPending && retryingNode === target.node_id}
+          onRetry={() => onRetry(target.node_id)}
+          onIsolate={() => onIsolate(target)}
+        />
+      ))}
+    </>
+  );
+  const stageDescription = (stage: DeploymentStage) =>
+    stage === 'config'
+      ? '自动下发，不中断现有连接'
+      : stage === 'verify'
+        ? '先验证一台机器，再继续扩大范围'
+        : stage === 'stop'
+          ? '停止服务前需要明确确认'
+          : '按监听依赖顺序更新其余机器';
+
+  return (
+    <div className="cgr-waves">
+      {groups.map(group => {
+        const single = group.steps.length === 1 ? stateOf(group.steps[0]) : null;
+        const singleClass =
+          single?.tone === 'err' ? 'is-fail' : single?.tone === 'warn' ? 'is-open' : single?.isOpen ? 'is-run' : '';
+        return (
+          <section className={`cgr-group cgr-stage ${singleClass}`} key={`${group.stage}:${group.steps[0].wave}`}>
+            <div className="cgr-head">
+              <b>{group.title}</b>
+              <span className="lbl">{stageDescription(group.stage)}</span>
+              <span className={`cgr-state ${single?.tone ?? ''}`}>
+                {single?.label ?? `${group.steps.length} 个步骤`}
+              </span>
+            </div>
+            {group.steps.length === 1 ? (
+              targetRows(group.steps[0])
+            ) : (
+              <div className="cgr-stage-steps">
+                {group.steps.map(step => {
+                  const state = stateOf(step);
+                  const stateClass =
+                    state.tone === 'err' ? 'is-fail' : state.tone === 'warn' ? 'is-open' : state.isOpen ? 'is-run' : '';
+                  return (
+                    <section className={`cgr-stage-step ${stateClass}`} key={step.wave}>
+                      <div className="cgr-step-head">
+                        <b>
+                          步骤 {step.step}/{step.steps}
+                        </b>
+                        <span className={`cgr-state ${state.tone}`}>{state.label}</span>
+                      </div>
+                      {targetRows(step)}
+                    </section>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
 
 function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   const nameOf = useNodeNames();
@@ -1198,179 +2151,241 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
     },
   });
 
-  if (detail.isPending) return <Loading />;
+  if (detail.isPending) return <Loading variant="deployment" />;
   if (detail.error) return <ErrorBox error={detail.error} />;
 
   const d = detail.data;
   // 只列出实际有操作的机器。十余行 skipped 会使实际执行的行难以定位，
   // 而本次发布涉及哪些机器正是详情页的主要内容。总数在列表页的 changed/total 中。
   const acting = d.targets.filter(t => t.status !== 'skipped');
-  const waves = [...new Set(acting.map(t => t.wave))].sort((a, b) => a - b);
+  const steps = deploymentSteps(acting, actionsOf);
   const publisher = can(who.role, 'publish');
   const dirty = d.targets.filter(t => t.status === 'failed-dirty');
   const failed = d.targets.filter(t => t.status.startsWith('failed'));
   const live = d.targets.filter(t => LIVE_TARGET.has(t.status));
   const openWave = live.length ? Math.min(...live.map(t => t.wave)) : null;
+  const openStep = steps.find(step => step.wave === openWave);
+  const openAction = openStep ? deploymentStepAction(openStep, nameOf) : null;
+  const askedStep = ask?.kind === 'wave' ? steps.find(step => step.wave === ask.wave) : undefined;
+  const finishedTargets = acting.filter(target => target.status === 'succeeded').length;
+  const finishedSteps = steps.filter(step => step.targets.every(target => target.status === 'succeeded')).length;
+  const disruptiveTargets = acting.filter(target => target.disruptive).length;
+  const executionDone = d.status === 'succeeded';
+  const effective = d.activation_status === 'activated';
+  const detailTone =
+    d.status === 'halted' || failed.length > 0
+      ? 'err'
+      : effective
+        ? 'ok'
+        : openStep?.needsConfirmation
+          ? 'warn'
+          : OPEN_STATES.has(d.status)
+            ? 'run'
+            : 'idle';
 
   return (
     <>
-      <div className="chipline" style={{ marginBottom: 8 }}>
-        <Status value={d.status} />
-        {d.activation_status === 'activated' && d.settlement_status === 'debt' && (
-          <span className="st st-gold">已生效 · {d.debt_targets} 台待补偿</span>
-        )}
-        {d.activation_status === 'activated' && d.settlement_status === 'converged' && (
-          <span className="st st-succeeded">已生效</span>
-        )}
-        {d.status === 'succeeded' && d.activation_status === 'waiting' && (
-          <span className="st st-gold">执行完成 · 待生效</span>
-        )}
-        {d.settlement_status === 'uncertain' && <span className="st st-warn">补偿状态待确认</span>}
-        <span className="mono d2">修订 {d.revision_id}</span>
-        {d.active ? <span className="st st-gold">active</span> : null}
-        {d.rollback_of_deployment_id ? (
-          <span className="st st-warn">rollback_to #{d.rollback_of_deployment_id}</span>
-        ) : null}
-        {d.sync_of_deployment_id ? <span className="st st-gold">sync_of #{d.sync_of_deployment_id}</span> : null}
-        <span className="dim">
-          actor {d.actor ?? '—'} · <Ago at={d.created_at} />
-        </span>
-      </div>
-
-      {d.status === 'halted' && (
-        <div className="callout err">
-          <b>熔断。</b>
-          {dirty.length > 0
-            ? `${dirty.map(t => nameOf(t.node_id)).join('、')} 进了 failed-dirty——agent 死在半路，这台现在什么状态没人知道。`
-            : failed.length > 0
-              ? `${failed.map(t => nameOf(t.node_id)).join('、')} 收敛失败，后面的波次已停住。`
-              : '人手停的：后面的波次不再下发，已成功的保持成功。'}
-          {failed.length > 0 ? '修好后逐台 retry；' : ''}
-          想换个修订重来就点「取消」。
-        </div>
-      )}
-
-      {waves.map(w => {
-        const inWave = acting.filter(t => t.wave === w);
-        const disruptive = inWave.some(t => t.disruptive);
-        const isOpen = openWave === w;
-        const canConfirm = isOpen && d.status !== 'halted' && waveNeedsConfirm(inWave, w);
-        const queued = openWave !== null && w > openWave;
-        return (
-          <div key={w}>
-            <div className="wavehead">
-              <span>
-                wave {w} · {disruptive ? '破坏性 · 灰度发布，一台一波' : '不掉线，一波推完'}
+      <div className="nd-sheet nd-page cg-page cg-detail">
+        <div className="fg-sheet nd-paper">
+          <header className="nd-page-head cg-head">
+            <div className="nd-page-identity">
+              <span className="cg-plate">
+                <Icon of="deploy" size={18} />
+                <span className={`cg-lamp ${detailTone}`} />
               </span>
-              <span className="rule" />
-              {canConfirm && (
+              <div className="nd-ident-text">
+                <div className="nd-ident-row">
+                  <h1 className="nd-id nd-name">变更单 #{d.id}</h1>
+                  <Status value={d.status} />
+                </div>
+                <span className="nd-ident-meta">
+                  {d.note || '未填写备注'} · {d.base_revision_id == null ? '空白环境' : `R${d.base_revision_id}`} → R
+                  {d.revision_id}
+                </span>
+              </div>
+            </div>
+            <ol className="cg-steps" aria-label="发布流程">
+              <li className="done">
+                <i>1</i>
+                <span>审阅计划</span>
+              </li>
+              <li className={executionDone ? 'done' : 'current'}>
+                <i>2</i>
+                <span>
+                  执行发布
+                  <small>
+                    {finishedSteps}/{steps.length} 步
+                  </small>
+                </span>
+              </li>
+              <li className={effective ? 'done' : executionDone ? 'current' : ''}>
+                <i>3</i>
+                <span>生效</span>
+              </li>
+            </ol>
+            <div className="nd-acts">
+              {openStep?.needsConfirmation && openWave === openStep.wave && d.status !== 'halted' && (
                 <button
                   className="btn primary"
-                  disabled={!publisher || confirm.isPending || confirmedWave === w}
-                  onClick={() => setAsk({ kind: 'wave', wave: w })}
+                  disabled={!publisher || confirm.isPending || confirmedWave === openStep.wave}
+                  onClick={() => setAsk({ kind: 'wave', wave: openStep.wave })}
                 >
-                  {confirmedWave === w ? '已确认下发' : `确认第 ${w} 波`}
+                  {confirmedWave === openStep.wave ? '已确认' : openAction}
                 </button>
               )}
-              {isOpen && !canConfirm && d.status !== 'halted' && <span className="note">进行中 · 等待 agent 拉取</span>}
-              {queued && <span className="note">等待前一波完成</span>}
+              {OPEN_STATES.has(d.status) && (
+                <button
+                  className="btn danger"
+                  disabled={!publisher || halt.isPending}
+                  onClick={() => setAsk({ kind: 'halt' })}
+                >
+                  熔断
+                </button>
+              )}
+              {(CANCELABLE.has(d.status) || d.status === 'succeeded') && (
+                <details className="cg-menu-wrap">
+                  <summary className="btn" aria-label="更多操作">
+                    <Icon of="more" size={16} />
+                  </summary>
+                  <div className="cg-menu" role="menu">
+                    {CANCELABLE.has(d.status) && (
+                      <button type="button" role="menuitem" onClick={() => setAsk({ kind: 'cancel' })}>
+                        <b>取消变更单</b>
+                        <span>停止本次发布，已完成的机器保持新配置</span>
+                      </button>
+                    )}
+                    {CANCELABLE.has(d.status) && (
+                      <button type="button" role="menuitem" onClick={() => setAsk({ kind: 'cancelRollback' })}>
+                        <b>取消并回滚</b>
+                        <span>停止本单并强制同步到运行基线</span>
+                      </button>
+                    )}
+                    {d.status === 'succeeded' && (
+                      <button type="button" role="menuitem" onClick={() => setAsk({ kind: 'rollback' })}>
+                        <b>恢复到这次快照</b>
+                        <span>恢复这次发布的模型并创建同步单</span>
+                      </button>
+                    )}
+                  </div>
+                </details>
+              )}
             </div>
-            <table className="tbl dp-wave">
-              <tbody>
-                {inWave.map(t => (
-                  <TargetRow
-                    key={t.node_id}
-                    t={t}
-                    publisher={publisher}
-                    system={can(who.role, 'system') && !isolate.isPending}
-                    retryPending={retry.isPending}
-                    retrying={retry.isPending && retry.variables === t.node_id}
-                    onRetry={() => retry.mutate(t.node_id)}
-                    onIsolate={() => isolate.mutate(t)}
-                  />
-                ))}
-              </tbody>
-            </table>
+          </header>
+
+          <div className="nd-paper-body cg-body">
+            <main className="cg-main">
+              {d.status === 'halted' && (
+                <div className="cgr-notice err">
+                  <span className="cg-lamp err" />
+                  <span>
+                    <b>发布已熔断。</b>
+                    {dirty.length > 0
+                      ? `${dirty.map(target => nameOf(target.node_id)).join('、')} 的现场状态无法确认。`
+                      : failed.length > 0
+                        ? `${failed.map(target => nameOf(target.node_id)).join('、')} 收敛失败，后续发布已停止。`
+                        : '人工停止了后续发布，已经成功的机器保持现状。'}
+                    {failed.length > 0 ? '修复机器后可以逐台重试；' : ''}也可以取消这张变更单后重新发布。
+                  </span>
+                </div>
+              )}
+
+              <section className="panel config-panel cg-sec">
+                <header>
+                  <PanelTitle of="deploy">执行进度</PanelTitle>
+                  <span className="cg-meta">
+                    {finishedTargets} / {acting.length} 台完成
+                  </span>
+                </header>
+                <DeploymentStages
+                  steps={steps}
+                  openWave={openWave}
+                  halted={d.status === 'halted'}
+                  publisher={publisher}
+                  system={can(who.role, 'system') && !isolate.isPending}
+                  retryPending={retry.isPending}
+                  retryingNode={retry.variables}
+                  onRetry={nodeId => retry.mutate(nodeId)}
+                  onIsolate={target => isolate.mutate(target)}
+                />
+              </section>
+
+              <section className="panel config-panel cg-sec cg-artifact-review">
+                <header>
+                  <PanelTitle of="artifacts">产物记录</PanelTitle>
+                  <span className="cg-meta">执行前 → 本次目标 · {acting.length} 台机器</span>
+                </header>
+                <RecordedArtifactChanges targets={acting} />
+              </section>
+
+              {(confirm.error ||
+                halt.error ||
+                cancel.error ||
+                cancelRollback.error ||
+                rollback.error ||
+                retry.error ||
+                isolate.error) && (
+                <ErrorBox
+                  error={
+                    confirm.error ??
+                    halt.error ??
+                    cancel.error ??
+                    cancelRollback.error ??
+                    rollback.error ??
+                    retry.error ??
+                    isolate.error
+                  }
+                />
+              )}
+            </main>
+
+            <aside className="cg-aside" aria-label="变更单信息">
+              <section className="panel config-panel cg-sec">
+                <header>
+                  <PanelTitle of="deploy">单据</PanelTitle>
+                </header>
+                <dl className="cg-kv">
+                  <dt>状态</dt>
+                  <dd>{STATUS_TEXT[d.status] ?? d.status}</dd>
+                  <dt>运行基线</dt>
+                  <dd>{d.base_revision_id == null ? '空白环境' : `R${d.base_revision_id}`}</dd>
+                  <dt>发布目标</dt>
+                  <dd className="act">R{d.revision_id}</dd>
+                  <dt>影响机器</dt>
+                  <dd>{acting.length} 台</dd>
+                  <dt>会中断连接</dt>
+                  <dd className={disruptiveTargets ? 'warn' : 'dim'}>
+                    {disruptiveTargets ? `${disruptiveTargets} 台` : '无'}
+                  </dd>
+                  <dt>发起人</dt>
+                  <dd>{d.actor ?? '—'}</dd>
+                  <dt>创建时间</dt>
+                  <dd>
+                    <Ago at={d.created_at} />
+                  </dd>
+                </dl>
+                <div className="chipline cg-detail-statuses">
+                  {effective && d.settlement_status === 'debt' && (
+                    <span className="st st-gold">已生效 · {d.debt_targets} 台待补偿</span>
+                  )}
+                  {effective && d.settlement_status === 'converged' && <span className="st st-succeeded">已生效</span>}
+                  {executionDone && !effective && <span className="st st-gold">执行完成 · 待生效</span>}
+                  {d.settlement_status === 'uncertain' && <span className="st st-warn">补偿状态待确认</span>}
+                  {d.rollback_of_deployment_id && (
+                    <span className="st st-warn">回滚到 #{d.rollback_of_deployment_id}</span>
+                  )}
+                  {d.sync_of_deployment_id && <span className="st st-gold">补推 #{d.sync_of_deployment_id}</span>}
+                </div>
+              </section>
+            </aside>
           </div>
-        );
-      })}
-
-      <div className="wavehead" style={{ marginTop: 14 }}>
-        <span>产物变更 · 本次目标与执行前配置</span>
-        <span className="rule" />
-      </div>
-      <RecordedArtifactChanges targets={acting} />
-
-      {(confirm.error ||
-        halt.error ||
-        cancel.error ||
-        cancelRollback.error ||
-        rollback.error ||
-        retry.error ||
-        isolate.error) && (
-        <ErrorBox
-          error={
-            confirm.error ??
-            halt.error ??
-            cancel.error ??
-            cancelRollback.error ??
-            rollback.error ??
-            retry.error ??
-            isolate.error
-          }
-        />
-      )}
-
-      <div className="toolbar" style={{ marginTop: 12 }}>
-        {OPEN_STATES.has(d.status) && (
-          <button
-            className="btn danger"
-            disabled={!publisher || halt.isPending}
-            title="停住后面的波次，已成功的保持成功"
-            onClick={() => setAsk({ kind: 'halt' })}
-          >
-            熔断
-          </button>
-        )}
-        {CANCELABLE.has(d.status) && (
-          <button
-            className="btn danger"
-            disabled={!publisher || cancel.isPending}
-            title="只停止这次发布：在途 target 转 canceled，之后能开新的发布"
-            onClick={() => setAsk({ kind: 'cancel' })}
-          >
-            取消
-          </button>
-        )}
-        {CANCELABLE.has(d.status) && (
-          <button
-            className="btn danger"
-            disabled={!can(who.role, 'system') || cancelRollback.isPending}
-            title="停止当前发布，并强制覆盖成它之前最近一次成功发布的快照"
-            onClick={() => setAsk({ kind: 'cancelRollback' })}
-          >
-            取消并回滚
-          </button>
-        )}
-        {d.status === 'succeeded' && (
-          <button
-            className="btn danger"
-            disabled={!can(who.role, 'system') || rollback.isPending}
-            title="恢复这次发布对应的模型快照，并创建强制同步工单"
-            onClick={() => setAsk({ kind: 'rollback' })}
-          >
-            恢复到这次快照
-          </button>
-        )}
-        <span className="sp" />
-        <span className="note">{OPEN_STATES.has(d.status) ? '每 3 秒刷新' : '已完成'}</span>
+        </div>
       </div>
 
-      {/* 危险操作确认。波次确认附带该波的中断影响摘要；回滚类操作需要输入「回滚」才能执行。 */}
+      {/* 危险操作确认。发布步骤确认附带中断影响摘要；回滚类操作需要输入「回滚」才能执行。 */}
       {ask?.kind === 'halt' && (
         <Confirm
           title="熔断这次发布？"
-          body={<>停住后面的波次，已成功的保持成功。要彻底收尾再点「取消」。</>}
+          body={<>停住后续发布，已成功的机器保持成功。要彻底收尾再点「取消」。</>}
           confirmLabel="熔断"
           onConfirm={() => {
             setAsk(null);
@@ -1429,9 +2444,9 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
       )}
       {ask?.kind === 'wave' && (
         <Confirm
-          title={`确认第 ${ask.wave} 波？`}
+          title={`${askedStep ? deploymentStepAction(askedStep, nameOf) : '继续发布'}？`}
           body={<WaveSummary targets={d.targets.filter(t => t.wave === ask.wave)} nameOf={nameOf} />}
-          confirmLabel="确认并下发"
+          confirmLabel="确认并开始"
           onConfirm={() => {
             setAsk(null);
             confirm.mutate(ask.wave);
@@ -1467,38 +2482,32 @@ function WaveSummary({ targets, nameOf }: { targets: DeploymentTargetDetail[]; n
   return (
     <>
       <p>
-        这一波 <b>{targets.length}</b> 台机器、{actionCount} 个动作。
+        这一步 <b>{targets.length}</b> 台机器、{actionCount} 个动作。
         {disruptive.length > 0 ? (
           <>
             其中 <b>{disruptive.length}</b> 台是破坏性的 —— 会断连接，确认后立刻执行。
           </>
         ) : (
-          '不掉线，一波推完。'
+          '不会中断连接，机器可以并行更新。'
         )}
       </p>
-      {/* 机器数并入动作所在的格，不单独占一列：窄屏下 .tbl 的每一格会变为独立一行，
-          单独的「90」占一行时无法与对应的动作关联。 */}
-      <table className="tbl dp-wave">
+      <table className="cg-sum">
         <tbody>
           {actions.map(([a, n]) => (
             <tr key={a}>
               <td>
-                <span className="st" style={{ fontSize: '10.5px' }}>
-                  {a}
-                </span>{' '}
+                <span className="cg-act">{(ACTION_LABEL as Record<string, string>)[a] ?? a}</span>{' '}
                 <b className="mono">×{n}</b>
               </td>
-              <td className="dim" style={{ fontSize: 12 }}>
-                {(ACTION_NOTE as Record<string, string>)[a]}
-              </td>
+              <td>{(ACTION_NOTE as Record<string, string>)[a]}</td>
             </tr>
           ))}
         </tbody>
       </table>
-      <p className="dim" style={{ fontSize: 12 }}>
+      <p className="cg-dim">
         {shown.join('、')}
         {rest > 0 && ` 等 ${targets.length} 台`}
-        {rest > 0 && <>（逐台明细在下面的波次表里）</>}
+        {rest > 0 && <>（逐台明细在下面的执行表里）</>}
       </p>
     </>
   );
@@ -1523,46 +2532,54 @@ function TargetRow({
 }) {
   const nameOf = useNodeNames();
   const guide = t.error ? guideFor(t.error) : undefined;
+  const tone = t.status.startsWith('failed')
+    ? 'err'
+    : t.status === 'succeeded'
+      ? 'ok'
+      : LIVE_TARGET.has(t.status)
+        ? 'run'
+        : 'idle';
+  const canRetry = t.status.startsWith('failed');
+  const canIsolate = ISOLATABLE_TARGET.has(t.status);
   return (
-    <>
-      <tr>
-        <td title={t.node_id}>{nameOf(t.node_id)}</td>
-        <td>
-          <Status value={t.status} />
-        </td>
-        <td className="dim" style={{ fontSize: 12 }}>
-          {t.error ? (
-            <span style={{ color: 'var(--err)' }}>{t.error}</span>
-          ) : t.dispatched_at ? (
-            <>
-              下发于 <Ago at={t.dispatched_at} />
-            </>
-          ) : (
-            ''
+    <div className="cgr-row is-run">
+      <span className={`cg-lamp ${tone}`} />
+      <span className="cgo-main">
+        <b title={t.node_id}>{nameOf(t.node_id)}</b>
+        <small>
+          {[t.node_id, ...actionsOf(t).map(action => (ACTION_LABEL as Record<string, string>)[action] ?? action)].join(
+            ' · ',
           )}
-        </td>
-        <td>
-          {t.status.startsWith('failed') && (
-            <button className="btn" disabled={!publisher || retryPending} onClick={onRetry}>
-              {retrying ? 'retrying…' : 'retry'}
-            </button>
+        </small>
+      </span>
+      <span className={`cgo-state ${tone}`}>{STATUS_TEXT[t.status] ?? t.status}</span>
+      <span className="cgo-when">{t.dispatched_at ? <Ago at={t.dispatched_at} /> : '—'}</span>
+      {(t.error || canRetry || canIsolate) && (
+        <div className="cgr-fail">
+          {t.error && <code>{t.error}</code>}
+          {t.error && guide && (
+            <p>
+              <span>处理方式</span>
+              {guide}
+              {t.status === 'failed-dirty' ? ' 这台机器当前状态未知，请先登录确认。' : ''}
+            </p>
           )}
-          {ISOLATABLE_TARGET.has(t.status) && (
-            <button className="btn danger" disabled={!system} onClick={onIsolate}>
-              隔离
-            </button>
+          {(canRetry || canIsolate) && (
+            <div className="ops">
+              {canRetry && (
+                <button className="btn" disabled={!publisher || retryPending} onClick={onRetry}>
+                  {retrying ? '重试中…' : '重试'}
+                </button>
+              )}
+              {canIsolate && (
+                <button className="btn danger" disabled={!system} onClick={onIsolate}>
+                  隔离
+                </button>
+              )}
+            </div>
           )}
-        </td>
-      </tr>
-      {t.error && guide && (
-        <tr>
-          <td colSpan={4} className="note" style={{ paddingTop: 2, paddingBottom: 6 }}>
-            <span className="dim">处理方式：</span>
-            {guide}
-            {t.status === 'failed-dirty' ? ' 这台机器当前状态未知，请先登录确认。' : ''}
-          </td>
-        </tr>
+        </div>
       )}
-    </>
+    </div>
   );
 }

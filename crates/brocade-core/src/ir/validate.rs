@@ -14,7 +14,11 @@ use crate::{
         HopPool, HopWire, Hysteria2, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
         HysteriaQuic, ModelSnapshot, RealityFallbackLimits, RealityFallbackRateLimit, Transport,
         Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, EXTERNAL_WIREGUARD_MAX_WORKERS,
+        VPNGATE_CONNECT_THRESHOLD_MAX_MS, VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS,
+        VPNGATE_MANAGED_ADDRESS, VPNGATE_MANAGED_PORT, VPNGATE_MAX_CANDIDATES,
+        VPNGATE_RUNTIME_MAX_POOLS_PER_NODE,
     },
+    physical::user::project_user,
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_public_key,
         is_reality_server_name, is_reality_short_id, parse_semver3,
@@ -22,6 +26,7 @@ use crate::{
 };
 
 use super::{
+    front::{analyze_front_routes, FrontRouteStatus},
     hops::{HopDialWire, HopPath},
     routing::HopIn,
     routing::{egress_tag, AppIr, DestMatch, Ingress, Rule},
@@ -49,6 +54,40 @@ pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<D
         "ModelSnapshot.nodes",
         diagnostics,
     );
+    let vpngate_pool_ids = snapshot
+        .external_outbounds
+        .iter()
+        .filter_map(|outbound| {
+            matches!(outbound.protocol, ExternalOutboundProtocol::Vpngate { .. })
+                .then_some(outbound.id.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    for node in &snapshot.nodes {
+        let referenced = snapshot
+            .apps
+            .iter()
+            .flat_map(|app| app.steps.iter())
+            .filter(|step| step.node == node.id)
+            .flat_map(|step| step.rules.iter())
+            .filter_map(|rule| match &rule.action {
+                Action::Proxy { outbound } if vpngate_pool_ids.contains(outbound.as_str()) => {
+                    Some(outbound.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if referenced.len() > VPNGATE_RUNTIME_MAX_POOLS_PER_NODE {
+            diagnostics.push(Diagnostic::error(
+                "external-outbound.vpngate-pool-limit",
+                format!("node {}", node.id),
+                format!(
+                    "机器 {} 同时引用了 {} 个 VPN Gate 池，不能超过 {VPNGATE_RUNTIME_MAX_POOLS_PER_NODE} 个隔离运行时",
+                    node.id,
+                    referenced.len()
+                ),
+            ));
+        }
+    }
     unique_by(
         snapshot.apps.iter().map(|app| app.id.as_str()),
         "id.dup",
@@ -457,7 +496,7 @@ pub fn validate_app(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnosti
     validate_steps(sys, app, diagnostics);
     validate_external_outbounds(app, diagnostics);
     validate_topology(app, diagnostics);
-    validate_fronts(app, diagnostics);
+    validate_fronts(sys, app, diagnostics);
     validate_reality(app, diagnostics);
     validate_hop_security(app, diagnostics);
     validate_reverse_needs_vless(app, diagnostics);
@@ -476,7 +515,11 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 "代理出站名称不能为空",
             ));
         }
-        if outbound.address.trim().is_empty() || outbound.address.chars().any(char::is_whitespace) {
+        let managed_vpngate = matches!(outbound.protocol, ExternalOutboundProtocol::Vpngate { .. });
+        if !managed_vpngate
+            && (outbound.address.trim().is_empty()
+                || outbound.address.chars().any(char::is_whitespace))
+        {
             diagnostics.push(Diagnostic::error(
                 "external-outbound.address",
                 &at,
@@ -513,6 +556,15 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                         "external-outbound.vless-encryption",
                         &at,
                         "VLESS encryption 必须为 none 或有效的客户端 Encryption 参数（包含服务端公钥）",
+                    ));
+                }
+                if encryption != "none"
+                    && !matches!(&outbound.security, ExternalOutboundSecurity::None)
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vless-encryption-security",
+                        &at,
+                        "VLESS Encryption 代理出站不能叠加 TLS 或 REALITY 传输安全",
                     ));
                 }
                 if flow.as_deref().is_some_and(|value| {
@@ -833,6 +885,99 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     }
                 }
             }
+            ExternalOutboundProtocol::Vpngate {
+                country_code,
+                server_id,
+                server_ids,
+                max_connect_ms,
+                min_download_bps,
+                max_candidates,
+            } => {
+                if country_code.len() != 2
+                    || !country_code.bytes().all(|byte| byte.is_ascii_uppercase())
+                    || country_code == "ZZ"
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-country",
+                        &at,
+                        "VPN Gate 地区必须是可路由的两位大写 ISO 代码，例如 JP、KR 或 US",
+                    ));
+                }
+                if *max_connect_ms == 0 || *max_connect_ms > VPNGATE_CONNECT_THRESHOLD_MAX_MS {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-connect-time",
+                        &at,
+                        format!(
+                            "VPN Gate 建连耗时上限必须在 1–{VPNGATE_CONNECT_THRESHOLD_MAX_MS} ms 之间"
+                        ),
+                    ));
+                }
+                if *min_download_bps > VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-download-speed",
+                        &at,
+                        format!(
+                            "VPN Gate 实测下载门槛不能超过 {VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS} bps"
+                        ),
+                    ));
+                }
+                if !(1..=VPNGATE_MAX_CANDIDATES).contains(max_candidates) {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-candidates",
+                        &at,
+                        format!("VPN Gate 候选节点数量必须在 1–{VPNGATE_MAX_CANDIDATES} 之间"),
+                    ));
+                }
+                if server_ids.len() > usize::from(VPNGATE_MAX_CANDIDATES)
+                    || server_ids.iter().collect::<BTreeSet<_>>().len() != server_ids.len()
+                    || (server_id.is_some() && !server_ids.is_empty())
+                    || (!server_ids.is_empty() && usize::from(*max_candidates) != server_ids.len())
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-manual-pool",
+                        &at,
+                        format!(
+                            "VPN Gate 手动池必须包含 1–{VPNGATE_MAX_CANDIDATES} 个不重复节点，候选数量须与节点数一致，不能同时指定旧版固定节点"
+                        ),
+                    ));
+                }
+                for server_id in server_id.iter().chain(server_ids) {
+                    if server_id.trim() != server_id
+                        || server_id.is_empty()
+                        || server_id.chars().count() > 128
+                        || server_id.chars().any(char::is_control)
+                    {
+                        diagnostics.push(Diagnostic::error(
+                            "external-outbound.vpngate-server",
+                            &at,
+                            "VPN Gate 固定节点 ID 不合法",
+                        ));
+                    }
+                }
+                if server_id.is_some() && *max_candidates != 1 {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-pinned-candidates",
+                        &at,
+                        "VPN Gate 固定节点的候选数量必须为 1",
+                    ));
+                }
+                if outbound.address != VPNGATE_MANAGED_ADDRESS
+                    || outbound.port != VPNGATE_MANAGED_PORT
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-endpoint",
+                        &at,
+                        "VPN Gate 的服务器由采集器管理，不能手工指定地址或端口",
+                    ));
+                }
+                if !outbound.bindings.is_empty() {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.vpngate-bindings",
+                        &at,
+                        "VPN Gate 不使用 WARP 机器身份，bindings 必须为空",
+                    ));
+                }
+            }
         }
         match &outbound.security {
             ExternalOutboundSecurity::None if matches!(&outbound.protocol, ExternalOutboundProtocol::Vless { encryption, .. } if encryption == "none") =>
@@ -861,6 +1006,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     ExternalOutboundProtocol::Socks5 { .. }
                         | ExternalOutboundProtocol::Wireguard { .. }
                         | ExternalOutboundProtocol::Warp { .. }
+                        | ExternalOutboundProtocol::Vpngate { .. }
                 ) =>
             {
                 diagnostics.push(Diagnostic::error(
@@ -1140,6 +1286,55 @@ pub fn validate_app_set(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
     validate_app_set_labels(apps, diagnostics);
     validate_app_set_dns(apps, diagnostics);
     validate_cross_app_listener_references(apps, diagnostics);
+    validate_subscription_names(apps, diagnostics);
+}
+
+/// Mihomo keeps proxies, external proxies and proxy groups in one name-based reference space.
+/// Validate the actual per-user projection: checking model objects directly would reject names
+/// which never coexist for one user and miss cross-project collisions which do.
+fn validate_subscription_names(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
+    const RESERVED: &[&str] = &["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
+
+    let users = apps
+        .iter()
+        .flat_map(|app| app.users.iter())
+        .map(|user| (user.tenant.clone(), user.id.clone()))
+        .collect::<BTreeSet<_>>();
+    for (tenant, user) in users {
+        let plan = project_user(apps, &tenant, &user);
+        let location = format!("{tenant}/{user}");
+        let mut names = BTreeMap::<String, String>::new();
+        let mut put = |name: &str, owner: String, diagnostics: &mut Vec<Diagnostic>| {
+            if RESERVED.contains(&name) {
+                diagnostics.push(Diagnostic::error(
+                    "subscription.name-reserved",
+                    &location,
+                    format!("{owner} 使用了 Mihomo 保留名称「{name}」"),
+                ));
+            }
+            if let Some(previous) = names.insert(name.to_owned(), owner.clone()) {
+                diagnostics.push(Diagnostic::error(
+                    "subscription.name-collision",
+                    &location,
+                    format!("Mihomo 名称「{name}」同时被 {previous} 和 {owner} 使用"),
+                ));
+            }
+        };
+
+        for entry in &plan.entries {
+            put(
+                &entry.name,
+                format!("订阅入口 {}", entry.ingress_id),
+                diagnostics,
+            );
+        }
+        for proxy in &plan.external_proxies {
+            put(&proxy.name, format!("外部成员 {}", proxy.id), diagnostics);
+        }
+        for front in &plan.front_groups {
+            put(&front.name, format!("前置组 {}", front.id), diagnostics);
+        }
+    }
 }
 
 /// Cross-project listener references share the same globally unique chain identity as stored
@@ -1657,10 +1852,42 @@ fn validate_chain_ingresses(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
 /// relaying arrangement lies outside brocade, the compiler has no basis to judge, and
 /// checking would only produce false alarms.
 fn validate_projection(ingress: &Ingress, diagnostics: &mut Vec<Diagnostic>) {
-    for (family, endpoint) in [
-        ("IPv4", ingress.projection.v4.as_ref()),
-        ("IPv6", ingress.projection.v6.as_ref()),
+    validate_projection_pair(
+        ingress,
+        "VLESS",
+        ingress.projection.v4.as_ref(),
+        ingress.projection.v6.as_ref(),
+        diagnostics,
+    );
+    for (protocol, projection) in [
+        (
+            "VLESS Encryption",
+            ingress.projection.vless_encryption.as_ref(),
+        ),
+        ("AnyTLS", ingress.projection.anytls.as_ref()),
+        ("Hysteria 2", ingress.projection.hysteria2.as_ref()),
     ] {
+        let Some(projection) = projection else {
+            continue;
+        };
+        validate_projection_pair(
+            ingress,
+            protocol,
+            projection.v4.as_ref(),
+            projection.v6.as_ref(),
+            diagnostics,
+        );
+    }
+}
+
+fn validate_projection_pair(
+    ingress: &Ingress,
+    protocol: &str,
+    v4: Option<&crate::model::ProjectionEndpoint>,
+    v6: Option<&crate::model::ProjectionEndpoint>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (family, endpoint) in [("IPv4", v4), ("IPv6", v6)] {
         let Some(endpoint) = endpoint else {
             continue;
         };
@@ -1669,8 +1896,8 @@ fn validate_projection(ingress: &Ingress, diagnostics: &mut Vec<Diagnostic>) {
                 "ingress.projection-blank",
                 &ingress.id,
                 format!(
-                    "接入面 {} 已启用 {family} 投影但未填写地址；不需要投影时请关闭开关，而非留空",
-                    ingress.id
+                    "接入面 {} 的 {protocol} 已启用 {family} 投影但未填写地址；不需要投影时请关闭开关，而非留空",
+                    ingress.id,
                 ),
             ));
         }
@@ -1678,7 +1905,7 @@ fn validate_projection(ingress: &Ingress, diagnostics: &mut Vec<Diagnostic>) {
             diagnostics.push(Diagnostic::error(
                 "ingress.projection-port",
                 &ingress.id,
-                format!("接入面 {} 的 {family} 投影端口是 0", ingress.id),
+                format!("接入面 {} 的 {protocol} {family} 投影端口是 0", ingress.id),
             ));
         }
     }
@@ -2551,24 +2778,17 @@ fn validate_sniffing_fallback(step: &super::routing::Step, diagnostics: &mut Vec
 /// anybody editing anything: issuing is asynchronous, and a machine enrolled a minute ago has
 /// none yet. That is the intended reading — the ingress is not ready, and saying so is more use
 /// than a green compile of something that cannot carry traffic.
-/// The one refusal that needs something the entrance may not have.
-///
-/// Blocking BitTorrent matches on what the sniffer decided the connection is speaking, and an
-/// entrance behind a front does not sniff (`sniff` in `ir/routing.rs`) — the rule compiles, ships,
-/// matches nothing, and the console goes on showing the switch as on. Silent failure in the safety
-/// direction is the worst kind: the operator believes the entrance is guarded and it is not.
-///
-/// An error rather than a warning, because there is a correct move in both directions and the
-/// operator has to pick one: drop the front, or accept that this entrance cannot refuse torrents.
-/// Neither is something the compiler may choose on their behalf.
+/// Blocking BitTorrent matches on what the sniffer decided the connection is speaking. Keep this
+/// check at the IR boundary so any future non-sniffing ingress shape cannot silently ship an
+/// enabled guard that matches nothing.
 fn validate_ingress_guard(diagnostics: &mut Vec<Diagnostic>, ingress: &Ingress) {
     if ingress.guard.no_bittorrent && !ingress.sniff {
         diagnostics.push(Diagnostic::error(
             "ingress.guard-needs-sniffing",
             &ingress.id,
             format!(
-                "接入面 {} 使用了前置代理、不做协议嗅探，「禁止 BT」在该场景下不会生效。\
-                 请移除前置代理，或关闭该开关",
+                "接入面 {} 未启用协议嗅探，「禁止 BT」在该场景下不会生效。\
+                 请启用嗅探，或关闭该开关",
                 ingress.id
             ),
         ));
@@ -3155,7 +3375,7 @@ fn detect_cycle(
     stack.remove(node);
 }
 
-fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
+fn validate_fronts(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
     for front in &app.fronts {
         // The group is empty while exit ingresses still point at it: the subscription
         // would present a policy group with no members, the client can select no node,
@@ -3180,40 +3400,17 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 continue;
             };
 
-            if let Some(node) = app.nodes.iter().find(|node| node.id == via_ingress.node) {
-                if !node.egress_allowed {
-                    diagnostics.push(Diagnostic::error(
-                        "front.via-no-egress",
-                        format!("{}/{}", front.id, via_ingress.id),
-                        format!(
-                            "前置组成员 {} 所在节点 {} 不允许出网",
-                            via_ingress.id, node.id
-                        ),
-                    ));
-                }
+            if let Some(parent) = via_ingress.front.as_deref() {
+                diagnostics.push(Diagnostic::error(
+                    "front.nested",
+                    format!("{}/{}", front.id, via),
+                    format!("前置组成员 {via} 已是前置组 {parent} 的目标；链式代理当前只支持一层"),
+                ));
             }
 
-            for step in app
-                .steps
-                .iter()
-                .filter(|step| step.chain == via_ingress.chain)
-            {
-                let Some(last) = step.rules.last() else {
-                    continue;
-                };
-                if matches!(last.dest_match, DestMatch::Any)
-                    && matches!(last.action, Action::Egress { .. } | Action::Proxy { .. })
-                {
-                    diagnostics.push(Diagnostic::error(
-                        "front.via-open",
-                        format!("{}/{}", via_ingress.id, step.node),
-                        format!(
-                            "{} 位于前置组「{}」成员 {} 的链上，但规则表以任意放行作为兜底",
-                            step.node, front.name, via_ingress.id
-                        ),
-                    ));
-                }
-            }
+            // A member keeps the ordinary server-side route of its ingress chain. Whether that
+            // route reaches each selected target is checked below; Front membership itself never
+            // changes the chain's default route or requires the first node to be an egress.
         }
 
         for outbound_id in &front.external_via {
@@ -3233,7 +3430,7 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 diagnostics.push(Diagnostic::error(
                     "tenant.scope",
                     format!("{}/{}", front.id, outbound.id),
-                    "前置组与订阅前置隧道必须属于同一租户",
+                    "前置组与外部成员隧道必须属于同一租户",
                 ));
             }
             if matches!(outbound.protocol, ExternalOutboundProtocol::Warp { .. }) {
@@ -3241,6 +3438,13 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     "front.warp-machine-identity",
                     format!("{}/{}", front.id, outbound.id),
                     "WARP 身份按机器生成，没有可安全下发给用户的共享身份；请使用手工隧道作为 Clash 前置",
+                ));
+            }
+            if matches!(outbound.protocol, ExternalOutboundProtocol::Vpngate { .. }) {
+                diagnostics.push(Diagnostic::error(
+                    "front.vpngate-managed-runtime",
+                    format!("{}/{}", front.id, outbound.id),
+                    "VPN Gate 配置由节点 Agent 持有，不能直接下发给客户端；请先发布一个使用该池出站的内部接入点，再把该接入点加入链式代理",
                 ));
             }
         }
@@ -3260,6 +3464,12 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
         let Some(front) = app.fronts.iter().find(|front| front.id == front_id) else {
             continue;
         };
+        // The attachment can sit on an ancestor-owned shared ingress, while the Front itself is
+        // scoped to one descendant tenant branch. Grants outside that branch keep using the
+        // ingress directly and neither need nor may learn about this Front's members.
+        if !under(&grant.tenant, &front.tenant) {
+            continue;
+        }
         // An empty group prompts no questions about grants. An empty via has only two
         // causes: the group has no members configured yet, or its members' machines were
         // decommissioned and `compile_app` dropped those vias. The latter is a
@@ -3267,7 +3477,7 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
         // deleting a swathe of grants before a machine hosting front ingresses could be
         // decommissioned — the same trap `front.unknown-via` fell into. An empty group
         // itself is reported by `front.no-via`.
-        if front.via.is_empty() {
+        if front.via.is_empty() || !front.external_via.is_empty() {
             continue;
         }
 
@@ -3277,31 +3487,29 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 && front.via.contains(&candidate.ingress)
         });
         if !has_via_grant {
-            diagnostics.push(Diagnostic::error(
+            diagnostics.push(Diagnostic::info(
                 "front.grant-via",
                 &grant.id,
                 format!(
-                    "用户 {}/{} 已获得 {} 的授权，但没有前置组 {} 中任何入口的授权",
+                    "用户 {}/{} 已获得 {} 的授权，但没有前置组 {} 中任何入口的授权；该目标不会进入此用户订阅",
                     grant.tenant, grant.user, grant.ingress, front.id
                 ),
             ));
         }
     }
 
-    // Ingresses fronted by a group: those with a non-empty front. These are the exits
-    // under a group, what a client looks for after being relayed through it; a mistyped
-    // group name reports front.missing, and a via member chain blocking them reports
-    // front.blocked.
+    // First keep dangling attachments as their own structural diagnostic. Route analysis below
+    // works from complete Fronts and must not turn a missing definition into an empty matrix.
     for ingress in app
         .ingresses
         .iter()
         .filter(|ingress| ingress.front.is_some())
     {
-        let Some(front) = ingress
+        if ingress
             .front
             .as_ref()
-            .and_then(|front_id| app.fronts.iter().find(|front| front.id == *front_id))
-        else {
+            .is_some_and(|front_id| app.fronts.iter().all(|front| front.id != *front_id))
+        {
             diagnostics.push(Diagnostic::error(
                 "front.missing",
                 &ingress.id,
@@ -3310,42 +3518,89 @@ fn validate_fronts(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     ingress.front.as_deref().unwrap_or("<none>")
                 ),
             ));
-            continue;
-        };
-        let Some(node) = app.nodes.iter().find(|node| node.id == ingress.node) else {
-            continue;
-        };
-        let hosts = [node.public_ipv4.as_deref(), node.public_ipv6.as_deref()];
+        }
+    }
 
-        for via in &front.via {
-            let Some(via_ingress) = app.ingresses.iter().find(|candidate| candidate.id == *via)
-            else {
-                continue;
-            };
-            for host in hosts.into_iter().flatten() {
-                let verdict = front_verdict(app, &via_ingress.chain, &via_ingress.node, host);
-                match verdict.kind {
-                    FrontVerdictKind::Ok => {}
-                    FrontVerdictKind::Blocked => diagnostics.push(Diagnostic::error(
-                        "front.blocked",
-                        verdict.at,
+    for front in &app.fronts {
+        let targets = app
+            .ingresses
+            .iter()
+            .filter(|ingress| ingress.front.as_deref() == Some(&front.id))
+            .map(|ingress| ingress.id.clone())
+            .collect::<Vec<_>>();
+        let analysis = analyze_front_routes(
+            Some(sys),
+            Some(app),
+            &front.id,
+            &front.via,
+            &front.external_via,
+            &targets,
+        );
+        let active = !front.via.is_empty() || !front.external_via.is_empty();
+        if active {
+            for target in &analysis.targets {
+                match target.landing.status {
+                    FrontRouteStatus::Blocked => diagnostics.push(Diagnostic::error(
+                        "front.target-no-egress",
+                        target
+                            .landing
+                            .node_id
+                            .as_deref()
+                            .unwrap_or(target.id.as_str()),
                         format!(
-                            "规则表拦截了 {host}，用户无法通过 {} 访问该地址",
-                            ingress.id
+                            "目标入口 {} 的落地链路明确无法出网：{}",
+                            target.id, target.landing.reason
                         ),
                     )),
-                    // `Info` again, and the wording says why: it cannot be determined.
-                    // Where the rules hold only dynamic matches such as geosite, static
-                    // inspection cannot see whether it is admitted — the half that can be
-                    // concluded is `front.blocked`, which is an error.
-                    FrontVerdictKind::Maybe | FrontVerdictKind::Unknown => {
+                    FrontRouteStatus::Conditional | FrontRouteStatus::Unknown => {
                         diagnostics.push(Diagnostic::info(
-                            "front.unproven",
-                            verdict.at,
-                            format!("判定不了是否放行 {host}"),
+                            "front.target-unproven",
+                            target
+                                .landing
+                                .node_id
+                                .as_deref()
+                                .unwrap_or(target.id.as_str()),
+                            format!(
+                                "目标入口 {} 的落地出网无法静态证明：{}",
+                                target.id, target.landing.reason
+                            ),
                         ));
                     }
+                    FrontRouteStatus::Reachable
+                    | FrontRouteStatus::External
+                    | FrontRouteStatus::Pending => {}
                 }
+            }
+        }
+
+        for cell in &analysis.cells {
+            match cell.relay.status {
+                FrontRouteStatus::Reachable | FrontRouteStatus::External => {}
+                FrontRouteStatus::Blocked => diagnostics.push(Diagnostic::error(
+                    "front.blocked",
+                    cell.relay
+                        .node_id
+                        .as_deref()
+                        .unwrap_or(cell.member_id.as_str()),
+                    format!(
+                        "成员 {} 无法访问目标入口 {}：{}",
+                        cell.member_id, cell.target_id, cell.relay.reason
+                    ),
+                )),
+                FrontRouteStatus::Conditional | FrontRouteStatus::Unknown => {
+                    diagnostics.push(Diagnostic::info(
+                        "front.unproven",
+                        cell.relay
+                            .node_id
+                            .as_deref()
+                            .unwrap_or(cell.member_id.as_str()),
+                        format!(
+                            "成员 {} 到目标入口 {} 无法静态证明：{}",
+                            cell.member_id, cell.target_id, cell.relay.reason
+                        ),
+                    ));
+                }
+                FrontRouteStatus::Pending => {}
             }
         }
     }
@@ -3534,6 +3789,30 @@ fn validate_tenants(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
         }
     }
 
+    for ingress in app
+        .ingresses
+        .iter()
+        .filter(|ingress| ingress.front.is_some())
+    {
+        let Some(front) = ingress
+            .front
+            .as_ref()
+            .and_then(|front_id| app.fronts.iter().find(|front| front.id == *front_id))
+        else {
+            continue;
+        };
+        if !under(&front.tenant, &ingress.tenant) {
+            diagnostics.push(Diagnostic::error(
+                "tenant.scope",
+                format!("{}/{}", front.id, ingress.id),
+                format!(
+                    "前置组属于 {}，而目标 {} 归属于 {}，不在可见范围内",
+                    front.tenant, ingress.id, ingress.tenant
+                ),
+            ));
+        }
+    }
+
     for grant in &app.grants {
         let Some(user) = app
             .users
@@ -3600,7 +3879,7 @@ where
 
 fn has_empty_match(rule: &Rule) -> bool {
     match &rule.dest_match {
-        DestMatch::Any | DestMatch::SniffingFailed | DestMatch::FrontDownstream => false,
+        DestMatch::Any | DestMatch::SniffingFailed => false,
         DestMatch::DomainSuffix(values)
         | DestMatch::DomainKeyword(values)
         | DestMatch::Geosite(values)
@@ -3643,8 +3922,7 @@ fn collect_match_slots(dest_match: &DestMatch, slots: &mut MatchSlots) -> bool {
         DestMatch::DomainSuffix(_)
         | DestMatch::DomainKeyword(_)
         | DestMatch::DomainRegex(_)
-        | DestMatch::Geosite(_)
-        | DestMatch::FrontDownstream => slots.put(MatchSlot::Domain),
+        | DestMatch::Geosite(_) => slots.put(MatchSlot::Domain),
         DestMatch::IpCidr(_) | DestMatch::Geoip(_) => slots.put(MatchSlot::Ip),
         DestMatch::Port(_) | DestMatch::PortExcept(_) => slots.put(MatchSlot::Port),
         DestMatch::Network(_) => slots.put(MatchSlot::Network),
@@ -3719,203 +3997,6 @@ fn starts_with_dns_scheme(value: &str) -> bool {
     ]
     .iter()
     .any(|prefix| value.starts_with(prefix))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrontVerdictKind {
-    Ok,
-    Blocked,
-    Maybe,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FrontVerdict {
-    kind: FrontVerdictKind,
-    at: String,
-}
-
-fn front_verdict(app: &AppIr, chain: &str, node: &str, host: &str) -> FrontVerdict {
-    front_verdict_inner(app, chain, node, host, &mut BTreeSet::new())
-}
-
-fn front_verdict_inner(
-    app: &AppIr,
-    chain: &str,
-    node: &str,
-    host: &str,
-    seen: &mut BTreeSet<String>,
-) -> FrontVerdict {
-    let key = format!("{chain}|{node}");
-    if !seen.insert(key) {
-        return FrontVerdict {
-            kind: FrontVerdictKind::Maybe,
-            at: node.to_owned(),
-        };
-    }
-
-    let Some(step) = app
-        .steps
-        .iter()
-        .find(|step| step.chain == chain && step.node == node)
-    else {
-        return FrontVerdict {
-            kind: FrontVerdictKind::Unknown,
-            at: node.to_owned(),
-        };
-    };
-
-    let mut dynamic_before_decision = false;
-    for rule in &step.rules {
-        match match_host(&rule.dest_match, host) {
-            MatchVerdict::Hit => match &rule.action {
-                Action::Egress { .. } => {
-                    return FrontVerdict {
-                        kind: if dynamic_before_decision {
-                            FrontVerdictKind::Maybe
-                        } else {
-                            FrontVerdictKind::Ok
-                        },
-                        at: node.to_owned(),
-                    };
-                }
-                Action::Proxy { .. } => {
-                    return FrontVerdict {
-                        kind: if dynamic_before_decision {
-                            FrontVerdictKind::Maybe
-                        } else {
-                            FrontVerdictKind::Ok
-                        },
-                        at: node.to_owned(),
-                    };
-                }
-                Action::Block => {
-                    return FrontVerdict {
-                        kind: if dynamic_before_decision {
-                            FrontVerdictKind::Maybe
-                        } else {
-                            FrontVerdictKind::Blocked
-                        },
-                        at: node.to_owned(),
-                    };
-                }
-                Action::Forward { to, .. } => {
-                    let verdict = front_verdict_inner(app, chain, to, host, seen);
-                    return if dynamic_before_decision {
-                        FrontVerdict {
-                            kind: FrontVerdictKind::Maybe,
-                            at: verdict.at,
-                        }
-                    } else {
-                        verdict
-                    };
-                }
-                Action::ReuseListener { listener, .. } => {
-                    let verdict =
-                        front_verdict_inner(app, &listener.chain, &listener.node, host, seen);
-                    return if dynamic_before_decision {
-                        FrontVerdict {
-                            kind: FrontVerdictKind::Maybe,
-                            at: verdict.at,
-                        }
-                    } else {
-                        verdict
-                    };
-                }
-            },
-            MatchVerdict::Miss => {}
-            MatchVerdict::Maybe => dynamic_before_decision = true,
-        }
-    }
-
-    FrontVerdict {
-        kind: if dynamic_before_decision {
-            FrontVerdictKind::Maybe
-        } else {
-            FrontVerdictKind::Unknown
-        },
-        at: node.to_owned(),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatchVerdict {
-    Hit,
-    Miss,
-    Maybe,
-}
-
-fn match_host(dest_match: &DestMatch, host: &str) -> MatchVerdict {
-    match dest_match {
-        DestMatch::Any => MatchVerdict::Hit,
-        DestMatch::DomainSuffix(values) => {
-            if values.iter().any(|value| domain_suffix_match(host, value)) {
-                MatchVerdict::Hit
-            } else {
-                MatchVerdict::Miss
-            }
-        }
-        DestMatch::DomainKeyword(values) => {
-            if values.iter().any(|value| host.contains(value)) {
-                MatchVerdict::Hit
-            } else {
-                MatchVerdict::Miss
-            }
-        }
-        DestMatch::IpCidr(values) => ip_match(host, values),
-        DestMatch::All(values) => {
-            let mut maybe = false;
-            for value in values {
-                match match_host(value, host) {
-                    MatchVerdict::Hit => {}
-                    MatchVerdict::Miss => return MatchVerdict::Miss,
-                    MatchVerdict::Maybe => maybe = true,
-                }
-            }
-            if maybe {
-                MatchVerdict::Maybe
-            } else {
-                MatchVerdict::Hit
-            }
-        }
-        DestMatch::FrontDownstream => MatchVerdict::Miss,
-        // Maybe rather than Miss: this walk knows a hostname and nothing else, and every one of
-        // these reads something it cannot see from here — a geo list, the port, the transport, what
-        // the sniffer found. Answering Miss would let a rule be pruned that fires in production.
-        DestMatch::DomainRegex(_)
-        | DestMatch::Geosite(_)
-        | DestMatch::Geoip(_)
-        | DestMatch::Port(_)
-        | DestMatch::PortExcept(_)
-        | DestMatch::Protocol(_)
-        | DestMatch::SniffingFailed
-        | DestMatch::Network(_) => MatchVerdict::Maybe,
-    }
-}
-
-fn domain_suffix_match(host: &str, suffix: &str) -> bool {
-    host == suffix || host.ends_with(&format!(".{suffix}"))
-}
-
-fn ip_match(host: &str, values: &[String]) -> MatchVerdict {
-    let Ok(ip) = host.parse::<IpAddr>() else {
-        return MatchVerdict::Miss;
-    };
-
-    for value in values {
-        if let Ok(exact) = value.parse::<IpAddr>() {
-            if exact == ip {
-                return MatchVerdict::Hit;
-            }
-        }
-        if let Ok(net) = value.parse::<ipnet::IpNet>() {
-            if net.contains(&ip) {
-                return MatchVerdict::Hit;
-            }
-        }
-    }
-
-    MatchVerdict::Miss
 }
 
 // Match the bundled Xray encryption envelope, with at least one complete public key.

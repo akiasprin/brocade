@@ -5,6 +5,9 @@ use serde_json::{json, Map, Value};
 use crate::artifacts::{
     grants::{GrantClient, GrantSyncBatch},
     phantun::{PhantunArtifact, PhantunConfig},
+    tunnel_probe::{
+        TunnelProbeArtifact, INBOUND_TAG as PROBE_INBOUND_TAG, OUTBOUND_TAG as PROBE_OUTBOUND_TAG,
+    },
     xray::{
         XrayArtifact, XrayConfig, XrayDnsServer, XrayHopInboundWire, XrayHopOutboundWire,
         XrayInbound, XrayIngressSecurity, XrayMatchCondition, XrayMux, XrayOutbound, XrayPolicy,
@@ -31,6 +34,37 @@ pub fn xray(artifact: &XrayArtifact) -> String {
         XrayArtifact::Disabled { .. } => json!({}),
         XrayArtifact::Config(config) => xray_config(config),
     };
+    format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
+}
+
+/// Render the short-lived client used to prove one external outbound works.
+///
+/// There is deliberately no default or Freedom outbound in this document. Even if the explicit
+/// rule were accidentally removed later, the only possible outbound would still be the tunnel.
+pub fn tunnel_probe(artifact: &TunnelProbeArtifact, log_path: &str) -> String {
+    let value = json!({
+        "log": {
+            "loglevel": "info",
+            "error": log_path,
+            "access": "none",
+        },
+        "inbounds": [{
+            "tag": PROBE_INBOUND_TAG,
+            "listen": "127.0.0.1",
+            "port": artifact.socks_port,
+            "protocol": "socks",
+            "settings": { "auth": "noauth", "udp": false },
+        }],
+        "outbounds": [outbound(&artifact.outbound)],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [{
+                "type": "field",
+                "inboundTag": [PROBE_INBOUND_TAG],
+                "outboundTag": PROBE_OUTBOUND_TAG,
+            }],
+        },
+    });
     format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
 }
 
@@ -347,32 +381,23 @@ fn inbound(inbound: &XrayInbound) -> Value {
             sniff,
             stream,
         } => {
-            // Deliberately without `routeOnly`, which is the half of this block worth
-            // explaining: it reads like the more restrained choice and is not.
+            // Sniffed destinations are routing metadata, not replacements for the requested
+            // socket target. This distinction is load-bearing for Front chaining: the member
+            // ingress sees the target proxy's TLS/QUIC handshake inside the first proxy hop.
+            // Replacing `ob.Target` would connect to its SNI instead of the configured target;
+            // REALITY intentionally uses a decoy SNI, so that path would always be wrong.
             //
-            // xray branches on it in one place (`app/dispatcher/default.go`):
-            //
-            //     if sniffingRequest.RouteOnly { ob.RouteTarget = destination }
-            //     else                         { ob.Target = destination }
-            //
-            // Without it the sniffed name replaces the outbound's target, so the exit's
-            // freedom outbound is handed a **domain** and resolves it itself. With it,
-            // routing still sees the name but the target stays the address the client
-            // supplied, and the exit connects to whatever the client's resolver returned.
-            //
-            // Which is wanted here is not a matter of taste. Subscribers sit behind
-            // censorship equipment that answers their queries with forged addresses;
-            // resolving at the exit is the entire point of carrying their traffic there.
-            //
-            // And it is load-bearing for a second reason that leaves no trace when broken.
-            // `domainStrategy` on the freedom outbound (the machine's own choice, see
-            // `model::DomainStrategy`) governs how a domain becomes an address — handed an
-            // address there is nothing for it to govern. Turning `routeOnly` on therefore
-            // switches that setting off for every sniffed connection while the artifact
-            // still says `UseIP`, `xray -test` still passes, and the console still shows
-            // the strategy the operator picked.
+            // `routeOnly` writes the sniffed name to `ob.RouteTarget`. Server-side domain rules
+            // therefore keep their full routing capability while Xray dials the destination the
+            // client actually requested. Brocade subscriptions use Mihomo fake-IP mapping and
+            // preserve domain destinations in proxy requests, so normal subscriber traffic still
+            // reaches the exit as a domain and remains governed by outbound `domainStrategy`.
             let sniffing = if *sniff {
-                json!({ "enabled": true, "destOverride": ["tls", "http", "quic"] })
+                json!({
+                    "enabled": true,
+                    "destOverride": ["tls", "http", "quic"],
+                    "routeOnly": true,
+                })
             } else {
                 json!({ "enabled": false })
             };
@@ -400,7 +425,11 @@ fn inbound(inbound: &XrayInbound) -> Value {
             settings,
         } => {
             let sniffing = if *sniff {
-                json!({ "enabled": true, "destOverride": ["tls", "http", "quic"] })
+                json!({
+                    "enabled": true,
+                    "destOverride": ["tls", "http", "quic"],
+                    "routeOnly": true,
+                })
             } else {
                 json!({ "enabled": false })
             };
@@ -435,7 +464,11 @@ fn inbound(inbound: &XrayInbound) -> Value {
             settings,
         } => {
             let sniffing = if *sniff {
-                json!({ "enabled": true, "destOverride": ["tls", "http", "quic"] })
+                json!({
+                    "enabled": true,
+                    "destOverride": ["tls", "http", "quic"],
+                    "routeOnly": true,
+                })
             } else {
                 json!({ "enabled": false })
             };
@@ -585,6 +618,7 @@ fn enable_sniffing(value: &mut Value, enabled: bool) {
             json!({
                 "enabled": true,
                 "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true,
             }),
         );
 }
@@ -1071,6 +1105,9 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                 }
                 ExternalOutboundProtocol::Warp { .. } => {
                     unreachable!("managed WARP must be lowered to WireGuard for its target node")
+                }
+                ExternalOutboundProtocol::Vpngate { .. } => {
+                    ("socks", json!({ "address": address, "port": port }))
                 }
             };
             let stream_settings = match vless_transport {

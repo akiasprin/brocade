@@ -3,26 +3,33 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use brocade_console::http::{
-    admin_router, admin_router_with_services, agent_router, agent_router_with_origin,
-    agent_router_with_origin_and_realtime, merged_router, with_console_static, EMBEDDED_XRAYS,
+    admin_router, admin_router_with_bootstrap_credential, admin_router_with_services, agent_router,
+    agent_router_with_origin, agent_router_with_origin_realtime_and_shutdown, merged_router,
+    with_console_static, BootstrapCredential, ConsoleServices, EMBEDDED_XRAYS,
 };
+use brocade_console::lifecycle::ShutdownSignal;
 use brocade_console::realtime::{RealtimeBroadcast, RealtimeService};
 use brocade_core::model::{ExternalOutboundProtocol, ExternalOutboundSecurity};
 use brocade_store::{
-    AdminContext, AdminInitRequest, CreateChainRequest, IssuedAdminToken, IssuedNodeToken, ModelOp,
-    PgStore, PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeTarget,
-    RegisterWarpBindingRequest, UpsertExternalOutboundRequest, ENROLLMENT_TOKEN_PREFIX,
+    AdminContext, AdminInitRequest, CreateChainRequest, CreateTenantRequest, IssuedAdminToken,
+    IssuedNodeToken, ModelOp, PgStore, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
+    PingProbeTarget, RegisterWarpBindingRequest, UpdateVpngateIntelligenceNode,
+    UpsertExternalOutboundRequest, ENROLLMENT_TOKEN_PREFIX,
 };
+use flate2::{write::GzEncoder, Compression};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
+use std::io::Write as _;
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tower::ServiceExt;
 
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
+const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
 
 struct TestPg {
     _container: testcontainers::ContainerAsync<Postgres>,
@@ -144,6 +151,338 @@ async fn admin_app(db: &TestPg) -> (Router, String) {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn proxycheck_credential_http_api_is_write_only() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let (app, token) = admin_app(&db).await;
+
+    let rejected = put_json(
+        &app,
+        &token,
+        "/vpngate/intelligence-credentials",
+        json!({ "proxycheck_api_keys": ["invalid"] }),
+    )
+    .await;
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+
+    let replacements = ["111111-222222-333333-444444", "aaaaaa-bbbbbb-cccccc-dddddd"];
+    let saved = put_json(
+        &app,
+        &token,
+        "/vpngate/intelligence-credentials",
+        json!({ "proxycheck_api_keys": replacements }),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK);
+    assert_eq!(saved.1, json!({ "proxycheck_api_key_configured": true }));
+    for replacement in replacements {
+        assert!(!saved.1.to_string().contains(replacement));
+    }
+
+    let overview = get_json(&app, &token, "/vpngate").await;
+    assert_eq!(overview.0, StatusCode::OK);
+    assert_eq!(
+        overview.1["intelligence_credentials"],
+        json!({ "proxycheck_api_key_configured": true })
+    );
+    for replacement in replacements {
+        assert!(!overview.1.to_string().contains(replacement));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn front_client_config_state_http_route_survives_reload() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    insert_front_target(db.pool()).await;
+    let revision = seed_subscription_serving(&db).await;
+    let (app, token) = admin_app(&db).await;
+
+    let front = json!({
+        "expected_revision": revision,
+        "id": "front-a1b2",
+        "tenant_id": "platform.acme",
+        "name": "Client Relay",
+        "strategy": "select",
+        "via": ["ing-b2c3"],
+        "external_via": [],
+        "targets": ["ing-c3d4"]
+    });
+    let (status, analysis) =
+        post_json(&app, &token, "/apps/app-a1b2/front-analysis", front.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{analysis}");
+    assert_eq!(analysis["topology_revision_id"], revision);
+    assert_eq!(analysis["permissions_revision_id"], revision);
+    assert_eq!(analysis["serving_generation"], 1);
+    assert_eq!(analysis["analysis"]["front_id"], "front-a1b2");
+    assert_eq!(analysis["analysis"]["blocking"], false);
+    assert_eq!(analysis["analysis"]["cells"].as_array().unwrap().len(), 1);
+
+    let (status, created) = post_json(&app, &token, "/apps/app-a1b2/fronts", front.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["client_config"]["status"], "activated");
+
+    let (status, state) = get_json(&app, &token, "/apps/app-a1b2/fronts/front-a1b2").await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    assert_eq!(state["front_id"], "front-a1b2");
+    assert_eq!(
+        state["head_snapshot_id"],
+        created["client_config"]["snapshot_id"]
+    );
+    assert_eq!(state["serving_snapshot_id"], state["head_snapshot_id"]);
+    assert_eq!(
+        state["serving_generation"],
+        created["client_config"]["serving_generation"]
+    );
+    assert_eq!(state["topology_revision_id"], revision);
+    assert_eq!(state["permissions_revision_id"], revision);
+    assert_eq!(state["active"], true);
+    assert_eq!(state["pending_topology"], json!([]));
+
+    let (status, stale_probe) = post_json(
+        &app,
+        &token,
+        "/users/platform.acme/alice/front-probes",
+        json!({
+            "app_id": "app-a1b2",
+            "front_id": "front-a1b2",
+            "member_id": "ing-b2c3",
+            "target_id": "ing-c3d4",
+            "expected_serving_generation": 1,
+            "expected_client_snapshot_id": created["client_config"]["snapshot_id"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale_probe}");
+    assert!(stale_probe["error"]
+        .as_str()
+        .unwrap()
+        .contains("Serving 已变化"));
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::get("/apps/app-a1b2/fronts/front-a1b2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let unauthorized_probe = app
+        .clone()
+        .oneshot(
+            Request::post("/users/platform.acme/alice/front-probes")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "app_id": "app-a1b2",
+                        "front_id": "front-a1b2",
+                        "member_id": "ing-b2c3",
+                        "target_id": "ing-c3d4",
+                        "expected_serving_generation": state["serving_generation"],
+                        "expected_client_snapshot_id": state["head_snapshot_id"],
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_probe.status(), StatusCode::UNAUTHORIZED);
+
+    let unauthorized_analysis = app
+        .oneshot(
+            Request::post("/apps/app-a1b2/front-analysis")
+                .header("content-type", "application/json")
+                .body(Body::from(front.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_analysis.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn tunnel_probe_http_routes_expose_history_and_protect_writes() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    db.store
+        .create_tenant(
+            &AdminContext::system_admin("fixture"),
+            CreateTenantRequest {
+                id: "platform.acme".to_owned(),
+                name: "Platform".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let committed = db
+        .store
+        .apply_draft(
+            &AdminContext::system_admin("fixture"),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: UpsertExternalOutboundRequest {
+                    id: "custom-1111-1111".to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "Vendor edge".to_owned(),
+                    address: "edge.vendor.example".to_owned(),
+                    port: 1080,
+                    protocol: ExternalOutboundProtocol::Socks5 {
+                        username: None,
+                        credential: String::new(),
+                    },
+                    security: ExternalOutboundSecurity::None,
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO subscription_serving_state (
+             id, topology_revision_id, permissions_revision_id, client_snapshot_id, generation
+         ) VALUES (
+             TRUE, $1, $1,
+             (SELECT head_snapshot_id FROM subscription_client_state WHERE id = TRUE),
+             1
+         )",
+    )
+    .bind(i64::try_from(committed.revision_id).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let (app, token) = admin_app(&db).await;
+    let list = get_json(&app, &token, "/tunnel-probes").await;
+    assert_eq!(list.0, StatusCode::OK);
+    assert!(list.1["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["outbound_id"] == "custom-1111-1111"));
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::put("/tenants/platform.acme/tunnels/custom-1111-1111/probe-policy")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "enabled": true, "interval_secs": 60, "timeout_secs": 5 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let policy = put_json(
+        &app,
+        &token,
+        "/tenants/platform.acme/tunnels/custom-1111-1111/probe-policy",
+        json!({ "enabled": true, "interval_secs": 60, "timeout_secs": 5 }),
+    )
+    .await;
+    assert_eq!(policy.0, StatusCode::OK);
+    assert_eq!(policy.1["enabled"], true);
+
+    let view = get_json(
+        &app,
+        &token,
+        "/tenants/platform.acme/tunnels/custom-1111-1111/probe?window_secs=86400",
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::OK);
+    assert_eq!(view.1["summary"]["total"], 0);
+
+    let invalid = put_json(
+        &app,
+        &token,
+        "/tenants/platform.acme/tunnels/custom-1111-1111/probe-policy",
+        json!({ "enabled": true, "interval_secs": 61, "timeout_secs": 5 }),
+    )
+    .await;
+    assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
+
+    let started = post_json(
+        &app,
+        &token,
+        "/tenants/platform.acme/tunnels/custom-1111-1111/probe-runs",
+        json!({}),
+    )
+    .await;
+    assert!(
+        matches!(
+            started.0,
+            StatusCode::ACCEPTED | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "runtime capability decides execution, not routing: {started:?}"
+    );
+    if started.0 == StatusCode::ACCEPTED {
+        assert_eq!(started.1["run"]["source"], "serving");
+        let run_id = started.1["run"]["id"].as_i64().unwrap();
+        let canceled = request_json_with_token(
+            &app,
+            "DELETE",
+            &format!("/tunnel-probe-runs/{run_id}"),
+            None,
+            &token,
+        )
+        .await;
+        assert_eq!(canceled.0, StatusCode::OK);
+        assert_eq!(canceled.1["status"], "canceled");
+
+        let draft_started = post_json(
+            &app,
+            &token,
+            "/tenants/platform.acme/tunnels/custom-1111-1111/probe-runs",
+            json!({ "source": "draft", "ops": [] }),
+        )
+        .await;
+        assert_eq!(draft_started.0, StatusCode::ACCEPTED);
+        assert_eq!(draft_started.1["run"]["source"], "draft");
+        assert_eq!(draft_started.1["run"]["serving_generation"], Value::Null);
+        assert_eq!(
+            draft_started.1["run"]["draft_sha256"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        let draft_run_id = draft_started.1["run"]["id"].as_i64().unwrap();
+        let canceled = request_json_with_token(
+            &app,
+            "DELETE",
+            &format!("/tunnel-probe-runs/{draft_run_id}"),
+            None,
+            &token,
+        )
+        .await;
+        assert_eq!(canceled.0, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn initial_html_uses_current_branding_without_default_title_flash() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -222,7 +561,7 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
             &AdminContext::system_admin("fixture"),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
-                    id: "warp".to_owned(),
+                    id: "warp-8f3a-2d71".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Cloudflare WARP".to_owned(),
                     address: "engage.cloudflareclient.com".to_owned(),
@@ -247,7 +586,7 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
         .register_warp_binding(
             &AdminContext::system_admin("fixture"),
             RegisterWarpBindingRequest {
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 device_id: "device-n1".to_owned(),
                 account_id: "account-n1".to_owned(),
@@ -263,7 +602,7 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
         .unwrap();
 
     let (app, token) = admin_app(&db).await;
-    let uri = "/tenants/platform.acme/tunnels/warp/warp-bindings/n1";
+    let uri = "/tenants/platform.acme/tunnels/warp-8f3a-2d71/warp-bindings/n1";
     let unauthorized = app
         .clone()
         .oneshot(
@@ -484,10 +823,12 @@ async fn realtime_websocket_authenticates_leases_and_forwards_a_sample() {
     insert_node(db.pool()).await;
     let token = db.store.issue_node_token("n1").await.unwrap().token;
     let service = RealtimeService::new(Default::default());
-    let app = agent_router_with_origin_and_realtime(
+    let shutdown = ShutdownSignal::new();
+    let app = agent_router_with_origin_realtime_and_shutdown(
         db.store.clone(),
         "http://127.0.0.1:8080".to_owned(),
         service.clone(),
+        shutdown.clone(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -526,8 +867,10 @@ async fn realtime_websocket_authenticates_leases_and_forwards_a_sample() {
     );
 
     let sample = brocade_deployment::protocol::AgentRealtimeSample {
+        diagnostics_unchanged: false,
         reverse_health: None,
         mux: None,
+        vpngate: None,
         sequence: 1,
         sampled_at_unix_millis: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -561,7 +904,19 @@ async fn realtime_websocket_authenticates_leases_and_forwards_a_sample() {
         "first connection sample marks a gap"
     );
 
-    socket.close(None).await.unwrap();
+    shutdown.request();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Agent WebSocket close failed: {error}"),
+                None => panic!("Agent WebSocket ended without a close frame"),
+            }
+        }
+    })
+    .await
+    .expect("the Agent WebSocket should close when shutdown starts");
     server.abort();
 }
 
@@ -582,11 +937,13 @@ async fn realtime_settings_and_sse_create_one_bounded_node_lease() {
     );
     let app = admin_router_with_services(
         db.store.clone(),
-        std::sync::Arc::new(tokio::sync::Notify::new()),
-        std::sync::Arc::new(tokio::sync::Notify::new()),
-        std::sync::Arc::new(tokio::sync::Notify::new()),
-        brocade_console::geoip::GeoIpLookup::default(),
-        service,
+        ConsoleServices::new(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            brocade_console::geoip::GeoIpLookup::default(),
+            service,
+        ),
     );
 
     let settings = app
@@ -1298,7 +1655,36 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         return;
     };
     db.store.migrate().await.unwrap();
-    let app = admin_router(db.store.clone());
+    let initialization_disabled = admin_router(db.store.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/init")
+                .header("authorization", format!("Bearer {BOOTSTRAP_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "operator_id": "root",
+                        "display_name": "root",
+                        "password": ADMIN_PASSWORD,
+                        "root_tenant": "platform"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        initialization_disabled.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(!db.store.admin_auth_state().await.unwrap().initialized);
+
+    let app = admin_router_with_bootstrap_credential(
+        db.store.clone(),
+        BootstrapCredential::new(BOOTSTRAP_TOKEN).unwrap(),
+    );
 
     let response = app
         .clone()
@@ -1315,12 +1701,62 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
     let body = response_json(response).await;
     assert_eq!(body["initialized"], false);
 
+    let missing_credential = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/init")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "operator_id": "attacker",
+                        "display_name": "attacker",
+                        "password": ADMIN_PASSWORD,
+                        "root_tenant": "platform"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_credential.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_credential = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/init")
+                .header(
+                    "authorization",
+                    "Bearer wrong-bootstrap-token-with-32-bytes",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "operator_id": "attacker",
+                        "display_name": "attacker",
+                        "password": ADMIN_PASSWORD,
+                        "root_tenant": "platform"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_credential.status(), StatusCode::UNAUTHORIZED);
+    assert!(!db.store.admin_auth_state().await.unwrap().initialized);
+
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/auth/init")
+                .header("authorization", format!("Bearer {BOOTSTRAP_TOKEN}"))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
@@ -1414,6 +1850,18 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         .unwrap();
     assert_eq!(duplicate.status(), StatusCode::FORBIDDEN);
 
+    // A valid request turns the fixed login deadline into a sliding idle deadline. The response
+    // must renew the browser's Max-Age at the same time, or the database session would outlive the
+    // cookie and an open console would still be logged out locally.
+    sqlx::query(
+        "UPDATE admin_sessions
+         SET last_used_at = now() - interval '2 minutes',
+             expires_at = now() + interval '1 hour'
+         WHERE operator_id = 'root' AND revoked_at IS NULL",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     let cookie_whoami = app
         .clone()
         .oneshot(
@@ -1427,8 +1875,40 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         .await
         .unwrap();
     assert_eq!(cookie_whoami.status(), StatusCode::OK);
+    let renewed_cookie = cookie_whoami
+        .headers()
+        .get("set-cookie")
+        .expect("active session should renew its browser cookie")
+        .to_str()
+        .unwrap();
+    assert!(renewed_cookie.starts_with(init_cookie_pair.as_str()));
+    assert!(renewed_cookie.contains("Max-Age=43200"));
     let body = response_json(cookie_whoami).await;
     assert_eq!(body["operator_id"], "root");
+    let extended: bool = sqlx::query_scalar(
+        "SELECT expires_at > now() + interval '11 hours 59 minutes'
+         FROM admin_sessions
+         WHERE operator_id = 'root' AND revoked_at IS NULL",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(extended);
+
+    let throttled_whoami = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/whoami")
+                .header("cookie", &init_cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(throttled_whoami.status(), StatusCode::OK);
+    assert!(throttled_whoami.headers().get("set-cookie").is_none());
 
     // The Bearer route must still work; the token is simply signed separately rather than handed
     // out by init.
@@ -1738,8 +2218,8 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
     .unwrap();
     assert_eq!(protocol, Some(1));
 
-    // A protocol newer than this control plane is incompatible as well. Treating the version as
-    // a lower bound would let an unknown future contract claim current desired state.
+    // Protocol v20 established a forward-compatible floor. A newer Agent remains serviceable
+    // while the Console is rolled out behind it and must not be sent into a rescue-update loop.
     let future_protocol = agent
         .clone()
         .oneshot(
@@ -1757,13 +2237,10 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         .await
         .unwrap();
     assert_eq!(future_protocol.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        future_protocol
-            .headers()
-            .get("x-brocade-agent-upgrade-required")
-            .unwrap(),
-        "1"
-    );
+    assert!(future_protocol
+        .headers()
+        .get("x-brocade-agent-upgrade-required")
+        .is_none());
 
     // Isolation is not implicit release approval. Before an administrator stages this build for
     // the node, the independent update channel remains quiet.
@@ -1821,7 +2298,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         .unwrap();
     assert_eq!(update.status(), StatusCode::OK);
 
-    // Once running the current protocol, an otherwise idle node still receives 204, but no
+    // Once running a compatible protocol, an otherwise idle node still receives 204, but no
     // upgrade-required marker: it has rejoined the desired-state channel.
     let current = agent
         .clone()
@@ -1844,6 +2321,161 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         .headers()
         .get("x-brocade-agent-upgrade-required")
         .is_none());
+
+    // Exit-IP intelligence has its own work lane. It observes the same minimum-version gate as
+    // desired state, but an idle eligible queue is simply 204 and cannot be delayed by catalogue
+    // desired-state generation.
+    let old_intelligence_worker = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/vpngate/intelligence-assignment")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    (brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION - 1).to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_intelligence_worker.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        old_intelligence_worker
+            .headers()
+            .get("x-brocade-agent-upgrade-required")
+            .unwrap(),
+        "1"
+    );
+
+    let idle_intelligence_worker = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/vpngate/intelligence-assignment")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(idle_intelligence_worker.status(), StatusCode::NO_CONTENT);
+    assert!(idle_intelligence_worker
+        .headers()
+        .get("x-brocade-agent-upgrade-required")
+        .is_none());
+
+    // Catalogue collection is another independent work lane for the same proxy-pool
+    // intelligence selection. Keep its protocol boundary explicit as well: an old Agent must
+    // upgrade before it can transport upstream bytes, while a current but unselected Agent is
+    // simply idle.
+    let old_catalogue_worker = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/vpngate/catalogue-assignment")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    (brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION - 1).to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_catalogue_worker.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        old_catalogue_worker
+            .headers()
+            .get("x-brocade-agent-upgrade-required")
+            .unwrap(),
+        "1"
+    );
+
+    let idle_catalogue_worker = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/vpngate/catalogue-assignment")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(idle_catalogue_worker.status(), StatusCode::NO_CONTENT);
+    assert!(idle_catalogue_worker
+        .headers()
+        .get("x-brocade-agent-upgrade-required")
+        .is_none());
+
+    // Complete VPN Gate reconcile reports can carry an empty pool set, but only the exact
+    // protocol that understands omission as deletion may submit one.
+    let old_reconcile = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/v1/vpngate/reconcile-report")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("content-type", "application/json")
+                .header(
+                    "x-brocade-protocol-version",
+                    (brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION - 1).to_string(),
+                )
+                .body(Body::from(
+                    json!({
+                        "topology_revision": 0,
+                        "catalog_generation": 0,
+                        "pools": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_reconcile.status(), StatusCode::CONFLICT);
+
+    let current_reconcile = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/v1/vpngate/reconcile-report")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("content-type", "application/json")
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+                )
+                .body(Body::from(
+                    json!({
+                        "topology_revision": 0,
+                        "catalog_generation": 0,
+                        "pools": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current_reconcile.status(), StatusCode::OK);
 
     assert!(db.store.revoke_node_token("n1").await.unwrap());
     let revoked = agent
@@ -1891,6 +2523,126 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         row.try_get::<Option<String>, _>("agent_version").unwrap(),
         Some("brocade-agent-test".to_owned())
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn selected_agent_catalogue_upload_is_deduplicated_and_published_by_console() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let issued = db.store.issue_node_token("n1").await.unwrap();
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET agent_protocol_version = $2, runtime_reported_at = now()
+          WHERE node_id = $1",
+    )
+    .bind("n1")
+    .bind(i32::try_from(brocade_deployment::protocol::AGENT_PROTOCOL_VERSION).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.store
+        .update_vpngate_intelligence_node(
+            &AdminContext::system_admin("catalogue-test"),
+            "n1",
+            UpdateVpngateIntelligenceNode { enabled: true },
+        )
+        .await
+        .unwrap();
+
+    let agent = agent_router(db.store.clone());
+    let assignment_response = agent
+        .clone()
+        .oneshot(
+            Request::get("/agent/v1/vpngate/catalogue-assignment")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assignment_response.status(), StatusCode::OK);
+    let assignment: Value = serde_json::from_slice(
+        &to_bytes(assignment_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let profile = "client\ndev tun\nproto udp\nremote 192.0.2.10 1194\n\
+                   up /tmp/provider-hook\ncipher AES-128-CBC\nauth SHA1\nremote-cert-tls server\n\
+                   <ca>\nCA\n</ca>\n<cert>\nCERT\n</cert>\n<key>\nKEY\n</key>\n";
+    let safe_profile = profile.replace("up /tmp/provider-hook\n", "sndbuf 0\n");
+    let encoded = BASE64.encode(safe_profile);
+    let header = "#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64";
+    let feed = format!(
+        "*vpn_servers\n{header}\n\
+         vpn1.example,192.0.2.10,100,21,30000000,Japan,JP,4,5000,10,2000,2weeks,Volunteer,older,{encoded}\n\
+         vpn1.example,192.0.2.10,123,19,32000000,Japan,JP,3,6000,12,2400,2weeks,Volunteer,newer,{encoded}\n*\n"
+    );
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(feed.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let report_response = agent
+        .oneshot(
+            Request::post(format!(
+                "/agent/v1/vpngate/catalogue-report?run_id={}&lease_generation={}",
+                assignment["run_id"], assignment["lease_generation"]
+            ))
+            .header("authorization", format!("Bearer {}", issued.token))
+            .header(
+                "x-brocade-protocol-version",
+                brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+            )
+            .header("content-type", "application/gzip")
+            .body(Body::from(compressed))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report_response.status(), StatusCode::OK);
+    let report: Value = serde_json::from_slice(
+        &to_bytes(report_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report, json!({ "accepted": true, "servers": 1 }));
+
+    let server = sqlx::query(
+        "SELECT server.score, server.message, profile.openvpn_config
+           FROM vpngate_servers server
+           JOIN vpngate_profiles profile ON profile.sha256 = server.profile_sha256
+          WHERE server.id = 'vpn1.example' AND server.current",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(server.try_get::<i64, _>("score").unwrap(), 123);
+    assert_eq!(server.try_get::<String, _>("message").unwrap(), "newer");
+    let stored_profile = server.try_get::<String, _>("openvpn_config").unwrap();
+    assert!(!stored_profile.contains("provider-hook"));
+    assert!(!stored_profile.contains("sndbuf"));
+    let run = sqlx::query(
+        "SELECT worker_id, accepted_rows, rejected_rows
+           FROM vpngate_sync_runs
+          WHERE id = $1",
+    )
+    .bind(assignment["run_id"].as_i64().unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(run.try_get::<String, _>("worker_id").unwrap(), "n1");
+    assert_eq!(run.try_get::<i32, _>("accepted_rows").unwrap(), 1);
+    assert_eq!(run.try_get::<i32, _>("rejected_rows").unwrap(), 1);
 }
 
 #[tokio::test]
@@ -2459,7 +3211,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    // (3) The admin side reads them back
+    // (3) The legacy admin view still serves already-open pages during a Console replacement.
     let response = admin
         .clone()
         .oneshot(
@@ -2521,7 +3273,7 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/probes/e2e")
+                .uri("/probes/e2e?format=columnar-v1")
                 .header("authorization", format!("Bearer {admin_token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -2538,7 +3290,16 @@ async fn http_agent_e2e_probe_round_trips_through_both_faces() {
         chain["exit_verdict"], "unknown",
         "没通就谈不上出口核对，agent 报的 match 要被纠正"
     );
-    assert_eq!(chain["samples"].as_array().unwrap().len(), 2, "样本要累积");
+    assert_eq!(
+        chain["samples"]["probed_at_unix_secs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "样本要累积"
+    );
+    assert_eq!(chain["samples"]["status"], json!(["ok", "timeout"]));
+    assert_eq!(chain["samples"]["ttfb_ms"], json!([86, null]));
 
     // (5) Rows whose chain is absent from the model are dropped rather than failing the batch —
     // right after a chain is deleted the agent's work list is still stale.
@@ -5961,6 +6722,10 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     };
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
+    sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-empty', 'Empty App', 1)")
+        .execute(db.pool())
+        .await
+        .unwrap();
     db.store
         .update_ping_probe_settings(
             &AdminContext::system_admin("fixture"),
@@ -5995,6 +6760,13 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         .unwrap();
 
     let (app, admin_token) = admin_app(&db).await;
+    let bootstrap = get_json(&app, &admin_token, "/bootstrap").await;
+    assert_eq!(bootstrap.0, StatusCode::OK);
+    assert_eq!(bootstrap.1["initial"]["node_count"], 1);
+    assert_eq!(
+        bootstrap.1["initial"]["chain_group_count"],
+        json!([["app-a1b2", 1], ["app-empty", 0]])
+    );
     let enabled = put_json(
         &app,
         &admin_token,
@@ -6005,6 +6777,14 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     assert_eq!(enabled.0, StatusCode::OK);
     assert_eq!(enabled.1["public_open"], true);
     let cookie = login_cookie(&app, "public", "").await;
+    let bootstrap = get_json_with_cookie(&app, "/bootstrap", &cookie).await;
+    assert_eq!(bootstrap.0, StatusCode::OK);
+    assert_eq!(bootstrap.1["who"]["operator_id"], "public");
+    assert_eq!(bootstrap.1["initial"]["node_count"], 1);
+    assert_eq!(
+        bootstrap.1["initial"]["chain_group_count"],
+        json!([["app-a1b2", 1]])
+    );
 
     // Public access includes the system's masked user and usage views. The same response layer
     // that masks machine addresses must keep UUID credentials and login state out of both the
@@ -6014,7 +6794,11 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "/quotas",
         "/usage/samples",
         "/usage/monthly-summary",
+        "/agent-log-policy",
         "/certs",
+        "/vpngate",
+        "/vpngate/runtimes",
+        "/vpngate/countries/JP/servers",
     ] {
         assert_eq!(
             get_json_with_cookie(&app, path, &cookie).await.0,
@@ -6022,6 +6806,18 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
             "public read-only view stayed closed: {path}"
         );
     }
+    let directory = get_json_with_cookie(&app, "/vpngate/countries/JP/servers", &cookie).await;
+    assert_eq!(directory.0, StatusCode::OK);
+    assert!(directory.1["items"].is_array());
+    assert_eq!(directory.1["page"], 1);
+    assert_eq!(directory.1["page_size"], 100);
+    assert!(directory.1["total"].is_number());
+    let oversized =
+        get_json_with_cookie(&app, "/vpngate/countries/JP/servers?page_size=101", &cookie).await;
+    assert_eq!(oversized.0, StatusCode::BAD_REQUEST);
+    let log_policy = get_json_with_cookie(&app, "/agent-log-policy", &cookie).await;
+    assert_eq!(log_policy.0, StatusCode::OK);
+    assert_eq!(log_policy.1["nodes"][0]["node_id"], "n1");
     let probe_plan =
         get_json_with_cookie(&app, "/users/platform.acme/alice/grant-probes", &cookie).await;
     assert!(
@@ -6073,6 +6869,23 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "probe address leaked: {list_address}"
     );
 
+    let latest = get_json_with_cookie(&app, "/ping-probe/nodes/latest", &cookie).await;
+    assert_eq!(latest.0, StatusCode::OK);
+    assert_eq!(latest.1["interval_secs"], 60);
+    assert_eq!(latest.1["nodes"][0]["node_id"], "n1");
+    assert_eq!(
+        latest.1["nodes"][0]["targets"][0]["latest"]["latency_us"],
+        37_250
+    );
+    let latest_address = latest.1["nodes"][0]["targets"][0]["address"]
+        .as_str()
+        .unwrap();
+    assert!(latest_address.starts_with("tcp://"));
+    assert!(
+        !latest_address.contains("192.0.2.1"),
+        "latest probe address leaked: {latest_address}"
+    );
+
     let detail = get_json_with_cookie(&app, "/ping-probe/nodes/n1?window_secs=3600", &cookie).await;
     assert_eq!(detail.0, StatusCode::OK);
     assert_eq!(detail.1["targets"][0]["samples"][0]["latency_us"], 37_250);
@@ -6080,6 +6893,44 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         .as_str()
         .unwrap()
         .starts_with("tcp://"));
+
+    let compact_ping = get_json_with_cookie(
+        &app,
+        "/ping-probe/nodes/n1/series?window_secs=3600",
+        &cookie,
+    )
+    .await;
+    assert_eq!(compact_ping.0, StatusCode::OK);
+    assert_eq!(
+        compact_ping.1["targets"][0]["probed_at_unix_secs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(compact_ping.1["targets"][0]["latency_us"][0], 37_250);
+    assert!(compact_ping.1["targets"][0].get("samples").is_none());
+
+    let overview = get_json_with_cookie(&app, "/load/nodes/n1/overview?windows=24", &cookie).await;
+    assert_eq!(overview.0, StatusCode::OK);
+    assert_eq!(overview.1["node_id"], "n1");
+    assert_eq!(overview.1["series"]["window_end_unix_secs"], json!([]));
+    assert!(overview.1["series"].is_object());
+    let metrics = get_json_with_cookie(
+        &app,
+        "/load/nodes/n1/metrics?windows=24&metrics=cpu.iowait_pct",
+        &cookie,
+    )
+    .await;
+    assert_eq!(metrics.0, StatusCode::OK);
+    assert_eq!(metrics.1["node_id"], "n1");
+    assert_eq!(metrics.1["metrics"]["cpu.iowait_pct"], json!([]));
+
+    let nic = get_json_with_cookie(&app, "/load/nodes/nic?windows=24", &cookie).await;
+    assert_eq!(nic.0, StatusCode::OK);
+    assert_eq!(nic.1["nodes"][0]["node_id"], "n1");
+    assert_eq!(nic.1["nodes"][0]["series"], json!([]));
+    assert!(nic.1["nodes"][0].get("host").is_none());
 
     let settings = get_json_with_cookie(&app, "/ping-probe/settings", &cookie).await;
     assert_eq!(settings.0, StatusCode::FORBIDDEN);
@@ -6415,6 +7266,230 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Xray rollout has more state than Agent clearance, so exercise the whole HTTP circuit: the
+/// admin freezes a target, the authenticated node receives only its open wave, and the report
+/// settles the immutable record. This catches route/header/origin mistakes that store tests
+/// cannot see and that otherwise present as an Agent receiving 204 forever.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_xray_release_is_offered_and_reported_by_digest() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let (admin, admin_token) = admin_app(&db).await;
+    let agent = agent_router_with_origin(db.store.clone(), "http://10.0.0.7:9091".to_owned());
+
+    let response = admin
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/nodes/n1/agent-token")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let issued: IssuedNodeToken =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let previous = "1".repeat(64);
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_versions = $2, runtime_reported_at = now(), last_poll_at = now()
+          WHERE node_id = $1",
+    )
+    .bind("n1")
+    .bind(json!({
+        "agent": "supporting-agent",
+        "xray": "Xray 26.4.25",
+        "xray_installed_sha256": previous,
+        "xray_running_sha256": previous,
+        "phantun": null,
+        "wg_tools": null,
+        "wg_backend": null
+    }))
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let response = admin
+        .clone()
+        .oneshot(
+            Request::get("/xray-releases")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let available: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let release_id = available["available_release_id"].as_str().unwrap();
+    let desired = available["available_xrays"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["arch"] == "x86_64")
+        .unwrap()["sha256"]
+        .as_str()
+        .unwrap();
+
+    let response = admin
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xray-releases")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "idempotency_key": "http-xray-release-test-1",
+                        "release_id": release_id,
+                        "nodes": ["n1"],
+                        "canary_node": "n1",
+                        "note": "HTTP rollout test"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let database_id = created["releases"][0]["id"].as_i64().unwrap();
+    assert_eq!(created["releases"][0]["batch_size"], 10);
+    assert_eq!(created["history"][0]["id"], database_id);
+    assert!(created["next_history_before_id"].is_null());
+
+    let response = admin
+        .clone()
+        .oneshot(
+            Request::get(format!("/xray-releases/history?before_id={database_id}"))
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let older: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(older["history"], json!([]));
+    assert!(older["next_history_before_id"].is_null());
+
+    let response = admin
+        .clone()
+        .oneshot(
+            Request::get(format!("/xray-releases/{database_id}"))
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(detail["id"], database_id);
+    assert_eq!(detail["targets"][0]["retryable"], false);
+    assert_eq!(detail["events"][0]["kind"], "created");
+
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::get("/agent/v1/xray-release")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("x-brocade-arch", "x86_64")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let offer: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(offer["release_id"], database_id);
+    assert_eq!(offer["attempt"], 1);
+    assert_eq!(offer["sha256"], desired);
+    assert_eq!(offer["previous_sha256"], previous);
+    assert_eq!(offer["url"], "http://10.0.0.7:9091/brocade-xray/x86_64");
+
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/v1/xray-release/report")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "release_id": database_id,
+                        "attempt": 1,
+                        "outcome": "succeeded",
+                        "performed_update": true,
+                        "xray_enabled": true,
+                        "installed_sha256": desired,
+                        "running_sha256": desired
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(ack["accepted"], true);
+
+    let response = admin
+        .oneshot(
+            Request::get("/xray-releases")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let settled: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(settled["releases"][0]["status"], "succeeded");
+    assert_eq!(settled["releases"][0]["active"], false);
+    assert_eq!(settled["releases"][0]["events"], json!([]));
+    assert_eq!(
+        settled["releases"][0]["targets"][0]["reported_performed_update"],
+        true
+    );
+
+    let response = agent
+        .oneshot(
+            Request::get("/agent/v1/xray-release")
+                .header("x-brocade-arch", "x86_64")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_grant_probe_plan_is_frozen_and_contains_no_connection_material() {
@@ -6589,6 +7664,53 @@ async fn insert_usage_model(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
          VALUES ('app-a1b2', 'platform.acme', 'alice', 'ing-b2c3')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_front_target(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('chn-c3d4-e5f6', 'app-a1b2', 'platform.acme', 'Target Chain', 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingresses (
+            id, app_id, chain_id, node_id, bind, port, front_id, transport_kind,
+            reality_private_key, reality_public_key, reality_short_ids,
+            reality_dest, reality_server_names, reality_flow,
+            reality_fallback_mode
+         ) VALUES (
+            'ing-c3d4', 'app-a1b2', 'chn-c3d4-e5f6', 'n1', '0.0.0.0', 8443, NULL, 'vless-reality',
+            'target-reality-private', 'target-reality-public', '[\"c3d4e5f6\"]'::jsonb,
+            'www.example.net:443', '[\"www.example.net\"]'::jsonb, 'xtls-rprx-vision',
+            'custom-site'
+         )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingress_client_settings (ingress_id, reality_fingerprint)
+         VALUES ('ing-c3d4', 'chrome')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO steps (chain_id, node_id, rules)
+         VALUES ('chn-c3d4-e5f6', 'n1', '[{\"m\":{\"t\":\"any\"},\"a\":{\"t\":\"egress\",\"send_through\":null}}]'::jsonb)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
+         VALUES ('app-a1b2', 'platform.acme', 'alice', 'ing-c3d4')",
     )
     .execute(pool)
     .await

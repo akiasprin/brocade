@@ -19,40 +19,46 @@ use crate::distribution;
 use crate::grant_automation;
 use crate::grant_probe;
 use crate::load;
+use crate::notifications;
 use crate::ping_probe;
 use crate::probe;
 use crate::provision;
+use crate::public_ip;
 use crate::quota;
 use crate::settings;
+use crate::traffic;
+use crate::tunnel_probe;
 use crate::usage;
+use crate::xray_release;
 use crate::{
     agent, materialize, AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult,
-    AdminLoginRequest, AdminLoginResult, AdminOperator, ArtifactContent, ArtifactIndex,
-    AuthenticatedAdmin, AuthenticatedNode, ChangeAdminPasswordRequest, ClashHaitunLink,
-    CompileView, ConsoleSnapshot, CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest,
-    CreateDeploymentRequest, CreateDeploymentResult, CreateFrontRequest, CreateGrantRequest,
-    CreateIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
-    DeleteStepResult, DeploymentCommandResult, DeploymentDetail, DeploymentList,
+    AdminLoginRequest, AdminLoginResult, AdminOperator, AdminSessionAuthentication,
+    ArtifactContent, ArtifactIndex, AuthenticatedAdmin, AuthenticatedNode,
+    ChangeAdminPasswordRequest, ClashHaitunLink, CompileView, ConsoleInitialData, ConsoleSnapshot,
+    CreateAdminOperatorRequest, CreateAppRequest, CreateChainRequest, CreateDeploymentRequest,
+    CreateDeploymentResult, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
+    CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DeleteFrontRequest,
+    DeleteFrontResult, DeleteStepResult, DeploymentCommandResult, DeploymentDetail, DeploymentList,
     DeploymentVerification, DeploymentWaveConfirmationResult, DynamicClashSubscription,
-    E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, HopLinkList,
-    IssuedAdminToken, IssuedNodeToken, IssuedUserLogin, LinkHealthItem, LinkHealthRequest,
-    LinkHealthResult, LinkMtuView, LinkProbeRequest, LinkProbeResult, LoadReportRequest,
-    LoadReportResult, LoadSeriesQuery, ModelWriteResult, NodeAgentStateList, NodeDesiredDeployment,
-    NodeLoadList, NodeLoadView, NodePingProbeList, NodePingProbeView, PingProbeReportRequest,
-    PingProbeReportResult, PingProbeSettings, ProbeTargetList, ProvisionNodeRequest,
-    ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan,
-    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
-    RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
-    ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
-    SetUserAppQuotaRequest, SetUserAppQuotaResult, SetUserPasswordRequest, SetUserPasswordResult,
-    StoreError, SystemInitRequest, SystemInitResult, TargetConvergenceReport, TenantList,
-    UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest,
-    UpdateUserStatusRequest, UpdateUserStatusResult, UpdateWarpBindingRequest,
-    UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult, UpsertFrontResult,
-    UpsertGrantResult, UpsertIngressResult, UpsertTenantResult, UpsertUserResult,
-    UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest, UsageReportResult,
-    UsageSampleList, UserAppQuotaList, UserGrantProbePlan, UserList, VerifyDeploymentRequest,
-    WarpBindingRemoval,
+    E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, FrontClientConfigState,
+    FrontRouteAnalysisView, HopLinkList, IssuedAdminToken, IssuedNodeToken, IssuedUserLogin,
+    LinkHealthItem, LinkHealthRequest, LinkHealthResult, LinkMtuView, LinkProbeRequest,
+    LinkProbeResult, LoadReportRequest, LoadReportResult, LoadSeriesQuery, ModelWriteResult,
+    NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, NodePingProbeLatestList,
+    NodePingProbeList, NodePingProbeView, PingProbeReportRequest, PingProbeReportResult,
+    PingProbeSettings, ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult,
+    PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan, RegisterWarpBindingRequest,
+    RegisterWarpBindingResult, RemoveRetiredNodesRequest, RemoveRetiredNodesResult,
+    RemoveWarpBindingRequest, RemoveWarpBindingResult, ReportTargetResult,
+    ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult, SetUserAppQuotaRequest,
+    SetUserAppQuotaResult, SetUserPasswordRequest, SetUserPasswordResult, StoreError,
+    SystemInitRequest, SystemInitResult, TargetConvergenceReport, TenantList, UpdateNodeRequest,
+    UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
+    UpsertChainResult, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
+    UpsertTenantResult, UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList,
+    UsageReportRequest, UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan,
+    UserList, VerifyDeploymentRequest, WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -72,6 +78,8 @@ const DUPLICATE_DATABASE: &str = "42P04";
 /// `template1` cannot be dropped at all, so the pair covers servers that have been tidied up.
 const MAINTENANCE_DATABASES: &[&str] = &["postgres", "template1"];
 
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// The SQLSTATE a failure carries, where it came from the server at all.
 fn sqlstate(error: &sqlx::Error) -> Option<String> {
     match error {
@@ -84,6 +92,15 @@ impl PgStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
+            // Brocade's workload is short, frequently repeated OLTP queries. PostgreSQL can
+            // otherwise spend seconds compiling JIT code when stale statistics make a small join
+            // look expensive, even though executing it only takes a few milliseconds.
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    connection.execute("SET jit = off").await?;
+                    Ok(())
+                })
+            })
             .connect(database_url)
             .await?;
         Ok(Self {
@@ -183,9 +200,7 @@ impl PgStore {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        // Keep migrations embedded in the store crate; cargo only refreshes this
-        // list when the crate is rebuilt.
-        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        MIGRATOR.run(&self.pool).await?;
         // Establish immutable model and subscription checkpoints before later initializers can
         // commit another model revision.
         materialize::ensure_current_snapshot(&self.pool).await?;
@@ -242,6 +257,20 @@ impl PgStore {
 
     pub async fn effective_node_log_limits(&self, node_id: &str) -> Result<crate::AgentLogLimits> {
         crate::log_policy::effective_node_log_limits(&self.pool, node_id).await
+    }
+
+    /// Physical NIC totals are operational accounting: no model revision or deployment is made.
+    pub async fn node_traffic(&self, actor: &AdminContext) -> Result<crate::NodeTrafficView> {
+        traffic::load_node_traffic(&self.pool, actor).await
+    }
+
+    pub async fn update_node_traffic(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: crate::UpdateNodeTrafficRequest,
+    ) -> Result<()> {
+        traffic::update_node_traffic(&self.pool, actor, node_id, request).await
     }
 
     /// Operational live-traffic policy. It is durable, but neither reading nor writing it creates
@@ -507,6 +536,86 @@ impl PgStore {
         agent_release::update_agent_release(&self.pool, actor, release, build).await
     }
 
+    pub async fn list_xray_releases(&self, limit: u32) -> Result<crate::XrayReleaseList> {
+        xray_release::list_xray_releases(&self.pool, limit).await
+    }
+
+    pub async fn xray_release(&self, release_id: i64) -> Result<crate::XrayRelease> {
+        xray_release::get_xray_release(&self.pool, release_id).await
+    }
+
+    pub async fn xray_release_overview(&self, release_id: i64) -> Result<crate::XrayRelease> {
+        xray_release::get_xray_release_overview(&self.pool, release_id).await
+    }
+
+    pub async fn list_xray_release_summaries(
+        &self,
+        limit: u32,
+        before_id: Option<i64>,
+    ) -> Result<Vec<crate::XrayReleaseSummary>> {
+        xray_release::list_xray_release_summaries(&self.pool, limit, before_id).await
+    }
+
+    pub async fn create_xray_release(
+        &self,
+        actor: &AdminContext,
+        request: crate::CreateXrayReleaseRequest,
+        build: crate::XrayBuildInfo<'_>,
+    ) -> Result<crate::XrayRelease> {
+        xray_release::create_xray_release(&self.pool, actor, request, build).await
+    }
+
+    pub async fn confirm_xray_release(
+        &self,
+        actor: &AdminContext,
+        release_id: i64,
+        available_build_id: &str,
+    ) -> Result<crate::XrayRelease> {
+        xray_release::confirm_xray_release(&self.pool, actor, release_id, available_build_id).await
+    }
+
+    pub async fn cancel_xray_release(
+        &self,
+        actor: &AdminContext,
+        release_id: i64,
+    ) -> Result<crate::XrayRelease> {
+        xray_release::cancel_xray_release(&self.pool, actor, release_id).await
+    }
+
+    pub async fn retry_xray_release_target(
+        &self,
+        actor: &AdminContext,
+        release_id: i64,
+        node_id: &str,
+        available_build_id: &str,
+    ) -> Result<crate::XrayRelease> {
+        xray_release::retry_xray_release_target(
+            &self.pool,
+            actor,
+            release_id,
+            node_id,
+            available_build_id,
+        )
+        .await
+    }
+
+    pub async fn claim_xray_release(
+        &self,
+        node_id: &str,
+        arch: &str,
+        available_build_id: &str,
+    ) -> Result<Option<crate::XrayReleaseAssignment>> {
+        xray_release::claim_xray_release(&self.pool, node_id, arch, available_build_id).await
+    }
+
+    pub async fn report_xray_release(
+        &self,
+        node_id: &str,
+        report: &brocade_deployment::protocol::XrayReleaseReport,
+    ) -> Result<bool> {
+        xray_release::report_xray_release(&self.pool, node_id, report).await
+    }
+
     pub async fn redacted_snapshot(
         &self,
         actor: &AdminContext,
@@ -567,6 +676,10 @@ impl PgStore {
 
     pub async fn list_tenants(&self, actor: &AdminContext) -> Result<TenantList> {
         console::list_tenants(&self.pool, actor).await
+    }
+
+    pub async fn console_initial_data(&self, actor: &AdminContext) -> Result<ConsoleInitialData> {
+        console::console_initial_data(&self.pool, actor).await
     }
 
     pub async fn list_node_agent_states(&self, actor: &AdminContext) -> Result<NodeAgentStateList> {
@@ -696,6 +809,164 @@ impl PgStore {
         grant_probe::user_grant_probe_generation_matches(&self.pool, expected).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn front_combination_probe_plan(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        app_id: &str,
+        front_id: &str,
+        member_id: &str,
+        target_id: &str,
+    ) -> Result<crate::FrontCombinationProbePlan> {
+        grant_probe::front_combination_probe_plan(
+            &self.pool, actor, tenant_id, user_id, app_id, front_id, member_id, target_id,
+        )
+        .await
+    }
+
+    pub async fn tunnel_probes(&self, actor: &AdminContext) -> Result<crate::TunnelProbeList> {
+        tunnel_probe::list(&self.pool, actor).await
+    }
+
+    pub async fn tunnel_probe_view(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        outbound_id: &str,
+        window_secs: u32,
+    ) -> Result<crate::TunnelProbeView> {
+        tunnel_probe::detail(&self.pool, actor, tenant_id, outbound_id, window_secs).await
+    }
+
+    pub async fn update_tunnel_probe_policy(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        outbound_id: &str,
+        request: crate::UpdateTunnelProbePolicy,
+    ) -> Result<crate::TunnelProbePolicy> {
+        tunnel_probe::update_policy(&self.pool, actor, tenant_id, outbound_id, request).await
+    }
+
+    pub async fn start_tunnel_probe(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        outbound_id: &str,
+    ) -> Result<(crate::TunnelProbeRun, bool)> {
+        tunnel_probe::start_manual(&self.pool, actor, tenant_id, outbound_id).await
+    }
+
+    pub async fn start_tunnel_probe_from(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        outbound_id: &str,
+        source: crate::TunnelProbeSource,
+        draft_ops: Vec<crate::ModelOp>,
+    ) -> Result<(crate::TunnelProbeRun, bool)> {
+        tunnel_probe::start_manual_from(
+            &self.pool,
+            actor,
+            tenant_id,
+            outbound_id,
+            source,
+            draft_ops,
+        )
+        .await
+    }
+
+    pub async fn tunnel_probe_run(
+        &self,
+        actor: &AdminContext,
+        run_id: i64,
+    ) -> Result<crate::TunnelProbeRun> {
+        tunnel_probe::get_run(&self.pool, actor, run_id).await
+    }
+
+    pub async fn cancel_tunnel_probe_run(
+        &self,
+        actor: &AdminContext,
+        run_id: i64,
+    ) -> Result<crate::TunnelProbeRun> {
+        tunnel_probe::cancel_run(&self.pool, actor, run_id).await
+    }
+
+    pub async fn enqueue_due_tunnel_probes(&self) -> Result<u64> {
+        tunnel_probe::enqueue_due(&self.pool).await
+    }
+
+    pub async fn claim_next_tunnel_probe(
+        &self,
+        owner: &str,
+    ) -> Result<Option<crate::ClaimedTunnelProbe>> {
+        tunnel_probe::claim_next(&self.pool, owner).await
+    }
+
+    pub async fn claimed_tunnel_probe_outbound(
+        &self,
+        claim: &crate::ClaimedTunnelProbe,
+    ) -> Result<brocade_core::model::ExternalOutbound> {
+        tunnel_probe::claimed_outbound(&self.pool, claim).await
+    }
+
+    pub async fn update_tunnel_probe_phase(
+        &self,
+        claim: &crate::ClaimedTunnelProbe,
+        phase: crate::TunnelProbePhase,
+    ) -> Result<bool> {
+        tunnel_probe::update_phase(&self.pool, claim, phase).await
+    }
+
+    pub async fn set_tunnel_probe_config_sha256(
+        &self,
+        claim: &crate::ClaimedTunnelProbe,
+        sha256: &str,
+    ) -> Result<bool> {
+        tunnel_probe::set_config_sha256(&self.pool, claim, sha256).await
+    }
+
+    pub async fn renew_tunnel_probe_lease(
+        &self,
+        claim: &crate::ClaimedTunnelProbe,
+    ) -> Result<bool> {
+        tunnel_probe::renew_lease(&self.pool, claim).await
+    }
+
+    pub async fn tunnel_probe_cancel_requested(
+        &self,
+        claim: &crate::ClaimedTunnelProbe,
+    ) -> Result<bool> {
+        tunnel_probe::cancel_requested(&self.pool, claim).await
+    }
+
+    pub async fn complete_tunnel_probe(
+        &self,
+        claim: &crate::ClaimedTunnelProbe,
+        completion: crate::TunnelProbeCompletion,
+    ) -> Result<bool> {
+        tunnel_probe::complete(&self.pool, claim, completion).await
+    }
+
+    pub async fn fail_tunnel_probe_claim(
+        &self,
+        claim: &crate::ClaimedTunnelProbe,
+        code: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        tunnel_probe::fail_claim(&self.pool, claim, code, detail).await
+    }
+
+    pub async fn prune_tunnel_probes(&self, retain_days: u32) -> Result<u64> {
+        tunnel_probe::prune(&self.pool, retain_days).await
+    }
+
+    pub async fn reap_expired_tunnel_probes(&self) -> Result<u64> {
+        tunnel_probe::reap_expired(&self.pool).await
+    }
+
     pub async fn clash_haitun_link_for_user(
         &self,
         actor: &AdminContext,
@@ -793,8 +1064,9 @@ impl PgStore {
         actor: &AdminContext,
         limit: u32,
         kind: Option<DeploymentKind>,
+        active_only: bool,
     ) -> Result<DeploymentList> {
-        deployment::list_deployments(&self.pool, actor, limit, kind).await
+        deployment::list_deployments(&self.pool, actor, limit, kind, active_only).await
     }
 
     pub async fn deployment_detail(
@@ -845,12 +1117,67 @@ impl PgStore {
         agent::record_node_route_ips(&self.pool, node_id, route).await
     }
 
-    pub async fn autofill_node_public_ips(
+    pub async fn record_node_public_ip(
         &self,
         node_id: &str,
-        route: &crate::RouteIpReport,
-    ) -> Result<Option<u64>> {
-        agent::autofill_node_public_ips(&self.pool, node_id, route).await
+        observation: &brocade_deployment::protocol::NodePublicIpObservation,
+    ) -> Result<crate::RecordPublicIpObservationResult> {
+        public_ip::record(&self.pool, node_id, observation).await
+    }
+
+    pub async fn prune_node_public_ip_events(&self, retain_days: u32) -> Result<u64> {
+        public_ip::prune(&self.pool, retain_days).await
+    }
+
+    pub async fn node_public_ip_history(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        visible_days: u32,
+    ) -> Result<crate::NodePublicIpHistory> {
+        public_ip::history(&self.pool, actor, node_id, visible_days).await
+    }
+
+    pub async fn reconcile_node_presence(&self) -> Result<u64> {
+        notifications::reconcile_offline(&self.pool).await
+    }
+
+    pub async fn claim_notification_delivery(
+        &self,
+        owner: &str,
+    ) -> Result<Option<crate::ClaimedNotificationDelivery>> {
+        notifications::claim_delivery(&self.pool, owner).await
+    }
+
+    pub async fn complete_notification_delivery(
+        &self,
+        delivery_id: i64,
+        owner: &str,
+        attempt: i32,
+    ) -> Result<bool> {
+        notifications::complete_delivery(&self.pool, delivery_id, owner, attempt).await
+    }
+
+    pub async fn fail_notification_delivery(
+        &self,
+        delivery_id: i64,
+        owner: &str,
+        attempt: i32,
+        error: &str,
+    ) -> Result<bool> {
+        notifications::fail_delivery(&self.pool, delivery_id, owner, attempt, error).await
+    }
+
+    pub async fn machine_events(
+        &self,
+        actor: &AdminContext,
+        limit: u32,
+    ) -> Result<crate::MachineEventList> {
+        notifications::list(&self.pool, actor, limit).await
+    }
+
+    pub async fn prune_machine_events(&self, retain_days: u32) -> Result<u64> {
+        notifications::prune(&self.pool, retain_days).await
     }
 
     pub async fn halt_deployment(
@@ -905,6 +1232,15 @@ impl PgStore {
     ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
         deployment::isolate_deployment_target(&self.pool, actor, deployment_id, node_id, request)
             .await
+    }
+
+    pub async fn isolate_node(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: brocade_deployment::protocol::IsolateNodeRequest,
+    ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
+        deployment::isolate_node(&self.pool, actor, node_id, request).await
     }
 
     pub async fn restore_node_service(
@@ -1164,6 +1500,34 @@ impl PgStore {
         console::upsert_front(&self.pool, actor, app_id, request).await
     }
 
+    pub async fn front_client_config_state(
+        &self,
+        actor: &AdminContext,
+        app_id: &str,
+        front_id: &str,
+    ) -> Result<FrontClientConfigState> {
+        console::front_client_config_state(&self.pool, actor, app_id, front_id).await
+    }
+
+    pub async fn front_route_analysis(
+        &self,
+        actor: &AdminContext,
+        app_id: &str,
+        request: CreateFrontRequest,
+    ) -> Result<FrontRouteAnalysisView> {
+        console::front_route_analysis(&self.pool, actor, app_id, request).await
+    }
+
+    pub async fn delete_front(
+        &self,
+        actor: &AdminContext,
+        app_id: &str,
+        front_id: &str,
+        request: DeleteFrontRequest,
+    ) -> Result<DeleteFrontResult> {
+        console::delete_front(&self.pool, actor, app_id, front_id, request).await
+    }
+
     pub async fn upsert_ingress(
         &self,
         actor: &AdminContext,
@@ -1227,6 +1591,15 @@ impl PgStore {
         report: &brocade_deployment::protocol::NodeRuntimeReport,
     ) -> Result<()> {
         agent::record_node_runtime(&self.pool, node_id, report).await
+    }
+
+    pub async fn record_node_traffic(
+        &self,
+        node_id: &str,
+        observed_at_unix_secs: i64,
+        reading: &brocade_deployment::protocol::NodeTrafficReading,
+    ) -> Result<()> {
+        traffic::record_node_traffic(&self.pool, node_id, observed_at_unix_secs, reading).await
     }
 
     pub async fn create_admin_operator(
@@ -1304,6 +1677,13 @@ impl PgStore {
         token: &str,
     ) -> Result<Option<AuthenticatedAdmin>> {
         admin::authenticate_admin_session(&self.pool, token).await
+    }
+
+    pub async fn authenticate_admin_session_with_refresh(
+        &self,
+        token: &str,
+    ) -> Result<Option<AdminSessionAuthentication>> {
+        admin::authenticate_admin_session_with_refresh(&self.pool, token).await
     }
 
     pub async fn revoke_admin_session(&self, token: &str) -> Result<bool> {
@@ -1422,8 +1802,20 @@ impl PgStore {
         usage::list_monthly_usage_summary(&self.pool, actor).await
     }
 
+    pub async fn list_monthly_usage_summary_for_offset(
+        &self,
+        actor: &AdminContext,
+        month_offset: i16,
+    ) -> Result<UsageMonthlySummary> {
+        usage::list_monthly_usage_summary_for_offset(&self.pool, actor, month_offset).await
+    }
+
     pub async fn prune_usage_readings(&self, retain_days: u32) -> Result<u64> {
         usage::prune_usage_readings(&self.pool, retain_days).await
+    }
+
+    pub async fn prune_usage_samples(&self, retain_days: u32) -> Result<u64> {
+        usage::prune_usage_samples(&self.pool, retain_days).await
     }
 
     pub async fn list_usage_node_series(
@@ -1472,6 +1864,47 @@ impl PgStore {
         load::node_load_view(&self.pool, actor, node_id, selection, max_samples).await
     }
 
+    pub async fn node_load_overview(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        selection: LoadSeriesQuery,
+        max_samples: u32,
+    ) -> Result<NodeLoadView> {
+        load::node_load_overview(&self.pool, actor, node_id, selection, max_samples).await
+    }
+
+    pub async fn node_load_columnar_overview(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        selection: LoadSeriesQuery,
+        max_samples: u32,
+    ) -> Result<crate::NodeLoadOverviewView> {
+        load::node_load_overview(&self.pool, actor, node_id, selection, max_samples)
+            .await
+            .map(load::columnar_overview)
+    }
+
+    pub async fn node_load_metrics(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        selection: LoadSeriesQuery,
+        max_samples: u32,
+        metric_ids: &[String],
+    ) -> Result<crate::NodeLoadMetricView> {
+        load::node_load_metrics(
+            &self.pool,
+            actor,
+            node_id,
+            selection,
+            max_samples,
+            metric_ids,
+        )
+        .await
+    }
+
     pub async fn list_node_load(
         &self,
         actor: &AdminContext,
@@ -1479,6 +1912,15 @@ impl PgStore {
         max_samples_per_node: u32,
     ) -> Result<NodeLoadList> {
         load::list_node_load(&self.pool, actor, selection, max_samples_per_node).await
+    }
+
+    pub async fn list_node_nic(
+        &self,
+        actor: &AdminContext,
+        windows: u32,
+        max_samples_per_node: u32,
+    ) -> Result<crate::NodeNicList> {
+        load::list_node_nic(&self.pool, actor, windows, max_samples_per_node).await
     }
 
     pub async fn ping_probe_settings(&self) -> Result<PingProbeSettings> {
@@ -1510,6 +1952,17 @@ impl PgStore {
         ping_probe::node_view(&self.pool, actor, node_id, window_secs).await
     }
 
+    pub async fn node_ping_probe_columnar_view(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        window_secs: u32,
+    ) -> Result<crate::NodePingProbeColumnarView> {
+        Ok(ping_probe::columnar_view(
+            ping_probe::node_view(&self.pool, actor, node_id, window_secs).await?,
+        ))
+    }
+
     pub async fn node_ping_probe_view_range(
         &self,
         actor: &AdminContext,
@@ -1521,12 +1974,36 @@ impl PgStore {
             .await
     }
 
+    pub async fn node_ping_probe_columnar_view_range(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        start_unix_secs: i64,
+        end_unix_secs: i64,
+    ) -> Result<crate::NodePingProbeColumnarView> {
+        Ok(ping_probe::columnar_view(
+            ping_probe::node_view_range(&self.pool, actor, node_id, start_unix_secs, end_unix_secs)
+                .await?,
+        ))
+    }
+
     pub async fn list_node_ping_probes(
         &self,
         actor: &AdminContext,
         window_secs: u32,
     ) -> Result<NodePingProbeList> {
         ping_probe::list_nodes(&self.pool, actor, window_secs).await
+    }
+
+    pub async fn list_latest_node_ping_probes(
+        &self,
+        actor: &AdminContext,
+    ) -> Result<NodePingProbeLatestList> {
+        ping_probe::list_latest_nodes(&self.pool, actor).await
+    }
+
+    pub async fn prune_node_ping_probe_samples(&self, retain_days: u32) -> Result<u64> {
+        ping_probe::prune_samples(&self.pool, retain_days).await
     }
 
     pub async fn hop_link_list(
@@ -1539,5 +2016,23 @@ impl PgStore {
 
     pub async fn prune_load_samples(&self, retain_days: u32) -> Result<u64> {
         load::prune_load_samples(&self.pool, retain_days).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha384};
+
+    use super::MIGRATOR;
+
+    #[test]
+    fn embedded_initial_migration_checksum_matches_the_source_file() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 1)
+            .expect("the initial migration is always embedded");
+        let source_checksum = Sha384::digest(include_bytes!("../migrations/0001_init.sql"));
+
+        assert_eq!(migration.checksum.as_ref(), source_checksum.as_slice());
     }
 }

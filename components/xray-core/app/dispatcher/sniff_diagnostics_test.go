@@ -132,6 +132,26 @@ func TestSniffDiagnosticUsesDebugAndConnectionID(t *testing.T) {
 	}
 }
 
+func TestSniffDiagnosticWarnsWhenIPHasNoRoutableDomain(t *testing.T) {
+	capture := &diagnosticLogCapture{}
+	log.RegisterHandler(capture)
+	defer log.RegisterHandler(&diagnosticLogCapture{})
+	ctx := commonctx.ContextWithID(context.Background(), commonctx.ID(12345))
+	request := session.SniffingRequest{Enabled: true, OverrideDestinationForProtocol: []string{"tls"}}
+	original := net.TCPDestination(net.ParseAddress("192.0.2.1"), 443)
+	logSniffDecision(ctx, request, original, nil, buf.ErrReadTimeout, "", "none", 200*time.Millisecond)
+	if len(capture.messages) != 1 {
+		t.Fatalf("got %d messages", len(capture.messages))
+	}
+	message, ok := capture.messages[0].(*log.GeneralMessage)
+	if !ok || message.Severity != log.Severity_Warning {
+		t.Fatalf("not Warning: %v", capture.messages[0])
+	}
+	if text := message.String(); !strings.Contains(text, "12345") || !strings.Contains(text, "result=failed") || !strings.Contains(text, "reason=timeout") {
+		t.Fatalf("missing failure context: %s", text)
+	}
+}
+
 func TestSniffDiagnosticsFailureReasons(t *testing.T) {
 	for _, test := range []struct {
 		name string

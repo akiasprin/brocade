@@ -70,10 +70,22 @@ trip('机器详情', { nav: 'nodes', drill: { p: 'node', id: 'hk-01' } }, '#/nod
 trip('没下钻的面', { nav: 'settings' }, '#/settings');
 trip('不走 wm 的面', { nav: 'topo' }, '#/topo');
 trip('链路详情两段', { nav: 'chains', drill: { p: 'chain', app: 'app-1', chain: 'c-a' } }, '#/chains/chain/app-1/c-a');
+trip('建链向导保留所属分组', { nav: 'chains', drill: { p: 'new', app: 'app-1' } }, '#/chains/new/app-1');
 trip(
-  '隧道详情由租户和资源 id 定位',
-  { nav: 'tunnels', drill: { p: 'tunnel', tenant: 'platform', id: 'warp-hk' } },
-  '#/tunnels/tunnel/platform/warp-hk',
+  'WARP 详情带资源类型',
+  { nav: 'tunnels', drill: { p: 'warp', id: 'warp-8f3a-2d71' } },
+  '#/tunnels/warp/warp-8f3a-2d71',
+);
+trip(
+  '自定义隧道详情带资源类型',
+  { nav: 'tunnels', drill: { p: 'custom', id: 'custom-8f3a-2d71' } },
+  '#/tunnels/custom/custom-8f3a-2d71',
+);
+trip('VPN Gate 总页进入浏览器历史', { nav: 'tunnels', drill: { p: 'vpngate' } }, '#/tunnels/vpngate');
+trip(
+  'VPN Gate 资源进入浏览器历史',
+  { nav: 'tunnels', drill: { p: 'vpngate', id: 'vpngate-8f3a-2d71' } },
+  '#/tunnels/vpngate/vpngate-8f3a-2d71',
 );
 trip('用户详情由用户名定位', { nav: 'users', drill: { p: 'user', id: 'alice' } }, '#/users/user/alice');
 
@@ -111,7 +123,12 @@ reads('什么都没有', '', null);
 reads('不认识的下钻', '#/nodes/bogus', { nav: 'nodes' });
 reads('详情少了 id', '#/deploy/detail', { nav: 'deploy' });
 reads('机器详情少了 id', '#/nodes/node', { nav: 'nodes' });
-reads('隧道详情少了资源 id', '#/tunnels/tunnel/platform', { nav: 'tunnels' });
+reads('WARP 详情少了资源 id', '#/tunnels/warp', { nav: 'tunnels' });
+reads('自定义详情少了资源 id', '#/tunnels/custom', { nav: 'tunnels' });
+reads('旧的通用隧道地址已禁用', '#/tunnels/tunnel/warp-8f3a-2d71', { nav: 'tunnels' });
+reads('旧的租户隧道地址已禁用', '#/tunnels/tunnel/platform/warp-8f3a-2d71', { nav: 'tunnels' });
+reads('资源类型与 id 前缀不一致', '#/tunnels/warp/custom-8f3a-2d71', { nav: 'tunnels' });
+reads('链式代理地址暂不开放', '#/tunnels/front/app-main/front-asia', { nav: 'tunnels' });
 reads('用户详情少了用户名', '#/users/user', { nav: 'users' });
 reads('用户详情多出路径段', '#/users/user/acme/alice', { nav: 'users' });
 reads('机器详情多出路径段', '#/nodes/node/hk-01/extra', { nav: 'nodes' });

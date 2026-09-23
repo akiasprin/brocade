@@ -21,6 +21,42 @@ afterEach(() => {
 });
 
 describe('submission batches', () => {
+  it('merges a listener port and security with the later rule-table write for the same step', () => {
+    const store = tab();
+    store.push({
+      op: 'put_step',
+      app_id: 'app',
+      chain_id: 'chain',
+      node_id: 'relay',
+      step: {
+        rules: [],
+        accept: {},
+        hop_in: { port: 21001, security: { t: 'encryption' } },
+      },
+    });
+    store.push({
+      op: 'put_step',
+      app_id: 'app',
+      chain_id: 'chain',
+      node_id: 'relay',
+      step: { rules: [{ m: { t: 'any' }, a: { t: 'egress', send_through: null } }], accept: {} },
+    });
+
+    expect(store.ops()).toEqual([
+      {
+        op: 'put_step',
+        app_id: 'app',
+        chain_id: 'chain',
+        node_id: 'relay',
+        step: {
+          rules: [{ m: { t: 'any' }, a: { t: 'egress', send_through: null } }],
+          accept: {},
+          hop_in: { port: 21001, security: { t: 'encryption' } },
+        },
+      },
+    ]);
+  });
+
   it('retains a later edit of the same object and independent node fields', () => {
     const store = tab();
     store.push({ op: 'update_node', node_id: 'A', node: { name: 'first', mtu: 1380 } });

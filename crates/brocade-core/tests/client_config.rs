@@ -1,14 +1,16 @@
 mod fixture;
 
 use brocade_core::{
+    artifacts::xray,
     client_config::SubscriptionClientConfig,
     compile::compile,
+    format::json,
     model::{
         Action, AnyTls, AnyTlsSecurity, ExternalOutbound, ExternalOutboundProtocol,
-        ExternalOutboundSecurity, ExternalWarpBinding, Hysteria2, HysteriaMasquerade, HysteriaObfs,
-        IngressIdentity, IngressWires, ModelSnapshot, Projection, ProjectionEndpoint,
-        RealityFallbackLimits, RealityFallbackMode, RealitySettings, RealityXhttp, Transport,
-        Xhttp, XhttpXmux,
+        ExternalOutboundSecurity, ExternalWarpBinding, Front, FrontStrategy, Hysteria2,
+        HysteriaMasquerade, HysteriaObfs, IngressIdentity, IngressWires, ModelSnapshot, Projection,
+        ProjectionEndpoint, ProtocolProjection, RealityFallbackLimits, RealityFallbackMode,
+        RealitySettings, RealityXhttp, Transport, Xhttp, XhttpXmux,
     },
 };
 use fixture::demo_snapshot;
@@ -20,6 +22,7 @@ fn set_projection_host(snapshot: &mut ModelSnapshot, host: &str) {
             port: 443,
         }),
         v6: None,
+        ..Projection::default()
     };
 }
 
@@ -30,6 +33,26 @@ fn projection_host(snapshot: &ModelSnapshot) -> &str {
         .as_ref()
         .unwrap()
         .host
+}
+
+#[test]
+fn protocol_projection_round_trips_through_the_client_checkpoint() {
+    let mut topology = demo_snapshot();
+    topology.apps[0].ingresses[0].projection.anytls = Some(ProtocolProjection {
+        v4: Some(ProjectionEndpoint {
+            host: "anytls.edge.example".to_owned(),
+            port: 8443,
+        }),
+        v6: None,
+    });
+
+    let checkpoint = SubscriptionClientConfig::from_snapshot(&topology);
+    let composed = checkpoint.apply(topology.clone()).unwrap();
+
+    assert_eq!(
+        composed.apps[0].ingresses[0].projection.anytls,
+        topology.apps[0].ingresses[0].projection.anytls
+    );
 }
 
 fn assert_topology_change_gates_projection(
@@ -74,6 +97,180 @@ fn assert_topology_change_allows_projection(
         projection_host(&next.apply(topology).unwrap()),
         "new.edge.example"
     );
+}
+
+#[test]
+fn front_collection_and_targets_apply_to_an_older_serving_topology() {
+    let topology = demo_snapshot();
+    let initial = SubscriptionClientConfig::from_snapshot(&topology);
+    let mut desired = topology.clone();
+    let app = desired.apps.iter_mut().find(|app| app.id == "frt").unwrap();
+    app.fronts[0].name = "亚洲优选".to_owned();
+    app.fronts[0].strategy = FrontStrategy::Select;
+    app.fronts.push(Front {
+        id: "f-frt-spare".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "备用前置".to_owned(),
+        via: vec!["i-frt-hk".to_owned()],
+        external_via: Vec::new(),
+        strategy: FrontStrategy::Fallback,
+    });
+    app.ingresses
+        .iter_mut()
+        .find(|ingress| ingress.id == "i-frt-us")
+        .unwrap()
+        .front = Some("f-frt-spare".to_owned());
+
+    let next = SubscriptionClientConfig::advance(Some(&initial), &desired);
+    let composed = next.apply(topology.clone()).unwrap();
+    let app = composed.apps.iter().find(|app| app.id == "frt").unwrap();
+    assert_eq!(app.fronts.len(), 2);
+    assert_eq!(app.fronts[0].name, "亚洲优选");
+    assert_eq!(app.fronts[0].strategy, FrontStrategy::Select);
+    assert_eq!(
+        app.ingresses
+            .iter()
+            .find(|ingress| ingress.id == "i-frt-us")
+            .unwrap()
+            .front
+            .as_deref(),
+        Some("f-frt-spare")
+    );
+
+    let mut deleted = desired;
+    let app = deleted.apps.iter_mut().find(|app| app.id == "frt").unwrap();
+    app.fronts.clear();
+    for ingress in &mut app.ingresses {
+        ingress.front = None;
+    }
+    let deleted = SubscriptionClientConfig::advance(Some(&next), &deleted)
+        .apply(topology)
+        .unwrap();
+    let app = deleted.apps.iter().find(|app| app.id == "frt").unwrap();
+    assert!(app.fronts.is_empty());
+    assert!(app.ingresses.iter().all(|ingress| ingress.front.is_none()));
+}
+
+#[test]
+fn deleting_a_front_clears_its_removed_but_still_serving_target() {
+    let topology = demo_snapshot();
+    let initial = SubscriptionClientConfig::from_snapshot(&topology);
+    let mut desired = topology.clone();
+    let app = desired.apps.iter_mut().find(|app| app.id == "frt").unwrap();
+    app.fronts.clear();
+    app.ingresses.retain(|ingress| ingress.id != "i-frt-au");
+    for ingress in &mut app.ingresses {
+        ingress.front = None;
+    }
+
+    let client = SubscriptionClientConfig::advance(Some(&initial), &desired);
+    let composed = client.apply(topology).unwrap();
+    let app = composed.apps.iter().find(|app| app.id == "frt").unwrap();
+    assert!(app.fronts.is_empty());
+    assert_eq!(
+        app.ingresses
+            .iter()
+            .find(|ingress| ingress.id == "i-frt-au")
+            .unwrap()
+            .front,
+        None
+    );
+}
+
+#[test]
+fn unavailable_front_members_are_pending_instead_of_dangling() {
+    let topology = demo_snapshot();
+    let mut desired = topology.clone();
+    desired
+        .apps
+        .iter_mut()
+        .find(|app| app.id == "frt")
+        .unwrap()
+        .fronts[0]
+        .via
+        .push("i-future".to_owned());
+
+    let client = SubscriptionClientConfig::from_snapshot(&desired);
+    assert!(client
+        .pending_topology(&topology)
+        .contains(&"front:f-frt-in:via:i-future".to_owned()));
+    let composed = client.apply(topology).unwrap();
+    let front = &composed
+        .apps
+        .iter()
+        .find(|app| app.id == "frt")
+        .unwrap()
+        .fronts[0];
+    assert_eq!(front.via, ["i-frt-hk"]);
+}
+
+#[test]
+fn a_front_waiting_for_its_first_member_hides_targets_instead_of_dialing_directly() {
+    let topology = demo_snapshot();
+    let mut desired = topology.clone();
+    desired
+        .apps
+        .iter_mut()
+        .find(|app| app.id == "frt")
+        .unwrap()
+        .fronts[0]
+        .via = vec!["i-future".to_owned()];
+
+    let client = SubscriptionClientConfig::from_snapshot(&desired);
+    assert!(client
+        .pending_topology(&topology)
+        .contains(&"front:f-frt-in:via:i-future".to_owned()));
+
+    let composed = client.apply(topology).unwrap();
+    let output = compile(&composed);
+    assert!(output.can_publish(), "{:#?}", output.diagnostics);
+    assert!(output
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "front.no-via"));
+
+    let plan = output.project_user("platform.acme", "alice").unwrap();
+    assert!(plan.front_groups.iter().all(|group| group.id != "f-frt-in"));
+    assert!(plan
+        .entries
+        .iter()
+        .all(|entry| { !matches!(entry.ingress_id.as_str(), "i-frt-au" | "i-frt-us") }));
+    assert!(plan
+        .entries
+        .iter()
+        .any(|entry| entry.ingress_id == "i-frt-hk"));
+}
+
+#[test]
+fn changing_fronts_does_not_change_any_node_plan() {
+    let topology = demo_snapshot();
+    let baseline = compile(&topology);
+    assert!(baseline.can_publish(), "{:#?}", baseline.diagnostics);
+    let mut without_fronts = topology.clone();
+    for app in &mut without_fronts.apps {
+        app.fronts.clear();
+        for ingress in &mut app.ingresses {
+            ingress.front = None;
+        }
+    }
+    let changed = compile(&without_fronts);
+    assert!(changed.can_publish(), "{:#?}", changed.diagnostics);
+
+    for node in &topology.nodes {
+        let baseline_plan = baseline.project_node(&node.id).unwrap();
+        let changed_plan = changed.project_node(&node.id).unwrap();
+        assert_eq!(
+            baseline_plan, changed_plan,
+            "Front 配置不应改变 {} 的机器期望状态",
+            node.id
+        );
+        assert_eq!(
+            json::xray(&xray::build(&baseline_plan)),
+            json::xray(&xray::build(&changed_plan)),
+            "Front 配置不应改变 {} 的 Xray 产物字节",
+            node.id
+        );
+    }
 }
 
 fn hysteria2_topology() -> ModelSnapshot {
@@ -164,10 +361,10 @@ fn warp_topology() -> ModelSnapshot {
         .tenant
         .clone();
     app.steps[step_index].rules[rule_index].action = Action::Proxy {
-        outbound: "warp-checkpoint".to_owned(),
+        outbound: "warp-8f3a-2d71".to_owned(),
     };
     topology.external_outbounds.push(ExternalOutbound {
-        id: "warp-checkpoint".to_owned(),
+        id: "warp-8f3a-2d71".to_owned(),
         tenant,
         name: "WARP checkpoint fixture".to_owned(),
         address: "engage.cloudflareclient.com".to_owned(),
@@ -265,6 +462,7 @@ fn projection_candidate_switches_only_when_topology_contract_matches() {
             port: 443,
         }),
         v6: None,
+        ..Projection::default()
     };
     let initial = SubscriptionClientConfig::from_snapshot(&topology);
 
@@ -315,6 +513,7 @@ fn public_projection_change_activates_without_a_topology_change() {
             port: 443,
         }),
         v6: None,
+        ..Projection::default()
     };
     let initial = SubscriptionClientConfig::from_snapshot(&topology);
     let mut desired = topology.clone();
@@ -613,6 +812,7 @@ fn projection_tombstone_disables_the_serving_projection_without_deleting_topolog
             port: 443,
         }),
         v6: None,
+        ..Projection::default()
     };
     let initial = SubscriptionClientConfig::from_snapshot(&topology);
     let mut desired = topology.clone();

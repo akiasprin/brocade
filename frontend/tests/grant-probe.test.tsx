@@ -90,20 +90,21 @@ describe('user grant probe', () => {
     vi.stubGlobal('fetch', fetchMock);
     const view = render(<GrantProbePanel user={user} />, { wrapper: wrapper() });
 
-    expect(view.getByText('网络拨测')).toBeTruthy();
+    expect(await view.findByText('网络拨测')).toBeTruthy();
     expect(await view.findByText('伦敦入口')).toBeTruthy();
     const results = view.container.querySelectorAll<HTMLElement>('.grant-probe-result');
     const matrix = view.container.querySelector<HTMLElement>('.grant-probe-matrix');
     expect(results).toHaveLength(2);
-    // 四种协议各有 V4/V6 两格。CSS 读取同一个槽位数，不会在新增协议后仍按旧的四列排版。
-    expect(matrix?.children).toHaveLength(8);
-    expect(matrix?.style.getPropertyValue('--grant-probe-slot-count')).toBe('8');
+    // 只显示当前 Serving 计划里确实启用的协议 / 地址族；没有启用的能力不占空列。
+    expect(matrix?.children).toHaveLength(2);
+    expect(matrix?.style.getPropertyValue('--grant-probe-slot-count')).toBe('2');
     expect(view.container.querySelectorAll('.grant-probe-result.missing')).toHaveLength(0);
     const tableHead = view.container.querySelector('.grant-probe-table-head');
     expect(tableHead).toBeTruthy();
-    expect(tableHead?.querySelectorAll('.grant-probe-matrix-head > span')).toHaveLength(8);
+    expect(tableHead?.querySelectorAll('.grant-probe-matrix-head > span')).toHaveLength(2);
     expect(tableHead?.textContent).toContain('线路 / Route');
-    expect(tableHead?.textContent).toContain('AnyTLS');
+    expect(tableHead?.textContent).not.toContain('VLESS · Encryption');
+    expect(tableHead?.textContent).not.toContain('AnyTLS');
     expect(results[0].dataset).toMatchObject({ protocol: 'VLESS', stack: 'V4' });
     expect(results[1].dataset).toMatchObject({ protocol: 'Hysteria2', stack: 'V6' });
     expect((view.getByRole('button', { name: '重试失败项' }) as HTMLButtonElement).disabled).toBe(true);
@@ -269,5 +270,7 @@ it('单独的 VLESS Encryption 入站也显示在拨测矩阵中', async () => {
   );
   const view = render(<GrantProbePanel user={user} />, { wrapper: wrapper() });
   expect(await view.findByText('加密入口')).toBeTruthy();
+  expect(view.container.querySelector('.grant-probe-table-head')?.textContent).toContain('VLESS · Encryption');
+  expect(view.container.querySelector('.grant-probe-matrix')?.children).toHaveLength(1);
   expect(view.getByLabelText('VLESS · Encryption · V4：尚未验证')).toBeTruthy();
 });

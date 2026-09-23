@@ -11,20 +11,16 @@
 // `inconclusive` 不是零值而是提示：建议值只基于探测成功的路径，
 // 未探测成功的越多，该建议偏大的可能性越高。偏小只影响吞吐，偏大会导致大包被丢弃。
 //
-// ## 版面：结论 → 待办 → 原始数据
+// ## 版面：总览 → 分层读数 → 原始数据
 //
-// 三块按是否需要处理由上到下排列，而非按数据粒度排列：
+// 页面先汇总可用链路、路径探测与 MTU 状态，再按数据层次展开：
 //
-// - 端到端是结论。它是唯一表示用户当前能否使用的部分——REALITY 参数错误、
+// - 端到端表示用户当前能否使用——REALITY 参数错误、
 //   规则遗漏转发、出口被封禁，这三种情况都不会使任何一跳的计数器停止增长，
-//   下面两块都无法发现。因此它排在第一位，并另有一条横幅给出结论。
+//   逐跳计数器无法发现这些问题。
 // - 节点 MTU 是依据：应修改为什么值、由哪条路径决定。本页只读——修改在机器详情
 //   的 WIREGUARD 卡中进行，该处与同一机器的其他 wg0 参数相邻。
-// - 逐对探测是原始数据，默认折叠。八台机器对应 32 条路径，每条的内容都是
-//   `探通 / 1500 / 1440`——32 行相同的读数不提供信息，反而会掩盖有效信息。
-//
-// 此前这三块是三张相同结构的平级表格，且顺序相反：端到端排在最下方，
-// 而它可能正在报告多条链的出口不符。
+// - 逐对探测保留为默认折叠的原始数据，避免大量相似读数掩盖路径状态。
 
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -32,12 +28,14 @@ import {
   fetchLinkMtu,
   fetchLinkQuality,
   type E2eProbeItem,
+  type HopLinkView,
   type LinkMtuItem,
   type NodeMtuItem,
 } from '../api';
 import { HopLinkTable } from './telemetry';
-import { FleetNetPanel } from './nodes';
+import { FleetNetPanel } from './fleet-net-panel';
 import { Ago, Empty, ErrorBox, Loading } from '../ui/bits';
+import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { ExitVerdict, ProbeBadge, ProbeSpark, toneOf } from '../ui/probe';
 
@@ -48,17 +46,25 @@ const STATUS_LABEL: Record<string, string> = {
   unsupported: '不支持',
 };
 
+type LinkTone = 'ok' | 'warn' | 'bad' | 'quiet';
+
 /** 生效值与建议值的关系。偏大会导致丢包，因此单独作为一档。 */
-function verdict(item: NodeMtuItem): { cls: string; text: string } {
-  if (item.suggested_mtu == null) return { cls: 'st-skipped', text: `${item.inconclusive} 条路径没探通，给不出建议` };
+function verdict(item: NodeMtuItem): { tone: LinkTone; label: string; detail: string } {
+  if (item.suggested_mtu == null)
+    return { tone: 'quiet', label: '暂无建议', detail: `${item.inconclusive} 条路径未完成` };
   if (item.suggested_mtu < item.current_mtu)
     return {
-      cls: 'st-halted',
-      text: `比建议值大 ${item.current_mtu - item.suggested_mtu}——大包会被悄悄打掉`,
+      tone: 'bad',
+      label: '需要调整',
+      detail: `高出建议 ${item.current_mtu - item.suggested_mtu}`,
     };
   if (item.suggested_mtu > item.current_mtu)
-    return { cls: 'st-warn', text: `还能加到 ${item.suggested_mtu}，偏小只是慢一点` };
-  return { cls: 'st-succeeded', text: '跟建议值一致' };
+    return {
+      tone: 'warn',
+      label: '低于建议',
+      detail: `可设为 ${item.suggested_mtu}`,
+    };
+  return { tone: 'ok', label: '合适', detail: '与建议一致' };
 }
 
 // 本页只读。此处此前有「采纳建议」——它向草稿推入一条 update_node，而同一字段在
@@ -73,7 +79,7 @@ export function LinksPane() {
   const probes = useQuery({
     queryKey: ['e2e-probes'],
     queryFn: () => fetchE2eProbes(),
-    refetchInterval: 30_000,
+    refetchInterval: 60_000,
   });
   // 逐跳链路质量。与本页的另外三类并列，但取数方式不同：另外三类都是主动探测
   // （ping 测量 MTU、建立一次连接），本类不发送任何探测包，读取的是内核在实际转发连接上
@@ -86,90 +92,191 @@ export function LinksPane() {
     retry: false,
   });
 
-  if (mtu.isPending) return <Loading />;
-  if (mtu.error) return <ErrorBox error={mtu.error} />;
-
-  const { links, nodes, default_mtu } = mtu.data;
+  const links = mtu.data?.links ?? [];
+  const nodes = mtu.data?.nodes ?? [];
+  const defaultMtu = mtu.data?.default_mtu ?? 0;
   const chains = probes.data?.chains ?? [];
   const hops = quality.data?.hops ?? [];
 
   return (
-    <>
-      {/* 全机队网络吞吐总览：所有机器的网卡汇总对 XRAY 承载。放在链路各节之前作为整体背景。 */}
-      <FleetNetPanel />
-      <E2eBand chains={chains} pending={probes.isPending} />
-      <E2eSection chains={chains} pending={probes.isPending} error={probes.error} />
-      {/* 排在 MTU 之前：MTU 表示该链路单次可通过的最大包长，属于条件；
-          本类表示该链路当前的实际带宽和瓶颈位置，属于结果。先查看结果，
-          结果异常时再查看条件。 */}
-      <LinkQualitySection hops={hops} />
-      <MtuSection nodes={nodes} defaultMtu={default_mtu} />
-      <PairProbes links={links} />
-    </>
+    <div className="cardpage link-page">
+      <section className="panel titled link-summary-panel" data-page-title="true">
+        <header>
+          <ListIcon of="link" />
+          <h4>链路与 MTU</h4>
+          <span className="hint">端到端、实际转发与路径尺寸</span>
+          <span className="sp" />
+          <span className="link-page-live">
+            <i /> 自动刷新
+          </span>
+        </header>
+        {mtu.isPending ? (
+          <Loading variant="metrics" />
+        ) : mtu.error ? (
+          <ErrorBox error={mtu.error} />
+        ) : (
+          <LinkOverview
+            chains={chains}
+            links={links}
+            nodes={nodes}
+            hops={hops}
+            defaultMtu={defaultMtu}
+            pending={probes.isPending}
+          />
+        )}
+      </section>
+
+      {mtu.isPending ? (
+        <>
+          <Loading variant="chart-panel" />
+          <Loading variant="table-panel" />
+        </>
+      ) : (
+        mtu.data && (
+          <>
+            <FleetNetPanel />
+            <E2eSection chains={chains} pending={probes.isPending} error={probes.error} />
+            <LinkQualitySection hops={hops} />
+            <MtuSection nodes={nodes} defaultMtu={defaultMtu} />
+            <PairProbes links={links} />
+          </>
+        )
+      )}
+    </div>
   );
 }
 
 /** 逐跳链路质量。标识转换为机器名，与本页其他位置一致。 */
-function LinkQualitySection({ hops }: { hops: import('../api').HopLinkView[] }) {
+function LinkQualitySection({ hops }: { hops: HopLinkView[] }) {
   const nodeName = useNodeNames();
-  return <HopLinkTable hops={hops} nodeName={nodeName} />;
+  if (hops.length === 0) return null;
+  return <HopLinkTable hops={hops} nodeName={nodeName} title="逐跳质量" />;
 }
 
-// 一句话的结论。它是本页最需要优先呈现的内容——此前它位于第三张表的第四列，
-// 只显示「对不上」，需要逐行查看才能定位。
-//
-// 三档分别表述，不合并：「不通」表示故障，「出口不符」表示连通但未穿过完整的链
-// （通常从链头直接出网），后者发生在每一跳都连通、编译无警告的情况下，
-// 是该类探测存在的主要原因。
-function E2eBand({ chains, pending }: { chains: E2eProbeItem[]; pending: boolean }) {
-  if (pending || chains.length === 0) return null;
-  const down = chains.filter(c => toneOf(c) === 'down');
-  const odd = chains.filter(c => c.status === 'ok' && c.exit_verdict === 'mismatch');
-  /* 出口 IP 只有一个取值时直接显示：多条链指向同一地址时，该地址本身即是排查线索。 */
-  const oddIps = [...new Set(odd.map(c => c.exit_ip).filter(Boolean))];
-  /* 「没有对不上的」不等于「都对得上」。外部隧道、NAT 或无稳定公网地址时核对不会跑，
-     不能把一次没做的检查报成做过了。 */
-  const unchecked = chains.filter(c => c.status === 'ok' && c.exit_verdict === 'unknown');
-
-  if (down.length === 0 && odd.length === 0) {
+function LinkOverview({
+  chains,
+  links,
+  nodes,
+  hops,
+  defaultMtu,
+  pending,
+}: {
+  chains: E2eProbeItem[];
+  links: LinkMtuItem[];
+  nodes: NodeMtuItem[];
+  hops: HopLinkView[];
+  defaultMtu: number;
+  pending: boolean;
+}) {
+  if (pending) {
     return (
-      <div className="lk-band">
-        <span className="lk-band-dot ok" />
-        <span className="lk-band-head">
-          {unchecked.length === 0
-            ? `${chains.length} 条链都通，出口也都对得上`
-            : `${chains.length} 条链都通，${
-                unchecked.length === chains.length ? '出口都' : `其中 ${unchecked.length} 条出口`
-              }未核对`}
-        </span>
+      <div className="link-overview" aria-label="链路概览">
+        <Loading variant="metrics" />
       </div>
     );
   }
+  const down = chains.filter(chain => toneOf(chain) === 'down');
+  const mismatched = chains.filter(chain => chain.status === 'ok' && chain.exit_verdict === 'mismatch');
+  const available = chains.filter(chain => chain.status === 'ok' && chain.exit_verdict !== 'mismatch').length;
+  const pathOk = links.filter(link => link.status === 'ok').length;
+  const pathDown = links.length - pathOk;
+  const mtuExact = nodes.filter(node => node.suggested_mtu === node.current_mtu).length;
+  const mtuHigh = nodes.filter(node => node.suggested_mtu != null && node.suggested_mtu < node.current_mtu);
+  const mtuLow = nodes.filter(node => node.suggested_mtu != null && node.suggested_mtu > node.current_mtu);
+  const activeHops = hops.filter(hop => hop.sample.conns > 0).length;
+  const overallTone: LinkTone =
+    down.length > 0 || pathDown > 0 || mtuHigh.length > 0
+      ? 'bad'
+      : mismatched.length > 0 || mtuLow.length > 0
+        ? 'warn'
+        : chains.length + links.length + nodes.length === 0
+          ? 'quiet'
+          : 'ok';
+  const status =
+    down.length > 0
+      ? `${down.map(chain => chain.chain_name).join('、')} 当前不可用`
+      : mismatched.length > 0
+        ? `${mismatched.map(chain => chain.chain_name).join('、')} 的出口与预期不符`
+        : pathDown > 0
+          ? `${pathDown} 条机器间路径未探通`
+          : mtuHigh.length > 0
+            ? `${mtuHigh.length} 台机器的 MTU 高于探测建议`
+            : mtuLow.length > 0
+              ? `${mtuLow.length} 台机器的 MTU 低于探测建议`
+              : chains.length + links.length + nodes.length === 0
+                ? '等待机器上报第一轮探测结果'
+                : '当前未发现链路异常';
+
+  const statusTone = overallTone === 'bad' ? ' err' : overallTone === 'warn' ? ' warn' : '';
   return (
-    <div className={`lk-band ${down.length ? 'bad' : 'warn'}`}>
-      <span className={`lk-band-dot ${down.length ? 'bad' : 'warn'}`} />
-      <span className="lk-band-head">
-        {down.length > 0
-          ? `${down.length} 条链不通`
-          : `${chains.length} 条链都通，但${odd.length === chains.length ? '出口全都' : `有 ${odd.length} 条出口`}对不上`}
+    <div className="link-overview" aria-label="链路概览">
+      <div className="link-overview-grid">
+        <LinkMetric
+          icon="chains"
+          label="端到端可用"
+          value={chains.length === 0 ? '—' : `${available}/${chains.length}`}
+          meta={mismatched.length > 0 ? `${mismatched.length} 条出口不符` : '完整用户路径'}
+          tone={down.length > 0 ? 'bad' : mismatched.length > 0 ? 'warn' : chains.length > 0 ? 'ok' : 'quiet'}
+        />
+        <LinkMetric
+          icon="observe"
+          label="路径探通"
+          value={links.length === 0 ? '—' : `${pathOk}/${links.length}`}
+          meta="机器之间"
+          tone={pathDown > 0 ? 'bad' : links.length > 0 ? 'ok' : 'quiet'}
+        />
+        <LinkMetric
+          icon="nodes"
+          label="MTU 一致"
+          value={nodes.length === 0 ? '—' : `${mtuExact}/${nodes.length}`}
+          meta={`全局默认 ${defaultMtu}`}
+          tone={
+            mtuHigh.length > 0
+              ? 'bad'
+              : mtuLow.length > 0
+                ? 'warn'
+                : nodes.length > 0 && mtuExact === nodes.length
+                  ? 'ok'
+                  : 'quiet'
+          }
+        />
+        <LinkMetric
+          icon="usage"
+          label="实际转发"
+          value={hops.length === 0 ? '—' : `${activeHops}/${hops.length}`}
+          meta="有连接的逐跳样本"
+          tone={activeHops > 0 ? 'ok' : 'quiet'}
+        />
+      </div>
+      <div className={`callout link-overview-status${statusTone}`} role="status">
+        <i />
+        <span>{status}</span>
+      </div>
+    </div>
+  );
+}
+
+function LinkMetric({
+  icon,
+  label,
+  value,
+  meta,
+  tone,
+}: {
+  icon: 'chains' | 'observe' | 'nodes' | 'usage';
+  label: string;
+  value: string;
+  meta: string;
+  tone: LinkTone;
+}) {
+  return (
+    <div className={`link-metric ${tone}`}>
+      <span className="link-metric-icon">
+        <Icon of={icon} size={15} />
       </span>
-      <span className="lk-band-why">
-        {down.length > 0 ? (
-          <>断在这几条：{down.map(c => c.chain_name).join('、')}。</>
-        ) : (
-          <>
-            {oddIps.length === 1 ? (
-              <>
-                出口 IP 都是 <b className="mono">{oddIps[0]}</b>
-                {odd[0]?.exit_loc ? `（${odd[0].exit_loc}）` : ''}——那不是这些链的出口节点。
-              </>
-            ) : (
-              <>出口 IP 不是这些链的出口节点。</>
-            )}{' '}
-            检查链路中是否存在提前直出的规则。每跳的计数器仍可能增长、编译也可能没有警告，所以只有端到端拨测能发现。
-          </>
-        )}
-      </span>
+      <span className="link-metric-label">{label}</span>
+      <strong>{value}</strong>
+      <small>{meta}</small>
     </div>
   );
 }
@@ -179,65 +286,68 @@ function E2eBand({ chains, pending }: { chains: E2eProbeItem[]; pending: boolean
 function E2eSection({ chains, pending, error }: { chains: E2eProbeItem[]; pending: boolean; error: unknown }) {
   const nameOf = useNodeNames();
   return (
-    <div className="lk-sec">
+    <section className="panel titled">
       <header>
-        <h4>端到端</h4>
-        <span className="hint">由入口节点为每条链发起一次探测</span>
+        <PanelTitle of="chains">端到端探测</PanelTitle>
+        <span className="hint">从入口经过完整用户路径到达外部落点</span>
+        <span className="sp" />
+        {chains.length > 0 && <span className="hint">{chains.length} 条链</span>}
       </header>
-      {pending ? (
-        <Loading />
-      ) : error ? (
-        <ErrorBox error={error} />
-      ) : chains.length === 0 ? (
-        <Empty>还没有链被探过。入口节点的 agent 每轮自己探，刚建好的链要等一会儿。</Empty>
-      ) : (
-        <table className="tbl cards lk-t">
-          <thead>
-            <tr>
-              <th>端到端</th>
-              <th>链</th>
-              <th>入口节点</th>
-              <th>出口地址</th>
-              <th>核对</th>
-              <th>最近</th>
-              <th>探于</th>
-            </tr>
-          </thead>
-          <tbody>
-            {chains.map(c => (
-              <tr key={`${c.app_id}/${c.chain_id}`}>
-                <td data-label="端到端">
-                  <ProbeBadge item={c} />
-                </td>
-                <td data-label="链">
-                  {c.chain_name} <span className="dim mono">{c.chain_id}</span>
-                </td>
-                <td data-label="入口节点" title={c.node_id}>
-                  {nameOf(c.node_id)}
-                </td>
-                <td data-label="出口地址" className="mono dim">
-                  {c.exit_ip ?? '—'}
-                  {c.exit_loc && ` ${c.exit_loc}`}
-                </td>
-                <td data-label="核对">
-                  <ExitVerdict item={c} />
-                </td>
-                <td data-label="最近">
-                  <ProbeSpark samples={c.samples} />
-                </td>
-                <td data-label="探于" className="dim">
-                  <Ago at={c.probed_at} />
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-      <p className="note lk-note">
-        探测走的是<b>与用户相同的路径</b>：入口节点使用一份编译期派生的隐藏凭据连接自己的入口，穿过整条链到达设置中
-        指定的落点。REALITY 参数、路由规则、出口出网都在这一次探测的覆盖范围内，而这三项出问题时，下面两块 都无法察觉。
-      </p>
-    </div>
+      <div className="link-card-body">
+        {pending ? (
+          <Loading variant="table" />
+        ) : error ? (
+          <ErrorBox error={error} />
+        ) : chains.length === 0 ? (
+          <Empty>还没有端到端探测结果。</Empty>
+        ) : (
+          <div className="link-table-wrap">
+            <table className="tbl cards link-table">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>链</th>
+                  <th>入口机器</th>
+                  <th>出口地址</th>
+                  <th>出口核对</th>
+                  <th>最近记录</th>
+                  <th>更新时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                {chains.map(chain => (
+                  <tr key={`${chain.app_id}/${chain.chain_id}`}>
+                    <td data-label="状态">
+                      <ProbeBadge item={chain} />
+                    </td>
+                    <td data-label="链">
+                      <b>{chain.chain_name}</b>
+                      <span className="link-table-id mono">{chain.chain_id}</span>
+                    </td>
+                    <td data-label="入口机器" title={chain.node_id}>
+                      {nameOf(chain.node_id)}
+                    </td>
+                    <td data-label="出口地址" className="mono dim">
+                      {chain.exit_ip ?? '—'}
+                      {chain.exit_loc && ` ${chain.exit_loc}`}
+                    </td>
+                    <td data-label="出口核对">
+                      <ExitVerdict item={chain} />
+                    </td>
+                    <td data-label="最近记录">
+                      <ProbeSpark samples={chain.samples} />
+                    </td>
+                    <td data-label="更新时间" className="dim">
+                      <Ago at={chain.probed_at} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -251,137 +361,145 @@ function E2eSection({ chains, pending, error }: { chains: E2eProbeItem[]; pendin
 function MtuSection({ nodes, defaultMtu }: { nodes: NodeMtuItem[]; defaultMtu: number }) {
   const nameOf = useNodeNames();
   return (
-    <div className="lk-sec">
+    <section className="panel titled">
       <header>
-        <h4>节点 MTU</h4>
-        <span className="hint">全局默认 {defaultMtu} · 在机器详情的 WIREGUARD 卡中修改</span>
+        <PanelTitle of="nodes">机器 MTU</PanelTitle>
+        <span className="hint">全局默认 {defaultMtu} · 在机器详情修改生效值</span>
+        <span className="sp" />
+        {nodes.length > 0 && <span className="hint">{nodes.length} 台机器</span>}
       </header>
-      {nodes.length === 0 ? (
-        <Empty>还没有机器上报探测结果。</Empty>
-      ) : (
-        <table className="tbl cards lk-t">
-          <thead>
-            <tr>
-              <th>机器</th>
-              <th>生效</th>
-              <th>建议</th>
-              <th>最窄那条路</th>
-              <th>没探通</th>
-              <th>判断</th>
-            </tr>
-          </thead>
-          <tbody>
-            {nodes.map(n => {
-              const v = verdict(n);
-              return (
-                <tr key={n.node_id}>
-                  <td data-label="机器" title={n.node_id}>
-                    {nameOf(n.node_id)}
-                  </td>
-                  <td data-label="生效">
-                    <span className="mono">{n.current_mtu}</span>{' '}
-                    <span className={`st ${n.overridden ? 'st-gold' : 'st-skipped'}`}>
-                      {n.overridden ? '本机设的' : '跟全局'}
-                    </span>
-                  </td>
-                  <td data-label="建议" className="mono">
-                    {n.suggested_mtu ?? '—'}
-                  </td>
-                  <td data-label="最窄" className="dim" title={n.tightest_peer ?? ''}>
-                    {n.tightest_peer ? nameOf(n.tightest_peer) : '—'}
-                  </td>
-                  <td data-label="没探通" className="mono">
-                    {n.inconclusive || '—'}
-                  </td>
-                  <td data-label="判断">
-                    <span className={`st ${v.cls}`}>{v.text}</span>
-                  </td>
+      <div className="link-card-body">
+        {nodes.length === 0 ? (
+          <Empty>还没有机器上报 MTU 探测结果。</Empty>
+        ) : (
+          <div className="link-table-wrap">
+            <table className="tbl cards link-table link-mtu-table">
+              <thead>
+                <tr>
+                  <th>机器</th>
+                  <th>当前值</th>
+                  <th>建议值</th>
+                  <th>最窄路径</th>
+                  <th>未完成</th>
+                  <th>状态</th>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
-    </div>
+              </thead>
+              <tbody>
+                {nodes.map(node => {
+                  const state = verdict(node);
+                  return (
+                    <tr key={node.node_id}>
+                      <td data-label="机器" title={node.node_id}>
+                        <b>{nameOf(node.node_id)}</b>
+                        <span className="link-table-id mono">{node.node_id}</span>
+                      </td>
+                      <td data-label="当前值">
+                        <span className="link-mtu-value mono">{node.current_mtu}</span>
+                        <span className="link-value-source">{node.overridden ? '本机设置' : '跟随全局'}</span>
+                      </td>
+                      <td data-label="建议值" className="mono link-mtu-value">
+                        {node.suggested_mtu ?? '—'}
+                      </td>
+                      <td data-label="最窄路径" title={node.tightest_peer ?? ''}>
+                        {node.tightest_peer ? nameOf(node.tightest_peer) : '—'}
+                      </td>
+                      <td data-label="未完成" className="mono">
+                        {node.inconclusive || '—'}
+                      </td>
+                      <td data-label="状态">
+                        <span className={`link-verdict ${state.tone}`}>
+                          <b>{state.label}</b>
+                          <small>{state.detail}</small>
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
 // 逐对探测。默认折叠：n 台机器对应 n×(n-1) 条路径，八台即 56 条，而多数情况下
 // 它们的读数完全相同。摘要行表明是否存在异常，需要查看原始读数时再展开。
 function PairProbes({ links }: { links: LinkMtuItem[] }) {
+  const nameOf = useNodeNames();
   const bad = links.filter(l => l.status !== 'ok');
   /* 所有路径 MTU 相同时显示为一个数值——这是常态，显示后即可确定无需展开。 */
   const mtus = [...new Set(links.filter(l => l.path_mtu != null).map(l => l.path_mtu))];
 
   if (links.length === 0) {
     return (
-      <div className="lk-sec">
+      <section className="panel titled">
         <header>
-          <h4>逐对探测</h4>
+          <PanelTitle of="observe">路径原始读数</PanelTitle>
+          <span className="hint">每一对机器之间的 underlay 探测</span>
         </header>
-        <Empty>还没有探测结果。</Empty>
-      </div>
+        <div className="link-card-body">
+          <Empty>还没有路径探测结果。</Empty>
+        </div>
+      </section>
     );
   }
   return (
-    <details className="lk-fold lk-sec">
+    <details className="panel titled">
       <summary>
-        <span className={`lk-dot ${bad.length ? 'warn' : 'ok'}`} />
-        逐对探测 ·{' '}
-        {bad.length > 0 ? (
-          <>
-            <b>
-              {links.length} 条里 {bad.length} 条没探通
-            </b>
-          </>
-        ) : (
-          <>
-            <b>{links.length} 条全通</b>
-            {mtus.length === 1 && <>，路径 MTU 一律 {mtus[0]}</>}
-          </>
-        )}
-        <span className="sum">agent 上报</span>
+        <PanelTitle of="observe">路径原始读数</PanelTitle>
+        <span className="hint">
+          {bad.length > 0 ? `${links.length} 条中有 ${bad.length} 条未探通` : `${links.length} 条路径均已探通`}
+          {bad.length === 0 && mtus.length === 1 && ` · 路径 MTU ${mtus[0]}`}
+        </span>
       </summary>
-      <div className="b">
-        <table className="tbl cards lk-t">
-          <thead>
-            <tr>
-              <th>从</th>
-              <th>探的落点</th>
-              <th>状态</th>
-              <th>path MTU</th>
-              <th>建议 wg MTU</th>
-              <th>探于</th>
-            </tr>
-          </thead>
-          <tbody>
-            {links.map(l => (
-              <tr key={`${l.node_id}>${l.peer_node_id}`}>
-                <td data-label="从" className="mono">
-                  {l.node_id} <span className="dim">→</span> {l.peer_node_id}
-                </td>
-                <td data-label="落点" className="mono dim">
-                  {l.endpoint_host}
-                </td>
-                <td data-label="状态">
-                  <span className={`st ${l.status === 'ok' ? 'st-succeeded' : 'st-warn'}`}>
-                    {STATUS_LABEL[l.status] ?? l.status}
-                  </span>
-                </td>
-                <td data-label="path MTU" className="mono">
-                  {l.path_mtu ?? '—'}
-                </td>
-                <td data-label="建议" className="mono">
-                  {l.suggested_wg_mtu ?? '—'}
-                </td>
-                <td data-label="探于" className="dim">
-                  <Ago at={l.probed_at} />
-                </td>
+      <div className="link-card-body">
+        <div className="link-table-wrap">
+          <table className="tbl cards link-table">
+            <thead>
+              <tr>
+                <th>路径</th>
+                <th>探测落点</th>
+                <th>状态</th>
+                <th>路径 MTU</th>
+                <th>建议 WG MTU</th>
+                <th>更新时间</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-        <p className="note lk-note">探测的是 underlay 落点，不是 overlay。建议值 = 路径 MTU − wg 封装开销。</p>
+            </thead>
+            <tbody>
+              {links.map(link => (
+                <tr key={`${link.node_id}>${link.peer_node_id}`}>
+                  <td data-label="路径">
+                    <b>
+                      {nameOf(link.node_id)} <span className="dim">→</span> {nameOf(link.peer_node_id)}
+                    </b>
+                    <span className="link-table-id mono">
+                      {link.node_id} → {link.peer_node_id}
+                    </span>
+                  </td>
+                  <td data-label="探测落点" className="mono dim">
+                    {link.endpoint_host}
+                  </td>
+                  <td data-label="状态">
+                    <span className={`link-path-state ${link.status === 'ok' ? 'ok' : 'warn'}`}>
+                      <i /> {STATUS_LABEL[link.status] ?? link.status}
+                    </span>
+                  </td>
+                  <td data-label="路径 MTU" className="mono link-mtu-value">
+                    {link.path_mtu ?? '—'}
+                  </td>
+                  <td data-label="建议 WG MTU" className="mono link-mtu-value">
+                    {link.suggested_wg_mtu ?? '—'}
+                  </td>
+                  <td data-label="更新时间" className="dim">
+                    <Ago at={link.probed_at} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </details>
   );

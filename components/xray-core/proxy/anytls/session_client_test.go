@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport"
 )
 
 func TestWriteWasteFramesKeepsWireLengthAndFrameHeaders(t *testing.T) {
@@ -203,5 +205,28 @@ func TestOpenStreamRetiresSessionInsteadOfWrappingToZero(t *testing.T) {
 	client.markSessionIdle(s)
 	if !s.isClosed() || len(client.idleSessions) != 0 || len(client.sessions) != 0 {
 		t.Fatalf("exhausted session was retained: closed=%v idle=%v sessions=%v", s.isClosed(), client.idleSessions, client.sessions)
+	}
+}
+
+func BenchmarkOpenStreamWirePacket(b *testing.B) {
+	writer := buf.NewBufferedWriter(buf.NewWriter(io.Discard))
+	s := &session{
+		isClient: true,
+		bw:       writer,
+		streams:  make(map[uint32]*stream),
+	}
+	s.fw = newFrameWriter(writer)
+	s.paddingScheme, _ = parsePaddingScheme("stop=0\n0=30-30")
+	s.nextSID.Store(1)
+	link := &transport.Link{Writer: buf.Discard}
+	target := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		opened, err := s.openStream(context.Background(), target, link)
+		if err != nil {
+			b.Fatal(err)
+		}
+		s.finishStream(opened.sid, nil)
 	}
 }

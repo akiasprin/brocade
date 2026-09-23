@@ -5,7 +5,10 @@ mod paths;
 mod platform;
 
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use clap::{Args, Parser, Subcommand};
 use cloudflare::{CloudflaredBinary, QuickTunnel};
 use database::{DatabaseChoice, ManagedPostgres};
@@ -86,6 +89,17 @@ struct UpArgs {
 #[derive(Debug, Deserialize)]
 struct AuthState {
     initialized: bool,
+}
+
+struct BootstrapToken {
+    secret: String,
+    private_file: Option<PathBuf>,
+}
+
+struct InitializationAccess<'a> {
+    url: &'a str,
+    local_addr: SocketAddr,
+    bootstrap_file: Option<&'a Path>,
 }
 
 #[tokio::main]
@@ -171,11 +185,13 @@ async fn up(args: UpArgs) -> Result<()> {
     } else {
         None
     };
+    let bootstrap_token = bootstrap_token(&paths.data, optional_env("BROCADE_BOOTSTRAP_TOKEN")?)?;
     let console_bin = console_binary(args.console_bin.clone())?;
     let mut console_command = Command::new(&console_bin);
     console_command
         .env("DATABASE_URL", &database_url)
         .env("BROCADE_ADMIN_BIND", admin_bind.to_string())
+        .env("BROCADE_BOOTSTRAP_TOKEN", &bootstrap_token.secret)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -215,23 +231,9 @@ async fn up(args: UpArgs) -> Result<()> {
     }
     println!("Local: {local_url}");
 
-    if args.tunnel {
-        match wait_until_initialized(&client, &local_url, &mut console, &mut shutdown).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let mut no_tunnel = None;
-                cleanup(&mut no_tunnel, &mut console, managed).await;
-                return Ok(());
-            }
-            Err(error) => {
-                let _ = remove_stale_runtime_file(&public_url_file);
-                let mut no_tunnel = None;
-                cleanup(&mut no_tunnel, &mut console, managed).await;
-                return Err(error);
-            }
-        }
-    }
-
+    // A bootstrap credential now protects /auth/init, so a requested Tunnel can safely become the
+    // operator's first reachable URL. Starting it only after initialization strands an SSH install:
+    // 127.0.0.1 names the operator's own computer in their browser, not this server.
     let mut tunnel = if args.tunnel {
         let started = tokio::select! {
             _ = shutdown.as_mut() => None,
@@ -262,6 +264,46 @@ async fn up(args: UpArgs) -> Result<()> {
     } else {
         None
     };
+    let initialization_url = tunnel
+        .as_ref()
+        .map(|tunnel| tunnel.url.clone())
+        .unwrap_or_else(|| local_url.clone());
+
+    match wait_until_initialized(
+        &client,
+        &local_url,
+        InitializationAccess {
+            url: &initialization_url,
+            local_addr,
+            bootstrap_file: bootstrap_token.private_file.as_deref(),
+        },
+        &mut console,
+        &mut tunnel,
+        &mut shutdown,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            if args.tunnel {
+                let _ = remove_stale_runtime_file(&public_url_file);
+            }
+            cleanup(&mut tunnel, &mut console, managed).await;
+            return Ok(());
+        }
+        Err(error) => {
+            if args.tunnel {
+                let _ = remove_stale_runtime_file(&public_url_file);
+            }
+            cleanup(&mut tunnel, &mut console, managed).await;
+            return Err(error);
+        }
+    }
+    if let Some(path) = &bootstrap_token.private_file {
+        if let Err(error) = remove_stale_runtime_file(path) {
+            eprintln!("初始化已完成，但无法删除一次性凭据文件：{error:#}");
+        }
+    }
 
     let event = tokio::select! {
         _ = &mut shutdown => RuntimeExit::Signal,
@@ -363,14 +405,22 @@ async fn wait_for_console(
 async fn wait_until_initialized(
     client: &reqwest::Client,
     local_url: &str,
+    access: InitializationAccess<'_>,
     console: &mut Child,
+    tunnel: &mut Option<QuickTunnel>,
     shutdown: &mut std::pin::Pin<Box<impl std::future::Future<Output = ()>>>,
 ) -> Result<bool> {
     if auth_state(client, local_url).await?.initialized {
         return Ok(true);
     }
     println!(
-        "首次启动尚未创建管理员。请先打开 {local_url} 完成初始化；完成前不会开放公网 Tunnel。"
+        "{}",
+        initialization_instructions(
+            access.url,
+            access.local_addr,
+            access.bootstrap_file,
+            tunnel.is_some(),
+        )
     );
     loop {
         tokio::select! {
@@ -380,10 +430,42 @@ async fn wait_until_initialized(
         if let Some(status) = console.try_wait()? {
             bail!("brocade-console 在等待管理员初始化时退出：{status}");
         }
+        if let Some(tunnel) = tunnel.as_mut() {
+            if let Some(status) = tunnel.child.try_wait()? {
+                bail!("cloudflared 在等待管理员初始化时退出：{status}");
+            }
+        }
         if auth_state(client, local_url).await?.initialized {
             return Ok(true);
         }
     }
+}
+
+fn initialization_instructions(
+    initialization_url: &str,
+    local_addr: SocketAddr,
+    bootstrap_file: Option<&Path>,
+    tunneled: bool,
+) -> String {
+    let credential = match bootstrap_file {
+        Some(path) => format!("一次性初始化凭据文件：{}", path.display()),
+        None => "一次性初始化凭据：BROCADE_BOOTSTRAP_TOKEN".to_owned(),
+    };
+    let mut instructions =
+        format!("首次启动尚未创建管理员。\n初始化地址：{initialization_url}\n{credential}");
+    if !tunneled && local_addr.ip().is_loopback() {
+        let target = match local_addr.ip() {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        instructions.push_str(&format!(
+            "\n浏览器不在这台服务器上时，请在浏览器所在电脑另开终端运行：\n\
+             ssh -N -L {port}:{target}:{port} <用户>@<服务器>\n\
+             然后打开 http://127.0.0.1:{port}",
+            port = local_addr.port(),
+        ));
+    }
+    instructions
 }
 
 async fn auth_state(client: &reqwest::Client, local_url: &str) -> Result<AuthState> {
@@ -490,6 +572,46 @@ fn console_binary(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+fn bootstrap_token(data_root: &Path, configured: Option<String>) -> Result<BootstrapToken> {
+    if let Some(secret) = configured {
+        validate_bootstrap_token(&secret)?;
+        return Ok(BootstrapToken {
+            secret,
+            private_file: None,
+        });
+    }
+
+    let path = data_root.join("bootstrap-token");
+    if path.exists() {
+        let secret = paths::read_private_text(&path)?;
+        let secret = secret.trim().to_owned();
+        validate_bootstrap_token(&secret)?;
+        return Ok(BootstrapToken {
+            secret,
+            private_file: Some(path),
+        });
+    }
+
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let secret = URL_SAFE_NO_PAD.encode(bytes);
+    atomic_write_private(&path, format!("{secret}\n").as_bytes(), 0o600)?;
+    Ok(BootstrapToken {
+        secret,
+        private_file: Some(path),
+    })
+}
+
+fn validate_bootstrap_token(secret: &str) -> Result<()> {
+    if secret.trim() != secret {
+        bail!("BROCADE_BOOTSTRAP_TOKEN 不能包含首尾空白");
+    }
+    if !(32..=512).contains(&secret.len()) {
+        bail!("BROCADE_BOOTSTRAP_TOKEN 必须为 32 至 512 字节");
+    }
+    Ok(())
+}
+
 fn managed_secret(data_root: &Path) -> Result<String> {
     if let Some(value) = optional_env("BROCADE_SECRET_KEY")? {
         validate_secret(value.trim())?;
@@ -576,5 +698,76 @@ mod tests {
             reachable_loopback("[::]:8080".parse().unwrap()),
             "[::1]:8080".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn tunneled_bootstrap_names_the_reachable_https_url() {
+        let message = initialization_instructions(
+            "https://bootstrap.example.trycloudflare.com",
+            "127.0.0.1:8080".parse().unwrap(),
+            Some(Path::new("/var/lib/brocade/bootstrap-token")),
+            true,
+        );
+
+        assert!(message.contains("初始化地址：https://bootstrap.example.trycloudflare.com"));
+        assert!(message.contains("/var/lib/brocade/bootstrap-token"));
+        assert!(!message.contains("ssh -N -L"));
+    }
+
+    #[test]
+    fn loopback_bootstrap_explains_the_complete_ssh_forward() {
+        let message = initialization_instructions(
+            "http://127.0.0.1:8080",
+            "127.0.0.1:8080".parse().unwrap(),
+            None,
+            false,
+        );
+
+        assert!(message.contains("初始化地址：http://127.0.0.1:8080"));
+        assert!(message.contains("ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>"));
+        assert!(message.contains("然后打开 http://127.0.0.1:8080"));
+        assert!(message.contains("BROCADE_BOOTSTRAP_TOKEN"));
+    }
+
+    #[test]
+    fn release_installer_prints_a_reachable_bootstrap_flow() {
+        const INSTALLER: &str = include_str!("../../../install.sh");
+
+        assert!(INSTALLER.contains("sudo brocade up --tunnel"));
+        assert!(INSTALLER.contains("启动后显示的“初始化地址”HTTPS 链接"));
+        assert!(INSTALLER.contains("ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>"));
+        assert!(INSTALLER.contains("sudo cat /var/lib/brocade/bootstrap-token"));
+        assert!(!INSTALLER.contains("默认初始化地址：http://127.0.0.1:8080"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_bootstrap_token_is_private_and_reused_until_initialization() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = bootstrap_token(root.path(), None).unwrap();
+        let path = first.private_file.as_ref().unwrap();
+        assert_eq!(path, &root.path().join("bootstrap-token"));
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let first_digest = Sha256::digest(first.secret.as_bytes());
+
+        let second = bootstrap_token(root.path(), None).unwrap();
+        assert_eq!(Sha256::digest(second.secret.as_bytes()), first_digest);
+        assert_eq!(second.private_file.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn configured_bootstrap_token_must_have_minimum_entropy_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let error = bootstrap_token(root.path(), Some("too-short".to_owned()))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("32 至 512 字节"));
+        assert!(!root.path().join("bootstrap-token").exists());
     }
 }

@@ -8,9 +8,13 @@ import (
 )
 
 func readOneUDP(r io.Reader) (*Buffer, error) {
-	b := New()
+	// A short destination silently truncates a datagram and the unread tail is
+	// lost, so packet readers must reserve the full accepted size before Read.
+	b := NewWithSize(MaxPacketSize)
 	for i := 0; i < 64; i++ {
-		_, err := b.ReadFrom(r)
+		raw := b.Extend(MaxPacketSize)
+		n, err := r.Read(raw)
+		b.Resize(0, int32(n))
 		if !b.IsEmpty() {
 			return b, nil
 		}

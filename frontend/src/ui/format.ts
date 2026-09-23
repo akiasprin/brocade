@@ -1,6 +1,7 @@
 const TiB = 1024 ** 4;
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
+const KiB = 1024;
 
 // 流量数值按 1024 进制转换为 KiB/MiB/GiB/TiB。小数位数随数量级递减：
 // 数值越大，精确到 0.01 以下的必要性越低。
@@ -13,7 +14,18 @@ export const bytes = (n: number) =>
       ? `${(n / GiB).toFixed(2)} GiB`
       : n >= MiB
         ? `${(n / MiB).toFixed(1)} MiB`
-        : `${(n / 1024).toFixed(0)} KiB`;
+        : n >= KiB
+          ? `${(n / KiB).toFixed(0)} KiB`
+          : `${n.toFixed(0)} B`;
+
+/** File and payload sizes keep one decimal below MiB, while sharing the same IEC unit names. */
+export const fileBytes = (n: number | null): string => {
+  if (n === null) return '—';
+  if (n < KiB) return `${n.toFixed(0)} B`;
+  if (n < MiB) return `${(n / KiB).toFixed(1)} KiB`;
+  if (n < GiB) return `${(n / MiB).toFixed(1)} MiB`;
+  return bytes(n);
+};
 
 export type HopWireKind = 'none' | 'encryption' | 'reality' | 'shadowsocks2022';
 

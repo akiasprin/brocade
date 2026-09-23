@@ -5,7 +5,6 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
-	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 )
@@ -37,12 +36,13 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		return nil, err
 	}
 
-	if size > buf.Size {
-		return nil, errors.New("packet size too large: ", size)
-	}
-
+	packetSize := int32(size)
 	b := buf.New()
-	if _, err := b.ReadFullFrom(r.reader, int32(size)); err != nil {
+	if packetSize > buf.Size {
+		b.Release()
+		b = buf.NewWithSize(packetSize)
+	}
+	if _, err := b.ReadFullFrom(r.reader, packetSize); err != nil {
 		b.Release()
 		return nil, err
 	}

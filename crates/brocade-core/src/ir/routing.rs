@@ -16,8 +16,7 @@ use crate::{
 /// A rule's matching half, which is the model-layer type verbatim.
 ///
 /// This layer does not rewrite matches, so a second type has no place here. The IR
-/// does exactly two things to rules: expand `FrontDownstream`, and append a trailing
-/// `Any`. Both add or remove whole rules, and neither turns one match into another. An
+/// appends only a trailing `Any`; it never changes one match into another. An
 /// identically shaped second type buys only a field-by-field cloning conversion, plus
 /// the rule that adding a match kind means remembering to edit two places.
 ///
@@ -209,6 +208,47 @@ pub struct EgressRoute {
     pub send_through: Option<IpAddr>,
 }
 
+/// The exact owned input of one chain-routing compilation.  Keeping this value independent from
+/// the rest of its project lets the control plane content-address and reuse a large project's
+/// unchanged chains without putting cache state inside the pure compiler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoutingChainInput {
+    app_id: String,
+    chain: model::Chain,
+    root: Option<String>,
+    nodes: Vec<model::Node>,
+    steps: Vec<model::Step>,
+    reused_listener_nodes: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingChainCompile {
+    chain: Chain,
+    steps: Vec<Step>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl RoutingChainInput {
+    pub fn compile(&self) -> RoutingChainCompile {
+        let mut diagnostics = Vec::new();
+        let chain = Chain {
+            id: self.chain.id.clone(),
+            app_id: Some(self.app_id.clone()),
+            tenant: self.chain.tenant.clone(),
+            name: self.chain.name.clone(),
+            subscription_country: self.chain.subscription_country.clone(),
+            root: self.root.clone(),
+        };
+        let mut steps = Vec::new();
+        compile_chain_steps(self, &mut diagnostics, &mut steps);
+        RoutingChainCompile {
+            chain,
+            steps,
+            diagnostics,
+        }
+    }
+}
+
 pub fn compile_app(
     doc: &model::ModelSnapshot,
     app: &model::AppView,
@@ -223,6 +263,21 @@ pub(crate) fn compile_app_with_listener_roots(
     listener_roots: Option<&BTreeSet<(String, String)>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> AppIr {
+    compile_app_with_listener_roots_and(doc, app, listener_roots, diagnostics, |input| {
+        input.compile()
+    })
+}
+
+pub(crate) fn compile_app_with_listener_roots_and<F>(
+    doc: &model::ModelSnapshot,
+    app: &model::AppView,
+    listener_roots: Option<&BTreeSet<(String, String)>>,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut compile_chain: F,
+) -> AppIr
+where
+    F: FnMut(&RoutingChainInput) -> RoutingChainCompile,
+{
     let chain_by_id = app
         .chains
         .iter()
@@ -332,12 +387,6 @@ pub(crate) fn compile_app_with_listener_roots(
         })
         .collect();
 
-    let front_via = ir
-        .fronts
-        .iter()
-        .flat_map(|front| front.via.iter().cloned())
-        .collect::<BTreeSet<_>>();
-
     ir.ingresses = app
         .ingresses
         .iter()
@@ -367,7 +416,9 @@ pub(crate) fn compile_app_with_listener_roots(
                 bind: ingress.bind,
                 port: ingress.port,
                 front: ingress.front.clone(),
-                sniff: !front_via.contains(&ingress.id),
+                // Front membership is a client subscription concern. It must not change the
+                // listener or any other machine artifact.
+                sniff: true,
                 identity: ingress.identity.clone(),
                 anytls_identity: ingress.anytls_identity.clone(),
                 wires,
@@ -384,18 +435,6 @@ pub(crate) fn compile_app_with_listener_roots(
         })
         .collect();
 
-    let front_via_chains = ir
-        .fronts
-        .iter()
-        .flat_map(|front| front.via.iter())
-        .filter_map(|ingress_id| {
-            ir.ingresses
-                .iter()
-                .find(|ingress| ingress.id == *ingress_id)
-                .map(|ingress| ingress.chain.clone())
-        })
-        .collect::<BTreeSet<_>>();
-    let front_downstream = front_downstream_hosts(&ir, &node_by_id);
     let local_listener_roots;
     let reused_listeners = match listener_roots {
         Some(listener_roots) => listener_roots,
@@ -409,12 +448,6 @@ pub(crate) fn compile_app_with_listener_roots(
         .filter(|(chain, _)| app.chains.iter().any(|candidate| candidate.id == *chain))
         .cloned()
         .collect();
-    let compile_context = ChainCompileContext {
-        front_via_chains: &front_via_chains,
-        front_downstream: &front_downstream,
-        reused_listeners,
-    };
-
     for chain in &app.chains {
         if disabled_chains.contains(chain.id.as_str()) {
             continue;
@@ -423,30 +456,60 @@ pub(crate) fn compile_app_with_listener_roots(
             .get(chain.id.as_str())
             .map(|ingress| ingress.node.as_str());
 
-        ir.chains.push(Chain {
-            id: chain.id.clone(),
-            app_id: Some(app.id.clone()),
-            tenant: chain.tenant.clone(),
-            name: chain.name.clone(),
-            subscription_country: chain.subscription_country.clone(),
-            root: root.map(str::to_owned),
-        });
-
-        compile_chain_steps(
-            doc,
-            app,
-            chain,
-            root,
-            &compile_context,
-            diagnostics,
-            &mut ir.steps,
-        );
+        let input = routing_chain_input(doc, app, chain, root, reused_listeners);
+        let compiled = compile_chain(&input);
+        ir.chains.push(compiled.chain);
+        ir.steps.extend(compiled.steps);
+        diagnostics.extend(compiled.diagnostics);
     }
 
     compile_grants(doc, app, &ir.ingresses, diagnostics, &mut ir.grants);
     collect_tenants(&mut ir);
     sort_ir(&mut ir);
     ir
+}
+
+fn routing_chain_input(
+    doc: &model::ModelSnapshot,
+    app: &model::AppView,
+    chain: &model::Chain,
+    root: Option<&str>,
+    reused_listeners: &BTreeSet<(String, String)>,
+) -> RoutingChainInput {
+    let steps = app
+        .steps
+        .iter()
+        .filter(|step| step.chain == chain.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut node_ids = root.into_iter().map(str::to_owned).collect::<BTreeSet<_>>();
+    for step in &steps {
+        node_ids.insert(step.node.clone());
+        for rule in &step.rules {
+            if let Action::Forward { to, .. } = &rule.action {
+                node_ids.insert(to.clone());
+            }
+        }
+    }
+    let nodes = doc
+        .nodes
+        .iter()
+        .filter(|node| node_ids.contains(&node.id))
+        .cloned()
+        .collect();
+    let reused_listener_nodes = reused_listeners
+        .iter()
+        .filter(|(owner_chain, _)| owner_chain == &chain.id)
+        .map(|(_, node)| node.clone())
+        .collect();
+    RoutingChainInput {
+        app_id: app.id.clone(),
+        chain: chain.clone(),
+        root: root.map(str::to_owned),
+        nodes,
+        steps,
+        reused_listener_nodes,
+    }
 }
 
 /// Chains with a decommissioned node on the trunk (the range reachable from the head
@@ -590,13 +653,17 @@ fn is_live_ingress(
 /// table: whoever the rules point at is a hop on the chain. Both the
 /// decommission-disable test and ingress reachability rest on it.
 fn chain_members(app: &model::AppView, chain_id: &str, root: &str) -> BTreeSet<String> {
+    chain_members_from_steps(&app.steps, chain_id, root)
+}
+
+fn chain_members_from_steps(steps: &[model::Step], chain_id: &str, root: &str) -> BTreeSet<String> {
     let mut members = BTreeSet::new();
     let mut queue = VecDeque::from([root.to_owned()]);
     while let Some(node_id) = queue.pop_front() {
         if !members.insert(node_id.clone()) {
             continue;
         }
-        for step in steps_at(app, chain_id, &node_id) {
+        for step in steps_at_source(steps, chain_id, &node_id) {
             for rule in &step.rules {
                 if let model::Action::Forward { to, .. } = &rule.action {
                     queue.push_back(to.clone());
@@ -740,7 +807,15 @@ pub(crate) fn reachable_listener_roots_across_apps(
 /// by membership discovery and IR construction prevents a Forward seen by one phase from being
 /// silently absent in the other.
 fn steps_at<'a>(app: &'a model::AppView, chain_id: &str, node_id: &str) -> Vec<&'a model::Step> {
-    app.steps
+    steps_at_source(&app.steps, chain_id, node_id)
+}
+
+fn steps_at_source<'a>(
+    steps: &'a [model::Step],
+    chain_id: &str,
+    node_id: &str,
+) -> Vec<&'a model::Step> {
+    steps
         .iter()
         .filter(|step| step.chain == chain_id && step.node == node_id)
         .collect()
@@ -774,45 +849,26 @@ fn merge_step_field<'a, T: Clone + PartialEq + 'a>(
     }
 }
 
-// The tables shared by every chain compiled for one app. Building them once keeps
-// recursive listener discovery and front-rule expansion consistent across chains.
-struct ChainCompileContext<'a> {
-    // Which chains some front references — a referenced chain denies by default, and
-    // the dead-chain test must skip them.
-    front_via_chains: &'a BTreeSet<String>,
-    // Front chain → the downstream hosts it admits. Looked up by chain id while
-    // expanding front rules.
-    front_downstream: &'a HashMap<String, BTreeSet<String>>,
-    // Listener roots reached through ReuseListener, including nested references.
-    reused_listeners: &'a BTreeSet<(String, String)>,
-}
-
 fn compile_chain_steps(
-    doc: &model::ModelSnapshot,
-    app: &model::AppView,
-    chain: &model::Chain,
-    root: Option<&str>,
-    context: &ChainCompileContext<'_>,
+    input: &RoutingChainInput,
     diagnostics: &mut Vec<Diagnostic>,
     out: &mut Vec<Step>,
 ) {
-    let Some(root) = root else {
+    let Some(root) = input.root.as_deref() else {
         return;
     };
+    let chain = &input.chain;
+    let source_steps = &input.steps;
+    let nodes = &input.nodes;
+    let reused_listener_nodes = &input.reused_listener_nodes;
 
     // A referenced listener is another root of this chain's stored rule forest. It remains owned
     // by this chain, but need not also be reachable from the chain's user ingress: removing the
     // owner's incoming edge must not make a subtree still used elsewhere disappear from the
     // compiled artifacts. Stable ordering keeps the output independent of rule insertion order.
-    let primary_members = chain_members(app, &chain.id, root);
+    let primary_members = chain_members_from_steps(source_steps, &chain.id, root);
     let mut roots = vec![root.to_owned()];
-    roots.extend(
-        context
-            .reused_listeners
-            .iter()
-            .filter(|(owner_chain, _)| owner_chain == &chain.id)
-            .map(|(_, node)| node.clone()),
-    );
+    roots.extend(reused_listener_nodes.iter().cloned());
     roots.sort();
     roots.dedup();
     if let Some(index) = roots.iter().position(|node| node == root) {
@@ -832,7 +888,7 @@ fn compile_chain_steps(
         if made.contains(&node_id) {
             continue;
         }
-        let node = match doc.nodes.iter().find(|node| node.id == node_id) {
+        let node = match nodes.iter().find(|node| node.id == node_id) {
             Some(node) => node,
             None => {
                 diagnostics.push(Diagnostic::error(
@@ -844,18 +900,18 @@ fn compile_chain_steps(
             }
         };
 
-        let sources = steps_at(app, &chain.id, &node_id);
+        let sources = steps_at_source(source_steps, &chain.id, &node_id);
         let source_rules = sources
             .iter()
             .flat_map(|step| step.rules.iter().cloned())
             .collect::<Vec<_>>();
-        let mut rules = expand_front_rules(
-            chain,
-            &node_id,
-            &source_rules,
-            context.front_downstream,
-            diagnostics,
-        );
+        let mut rules = source_rules
+            .into_iter()
+            .map(|rule| Rule {
+                dest_match: rule.dest_match,
+                action: rule.action,
+            })
+            .collect::<Vec<_>>();
         let at = format!("{}/{}", chain.id, node_id);
         let source_accept = merge_step_field(
             sources.iter().map(|step| step.accept.as_ref()),
@@ -872,14 +928,7 @@ fn compile_chain_steps(
             diagnostics,
         );
 
-        let padded = append_default_rule(
-            node,
-            chain,
-            &node_id,
-            context.front_via_chains.contains(&chain.id),
-            diagnostics,
-            &mut rules,
-        );
+        let padded = append_default_rule(node, chain, &node_id, diagnostics, &mut rules);
         if primary_members.contains(&node_id) && matches!(padded, Some(Action::Block)) {
             padded_block = true;
         }
@@ -902,9 +951,7 @@ fn compile_chain_steps(
                 }
             )
         });
-        let reused = context
-            .reused_listeners
-            .contains(&(chain.id.clone(), node_id.clone()));
+        let reused = reused_listener_nodes.contains(&node_id);
         let (accept, hop_in) = if node_id == *root && !reused {
             (None, reverse_upstream.then_some(source_hop_in).flatten())
         } else {
@@ -922,7 +969,7 @@ fn compile_chain_steps(
         made.insert(node_id.clone());
         steps.push(Step {
             id: format!("s-{}-{node_id}", chain.id),
-            app_id: Some(app.id.clone()),
+            app_id: Some(input.app_id.clone()),
             chain: chain.id.clone(),
             node: node_id,
             accept: accept.map(|accept| Accept {
@@ -938,10 +985,10 @@ fn compile_chain_steps(
     }
 
     let mut unreachable = BTreeMap::<&str, usize>::new();
-    for source in app.steps.iter().filter(|source| {
+    for source in source_steps.iter().filter(|source| {
         source.chain == chain.id
             && !made.contains(&source.node)
-            && doc.nodes.iter().any(|node| node.id == source.node)
+            && nodes.iter().any(|node| node.id == source.node)
     }) {
         *unreachable.entry(source.node.as_str()).or_default() += source.rules.len();
     }
@@ -962,10 +1009,7 @@ fn compile_chain_steps(
     // in the rule table has the compiler append a Block fallback. The `step.no-egress`
     // warning says only "this node got a Block appended" and cannot say "the chain no
     // longer has an exit at all", and it is the latter that should block a release.
-    // Front chains do not participate: denying by default is their semantics, and
-    // blocking everything is a legitimate intermediate state meaning "nothing has been
-    // admitted yet" (already covered by the front.default-block warning).
-    if !context.front_via_chains.contains(&chain.id) && padded_block {
+    if padded_block {
         let alive = steps
             .iter()
             .filter(|step| primary_members.contains(&step.node))
@@ -995,79 +1039,6 @@ fn compile_chain_steps(
     out.extend(steps);
 }
 
-fn expand_front_rules(
-    chain: &model::Chain,
-    node_id: &str,
-    rules: &[model::Rule],
-    front_downstream: &HashMap<String, BTreeSet<String>>,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<Rule> {
-    rules
-        .iter()
-        .flat_map(|rule| {
-            if rule.dest_match != DestMatch::FrontDownstream {
-                if contains_front_downstream(&rule.dest_match) {
-                    diagnostics.push(Diagnostic::error(
-                        "rule.front-scope",
-                        format!("{}/{}", chain.id, node_id),
-                        "「本组落地机」只能作为顶层匹配条件，不能嵌套在 All 中",
-                    ));
-                }
-                return vec![Rule {
-                    dest_match: rule.dest_match.clone(),
-                    action: rule.action.clone(),
-                }];
-            }
-
-            let hosts = front_downstream.get(&chain.id).cloned().unwrap_or_default();
-            if hosts.is_empty() {
-                diagnostics.push(Diagnostic::error(
-                    "rule.front-scope",
-                    format!("{}/{}", chain.id, node_id),
-                    "「本组落地机」为空，规则永不命中",
-                ));
-                return vec![Rule {
-                    dest_match: DestMatch::FrontDownstream,
-                    action: rule.action.clone(),
-                }];
-            }
-
-            let domains = hosts
-                .iter()
-                .filter(|host| !is_ip_literal(host))
-                .cloned()
-                .collect::<Vec<_>>();
-            let ips = hosts
-                .iter()
-                .filter(|host| is_ip_literal(host))
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut expanded = Vec::new();
-            if !domains.is_empty() {
-                expanded.push(Rule {
-                    dest_match: DestMatch::DomainSuffix(domains),
-                    action: rule.action.clone(),
-                });
-            }
-            if !ips.is_empty() {
-                expanded.push(Rule {
-                    dest_match: DestMatch::IpCidr(ips),
-                    action: rule.action.clone(),
-                });
-            }
-            expanded
-        })
-        .collect()
-}
-
-fn contains_front_downstream(dest_match: &DestMatch) -> bool {
-    match dest_match {
-        DestMatch::FrontDownstream => true,
-        DestMatch::All(values) => values.iter().any(contains_front_downstream),
-        _ => false,
-    }
-}
-
 /// Append the "no rule written = exit here" case. Returns the appended action, or
 /// None when nothing was appended (the rule table's last entry is already an any). The
 /// dead-chain test uses the return value to recognize a Block that filled a hole — an
@@ -1077,7 +1048,6 @@ fn append_default_rule(
     node: &model::Node,
     chain: &model::Chain,
     node_id: &str,
-    is_front_chain: bool,
     diagnostics: &mut Vec<Diagnostic>,
     rules: &mut Vec<Rule>,
 ) -> Option<Action> {
@@ -1092,7 +1062,7 @@ fn append_default_rule(
     // the "no rule written = exit here" case — with no trunk declaration there is no
     // "automatically forward to the next hop" to append. A node that wants to go
     // further must write `any → Forward(next)` itself.
-    let action = terminal_default(node, chain, node_id, is_front_chain, diagnostics);
+    let action = terminal_default(node, chain, node_id, diagnostics);
     rules.push(Rule {
         dest_match: DestMatch::Any,
         action: action.clone(),
@@ -1104,18 +1074,8 @@ fn terminal_default(
     node: &model::Node,
     chain: &model::Chain,
     node_id: &str,
-    is_front_chain: bool,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Action {
-    if is_front_chain {
-        diagnostics.push(Diagnostic::warn(
-            "front.default-block",
-            format!("{}/{}", chain.id, node_id),
-            format!("{node_id} 前置链末端补 Block"),
-        ));
-        return Action::Block;
-    }
-
     if node.egress_allowed {
         Action::Egress { send_through: None }
     } else {
@@ -1126,42 +1086,6 @@ fn terminal_default(
         ));
         Action::Block
     }
-}
-
-fn front_downstream_hosts(
-    ir: &AppIr,
-    node_by_id: &HashMap<&str, &model::Node>,
-) -> HashMap<String, BTreeSet<String>> {
-    let mut by_chain = HashMap::<String, BTreeSet<String>>::new();
-
-    for front in &ir.fronts {
-        // "The exits under a group" are the ingresses with a non-empty front: they are
-        // what a client looks for after being relayed through this group. A via is a
-        // dialing entrance, not an expansion target — expansion targets live on the
-        // chain, see expand_front_rules. Projection is deliberately absent here: it is a
-        // custom subscription endpoint whose relaying arrangement lives outside brocade,
-        // not an address the compiler can use to derive or validate this route.
-        let hosts = ir
-            .ingresses
-            .iter()
-            .filter(|ingress| ingress.front.as_deref() == Some(front.id.as_str()))
-            .filter_map(|ingress| node_by_id.get(ingress.node.as_str()))
-            .flat_map(|node| [node.public_ipv4.clone(), node.public_ipv6.clone()])
-            .flatten()
-            .collect::<BTreeSet<_>>();
-
-        for via in &front.via {
-            let Some(via_ingress) = ir.ingresses.iter().find(|ingress| ingress.id == *via) else {
-                continue;
-            };
-            by_chain
-                .entry(via_ingress.chain.clone())
-                .or_default()
-                .extend(hosts.iter().cloned());
-        }
-    }
-
-    by_chain
 }
 
 fn compile_grants(
@@ -1262,10 +1186,6 @@ pub fn egress_tag(send_through: Option<&IpAddr>) -> String {
         Some(value) => format!("out:egress:{value}"),
         None => "out:egress".to_owned(),
     }
-}
-
-fn is_ip_literal(value: &str) -> bool {
-    value.parse::<IpAddr>().is_ok()
 }
 
 fn user_key(tenant: &str, user: &str) -> String {

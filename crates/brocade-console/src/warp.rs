@@ -113,6 +113,7 @@ async fn unregister_at(
     access_token: &str,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(25))
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
@@ -156,6 +157,7 @@ async fn register_at(
     node_name: &str,
 ) -> Result<Registration, String> {
     let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(25))
         .min_tls_version(reqwest::tls::Version::TLS_1_2)

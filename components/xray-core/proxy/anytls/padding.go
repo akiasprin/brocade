@@ -3,8 +3,8 @@ package anytls
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
-	"math/big"
 	"strconv"
 	"strings"
 )
@@ -28,9 +28,14 @@ var defaultPaddingScheme = []byte(`stop=8
 
 type paddingScheme struct {
 	rawScheme []byte
-	scheme    map[string]string
+	records   map[uint32][]paddingRange
 	stop      uint32
 	md5       string
+}
+
+type paddingRange struct {
+	minSize int
+	maxSize int
 }
 
 func newPaddingScheme(rawScheme []byte) (*paddingScheme, error) {
@@ -43,9 +48,10 @@ func newPaddingScheme(rawScheme []byte) (*paddingScheme, error) {
 	p := &paddingScheme{
 		rawScheme: rawScheme,
 		md5:       fmt.Sprintf("%x", md5.Sum(rawScheme)),
+		records:   make(map[uint32][]paddingRange),
 	}
 
-	scheme := make(map[string]string)
+	seen := make(map[string]struct{})
 	stopSeen := false
 	for lineNumber, line := range strings.Split(string(rawScheme), "\n") {
 		line = strings.TrimSpace(line)
@@ -61,9 +67,10 @@ func newPaddingScheme(rawScheme []byte) (*paddingScheme, error) {
 		if key == "" || value == "" {
 			return nil, fmt.Errorf("anytls: empty padding scheme token on line %d", lineNumber+1)
 		}
-		if _, exists := scheme[key]; exists {
+		if _, exists := seen[key]; exists {
 			return nil, fmt.Errorf("anytls: duplicate padding scheme key %q", key)
 		}
+		seen[key] = struct{}{}
 
 		if key == "stop" {
 			if stopSeen {
@@ -75,7 +82,6 @@ func newPaddingScheme(rawScheme []byte) (*paddingScheme, error) {
 				return nil, fmt.Errorf("anytls: invalid padding scheme stop")
 			}
 			p.stop = uint32(stop)
-			scheme[key] = value
 			continue
 		}
 
@@ -87,38 +93,44 @@ func newPaddingScheme(rawScheme []byte) (*paddingScheme, error) {
 		if packet == 0 {
 			maxTargetSize = maxFramePayload
 		}
+		ranges := make([]paddingRange, 0, strings.Count(value, ",")+1)
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
 			if token == "c" {
+				ranges = append(ranges, paddingRange{minSize: CheckMark, maxSize: CheckMark})
 				continue
 			}
-			rangeParts := strings.Split(token, "-")
-			if len(rangeParts) != 2 {
+			minText, maxText, found := strings.Cut(token, "-")
+			if !found || strings.Contains(maxText, "-") {
 				return nil, fmt.Errorf("anytls: invalid padding range %q", token)
 			}
-			min, minErr := strconv.ParseUint(strings.TrimSpace(rangeParts[0]), 10, 32)
-			max, maxErr := strconv.ParseUint(strings.TrimSpace(rangeParts[1]), 10, 32)
+			min, minErr := strconv.ParseUint(strings.TrimSpace(minText), 10, 32)
+			max, maxErr := strconv.ParseUint(strings.TrimSpace(maxText), 10, 32)
 			if minErr != nil || maxErr != nil || min == 0 || max == 0 || min > max || max > maxTargetSize {
 				return nil, fmt.Errorf("anytls: invalid padding range %q", token)
 			}
+			ranges = append(ranges, paddingRange{minSize: int(min), maxSize: int(max)})
 		}
-		scheme[key] = value
+		p.records[uint32(packet)] = ranges
 	}
 
 	if !stopSeen {
 		return nil, fmt.Errorf("anytls: padding scheme stop is missing")
 	}
 
-	p.scheme = scheme
 	return p, nil
 }
 
-func getDefaultPaddingScheme() *paddingScheme {
+var parsedDefaultPaddingScheme = func() *paddingScheme {
 	p, err := newPaddingScheme(defaultPaddingScheme)
 	if err != nil {
 		panic(err)
 	}
 	return p
+}()
+
+func getDefaultPaddingScheme() *paddingScheme {
+	return parsedDefaultPaddingScheme
 }
 
 func parsePaddingScheme(schemeStr string) (*paddingScheme, error) {
@@ -132,54 +144,50 @@ func (p *paddingScheme) GenerateRecordPayloadSizes(pkt uint32) []int {
 	if p == nil {
 		return nil
 	}
+	ranges := p.records[pkt]
+	if len(ranges) == 0 {
+		return nil
+	}
+	return p.appendRecordPayloadSizes(make([]int, 0, len(ranges)), pkt)
+}
 
-	pktSizes := []int{}
-	key := strconv.Itoa(int(pkt))
-	s, ok := p.scheme[key]
-	if !ok {
-		return pktSizes
+func (p *paddingScheme) appendRecordPayloadSizes(dst []int, pkt uint32) []int {
+	ranges := p.records[pkt]
+	if len(ranges) == 0 {
+		return dst
 	}
 
-	sRanges := strings.Split(s, ",")
-	for _, sRange := range sRanges {
-		sRange = strings.TrimSpace(sRange)
+	for index := range ranges {
+		item := &ranges[index]
+		dst = append(dst, item.payloadSize())
+	}
+	return dst
+}
 
-		if sRange == "c" {
-			pktSizes = append(pktSizes, CheckMark)
-			continue
-		}
+func (r *paddingRange) payloadSize() int {
+	if r.minSize == CheckMark || r.maxSize <= r.minSize {
+		return r.minSize
+	}
+	limit := uint32(r.maxSize - r.minSize + 1)
+	return r.minSize + int(randomPaddingOffset(limit))
+}
 
-		sRangeMinMax := strings.Split(sRange, "-")
-		if len(sRangeMinMax) != 2 {
-			continue
-		}
-
-		_min, err := strconv.ParseInt(sRangeMinMax[0], 10, 64)
-		if err != nil {
-			continue
-		}
-		_max, err := strconv.ParseInt(sRangeMinMax[1], 10, 64)
-		if err != nil {
-			continue
-		}
-
-		if _min > _max {
-			_min, _max = _max, _min
-		}
-
-		if _min <= 0 || _max <= 0 {
-			continue
-		}
-
-		if _min == _max {
-			pktSizes = append(pktSizes, int(_min))
-		} else {
-			i, _ := rand.Int(rand.Reader, big.NewInt(_max-_min+1))
-			pktSizes = append(pktSizes, int(i.Int64()+_min))
+// randomPaddingOffset uses rejection sampling so every value below limit has
+// exactly the same probability. Padding sizes are fingerprinting material, so
+// they continue to use the process cryptographic random source.
+func randomPaddingOffset(limit uint32) uint32 {
+	if limit <= 1 {
+		return 0
+	}
+	threshold := -limit % limit
+	for {
+		var raw [4]byte
+		_, _ = rand.Read(raw[:])
+		value := binary.LittleEndian.Uint32(raw[:])
+		if value >= threshold {
+			return value % limit
 		}
 	}
-
-	return pktSizes
 }
 
 func getPadding0Size(scheme *paddingScheme) uint16 {
@@ -187,9 +195,12 @@ func getPadding0Size(scheme *paddingScheme) uint16 {
 		return 30
 	}
 
-	sizes := scheme.GenerateRecordPayloadSizes(0)
-	if len(sizes) > 0 && sizes[0] > 0 && sizes[0] <= maxFramePayload {
-		return uint16(sizes[0])
+	ranges := scheme.records[0]
+	if len(ranges) > 0 {
+		size := ranges[0].payloadSize()
+		if size > 0 && size <= maxFramePayload {
+			return uint16(size)
+		}
 	}
 
 	return 30

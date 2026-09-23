@@ -1,13 +1,33 @@
-import { createContext, useContext, type ReactNode } from 'react';
-import { loginAdmin, type AdminRole, type Whoami } from './api';
+import { createContext, useContext, useEffect, type ReactNode } from 'react';
+import {
+  fetchConsoleBootstrap,
+  fetchSessionWhoami,
+  loginAdmin,
+  type AdminRole,
+  type ConsoleInitialData,
+  type Whoami,
+} from './api';
 
 export interface Session {
   who: Whoami;
+  initial: ConsoleInitialData;
 }
 
 const Ctx = createContext<Session | null>(null);
 
+export const SESSION_KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
+
 export function SessionProvider({ value, children }: { value: Session; children: ReactNode }) {
+  useEffect(() => {
+    // An open console is an active session even when its current page has no polling query. The
+    // server throttles durable expiry updates, so this lightweight identity read cannot turn into
+    // an unbounded write rate. A transient network failure must not be mistaken for a logout.
+    const timer = window.setInterval(() => {
+      void fetchSessionWhoami().catch(() => undefined);
+    }, SESSION_KEEPALIVE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [value.who.operator_id]);
+
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
@@ -42,8 +62,8 @@ export const suppressAutoPublic = () => sessionStorage.setItem(NO_AUTO_PUBLIC, '
 export async function enterPublic() {
   sessionStorage.removeItem(NO_AUTO_PUBLIC);
   // 免密账户使用空密码登录（服务端 authenticate_admin_password）。
-  const result = await loginAdmin({ operator_id: PUBLIC_ID, password: '' });
-  return result.admin;
+  await loginAdmin({ operator_id: PUBLIC_ID, password: '' });
+  return fetchConsoleBootstrap();
 }
 
 const RANK: Record<AdminRole, number> = {

@@ -76,11 +76,13 @@ func testMuxReceiver(port net.Port, stream *internet.StreamConfig) *serial.Typed
 }
 
 type muxHopConnection struct {
-	client    stdnet.Conn
-	server    stdnet.Conn
-	blackhole atomic.Bool
-	closeOnce sync.Once
-	owner     *muxHopProxy
+	client                  stdnet.Conn
+	server                  stdnet.Conn
+	blackhole               atomic.Bool
+	clientToServerBlackhole atomic.Bool
+	serverToClientBlackhole atomic.Bool
+	closeOnce               sync.Once
+	owner                   *muxHopProxy
 }
 
 func (c *muxHopConnection) close() {
@@ -91,12 +93,12 @@ func (c *muxHopConnection) close() {
 	})
 }
 
-func (c *muxHopConnection) forward(dst, src stdnet.Conn) {
+func (c *muxHopConnection) forward(dst, src stdnet.Conn, directionalBlackhole *atomic.Bool) {
 	defer c.close()
 	payload := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(payload)
-		if n > 0 && !c.blackhole.Load() {
+		if n > 0 && !c.blackhole.Load() && !directionalBlackhole.Load() {
 			if delay := time.Duration(c.owner.delay.Load()); delay > 0 {
 				time.Sleep(delay)
 			}
@@ -116,6 +118,7 @@ type muxHopProxy struct {
 	mu        sync.Mutex
 	conns     []*muxHopConnection
 	active    atomic.Int32
+	accepted  atomic.Int32
 	delay     atomic.Int64
 	done      chan struct{}
 	closeOnce sync.Once
@@ -148,6 +151,7 @@ func (p *muxHopProxy) accept() {
 		if err != nil {
 			return
 		}
+		p.accepted.Add(1)
 		server, err := stdnet.DialTimeout("tcp", p.target, 2*time.Second)
 		if err != nil {
 			_ = client.Close()
@@ -158,8 +162,8 @@ func (p *muxHopProxy) accept() {
 		p.conns = append(p.conns, connection)
 		p.mu.Unlock()
 		p.active.Add(1)
-		go connection.forward(server, client)
-		go connection.forward(client, server)
+		go connection.forward(server, client, &connection.clientToServerBlackhole)
+		go connection.forward(client, server, &connection.serverToClientBlackhole)
 	}
 }
 

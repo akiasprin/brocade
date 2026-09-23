@@ -341,7 +341,7 @@ mod tests {
         );
 
         let mut artifact = json!({
-            "tag": "out:app/external/vendor-edge",
+            "tag": "out:app/external/custom-1111-1111",
             "protocol": "vless",
             "settings": { "id": "VLESS-SECRET" }
         });

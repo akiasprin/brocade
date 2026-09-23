@@ -13,11 +13,15 @@ mod logcap;
 mod options;
 mod phantun;
 mod probe;
+mod public_ip;
 mod realtime;
 mod selfupdate;
 mod spool;
+mod traffic;
+mod vpngate;
 mod wg;
 mod xray_grpc;
+mod xrayupdate;
 pub(crate) use command::{command_success, run_command, run_shell, run_shell_with_timeout};
 use http::{HttpClient, HttpResponse};
 use options::{ApplyMode, Options};
@@ -47,7 +51,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     net::IpAddr,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, OnceLock},
     thread,
@@ -87,6 +91,38 @@ const XRAY_BOUNDED_LOG_MARKER: &str = "xray.bounded-log";
 const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
 const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
 const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
+static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn request_termination(_signal: libc::c_int) {
+    TERMINATION_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn install_termination_handlers() -> Result<(), String> {
+    // SAFETY: the handler has C ABI, performs only one async-signal-safe atomic store, and the
+    // sigaction structure and mask are initialized before either call publishes it to the kernel.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = request_termination as *const () as usize;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(format!(
+                    "install signal handler for {signal}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn finish_traffic_meter(state_dir: &Path) {
+    if let Err(error) = traffic::sample(state_dir) {
+        eprintln!("traffic final sample: {error}");
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UsageCursor {
@@ -426,6 +462,11 @@ fn run() -> Result<(), String> {
         // Internal stdin consumer used by the Xray/Phantun launch pipelines. It must not require
         // a control-plane URL or token: doing so would put a secret on every child command line.
         Some("log-sink") => return logcap::run_args(&args[1..]),
+        // OpenVPN 2.7 can invoke one DNS hook for both up and down. Keep it inside the Agent so
+        // provider-supplied DNS data is parsed as data and can only update the matching netns
+        // resolver file; calling the host systemd-resolved service would reinterpret the netns
+        // interface index in the host namespace.
+        Some("vpngate-dns-updown") => return vpngate::run_dns_updown_hook(&args[1..]),
         _ => {}
     }
 
@@ -1113,6 +1154,7 @@ fn spawn_spool_reporter(
 /// started, empty process and mistake the reset for users sending no traffic.
 fn run_forever(options: Options) -> Result<(), String> {
     certfile::ensure_layout(&options.state_dir)?;
+    install_termination_handlers()?;
     match logcap::ensure_agent_journal_namespace(&options.state_dir) {
         Ok(true) => {
             println!("agent 日志已切到独立 journal，重启一次使配置生效");
@@ -1133,6 +1175,7 @@ fn run_forever(options: Options) -> Result<(), String> {
 
     let runtime_reports = Arc::new(RuntimeReports::default());
     let _ = RUNTIME_REPORTS.set(Arc::clone(&runtime_reports));
+    let vpngate_realtime: realtime::VpngateCache = Default::default();
     {
         let report_options = options.clone();
         let reports_in = Arc::clone(&runtime_reports);
@@ -1161,10 +1204,55 @@ fn run_forever(options: Options) -> Result<(), String> {
         // independent of load and usage on purpose: neither their 30-second cadence nor their
         // persistence/accounting semantics changes when this stream is enabled.
         let options = options.clone();
+        let vpngate_realtime = Arc::clone(&vpngate_realtime);
         thread::Builder::new()
             .name("realtime".to_owned())
-            .spawn(move || realtime::run(&options))
+            .spawn(move || realtime::run(&options, vpngate_realtime))
             .map_err(|error| format!("cannot spawn realtime telemetry thread: {error}"))?;
+    }
+
+    {
+        // Managed VPN Gate profiles converge independently from model deployments. Replacing a
+        // volatile provider profile must neither restart the node's main Xray nor manufacture a
+        // configuration revision.
+        let options = options.clone();
+        let vpngate_realtime = Arc::clone(&vpngate_realtime);
+        thread::Builder::new()
+            .name("vpngate".to_owned())
+            .spawn(move || vpngate::run_forever(&options, vpngate_realtime))
+            .map_err(|error| format!("cannot spawn VPN Gate thread: {error}"))?;
+    }
+
+    {
+        // Exit-IP intelligence is deliberately not part of the VPN Gate desired-state loop. A
+        // long OpenVPN catalogue batch must not hold up lightweight provider lookups for exits
+        // that other probes have already discovered.
+        let options = options.clone();
+        thread::Builder::new()
+            .name("vpngate-intelligence".to_owned())
+            .spawn(move || vpngate::run_intelligence_forever(&options))
+            .map_err(|error| format!("cannot spawn VPN Gate intelligence thread: {error}"))?;
+    }
+
+    {
+        // Catalogue OpenVPN probes can block for a full connection timeout. Keep them away from
+        // the runtime supervisor so a dead active exit is still detected and switched promptly.
+        let options = options.clone();
+        thread::Builder::new()
+            .name("vpngate-probe".to_owned())
+            .spawn(move || vpngate::run_probe_forever(&options))
+            .map_err(|error| format!("cannot spawn VPN Gate probe thread: {error}"))?;
+    }
+
+    {
+        // Public directory collection shares the operator-selected worker scope with IP
+        // intelligence, but not its execution loop. The Console remains the parser and publisher;
+        // this thread only transports one leased upstream snapshot.
+        let options = options.clone();
+        thread::Builder::new()
+            .name("vpngate-catalogue".to_owned())
+            .spawn(move || vpngate::run_catalogue_forever(&options))
+            .map_err(|error| format!("cannot spawn VPN Gate catalogue thread: {error}"))?;
     }
 
     {
@@ -1362,10 +1450,18 @@ fn run_forever(options: Options) -> Result<(), String> {
             .spawn(move || {
                 let mut next_tick = Instant::now();
                 loop {
-                    each_round("load", || match build_load_report(&options) {
-                        Ok(Some(report)) => reports_out.publish(report),
-                        Ok(None) => {}
-                        Err(error) => eprintln!("load: {error}"),
+                    each_round("load", || {
+                        // This is also the durable traffic-meter clock. Persist independently of
+                        // HTTP delivery so a control-plane outage does not create an accounting
+                        // outage and a power loss leaves at most one ten-second interval unknown.
+                        if let Err(error) = traffic::sample(&options.state_dir) {
+                            eprintln!("traffic: {error}");
+                        }
+                        match build_load_report(&options) {
+                            Ok(Some(report)) => reports_out.publish(report),
+                            Ok(None) => {}
+                            Err(error) => eprintln!("load: {error}"),
+                        }
                     });
 
                     let now = Instant::now();
@@ -1482,6 +1578,58 @@ fn run_forever(options: Options) -> Result<(), String> {
             })
             .map_err(|error| format!("cannot spawn e2e-report thread: {error}"))?;
 
+        // The direct public-IP observation deliberately shares only the E2E probe settings, not
+        // its data path: it contacts the configured CGI Trace endpoint without Xray and forces
+        // the two address families independently. A node with no chains still gets observed.
+        let public_ip_options = options.clone();
+        let public_ip_settings = Arc::clone(&settings);
+        thread::Builder::new()
+            .name("public-ip".to_owned())
+            .spawn(move || {
+                let mut settings = public_ip_settings.wait_for_initial();
+                let mut failures: [Option<String>; 2] = [None, None];
+                let mut tick = Instant::now();
+                loop {
+                    settings = public_ip_settings.latest().unwrap_or(settings);
+                    each_round("public-ip", || {
+                        for (family, result) in
+                            public_ip::observe_and_report(&public_ip_options, &settings)
+                        {
+                            let index = public_ip::family_index(family);
+                            match result {
+                                Ok(()) => {
+                                    if failures[index].take().is_some() {
+                                        println!(
+                                            "public-ip: {} 探测恢复",
+                                            public_ip::family_label(family)
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    if failures[index].as_deref() != Some(error.as_str()) {
+                                        eprintln!(
+                                            "public-ip: {} 暂不可用：{error}",
+                                            public_ip::family_label(family)
+                                        );
+                                        failures[index] = Some(error);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    let mut next_tick =
+                        next_periodic_tick(tick, settings.interval(), Instant::now());
+                    while let Some(next) =
+                        public_ip_settings.wait_for_change_until(&settings, next_tick)
+                    {
+                        settings = next;
+                        next_tick = next_periodic_tick(tick, settings.interval(), Instant::now());
+                    }
+                    tick = next_tick;
+                }
+            })
+            .map_err(|error| format!("cannot spawn public-ip thread: {error}"))?;
+
         let settings_in = Arc::clone(&settings);
         let reports_out = Arc::clone(&reports);
         thread::Builder::new()
@@ -1508,10 +1656,17 @@ fn run_forever(options: Options) -> Result<(), String> {
             .map_err(|error| format!("cannot spawn e2e thread: {error}"))?;
     }
 
+    let xray_updates = Arc::new(xrayupdate::XrayUpdateQueue::default());
+    xrayupdate::spawn_xray_updates(&options, &xray_updates);
     selfupdate::spawn_selfupdate(&options, &wants_exit);
 
     let mut apply_tick = Instant::now();
     loop {
+        if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            finish_traffic_meter(&options.state_dir);
+            println!("收到退出信号，最终流量样本已落盘");
+            return Ok(());
+        }
         if let Err(error) = apply_once_locked(&options, &meter) {
             eprintln!("apply: {error}");
         }
@@ -1527,9 +1682,22 @@ fn run_forever(options: Options) -> Result<(), String> {
         // OpenRC), so nohup'd Xray/Phantun children are not killed alongside; wg0 is a kernel
         // interface and is unaffected; convergence is idempotent and re-runs every 15 seconds; and
         // anything owed to the control plane is already on disk in the spool.
+        if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            finish_traffic_meter(&options.state_dir);
+            println!("这一轮收敛做完了，最终流量样本已落盘，退出服务");
+            return Ok(());
+        }
         if wants_exit.load(std::sync::atomic::Ordering::SeqCst) {
+            finish_traffic_meter(&options.state_dir);
             println!("selfupdate: 这一轮收敛做完了，退出让服务管理器用新二进制拉起来");
-            std::process::exit(0);
+            return Ok(());
+        }
+        // The Xray lane owns its own preflight and rollback boundary. It must run after every
+        // completed convergence attempt, including a failed one: the failure may be exactly that
+        // the old Xray cannot parse the newly written desired config, while the staged candidate
+        // can. Gating this on convergence creates an otherwise permanent dependency cycle.
+        if let Err(error) = xrayupdate::apply_pending(&options, &meter, &xray_updates) {
+            warn(format!("xray-update: {error}"));
         }
         let now = Instant::now();
         apply_tick = next_periodic_tick(apply_tick, APPLY_INTERVAL, now);
@@ -1761,7 +1929,8 @@ fn wait_for_xray_certificate_reload(options: &Options) -> Result<(), String> {
     if !path.exists() || options.state_dir.join("xray.disabled").exists() {
         return Ok(());
     }
-    run_command("xray", &["-test", "-config", &path.display().to_string()])?;
+    let xray = xray_program();
+    run_command(&xray, &["-test", "-config", &path.display().to_string()])?;
     if !xray_running() {
         return Err("证书文件已写入，但 xray 当前没有运行；拒绝把磁盘状态报告成已加载".to_owned());
     }
@@ -2353,7 +2522,7 @@ fn apply_hot_swap(
     let call = |verb: &str, rest: &[&str]| -> Result<String, String> {
         let mut args = vec!["api", verb, server.as_str()];
         args.extend_from_slice(rest);
-        run_command("xray", &args)
+        run_command(&xray_program(), &args)
     };
     let stage = |name: &str, value: Value| -> Result<PathBuf, String> {
         let path = state_dir.join(name);
@@ -2448,10 +2617,12 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     let content =
         fs::read_to_string(path).map_err(|error| format!("读取待启动的 xray 配置失败：{error}"))?;
     let disable_splice = xray_needs_splice_disabled(&content)?;
+    let xray = xray_program();
+    let executable = shell_quote(&xray);
     let launch = if disable_splice {
-        format!("env 'xray.buf.splice=disable' xray run -config {conf}")
+        format!("env 'xray.buf.splice=disable' {executable} run -config {conf}")
     } else {
-        format!("xray run -config {conf}")
+        format!("{executable} run -config {conf}")
     };
     let state_dir = path.parent().ok_or("xray config has no state directory")?;
     let log_dir = state_dir.join("logs");
@@ -2460,7 +2631,7 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     let sink = logcap::command(&log_path, state_dir, logcap::WorkloadLog::Xray)?;
     let pipeline = shell_quote(&format!("{launch} 2>&1 | {sink}"));
     let log = shell_quote(&log_path.display().to_string());
-    run_command("xray", &["-test", "-config", &path.display().to_string()])?;
+    run_command(&xray, &["-test", "-config", &path.display().to_string()])?;
     // Xray closes its listeners as soon as SIGTERM starts the synchronous feature teardown.
     // Waiting for that teardown before launching the replacement makes the entire wait a service
     // outage. Bound the graceful phase tightly, then kill a stuck old process; a configuration
@@ -3116,10 +3287,7 @@ fn terminate_xray() -> Result<(), String> {
 fn xray_process_identity() -> Result<XrayProcessIdentity, String> {
     // The serving instance is the oldest live Xray by construction. Excluding zombies before
     // choosing the oldest matters: the leftover zombie is normally older than its replacement.
-    let process = live_processes_named("xray")
-        .into_iter()
-        .min_by_key(|process| process.start_ticks)
-        .ok_or("xray process is not running")?;
+    let process = serving_xray_process().ok_or("xray process is not running")?;
     let btime = fs::read_to_string("/proc/stat")
         .map_err(|error| format!("failed to read /proc/stat: {error}"))?
         .lines()
@@ -3197,12 +3365,124 @@ fn xray_asset_dirs() -> Vec<PathBuf> {
 }
 
 fn which_xray() -> Result<PathBuf, String> {
-    let out = run_shell("command -v xray")?;
+    let configured = options::xray_binary_path();
+    if configured.is_absolute() || configured.components().count() > 1 {
+        return configured
+            .is_file()
+            .then_some(configured.clone())
+            .ok_or_else(|| format!("配置的 xray 不存在或不是普通文件：{}", configured.display()));
+    }
+    let out = run_shell(&format!(
+        "command -v {}",
+        shell_quote(&configured.to_string_lossy())
+    ))?;
     let path = out.trim();
     if path.is_empty() {
         return Err("xray 不在 PATH 里".to_owned());
     }
     Ok(PathBuf::from(path))
+}
+
+fn xray_program() -> String {
+    options::xray_binary_path().to_string_lossy().into_owned()
+}
+
+fn serving_xray_process() -> Option<ProcessRef> {
+    // The serving instance is the oldest live Xray by construction. Probe and API children live
+    // for seconds or milliseconds; excluding zombies before selecting keeps a stale child from
+    // becoming the reported binary identity.
+    live_processes_named("xray")
+        .into_iter()
+        .min_by_key(|process| process.start_ticks)
+}
+
+pub(crate) fn installed_xray_sha256() -> Option<String> {
+    which_xray()
+        .ok()
+        .and_then(|path| cached_xray_sha256(&path).ok())
+}
+
+pub(crate) fn running_xray_sha256() -> Option<String> {
+    cached_xray_sha256(&serving_xray_executable_path()?).ok()
+}
+
+pub(crate) fn serving_xray_executable_path() -> Option<PathBuf> {
+    let process = serving_xray_process()?;
+    Some(PathBuf::from(format!("/proc/{}/exe", process.pid)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XrayFileVersion {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified_secs: i64,
+    modified_nanos: i64,
+    changed_secs: i64,
+    changed_nanos: i64,
+}
+
+impl XrayFileVersion {
+    fn read(path: &Path) -> Result<Self, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("读取 Xray 文件身份 {} 失败：{error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("Xray 路径不是普通文件：{}", path.display()));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified_secs: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            changed_secs: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+        })
+    }
+}
+
+// Runtime state is reported every 30 seconds. Reading the installed path and `/proc/<pid>/exe`
+// naively hashes the same multi-megabyte inode twice per report and hundreds of gigabytes per day.
+// Four identities cover the installed binary, its serving inode, and both sides of one update.
+// inode + size + mtime + ctime invalidates atomic replacement and in-place edits without trusting
+// the path alone. The second metadata read prevents caching a hash of bytes that changed mid-read.
+static XRAY_DIGEST_CACHE: OnceLock<Mutex<Vec<(XrayFileVersion, String)>>> = OnceLock::new();
+
+fn cached_xray_sha256(path: &Path) -> Result<String, String> {
+    const CACHE_ENTRIES: usize = 4;
+    let before = XrayFileVersion::read(path)?;
+    let cache = XRAY_DIGEST_CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(CACHE_ENTRIES)));
+    let known = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(version, _)| *version == before)
+        .map(|(_, digest)| digest.clone());
+    if let Some(digest) = known {
+        if XrayFileVersion::read(path)? == before {
+            return Ok(digest);
+        }
+    }
+
+    let digest = file_sha256_hex(path)?;
+    let after = XrayFileVersion::read(path)?;
+    if before != after {
+        return Err(format!(
+            "Xray 文件在计算摘要期间发生变化：{}",
+            path.display()
+        ));
+    }
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, known)) = cache.iter().find(|(version, _)| *version == after) {
+        return Ok(known.clone());
+    }
+    if cache.len() == CACHE_ENTRIES {
+        cache.remove(0);
+    }
+    cache.push((after, digest.clone()));
+    Ok(digest)
 }
 
 /// Rule-database reconcile: size, mtime, and sha256 of the two .dat files.
@@ -4841,6 +5121,31 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
     }
 
     #[test]
+    fn xray_digest_cache_invalidates_on_atomic_binary_replacement() {
+        let dir = test_state_dir("xray-digest-cache");
+        let path = dir.join("xray");
+        fs::write(&path, b"old-bytes").unwrap();
+        assert_eq!(
+            super::cached_xray_sha256(&path).unwrap(),
+            sha256_hex(b"old-bytes")
+        );
+        assert_eq!(
+            super::cached_xray_sha256(&path).unwrap(),
+            sha256_hex(b"old-bytes")
+        );
+
+        let replacement = dir.join("replacement");
+        fs::write(&replacement, b"new-bytes").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            super::cached_xray_sha256(&path).unwrap(),
+            sha256_hex(b"new-bytes")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn usage_sequence_is_reserved_on_disk_and_survives_process_restart() {
         let dir = test_state_dir("usage-cursor");
         let (instance_a, first) = super::reserve_usage_sequence(&dir).unwrap();
@@ -4944,10 +5249,29 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let read = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
-            assert!(request.starts_with("POST /agent/v1/usage "));
+            let mut request = Vec::new();
+            let (header_end, _) = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "request ended before its body arrived");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .expect("request includes Content-Length")
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= header_end + 4 + content_length {
+                    break (header_end, content_length);
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /agent/v1/usage "));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
                 .unwrap();
@@ -4958,6 +5282,7 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
             token: "test".to_owned(),
             state_dir: dir.clone(),
             apply_mode: ApplyMode::Linux,
+            vpngate_stats_window: std::time::Duration::from_secs(900),
         };
 
         super::usage_cycle(&options).unwrap();

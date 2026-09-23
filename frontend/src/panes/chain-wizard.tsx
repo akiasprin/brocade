@@ -1,10 +1,12 @@
-import { useMemo, useState } from 'react';
-import { HOP_WIRE_OPTIONS, type HopWireKind } from '../ui/format';
+import { useId, useMemo, useState, type ReactNode } from 'react';
+import type { HopWireKind } from '../ui/format';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   createApp,
   createChain,
   createIngress,
+  setNodeEgressDns,
+  upsertExternalOutbound,
   fetchCompileView,
   fetchNodes,
   fetchRevisions,
@@ -14,39 +16,47 @@ import {
   putStep,
   stageGrant,
   type HopDial,
+  type DestMatch,
+  type EgressDnsResolution,
+  type ExternalOutbound,
   type HopInRequest,
   type NodeAgentStateItem,
+  type SnapshotApp,
   type RealityFallbackMode,
-  type Rule,
   type Wires,
 } from '../api';
 import { nodeCertificateLabel } from '../certificate';
 import { can, useSession } from '../session';
 import {
-  DIAL_LABEL,
-  DIAL_ORDER,
   defaultHopWire,
-  defaultHopDial,
   dialKindOf,
-  dialUnavailable,
-  hopDialOf,
+  egressDnsSelectorKey,
+  hostOf,
+  matchValues,
+  reusableListeners,
   under,
-  type DialKind,
-  forwardAction,
 } from './rules';
 import { ErrorBox, Loading } from '../ui/bits';
-import {
-  freePortAcross,
-  freeSpanAcross,
-  hopListener,
-  hopListeners,
-  isValidSlug,
-  occupiedPorts,
-  portClash,
-  spanClash,
-} from './ports';
+import { freePortAcross, freeSpanAcross, hopListener, isValidSlug, occupiedPorts, portClash, spanClash } from './ports';
 import { appId as randomAppId, modelIdPair } from '../model-id';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
+import { DEFAULT_VLESS_ENCRYPTION } from '../vless-encryption';
+import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader } from '../ui/wizard-paper';
+import { Icon, type IconName } from '../ui/icons';
+import { SUBSCRIPTION_COUNTRY_CODES, subscriptionCountryLabel } from '../ui/subscription-country';
+import { vpngateNodeEligibility } from '../vpngate-capability';
+import { useUnsavedChanges } from '../ui/navigation-guard';
+import {
+  wizardDefaultListenerWire,
+  wizardEgressRule,
+  wizardForwardEdges,
+  wizardMembers,
+  wizardRuleIssue,
+  wizardRulesWithListenerPorts,
+  wizardSpine,
+  type WizardRuleTables,
+} from './chain-wizard-graph';
+import { WizardPathEditor, type WizardDnsChange } from './chain-wizard-path';
 
 // 使一台机器运行 xray 的方式：为其创建一条链和一个接入面。
 // 是否运行 xray 由编译器计算得出（physical/node.rs 的 xray_plan），节点上没有也不应有
@@ -58,10 +68,8 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 // 使用哪个端口。其余六行是可自动计算的 id 和名称，却各占一行，且每一行都可能覆盖已有的链
 // （`chains.id` 是全局主键，写入接口是 upsert）。
 //
-// 现在主体是一跳一行：行序即流量方向，末位自动出网。每一跳的属性附在该行内——
-// 入口包含监听端口，中继包含连接方式、中转端口和加密档位。该布局的第一个依据是
-// 与链详情页保持一致（创建时看到的结构与创建后看到的相同）；第二个依据是
-// 明文直连是逐跳的属性，警告需要显示在对应的跳上，修改也在该位置进行。
+// 主体与链详情共用 Rule 的语义：任意规则形成主干，例外转发形成支路；每台机器只有
+// 一张规则表和一个中转监听。创建时看到的规则就是写入草稿的规则，不另外维护线性路径。
 //
 // 分组、链和入口的内部 id 都自动生成并隐藏；用户只维护可读名称。
 //
@@ -72,8 +80,8 @@ import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNa
 // 且使用另一套排版，同一功能存在两种形式。
 
 // 校验规则来自 ir/validate.rs：链必须有接入面（chain.no-ingress）。链头即接入面所在的
-// 机器，顺序由规则表表达——向导自动满足该要求：入口挂在本机，每台写入一条
-// `any → 下一台`（末位为出网），顺序显式写入规则。
+// 机器，路径由规则表表达——向导自动满足该要求：入口挂在本机，每台写入自己的
+// 规则表；默认 `any → 下一台`（末位为出网），也可在此修改并增加例外。
 
 // 「＋ 新建分组…」在下拉框中的取值。前后空格与冒号不会出现在 app-xxxx 中。
 const NEW_APP = ' :new-app:';
@@ -84,37 +92,91 @@ const HY2_HOP_SPAN = 100;
 
 export const NEW_CHAIN_PROTOCOL_DEFAULTS = {
   vless: true,
+  vlessEncryption: false,
   anytls: true,
   hysteria2: true,
 } as const;
 
+interface TcpListenerChoice {
+  label: string;
+  port: number;
+}
+
+/** Return one readable error for TCP listeners created together on the entry node. */
+export function entryTcpPortCollision(listeners: TcpListenerChoice[]): string | null {
+  const byPort = new Map<number, string[]>();
+  for (const listener of listeners) {
+    const labels = byPort.get(listener.port) ?? [];
+    labels.push(listener.label);
+    byPort.set(listener.port, labels);
+  }
+  for (const [port, labels] of byPort) {
+    if (labels.length > 1) return `${labels.join(' 与 ')} 不能共用 TCP ${port}`;
+  }
+  return null;
+}
+
+/** A custom hop field is a host only; the listener port is managed in the adjacent field. */
+export function customHopHostError(value: string): string | null {
+  const host = value.trim();
+  if (!host) return '填写自定义主机地址';
+  if (/[\s/?#]/.test(host)) return '这里只填写主机地址，不要带端口、路径或空格';
+  if (host.startsWith('[') !== host.endsWith(']')) return 'IPv6 方括号不完整';
+  if (host.includes(':')) {
+    const literal = host.startsWith('[') ? host.slice(1, -1) : host;
+    try {
+      new URL(`http://[${literal}]/`);
+    } catch {
+      return 'IPv6 地址无效；这里只填写地址，端口在右侧设置';
+    }
+  }
+  return null;
+}
+
 export function newChainWires({
   vlessEncryption = false,
   vlessEncryptionPort = 13800,
+  vlessEncryptionProfile = 'default',
   vless,
   anytls,
   hysteria2,
   anytlsPort,
+  anytlsPaddingScheme = [],
   hy2Start,
   hy2End,
+  hy2Up = '',
+  hy2Down = '',
 }: {
   vlessEncryption?: boolean;
   vlessEncryptionPort?: number;
+  vlessEncryptionProfile?: 'default' | 'native';
   vless: boolean;
   anytls: boolean;
   hysteria2: boolean;
   anytlsPort: number;
+  anytlsPaddingScheme?: string[];
   hy2Start: number;
   hy2End: number;
+  hy2Up?: string;
+  hy2Down?: string;
 }): Wires {
   return {
-    ...(vlessEncryption ? { vless_encryption: { port: vlessEncryptionPort } } : {}),
+    ...(vlessEncryption
+      ? {
+          vless_encryption: {
+            port: vlessEncryptionPort,
+            ...(vlessEncryptionProfile === 'native'
+              ? { options: { ...DEFAULT_VLESS_ENCRYPTION, appearance: 'native' as const } }
+              : {}),
+          },
+        }
+      : {}),
     vless: vless ? { kind: 'vless-reality' } : null,
     anytls: anytls
       ? {
           port: anytlsPort,
           security: 'tls',
-          padding_scheme: [],
+          padding_scheme: anytlsPaddingScheme,
           idle_session_check_interval_secs: 30,
           idle_session_timeout_secs: 30,
           min_idle_session: 1,
@@ -125,7 +187,10 @@ export function newChainWires({
       ? {
           port: hy2Start,
           hop: { start: hy2Start, end: hy2End },
-          bandwidth: {},
+          bandwidth: {
+            ...(hy2Up.trim() ? { up: hy2Up.trim() } : {}),
+            ...(hy2Down.trim() ? { down: hy2Down.trim() } : {}),
+          },
           congestion: 'brutal',
           obfs: { kind: 'salamander', password: 'quick-brown-fox' },
           masquerade: { kind: 'not-found' },
@@ -136,19 +201,11 @@ export function newChainWires({
 
 type HopSec = HopWireKind;
 
-/** 某一跳上被手动修改的字段。未修改的一律实时计算（默认值需随数据变化，见下方说明）。 */
-type HopEdit = { kind?: DialKind; addr?: string };
-
 // 中转端口按**监听的机器**存储而非按跳存储——模型中 `hop_in` 关联在 `(chain, node)` 上，
 // 一台机器在一条链上只有一个端口。常规档位由下游监听，反向两档由下游连接上游、
 // 端口开在上游，两种跳可能位于同一台机器上（前一跳常规进入、后一跳反向发出），
 // 此时它们本应是同一个端口。按跳存储会导致两份状态写入同一条记录，后写入的覆盖先写入的。
 type PortEdit = { port?: string; sec?: HopSec };
-
-// 该跳是否会以明文传输 UUID 和目标地址：连接的是具体地址（非 overlay 且非反向），
-// 且中转端口未加密。走 overlay 时 wg 已对该跳加密，内层不加密是合理的。
-// 判定与规则编辑器中的对应警告一致。
-const plaintextHop = (dial: HopDial, sec: HopSec) => dial.t === 'addr' && sec === 'none';
 
 /** Default the wire of one listener from every chain edge that uses it. */
 export function defaultListenerHopWire(spine: string[], host: string, dialAt: (index: number) => HopDial): HopSec {
@@ -160,6 +217,57 @@ export function defaultListenerHopWire(spine: string[], host: string, dialAt: (i
     usedOverOverlay = true;
   }
   return usedOverOverlay ? 'none' : 'encryption';
+}
+
+function WizardProtocolTile({
+  name,
+  note,
+  icon,
+  enabled,
+  onToggle,
+  port,
+  params,
+  expanded,
+  onExpand,
+  portRange = false,
+}: {
+  name: string;
+  note: string;
+  icon: IconName;
+  enabled: boolean;
+  onToggle: (enabled: boolean) => void;
+  port: ReactNode;
+  params?: ReactNode;
+  expanded?: boolean;
+  onExpand?: () => void;
+  portRange?: boolean;
+}) {
+  const checkboxId = useId();
+  return (
+    <div className={`protocol-choice wzp-card${enabled ? ' on' : ''}${portRange ? ' range' : ''}`}>
+      <input
+        id={checkboxId}
+        type="checkbox"
+        aria-label={name}
+        checked={enabled}
+        onChange={event => onToggle(event.target.checked)}
+      />
+      <label className="protocol-choice-copy" htmlFor={checkboxId}>
+        <b>
+          <Icon of={icon} size={14} className="protocol-choice-icon" />
+          {name}
+        </b>
+        <span className="note">{note}</span>
+      </label>
+      <span className="wzp-port">{port}</span>
+      {params && (
+        <button type="button" className="wzp-more" aria-expanded={expanded} onClick={onExpand}>
+          {expanded ? '收起参数' : '参数'}
+        </button>
+      )}
+      {expanded && params && <div className="wzp-body">{params}</div>}
+    </div>
+  );
 }
 
 export function ChainWizard({
@@ -205,17 +313,36 @@ export function ChainWizard({
   const appMode: 'new' | 'existing' = fixedApp ? 'existing' : (appModeRaw ?? (apps.length > 0 ? 'existing' : 'new'));
   const pickedApp = fixedApp?.id ?? pickedAppRaw ?? apps[0]?.id ?? '';
   const [chainNameRaw, setChainName] = useState<string | null>(null);
-  // 该数组有序：第 0 台是接入面所在的机器（即链头），其后每台是下一跳。
-  // 规则由该顺序推导得出，不需要理解规则表的结构。
-  // 链头尚未选择时为空数组——此时路径只有选择入口机器的那一行。
-  const [spine, setSpine] = useState<string[]>(node ? [node.node_id] : []);
-  const [bind, setBind] = useState('0.0.0.0');
-  const [hopEdits, setHopEdits] = useState<Record<string, HopEdit>>({});
+  const [subscriptionCountry, setSubscriptionCountry] = useState('');
+  // 与链详情共用 Rule 的语义：主干和支路均从显式转发规则推导，不保存第二份路径顺序。
+  const [headId, setHeadId] = useState<string | null>(node?.node_id ?? null);
+  const [pathRules, setPathRules] = useState<WizardRuleTables>(node ? { [node.node_id]: [wizardEgressRule()] } : {});
+  const [dnsChanges, setDnsChanges] = useState<WizardDnsChange[]>([]);
+  const [importedOutbounds, setImportedOutbounds] = useState<ExternalOutbound[]>([]);
+  const availableOutbounds = [
+    ...(snapshot.data?.snapshot.external_outbounds ?? []),
+    ...importedOutbounds.filter(
+      item => !(snapshot.data?.snapshot.external_outbounds ?? []).some(existing => existing.id === item.id),
+    ),
+  ];
+  const spine = wizardSpine(headId, pathRules);
+  const members = wizardMembers(headId, pathRules);
+  const exceptionCount = members.reduce(
+    (count, id) => count + (pathRules[id] ?? []).filter(rule => rule.m.t !== 'any').length,
+    0,
+  );
+  const bind = '0.0.0.0';
+  const [paddingMode, setPaddingMode] = useState<'default' | 'custom'>('default');
+  const [customPadding, setCustomPadding] = useState('');
+  const [hy2Up, setHy2Up] = useState('');
+  const [hy2Down, setHy2Down] = useState('');
   /* 键是监听的机器而非跳。见 PortEdit。 */
   const [portEdits, setPortEdits] = useState<Record<string, PortEdit>>({});
   const [showOps, setShowOps] = useState(false);
+  const [openProtocol, setOpenProtocol] = useState<string | null>(null);
   const [realityTargetRaw, setRealityTarget] = useState<RealityFallbackMode | '' | null>(null);
-  const [encryptionEnabled, setEncryptionEnabled] = useState(false);
+  const [encryptionEnabled, setEncryptionEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.vlessEncryption);
+  const [encryptionProfile, setEncryptionProfile] = useState<'default' | 'native'>('default');
   const [vlessEnabled, setVlessEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.vless);
   const [anyTlsEnabled, setAnyTlsEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.anytls);
   const [hy2Enabled, setHy2Enabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.hysteria2);
@@ -223,12 +350,14 @@ export function ChainWizard({
   const [customRealityNames, setCustomRealityNames] = useState('');
   const [customRealityFingerprint, setCustomRealityFingerprint] = useState('chrome');
   const [error, setError] = useState<unknown>(null);
+  const [attempted, setAttempted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
   const nameMap = new Map((nodes.data?.nodes ?? []).map(n => [n.node_id, n.name]));
   const nameOf = (id: string) => nameMap.get(id) || id;
-  // 链头即接入面所在的机器，也是主干的第 0 位。整条链的租户、默认名称、默认端口都取自它，
+  // 链头即接入面所在的机器，也是主干的第 0 位。整条链的租户和默认端口取自它，
   // 因此在未选择之前本页无法给出任何默认值——`ready` 会拦截提交。
-  const head = (nodes.data?.nodes ?? []).find(n => n.node_id === spine[0]) ?? node ?? null;
+  const head = (nodes.data?.nodes ?? []).find(n => n.node_id === headId) ?? node ?? null;
   const headLabel = head ? head.name || head.node_id : '';
   const headCertificateNode = snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === head?.node_id);
   const headCertificate = headCertificateNode?.certificate_name ?? null;
@@ -254,12 +383,9 @@ export function ChainWizard({
       realityFingerprintIsValid(customRealityFingerprint));
   const [appId] = useState(() => randomAppId());
   const appLabel = appLabelRaw ?? headLabel;
-  const chainName = chainNameRaw ?? (headLabel ? `${headLabel} 直出` : '');
+  const chainName = chainNameRaw ?? '';
   /* 选择连接方式需要读取对端的公网地址，因此此处需要完整的节点数据而非只有名称。 */
   const nodeOf = (id: string) => (nodes.data?.nodes ?? []).find(n => n.node_id === id) ?? null;
-  const addable = (nodes.data?.nodes ?? [])
-    .filter(n => !n.retired_at && !spine.includes(n.node_id))
-    .map(n => n.node_id);
 
   // 系统层的端口（WireGuard）只存在于编译产生的 IR 中。查询键与顶栏角标、检视窗相同，
   // 因此通常命中缓存。
@@ -283,7 +409,11 @@ export function ChainWizard({
       ),
     ),
   );
-  const [portRaw, setPort] = useState<number | null>(null);
+  const [portRaw, setPort] = useState<string | null>(null);
+  const [encryptionPortRaw, setEncryptionPort] = useState<string | null>(null);
+  const [anyTlsPortRaw, setAnyTlsPort] = useState<string | null>(null);
+  const [hy2StartRaw, setHy2Start] = useState<string | null>(null);
+  const [hy2EndRaw, setHy2End] = useState<string | null>(null);
 
   const targetApp = appMode === 'new' ? appId.trim() : pickedApp;
 
@@ -299,67 +429,100 @@ export function ChainWizard({
 
   // VLESS 起始值取自全局设置（settings.ports.ingress_base）。常量只用于设置尚未加载时的
   // 短暂回退；始终硬编码会让运营者修改基线后，建链向导仍填入旧值。
-  const port = portRaw ?? freePortAcross(taken, [head?.node_id ?? ''], ingressBase);
+  const portText = portRaw ?? String(freePortAcross(taken, [head?.node_id ?? ''], ingressBase));
+  const port = Number(portText);
 
   // The wizard exposes which protocols are created but keeps protocol tuning out of the first
   // decision. Each enabled protocol receives a conflict-free factory port; detailed transport,
   // hopping and masquerade controls remain on the chain detail page.
-  let anyTlsPort = freePortAcross(taken, [head?.node_id ?? ''], settings.data?.ports?.anytls_base || ANYTLS_PORT_BASE);
-  while (anyTlsPort === port && anyTlsPort < 65536) anyTlsPort += 1;
+  let autoAnyTlsPort = freePortAcross(
+    taken,
+    [head?.node_id ?? ''],
+    settings.data?.ports?.anytls_base || ANYTLS_PORT_BASE,
+  );
+  while (autoAnyTlsPort === port && autoAnyTlsPort < 65536) autoAnyTlsPort += 1;
+  const anyTlsPortText = anyTlsPortRaw ?? String(autoAnyTlsPort);
+  const anyTlsPort = Number(anyTlsPortText);
   const udpTaken = useMemo(
     () => occupiedPorts(apps, nodes.data?.nodes ?? [], compile.data?.system, undefined, 'udp'),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [snapshot.data, nodes.data, compile.data],
   );
-  const hy2Start = freeSpanAcross(
+  const autoHy2Start = freeSpanAcross(
     udpTaken,
     [head?.node_id ?? ''],
     settings.data?.ports?.hy2_base || HY2_PORT_BASE,
     HY2_HOP_SPAN,
   );
-  const hy2End = hy2Start + HY2_HOP_SPAN - 1;
-  let encryptionPort = freePortAcross(
+  const hy2StartText = hy2StartRaw ?? String(autoHy2Start);
+  const hy2Start = Number(hy2StartText);
+  const hy2EndText = hy2EndRaw ?? String(hy2Start + HY2_HOP_SPAN - 1);
+  const hy2End = Number(hy2EndText);
+  let autoEncryptionPort = freePortAcross(
     taken,
     [head?.node_id ?? ''],
     settings.data?.ports?.vless_encryption_base || 13800,
   );
   while (
-    encryptionPort < 65536 &&
-    ((vlessEnabled && encryptionPort === port) ||
-      (anyTlsEnabled && encryptionPort === anyTlsPort) ||
-      taken.get(head?.node_id ?? '')?.has(encryptionPort))
+    autoEncryptionPort < 65536 &&
+    ((vlessEnabled && autoEncryptionPort === port) ||
+      (anyTlsEnabled && autoEncryptionPort === anyTlsPort) ||
+      taken.get(head?.node_id ?? '')?.has(autoEncryptionPort))
   )
-    encryptionPort += 1;
+    autoEncryptionPort += 1;
+  const encryptionPortText = encryptionPortRaw ?? String(autoEncryptionPort);
+  const encryptionPort = Number(encryptionPortText);
   const enabledProtocolCount =
     Number(vlessEnabled) + Number(anyTlsEnabled) + Number(hy2Enabled) + Number(encryptionEnabled);
   const wires = newChainWires({
     vlessEncryption: encryptionEnabled,
     vlessEncryptionPort: encryptionPort,
+    vlessEncryptionProfile: encryptionProfile,
     vless: vlessEnabled,
     anytls: anyTlsEnabled,
     hysteria2: hy2Enabled,
     anytlsPort: anyTlsPort,
+    anytlsPaddingScheme:
+      paddingMode === 'custom'
+        ? customPadding
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .filter(Boolean)
+        : [],
     hy2Start,
     hy2End,
+    hy2Up,
+    hy2Down,
   });
+  const entryTcpListeners: TcpListenerChoice[] = [];
+  if (vlessEnabled) entryTcpListeners.push({ label: 'VLESS · REALITY', port });
+  if (encryptionEnabled) entryTcpListeners.push({ label: 'VLESS · Encryption', port: encryptionPort });
+  if (anyTlsEnabled) entryTcpListeners.push({ label: 'AnyTLS', port: anyTlsPort });
+  const entryPortCollision = entryTcpPortCollision(entryTcpListeners);
+  const entryPortIssues = entryTcpListeners.flatMap(listener => {
+    if (!Number.isInteger(listener.port) || listener.port < 1 || listener.port > 65_535) {
+      return [`${listener.label} 端口必须是 1–65535`];
+    }
+    const clash = portClash(taken, [head?.node_id ?? ''], listener.port);
+    return clash ? [`${listener.label}：${clash}`] : [];
+  });
+  if (hy2Enabled) {
+    if (
+      !Number.isInteger(hy2Start) ||
+      !Number.isInteger(hy2End) ||
+      hy2Start < 1 ||
+      hy2End > 65_535 ||
+      hy2End < hy2Start
+    )
+      entryPortIssues.push('Hysteria 2 端口范围必须在 1–65535，且结束端口不小于起始端口');
+    else {
+      const clash = spanClash(udpTaken, [head?.node_id ?? ''], hy2Start, hy2End);
+      if (clash) entryPortIssues.push(`Hysteria 2：${clash}`);
+    }
+  }
 
-  // 该跳的默认连接方式，判定与规则编辑器共用同一实现（`defaultHopDial`）：对端有非 NAT
-  // 公网地址时直连，否则回退到 overlay。**默认**不选择反向（`self: null`）：反向是一项
-  // 拓扑决策，而非连接失败时的回退——下游位于 NAT 之后而上游有公网地址时，
-  // 走 overlay 同样可用，自动改为反向相当于代为做出未经确认的决策。可手动选择（见下方
-  // 的下拉框），选择后端口移到上游一侧。
-  const autoKind = (id: string): DialKind =>
-    dialKindOf(defaultHopDial({ peer: nodeOf(id), self: null, port: hopBase }), nodeOf(id));
-
-  const hopKindOf = (id: string): DialKind => hopEdits[id]?.kind ?? autoKind(id);
-  const isReverse = (kind: DialKind) => kind === 'reverse_v4' || kind === 'reverse_v6';
-
-  // 第 i 跳（进入 spine[i] 的那一跳）的端口位于哪台机器。常规档位由下游监听；反向档位是
-  // 下游连接上游，由上游监听——编译器的取值方式相同（ir/hops.rs 的
-  // `entry_hop_in`：转发取对端的，反向取本机的）。
-  const listenerOfHop = (i: number) => hopListener(spine, i, isReverse(hopKindOf(spine[i])));
-  /* 该链上需要开启中转端口的机器。去重的原因见 `hopListeners`。 */
-  const listeners = hopListeners(spine, i => isReverse(hopKindOf(spine[i])));
+  const edges = wizardForwardEdges(headId, pathRules);
+  const listeners = [...new Set(edges.map(edge => edge.listener))];
 
   // 为每台监听的机器选择一个未占用的端口。选择时不需要考虑该链上的其他机器——不同机器上的
   // 端口互不影响；同一台机器不会重复选择，由上面的去重保证。
@@ -370,22 +533,33 @@ export function ChainWizard({
   for (const host of listeners) autoHostPorts.set(host, freePortAcross(taken, [host], hopBase));
 
   const hostPortOf = (host: string) => portEdits[host]?.port ?? String(autoHostPorts.get(host) ?? hopBase);
-  /* 自定义档的地址需手动填写，其余各档可推导得出。 */
-  const hopDialFor = (id: string): HopDial => {
-    const kind = hopKindOf(id);
-    /* 连接的是对端监听的端口。反向档不携带地址和端口（由编译器推导），传入值不影响结果。 */
-    const p = Number(hostPortOf(id)) || hopBase;
-    if (kind === 'custom') {
-      const host = (hopEdits[id]?.addr ?? '').trim();
-      return { t: 'addr', v: host ? `${host}:${p}` : `:${p}` };
-    }
-    return hopDialOf(kind, nodeOf(id), p);
-  };
-  const hostSecOf = (host: string): HopSec =>
-    portEdits[host]?.sec ?? defaultListenerHopWire(spine, host, i => hopDialFor(spine[i]));
-  const patchHop = (id: string, next: HopEdit) => setHopEdits(prev => ({ ...prev, [id]: { ...prev[id], ...next } }));
+  const hostSecOf = (host: string): HopSec => portEdits[host]?.sec ?? wizardDefaultListenerWire(edges, host);
   const patchPort = (host: string, next: PortEdit) =>
     setPortEdits(prev => ({ ...prev, [host]: { ...prev[host], ...next } }));
+  const stagedRules = wizardRulesWithListenerPorts(headId, pathRules, host => Number(hostPortOf(host)) || hopBase);
+  const dnsPolicies = snapshot.data?.node_egress_dns ?? [];
+  const patchDns = (nodeId: string, selector: DestMatch, resolution: EgressDnsResolution | null) => {
+    const key = egressDnsSelectorKey(selector);
+    const baseline =
+      dnsPolicies.find(policy => policy.node === nodeId && egressDnsSelectorKey(policy.selector) === key)?.resolution ??
+      null;
+    setDnsChanges(current => {
+      const remaining = current.filter(
+        change => change.node !== nodeId || egressDnsSelectorKey(change.selector) !== key,
+      );
+      return JSON.stringify(resolution) === JSON.stringify(baseline)
+        ? remaining
+        : [...remaining, { node: nodeId, selector, resolution }];
+    });
+  };
+  const activeDnsChanges = dnsChanges.filter(change =>
+    (stagedRules[change.node] ?? []).some(
+      rule => rule.a.t === 'egress' && egressDnsSelectorKey(rule.m) === egressDnsSelectorKey(change.selector),
+    ),
+  );
+  const usedImportedOutbounds = importedOutbounds.filter(outbound =>
+    members.some(id => (stagedRules[id] ?? []).some(rule => rule.a.t === 'proxy' && rule.a.outbound === outbound.id)),
+  );
 
   // 冲突时拦截。upsert 的语义是存在即覆盖，放行会在无提示的情况下覆盖已有配置。
   // 字符集在此一并校验：链 id 会拼入接受凭据的 label（形如 {chain}@{node}），违反该约束
@@ -401,7 +575,11 @@ export function ChainWizard({
     (ingressOwner
       ? `接入面 ID「${ingressId.trim()}」已经被线路「${ingressOwner.label || ingressOwner.id}」用了`
       : null);
-  const portTaken = portClash(taken, [head?.node_id ?? ''], port);
+  const hopAddressIssues = edges.flatMap(edge => {
+    if (dialKindOf(edge.dial, nodeOf(edge.target)) !== 'custom') return [];
+    const message = customHopHostError(hostOf(edge.dial));
+    return message ? [{ host: edge.target, msg: message }] : [];
+  });
   /* 各监听机器分别校验：端口冲突会导致 xray 启动失败，编译时报 node.port-clash。 */
   const hopPortIssues = listeners.flatMap(host => {
     const raw = hostPortOf(host);
@@ -411,14 +589,79 @@ export function ChainWizard({
     }
     const clash = portClash(taken, [host], p);
     if (clash) return [{ host, msg: clash }];
-    // 链头作为反向上游时，其上同时开启接入端口和该反向端口。两者都是本次新建的，
-    // `taken` 中尚不包含，上面的校验无法覆盖——只能在此额外校验一次。
-    if (vlessEnabled && host === head?.node_id && p === port) {
-      return [{ host, msg: `与这条链的接入口 ${port} 冲突（同在 ${nameOf(host)} 上）` }];
+    // 链头作为反向上游时，其上同时开启接入协议和该反向端口。它们都是本次新建的，
+    // `taken` 中尚不包含，上面的校验无法覆盖；需要检查所有 TCP 接入协议，而不只是 VLESS。
+    const entryListener = host === head?.node_id ? entryTcpListeners.find(listener => listener.port === p) : null;
+    if (entryListener) {
+      return [{ host, msg: `与 ${entryListener.label} 接入口 TCP ${p} 冲突（同在 ${nameOf(host)} 上）` }];
     }
     return [];
   });
   const hopIssueOf = (host: string) => hopPortIssues.find(x => x.host === host)?.msg ?? null;
+  const existingApp = apps.find(candidate => candidate.id === targetApp) ?? null;
+  const sourceApp: SnapshotApp = {
+    ...(existingApp ?? { id: targetApp, label: appLabel.trim(), ingresses: [], fronts: [], grants: [] }),
+    chains: [
+      ...(existingApp?.chains ?? []),
+      { id: chainId.trim(), tenant: head?.tenant_id ?? '', name: chainName.trim() },
+    ],
+    steps: [
+      ...(existingApp?.steps ?? []),
+      ...members.map(id => ({
+        chain: chainId.trim(),
+        node: id,
+        accept: null,
+        hop_in: null,
+        rules: stagedRules[id] ?? [],
+      })),
+    ],
+  };
+  const listenerApps = [...apps.filter(candidate => candidate.id !== sourceApp.id), sourceApp];
+  const pathTargetIssue =
+    members.flatMap(source =>
+      (stagedRules[source] ?? []).flatMap(rule => {
+        if (rule.a.t === 'forward') {
+          const target = nodeOf(rule.a.to);
+          if (!target) return [`${nameOf(source)} 的转发目标不存在`];
+          if (target.retired_at) return [`${nameOf(target.node_id)} 已退役，不能作为转发目标`];
+          if (!under(head?.tenant_id ?? '', target.tenant_id))
+            return [`${nameOf(target.node_id)} 不在当前线路的可用范围内`];
+        }
+        if (rule.a.t === 'proxy') {
+          const outboundId = rule.a.outbound;
+          const outbound = availableOutbounds.find(candidate => candidate.id === outboundId);
+          if (!outbound) return [`${nameOf(source)} 的代理出站不存在`];
+          if (
+            outbound.tenant !== head?.tenant_id &&
+            (outbound.protocol.t === 'warp' || !under(head?.tenant_id ?? '', outbound.tenant))
+          )
+            return [`${outbound.name || outbound.id} 不在当前线路的可用范围内`];
+          if (outbound.protocol.t === 'vpngate') {
+            const eligibility = vpngateNodeEligibility(nodeOf(source) ?? undefined);
+            if (!eligibility.eligible) return [`${nameOf(source)} 不能使用 VPN Gate：${eligibility.reason}`];
+          }
+        }
+        if (rule.a.t === 'reuse_listener') {
+          const listener = rule.a.listener;
+          const candidate = reusableListeners({
+            apps: listenerApps,
+            sourceApp: sourceApp.id,
+            sourceChain: chainId.trim(),
+            sourceNode: source,
+            sourceRules: stagedRules[source] ?? [],
+            sourceDrafts: stagedRules,
+            nodes: nodes.data?.nodes ?? [],
+          }).find(item => item.ref.chain === listener.chain && item.ref.node === listener.node);
+          if (!candidate) return [`${nameOf(source)} 引用的监听不存在`];
+          if (candidate.blocked) return [`${nameOf(source)} 不能引用 ${candidate.nodeName}：${candidate.blocked}`];
+          if (rule.a.dial.t === 'addr') {
+            const issue = customHopHostError(rule.a.dial.v);
+            if (issue) return [`${nameOf(source)} 引用 ${candidate.nodeName}：${issue}`];
+          }
+        }
+        return [];
+      }),
+    )[0] ?? null;
 
   // ── 该链的授权对象 ──
   // 链创建后仍不可用：接入面已开启但没有任何 grant，无法建立连接。此时需要离开向导、
@@ -427,25 +670,65 @@ export function ChainWizard({
   const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
   /* 键使用 `租户/用户`：用户 id 只在租户内唯一（user.dup 只在单个租户内查重）。 */
   const [pickedUsers, setPickedUsers] = useState<Set<string>>(new Set());
+  const guardScope = node ? `chain-wizard:node:${node.node_id}` : `chain-wizard:app:${fixedApp?.id ?? 'new'}`;
+  const initialPathRules: WizardRuleTables = node ? { [node.node_id]: [wizardEgressRule()] } : {};
+  const dirty =
+    appModeRaw !== null ||
+    appLabelRaw !== null ||
+    pickedAppRaw !== null ||
+    chainNameRaw !== null ||
+    subscriptionCountry !== '' ||
+    headId !== (node?.node_id ?? null) ||
+    JSON.stringify(pathRules) !== JSON.stringify(initialPathRules) ||
+    activeDnsChanges.length > 0 ||
+    paddingMode !== 'default' ||
+    customPadding !== '' ||
+    hy2Up !== '' ||
+    hy2Down !== '' ||
+    Object.keys(portEdits).length > 0 ||
+    realityTargetRaw !== null ||
+    encryptionEnabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.vlessEncryption ||
+    encryptionProfile !== 'default' ||
+    vlessEnabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.vless ||
+    anyTlsEnabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.anytls ||
+    hy2Enabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.hysteria2 ||
+    customRealityDest !== '' ||
+    customRealityNames !== '' ||
+    customRealityFingerprint !== 'chrome' ||
+    portRaw !== null ||
+    encryptionPortRaw !== null ||
+    anyTlsPortRaw !== null ||
+    hy2StartRaw !== null ||
+    hy2EndRaw !== null ||
+    pickedUsers.size > 0;
+  const clearUnsavedChanges = useUnsavedChanges(dirty, '新链向导', guardScope);
 
-  // 接入面的租户随链头机器确定，可授权对象由它决定（validate.rs 的 tenant.scope：
-  // `under(grant.tenant, ingress.tenant)`）。链头未选择时该项没有取值——
-  // 下方的说明会予以提示，而非留空。
+  // 用户可以先于入口选择；入口确定后再依据接入面租户校验授权范围
+  // （validate.rs 的 tenant.scope：`under(grant.tenant, ingress.tenant)`）。
   const ingressTenant = head?.tenant_id ?? '';
-  const userRows = (users.data?.users ?? []).map(u => ({
-    ...u,
-    key: `${u.tenant_id}/${u.id}`,
-    // 不可选的保留在列表中并说明原因，判定和处理方式与规则编辑器的下拉框一致：
-    // 直接隐藏会导致该用户从列表中消失，需要到其他位置查找。
-    blocked: under(u.tenant_id, ingressTenant) ? null : '该用户不在当前入口的可授权范围内',
-  }));
+  const userRows = [...(users.data?.users ?? [])]
+    .sort((a, b) => a.tenant_id.localeCompare(b.tenant_id) || a.id.localeCompare(b.id))
+    .map(u => ({
+      ...u,
+      key: `${u.tenant_id}/${u.id}`,
+      // 不可选的保留在列表中并说明原因，判定和处理方式与规则编辑器的下拉框一致：
+      // 直接隐藏会导致该用户从列表中消失，需要到其他位置查找。停用用户也不能在新链上
+      // 获得一条看似可用的授权，否则向导完成后仍无法连接，原因却要去用户页寻找。
+      blocked:
+        u.status !== 'active'
+          ? '该用户已停用'
+          : !head || under(u.tenant_id, ingressTenant)
+            ? null
+            : '该用户不在当前入口的可授权范围内',
+    }));
 
+  const selectedUsers = userRows.filter(u => pickedUsers.has(u.key));
   // 实际会写入的授权。更换入口后重新计算，不清空 `pickedUsers`：更换机器可能使某个用户
   // 超出租户范围，此时不应写入；但若删除其勾选状态，切换回原机器时该选择会丢失——
   // 而反复切换是建链时的常见操作。因此保留失效的键，合法性每次实时计算。
-  const grantedUsers = userRows.filter(u => pickedUsers.has(u.key) && !u.blocked);
+  const grantedUsers = selectedUsers.filter(u => !u.blocked);
   /* 有用户因当前入口而不可授权时给出提示。不提示时页脚的操作条数会少于预期且无法解释。 */
-  const droppedUsers = userRows.filter(u => pickedUsers.has(u.key) && u.blocked);
+  const droppedUsers = selectedUsers.filter(u => u.blocked);
   const toggleUser = (key: string) =>
     setPickedUsers(prev => {
       const next = new Set(prev);
@@ -455,9 +738,31 @@ export function ChainWizard({
     });
   const selectableUsers = userRows.filter(u => !u.blocked);
 
+  const targeted = new Set(edges.map(edge => edge.target));
+  const stepBodies: Array<{ id: string; body: Parameters<typeof putStep>[3] }> = members.map(id => {
+    const sec = hostSecOf(id);
+    const hopIn: HopInRequest | undefined = listeners.includes(id)
+      ? {
+          port: Number(hostPortOf(id)) || hopBase,
+          security:
+            sec === 'reality'
+              ? { t: 'reality', v: { dest: realitySite.dest, server_names: realitySite.names } }
+              : { t: sec },
+        }
+      : undefined;
+    return {
+      id,
+      body: {
+        rules: stagedRules[id] ?? [],
+        ...(targeted.has(id) ? { accept: {} } : {}),
+        ...(hopIn ? { hop_in: hopIn } : {}),
+      },
+    };
+  });
+
   // 将写入草稿的操作列表。该列表既用于页脚展示，也是提交时实际执行的内容——
   // 分两处实现会导致预览显示三条而实际写入四条，且该偏差没有任何提示。
-  const ops = useMemo(() => {
+  const ops = (() => {
     const list: { op: string; arg: string }[] = [];
     if (appMode === 'new') list.push({ op: 'upsert_app', arg: `${targetApp}「${appLabel.trim() || targetApp}」` });
     list.push({
@@ -486,16 +791,28 @@ export function ChainWizard({
           : ''
       }`,
     });
-    if (spine.length > 1) {
-      spine.forEach((id, i) => {
-        if (i < spine.length - 1) {
-          const to = spine[i + 1];
-          const dial = hopDialFor(to);
-          const how = dial.t === 'overlay' ? 'WireGuard' : dial.t === 'reverse' ? `反向 ${dial.v}` : dial.v;
-          list.push({ op: 'put_step', arg: `${nameOf(id)}：任意 → 转发 ${nameOf(to)}（${how}）` });
-        } else {
-          list.push({ op: 'put_step', arg: `${nameOf(id)}：任意 → 从本机出网` });
-        }
+    for (const outbound of usedImportedOutbounds)
+      list.push({ op: 'upsert_external_outbound', arg: `${outbound.name}（${outbound.id}）` });
+    for (const step of stepBodies) {
+      const summary = step.body.rules.map(rule => {
+        const match =
+          rule.m.t === 'any' ? '任意' : `${rule.m.t}${matchValues(rule.m) ? `=${matchValues(rule.m)}` : ''}`;
+        const action =
+          rule.a.t === 'forward'
+            ? `转发 ${nameOf(rule.a.to)}`
+            : rule.a.t === 'proxy'
+              ? `代理出站 ${rule.a.outbound}`
+              : rule.a.t === 'egress'
+                ? '从本机出网'
+                : '拒绝';
+        return `${match} → ${action}`;
+      });
+      list.push({ op: 'put_step', arg: `${nameOf(step.id)}：${summary.join('；')}` });
+    }
+    for (const change of activeDnsChanges) {
+      list.push({
+        op: 'set_node_egress_dns',
+        arg: `${nameOf(change.node)}：${change.selector.t}${matchValues(change.selector) ? `=${matchValues(change.selector)}` : ''} → ${change.resolution ? `自定义 DNS ${change.resolution.address}:${change.resolution.port}` : '默认 DNS'}`,
       });
     }
     /* 授权排在最后：grant 引用接入面，接入面需要先创建。草稿按顺序回放。 */
@@ -506,35 +823,11 @@ export function ChainWizard({
       });
     }
     return list;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    appMode,
-    targetApp,
-    appLabel,
-    chainId,
-    chainName,
-    ingressId,
-    bind,
-    port,
-    spine,
-    hopEdits,
-    portEdits,
-    autoHostPorts,
-    nodes.data,
-    pickedUsers,
-    users.data,
-    ingressTenant,
-    realityTarget,
-    headCertificateLabel,
-    vlessEnabled,
-    encryptionEnabled,
-    encryptionPort,
-    anyTlsEnabled,
-    hy2Enabled,
-  ]);
+  })();
 
   const submit = async () => {
     setError(null);
+    setSubmitting(true);
     try {
       const app = targetApp;
       if (appMode === 'new') await createApp({ id: app, label: appLabel.trim() || app });
@@ -542,7 +835,7 @@ export function ChainWizard({
         id: chainId.trim(),
         tenant_id: head?.tenant_id ?? '',
         name: chainName.trim() || chainId.trim(),
-        subscription_country: null,
+        subscription_country: subscriptionCountry || null,
       });
       await createIngress(app, {
         id: ingressId.trim(),
@@ -566,7 +859,11 @@ export function ChainWizard({
                 fallback_guard: true,
               },
         wires,
-        projection: {},
+        projection: {
+          ...(wires.vless_encryption ? { vless_encryption: {} } : {}),
+          ...(wires.anytls ? { anytls: {} } : {}),
+          ...(wires.hysteria2 ? { hysteria2: {} } : {}),
+        },
         guard: {
           no_private: true,
           no_bittorrent: true,
@@ -576,49 +873,21 @@ export function ChainWizard({
         },
       });
 
-      // 线性中继：每台转发给下一台，最后一台出网。
-      // 缺少这些规则时，入口机器会就地出网（规则表为空时编译器补全 Egress），
-      // 中继不会被使用。分流等复杂选路在规则表中配置。
-      if (spine.length > 1) {
-        for (let i = 0; i < spine.length; i += 1) {
-          const id = spine[i];
-          const rules: Rule[] =
-            i < spine.length - 1
-              ? [{ m: { t: 'any' }, a: forwardAction(spine[i + 1], hopDialFor(spine[i + 1])) }]
-              : [{ m: { t: 'any' }, a: { t: 'egress', send_through: null } }];
-          // 除入口外，每一跳都是其他节点的转发目标，必须具备接受凭据，否则报 relay.no-accept。
-          // 反向档同样需要：编译器取用的 credential 始终来自 `to` 的 accept（ir/hops.rs
-          // 的 `credential`），只是含义相反——转发时它是连接对端使用的凭据，反向时它是
-          // 下游连接时提供的身份标识，上游据此识别该连接并交给 portal。
-          //
-          // 中转端口只写给实际监听的机器：常规档位是下游，反向档位是上游。为不监听的机器
-          // 也写入会占用其一个无用端口，并进入端口冲突校验。
-          // 选择 REALITY 时必须携带站点：服务端要求 dest 且 server_names 非空
-          // （console.rs 的 resolve_hop_security），留空会返回 400——与接入面不同，
-          // 接入面留空表示使用全局设置中的站点，因此此处显式填入全局站点。
-          const sec = hostSecOf(id);
-          const hopIn: HopInRequest | undefined = listeners.includes(id)
-            ? {
-                port: Number(hostPortOf(id)) || hopBase,
-                security:
-                  sec === 'reality'
-                    ? { t: 'reality', v: { dest: realitySite.dest, server_names: realitySite.names } }
-                    : sec === 'encryption'
-                      ? { t: 'encryption' }
-                      : sec === 'shadowsocks2022'
-                        ? { t: 'shadowsocks2022' }
-                        : { t: 'none' },
-              }
-            : undefined;
-          await putStep(app, chainId.trim(), id, {
-            rules,
-            ...(i > 0 ? { accept: {} } : {}),
-            // 链头作为反向上游时同样需要开启端口。编译器为该档位放宽了链头不配置中转端口
-            // 的限制（ir/routing.rs），accept 仍会被清除——链头不应持有供其他节点连接的凭据。
-            ...(hopIn ? { hop_in: hopIn } : {}),
-          });
-        }
-      }
+      for (const outbound of usedImportedOutbounds)
+        await upsertExternalOutbound({
+          id: outbound.id,
+          tenant_id: outbound.tenant,
+          name: outbound.name,
+          address: outbound.address,
+          port: outbound.port,
+          protocol: outbound.protocol,
+          security: outbound.security,
+        });
+
+      // 目标凭据、反向监听和规则全部来自同一份 stepBodies；与页脚预览逐项对应。
+      for (const step of stepBodies) await putStep(app, chainId.trim(), step.id, step.body);
+      // DNS 是机器级策略，与链规则同批草稿，但不归新链所有。
+      for (const change of activeDnsChanges) await setNodeEgressDns(change.node, change.selector, change.resolution);
 
       // 授权最后写入：它引用接入面，前面的 upsert_ingress 需要先进入草稿。
       // 顺序与页脚列出的一致——两处不一致会使预览内容与实际执行不符。
@@ -637,9 +906,12 @@ export function ChainWizard({
       qc.invalidateQueries({ queryKey: ['nodes'] });
       // 成功后回到进入向导前的上下文。草稿条已经承担待提交状态，不再停留展示一份
       // 与提交前预览重复的“改了什么”结果页。
+      clearUnsavedChanges();
       onDone();
     } catch (e) {
       setError(e);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -654,277 +926,291 @@ export function ChainWizard({
     users.isPending ||
     (current != null && compile.isPending)
   )
-    return <Loading />;
+    return <Loading variant="form" />;
   const dependencyError =
     snapshot.error ?? settings.error ?? nodes.error ?? revisions.error ?? users.error ?? compile.error;
   if (dependencyError) return <ErrorBox error={dependencyError} />;
 
-  const ready =
-    !!head &&
-    spine.length > 0 &&
-    targetApp.length > 0 &&
-    chainId.trim().length > 0 &&
-    ingressId.trim().length > 0 &&
-    port > 0 &&
-    port < 65536 &&
-    !chainClash &&
-    !ingressClash &&
-    (!vlessEnabled || !portTaken) &&
-    enabledProtocolCount > 0 &&
-    (!encryptionEnabled || (encryptionPort > 0 && encryptionPort < 65536)) &&
-    (!anyTlsEnabled ||
-      (anyTlsPort > 0 && anyTlsPort < 65536 && !portClash(taken, [head?.node_id ?? ''], anyTlsPort))) &&
-    (!hy2Enabled || (hy2End <= 65535 && !spanClash(udpTaken, [head?.node_id ?? ''], hy2Start, hy2End))) &&
-    (!(anyTlsEnabled || hy2Enabled) || !!headCertificate) &&
-    hopPortIssues.length === 0 &&
-    realityTargetReady &&
-    (!listeners.some(host => hostSecOf(host) === 'reality') || globalRealityReady);
+  const blockers = [
+    !head ? '选择入口节点' : null,
+    !targetApp ? '没有可用的分组' : null,
+    appMode === 'new' && !appLabel.trim() ? '填写新分组名称' : null,
+    !chainName.trim() ? '填写链名称' : null,
+    chainClash,
+    ingressClash,
+    enabledProtocolCount === 0 ? '至少开启一个接入协议' : null,
+    anyTlsEnabled && paddingMode === 'custom' && !customPadding.trim() ? '填写 AnyTLS Padding 规则' : null,
+    hy2Enabled && Boolean(hy2Up.trim()) !== Boolean(hy2Down.trim()) ? 'Hysteria 2 上下行带宽需同时填写' : null,
+    entryPortCollision,
+    entryPortIssues[0] ?? null,
+    anyTlsEnabled || hy2Enabled ? (!headCertificate ? `先为入口节点分配${headCertificateLabel}` : null) : null,
+    !realityTargetReady ? '补全 VLESS · REALITY 伪装目标' : null,
+    wizardRuleIssue(headId, stagedRules),
+    activeDnsChanges.find(
+      change =>
+        change.resolution &&
+        (!change.resolution.address.trim() || change.resolution.port < 1 || change.resolution.port > 65535),
+    )
+      ? '补全自定义 DNS 地址和端口'
+      : null,
+    pathTargetIssue,
+    members.find(
+      id =>
+        (stagedRules[id] ?? []).some(rule => rule.a.t === 'egress') &&
+        snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === id)?.egress_allowed === false,
+    )
+      ? '路径中有不允许出网的机器，请改为转发或拒绝'
+      : null,
+    hopAddressIssues[0]?.msg ?? null,
+    hopPortIssues[0]?.msg ?? null,
+    listeners.some(host => hostSecOf(host) === 'reality') && !globalRealityReady
+      ? '中转协议使用 REALITY 前，先配置全局伪装站点'
+      : null,
+  ].filter((message): message is string => !!message);
+  const ready = blockers.length === 0;
 
   return (
-    <form
-      className="wz"
+    <WizardPaper
       onSubmit={e => {
         e.preventDefault();
+        setAttempted(true);
+        if (!ready || submitting) return;
         void submit();
       }}
     >
-      {/* ── 标识：线路和链名。两个入口的差异集中在该项 ── */}
-      <div className="wz-fields">
-        <div className="wz-fld">
-          <label>分组</label>
-          {/* 下拉框与新建的两个输入框在同一行：它们对应同一项输入——选择哪个线路，
+      <WizardPaperHeader
+        title="新建链"
+        icon="chains"
+        meta={[
+          chainName.trim() || '未命名',
+          fixedApp?.label || apps.find(app => app.id === pickedApp)?.label || appLabel.trim(),
+        ]
+          .filter(Boolean)
+          .join(' · ')}
+        stages={[
+          { label: '配置链', state: 'current' },
+          { label: '提交草稿', state: 'next' },
+          { label: '预览发布', state: 'next' },
+        ]}
+        aside={<span className="st st-gold">写入草稿</span>}
+      />
+      <div className="nd-paper-body pv-body">
+        <fieldset className="pv-fields pv-chain-fields" disabled={submitting}>
+          <div className="nd-tab-config">
+            <WizardCard title="基本信息" icon="identity" hint={`${selectedUsers.length} 人已选`}>
+              <div className="wzi">
+                <div className="wzi-col">
+                  <p className="eyebrow">这条链</p>
+                  <div className="fgrid one">
+                    <WizardField label="分组" htmlFor="chain-wizard-app">
+                      {/* 下拉框与新建的两个输入框在同一行：它们对应同一项输入——选择哪个线路，
               取值要么是已有分组，要么是新建分组的名称；技术 ID 自动生成。
               分为两行会被理解为两个问题，且第二行需要依靠缩进和竖线表明其从属关系。
 
               选择新建时下拉框收窄：此时它只显示「＋ 新建分组…」，
               占用半行宽度没有必要——宽度分配给需要填写的名称。 */}
-          <div className="wz-app">
-            {/* 始终使用下拉框，即使只有一个选项。从线路页进入时它只包含该线路——
+                      <div className="wz-app">
+                        {/* 始终使用下拉框，即使只有一个选项。从线路页进入时它只包含该线路——
                 改为只读文本时，同一字段在两个入口下是两种控件，需要先判断当前是否可修改。
                 只有一个选项的下拉框本身即表明取值唯一。 */}
-            <select
-              className={`f${appMode === 'new' && !fixedApp ? ' narrow' : ''}`}
-              value={appMode === 'new' ? NEW_APP : pickedApp}
-              // 只有一项时不禁用：禁用的下拉框与异常状态使用同一视觉信号，
-              // 而此处的实际情况是没有其他选项——该情况由选项数量本身表达。
-              onChange={e => {
-                if (e.target.value === NEW_APP) setAppMode('new');
-                else {
-                  setAppMode('existing');
-                  setPickedApp(e.target.value);
-                }
-              }}
-            >
-              {fixedApp ? (
-                <option value={fixedApp.id}>
-                  {fixedApp.label || fixedApp.id}（{fixedApp.id}）
-                </option>
-              ) : (
-                <>
-                  {/* 不提供空选项。该字段始终有取值：第一个已有线路，没有任何线路时为新建。
+                        <select
+                          id="chain-wizard-app"
+                          className={`f${appMode === 'new' && !fixedApp ? ' narrow' : ''}`}
+                          value={appMode === 'new' ? NEW_APP : pickedApp}
+                          // 只有一项时不禁用：禁用的下拉框与异常状态使用同一视觉信号，
+                          // 而此处的实际情况是没有其他选项——该情况由选项数量本身表达。
+                          onChange={e => {
+                            if (e.target.value === NEW_APP) setAppMode('new');
+                            else {
+                              setAppMode('existing');
+                              setPickedApp(e.target.value);
+                            }
+                          }}
+                        >
+                          {fixedApp ? (
+                            <option value={fixedApp.id}>
+                              {fixedApp.label || fixedApp.id}（{fixedApp.id}）
+                            </option>
+                          ) : (
+                            <>
+                              {/* 不提供空选项。该字段始终有取值：第一个已有线路，没有任何线路时为新建。
                       空选项会增加一次点击以选择本应默认选中的项，且选中空选项时
                       `ready` 仍为禁用状态，会被理解为填写有误。 */}
-                  {apps.map(a => (
-                    <option key={a.id} value={a.id}>
-                      {a.label || a.id}（{a.id}）
-                    </option>
-                  ))}
-                  {/* 新建作为下拉框的最后一项，不再使用独立的单选组：它与其他选项是
+                              {apps.map(a => (
+                                <option key={a.id} value={a.id}>
+                                  {a.label || a.id}（{a.id}）
+                                </option>
+                              ))}
+                              {/* 新建作为下拉框的最后一项，不再使用独立的单选组：它与其他选项是
                       同一问题的不同取值，使用两种控件相当于重复询问。
                       建分组要 system-admin，但该项照常列出、只是禁用——按角色隐藏时，
                       没有任何线路的只读视角会看到一个空下拉框。 */}
-                  <option value={NEW_APP} disabled={!system}>
-                    ＋ 新建分组…
-                  </option>
-                </>
-              )}
-            </select>
-            {appMode === 'new' && !fixedApp && (
-              <input
-                className="f"
-                value={appLabel}
-                onChange={e => setAppLabel(e.target.value)}
-                placeholder="分组名称"
-              />
-            )}
-          </div>
-          {/* 说明该字段的含义——「线路」一词本身不体现它是计费单元。 */}
-          <p className="note">线路分组，也是计费单元；同类链放在一起。</p>
-        </div>
-        <div className="wz-fld">
-          <label>链名称</label>
-          <input
-            className="f"
-            value={chainName}
-            disabled={!head}
-            placeholder="选完入口自动填"
-            onChange={e => setChainName(e.target.value)}
-          />
-          <p className="note">列表和面包屑上显示的名字，随时能改</p>
-        </div>
-      </div>
-
-      <h4 className="sec">
-        接入协议
-        <span className="rule" />
-      </h4>
-      <div className="wz-protocols" aria-label="接入协议">
-        <label className={vlessEnabled ? 'on' : ''}>
-          <input type="checkbox" checked={vlessEnabled} onChange={event => setVlessEnabled(event.target.checked)} />
-          <span>
-            <b>VLESS · REALITY</b>
-            <small>传输层加密 · TCP {port}</small>
-          </span>
-        </label>
-        <label className={encryptionEnabled ? 'on' : ''}>
-          <input
-            type="checkbox"
-            checked={encryptionEnabled}
-            onChange={event => setEncryptionEnabled(event.target.checked)}
-          />
-          <span>
-            <b>VLESS · Encryption</b>
-            <small>协议层加密 · TCP {encryptionPort}</small>
-          </span>
-        </label>
-        <label className={anyTlsEnabled ? 'on' : ''}>
-          <input type="checkbox" checked={anyTlsEnabled} onChange={event => setAnyTlsEnabled(event.target.checked)} />
-          <span>
-            <b>AnyTLS</b>
-            <small>TLS · TCP {anyTlsPort}</small>
-          </span>
-        </label>
-        <label className={hy2Enabled ? 'on' : ''}>
-          <input type="checkbox" checked={hy2Enabled} onChange={event => setHy2Enabled(event.target.checked)} />
-          <span>
-            <b>Hysteria 2</b>
-            <small>
-              QUIC · UDP {hy2Start}–{hy2End}
-            </small>
-          </span>
-        </label>
-      </div>
-      {enabledProtocolCount === 0 && <p className="note warn">至少开启一个接入协议。</p>}
-      {(anyTlsEnabled || hy2Enabled) && !headCertificate && head && (
-        <p className="note warn">
-          AnyTLS（TLS）和 Hysteria 2 需要{headCertificateLabel}；先为 {headLabel} 分配证书组。
-        </p>
-      )}
-
-      {/* ── 路径：一跳一行 ── */}
-      <h4 className="sec">
-        路径
-        <span className="rule" />
-      </h4>
-      <div className="wz-hops">
-        {spine.length === 0 && (
-          <div className="wz-hop add">
-            <span className="idx">01</span>
-            <span className="who">
-              <select
-                className="f"
-                value=""
-                onChange={e => {
-                  if (e.target.value) setSpine([e.target.value]);
-                }}
-              >
-                <option value="">— 选择入口节点 —</option>
-                {addable.map(n => (
-                  <option key={n} value={n}>
-                    {nameOf(n)}（{n}）
-                  </option>
-                ))}
-              </select>
-            </span>
-            <span className="ctl">
-              <span className="note">接入面开在这台机器上，用户从这里接入</span>
-            </span>
-          </div>
-        )}
-        {spine.map((id, i) => {
-          const entry = i === 0;
-          const last = i === spine.length - 1;
-          const kind = hopKindOf(id);
-          const dial = hopDialFor(id);
-          const peer = nodeOf(id);
-          /* 该跳的端口位于哪台机器：常规档位是本台（下游），反向档位是上一台。 */
-          const host = entry ? id : listenerOfHop(i);
-          const rev = !entry && isReverse(kind);
-          const issue = entry ? null : hopIssueOf(host);
-          // 明文判定对反向档同样适用：该隧道使用上游端口的加密配置
-          // （ir/hops.rs 的 `dial_security` 取 `entry_hop_in.security`），未加密即为明文。
-          // 只有 overlay 档例外——wg 已对该跳加密。
-          const plain = !entry && (plaintextHop(dial, hostSecOf(host)) || (rev && hostSecOf(host) === 'none'));
-          return (
-            <div className="wz-hop" key={`${id}/${i}`}>
-              <span className="idx">{String(i + 1).padStart(2, '0')}</span>
-              <span className="who">
-                <b title={id}>{nameOf(id)}</b>
-                {entry && <span className="st b-role">入口节点</span>}
-                {last && !entry && <span className="st st-succeeded">出口节点</span>}
-                {!entry && !last && <span className="st">中转节点</span>}
-                <span className="mono dim">{id}</span>
-              </span>
-              <span className="ctl">
-                {entry ? (
-                  <>
-                    <span className="note">用户从这里接入</span>
-                    {/* 链头同样可更换：删除后回到选择入口机器的那一行。从机器页进入时不提供该操作——
-                        该机器是进入本页的前提，在此更换不符合当前上下文。 */}
-                    {!node && (
-                      <button
-                        className="del-ctl"
-                        title="换一台当入口"
-                        aria-label="换一台当入口"
-                        onClick={e => {
-                          e.preventDefault();
-                          setSpine([]);
+                              <option value={NEW_APP} disabled={!system}>
+                                ＋ 新建分组…
+                              </option>
+                            </>
+                          )}
+                        </select>
+                        {appMode === 'new' && !fixedApp && (
+                          <input
+                            id="chain-wizard-app-name"
+                            className="f"
+                            value={appLabel}
+                            onChange={e => setAppLabel(e.target.value)}
+                            placeholder="分组名称"
+                            aria-label="新分组名称"
+                            aria-invalid={attempted && !appLabel.trim()}
+                          />
+                        )}
+                      </div>
+                      {/* 说明该字段的含义——「线路」一词本身不体现它是计费单元。 */}
+                      <span className={`sub${attempted && appMode === 'new' && !appLabel.trim() ? ' bad' : ''}`}>
+                        {attempted && appMode === 'new' && !appLabel.trim()
+                          ? '填写一个便于识别的分组名称。'
+                          : '线路分组，也是计费单元。'}
+                      </span>
+                    </WizardField>
+                    <WizardField label="链名称" htmlFor="chain-wizard-name">
+                      <input
+                        id="chain-wizard-name"
+                        className="f"
+                        value={chainName}
+                        placeholder="给这条链起个名字"
+                        onChange={e => setChainName(e.target.value)}
+                        aria-invalid={attempted && !chainName.trim()}
+                      />
+                      {attempted && !chainName.trim() && <span className="sub bad">填写一个便于识别的链名称。</span>}
+                    </WizardField>
+                    <WizardField label="订阅地区" htmlFor="chain-wizard-country">
+                      <select
+                        id="chain-wizard-country"
+                        className="f"
+                        value={subscriptionCountry}
+                        onChange={event => setSubscriptionCountry(event.target.value)}
+                      >
+                        <option value="">按出口探测自动识别</option>
+                        {SUBSCRIPTION_COUNTRY_CODES.map(code => (
+                          <option value={code} key={code}>
+                            {subscriptionCountryLabel(code)}
+                          </option>
+                        ))}
+                      </select>
+                    </WizardField>
+                  </div>
+                </div>
+                <div className="wzi-col">
+                  <p className="eyebrow">谁能用</p>
+                  {userRows.length === 0 ? (
+                    <p className="note">还没有用户；建链后仍可回来授权。</p>
+                  ) : (
+                    <>
+                      <select
+                        className="f wzg-add"
+                        aria-label="添加可用用户"
+                        value=""
+                        disabled={selectableUsers.every(user => pickedUsers.has(user.key))}
+                        onChange={event => {
+                          if (event.target.value) toggleUser(event.target.value);
                         }}
                       >
-                        ×
-                      </button>
-                    )}
-                  </>
-                ) : (
-                  <button
-                    className="del-ctl"
-                    title="从这条链上去掉这一跳"
-                    aria-label="从这条链上去掉这一跳"
-                    onClick={e => {
-                      e.preventDefault();
-                      setSpine(spine.filter(x => x !== id));
-                    }}
-                  >
-                    ×
-                  </button>
-                )}
-              </span>
-
-              <span className="attrs">
-                {entry ? (
-                  <>
-                    {vlessEnabled && (
-                      <span className="attr">
-                        <span className="k">VLESS 监听</span>
-                        <input
-                          className="f mono"
-                          style={{ width: 116 }}
-                          value={bind}
-                          onChange={e => setBind(e.target.value)}
-                        />
-                        <input
-                          className="f mono"
-                          style={{ width: 78 }}
-                          value={port}
-                          inputMode="numeric"
-                          onChange={e => setPort(Number(e.target.value))}
-                        />
-                      </span>
-                    )}
-                    {vlessEnabled && (
-                      <span className="attr">
-                        <span className="k">伪装</span>
+                        <option value="">＋ 添加用户…</option>
+                        {userRows
+                          .filter(user => !user.blocked && !pickedUsers.has(user.key))
+                          .map(user => (
+                            <option key={user.key} value={user.key}>
+                              {user.id} · {user.tenant_id}
+                            </option>
+                          ))}
+                      </select>
+                      <div className="wzg">
+                        {selectedUsers.map(user => (
+                          <div className="wzg-row" key={user.key} title={user.blocked ?? undefined}>
+                            <span>
+                              {user.id}
+                              {user.blocked ? ` · ${user.blocked}` : ''}
+                            </span>
+                            <button
+                              type="button"
+                              className="del-ctl"
+                              aria-label={`撤销 ${user.id} 的授权`}
+                              onClick={() => toggleUser(user.key)}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      {selectedUsers.length === 0 && <p className="note">还没有选择用户，建完也可以再加。</p>}
+                      <div className="wzg-actions">
+                        <button
+                          type="button"
+                          className="btn sm"
+                          disabled={
+                            selectableUsers.length === 0 || selectableUsers.every(user => pickedUsers.has(user.key))
+                          }
+                          onClick={() =>
+                            setPickedUsers(prev => new Set([...prev, ...selectableUsers.map(user => user.key)]))
+                          }
+                        >
+                          全选
+                        </button>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          disabled={selectedUsers.length === 0}
+                          onClick={() => setPickedUsers(new Set())}
+                        >
+                          全不选
+                        </button>
+                      </div>
+                      {userRows
+                        .filter(user => user.blocked && !pickedUsers.has(user.key))
+                        .map(user => (
+                          <button
+                            type="button"
+                            key={user.key}
+                            className="wzg-blocked"
+                            disabled
+                            title={user.blocked ?? undefined}
+                          >
+                            {user.id} · {user.blocked}
+                          </button>
+                        ))}
+                      {droppedUsers.length > 0 && (
+                        <p className="note warn">
+                          {droppedUsers.map(user => user.id).join('、')} 当前不可授权，本次不会写入。
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+            </WizardCard>
+            <WizardCard title="接入协议" icon="ingress" hint={`${enabledProtocolCount} 种 · 端口自动避让`}>
+              <div className="wzp" aria-label="接入协议">
+                <WizardProtocolTile
+                  name="VLESS · REALITY"
+                  note="REALITY 侧重抗识别与抗封锁。"
+                  icon="xray"
+                  enabled={vlessEnabled}
+                  onToggle={setVlessEnabled}
+                  port={
+                    <>
+                      <span>TCP</span>
+                      <input
+                        className="f mono"
+                        inputMode="numeric"
+                        aria-label="VLESS 监听端口"
+                        value={portText}
+                        onChange={event => setPort(event.target.value)}
+                      />
+                    </>
+                  }
+                  params={
+                    <div className="fgrid one">
+                      <WizardField label="伪装目标" htmlFor="chain-wizard-reality">
                         <select
+                          id="chain-wizard-reality"
                           className="f"
                           aria-label="REALITY 目标来源"
                           value={realityTarget}
@@ -940,277 +1226,310 @@ export function ChainWizard({
                           </option>
                           <option value="custom-site">自定义站点…</option>
                         </select>
-                      </span>
-                    )}
-                    {vlessEnabled && realityTarget === 'custom-site' && (
-                      <span className="attr wz-reality-custom">
-                        <span className="k">目标 / SNI</span>
-                        <input
-                          className="f mono"
-                          value={customRealityDest}
-                          placeholder="example.com:443"
-                          onChange={event => setCustomRealityDest(event.target.value)}
-                        />
-                        <input
-                          className="f mono"
-                          value={customRealityNames}
-                          placeholder="example.com"
-                          onChange={event => setCustomRealityNames(event.target.value)}
-                        />
-                        <select
-                          className="f"
-                          aria-label="自定义 REALITY 指纹"
-                          value={customRealityFingerprint}
-                          onChange={event => setCustomRealityFingerprint(event.target.value)}
-                        >
-                          {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
-                            <option value={value} key={value}>
-                              {label}
-                            </option>
-                          ))}
-                        </select>
-                      </span>
-                    )}
-                    {vlessEnabled && realityTarget !== '' && !realityTargetReady && (
-                      <span className="note warn">该目标尚不完整，补齐后才能创建。</span>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <span className="attr">
-                      <span className="k">怎么到它</span>
-                      <select
-                        className="f"
-                        value={kind}
-                        onChange={e => patchHop(id, { kind: e.target.value as DialKind })}
-                      >
-                        {DIAL_ORDER.map(k => (
-                          // 反向两档判定的是**上游**（即本行的上一台）是否有公网地址：
-                          // 该档由下游连接上游，可达性取决于上游。将 peer 作为 self 传入
-                          // 会使判定方向相反，导致下游有公网而上游没有时将不可用的档
-                          // 显示为可用。
-                          <option key={k} value={k} disabled={dialUnavailable(k, peer, nodeOf(spine[i - 1]))}>
-                            {DIAL_LABEL[k]}
-                          </option>
-                        ))}
-                      </select>
-                      {kind === 'custom' ? (
-                        <input
-                          className="f mono"
-                          style={{ width: 150 }}
-                          placeholder="10.0.0.9 / 2001:db8::9"
-                          value={hopEdits[id]?.addr ?? ''}
-                          onChange={e => patchHop(id, { addr: e.target.value })}
-                        />
-                      ) : (
-                        <span className="mono dim">
-                          {dial.t === 'addr' ? dial.v : dial.t === 'overlay' ? 'overlay 地址' : '对端连过来'}
-                        </span>
+                      </WizardField>
+                      {realityTarget === 'custom-site' && (
+                        <div className="wzp-reality-custom">
+                          <input
+                            className="f mono"
+                            value={customRealityDest}
+                            placeholder="example.com:443"
+                            aria-label="自定义 REALITY 目标"
+                            onChange={event => setCustomRealityDest(event.target.value)}
+                          />
+                          <input
+                            className="f mono"
+                            value={customRealityNames}
+                            placeholder="example.com"
+                            aria-label="自定义 REALITY SNI"
+                            onChange={event => setCustomRealityNames(event.target.value)}
+                          />
+                          <select
+                            className="f"
+                            aria-label="自定义 REALITY 指纹"
+                            value={customRealityFingerprint}
+                            onChange={event => setCustomRealityFingerprint(event.target.value)}
+                          >
+                            {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                              <option value={value} key={value}>
+                                {label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
                       )}
-                    </span>
-                    {/* 端口和加密都是**监听机器**的属性，不属于该跳：反向档下它们位于上游，
-                        而上游可能同时被前一跳以常规方式连接——两者本就是同一个端口，
-                        两行绑定同一份状态，修改任一行结果相同。因此需要标明端口所在的机器，
-                        否则会被理解为正在配置当前这一台。 */}
-                    <span className="attr">
-                      <span className="k">{rev ? '反向接入口' : '中转口'}</span>
+                      {!realityTargetReady && <p className="note warn">补全 REALITY 伪装目标后才能加入草稿。</p>}
+                      <p className="note">其余参数用默认值，建成后在线路详情里调。</p>
+                    </div>
+                  }
+                  expanded={openProtocol === 'vless' || !realityTargetReady}
+                  onExpand={() => setOpenProtocol(openProtocol === 'vless' ? null : 'vless')}
+                />
+                <WizardProtocolTile
+                  name="VLESS · Encryption"
+                  note="仅加密数据流，不提供 HTTPS 伪装，适合无封锁网络。"
+                  icon="xray"
+                  enabled={encryptionEnabled}
+                  onToggle={setEncryptionEnabled}
+                  port={
+                    <>
+                      <span>TCP</span>
                       <input
                         className="f mono"
-                        style={{ width: 78 }}
-                        value={hostPortOf(host)}
                         inputMode="numeric"
-                        onChange={e => patchPort(host, { port: e.target.value })}
+                        aria-label="VLESS Encryption 监听端口"
+                        value={encryptionPortText}
+                        onChange={event => setEncryptionPort(event.target.value)}
+                        disabled={!encryptionEnabled}
                       />
-                      {rev && <span className="st">开在 {nameOf(host)} 上</span>}
-                    </span>
-                    <span className="attr">
-                      <span className="k">协议</span>
-                      <select
-                        className="f"
-                        value={hostSecOf(host)}
-                        onChange={e => patchPort(host, { sec: e.target.value as HopSec })}
-                      >
-                        {/* `rev` 表示该跳是反向接入，该端口承载的是反向隧道。
-                            隧道基于 VLESS 账号建立，shadowsocks 没有对应的账号机制。 */}
-                        {HOP_WIRE_OPTIONS.map(option => (
-                          <option
-                            key={option.kind}
-                            value={option.kind}
-                            disabled={(rev && !option.reverseOk) || (option.kind === 'reality' && !globalRealityReady)}
-                          >
-                            {option.label}
-                            {rev && !option.reverseOk ? ' — 反向隧道只有 VLESS 承载' : ''}
-                            {option.kind === 'reality' && !globalRealityReady ? ' — 先配置全局站点' : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </span>
-                  </>
-                )}
-              </span>
-
-              {issue && (
-                <span className="attrs">
-                  <p className="note warn">{issue}。端口冲突会导致 xray 无法启动，编译会报 node.port-clash。</p>
-                </span>
+                    </>
+                  }
+                  params={
+                    <div className="fgrid one">
+                      <WizardField label="握手档位" htmlFor="chain-wizard-encryption-profile">
+                        <select
+                          id="chain-wizard-encryption-profile"
+                          className="f"
+                          value={encryptionProfile}
+                          onChange={event => setEncryptionProfile(event.target.value as 'default' | 'native')}
+                        >
+                          <option value="default">默认 · random · 600s</option>
+                          <option value="native">native · 600s</option>
+                        </select>
+                      </WizardField>
+                      <p className="note">其余参数用默认值，建成后在线路详情里调。</p>
+                    </div>
+                  }
+                  expanded={openProtocol === 'encryption'}
+                  onExpand={() => setOpenProtocol(openProtocol === 'encryption' ? null : 'encryption')}
+                />
+                <WizardProtocolTile
+                  name="AnyTLS"
+                  note="基于 TLS 加密，通过 Padding 填充缓解流量特征识别，通过连接复用减少 TLS 握手开销。"
+                  icon="bolt"
+                  enabled={anyTlsEnabled}
+                  onToggle={setAnyTlsEnabled}
+                  port={
+                    <>
+                      <span>TCP</span>
+                      <input
+                        className="f mono"
+                        inputMode="numeric"
+                        aria-label="AnyTLS 监听端口"
+                        value={anyTlsPortText}
+                        onChange={event => setAnyTlsPort(event.target.value)}
+                        disabled={!anyTlsEnabled}
+                      />
+                    </>
+                  }
+                  params={
+                    <div className="fgrid one">
+                      <WizardField label="Padding" htmlFor="chain-wizard-padding">
+                        <select
+                          id="chain-wizard-padding"
+                          className="f"
+                          value={paddingMode}
+                          onChange={event => setPaddingMode(event.target.value as 'default' | 'custom')}
+                        >
+                          <option value="default">默认方案</option>
+                          <option value="custom">自定义…</option>
+                        </select>
+                      </WizardField>
+                      {paddingMode === 'custom' && (
+                        <textarea
+                          className="f wzp-padding-custom"
+                          aria-label="AnyTLS 自定义 Padding"
+                          value={customPadding}
+                          placeholder="每行一条 Padding 规则"
+                          onChange={event => setCustomPadding(event.target.value)}
+                        />
+                      )}
+                      <p className="note">使用{headCertificateLabel}；其余参数用默认值，建成后在线路详情里调。</p>
+                    </div>
+                  }
+                  expanded={openProtocol === 'anytls'}
+                  onExpand={() => setOpenProtocol(openProtocol === 'anytls' ? null : 'anytls')}
+                />
+                <WizardProtocolTile
+                  name="Hysteria 2"
+                  portRange
+                  note="适合高延迟、丢包网络，依赖 UDP 可用；UDP 被封锁时无法连接。"
+                  icon="hysteria"
+                  enabled={hy2Enabled}
+                  onToggle={setHy2Enabled}
+                  port={
+                    <>
+                      <span>UDP</span>
+                      <input
+                        className="f mono"
+                        inputMode="numeric"
+                        aria-label="Hysteria 2 起始端口"
+                        value={hy2StartText}
+                        onChange={event => setHy2Start(event.target.value)}
+                        disabled={!hy2Enabled}
+                      />
+                      <span>–</span>
+                      <input
+                        className="f mono"
+                        inputMode="numeric"
+                        aria-label="Hysteria 2 结束端口"
+                        value={hy2EndText}
+                        onChange={event => setHy2End(event.target.value)}
+                        disabled={!hy2Enabled}
+                      />
+                    </>
+                  }
+                  params={
+                    <div className="fgrid one">
+                      <WizardField label="端口跳跃">
+                        <span className="wzp-hop-summary mono">
+                          {hy2StartText}–{hy2EndText}（{hy2End - hy2Start + 1} 个）
+                        </span>
+                        <button
+                          type="button"
+                          className="btn sm"
+                          onClick={() => {
+                            setHy2Start(null);
+                            setHy2End(null);
+                          }}
+                        >
+                          重新分配
+                        </button>
+                      </WizardField>
+                      <WizardField label="带宽">
+                        <span className="wzp-bandwidth">
+                          <input
+                            className="f mono"
+                            aria-label="Hysteria 2 上行带宽"
+                            placeholder="上行自动"
+                            value={hy2Up}
+                            onChange={event => setHy2Up(event.target.value)}
+                          />
+                          <span>·</span>
+                          <input
+                            className="f mono"
+                            aria-label="Hysteria 2 下行带宽"
+                            placeholder="下行自动"
+                            value={hy2Down}
+                            onChange={event => setHy2Down(event.target.value)}
+                          />
+                        </span>
+                      </WizardField>
+                      <p className="note">使用{headCertificateLabel}；其余参数用默认值，建成后在线路详情里调。</p>
+                    </div>
+                  }
+                  expanded={openProtocol === 'hy2'}
+                  onExpand={() => setOpenProtocol(openProtocol === 'hy2' ? null : 'hy2')}
+                />
+              </div>
+              {enabledProtocolCount === 0 && (
+                <p className="note warn wz-inline-alert" role="alert">
+                  至少开启一个接入协议。
+                </p>
               )}
-              {!issue && entry && portTaken && (
-                <span className="attrs">
-                  <p className="note warn">{portTaken}。端口冲突会导致 xray 无法启动，编译会报 node.port-clash。</p>
-                </span>
+              {(entryPortCollision || entryPortIssues.length > 0) && (
+                <p className="note warn wz-inline-alert" role="alert">
+                  {entryPortCollision ?? entryPortIssues[0]}。
+                </p>
               )}
-              {/* 警告显示在对应的跳上，处理方式写在同一句中——修改位置即左侧的两个字段，
-                  无需到其他位置操作。（此前另有一块汇总提示和一键修改，已移除：
-                  同一内容在一屏内重复表达。） */}
-              {plain && (
-                <span className="attrs">
-                  <p className="note warn">
-                    明文直连：会暴露 UUID 和目标地址。改用加密档，或将连接方式改为经 WireGuard。
-                  </p>
-                </span>
+              {(anyTlsEnabled || hy2Enabled) && !headCertificate && head && (
+                <p className="note warn wz-inline-alert" role="alert">
+                  AnyTLS（TLS）和 Hysteria 2 需要{headCertificateLabel}；先为 {headLabel} 分配证书组。
+                </p>
               )}
-            </div>
-          );
-        })}
-
-        {spine.length > 0 && (
-          <div className="wz-hop add">
-            <span className="idx">＋</span>
-            <span className="who">
-              <select
-                className="f"
-                value=""
-                disabled={addable.length === 0}
-                onChange={e => {
-                  if (e.target.value) setSpine([...spine, e.target.value]);
-                }}
-              >
-                <option value="">{addable.length ? '＋ 在末尾加一跳…' : '没有别的机器可加'}</option>
-                {addable.map(n => (
-                  <option key={n} value={n}>
-                    {nameOf(n)}（{n}）
-                  </option>
-                ))}
-              </select>
-            </span>
-            <span className="ctl">
-              <span className="note">{spine.length === 1 ? '当前为直出：入口节点直接出网' : '末位作为出口节点'}</span>
-            </span>
+            </WizardCard>
           </div>
+          <WizardCard
+            title="路径"
+            icon="chains"
+            hint={
+              !headId
+                ? '待选入口'
+                : `${spine.length} 台 · ${spine.length === 1 ? '直出' : `${spine.length - 1} 跳`}${
+                    exceptionCount ? ` · ${exceptionCount} 条例外` : ''
+                  }`
+            }
+          >
+            <WizardPathEditor
+              root={headId}
+              tables={pathRules}
+              onRootChange={setHeadId}
+              onTablesChange={setPathRules}
+              fixedHead={!!node}
+              nodes={nodes.data?.nodes ?? []}
+              app={apps.find(candidate => candidate.id === targetApp) ?? null}
+              apps={apps}
+              chainId={chainId.trim()}
+              tenant={head?.tenant_id ?? ''}
+              outbounds={availableOutbounds}
+              onOutboundCreated={outbound =>
+                setImportedOutbounds(current => [...current.filter(item => item.id !== outbound.id), outbound])
+              }
+              taken={taken}
+              hopBase={hopBase}
+              portOf={hostPortOf}
+              wireOf={hostSecOf}
+              onPortChange={(host, value) => patchPort(host, { port: value })}
+              onWireChange={(host, value) => patchPort(host, { sec: value })}
+              portIssueOf={hopIssueOf}
+              egressAllowed={id =>
+                snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === id)?.egress_allowed !== false
+              }
+              globalRealityReady={globalRealityReady}
+              realitySite={realitySite}
+              entryProtocolCount={enabledProtocolCount}
+              dnsPolicies={dnsPolicies}
+              dnsChanges={activeDnsChanges}
+              onDnsChange={patchDns}
+            />
+          </WizardCard>
+        </fieldset>
+        {(chainClash || ingressClash) && <div className="callout err">{chainClash || ingressClash}</div>}
+
+        {error != null && <ErrorBox error={error} />}
+
+        {showOps && (
+          <WizardCard title="草稿操作" icon="artifacts">
+            <ul className="wz-ops" id="chain-wizard-ops">
+              {ops.map((o, i) => (
+                <li key={i}>
+                  <span className="op">{o.op}</span>
+                  <span className="arg">{o.arg}</span>
+                </li>
+              ))}
+            </ul>
+          </WizardCard>
         )}
       </div>
-      {/* 说明该向导的适用范围：它只能创建线性路径。分流在规则表中配置——在此提供入口
-          相当于把整张规则表并入建链步骤，而此时链路是否连通尚未确定。 */}
-      {spine.length > 0 && (
-        <p className="note" style={{ marginTop: 8 }}>
-          分流规则需在本次简易建链向导完成后再编辑设置。
-        </p>
-      )}
-
-      {/* ── 授权对象：选中的用户各生成一条 upsert_grant ── */}
-      <h4 className="sec">
-        谁能用
-        <span className="rule" />
-      </h4>
-      {!head ? (
-        // 链头未选择时无法计算：接入面的租户随其确定，而租户决定可授权的用户范围。
-        // 此时列出全部用户供选择，会导致所选用户在后续被过滤掉且无提示。
-        <p className="note">先在上面选一台当入口——入口决定哪些用户可以授权。</p>
-      ) : users.isPending ? (
-        <Loading />
-      ) : userRows.length === 0 ? (
-        <p className="note">还没有用户。建完链去「用户」面开户，再回来授权——这一段不会消失。</p>
-      ) : (
-        <>
-          <div className="wz-grantbar">
-            <span className="n">
-              <b>{grantedUsers.length}</b> / {selectableUsers.length} 人
-            </span>
-            {/* 提供全选：单人运营的常见配置是所有用户可使用所有线路，一个按钮即可完成。
-                全不选与之配套，用于撤销误操作。 */}
-            <button
-              type="button"
-              className="btn sm"
-              disabled={selectableUsers.length === 0 || grantedUsers.length === selectableUsers.length}
-              onClick={() => setPickedUsers(new Set(selectableUsers.map(u => u.key)))}
-            >
-              全选
-            </button>
-            <button
-              type="button"
-              className="btn sm"
-              disabled={grantedUsers.length === 0}
-              onClick={() => setPickedUsers(new Set())}
-            >
-              全不选
-            </button>
-          </div>
-          <div className="wz-grants">
-            {userRows.map(u => (
-              <button
-                key={u.key}
-                type="button"
-                className="wz-grant"
-                aria-pressed={!u.blocked && pickedUsers.has(u.key)}
-                aria-disabled={!!u.blocked}
-                disabled={!!u.blocked}
-                title={u.blocked ?? `授权 ${u.id} 连这条链`}
-                onClick={() => toggleUser(u.key)}
-              >
-                <span className="tick" aria-hidden="true">
-                  ✓
-                </span>
-                {u.id}
-              </button>
-            ))}
-          </div>
-          {droppedUsers.length > 0 && (
-            // 更换入口使某些用户超出租户范围。需要提示：不提示时页脚的操作条数会
-            // 少于预期且无法解释，而这些用户仍显示为已勾选。勾选状态保留——
-            // 切换回原机器时它们会重新生效。
-            <p className="note warn">
-              换了入口之后 {droppedUsers.map(u => u.id).join('、')} 不在可授权范围，本次不会为其授权。
-            </p>
-          )}
-        </>
-      )}
-
-      {(chainClash || ingressClash) && <div className="callout red">{chainClash || ingressClash}</div>}
-
-      {error != null && <ErrorBox error={error} />}
-
-      {/* ── 页脚：将写入草稿的操作，展开后列出 ── */}
-      <div className="wz-foot">
-        {head ? (
-          <>
-            <button type="button" className="wz-count" aria-expanded={showOps} onClick={() => setShowOps(v => !v)}>
-              {showOps ? '▾' : '▸'} 会往草稿里加 {ops.length} 条操作
-            </button>
-            <span className="note">顶栏按「提交」才写进库。</span>
-          </>
-        ) : (
-          // 链头未选择时无法计算这些操作（接入面所在的机器尚未确定），
-          // 此时给出数量会与实际不符。
-          <span className="note">先在上面选一台当入口。</span>
+      <WizardFooter
+        id="chain-wizard-submit-note"
+        tone={submitting ? 'busy' : ready ? 'ready' : 'idle'}
+        title={submitting ? '加入草稿中…' : ready ? '配置完整' : '还不能加入草稿'}
+        description={ready ? '这里只暂存改动；顶栏按「提交」后才写入修订。' : blockers[0]}
+      >
+        {head && (
+          <button
+            type="button"
+            className="btn sm"
+            aria-expanded={showOps}
+            aria-controls="chain-wizard-ops"
+            onClick={() => setShowOps(v => !v)}
+          >
+            {showOps ? '▾' : '▸'} 预览 {ops.length} 条草稿操作
+          </button>
         )}
-        <span className="sp" />
-        <button type="button" className="btn" onClick={onDone}>
+        <button type="button" className="btn" disabled={submitting} onClick={onDone}>
           取消
         </button>
-        <button className="btn primary" disabled={!ready} type="submit">
-          加进草稿
+        <button
+          className="btn primary"
+          disabled={!ready || submitting}
+          type="submit"
+          aria-describedby="chain-wizard-submit-note"
+          aria-busy={submitting}
+        >
+          {submitting ? '加入中…' : '加入草稿'}
         </button>
-      </div>
-      {showOps && (
-        <ul className="wz-ops">
-          {ops.map((o, i) => (
-            <li key={i}>
-              <span className="op">{o.op}</span>
-              <span className="arg">{o.arg}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </form>
+      </WizardFooter>
+    </WizardPaper>
   );
 }

@@ -1,20 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { ApiError, fetchAuthState, fetchSessionWhoami, initAdmin, loginAdmin, type BrandingSettings } from '../api';
+import { ApiError, fetchAuthState, fetchConsoleBootstrap, initAdmin, loginAdmin, type BrandingSettings } from '../api';
 import type { Session } from '../app';
 import { enterPublic } from '../session';
+import { PASSWORD_MIN_LENGTH } from './password-policy';
 
 export function Login({ branding, onLogin }: { branding: BrandingSettings; onLogin: (session: Session) => void }) {
   const auth = useQuery({ queryKey: ['auth-state'], queryFn: fetchAuthState });
-  const whoami = useQuery({
-    queryKey: ['session-whoami'],
-    queryFn: fetchSessionWhoami,
-    retry: false,
-  });
-  useEffect(() => {
-    if (whoami.data) onLogin({ who: whoami.data });
-  }, [onLogin, whoami.data]);
-
   const initialized = auth.data?.initialized;
 
   return (
@@ -46,12 +38,15 @@ export function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Sess
   const [operatorId, setOperatorId] = useState('root');
   const [password, setPassword] = useState('');
   const login = useMutation({
-    mutationFn: () => loginAdmin({ operator_id: operatorId.trim(), password }),
-    onSuccess: result => onLogin({ who: result.admin }),
+    mutationFn: async () => {
+      await loginAdmin({ operator_id: operatorId.trim(), password });
+      return fetchConsoleBootstrap();
+    },
+    onSuccess: result => onLogin(result),
   });
   const guest = useMutation({
     mutationFn: enterPublic,
-    onSuccess: who => onLogin({ who }),
+    onSuccess: result => onLogin(result),
   });
 
   return (
@@ -92,6 +87,7 @@ export function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Sess
 }
 
 export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) => void }) {
+  const [bootstrapToken, setBootstrapToken] = useState('');
   const [operatorId, setOperatorId] = useState('root');
   const [password, setPassword] = useState('');
   const [reveal, setReveal] = useState(false);
@@ -99,28 +95,42 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
   // 用户名是主键，会被 revisions.author 和 deployment actor 引用，不可修改。内部归属使用
   // 固定初始值，单租户产品不把实现细节暴露为一个可选字段。
   const init = useMutation({
-    mutationFn: () =>
-      initAdmin({
+    mutationFn: async () => {
+      await initAdmin(bootstrapToken.trim(), {
         operator_id: operatorId.trim(),
         display_name: operatorId.trim(),
         password,
         root_tenant: 'platform',
-      }),
-    onSuccess: result => onInitialized({ who: result.admin }),
+      });
+      return fetchConsoleBootstrap();
+    },
+    onSuccess: result => onInitialized(result),
   });
-  const tooShort = password.length > 0 && password.length < 8;
+  const tooShort = password.length > 0 && password.length < PASSWORD_MIN_LENGTH;
 
   return (
     <form
       onSubmit={e => {
         e.preventDefault();
-        if (operatorId.trim() && password.length >= 8) init.mutate();
+        if (bootstrapToken.trim() && operatorId.trim() && password.length >= PASSWORD_MIN_LENGTH) init.mutate();
       }}
     >
       <p className="note">面板支持多用户统计；初始化时会预置使用者 zero，默认不开放登录。</p>
       <label className="fieldline">
+        <span>初始化凭据</span>
+        <input
+          className="f"
+          type="password"
+          autoComplete="one-time-code"
+          autoFocus
+          value={bootstrapToken}
+          onChange={e => setBootstrapToken(e.target.value)}
+        />
+      </label>
+      <p className="note dim">使用启动器提示的私有文件内容，或 BROCADE_BOOTSTRAP_TOKEN；成功后即失效。</p>
+      <label className="fieldline">
         <span>用户名</span>
-        <input className="f" autoFocus value={operatorId} onChange={e => setOperatorId(e.target.value)} />
+        <input className="f" value={operatorId} onChange={e => setOperatorId(e.target.value)} />
       </label>
       <label className="fieldline">
         <span>密码</span>
@@ -136,15 +146,17 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
           </button>
         </span>
       </label>
-      {tooShort && <div className="callout err">密码至少 8 位</div>}
-      {init.error && <div className="callout err">{errorText(init.error)}</div>}
+      {tooShort && <div className="callout err">密码至少 {PASSWORD_MIN_LENGTH} 位</div>}
+      {init.error && <div className="callout err">{initializationError(init.error)}</div>}
       <p className="note dim">用户名创建后不可修改；访客模式默认关闭，可在设置中开启。</p>
       <div className="toolbar">
         <span className="sp" />
         <button
           className="btn primary"
           type="submit"
-          disabled={init.isPending || !operatorId.trim() || password.length < 8}
+          disabled={
+            init.isPending || !bootstrapToken.trim() || !operatorId.trim() || password.length < PASSWORD_MIN_LENGTH
+          }
         >
           {init.isPending ? '初始化中…' : '创建管理员'}
         </button>
@@ -155,6 +167,12 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
 
 function loginError(error: unknown): string {
   if (error instanceof ApiError && error.status === 401) return '用户名或密码不正确';
+  return errorText(error);
+}
+
+function initializationError(error: unknown): string {
+  if (error instanceof ApiError && error.status === 401) return '初始化凭据不正确';
+  if (error instanceof ApiError && error.status === 503) return '服务端尚未配置初始化凭据';
   return errorText(error);
 }
 

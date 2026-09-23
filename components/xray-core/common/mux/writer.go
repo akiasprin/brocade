@@ -3,6 +3,7 @@ package mux
 import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -69,14 +70,24 @@ func (w *Writer) writeMetaOnly() error {
 }
 
 func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
+	dataSize := data.Len()
+	// The frame format carries its payload length in an unsigned 16-bit field.
+	if dataSize > buf.MaxPacketSize {
+		buf.ReleaseMulti(data)
+		return errors.New("frame payload is too large: ", dataSize)
+	}
 	frame := buf.New()
 	if len(data) == 1 {
 		frame.UDP = data[0].UDP
 	}
 	if err := meta.WriteTo(frame); err != nil {
+		frame.Release()
+		buf.ReleaseMulti(data)
 		return err
 	}
-	if _, err := serial.WriteUint16(frame, uint16(data.Len())); err != nil {
+	if _, err := serial.WriteUint16(frame, uint16(dataSize)); err != nil {
+		frame.Release()
+		buf.ReleaseMulti(data)
 		return err
 	}
 

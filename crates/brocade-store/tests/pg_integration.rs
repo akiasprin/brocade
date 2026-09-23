@@ -5,13 +5,13 @@ use brocade_core::{
         Action, AnyTls, ConnectionSettings, DestMatch, Dns, DomainStrategy,
         EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
         ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
-        ExternalVlessXhttp, ExternalVlessXhttpDownload, HopDial, HopMux, HopPool, Hysteria2,
-        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, IngressWires,
-        IpFamily, ListenerDial, ListenerRef, ModelSettings, NodeConnection, OverlaySettings,
-        PortSettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
-        RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealityFallbackRateLimit,
-        RealitySettings, RealitySite, Rule, Transport, WgTransport, Xhttp, XhttpDownload,
-        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+        ExternalVlessXhttp, ExternalVlessXhttpDownload, FrontStrategy, HopDial, HopMux, HopPool,
+        Hysteria2, HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
+        IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSettings, NodeConnection,
+        OverlaySettings, PortSettings, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
+        ProtocolProjection, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode,
+        RealityFallbackRateLimit, RealitySettings, RealitySite, Rule, Transport, WgTransport,
+        Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
     physical::user::SubscriptionFilter,
 };
@@ -21,28 +21,32 @@ use brocade_deployment::plan::{
     PlannedTargetStatus,
 };
 use brocade_deployment::protocol::{
-    DiskDetailSample, E2eProbeAnyTls, E2eProbeSecurity, E2eProbeTarget, GeodataFileState,
-    GeodataObservation, HostFacts, LoadReportRequest, LoadSample, LocalReconcileReport,
-    NetworkDetailSample, NodeRuntimeReport, NodeVersions, RouteIpReport, SpoolBacklog,
-    WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus,
+    DiskDetailSample, E2eExitVerdict, E2eProbe, E2eProbeAnyTls, E2eProbeRequest, E2eProbeSecurity,
+    E2eProbeStatus, E2eProbeTarget, GeodataFileState, GeodataObservation, HostFacts,
+    LoadReportRequest, LoadSample, LocalReconcileReport, NetworkDetailSample,
+    NodePublicIpObservation, NodeRuntimeReport, NodeTrafficReading, NodeVersions, PublicIpFamily,
+    SpoolBacklog, WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus,
 };
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
     AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentLogLimits, ApplyDraftResult,
     CertDomainInput, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest,
-    CreateChainRequest, CreateDeploymentRequest, CreateGrantRequest, CreateIngressRequest,
-    CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
-    HopInRequest, HopWireRequest, IsolateDeploymentTargetRequest, IssuedCertificate, LinkProbe,
-    LinkProbeRequest, LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment, PgStore,
-    PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeTarget, ProbeTransport,
-    ProvisionNodeRequest, PutStepRequest, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
+    CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest,
+    CreateIngressRequest, CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest,
+    CreateUserRequest, CreateXrayReleaseRequest, DeleteFrontRequest, HopInRequest, HopWireRequest,
+    IsolateDeploymentTargetRequest, IsolateNodeRequest, IssuedCertificate, LinkProbe,
+    LinkProbeRequest, LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment,
+    NodeTrafficCycleKind, PgStore, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
+    PingProbeTarget, ProbeTransport, ProvisionNodeRequest, PublicIpObservationOutcome,
+    PutStepRequest, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
     RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest, SetUserPasswordRequest,
     StepAcceptRequest, StoreError, TargetApplyResult, TargetConvergenceReport, TransportRequest,
     UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
-    UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
-    UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest,
-    UserAccountType, VerifyDeploymentRequest, WiresRequest, ENROLLMENT_TOKEN_PREFIX,
-    NODE_TOKEN_PREFIX,
+    UpdateNodeTrafficRequest, UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest,
+    UpdateUserStatusRequest, UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter,
+    UsageReportRequest, UserAccountType, VerifyDeploymentRequest, WiresRequest, XrayBuildInfo,
+    XrayReleaseArtifact, XrayReleaseOutcome, XrayReleaseReport, XrayReleaseStatus,
+    XrayReleaseTargetStatus, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -108,6 +112,26 @@ impl TestPg {
     }
 }
 
+async fn wait_for_advisory_waiters(pool: &PgPool, minimum: i64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks
+                  WHERE locktype = 'advisory' AND NOT granted",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= minimum {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {minimum} advisory lock waiter(s)"));
+}
+
 fn system_admin() -> AdminContext {
     AdminContext::system_admin("test-system")
 }
@@ -117,13 +141,15 @@ fn system_admin() -> AdminContext {
 async fn seed_subscription_serving(db: &TestPg) -> u64 {
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
     let revision = snapshot.revision;
+    let mut snapshot_document = serde_json::to_value(&snapshot).unwrap();
+    seal_external_credentials_for_fixture(&mut snapshot_document);
     sqlx::query(
         "INSERT INTO model_snapshots (revision_id, snapshot)
          VALUES ($1, $2)
          ON CONFLICT (revision_id) DO UPDATE SET snapshot = EXCLUDED.snapshot",
     )
     .bind(i64::try_from(revision).unwrap())
-    .bind(serde_json::to_value(&snapshot).unwrap())
+    .bind(snapshot_document)
     .execute(db.pool())
     .await
     .unwrap();
@@ -132,7 +158,8 @@ async fn seed_subscription_serving(db: &TestPg) -> u64 {
     // typed struct directly would preserve struct-field order, while a JSON value (and JSONB)
     // canonicalizes object keys; those are semantically equal documents but different byte
     // sequences.
-    let client_document = serde_json::to_value(client).unwrap();
+    let mut client_document = serde_json::to_value(client).unwrap();
+    seal_external_credentials_for_fixture(&mut client_document);
     let client_sha = brocade_core::hash::sha256_hex(&serde_json::to_vec(&client_document).unwrap());
     let client_snapshot_id: i64 = sqlx::query_scalar(
         "INSERT INTO subscription_client_snapshots (
@@ -175,6 +202,36 @@ async fn seed_subscription_serving(db: &TestPg) -> u64 {
     .await
     .unwrap();
     revision
+}
+
+/// Direct fixtures bypass the production snapshot writer, so reproduce its external credential
+/// envelope before putting either immutable document in JSONB. A clear test credential would be
+/// rejected by the production reader, exactly as a clear real credential should be.
+fn seal_external_credentials_for_fixture(document: &mut serde_json::Value) {
+    let Some(outbounds) = document
+        .get_mut("external_outbounds")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for outbound in outbounds {
+        let tenant = outbound["tenant"].as_str().unwrap();
+        let id = outbound["id"].as_str().unwrap();
+        let Some(credential) = outbound
+            .pointer("/protocol/v/credential")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let sealed = brocade_store::secrets::seal(
+            &brocade_store::secrets::external_outbound_context(tenant, id),
+            credential,
+        )
+        .unwrap();
+        *outbound
+            .pointer_mut("/protocol/v/credential")
+            .expect("credential pointer just resolved") = serde_json::Value::String(sealed);
+    }
 }
 
 /// Commit direct fixture mutations as a real immutable revision. Production writes do this in
@@ -333,6 +390,20 @@ fn provision_node_request(id: &str) -> ProvisionNodeRequest {
         cert_label_id: None,
         enrollment_ttl_seconds: None,
     }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn store_connections_disable_postgres_jit() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+
+    let jit: String = sqlx::query_scalar("SHOW jit")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(jit, "off");
 }
 
 #[tokio::test]
@@ -610,6 +681,111 @@ async fn reordering_app_positions_keeps_ids_and_all_usage_ownership_stable() {
         order_after_create,
         ["app-secondary", "app-main", "app-c0de"]
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn successful_e2e_probe_queues_public_exit_ip_intelligence() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::BIGINT")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+    for (offset, status, ttfb_ms, exit_ip) in [
+        (0, E2eProbeStatus::Ok, Some(25), "8.8.8.8"),
+        (1, E2eProbeStatus::Ok, Some(26), "10.0.0.1"),
+        (2, E2eProbeStatus::ChainBroken, None, "1.1.1.1"),
+    ] {
+        db.store
+            .record_e2e_probe(
+                "n1",
+                E2eProbeRequest {
+                    probed_at_unix_secs: now + offset,
+                    chains: vec![E2eProbe {
+                        app_id: None,
+                        chain_id: "chn-a1b2-c3d4".to_owned(),
+                        status,
+                        ttfb_ms,
+                        exit_ip: Some(exit_ip.to_owned()),
+                        exit_loc: Some("US".to_owned()),
+                        exit_verdict: E2eExitVerdict::Unknown,
+                        detail: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let queued: Vec<String> = sqlx::query_scalar(
+        "SELECT host(exit_ip)
+           FROM vpngate_exit_reputations
+          ORDER BY exit_ip",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(queued, ["8.8.8.8"]);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn e2e_probe_view_reuses_verified_exit_ip_intelligence() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    sqlx::query(
+        "INSERT INTO e2e_probes (
+            chain_id, app_id, node_id, status, ttfb_ms, exit_ip,
+            exit_loc, exit_verdict, probed_at
+         ) VALUES (
+            'chn-a1b2-c3d4', 'app-main', 'n1', 'ok', 25, '198.51.100.80',
+            'JP', 'unknown', now()
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO vpngate_exit_reputations (
+            exit_ip, country_code, ip_scores, ip_networks, verified_at
+         ) VALUES (
+            '198.51.100.80'::inet,
+            'JP',
+            '[{\"provider\":\"proxycheck\",\"score\":0,\"country_code\":\"JP\"}]'::jsonb,
+            '[{\"provider\":\"proxycheck\",\"isp\":\"Example ISP\",\"network_type\":\"residential\"}]'::jsonb,
+            now()
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let probes = db.store.e2e_probes(&system_admin()).await.unwrap();
+    let intelligence = probes[0].exit_intelligence.as_ref().unwrap();
+    assert_eq!(intelligence.country_code.as_deref(), Some("JP"));
+    assert_eq!(intelligence.scores[0].score, 0);
+    assert_eq!(intelligence.networks[0].isp.as_deref(), Some("Example ISP"));
+
+    sqlx::query(
+        "UPDATE vpngate_exit_reputations
+            SET verified_at = NULL, ip_scores = '[]'::jsonb, ip_networks = '[]'::jsonb
+          WHERE exit_ip = '198.51.100.80'::inet",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(db.store.e2e_probes(&system_admin()).await.unwrap()[0]
+        .exit_intelligence
+        .is_none());
 }
 
 #[tokio::test]
@@ -986,6 +1162,7 @@ async fn line_order_drives_every_operator_facing_projection() {
     .execute(db.pool())
     .await
     .unwrap();
+    rebuild_usage_rollups(db.pool()).await;
 
     // Reverse the visible order without touching either stable ID. Every API whose rows are
     // displayed as ordinary line groups must now follow position rather than re-sorting by ID.
@@ -1067,7 +1244,17 @@ async fn tenant_creation_adds_exactly_one_default_warp_in_the_same_revision() {
     assert_eq!(snapshot.revision, created.revision_id);
     assert_eq!(snapshot.external_outbounds.len(), 1);
     let warp = &snapshot.external_outbounds[0];
-    assert_eq!(warp.id, "warp.platform.acme");
+    assert!(warp.id.starts_with("warp-"));
+    assert_eq!(warp.id.len(), "warp-0000-0000".len());
+    assert_eq!(warp.id.as_bytes()[9], b'-');
+    assert!(
+        warp.id[5..9]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+            && warp.id[10..]
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+    );
     assert_eq!(warp.tenant, "platform.acme");
     assert_eq!(warp.name, "Cloudflare WARP");
     assert_eq!(warp.address, "engage.cloudflareclient.com");
@@ -1083,12 +1270,12 @@ async fn tenant_creation_adds_exactly_one_default_warp_in_the_same_revision() {
             workers: 0,
         } if allowed_ips == &["0.0.0.0/0", "::/0"] && domain_strategy == "ForceIP"
     ));
-    let credential: String = sqlx::query_scalar(
-        "SELECT credential_sealed FROM external_outbounds WHERE id = 'warp.platform.acme'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
+    let credential: String =
+        sqlx::query_scalar("SELECT credential_sealed FROM external_outbounds WHERE id = $1")
+            .bind(&warp.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
     assert!(
         credential.is_empty(),
         "WARP has no resource-level credential"
@@ -1114,6 +1301,40 @@ async fn tenant_creation_adds_exactly_one_default_warp_in_the_same_revision() {
     .await
     .unwrap();
     assert_eq!(count, 1);
+
+    let legacy_id = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: UpsertExternalOutboundRequest {
+                    id: "warp".to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "Legacy WARP".to_owned(),
+                    address: "engage.cloudflareclient.com".to_owned(),
+                    port: 2408,
+                    protocol: ExternalOutboundProtocol::Warp {
+                        mtu: 1280,
+                        keep_alive: 25,
+                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
+                        no_kernel_tun: false,
+                        domain_strategy: "ForceIP".to_owned(),
+                        workers: 0,
+                    },
+                    security: ExternalOutboundSecurity::None,
+                    note: None,
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        legacy_id
+            .to_string()
+            .contains("WARP tunnel id must use warp-<4 lowercase hex>-<4 lowercase hex>"),
+        "{legacy_id}"
+    );
 }
 
 #[tokio::test]
@@ -1130,7 +1351,7 @@ async fn external_outbound_round_trips_sealed_and_redacted() {
     insert_minimal_fixture(db.pool()).await;
 
     let request = UpsertExternalOutboundRequest {
-        id: "vendor-edge".to_owned(),
+        id: "custom-1111-1111".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "Vendor edge".to_owned(),
         address: "edge.vendor.example".to_owned(),
@@ -1161,13 +1382,14 @@ async fn external_outbound_round_trips_sealed_and_redacted() {
         .await
         .unwrap();
 
-    let sealed: String =
-        sqlx::query("SELECT credential_sealed FROM external_outbounds WHERE id = 'vendor-edge'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap()
-            .try_get("credential_sealed")
-            .unwrap();
+    let sealed: String = sqlx::query(
+        "SELECT credential_sealed FROM external_outbounds WHERE id = 'custom-1111-1111'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .try_get("credential_sealed")
+    .unwrap();
     assert!(sealed.starts_with("v1."));
     assert!(!sealed.contains(request.protocol.credential()));
     let first_client_sealed: String = sqlx::query_scalar(
@@ -1322,7 +1544,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
-                    id: "warp".to_owned(),
+                    id: "warp-8f3a-2d71".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Cloudflare WARP".to_owned(),
                     address: "engage.cloudflareclient.com".to_owned(),
@@ -1351,7 +1573,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
         .register_warp_binding(
             &system_admin(),
             RegisterWarpBindingRequest {
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 device_id: "device-1".to_owned(),
                 account_id: "account-1".to_owned(),
@@ -1372,7 +1594,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
     let row = sqlx::query(
         "SELECT access_token_sealed, private_key_sealed
          FROM external_outbound_bindings
-         WHERE outbound_id = 'warp' AND node_id = 'n1'",
+         WHERE outbound_id = 'warp-8f3a-2d71' AND node_id = 'n1'",
     )
     .fetch_one(db.pool())
     .await
@@ -1390,7 +1612,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
             &system_admin(),
             UpdateWarpBindingRequest {
                 tenant_id: "platform.acme".to_owned(),
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 endpoint_address: Some("162.159.193.10".to_owned()),
                 endpoint_port: Some(500),
@@ -1447,7 +1669,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
             &system_admin(),
             UpdateWarpBindingRequest {
                 tenant_id: "platform.acme".to_owned(),
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 endpoint_address: Some("162.159.193.10".to_owned()),
                 endpoint_port: Some(500),
@@ -1470,7 +1692,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
             &system_admin(),
             UpdateWarpBindingRequest {
                 tenant_id: "platform.acme".to_owned(),
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 endpoint_address: None,
                 endpoint_port: None,
@@ -1536,7 +1758,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
         let tunnel = snapshot
             .external_outbounds
             .iter()
-            .find(|outbound| outbound.id == "warp")
+            .find(|outbound| outbound.id == "warp-8f3a-2d71")
             .unwrap();
         assert_eq!(tunnel.bindings.len(), 1);
         assert_eq!(tunnel.bindings[0].node, "n1");
@@ -1572,7 +1794,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
-                    id: "warp".to_owned(),
+                    id: "warp-8f3a-2d71".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Cloudflare WARP".to_owned(),
                     address: "engage.cloudflareclient.com".to_owned(),
@@ -1597,7 +1819,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
         .register_warp_binding(
             &system_admin(),
             RegisterWarpBindingRequest {
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 device_id: "device-remove".to_owned(),
                 account_id: "account-remove".to_owned(),
@@ -1626,7 +1848,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
             rules: vec![Rule {
                 dest_match: DestMatch::Any,
                 action: Action::Proxy {
-                    outbound: "warp".to_owned(),
+                    outbound: "warp-8f3a-2d71".to_owned(),
                 },
             }],
             note: None,
@@ -1635,7 +1857,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
     .await;
     let current_error = db
         .store
-        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp", "n1")
+        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp-8f3a-2d71", "n1")
         .await
         .unwrap_err();
     assert!(
@@ -1671,7 +1893,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
     .await;
     let published_error = db
         .store
-        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp", "n1")
+        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp-8f3a-2d71", "n1")
         .await
         .unwrap_err();
     assert!(
@@ -1693,7 +1915,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
 
     let prepared = db
         .store
-        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp", "n1")
+        .prepare_warp_binding_removal(&system_admin(), "platform.acme", "warp-8f3a-2d71", "n1")
         .await
         .unwrap();
     assert_eq!(prepared.device_id, "device-remove");
@@ -1705,7 +1927,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
             &system_admin(),
             RemoveWarpBindingRequest {
                 tenant_id: "platform.acme".to_owned(),
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 expected_device_id: "different-device".to_owned(),
                 note: None,
@@ -1724,7 +1946,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
             &system_admin(),
             RemoveWarpBindingRequest {
                 tenant_id: "platform.acme".to_owned(),
-                outbound_id: "warp".to_owned(),
+                outbound_id: "warp-8f3a-2d71".to_owned(),
                 node_id: "n1".to_owned(),
                 expected_device_id: prepared.device_id,
                 note: None,
@@ -1739,11 +1961,11 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
     let warp = snapshot
         .external_outbounds
         .iter()
-        .find(|outbound| outbound.id == "warp")
+        .find(|outbound| outbound.id == "warp-8f3a-2d71")
         .unwrap();
     assert!(warp.bindings.is_empty());
     let rows = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM external_outbound_bindings WHERE outbound_id = 'warp'",
+        "SELECT count(*) FROM external_outbound_bindings WHERE outbound_id = 'warp-8f3a-2d71'",
     )
     .fetch_one(db.pool())
     .await
@@ -1761,7 +1983,7 @@ async fn external_vless_xhttp_round_trips() {
     insert_minimal_fixture(db.pool()).await;
 
     let request = UpsertExternalOutboundRequest {
-        id: "xhttp-edge".to_owned(),
+        id: "custom-2222-2222".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "XHTTP edge".to_owned(),
         address: "upload.vendor.example".to_owned(),
@@ -1808,13 +2030,14 @@ async fn external_vless_xhttp_round_trips() {
         .await
         .unwrap();
 
-    let options: serde_json::Value =
-        sqlx::query("SELECT protocol_options FROM external_outbounds WHERE id = 'xhttp-edge'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap()
-            .try_get("protocol_options")
-            .unwrap();
+    let options: serde_json::Value = sqlx::query(
+        "SELECT protocol_options FROM external_outbounds WHERE id = 'custom-2222-2222'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .try_get("protocol_options")
+    .unwrap();
     assert_eq!(options["transport"]["t"], "xhttp");
     assert_eq!(options["transport"]["v"]["path"], "/upload");
     assert_eq!(
@@ -2488,6 +2711,59 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
     assert_eq!(exact.targets[0].samples.len(), 1);
     assert_eq!(exact.targets[0].samples[0].latency_us, Some(37_250));
 
+    let latest = db
+        .store
+        .list_latest_node_ping_probes(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(latest.interval_secs, 5);
+    let node = latest
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(node.targets.len(), 2);
+    assert_eq!(
+        node.targets[0].latest.as_ref().unwrap().latency_us,
+        Some(37_250)
+    );
+    assert!(!node.targets[1].latest.as_ref().unwrap().attempted);
+
+    db.store
+        .record_ping_probe(
+            "n1",
+            PingProbeReportRequest {
+                probed_at_unix_secs: now + 1,
+                samples: vec![PingProbeSample {
+                    target: "tcp://192.0.2.1:443".to_owned(),
+                    attempted: true,
+                    latency_us: Some(12_500),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let latest = db
+        .store
+        .list_latest_node_ping_probes(&system_admin())
+        .await
+        .unwrap();
+    let node = latest
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(
+        node.targets[0].latest.as_ref().unwrap().latency_us,
+        Some(12_500),
+        "each target must independently select its newest sample"
+    );
+    assert_eq!(
+        node.targets[1].latest.as_ref().unwrap().probed_at_unix_secs,
+        now,
+        "a newer TCP sample must not hide the latest ICMP sample"
+    );
+
     let before_sample = db
         .store
         .node_ping_probe_view_range(&system_admin(), "n1", now - 3_600, now - 1_800)
@@ -2506,7 +2782,7 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         .record_ping_probe(
             "n1",
             PingProbeReportRequest {
-                probed_at_unix_secs: now + 1,
+                probed_at_unix_secs: now + 2,
                 samples: vec![PingProbeSample {
                     target: "icmp://[2001:db8::1]".to_owned(),
                     attempted: false,
@@ -2519,6 +2795,24 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         matches!(invalid, Err(StoreError::InvalidData(_))),
         "an unattempted sample must not smuggle in a latency"
     );
+
+    sqlx::query(
+        "INSERT INTO node_ping_probe_samples
+            (node_id, target, probed_at, attempted, latency_us)
+         VALUES ('n1', 'tcp://1.1.1.1:443', now() - interval '8 days', TRUE, 1000)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(db.store.prune_node_ping_probe_samples(7).await.unwrap(), 1);
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM node_ping_probe_samples
+          WHERE probed_at >= now() - interval '7 days'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(retained > 0, "retention must keep the current probe round");
 }
 
 #[tokio::test]
@@ -2547,6 +2841,7 @@ async fn usage_node_series_honours_exact_history_boundaries() {
     .execute(db.pool())
     .await
     .unwrap();
+    rebuild_usage_node_rollups(db.pool()).await;
 
     let exact = db
         .store
@@ -2561,6 +2856,8 @@ async fn usage_node_series_honours_exact_history_boundaries() {
     assert_eq!(node.buckets.len(), 1);
     assert_eq!(node.buckets[0].user_uplink_bytes, 120);
     assert_eq!(node.buckets[0].user_downlink_bytes, 80);
+    assert_eq!(node.month_user_uplink_bytes, 120);
+    assert_eq!(node.month_user_downlink_bytes, 80);
 
     let before_sample = db
         .store
@@ -2573,6 +2870,881 @@ async fn usage_node_series_honours_exact_history_boundaries() {
         .find(|node| node.node_id == "n1")
         .expect("the monthly total keeps n1 visible outside the selected history range");
     assert!(node.buckets.is_empty());
+    assert_eq!(node.month_user_uplink_bytes, 120);
+    assert_eq!(node.month_user_downlink_bytes, 80);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn usage_detail_retention_keeps_daily_node_rollups() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO usage_samples (
+            window_start, window_end, node_id, tenant_id, user_id, ingress_id,
+            app_id, grant_label, uplink_bytes, downlink_bytes, has_gap
+         ) VALUES
+            (now() - interval '8 days 1 minute', now() - interval '8 days',
+             'n1', 'platform.acme', 'alice', 'ing-a1b2', 'app-main',
+             'alice@platform.acme#ing-a1b2', 10, 20, TRUE),
+            (now() - interval '1 minute', now(),
+             'n1', 'platform.acme', 'alice', 'ing-a1b2', 'app-main',
+             'alice@platform.acme#ing-a1b2', 30, 40, FALSE)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO usage_chain_samples (
+            window_start, window_end, node_id, tenant_id, app_id, chain_id,
+            hop_label, uplink_bytes, downlink_bytes, has_gap
+         ) VALUES
+            (now() - interval '8 days 1 minute', now() - interval '8 days',
+             'n1', 'platform.acme', 'app-main', 'chn-a1b2-c3d4',
+             'chn-a1b2-c3d4@n1', 50, 60, FALSE),
+            (now() - interval '1 minute', now(),
+             'n1', 'platform.acme', 'app-main', 'chn-a1b2-c3d4',
+             'chn-a1b2-c3d4@n1', 70, 80, FALSE)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    rebuild_usage_rollups(db.pool()).await;
+
+    let before: (i64, i64, i64, i64, bool) = sqlx::query_as(
+        "SELECT sum(user_uplink_bytes)::bigint,
+                sum(user_downlink_bytes)::bigint,
+                sum(relay_uplink_bytes)::bigint,
+                sum(relay_downlink_bytes)::bigint,
+                bool_or(has_gap)
+           FROM usage_node_rollups
+          WHERE tenant_id = 'platform.acme' AND node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(before, (40, 60, 120, 140, true));
+
+    assert_eq!(db.store.prune_usage_samples(7).await.unwrap(), 2);
+    let detail_counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM usage_samples),
+                (SELECT count(*) FROM usage_chain_samples)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(detail_counts, (1, 1));
+    let after: (i64, i64, i64, i64, bool) = sqlx::query_as(
+        "SELECT sum(user_uplink_bytes)::bigint,
+                sum(user_downlink_bytes)::bigint,
+                sum(relay_uplink_bytes)::bigint,
+                sum(relay_downlink_bytes)::bigint,
+                bool_or(has_gap)
+           FROM usage_node_rollups
+          WHERE tenant_id = 'platform.acme' AND node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "retention must never alter durable daily totals"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn globally_unique_model_ids_cannot_change_app_or_tenant_owner() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES
+            ('chn-a1b2-dead', 'app-main', 'platform.other', 'Other tenant chain', 1),
+            ('chn-a1b2-feed', 'app-other', 'platform.acme', 'Other app chain', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO fronts (id, app_id, tenant_id, name, strategy)
+         VALUES ('front-owned', 'app-main', 'platform.acme', 'Owned Front', 'select')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let revision_before: (i64, i64) = sqlx::query_as(
+        "SELECT current_revision, (SELECT count(*) FROM revisions)
+           FROM control_state
+          WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let chain_before: (String, String, String, i32) = sqlx::query_as(
+        "SELECT app_id, tenant_id, name, position
+           FROM chains
+          WHERE id = 'chn-a1b2-c3d4'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let front_before: (String, String, String, String) = sqlx::query_as(
+        "SELECT app_id, tenant_id, name, strategy
+           FROM fronts
+          WHERE id = 'front-owned'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let ingress_before: (String, String, String, i32, String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT app_id, chain_id, node_id, port, reality_private_key, reality_public_key,
+                    front_id
+               FROM ingresses
+              WHERE id = 'ing-a1b2'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+    let chain_takeover = CreateChainRequest {
+        id: "chn-a1b2-c3d4".to_owned(),
+        tenant_id: "platform.other".to_owned(),
+        name: "Take over chain".to_owned(),
+        subscription_country: Some("US".to_owned()),
+        note: None,
+    };
+    let denied = db
+        .store
+        .upsert_chain(
+            &tenant_admin("platform.other"),
+            "app-main",
+            chain_takeover.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, StoreError::Forbidden(_)));
+    let privileged_move = db
+        .store
+        .upsert_chain(&system_admin(), "app-main", chain_takeover)
+        .await
+        .unwrap_err();
+    assert!(matches!(privileged_move, StoreError::Unsupported(_)));
+    let cross_app_move = db
+        .store
+        .upsert_chain(
+            &system_admin(),
+            "app-other",
+            CreateChainRequest {
+                id: "chn-a1b2-c3d4".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Move app".to_owned(),
+                subscription_country: None,
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(cross_app_move, StoreError::Unsupported(_)));
+
+    let current_revision = u64::try_from(revision_before.0).unwrap();
+    let front_takeover = CreateFrontRequest {
+        expected_revision: current_revision,
+        id: "front-owned".to_owned(),
+        tenant_id: "platform.other".to_owned(),
+        name: "Take over Front".to_owned(),
+        strategy: FrontStrategy::Fallback,
+        via: Vec::new(),
+        external_via: Vec::new(),
+        targets: Vec::new(),
+        note: None,
+    };
+    let denied = db
+        .store
+        .upsert_front(
+            &tenant_admin("platform.other"),
+            "app-main",
+            front_takeover.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, StoreError::Forbidden(_)));
+    let privileged_move = db
+        .store
+        .upsert_front(&system_admin(), "app-main", front_takeover)
+        .await
+        .unwrap_err();
+    assert!(matches!(privileged_move, StoreError::Unsupported(_)));
+    let cross_app_move = db
+        .store
+        .upsert_front(
+            &system_admin(),
+            "app-other",
+            CreateFrontRequest {
+                expected_revision: current_revision,
+                id: "front-owned".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "Move app".to_owned(),
+                strategy: FrontStrategy::Select,
+                via: Vec::new(),
+                external_via: Vec::new(),
+                targets: Vec::new(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(cross_app_move, StoreError::Unsupported(_)));
+
+    let ingress_takeover: CreateIngressRequest = serde_json::from_value(json!({
+        "id": "ing-a1b2",
+        "chain_id": "chn-a1b2-dead",
+        "node_id": "n-other",
+        "bind": "0.0.0.0",
+        "port": 8443,
+        "reality": {
+            "fallback_mode": "global-site",
+            "fallback_limits": { "mode": "off" },
+            "fallback_guard": true
+        },
+        "wires": { "vless": { "kind": "vless-reality" } },
+        "projection": {},
+        "guard": {
+            "no_private": true,
+            "no_bittorrent": true,
+            "no_mail": true,
+            "no_udp_amplification": true,
+            "tcp_and_quic_only": false
+        }
+    }))
+    .unwrap();
+    let denied = db
+        .store
+        .upsert_ingress(
+            &tenant_admin("platform.other"),
+            "app-main",
+            ingress_takeover.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, StoreError::Forbidden(_)));
+    let privileged_move = db
+        .store
+        .upsert_ingress(&system_admin(), "app-main", ingress_takeover)
+        .await
+        .unwrap_err();
+    assert!(matches!(privileged_move, StoreError::Unsupported(_)));
+
+    let mut cross_app_ingress: CreateIngressRequest = serde_json::from_value(json!({
+        "id": "ing-a1b2",
+        "chain_id": "chn-a1b2-feed",
+        "node_id": "n1",
+        "bind": "0.0.0.0",
+        "port": 9443,
+        "reality": {
+            "fallback_mode": "global-site",
+            "fallback_limits": { "mode": "off" },
+            "fallback_guard": true
+        },
+        "wires": { "vless": { "kind": "vless-reality" } },
+        "projection": {},
+        "guard": {
+            "no_private": true,
+            "no_bittorrent": true,
+            "no_mail": true,
+            "no_udp_amplification": true,
+            "tcp_and_quic_only": false
+        }
+    }))
+    .unwrap();
+    cross_app_ingress.note = Some("try moving the ingress between apps".to_owned());
+    let cross_app_move = db
+        .store
+        .upsert_ingress(&system_admin(), "app-other", cross_app_ingress)
+        .await
+        .unwrap_err();
+    assert!(matches!(cross_app_move, StoreError::Unsupported(_)));
+
+    let revision_after: (i64, i64) = sqlx::query_as(
+        "SELECT current_revision, (SELECT count(*) FROM revisions)
+           FROM control_state
+          WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        revision_after, revision_before,
+        "rejected ownership changes must leave no audit revision behind"
+    );
+    let chain_after: (String, String, String, i32) = sqlx::query_as(
+        "SELECT app_id, tenant_id, name, position
+           FROM chains
+          WHERE id = 'chn-a1b2-c3d4'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(chain_after, chain_before);
+    let front_after: (String, String, String, String) = sqlx::query_as(
+        "SELECT app_id, tenant_id, name, strategy
+           FROM fronts
+          WHERE id = 'front-owned'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(front_after, front_before);
+    let ingress_after: (String, String, String, i32, String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT app_id, chain_id, node_id, port, reality_private_key, reality_public_key,
+                    front_id
+               FROM ingresses
+              WHERE id = 'ing-a1b2'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        ingress_after, ingress_before,
+        "a rejected takeover must not rotate ingress identity or alter its Front attachment"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn front_save_updates_subscriptions_without_creating_a_deployment() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_front_target_fixture(db.pool()).await;
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: UpsertExternalOutboundRequest {
+                    id: "custom-3333-3333".to_owned(),
+                    tenant_id: "platform.acme".to_owned(),
+                    name: "测试供应商".to_owned(),
+                    address: "vendor.example".to_owned(),
+                    port: 443,
+                    protocol: ExternalOutboundProtocol::Vless {
+                        credential: "00000000-0000-4000-8000-000000000001".to_owned(),
+                        encryption: "none".to_owned(),
+                        flow: None,
+                        transport: ExternalVlessTransport::Raw,
+                    },
+                    security: ExternalOutboundSecurity::Tls {
+                        server_name: "vendor.example".to_owned(),
+                        fingerprint: "chrome".to_owned(),
+                    },
+                    note: Some("external Front probe fixture".to_owned()),
+                },
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.other', 'Other tenant')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO fronts (id, app_id, tenant_id, name, strategy)
+         VALUES ('front-other', 'app-main', 'platform.other', 'Other Front', 'select')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let initial_revision = seed_subscription_serving(&db).await;
+    let jobs_before_front = job_count(db.pool()).await;
+
+    let uuid = "2d2304da-f114-4574-8d44-625afdb1db5c";
+    let before = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(
+        !before.content.contains("dialer-proxy"),
+        "{}",
+        before.content
+    );
+
+    let request = CreateFrontRequest {
+        expected_revision: initial_revision,
+        id: "front-a1b2".to_owned(),
+        tenant_id: "platform.acme".to_owned(),
+        name: "入口组".to_owned(),
+        strategy: FrontStrategy::UrlTest,
+        via: vec!["ing-a1b2".to_owned()],
+        external_via: vec!["custom-3333-3333".to_owned()],
+        targets: vec!["ing-b2c3".to_owned()],
+        note: Some("configure client chained proxy".to_owned()),
+    };
+    let analysis = db
+        .store
+        .front_route_analysis(&system_admin(), "app-main", request.clone())
+        .await
+        .unwrap();
+    assert!(!analysis.analysis.blocking);
+    assert_eq!(analysis.analysis.cells.len(), 2);
+    let internal_cell = analysis
+        .analysis
+        .cells
+        .iter()
+        .find(|cell| cell.member_id == "ing-a1b2")
+        .unwrap();
+    assert_eq!(
+        internal_cell.combined.status,
+        brocade_core::ir::front::FrontRouteStatus::Reachable
+    );
+    let denied = db
+        .store
+        .upsert_front(&tenant_admin("platform.other"), "app-main", request.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, StoreError::Forbidden(_)));
+    let denied_analysis = db
+        .store
+        .front_route_analysis(&tenant_admin("platform.other"), "app-main", request.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(denied_analysis, StoreError::Forbidden(_)));
+    assert_eq!(
+        db.store.materialize_snapshot(None).await.unwrap().revision,
+        initial_revision,
+        "a rejected cross-tenant Front write must leave no audit revision behind"
+    );
+    let takeover = db
+        .store
+        .upsert_front(
+            &tenant_admin("platform.acme"),
+            "app-main",
+            CreateFrontRequest {
+                id: "front-other".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                name: "take over hidden Front".to_owned(),
+                via: Vec::new(),
+                external_via: Vec::new(),
+                targets: Vec::new(),
+                strategy: FrontStrategy::Select,
+                expected_revision: initial_revision,
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(takeover, StoreError::Forbidden(_)));
+    let untouched_tenant: String =
+        sqlx::query_scalar("SELECT tenant_id FROM fronts WHERE id = 'front-other'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(untouched_tenant, "platform.other");
+    let name_collision = db
+        .store
+        .upsert_front(
+            &system_admin(),
+            "app-main",
+            CreateFrontRequest {
+                name: "Main Chain".to_owned(),
+                ..request.clone()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&name_collision, StoreError::InvalidData(message) if message.contains("subscription.name-collision")),
+        "最终订阅名称冲突必须在事务提交前被拒绝：{name_collision}"
+    );
+    assert_eq!(
+        db.store.materialize_snapshot(None).await.unwrap().revision,
+        initial_revision,
+        "名称冲突不能留下模型修订"
+    );
+    let saved = db
+        .store
+        .upsert_front(&system_admin(), "app-main", request.clone())
+        .await
+        .unwrap();
+
+    assert!(saved.revision_id > initial_revision);
+    assert_eq!(saved.targets, vec!["ing-b2c3"]);
+    assert_eq!(saved.client_config.pending_topology, Vec::<String>::new());
+    assert!(matches!(
+        saved.client_config.status,
+        brocade_store::ClientConfigCommitStatus::Activated
+    ));
+    let state = db
+        .store
+        .front_client_config_state(&system_admin(), "app-main", "front-a1b2")
+        .await
+        .unwrap();
+    assert_eq!(state.head_snapshot_id, saved.client_config.snapshot_id);
+    assert_eq!(state.serving_snapshot_id, Some(state.head_snapshot_id));
+    assert_eq!(
+        state.serving_generation,
+        saved.client_config.serving_generation
+    );
+    assert!(state.active);
+    assert!(state.pending_topology.is_empty());
+    let probe_plan = db
+        .store
+        .front_combination_probe_plan(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            "app-main",
+            "front-a1b2",
+            "ing-a1b2",
+            "ing-b2c3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        probe_plan.serving_generation,
+        state.serving_generation.unwrap()
+    );
+    assert_eq!(probe_plan.client_snapshot_id, state.head_snapshot_id);
+    assert!(!probe_plan.items.is_empty());
+    assert!(probe_plan.items.iter().all(|item| {
+        item.front_id == "front-a1b2"
+            && item.member_id == "ing-a1b2"
+            && item.target_id == "ing-b2c3"
+            && matches!(
+                &item.member,
+                brocade_store::FrontCombinationProbeMember::Internal(member)
+                    if member.ingress_id == "ing-a1b2"
+            )
+            && item.target.ingress_id == "ing-b2c3"
+    }));
+    let external_probe_plan = db
+        .store
+        .front_combination_probe_plan(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            "app-main",
+            "front-a1b2",
+            "custom-3333-3333",
+            "ing-b2c3",
+        )
+        .await
+        .unwrap();
+    assert!(!external_probe_plan.items.is_empty());
+    assert!(external_probe_plan.items.iter().all(|item| {
+        item.member_id == "custom-3333-3333"
+            && item.member_family == "tunnel"
+            && item.member_protocol == "vless"
+            && matches!(
+                &item.member,
+                brocade_store::FrontCombinationProbeMember::External(member)
+                    if member.id == "custom-3333-3333"
+                        && member.protocol.credential()
+                            == "00000000-0000-4000-8000-000000000001"
+            )
+            && item.target.ingress_id == "ing-b2c3"
+    }));
+    let stale_cell = db
+        .store
+        .front_combination_probe_plan(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            "app-main",
+            "front-a1b2",
+            "ing-b2c3",
+            "ing-a1b2",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_cell, StoreError::Conflict(_)));
+    let denied_state = db
+        .store
+        .front_client_config_state(&tenant_admin("platform.other"), "app-main", "front-a1b2")
+        .await
+        .unwrap_err();
+    assert!(matches!(denied_state, StoreError::Forbidden(_)));
+
+    let unchanged = db
+        .store
+        .upsert_front(
+            &system_admin(),
+            "app-main",
+            CreateFrontRequest {
+                expected_revision: saved.revision_id,
+                ..request.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged.revision_id, saved.revision_id);
+    assert_eq!(
+        unchanged.client_config.serving_generation, saved.client_config.serving_generation,
+        "无变化保存不能谎报 generation 推进"
+    );
+    assert!(matches!(
+        unchanged.client_config.status,
+        brocade_store::ClientConfigCommitStatus::Unchanged
+    ));
+    assert_eq!(deployment_count(db.pool()).await, 0);
+    assert_eq!(
+        job_count(db.pool()).await,
+        jobs_before_front,
+        "Front save must not queue an Agent release"
+    );
+    let target_front: Option<String> =
+        sqlx::query_scalar("SELECT front_id FROM ingresses WHERE id = 'ing-b2c3'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(target_front.as_deref(), Some("front-a1b2"));
+
+    let after_save = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert_eq!(
+        after_save.revision, initial_revision,
+        "client-only saves must not move the serving machine topology"
+    );
+    assert!(after_save.content.contains("name: \"入口组\""));
+    assert!(after_save.content.contains("type: url-test"));
+    assert!(after_save
+        .content
+        .contains("proxies: [\"Main Chain\", \"测试供应商\"]"));
+    assert!(after_save.content.contains("dialer-proxy: \"入口组\""));
+
+    let denied_delete = db
+        .store
+        .delete_front(
+            &tenant_admin("platform.other"),
+            "app-main",
+            "front-a1b2",
+            DeleteFrontRequest {
+                expected_revision: saved.revision_id,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(denied_delete, StoreError::Forbidden(_)));
+
+    let stale_analysis = db
+        .store
+        .front_route_analysis(&system_admin(), "app-main", request.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_analysis, StoreError::Conflict(_)));
+    let stale = db
+        .store
+        .upsert_front(&system_admin(), "app-main", request)
+        .await
+        .unwrap_err();
+    assert!(matches!(stale, StoreError::Conflict(_)));
+
+    // A machine draft may have been assembled before the Front save. Replaying its complete
+    // ingress document must not rewind the client-owned target attachment.
+    let machine_draft = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertIngress {
+                app_id: "app-main".to_owned(),
+                ingress: CreateIngressRequest {
+                    id: "ing-b2c3".to_owned(),
+                    chain_id: "chn-b2c3-d4e5".to_owned(),
+                    node_id: "n1".to_owned(),
+                    bind: "0.0.0.0".parse().unwrap(),
+                    port: 9443,
+                    reality: CreateRealityIngressRequest {
+                        fallback_mode: RealityFallbackMode::CustomSite,
+                        fallback_limits: RealityFallbackLimits::Off,
+                        fallback_guard: true,
+                        dest: Some("target.example.com:443".to_owned()),
+                        server_names: vec!["target.example.com".to_owned()],
+                        fingerprint: Some("chrome".to_owned()),
+                        flow: Some("xtls-rprx-vision".to_owned()),
+                    },
+                    wires: WiresRequest::default(),
+                    projection: Projection::default(),
+                    guard: brocade_core::model::IngressGuard::OPEN,
+                    note: None,
+                },
+            }],
+            Some("edit target machine ingress".to_owned()),
+        )
+        .await
+        .unwrap();
+    let target_front: Option<String> =
+        sqlx::query_scalar("SELECT front_id FROM ingresses WHERE id = 'ing-b2c3'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(target_front.as_deref(), Some("front-a1b2"));
+    assert!(db
+        .store
+        .clash_subscription_by_uuid(uuid)
+        .await
+        .unwrap()
+        .content
+        .contains("dialer-proxy: \"入口组\""));
+
+    let jobs_before_delete = job_count(db.pool()).await;
+    let deleted = db
+        .store
+        .delete_front(
+            &system_admin(),
+            "app-main",
+            "front-a1b2",
+            DeleteFrontRequest {
+                expected_revision: machine_draft.revision_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(deleted.removed);
+    assert!(matches!(
+        deleted.client_config.status,
+        brocade_store::ClientConfigCommitStatus::Activated
+    ));
+    assert_eq!(deployment_count(db.pool()).await, 0);
+    assert_eq!(
+        job_count(db.pool()).await,
+        jobs_before_delete,
+        "Front deletion must not queue an Agent release"
+    );
+    let target_front: Option<String> =
+        sqlx::query_scalar("SELECT front_id FROM ingresses WHERE id = 'ing-b2c3'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(target_front, None);
+    let after_delete = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(!after_delete.content.contains("name: \"入口组\""));
+    assert!(!after_delete.content.contains("dialer-proxy"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn front_analysis_and_save_reject_a_statically_blocked_landing_route() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_front_target_fixture(db.pool()).await;
+    sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = 'chn-b2c3-d4e5'")
+        .bind(json!([{
+            "m": { "t": "any" },
+            "a": { "t": "block" }
+        }]))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let initial_revision = seed_subscription_serving(&db).await;
+    let request = CreateFrontRequest {
+        expected_revision: initial_revision,
+        id: "front-a1b2".to_owned(),
+        tenant_id: "platform.acme".to_owned(),
+        name: "Blocked Front".to_owned(),
+        strategy: FrontStrategy::Select,
+        via: vec!["ing-a1b2".to_owned()],
+        external_via: Vec::new(),
+        targets: vec!["ing-b2c3".to_owned()],
+        note: None,
+    };
+
+    let analysis = db
+        .store
+        .front_route_analysis(&system_admin(), "app-main", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(analysis.topology_revision_id, Some(initial_revision));
+    assert_eq!(analysis.permissions_revision_id, Some(initial_revision));
+    assert_eq!(analysis.serving_generation, Some(1));
+    assert!(analysis.pending_topology.is_empty());
+    assert!(analysis.analysis.blocking);
+    assert_eq!(analysis.analysis.cells.len(), 1);
+    assert_eq!(
+        analysis.analysis.cells[0].relay.status,
+        brocade_core::ir::front::FrontRouteStatus::Reachable
+    );
+    assert_eq!(
+        analysis.analysis.cells[0].landing.status,
+        brocade_core::ir::front::FrontRouteStatus::Blocked
+    );
+    assert_eq!(
+        analysis.analysis.cells[0].landing.chain_id.as_deref(),
+        Some("chn-b2c3-d4e5")
+    );
+    assert_eq!(
+        analysis.analysis.cells[0].landing.node_id.as_deref(),
+        Some("n1")
+    );
+    assert_eq!(analysis.analysis.cells[0].landing.rule_index, Some(1));
+    assert_eq!(
+        analysis.analysis.cells[0].landing.selector.as_deref(),
+        Some("any")
+    );
+    assert_eq!(
+        analysis.analysis.cells[0].landing.action.as_deref(),
+        Some("block")
+    );
+    assert_eq!(
+        analysis.analysis.cells[0].combined.status,
+        brocade_core::ir::front::FrontRouteStatus::Blocked
+    );
+
+    let before: (i64, i64, i64) = sqlx::query_as(
+        "SELECT control.current_revision, client.head_snapshot_id, serving.generation
+           FROM control_state control
+           JOIN subscription_client_state client ON client.id = TRUE
+           JOIN subscription_serving_state serving ON serving.id = TRUE
+          WHERE control.id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let rejected = db
+        .store
+        .upsert_front(&system_admin(), "app-main", request)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&rejected, StoreError::InvalidData(message) if message.contains("front.target-no-egress")),
+        "the write must be rejected by the same authoritative route diagnostic: {rejected}"
+    );
+    let after: (i64, i64, i64) = sqlx::query_as(
+        "SELECT control.current_revision, client.head_snapshot_id, serving.generation
+           FROM control_state control
+           JOIN subscription_client_state client ON client.id = TRUE
+           JOIN subscription_serving_state serving ON serving.id = TRUE
+          WHERE control.id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "a blocked Front must not advance any checkpoint"
+    );
+    let fronts: i64 = sqlx::query_scalar("SELECT count(*) FROM fronts WHERE id = 'front-a1b2'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fronts, 0,
+        "the rejected Front write must roll back completely"
+    );
 }
 
 #[tokio::test]
@@ -2920,7 +4092,11 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     let versions = NodeVersions {
         agent: "0.1.0".to_owned(),
         xray: Some("Xray 26.3.27 (Xray, Penetrates Everything.)".to_owned()),
+        xray_installed_sha256: Some("a".repeat(64)),
+        xray_running_sha256: Some("a".repeat(64)),
         phantun: Some("phantun 0.7.0".to_owned()),
+        openvpn: Some("OpenVPN 2.6.12 x86_64-pc-linux-gnu".to_owned()),
+        vpngate_catalog_probe_workers: Some(16),
         wg_tools: Some("wireguard-tools v1.0.20210914".to_owned()),
         wg_backend: Some("kernel".to_owned()),
     };
@@ -2963,6 +4139,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 geodata: Some(geodata.clone()),
                 local_reconcile: Some(reconcile.clone()),
                 wireguard_health: Some(wireguard_health.clone()),
+                traffic: None,
                 spool: SpoolBacklog {
                     observation: 3,
                     usage: 41,
@@ -3038,6 +4215,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 geodata: None,
                 local_reconcile: None,
                 wireguard_health: None,
+                traffic: None,
                 spool: SpoolBacklog {
                     observation: 0,
                     usage: 0,
@@ -3086,6 +4264,618 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO admin_operators (id, display_name, role, password_hash)
+         VALUES ('test-system', 'Test System', 'system-admin', 'test-only')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO nodes (
+            id, tenant_id, name, public_ipv4, overlay_addr,
+            wg_private_key, wg_public_key, wg_listen_port,
+            api_port, overlay, egress_allowed, dns_kind, dns_servers
+         ) VALUES (
+            'n2', 'platform.acme', 'Node 2', 'n2.example.net', '10.66.0.2',
+            'wg-private-2', 'wg-public-2', 51821,
+            10086, TRUE, TRUE, 'servers', '[\"1.1.1.1\"]'::jsonb
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let old_n1 = "1".repeat(64);
+    let old_n2 = "2".repeat(64);
+    for (node_id, digest) in [("n1", &old_n1), ("n2", &old_n2)] {
+        sqlx::query(
+            "INSERT INTO node_agent_state (
+                 node_id, runtime_versions, runtime_reported_at, last_poll_at
+             ) VALUES ($1, $2, now(), now())",
+        )
+        .bind(node_id)
+        .bind(json!({
+            "agent": "supporting-agent",
+            "xray": "Xray 26.4.25",
+            "xray_installed_sha256": digest,
+            "xray_running_sha256": digest,
+            "phantun": null,
+            "wg_tools": null,
+            "wg_backend": null
+        }))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    let build_id = "a".repeat(64);
+    let desired = "b".repeat(64);
+    let artifacts = vec![XrayReleaseArtifact {
+        arch: "x86_64".to_owned(),
+        sha256: desired.clone(),
+    }];
+    let request = CreateXrayReleaseRequest {
+        idempotency_key: "xray-release-test-1".to_owned(),
+        release_id: build_id.clone(),
+        nodes: vec!["n1".to_owned(), "n2".to_owned()],
+        canary_node: "n2".to_owned(),
+        batch_size: 10,
+        note: Some("canary the embedded Xray".to_owned()),
+    };
+    let build = XrayBuildInfo {
+        release_id: &build_id,
+        version: "26.9.1",
+        artifacts: &artifacts,
+    };
+
+    let denied = db
+        .store
+        .create_xray_release(&publisher("platform.acme"), request.clone(), build)
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, StoreError::Forbidden(_)));
+
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET last_poll_at = now() - interval '2 minutes'
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut stale_request = request.clone();
+    stale_request.idempotency_key = "xray-release-stale-node".to_owned();
+    let stale_node = db
+        .store
+        .create_xray_release(&system_admin(), stale_request, build)
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_node, StoreError::InvalidData(_)));
+    sqlx::query("UPDATE node_agent_state SET last_poll_at = now() WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_versions = runtime_versions - 'xray_running_sha256'
+          WHERE node_id = 'n2'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut stopped_canary_request = request.clone();
+    stopped_canary_request.idempotency_key = "xray-release-stopped-canary".to_owned();
+    let stopped_canary = db
+        .store
+        .create_xray_release(&system_admin(), stopped_canary_request, build)
+        .await
+        .unwrap_err();
+    assert!(matches!(stopped_canary, StoreError::InvalidData(_)));
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_versions = jsonb_set(
+                runtime_versions, '{xray_running_sha256}', to_jsonb($2::text)
+            )
+          WHERE node_id = $1",
+    )
+    .bind("n2")
+    .bind(&old_n2)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let created = db
+        .store
+        .create_xray_release(&system_admin(), request.clone(), build)
+        .await
+        .unwrap();
+    assert_eq!(created.targets[0].node_id, "n2");
+    assert_eq!(created.targets[0].wave, 1);
+    assert_eq!(created.targets[1].node_id, "n1");
+    assert_eq!(created.targets[1].wave, 2);
+
+    let reused = db
+        .store
+        .create_xray_release(&system_admin(), request.clone(), build)
+        .await
+        .unwrap();
+    assert_eq!(
+        reused.id, created.id,
+        "a lost create response is safe to retry"
+    );
+    let mut mismatched_retry = request.clone();
+    mismatched_retry.note = Some("same key, different intent".to_owned());
+    let mismatch = db
+        .store
+        .create_xray_release(&system_admin(), mismatched_retry, build)
+        .await
+        .unwrap_err();
+    assert!(matches!(mismatch, StoreError::Conflict(_)));
+    let mut competing = request;
+    competing.idempotency_key = "xray-release-test-2".to_owned();
+    let conflict = db
+        .store
+        .create_xray_release(&system_admin(), competing, build)
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, StoreError::Conflict(_)));
+    assert!(db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let canary = db
+        .store
+        .claim_xray_release("n2", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(canary.previous_sha256, old_n2);
+    assert_eq!(canary.sha256, desired);
+    assert!(db
+        .store
+        .report_xray_release(
+            "n2",
+            &XrayReleaseReport {
+                release_id: created.id,
+                attempt: 1,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: true,
+                xray_enabled: true,
+                installed_sha256: Some(desired.clone()),
+                running_sha256: Some(desired.clone()),
+                error: None,
+            },
+        )
+        .await
+        .unwrap());
+
+    let expanded = db
+        .store
+        .confirm_xray_release(&system_admin(), created.id, &build_id)
+        .await
+        .unwrap();
+    assert_eq!(expanded.confirmed_wave, 2);
+    let second = db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.previous_sha256, old_n1);
+    let false_recovery = db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: created.id,
+                attempt: 1,
+                outcome: XrayReleaseOutcome::FailedRecovered,
+                performed_update: false,
+                xray_enabled: true,
+                installed_sha256: Some(desired.clone()),
+                running_sha256: Some(old_n1.clone()),
+                error: Some("old process remains but the managed path was not restored".to_owned()),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(false_recovery, StoreError::InvalidData(_)));
+    let still_running_new_bytes = db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: created.id,
+                attempt: 1,
+                outcome: XrayReleaseOutcome::FailedRecovered,
+                performed_update: false,
+                xray_enabled: true,
+                installed_sha256: Some(old_n1.clone()),
+                running_sha256: Some(desired.clone()),
+                error: Some("managed path was restored but the new process remains".to_owned()),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        still_running_new_bytes,
+        StoreError::InvalidData(_)
+    ));
+    assert!(db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: created.id,
+                attempt: 1,
+                outcome: XrayReleaseOutcome::FailedRecovered,
+                performed_update: false,
+                xray_enabled: true,
+                installed_sha256: Some(old_n1.clone()),
+                running_sha256: Some(old_n1.clone()),
+                error: Some("new process failed health check; old process restored".to_owned()),
+            },
+        )
+        .await
+        .unwrap());
+    let halted = db
+        .store
+        .list_xray_releases(1)
+        .await
+        .unwrap()
+        .releases
+        .remove(0);
+    assert_eq!(halted.status, XrayReleaseStatus::Halted);
+    assert_eq!(
+        halted.targets[1].status,
+        XrayReleaseTargetStatus::FailedRecovered
+    );
+    assert!(db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let retried = db
+        .store
+        .retry_xray_release_target(&system_admin(), created.id, "n1", &build_id)
+        .await
+        .unwrap();
+    assert_eq!(retried.status, XrayReleaseStatus::Running);
+    assert_eq!(retried.targets[1].attempt, 2);
+    let retry_offer = db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry_offer.attempt, 2);
+
+    let stale = db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: created.id,
+                attempt: 1,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: true,
+                xray_enabled: true,
+                installed_sha256: Some(desired.clone()),
+                running_sha256: Some(desired.clone()),
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !stale,
+        "a delayed result from attempt 1 must not settle attempt 2"
+    );
+    assert!(db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: created.id,
+                attempt: 2,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: true,
+                xray_enabled: true,
+                installed_sha256: Some(desired.clone()),
+                running_sha256: Some(desired.clone()),
+                error: None,
+            },
+        )
+        .await
+        .unwrap());
+    let finished = db
+        .store
+        .list_xray_releases(1)
+        .await
+        .unwrap()
+        .releases
+        .remove(0);
+    assert_eq!(finished.status, XrayReleaseStatus::Succeeded);
+    assert!(!finished.active);
+    assert!(finished
+        .events
+        .iter()
+        .any(|event| event.kind == "wave-confirmed"));
+    assert!(finished
+        .events
+        .iter()
+        .any(|event| event.kind == "target-retried"));
+    assert!(finished
+        .events
+        .iter()
+        .any(|event| event.kind == "succeeded"));
+
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_versions = jsonb_set(
+                    jsonb_set(runtime_versions, '{xray_installed_sha256}', to_jsonb($2::text)),
+                    '{xray_running_sha256}', to_jsonb($2::text)
+                ),
+                runtime_reported_at = now(), last_poll_at = now()
+          WHERE node_id = $1",
+    )
+    .bind("n2")
+    .bind(&desired)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let already_current = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "xray-release-test-noop-canary".to_owned(),
+                release_id: build_id.clone(),
+                nodes: vec!["n2".to_owned()],
+                canary_node: "n2".to_owned(),
+                batch_size: 10,
+                note: None,
+            },
+            build,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(already_current, StoreError::InvalidData(_)));
+
+    let canceled = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "xray-release-test-cancel-race".to_owned(),
+                release_id: build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                canary_node: "n1".to_owned(),
+                batch_size: 10,
+                note: None,
+            },
+            build,
+        )
+        .await
+        .unwrap();
+    db.store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .cancel_xray_release(&system_admin(), canceled.id)
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: canceled.id,
+                attempt: 1,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: true,
+                xray_enabled: true,
+                installed_sha256: Some("b".repeat(64)),
+                running_sha256: Some("b".repeat(64)),
+                error: None,
+            },
+        )
+        .await
+        .unwrap());
+    let canceled = db
+        .store
+        .list_xray_releases(1)
+        .await
+        .unwrap()
+        .releases
+        .remove(0);
+    assert_eq!(canceled.status, XrayReleaseStatus::Canceled);
+    assert_eq!(
+        canceled.targets[0].status,
+        XrayReleaseTargetStatus::Succeeded
+    );
+    assert!(canceled
+        .events
+        .iter()
+        .any(|event| event.kind == "target-reported-after-cancel"));
+
+    let unverified = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "xray-release-test-real-canary".to_owned(),
+                release_id: build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                canary_node: "n1".to_owned(),
+                batch_size: 10,
+                note: None,
+            },
+            build,
+        )
+        .await
+        .unwrap();
+    db.store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let early_retry = db
+        .store
+        .retry_xray_release_target(&system_admin(), unverified.id, "n1", &build_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(early_retry, StoreError::Conflict(_)));
+    sqlx::query(
+        "UPDATE xray_release_targets
+            SET dispatched_at = now() - interval '31 minutes'
+          WHERE release_id = $1 AND node_id = 'n1'",
+    )
+    .bind(unverified.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let lease_retried = db
+        .store
+        .retry_xray_release_target(&system_admin(), unverified.id, "n1", &build_id)
+        .await
+        .unwrap();
+    assert_eq!(lease_retried.targets[0].attempt, 2);
+    assert!(db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: unverified.id,
+                attempt: 2,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: false,
+                xray_enabled: true,
+                installed_sha256: Some("b".repeat(64)),
+                running_sha256: Some("b".repeat(64)),
+                error: None,
+            },
+        )
+        .await
+        .unwrap());
+    let no_op = db.store.xray_release(unverified.id).await.unwrap();
+    assert_eq!(no_op.status, XrayReleaseStatus::Halted);
+    assert_eq!(no_op.targets[0].status, XrayReleaseTargetStatus::Unverified);
+    assert_eq!(no_op.targets[0].reported_performed_update, Some(false));
+    assert!(no_op.targets[0].retryable);
+
+    let retry = db
+        .store
+        .retry_xray_release_target(&system_admin(), unverified.id, "n1", &build_id)
+        .await
+        .unwrap();
+    assert_eq!(retry.targets[0].attempt, 3);
+    db.store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: unverified.id,
+                attempt: 3,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: true,
+                xray_enabled: false,
+                installed_sha256: Some("b".repeat(64)),
+                running_sha256: None,
+                error: None,
+            },
+        )
+        .await
+        .unwrap());
+    let unverified = db.store.xray_release(unverified.id).await.unwrap();
+    assert_eq!(unverified.status, XrayReleaseStatus::Halted);
+    assert_eq!(
+        unverified.targets[0].status,
+        XrayReleaseTargetStatus::Unverified
+    );
+    assert_eq!(unverified.targets[0].reported_performed_update, Some(true));
+    assert_eq!(unverified.targets[0].reported_xray_enabled, Some(false));
+    assert!(unverified.targets[0].retryable);
+    db.store
+        .cancel_xray_release(&system_admin(), unverified.id)
+        .await
+        .unwrap();
+
+    let unsupported = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "xray-release-test-corrected-arch".to_owned(),
+                release_id: build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                canary_node: "n1".to_owned(),
+                batch_size: 10,
+                note: None,
+            },
+            build,
+        )
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .claim_xray_release("n1", "wrong_arch", &build_id)
+        .await
+        .unwrap()
+        .is_none());
+    db.store
+        .retry_xray_release_target(&system_admin(), unsupported.id, "n1", &build_id)
+        .await
+        .unwrap();
+    let corrected = db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(corrected.attempt, 2);
+    assert_eq!(corrected.sha256, "b".repeat(64));
+
+    let newest = db.store.list_xray_release_summaries(2, None).await.unwrap();
+    assert_eq!(newest.len(), 2);
+    let cursor = newest.last().unwrap().id;
+    let older = db
+        .store
+        .list_xray_release_summaries(2, Some(cursor))
+        .await
+        .unwrap();
+    assert!(!older.is_empty());
+    assert!(older.iter().all(|release| release.id < cursor));
+}
+
 /// Delivery is asynchronous, so an earlier snapshot may finish its POST after a newer one. The
 /// server must acknowledge that retry without moving the current runtime state backwards.
 #[tokio::test]
@@ -3107,13 +4897,18 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
         versions: NodeVersions {
             agent: agent.to_owned(),
             xray: None,
+            xray_installed_sha256: None,
+            xray_running_sha256: None,
             phantun: None,
+            openvpn: None,
+            vpngate_catalog_probe_workers: None,
             wg_tools: None,
             wg_backend: None,
         },
         geodata: None,
         local_reconcile: None,
         wireguard_health: None,
+        traffic: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
@@ -3156,13 +4951,18 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         versions: NodeVersions {
             agent: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             xray: None,
+            xray_installed_sha256: None,
+            xray_running_sha256: None,
             phantun: None,
+            openvpn: None,
+            vpngate_catalog_probe_workers: None,
             wg_tools: None,
             wg_backend: None,
         },
         geodata: None,
         local_reconcile: None,
         wireguard_health: None,
+        traffic: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
@@ -4244,6 +6044,26 @@ async fn redeem_node_enrollment_issues_node_token_and_rejects_reuse() {
         .await
         .unwrap()
         .is_some());
+    let waiting: String =
+        sqlx::query_scalar("SELECT status FROM node_presence_state WHERE node_id = 'n-enroll'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(waiting, "waiting");
+    db.store
+        .record_node_poll("n-enroll", Some(AGENT_BUILD))
+        .await
+        .unwrap();
+    let first_online: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM machine_events
+          WHERE node_id = 'n-enroll'
+            AND event_kind = 'node_online'
+            AND previous_value = 'waiting'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(first_online, 1);
 
     let reused = db
         .store
@@ -4479,6 +6299,79 @@ async fn admin_operator_token_issue_authenticate_and_revoke() {
     assert!(db
         .store
         .authenticate_admin_token(&issued.token)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn active_admin_session_slides_its_idle_expiry_without_reviving_expired_sessions() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let login = db
+        .store
+        .init_admin(AdminInitRequest {
+            operator_id: "admin".to_owned(),
+            display_name: "Administrator".to_owned(),
+            password: "admin-password".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE admin_sessions
+         SET last_used_at = now() - interval '2 minutes',
+             expires_at = now() + interval '1 hour'
+         WHERE operator_id = 'admin'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let authentication = db
+        .store
+        .authenticate_admin_session_with_refresh(&login.session.token)
+        .await
+        .unwrap()
+        .expect("live session should authenticate");
+    assert!(authentication.refreshed);
+    assert_eq!(authentication.admin.operator_id, "admin");
+    let extended: bool = sqlx::query_scalar(
+        "SELECT expires_at > now() + interval '11 hours 59 minutes'
+         FROM admin_sessions
+         WHERE operator_id = 'admin'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(extended, "activity should restore the full idle window");
+
+    let throttled = db
+        .store
+        .authenticate_admin_session_with_refresh(&login.session.token)
+        .await
+        .unwrap()
+        .expect("recently refreshed session should remain valid");
+    assert!(
+        !throttled.refreshed,
+        "refresh writes should remain rate-limited"
+    );
+
+    sqlx::query(
+        "UPDATE admin_sessions
+         SET last_used_at = now() - interval '2 minutes',
+             expires_at = now() - interval '1 second'
+         WHERE operator_id = 'admin'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(db
+        .store
+        .authenticate_admin_session_with_refresh(&login.session.token)
         .await
         .unwrap()
         .is_none());
@@ -5905,12 +7798,20 @@ async fn tenant_scoped_deployment_filters_targets_and_visibility() {
     .collect();
     assert_eq!(target_nodes, vec!["n1".to_owned()]);
 
-    let acme_list = db.store.list_deployments(&acme, 10, None).await.unwrap();
+    let acme_list = db
+        .store
+        .list_deployments(&acme, 10, None, false)
+        .await
+        .unwrap();
     assert_eq!(acme_list.deployments.len(), 1);
     assert_eq!(acme_list.deployments[0].total_targets, 1);
     assert_eq!(acme_list.deployments[0].changed_targets, 1);
 
-    let other_list = db.store.list_deployments(&other, 10, None).await.unwrap();
+    let other_list = db
+        .store
+        .list_deployments(&other, 10, None, false)
+        .await
+        .unwrap();
     assert!(other_list.deployments.is_empty());
 
     let acme_detail = db
@@ -6217,6 +8118,13 @@ async fn retired_node_removal_is_atomic_and_cleans_chains_and_operational_state(
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     insert_other_tenant_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO admin_operators (id, display_name, role, password_hash)
+         VALUES ('test-system', 'Test System', 'system-admin', 'test-only')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
 
     let forbidden = db
         .store
@@ -6243,6 +8151,50 @@ async fn retired_node_removal_is_atomic_and_cleans_chains_and_operational_state(
     assert!(matches!(active, StoreError::Conflict(_)));
 
     db.store.issue_node_token("n1").await.unwrap();
+    let old_xray = "1".repeat(64);
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_versions = $2, runtime_reported_at = now(), last_poll_at = now()
+          WHERE node_id = $1",
+    )
+    .bind("n1")
+    .bind(json!({
+        "agent": "supporting-agent",
+        "xray": "Xray 26.4.25",
+        "xray_installed_sha256": old_xray,
+        "xray_running_sha256": old_xray,
+        "phantun": null,
+        "wg_tools": null,
+        "wg_backend": null
+    }))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let xray_build_id = "a".repeat(64);
+    let xray_artifacts = vec![XrayReleaseArtifact {
+        arch: "x86_64".to_owned(),
+        sha256: "b".repeat(64),
+    }];
+    let xray_release = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "xray-lifecycle-removal".to_owned(),
+                release_id: xray_build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                canary_node: "n1".to_owned(),
+                batch_size: 10,
+                note: None,
+            },
+            XrayBuildInfo {
+                release_id: &xray_build_id,
+                version: "26.9.1",
+                artifacts: &xray_artifacts,
+            },
+        )
+        .await
+        .unwrap();
     let retiring = db
         .store
         .update_node_status(
@@ -6258,6 +8210,12 @@ async fn retired_node_removal_is_atomic_and_cleans_chains_and_operational_state(
         retiring.lifecycle.phase,
         brocade_store::NodeLifecyclePhase::Retiring
     );
+    let canceled_xray = db.store.xray_release(xray_release.id).await.unwrap();
+    assert_eq!(canceled_xray.status, XrayReleaseStatus::Canceled);
+    assert!(canceled_xray
+        .events
+        .iter()
+        .any(|event| event.kind == "canceled-for-node-lifecycle"));
     let teardown = db
         .store
         .claim_desired_for_node("n1")
@@ -6344,6 +8302,12 @@ async fn retired_node_removal_is_atomic_and_cleans_chains_and_operational_state(
         .unwrap();
     assert_eq!(result.removed_nodes, vec!["n1"]);
     assert_eq!(result.removed_chains, vec!["chn-a1b2-c3d4"]);
+    let preserved_xray = db.store.xray_release(xray_release.id).await.unwrap();
+    assert_eq!(preserved_xray.targets[0].node_id, "n1");
+    assert!(preserved_xray
+        .events
+        .iter()
+        .any(|event| event.node_id.as_deref() == Some("n1")));
 
     let snapshot = db
         .store
@@ -7653,7 +9617,6 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
                 node_id: "n1".to_owned(),
                 bind: "0.0.0.0".parse().unwrap(),
                 port: 443,
-                front_id: None,
                 guard: brocade_core::model::IngressGuard::OPEN,
                 reality: CreateRealityIngressRequest {
                     fallback_mode: RealityFallbackMode::CustomSite,
@@ -8599,6 +10562,19 @@ async fn list_deployments_returns_recent_status_and_target_counts() {
         )
         .await
         .unwrap();
+    let active_runtime = db
+        .store
+        .list_deployments(&system_admin(), 4, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        active_runtime
+            .deployments
+            .iter()
+            .map(|deployment| deployment.id)
+            .collect::<Vec<_>>(),
+        vec![created.deployment_id]
+    );
     let desired = db
         .store
         .claim_desired_for_node("n1")
@@ -8612,7 +10588,7 @@ async fn list_deployments_returns_recent_status_and_target_counts() {
 
     let list = db
         .store
-        .list_deployments(&system_admin(), 10, None)
+        .list_deployments(&system_admin(), 10, None, false)
         .await
         .unwrap();
     let item = list
@@ -8627,6 +10603,16 @@ async fn list_deployments_returns_recent_status_and_target_counts() {
     assert_eq!(item.failed_targets, 0);
     assert_eq!(item.disruptive_targets, 1);
     assert_eq!(item.max_wave, 1);
+
+    let runtime = db
+        .store
+        .list_deployments(&system_admin(), 4, None, true)
+        .await
+        .unwrap();
+    assert!(
+        runtime.deployments.is_empty(),
+        "the shell runtime query must not return completed history"
+    );
 }
 
 // Keep ordinary rounds close to now. Delayed spool delivery is valid; only a clock more than ten
@@ -9007,6 +10993,20 @@ async fn later_sequence_in_the_same_second_is_a_benign_usage_noop() {
     .await
     .unwrap();
     assert_eq!(bytes, (60, 100), "same-second growth is deferred, not lost");
+    let node_rollup: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT user_uplink_bytes, user_downlink_bytes,
+                relay_uplink_bytes, relay_downlink_bytes
+           FROM usage_node_rollups
+          WHERE tenant_id = 'platform.acme' AND node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        node_rollup,
+        (60, 100, 0, 0),
+        "a duplicate/no-op report must not increment the daily projection"
+    );
 }
 
 #[tokio::test]
@@ -9520,6 +11520,16 @@ async fn usage_report_accepts_reverse_hop_counters_reported_by_the_portal() {
     assert_eq!(row.try_get::<String, _>("node_id").unwrap(), "n2");
     assert_eq!(row.try_get::<i64, _>("uplink_bytes").unwrap(), 100);
     assert_eq!(row.try_get::<i64, _>("downlink_bytes").unwrap(), 200);
+    let node_rollup: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT user_uplink_bytes, user_downlink_bytes,
+                relay_uplink_bytes, relay_downlink_bytes
+           FROM usage_node_rollups
+          WHERE tenant_id = 'platform.acme' AND node_id = 'n2'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(node_rollup, (0, 0, 100, 200));
 
     let frozen_binding: serde_json::Value = sqlx::query_scalar(
         "SELECT g.bindings -> 'chn-a1b2-c3d4@n2'
@@ -9673,6 +11683,79 @@ async fn insert_month_sample(
     .bind(minute)
     .bind(up)
     .bind(down)
+    .execute(pool)
+    .await
+    .unwrap();
+    rebuild_usage_rollups(pool).await;
+}
+
+async fn rebuild_usage_rollups(pool: &PgPool) {
+    sqlx::query("DELETE FROM usage_rollups")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO usage_rollups (
+            tenant_id, user_id, app_id, period_start, period_end,
+            uplink_bytes, downlink_bytes, has_gap
+         )
+         SELECT s.tenant_id, s.user_id, coalesce(s.app_id, i.app_id),
+                date_trunc('day', s.window_start AT TIME ZONE 'Asia/Hong_Kong')
+                    AT TIME ZONE 'Asia/Hong_Kong',
+                (date_trunc('day', s.window_start AT TIME ZONE 'Asia/Hong_Kong')
+                    + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
+                sum(s.uplink_bytes)::bigint, sum(s.downlink_bytes)::bigint,
+                bool_or(s.has_gap)
+           FROM usage_samples s
+           LEFT JOIN ingresses i ON i.id = s.ingress_id
+          WHERE coalesce(s.app_id, i.app_id) IS NOT NULL
+          GROUP BY s.tenant_id, s.user_id, coalesce(s.app_id, i.app_id),
+                   date_trunc('day', s.window_start AT TIME ZONE 'Asia/Hong_Kong')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    rebuild_usage_node_rollups(pool).await;
+}
+
+async fn rebuild_usage_node_rollups(pool: &PgPool) {
+    sqlx::query("DELETE FROM usage_node_rollups")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO usage_node_rollups (
+            tenant_id, node_id, period_start, period_end,
+            user_uplink_bytes, user_downlink_bytes,
+            relay_uplink_bytes, relay_downlink_bytes, has_gap
+         )
+         WITH detail AS (
+             SELECT tenant_id, node_id, window_start,
+                    uplink_bytes AS user_uplink_bytes,
+                    downlink_bytes AS user_downlink_bytes,
+                    0::bigint AS relay_uplink_bytes,
+                    0::bigint AS relay_downlink_bytes,
+                    has_gap
+               FROM usage_samples
+             UNION ALL
+             SELECT tenant_id, node_id, window_start,
+                    0::bigint, 0::bigint, uplink_bytes, downlink_bytes, has_gap
+               FROM usage_chain_samples
+         )
+         SELECT tenant_id, node_id,
+                date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                    AT TIME ZONE 'Asia/Hong_Kong',
+                (date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
+                    + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
+                sum(user_uplink_bytes)::bigint,
+                sum(user_downlink_bytes)::bigint,
+                sum(relay_uplink_bytes)::bigint,
+                sum(relay_downlink_bytes)::bigint,
+                bool_or(has_gap)
+           FROM detail
+          GROUP BY tenant_id, node_id,
+                   date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')",
+    )
     .execute(pool)
     .await
     .unwrap();
@@ -10671,6 +12754,7 @@ async fn monthly_usage_keeps_the_app_frozen_on_the_sample() {
     .execute(db.pool())
     .await
     .unwrap();
+    rebuild_usage_rollups(db.pool()).await;
 
     // The ingress is moved to another view
     sqlx::query("UPDATE ingresses SET app_id = 'app-other' WHERE id = 'ing-a1b2'")
@@ -10784,6 +12868,7 @@ async fn monthly_usage_summary_aggregates_current_month_per_user() {
     .execute(db.pool())
     .await
     .unwrap();
+    rebuild_usage_rollups(db.pool()).await;
 
     let system = db
         .store
@@ -10822,6 +12907,10 @@ async fn monthly_usage_summary_aggregates_current_month_per_user() {
     .unwrap();
     assert!(month_ok, "month_start 的月份不对: {}", system.month_start);
     assert_eq!(system.views.len(), 3);
+    assert_eq!(system.days.len(), 1);
+    assert_eq!(system.days[0].uplink_bytes, 48);
+    assert_eq!(system.days[0].downlink_bytes, 71);
+    assert!(system.days[0].has_gap);
 
     // alice has two sample rows on this month's view (app-main) → 40/60, has_gap
     let alice = system.views.iter().find(|r| r.user_id == "alice").unwrap();
@@ -10846,6 +12935,38 @@ async fn monthly_usage_summary_aggregates_current_month_per_user() {
     assert_eq!(charlie.app_id, "app-other");
     assert_eq!(charlie.uplink_bytes, 3);
 
+    // The preceding month is a separate selection, not a comparison bolted onto the current
+    // response. Its view rows and daily composition must both use the shifted +08 boundaries.
+    let previous = db
+        .store
+        .list_monthly_usage_summary_for_offset(&system_admin(), -1)
+        .await
+        .unwrap();
+    let previous_month_ok: bool = sqlx::query_scalar(
+        "SELECT $1 = to_char(date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
+                              - INTERVAL '1 month', 'YYYY-MM-DD HH24:MI:SS')
+            AND $2 = to_char(date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong'),
+                             'YYYY-MM-DD HH24:MI:SS')",
+    )
+    .bind(&previous.month_start)
+    .bind(&previous.month_end)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(previous_month_ok);
+    assert_eq!(previous.views.len(), 1);
+    assert_eq!(previous.views[0].uplink_bytes, 999);
+    assert_eq!(previous.views[0].downlink_bytes, 999);
+    assert_eq!(previous.days.len(), 1);
+    assert_eq!(previous.days[0].uplink_bytes, 999);
+    assert_eq!(previous.days[0].downlink_bytes, 999);
+    let invalid_offset = db
+        .store
+        .list_monthly_usage_summary_for_offset(&system_admin(), -2)
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid_offset, StoreError::InvalidData(_)));
+
     // Subtree scoping: platform.acme's publisher sees only their own tenant
     let acme = db
         .store
@@ -10854,6 +12975,8 @@ async fn monthly_usage_summary_aggregates_current_month_per_user() {
         .unwrap();
     assert_eq!(acme.views.len(), 2);
     assert!(acme.views.iter().all(|r| r.tenant_id == "platform.acme"));
+    assert_eq!(acme.days[0].uplink_bytes, 45);
+    assert_eq!(acme.days[0].downlink_bytes, 67);
 }
 
 #[tokio::test]
@@ -12103,6 +14226,50 @@ async fn migration_enforces_reality_client_policy_shape() {
     assert!(bad_time.is_err(), "excessive max time diff should fail");
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn migration_enforces_protocol_specific_tunnel_ids() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    for (id, protocol, constraint) in [
+        (
+            "tunnel-8f3a-2d71",
+            "socks5",
+            "external_outbounds_custom_id_check",
+        ),
+        (
+            "vpngate-jp",
+            "vpngate",
+            "external_outbounds_vpngate_id_check",
+        ),
+        ("warp-platform", "warp", "external_outbounds_warp_id_check"),
+    ] {
+        let error = sqlx::query(
+            "INSERT INTO external_outbounds
+                (id, tenant_id, name, address, port, protocol, credential_sealed,
+                 protocol_options, security)
+             VALUES ($1, 'platform.acme', 'invalid id', 'example.com', 443, $2, '',
+                     '{}'::jsonb, '{\"t\":\"none\"}'::jsonb)",
+        )
+        .bind(id)
+        .bind(protocol)
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some(constraint),
+            "{id}/{protocol}: {error}"
+        );
+    }
+}
+
 async fn base_of(pool: &PgPool, deployment_id: i64) -> Option<i64> {
     sqlx::query("SELECT base_revision_id FROM deployments WHERE id = $1")
         .bind(deployment_id)
@@ -12381,6 +14548,15 @@ fn unknown_reported_state() -> ReportedNodeState {
 
 async fn deployment_count(pool: &PgPool) -> i64 {
     sqlx::query("SELECT count(*) AS n FROM deployments")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap()
+}
+
+async fn job_count(pool: &PgPool) -> i64 {
+    sqlx::query("SELECT count(*) AS n FROM jobs")
         .fetch_one(pool)
         .await
         .unwrap()
@@ -12783,10 +14959,11 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
             wmem_max: 4096,
             somaxconn: 4096,
         },
-        samples: vec![sample],
+        samples: vec![sample.clone()],
         processes: vec![],
         hops: vec![],
     };
+    let mut history_report = report.clone();
 
     let accepted = db
         .store
@@ -12814,6 +14991,51 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
     assert_eq!(view.series[0].disk_detail.as_ref(), Some(&disk));
     assert_eq!(view.series[0].conntrack_count, Some(1200));
     assert_eq!(view.latest_sample.as_ref(), view.series.last());
+
+    let overview = db
+        .store
+        .node_load_overview(
+            &system_admin(),
+            "net-observe",
+            LoadSeriesQuery::Absolute {
+                start_unix_secs: now - 60,
+                end_unix_secs: now + 1,
+            },
+            64,
+        )
+        .await
+        .unwrap();
+    assert_eq!(overview.series.len(), 1);
+    assert!(overview.series[0].network_detail.is_none());
+    assert!(overview.series[0].disk_detail.is_none());
+    assert_eq!(
+        overview
+            .latest_sample
+            .as_ref()
+            .and_then(|sample| sample.network_detail.as_ref()),
+        Some(&network)
+    );
+
+    let metrics = db
+        .store
+        .node_load_metrics(
+            &system_admin(),
+            "net-observe",
+            LoadSeriesQuery::Absolute {
+                start_unix_secs: now - 60,
+                end_unix_secs: now + 1,
+            },
+            64,
+            &[
+                "network.tcp_curr_estab".to_owned(),
+                "disk.read_bps".to_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics.window_end_unix_secs, vec![now]);
+    assert_eq!(metrics.metrics["network.tcp_curr_estab"], vec![Some(82.0)]);
+    assert_eq!(metrics.metrics["disk.read_bps"], vec![Some(2048.0)]);
 
     let stale = db
         .store
@@ -12845,6 +15067,66 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
     assert_eq!(latest.latest_sample.as_ref(), latest.series.last());
     assert_eq!(latest.range_start_unix_secs, now - 30);
     assert_eq!(latest.range_end_unix_secs, now);
+
+    let list = db
+        .store
+        .list_node_load(
+            &system_admin(),
+            LoadSeriesQuery::LatestWindows { windows: 1 },
+            64,
+        )
+        .await
+        .unwrap();
+    let listed = list
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "net-observe")
+        .unwrap();
+    assert_eq!(listed.series, latest.series);
+    assert_eq!(listed.latest_sample, latest.latest_sample);
+    assert_eq!(listed.host, latest.host);
+
+    history_report.samples = vec![
+        LoadSample {
+            window_start_unix_secs: now - 90,
+            window_end_unix_secs: now - 60,
+            nic_rx_bps: 10,
+            nic_tx_bps: 20,
+            ..sample.clone()
+        },
+        LoadSample {
+            window_start_unix_secs: now - 60,
+            window_end_unix_secs: now - 30,
+            nic_rx_bps: 30,
+            nic_tx_bps: 40,
+            ..sample
+        },
+    ];
+    let accepted = db
+        .store
+        .record_load_report("net-observe", history_report)
+        .await
+        .unwrap();
+    assert_eq!(accepted.accepted_samples, 2);
+
+    let nic = db
+        .store
+        .list_node_nic(&system_admin(), 2, 64)
+        .await
+        .unwrap();
+    let listed = nic
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "net-observe")
+        .unwrap();
+    assert_eq!(listed.series.len(), 2);
+    assert_eq!(listed.series[0].window_start_unix_secs, now - 60);
+    assert_eq!(listed.series[0].nic_rx_bps, 30);
+    assert_eq!(listed.series[1].window_start_unix_secs, now - 30);
+    assert_eq!(listed.series[1].nic_rx_bps, 100);
+    let json = serde_json::to_string(listed).unwrap();
+    assert!(!json.contains("cpu_detail"));
+    assert!(!json.contains("network_detail"));
 }
 
 async fn insert_usage_history_for_main_fixture(pool: &PgPool) {
@@ -14074,7 +16356,6 @@ async fn an_ingress_can_turn_flow_off_without_the_fleet_losing_it() {
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: if id == "ing-a1b2" { 443 } else { 8443 },
-        front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
             fallback_mode: RealityFallbackMode::CustomSite,
@@ -14146,7 +16427,6 @@ async fn an_ingress_equal_to_the_global_reality_site_keeps_following_it() {
                 node_id: "n1".to_owned(),
                 bind: "0.0.0.0".parse().unwrap(),
                 port: 443,
-                front_id: None,
                 guard: brocade_core::model::IngressGuard::OPEN,
                 reality: CreateRealityIngressRequest {
                     fallback_mode: RealityFallbackMode::GlobalSite,
@@ -14243,7 +16523,6 @@ async fn reality_fallback_mode_and_limits_round_trip_without_an_external_target(
                 node_id: "n1".to_owned(),
                 bind: "0.0.0.0".parse().unwrap(),
                 port: 443,
-                front_id: None,
                 guard: brocade_core::model::IngressGuard::OPEN,
                 reality: CreateRealityIngressRequest {
                     fallback_mode: RealityFallbackMode::NodeCertificate,
@@ -14317,7 +16596,6 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port,
-        front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
             fallback_mode: RealityFallbackMode::CustomSite,
@@ -14506,7 +16784,6 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: 443,
-        front_id: None,
         reality: CreateRealityIngressRequest {
             fallback_mode: RealityFallbackMode::CustomSite,
             fallback_limits: RealityFallbackLimits::Balanced,
@@ -14736,7 +17013,6 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port,
-        front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
             fallback_mode: RealityFallbackMode::CustomSite,
@@ -14863,7 +17139,6 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: 443,
-        front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
             fallback_mode: RealityFallbackMode::CustomSite,
@@ -14903,6 +17178,14 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                         port: 20443,
                     }),
                     v6: None,
+                    anytls: Some(ProtocolProjection {
+                        v4: Some(ProjectionEndpoint {
+                            host: "anytls.acc.example.net".to_owned(),
+                            port: 21443,
+                        }),
+                        v6: None,
+                    }),
+                    ..Projection::default()
                 },
                 download(40443),
             ),
@@ -14921,6 +17204,17 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
         })
     );
     assert_eq!(stored.projection.v6, None);
+    assert_eq!(
+        stored
+            .projection
+            .anytls
+            .as_ref()
+            .and_then(|projection| projection.v4.as_ref()),
+        Some(&ProjectionEndpoint {
+            host: "anytls.acc.example.net".to_owned(),
+            port: 21443,
+        })
+    );
     assert_eq!(
         stored.wires.xhttp().unwrap().host.as_deref(),
         Some("upload.route.example")
@@ -14954,6 +17248,14 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                         port: 20443,
                     }),
                     v6: None,
+                    anytls: Some(ProtocolProjection {
+                        v4: Some(ProjectionEndpoint {
+                            host: "anytls.acc.example.net".to_owned(),
+                            port: 21443,
+                        }),
+                        v6: None,
+                    }),
+                    ..Projection::default()
                 },
                 download(40443),
             ),
@@ -14976,6 +17278,14 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                         port: 20443,
                     }),
                     v6: None,
+                    anytls: Some(ProtocolProjection {
+                        v4: Some(ProjectionEndpoint {
+                            host: "anytls.acc.example.net".to_owned(),
+                            port: 21443,
+                        }),
+                        v6: None,
+                    }),
+                    ..Projection::default()
                 },
                 download(40444),
             ),
@@ -15013,6 +17323,7 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                         port: 20443,
                     }),
                     v6: None,
+                    ..Projection::default()
                 },
                 None,
             ),
@@ -15062,12 +17373,10 @@ async fn isolated_target_becomes_supersedable_debt_and_requires_explicit_reentry
 
     let isolated = db
         .store
-        .isolate_deployment_target(
+        .isolate_node(
             &system_admin(),
-            first.deployment_id,
             "n1",
-            IsolateDeploymentTargetRequest {
-                expected_target_status: "pending".to_owned(),
+            IsolateNodeRequest {
                 acknowledge_uncertain: false,
             },
         )
@@ -15215,6 +17524,153 @@ async fn isolated_target_becomes_supersedable_debt_and_requires_explicit_reentry
     .await
     .unwrap();
     assert!(!isolation_exists);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_can_be_isolated_without_an_active_deployment() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    let isolated = db
+        .store
+        .isolate_node(
+            &system_admin(),
+            "n1",
+            IsolateNodeRequest {
+                acknowledge_uncertain: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(isolated.isolated);
+    assert!(isolated.affected_deployments.is_empty());
+    assert_eq!(isolated.debt_count, 0);
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM node_operational_isolations WHERE node_id = 'n1')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap());
+    let state = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert!(state.operationally_isolated);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn concurrent_isolation_captures_a_deployment_created_after_its_initial_read() {
+    const INSERT_GATE: i64 = 9_173_001;
+
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+    let revision = db.store.materialize_snapshot(None).await.unwrap().revision;
+
+    // Stop creation after it has classified isolation but before the deployment row is visible.
+    // Without the deployment/isolation coordination lock, isolation commits during this pause,
+    // sees no target, and creation subsequently leaves an unclaimable pending target behind.
+    sqlx::query(
+        "CREATE FUNCTION block_deployment_insert_for_isolation_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(9173001);
+             RETURN NEW;
+         END
+         $$",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER block_deployment_insert_for_isolation_test
+         BEFORE INSERT ON deployments
+         FOR EACH ROW EXECUTE FUNCTION block_deployment_insert_for_isolation_test()",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let mut insert_gate = db.pool().acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(INSERT_GATE)
+        .execute(&mut *insert_gate)
+        .await
+        .unwrap();
+
+    let creator_store = db.store.clone();
+    let creator = tokio::spawn(async move {
+        creator_store
+            .create_deployment(
+                &system_admin(),
+                create_deployment_request(revision, "isolation-create-race"),
+            )
+            .await
+    });
+
+    wait_for_advisory_waiters(db.pool(), 1).await;
+    let isolator_store = db.store.clone();
+    let isolator = tokio::spawn(async move {
+        isolator_store
+            .isolate_node(
+                &system_admin(),
+                "n1",
+                IsolateNodeRequest {
+                    acknowledge_uncertain: false,
+                },
+            )
+            .await
+    });
+    // The creator owns the coordination lock while its INSERT is paused, so isolation must wait
+    // behind it instead of committing an incomplete view of the active targets.
+    wait_for_advisory_waiters(db.pool(), 2).await;
+
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(INSERT_GATE)
+        .fetch_one(&mut *insert_gate)
+        .await
+        .unwrap();
+    assert!(unlocked);
+
+    let (created, isolated) = tokio::time::timeout(Duration::from_secs(5), async {
+        let created = creator.await.unwrap().unwrap();
+        let isolated = isolator.await.unwrap().unwrap();
+        (created, isolated)
+    })
+    .await
+    .expect("deployment creation and isolation should finish after releasing the insert gate");
+
+    assert_eq!(
+        target_status(db.pool(), created.deployment_id, "n1").await,
+        "deferred"
+    );
+    assert_eq!(isolated.affected_deployments, vec![created.deployment_id]);
+    assert_eq!(isolated.debt_count, 1);
+    let detail = db
+        .store
+        .deployment_detail(&system_admin(), created.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(detail.status, "succeeded");
+    assert_eq!(detail.active, None);
+    assert_eq!(detail.settlement_status, "debt");
 }
 
 #[tokio::test]
@@ -16316,7 +18772,7 @@ async fn self_signed_publication_waits_for_every_assigned_node_to_preload_both_s
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn first_online_report_fills_only_blank_public_ip_and_stamps_a_snapshot() {
+async fn public_ip_observations_are_separate_from_config_and_changes_are_debounced() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -16327,55 +18783,261 @@ async fn first_online_report_fills_only_blank_public_ip_and_stamps_a_snapshot() 
         .await
         .unwrap();
 
-    let revision = db
-        .store
-        .autofill_node_public_ips(
-            "n1",
-            &RouteIpReport {
-                ipv4: Some("172.93.186.36".to_owned()),
-                ipv6: Some("fd00::1".to_owned()),
-            },
-        )
-        .await
-        .unwrap()
-        .expect("blank public IPv4 is filled");
-    let row = sqlx::query("SELECT public_ipv4, public_ipv6 FROM nodes WHERE id = 'n1'")
+    let observed_at: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(
-        row.try_get::<Option<String>, _>("public_ipv4")
-            .unwrap()
-            .as_deref(),
-        Some("172.93.186.36")
-    );
+    let first = db
+        .store
+        .record_node_public_ip(
+            "n1",
+            &NodePublicIpObservation {
+                observed_at_unix_secs: observed_at,
+                family: PublicIpFamily::V4,
+                ip: "172.93.186.36".to_owned(),
+                country_code: Some("tw".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, PublicIpObservationOutcome::FirstObserved);
+
+    let row = sqlx::query(
+        "SELECT nodes.public_ipv4, state.current_ip, state.country_code
+           FROM nodes
+           JOIN node_public_ip_state state ON state.node_id = nodes.id AND state.family = 4
+          WHERE nodes.id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     assert!(row
-        .try_get::<Option<String>, _>("public_ipv6")
+        .try_get::<Option<String>, _>("public_ipv4")
         .unwrap()
         .is_none());
-    let snapshot = db.store.materialize_snapshot(Some(revision)).await.unwrap();
-    let node = snapshot.nodes.iter().find(|node| node.id == "n1").unwrap();
-    assert_eq!(node.public_ipv4.as_deref(), Some("172.93.186.36"));
+    assert_eq!(
+        row.try_get::<String, _>("current_ip").unwrap(),
+        "172.93.186.36"
+    );
+    assert_eq!(
+        row.try_get::<Option<String>, _>("country_code")
+            .unwrap()
+            .as_deref(),
+        Some("TW")
+    );
+    let listed = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.nodes[0]
+            .observed_public_ipv4
+            .as_ref()
+            .map(|state| state.current_ip.as_str()),
+        Some("172.93.186.36")
+    );
+    assert!(listed.nodes[0].observed_public_ipv6.is_none());
 
+    let changed = NodePublicIpObservation {
+        observed_at_unix_secs: observed_at,
+        family: PublicIpFamily::V4,
+        ip: "8.8.8.8".to_owned(),
+        country_code: Some("US".to_owned()),
+    };
     assert_eq!(
         db.store
-            .autofill_node_public_ips(
-                "n1",
-                &RouteIpReport {
-                    ipv4: Some("8.8.8.8".to_owned()),
-                    ipv6: None,
-                },
-            )
+            .record_node_public_ip("n1", &changed)
             .await
-            .unwrap(),
-        None
+            .unwrap()
+            .outcome,
+        PublicIpObservationOutcome::Candidate
     );
-    let current: Option<String> =
-        sqlx::query_scalar("SELECT public_ipv4 FROM nodes WHERE id = 'n1'")
+    sqlx::query(
+        "UPDATE node_public_ip_state
+            SET candidate_first_seen_at = candidate_first_seen_at - interval '11 seconds'
+          WHERE node_id = 'n1' AND family = 4",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        db.store
+            .record_node_public_ip("n1", &changed)
+            .await
+            .unwrap()
+            .outcome,
+        PublicIpObservationOutcome::Changed
+    );
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM node_public_ip_events WHERE node_id = 'n1' AND family = 4",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(events, 2, "steady samples do not create history rows");
+    let history = db
+        .store
+        .node_public_ip_history(&system_admin(), "n1", 14)
+        .await
+        .unwrap();
+    assert_eq!(history.retention_days, 90);
+    assert_eq!(history.events.len(), 2);
+    assert_eq!(
+        history.events[0].previous_ip.as_deref(),
+        Some("172.93.186.36")
+    );
+    assert_eq!(history.events[0].current_ip, "8.8.8.8");
+    let notification = db.store.machine_events(&system_admin(), 10).await.unwrap();
+    assert_eq!(notification.retention_days, 90);
+    assert_eq!(notification.events.len(), 1);
+    assert_eq!(notification.events[0].event_kind, "public_ip_changed");
+    assert_eq!(notification.events[0].family, Some(4));
+    assert_eq!(
+        notification.events[0].previous_value.as_deref(),
+        Some("172.93.186.36")
+    );
+    assert_eq!(
+        notification.events[0].current_value.as_deref(),
+        Some("8.8.8.8")
+    );
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE status = 'pending'")
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(current.as_deref(), Some("172.93.186.36"));
+    assert_eq!(
+        pending, 1,
+        "a confirmed IP change queues exactly one webhook"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn machine_presence_transitions_are_deduplicated_and_deliverable() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    db.store.issue_node_token("n1").await.unwrap();
+    let waiting: String =
+        sqlx::query_scalar("SELECT status FROM node_presence_state WHERE node_id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(waiting, "waiting");
+
+    db.store.record_node_poll("n1", None).await.unwrap();
+    db.store.record_node_poll("n1", None).await.unwrap();
+    let online_events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM machine_events
+          WHERE node_id = 'n1' AND event_kind = 'node_online'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        online_events, 1,
+        "steady polling must not repeat online events"
+    );
+
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET last_poll_at = now() - interval '2 minutes'
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(db.store.reconcile_node_presence().await.unwrap(), 1);
+    assert_eq!(db.store.reconcile_node_presence().await.unwrap(), 0);
+    let offline: String =
+        sqlx::query_scalar("SELECT status FROM node_presence_state WHERE node_id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(offline, "offline");
+
+    db.store.record_node_poll("n1", None).await.unwrap();
+    let events = db.store.machine_events(&system_admin(), 10).await.unwrap();
+    assert_eq!(events.events.len(), 3);
+    assert_eq!(events.events[0].event_kind, "node_online");
+    assert_eq!(events.events[0].previous_value.as_deref(), Some("offline"));
+    assert_eq!(events.events[1].event_kind, "node_offline");
+    assert_eq!(events.events[2].previous_value.as_deref(), Some("waiting"));
+
+    let delivery = db
+        .store
+        .claim_notification_delivery("test-console")
+        .await
+        .unwrap()
+        .expect("the first transition should have a pending delivery");
+    assert_eq!(delivery.attempt, 1);
+    assert!(db
+        .store
+        .complete_notification_delivery(delivery.delivery_id, "test-console", delivery.attempt)
+        .await
+        .unwrap());
+    assert!(!db
+        .store
+        .complete_notification_delivery(delivery.delivery_id, "test-console", delivery.attempt)
+        .await
+        .unwrap());
+    let retry = db
+        .store
+        .claim_notification_delivery("test-console")
+        .await
+        .unwrap()
+        .expect("another transition should remain pending");
+    assert!(db
+        .store
+        .fail_notification_delivery(
+            retry.delivery_id,
+            "test-console",
+            retry.attempt,
+            "temporary failure",
+        )
+        .await
+        .unwrap());
+    let retry_state = sqlx::query(
+        "SELECT status, attempts, next_attempt_at > now() AS delayed, last_error
+           FROM notification_deliveries WHERE id = $1",
+    )
+    .bind(retry.delivery_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        retry_state.try_get::<String, _>("status").unwrap(),
+        "pending"
+    );
+    assert_eq!(retry_state.try_get::<i32, _>("attempts").unwrap(), 1);
+    assert!(retry_state.try_get::<bool, _>("delayed").unwrap());
+    assert_eq!(
+        retry_state.try_get::<String, _>("last_error").unwrap(),
+        "temporary failure"
+    );
+
+    sqlx::query("UPDATE node_presence_state SET status = 'offline' WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE node_lifecycle_state SET phase = 'retiring' WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.record_node_poll("n1", None).await.unwrap();
+    let after_retiring_poll: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM machine_events WHERE node_id = 'n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        after_retiring_poll, 3,
+        "teardown polling is not a recovery notification"
+    );
 }
 
 async fn insert_minimal_fixture(pool: &PgPool) {
@@ -16467,6 +19129,63 @@ async fn insert_minimal_fixture(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
          VALUES ('app-main', 'platform.acme', 'alice', 'ing-a1b2')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_front_target_fixture(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO chains (id, app_id, tenant_id, name, position)
+         VALUES ('chn-b2c3-d4e5', 'app-main', 'platform.acme', 'Target Chain', 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO ingresses (
+            id, app_id, chain_id, node_id, bind, port, front_id, transport_kind,
+            reality_private_key, reality_public_key, reality_short_ids,
+            reality_dest, reality_server_names, reality_flow,
+            reality_fallback_mode
+         ) VALUES (
+            'ing-b2c3', 'app-main', 'chn-b2c3-d4e5', 'n1', '0.0.0.0', 8443, NULL,
+            'vless-reality', 'target-reality-private', 'target-reality-public',
+            '[\"9368b1cf\"]'::jsonb, 'target.example.com:443',
+            '[\"target.example.com\"]'::jsonb, 'xtls-rprx-vision', 'custom-site'
+         )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingress_client_settings (ingress_id, reality_fingerprint)
+         VALUES ('ing-b2c3', 'chrome')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let rules = json!([
+        {
+            "m": { "t": "any" },
+            "a": { "t": "egress", "send_through": null }
+        }
+    ]);
+    sqlx::query(
+        "INSERT INTO steps (chain_id, node_id, rules)
+         VALUES ('chn-b2c3-d4e5', 'n1', $1)",
+    )
+    .bind(rules)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
+         VALUES ('app-main', 'platform.acme', 'alice', 'ing-b2c3')",
     )
     .execute(pool)
     .await
@@ -17596,7 +20315,6 @@ async fn hysteria2_quic_tuning_round_trips_field_by_field() {
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: 8443,
-        front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
             fallback_mode: RealityFallbackMode::GlobalSite,
@@ -17683,7 +20401,7 @@ async fn proxy_outbound_anytls_and_deletion_are_sealed_scoped_and_reference_safe
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     let request = UpsertExternalOutboundRequest {
-        id: "anytls-proxy".to_owned(),
+        id: "custom-4444-4444".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "AnyTLS Proxy".to_owned(),
         address: "edge.example.com".to_owned(),
@@ -18038,4 +20756,103 @@ async fn reverse_health_settings_round_trip_and_validate() {
         .update_settings(&system_admin(), settings)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let meter = "0123456789abcdef0123456789abcdef";
+    let reading = |sequence, rx_bytes, tx_bytes, discontinuities| NodeTrafficReading {
+        meter_id: meter.to_owned(),
+        sequence,
+        interface: "eth0".to_owned(),
+        boot_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+        rx_bytes,
+        tx_bytes,
+        discontinuities,
+    };
+
+    // First absolute reading is a baseline. Only later monotonic differences enter the ledger.
+    db.store
+        .record_node_traffic("n1", now - 4, &reading(1, 0, 0, 0))
+        .await
+        .unwrap();
+    db.store
+        .record_node_traffic("n1", now - 3, &reading(2, 100, 200, 0))
+        .await
+        .unwrap();
+    // A delayed duplicate cannot charge the bytes a second time or replace the newer baseline.
+    db.store
+        .record_node_traffic("n1", now - 2, &reading(2, 9_999, 9_999, 0))
+        .await
+        .unwrap();
+
+    let before = db.store.node_traffic(&system_admin()).await.unwrap();
+    let before = before
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(
+        (before.rx_bytes.as_str(), before.tx_bytes.as_str()),
+        ("100", "200")
+    );
+    assert_eq!(before.total_bytes, "300");
+    assert!(
+        before.has_gap,
+        "tracking began after this UTC period started"
+    );
+
+    db.store
+        .update_node_traffic(
+            &system_admin(),
+            "n1",
+            UpdateNodeTrafficRequest {
+                cycle_kind: NodeTrafficCycleKind::Monthly,
+                reset_month: None,
+                reset_day: 1,
+                calibrated_total_bytes: Some("1073741824".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let calibrated = db.store.node_traffic(&system_admin()).await.unwrap();
+    let calibrated = calibrated
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(calibrated.total_bytes, "1073741824");
+    assert!(
+        !calibrated.has_gap,
+        "calibration clears only preceding uncertainty"
+    );
+
+    db.store
+        .record_node_traffic("n1", now + 1, &reading(3, 150, 250, 0))
+        .await
+        .unwrap();
+    let mut reboot = reading(4, 160, 260, 1);
+    reboot.boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    db.store
+        .record_node_traffic("n1", now + 2, &reboot)
+        .await
+        .unwrap();
+    let after = db.store.node_traffic(&system_admin()).await.unwrap();
+    let after = after
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(after.total_bytes, "1073741944");
+    assert!(after.has_gap, "a reboot after calibration remains visible");
+    assert_eq!(after.last_gap_reason.as_deref(), Some("machine-reboot"));
 }

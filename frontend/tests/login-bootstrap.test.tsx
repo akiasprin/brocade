@@ -44,10 +44,12 @@ describe('系统初始化默认身份', () => {
   it('以 root 初始化后直接进入控制台，zero 不设置登录密码', async () => {
     const onInitialized = vi.fn();
     let initBody: Record<string, unknown> | null = null;
+    let initAuthorization: string | null = null;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
       if (path === '/auth/init') {
         initBody = JSON.parse(String(init?.body));
+        initAuthorization = new Headers(init?.headers).get('authorization');
         return jsonResponse(
           {
             admin: { operator_id: 'root', role: 'system-admin', tenant_scope: null, token_prefix: null },
@@ -56,6 +58,12 @@ describe('系统初始化默认身份', () => {
           201,
         );
       }
+      if (path === '/bootstrap') {
+        return jsonResponse({
+          who: { operator_id: 'root', role: 'system-admin', tenant_scope: null, token_prefix: null },
+          initial: { node_count: 2, chain_group_count: [['app-a1b2', 3]] },
+        });
+      }
       throw new Error(`unexpected request ${path}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -63,8 +71,14 @@ describe('系统初始化默认身份', () => {
     const view = render(<InitializeAdmin onInitialized={onInitialized} />, { wrapper: wrapper() });
     expect((view.getByLabelText('用户名') as HTMLInputElement).value).toBe('root');
     expect(view.getByText('面板支持多用户统计；初始化时会预置使用者 zero，默认不开放登录。')).toBeTruthy();
+    const submit = view.getByRole('button', { name: '创建管理员' }) as HTMLButtonElement;
     fireEvent.change(view.getByLabelText('密码'), { target: { value: 'root-password' } });
-    fireEvent.click(view.getByRole('button', { name: '创建管理员' }));
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(view.getByLabelText('初始化凭据'), {
+      target: { value: 'bootstrap-test-token-with-at-least-32-bytes' },
+    });
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
 
     await vi.waitFor(() => expect(onInitialized).toHaveBeenCalled());
     expect(initBody).toEqual({
@@ -73,11 +87,27 @@ describe('系统初始化默认身份', () => {
       password: 'root-password',
       root_tenant: 'platform',
     });
+    expect(initAuthorization).toBe('Bearer bootstrap-test-token-with-at-least-32-bytes');
     expect(fetchMock.mock.calls.some(([input]) => String(input) === '/visitor-access')).toBe(false);
     expect(view.queryByText(/zero.*密码/)).toBeNull();
     expect(view.queryByText(/租户/)).toBeNull();
     expect(onInitialized).toHaveBeenCalledWith({
       who: { operator_id: 'root', role: 'system-admin', tenant_scope: null, token_prefix: null },
+      initial: { node_count: 2, chain_group_count: [['app-a1b2', 3]] },
     });
+  });
+
+  it('明确提示错误的一次性初始化凭据', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ error: 'unauthorized' }, 401)),
+    );
+    const view = render(<InitializeAdmin onInitialized={vi.fn()} />, { wrapper: wrapper() });
+
+    fireEvent.change(view.getByLabelText('初始化凭据'), { target: { value: 'wrong-token' } });
+    fireEvent.change(view.getByLabelText('密码'), { target: { value: 'root-password' } });
+    fireEvent.click(view.getByRole('button', { name: '创建管理员' }));
+
+    await vi.waitFor(() => expect(view.getByText('初始化凭据不正确')).toBeTruthy());
   });
 });

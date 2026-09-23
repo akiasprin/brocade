@@ -6,6 +6,7 @@ import {
   type ReverseHealthOverride,
 } from './api';
 import { SettingsParameterSummary, type SettingsParameterMetric } from './ui/settings-parameter-summary';
+import { SegmentedControl } from './ui/bits';
 
 type BaseKey = Exclude<keyof ReverseHealthPolicy, 'tuning' | 'disconnect_on_health_failure'>;
 type TuningKey = keyof ReverseHealthTuning;
@@ -106,24 +107,16 @@ function PolicyFields({
           <div className="setfld">
             <label>探活失败时已有请求</label>
             <div className="v">
-              <span className="segsw" role="group" aria-label="探活失败时已有请求">
-                <button
-                  type="button"
-                  aria-pressed={!value.disconnect_on_health_failure}
-                  disabled={!editable}
-                  onClick={() => onChange({ ...value, disconnect_on_health_failure: false })}
-                >
-                  保留
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={value.disconnect_on_health_failure === true}
-                  disabled={!editable}
-                  onClick={() => onChange({ ...value, disconnect_on_health_failure: true })}
-                >
-                  主动断开
-                </button>
-              </span>
+              <SegmentedControl
+                value={value.disconnect_on_health_failure}
+                options={[
+                  { value: false, label: '保留' },
+                  { value: true, label: '主动断开' },
+                ]}
+                disabled={!editable}
+                ariaLabel="探活失败时已有请求"
+                onChange={disconnect_on_health_failure => onChange({ ...value, disconnect_on_health_failure })}
+              />
             </div>
           </div>
         </div>

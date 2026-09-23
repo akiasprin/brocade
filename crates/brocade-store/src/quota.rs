@@ -91,7 +91,8 @@ pub struct QuotaEnforcementOutcome {
 // This month's consumption does not go through `list_monthly_usage_summary` here: that query
 // carries `coalesce(s.app_id, i.app_id)` and a LEFT JOIN on ingresses, serving someone opening a
 // page and wanting historical completeness; this one runs every 60 seconds and has to hit the
-// `usage_samples_by_user_app_window` index, so it uses the frozen attribution column directly.
+// daily `usage_rollups` projection, so a one-minute enforcement round reads at most one row per
+// elapsed day instead of every 30-second accounting window.
 //
 // Month boundaries follow the same convention as everywhere else: date_trunc at +08, decided
 // server-side.
@@ -99,12 +100,14 @@ const MONTH_USED_SQL: &str = "
     SELECT q.tenant_id, q.user_id, q.app_id, q.limit_bytes,
            coalesce((
                SELECT sum(s.uplink_bytes + s.downlink_bytes)
-               FROM usage_samples s
+               FROM usage_rollups s
                WHERE s.tenant_id = q.tenant_id
                  AND s.user_id = q.user_id
                  AND s.app_id = q.app_id
-                 AND s.window_start >= (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
+                 AND s.period_start >= (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
                                         AT TIME ZONE 'Asia/Hong_Kong')
+                 AND s.period_start < ((date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
+                                        + INTERVAL '1 month') AT TIME ZONE 'Asia/Hong_Kong')
            ), 0)::bigint AS used_bytes
     FROM user_app_quotas q
 ";

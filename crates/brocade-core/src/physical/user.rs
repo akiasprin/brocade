@@ -6,7 +6,7 @@ use crate::{
     ir::routing::{AppIr, AppNode, Ingress},
     model::{
         AnyTls, ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2,
-        IpFamily, ProjectionDownloadEndpoint, ProjectionEndpoint, Xhttp,
+        IpFamily, Network, ProjectionDownloadEndpoint, ProjectionEndpoint, Xhttp,
     },
 };
 
@@ -376,10 +376,15 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
             let front = ingress
                 .front
                 .as_ref()
-                .and_then(|front_id| app.fronts.iter().find(|front| front.id == *front_id));
+                .and_then(|front_id| app.fronts.iter().find(|front| front.id == *front_id))
+                // An ancestor ingress may be shared by several tenant branches. Its Front
+                // attachment is client-only and belongs to one of those branches; users outside
+                // that branch keep their ordinary direct projection and must not receive the
+                // group's external tunnel credentials.
+                .filter(|front| tenant_within(tenant, &front.tenant));
             let wires = securities(ingress);
-            for server in subscription_servers(node, ingress) {
-                for (security, wire_suffix) in &wires {
+            for (security, wire_suffix) in &wires {
+                for server in subscription_servers(node, ingress, security) {
                     let independent_transport = !matches!(
                         security,
                         UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_)
@@ -392,19 +397,7 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                         name: format!("{}{}{}", chain_name, wire_suffix, server.name_suffix),
                         server: server.address.clone(),
                         family: server.family,
-                        // The QUIC wire announces its own port even where a projection set one.
-                        // A projection is one address and one number, and there are now two
-                        // wires wanting different numbers behind it — so the address it
-                        // supplies is honoured and the port comes from the wire that will
-                        // actually answer. An external line still has to carry that UDP port;
-                        // announcing the projection's instead would name a port nothing
-                        // listens on at either end.
-                        port: match security {
-                            UserSecurityPlan::Hysteria2(plan) => plan.settings.port,
-                            UserSecurityPlan::AnyTls(plan) => plan.settings.port,
-                            UserSecurityPlan::VlessEncryption { port, .. } => *port,
-                            _ => server.port,
-                        },
+                        port: server.port,
                         // The independent download belongs to the XHTTP half and to nothing else;
                         // QUIC carries its own streams and has no second connection to project.
                         download: server
@@ -433,7 +426,7 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
                         } else {
                             ingress.wires.xhttp().cloned()
                         },
-                        front_id: ingress.front.clone(),
+                        front_id: front.map(|front| front.id.clone()),
                         front_name: front.map(|front| front.name.clone()),
                     });
                 }
@@ -470,14 +463,117 @@ pub fn project_user(apps: &[AppIr], tenant: &str, user: &str) -> UserPlan {
     let external_proxies = external_proxies(apps, &entries);
     let front_groups = front_groups(apps, &entries, &external_proxies);
 
-    UserPlan {
+    let mut plan = UserPlan {
         tenant: tenant.to_owned(),
         user: user.to_owned(),
         uuid,
         entries,
         external_proxies,
         front_groups,
-    }
+    };
+    // A client-only checkpoint can name members which are waiting for a machine topology release.
+    // Keep that state fail-closed: until at least one member is both served and granted to this
+    // user, omit the empty group and every target that would otherwise fall back to a direct dial.
+    plan.prune_empty_fronts();
+    plan
+}
+
+/// Keep the exact per-project inputs consumed by [`project_user`].  Empty project shells remain
+/// in source order because chain ordering is part of the subscription contract; unrelated users,
+/// grants and chains no longer make this user's projection cache miss.
+pub fn scope_user_apps(apps: &[AppIr], tenant: &str, user: &str) -> Vec<AppIr> {
+    apps.iter()
+        .map(|app| {
+            let grants = app
+                .grants
+                .iter()
+                .filter(|grant| grant.tenant == tenant && grant.user == user)
+                .cloned()
+                .collect::<Vec<_>>();
+            let ingress_ids = grants
+                .iter()
+                .map(|grant| grant.ingress.as_str())
+                .collect::<BTreeSet<_>>();
+            let ingresses = app
+                .ingresses
+                .iter()
+                .filter(|ingress| ingress_ids.contains(ingress.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let chain_ids = ingresses
+                .iter()
+                .map(|ingress| ingress.chain.as_str())
+                .collect::<BTreeSet<_>>();
+            let front_ids = ingresses
+                .iter()
+                .filter_map(|ingress| ingress.front.as_deref())
+                .collect::<BTreeSet<_>>();
+            let fronts = app
+                .fronts
+                .iter()
+                .filter(|front| front_ids.contains(front.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let outbound_ids = fronts
+                .iter()
+                .flat_map(|front| front.external_via.iter().map(String::as_str))
+                .collect::<BTreeSet<_>>();
+            let external_outbounds = app
+                .external_outbounds
+                .iter()
+                .filter(|outbound| outbound_ids.contains(outbound.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let node_ids = ingresses
+                .iter()
+                .map(|ingress| ingress.node.as_str())
+                .collect::<BTreeSet<_>>();
+            let nodes = app
+                .nodes
+                .iter()
+                .filter(|node| node_ids.contains(node.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let users = app
+                .users
+                .iter()
+                .filter(|candidate| candidate.tenant == tenant && candidate.id == user)
+                .cloned()
+                .collect::<Vec<_>>();
+            let chains = app
+                .chains
+                .iter()
+                .filter(|chain| chain_ids.contains(chain.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let tenants = nodes
+                .iter()
+                .map(|node| node.tenant.clone())
+                .chain(users.iter().map(|user| user.tenant.clone()))
+                .chain(chains.iter().map(|chain| chain.tenant.clone()))
+                .chain(ingresses.iter().map(|ingress| ingress.tenant.clone()))
+                .chain(fronts.iter().map(|front| front.tenant.clone()))
+                .chain(grants.iter().map(|grant| grant.tenant.clone()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            AppIr {
+                revision: 0,
+                app_id: app.app_id.clone(),
+                tenants,
+                nodes,
+                users,
+                external_outbounds,
+                chains,
+                ingresses,
+                fronts,
+                steps: Vec::new(),
+                listener_roots: BTreeSet::new(),
+                grants,
+                hops: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 /// Subscription protocols have a product order independent of their rendered suffixes.
@@ -493,6 +589,10 @@ fn subscription_protocol_rank(security: &UserSecurityPlan) -> u8 {
         UserSecurityPlan::AnyTls(_) => 1,
         UserSecurityPlan::Hysteria2(_) => 2,
     }
+}
+
+fn tenant_within(tenant: &str, scope: &str) -> bool {
+    tenant == scope || tenant.starts_with(&format!("{scope}."))
 }
 
 /// The direct address precedes its v6 peer inside one protocol pair. `None` is the single
@@ -542,26 +642,41 @@ struct SubscriptionServer {
 ///
 /// The two families are computed independently and do not affect each other: v4 may
 /// be projected alone, both may be, or neither.
-fn subscription_servers(node: &AppNode, ingress: &Ingress) -> Vec<SubscriptionServer> {
-    let xhttp_download = ingress
-        .wires
-        .xhttp()
-        .and_then(|xhttp| xhttp.download.as_ref());
+fn subscription_servers(
+    node: &AppNode,
+    ingress: &Ingress,
+    security: &UserSecurityPlan,
+) -> Vec<SubscriptionServer> {
+    let vless = matches!(
+        security,
+        UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_)
+    );
+    let xhttp_download = vless
+        .then(|| {
+            ingress
+                .wires
+                .xhttp()
+                .and_then(|xhttp| xhttp.download.as_ref())
+        })
+        .flatten();
+    let v4 = projected_endpoint(ingress, security, IpFamily::V4);
+    let v6 = projected_endpoint(ingress, security, IpFamily::V6);
+    let listen_port = security_port(ingress, security);
     let mut servers = Vec::new();
     servers.extend(family_server(
-        ingress.projection.v4.as_ref(),
+        v4.as_ref(),
         node.public_ipv4.as_deref(),
         node.public_ipv4_nat,
-        ingress.port,
+        listen_port,
         IpFamily::V4,
         "",
         xhttp_download.and_then(|download| download.v4.as_ref()),
     ));
     servers.extend(family_server(
-        ingress.projection.v6.as_ref(),
+        v6.as_ref(),
         node.public_ipv6.as_deref(),
         node.public_ipv6_nat,
-        ingress.port,
+        listen_port,
         IpFamily::V6,
         " | v6",
         xhttp_download.and_then(|download| download.v6.as_ref()),
@@ -570,12 +685,122 @@ fn subscription_servers(node: &AppNode, ingress: &Ingress) -> Vec<SubscriptionSe
         servers.push(SubscriptionServer {
             address: "?".to_owned(),
             family: None,
-            port: ingress.port,
+            port: listen_port,
             download: None,
             name_suffix: "",
         });
     }
     servers
+}
+
+/// Resolve one protocol's mapping. `None` on a per-protocol pair is the historical shared
+/// representation: keep the VLESS host but substitute the protocol's real listening port.
+/// `Some(empty)` is an explicit direct mapping and therefore must not inherit anything.
+fn projected_endpoint(
+    ingress: &Ingress,
+    security: &UserSecurityPlan,
+    family: IpFamily,
+) -> Option<ProjectionEndpoint> {
+    let legacy = || match family {
+        IpFamily::V4 => ingress.projection.v4.as_ref(),
+        IpFamily::V6 => ingress.projection.v6.as_ref(),
+    };
+    let specific = match security {
+        UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_) => return legacy().cloned(),
+        UserSecurityPlan::VlessEncryption { .. } => ingress.projection.vless_encryption.as_ref(),
+        UserSecurityPlan::AnyTls(_) => ingress.projection.anytls.as_ref(),
+        UserSecurityPlan::Hysteria2(_) => ingress.projection.hysteria2.as_ref(),
+    };
+    if let Some(specific) = specific {
+        return match family {
+            IpFamily::V4 => specific.v4.clone(),
+            IpFamily::V6 => specific.v6.clone(),
+        };
+    }
+    legacy().map(|endpoint| ProjectionEndpoint {
+        host: endpoint.host.clone(),
+        port: security_port(ingress, security),
+    })
+}
+
+fn security_port(ingress: &Ingress, security: &UserSecurityPlan) -> u16 {
+    match security {
+        UserSecurityPlan::Reality(_) | UserSecurityPlan::Tls(_) => ingress.port,
+        UserSecurityPlan::VlessEncryption { port, .. } => *port,
+        UserSecurityPlan::AnyTls(plan) => plan.settings.port,
+        UserSecurityPlan::Hysteria2(plan) => plan.settings.port,
+    }
+}
+
+/// One socket which a target ingress actually publishes to subscribers.
+///
+/// Port and transport are part of reachability: a member chain can allow TCP/443 and block
+/// UDP/8443 while both sockets share one hostname. Keeping this derivation beside subscription
+/// generation prevents the static Front analysis from checking a route different from the one a
+/// client will dial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubscriptionEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub network: Network,
+}
+
+impl SubscriptionEndpoint {
+    pub fn label(&self) -> String {
+        let host = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        let network = match self.network {
+            Network::Tcp => "tcp",
+            Network::Udp => "udp",
+        };
+        format!("{host}:{}/{network}", self.port)
+    }
+}
+
+pub(crate) fn subscription_endpoints(
+    node: &AppNode,
+    ingress: &Ingress,
+) -> Vec<SubscriptionEndpoint> {
+    let mut endpoints = Vec::new();
+    for (security, _) in securities(ingress) {
+        let network = if matches!(security, UserSecurityPlan::Hysteria2(_)) {
+            Network::Udp
+        } else {
+            Network::Tcp
+        };
+        for server in subscription_servers(node, ingress, &security)
+            .into_iter()
+            .filter(|server| server.family.is_some())
+        {
+            endpoints.push(SubscriptionEndpoint {
+                host: server.address.clone(),
+                port: server.port,
+                network,
+            });
+            if let Some(download) = server.download {
+                endpoints.push(SubscriptionEndpoint {
+                    host: download.host,
+                    port: download.port,
+                    network: Network::Tcp,
+                });
+            }
+        }
+    }
+    endpoints.sort_by(|left, right| {
+        let network_rank = |network| match network {
+            Network::Tcp => 0,
+            Network::Udp => 1,
+        };
+        left.host
+            .cmp(&right.host)
+            .then_with(|| left.port.cmp(&right.port))
+            .then_with(|| network_rank(left.network).cmp(&network_rank(right.network)))
+    });
+    endpoints.dedup();
+    endpoints
 }
 
 /// Whether a family contributes an entry, and with which address.
@@ -651,7 +876,11 @@ fn external_proxies(
                 // Validation rejects this combination. Keeping it out of the subscription as
                 // well makes a bypassed validator fail closed instead of publishing a logical
                 // WARP resource with no user identity.
-                if matches!(outbound.protocol, ExternalOutboundProtocol::Warp { .. }) {
+                if matches!(
+                    outbound.protocol,
+                    ExternalOutboundProtocol::Warp { .. }
+                        | ExternalOutboundProtocol::Vpngate { .. }
+                ) {
                     continue;
                 }
                 let id = outbound.id.clone();

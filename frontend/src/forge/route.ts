@@ -20,6 +20,8 @@
 //   DeployPane 遇到没有携带键的 plan 时会自行生成。
 
 import { wm } from '../wm/store';
+import { cancelVisualTransition } from '../ui/motion';
+import { confirmDiscardChanges } from '../ui/navigation-guard';
 import { DEFAULT_NAV, forge, isNavKey, type NavKey } from './state';
 
 // 下钻状态在各页面中是私有的 `type Drill`，此处只将其视为一组字段。
@@ -36,6 +38,8 @@ interface Field {
   // 反序列化时需要还原类型：地址栏中全部是字符串，而 deploy 的 id 是数字，
   // `deployments.find(d => d.id === id)` 传入 '12' 时不会匹配到任何记录。
   num?: boolean;
+  optional?: boolean;
+  pattern?: RegExp;
 }
 
 interface DrillSpec {
@@ -57,8 +61,19 @@ const DRILL: Partial<Record<NavKey, DrillSpec[]>> = {
     // 创建响应中的明文 token 不进入地址；恢复安装页时可以重新签发一枚。
     { seg: 'install', fields: [{ name: 'node' }], rest: { step: 4 } },
   ],
-  chains: [{ seg: 'chain', fields: [{ name: 'app' }, { name: 'chain' }] }],
-  tunnels: [{ seg: 'tunnel', fields: [{ name: 'tenant' }, { name: 'id' }] }],
+  chains: [
+    { seg: 'chain', fields: [{ name: 'app' }, { name: 'chain' }] },
+    { seg: 'new', fields: [{ name: 'app' }] },
+  ],
+  tunnels: [
+    // 外部出口 id 在数据库中全局唯一；租户只用于服务端授权边界，不进入浏览器地址。
+    { seg: 'custom', fields: [{ name: 'id', pattern: /^custom-[0-9a-f]{4}-[0-9a-f]{4}$/ }] },
+    { seg: 'warp', fields: [{ name: 'id', pattern: /^warp-[0-9a-f]{4}-[0-9a-f]{4}$/ }] },
+    {
+      seg: 'vpngate',
+      fields: [{ name: 'id', optional: true, pattern: /^vpngate-[0-9a-f]{4}-[0-9a-f]{4}$/ }],
+    },
+  ],
   /* 单租户阶段用户 id 足以恢复详情，内部归属不进入可见地址。 */
   users: [{ seg: 'new' }, { seg: 'user', fields: [{ name: 'id' }] }],
   deploy: [{ seg: 'plan' }, { seg: 'detail', fields: [{ name: 'id', num: true }] }],
@@ -81,8 +96,13 @@ export function serialize(loc: Loc): string {
       const v = loc.drill[f.name];
       // 字段缺失时回退到该页面的根路径：少一层优于生成 `#/deploy/detail/undefined`
       // ——该地址解析后会得到一个 id 为空的详情页。
-      if (v == null) return `#/${loc.nav}`;
-      parts.push(encodeURIComponent(String(v)));
+      if (v == null) {
+        if (f.optional) continue;
+        return `#/${loc.nav}`;
+      }
+      const raw = String(v);
+      if (f.pattern && !f.pattern.test(raw)) return `#/${loc.nav}`;
+      parts.push(encodeURIComponent(raw));
     }
   }
   return `#/${parts.join('/')}`;
@@ -101,9 +121,16 @@ export function parse(hash: string): Loc | null {
   const values = rest;
   // 路径段数量必须与当前路由表完全一致。手改出的缺段或多段地址都回到页面根部，
   // 不把半个标识传给详情页。
-  if (values.length !== fields.length) return { nav };
+  const requiredFields = fields.filter(field => !field.optional).length;
+  if (values.length < requiredFields || values.length > fields.length) return { nav };
+  let valid = true;
   fields.forEach((f, i) => {
     const raw = values[i];
+    if (raw == null) return;
+    if (f.pattern && !f.pattern.test(raw)) {
+      valid = false;
+      return;
+    }
     if (!f.num) {
       drill[f.name] = raw;
       return;
@@ -111,6 +138,7 @@ export function parse(hash: string): Loc | null {
     const n = Number(raw);
     drill[f.name] = Number.isFinite(n) ? n : raw;
   });
+  if (!valid) return { nav };
   return { nav, drill };
 }
 
@@ -125,6 +153,208 @@ function current(): Loc {
 // 恢复期间不写回地址：apply 会连续修改 forge 和 wm，每次修改都会触发 sync，
 // 而这些变化的来源即是地址栏——再次 push 会重复写入自身的历史记录。
 let applying = false;
+
+const ROUTE_HISTORY_KEY = 'brocadeRoute';
+
+interface RouteHistoryState {
+  index: number;
+  scrollTop: number;
+  fromHash?: string;
+}
+
+type RoutePosition = Pick<RouteHistoryState, 'scrollTop'>;
+
+const POSITION_SAVE_DELAY = 250;
+const POSITION_SAVE_INTERVAL = 1_000;
+const POSITION_CACHE_LIMIT = 100;
+const positionCache = new Map<number, RoutePosition>();
+let historyIndex = 0;
+let historyHash = '';
+let approvedTraversal = false;
+let revertingTraversal = false;
+let positionSaveTimer = 0;
+let lastPositionSave = -Infinity;
+let lastHistoryWarning = -Infinity;
+let positionRestoreCleanup: (() => void) | null = null;
+
+const stateRecord = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+
+const routeHistoryState = (value: unknown = window.history.state): RouteHistoryState | null => {
+  const raw = stateRecord(value)[ROUTE_HISTORY_KEY];
+  if (raw === null || typeof raw !== 'object') return null;
+  const state = raw as Partial<RouteHistoryState>;
+  if (
+    typeof state.index !== 'number' ||
+    !Number.isSafeInteger(state.index) ||
+    typeof state.scrollTop !== 'number' ||
+    !Number.isFinite(state.scrollTop)
+  )
+    return null;
+  return {
+    index: state.index,
+    scrollTop: Math.max(0, state.scrollTop),
+    fromHash: typeof state.fromHash === 'string' ? state.fromHash : undefined,
+  };
+};
+
+const withRouteHistoryState = (state: RouteHistoryState, source: unknown = window.history.state) => ({
+  ...stateRecord(source),
+  [ROUTE_HISTORY_KEY]: state,
+});
+
+/** A rejected or silently ignored write must never advance the application's history index. */
+const writeRouteHistory = (method: 'pushState' | 'replaceState', state: RouteHistoryState, hash: string): boolean => {
+  let failure = 'HistoryWriteIgnored';
+  try {
+    window.history[method](withRouteHistoryState(state), '', hash);
+    const written = routeHistoryState();
+    if (
+      window.location.hash === hash &&
+      written?.index === state.index &&
+      written.scrollTop === state.scrollTop &&
+      written.fromHash === state.fromHash
+    )
+      return true;
+  } catch (error) {
+    // Exception messages may contain URLs. Keep diagnostics bounded and free of route data.
+    failure = error instanceof Error ? error.name : 'HistoryWriteFailed';
+  }
+  if (performance.now() - lastHistoryWarning >= 10_000) {
+    lastHistoryWarning = performance.now();
+    console.warn(`浏览器历史写入失败（${method} / ${failure}）；保留当前导航和内存位置。`);
+  }
+  return false;
+};
+
+const cachePosition = (index: number, position: RoutePosition) => {
+  positionCache.delete(index);
+  positionCache.set(index, position);
+  if (positionCache.size > POSITION_CACHE_LIMIT) {
+    const oldest = positionCache.keys().next().value;
+    if (oldest !== undefined) positionCache.delete(oldest);
+  }
+};
+
+const cancelPositionSave = () => {
+  if (positionSaveTimer) window.clearTimeout(positionSaveTimer);
+  positionSaveTimer = 0;
+};
+
+const workspaceScroller = (): HTMLElement | null => document.querySelector<HTMLElement>('.fg-desk');
+
+const rememberCurrentPosition = () => {
+  // Do not replace a pending restoration with the outgoing DOM or a partially loaded list.
+  if (typeof document === 'undefined' || applying || positionRestoreCleanup) return false;
+  const previous = positionCache.get(historyIndex) ?? { scrollTop: 0 };
+  const scroller = workspaceScroller();
+  cachePosition(historyIndex, {
+    scrollTop: scroller?.scrollTop ?? previous.scrollTop,
+  });
+  return true;
+};
+
+const persistCurrentPosition = () => {
+  cancelPositionSave();
+  // popstate already exposes the destination history entry while the old page is still mounted.
+  if (window.location.hash !== historyHash || revertingTraversal) return;
+  const previous = routeHistoryState();
+  const position = positionCache.get(historyIndex);
+  if (!position || previous?.index !== historyIndex) return;
+  if (previous.scrollTop === position.scrollTop) return;
+  lastPositionSave = performance.now();
+  writeRouteHistory('replaceState', { ...previous, ...position }, historyHash);
+};
+
+const schedulePositionSave = () => {
+  cancelPositionSave();
+  const index = historyIndex;
+  const hash = historyHash;
+  positionSaveTimer = window.setTimeout(
+    () => {
+      positionSaveTimer = 0;
+      if (index === historyIndex && hash === historyHash) persistCurrentPosition();
+    },
+    Math.max(POSITION_SAVE_DELAY, lastPositionSave + POSITION_SAVE_INTERVAL - performance.now()),
+  );
+};
+
+/** Restore after React has replaced the route body. Resize/DOM observers cover async list data. */
+const restoreWorkspacePosition = (state: Pick<RouteHistoryState, 'scrollTop'>) => {
+  if (typeof document === 'undefined') return;
+  positionRestoreCleanup?.();
+
+  let stopped = false;
+  let resizeObserver: ResizeObserver | null = null;
+  let mutationObserver: MutationObserver | null = null;
+  let timeout = 0;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    resizeObserver?.disconnect();
+    mutationObserver?.disconnect();
+    if (timeout) window.clearTimeout(timeout);
+    positionRestoreCleanup = null;
+  };
+  positionRestoreCleanup = stop;
+
+  const applyPosition = () => {
+    if (stopped) return;
+    const scroller = workspaceScroller();
+    const surface = document.querySelector<HTMLElement>('.fg-view, .fg-topo');
+    if (!surface) return;
+
+    const maxScroll = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight) : 0;
+    if (scroller) scroller.scrollTop = Math.min(state.scrollTop, maxScroll);
+    surface.focus({ preventScroll: true });
+
+    const scrollReady = !scroller || state.scrollTop <= maxScroll + 1;
+    if (scrollReady) stop();
+  };
+
+  // One pre-paint frame is enough for useSyncExternalStore to commit the route body. Waiting for a
+  // second frame exposes the new page at the previous page's scrollTop for one paint; on a narrow
+  // screen that moves almost the whole viewport and looks like a full-screen flash when going back.
+  timeout = window.setTimeout(() => {
+    applyPosition();
+    stop();
+  }, 4_000);
+  window.requestAnimationFrame(() => {
+    if (stopped) return;
+    applyPosition();
+    if (stopped) return;
+    const surface = document.querySelector<HTMLElement>('.fg-view, .fg-topo') ?? workspaceScroller() ?? document.body;
+    if (!surface) return;
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(applyPosition);
+      resizeObserver.observe(surface);
+    }
+    if (typeof MutationObserver !== 'undefined') {
+      mutationObserver = new MutationObserver(applyPosition);
+      mutationObserver.observe(surface, { childList: true, subtree: true });
+    }
+  });
+};
+
+const currentWorkspacePosition = (): RoutePosition => ({
+  scrollTop: workspaceScroller()?.scrollTop ?? 0,
+});
+
+const pushLocation = (hash: string, position: RoutePosition = { scrollTop: 0 }): boolean => {
+  const fromHash = window.location.hash;
+  rememberCurrentPosition();
+  persistCurrentPosition();
+  const nextIndex = historyIndex + 1;
+  if (!writeRouteHistory('pushState', { index: nextIndex, ...position, fromHash }, hash)) return false;
+  // A push after back replaces the forward branch, including cached entries whose indices recur.
+  for (const index of positionCache.keys()) {
+    if (index >= nextIndex) positionCache.delete(index);
+  }
+  historyIndex = nextIndex;
+  historyHash = hash;
+  cachePosition(historyIndex, position);
+  return true;
+};
 
 // 页面名称由外壳管理（NAV / MORE 两张表），在 startRouting 时传入；
 // 在此处 import 会形成循环依赖。只在打开窗口时使用一次，默认值为 nav 本身。
@@ -163,14 +393,56 @@ function apply(loc: Loc) {
     在当前外壳下不产生任何效果，需要再次点击「发布」才能看到。
 
     它与后退键、地址栏直达使用同一个 `apply`——三条路径语义一致，增加下钻层级只需
-    修改 DRILL 表。 */
-export function navigate(nav: NavKey, drill?: Loc['drill']) {
+    修改 DRILL 表。新导航始终创建当前访问位置并回到顶部；恢复旧滚动只属于显式返回。 */
+const moveTo = (
+  nav: NavKey,
+  drill: Loc['drill'] | undefined,
+  restorePrevious: boolean,
+  preservePosition = false,
+): boolean => {
   const loc: Loc = { nav, drill };
-  // apply 期间抑制 sync（它连续修改 forge 和 wm，每次修改都会触发一次），完成后
-  // 统一写入一条。中间的过渡状态不是实际访问过的位置，不应各占一条历史记录。
-  apply(loc);
   const next = serialize(loc);
-  if (next !== window.location.hash) window.history.pushState(null, '', next);
+  if (!confirmDiscardChanges()) return false;
+  cancelVisualTransition();
+  const nextPosition = preservePosition ? currentWorkspacePosition() : { scrollTop: 0 };
+
+  // 只有带有“返回”语义的控件才能复用上一条历史。顶栏恰好指向上一页时仍是一次新导航，
+  // 否则会把上一页的中段滚动位置恢复出来，看起来像新页面从半截开始。
+  if (restorePrevious && routeHistoryState()?.fromHash === next) {
+    rememberCurrentPosition();
+    persistCurrentPosition();
+    approvedTraversal = true;
+    window.history.back();
+    return true;
+  }
+
+  // React 的外部 store 更新可能在事件结束前提交。先记录旧页面，避免 apply 之后焦点元素
+  // 已被卸载、详情的内容高度又覆盖列表原有 scrollTop。
+  if (next !== window.location.hash) {
+    if (!pushLocation(next, nextPosition)) return false;
+  } else {
+    cancelPositionSave();
+    cachePosition(historyIndex, nextPosition);
+  }
+  // 先确认历史写入成功，再提交外部 store；被限流时页面、URL 和索引一起留在原处。
+  // apply 期间抑制 sync，避免 forge / wm 的中间状态各占一条历史记录。
+  apply(loc);
+  restoreWorkspacePosition(nextPosition);
+  return true;
+};
+
+export function navigate(nav: NavKey, drill?: Loc['drill']): boolean {
+  return moveTo(nav, drill, false);
+}
+
+/** Change an object selected inside a persistent master-detail page without jumping its roster. */
+export function navigateInPlace(nav: NavKey, drill?: Loc['drill']): boolean {
+  return moveTo(nav, drill, false, true);
+}
+
+/** 返回父级时优先复用紧邻的历史项，以恢复离开前的滚动位置。 */
+export function returnTo(nav: NavKey, drill?: Loc['drill']): boolean {
+  return moveTo(nav, drill, true);
 }
 
 /* ══ 启动 ══ */
@@ -186,15 +458,23 @@ let started = false;
     订阅和监听只挂一次。 */
 export function startRouting(label: (nav: NavKey) => string) {
   labelOf = label;
+  cancelPositionSave();
+  positionRestoreCleanup?.();
+  positionCache.clear();
   // 地址中有位置时以地址为准；站点根地址始终打开默认列表，不恢复上次页面或下钻。
   // 使用 replace，避免为首次进入额外增加一条历史记录。
   const initial = parse(window.location.hash);
-  if (initial) {
-    apply(initial);
-  } else {
-    apply({ nav: DEFAULT_NAV });
-    window.history.replaceState(null, '', serialize(current()));
-  }
+  const initialLocation = initial ?? { nav: DEFAULT_NAV };
+  apply(initialLocation);
+  const initialHash = serialize(initialLocation);
+  const restoredState = routeHistoryState();
+  historyIndex = restoredState?.index ?? 0;
+  historyHash = initialHash;
+  const initialState = restoredState ?? { index: historyIndex, scrollTop: 0 };
+  cachePosition(historyIndex, initialState);
+  writeRouteHistory('replaceState', initialState, initialHash);
+  if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual';
+  restoreWorkspacePosition(restoredState ?? { scrollTop: 0 });
 
   if (started) return;
   started = true;
@@ -204,15 +484,86 @@ export function startRouting(label: (nav: NavKey) => string) {
     const next = serialize(current());
     /* 地址未变化时不写入历史记录。wm 的每次拖动窗口和测量高度都会触发该函数，它们不属于导航。 */
     if (next === window.location.hash) return;
-    window.history.pushState(null, '', next);
+    if (pushLocation(next)) restoreWorkspacePosition({ scrollTop: 0 });
+    else apply(parse(window.location.hash) ?? { nav: DEFAULT_NAV });
   };
   forge.subscribe(sync);
   wm.subscribe(sync);
 
-  // popstate 处理前进后退；hashchange 处理手动修改地址栏。同一次导航同时触发两者不影响结果，
-  // apply 到相同位置时不产生任何操作。
-  const restore = () => {
-    apply(parse(window.location.hash) ?? { nav: DEFAULT_NAV });
+  // 工作区滚动只采集到内存。rAF 仍可能每秒写 60/120 次 history，耗尽 WebKit
+  // 与导航共用的配额；停止操作后防抖保存，并为频繁短滚动保留至少一秒的写入间隔。
+  const recordPosition = () => {
+    if (rememberCurrentPosition()) schedulePositionSave();
+  };
+  document.addEventListener(
+    'scroll',
+    event => {
+      if (!(event.target instanceof HTMLElement) || !event.target.classList.contains('fg-desk')) return;
+      recordPosition();
+    },
+    true,
+  );
+  window.addEventListener('pagehide', () => {
+    rememberCurrentPosition();
+    persistCurrentPosition();
+  });
+
+  // popstate 处理前进后退；hashchange 处理手动修改地址栏。hash 导航在部分浏览器会连续触发
+  // 两者，第二次必须按序列化位置去重，否则同一个返回动作会应用两次。
+  const restore = (event: PopStateEvent | HashChangeEvent) => {
+    const next = parse(window.location.hash) ?? { nav: DEFAULT_NAV };
+    const canonicalHash = serialize(next);
+    const previous = current();
+    const poppedState = event instanceof PopStateEvent ? routeHistoryState(event.state) : routeHistoryState();
+    if (revertingTraversal) {
+      // history.go() 异步返回被拒绝离开前的位置。原 traversal 自己还可能补发一次
+      // hashchange；那次 URL 仍是被拒绝的目标，不能提前消耗标记。只有 URL 与仍保留的
+      // 应用状态重新一致时，才算真正回到了原历史项。
+      if (serialize(previous) !== serialize(next)) return;
+      revertingTraversal = false;
+      historyIndex = poppedState?.index ?? historyIndex;
+      return;
+    }
+    if (serialize(previous) === canonicalHash && (!poppedState || poppedState.index === historyIndex)) {
+      if (canonicalHash !== window.location.hash) {
+        writeRouteHistory('replaceState', poppedState ?? { index: historyIndex, scrollTop: 0 }, canonicalHash);
+      }
+      return;
+    }
+
+    // Direct browser traversal bypasses moveTo. Save the old DOM to its in-memory index only;
+    // replaceState here would overwrite the destination entry with the departing page's position.
+    rememberCurrentPosition();
+    cancelPositionSave();
+    if (!approvedTraversal && !confirmDiscardChanges()) {
+      revertingTraversal = true;
+      const delta = poppedState ? historyIndex - poppedState.index : -1;
+      window.history.go(delta || -1);
+      return;
+    }
+
+    approvedTraversal = false;
+    cancelVisualTransition();
+    const nextIndex = poppedState?.index ?? historyIndex + 1;
+    if (!poppedState) {
+      for (const index of positionCache.keys()) {
+        if (index >= nextIndex) positionCache.delete(index);
+      }
+    }
+    const state = poppedState ?? {
+      index: nextIndex,
+      scrollTop: 0,
+      fromHash: serialize(previous),
+    };
+    const position = positionCache.get(nextIndex) ?? state;
+    historyIndex = nextIndex;
+    historyHash = canonicalHash;
+    cachePosition(historyIndex, position);
+    if (!poppedState || canonicalHash !== window.location.hash) {
+      writeRouteHistory('replaceState', { ...state, ...position }, canonicalHash);
+    }
+    apply(next);
+    restoreWorkspacePosition(position);
   };
   window.addEventListener('popstate', restore);
   window.addEventListener('hashchange', restore);

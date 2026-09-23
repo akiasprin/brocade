@@ -3,6 +3,8 @@
  * Every trace comes from the categorical observation palette, including the primary trace. This
  * keeps multi-series charts balanced instead of forcing their first line to a separate KPI color.
  * CSS owns the real colors so canvas series and HTML legends stay identical. */
+import { LOADING_LINE_WIDTH, LOADING_SPINNER_RADIUS, LOADING_TEXT } from './loading';
+
 export const OBSERVE_SERIES_COLOR_VARS = [
   '--observe-1',
   '--observe-2',
@@ -15,6 +17,19 @@ export const OBSERVE_SERIES_COLOR_VARS = [
   '--observe-9',
   '--observe-10',
 ] as const;
+
+export function observeLoadingOptions(resolve: (name: string, fallback: string) => string) {
+  return {
+    text: LOADING_TEXT,
+    color: resolve('--action', '#286983'),
+    textColor: resolve('--ink-3', '#707780'),
+    maskColor: 'transparent',
+    fontSize: 11,
+    spinnerRadius: LOADING_SPINNER_RADIUS,
+    lineWidth: LOADING_LINE_WIDTH,
+    zlevel: 0,
+  };
+}
 
 /* Fallbacks for the CSS tokens of the same name; keep both lists in sync with styles.css.
    Rosé Pine Moon / Dawn, with slots 6, 8 and 10 filled in — the palette ships only six accents. */
@@ -308,6 +323,24 @@ function bpsRung(value: number): readonly [number, string] {
   return BPS_UNITS.find(([step]) => value / step >= 1) ?? BPS_UNITS[BPS_UNITS.length - 1];
 }
 
+export interface ObserveBpsReadingParts {
+  number: string;
+  unit: string;
+}
+
+/**
+ * Split a compact throughput reading into number and unit while letting adjacent readings share
+ * one rung. The shared reference matters for side-by-side RX/TX values: `1.00 Gbit/s` next to
+ * `958 Mbit/s` makes 958 look larger at a glance, while `1.00` next to `0.958 Gbit/s` preserves the
+ * actual ordering. Pass the larger value of the pair as `reference`.
+ */
+export function observeBpsReadingParts(value: number, reference = value): ObserveBpsReadingParts {
+  const safeValue = Number.isFinite(value) && value > 0 ? value : 0;
+  const safeReference = Number.isFinite(reference) && reference > 0 ? reference : safeValue;
+  const [divisor, unit] = bpsRung(safeReference);
+  return { number: significantText(safeValue / divisor), unit };
+}
+
 /**
  * A throughput reading with nothing behind it to agree with — a KPI chip, a month total, a fleet
  * sum. It picks its own rung, since there is no axis whose unit it should be borrowing.
@@ -316,8 +349,8 @@ function bpsRung(value: number): readonly [number, string] {
  * plot and the plot's own scale never name different units for the same quantity.
  */
 export function observeBpsReading(value: number): string {
-  const [divisor, name] = bpsRung(value);
-  return `${significantText(value / divisor)} ${name}`;
+  const reading = observeBpsReadingParts(value);
+  return `${reading.number} ${reading.unit}`;
 }
 
 /**

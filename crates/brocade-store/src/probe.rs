@@ -15,7 +15,7 @@ use brocade_deployment::protocol::{
     E2eProbeResult, E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
     E2eProbeTls, E2eProbeXhttp, E2eProbeXhttpRange, E2eProbeXhttpXmux, LinkHealthRequest,
     LinkHealthResult, LinkProbeRequest, LinkProbeResult, LinkProbeStatus, ProbeTarget,
-    ProbeTargetList, ProbeTransport,
+    ProbeTargetList, ProbeTransport, VpngateIpNetwork, VpngateIpScore,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -535,19 +535,31 @@ pub struct E2eProbeItem {
     pub ttfb_ms: Option<u32>,
     pub exit_ip: Option<String>,
     pub exit_loc: Option<String>,
+    /// Existing intelligence for the exact observed exit IP. This is a read-only association:
+    /// opening a chain never queues provider requests or creates a second source of truth.
+    pub exit_intelligence: Option<E2eExitIpIntelligence>,
     pub exit_verdict: String,
     pub detail: Option<String>,
     pub probed_at: String,
-    /// The last six hours in chronological order (oldest to newest). The UI places them on a real
-    /// time axis rather than distributing an irregular series at equal distances.
-    pub samples: Vec<E2eProbeSample>,
+    /// The last six hours in chronological order (oldest to newest). The three columns always
+    /// have equal lengths. Keeping exact points in columns avoids repeating JSON field names and
+    /// timestamp formatting for every sample without changing the curve's resolution.
+    pub samples: E2eProbeSampleSeries,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct E2eProbeSample {
-    pub probed_at: String,
-    pub status: String,
-    pub ttfb_ms: Option<u32>,
+pub struct E2eExitIpIntelligence {
+    pub country_code: Option<String>,
+    pub scores: Vec<VpngateIpScore>,
+    pub networks: Vec<VpngateIpNetwork>,
+    pub verified_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eProbeSampleSeries {
+    pub probed_at_unix_secs: Vec<i64>,
+    pub status: Vec<String>,
+    pub ttfb_ms: Vec<Option<u32>>,
 }
 
 /// Which chains this machine probes as their head.
@@ -712,8 +724,9 @@ async fn self_signed_certificate_pin(pool: &PgPool, node_id: &str) -> Result<Opt
 /// empty means this node genuinely heads no chains, while failure means the control plane cannot
 /// safely state what it should probe.
 fn e2e_probe_plan(snapshot: &ModelSnapshot, node_id: &str) -> Result<ProbePlan> {
-    brocade_core::compile::compile(snapshot)
-        .project_probe(node_id)
+    let output = crate::compile_cache::compile_incremental(snapshot);
+    crate::compile_cache::project_probe(&output, node_id)
+        .map(|plan| plan.as_ref().clone())
         .map_err(StoreError::from)
 }
 
@@ -799,6 +812,22 @@ pub async fn record_e2e_probe(
         .execute(&mut *tx)
         .await?;
 
+        // Exit intelligence is global by exact public IP, not a VPN Gate-only fact. Feed every
+        // successful chain probe into the same deduplicated queue so ordinary node exits,
+        // external proxies and VPN Gate exits all reuse one provider result. Invalid, private and
+        // documentation addresses remain valid probe evidence but must never become third-party
+        // lookup work.
+        if chain.status == E2eProbeStatus::Ok {
+            if let Some(exit_ip) = chain.exit_ip.as_deref().and_then(crate::public_route_ip) {
+                crate::vpngate::queue_exit_reputation(
+                    &mut tx,
+                    &exit_ip.to_string(),
+                    request.probed_at_unix_secs,
+                )
+                .await?;
+            }
+        }
+
         // The sample table takes its own row. A repeat report within the same second collides
         // on the primary key — DO NOTHING rather than overwrite: with two probes landing in one
         // second, the first to arrive is already a fact.
@@ -851,10 +880,17 @@ pub async fn e2e_probe_view(
 
     let rows = sqlx::query(
         "SELECT p.chain_id, p.app_id, c.name AS chain_name, p.node_id, p.status, p.ttfb_ms,
-                p.exit_ip, p.exit_loc, p.exit_verdict, p.detail, p.probed_at::text AS probed_at
+                p.exit_ip, p.exit_loc, p.exit_verdict, p.detail, p.probed_at::text AS probed_at,
+                reputation.country_code AS intelligence_country_code,
+                reputation.ip_scores AS intelligence_scores,
+                reputation.ip_networks AS intelligence_networks,
+                reputation.verified_at::text AS intelligence_verified_at
          FROM e2e_probes p
          JOIN chains c ON c.id = p.chain_id
          JOIN apps a ON a.id = c.app_id
+         LEFT JOIN vpngate_exit_reputations reputation
+           ON host(reputation.exit_ip) = p.exit_ip
+          AND reputation.verified_at IS NOT NULL
          WHERE (
                 $1::text IS NULL
                 OR c.tenant_id = $1
@@ -870,7 +906,10 @@ pub async fn e2e_probe_view(
     // Fetch the samples once and group them by chain rather than querying per chain in a loop:
     // with many chains that is N+1.
     let sample_rows = sqlx::query(
-        "SELECT s.chain_id, s.probed_at::text AS probed_at, s.status, s.ttfb_ms
+        "SELECT s.chain_id,
+                EXTRACT(EPOCH FROM s.probed_at)::BIGINT AS probed_at_unix_secs,
+                s.status,
+                s.ttfb_ms
          FROM e2e_probe_samples s
          JOIN chains c ON c.id = s.chain_id
          WHERE (
@@ -886,21 +925,43 @@ pub async fn e2e_probe_view(
     .bind(SAMPLE_WINDOW_SECS)
     .fetch_all(pool)
     .await?;
-    let mut samples: std::collections::BTreeMap<String, Vec<E2eProbeSample>> = Default::default();
+    let mut samples: std::collections::BTreeMap<String, E2eProbeSampleSeries> = Default::default();
     for row in &sample_rows {
-        samples
-            .entry(row.try_get("chain_id")?)
-            .or_default()
-            .push(E2eProbeSample {
-                probed_at: row.try_get("probed_at")?,
-                status: row.try_get("status")?,
-                ttfb_ms: optional_u32(row.try_get("ttfb_ms")?),
-            });
+        let series = samples.entry(row.try_get("chain_id")?).or_default();
+        series
+            .probed_at_unix_secs
+            .push(row.try_get("probed_at_unix_secs")?);
+        series.status.push(row.try_get("status")?);
+        series.ttfb_ms.push(optional_u32(row.try_get("ttfb_ms")?));
     }
 
     rows.iter()
         .map(|row| {
             let chain_id: String = row.try_get("chain_id")?;
+            let intelligence_verified_at: Option<String> =
+                row.try_get("intelligence_verified_at")?;
+            let intelligence_scores: Option<serde_json::Value> =
+                row.try_get("intelligence_scores")?;
+            let intelligence_networks: Option<serde_json::Value> =
+                row.try_get("intelligence_networks")?;
+            let exit_intelligence = match (
+                intelligence_verified_at,
+                intelligence_scores,
+                intelligence_networks,
+            ) {
+                (None, None, None) => None,
+                (Some(verified_at), Some(scores), Some(networks)) => Some(E2eExitIpIntelligence {
+                    country_code: row.try_get("intelligence_country_code")?,
+                    scores: decode_exit_intelligence("intelligence_scores", scores)?,
+                    networks: decode_exit_intelligence("intelligence_networks", networks)?,
+                    verified_at,
+                }),
+                _ => {
+                    return Err(StoreError::InvalidData(
+                        "exit IP intelligence row is incomplete".to_owned(),
+                    ))
+                }
+            };
             Ok(E2eProbeItem {
                 app_id: row.try_get("app_id")?,
                 chain_name: row.try_get("chain_name")?,
@@ -909,6 +970,7 @@ pub async fn e2e_probe_view(
                 ttfb_ms: optional_u32(row.try_get("ttfb_ms")?),
                 exit_ip: row.try_get("exit_ip")?,
                 exit_loc: row.try_get("exit_loc")?,
+                exit_intelligence,
                 exit_verdict: row.try_get("exit_verdict")?,
                 detail: row.try_get("detail")?,
                 probed_at: row.try_get("probed_at")?,
@@ -917,6 +979,14 @@ pub async fn e2e_probe_view(
             })
         })
         .collect()
+}
+
+fn decode_exit_intelligence<T: serde::de::DeserializeOwned>(
+    field: &str,
+    value: serde_json::Value,
+) -> Result<T> {
+    serde_json::from_value(value)
+        .map_err(|error| StoreError::InvalidData(format!("{field} contains invalid JSON: {error}")))
 }
 
 fn optional_u32(value: Option<i32>) -> Option<u32> {

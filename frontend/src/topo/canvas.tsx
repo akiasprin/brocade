@@ -9,6 +9,8 @@ import {
   type UsageChainSample,
 } from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
+import { bytes } from '../ui/format';
+import { Icon } from '../ui/icons';
 import { artifactPanel } from '../ui/artifact-panel';
 import { InspectPane } from '../panes/inspect';
 import {
@@ -43,17 +45,7 @@ interface Sel {
 // 两处都不符合 ISO 格式——直接调用 Date.parse 会得到 NaN，统计口径行会显示为无效值。
 const tsMs = (t: string): number => Date.parse(t.replace(' ', 'T').replace(/([+-]\d{2})$/, '$1:00'));
 
-const fmtBytes = (b: number): string => {
-  if (!b) return '0 B';
-  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  let v = b;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
-  return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${u[i]}`;
-};
+const fmtBytes = bytes;
 
 // ══════════════════════════════════════════════════════════════
 // 检视台面：只用于查看。
@@ -294,10 +286,19 @@ export function TopoCanvas() {
     };
   }, [geo]);
 
-  if (!current || compile.isPending) return <Loading />;
-  if (compile.error) return <ErrorBox error={compile.error} />;
+  const initialError = revisions.error ?? compile.error ?? snapshot.error ?? usage.error ?? series.error;
+  if (initialError) return <ErrorBox error={initialError} />;
+  if (
+    revisions.isPending ||
+    (current != null && compile.isPending) ||
+    snapshot.isPending ||
+    usage.isPending ||
+    series.isPending
+  )
+    return <Loading variant="canvas" />;
+  if (!current) return <div id="stage-chip">还没有机器。先去「机器」面纳管一台。</div>;
   if (!system || !geo || system.nodes.length === 0)
-    return <div id="stage-chip">还没有节点。先去「机器」面纳管一台。</div>;
+    return <div id="stage-chip">还没有机器。先去「机器」面纳管一台。</div>;
   if (apps.length === 0) return <div id="stage-chip">还没有线路。先去「线路」面建一条。</div>;
 
   const nameOf = (id: string) =>
@@ -899,7 +900,7 @@ function Callout({
           <span className="fw-kind">{KIND_CN[sel.kind]}</span>
           <span className="fw-title">{title}</span>
           <button className="btn" onClick={onClose} title="关掉">
-            ✕
+            <Icon of="close" size={14} />
           </button>
         </div>
         <div className="topo-callout-body">

@@ -83,14 +83,42 @@ test('所有面板标题固定使用 PanelTitle，列表页只使用 ListIcon �
   assert.match(settings, /function SettingsTitle[\s\S]*?<PanelTitle of=\{ICON_OF\[id\]\}>/);
 });
 
+test('主列表页标题不显示数量或状态汇总', () => {
+  const nodes = panes.get('nodes.tsx');
+  const chains = panes.get('chains.tsx');
+  const tunnels = panes.get('tunnels.tsx');
+  const users = panes.get('users.tsx');
+
+  assert.doesNotMatch(nodes, /<span className="hint">\{count\} 台<\/span>/);
+  assert.doesNotMatch(nodes, /<span className="rd">/);
+  assert.doesNotMatch(chains, /<span className="hint">\{groups\.length\} 个分组<\/span>/);
+  assert.doesNotMatch(chains, /<span className="rd">/);
+  assert.doesNotMatch(tunnels, /<span className="hint">\{tunnels\.length\} 条<\/span>/);
+  assert.doesNotMatch(users, /user-roster-availability/);
+});
+
+test('公网 IP 变更记录作为状态巡检后的 AGENT 指标展开详情', () => {
+  const nodes = panes.get('nodes.tsx');
+  const agent = nodes.slice(nodes.indexOf('function AgentCard('), nodes.indexOf('export function AppliedCard('));
+
+  assert.ok(agent.indexOf("'状态巡检'") < agent.indexOf("'IP 变更记录'"));
+  assert.match(agent, /event\.event_kind === 'changed'/);
+  assert.match(agent, /publicIpChangeCount[\s\S]*?<span className="nd-rt-u">条<\/span>/);
+  assert.match(agent, /aria-expanded=\{publicIpHistoryOpen\}/);
+  assert.match(agent, /<PublicIpHistoryDetails/);
+  assert.match(nodes, /className="nd-public-ip-foot"[\s\S]*?最近观测 <Ago at=\{lastSeen\} \/>/);
+  assert.match(styles, /\.nd-public-ip-metric\s*\{[^}]*cursor:\s*pointer/s);
+  assert.match(styles, /\.nd-public-ip-detail\s*\{[^}]*grid-column:\s*1 \/ -1/s);
+  assert.match(styles, /\.nd-public-ip-history \.empty-compact\s*\{[^}]*padding:\s*2px 0/s);
+  assert.match(styles, /\.nd-public-ip-history \.rvh-ev\s*\{[^}]*padding-block:\s*4px/s);
+  assert.match(styles, /@container \(min-width: 640px\)[\s\S]*?\.nd-public-ip-detail\s*\{[^}]*grid-column:\s*2/s);
+});
+
 test('配置控件与说明文字共用 6px 垂直间距', () => {
   assert.match(styles, /--field-note-gap:\s*6px;/);
   assert.match(styles, /\.setfld \.v\s*\{[^}]*row-gap:\s*var\(--field-note-gap\)/s);
   assert.match(styles, /\.fgrid \.v \.sub\s*\{[^}]*margin-top:\s*var\(--field-note-gap\)/s);
-  assert.match(
-    styles,
-    /\.chain-face dd > :not\(\.note\) \+ \.note,[\s\S]*?margin-top:\s*var\(--field-note-gap\)/,
-  );
+  assert.match(styles, /\.chain-face dd > :not\(\.note\) \+ \.note,[\s\S]*?margin-top:\s*var\(--field-note-gap\)/);
 });
 
 const splitSelectors = selectorList => {
@@ -138,16 +166,23 @@ const staticClasses = contents => {
   return classes;
 };
 
-/* 机器页还会通过 rules/telemetry 渲染规则编辑器和观测卡，
- * 因此这两个子组件也是机器/线路/用户基准的一部分。 */
-const referenceFiles = ['nodes.tsx', 'chains.tsx', 'users.tsx', 'rules.tsx', 'telemetry.tsx'];
+/* 机器页还会通过 rules/telemetry 和按需图表模块渲染规则编辑器与观测卡，
+ * 因此这些子组件也是机器/线路/用户基准的一部分。 */
+const referenceFiles = [
+  'nodes.tsx',
+  'chains.tsx',
+  'users.tsx',
+  'rules.tsx',
+  'telemetry.tsx',
+  'fleet-net-panel.tsx',
+  'node-observation-charts.tsx',
+];
 const referenceClasses = new Set([
   'panel',
   'config-panel',
   'titled',
   'cardpage',
   'fg-sheet',
-  'b-col',
   'duo',
   'col',
   'observed',
@@ -157,6 +192,11 @@ const referenceClasses = new Set([
   'history-chart-card',
   'load-network',
   'load-metric',
+  // 发布 mockup 的修饰类只编排既有 titled/config-panel 骨架，并继续使用全局设计 token。
+  // 明确列出允许项，避免把所有发布页私有类都加入基准后掩盖新的面板皮肤。
+  'cgf',
+  'cg-sec',
+  'cg-software',
   // 隧道列表明确复用三个基准列表页标题，与它们在同一条 CSS 规则中。
   'tunnel-list-panel',
 ]);
@@ -168,7 +208,9 @@ const panelHooksOutsideReferences = new Set();
 for (const declaration of panelDeclarations()) {
   if (referenceFiles.includes(declaration.file)) continue;
   for (const name of declaration.classes.slice(1)) {
-    if (name !== 'config-panel' && name !== 'titled') panelHooksOutsideReferences.add(`.${name}`);
+    if (name !== 'config-panel' && name !== 'titled' && !referenceClasses.has(name)) {
+      panelHooksOutsideReferences.add(`.${name}`);
+    }
   }
   const id = declaration.tag.match(/\bid="([^"]+)"/);
   if (id) panelHooksOutsideReferences.add(`#${id[1]}`);
@@ -186,7 +228,10 @@ const panelSkinOffenders = css => {
       const target = finalCompound(selector);
       const targetsPanelShell = /\.panel\b/.test(selector) && /\.panel\b/.test(target);
       const targetsPanelTitle = /\.panel\b/.test(selector) && /^(?:header|summary|h4)(?:\b|:)/.test(target);
-      const targetsOutsideHook = [...panelHooksOutsideReferences].some(hook => target.includes(hook));
+      const targetsOutsideHook = [...panelHooksOutsideReferences].some(hook => {
+        const escaped = hook.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(`${escaped}(?![\\w-])`).test(target);
+      });
       if (!targetsPanelShell && !targetsPanelTitle && !targetsOutsideHook) continue;
 
       const unknownClasses = [...selector.matchAll(/\.([A-Za-z_][\w-]*)/g)]

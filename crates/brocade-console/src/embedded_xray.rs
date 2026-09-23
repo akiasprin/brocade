@@ -4,7 +4,10 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::{Path, PathBuf},
 };
 
@@ -54,6 +57,13 @@ fn materialize(cache_root: &Path, arch: &str, bytes: &[u8], digest: &str) -> io:
         ));
     }
 
+    // First use can arrive from several probe workers at once. Keep verification, repair and
+    // publication under one process-shared lock: repeatedly renaming the same destination is
+    // atomic for readers, but Linux may still reject an exec racing a newly published writer with
+    // ETXTBSY. The lock lives in the already-verified private directory and also covers two
+    // Console processes briefly overlapping during a restart.
+    let _publication_lock = publication_lock(&directory)?;
+
     // A new release gets a new path. Existing probes can finish on their original inode.
     let destination = directory.join(format!("xray-{arch}-{digest}"));
     if verified_cache(&destination, bytes.len() as u64, digest)? {
@@ -70,6 +80,34 @@ fn materialize(cache_root: &Path, arch: &str, bytes: &[u8], digest: &str) -> io:
     staging.into_temp_path().persist(&destination)?;
     File::open(&directory)?.sync_all()?;
     Ok(destination)
+}
+
+fn publication_lock(directory: &Path) -> io::Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(".publish.lock"))?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::other(
+            "Xray 缓存发布锁必须是服务账号所有的私有普通文件",
+        ));
+    }
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(lock);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn verified_cache(path: &Path, length: u64, digest: &str) -> io::Result<bool> {
@@ -193,6 +231,17 @@ mod tests {
             let paths: Vec<_> = tasks.into_iter().map(|task| task.join().unwrap()).collect();
             assert!(paths.iter().all(|path| path == &paths[0]));
         });
-        assert_eq!(fs::read_dir(root.path().join("xray")).unwrap().count(), 1);
+        let entries: Vec<_> = fs::read_dir(root.path().join("xray"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|name| name.to_string_lossy().starts_with("xray-"))
+                .count(),
+            1
+        );
+        assert!(entries.iter().any(|name| name == ".publish.lock"));
     }
 }

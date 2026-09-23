@@ -10,7 +10,7 @@ import { useEffect, useState } from 'react';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CertsView } from '../src/api';
+import { AGENT_PROTOCOL_VERSION, type CertsView } from '../src/api';
 
 /* settings.tsx 经 ui/branding → … 在模块求值期读 matchMedia，jsdom 没有实现。
    import 是提升的，所以装在这里而不是 beforeEach。 */
@@ -30,6 +30,7 @@ const { SessionProvider } = await import('../src/session');
 const { SettingsPane } = await import('../src/panes/settings');
 
 const SESSION = {
+  initial: { node_count: 0, chain_group_count: [] },
   who: {
     operator_id: 'tester',
     role: 'system-admin' as const,
@@ -86,8 +87,46 @@ const ROUTES: Record<string, () => unknown> = {
     global: { agent_journal_mib: 100, xray_mib: 100, phantun_mib: 100 },
     nodes: [],
   }),
+  '/tunnel-probes': () => ({
+    origin: 'console',
+    endpoint_url: 'http://cp.cloudflare.com/cdn-cgi/trace',
+    retention_days: 7,
+    items: [],
+  }),
+  '/tunnel-probes/capability': () => ({
+    available: true,
+    version: 'test',
+    reason: null,
+    concurrency: 1,
+  }),
   '/ping-probe/settings': () => ({ targets: [], interval_secs: 60, timeout_ms: 420 }),
   '/links/mtu': () => ({ default_mtu: 1420, nodes: [], links: [] }),
+  '/nodes/agent-state': () => ({ nodes: [] }),
+  '/vpngate': () => ({
+    manual_pools_supported: true,
+    status: {},
+    countries: [],
+    admission_policy: {
+      minimum_successful_sources: 1,
+      country_policy: 'any_match',
+      risk_decision_policy: 'all_available_pass',
+      provider_rules: [
+        { provider: 'proxycheck', maximum_score: 80 },
+        { provider: 'ffraud', maximum_score: 80 },
+        { provider: 'iplogs', maximum_score: 80 },
+      ],
+    },
+    intelligence_policy: {
+      refresh_mode: 'on_change',
+      refresh_interval_hours: 168,
+      active_window_hours: 72,
+      stale_policy: 'retain',
+      stale_after_hours: 168,
+    },
+    intelligence_credentials: {
+      proxycheck_api_key_configured: true,
+    },
+  }),
   '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),
 };
 
@@ -146,6 +185,23 @@ function stubFetch() {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (path: string, init?: RequestInit) => {
+      if (path.startsWith('/vpngate/intelligence-nodes/') && init?.method === 'PUT') {
+        const nodeId = decodeURIComponent(path.slice('/vpngate/intelligence-nodes/'.length));
+        const enabled = Boolean(JSON.parse(String(init.body)).enabled);
+        return Response.json({ node_id: nodeId, enabled, selected_at_unix_secs: enabled ? 1 : null });
+      }
+      if (path === '/vpngate/admission-policy' && init?.method === 'PUT') {
+        return Response.json(JSON.parse(String(init.body)));
+      }
+      if (path === '/vpngate/intelligence-policy' && init?.method === 'PUT') {
+        return Response.json(JSON.parse(String(init.body)));
+      }
+      if (path === '/vpngate/intelligence-credentials' && init?.method === 'PUT') {
+        return Response.json({ proxycheck_api_key_configured: true });
+      }
+      if (path === '/vpngate/intelligence-refresh' && init?.method === 'POST') {
+        return Response.json({ queued: 2 });
+      }
       if (path === '/settings/ports' || path === '/settings/probe') {
         const body = JSON.parse(String(init?.body));
         const current = ROUTES['/settings']() as ReturnType<typeof committedSettings>;
@@ -185,7 +241,7 @@ function Harness({ role = 'system-admin' }: { role?: 'system-admin' | 'editor' }
   );
   return (
     <QueryClientProvider client={client}>
-      <SessionProvider value={{ who: { ...SESSION.who, role } }}>
+      <SessionProvider value={{ initial: SESSION.initial, who: { ...SESSION.who, role } }}>
         <ShellDraftInvalidation />
         <SettingsPane />
       </SessionProvider>
@@ -223,6 +279,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   ROUTES['/settings'] = committedSettings;
   ROUTES['/links/mtu'] = () => ({ default_mtu: 1420, nodes: [], links: [] });
+  ROUTES['/nodes/agent-state'] = () => ({ nodes: [] });
   ROUTES['/certs'] = () => ({
     groups: [],
     nodes: [],
@@ -232,6 +289,108 @@ afterEach(() => {
 });
 
 describe('设置页分段保存的基准', () => {
+  it('按来源分别保存 VPN Gate 准入阈值，不提交聚合分数', async () => {
+    render(<Harness />);
+    await screen.findByText('情报任务');
+    const scope = section('set-vpngate-intelligence');
+    const ffraud = fieldInput(scope, 'FFraud');
+    fireEvent.change(ffraud, { target: { value: '67' } });
+    fireEvent.click(scope.getByRole('button', { name: '保存准入规则' }));
+
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        '/vpngate/admission-policy',
+        expect.objectContaining({
+          method: 'PUT',
+          body: expect.stringContaining('"provider":"ffraud","maximum_score":67'),
+        }),
+      ),
+    );
+    const request = vi.mocked(fetch).mock.calls.find(([path]) => path === '/vpngate/admission-policy');
+    expect(request?.[1]?.body).not.toContain('max_ip_risk');
+  });
+
+  it('只在定期模式显示刷新周期，并按 72 小时条件保存情报更新规则', async () => {
+    render(<Harness />);
+    await screen.findByText('情报任务');
+    const scope = section('set-vpngate-intelligence');
+    const activeWindow = scope.getByRole('spinbutton', {
+      name: '纳入 IP 情报更新的最后成功拨通小时数',
+    });
+    expect((activeWindow as HTMLInputElement).value).toBe('72');
+    expect(scope.queryByRole('spinbutton', { name: 'IP 情报刷新周期间隔' })).toBeNull();
+
+    fireEvent.click(scope.getByRole('button', { name: '定期刷新' }));
+    expect(scope.getByRole('spinbutton', { name: 'IP 情报刷新周期间隔' })).toBeTruthy();
+    fireEvent.change(activeWindow, { target: { value: '48' } });
+    fireEvent.click(scope.getByRole('button', { name: '保存更新规则' }));
+
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        '/vpngate/intelligence-policy',
+        expect.objectContaining({
+          method: 'PUT',
+          body: expect.stringContaining('"active_window_hours":48'),
+        }),
+      ),
+    );
+  });
+
+  it('以多条密码输入追加 ProxyCheck Key 池，不从 API 读回密钥', async () => {
+    render(<Harness />);
+    await screen.findByText('情报任务');
+    const scope = section('set-vpngate-intelligence');
+    const first = scope.getByLabelText('ProxyCheck API 密钥 1') as HTMLInputElement;
+    const row = first.closest('.setfld');
+    expect(row).not.toBeNull();
+    expect(first.type).toBe('password');
+    expect(first.placeholder).toContain('追加');
+    expect(
+      within(row as HTMLElement).getByText('已配置；旧 Key 不回显，追加不会覆盖 · 最多 32 个，随机起点轮换'),
+    ).toBeTruthy();
+
+    const replacements = ['111111-222222-333333-444444', 'aaaaaa-bbbbbb-cccccc-dddddd'];
+    fireEvent.change(first, { target: { value: replacements[0] } });
+    fireEvent.click(within(row as HTMLElement).getByRole('button', { name: '＋ 添加密钥' }));
+    const second = scope.getByLabelText('ProxyCheck API 密钥 2') as HTMLInputElement;
+    expect(second.type).toBe('password');
+    fireEvent.change(second, { target: { value: replacements[1] } });
+    fireEvent.click(within(row as HTMLElement).getByRole('button', { name: '追加到 Key 池' }));
+
+    await waitFor(() => expect((scope.getByLabelText('ProxyCheck API 密钥 1') as HTMLInputElement).value).toBe(''));
+    expect(scope.queryByLabelText('ProxyCheck API 密钥 2')).toBeNull();
+    const request = vi.mocked(fetch).mock.calls.find(([path]) => path === '/vpngate/intelligence-credentials');
+    expect(request?.[1]?.method).toBe('PUT');
+    expect(request?.[1]?.body).toBe(JSON.stringify({ proxycheck_api_keys: replacements, mode: 'append' }));
+  });
+
+  it('可从全机队多选 Agent 分发目录采集与三源 IP 情报任务', async () => {
+    ROUTES['/nodes/agent-state'] = () => ({
+      nodes: [
+        {
+          node_id: 'edge-1',
+          tenant_id: 'platform',
+          name: '香港出口',
+          lifecycle_phase: 'active',
+          operationally_isolated: false,
+          agent_protocol_version: AGENT_PROTOCOL_VERSION,
+          runtime_report_fresh: true,
+          vpngate_intelligence_enabled: false,
+        },
+      ],
+    });
+    render(<Harness />);
+    await screen.findByText('情报执行 Agent');
+    expect(screen.getByText(/同时执行 VPN Gate 上游目录采集和出口 IP 情报查询/)).toBeTruthy();
+    const checkbox = await screen.findByRole('checkbox', { name: /香港出口/ });
+    fireEvent.click(checkbox);
+    await waitFor(() => expect((checkbox as HTMLInputElement).checked).toBe(true));
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      '/vpngate/intelligence-nodes/edge-1',
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ enabled: true }) }),
+    );
+  });
+
   it('所有设置段与机器配置、链路设置共用 config-panel 和图标标题', async () => {
     render(<Harness />);
     await screen.findByPlaceholderText('example.com:443');
@@ -249,6 +408,8 @@ describe('设置页分段保存的基准', () => {
       'set-probe',
       'set-ping-probe',
       'set-geodata',
+      'set-vpngate-intelligence',
+      'set-tunnel-probes',
     ]) {
       const panel = document.getElementById(id)!;
       expect(panel.classList.contains('config-panel')).toBe(true);
@@ -256,6 +417,16 @@ describe('设置页分段保存的基准', () => {
       expect(panel.querySelector(':scope > header .panel-title-icon')).toBeTruthy();
       expect(panel.querySelector(':scope > header .no')).toBeNull();
     }
+
+    for (const id of ['set-ping-probe', 'set-vpngate-intelligence', 'set-tunnel-probes']) {
+      const panel = document.getElementById(id)!;
+      expect(panel.querySelector(':scope > .cardsub')).toBeTruthy();
+    }
+    expect(document.querySelector('#set-ping-probe > .settings-block')).toBeTruthy();
+    expect(
+      document.querySelectorAll('#set-vpngate-intelligence > .vpngate-intelligence-layout > .settings-block'),
+    ).toHaveLength(3);
+    expect(document.querySelector('#set-tunnel-probes > .settings-block')).toBeTruthy();
   });
 
   it('端口基线明确区分 VLESS 与 AnyTLS', async () => {
@@ -267,7 +438,7 @@ describe('设置页分段保存的基准', () => {
     expect((ports.getByDisplayValue('13443') as HTMLInputElement).value).toBe('13443');
     expect((ports.getByDisplayValue('14443') as HTMLInputElement).value).toBe('14443');
     expect(ports.queryByText('接入面')).toBeNull();
-    expect(ports.getByText('仅影响新建')).toBeTruthy();
+    expect(ports.getByText(/仅影响新建/)).toBeTruthy();
     expect(ports.queryByText('需要发布')).toBeNull();
     expect(ports.getByDisplayValue('13443').closest('.port-allocation-grid')).toBeTruthy();
     expect(document.getElementById('set-ports')?.querySelector('.settings-parameter-group')).toBeNull();
@@ -309,17 +480,22 @@ describe('设置页分段保存的基准', () => {
     expect(wireguard.queryByText(/大包会被打掉|生效值大过探测建议|还有余量/)).toBeNull();
   });
 
-  it('Ping 调度与探测目标沿用设置页的平面配置组', async () => {
+  it('Ping 调度与目标共用单层面板和紧凑表头', async () => {
     render(<Harness />);
     await screen.findByPlaceholderText('example.com:443');
 
     const ping = section('set-ping-probe');
     const schedule = ping.getByLabelText('Ping 探测调度');
     const targets = ping.getByText('探测目标', { selector: '.eyebrow' }).closest('.ping-probe-target-section');
-    expect(schedule.classList.contains('settings-block')).toBe(true);
+    expect(schedule.classList.contains('settings-block')).toBe(false);
     expect(schedule.querySelector('.ping-probe-schedule-grid')).toBeTruthy();
-    expect(targets?.classList.contains('settings-block')).toBe(true);
-    expect(document.getElementById('set-ping-probe')?.querySelector('.ping-probe-timing')).toBeTruthy();
+    expect(targets?.classList.contains('settings-block')).toBe(false);
+    expect(ping.getByRole('button', { name: '＋ TCP' })).toBeTruthy();
+    expect(ping.getByRole('button', { name: '＋ ICMP' })).toBeTruthy();
+    const panel = document.getElementById('set-ping-probe')!;
+    expect(panel.querySelector(':scope > .cardsub')?.textContent).toContain('周期探测');
+    expect(schedule.closest('.ping-probe-settings-block')).toBe(panel.querySelector(':scope > .settings-block'));
+    expect(panel.querySelector('.ping-probe-timing')).toBeTruthy();
   });
 
   it('VLESS Encryption 起始端口默认 13800，允许保存自定义起点', async () => {

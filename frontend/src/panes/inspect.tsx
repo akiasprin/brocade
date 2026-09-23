@@ -18,7 +18,7 @@ export function InspectPane({ kind, id }: { kind: string; id: string }) {
     enabled: !!current,
   });
 
-  if (revisions.isPending || (current != null && compile.isPending)) return <Loading />;
+  if (revisions.isPending || (current != null && compile.isPending)) return <Loading variant="table" />;
   if (revisions.error || compile.error) return <ErrorBox error={revisions.error ?? compile.error} />;
   if (!current) return <Empty>还没有可检视的修订。</Empty>;
   if (!compile.data) return <ErrorBox error={new Error('编译结果没有返回内容')} />;
@@ -91,7 +91,7 @@ function NodeInspect({ id, system, apps }: { id: string; system: SystemIr; apps:
   return (
     <>
       <dl className="kv" style={{ gridTemplateColumns: '92px minmax(0,1fr)' }}>
-        <dt>节点</dt>
+        <dt>机器</dt>
         <dd>
           {appNode?.name || n.id} {appNode?.name && <span className="dim mono">{n.id}</span>}
         </dd>

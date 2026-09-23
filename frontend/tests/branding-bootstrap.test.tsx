@@ -33,6 +33,25 @@ function mount() {
 }
 
 describe('站点标题初始化', () => {
+  it('并行读取会话与公开访问状态，恢复期间只显示中性台面', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === '/branding') return Promise.resolve(Response.json({ site_name: '我的站点', icon_data_url: null }));
+      if (path === '/bootstrap' || path === '/auth/state') return new Promise<Response>(() => {});
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const view = mount();
+    expect(view.container.querySelector('#stage')).toBeTruthy();
+    expect(view.container.querySelector('.login-fw')).toBeNull();
+    await waitFor(() => {
+      const paths = fetchMock.mock.calls.map(([input]) => String(input));
+      expect(paths).toContain('/bootstrap');
+      expect(paths).toContain('/auth/state');
+    });
+  });
+
   it('读取首页配置，接口返回前不回退 Brocade，之后仍接受新标题', async () => {
     const script = document.createElement('script');
     script.id = 'brocade-branding';
@@ -99,7 +118,7 @@ describe('站点标题初始化', () => {
       'fetch',
       vi.fn(async (path: string) => {
         if (path === '/branding') throw new Error('offline');
-        if (path === '/whoami') return Response.json({ error: 'unauthorized' }, { status: 401 });
+        if (path === '/bootstrap') return Response.json({ error: 'unauthorized' }, { status: 401 });
         if (path === '/auth/state') return Response.json({ initialized: true, public_open: false });
         throw new Error(`Unexpected request: ${path}`);
       }),

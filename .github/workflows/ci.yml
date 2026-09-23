@@ -73,13 +73,63 @@ jobs:
         run: go test -race ./proxy/anytls -count=3 -timeout=10m
 
       - name: Mux and reverse deterministic tests
-        run: go test ./common/mux ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless -count=1 -timeout=10m
+        run: go test ./common/buf ./common/mux ./app/reverse ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless/... -count=1 -timeout=10m
+
+      - name: Mux metadata fuzz
+        run: go test ./common/mux -run '^$' -fuzz '^FuzzFrameMetadataUnmarshal$' -fuzztime=10s -timeout=2m
+
+      - name: Mux reverse-health framing fuzz
+        run: go test ./common/mux -run '^$' -fuzz '^FuzzProbeFrameRoundTrip$' -fuzztime=10s -timeout=2m
+
+      # These launch real Xray processes and put a controllable TCP fault proxy
+      # between them. Unit-level state-machine checks cannot prove failover,
+      # stream preservation, bounded reconnects, or process shutdown behavior.
+      - name: Mux and reverse real-process fault tests
+        run: |
+          go test ./testing/scenarios \
+            -run '^(TestMuxWorkerPoolRealProcesses|TestMuxWorkerPoolRealProcessFaultMatrix|TestMuxWorkerPoolShutdownDuringBlackholedProbe|TestReverseProxy)$' \
+            -count=1 -timeout=10m
+
+      - name: VLESS reverse instrumented real-process fault tests
+        env:
+          XRAY_COV: ${{ runner.temp }}/xray-reverse-coverage
+        run: |
+          mkdir -p "${XRAY_COV}"
+          go test -tags=coverage ./testing/scenarios \
+            -run '^TestVLESSReverseRealProcess(ConcurrencyAndRestart|UDPDataPlane|OneWayBlackholeRecovery|PortalOutageBackoff)$' \
+            -count=1 -timeout=5m
+          go tool covdata textfmt -i="${XRAY_COV}" -o="${RUNNER_TEMP}/xray-reverse.out"
+          go tool cover -func="${RUNNER_TEMP}/xray-reverse.out" > "${RUNNER_TEMP}/xray-reverse-summary.txt"
+          awk '
+            ($1 ~ /common\/mux\/reverse_health.go:/ && $2 == "failHealthLocked") ||
+            ($1 ~ /app\/reverse\/portal.go:/ && $2 == "PickAvailable") ||
+            ($1 ~ /proxy\/vless\/inbound\/inbound.go:/ && $2 == "NewMux") ||
+            ($1 ~ /proxy\/vless\/outbound\/outbound.go:/ && $2 == "monitor") {
+              coverage = $3
+              sub(/%/, "", coverage)
+              print
+              found++
+              if (coverage + 0 < 50) failed = 1
+            }
+            END { if (found != 4 || failed) exit 1 }
+          ' "${RUNNER_TEMP}/xray-reverse-summary.txt"
+          tail -n 1 "${RUNNER_TEMP}/xray-reverse-summary.txt"
 
       - name: Mux and reverse vet
-        run: go vet ./common/mux ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless
+        run: |
+          go vet ./common/buf ./common/mux ./app/reverse ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless ./testing/scenarios
+          # Vision intentionally reaches TLS implementation fields through unsafe.Pointer.
+          # Keep every other analyzer enabled for the VLESS subpackages.
+          go vet -unsafeptr=false ./proxy/vless/...
+          go vet -tags='coverage coveragemain' ./main ./testing/scenarios
+          go vet -race ./testing/scenarios
 
-      - name: Mux race tests
-        run: go test -race ./common/mux -count=1 -timeout=10m
+      - name: Mux and reverse race tests
+        run: |
+          go test -race ./common/buf ./common/mux ./app/reverse ./proxy/vless/... -count=1 -timeout=10m
+          go test -race ./testing/scenarios \
+            -run '^TestVLESSReverseRealProcess(ConcurrencyAndRestart|UDPDataPlane|OneWayBlackholeRecovery|PortalOutageBackoff)$' \
+            -count=1 -timeout=5m
 
   check:
     name: fmt + clippy + test
@@ -144,6 +194,7 @@ jobs:
         run: |
           cargo test --workspace --locked
           cargo test -p brocade-store --test pg_integration --locked -- --ignored
+          cargo test -p brocade-store --test tunnel_probe_pg --locked -- --ignored
           cargo test -p brocade-console --test http_integration --locked -- --ignored
 
       - name: Front-end lint, tests and self-checks

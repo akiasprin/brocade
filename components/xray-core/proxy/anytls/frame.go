@@ -97,6 +97,12 @@ func newFrameWriter(bw *buf.BufferedWriter) *frameWriter {
 
 const maxFramePayload = 0xffff
 
+func putFrameHeader(header []byte, cmd byte, sid uint32, length int) {
+	header[0] = cmd
+	binary.BigEndian.PutUint32(header[1:5], sid)
+	binary.BigEndian.PutUint16(header[5:7], uint16(length))
+}
+
 func (w *frameWriter) writeFrame(f *frame) error {
 	if f == nil {
 		return nil
@@ -104,9 +110,7 @@ func (w *frameWriter) writeFrame(f *frame) error {
 	if len(f.data) > maxFramePayload {
 		return errors.New("anytls: frame payload too large")
 	}
-	w.header[0] = f.cmd
-	binary.BigEndian.PutUint32(w.header[1:5], f.sid)
-	binary.BigEndian.PutUint16(w.header[5:7], uint16(len(f.data)))
+	putFrameHeader(w.header[:], f.cmd, f.sid, len(f.data))
 
 	if _, err := w.bw.Write(w.header[:]); err != nil {
 		return err
@@ -127,9 +131,7 @@ func (w *frameWriter) writeMultiBuffer(cmd byte, sid uint32, mb buf.MultiBuffer)
 	if mb.Len() > maxFramePayload {
 		return errors.New("anytls: frame payload too large")
 	}
-	w.header[0] = cmd
-	binary.BigEndian.PutUint32(w.header[1:5], sid)
-	binary.BigEndian.PutUint16(w.header[5:7], uint16(mb.Len()))
+	putFrameHeader(w.header[:], cmd, sid, int(mb.Len()))
 
 	if _, err := w.bw.Write(w.header[:]); err != nil {
 		return err

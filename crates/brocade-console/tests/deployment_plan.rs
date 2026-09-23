@@ -1535,7 +1535,7 @@ fn adding_a_managed_warp_outbound_requires_an_xray_restart() {
         vec![direct_app("direct", "hk", "i-hk", 8443, true, any_egress())],
     );
     before.external_outbounds = vec![ExternalOutbound {
-        id: "warp".to_owned(),
+        id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "WARP".to_owned(),
         address: "engage.example".to_owned(),
@@ -1583,7 +1583,7 @@ fn adding_a_managed_warp_outbound_requires_an_xray_restart() {
     after.apps[0].steps[0].rules = vec![Rule {
         dest_match: DestMatch::Any,
         action: Action::Proxy {
-            outbound: "warp".to_owned(),
+            outbound: "warp-8f3a-2d71".to_owned(),
         },
     }];
 

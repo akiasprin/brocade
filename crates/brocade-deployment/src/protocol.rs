@@ -6,10 +6,12 @@ use crate::plan::{
     NodeDesiredState, PlannedAction,
 };
 
-/// Wire contract spoken by this agent build. Desired state is withheld from incompatible
-/// protocols so an agent never claims work whose fields or actions it cannot interpret; the
-/// independently approved self-update endpoint remains available as the recovery path.
-pub const AGENT_PROTOCOL_VERSION: u32 = 8;
+/// Oldest Agent wire contract accepted by this control plane. Protocols are forward-compatible
+/// from v20 onward, so a newer Agent remains serviceable during a staggered Console rollout.
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
+
+/// Wire contract spoken by this Agent build.
+pub const AGENT_PROTOCOL_VERSION: u32 = 21;
 
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
@@ -23,6 +25,547 @@ pub const MAX_AGENT_LOG_MAX_MIB: u32 = 4096;
 /// memory use while still giving the operator a genuinely live view.
 pub const DEFAULT_REALTIME_INTERVAL_SECS: u32 = 1;
 pub const REALTIME_INTERVAL_OPTIONS: &[u32] = &[1, 2, 5];
+
+/// An OpenVPN transport accepted from VPN Gate after the control plane has sanitized the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateTransport {
+    Udp,
+    Tcp,
+}
+
+/// Stable source names for exit-IP intelligence. These spellings are persisted in JSON and shown
+/// by the Console, so adding a source is a protocol and storage change rather than a display-only
+/// label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateIpProvider {
+    Proxycheck,
+    Ffraud,
+    Iplogs,
+}
+
+/// One provider's risk score and country claim for one exact exit IP.
+///
+/// `score` deliberately remains provider-attributed. Although the wire representation uses a
+/// common 0–100 integer for convenient validation and display, the number is meaningful only to
+/// the matching provider rule and must never be compared with or aggregated into another source's
+/// score. `country_code` is carried on the same source fact so disagreement stays observable
+/// instead of being collapsed into a synthetic country.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateIpScore {
+    pub provider: VpngateIpProvider,
+    pub score: u8,
+    #[serde(default)]
+    pub country_code: String,
+}
+
+/// How provider country claims are combined for a country-scoped VPN Gate pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateCountryPolicy {
+    Ignore,
+    AnyMatch,
+    AllMatch,
+}
+
+/// How already provider-local risk decisions are combined.
+///
+/// These variants combine booleans, never raw scores. That distinction is essential because the
+/// three providers do not calculate risk on the same scale even when all return a value rendered
+/// as 0–100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateRiskDecisionPolicy {
+    AnyAvailablePass,
+    AllAvailablePass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateProviderRiskRule {
+    pub provider: VpngateIpProvider,
+    pub maximum_score: u8,
+}
+
+/// Operational VPN Gate admission policy. It is stored independently from immutable model
+/// revisions so changing intelligence thresholds immediately re-evaluates retained raw evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateAdmissionPolicy {
+    pub minimum_successful_sources: u8,
+    pub country_policy: VpngateCountryPolicy,
+    pub risk_decision_policy: VpngateRiskDecisionPolicy,
+    pub provider_rules: Vec<VpngateProviderRiskRule>,
+}
+
+impl Default for VpngateAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_successful_sources: 1,
+            country_policy: VpngateCountryPolicy::AnyMatch,
+            risk_decision_policy: VpngateRiskDecisionPolicy::AllAvailablePass,
+            provider_rules: vec![
+                VpngateProviderRiskRule {
+                    provider: VpngateIpProvider::Proxycheck,
+                    maximum_score: 80,
+                },
+                VpngateProviderRiskRule {
+                    provider: VpngateIpProvider::Ffraud,
+                    maximum_score: 80,
+                },
+                VpngateProviderRiskRule {
+                    provider: VpngateIpProvider::Iplogs,
+                    maximum_score: 80,
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VpngateAdmissionDecision {
+    Admitted,
+    Rejected,
+    InsufficientEvidence,
+}
+
+pub fn validate_vpngate_admission_policy(policy: &VpngateAdmissionPolicy) -> bool {
+    let providers = policy
+        .provider_rules
+        .iter()
+        .map(|rule| rule.provider)
+        .collect::<std::collections::BTreeSet<_>>();
+    (1..=3).contains(&policy.minimum_successful_sources)
+        && policy.provider_rules.len() == 3
+        && providers
+            == std::collections::BTreeSet::from([
+                VpngateIpProvider::Proxycheck,
+                VpngateIpProvider::Ffraud,
+                VpngateIpProvider::Iplogs,
+            ])
+        && policy
+            .provider_rules
+            .iter()
+            .all(|rule| rule.maximum_score <= 100)
+}
+
+pub fn evaluate_vpngate_admission(
+    policy: &VpngateAdmissionPolicy,
+    expected_country_code: &str,
+    scores: &[VpngateIpScore],
+) -> VpngateAdmissionDecision {
+    if !validate_vpngate_admission_policy(policy) {
+        return VpngateAdmissionDecision::InsufficientEvidence;
+    }
+    let providers = scores
+        .iter()
+        .map(|score| score.provider)
+        .collect::<std::collections::BTreeSet<_>>();
+    if scores.len() != providers.len()
+        || scores.len() < usize::from(policy.minimum_successful_sources)
+        || scores.iter().any(|score| {
+            score.score > 100
+                || score.country_code.len() != 2
+                || !score
+                    .country_code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase())
+        })
+    {
+        return VpngateAdmissionDecision::InsufficientEvidence;
+    }
+
+    let country_matches = |score: &VpngateIpScore| score.country_code == expected_country_code;
+    let country_accepted = match policy.country_policy {
+        VpngateCountryPolicy::Ignore => true,
+        VpngateCountryPolicy::AnyMatch => scores.iter().any(country_matches),
+        VpngateCountryPolicy::AllMatch => scores.iter().all(country_matches),
+    };
+    if !country_accepted {
+        return VpngateAdmissionDecision::Rejected;
+    }
+
+    let provider_passes = scores
+        .iter()
+        .map(|score| {
+            policy
+                .provider_rules
+                .iter()
+                .find(|rule| rule.provider == score.provider)
+                .is_some_and(|rule| score.score <= rule.maximum_score)
+        })
+        .collect::<Vec<_>>();
+    let risk_accepted = match policy.risk_decision_policy {
+        VpngateRiskDecisionPolicy::AnyAvailablePass => provider_passes.iter().any(|pass| *pass),
+        VpngateRiskDecisionPolicy::AllAvailablePass => provider_passes.iter().all(|pass| *pass),
+    };
+    if risk_accepted {
+        VpngateAdmissionDecision::Admitted
+    } else {
+        VpngateAdmissionDecision::Rejected
+    }
+}
+
+/// Broad access-network class. Provider-specific labels are normalized by the Agent while the
+/// accompanying ISP name and provider attribution preserve where the claim came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateNetworkType {
+    Datacenter,
+    Residential,
+    Business,
+    Mobile,
+    Relay,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateIpNetwork {
+    pub provider: VpngateIpProvider,
+    pub isp: Option<String>,
+    pub network_type: VpngateNetworkType,
+}
+
+/// The answer to `/agent/v1/vpngate/intelligence-assignment`.
+///
+/// Exit-IP intelligence is a separate work lane from VPN Gate desired state. Keeping this lease
+/// out of the catalogue response prevents a slow OpenVPN batch from delaying unrelated provider
+/// lookups.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateIpIntelligenceAssignment {
+    pub exit_ip: String,
+    pub lease_generation: u64,
+    /// Present only for the lifetime of this authenticated lease. This value must never be logged
+    /// or persisted by the Agent; the report contains provider results, not credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxycheck_api_key: Option<String>,
+}
+
+/// One VPN Gate upstream snapshot fetch leased to an operator-selected Agent.
+///
+/// The Agent only transports a bounded gzip snapshot. Parsing, profile sanitization,
+/// deduplication and catalogue publication remain Console responsibilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateCatalogSyncAssignment {
+    pub run_id: u64,
+    pub lease_generation: u64,
+    pub source_url: String,
+}
+
+/// A terminal fetch failure for a leased VPN Gate catalogue collection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateCatalogSyncFailure {
+    pub run_id: u64,
+    pub lease_generation: u64,
+    pub code: String,
+    pub detail: String,
+}
+
+/// Successful response from one provider. Country stays per-provider on the wire because
+/// admission evaluates each source independently instead of trusting a merged worker value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateIpIntelligenceObservation {
+    pub provider: VpngateIpProvider,
+    pub score: u8,
+    pub country_code: String,
+    pub isp: Option<String>,
+    pub network_type: VpngateNetworkType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateIpIntelligenceFailure {
+    pub provider: VpngateIpProvider,
+    pub code: String,
+}
+
+/// Completion of one lease. Every source must occur exactly once across observations and
+/// failures. Any successful observation is immediately usable; failed sources remain retryable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateIpIntelligenceReport {
+    pub exit_ip: String,
+    pub lease_generation: u64,
+    pub observations: Vec<VpngateIpIntelligenceObservation>,
+    pub failures: Vec<VpngateIpIntelligenceFailure>,
+}
+
+/// One public profile the Agent may measure or select for a managed country pool.
+///
+/// `openvpn_config` is public VPN Gate material, but it is still treated as opaque configuration:
+/// neither endpoint logs nor reports echo it. The digest is the durable identity used for
+/// idempotent replacement.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateCandidate {
+    pub server_id: String,
+    pub hostname: String,
+    pub country_code: String,
+    pub remote_address: String,
+    pub remote_port: u16,
+    pub transport: VpngateTransport,
+    pub profile_sha256: String,
+    pub openvpn_config: String,
+    /// Last exit IP whose country and intelligence were verified by a selected Agent. The Agent only
+    /// reuses the accompanying facts when a fresh tunnel exposes this exact address; an exit change
+    /// returns the candidate to the pending-intelligence state instead of inheriting stale trust.
+    #[serde(default)]
+    pub verified_exit_ip: Option<String>,
+    #[serde(default)]
+    pub verified_exit_country_code: Option<String>,
+    #[serde(default)]
+    pub verified_ip_scores: Vec<VpngateIpScore>,
+    #[serde(default)]
+    pub verified_ip_networks: Vec<VpngateIpNetwork>,
+}
+
+/// One bounded catalogue-measurement batch assigned to a selected VPN Gate probe node.
+///
+/// Catalogue probing is deliberately separate from [`VpngateDesiredPool`]: a machine can help
+/// qualify a country candidate without running a revisioned outbound, and two outbounds for the
+/// same country must not make that machine download the same speed-test object twice.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateProbeAssignment {
+    pub country_code: String,
+    pub candidates: Vec<VpngateCandidate>,
+}
+
+/// One audited request to move an automatic pool away from its current primary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateManualSwitchCommand {
+    pub request_id: u64,
+    pub previous_server_id: String,
+    pub cooldown_secs: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateManualSwitchStatus {
+    Applied,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateManualSwitchResult {
+    pub request_id: u64,
+    pub status: VpngateManualSwitchStatus,
+    pub previous_server_id: String,
+    pub selected_server_id: Option<String>,
+    pub cooldown_until_unix_secs: Option<i64>,
+    pub error_detail: Option<String>,
+}
+
+/// Runtime intent for one revisioned VPN Gate country pool on one node.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateDesiredPool {
+    pub outbound_id: String,
+    pub country_code: String,
+    pub max_connect_ms: u32,
+    pub min_download_bps: u64,
+    pub max_candidates: u8,
+    pub runtime_slot: u16,
+    pub host_address: String,
+    pub peer_address: String,
+    pub prefix_len: u8,
+    pub socks_port: u16,
+    pub candidates: Vec<VpngateCandidate>,
+    #[serde(default)]
+    pub manual_switch: Option<VpngateManualSwitchCommand>,
+}
+
+/// The answer to `/agent/v1/vpngate/desired`.
+///
+/// It is operational desired state rather than a deployment artifact: catalogue refreshes and
+/// failover choices must not create model revisions or restart the node's main Xray process.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateDesiredState {
+    pub topology_revision: u64,
+    pub catalog_generation: u64,
+    #[serde(default)]
+    pub admission_policy: VpngateAdmissionPolicy,
+    pub pools: Vec<VpngateDesiredPool>,
+    #[serde(default)]
+    pub probe_assignments: Vec<VpngateProbeAssignment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateProbeStatus {
+    Succeeded,
+    Failed,
+}
+
+/// A single real connection attempt made inside the Agent's isolated network namespace.
+///
+/// A successful transport measurement always has an exit IP, setup time and download rate.
+/// Country, risk and access-network facts are optional because a newly discovered exit is queried
+/// asynchronously by a selected Agent. Runtime admission still fails closed until a later desired
+/// state carries enough provider-local evidence for that exact IP under the configured policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateProbeSample {
+    pub server_id: String,
+    pub profile_sha256: String,
+    pub status: VpngateProbeStatus,
+    pub exit_ip: Option<String>,
+    pub exit_country_code: Option<String>,
+    pub connect_ms: Option<u32>,
+    pub download_bps: Option<u64>,
+    #[serde(default)]
+    pub ip_scores: Vec<VpngateIpScore>,
+    #[serde(default)]
+    pub ip_networks: Vec<VpngateIpNetwork>,
+    pub error_code: Option<String>,
+    pub error_detail: Option<String>,
+    pub probed_at_unix_secs: i64,
+}
+
+/// Current runtime state plus newly completed samples for one pool. Reports echo both generations
+/// so a delayed attempt can be retained as history without replacing a newer selected profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngatePoolReport {
+    pub topology_revision: u64,
+    pub catalog_generation: u64,
+    pub outbound_id: String,
+    pub runtime_status: String,
+    pub selected_server_id: Option<String>,
+    pub applied_profile_sha256: Option<String>,
+    #[serde(default)]
+    pub manual_switch_result: Option<VpngateManualSwitchResult>,
+    pub samples: Vec<VpngateProbeSample>,
+}
+
+/// One complete post-reconcile view of every VPN Gate pool still present on a node.
+///
+/// The empty list is meaningful: it confirms that the Agent removed every previously managed
+/// pool. Sending the complete bounded set lets the Console delete omitted replaceable state
+/// without treating the absence of an individual per-pool report as proof of convergence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateReconcileReport {
+    pub topology_revision: u64,
+    pub catalog_generation: u64,
+    pub pools: Vec<VpngatePoolReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateRuntimeState {
+    Pending,
+    Healthy,
+    Degraded,
+    FailingOver,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateBackendRole {
+    Active,
+    Standby,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateBackendState {
+    Starting,
+    Healthy,
+    Unhealthy,
+    Backoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateFailureReason {
+    ProcessExited,
+    SocksUnavailable,
+    EgressUnreachable,
+    CandidateRemoved,
+    AdmissionRejected,
+    StartFailed,
+    NoCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateRuntimeEventKind {
+    ActiveFailed,
+    FailoverStarted,
+    FailoverCompleted,
+    StandbyLost,
+    RefillStarted,
+    RefillCompleted,
+    RefillFailed,
+    PoolRecovered,
+}
+
+/// Bounded, in-memory VPN Gate supervisor state carried on the existing on-demand realtime path.
+/// It deliberately excludes provider profiles, host addresses and free-form process errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateRealtimePool {
+    pub outbound_id: String,
+    pub country_code: String,
+    pub state: VpngateRuntimeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<VpngateFailureReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_slot: Option<u8>,
+    pub ready_standbys: u8,
+    pub candidate_count: u8,
+    pub consecutive_failures: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_age_millis: Option<u64>,
+    pub probes: u64,
+    pub probe_failures: u64,
+    pub failovers: u64,
+    pub refill_attempts: u64,
+    pub refill_failures: u64,
+    #[serde(default)]
+    pub refill_backoff_remaining_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateRealtimeBackend {
+    pub outbound_id: String,
+    pub slot: u8,
+    pub role: VpngateBackendRole,
+    pub state: VpngateBackendState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<VpngateFailureReason>,
+    pub server_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_age_millis: Option<u64>,
+    pub consecutive_failures: u8,
+    pub backoff_remaining_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateRuntimeEvent {
+    pub sequence: u64,
+    pub at_unix_millis: i64,
+    pub outbound_id: String,
+    pub kind: VpngateRuntimeEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_slot: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_slot: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<VpngateFailureReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_elapsed_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateRealtimeReport {
+    pub boot_id: String,
+    pub sequence: u64,
+    pub sampled_at_unix_millis: i64,
+    pub pools: Vec<VpngateRealtimePool>,
+    pub backends: Vec<VpngateRealtimeBackend>,
+    pub events: Vec<VpngateRuntimeEvent>,
+}
+
+/// Raw catalogue measurements for one country, independent from any model outbound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateProbeReport {
+    pub catalog_generation: u64,
+    pub country_code: String,
+    pub samples: Vec<VpngateProbeSample>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealtimeTelemetryPolicy {
@@ -61,10 +604,21 @@ pub enum AgentRealtimeCommand {
 /// `has_gap` rather than guessed across.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRealtimeSample {
+    /// `true` means the three diagnostic reports below were deliberately omitted because they
+    /// have not reached their lower-frequency refresh deadline. It is distinct from all three
+    /// fields being absent in a complete sample, which authoritatively clears the previous
+    /// diagnostic state.
+    ///
+    /// The default keeps protocol v20/v21 Agents compatible: their samples are complete, just as
+    /// they were before this bandwidth hint existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub diagnostics_unchanged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverse_health: Option<ReverseHealthReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mux: Option<MuxReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpngate: Option<VpngateRealtimeReport>,
     pub sequence: u64,
     pub sampled_at_unix_millis: i64,
     pub elapsed_millis: u32,
@@ -72,6 +626,10 @@ pub struct AgentRealtimeSample {
     pub rx_bytes_per_sec: u64,
     pub tx_bytes_per_sec: u64,
     pub has_gap: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +917,34 @@ pub struct RouteIpReport {
     pub ipv6: Option<String>,
 }
 
+/// One direct request from an Agent to the operator-configured CGI trace endpoint. IPv4 and IPv6
+/// are separate observations: lack of one family must never erase or delay a successful sample
+/// from the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePublicIpObservation {
+    pub observed_at_unix_secs: i64,
+    pub family: PublicIpFamily,
+    pub ip: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PublicIpFamily {
+    V4,
+    V6,
+}
+
+impl PublicIpFamily {
+    pub fn number(self) -> i16 {
+        match self {
+            Self::V4 => 4,
+            Self::V6 => 6,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TargetApplyResult {
@@ -528,6 +1114,12 @@ pub struct DeploymentTargetDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IsolateDeploymentTargetRequest {
     pub expected_target_status: String,
+    #[serde(default)]
+    pub acknowledge_uncertain: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolateNodeRequest {
     #[serde(default)]
     pub acknowledge_uncertain: bool,
 }
@@ -804,8 +1396,8 @@ pub struct UsageSample {
 /// A calendar-month rollup, one row per (user × view). A view is an app (shown in the console as
 /// the app's label). Ingresses hang off apps and samples group by app_id through a JOIN on
 /// ingresses, so a view's total is that user's traffic across all its access points for the month.
-/// Months are the calendar months of the control plane's local zone (+08), decided server-side and
-/// never sent by the UI.
+/// Months are the calendar months of the control plane's local zone (+08). The UI may select the
+/// current or previous month by offset, but never supplies timestamp boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageMonthlyViewRow {
     pub tenant_id: String,
@@ -819,6 +1411,19 @@ pub struct UsageMonthlyViewRow {
     pub has_gap: bool,
 }
 
+/// One local-calendar day's user traffic inside a [`UsageMonthlySummary`]. The same sample set is
+/// used for the daily bars and the per-view totals so the two presentations keep one accounting
+/// boundary. Days without traffic are omitted; the UI can fill the short, known calendar range
+/// without transferring placeholder rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageDailyRow {
+    /// A +08 local-calendar date in `YYYY-MM-DD` form.
+    pub day: String,
+    pub uplink_bytes: u64,
+    pub downlink_bytes: u64,
+    pub has_gap: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageMonthlySummary {
     /// A +08 wall-clock string of the form "2026-08-01 00:00:00" that does not vary with the
@@ -827,6 +1432,7 @@ pub struct UsageMonthlySummary {
     pub month_start: String,
     pub month_end: String,
     pub views: Vec<UsageMonthlyViewRow>,
+    pub days: Vec<UsageDailyRow>,
 }
 
 /// One machine's total for one reporting window. The buckets are the agent's USAGE windows
@@ -1192,7 +1798,33 @@ pub struct NodeRuntimeReport {
     /// watchdog. `None` covers the few seconds before the Agent's first watchdog round or a host
     /// where the check cannot run.
     pub wireguard_health: Option<WireGuardHealth>,
+    /// Durable byte meter for the interface carrying the node's default route.
+    ///
+    /// These are Agent-lifetime logical counters rather than the kernel interface counters: the
+    /// Agent persists them and carries them across process and machine restarts. `None` keeps the
+    /// additive protocol change readable from older Agents; it means unsupported/not reported,
+    /// never a measured zero.
+    #[serde(default)]
+    pub traffic: Option<NodeTrafficReading>,
     pub spool: SpoolBacklog,
+}
+
+/// One durable reading of the node's automatically selected default-route interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTrafficReading {
+    /// Stable random identity of the local meter state. A change tells the control plane that the
+    /// Agent's durable state was replaced and that the two counter epochs cannot be joined.
+    pub meter_id: String,
+    /// Monotonic within `meter_id`; makes retries and delayed runtime reports idempotent.
+    pub sequence: u64,
+    pub interface: String,
+    /// Linux boot id used to explain a kernel-counter reset without resetting the logical total.
+    pub boot_id: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// Monotonic count of boundaries at which an exact delta was unknowable (reboot, interface
+    /// replacement or a counter regression). The logical counters never guess across one.
+    pub discontinuities: u64,
 }
 
 /// The versions of the components running on this machine.
@@ -1217,7 +1849,30 @@ pub struct NodeVersions {
     /// reporting anything. Without this field, a machine whose .dat never updates and a machine
     /// that cannot reach the download source are indistinguishable in every other field.
     pub xray: Option<String>,
+    /// The digest of the binary at the managed Xray path. This and `xray_running_sha256` are
+    /// deliberately separate: an atomic replacement changes the path while the old process keeps
+    /// executing its original inode until it is restarted.
+    #[serde(default)]
+    pub xray_installed_sha256: Option<String>,
+    /// The digest of `/proc/<serving-xray-pid>/exe`. `None` means no serving Xray could be
+    /// identified, not that the managed binary is absent.
+    #[serde(default)]
+    pub xray_running_sha256: Option<String>,
     pub phantun: Option<String>,
+    /// The first line of `openvpn --version`.
+    ///
+    /// VPN Gate is an optional node capability: `None` is a valid Agent installation, but that
+    /// machine must not receive or be offered VPN Gate egress work. OpenVPN is started on demand
+    /// inside a managed network namespace; this does not describe a system-wide daemon.
+    #[serde(default)]
+    pub openvpn: Option<String>,
+    /// Maximum number of catalogue profiles this Agent can probe concurrently.
+    ///
+    /// Older Agents omit the field and therefore keep receiving the legacy single-country,
+    /// two-candidate assignments. This capability lets Console and Agent roll independently: a
+    /// newer Console must not send a parallel batch until the node reports support for it.
+    #[serde(default)]
+    pub vpngate_catalog_probe_workers: Option<u8>,
     /// `wg --version`. Below wireguard-tools 1.0.20200121 there is no `wg syncconf`, which is the
     /// only second-rung remedy that does not interrupt sessions. Without it, every drift
     /// escalates to restarting the interface, which drops every session on that machine.
@@ -1230,6 +1885,50 @@ pub struct NodeVersions {
     /// `wireguard-go` or `boringtun`. Their `wg show` output is identical while throughput
     /// differs by an order of magnitude, so the backend has to be queried explicitly.
     pub wg_backend: Option<String>,
+}
+
+/// One Xray binary rollout assignment offered to an authenticated node.
+///
+/// It lives outside desired state because a machine with no configuration work is exactly as
+/// eligible for a runtime upgrade as a busy one. `attempt` fences a retry of the same immutable
+/// release from a delayed report produced by its preceding attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XrayReleaseOffer {
+    pub release_id: i64,
+    pub attempt: u32,
+    pub version: String,
+    pub url: String,
+    pub sha256: String,
+    pub previous_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XrayReleaseOutcome {
+    Succeeded,
+    FailedRecovered,
+    FailedDirty,
+    Unsupported,
+}
+
+/// Final, idempotent result of one node's Xray rollout attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XrayReleaseReport {
+    pub release_id: i64,
+    pub attempt: u32,
+    pub outcome: XrayReleaseOutcome,
+    /// True only when this attempt actually replaced the managed path. Defaulting to false keeps
+    /// v8 reports from the first supporting Agent readable while preventing a no-op from proving a
+    /// canary transition.
+    #[serde(default)]
+    pub performed_update: bool,
+    pub xray_enabled: bool,
+    #[serde(default)]
+    pub installed_sha256: Option<String>,
+    #[serde(default)]
+    pub running_sha256: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// What the local reconcile (`reconcile_local`) did this round.
@@ -1869,6 +2568,33 @@ pub struct NodePingProbeList {
     pub nodes: Vec<NodePingProbeView>,
 }
 
+/// Latest observation for one configured target on a machine-list card.
+///
+/// The list view answers a current-state question, so it must not carry a history window merely
+/// to derive one number in the browser. `None` means this target has never produced a retained
+/// sample for the machine. An attempted sample with no latency remains a timeout, while an
+/// unattempted sample remains a capability or route gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingProbeTargetLatest {
+    pub name: String,
+    pub address: String,
+    pub latest: Option<PingProbePoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePingProbeLatestView {
+    pub node_id: String,
+    pub targets: Vec<PingProbeTargetLatest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePingProbeLatestList {
+    /// The configured Agent sampling interval lets clients distinguish a current observation from
+    /// an old last-known value without duplicating probe settings onto the public settings route.
+    pub interval_secs: u32,
+    pub nodes: Vec<NodePingProbeLatestView>,
+}
+
 /// One hop, as the console reads it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HopLinkView {
@@ -1888,6 +2614,196 @@ pub struct HopLinkList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ip_observation_has_stable_family_spelling() {
+        let encoded = serde_json::to_value(NodePublicIpObservation {
+            observed_at_unix_secs: 1,
+            family: PublicIpFamily::V6,
+            ip: "2606:4700:4700::1111".to_owned(),
+            country_code: Some("US".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(encoded["family"], "v6");
+        assert_eq!(encoded["country_code"], "US");
+    }
+
+    #[test]
+    fn legacy_runtime_versions_default_new_xray_identities() {
+        let versions: NodeVersions = serde_json::from_value(serde_json::json!({
+            "agent": "brocade-agent/old",
+            "xray": "Xray 26.4.25",
+            "phantun": null,
+            "wg_tools": null,
+            "wg_backend": null
+        }))
+        .unwrap();
+        assert_eq!(versions.xray_installed_sha256, None);
+        assert_eq!(versions.xray_running_sha256, None);
+        assert_eq!(versions.openvpn, None);
+        assert_eq!(versions.vpngate_catalog_probe_workers, None);
+    }
+
+    #[test]
+    fn legacy_runtime_report_defaults_missing_traffic_meter() {
+        let report: NodeRuntimeReport = serde_json::from_value(serde_json::json!({
+            "observed_at_unix_secs": 1,
+            "versions": {
+                "agent": "old-agent",
+                "xray": null,
+                "phantun": null,
+                "wg_tools": null,
+                "wg_backend": null
+            },
+            "certificate": { "t": "unmanaged" },
+            "geodata": null,
+            "local_reconcile": null,
+            "wireguard_health": null,
+            "spool": { "observation": 0, "usage": 0, "dropped": 0 }
+        }))
+        .unwrap();
+        assert_eq!(report.traffic, None);
+    }
+
+    #[test]
+    fn vpngate_v12_extensions_default_when_decoding_older_desired_state() {
+        let desired: VpngateDesiredState = serde_json::from_value(serde_json::json!({
+            "topology_revision": 7,
+            "catalog_generation": 9,
+            "pools": []
+        }))
+        .unwrap();
+        assert!(desired.probe_assignments.is_empty());
+        assert_eq!(desired.admission_policy, VpngateAdmissionPolicy::default());
+
+        let candidate: VpngateCandidate = serde_json::from_value(serde_json::json!({
+            "server_id": "vpn1",
+            "hostname": "vpn1",
+            "country_code": "JP",
+            "remote_address": "192.0.2.10",
+            "remote_port": 1194,
+            "transport": "udp",
+            "profile_sha256": "a".repeat(64),
+            "openvpn_config": "client"
+        }))
+        .unwrap();
+        assert_eq!(candidate.verified_exit_ip, None);
+        assert_eq!(candidate.verified_exit_country_code, None);
+        assert!(candidate.verified_ip_scores.is_empty());
+        assert!(candidate.verified_ip_networks.is_empty());
+    }
+
+    #[test]
+    fn xray_release_outcome_uses_a_stable_wire_spelling() {
+        assert_eq!(
+            serde_json::to_string(&XrayReleaseOutcome::FailedRecovered).unwrap(),
+            r#""failed-recovered""#
+        );
+    }
+
+    #[test]
+    fn xray_rollout_extensions_remain_backward_compatible_with_protocol_v8() {
+        #[derive(Deserialize)]
+        struct EarlierV8Report {
+            release_id: i64,
+            attempt: u32,
+            outcome: XrayReleaseOutcome,
+            xray_enabled: bool,
+            installed_sha256: Option<String>,
+            running_sha256: Option<String>,
+            error: Option<String>,
+        }
+
+        assert_eq!(AGENT_PROTOCOL_VERSION, 21);
+        assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
+        let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
+            "release_id": 7,
+            "attempt": 1,
+            "outcome": "succeeded",
+            "xray_enabled": true,
+            "installed_sha256": "a".repeat(64),
+            "running_sha256": "a".repeat(64)
+        }))
+        .unwrap();
+        assert!(!report.performed_update);
+
+        let encoded = serde_json::to_value(XrayReleaseReport {
+            performed_update: true,
+            error: None,
+            ..report
+        })
+        .unwrap();
+        let earlier: EarlierV8Report = serde_json::from_value(encoded).unwrap();
+        assert_eq!(earlier.release_id, 7);
+        assert_eq!(earlier.attempt, 1);
+        assert_eq!(earlier.outcome, XrayReleaseOutcome::Succeeded);
+        assert!(earlier.xray_enabled);
+        assert_eq!(earlier.installed_sha256, Some("a".repeat(64)));
+        assert_eq!(earlier.running_sha256, Some("a".repeat(64)));
+        assert_eq!(earlier.error, None);
+    }
+
+    #[test]
+    fn vpngate_admission_never_aggregates_provider_scores() {
+        let policy = VpngateAdmissionPolicy::default();
+        let scores = vec![
+            VpngateIpScore {
+                provider: VpngateIpProvider::Proxycheck,
+                score: 79,
+                country_code: "JP".to_owned(),
+            },
+            VpngateIpScore {
+                provider: VpngateIpProvider::Ffraud,
+                score: 81,
+                country_code: "US".to_owned(),
+            },
+        ];
+        assert_eq!(
+            evaluate_vpngate_admission(&policy, "JP", &scores),
+            VpngateAdmissionDecision::Rejected
+        );
+
+        let mut any_pass = policy;
+        any_pass.risk_decision_policy = VpngateRiskDecisionPolicy::AnyAvailablePass;
+        assert_eq!(
+            evaluate_vpngate_admission(&any_pass, "JP", &scores),
+            VpngateAdmissionDecision::Admitted
+        );
+    }
+
+    #[test]
+    fn vpngate_admission_accepts_one_source_and_does_not_require_country_agreement() {
+        let policy = VpngateAdmissionPolicy::default();
+        assert_eq!(
+            evaluate_vpngate_admission(
+                &policy,
+                "JP",
+                &[VpngateIpScore {
+                    provider: VpngateIpProvider::Iplogs,
+                    score: 42,
+                    country_code: "JP".to_owned(),
+                }]
+            ),
+            VpngateAdmissionDecision::Admitted
+        );
+
+        let scores = vec![
+            VpngateIpScore {
+                provider: VpngateIpProvider::Proxycheck,
+                score: 20,
+                country_code: "JP".to_owned(),
+            },
+            VpngateIpScore {
+                provider: VpngateIpProvider::Ffraud,
+                score: 30,
+                country_code: "US".to_owned(),
+            },
+        ];
+        assert_eq!(
+            evaluate_vpngate_admission(&policy, "JP", &scores),
+            VpngateAdmissionDecision::Admitted
+        );
+    }
 
     #[test]
     fn realtime_commands_have_a_small_stable_wire_shape() {
@@ -1916,7 +2832,27 @@ mod tests {
             "has_gap": false
         }))
         .unwrap();
+        assert!(!nic_only.diagnostics_unchanged);
         assert_eq!(nic_only.mux, None);
+        assert_eq!(nic_only.vpngate, None);
+
+        let vpngate: VpngateRealtimeReport = serde_json::from_value(serde_json::json!({
+            "boot_id": "boot-a",
+            "sequence": 3,
+            "sampled_at_unix_millis": 10,
+            "pools": [{
+                "outbound_id": "vpngate-jp", "country_code": "JP", "state": "degraded",
+                "reason": "egress_unreachable", "active_slot": 1, "ready_standbys": 0,
+                "candidate_count": 16, "consecutive_failures": 1,
+                "last_success_age_millis": 5000, "probes": 20, "probe_failures": 2,
+                "failovers": 1, "refill_attempts": 2, "refill_failures": 1
+            }],
+            "backends": [],
+            "events": []
+        }))
+        .unwrap();
+        assert_eq!(vpngate.pools[0].state, VpngateRuntimeState::Degraded);
+        assert_eq!(vpngate.pools[0].refill_backoff_remaining_millis, 0);
 
         let report: MuxReport = serde_json::from_value(serde_json::json!({
             "boot_id": "9",

@@ -3,8 +3,10 @@ package buf_test
 import (
 	"bytes"
 	"io"
+	stdnet "net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	. "github.com/xtls/xray-core/common/buf"
@@ -117,6 +119,38 @@ func TestPacketReader_ReadMultiBuffer(t *testing.T) {
 	common.Must(err)
 	if s := mb.String(); s != alpha {
 		t.Error("content: ", s)
+	}
+}
+
+func TestPacketReaderPreservesPacketLargerThanRegularBuffer(t *testing.T) {
+	listener, err := stdnet.ListenUDP("udp4", &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	sender, err := stdnet.DialUDP("udp4", nil, listener.LocalAddr().(*stdnet.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	payload := bytes.Repeat([]byte{0x5a}, 4*Size+17)
+	if n, err := sender.Write(payload); err != nil {
+		t.Fatal(err)
+	} else if n != len(payload) {
+		t.Fatalf("sent packet length = %d, want %d", n, len(payload))
+	}
+	reader := &PacketReader{Reader: listener}
+	mb, err := reader.ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ReleaseMulti(mb)
+	if len(mb) != 1 || !bytes.Equal(mb[0].Bytes(), payload) {
+		t.Fatalf("packet length = %d, want %d", mb.Len(), len(payload))
 	}
 }
 

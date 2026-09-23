@@ -12,7 +12,9 @@ import {
 } from '../api';
 import { can, useSession } from '../session';
 import { Ago, Empty, ErrorBox, Loading } from '../ui/bits';
-import { copyText } from '../ui/platform';
+import { CopyButton } from '../ui/copy-button';
+import { PASSWORD_MIN_LENGTH } from '../ui/password-policy';
+import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 
 // 五个角色等级，由高到低。该顺序即版面顺序——`can()` 使用序号比较
 // （`RANK[role] >= RANK.editor`），五档严格递进，不存在「可发布但不可修改」这类组合。
@@ -21,7 +23,7 @@ import { copyText } from '../ui/platform';
 // `adds` 写的是相对下一档新增的权限，而非该档的全部权限——递进关系用该方式表述
 // 才不需要将基础权限重复五次。依据是 session.tsx 的 can() 及各页面的调用点。
 const LADDER: { role: AdminRole; adds: string; where: string }[] = [
-  { role: 'system-admin', adds: '改设置、节点身份与退役、建链、回滚', where: '外加下面所有档的' },
+  { role: 'system-admin', adds: '改设置、机器身份与退役、建链、回滚', where: '外加下面所有档的' },
   { role: 'tenant-admin', adds: '建租户、管操作者', where: '管的是自己 scope 底下那棵子树' },
   { role: 'publisher', adds: '把草稿发出去', where: '发布要盖修订' },
   { role: 'editor', adds: '改用户、改链路', where: '写进草稿，不发布' },
@@ -30,23 +32,33 @@ const LADDER: { role: AdminRole; adds: string; where: string }[] = [
 
 const ROLES: AdminRole[] = ['readonly', 'editor', 'publisher', 'tenant-admin', 'system-admin'];
 
+const EMPTY_OPERATOR_FORM = { id: '', role: 'readonly' as AdminRole, scope: '', password: '' };
+
 export function OperatorsPane() {
   const { who } = useSession();
   const qc = useQueryClient();
   const operators = useQuery({ queryKey: ['operators'], queryFn: () => fetchOperators() });
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
 
-  const [form, setForm] = useState<{ id: string; role: AdminRole; scope: string; password: string }>({
-    id: '',
-    role: 'readonly',
-    scope: '',
-    password: '',
-  });
+  const [form, setForm] = useState<{ id: string; role: AdminRole; scope: string; password: string }>(() => ({
+    ...EMPTY_OPERATOR_FORM,
+  }));
   const [creating, setCreating] = useState(false);
   /* 一次性 token：签发后只保存在内存中直到被复制，不写入任何存储 */
   const [issued, setIssued] = useState<{ id: string; token: string } | null>(null);
   /* 代为设置的一次性密码，同样只保存在内存中 */
   const [issuedPassword, setIssuedPassword] = useState<{ id: string; password: string } | null>(null);
+  const createGuardScope = 'operator:create';
+  const createDirty = creating && JSON.stringify(form) !== JSON.stringify(EMPTY_OPERATOR_FORM);
+  useUnsavedChanges(createDirty, '新操作者表单', createGuardScope);
+  useUnsavedChanges(issued !== null, `${issued?.id ?? '操作者'} 的一次性 API token`);
+  useUnsavedChanges(issuedPassword !== null, `${issuedPassword?.id ?? '操作者'} 的一次性密码`);
+
+  const closeCreate = () => {
+    if (!confirmDiscardChanges(createGuardScope)) return;
+    setForm({ ...EMPTY_OPERATOR_FORM });
+    setCreating(false);
+  };
 
   const refresh = () => qc.invalidateQueries({ queryKey: ['operators'] });
   const create = useMutation({
@@ -62,7 +74,7 @@ export function OperatorsPane() {
       }),
     onSuccess: () => {
       refresh();
-      setForm({ ...form, id: '', password: '' });
+      setForm({ ...EMPTY_OPERATOR_FORM });
       setCreating(false);
     },
   });
@@ -87,7 +99,7 @@ export function OperatorsPane() {
 
   // 新操作者的 scope 来自租户列表。租户尚未读到或读取失败时不能用空列表继续渲染，
   // 否则界面会显示一张可提交、但必然把 scope 提交为空的表单。
-  if (operators.isPending || tenants.isPending) return <Loading />;
+  if (operators.isPending || tenants.isPending) return <Loading variant="panel" />;
   if (operators.error || tenants.error) return <ErrorBox error={operators.error ?? tenants.error} />;
 
   const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
@@ -101,8 +113,8 @@ export function OperatorsPane() {
         <h4>操作者</h4>
         <span className="sub">密码用于登录控制台，token 用于脚本调用 API，两者互不依赖</span>
         <span className="sp" />
-        <button className="btn" disabled={!manage} onClick={() => setCreating(!creating)}>
-          {creating ? '收起' : '＋ 建操作者'}
+        <button className="btn" disabled={!manage} onClick={() => (creating ? closeCreate() : setCreating(true))}>
+          {creating ? '取消新建' : '＋ 建操作者'}
         </button>
       </div>
 
@@ -112,7 +124,7 @@ export function OperatorsPane() {
           onSubmit={e => {
             e.preventDefault();
             const publicReadonly = form.id.trim() === 'public' && form.role === 'readonly';
-            if (form.id.trim() && (publicReadonly || form.password.length >= 8)) create.mutate();
+            if (form.id.trim() && (publicReadonly || form.password.length >= PASSWORD_MIN_LENGTH)) create.mutate();
           }}
         >
           <p className="fh">新操作者</p>
@@ -156,7 +168,9 @@ export function OperatorsPane() {
               type="password"
               autoComplete="new-password"
               placeholder={
-                form.id.trim() === 'public' && form.role === 'readonly' ? '登录密码（可留空）' : '登录密码（至少 8 位）'
+                form.id.trim() === 'public' && form.role === 'readonly'
+                  ? '登录密码（可留空）'
+                  : `登录密码（至少 ${PASSWORD_MIN_LENGTH} 位）`
               }
               value={form.password}
               onChange={e => setForm({ ...form, password: e.target.value })}
@@ -168,7 +182,8 @@ export function OperatorsPane() {
                 !manage ||
                 create.isPending ||
                 !form.id.trim() ||
-                (!(form.id.trim() === 'public' && form.role === 'readonly') && form.password.length < 8)
+                (!(form.id.trim() === 'public' && form.role === 'readonly') &&
+                  form.password.length < PASSWORD_MIN_LENGTH)
               }
             >
               {create.isPending ? '提交中…' : '建操作者'}
@@ -176,7 +191,7 @@ export function OperatorsPane() {
           </div>
           <p className="hint" style={{ marginTop: 8 }}>
             只有固定的 <span className="mono">public</span> + <span className="mono">readonly</span> 账号可留空，
-            用于访客页面；其他操作者必须设置至少 8 位密码。
+            用于访客页面；其他操作者必须设置至少 {PASSWORD_MIN_LENGTH} 位密码。
           </p>
         </form>
       )}
@@ -217,9 +232,7 @@ export function OperatorsPane() {
             {issuedPassword.password}
           </div>
           <div className="toolbar">
-            <button className="btn" onClick={() => void copyText(issuedPassword.password)}>
-              复制
-            </button>
+            <CopyButton className="btn" text={issuedPassword.password} />
             <span className="sp" />
             <button className="btn primary" onClick={() => setIssuedPassword(null)}>
               我抄好了
@@ -235,9 +248,7 @@ export function OperatorsPane() {
             {issued.token}
           </div>
           <div className="toolbar">
-            <button className="btn" onClick={() => void copyText(issued.token)}>
-              复制
-            </button>
+            <CopyButton className="btn" text={issued.token} />
             <span className="sp" />
             <button className="btn primary" onClick={() => setIssued(null)}>
               我抄好了

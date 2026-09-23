@@ -3,7 +3,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SnapshotIngress } from '../src/api';
-import { IngressProjectionRow, useProjectionHandles, type ProjectionHandle } from '../src/panes/chains';
+import {
+  effectiveProjectionEndpoint,
+  IngressProjectionRow,
+  useProjectionHandles,
+  withProjectionEndpoint,
+  type ProjectionHandle,
+} from '../src/panes/chains';
 
 const ingress: SnapshotIngress = {
   id: 'ingress-1',
@@ -45,6 +51,7 @@ function ProjectionHarness({ onReport }: { onReport: (handle: ProjectionHandle) 
         <IngressProjectionRow
           appId="app-1"
           ingress={ingress}
+          protocol="vless"
           family="v4"
           node={{ public_ipv4: '192.0.2.1', public_ipv6: null }}
           editable
@@ -58,6 +65,15 @@ function ProjectionHarness({ onReport }: { onReport: (handle: ProjectionHandle) 
 afterEach(cleanup);
 
 describe('projection handle registration', () => {
+  it('keeps the default public endpoint implicit', async () => {
+    const reports = vi.fn<(handle: ProjectionHandle) => void>();
+    const view = render(<ProjectionHarness onReport={reports} />);
+
+    await waitFor(() => expect(reports).toHaveBeenCalledTimes(1));
+    expect(view.queryByText(/使用机器公网地址/)).toBeNull();
+    expect(view.queryByText(/192\.0\.2\.1/)).toBeNull();
+  });
+
   it('reports once per semantic form change instead of looping after the parent rerenders', async () => {
     const reports = vi.fn<(handle: ProjectionHandle) => void>();
     const view = render(<ProjectionHarness onReport={reports} />);
@@ -72,5 +88,34 @@ describe('projection handle registration', () => {
     fireEvent.change(view.getByPlaceholderText('地址或域名'), { target: { value: 'edge.example.com' } });
     await waitFor(() => expect(reports).toHaveBeenCalledTimes(3));
     expect(reports.mock.calls[2]?.[0]).toMatchObject({ dirty: true, blocked: false });
+  });
+
+  it('expands a legacy shared address into an independent protocol mapping', () => {
+    const legacy: SnapshotIngress = {
+      ...ingress,
+      projection: { v4: { host: 'legacy.edge.example', port: 10443 } },
+      wires: {
+        ...ingress.wires,
+        anytls: {
+          port: 2443,
+          security: 'tls',
+          padding_scheme: [],
+          masquerade: { kind: 'not-found' },
+        },
+      },
+    };
+
+    expect(effectiveProjectionEndpoint(legacy, 'vless', 'v4')).toEqual({
+      host: 'legacy.edge.example',
+      port: 10443,
+    });
+    expect(effectiveProjectionEndpoint(legacy, 'anytls', 'v4')).toEqual({
+      host: 'legacy.edge.example',
+      port: 2443,
+    });
+    expect(withProjectionEndpoint(legacy.projection, 'anytls', 'v4', null)).toEqual({
+      v4: { host: 'legacy.edge.example', port: 10443 },
+      anytls: { v4: null },
+    });
   });
 });

@@ -31,7 +31,11 @@
 //! the previous one wrote, and a bare blob leaves nothing to branch on but guessing at lengths.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
+use brocade_core::hash::hex_lower;
+use ring::{
+    aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN},
+    hmac,
+};
 
 use crate::{Result, StoreError};
 
@@ -45,6 +49,8 @@ const VERSION: &str = "v1";
 
 /// Sealing context for the DNS provider credential.
 pub const CTX_DNS_CREDENTIAL: &str = "dns-credential";
+/// Sealing context for the ProxyCheck API key used by exit-IP intelligence workers.
+pub const CTX_PROXYCHECK_API_KEY: &str = "proxycheck-api-key";
 /// Sealing context for an ACME account key.
 pub const CTX_ACME_ACCOUNT: &str = "acme-account";
 /// Sealing context for a node certificate's private key.
@@ -55,6 +61,45 @@ pub const CTX_CERT_KEY: &str = "cert-key";
 /// column: the moved ciphertext will fail authentication when read under the destination id.
 pub fn external_outbound_context(tenant_id: &str, outbound_id: &str) -> String {
     format!("external-outbound:{tenant_id}/{outbound_id}")
+}
+
+/// Binds the short-lived frozen input of a draft tunnel probe to its durable run identity.
+///
+/// A draft has no immutable model revision from which a worker can reconstruct credentials after
+/// a Console restart. The complete selected outbound is therefore sealed for the lifetime of the
+/// active run and cannot be transplanted to another tenant, tunnel, or run row.
+pub(crate) fn tunnel_probe_draft_context(
+    run_id: i64,
+    tenant_id: &str,
+    outbound_id: &str,
+) -> String {
+    format!("tunnel-probe-draft:{run_id}:{tenant_id}/{outbound_id}")
+}
+
+/// Stable, non-reversible identity for one draft probe input.
+///
+/// A plain SHA-256 would turn the public run fingerprint into an offline oracle for weak proxy
+/// passwords. Keying it with the database secret lets idempotent requests recognize the same
+/// frozen draft without disclosing a credential-derived digest.
+pub(crate) fn tunnel_probe_draft_fingerprint(
+    tenant_id: &str,
+    outbound_id: &str,
+    plaintext: &str,
+) -> Result<String> {
+    let Some(key) = key_material()? else {
+        return Err(StoreError::InvalidData(format!(
+            "{SECRET_KEY_ENV} is not set, so a draft probe cannot be frozen"
+        )));
+    };
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+    let mut input = hmac::Context::with_key(&key);
+    input.update(b"tunnel-probe-draft-fingerprint\0");
+    input.update(tenant_id.as_bytes());
+    input.update(b"\0");
+    input.update(outbound_id.as_bytes());
+    input.update(b"\0");
+    input.update(plaintext.as_bytes());
+    Ok(hex_lower(input.sign().as_ref()))
 }
 
 /// Binds one managed tunnel's machine private key to all three stable identifiers.
@@ -240,6 +285,23 @@ mod tests {
             let a = seal(CTX_CERT_KEY, "same").unwrap();
             let b = seal(CTX_CERT_KEY, "same").unwrap();
             assert_ne!(a, b);
+        });
+    }
+
+    #[test]
+    fn draft_probe_fingerprint_is_stable_and_bound_to_the_tunnel() {
+        with_key(Some(KEY), || {
+            let first =
+                tunnel_probe_draft_fingerprint("platform", "edge", "secret config").unwrap();
+            let same = tunnel_probe_draft_fingerprint("platform", "edge", "secret config").unwrap();
+            let other_tunnel =
+                tunnel_probe_draft_fingerprint("platform", "other", "secret config").unwrap();
+            let other_config =
+                tunnel_probe_draft_fingerprint("platform", "edge", "changed config").unwrap();
+            assert_eq!(first, same);
+            assert_eq!(first.len(), 64);
+            assert_ne!(first, other_tunnel);
+            assert_ne!(first, other_config);
         });
     }
 

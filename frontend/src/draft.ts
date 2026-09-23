@@ -55,18 +55,6 @@ export type ModelOp =
       chain: { id: string; tenant_id: string; name: string; subscription_country?: string | null };
     }
   | {
-      op: 'upsert_front';
-      app_id: string;
-      front: {
-        id: string;
-        tenant_id: string;
-        name: string;
-        strategy: 'url-test' | 'select' | 'fallback';
-        via: string[];
-        external_via: string[];
-      };
-    }
-  | {
       op: 'create_ingress';
       app_id: string;
       ingress: {
@@ -75,7 +63,6 @@ export type ModelOp =
         node_id: string;
         bind: string;
         port: number;
-        front_id?: string;
         reality: CreateRealityIngress;
         projection: IngressProjection;
         wires: Wires;
@@ -91,7 +78,6 @@ export type ModelOp =
         node_id: string;
         bind: string;
         port: number;
-        front_id?: string;
         reality: CreateRealityIngress;
         projection: IngressProjection;
         wires: Wires;
@@ -247,12 +233,6 @@ function entryOf(op: ModelOp): DraftEntry {
         label: `隧道 ${op.outbound.name || op.outbound.id}`,
         op,
       };
-    case 'upsert_front':
-      return {
-        key: `front:${op.app_id}/${op.front.id}`,
-        label: `订阅前置 ${op.front.name || op.front.id}`,
-        op,
-      };
     case 'create_chain':
     case 'upsert_chain':
       return { key: `chain:${op.app_id}/${op.chain.id}`, label: `链 ${op.chain.id}`, op };
@@ -387,7 +367,7 @@ export class DraftStore {
   // 快照需要保持稳定引用：useSyncExternalStore 每次接收到新数组都会判定为已变更，
   // 导致持续重渲染。只有实际发生修改时才创建新数组。
   private snap: readonly DraftEntry[] = [];
-  /* 每次变更递增 1。api.ts 的预览缓存将其作为键的一部分——草稿变化时缓存立即失效。 */
+  /* 每次通知递增 1。查询层用它拒绝较早一代的响应；提交状态等非内容变化也会通知。 */
   private ver = 0;
 
   subscribe = (listener: () => void): (() => void) => {
@@ -400,6 +380,9 @@ export class DraftStore {
   snapshot = (): readonly DraftEntry[] => this.snap;
 
   version = (): number => this.ver;
+
+  /* 服务端预览同时受操作者权限和草稿操作影响。提交状态等纯 UI 通知不应改变此键。 */
+  previewKey = (): string => JSON.stringify([this.owner, this.ops()]);
 
   /* Restore and share the operator's draft. Concurrent branch heads are never overwritten. */
   init(operator: string) {
@@ -554,6 +537,15 @@ export class DraftStore {
       entry = entryOf({ op: 'create_chain', app_id: op.app_id, chain: op.chain });
     } else if (previous?.op === 'create_ingress' && op.op === 'upsert_ingress') {
       entry = entryOf({ op: 'create_ingress', app_id: op.app_id, ingress: op.ingress });
+    } else if (previous?.op === 'put_step' && op.op === 'put_step') {
+      // One rule-table save can write the downstream listener first (including hop_in), then the
+      // downstream editor writes its own rules under the same draft key. Optional fields mean
+      // "leave unchanged" at the store boundary, so replacing the browser operation wholesale
+      // used to discard the newly selected port/security before the batch ever reached the store.
+      entry = entryOf({
+        ...op,
+        step: { ...previous.step, ...op.step },
+      });
     } else if (previous?.op === 'update_node' && op.op === 'update_node') {
       // The node detail page deliberately splits one machine across independent cards. Keep the
       // fields saved by those cards in one operation; replacing the whole partial body would make

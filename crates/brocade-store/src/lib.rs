@@ -3,6 +3,7 @@ mod agent;
 mod agent_release;
 mod branding;
 mod cert;
+mod compile_cache;
 mod console;
 mod credentials;
 mod deployment;
@@ -16,24 +17,31 @@ mod lifecycle;
 mod load;
 mod log_policy;
 mod materialize;
+mod notifications;
 mod pg;
 mod ping_probe;
 mod probe;
 mod provision;
+mod public_ip;
 mod quota;
 mod realtime;
 pub mod secrets;
 mod serving;
 mod settings;
 mod subscription_client;
+mod traffic;
+mod tunnel_probe;
 mod usage;
+mod vpngate;
+mod xray_release;
 
 pub use admin::{
     AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult, AdminLoginRequest,
-    AdminLoginResult, AdminOperator, AdminRole, AuthenticatedAdmin, AuthenticatedUser,
-    ChangeAdminPasswordRequest, CreateAdminOperatorRequest, IssuedAdminSession, IssuedAdminToken,
-    IssuedUserLogin, ResetAdminPasswordResult, SetUserPasswordRequest, SetUserPasswordResult,
-    SystemInitRequest, SystemInitResult, ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
+    AdminLoginResult, AdminOperator, AdminRole, AdminSessionAuthentication, AuthenticatedAdmin,
+    AuthenticatedUser, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, IssuedAdminSession,
+    IssuedAdminToken, IssuedUserLogin, ResetAdminPasswordResult, SetUserPasswordRequest,
+    SetUserPasswordResult, SystemInitRequest, SystemInitResult, ADMIN_SESSION_TTL_SECONDS,
+    PUBLIC_OPERATOR_ID,
 };
 pub use agent::public_route_ip;
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
@@ -45,16 +53,25 @@ pub use brocade_deployment::protocol::{
     DeploymentWaveConfirmationRequest, DeploymentWaveConfirmationResult, E2eExitVerdict, E2eProbe,
     E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest, E2eProbeResult, E2eProbeStatus,
     E2eProbeTarget, E2eProbeTargetList, HopLinkList, HopLinkSample, HopLinkView, HostFacts,
-    IsolateDeploymentTargetRequest, LinkHealth, LinkHealthRequest, LinkHealthResult, LinkProbe,
-    LinkProbeRequest, LinkProbeResult, LinkProbeStatus, LoadReportRequest, LoadReportResult,
-    LoadSample, NodeDesiredDeployment, NodeIsolationCommandResult, NodeLoadList, NodeLoadView,
-    NodePingProbeList, NodePingProbeView, PhantunBinaries, PingProbePoint, PingProbeReportRequest,
-    PingProbeReportResult, PingProbeSample, PingProbeSettings, PingProbeTarget,
-    PingProbeTargetSeries, ProbeTarget, ProbeTargetList, ProbeTransport, RealtimeTelemetryPolicy,
-    ReportTargetResult, ReportedNodeState, RouteIpReport, TargetApplyResult,
-    TargetConvergenceReport, UpdateRealtimeTelemetryPolicyRequest, UsageCounter,
-    UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries,
+    IsolateDeploymentTargetRequest, IsolateNodeRequest, LinkHealth, LinkHealthRequest,
+    LinkHealthResult, LinkProbe, LinkProbeRequest, LinkProbeResult, LinkProbeStatus,
+    LoadReportRequest, LoadReportResult, LoadSample, NodeDesiredDeployment,
+    NodeIsolationCommandResult, NodeLoadList, NodeLoadView, NodePingProbeLatestList,
+    NodePingProbeLatestView, NodePingProbeList, NodePingProbeView, PhantunBinaries, PingProbePoint,
+    PingProbeReportRequest, PingProbeReportResult, PingProbeSample, PingProbeSettings,
+    PingProbeTarget, PingProbeTargetLatest, PingProbeTargetSeries, ProbeTarget, ProbeTargetList,
+    ProbeTransport, RealtimeTelemetryPolicy, ReportTargetResult, ReportedNodeState, RouteIpReport,
+    TargetApplyResult, TargetConvergenceReport, UpdateRealtimeTelemetryPolicyRequest, UsageCounter,
+    UsageDailyRow, UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries,
     UsageNodeSeriesList, UsageReportRequest, UsageReportResult, UsageSample, UsageSampleList,
+    VpngateAdmissionDecision, VpngateAdmissionPolicy, VpngateCandidate, VpngateCountryPolicy,
+    VpngateDesiredPool, VpngateDesiredState, VpngateIpIntelligenceAssignment,
+    VpngateIpIntelligenceFailure, VpngateIpIntelligenceObservation, VpngateIpIntelligenceReport,
+    VpngateIpNetwork, VpngateIpProvider, VpngateIpScore, VpngateManualSwitchCommand,
+    VpngateManualSwitchResult, VpngateManualSwitchStatus, VpngateNetworkType, VpngatePoolReport,
+    VpngateProbeAssignment, VpngateProbeReport, VpngateProbeSample, VpngateProbeStatus,
+    VpngateProviderRiskRule, VpngateReconcileReport, VpngateRiskDecisionPolicy, VpngateTransport,
+    XrayReleaseOffer, XrayReleaseOutcome, XrayReleaseReport,
 };
 pub use cert::{
     CertDomain, CertDomainInput, CertGroup, CertificateDnsTarget, CertificateOrder,
@@ -64,21 +81,22 @@ pub use cert::{
 };
 pub use console::{
     ArtifactContent, ArtifactIndex, ArtifactIndexEntry, ClashHaitunLink, ClashSubscriptionUsage,
-    CompileView, ConsoleEgressDnsPolicy, ConsoleSnapshot, CreateAppRequest, CreateChainRequest,
-    CreateFrontRequest, CreateGrantRequest, CreateIngressRequest, CreateRealityIngressRequest,
-    CreateTenantRequest, CreateUserRequest, DeleteStepResult, DeploymentVerification,
-    DynamicClashSubscription, HopInRequest, HopWireRequest, ModelWriteResult, NodeAgentStateItem,
-    NodeAgentStateList, PruneChainResult, PutStepRequest, RedactedModelSnapshot, RedactedSecret,
-    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
-    RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult, RevisionList,
-    RevisionListItem, RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult,
-    StepAcceptRequest, TenantList, TenantListItem, TransportRequest, UpdateNodeRequest,
-    UpdateNodeResult, UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
-    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
-    UpsertChainResult, UpsertExternalOutboundRequest, UpsertFrontResult, UpsertGrantResult,
-    UpsertIngressResult, UpsertTenantResult, UpsertUserResult, UserAccountType, UserAppQuota,
-    UserAppQuotaList, UserList, UserListItem, VerifyDeploymentRequest, WarpBindingRemoval,
-    WiresRequest,
+    CompileView, ConsoleEgressDnsPolicy, ConsoleInitialData, ConsoleSnapshot, CreateAppRequest,
+    CreateChainRequest, CreateFrontRequest, CreateGrantRequest, CreateIngressRequest,
+    CreateRealityIngressRequest, CreateTenantRequest, CreateUserRequest, DeleteFrontRequest,
+    DeleteFrontResult, DeleteStepResult, DeploymentVerification, DynamicClashSubscription,
+    FrontClientConfigState, FrontRouteAnalysisView, HopInRequest, HopWireRequest, ModelWriteResult,
+    NodeAgentStateItem, NodeAgentStateList, PruneChainResult, PutStepRequest,
+    RedactedModelSnapshot, RedactedSecret, RegisterWarpBindingRequest, RegisterWarpBindingResult,
+    RemoveRetiredNodesRequest, RemoveRetiredNodesResult, RemoveWarpBindingRequest,
+    RemoveWarpBindingResult, RevisionList, RevisionListItem, RotateUserUuidResult,
+    SetUserAppQuotaRequest, SetUserAppQuotaResult, StepAcceptRequest, TenantList, TenantListItem,
+    TransportRequest, UpdateNodeRequest, UpdateNodeResult, UpdateNodeStatusRequest,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateUserStatusResult,
+    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
+    UpsertExternalOutboundRequest, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
+    UpsertTenantResult, UpsertUserResult, UserAccountType, UserAppQuota, UserAppQuotaList,
+    UserList, UserListItem, VerifyDeploymentRequest, WarpBindingRemoval, WiresRequest,
 };
 pub use credentials::{
     admin_session_token_hash, admin_token_display_prefix, admin_token_hash,
@@ -98,26 +116,67 @@ pub use draft::{ApplyDraftResult, DraftPreview, ModelOp};
 pub use grant_automation::{
     GrantAutomationOutcome, GrantAutomationStatus, GRANTS_AUTOMATION_ACTOR,
 };
-pub use grant_probe::{UserGrantProbePlan, UserGrantProbeTarget};
+pub use grant_probe::{
+    FrontCombinationProbeMember, FrontCombinationProbePlan, FrontCombinationProbeTarget,
+    UserGrantProbePlan, UserGrantProbeTarget,
+};
 pub use lifecycle::{
     AbandonNodeRequest, NodeLifecyclePhase, NodeLifecycleState, NodeLifecycleTransitionResult,
 };
-pub use load::LoadSeriesQuery;
+pub use load::{
+    LoadSeriesQuery, NodeLoadMetricView, NodeLoadOverviewSeries, NodeLoadOverviewView, NodeNicList,
+    NodeNicSample, NodeNicView,
+};
 pub use log_policy::{
     AgentLogLimitOverrides, AgentLogLimits, AgentLogPolicyView, NodeLogPolicyItem,
     UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, DEFAULT_AGENT_LOG_MAX_MIB,
     DEFAULT_PHANTUN_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
 };
+pub use notifications::{
+    ClaimedNotificationDelivery, MachineEventList, MachineEventView, MACHINE_EVENT_RETENTION_DAYS,
+};
 pub use pg::PgStore;
+pub use ping_probe::{NodePingProbeColumnarView, PingProbeTargetColumnarSeries};
 pub use probe::{
-    E2eProbeItem, E2eProbeSample, LinkHealthItem, LinkMtuItem, LinkMtuView, NodeMtuItem,
+    E2eExitIpIntelligence, E2eProbeItem, E2eProbeSampleSeries, LinkHealthItem, LinkMtuItem,
+    LinkMtuView, NodeMtuItem,
 };
 pub use provision::{
     ProvisionNodeRequest, ProvisionNodeResult, ProvisionedNode, ProvisionedNodeEnrollment,
 };
+pub use public_ip::{
+    NodePublicIpEventView, NodePublicIpHistory, NodePublicIpStateView, PublicIpObservationOutcome,
+    RecordPublicIpObservationResult, PUBLIC_IP_EVENT_RETENTION_DAYS,
+};
 pub use quota::{QuotaEnforcementOutcome, QuotaEnforcementPlan, QuotaGrantChange, QUOTA_ACTOR};
 pub use settings::{SettingsSnapshot, UpdateSettingsResult};
 pub use subscription_client::{ClientConfigCommitResult, ClientConfigCommitStatus};
+pub use traffic::{
+    NodeTrafficCycleKind, NodeTrafficItem, NodeTrafficView, UpdateNodeTrafficRequest,
+};
+pub use tunnel_probe::{
+    ClaimedTunnelProbe, TunnelProbeCompletion, TunnelProbeHealth, TunnelProbeJobStatus,
+    TunnelProbeList, TunnelProbeListItem, TunnelProbePhase, TunnelProbePoint, TunnelProbePolicy,
+    TunnelProbeResultStatus, TunnelProbeRun, TunnelProbeSource, TunnelProbeSummary,
+    TunnelProbeTrigger, TunnelProbeView, UpdateTunnelProbePolicy, TUNNEL_PROBE_RETENTION_DAYS,
+};
+pub use vpngate::{
+    RequestVpngatePoolSwitch, UpdateVpngateCatalogSettings, UpdateVpngateIntelligenceCredentials,
+    UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode, VpngateCatalogStatus,
+    VpngateCountrySummary, VpngateDirectoryFilter, VpngateDirectorySort,
+    VpngateIntelligenceCredentialUpdateMode, VpngateIntelligenceCredentials,
+    VpngateIntelligenceNodeSelection, VpngateIntelligencePolicy, VpngateIntelligenceRefreshMode,
+    VpngateIntelligenceRefreshResult, VpngateIpIntelligenceClaim, VpngateOverview,
+    VpngatePoolSwitchRequestView, VpngateProbeNodeAddress, VpngateProbeNodeOrigin,
+    VpngateProbeNodeSelection, VpngateReportReceipt, VpngateRuntimeSelection, VpngateRuntimeView,
+    VpngateServerInput, VpngateServerPage, VpngateServerPageRequest, VpngateServerView,
+    VpngateStaleIntelligencePolicy, VpngateSyncBatch, VpngateSyncClaim, VpngateSyncHistoryPoint,
+};
+pub use xray_release::{
+    CreateXrayReleaseRequest, XrayBuildInfo, XrayRelease, XrayReleaseArtifact,
+    XrayReleaseAssignment, XrayReleaseEvent, XrayReleaseList, XrayReleaseStatus,
+    XrayReleaseSummary, XrayReleaseTarget, XrayReleaseTargetStatus, DEFAULT_XRAY_BATCH_SIZE,
+};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 

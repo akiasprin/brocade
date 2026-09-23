@@ -26,6 +26,10 @@ const IO_POLL: Duration = Duration::from_millis(20);
 const IDLE_POLL: Duration = Duration::from_millis(250);
 const INITIAL_RECONNECT: Duration = Duration::from_secs(1);
 const MAX_RECONNECT: Duration = Duration::from_secs(300);
+/// NIC rates stay at the requested live cadence, while the much larger worker snapshots refresh
+/// only often enough for their 15-second UI freshness budget. This removes repeated serialization
+/// and transport of an unchanged fleet-shaped report from every one-second sample.
+const DIAGNOSTICS_REFRESH: Duration = Duration::from_secs(5);
 const MAX_FRAME_BYTES: usize = 512 * 1024;
 const MAX_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 fn accepted_interval(interval_millis: u32) -> bool {
@@ -86,8 +90,10 @@ impl RateSampler {
         self.sequence = self.sequence.wrapping_add(1).max(1);
         let has_timing_gap = elapsed > expected_interval.saturating_mul(2);
         let sample = AgentRealtimeSample {
+            diagnostics_unchanged: false,
             reverse_health: None,
             mux: None,
+            vpngate: None,
             sequence: self.sequence,
             sampled_at_unix_millis: reading.sampled_at_unix_millis,
             elapsed_millis,
@@ -104,7 +110,10 @@ impl RateSampler {
 type HealthCache =
     std::sync::Arc<std::sync::Mutex<Option<brocade_deployment::protocol::ReverseHealthReport>>>;
 type MuxCache = std::sync::Arc<std::sync::Mutex<Option<brocade_deployment::protocol::MuxReport>>>;
-pub(crate) fn run(options: &Options) {
+pub(crate) type VpngateCache =
+    std::sync::Arc<std::sync::Mutex<Option<brocade_deployment::protocol::VpngateRealtimeReport>>>;
+
+pub(crate) fn run(options: &Options, vpngate: VpngateCache) {
     let health: HealthCache = Default::default();
     let mux: MuxCache = Default::default();
     let health_cache = health.clone();
@@ -131,7 +140,7 @@ pub(crate) fn run(options: &Options) {
         match connect(options) {
             Ok(socket) => {
                 backoff = INITIAL_RECONNECT;
-                if let Err(error) = serve(socket, &health, &mux) {
+                if let Err(error) = serve(socket, &health, &mux, &vpngate) {
                     eprintln!("realtime: connection ended: {error}");
                 }
             }
@@ -213,9 +222,11 @@ fn serve(
     mut socket: WebSocket<Stream>,
     health: &HealthCache,
     mux: &MuxCache,
+    vpngate: &VpngateCache,
 ) -> Result<(), String> {
     let mut active_interval = None;
     let mut next_sample = Instant::now();
+    let mut next_diagnostics = Instant::now();
     let mut sampler = RateSampler::default();
     let mut write_pending = false;
     sampler.reset();
@@ -236,6 +247,7 @@ fn serve(
                         if active_interval != Some(interval) {
                             sampler.reset();
                             next_sample = Instant::now();
+                            next_diagnostics = Instant::now();
                         }
                         active_interval = Some(interval);
                     }
@@ -266,9 +278,16 @@ fn serve(
                     match read_nic(now) {
                         Ok(reading) => {
                             if let Some(mut sample) = sampler.advance(reading, interval) {
-                                sample.reverse_health =
-                                    health.lock().ok().and_then(|value| value.clone());
-                                sample.mux = mux.lock().ok().and_then(|value| value.clone());
+                                if now >= next_diagnostics {
+                                    sample.reverse_health =
+                                        health.lock().ok().and_then(|value| value.clone());
+                                    sample.mux = mux.lock().ok().and_then(|value| value.clone());
+                                    sample.vpngate =
+                                        vpngate.lock().ok().and_then(|value| value.clone());
+                                    next_diagnostics = now + DIAGNOSTICS_REFRESH;
+                                } else {
+                                    sample.diagnostics_unchanged = true;
+                                }
                                 let text = serde_json::to_string(&sample)
                                     .map_err(|error| error.to_string())?;
                                 write_pending = send_sample(&mut socket, text)?;
@@ -456,9 +475,16 @@ mod tests {
             token: "node-secret".to_owned(),
             state_dir: std::env::temp_dir(),
             apply_mode: ApplyMode::StateDir,
+            vpngate_stats_window: std::time::Duration::from_secs(900),
         };
         let socket = connect(&options).unwrap();
-        serve(socket, &Default::default(), &Default::default()).unwrap();
+        serve(
+            socket,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         server.join().unwrap();
     }
 }

@@ -3,8 +3,10 @@ import { fetchArtifactContent, fetchArtifactIndex, fetchRevisions, type Artifact
 import { useSyncExternalStore } from 'react';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
 import { artifactPanel } from '../ui/artifact-panel';
-import { copyText } from '../ui/platform';
 import { can, useSession } from '../session';
+import { CopyButton } from '../ui/copy-button';
+import { fileBytes } from '../ui/format';
+import { Icon } from '../ui/icons';
 
 const FILE: Record<string, { file: string; lang: string }> = {
   phantun: { file: 'phantun.json', lang: 'json' },
@@ -16,7 +18,7 @@ const FILE: Record<string, { file: string; lang: string }> = {
   clash: { file: 'clash.yaml', lang: 'yaml' },
 };
 const fileOf = (kind: string) => FILE[kind] ?? { file: kind, lang: 'txt' };
-const fmtSize = (n: number | null) => (n === null ? '—' : n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`);
+const fmtSize = fileBytes;
 
 // 产物面板：左侧目录树、右侧代码，整体沿用 playground 配置输出的形态。
 // 它是工作台右侧的独立面板，既不是窗口也不属于画布——在两个台面上都存在，
@@ -56,14 +58,14 @@ export function ArtifactPanel() {
         <span className="fw-kind">产物</span>
         <span className="artpanel-title">当前网络结构的产物</span>
         <button title="收起面板" onClick={() => artifactPanel.close()}>
-          ✕
+          <Icon of="close" size={14} />
         </button>
       </div>
       {body}
     </aside>
   );
 
-  if (revisions.isPending || (!!revision && index.isPending)) return shell(<Loading />);
+  if (revisions.isPending || (!!revision && index.isPending)) return shell(<Loading variant="tree" />);
   if (revisions.error) return shell(<ErrorBox error={revisions.error} />);
   if (revision == null) return shell(<Empty>还没有可查看的修订。</Empty>);
   if (index.error) return shell(<ErrorBox error={index.error} />);
@@ -84,9 +86,9 @@ export function ArtifactPanel() {
   // 服务端的 artifact_index 才会生成它们。
   const groups = [
     {
-      grp: '节点产物',
+      grp: '机器产物',
       items: all.filter(e => e.target_kind === 'node'),
-      empty: '还没有节点产物。先纳管机器。',
+      empty: '还没有机器产物。先纳管机器。',
     },
     {
       grp: '订阅',
@@ -159,16 +161,12 @@ function ArtifactBody({ entry, revision }: { entry: ArtifactIndexEntry; revision
     <div className="cfg-main">
       <div className="cfg-bar">
         <span className="cfg-path">
-          {entry.target_kind === 'node' ? '节点产物' : '订阅'} / {entry.target_id} /&nbsp;
+          {entry.target_kind === 'node' ? '机器产物' : '订阅'} / {entry.target_id} /&nbsp;
         </span>
         <span className="cfg-file">{meta.file}</span>
         <span className={`cfg-fmt ${meta.lang}`}>{meta.lang}</span>
         <span className="cfg-sp" />
-        {text && (
-          <button className="btn" onClick={() => void copyText(text)}>
-            复制
-          </button>
-        )}
+        {text && <CopyButton className="btn" text={text} />}
       </div>
       {entry.state !== 'present' ? (
         <div className="cfg-code">
@@ -178,7 +176,7 @@ function ArtifactBody({ entry, revision }: { entry: ArtifactIndexEntry; revision
           </pre>
         </div>
       ) : content.isPending ? (
-        <Loading />
+        <Loading variant="code" />
       ) : content.error ? (
         <ErrorBox error={content.error} />
       ) : (

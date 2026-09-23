@@ -237,4 +237,6 @@ trap - 0 HUP INT TERM
 
 say "Brocade 已安装完成。"
 say "普通启动：brocade up（非 root shell 使用 sudo brocade up）"
-say "临时 Tunnel：brocade up --tunnel（非 root shell 使用 sudo）"
+say "远程初始化：sudo brocade up --tunnel；请打开启动后显示的“初始化地址”HTTPS 链接"
+say "SSH 转发初始化：在浏览器所在电脑运行 ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>，再打开 http://127.0.0.1:8080"
+say "一次性初始化凭据：启动后运行 sudo cat /var/lib/brocade/bootstrap-token（初始化成功后自动删除）"

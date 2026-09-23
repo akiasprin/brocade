@@ -10,7 +10,7 @@ const APP_RANDOM_BYTES = 2;
 const APP_ID = /^app-([0-9a-f]{4})$/;
 const INGRESS_ID = /^ing-([0-9a-f]{4})$/;
 const CHAIN_ID = /^chn-([0-9a-f]{4})-([0-9a-f]{4})$/;
-const TUNNEL_ID = /^tunnel-([0-9a-f]{4})-([0-9a-f]{4})$/;
+const TUNNEL_ID = /^(?:custom|warp|vpngate)-([0-9a-f]{4})-([0-9a-f]{4})$/;
 
 const hex = (bytes: Uint8Array, start: number): string =>
   [...bytes.slice(start, start + 2)].map(byte => byte.toString(16).padStart(2, '0')).join('');
@@ -31,7 +31,17 @@ export const appIdFromBytes = (bytes: Uint8Array): string => {
 
 export const tunnelIdFromBytes = (bytes: Uint8Array): string => {
   if (bytes.length < RANDOM_BYTES) throw new Error(`tunnel id needs ${RANDOM_BYTES} random bytes`);
-  return `tunnel-${hex(bytes, 0)}-${hex(bytes, 2)}`;
+  return `custom-${hex(bytes, 0)}-${hex(bytes, 2)}`;
+};
+
+export const warpTunnelIdFromBytes = (bytes: Uint8Array): string => {
+  if (bytes.length < RANDOM_BYTES) throw new Error(`WARP tunnel id needs ${RANDOM_BYTES} random bytes`);
+  return `warp-${hex(bytes, 0)}-${hex(bytes, 2)}`;
+};
+
+export const vpngateTunnelIdFromBytes = (bytes: Uint8Array): string => {
+  if (bytes.length < RANDOM_BYTES) throw new Error(`VPN Gate tunnel id needs ${RANDOM_BYTES} random bytes`);
+  return `vpngate-${hex(bytes, 0)}-${hex(bytes, 2)}`;
 };
 
 export const isModelId = (kind: ModelIdKind, value: string): boolean =>
@@ -79,4 +89,26 @@ export function tunnelId(used: ReadonlySet<string> = new Set()): string {
     if (!used.has(id)) return id;
   }
   throw new Error('无法生成不重复的隧道 ID，请重试');
+}
+
+/** Generate an opaque WARP id while keeping its resource kind recognizable in routes and logs. */
+export function warpTunnelId(used: ReadonlySet<string> = new Set()): string {
+  const crypto = globalThis.crypto;
+  if (!crypto?.getRandomValues) throw new Error('浏览器不支持安全随机数，无法生成 ID');
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const id = warpTunnelIdFromBytes(crypto.getRandomValues(new Uint8Array(RANDOM_BYTES)));
+    if (!used.has(id)) return id;
+  }
+  throw new Error('无法生成不重复的 WARP ID，请重试');
+}
+
+/** Generate an opaque VPN Gate pool id; country and fixed-server choices remain model fields. */
+export function vpngateTunnelId(used: ReadonlySet<string> = new Set()): string {
+  const crypto = globalThis.crypto;
+  if (!crypto?.getRandomValues) throw new Error('浏览器不支持安全随机数，无法生成 ID');
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const id = vpngateTunnelIdFromBytes(crypto.getRandomValues(new Uint8Array(RANDOM_BYTES)));
+    if (!used.has(id)) return id;
+  }
+  throw new Error('无法生成不重复的 VPN Gate ID，请重试');
 }

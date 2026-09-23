@@ -13,12 +13,30 @@ const PATHS = {
       <path d="M8.4 10 H11.4" />
     </>
   ),
+  /* 两层机架：外部服务器（如 VPN Gate 目录节点），与表示受管机器的终端框 nodes 区分。 */
+  servers: (
+    <>
+      <rect x="2.2" y="2.3" width="11.6" height="4.7" rx="1.2" />
+      <rect x="2.2" y="9" width="11.6" height="4.7" rx="1.2" />
+      <circle cx="4.9" cy="4.65" r="0.8" fill="currentColor" stroke="none" />
+      <circle cx="4.9" cy="11.35" r="0.8" fill="currentColor" stroke="none" />
+    </>
+  ),
   /* 两个端点加一条路由 */
   chains: (
     <>
       <circle cx="3.3" cy="12.6" r="1.7" />
       <circle cx="12.7" cy="3.4" r="1.7" />
       <path d="M4.8 11.3 C 7.5 8.6, 8.5 7.4, 11.2 4.7" />
+    </>
+  ),
+  /* 更多菜单里的拓扑入口：三点分支比完整线路曲线更轻，也直接表达节点关系。 */
+  topology: (
+    <>
+      <path d="M8 7.3 V4.3 M7.3 8.3 L4.4 11.1 M8.7 8.3 L11.6 11.1" strokeWidth="1.25" />
+      <circle cx="8" cy="3.2" r="1.15" fill="currentColor" stroke="none" />
+      <circle cx="3.5" cy="12" r="1.15" fill="currentColor" stroke="none" />
+      <circle cx="12.5" cy="12" r="1.15" fill="currentColor" stroke="none" />
     </>
   ),
   /* 一段轴向管道：左侧椭圆是接入口，横向体积表示一项可复用的传输资源。
@@ -60,6 +78,13 @@ const PATHS = {
     <>
       <circle cx="8" cy="8" r="6" />
       <path d="M2.3 8 H13.7 M8 2 C10.8 5.1 10.8 10.9 8 14 M8 2 C5.2 5.1 5.2 10.9 8 14" />
+    </>
+  ),
+  /* 旗帜：地区。不用地球轮廓，地球已表示 DNS。 */
+  region: (
+    <>
+      <path d="M3.2 14.2 V2.6" />
+      <path d="M3.2 2.6 C4.6 1.8 5.9 1.8 7.4 2.5 C8.9 3.2 10.4 3.4 12.8 2.6 V8.9 C10.4 9.7 8.9 9.5 7.4 8.8 C5.9 8.1 4.6 8.1 3.2 8.9" />
     </>
   ),
   /* 安全边界。 */
@@ -142,12 +167,27 @@ const PATHS = {
       <path d="M5.7 8 H10.3" />
     </>
   ),
+  /* 链路与 MTU：一把端点明确的短尺，强调测量而不是再次画一条链。 */
+  linkMeasure: (
+    <>
+      <path d="M2.4 5.5 V10.5 M13.6 5.5 V10.5 M2.6 8 H13.4" strokeWidth="1.25" />
+      <path d="M5.4 6.8 V9.2 M8 7.1 V8.9 M10.6 6.8 V9.2" strokeWidth="1.25" />
+    </>
+  ),
   /* 订阅源：圆点和两级扩散弧沿用 feed 的通用语义。 */
   subscription: (
     <>
       <circle cx="3.5" cy="12.5" r="1" fill="currentColor" stroke="none" />
       <path d="M3 7.5 A5.5 5.5 0 0 1 8.5 13" />
       <path d="M3 3 A10 10 0 0 1 13 13" />
+    </>
+  ),
+  /* 顶栏功能菜单：短而细的错落横线，保持菜单语义，同时不在紧凑按钮里形成粗重色块。 */
+  menu: (
+    <>
+      <path d="M3.5 4.5 H12.5" />
+      <path d="M5.2 8 H12.5" />
+      <path d="M3.5 11.5 H10.8" />
     </>
   ),
   /* 带文字的更多操作按钮使用横向三点，不复用纯字符以保持描边和基线一致。 */
@@ -174,6 +214,14 @@ const PATHS = {
       <path d="M8 4.9 A3.1 3.1 0 0 0 8 11.1 Z" fill="currentColor" stroke="none" opacity=".22" />
     </>
   ),
+  /* 外观分段项使用独立的日/月轮廓，当前模式无需再从一枚混合图标里猜。 */
+  sun: (
+    <>
+      <circle cx="8" cy="8" r="2.7" />
+      <path d="M8 1.5 V3 M8 13 V14.5 M1.5 8 H3 M13 8 H14.5 M3.4 3.4 L4.45 4.45 M11.55 11.55 L12.6 12.6 M12.6 3.4 L11.55 4.45 M4.45 11.55 L3.4 12.6" />
+    </>
+  ),
+  moon: <path d="M12.8 10.6 A5.6 5.6 0 0 1 5.4 3.2 A5.8 5.8 0 1 0 12.8 10.6 Z" />,
   /* 出盘上箭头：发布 */
   deploy: (
     <>
@@ -213,6 +261,13 @@ const PATHS = {
       <path d="M8 7.9 V14.1" />
     </>
   ),
+  /* 顶栏产物开关：带页签的文件夹，表达可展开浏览的一组生成结果。 */
+  artifactFolder: (
+    <>
+      <path d="M2.2 5 V4.2 C2.2 3.4 2.8 2.8 3.6 2.8 H6.4 L7.9 4.5 H12.4 C13.2 4.5 13.8 5.1 13.8 5.9 V12.1 C13.8 12.9 13.2 13.5 12.4 13.5 H3.6 C2.8 13.5 2.2 12.9 2.2 12.1 Z" />
+      <path d="M2.3 6.2 H13.7" />
+    </>
+  ),
   /* 脉搏线：诊断 */
   diag: <path d="M1.8 8 H4.6 L6.4 3.4 L9.6 12.6 L11.4 8 H14.2" />,
   /* 趋势线：观测（机器详情页签，指标上行 + 端点） */
@@ -241,16 +296,51 @@ const PATHS = {
       <path d="M8.2 5.8 L10.8 3.2 L13.4 5.8" />
     </>
   ),
+  /* 面包屑流量读数：箭头指向机器表示接收，离开机器表示发送。 */
+  rx: (
+    <>
+      <path d="M8 3 V12.3" />
+      <path d="M4.4 8.9 L8 12.5 L11.6 8.9" />
+    </>
+  ),
+  tx: (
+    <>
+      <path d="M8 13 V3.7" />
+      <path d="M4.4 7.3 L8 3.7 L11.6 7.3" />
+    </>
+  ),
   /* 产物状态：已应用 / 已关闭 / 已变化。
      关闭用一条横线而不是叉——叉读作失败，而 disabled 是一个正常取值，需要与 dirty 区分。
      变化用 ≠，即「机器上的与该修订不一致」。 */
   check: <path d="M3.4 8.4 L6.6 11.6 L12.8 4.8" />,
+  copy: (
+    <>
+      <rect x="5" y="5" width="8" height="8" rx="1.5" />
+      <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" />
+    </>
+  ),
+  close: <path d="M3.5 3.5 L12.5 12.5 M12.5 3.5 L3.5 12.5" />,
   dash: <path d="M3.8 8 H12.2" />,
+  /* 在等：发布流水里表示等待确认或待补偿。与 check / close 同为结果图标，因此同样只有线稿。 */
+  clock: (
+    <>
+      <circle cx="8" cy="8" r="5.6" />
+      <path d="M8 5 V8.2 L10.2 9.6" />
+    </>
+  ),
   neq: (
     <>
       <path d="M3.4 6.3 H12.6" />
       <path d="M3.4 9.7 H12.6" />
       <path d="M10.3 3.2 L5.7 12.8" />
+    </>
+  ),
+  /* 圆中的 i：只读的说明信息。 */
+  info: (
+    <>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M8 7.3 V11.3" />
+      <circle cx="8" cy="4.9" r="0.85" fill="currentColor" stroke="none" />
     </>
   ),
   /* 异常读数标记。判定结果此前只由金色文字表达，颜色之外再给一个形状，
@@ -295,7 +385,7 @@ export function Icon({ of, size = 16, className }: { of: IconName; size?: number
 }
 
 /* 列表页标题行的固定用法：16px，颜色由 .list-ico 定为 --ink-2，比 15px/600 的标题浅一档。 */
-export function ListIcon({ of }: { of: 'nodes' | 'chains' | 'tunnels' | 'users' }) {
+export function ListIcon({ of }: { of: IconName }) {
   return <Icon of={of} size={16} className="list-ico" />;
 }
 

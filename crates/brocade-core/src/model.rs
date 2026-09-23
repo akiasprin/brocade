@@ -854,6 +854,31 @@ pub struct ExternalWarpBinding {
 /// turn a configuration typo into substantial scheduler and memory pressure.
 pub const EXTERNAL_WIREGUARD_MAX_WORKERS: u16 = 256;
 
+/// The endpoint written into a node's main Xray configuration for one managed VPN Gate pool.
+///
+/// The Agent owns a `/30` per pool under this link-local block. Its host side is `.1`; an
+/// OpenVPN-isolated network namespace owns `.2` and runs a small SOCKS listener there. Keeping
+/// this mapping in the pure model crate gives the compiler and Agent one deterministic source of
+/// truth without making compilation depend on the live VPN Gate catalogue.
+pub const VPNGATE_RUNTIME_SOCKS_PORT: u16 = 1080;
+pub const VPNGATE_RUNTIME_MAX_POOLS_PER_NODE: usize = 16;
+pub const VPNGATE_MANAGED_ADDRESS: &str = "managed.vpngate.invalid";
+pub const VPNGATE_MANAGED_PORT: u16 = 1;
+
+pub fn vpngate_runtime_peer(slot: usize) -> Option<Ipv4Addr> {
+    if slot >= VPNGATE_RUNTIME_MAX_POOLS_PER_NODE {
+        return None;
+    }
+    let offset = u16::try_from(slot).ok()?.checked_mul(4)?.checked_add(2)?;
+    let third = 240_u16.checked_add(offset / 256)?;
+    Some(Ipv4Addr::new(
+        169,
+        254,
+        u8::try_from(third).ok()?,
+        u8::try_from(offset % 256).ok()?,
+    ))
+}
+
 /// The first externally managed protocol set.
 ///
 /// `credential` has one name across variants so the store can seal it through one path and the
@@ -930,6 +955,51 @@ pub enum ExternalOutboundProtocol {
         #[serde(default)]
         workers: u16,
     },
+    /// A country-scoped, continuously measured pool sourced from VPN Gate.
+    ///
+    /// The catalogue and selected OpenVPN profile are operational state and are intentionally not
+    /// embedded here. A revision records only stable operator intent; the Agent receives the
+    /// currently selected, sanitized profile over its operational desired-state endpoint.
+    Vpngate {
+        /// Uppercase ISO 3166-1 alpha-2 country or region code.
+        country_code: String,
+        /// Pin this outbound to one catalogue server. `None` keeps the country-pool behavior and
+        /// lets each Agent choose the best measured relay. A pinned server still has to pass the
+        /// same real-exit and measurement gates; it fails closed instead of silently switching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_id: Option<String>,
+        /// An explicit manual pool. Empty preserves automatic country selection (or legacy
+        /// `server_id` pinning); nonempty never falls back to unselected catalogue servers.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        server_ids: Vec<String>,
+        /// Refuse candidates whose measured OpenVPN setup time exceeds this bound.
+        #[serde(default = "vpngate_max_connect_ms")]
+        max_connect_ms: u32,
+        /// Refuse candidates whose measured download rate is below this bound.
+        #[serde(default = "vpngate_min_download_bps")]
+        min_download_bps: u64,
+        /// Number of independently usable candidates retained for failover.
+        #[serde(default = "vpngate_max_candidates")]
+        max_candidates: u8,
+    },
+}
+
+pub const VPNGATE_DEFAULT_MAX_CONNECT_MS: u32 = 15_000;
+pub const VPNGATE_DEFAULT_MIN_DOWNLOAD_BPS: u64 = 1_000_000;
+pub const VPNGATE_CONNECT_THRESHOLD_MAX_MS: u32 = 35_000;
+pub const VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS: u64 = 10_000_000_000;
+pub const VPNGATE_MAX_CANDIDATES: u8 = 16;
+
+fn vpngate_max_connect_ms() -> u32 {
+    VPNGATE_DEFAULT_MAX_CONNECT_MS
+}
+
+fn vpngate_min_download_bps() -> u64 {
+    VPNGATE_DEFAULT_MIN_DOWNLOAD_BPS
+}
+
+fn vpngate_max_candidates() -> u8 {
+    VPNGATE_MAX_CANDIDATES
 }
 
 /// Network layer used by an externally managed VLESS server.
@@ -1010,7 +1080,7 @@ impl ExternalOutboundProtocol {
             | Self::Socks5 { credential, .. }
             | Self::HttpConnect { credential, .. }
             | Self::Wireguard { credential, .. } => credential,
-            Self::Warp { .. } => "",
+            Self::Warp { .. } | Self::Vpngate { .. } => "",
         }
     }
 
@@ -1022,14 +1092,17 @@ impl ExternalOutboundProtocol {
             | Self::Socks5 { credential, .. }
             | Self::HttpConnect { credential, .. }
             | Self::Wireguard { credential, .. } => *credential = value,
-            Self::Warp { .. } => {}
+            Self::Warp { .. } | Self::Vpngate { .. } => {}
         }
     }
 
     pub fn allows_empty_credential(&self) -> bool {
         matches!(
             self,
-            Self::Socks5 { .. } | Self::HttpConnect { .. } | Self::Warp { .. }
+            Self::Socks5 { .. }
+                | Self::HttpConnect { .. }
+                | Self::Warp { .. }
+                | Self::Vpngate { .. }
         )
     }
 }
@@ -1161,6 +1234,13 @@ pub struct IngressGuard {
     pub tcp_and_quic_only: bool,
 }
 
+/// Fixed destination ports emitted by [`IngressGuard::no_mail`]. Shared by machine artifact
+/// generation and Front reachability analysis so the preview cannot drift from enforcement.
+pub(crate) const INGRESS_GUARD_MAIL_PORTS: [u16; 3] = [25, 465, 587];
+
+/// Fixed UDP amplification destinations emitted by [`IngressGuard::no_udp_amplification`].
+pub(crate) const INGRESS_GUARD_AMPLIFICATION_PORTS: [u16; 7] = [19, 53, 123, 161, 389, 1900, 11211];
+
 impl Default for IngressGuard {
     fn default() -> Self {
         Self {
@@ -1196,7 +1276,7 @@ pub struct IngressIdentity {
     pub short_ids: Vec<String>,
 }
 
-/// Ingress projection: the address written into subscriptions, decoupled from where the
+/// Ingress projection: the addresses written into subscriptions, decoupled from where the
 /// machine listens.
 ///
 /// Some machines sit behind an optimized line, such as a datacenter relay or third-party
@@ -1207,18 +1287,44 @@ pub struct IngressIdentity {
 /// Its public host, public port, HTTP Host and client mux affect only subscription artifacts: the
 /// `@host:port` of a VLESS URI and Clash's `server`/`port`. One explicit exception is a REALITY +
 /// XHTTP independent download: its `origin_port`, or its public download port when origin is
-/// absent, creates a node-side TLS listener and therefore changes Xray. `FrontDownstream` still
-/// matches the node's declared public addresses rather than a projection, because the relay
-/// behind a projection is outside brocade and the compiler cannot infer how traffic reaches it.
+/// absent, creates a node-side TLS listener and therefore changes Xray.
 ///
-/// Two families rather than one address, because a line usually carries only v4 or only v6
-/// and each is projected separately. That separation is also why a machine behind NAT with
-/// no dialable public v4 can still serve ingress through a v4 projection: a projection is an
-/// external line's endpoint and is independent of this machine's own position on the network
+/// Every wire owns its mapping because VLESS, VLESS Encryption, AnyTLS and Hysteria 2 may be
+/// exposed through different public lines and ports. The root `v4` / `v6` pair is VLESS's pair.
+/// The optional per-wire pairs preserve the old serialized shape: `None` means this snapshot was
+/// written before mappings were split and the wire inherits the legacy VLESS host while keeping
+/// its own listening port. New writers always send `Some`, including `Some(default())` for a wire
+/// that deliberately uses the machine address. This makes legacy inheritance distinguishable
+/// from an explicit direct mapping without rewriting immutable historical revisions.
+///
+/// Two families rather than one address, because a line usually carries only v4 or only v6 and
+/// each is projected separately. That separation is also why a machine behind NAT with no
+/// dialable public v4 can still serve ingress through a v4 projection: a projection is an external
+/// line's endpoint and is independent of this machine's own position on the network
 /// (`physical/user.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Projection {
+    /// VLESS · TLS / REALITY.
+    #[serde(default)]
+    pub v4: Option<ProjectionEndpoint>,
+    #[serde(default)]
+    pub v6: Option<ProjectionEndpoint>,
+    /// `None` is the legacy shared-address representation; `Some(empty)` explicitly means direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vless_encryption: Option<ProtocolProjection>,
+    /// `None` is the legacy shared-address representation; `Some(empty)` explicitly means direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anytls: Option<ProtocolProjection>,
+    /// `None` is the legacy shared-address representation; `Some(empty)` explicitly means direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hysteria2: Option<ProtocolProjection>,
+}
+
+/// One protocol's independently mapped public endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolProjection {
     #[serde(default)]
     pub v4: Option<ProjectionEndpoint>,
     #[serde(default)]
@@ -2634,6 +2740,8 @@ pub struct Reality {
     pub flow: Option<String>,
 }
 
+/// Shared client-only chained-proxy group. It affects subscription projection and validation but
+/// must never change a node artifact; server connectivity remains owned by ordinary chain rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Front {
@@ -2764,7 +2872,6 @@ pub enum DestMatch {
     /// effect.
     Protocol(Vec<String>),
     All(Vec<DestMatch>),
-    FrontDownstream,
 }
 
 impl DestMatch {
@@ -3181,6 +3288,41 @@ pub fn is_valid_slug(value: &str) -> bool {
         })
 }
 
+fn is_valid_opaque_tunnel_id(value: &str, prefix: &str) -> bool {
+    let Some((first, second)) = value
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    let is_lower_hex4 = |part: &str| {
+        part.len() == 4
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    is_lower_hex4(first) && is_lower_hex4(second)
+}
+
+/// Whether an operator-configured tunnel uses the opaque `custom-xxxx-xxxx` resource id shape.
+pub fn is_valid_custom_tunnel_id(value: &str) -> bool {
+    is_valid_opaque_tunnel_id(value, "custom-")
+}
+
+/// Whether a managed WARP tunnel uses the opaque `warp-xxxx-xxxx` resource id shape.
+///
+/// Tunnel ids deliberately carry no tenant or provider identity. The store uses these checks for
+/// every new write. The compiler intentionally does not: immutable historical revisions with a
+/// legacy id must remain reproducible for audit and rollback after an upgrade.
+pub fn is_valid_warp_tunnel_id(value: &str) -> bool {
+    is_valid_opaque_tunnel_id(value, "warp-")
+}
+
+/// Whether a managed VPN Gate pool uses the opaque `vpngate-xxxx-xxxx` resource id shape.
+pub fn is_valid_vpngate_tunnel_id(value: &str) -> bool {
+    is_valid_opaque_tunnel_id(value, "vpngate-")
+}
+
 /// A user credential's label: `{user}@{tenant}#{ingress}`.
 ///
 /// The label serves three roles: an xray client's email, the key of a statistics counter
@@ -3372,7 +3514,10 @@ mod grant_label_tests {
 
 #[cfg(test)]
 mod slug_tests {
-    use super::is_valid_slug;
+    use super::{
+        is_valid_custom_tunnel_id, is_valid_slug, is_valid_vpngate_tunnel_id,
+        is_valid_warp_tunnel_id,
+    };
 
     #[test]
     fn slug_accepts_the_documented_charset_and_rejects_the_rest() {
@@ -3392,6 +3537,21 @@ mod slug_tests {
         assert!(!is_valid_slug("a>>>b"), ">>> 是统计指标名的分隔符");
         assert!(!is_valid_slug(&"a".repeat(33)));
         assert!(is_valid_slug(&"a".repeat(32)));
+    }
+
+    #[test]
+    fn tunnel_ids_are_opaque_kind_specific_and_fixed_width() {
+        assert!(is_valid_custom_tunnel_id("custom-8f3a-2d71"));
+        assert!(is_valid_warp_tunnel_id("warp-8f3a-2d71"));
+        assert!(is_valid_vpngate_tunnel_id("vpngate-8f3a-2d71"));
+        assert!(!is_valid_custom_tunnel_id("tunnel-8f3a-2d71"));
+        assert!(!is_valid_custom_tunnel_id("vendor-edge"));
+        assert!(!is_valid_warp_tunnel_id("warp"));
+        assert!(!is_valid_warp_tunnel_id("warp-platform-acme"));
+        assert!(!is_valid_warp_tunnel_id("warp-8F3A-2d71"));
+        assert!(!is_valid_warp_tunnel_id("warp-8f3a-2d71-extra"));
+        assert!(!is_valid_vpngate_tunnel_id("vpngate-jp"));
+        assert!(!is_valid_vpngate_tunnel_id("vpngate-8F3A-2d71"));
     }
 }
 

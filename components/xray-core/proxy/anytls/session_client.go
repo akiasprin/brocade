@@ -40,7 +40,8 @@ func (s *session) writePacketWithPadding(packetIndex uint32, frames buf.MultiBuf
 		}
 		return s.fw.flush()
 	}
-	pktSizes := scheme.GenerateRecordPayloadSizes(packetIndex)
+	var sizeScratch [16]int
+	pktSizes := scheme.appendRecordPayloadSizes(sizeScratch[:0], packetIndex)
 	if len(pktSizes) == 0 {
 		if err := s.fw.bw.WriteMultiBuffer(frames); err != nil {
 			return err
@@ -199,28 +200,15 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	s.inIdlePool.Store(false)
 	s.streamsMu.Unlock()
 
-	var frames buf.MultiBuffer
-	addrBuf := buf.New()
-	if err := M.SocksaddrSerializer.WriteAddrPort(addrBuf, singbridge.ToSocksaddr(actualDest)); err != nil {
-		addrBuf.Release()
-		s.finishStream(sid, err)
-		return nil, errors.New("anytls: write socks addr failed").Base(err)
-	}
-	synFrame, err := newFrame(cmdSYN, sid).toMultiBuffer()
-	if err != nil {
-		addrBuf.Release()
+	destination := singbridge.ToSocksaddr(actualDest)
+	addressLength := M.SocksaddrSerializer.AddrPortLen(destination)
+	if addressLength <= 0 || addressLength > maxFramePayload {
+		err := errors.New("anytls: invalid destination address length: ", addressLength)
 		s.finishStream(sid, err)
 		return nil, err
 	}
-	frames = append(frames, synFrame...)
-	addrFrame, err := (&frame{cmd: cmdPSH, sid: sid}).toMultiBufferWithBody(addrBuf)
-	if err != nil {
-		s.finishStream(sid, err)
-		return nil, err
-	}
-	frames = append(frames, addrFrame...)
 
-	s.writeMu.Lock()
+	settingsText := ""
 	if !s.settingsSent {
 		s.schemeMu.RLock()
 		md5Value := ""
@@ -228,16 +216,36 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 			md5Value = s.paddingScheme.md5
 		}
 		s.schemeMu.RUnlock()
-		settingsFrame, err := (&frame{cmd: cmdSettings, sid: 0, data: []byte("v=2\nclient=" + clientMetadata() + "\npadding-md5=" + md5Value)}).toMultiBuffer()
-		if err != nil {
-			s.writeMu.Unlock()
+		settingsText = "v=2\nclient=" + clientMetadata() + "\npadding-md5=" + md5Value
+		if len(settingsText) > maxFramePayload {
+			err := errors.New("anytls: settings frame payload too large")
 			s.finishStream(sid, err)
 			return nil, err
 		}
-		frames = append(settingsFrame, frames...)
+	}
+
+	packetLength := 2*frameHeaderSize + addressLength
+	if settingsText != "" {
+		packetLength += frameHeaderSize + len(settingsText)
+	}
+	packet := buf.NewWithSize(int32(packetLength))
+	if settingsText != "" {
+		putFrameHeader(packet.Extend(frameHeaderSize), cmdSettings, 0, len(settingsText))
+		copy(packet.Extend(int32(len(settingsText))), settingsText)
+	}
+	putFrameHeader(packet.Extend(frameHeaderSize), cmdSYN, sid, 0)
+	putFrameHeader(packet.Extend(frameHeaderSize), cmdPSH, sid, addressLength)
+	if err := M.SocksaddrSerializer.WriteAddrPort(packet, destination); err != nil {
+		packet.Release()
+		s.finishStream(sid, err)
+		return nil, errors.New("anytls: write socks addr failed").Base(err)
+	}
+
+	s.writeMu.Lock()
+	if settingsText != "" {
 		s.settingsSent = true
 	}
-	writeErr := s.writePacketLocked(frames)
+	writeErr := s.writePacketLocked(buf.MultiBuffer{packet})
 	s.writeMu.Unlock()
 	if writeErr != nil {
 		s.finishStream(sid, writeErr)
@@ -248,6 +256,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 
 	if target.Network == net.Network_UDP {
 		reqBuf := buf.New()
+		header := reqBuf.Extend(frameHeaderSize)
 		err := uot.WriteRequest(reqBuf, uot.Request{
 			IsConnect:   true,
 			Destination: singbridge.ToSocksaddr(target),
@@ -257,13 +266,16 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 			s.finishStream(sid, err)
 			return nil, errors.New("anytls: write UoT request failed").Base(err)
 		}
-		UDPPSHframe, err := (&frame{cmd: cmdPSH, sid: sid}).toMultiBufferWithBody(reqBuf)
-		if err != nil {
+		requestLength := int(reqBuf.Len()) - frameHeaderSize
+		if requestLength <= 0 || requestLength > maxFramePayload {
+			reqBuf.Release()
+			err := errors.New("anytls: invalid UoT request length: ", requestLength)
 			s.finishStream(sid, err)
 			return nil, err
 		}
+		putFrameHeader(header, cmdPSH, sid, requestLength)
 
-		err = s.writePacket(UDPPSHframe)
+		err = s.writePacket(buf.MultiBuffer{reqBuf})
 
 		if err != nil {
 			s.finishStream(sid, err)

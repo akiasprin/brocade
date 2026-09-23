@@ -135,7 +135,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
     doc.external_outbounds = vec![
         ExternalOutbound {
-            id: "vless-external".to_owned(),
+            id: "custom-1111-1111".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS".to_owned(),
             address: "vless.example.net".to_owned(),
@@ -155,7 +155,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "socks-external".to_owned(),
+            id: "custom-2222-2222".to_owned(),
             tenant: "platform".to_owned(),
             name: "SOCKS5".to_owned(),
             address: "socks.example.net".to_owned(),
@@ -168,7 +168,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "xhttp-external".to_owned(),
+            id: "custom-3333-3333".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS XHTTP".to_owned(),
             address: "upload.example.net".to_owned(),
@@ -205,7 +205,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "http-external".to_owned(),
+            id: "custom-4444-4444".to_owned(),
             tenant: "platform".to_owned(),
             name: "HTTP CONNECT".to_owned(),
             address: "http.example.net".to_owned(),
@@ -221,7 +221,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "ss2022-external".to_owned(),
+            id: "custom-5555-5555".to_owned(),
             tenant: "platform".to_owned(),
             name: "SS2022".to_owned(),
             address: "ss.example.net".to_owned(),
@@ -234,7 +234,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "ss-classic-external".to_owned(),
+            id: "custom-6666-6666".to_owned(),
             tenant: "platform".to_owned(),
             name: "Shadowsocks XChaCha20".to_owned(),
             address: "ss-classic.example.net".to_owned(),
@@ -247,7 +247,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "wireguard-external".to_owned(),
+            id: "custom-7777-7777".to_owned(),
             tenant: "platform".to_owned(),
             name: "WireGuard".to_owned(),
             address: "wg.example.net".to_owned(),
@@ -268,18 +268,18 @@ fn external_proxy_protocols_load_in_the_real_binary() {
         },
     ];
     app.steps[0].rules = [
-        "vless-external",
-        "socks-external",
-        "xhttp-external",
-        "http-external",
-        "ss2022-external",
-        "ss-classic-external",
-        "wireguard-external",
+        "custom-1111-1111",
+        "custom-2222-2222",
+        "custom-3333-3333",
+        "custom-4444-4444",
+        "custom-5555-5555",
+        "custom-6666-6666",
+        "custom-7777-7777",
     ]
     .into_iter()
     .enumerate()
     .map(|(index, outbound)| Rule {
-        dest_match: if outbound == "wireguard-external" {
+        dest_match: if outbound == "custom-7777-7777" {
             DestMatch::Any
         } else {
             DestMatch::DomainSuffix(vec![format!("case-{index}.example")])
@@ -321,7 +321,7 @@ fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
     };
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
     doc.external_outbounds = vec![ExternalOutbound {
-        id: "warp".to_owned(),
+        id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform".to_owned(),
         name: "Cloudflare WARP".to_owned(),
         address: "engage.cloudflareclient.com".to_owned(),
@@ -360,7 +360,7 @@ fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
     app.steps[0].rules = vec![Rule {
         dest_match: DestMatch::Any,
         action: Action::Proxy {
-            outbound: "warp".to_owned(),
+            outbound: "warp-8f3a-2d71".to_owned(),
         },
     }];
 
@@ -383,7 +383,7 @@ fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|outbound| outbound["tag"] == "out:external/warp")
+        .find(|outbound| outbound["tag"] == "out:external/warp-8f3a-2d71")
         .expect("managed WARP outbound");
     assert_eq!(warp["protocol"], "wireguard");
     assert_eq!(warp["settings"]["reserved"], json!([1, 2, 3]));

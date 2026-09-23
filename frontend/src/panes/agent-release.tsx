@@ -1,8 +1,10 @@
+import { useState } from 'react';
 import { useServerForm } from '../ui/server-form';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchAgentRelease, fetchNodes, saveAgentRelease, type AgentReleaseScope, type AgentReleaseView } from '../api';
 import { Ago, ErrorBox, Loading } from '../ui/bits';
 import { PanelTitle } from '../ui/icons';
+import { useUnsavedChanges } from '../ui/navigation-guard';
 
 const bareBuild = (raw: string | null) => raw?.replace(/^brocade-agent\//, '') ?? null;
 
@@ -28,8 +30,88 @@ export function useAgentDrift(): { pending: number; loading: boolean } {
   return { pending: inScope.filter(n => !onThisBuild(view, n.agent_version)).length, loading: false };
 }
 
-export function AgentReleaseSection({ editable }: { editable: boolean }) {
+export interface AgentSummary {
+  loading: boolean;
+  version: string | null;
+  /** 批准范围：全部机器 / N 台机器 / 未批准 */
+  scopeLabel: string;
+  approved: number;
+  replaced: number;
+  waiting: string[];
+  approvedAt: string | null;
+  approvedBy: string | null;
+  /** 发布流水里的「批准 Agent」一行；从未批准过时为 null。 */
+  event: { at: string; by: string | null; version: string | null; scope: string } | null;
+}
+
+/** 发布页的软件读数行。与 `AgentReleaseSection` 读同一组查询，不产生额外请求。 */
+export function useAgentSummary(): AgentSummary {
+  const rel = useQuery({ queryKey: ['agent-release'], queryFn: () => fetchAgentRelease() });
+  const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const empty: AgentSummary = {
+    loading: rel.isPending || nodes.isPending,
+    version: null,
+    scopeLabel: '—',
+    approved: 0,
+    replaced: 0,
+    waiting: [],
+    approvedAt: null,
+    approvedBy: null,
+    event: null,
+  };
+  if (!rel.data || !nodes.data) return empty;
+  const view = rel.data;
+  const rows = nodes.data.nodes;
+  const inScope =
+    view.released.scope === 'all'
+      ? rows
+      : view.released.scope === 'nodes'
+        ? rows.filter(n => view.released.nodes.includes(n.node_id))
+        : [];
+  const waiting = inScope.filter(n => !onThisBuild(view, n.agent_version));
+  const scopeLabel =
+    view.released.scope === 'all'
+      ? '全部机器'
+      : view.released.scope === 'nodes'
+        ? `${inScope.length} 台机器`
+        : '未批准';
+  return {
+    loading: false,
+    version: view.agent_version,
+    scopeLabel,
+    approved: inScope.length,
+    replaced: inScope.length - waiting.length,
+    waiting: waiting.map(n => n.name || n.node_id),
+    approvedAt: view.released.released_at,
+    approvedBy: view.released.released_by,
+    event: view.released.released_at
+      ? {
+          at: view.released.released_at,
+          by: view.released.released_by,
+          version: view.released.version,
+          scope: scopeLabel,
+        }
+      : null,
+  };
+}
+
+export function AgentReleaseSection({
+  editable,
+  compact = false,
+  open,
+  onClose,
+}: {
+  editable: boolean;
+  compact?: boolean;
+  /** 由调用方控制展开时（发布页的软件读数行即摘要），收起状态不渲染任何东西。 */
+  open?: boolean;
+  onClose?: () => void;
+}) {
   const qc = useQueryClient();
+  const controlled = open !== undefined;
+  const [internalExpanded, setExpanded] = useState(!compact);
+  const expanded = controlled ? open : internalExpanded;
+  const collapse = onClose ?? (() => setExpanded(false));
   const rel = useQuery({ queryKey: ['agent-release'], queryFn: () => fetchAgentRelease() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const { form, setForm, accept } = useServerForm({
@@ -65,21 +147,25 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
     },
   });
 
-  if (rel.isPending || nodes.isPending) return <Loading />;
-  // 机器列表决定批准范围和“全选”的含义；读取失败时不能把空列表当成空机队，
-  // 否则一次保存会把原有范围误算成 off。
-  if (rel.error || nodes.error) return <ErrorBox error={rel.error ?? nodes.error} />;
-  const view = rel.data!;
+  const view = rel.data;
   const rows = nodes.data?.nodes ?? [];
   const allIds = rows.map(n => n.node_id);
   const f = form ?? { scope: 'off' as AgentReleaseScope, nodes: [], note: '' };
   const selected = f.scope === 'all' ? allIds : f.nodes.filter(id => allIds.includes(id));
   const effectiveScope: AgentReleaseScope = f.scope === 'all' ? 'all' : selected.length ? 'nodes' : 'off';
   const dirty =
-    effectiveScope !== view.released.scope ||
-    (effectiveScope === 'nodes' && !sameIds(selected, view.released.nodes)) ||
-    f.note.trim() !== '' ||
-    (effectiveScope !== 'off' && view.released.release_id !== view.available_release_id);
+    view !== undefined &&
+    (effectiveScope !== view.released.scope ||
+      (effectiveScope === 'nodes' && !sameIds(selected, view.released.nodes)) ||
+      f.note.trim() !== '' ||
+      (effectiveScope !== 'off' && view.released.release_id !== view.available_release_id));
+  useUnsavedChanges(dirty, 'Agent 发布范围');
+
+  if (rel.isPending || nodes.isPending) return <Loading variant="panel" />;
+  // 机器列表决定批准范围和“全选”的含义；读取失败时不能把空列表当成空机队，
+  // 否则一次保存会把原有范围误算成 off。
+  if (rel.error || nodes.error) return <ErrorBox error={rel.error ?? nodes.error} />;
+  const loadedView = view!;
   const toggle = (id: string) => {
     const next = selected.includes(id) ? selected.filter(n => n !== id) : [...selected, id];
     setForm({ ...f, scope: next.length ? 'nodes' : 'off', nodes: next });
@@ -87,11 +173,64 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
   const allSelected = allIds.length > 0 && sameIds(selected, allIds);
   const toggleAll = () => setForm({ ...f, scope: allSelected ? 'off' : 'all', nodes: allSelected ? [] : allIds });
 
+  if (!expanded) {
+    if (controlled) return null;
+    const releasedIds =
+      loadedView.released.scope === 'all'
+        ? allIds
+        : loadedView.released.scope === 'nodes'
+          ? loadedView.released.nodes.filter(id => allIds.includes(id))
+          : [];
+    const replaced = rows.filter(
+      node => releasedIds.includes(node.node_id) && onThisBuild(loadedView, node.agent_version),
+    ).length;
+    const scopeLabel =
+      loadedView.released.scope === 'all'
+        ? '全部机器'
+        : loadedView.released.scope === 'nodes'
+          ? `${releasedIds.length} 台机器`
+          : '未批准';
+    return (
+      <section className="panel titled cg-software" id="cg-agent">
+        <header>
+          <PanelTitle of="agent">Agent 版本</PanelTitle>
+        </header>
+        <div className="cg-soft">
+          <div className="cg-soft-row cg-soft-version">
+            <span>可发版本</span>
+            <b>v{loadedView.agent_version}</b>
+          </div>
+          <div className="cg-soft-row">
+            <span>已批准</span>
+            <b>{scopeLabel}</b>
+          </div>
+          <div className="cg-soft-row">
+            <span>已替换</span>
+            <b>
+              {replaced} / {releasedIds.length} 台
+            </b>
+          </div>
+          <div className="cg-soft-foot">
+            <p className="note">批准后 10 分钟内，范围内的机器自行替换并重启。</p>
+            <button className="btn" type="button" onClick={() => setExpanded(true)}>
+              {editable ? '批准' : '查看'}
+            </button>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
   return (
-    <section className="panel titled" id="dp-agent">
+    <section className={`panel titled cg-software${compact || controlled ? ' is-expanded' : ''}`} id="cg-agent">
       <header>
         <PanelTitle of="agent">Agent 版本</PanelTitle>
         <span className="sp" />
+        {(compact || controlled) && (
+          <button className="btn" type="button" onClick={collapse}>
+            收起
+          </button>
+        )}
       </header>
 
       {save.error && <ErrorBox error={save.error} />}
@@ -104,21 +243,25 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
       <dl className="kv form2">
         <dt>可发版本</dt>
         <dd>
-          <span className="mono">v{view.agent_version}</span>
+          <span className="mono">v{loadedView.agent_version}</span>
           <span className="dim" style={{ marginLeft: 8 }}>
-            {view.available_agents.map(a => `${a.arch} ${a.sha256.slice(0, 8)}`).join(' · ')}
+            {loadedView.available_agents.map(a => `${a.arch} ${a.sha256.slice(0, 8)}`).join(' · ')}
           </span>
         </dd>
 
         <dt>已批准</dt>
         <dd>
-          {view.released.release_id ? (
+          {loadedView.released.release_id ? (
             <>
-              <span className={view.released.release_id === view.available_release_id ? 'mono' : 'mono bad'}>
-                {view.released.version ? `v${view.released.version}` : '—'}
+              <span
+                className={loadedView.released.release_id === loadedView.available_release_id ? 'mono' : 'mono bad'}
+              >
+                {loadedView.released.version ? `v${loadedView.released.version}` : '—'}
               </span>
               <span className="dim" style={{ marginLeft: 8 }}>
-                {[view.released.released_at?.slice(0, 16), view.released.released_by].filter(Boolean).join(' · ')}
+                {[loadedView.released.released_at?.slice(0, 16), loadedView.released.released_by]
+                  .filter(Boolean)
+                  .join(' · ')}
               </span>
             </>
           ) : (
@@ -147,7 +290,7 @@ export function AgentReleaseSection({ editable }: { editable: boolean }) {
         </thead>
         <tbody>
           {rows.map(n => {
-            const on = onThisBuild(view, n.agent_version);
+            const on = onThisBuild(loadedView, n.agent_version);
             const picked = selected.includes(n.node_id);
             return (
               <tr key={n.node_id} className={picked ? undefined : 'out'}>

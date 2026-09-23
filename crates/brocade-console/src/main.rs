@@ -2,9 +2,12 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::Router;
 use brocade_console::http::{
-    admin_router_with_services, agent_router_with_origin_and_realtime,
+    admin_router_with_services, agent_router_with_origin_realtime_and_shutdown,
     merged_router_with_wakes_and_realtime, with_console_branding, with_console_static,
-    with_console_static_dir,
+    with_console_static_dir, BootstrapCredential, ConsoleServices,
+};
+use brocade_console::lifecycle::{
+    serve_http_surfaces, ShutdownOutcome, ShutdownSignal, DEFAULT_SHUTDOWN_GRACE,
 };
 use brocade_store::PgStore;
 use tokio::sync::Notify;
@@ -12,6 +15,7 @@ use tokio::sync::Notify;
 /// How long raw readings are retained. The difference needs only the most recent one, and a week
 /// is so that accounts can be reconciled after an incident.
 const USAGE_READING_RETAIN_DAYS: u32 = 7;
+const USAGE_SAMPLE_RETAIN_DAYS: u32 = 7;
 
 /// How long telemetry is retained. A week for the same reason as above — long enough to look back
 /// at an incident after the weekend — but the resemblance stops there: usage_readings are kept so
@@ -21,6 +25,12 @@ const USAGE_READING_RETAIN_DAYS: u32 = 7;
 /// the sampling interval instead would cost the resolution that makes a CPU spike visible at all,
 /// which is the one thing this data is for.
 const LOAD_SAMPLE_RETAIN_DAYS: u32 = 7;
+const PING_PROBE_RETAIN_DAYS: u32 = 7;
+// Serving and directory reads use `vpngate_candidate_probe_latest`; the append-only copy is only
+// for short incident reconstruction. Keeping one day gives an operator the complete lead-up to a
+// problem without making current selection pay for a week of high-cardinality probe history.
+const VPNGATE_CANDIDATE_RETAIN_DAYS: u32 = 1;
+const VPNGATE_OBSERVATION_RETAIN_DAYS: u32 = 2;
 
 /// How often quotas are checked. Usage reports in 30-second windows, so anything denser has no new
 /// data to look at; with the agent's 15-second fetch interval, going over to being cut off takes
@@ -65,6 +75,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let store = PgStore::connect(&database_url).await?;
     store.migrate().await?;
+    let bootstrap_credential = match env::var("BROCADE_BOOTSTRAP_TOKEN") {
+        Ok(secret) => Some(BootstrapCredential::new(&secret)?),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("BROCADE_BOOTSTRAP_TOKEN must be valid UTF-8".into());
+        }
+    };
+    if !store.admin_auth_state().await?.initialized && bootstrap_credential.is_none() {
+        eprintln!(
+            "brocade-console has not been initialized; /auth/init is disabled until \
+             BROCADE_BOOTSTRAP_TOKEN is configured"
+        );
+    }
     if store.ensure_default_app_group().await? {
         eprintln!("brocade-console created the line group 默认分组");
     }
@@ -115,6 +138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
+    // Machine online/offline/IP-change events are always persisted. A generic webhook worker is
+    // added when BROCADE_NOTIFICATION_WEBHOOK_URL is configured; its delivery state is durable.
+    brocade_console::notifications::spawn(store.clone());
+
     // Retention cleanup. The control plane had no background loop before this one —
     // usage_readings appends a row per label every 30 seconds and never reclaims, so without
     // someone clearing it, it does not last long.
@@ -132,10 +159,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(rows) => eprintln!("usage: 清掉 {rows} 条过期读数"),
                 Err(error) => eprintln!("usage: 清理读数失败：{error}"),
             }
+            match pruner.prune_usage_samples(USAGE_SAMPLE_RETAIN_DAYS).await {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("usage: 清掉 {rows} 条已汇总明细"),
+                Err(error) => eprintln!("usage: 清理明细失败：{error}"),
+            }
             match pruner.prune_load_samples(LOAD_SAMPLE_RETAIN_DAYS).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("load: 清掉 {rows} 条过期遥测"),
                 Err(error) => eprintln!("load: 清理遥测失败：{error}"),
+            }
+            match pruner
+                .prune_node_ping_probe_samples(PING_PROBE_RETAIN_DAYS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("ping: 清掉 {rows} 条过期探测"),
+                Err(error) => eprintln!("ping: 清理探测失败：{error}"),
+            }
+            match pruner
+                .prune_vpngate_history(
+                    VPNGATE_CANDIDATE_RETAIN_DAYS,
+                    VPNGATE_OBSERVATION_RETAIN_DAYS,
+                )
+                .await
+            {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("vpngate: 清掉 {rows} 条过期观测"),
+                Err(error) => eprintln!("vpngate: 清理观测失败：{error}"),
+            }
+            match pruner
+                .prune_node_public_ip_events(brocade_store::PUBLIC_IP_EVENT_RETENTION_DAYS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("public-ip: 清掉 {rows} 条过期变更事件"),
+                Err(error) => eprintln!("public-ip: 清理变更事件失败：{error}"),
+            }
+            match pruner
+                .prune_machine_events(brocade_store::MACHINE_EVENT_RETENTION_DAYS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("notifications: 清掉 {rows} 条过期机器事件"),
+                Err(error) => eprintln!("notifications: 清理机器事件失败：{error}"),
             }
         }
     });
@@ -225,13 +292,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // claiming desired has committed while the response has not been written, so the agent
     // received nothing and the row already reads `dispatched`, and it waits out a full 15-minute
     // lease before it can claim work again (DISPATCH_LEASE_INTERVAL in `deployment.rs`).
-    // Both listening surfaces need the signal, hence a watch broadcast rather than passing one
-    // future twice.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Both listening surfaces, streaming responses, and upgraded connections share this signal.
+    // The server lifecycle also starts its own hard deadline from the same transition, so a future
+    // endpoint which forgets to observe it still cannot hold a systemd restart indefinitely.
+    let shutdown = ShutdownSignal::new();
+    let shutdown_trigger = shutdown.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         eprintln!("brocade-console 收到停止信号，等手上的请求做完");
-        let _ = shutdown_tx.send(true);
+        shutdown_trigger.request();
     });
 
     // Certificate issuance. Started before the listeners so that a control plane coming up with
@@ -249,6 +318,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a restart shows countries before the download finishes, and before it is even attempted.
     let geoip = brocade_console::geoip::spawn(store.clone());
 
+    // External-tunnel checks originate here on the Console machine. Scheduling and run state are
+    // durable in PostgreSQL; this process is only a leased executor, so restart and multi-instance
+    // deployments cannot duplicate a check.
+    brocade_console::tunnel_probe::spawn(store.clone());
+
     // Which of the two sources the front end comes from is the same decision on both listener
     // layouts, so it is made once here rather than at each of the two call sites — where the two
     // could drift into disagreeing.
@@ -262,47 +336,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             branding_store.clone(),
         )
     };
+    let admin_services =
+        ConsoleServices::new(quota_wake, grants_wake, cert_wake, geoip, realtime.clone())
+            .and_bootstrap_credential(bootstrap_credential)
+            .and_shutdown(shutdown.clone());
 
-    match agent_listener {
+    let outcome = match agent_listener {
         // Split: the console keeps the static fallback, the agent face is on its own.
         Some(agent_listener) => {
-            let admin = axum::serve(
-                admin_listener,
-                with_console(admin_router_with_services(
-                    store.clone(),
-                    quota_wake,
-                    grants_wake,
-                    cert_wake,
-                    geoip,
-                    realtime.clone(),
-                )),
+            let admin = with_console(admin_router_with_services(store.clone(), admin_services));
+            let agent = agent_router_with_origin_realtime_and_shutdown(
+                store,
+                agent_origin,
+                realtime,
+                shutdown.clone(),
+            );
+            serve_http_surfaces(
+                (admin_listener, admin),
+                Some((agent_listener, agent)),
+                shutdown,
+                DEFAULT_SHUTDOWN_GRACE,
             )
-            .with_graceful_shutdown(shutdown_when(shutdown_rx.clone()));
-            let agent = axum::serve(
-                agent_listener,
-                agent_router_with_origin_and_realtime(store, agent_origin, realtime),
-            )
-            .with_graceful_shutdown(shutdown_when(shutdown_rx));
-            tokio::try_join!(admin, agent)?;
+            .await?
         }
         // The default. The static fallback still goes on last, so it catches only what neither
         // face claimed — the agent's paths are real routes and win over it.
         None => {
-            axum::serve(
-                admin_listener,
-                with_console(merged_router_with_wakes_and_realtime(
-                    store,
-                    quota_wake,
-                    grants_wake,
-                    cert_wake,
-                    geoip,
-                    agent_origin,
-                    realtime,
-                )),
+            let router = with_console(merged_router_with_wakes_and_realtime(
+                store,
+                agent_origin,
+                admin_services,
+            ));
+            serve_http_surfaces(
+                (admin_listener, router),
+                None,
+                shutdown,
+                DEFAULT_SHUTDOWN_GRACE,
             )
-            .with_graceful_shutdown(shutdown_when(shutdown_rx))
-            .await?;
+            .await?
         }
+    };
+    if outcome == ShutdownOutcome::DeadlineExceeded {
+        eprintln!(
+            "brocade-console 等待现有工作超过 {} 秒，结束剩余连接",
+            DEFAULT_SHUTDOWN_GRACE.as_secs()
+        );
     }
     Ok(())
 }
@@ -337,14 +415,4 @@ async fn shutdown_signal() {
         _ = interrupt => {}
         _ = terminate => {}
     }
-}
-
-async fn shutdown_when(mut rx: tokio::sync::watch::Receiver<bool>) {
-    // The signal may arrive before `with_graceful_shutdown` receives this future, so the current
-    // value is checked first and changes awaited after — awaiting `changed()` alone misses that
-    // one, and the slower of the two surfaces never closes.
-    if *rx.borrow() {
-        return;
-    }
-    let _ = rx.changed().await;
 }

@@ -35,13 +35,14 @@ or mechanically translated. Tests below use Xray-native `buf`, `pipe`,
 | AT-006 | Goroutine, file-descriptor, stream-map, and active-stream convergence | Brocade extension | 64 complete real-TCP session lifecycles after warm-up; Linux `/proc/self/fd`, runtime goroutine baseline, and timeout diagnostics | `leak_test.go` |
 | AT-007 | UoT v2 records, zero-length UDP payloads, destination metadata, and TCP multiplexing | Protocol documents | Xray packet buffers and dispatcher echo; zero-length datagrams are a Brocade/Xray boundary extension | `session_integration_test.go`, `fuzz_test.go`, `common/buf/multi_buffer_test.go`, `transport/pipe/pipe_test.go` |
 | AT-008 | Parsers and session state remain bounded for arbitrary input up to 1 MiB | Brocade extension | Go native fuzzing with independently selected seeds; generated regression corpus is retained under `testdata/fuzz` | `fuzz_test.go`, `testdata/fuzz/FuzzAnyTLSSessionFrames` |
-| AT-009 | Steady-state PSH writes remain frame-bounded and exact-body reads reuse complete buffers | Brocade profiling extension | Counting `net.Conn`, deterministic 64 KiB write benchmark, pending-control ordering, and buffer-identity assertions | `frame_test.go`, `utils_test.go` |
+| AT-009 | Steady-state PSH writes remain frame-bounded, stream-open frames are encoded contiguously, padding plans avoid runtime parsing, and exact-body reads reuse complete buffers | Brocade profiling extension | Counting `net.Conn`, deterministic data/open/padding/read benchmarks, pending-control ordering, end-to-end TCP/UDP wire decoding, and buffer-identity assertions | `frame_test.go`, `padding_test.go`, `session_client_test.go`, `session_integration_test.go`, `utils_test.go` |
 
 ## Gate mapping
 
 - Deterministic repetition: `go test ./common/buf ./transport/pipe ./proxy/anytls -count=10 -timeout=5m`
 - Race and lifecycle repetition: `go test -race ./common/buf ./transport/pipe ./proxy/anytls -count=3 -timeout=10m`
 - PSH write-call benchmark: `go test ./proxy/anytls -run '^$' -bench '^BenchmarkSendStreamData64KiB$' -benchmem`
+- Session-open, padding, and receive benchmarks: `go test ./proxy/anytls -run '^$' -bench '^(BenchmarkOpenStreamWirePacket|BenchmarkGenerateRecordPayloadSizes|BenchmarkReadMultiBufferExactBuffered)$' -benchmem`
 - Timed fuzzing: all four `FuzzAnyTLS*` targets run for 10 seconds each in CI.
 - Release candidates still require the full bilateral interoperability matrix;
   these package-level tests do not replace it.

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { wm, type Win } from '../wm/store';
 import { useNarrow } from './viewport';
+import { Icon } from './icons';
 
 export function useWm() {
   return useSyncExternalStore(wm.subscribe, wm.snapshot);
@@ -125,7 +126,7 @@ function WindowFrame({
         )}
         {showClose && (
           <button title="关闭" onClick={() => wm.close(win.id)}>
-            ✕
+            <Icon of="close" size={13} />
           </button>
         )}
       </div>

@@ -1,11 +1,20 @@
 // 编译台外壳：一条顶栏、一块工作区，以及贯通到顶的产物栏。
 // 页面自身负责对象下钻；顶栏负责主导航与诊断入口。
 
-import { Fragment, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import {
+  Fragment,
+  lazy,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchCompileView,
-  fetchDeployments,
+  fetchActiveDeployments,
   fetchGrantAutomationStatus,
   fetchNodes,
   fetchRevisions,
@@ -19,9 +28,7 @@ import {
   visibleDiagnostics,
 } from '../api';
 import { Pane } from '../panes';
-import { LinksPane } from '../panes/links';
-import { TopoCanvas } from '../topo/canvas';
-import { ErrorBox, Loading } from '../ui/bits';
+import { ErrorBox, Loading, LoadingBoundary } from '../ui/bits';
 import { useNarrow } from '../ui/viewport';
 import { artifactPanel } from '../ui/artifact-panel';
 import { DiagTable } from '../ui/diag-table';
@@ -30,7 +37,7 @@ import { wm, type CrumbSeg } from '../wm/store';
 import { draft } from '../draft';
 import { DraftBar } from './draft-bar';
 import { ArtifactRail, blastRadius, useChangedArtifacts } from './artifacts';
-import { navigate, startRouting } from './route';
+import { navigate, returnTo, startRouting, type Loc } from './route';
 import { can, isPublic, isVisitor } from '../session';
 import { forge, useForge, type NavKey } from './state';
 import { theme } from './theme';
@@ -38,6 +45,13 @@ import { palette, PALETTES } from './palette';
 import { Icon, type IconName } from '../ui/icons';
 import { BrandIcon } from '../ui/branding';
 import { compactGrantAutomation, RuntimeCrumbStatus, type RuntimeCrumbState } from '../ui/grant-automation';
+import { motionOriginFor, runVisualTransition } from '../ui/motion';
+import { usePresence } from '../ui/presence';
+import { confirmDiscardChanges } from '../ui/navigation-guard';
+import { FleetTrafficMeter } from '../ui/fleet-traffic';
+
+const LinksPane = lazy(() => import('../panes/links').then(module => ({ default: module.LinksPane })));
+const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
 
 interface Face {
   key: NavKey;
@@ -51,8 +65,8 @@ interface Face {
 // 顶栏只显示当前主工作流。规则负责选择转发目标；隧道资源本身的生命周期统一在隧道页管理。
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
-  { key: 'chains', label: '线路', icon: 'chains' },
   { key: 'tunnels', label: '隧道', icon: 'tunnels' },
+  { key: 'chains', label: '线路', icon: 'chains' },
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },
@@ -67,8 +81,8 @@ const MOBILE_MORE = NAV.filter(f => f.key === 'tunnels' || f.key === 'deploy' ||
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从「⋯」进入。
 const MORE: Face[] = [
   { key: 'settings', label: '设置', icon: 'settings', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
-  { key: 'topo', label: '拓扑', icon: 'chains' },
-  { key: 'links', label: '链路与 MTU', icon: 'link' },
+  { key: 'topo', label: '拓扑', icon: 'topology' },
+  { key: 'links', label: '链路与 MTU', icon: 'linkMeasure' },
 ];
 
 /* 不进入页面列表，但需要标题：面包屑和窗口名都读取 LABEL。 */
@@ -77,6 +91,15 @@ const OFF_NAV: Face[] = [{ key: 'password', label: '改密码' }];
 const LABEL: Record<NavKey, string> = Object.fromEntries(
   [...NAV, ...MORE, ...OFF_NAV].map(f => [f.key, f.label]),
 ) as Record<NavKey, string>;
+
+const ROLE_LABEL: Record<AdminRole, string> = {
+  user: '用户',
+  readonly: '只读',
+  editor: '编辑',
+  publisher: '发布',
+  'tenant-admin': '租户管理员',
+  'system-admin': '系统管理员',
+};
 
 const visible = (faces: Face[], who: Whoami) => faces.filter(f => !f.roles || f.roles.includes(who.role));
 
@@ -98,12 +121,14 @@ export function ForgeShell({
   const pub = isVisitor(session.who);
   const nav = st.nav;
   const panel = useSyncExternalStore(artifactPanel.subscribe, artifactPanel.snapshot);
+  const railPresence = usePresence(panel.open && artifacts, 300);
   // 草稿版本进入该层的查询键，同时统一失效所有页面的读取缓存。
   // 仅依靠查询键不够：各页面使用 `['snapshot']`，键中不含草稿版本，草稿变化后
   // 它们仍会命中缓存——表现为修改后草稿条已出现但表格内容未更新。
   // 订阅集中在此而非分散在各写入点：草稿可能从任意位置写入（api.ts 中的写函数、
   // 连线操作、冒烟脚本），失效逻辑只应有一处。
   const draftVer = useSyncExternalStore(draft.subscribe, draft.version);
+  const draftDirty = !draft.isEmpty();
   const qc = useQueryClient();
   useEffect(
     () =>
@@ -133,7 +158,7 @@ export function ForgeShell({
     startRouting(nav => LABEL[nav]);
     return true;
   });
-  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
+  const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled: !pub });
   const current = revisions.data?.current_revision;
   // 上一个版本：修订列表按 id 倒序排列，取当前记录的下一条。第一个版本没有上一版，
   // 此时不显示影响范围——将全部产物标记为已变更不提供信息。
@@ -148,23 +173,26 @@ export function ForgeShell({
   const compile = useQuery({
     queryKey: ['compile', current, draftVer],
     queryFn: () => fetchCompileView(current!),
-    enabled: current != null,
+    enabled: !pub && current != null,
   });
-  const snapshot = useQuery({ queryKey: ['snapshot', draftVer], queryFn: () => fetchSnapshot() });
+  const snapshot = useQuery({
+    queryKey: ['snapshot', draftVer],
+    queryFn: () => fetchSnapshot(),
+    enabled: !pub && (st.diag || railPresence.present),
+  });
   const verify = useQuery({
     queryKey: ['deployment-verify', current],
     queryFn: () => verifyDeployment({ revision_id: current! }),
     enabled: !pub && current != null && draft.isEmpty(),
     refetchInterval: q => ((q.state.data?.summary.changed_targets ?? 0) > 0 ? 5_000 : false),
   });
-  // 发布列表全局轮询：任意页面下顶栏都需要能显示发布中状态，不能只在发布页打开时
-  // 才获知有发布在执行。发布页也读取该 key，tanstack 共享缓存不会重复请求。
-  // active 表示限流锁被占用（deployment.rs），包含 halted 未收尾的情况。
+  // 顶栏只关心仍占用 single-flight 锁的发布。与历史页分开缓存，避免每个页面每五秒
+  // 下载并聚合 50 条历史；所有发布 mutation 对 ['deployments'] 的前缀失效会同时刷新两者。
   const deployments = useQuery({
-    queryKey: ['deployments'],
-    queryFn: () => fetchDeployments(),
+    queryKey: ['deployments', 'runtime'],
+    queryFn: () => fetchActiveDeployments(),
     enabled: !pub,
-    refetchInterval: 5_000,
+    refetchInterval: query => (query.state.data?.deployments.some(deployment => deployment.active) ? 5_000 : 30_000),
   });
   const activeDeploy = (deployments.data?.deployments ?? []).find(d => d.active);
   // 等待确认与执行中需要区分：含破坏性动作的波需要人工确认后才继续下发，而顶栏两种情况
@@ -176,16 +204,22 @@ export function ForgeShell({
     queryKey: ['grant-automation'],
     queryFn: () => fetchGrantAutomationStatus(),
     enabled: !pub,
-    refetchInterval: 5_000,
+    refetchInterval: query => ((query.state.data?.pending_jobs ?? 0) > 0 ? 5_000 : 30_000),
   });
 
-  const { list, changed, dirty, pending: artifactsPending, error: artifactsError } = useChangedArtifacts(current, prev);
+  const {
+    list,
+    changed,
+    dirty,
+    pending: artifactsPending,
+    error: artifactsError,
+  } = useChangedArtifacts(current, prev, { enabled: artifacts && draftDirty });
   const draftBlast = useMemo(() => blastRadius(list, changed), [list, changed]);
   const pendingTargets = dirty ? undefined : verify.data?.summary.changed_targets;
   const diagnostics = visibleDiagnostics(compile.data?.diagnostics);
   // 诊断的 location 中全部是 id，而面板需要显示名称。这两份数据在其他位置已在读取，
   // 此处只是将 id 到名称的转换集中处理（见 formatLocation）。
-  const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), enabled: !pub && st.diag });
   const diagNames = useMemo<DiagNames>(() => {
     const nodes = new Map((nodeList.data?.nodes ?? []).map(n => [n.node_id, n.name]));
     const chains = new Map(
@@ -195,8 +229,8 @@ export function ForgeShell({
   }, [nodeList.data, snapshot.data]);
 
   const grantRuntime = compactGrantAutomation(grantAutomation.data, grantAutomation.isPending, !!grantAutomation.error);
-  // 面包屑只留一段短状态：需要人工介入和失败优先，安静时才显示队列健康。
-  // 修订号由相邻的 Rn 只显示一次，避免“已收敛到修订 n · 修订 n”。
+  // 面包屑只留一段需要关注的短状态；健康且空闲时不显示常驻文案。
+  // 修订号只跟随活动发布出现，避免把当前修订误读成需要处理的状态。
   const runtimeReadError = revisions.error ?? compile.error;
   const crumbRuntime: RuntimeCrumbState = runtimeReadError
     ? { text: revisions.error ? '修订状态未知' : '编译状态未知', tone: 'bad' }
@@ -210,73 +244,77 @@ export function ForgeShell({
               tone: draftBlast.size ? 'hot' : 'normal',
               title: draftBlast.size ? [...draftBlast].join(', ') : undefined,
             }
-      : verify.isPending
-        ? { text: '检查中', tone: 'normal' }
-        : verify.error
-          ? { text: '发布状态未知', tone: 'bad' }
-          : awaitingDeploy
-            ? { text: `发布 #${awaitingDeploy.id} · 待确认`, tone: 'bad' }
-            : grantRuntime.tone === 'bad'
-              ? grantRuntime
-              : pendingTargets
-                ? { text: `待发布 ${pendingTargets} 台`, tone: 'hot' }
-                : grantRuntime;
+      : awaitingDeploy
+        ? { text: `发布 #${awaitingDeploy.id} · 待确认`, tone: 'bad' }
+        : activeDeploy
+          ? { text: `发布 #${activeDeploy.id} · 进行中`, tone: 'hot' }
+          : verify.isPending
+            ? { text: '检查中', tone: 'normal' }
+            : verify.error
+              ? { text: '发布状态未知', tone: 'bad' }
+              : grantRuntime.tone === 'bad'
+                ? grantRuntime
+                : pendingTargets
+                  ? { text: `待发布 ${pendingTargets} 台`, tone: 'hot' }
+                  : grantRuntime;
 
   return (
     <div className={`forge${narrow ? ' narrow' : ''}`}>
       <div className="fg-left">
-        <TopBar
-          branding={branding}
-          who={session.who}
-          narrow={narrow}
-          nav={nav}
-          summary={compile.data?.summary}
-          diagnostics={diagnostics}
-          diagNames={diagNames}
-          diagnosticsPending={revisions.isPending || (current != null && compile.isPending)}
-          diagnosticsError={runtimeReadError}
-          pendingTargets={pendingTargets}
-          activeDeploy={activeDeploy}
-          awaitingDeploy={awaitingDeploy}
-          railOpen={panel.open}
-          onLogout={onLogout}
-        />
+        <div className={`fg-desk${nav === 'topo' ? ' is-topo' : ''}`}>
+          <TopBar
+            branding={branding}
+            who={session.who}
+            narrow={narrow}
+            nav={nav}
+            summary={compile.data?.summary}
+            diagnostics={diagnostics}
+            diagNames={diagNames}
+            diagnosticsPending={revisions.isPending || (current != null && compile.isPending)}
+            diagnosticsError={runtimeReadError}
+            pendingTargets={pendingTargets}
+            activeDeploy={activeDeploy}
+            awaitingDeploy={awaitingDeploy}
+            railOpen={panel.open}
+            onLogout={() => confirmDiscardChanges() && onLogout()}
+          />
 
-        {/* 窄屏不显示该行，也不给它任何替代形态：当前位置由导航行里高亮的那一格加内容区
-            自己的标题表示，发布状态读数由窄屏「发布」按钮的角标承担。 */}
-        {!narrow && (
-          <div className="fg-crumb">
-            <ForgeCrumb nav={nav} />
-            {/* 公开访客不显示该行右侧的全部读数：发布状态和修订号属于同一类信息，
-                而这两个查询在该身份下无权访问——保留会始终停留在检查中的状态。 */}
-            {!pub && (
+          {/* 手机端由主导航和浏览器历史承担定位，不再重复显示面包屑。 */}
+          {!narrow && (
+            <div className="fg-crumb">
+              <ForgeCrumb nav={nav} />
               <span className="fg-crumb-right">
-                <RuntimeCrumbStatus state={crumbRuntime} revision={current} />
+                <FleetTrafficMeter />
+                {/* 公开访客无权读取发布状态和修订号，实时流量仍按节点读取权限展示。 */}
+                {!pub && <RuntimeCrumbStatus state={crumbRuntime} revision={activeDeploy ? current : undefined} />}
               </span>
-            )}
-          </div>
-        )}
+            </div>
+          )}
 
-        <DraftBar current={current} />
+          <DraftBar current={current} />
 
-        {nav === 'topo' ? (
-          <div className="fg-topo">
-            <TopoCanvas />
-          </div>
-        ) : (
-          <div className="fg-desk">
-            <Work nav={nav} />
-          </div>
-        )}
+          {nav === 'topo' ? (
+            <div className="fg-topo" key="topo" role="main" aria-label={`${LABEL[nav]}内容`} tabIndex={-1}>
+              <LoadingBoundary fallback={<Loading variant="canvas" />} variant="canvas">
+                <TopoCanvas />
+              </LoadingBoundary>
+            </div>
+          ) : (
+            <div className="fg-view" key={nav} role="main" aria-label={`${LABEL[nav]}内容`} tabIndex={-1}>
+              <Work nav={nav} />
+            </div>
+          )}
+        </div>
       </div>
 
-      {panel.open && artifacts && (
+      {railPresence.present && (
         <ArtifactRail
           revision={current}
           prev={prev}
           compareClean={(pendingTargets ?? 0) > 0}
           apps={snapshot.data?.snapshot.apps ?? []}
           onClose={() => artifactPanel.close()}
+          motionState={railPresence.phase}
         />
       )}
 
@@ -411,7 +449,15 @@ function TopBar({
 }) {
   const st = useForge();
   const [more, setMore] = useState(false);
+  const moreButtonRef = useRef<HTMLButtonElement>(null);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  const menuPresence = usePresence(more, 180);
+  const diagPresence = usePresence(st.diag, 180);
+  const themeKey = useSyncExternalStore(theme.subscribe, theme.snapshot);
   const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
+  const selectedPaletteName = PALETTES.find(option => option.key === paletteKey)?.name ?? paletteKey;
+  const nextThemeTransition = theme.snapshot() === 'dark' ? 'theme-light' : 'theme-dark';
+  const toggleTheme = () => runVisualTransition(() => theme.toggle(), nextThemeTransition);
   /* 评审角色无法获取产物（服务端返回 403），开关一并隐藏 */
   const artifacts = can(who.role, 'artifacts');
 
@@ -423,7 +469,9 @@ function TopBar({
       forge.setDiag(false);
     };
     const esc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
+      if (e.key !== 'Escape') return;
+      close();
+      if (more) moreButtonRef.current?.focus();
     };
     document.addEventListener('click', close);
     document.addEventListener('keydown', esc);
@@ -449,89 +497,193 @@ function TopBar({
         ? `${pendingTargets} 台待发布`
         : undefined;
 
-  const diagPop = st.diag && (
-    <div className="fg-pop" onClick={e => e.stopPropagation()}>
+  const focusMenuEdge = (edge: 'first' | 'last') => {
+    requestAnimationFrame(() => {
+      const items = moreMenuRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)');
+      if (!items?.length) return;
+      items[edge === 'first' ? 0 : items.length - 1]?.focus();
+    });
+  };
+
+  const openMoreFromKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    setMore(true);
+    forge.setDiag(false);
+    focusMenuEdge(event.key === 'ArrowDown' ? 'first' : 'last');
+  };
+
+  const moveWithinMore = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Tab') {
+      setMore(false);
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+    if (items.length === 0) return;
+    event.preventDefault();
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    if (event.key === 'Home') return items[0]?.focus();
+    if (event.key === 'End') return items.at(-1)?.focus();
+    const step = event.key === 'ArrowDown' ? 1 : -1;
+    const next = current < 0 ? (step > 0 ? 0 : items.length - 1) : (current + step + items.length) % items.length;
+    items[next]?.focus();
+  };
+
+  const diagPop = diagPresence.present && (
+    <div
+      className="fg-pop"
+      data-motion-state={diagPresence.phase}
+      aria-hidden={!st.diag || undefined}
+      inert={!st.diag}
+      onClick={e => e.stopPropagation()}
+    >
       {diagnosticsError ? (
         <ErrorBox error={diagnosticsError} />
       ) : diagnosticsPending ? (
-        <Loading />
+        <Loading variant="table" />
       ) : (
         <DiagTable diagnostics={diagnostics} names={diagNames} />
       )}
     </div>
   );
 
-  const menu = more && (
-    <div className="fg-menu nav-menu" onClick={() => setMore(false)}>
+  const menu = menuPresence.present && (
+    <div
+      id="forge-more-menu"
+      ref={moreMenuRef}
+      className="fg-menu nav-menu"
+      role="menu"
+      aria-label="更多功能"
+      data-motion-state={menuPresence.phase}
+      aria-hidden={!more || undefined}
+      inert={!more}
+      onClick={() => setMore(false)}
+      onKeyDown={moveWithinMore}
+    >
       {rest.map(f => (
-        <button key={f.key} onClick={() => navigate(f.key)}>
+        <button
+          key={f.key}
+          type="button"
+          role="menuitem"
+          className="fg-menu-item"
+          aria-current={nav === f.key ? 'page' : undefined}
+          onClick={() => navigate(f.key)}
+        >
           {f.icon && <Icon of={f.icon} size={14} className="fg-menu-icon" />}
-          <span>
+          <span className="fg-menu-copy">
             {f.label}
             {f.key === 'deploy' && deploymentMenuHint && <small>{deploymentMenuHint}</small>}
           </span>
+          {nav === f.key && <Icon of="check" size={13} className="fg-menu-check" />}
         </button>
       ))}
-      {/* 分隔线用于区分页面项和设置项。上方没有任何项时（公开访客在 MORE 中没有可见页面），
-          该分隔线上方没有内容，会成为菜单顶部的一条无意义的横线。 */}
-      {rest.length > 0 && <hr />}
       {/* 产物在窄屏下是全屏覆盖层，不是随手查看的内容，因此从导航行收入菜单。 */}
       {narrow && artifacts && (
-        <button onClick={() => artifactPanel.toggle()}>
-          <Icon of="artifacts" size={14} className="fg-menu-icon" />
-          <span>
+        <button type="button" role="menuitem" className="fg-menu-item" onClick={() => artifactPanel.toggle()}>
+          <Icon of="artifactFolder" size={14} className="fg-menu-icon" />
+          <span className="fg-menu-copy">
             产物<small>这一版编译出了什么</small>
           </span>
         </button>
       )}
-      <button onClick={() => theme.toggle()}>
-        <Icon of="theme" size={14} className="fg-menu-icon" />
-        <span>
-          切换亮 / 暗<small>默认暗色</small>
-        </span>
-      </button>
-      {/* 调色盘是即时预览项而不是跳转项：点击不关闭菜单（stopPropagation），
-          可以连续试色。选中态由 aria-pressed 的圆环表示。 */}
-      <div className="fg-accrow" onClick={e => e.stopPropagation()}>
-        <Icon of="theme" size={14} className="fg-menu-icon" />
-        <span className="t">配色</span>
-        {PALETTES.map(option => (
-          <button
-            key={option.key}
-            className="fg-accdot"
-            title={`${option.name}：${option.description}`}
-            aria-label={`配色 ${option.name}：${option.description}`}
-            aria-pressed={paletteKey === option.key}
-            style={{ backgroundColor: option.action }}
-            onClick={() => palette.set(option.key)}
-          />
-        ))}
+      {/* 页面入口与即时外观控制分组。明暗模式使用明确的二选一，色调单独一行并显示当前名称；
+          两组操作都保持菜单打开，便于直接比较。 */}
+      {(rest.length > 0 || (narrow && artifacts)) && <hr />}
+      <div className="fg-appearance" role="group" aria-label="外观" onClick={e => e.stopPropagation()}>
+        <div className="fg-appearance-title">外观</div>
+        <div className="fg-appearance-row">
+          <span className="fg-appearance-label">模式</span>
+          <div className="fg-theme-switch" role="group" aria-label="明暗模式">
+            <button
+              type="button"
+              role="menuitemradio"
+              className="fg-theme-option"
+              aria-label="使用亮色模式"
+              aria-checked={themeKey === 'light'}
+              onClick={() => {
+                if (themeKey === 'light') return;
+                toggleTheme();
+              }}
+            >
+              <Icon of="sun" size={12} className="fg-theme-option-icon" />
+              亮色
+            </button>
+            <button
+              type="button"
+              role="menuitemradio"
+              className="fg-theme-option"
+              aria-label="使用暗色模式"
+              aria-checked={themeKey === 'dark'}
+              onClick={() => {
+                if (themeKey === 'dark') return;
+                toggleTheme();
+              }}
+            >
+              <Icon of="moon" size={12} className="fg-theme-option-icon" />
+              暗色
+            </button>
+          </div>
+        </div>
+        <div className="fg-appearance-row">
+          <span className="fg-appearance-label">
+            色调<small>{selectedPaletteName}</small>
+          </span>
+          <div className="fg-tone-list" role="group" aria-label="界面色调">
+            {PALETTES.map(option => (
+              <button
+                key={option.key}
+                type="button"
+                role="menuitemradio"
+                className="fg-accdot"
+                title={`${option.name}：${option.description}`}
+                aria-label={`使用${option.name}色调：${option.description}`}
+                aria-checked={paletteKey === option.key}
+                onClick={event =>
+                  runVisualTransition(
+                    () => palette.set(option.key),
+                    'appearance',
+                    motionOriginFor(event.currentTarget, event.clientX, event.clientY),
+                  )
+                }
+              >
+                <span className="fg-accdot-swatch" style={{ backgroundColor: option.action }}>
+                  {paletteKey === option.key && <Icon of="check" size={9} className="fg-accdot-check" />}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
+      <hr />
       {/* 修改密码对所有角色开放，因此不与上面按角色过滤的页面放在一起。
           公开账户除外：它是免密的共用身份，为其设置密码会导致所有人无法登录。 */}
       {!isPublic(who) && (
-        <button onClick={() => navigate('password')}>
+        <button
+          type="button"
+          role="menuitem"
+          className="fg-menu-item"
+          aria-current={nav === 'password' ? 'page' : undefined}
+          onClick={() => navigate('password')}
+        >
           <Icon of="security" size={14} className="fg-menu-icon" />
-          <span>
-            改密码<small>改自己的登录密码</small>
-          </span>
+          <span className="fg-menu-copy">改密码</span>
+          {nav === 'password' && <Icon of="check" size={13} className="fg-menu-check" />}
         </button>
       )}
-      {/* 公开访客的「退出」即登录入口：该页面上没有其他位置可以返回登录表单。 */}
-      <button onClick={onLogout}>
+      {/* 公开访客从这里进入登录；已有身份从这里退出。完整身份留在辅助标签中，菜单只展示
+          单行操作和角色，避免长 ID 把一个简单动作撑成两三行。 */}
+      <button
+        type="button"
+        role="menuitem"
+        className="fg-menu-item fg-account-action"
+        aria-label={isPublic(who) ? '登录' : `退出登录，当前角色${ROLE_LABEL[who.role]}`}
+        title={isPublic(who) ? '登录' : `${who.self_user?.user_id ?? who.operator_id} · ${ROLE_LABEL[who.role]}`}
+        onClick={onLogout}
+      >
         <Icon of={isPublic(who) ? 'access' : 'outbound'} size={14} className="fg-menu-icon" />
-        <span>
-          {isPublic(who) ? '登录' : '退出'}
-          <small>
-            {isPublic(who) ? (
-              '现在是公开访客，登录换成你自己的身份'
-            ) : (
-              <>
-                {who.self_user?.user_id ?? who.operator_id} · {who.role}
-              </>
-            )}
-          </small>
-        </span>
+        <span className="fg-menu-copy">{isPublic(who) ? '登录' : '退出登录'}</span>
+        {!isPublic(who) && <span className="fg-account-role">{ROLE_LABEL[who.role]}</span>}
       </button>
     </div>
   );
@@ -576,17 +728,22 @@ function TopBar({
 
         <div className="fg-menuwrap">
           <button
-            className="fg-ico"
+            ref={moreButtonRef}
+            type="button"
+            className="fg-ico fg-more-trigger"
             title="更多"
             aria-label="更多"
+            aria-haspopup="menu"
+            aria-controls="forge-more-menu"
             aria-expanded={more}
+            onKeyDown={openMoreFromKeyboard}
             onClick={e => {
               e.stopPropagation();
               setMore(v => !v);
               forge.setDiag(false);
             }}
           >
-            ⋯
+            <Icon of="menu" size={16} className="fg-more-icon" />
           </button>
           {menu}
         </div>
@@ -616,13 +773,14 @@ function TopBar({
           读不了产物的角色看到的是禁用而不是消失：按角色隐藏时，顶栏在不同身份下少一个
           控件，而少掉的那个是这套外壳里唯一的产物入口。 */}
       <button
+        type="button"
         className="fg-tgl"
         aria-pressed={railOpen}
         disabled={!artifacts}
-        title="显示 / 隐藏产物栏"
+        title={artifacts ? '显示 / 隐藏产物栏' : '当前身份无权查看产物'}
         onClick={() => artifactPanel.toggle()}
       >
-        <Icon of="artifacts" size={13} className="fg-tgl-ic" />
+        <Icon of="artifactFolder" size={13} className="fg-tgl-ic" />
         产物
       </button>
 
@@ -631,6 +789,7 @@ function TopBar({
       {!isVisitor(who) && (
         <div className="fg-menuwrap">
           <button
+            type="button"
             className="fg-tgl"
             aria-expanded={st.diag}
             title="诊断"
@@ -654,16 +813,22 @@ function TopBar({
 
       <div className="fg-menuwrap">
         <button
-          className="btn fg-more"
+          ref={moreButtonRef}
+          type="button"
+          className="btn fg-more fg-more-trigger"
           title="更多"
           aria-label="更多"
+          aria-haspopup="menu"
+          aria-controls="forge-more-menu"
+          aria-expanded={more}
+          onKeyDown={openMoreFromKeyboard}
           onClick={e => {
             e.stopPropagation();
             setMore(v => !v);
             forge.setDiag(false);
           }}
         >
-          ⋯
+          <Icon of="menu" size={16} className="fg-more-icon" />
         </button>
         {menu}
       </div>
@@ -684,19 +849,16 @@ function ForgeCrumb({ nav }: { nav: NavKey }) {
   const snap = useSyncExternalStore(wm.subscribe, wm.snapshot);
   const win = snap.wins.find(w => w.key === `tab:${nav}`);
   const segs = (win?.data.crumb as CrumbSeg[] | undefined) ?? [];
-  // 返回到第 `keep` 段（0 表示顶层）。`crumb` 需要同步截断：只修改 drill 时，
-  // 面板已返回列表而面包屑仍显示原有层级，表现为点击无响应。
-  const goto = (drill: unknown, keep: number) => {
-    if (!win) return;
-    wm.setData(win.id, { ...win.data, drill, crumb: segs.slice(0, keep) });
-  };
+  const goto = (drill?: unknown) => returnTo(nav, drill as Loc['drill']);
 
   return (
     <>
       {segs.length === 0 ? (
         <span className="cur">{LABEL[nav]}</span>
       ) : (
-        <a onClick={() => goto(undefined, 0)}>{LABEL[nav]}</a>
+        <button type="button" className="fg-crumb-link" onClick={() => goto()}>
+          {LABEL[nav]}
+        </button>
       )}
       {segs.map((seg, i) => (
         <Fragment key={i}>
@@ -704,7 +866,9 @@ function ForgeCrumb({ nav }: { nav: NavKey }) {
           {i === segs.length - 1 || seg.drill === undefined ? (
             <span className="cur">{seg.label}</span>
           ) : (
-            <a onClick={() => goto(seg.drill, i + 1)}>{seg.label}</a>
+            <button type="button" className="fg-crumb-link" onClick={() => goto(seg.drill)}>
+              {seg.label}
+            </button>
           )}
         </Fragment>
       ))}
@@ -727,17 +891,14 @@ function Work({ nav }: { nav: NavKey }) {
 
   if (nav === 'links')
     return (
-      <div className="fg-sheet">
+      <LoadingBoundary fallback={<Loading variant="links" sheeted />} variant="links">
         <LinksPane />
-      </div>
+      </LoadingBoundary>
     );
-  if (!win) return <Loading />;
-  // 这两个页面自行分页：管控面板和详细面板各自是一张纸（fg-sheet），
-  // 不再由外壳包裹一层纸并在其中嵌套 panel 卡片——与 d-desk 的布局方式一致。
-  if (nav === 'nodes' || nav === 'users') return <Pane win={win} bare />;
-  return (
-    <div className="fg-sheet">
-      <Pane win={win} />
-    </div>
-  );
+  if (!win) {
+    return null;
+  }
+  // 页面根节点自己决定是列表卡片还是连续详情纸。工作区只负责滚动，不再先画一层通用纸：
+  // 否则卡片页会多出一个无意义的表面，初次读取时也会先闪出这张空纸。
+  return <Pane win={win} bare={nav === 'nodes' || nav === 'users'} />;
 }

@@ -75,7 +75,6 @@ async fn fallback_guard_round_trips() {
         node_id: "n1".to_owned(),
         bind: "0.0.0.0".parse().unwrap(),
         port: 443,
-        front_id: None,
         guard: brocade_core::model::IngressGuard::OPEN,
         reality: CreateRealityIngressRequest {
             fallback_mode: brocade_core::model::RealityFallbackMode::CustomSite,

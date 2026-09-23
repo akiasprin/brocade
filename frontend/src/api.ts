@@ -1,5 +1,5 @@
-// admin 面的数据获取入口。浏览器默认使用 HttpOnly session cookie；Bearer token 仅作为
-// API 和自动化调用的可选方式。类型定义与服务端的序列化结果逐字段对应。
+// admin 面的数据获取入口。浏览器默认使用 HttpOnly session cookie；Bearer token 用于
+// API/自动化调用，以及创建首个管理员时的一次性初始化凭据。类型定义与服务端逐字段对应。
 
 import { draft, type ModelOp } from './draft';
 
@@ -17,6 +17,18 @@ export interface Whoami {
    * 掩码在服务端出口处生成，与界面无关；该字段只用于决定是否渲染那些点击后会被拒绝的入口。
    */
   masked_assets: boolean;
+}
+
+/** Identity-scoped inventory returned before the application shell mounts. */
+export interface ConsoleInitialData {
+  node_count: number;
+  /** Each JSON tuple is `[group_id, member_count]`, in the same order as the chain page. */
+  chain_group_count: [groupId: string, memberCount: number][];
+}
+
+export interface ConsoleBootstrap {
+  who: Whoami;
+  initial: ConsoleInitialData;
 }
 
 export class ApiError extends Error {
@@ -69,13 +81,50 @@ export interface DraftPreview {
   artifacts: { revision: number; artifacts: ArtifactIndexEntry[] };
 }
 
-export const previewDraft = (ops: ModelOp[]) => post<DraftPreview>('/model/preview', { ops });
+export const previewDraft = (ops: ModelOp[], signal?: AbortSignal) =>
+  api<DraftPreview>('/model/preview', '', {
+    method: 'POST',
+    body: JSON.stringify({ ops }),
+    signal,
+  });
 
 // 一次渲染中读取快照的页面不止一个，编译摘要还需再读一次——同一份草稿不应重复预览三次。
-// 缓存键包含草稿版本号，草稿变化时缓存自动失效；另加一个较短的 TTL，
-// 使服务端被其他人修改后不会长期读取到旧数据。
-let previewCache: { key: string; at: number; p: Promise<DraftPreview> } | null = null;
+// 缓存键包含操作者作用域和实际操作；提交状态等纯 UI 通知不会重启编译。另加一个较短
+// 的 TTL，使服务端被其他人修改后不会长期读取到旧数据。
+let previewCache: {
+  key: string;
+  settledAt: number | null;
+  controller: AbortController;
+  p: Promise<DraftPreview>;
+} | null = null;
 const PREVIEW_TTL_MS = 1500;
+const activeDraftPreviewControllers = new Set<AbortController>();
+
+function trackDraftPreview<T>(controller: AbortController, request: Promise<T>): Promise<T> {
+  activeDraftPreviewControllers.add(controller);
+  void request.then(
+    () => activeDraftPreviewControllers.delete(controller),
+    () => activeDraftPreviewControllers.delete(controller),
+  );
+  return request;
+}
+
+function abortDraftPreviews() {
+  for (const controller of activeDraftPreviewControllers) controller.abort();
+  activeDraftPreviewControllers.clear();
+}
+
+let observedDraftContent = draft.previewKey();
+draft.subscribe(() => {
+  const content = draft.previewKey();
+  // beginSubmission/finishSubmission also notify subscribers. They do not change the model and
+  // must not restart an expensive preview; edits, undo, discard, cross-tab sync and operator
+  // changes do change this exact wire document and cancel every stale preview lane.
+  if (content === observedDraftContent) return;
+  observedDraftContent = content;
+  abortDraftPreviews();
+  previewCache = null;
+});
 
 // A first in-flight query has no cached data, so invalidation alone may leave it running.
 // Never return a response (or error) from an earlier draft generation to a current-view reader.
@@ -86,20 +135,35 @@ async function currentDraftRead<T>(read: () => Promise<T>): Promise<T> {
       const value = await read();
       if (version === draft.version()) return value;
     } catch (error) {
-      if (version === draft.version()) throw error;
+      const aborted = error instanceof Error && error.name === 'AbortError';
+      if (version === draft.version() && !aborted) throw error;
     }
   }
 }
 
 export function draftPreview(): Promise<DraftPreview> {
   const ops = draft.ops();
-  const key = `${draft.version()}:${JSON.stringify(ops)}`;
+  const key = draft.previewKey();
   const now = Date.now();
-  if (previewCache && previewCache.key === key && now - previewCache.at < PREVIEW_TTL_MS) {
+  if (
+    previewCache &&
+    previewCache.key === key &&
+    (previewCache.settledAt === null || now - previewCache.settledAt < PREVIEW_TTL_MS)
+  ) {
     return previewCache.p;
   }
-  const p = previewDraft(ops);
-  previewCache = { key, at: now, p };
+  if (previewCache?.settledAt === null) previewCache.controller.abort();
+  const controller = new AbortController();
+  const p = trackDraftPreview(controller, previewDraft(ops, controller.signal));
+  previewCache = { key, settledAt: null, controller, p };
+  // TTL starts after completion. A slow request remains the one authoritative in-flight request;
+  // expiring it from its start time was what allowed the same draft to fan out repeatedly.
+  void p.then(
+    () => {
+      if (previewCache?.p === p) previewCache.settledAt = Date.now();
+    },
+    () => {},
+  );
   /* 失败结果不写入缓存，否则一次网络异常会导致该草稿在 TTL 内始终无法读取 */
   p.catch(() => {
     if (previewCache?.p === p) previewCache = null;
@@ -107,9 +171,10 @@ export function draftPreview(): Promise<DraftPreview> {
   return p;
 }
 
-/** Write one control-plane-only field immediately and invalidate the draft projection cache. */
+/** Write state outside the browser draft and invalidate projections based on the old committed state. */
 async function immediateModelWrite<T>(write: () => Promise<T>): Promise<T> {
   const result = await write();
+  abortDraftPreviews();
   previewCache = null;
   return result;
 }
@@ -132,26 +197,101 @@ function enqueueImmediateOrder<T>(scope: string, write: () => Promise<T>): Promi
   return next;
 }
 
+export interface ClientConfigCommitResult {
+  snapshot_id: number;
+  status: 'unchanged' | 'activated' | 'awaiting-first-topology';
+  serving_generation: number | null;
+  pending_topology: string[];
+}
+
+export interface FrontClientConfigState {
+  front_id: string;
+  head_snapshot_id: number;
+  serving_snapshot_id: number | null;
+  topology_revision_id: number | null;
+  permissions_revision_id: number | null;
+  serving_generation: number | null;
+  active: boolean;
+  pending_topology: string[];
+}
+
+export type FrontRouteStatus = 'reachable' | 'blocked' | 'conditional' | 'unknown' | 'external' | 'pending';
+
+export interface FrontRouteDecision {
+  status: FrontRouteStatus;
+  chain_id: string | null;
+  node_id: string | null;
+  rule_index: number | null;
+  selector: string | null;
+  action: string | null;
+  reason: string;
+}
+
+export interface FrontRouteMember {
+  id: string;
+  kind: 'internal' | 'external';
+  chain_id: string | null;
+  node_id: string | null;
+  pending: boolean;
+}
+
+export interface FrontRouteTarget {
+  id: string;
+  chain_id: string | null;
+  node_id: string | null;
+  endpoints: string[];
+  landing: FrontRouteDecision;
+  pending: boolean;
+}
+
+export interface FrontRouteCell {
+  member_id: string;
+  target_id: string;
+  endpoints: { endpoint: string; decision: FrontRouteDecision }[];
+  relay: FrontRouteDecision;
+  landing: FrontRouteDecision;
+  combined: FrontRouteDecision;
+}
+
+export interface FrontRouteAnalysisView {
+  base_client_snapshot_id: number;
+  topology_revision_id: number | null;
+  permissions_revision_id: number | null;
+  serving_generation: number | null;
+  pending_topology: string[];
+  analysis: {
+    front_id: string;
+    members: FrontRouteMember[];
+    targets: FrontRouteTarget[];
+    cells: FrontRouteCell[];
+    blocking: boolean;
+  };
+}
+
 export const applyDraft = (ops: ModelOp[], note?: string) =>
   post<{
     revision_id: number;
     changed: number;
-    client_config: {
-      snapshot_id: number;
-      status: 'unchanged' | 'activated' | 'awaiting-first-topology';
-      serving_generation: number | null;
-      pending_topology: string[];
-    };
+    client_config: ClientConfigCommitResult;
   }>('/model/apply', { ops, note: note ?? null });
 
 /* 草稿中某一份产物的内容。索引只提供清单和 sha256，展开某一份时才拉取其内容。 */
-export const previewDraftArtifact = (ops: ModelOp[], targetKind: string, targetId: string, artifactKind: string) =>
-  post<ArtifactContent>('/model/preview/artifact', {
-    ops,
-    target_kind: targetKind,
-    target_id: targetId,
-    artifact_kind: artifactKind,
-  });
+export const previewDraftArtifact = (ops: ModelOp[], targetKind: string, targetId: string, artifactKind: string) => {
+  const controller = new AbortController();
+  return trackDraftPreview(
+    controller,
+    api<ArtifactContent>('/model/preview/artifact', '', {
+      method: 'POST',
+      body: JSON.stringify({
+        ops,
+        target_kind: targetKind,
+        target_id: targetId,
+        artifact_kind: artifactKind,
+      }),
+      signal: controller.signal,
+    }),
+  );
+};
 
 const post = <T>(path: string, body?: unknown, token = '') =>
   api<T>(path, token, {
@@ -186,9 +326,12 @@ export interface LoginAdminResponse {
 export const fetchAuthState = () => api<AuthState>('/auth/state');
 export const setVisitorAccess = (enabled: boolean) =>
   api<AuthState>('/visitor-access', '', { method: 'PUT', body: JSON.stringify({ enabled }) });
-export const fetchSessionWhoami = () => api<Whoami>('/whoami');
-export const initAdmin = (body: { operator_id: string; display_name: string; password: string; root_tenant: string }) =>
-  api<InitAdminResponse>('/auth/init', '', { method: 'POST', body: JSON.stringify(body) });
+export const fetchSessionWhoami = () => api<Whoami>('/whoami', '', { cache: 'no-store' });
+export const fetchConsoleBootstrap = () => api<ConsoleBootstrap>('/bootstrap');
+export const initAdmin = (
+  bootstrapToken: string,
+  body: { operator_id: string; display_name: string; password: string; root_tenant: string },
+) => api<InitAdminResponse>('/auth/init', bootstrapToken, { method: 'POST', body: JSON.stringify(body) });
 export const loginAdmin = (body: { operator_id: string; password: string }) =>
   api<LoginAdminResponse>('/auth/login', '', { method: 'POST', body: JSON.stringify(body) });
 export const logoutAdmin = () => api<{ revoked: boolean }>('/auth/logout', '', { method: 'POST' });
@@ -283,12 +426,24 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 8;
+export const AGENT_PROTOCOL_VERSION = 21;
+export const MIN_AGENT_PROTOCOL_VERSION = 20;
+export const VPNGATE_MAX_CANDIDATES = 16;
+export const VPNGATE_CONNECT_THRESHOLD_MAX_MS = 35_000;
+export const VPNGATE_DEFAULT_PROBE_WORKERS = 16;
+export const VPNGATE_MAX_PROBE_WORKERS = 128;
 
 export interface NodeVersions {
   agent: string;
   xray: string | null;
+  /** 受管路径上的 Xray 与实际服务进程分别取摘要；原子替换后、重启前两者会短暂不同。 */
+  xray_installed_sha256?: string | null;
+  xray_running_sha256?: string | null;
   phantun: string | null;
+  /** 可选能力；缺失或 null 表示该机器不纳入 VPN Gate 接入节点。 */
+  openvpn?: string | null;
+  /** VPN Gate 目录拨测的有界并发能力；旧 Agent 缺失时按串行处理。 */
+  vpngate_catalog_probe_workers?: number | null;
   wg_tools: string | null;
   /** WG 启用时为 `kernel` 或 `userspace`；WG 关闭时为 null。内核版本低于 5.6 时
       wg-quick 回退到 wireguard-go，`wg show` 的输出与内核态相同，但吞吐相差一个数量级。 */
@@ -341,12 +496,24 @@ export interface NodeAgentStateItem {
   public_ipv6_nat: boolean;
   route_ipv4: string | null;
   route_ipv6: string | null;
+  observed_public_ipv4?: NodePublicIpState | null;
+  observed_public_ipv6?: NodePublicIpState | null;
   token_prefix: string | null;
   token_created_at: string | null;
   token_last_used_at: string | null;
   token_revoked_at: string | null;
   agent_version: string | null;
   agent_protocol_version: number | null;
+  /** Selected to probe the shared, outbound-independent VPN Gate catalogue. */
+  vpngate_probe_enabled: boolean;
+  /** Per-machine catalogue probe concurrency; null or absent means the machine is not selected. */
+  vpngate_probe_workers?: number | null;
+  /** Console receipt time of the latest accepted catalogue-probe samples; absent on older Consoles. */
+  vpngate_probe_reported_at?: string | null;
+  /** True after a selected machine has supplied no accepted catalogue-probe samples for thirty minutes. */
+  vpngate_probe_data_stale?: boolean;
+  /** Selected to collect the upstream directory and query three-provider exit-IP intelligence; absent on older Consoles. */
+  vpngate_intelligence_enabled?: boolean;
   // 运行时对账。null 表示尚未上报（刚纳管尚未轮到，或协议尚未恢复），
   // 需要与上报值为零区分——界面显示为「—」而非 0，否则状态最差的机器
   // 会显示为状态最好的。
@@ -355,8 +522,10 @@ export interface NodeAgentStateItem {
   last_local_reconcile: LocalReconcileReport | null;
   wireguard_health: WireGuardHealth | null;
   runtime_reported_at: string | null;
+  runtime_report_fresh: boolean;
   geodata_observed: GeodataObservation | null;
   last_poll_at: string | null;
+  desired_poll_fresh: boolean;
   last_usage_report_at: string | null;
   usage_generation_id?: number | null;
   usage_last_result?: {
@@ -408,6 +577,52 @@ export interface NodeAgentStateItem {
   applied: Record<string, unknown> | null;
 }
 
+export interface NodePublicIpState {
+  current_ip: string;
+  country_code: string | null;
+  since_at: string;
+  last_seen_at: string;
+  candidate_ip: string | null;
+  candidate_first_seen_at: string | null;
+  candidate_observations: number;
+}
+
+export type PublicIpFamily = 'v4' | 'v6';
+
+export interface NodePublicIpEvent {
+  id: number;
+  family: PublicIpFamily;
+  event_kind: 'first_observed' | 'changed';
+  previous_ip: string | null;
+  current_ip: string;
+  previous_country_code: string | null;
+  current_country_code: string | null;
+  observed_at: string;
+}
+
+export interface NodePublicIpHistory {
+  node_id: string;
+  visible_days: number;
+  retention_days: number;
+  events: NodePublicIpEvent[];
+}
+
+export interface MachineEvent {
+  id: number;
+  node_id: string;
+  node_name: string;
+  event_kind: 'node_online' | 'node_offline' | 'public_ip_changed';
+  family: 4 | 6 | null;
+  previous_value: string | null;
+  current_value: string | null;
+  occurred_at: string;
+}
+
+export interface MachineEventList {
+  retention_days: number;
+  events: MachineEvent[];
+}
+
 export interface NodeLifecycleTransitionResult {
   revision_id: number;
   node_id: string;
@@ -452,6 +667,14 @@ export const abandonNode = (id: string, unregisterWarp = true) =>
   });
 
 export const fetchNodes = (token = '') => api<{ nodes: NodeAgentStateItem[] }>('/nodes/agent-state', token);
+
+export const fetchNodePublicIpHistory = (nodeId: string, days = 14) =>
+  api<NodePublicIpHistory>(
+    `/nodes/${encodeURIComponent(nodeId)}/public-ip-history?days=${encodeURIComponent(String(days))}`,
+  );
+
+export const fetchMachineEvents = (limit = 50) =>
+  api<MachineEventList>(`/notifications?limit=${encodeURIComponent(String(limit))}`);
 
 /* Dns 是带标签的枚举：{"t":"system"} 或 {"t":"servers","v":["1.1.1.1"]} */
 export type Dns = { t: 'system' } | { t: 'servers'; v: string[] };
@@ -659,6 +882,10 @@ export const planDeployment = (revision_id: number, token = '') =>
 export const fetchDeployments = (kind?: 'config' | 'grants', token = '') =>
   api<{ deployments: DeploymentListItem[] }>(`/deployments?limit=50${kind ? `&kind=${kind}` : ''}`, token);
 
+/** The application shell needs only the single-flight rows that can affect its global badge. */
+export const fetchActiveDeployments = (token = '') =>
+  api<{ deployments: DeploymentListItem[] }>('/deployments?limit=4&active_only=true', token);
+
 export const fetchDeployment = (id: number, token = '', includeContent = false) =>
   api<DeploymentDetail>(`/deployments/${id}${includeContent ? '?include=content' : ''}`, token);
 
@@ -679,6 +906,11 @@ export const isolateDeploymentTarget = (
     `/deployments/${deploymentId}/targets/${encodeURIComponent(nodeId)}/isolate`,
     request,
   );
+
+export const isolateNode = (nodeId: string, acknowledgeUncertain = false) =>
+  post<NodeIsolationCommandResult>(`/nodes/${encodeURIComponent(nodeId)}/isolate`, {
+    acknowledge_uncertain: acknowledgeUncertain,
+  });
 
 export const restoreNodeService = (nodeId: string) =>
   post<NodeIsolationCommandResult>(`/nodes/${encodeURIComponent(nodeId)}/restore-service`, {});
@@ -826,6 +1058,10 @@ export interface GrantProbePlan {
 
 export type GrantProbeItemStatus = 'waiting' | 'running' | 'passed' | 'failed' | 'canceled';
 export interface GrantProbeJobItem extends GrantProbePlanItem {
+  member_id?: string;
+  member_name?: string;
+  member_family?: GrantProbePlanItem['family'];
+  member_protocol?: GrantProbePlanItem['protocol'];
   status: GrantProbeItemStatus;
   ttfb_ms: number | null;
   detail: string | null;
@@ -834,10 +1070,13 @@ export interface GrantProbeJobItem extends GrantProbePlanItem {
 export type GrantProbeJobStatus = 'running' | 'completed' | 'canceled' | 'superseded';
 export interface GrantProbeJob {
   id: string;
+  kind?: 'grant' | 'front-combination';
   tenant_id: string;
   user_id: string;
   serving_revision: number;
   serving_generation: number;
+  client_snapshot_id?: number | null;
+  timeout_secs?: number;
   status: GrantProbeJobStatus;
   message: string | null;
   created_at_unix_secs: number;
@@ -852,9 +1091,132 @@ export const startUserGrantProbe = (tenant: string, user: string, itemIds: strin
   post<{ job: GrantProbeJob; reused: boolean }>(`/users/${tenant}/${user}/grant-probes`, {
     item_ids: itemIds,
   });
+export const startFrontCombinationProbe = (
+  tenant: string,
+  user: string,
+  body: {
+    app_id: string;
+    front_id: string;
+    member_id: string;
+    target_id: string;
+    expected_serving_generation: number;
+    expected_client_snapshot_id: number;
+  },
+) => post<{ job: GrantProbeJob; reused: boolean }>(`/users/${tenant}/${user}/front-probes`, body);
 export const fetchGrantProbeJob = (id: string) => api<GrantProbeJob>(`/grant-probes/${id}`);
 export const cancelGrantProbe = (id: string) => api<GrantProbeJob>(`/grant-probes/${id}`, '', { method: 'DELETE' });
 export const grantProbeEventsUrl = (id: string) => `/grant-probes/${encodeURIComponent(id)}/events`;
+
+export type TunnelProbeHealth = 'healthy' | 'degraded' | 'down' | 'paused' | 'unknown';
+export type TunnelProbeJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled' | 'unsupported';
+export type TunnelProbePhase = 'queued' | 'preparing' | 'starting-xray' | 'requesting' | 'finished';
+export type TunnelProbeSource = 'serving' | 'draft';
+export type TunnelProbeResultStatus =
+  'ok' | 'timeout' | 'connect-failed' | 'target-failed' | 'unsupported' | 'canceled' | 'interrupted';
+
+export interface TunnelProbePolicy {
+  enabled: boolean;
+  interval_secs: number;
+  timeout_secs: number;
+  next_run_at_unix_secs: number | null;
+  updated_at_unix_secs: number;
+}
+
+export interface TunnelProbeRun {
+  id: number;
+  tenant_id: string;
+  outbound_id: string;
+  outbound_name: string;
+  protocol: string;
+  trigger: 'manual' | 'scheduled';
+  source: TunnelProbeSource;
+  topology_revision: number;
+  serving_generation: number | null;
+  draft_sha256: string | null;
+  settings_revision: number;
+  timeout_secs: number;
+  status: TunnelProbeJobStatus;
+  phase: TunnelProbePhase;
+  result: TunnelProbeResultStatus | null;
+  ttfb_ms: number | null;
+  http_status: number | null;
+  exit_ip: string | null;
+  exit_loc: string | null;
+  attempt_count: number;
+  error_code: string | null;
+  error_detail: string | null;
+  queued_at_unix_secs: number;
+  started_at_unix_secs: number | null;
+  finished_at_unix_secs: number | null;
+  cancel_requested: boolean;
+}
+
+export interface TunnelProbeListItem {
+  tenant_id: string;
+  outbound_id: string;
+  name: string;
+  protocol: string;
+  supported: boolean;
+  unsupported_reason: string | null;
+  health: TunnelProbeHealth;
+  policy: TunnelProbePolicy | null;
+  latest_run: TunnelProbeRun | null;
+}
+
+export interface TunnelProbeList {
+  origin: 'console';
+  endpoint_url: string;
+  retention_days: number;
+  items: TunnelProbeListItem[];
+}
+
+export interface TunnelProbeSummary {
+  window_secs: number;
+  total: number;
+  succeeded: number;
+  success_rate: number | null;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  failures: number;
+}
+
+export interface TunnelProbeView {
+  item: TunnelProbeListItem;
+  retention_days: number;
+  summary: TunnelProbeSummary;
+  points: {
+    run_id: number;
+    finished_at_unix_secs: number;
+    result: TunnelProbeResultStatus;
+    ttfb_ms: number | null;
+  }[];
+  recent_runs: TunnelProbeRun[];
+}
+
+const tunnelProbeBase = (tenant: string, outbound: string) =>
+  `/tenants/${encodeURIComponent(tenant)}/tunnels/${encodeURIComponent(outbound)}`;
+
+export const fetchTunnelProbeCapability = () => api<GrantProbeCapability>('/tunnel-probes/capability');
+export const fetchTunnelProbes = () => api<TunnelProbeList>('/tunnel-probes');
+export const fetchTunnelProbe = (tenant: string, outbound: string, windowSecs = 86_400) =>
+  api<TunnelProbeView>(`${tunnelProbeBase(tenant, outbound)}/probe?window_secs=${windowSecs}`);
+export const startTunnelProbe = (tenant: string, outbound: string, source: TunnelProbeSource = 'serving') =>
+  post<{ run: TunnelProbeRun; reused: boolean }>(`${tunnelProbeBase(tenant, outbound)}/probe-runs`, {
+    source,
+    ops: source === 'draft' ? draft.ops() : [],
+  });
+export const updateTunnelProbePolicy = (
+  tenant: string,
+  outbound: string,
+  policy: Pick<TunnelProbePolicy, 'enabled' | 'interval_secs' | 'timeout_secs'>,
+) =>
+  api<TunnelProbePolicy>(`${tunnelProbeBase(tenant, outbound)}/probe-policy`, '', {
+    method: 'PUT',
+    body: JSON.stringify(policy),
+  });
+export const fetchTunnelProbeRun = (id: number) => api<TunnelProbeRun>(`/tunnel-probe-runs/${id}`);
+export const cancelTunnelProbe = (id: number) =>
+  api<TunnelProbeRun>(`/tunnel-probe-runs/${id}`, '', { method: 'DELETE' });
 
 export interface ClashSubscriptionInfo {
   url: string;
@@ -1236,7 +1598,6 @@ export interface UpsertIngressBody {
   node_id: string;
   bind: string;
   port: number;
-  front_id?: string;
   reality: CreateRealityIngress;
   wires: Wires;
   projection: IngressProjection;
@@ -1249,7 +1610,7 @@ export interface UpsertIngressBody {
 export interface IngressGuard {
   /** 机房内网和机队自身的覆盖网段。用于补足隔离，不属于滥用防护。 */
   no_private: boolean;
-  /** BT，按协议识别而非端口。要求该入口启用嗅探，使用前置代理的入口在编译时会被拒绝。 */
+  /** BT，按协议识别而非端口。要求该入口启用嗅探。 */
   no_bittorrent: boolean;
   /** 25 / 465 / 587。发送垃圾邮件是机器 IP 被列入黑名单的主要原因。 */
   no_mail: boolean;
@@ -1264,10 +1625,20 @@ export interface IngressGuard {
 // 「不投影」不能用空 host 表示——空串表示已启用但未填写，服务端通过
 // `ingress.projection-blank` 拒绝。该类型中不存在 `host: ''` 这一合法状态：
 // 关闭时不传该族即可。
-export interface IngressProjection {
+export interface ProtocolProjection {
   v4?: ProjectionEndpoint | null;
   v6?: ProjectionEndpoint | null;
 }
+
+/** VLESS keeps the historical root pair for wire compatibility. The optional protocol pairs
+ * distinguish a legacy shared mapping (missing) from an explicit direct mapping (`{}`). */
+export interface IngressProjection extends ProtocolProjection {
+  vless_encryption?: ProtocolProjection | null;
+  anytls?: ProtocolProjection | null;
+  hysteria2?: ProtocolProjection | null;
+}
+
+export type ProjectionProtocol = 'vless' | 'vless_encryption' | 'anytls' | 'hysteria2';
 
 export interface ProjectionEndpoint {
   host: string;
@@ -1332,8 +1703,7 @@ export type DestMatch =
   | { t: 'geoip'; v: string[] }
   | { t: 'port'; v: string[] }
   | { t: 'network'; v: 'tcp' | 'udp' }
-  | { t: 'all'; v: DestMatch[] }
-  | { t: 'front_downstream' };
+  | { t: 'all'; v: DestMatch[] };
 
 // 该跳连接对端时使用的地址。不填写表示使用 overlay。
 //
@@ -1493,6 +1863,20 @@ export type ExternalOutboundProtocol =
         /** 0 表示交给 Xray/wireguard-go 自动决定。 */
         workers: number;
       };
+    }
+  | {
+      /** A node-managed country pool. Provider profiles never cross the client boundary. */
+      t: 'vpngate';
+      v: {
+        country_code: string;
+        /** Missing means a measured country pool; present pins the outbound to one relay. */
+        server_id?: string | null;
+        /** Nonempty restricts failover to this manual pool; empty uses the automatic country pool. */
+        server_ids?: string[];
+        max_connect_ms: number;
+        min_download_bps: number;
+        max_candidates: number;
+      };
     };
 
 export interface ExternalWarpBinding {
@@ -1571,6 +1955,342 @@ export const upsertExternalOutbound = async (outbound: ExternalOutboundWrite) =>
   return { revision_id: 0 } as ModelWriteResult;
 };
 
+export interface VpngateCatalogStatus {
+  enabled: boolean;
+  interval_secs: number;
+  source_url: string;
+  next_sync_at_unix_secs: number;
+  syncing: boolean;
+  last_success_run_id: number | null;
+  last_error_code: string | null;
+  last_error_detail: string | null;
+  current_servers: number;
+  retained_servers: number;
+  retained_observations: number;
+}
+
+export interface VpngateSyncHistoryPoint {
+  finished_at_unix_secs: number;
+  current_servers: number;
+  /** Unique server IDs first observed in this successful sync run; absent on older Consoles. */
+  first_seen_servers?: number;
+  accepted_rows: number;
+  rejected_rows: number;
+}
+
+export interface VpngateCountrySummary {
+  country_code: string;
+  country_name: string;
+  /** Servers observed in the latest complete provider snapshot. */
+  current_servers: number;
+  /** Persistent directory count, including servers absent from the latest snapshot. */
+  retained_servers?: number;
+  /** Servers that currently pass every configured admission gate, capped at sixteen per region. */
+  candidate_servers: number;
+  measured_successful: number;
+}
+
+export interface VpngateOverview {
+  /** Absent on older Consoles that ignore manual pool membership. */
+  manual_pools_supported?: boolean;
+  status: VpngateCatalogStatus;
+  admission_policy: VpngateAdmissionPolicy;
+  /** Absent on Consoles from before configurable intelligence refresh was introduced. */
+  intelligence_policy?: VpngateIntelligencePolicy;
+  /** Only configuration state is readable; the stored API key is never returned. */
+  intelligence_credentials?: VpngateIntelligenceCredentials;
+  /** Most recent successful catalogue collections, oldest first. Absent on older Consoles. */
+  sync_history?: VpngateSyncHistoryPoint[];
+  countries: VpngateCountrySummary[];
+}
+
+export interface VpngateServerView {
+  id: string;
+  hostname: string;
+  ip: string;
+  country_code: string;
+  country_name: string;
+  ping_ms: number | null;
+  catalog_speed_bps: number;
+  vpn_sessions: number;
+  last_seen_at_unix_secs: number;
+  /** False means retained from an earlier provider snapshot; it may still qualify through probes. */
+  seen_in_latest_sync?: boolean;
+  /** In the globally qualified candidate set; at most sixteen entries per country. */
+  active: boolean;
+  /** One-based backend ranking after admission; absent for nodes outside the candidate ranking. */
+  candidate_rank?: number | null;
+  /** Provider-local Pareto frontier used as the first candidate ordering key. */
+  pareto_layer?: number | null;
+  /** Fleet quality uses one latest fresh sample per probing machine, never cumulative counts. */
+  global_download_bps?: number | null;
+  global_connect_ms?: number | null;
+  measured_nodes: number;
+  successful_samples: number;
+  latest_probe_status: string | null;
+  latest_exit_ip: string | null;
+  latest_exit_country_code: string | null;
+  latest_connect_ms: number | null;
+  latest_download_bps: number | null;
+  latest_ip_scores: VpngateIpScore[];
+  latest_ip_networks: VpngateIpNetwork[];
+  latest_error_code: string | null;
+  latest_probed_at_unix_secs: number | null;
+  latest_successful_probed_at_unix_secs: number | null;
+  intelligence_verified_at_unix_secs: number | null;
+  intelligence_stale: boolean;
+}
+
+export type VpngateDirectoryFilter = 'all' | 'candidate' | 'successful' | 'failed' | 'pending' | 'current' | 'retained';
+export type VpngateDirectorySort = 'candidate' | 'download' | 'connect' | 'catalog' | 'samples' | 'recent' | 'hostname';
+
+export interface VpngateServerPageRequest {
+  page: number;
+  page_size: number;
+  search: string;
+  filter: VpngateDirectoryFilter;
+  sort: VpngateDirectorySort;
+}
+
+export interface VpngateServerPage {
+  items: VpngateServerView[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+const optionalNumberOrder = (left: number | null | undefined, right: number | null | undefined, descending = false) => {
+  if (left == null) return right == null ? 0 : 1;
+  if (right == null) return -1;
+  return descending ? right - left : left - right;
+};
+
+/** Keep a new UI usable during a rolling restart in which an older Console still returns the
+ * complete array. This path reproduces the server contract locally and can be removed after the
+ * compatibility window; normal installations only receive VpngateServerPage. */
+function legacyVpngateServerPage(items: VpngateServerView[], request: VpngateServerPageRequest): VpngateServerPage {
+  const term = request.search.trim().toLowerCase();
+  const filtered = items.filter(item => {
+    const matchesFilter =
+      request.filter === 'all' ||
+      (request.filter === 'candidate' && item.active) ||
+      (request.filter === 'successful' && item.successful_samples > 0) ||
+      (request.filter === 'failed' && item.latest_probe_status === 'failed') ||
+      (request.filter === 'pending' && item.latest_probe_status == null) ||
+      (request.filter === 'current' && item.seen_in_latest_sync) ||
+      (request.filter === 'retained' && !item.seen_in_latest_sync);
+    if (!matchesFilter || !term) return matchesFilter;
+    return [
+      item.id,
+      item.hostname,
+      item.ip,
+      item.latest_exit_ip,
+      item.latest_exit_country_code,
+      item.latest_error_code,
+      JSON.stringify(item.latest_ip_scores),
+      JSON.stringify(item.latest_ip_networks),
+    ]
+      .filter((value): value is string => value != null)
+      .some(value => value.toLowerCase().includes(term));
+  });
+  filtered.sort((left, right) => {
+    let requested = 0;
+    if (request.sort === 'download')
+      requested = optionalNumberOrder(left.global_download_bps, right.global_download_bps, true);
+    else if (request.sort === 'connect')
+      requested = optionalNumberOrder(left.global_connect_ms, right.global_connect_ms);
+    else if (request.sort === 'catalog')
+      requested =
+        optionalNumberOrder(left.catalog_speed_bps, right.catalog_speed_bps, true) ||
+        optionalNumberOrder(left.ping_ms, right.ping_ms);
+    else if (request.sort === 'samples') requested = right.successful_samples - left.successful_samples;
+    else if (request.sort === 'recent')
+      requested = optionalNumberOrder(left.latest_probed_at_unix_secs, right.latest_probed_at_unix_secs, true);
+    else if (request.sort === 'hostname') requested = left.hostname.localeCompare(right.hostname);
+    return (
+      requested || optionalNumberOrder(left.candidate_rank, right.candidate_rank) || left.id.localeCompare(right.id)
+    );
+  });
+  const offset = (request.page - 1) * request.page_size;
+  return {
+    items: filtered.slice(offset, offset + request.page_size),
+    total: filtered.length,
+    page: request.page,
+    page_size: request.page_size,
+  };
+}
+
+export interface VpngateRuntimeView {
+  node_id: string;
+  node_name: string;
+  tenant_id: string;
+  outbound_id: string;
+  outbound_name: string;
+  country_code: string;
+  automatic_pool: boolean;
+  runtime_status: string;
+  selected_server_id: string | null;
+  selected_hostname: string | null;
+  reported_at_unix_secs: number;
+  latest_probe_status: string | null;
+  latest_exit_ip: string | null;
+  latest_exit_country_code: string | null;
+  latest_connect_ms: number | null;
+  latest_download_bps: number | null;
+  latest_ip_scores: VpngateIpScore[];
+  latest_ip_networks: VpngateIpNetwork[];
+  latest_error_code: string | null;
+  latest_error_detail: string | null;
+  latest_probed_at_unix_secs: number | null;
+  latest_successful_probed_at_unix_secs: number | null;
+  intelligence_verified_at_unix_secs: number | null;
+  intelligence_stale: boolean;
+  switch_request_id: number | null;
+  switch_status: 'pending' | 'applied' | 'failed' | null;
+  switch_previous_server_id: string | null;
+  switch_previous_hostname: string | null;
+  switch_selected_server_id: string | null;
+  switch_cooldown_until_unix_secs: number | null;
+  switch_error_detail: string | null;
+}
+
+export interface VpngatePoolSwitchRequestView {
+  request_id: number;
+  node_id: string;
+  outbound_id: string;
+  previous_server_id: string;
+  status: 'pending' | 'applied' | 'failed';
+  selected_server_id: string | null;
+  cooldown_until_unix_secs: number | null;
+  error_detail: string | null;
+  requested_at_unix_secs: number;
+  completed_at_unix_secs: number | null;
+}
+
+export const fetchVpngateOverview = () => api<VpngateOverview>('/vpngate');
+
+export const fetchVpngateCountryServers = (countryCode: string, request: VpngateServerPageRequest) => {
+  const params = new URLSearchParams({
+    page: String(request.page),
+    page_size: String(request.page_size),
+    search: request.search,
+    filter: request.filter,
+    sort: request.sort,
+  });
+  return api<VpngateServerPage | VpngateServerView[]>(
+    `/vpngate/countries/${encodeURIComponent(countryCode)}/servers?${params.toString()}`,
+  ).then(value => (Array.isArray(value) ? legacyVpngateServerPage(value, request) : value));
+};
+
+export const fetchVpngateRuntimes = () => api<VpngateRuntimeView[]>('/vpngate/runtimes');
+
+export const requestVpngatePoolSwitch = (nodeId: string, outboundId: string, expectedServerId: string) =>
+  api<VpngatePoolSwitchRequestView>(
+    `/vpngate/runtimes/${encodeURIComponent(nodeId)}/${encodeURIComponent(outboundId)}/switch`,
+    '',
+    {
+      method: 'POST',
+      body: JSON.stringify({ expected_server_id: expectedServerId }),
+    },
+  );
+
+export const updateVpngateCatalogSettings = (body: { enabled: boolean; interval_secs: number }) =>
+  api<VpngateCatalogStatus>('/vpngate/settings', '', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+
+export const startVpngateSync = () => post<{ queued: boolean }>('/vpngate/sync');
+
+export type VpngateIpProvider = 'proxycheck' | 'ffraud' | 'iplogs';
+export type VpngateNetworkType = 'datacenter' | 'residential' | 'business' | 'mobile' | 'relay' | 'unknown';
+export type VpngateCountryPolicy = 'ignore' | 'any_match' | 'all_match';
+export type VpngateRiskDecisionPolicy = 'any_available_pass' | 'all_available_pass';
+
+export interface VpngateIpScore {
+  provider: VpngateIpProvider;
+  score: number;
+  country_code: string;
+}
+
+export interface VpngateProviderRiskRule {
+  provider: VpngateIpProvider;
+  maximum_score: number;
+}
+
+export interface VpngateAdmissionPolicy {
+  minimum_successful_sources: number;
+  country_policy: VpngateCountryPolicy;
+  risk_decision_policy: VpngateRiskDecisionPolicy;
+  provider_rules: VpngateProviderRiskRule[];
+}
+
+export type VpngateIntelligenceRefreshMode = 'on_change' | 'periodic';
+export type VpngateStaleIntelligencePolicy = 'retain' | 'mark' | 'reject';
+
+export interface VpngateIntelligencePolicy {
+  refresh_mode: VpngateIntelligenceRefreshMode;
+  refresh_interval_hours: number;
+  active_window_hours: number;
+  stale_policy: VpngateStaleIntelligencePolicy;
+  stale_after_hours: number;
+}
+
+export interface VpngateIntelligenceCredentials {
+  proxycheck_api_key_configured: boolean;
+}
+
+export interface VpngateIpNetwork {
+  provider: VpngateIpProvider;
+  isp: string | null;
+  network_type: VpngateNetworkType;
+}
+
+export interface VpngateProbeNodeSelection {
+  node_id: string;
+  enabled: boolean;
+  workers: number | null;
+  selected_at_unix_secs: number | null;
+}
+
+export const updateVpngateProbeNode = (nodeId: string, enabled: boolean, workers?: number) =>
+  api<VpngateProbeNodeSelection>(`/vpngate/probe-nodes/${encodeURIComponent(nodeId)}`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ enabled, ...(workers === undefined ? {} : { workers }) }),
+  });
+
+export interface VpngateIntelligenceNodeSelection {
+  node_id: string;
+  enabled: boolean;
+  selected_at_unix_secs: number | null;
+}
+
+export const updateVpngateIntelligenceNode = (nodeId: string, enabled: boolean) =>
+  api<VpngateIntelligenceNodeSelection>(`/vpngate/intelligence-nodes/${encodeURIComponent(nodeId)}`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ enabled }),
+  });
+
+export const updateVpngateAdmissionPolicy = (policy: VpngateAdmissionPolicy) =>
+  api<VpngateAdmissionPolicy>('/vpngate/admission-policy', '', {
+    method: 'PUT',
+    body: JSON.stringify(policy),
+  });
+
+export const updateVpngateIntelligencePolicy = (policy: VpngateIntelligencePolicy) =>
+  api<VpngateIntelligencePolicy>('/vpngate/intelligence-policy', '', {
+    method: 'PUT',
+    body: JSON.stringify(policy),
+  });
+
+export const updateVpngateIntelligenceCredentials = (proxycheckApiKeys: string[]) =>
+  api<VpngateIntelligenceCredentials>('/vpngate/intelligence-credentials', '', {
+    method: 'PUT',
+    body: JSON.stringify({ proxycheck_api_keys: proxycheckApiKeys, mode: 'append' }),
+  });
+
+export const startVpngateIntelligenceRefresh = () => post<{ queued: number }>('/vpngate/intelligence-refresh');
+
 export interface WarpBindingResult {
   revision_id: number;
   binding: ExternalWarpBinding;
@@ -1596,9 +2316,11 @@ export interface WarpBindingOverrides {
 }
 
 export const registerWarpBinding = (tenantId: string, outboundId: string, nodeId: string): Promise<WarpBindingResult> =>
-  post<WarpBindingResult>(
-    `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings`,
-    { node_id: nodeId, accept_terms: true },
+  immediateModelWrite(() =>
+    post<WarpBindingResult>(
+      `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings`,
+      { node_id: nodeId, accept_terms: true },
+    ),
   );
 
 export const updateWarpBinding = (
@@ -1607,10 +2329,12 @@ export const updateWarpBinding = (
   nodeId: string,
   overrides: WarpBindingOverrides,
 ): Promise<WarpBindingResult> =>
-  api<WarpBindingResult>(
-    `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings/${encodeURIComponent(nodeId)}`,
-    '',
-    { method: 'PUT', body: JSON.stringify(overrides) },
+  immediateModelWrite(() =>
+    api<WarpBindingResult>(
+      `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings/${encodeURIComponent(nodeId)}`,
+      '',
+      { method: 'PUT', body: JSON.stringify(overrides) },
+    ),
   );
 
 export const removeWarpBinding = (
@@ -1618,10 +2342,12 @@ export const removeWarpBinding = (
   outboundId: string,
   nodeId: string,
 ): Promise<RemoveWarpBindingResult> =>
-  api<RemoveWarpBindingResult>(
-    `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings/${encodeURIComponent(nodeId)}`,
-    '',
-    { method: 'DELETE' },
+  immediateModelWrite(() =>
+    api<RemoveWarpBindingResult>(
+      `/tenants/${encodeURIComponent(tenantId)}/tunnels/${encodeURIComponent(outboundId)}/warp-bindings/${encodeURIComponent(nodeId)}`,
+      '',
+      { method: 'DELETE' },
+    ),
   );
 
 // 该链在该机器上的中转 inbound：监听端口和传输层。
@@ -1775,11 +2501,20 @@ export function currentWires(ingress: SnapshotIngress): Wires {
   };
 }
 
+function projectionForWireChange(ingress: SnapshotIngress, wires: Wires): IngressProjection {
+  const previous = currentWires(ingress);
+  let projection = ingress.projection;
+  for (const protocol of ['vless_encryption', 'anytls', 'hysteria2'] as const) {
+    if (wires[protocol] && !previous[protocol] && projection[protocol] == null) {
+      projection = { ...projection, [protocol]: {} };
+    }
+  }
+  return projection;
+}
+
 export function ingressUpsertBody(
   ingress: SnapshotIngress,
-  patch: Partial<
-    Pick<UpsertIngressBody, 'node_id' | 'bind' | 'port' | 'front_id' | 'projection' | 'wires' | 'guard'>
-  > = {},
+  patch: Partial<Pick<UpsertIngressBody, 'node_id' | 'bind' | 'port' | 'projection' | 'wires' | 'guard'>> = {},
 ): UpsertIngressBody {
   // 只启用 UDP 的接入面没有 VLESS 一侧，也不包含 REALITY 的相关字段。回传空表示跟随全局，
   // 与其在库中的状态一致（这些列本身为 NULL）。
@@ -1787,13 +2522,13 @@ export function ingressUpsertBody(
     kind: 'vless-reality',
   };
   const realitySource = transport.kind.startsWith('vless-reality') ? transport : undefined;
+  const wires = patch.wires ?? currentWires(ingress);
   return {
     id: ingress.id,
     chain_id: ingress.chain,
     node_id: patch.node_id ?? ingress.node,
     bind: patch.bind ?? ingress.bind,
     port: patch.port ?? ingress.port,
-    front_id: patch.front_id ?? ingress.front ?? undefined,
     reality: {
       // TLS 档没有借用站点，这两个字段为 undefined。回传空表示跟随全局，与其在库中的
       // 状态一致（这两列本身为 NULL）。
@@ -1811,14 +2546,13 @@ export function ingressUpsertBody(
       // 若该接入面同时启用了 XHTTP，运行时会拒绝所有连接。
       flow: transport.flow ?? '',
     },
-    // 该请求是全量覆盖而非 PATCH：不携带 projection 即表示两个地址族都不投影。
-    // 因此未修改投影的调用方（修改端口、迁移机器）也必须将现有值原样带上，
-    // 否则一次端口修改会清除投影配置。
-    projection: patch.projection ?? ingress.projection,
+    // 该请求是全量覆盖而非 PATCH：不携带 projection 即表示所有协议、两个地址族都不投影。
+    // 因此未修改投影的调用方（修改端口、迁移机器）也必须将现有值原样带上。
+    projection: patch.projection ?? (patch.wires ? projectionForWireChange(ingress, wires) : ingress.projection),
     // 同样属于全量覆盖的问题：不携带 wires 即表示回到只有 VLESS+REALITY 一条线，
     // 因此一次端口修改会改变 XHTTP 或整条 QUIC 线路，且已下发的客户端配置全部失效——
     // 与上面 projection 处属同一类问题。
-    wires: patch.wires ?? currentWires(ingress),
+    wires,
     // 与 projection、wires 属同一类问题，且后果更不易察觉：不携带 guard 即表示四项默认启用，
     // 因此已关闭某条限制的入口，会在其他人修改一次端口后重新启用——界面上没有任何提示，
     // 而该限制可能正是该入口的配置目的。
@@ -1935,20 +2669,44 @@ export interface SnapshotFront {
   external_via: string[];
 }
 
-export const upsertFront = async (
-  appId: string,
-  front: {
-    id: string;
-    tenant_id: string;
-    name: string;
-    strategy: SnapshotFront['strategy'];
-    via: string[];
-    external_via: string[];
-  },
-) => {
-  draft.push({ op: 'upsert_front', app_id: appId, front });
-  return { revision_id: 0 } as ModelWriteResult;
-};
+export interface FrontWriteBody {
+  expected_revision: number;
+  id: string;
+  tenant_id: string;
+  name: string;
+  strategy: SnapshotFront['strategy'];
+  via: string[];
+  external_via: string[];
+  targets: string[];
+}
+
+export const upsertFront = async (appId: string, front: FrontWriteBody) =>
+  immediateModelWrite(() =>
+    post<{
+      revision_id: number;
+      front: SnapshotFront;
+      targets: string[];
+      client_config: ClientConfigCommitResult;
+    }>(`/apps/${encodeURIComponent(appId)}/fronts`, front),
+  );
+
+export const analyzeFrontRoutes = (appId: string, front: FrontWriteBody) =>
+  post<FrontRouteAnalysisView>(`/apps/${encodeURIComponent(appId)}/front-analysis`, front);
+
+export const fetchFrontClientConfigState = (appId: string, frontId: string) =>
+  api<FrontClientConfigState>(`/apps/${encodeURIComponent(appId)}/fronts/${encodeURIComponent(frontId)}`);
+
+export const deleteFront = (appId: string, frontId: string, expectedRevision: number) =>
+  immediateModelWrite(() =>
+    api<{
+      revision_id: number;
+      removed: boolean;
+      client_config: ClientConfigCommitResult;
+    }>(`/apps/${encodeURIComponent(appId)}/fronts/${encodeURIComponent(frontId)}`, '', {
+      method: 'DELETE',
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+    }),
+  );
 export interface ConsoleSnapshot {
   /* 服务端返回完整的 ModelSnapshot，此处只声明需要使用的部分——完整声明相当于在浏览器中
      维护第二份模型定义，最终会与 model.rs 产生差异。 */
@@ -1962,6 +2720,7 @@ export interface ConsoleSnapshot {
        以它为基准的控件在保存后会回落到已提交值——界面表现为改动没有发生。 */
     nodes?: {
       id: string;
+      tenant?: string;
       name?: string;
       public_ipv4?: string | null;
       public_ipv6?: string | null;
@@ -1985,6 +2744,7 @@ export interface ConsoleSnapshot {
         transport: { t: 'udp' } | { t: 'fake_tcp'; v: { port: number } };
       };
     }[];
+    users?: { tenant: string }[];
     settings?: ModelSettings;
   };
   /* DNS 策略由机器持有，存在即下发，不由链路 Egress 规则启用。 */
@@ -1998,6 +2758,11 @@ export const fetchSnapshot = (): Promise<ConsoleSnapshot> =>
   currentDraftRead(() =>
     draft.isEmpty() ? api<ConsoleSnapshot>('/model/snapshot') : draftPreview().then(p => p.snapshot),
   );
+
+// Immediate control-plane writes must not resolve references against browser-only draft objects.
+// WARP registration needs this because of its irreversible provider-side effect; Front uses it
+// because its complete client configuration commits immediately while machine edits stay draft.
+export const fetchCommittedSnapshot = (): Promise<ConsoleSnapshot> => api<ConsoleSnapshot>('/model/snapshot');
 
 /* ── 操作者 ── */
 
@@ -2097,8 +2862,8 @@ export const fetchUsage = (filter: {
   return api<{ samples: UsageSample[]; chain_samples?: UsageChainSample[] }>(`/usage/samples?${q}`);
 };
 
-// 自然月汇总：一行对应一个（用户 × 项目）组合。项目带有 label（如「日本 rfc 入口」），
-// 一行即该项目下所有接入点对该用户当月的合计。
+// 自然月汇总：一行对应一个（用户 × 项目）组合，days 是同一批样本的每日上下行组成。
+// 项目带有 label（如「日本 rfc 入口」），一行即该项目下所有接入点对该用户当月的合计。
 // 月份字符串使用 +08 本地时间（如「2026-08-01 00:00:00」），不随数据库会话时区变化。
 export interface UsageMonthlyViewRow {
   tenant_id: string;
@@ -2109,13 +2874,26 @@ export interface UsageMonthlyViewRow {
   has_gap: boolean;
 }
 
+export interface UsageDailyRow {
+  day: string;
+  uplink_bytes: number;
+  downlink_bytes: number;
+  has_gap: boolean;
+}
+
 export interface UsageMonthlySummary {
   month_start: string;
   month_end: string;
   views: UsageMonthlyViewRow[];
+  /** Newer control planes always return this field. It remains optional so a newer Console UI
+   * can stay usable while an older local process is still running during a rolling restart. */
+  days?: UsageDailyRow[];
 }
 
-export const fetchUsageMonthly = () => api<UsageMonthlySummary>('/usage/monthly-summary');
+export const fetchUsageMonthly = (monthOffset: 0 | -1 = 0) =>
+  api<UsageMonthlySummary>(
+    monthOffset === 0 ? '/usage/monthly-summary' : `/usage/monthly-summary?month_offset=${monthOffset}`,
+  );
 
 // 机器列表右端的柱状图：一格对应一个 USAGE 上报窗口（30s），服务端已按机器聚合。
 // 不要改回使用 /usage/samples 自行汇总——那是明细行，一台机器有数十个用户即会超出其 500 行上限。
@@ -2381,6 +3159,49 @@ export const saveNodeLogPolicy = (nodeId: string, overrides: AgentLogLimitOverri
     body: JSON.stringify(overrides),
   });
 
+/* ── 机器物理网卡累计：UTC 重置周期与总量校准，均为即时运行态配置 ── */
+export type NodeTrafficCycleKind = 'monthly' | 'yearly';
+
+export interface NodeTrafficItem {
+  node_id: string;
+  tenant_id: string;
+  name: string;
+  cycle_kind: NodeTrafficCycleKind;
+  reset_month: number | null;
+  reset_day: number;
+  period_start_unix_secs: number;
+  period_end_unix_secs: number;
+  /* 十进制字符串避免累计值超过 JavaScript 的安全整数后丢字节。 */
+  rx_bytes: string;
+  tx_bytes: string;
+  total_bytes: string;
+  interface: string | null;
+  tracking_started_at_unix_secs: number | null;
+  last_reported_at_unix_secs: number | null;
+  calibrated_at_unix_secs: number | null;
+  last_gap_at_unix_secs: number | null;
+  last_gap_reason: string | null;
+  has_gap: boolean;
+}
+
+export interface NodeTrafficView {
+  nodes: NodeTrafficItem[];
+}
+
+export interface UpdateNodeTrafficRequest {
+  cycle_kind: NodeTrafficCycleKind;
+  reset_month: number | null;
+  reset_day: number;
+  calibrated_total_bytes: string | null;
+}
+
+export const fetchNodeTraffic = () => api<NodeTrafficView>('/node-traffic');
+export const saveNodeTraffic = (nodeId: string, body: UpdateNodeTrafficRequest) =>
+  api<NodeTrafficView>(`/node-traffic/nodes/${encodeURIComponent(nodeId)}`, '', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+
 /* ── agent 发布 ──
  *
  * 与分发一样不产生修订、不需要发布，但作用对象不同：机队上运行的 agent 二进制本身。
@@ -2435,6 +3256,131 @@ export interface AgentReleaseView {
 export const fetchAgentRelease = () => api<AgentReleaseView>('/agent-release');
 export const saveAgentRelease = (body: AgentRelease) =>
   api<AgentReleaseView>('/agent-release', '', { method: 'PUT', body: JSON.stringify(body) });
+
+/* ── Xray 二进制发布 ──
+ *
+ * 配置仍由不可变模型修订发布；这里发布的是解释配置的可执行文件。一次记录冻结 Console
+ * 当前携带的架构摘要、每台机器更新前的摘要和操作事件，因此失败恢复与历史审计不依赖
+ * 后续部署的 Console 仍保留相同字节。 */
+export type XrayReleaseStatus = 'running' | 'halted' | 'succeeded' | 'canceled';
+export type XrayReleaseTargetStatus =
+  | 'pending'
+  | 'dispatched'
+  | 'succeeded'
+  | 'unverified'
+  | 'failed-recovered'
+  | 'failed-dirty'
+  | 'unsupported'
+  | 'canceled';
+
+export interface XrayReleaseArtifact {
+  arch: string;
+  sha256: string;
+}
+
+export interface XrayReleaseTarget {
+  node_id: string;
+  wave: number;
+  status: XrayReleaseTargetStatus;
+  attempt: number;
+  before_sha256: string;
+  desired_sha256: string | null;
+  arch: string | null;
+  error: string | null;
+  reported_performed_update: boolean | null;
+  reported_xray_enabled: boolean | null;
+  reported_installed_sha256: string | null;
+  reported_running_sha256: string | null;
+  retryable: boolean;
+  dispatched_at: string | null;
+  finished_at: string | null;
+}
+
+export interface XrayReleaseEvent {
+  id: number;
+  kind: string;
+  node_id: string | null;
+  wave: number | null;
+  actor: string | null;
+  detail: unknown;
+  created_at: string;
+}
+
+export interface XrayRelease {
+  id: number;
+  release_id: string;
+  version: string;
+  artifacts: XrayReleaseArtifact[];
+  status: XrayReleaseStatus;
+  active: boolean;
+  confirmed_wave: number;
+  batch_size: number;
+  note: string | null;
+  created_at: string;
+  created_by: string;
+  halted_at: string | null;
+  finished_at: string | null;
+  targets: XrayReleaseTarget[];
+  events: XrayReleaseEvent[];
+}
+
+export interface XrayReleaseSummary {
+  id: number;
+  release_id: string;
+  version: string;
+  status: XrayReleaseStatus;
+  active: boolean;
+  confirmed_wave: number;
+  batch_size: number;
+  note: string | null;
+  created_at: string;
+  created_by: string;
+  halted_at: string | null;
+  finished_at: string | null;
+  target_count: number;
+  succeeded_count: number;
+  problem_count: number;
+}
+
+export interface XrayReleaseView {
+  available_release_id: string;
+  available_xrays: XrayReleaseArtifact[];
+  xray_version: string;
+  console_version: string;
+  build_commit: string;
+  history: XrayReleaseSummary[];
+  next_history_before_id: number | null;
+  releases: XrayRelease[];
+}
+
+export interface XrayReleaseHistoryPage {
+  history: XrayReleaseSummary[];
+  next_history_before_id: number | null;
+}
+
+export interface CreateXrayRelease {
+  idempotency_key: string;
+  release_id: string;
+  nodes: string[];
+  canary_node: string;
+  batch_size: number;
+  note: string | null;
+}
+
+export const fetchXrayReleases = () => api<XrayReleaseView>('/xray-releases');
+export const fetchXrayReleaseHistory = (beforeId: number) =>
+  api<XrayReleaseHistoryPage>(`/xray-releases/history?before_id=${beforeId}`);
+export const fetchXrayRelease = (releaseId: number) => api<XrayRelease>(`/xray-releases/${releaseId}`);
+export const createXrayRelease = (body: CreateXrayRelease) =>
+  api<XrayReleaseView>('/xray-releases', '', { method: 'POST', body: JSON.stringify(body) });
+export const confirmXrayRelease = (releaseId: number) =>
+  api<XrayReleaseView>(`/xray-releases/${releaseId}/confirm`, '', { method: 'POST' });
+export const cancelXrayRelease = (releaseId: number) =>
+  api<XrayReleaseView>(`/xray-releases/${releaseId}/cancel`, '', { method: 'POST' });
+export const retryXrayReleaseTarget = (releaseId: number, nodeId: string) =>
+  api<XrayReleaseView>(`/xray-releases/${releaseId}/targets/${encodeURIComponent(nodeId)}/retry`, '', {
+    method: 'POST',
+  });
 
 /* ── 证书 ──
  *
@@ -2676,10 +3622,17 @@ export const fetchLinkHealth = (token = '') => api<{ hops: LinkHealthItem[] }>('
 export type E2eProbeStatus = 'ok' | 'handshake-failed' | 'chain-broken' | 'timeout' | 'unsupported';
 export type E2eExitVerdict = 'match' | 'mismatch' | 'unknown';
 
-export interface E2eProbeSample {
-  probed_at: string;
-  status: E2eProbeStatus;
-  ttfb_ms: number | null;
+export interface E2eProbeSampleSeries {
+  probed_at_unix_secs: number[];
+  status: E2eProbeStatus[];
+  ttfb_ms: Array<number | null>;
+}
+
+export interface E2eExitIpIntelligence {
+  country_code: string | null;
+  scores: VpngateIpScore[];
+  networks: VpngateIpNetwork[];
+  verified_at: string;
 }
 
 export interface E2eProbeItem {
@@ -2692,16 +3645,72 @@ export interface E2eProbeItem {
   /* 首字节时间。只有连通时才有取值——失败时的耗时等于超时值，与链路速度无关 */
   ttfb_ms: number | null;
   exit_ip: string | null;
-  /* 探测目标返回的国家码。无法核对 IP 时，它可以表明出网的国家 */
+  /* 探测目标返回的地区码。无法核对 IP 时，它可以表明出网地区。 */
   exit_loc: string | null;
+  /* 按出口 IP 精确关联已有情报；读取链详情不会触发第三方查询。 */
+  exit_intelligence?: E2eExitIpIntelligence | null;
   exit_verdict: E2eExitVerdict;
   detail: string | null;
   probed_at: string;
-  /* 最近 6 小时结果，按时间正序（旧到新）排列；前端按 probed_at 放到真实时间轴上。 */
-  samples: E2eProbeSample[];
+  /* 最近 6 小时的完整结果，三列等长且按时间正序（旧到新）排列。 */
+  samples: E2eProbeSampleSeries;
 }
 
-export const fetchE2eProbes = (token = '') => api<{ chains: E2eProbeItem[] }>('/probes/e2e', token);
+interface LegacyE2eProbeSample {
+  probed_at: string;
+  status: E2eProbeStatus;
+  ttfb_ms: number | null;
+}
+
+type E2eProbeWireItem = Omit<E2eProbeItem, 'samples'> & {
+  samples: E2eProbeSampleSeries | LegacyE2eProbeSample[];
+};
+
+function legacyProbeTimeUnixSecs(value: string): number {
+  const normalized = value
+    .trim()
+    .replace(' ', 'T')
+    .replace(/(\.\d{3})\d+/, '$1')
+    .replace(/([+-]\d{2})$/, '$1:00');
+  return Math.floor(Date.parse(normalized) / 1_000);
+}
+
+function normalizeE2eProbeItem(item: E2eProbeWireItem): E2eProbeItem {
+  if (Array.isArray(item.samples)) {
+    const probed_at_unix_secs = item.samples.map(sample => legacyProbeTimeUnixSecs(sample.probed_at));
+    if (probed_at_unix_secs.some(value => !Number.isFinite(value))) {
+      throw new Error(`线路 ${item.chain_id} 的端到端样本时间无效`);
+    }
+    return {
+      ...item,
+      samples: {
+        probed_at_unix_secs,
+        status: item.samples.map(sample => sample.status),
+        ttfb_ms: item.samples.map(sample => sample.ttfb_ms),
+      },
+    };
+  }
+
+  const { probed_at_unix_secs, status, ttfb_ms } = item.samples;
+  if (
+    !Array.isArray(probed_at_unix_secs) ||
+    !Array.isArray(status) ||
+    !Array.isArray(ttfb_ms) ||
+    probed_at_unix_secs.length !== status.length ||
+    probed_at_unix_secs.length !== ttfb_ms.length
+  ) {
+    throw new Error(`线路 ${item.chain_id} 的端到端样本列长度不一致`);
+  }
+  if (probed_at_unix_secs.some(value => !Number.isFinite(value))) {
+    throw new Error(`线路 ${item.chain_id} 的端到端样本时间无效`);
+  }
+  return item as E2eProbeItem;
+}
+
+export const fetchE2eProbes = async (token = ''): Promise<{ chains: E2eProbeItem[] }> => {
+  const view = await api<{ chains: E2eProbeWireItem[] }>('/probes/e2e?format=columnar-v1', token);
+  return { chains: view.chains.map(normalizeE2eProbeItem) };
+};
 
 /* ── 节点：更新与 token ── */
 
@@ -3063,6 +4072,20 @@ export interface LoadSample {
   uptime_secs: number;
 }
 
+/** 机器总览卡片只需要的 NIC 窗口；深度资源明细留在机器详情接口。 */
+export interface NodeNicSample {
+  window_start_unix_secs: number;
+  window_end_unix_secs: number;
+  has_gap: boolean;
+  nic_rx_bps: number;
+  nic_tx_bps: number;
+}
+
+export interface NodeNicView {
+  node_id: string;
+  series: NodeNicSample[];
+}
+
 /** 本系统部署在该机器上的进程。用于区分是机器整体负载高还是本系统进程负载高。 */
 export interface ProcessSample {
   proc: 'xray' | 'wg' | 'phantun' | 'agent';
@@ -3090,6 +4113,84 @@ export interface NodeLoadView {
   /** 按时间从旧到新排列，可直接从左向右绘制 */
   series: LoadSample[];
   processes: ProcessSample[];
+}
+
+/** 两张深度图共用一次读取：时间轴和 gap 只出现一次，各指标保持数据库中的原始点数。 */
+export interface NodeLoadMetricView {
+  node_id: string;
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
+  window_end_unix_secs: number[];
+  has_gap: boolean[];
+  metrics: Record<string, Array<number | null>>;
+}
+
+interface NodeLoadOverviewSeries {
+  window_start_unix_secs: number[];
+  window_end_unix_secs: number[];
+  has_gap: boolean[];
+  cpu_user_pct: number[];
+  cpu_sys_pct: number[];
+  cpu_softirq_pct: number[];
+  cpu_peak_pct: number[];
+  cpu_steal_pct: number[];
+  load1: number[];
+  mem_available_bytes: number[];
+  swap_used_bytes: number[];
+  oom_kills: number[];
+  disk_free_bytes: number[];
+  disk_inode_free_pct: number[];
+  nic_rx_bps: number[];
+  nic_tx_bps: number[];
+  nic_rx_drop: number[];
+  nic_tx_drop: number[];
+  nic_err: number[];
+  conntrack_count: Array<number | null>;
+  uptime_secs: number[];
+}
+
+interface NodeLoadOverviewView extends Omit<NodeLoadView, 'series'> {
+  series: NodeLoadOverviewSeries;
+}
+
+function expandNodeLoadOverview(view: NodeLoadOverviewView): NodeLoadView {
+  const pointCount = view.series.window_end_unix_secs.length;
+  const columns = Object.entries(view.series);
+  const invalidColumn = columns.find(([, values]) => values.length !== pointCount);
+  if (invalidColumn) {
+    throw new Error(`机器观测图表列长度不一致：${invalidColumn[0]}`);
+  }
+
+  return {
+    ...view,
+    series: view.series.window_end_unix_secs.map((window_end_unix_secs, index) => ({
+      window_start_unix_secs: view.series.window_start_unix_secs[index],
+      window_end_unix_secs,
+      has_gap: view.series.has_gap[index],
+      cpu_user_pct: view.series.cpu_user_pct[index],
+      cpu_sys_pct: view.series.cpu_sys_pct[index],
+      cpu_softirq_pct: view.series.cpu_softirq_pct[index],
+      cpu_peak_pct: view.series.cpu_peak_pct[index],
+      cpu_steal_pct: view.series.cpu_steal_pct[index],
+      load1: view.series.load1[index],
+      cpu_detail: null,
+      mem_available_bytes: view.series.mem_available_bytes[index],
+      swap_used_bytes: view.series.swap_used_bytes[index],
+      memory_detail: null,
+      oom_kills: view.series.oom_kills[index],
+      disk_free_bytes: view.series.disk_free_bytes[index],
+      disk_inode_free_pct: view.series.disk_inode_free_pct[index],
+      disk_detail: null,
+      nic_rx_bps: view.series.nic_rx_bps[index],
+      nic_tx_bps: view.series.nic_tx_bps[index],
+      nic_rx_drop: view.series.nic_rx_drop[index],
+      nic_tx_drop: view.series.nic_tx_drop[index],
+      nic_err: view.series.nic_err[index],
+      conntrack_count: view.series.conntrack_count[index],
+      network_detail: null,
+      uptime_secs: view.series.uptime_secs[index],
+    })),
+  };
 }
 
 /** 一跳一个窗口的链路质量。键为 (chain_id, peer_node_id)，与 link_health 使用同一键。 */
@@ -3131,9 +4232,30 @@ export const fetchNodeLoad = (nodeId: string, startUnixSecs: number, endUnixSecs
     token,
   );
 
+export const fetchNodeLoadOverview = (nodeId: string, startUnixSecs: number, endUnixSecs: number, token = '') =>
+  api<NodeLoadOverviewView>(
+    `/load/nodes/${encodeURIComponent(nodeId)}/overview?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}`,
+    token,
+  ).then(expandNodeLoadOverview);
+
+export const fetchNodeLoadMetrics = (
+  nodeId: string,
+  startUnixSecs: number,
+  endUnixSecs: number,
+  metrics: readonly string[],
+  token = '',
+) =>
+  api<NodeLoadMetricView>(
+    `/load/nodes/${encodeURIComponent(nodeId)}/metrics?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}&metrics=${encodeURIComponent(metrics.join(','))}`,
+    token,
+  );
+
 /** 最近 N 个已上报窗口，不受样本距当前时刻多久影响。 */
 export const fetchNodeLoadListWindows = (windows = 24, token = '') =>
   api<{ nodes: NodeLoadView[] }>(`/load/nodes?windows=${windows}`, token);
+
+export const fetchNodeNicListWindows = (windows = 24, token = '') =>
+  api<{ nodes: NodeNicView[] }>(`/load/nodes/nic?windows=${windows}`, token);
 
 export const fetchNodeLoadWindows = (nodeId: string, windows = 24, token = '') =>
   api<NodeLoadView>(`/load/nodes/${encodeURIComponent(nodeId)}?windows=${windows}`, token);
@@ -3155,17 +4277,79 @@ export interface NodePingProbeView {
   targets: PingProbeTargetSeries[];
 }
 
+interface PingProbeTargetColumnarSeries extends PingProbeTarget {
+  probed_at_unix_secs: number[];
+  attempted: boolean[];
+  latency_us: Array<number | null>;
+}
+
+interface NodePingProbeColumnarView {
+  node_id: string;
+  targets: PingProbeTargetColumnarSeries[];
+}
+
+function expandNodePingProbeSeries(view: NodePingProbeColumnarView): NodePingProbeView {
+  return {
+    node_id: view.node_id,
+    targets: view.targets.map(target => {
+      if (
+        target.attempted.length !== target.probed_at_unix_secs.length ||
+        target.latency_us.length !== target.probed_at_unix_secs.length
+      ) {
+        throw new Error(`PING 图表列长度不一致：${target.address}`);
+      }
+      return {
+        name: target.name,
+        address: target.address,
+        samples: target.probed_at_unix_secs.map((probed_at_unix_secs, index) => ({
+          probed_at_unix_secs,
+          attempted: target.attempted[index],
+          latency_us: target.latency_us[index],
+        })),
+      };
+    }),
+  };
+}
+
 export const fetchNodePingProbeList = (windowSecs = 3600, token = '') =>
   api<{ nodes: NodePingProbeView[] }>(`/ping-probe/nodes?window_secs=${windowSecs}`, token);
 
-export const fetchNodePingProbe = (nodeId: string, windowSecs = 86_400, token = '') =>
-  api<NodePingProbeView>(`/ping-probe/nodes/${encodeURIComponent(nodeId)}?window_secs=${windowSecs}`, token);
+export interface PingProbeTargetLatest extends PingProbeTarget {
+  latest: PingProbePoint | null;
+}
 
-export const fetchNodePingProbeRange = (nodeId: string, startUnixSecs: number, endUnixSecs: number, token = '') =>
-  api<NodePingProbeView>(
-    `/ping-probe/nodes/${encodeURIComponent(nodeId)}?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}`,
+export interface NodePingProbeLatestView {
+  node_id: string;
+  targets: PingProbeTargetLatest[];
+}
+
+export interface NodePingProbeLatestList {
+  interval_secs: number;
+  nodes: NodePingProbeLatestView[];
+}
+
+export const fetchLatestNodePingProbes = (token = '') =>
+  api<NodePingProbeLatestList>('/ping-probe/nodes/latest', token);
+
+export const fetchNodePingProbe = (nodeId: string, windowSecs = 86_400, token = '', signal?: AbortSignal) =>
+  api<NodePingProbeColumnarView>(
+    `/ping-probe/nodes/${encodeURIComponent(nodeId)}/series?window_secs=${windowSecs}`,
     token,
-  );
+    { signal },
+  ).then(expandNodePingProbeSeries);
+
+export const fetchNodePingProbeRange = (
+  nodeId: string,
+  startUnixSecs: number,
+  endUnixSecs: number,
+  token = '',
+  signal?: AbortSignal,
+) =>
+  api<NodePingProbeColumnarView>(
+    `/ping-probe/nodes/${encodeURIComponent(nodeId)}/series?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}`,
+    token,
+    { signal },
+  ).then(expandNodePingProbeSeries);
 
 export const fetchLinkQuality = (chainId?: string, token = '') =>
   api<{ hops: HopLinkView[] }>(`/links/quality${chainId ? `?chain_id=${encodeURIComponent(chainId)}` : ''}`, token);

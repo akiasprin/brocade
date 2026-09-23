@@ -54,7 +54,7 @@ it('直接显示保存的配置差异，不按同一修订重新生成两份相�
     { state: 'present', sha256: 'after', content: '{"serverNames":["new.example","old.example"]}' },
   );
   await view.findByText('测试节点');
-  fireEvent.click(view.getByText('xray.json'));
+  fireEvent.click(view.getByRole('button', { name: /xray\.json/ }));
   expect(view.container.querySelector('tr.del')?.textContent).toContain('["old.example","new.example"]');
   expect(view.container.querySelector('tr.add')?.textContent).toContain('["new.example","old.example"]');
 });
@@ -65,7 +65,7 @@ it('旧原文缺失时显示实际哈希，不把未知基线当成没有变化'
     { state: 'present', sha256: 'after-hash', content: '{}' },
   );
   await view.findByText('测试节点');
-  fireEvent.click(view.getByText('xray.json'));
+  fireEvent.click(view.getByRole('button', { name: /xray\.json/ }));
   expect(view.getByText('before-hash')).toBeTruthy();
   expect(view.getByText('after-hash')).toBeTruthy();
   expect(view.container.querySelectorAll('tr.add')).toHaveLength(0);

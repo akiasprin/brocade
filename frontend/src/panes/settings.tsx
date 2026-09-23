@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   DEFAULT_HOP_MUX,
   DEFAULT_REVERSE_HEALTH,
+  MIN_AGENT_PROTOCOL_VERSION,
   type ReverseHealthPolicy,
   type ReverseHealthOverride,
   fetchCerts,
@@ -16,9 +17,14 @@ import {
   fetchDistribution,
   fetchAgentLogPolicy,
   fetchLinkMtu,
+  fetchNodes,
   fetchSettings,
   hopMuxError,
   fetchPingProbeSettings,
+  fetchTunnelProbeCapability,
+  fetchTunnelProbes,
+  fetchVpngateOverview,
+  startVpngateIntelligenceRefresh,
   saveDistribution,
   saveAgentLogDefault,
   saveNodeLogPolicy,
@@ -27,6 +33,10 @@ import {
   saveSettings,
   savePingProbeSettings,
   setVisitorAccess,
+  updateVpngateIntelligenceNode,
+  updateVpngateAdmissionPolicy,
+  updateVpngateIntelligenceCredentials,
+  updateVpngateIntelligencePolicy,
   createCertGroup,
   deleteCertificate,
   deleteCertGroup,
@@ -45,16 +55,28 @@ import {
   type LinkMtuItem,
   type HopMux,
   type ModelSettings,
+  type NodeAgentStateItem,
   type PingProbeSettings,
+  type VpngateAdmissionPolicy,
+  type VpngateIntelligencePolicy,
+  type VpngateIpProvider,
+  type VpngateOverview,
 } from '../api';
 import { draft } from '../draft';
 import { can, useSession } from '../session';
-import { ErrorBox, Loading } from '../ui/bits';
+import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
 import { BrandIcon } from '../ui/branding';
 import { PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
+import { LOG_MAX_MIB, LOG_MIN_MIB, validLogMib } from '../ui/log-policy';
 import { SettingsParameterSummary } from '../ui/settings-parameter-summary';
+import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { REALITY_FINGERPRINT_OPTIONS } from '../reality';
+import { TunnelProbeSettingsSection } from '../tunnel-probe';
+
+// Kept as re-exports for callers that used the settings module before the values moved into a
+// lightweight shared module.
+export { LOG_MAX_MIB, LOG_MIN_MIB, validLogMib } from '../ui/log-policy';
 
 /* 空串表示不设置该项（服务端类型为 Option<T>），不应将空串作为 "" 提交 */
 const text = (v: string | null) => v ?? '';
@@ -265,52 +287,31 @@ const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
   geodata: ['geodataCron', 'geodataGeoip', 'geodataGeosite'],
 };
 
-/* 保存之后会发生什么，四类。段标题里只写结果，原因写在段自己的说明里。
- *
- * 这是九段之间最大的一处差别，此前它只出现在每段说明的末尾（「不盖修订，保存即生效」
- * 「修改本段需要发布一次」），与其余的说明同为一句灰色小字，需要读完整句才能得知。 */
-type Apply = 'now' | 'publish' | 'cycle' | 'future';
-
-const APPLY: Record<Apply, string> = {
-  now: '保存即生效',
-  publish: '需要发布',
-  cycle: '下一轮生效',
-  future: '仅影响新建',
-};
-
-/* 标题图标与机器配置、链路设置共用同一套线稿图标。设置项仍按两栏顺序排列；
- * 生效方式是段自身的属性，由标题右侧的徽章说明。 */
-type NavItem = { id: string; label: string; icon: IconName; apply: Apply; key?: SectionKey };
+/* 标题图标与机器配置、链路设置共用同一套线稿图标。设置项仍按两栏顺序排列。 */
+type NavItem = { id: string; label: string; icon: IconName; key?: SectionKey };
 
 const NAV: NavItem[] = [
-  { id: 'set-branding', label: '站点外观', icon: 'settings', apply: 'now' },
-  { id: 'set-visitor', label: '访客模式', icon: 'access', apply: 'now' },
-  { id: 'set-dist', label: '分发', icon: 'deploy', apply: 'now' },
-  { id: 'set-agent-logs', label: '日志保留', icon: 'artifacts', apply: 'cycle' },
-  { id: 'set-cert', label: '证书', icon: 'certificate', apply: 'now' },
-  { id: 'set-xray', label: 'XRAY', icon: 'protocol', apply: 'publish', key: 'xray' },
-  { id: 'set-conn', label: '连接策略', icon: 'config', apply: 'publish', key: 'connection' },
-  { id: 'set-wg', label: 'WireGuard', icon: 'tunnels', apply: 'publish', key: 'wireguard' },
-  { id: 'set-ports', label: '端口分配', icon: 'ingress', apply: 'future', key: 'ports' },
+  { id: 'set-branding', label: '站点外观', icon: 'settings' },
+  { id: 'set-visitor', label: '访客模式', icon: 'access' },
+  { id: 'set-dist', label: '分发', icon: 'deploy' },
+  { id: 'set-agent-logs', label: '日志保留', icon: 'artifacts' },
+  { id: 'set-cert', label: '证书', icon: 'certificate' },
+  { id: 'set-xray', label: 'XRAY', icon: 'protocol', key: 'xray' },
+  { id: 'set-conn', label: '连接策略', icon: 'config', key: 'connection' },
+  { id: 'set-wg', label: 'WireGuard', icon: 'tunnels', key: 'wireguard' },
+  { id: 'set-ports', label: '端口分配', icon: 'ingress', key: 'ports' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
-  { id: 'set-probe', label: '端到端探测', icon: 'observe', apply: 'cycle', key: 'probe' },
-  { id: 'set-ping-probe', label: 'Ping 链路探测', icon: 'diag', apply: 'cycle' },
-  { id: 'set-geodata', label: '规则库更新', icon: 'dns', apply: 'publish', key: 'geodata' },
+  { id: 'set-probe', label: '端到端探测', icon: 'observe', key: 'probe' },
+  { id: 'set-ping-probe', label: 'Ping 链路探测', icon: 'diag' },
+  { id: 'set-geodata', label: '规则库更新', icon: 'dns', key: 'geodata' },
+  { id: 'set-tunnel-probes', label: '隧道监测', icon: 'tunnels' },
+  { id: 'set-vpngate-intelligence', label: '情报任务', icon: 'observe' },
 ];
 
-const APPLY_OF: Record<string, Apply> = Object.fromEntries(NAV.map(item => [item.id, item.apply]));
 const ICON_OF: Record<string, IconName> = Object.fromEntries(NAV.map(item => [item.id, item.icon]));
 
 function SettingsTitle({ id, children }: { id: string; children: React.ReactNode }) {
   return <PanelTitle of={ICON_OF[id]}>{children}</PanelTitle>;
-}
-
-/** 段标题里的生效方式。复用全站状态签：即时生效是完成态，需要发布是待处理态，
-    下一轮生效保持中性，避免再造一套外观相近但语义不同的徽章。 */
-function ApplyBadge({ id }: { id: string }) {
-  const kind = APPLY_OF[id];
-  const tone = kind === 'now' ? 'st-ok' : kind === 'publish' ? 'st-gold' : kind === 'cycle' ? 'st-pending' : '';
-  return <span className={`st settings-apply-status ${tone}`}>{APPLY[kind]}</span>;
 }
 
 function SettingsSaveBar({
@@ -454,7 +455,7 @@ function MtuProbe() {
             </tbody>
           </table>
           <p className="note" style={{ marginTop: 8 }}>
-            建议值 = 最小路径 MTU 减去 wg 封装开销，采纳要去节点面逐台改。开销不是一个常数， 随<b>对端</b>
+            建议值 = 最小路径 MTU 减去 wg 封装开销，采纳要去机器面逐台改。开销不是一个常数， 随<b>对端</b>
             的入口形态变：直连 v4 是 60（IP 20 + UDP 8 + wg 32）；对端走 phantun 假 TCP 就是 72——TCP 头顶掉 UDP 头，多
             12 字节；落点有 AAAA 记录的各再加 20 （wg 可能走 v6，宁可把建议值算小）。所以两台的建议值差 12 或 20
             是正常的， 不是哪一条探歪了。
@@ -535,14 +536,15 @@ function Section({
     <section className="panel config-panel" id={id}>
       <header>
         <SettingsTitle id={id}>{name}</SettingsTitle>
-        <ApplyBadge id={id} />
       </header>
       <p className="cardsub">{sub}</p>
       {children}
       <SettingsSaveBar
         dirty={dirty}
         saving={saving}
-        savedText={savedRev !== null ? `已保存，盖出修订 ${savedRev}` : null}
+        savedText={
+          savedRev !== null ? (savedRev === 0 ? '已加入变更集，尚未提交' : `已保存，盖出修订 ${savedRev}`) : null
+        }
         editable={editable}
         disabled={validationError !== null}
         title={validationError ?? undefined}
@@ -659,8 +661,8 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
     f.directory !== storedDirectory ||
     f.contact.trim() !== (d?.acme_contact ?? '') ||
     Number(f.renew) !== (d?.renew_before_days ?? 30);
+  useUnsavedChanges(dirty, '证书签发配置');
 
-  const staging = f.directory === view.letsencrypt_staging;
   const publicCaConfigured = d?.signing_method === 'public-ca';
   return (
     <section className="panel config-panel" id="set-cert">
@@ -759,22 +761,16 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           <div className="setfld">
             <label>签发环境</label>
             <div className="v">
-              <span className={dirty && f.directory !== storedDirectory ? 'segsw chg' : 'segsw'} role="group">
-                <button
-                  type="button"
-                  aria-pressed={!staging}
-                  onClick={() => setForm({ ...f, directory: view.letsencrypt })}
-                >
-                  正式
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={staging}
-                  onClick={() => setForm({ ...f, directory: view.letsencrypt_staging })}
-                >
-                  staging
-                </button>
-              </span>
+              <SegmentedControl
+                value={f.directory}
+                options={[
+                  { value: view.letsencrypt, label: '正式' },
+                  { value: view.letsencrypt_staging, label: 'staging' },
+                ]}
+                className={dirty && f.directory !== storedDirectory ? 'chg' : undefined}
+                ariaLabel="签发环境"
+                onChange={directory => setForm({ ...f, directory })}
+              />
             </div>
           </div>
 
@@ -858,6 +854,28 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
   const [pending, setPending] = useState<string | null>(null);
   const [resultText, setResultText] = useState<string | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
+  const createGuardScope = 'certificate-group:create';
+  const editGuardScope = editing ? `certificate-group:edit:${editing.id}` : 'certificate-group:edit';
+  const creatingDirty =
+    creating !== null &&
+    (creating.name !== '' ||
+      creating.note !== '' ||
+      creating.certificateName !== '' ||
+      creating.signingMethod !== null);
+  const editedGroup = editing ? view.groups.find(group => group.id === editing.id) : undefined;
+  const editingDirty =
+    editing !== null &&
+    editedGroup !== undefined &&
+    (editing.name !== editedGroup.name || editing.note !== (editedGroup.note ?? ''));
+  useUnsavedChanges(creatingDirty, '新证书组', createGuardScope);
+  useUnsavedChanges(editingDirty, `${editedGroup?.name ?? '证书组'}的信息`, editGuardScope);
+
+  const cancelCreating = () => {
+    if (confirmDiscardChanges(createGuardScope)) setCreating(null);
+  };
+  const cancelEditing = () => {
+    if (confirmDiscardChanges(editGuardScope)) setEditing(null);
+  };
   // Unlike the section saves, these actions are plain promises rather than useMutation.
   // Keep a synchronous lock as well as disabled buttons: two click events can be delivered before
   // React commits the pending render, and asking for one spare must never create two rows.
@@ -918,7 +936,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
             publicCaConfigured={publicCaConfigured}
             busy={pending !== null}
             onChange={setCreating}
-            onCancel={() => setCreating(null)}
+            onCancel={cancelCreating}
             onSave={() => {
               run(
                 'create-group',
@@ -983,7 +1001,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
           publicCaConfigured={publicCaConfigured}
           busy={pending !== null}
           onChange={setCreating}
-          onCancel={() => setCreating(null)}
+          onCancel={cancelCreating}
           onSave={() => {
             run(
               'create-group',
@@ -1062,6 +1080,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   disabled={!editable || pending !== null || group.is_default}
                   title={group.is_default ? '默认自签证书组名称固定' : '修改证书组名称'}
                   onClick={() => {
+                    if (!confirmDiscardChanges(editGuardScope)) return;
                     openGroup(group.id);
                     setEditing({
                       id: group.id,
@@ -1147,7 +1166,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                   value={editing}
                   busy={pending !== null}
                   onChange={next => setEditing({ ...next, id: group.id })}
-                  onCancel={() => setEditing(null)}
+                  onCancel={cancelEditing}
                   onSave={() => {
                     run(
                       `update-group:${group.id}`,
@@ -1360,24 +1379,16 @@ function GroupForm({
         <div className="cert-group-method">
           <span>证书类型</span>
           <div className="v">
-            <span className="segsw" role="group" aria-label="证书组类型">
-              <button
-                type="button"
-                aria-pressed={value.signingMethod === 'self-signed'}
-                disabled={busy}
-                onClick={() => onChange({ ...value, signingMethod: 'self-signed' })}
-              >
-                自签证书
-              </button>
-              <button
-                type="button"
-                aria-pressed={value.signingMethod === 'public-ca'}
-                disabled={busy}
-                onClick={() => onChange({ ...value, signingMethod: 'public-ca' })}
-              >
-                Let&apos;s Encrypt + Cloudflare DNS
-              </button>
-            </span>
+            <SegmentedControl<CertificateTrack | ''>
+              value={value.signingMethod ?? ''}
+              options={[
+                { value: 'self-signed', label: '自签证书' },
+                { value: 'public-ca', label: "Let's Encrypt + Cloudflare DNS" },
+              ]}
+              disabled={busy}
+              ariaLabel="证书组类型"
+              onChange={signingMethod => signingMethod && onChange({ ...value, signingMethod })}
+            />
             <span className={publicCaUnavailable ? 'hint bad' : 'hint'}>
               {value.signingMethod === null
                 ? '请选择这个证书组的类型。'
@@ -1447,6 +1458,7 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
   const [savedAt, setSavedAt] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
   const dirty = f.site_name !== data.site_name || f.icon_data_url !== data.icon_data_url;
+  useUnsavedChanges(dirty, '站点外观');
   const save = useMutation({
     onMutate: () => qc.cancelQueries({ queryKey: ['branding'] }),
     mutationFn: (submitted: BrandingSettings) => saveBranding(submitted),
@@ -1486,7 +1498,6 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
     <section className="panel config-panel" id="set-branding">
       <header>
         <SettingsTitle id="set-branding">站点外观</SettingsTitle>
-        <ApplyBadge id="set-branding" />
       </header>
       <p className="cardsub">控制台左上角使用这里的名称和图标；它们也同步到登录页和浏览器标签页</p>
       {save.error && <ErrorBox error={save.error} />}
@@ -1553,31 +1564,22 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
     <section className="panel config-panel" id="set-visitor">
       <header>
         <SettingsTitle id="set-visitor">访客模式</SettingsTitle>
-        <ApplyBadge id="set-visitor" />
         <span className="sp" />
       </header>
       <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客</p>
       {update.error && <ErrorBox error={update.error} />}
       <Group label="公开访问">
         <Fld label="访问状态">
-          <span className="segsw" role="group">
-            <button
-              type="button"
-              aria-pressed={!enabled}
-              disabled={!editable || update.isPending}
-              onClick={() => update.mutate(false)}
-            >
-              关闭
-            </button>
-            <button
-              type="button"
-              aria-pressed={enabled}
-              disabled={!editable || update.isPending}
-              onClick={() => update.mutate(true)}
-            >
-              开启
-            </button>
-          </span>
+          <SegmentedControl
+            value={enabled}
+            options={[
+              { value: false, label: '关闭' },
+              { value: true, label: '开启' },
+            ]}
+            disabled={!editable || update.isPending}
+            ariaLabel="访客模式"
+            onChange={next => update.mutate(next)}
+          />
           <span className="hint">管理员和用户登录不受影响</span>
         </Fld>
       </Group>
@@ -1606,6 +1608,7 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
   const stored = data.stored;
   const effective = data.effective;
   const dirty = f.url !== (stored.agent_public_url ?? '');
+  useUnsavedChanges(dirty, 'Agent 分发地址');
   // 地址留空会回退到进程启动时的环境变量，因此仍显示实际值，避免把空输入框误解为未配置。
   const fallbackNote = (own: string | null, live: string | null) =>
     !own && live ? <span className="hint">当前生效：{live}（来自环境变量）</span> : null;
@@ -1614,11 +1617,10 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
     <section className="panel config-panel" id="set-dist">
       <header>
         <SettingsTitle id="set-dist">分发</SettingsTitle>
-        <ApplyBadge id="set-dist" />
       </header>
-      <p className="cardsub">节点从哪里访问这台控制面，以及当前控制台内置的 XRAY 构建</p>
+      <p className="cardsub">机器从哪里访问这台控制面，以及当前控制台内置的 XRAY 构建</p>
       {save.error && <ErrorBox error={save.error} />}
-      <Group label="节点分发">
+      <Group label="机器分发">
         <Fld label="Agent 请求地址">
           <input
             className={dirty && f.url !== (stored.agent_public_url ?? '') ? 'f chg' : 'f'}
@@ -1637,7 +1639,8 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
           <span className="hint">随当前控制台构建提供，不支持在设置中覆盖</span>
         </Fld>
         <div className="guard">
-          版本与二进制由控制台一同内置，节点安装时会校验文件摘要。升级 XRAY 需要部署包含目标构建的新控制台。
+          版本与二进制由控制台一同内置，机器安装时会校验文件摘要。升级 XRAY
+          时先部署包含目标构建的新控制台，再到发布页创建灰度发布。
         </div>
       </Group>
       <SettingsSaveBar
@@ -1650,17 +1653,6 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
     </section>
   );
 }
-
-/* 机器详情页的「本机覆盖」卡也编辑这一项，取值范围由此处导出而非各自写一份：
-   两处写同一个数字时，改动只会落在其中一处，另一处把服务端会拒绝的值显示为合法。 */
-export const LOG_MIN_MIB = 16;
-export const LOG_MAX_MIB = 4096;
-
-export const validLogMib = (raw: string) => {
-  if (!/^\d+$/.test(raw.trim())) return null;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value >= LOG_MIN_MIB && value <= LOG_MAX_MIB ? value : null;
-};
 
 type AgentLogKey = keyof AgentLogLimits;
 type AgentLogForm = Record<AgentLogKey, string>;
@@ -1746,6 +1738,7 @@ export function NodeLogPolicyRow({
   const baseline = logOverrideForm(node.overrides);
   const next = parsedLogOverrides(form);
   const dirty = AGENT_LOG_CLASSES.some(item => form[item.key].trim() !== baseline[item.key]);
+  useUnsavedChanges(dirty, `${node.name} 的日志保留`);
   const overrideCount = AGENT_LOG_CLASSES.filter(item => node.overrides[item.key] !== null).length;
   const clear: AgentLogLimitOverrides = { agent_journal_mib: null, xray_mib: null, phantun_mib: null };
 
@@ -1821,6 +1814,7 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
   const { form, setForm, accept } = useServerForm(logLimitForm(data.global));
   const limits = parsedLogLimits(form);
   const dirty = limits !== null && AGENT_LOG_CLASSES.some(item => limits[item.key] !== data.global[item.key]);
+  useUnsavedChanges(dirty, '全局日志保留');
   const save = useMutation({
     onMutate: () => qc.cancelQueries({ queryKey: ['agent-log-policy'] }),
     mutationFn: (submitted: AgentLogForm) => saveAgentLogDefault(parsedLogLimits(submitted)!),
@@ -1835,7 +1829,6 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
     <section className="panel config-panel agent-log-policy" id="set-agent-logs">
       <header>
         <SettingsTitle id="set-agent-logs">日志保留</SettingsTitle>
-        <ApplyBadge id="set-agent-logs" />
       </header>
       <p className="cardsub">只设置全局默认值；单台机器的覆盖项在对应机器配置中管理</p>
       {save.error && <ErrorBox error={save.error} />}
@@ -1948,6 +1941,7 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
     targets: form.targets.map(target => ({ name: target.name.trim(), address: target.address.trim() })),
   };
   const dirty = JSON.stringify(normalized) !== JSON.stringify(data);
+  useUnsavedChanges(dirty, 'Ping 链路探测');
   const invalid = pingProbeFormError(normalized);
   const save = useMutation({
     onMutate: () => qc.cancelQueries({ queryKey: ['ping-probe-settings'] }),
@@ -1977,78 +1971,83 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
     <section className="panel config-panel ping-probe-settings" id="set-ping-probe">
       <header>
         <SettingsTitle id="set-ping-probe">Ping 链路探测</SettingsTitle>
-        <ApplyBadge id="set-ping-probe" />
       </header>
-      <p className="cardsub">统一配置巡检节奏与目标；TCP Connect 和 ICMP Echo 共用一张目标清单</p>
+      <p className="cardsub">机器到指定目标的周期探测</p>
       {save.error && <ErrorBox error={save.error} />}
-      <div className="setgrp settings-block ping-probe-schedule" aria-label="Ping 探测调度">
-        <p className="eyebrow">探测节奏</p>
-        <div className="ping-probe-schedule-grid">
-          <label className="ping-probe-timing">
-            <span>巡检周期</span>
-            <div>
-              <input
-                className="f"
-                aria-label="探测间隔"
-                type="number"
-                min={5}
-                max={86_400}
-                value={form.interval_secs}
-                onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
-              />
-              <b>秒</b>
-            </div>
-            <small>默认 60；每轮每个目标各探测一次</small>
-          </label>
-          <label className="ping-probe-timing">
-            <span>单次超时</span>
-            <div>
-              <input
-                className="f"
-                aria-label="探测超时"
-                type="number"
-                min={1}
-                max={120_000}
-                value={form.timeout_ms}
-                onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
-              />
-              <b>ms</b>
-            </div>
-            <small>默认 420；超过后记为无响应</small>
-          </label>
-        </div>
-      </div>
-      <section className="setgrp settings-block ping-probe-target-section">
-        <p className="eyebrow">探测目标</p>
-        <div className="ping-probe-target-toolbar">
-          <span className="hint">已配置 {form.targets.length}/32</span>
-          <div className="ping-probe-add">
-            {(['tcp', 'icmp'] as const).map(protocol => (
-              <button
-                className="btn sm"
-                type="button"
-                key={protocol}
-                disabled={!editable || form.targets.length >= 32}
-                onClick={() =>
-                  setForm(current => ({
-                    ...current,
-                    targets: [...current.targets, { name: '', address: `${protocol}://` }],
-                  }))
-                }
-              >
-                ＋ {protocol.toUpperCase()}
-              </button>
-            ))}
+      <div className="setgrp settings-block ping-probe-settings-block">
+        <div className="setgrp ping-probe-schedule" aria-label="Ping 探测调度">
+          <p className="eyebrow">探测节奏</p>
+          <div className="ping-probe-schedule-grid">
+            <label className="ping-probe-timing">
+              <span>巡检周期</span>
+              <div>
+                <input
+                  className="f"
+                  aria-label="探测间隔"
+                  type="number"
+                  min={5}
+                  max={86_400}
+                  value={form.interval_secs}
+                  onChange={event => setForm({ ...form, interval_secs: Number(event.target.value) })}
+                />
+                <b>秒</b>
+              </div>
+            </label>
+            <label className="ping-probe-timing">
+              <span>单次超时</span>
+              <div>
+                <input
+                  className="f"
+                  aria-label="探测超时"
+                  type="number"
+                  min={1}
+                  max={120_000}
+                  value={form.timeout_ms}
+                  onChange={event => setForm({ ...form, timeout_ms: Number(event.target.value) })}
+                />
+                <b>ms</b>
+              </div>
+            </label>
           </div>
         </div>
-        <div className="ping-probe-targets">
-          {form.targets.map((target, index) => (
-            <div className="ping-probe-target" key={index}>
-              <span className="ping-probe-kind">
-                {target.address.startsWith('icmp://') ? 'ICMP' : target.address.startsWith('tcp://') ? 'TCP' : '—'}
-              </span>
-              <label>
-                <span>名称</span>
+        <section className="setgrp ping-probe-target-section">
+          <div className="ping-probe-target-toolbar">
+            <p className="eyebrow">
+              探测目标 <span>{form.targets.length}/32</span>
+            </p>
+            <div className="ping-probe-add">
+              {(['tcp', 'icmp'] as const).map(protocol => (
+                <button
+                  className="btn sm"
+                  type="button"
+                  key={protocol}
+                  disabled={!editable || form.targets.length >= 32}
+                  onClick={() =>
+                    setForm(current => ({
+                      ...current,
+                      targets: [...current.targets, { name: '', address: `${protocol}://` }],
+                    }))
+                  }
+                >
+                  ＋ {protocol.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+          {form.targets.length > 0 && (
+            <div className="ping-probe-target-head" aria-hidden="true">
+              <span>类型</span>
+              <span>名称</span>
+              <span>地址</span>
+              <span />
+            </div>
+          )}
+          <div className="ping-probe-targets">
+            {form.targets.map((target, index) => (
+              <div className="ping-probe-target" key={index}>
+                <span className="ping-probe-kind">
+                  {target.address.startsWith('icmp://') ? 'ICMP' : target.address.startsWith('tcp://') ? 'TCP' : '—'}
+                </span>
                 <input
                   className="f"
                   aria-label={`目标 ${index + 1} 名称`}
@@ -2056,9 +2055,6 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
                   value={target.name}
                   onChange={event => updateTarget(index, 'name', event.target.value)}
                 />
-              </label>
-              <label>
-                <span>地址</span>
                 <input
                   className="f mono"
                   aria-label={`目标 ${index + 1} 地址`}
@@ -2066,35 +2062,31 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
                   value={target.address}
                   onChange={event => updateTarget(index, 'address', event.target.value)}
                 />
-              </label>
-              <button
-                className="btn sm ping-probe-remove"
-                type="button"
-                disabled={!editable}
-                onClick={() =>
-                  setForm(current => ({
-                    ...current,
-                    targets: current.targets.filter((_, targetIndex) => targetIndex !== index),
-                  }))
-                }
-              >
-                移除
-              </button>
-            </div>
-          ))}
-          {form.targets.length === 0 && (
-            <div className="ping-probe-empty-settings">
-              <b>还没有探测目标</b>
-              <span>从右上角添加 TCP 或 ICMP 目标后，机器会在下一轮开始采样。</span>
-            </div>
-          )}
-        </div>
-        {invalid && <span className="agent-log-invalid">{invalid}</span>}
-        <p className="ping-probe-note">
-          两类计时都从域名解析完成后开始。TCP 只计建连，ICMP 只计 Echo 往返；不会采集 DNS 耗时、内核 RTT、RTO、SYN
-          重传或连接错误分类。没有可用 IPv6 路由或 ICMP Socket 权限时记为未探测，不计作丢包。
-        </p>
-      </section>
+                <button
+                  className="btn sm ping-probe-remove"
+                  type="button"
+                  disabled={!editable}
+                  onClick={() =>
+                    setForm(current => ({
+                      ...current,
+                      targets: current.targets.filter((_, targetIndex) => targetIndex !== index),
+                    }))
+                  }
+                >
+                  移除
+                </button>
+              </div>
+            ))}
+            {form.targets.length === 0 && (
+              <div className="ping-probe-empty-settings">
+                <b>还没有探测目标</b>
+                <span>添加 TCP 或 ICMP 目标</span>
+              </div>
+            )}
+          </div>
+          {invalid && <span className="agent-log-invalid">{invalid}</span>}
+        </section>
+      </div>
       <SettingsSaveBar
         dirty={dirty}
         saving={save.isPending}
@@ -2132,19 +2124,29 @@ const Group = ({ label, children, className }: { label?: string; children: React
  * 0 秒会中断正在传输的数据，不应是易于点击的选项），但已设置时正常显示并保留。 */
 const SECS_PICKS = [1, 2, 3, 4, 5];
 
-function Secs({ value, changed, onPick }: { value: string; changed: boolean; onPick: (v: string) => void }) {
+function Secs({
+  value,
+  changed,
+  ariaLabel,
+  onPick,
+}: {
+  value: string;
+  changed: boolean;
+  ariaLabel: string;
+  onPick: (v: string) => void;
+}) {
   const now = Number(value.trim());
   const picks = [...SECS_PICKS];
   if (Number.isFinite(now) && value.trim() !== '' && !picks.includes(now)) picks.push(now);
   picks.sort((a, b) => a - b);
   return (
-    <span className={changed ? 'segsw chg' : 'segsw'} role="group">
-      {picks.map(v => (
-        <button key={v} type="button" aria-pressed={String(v) === value.trim()} onClick={() => onPick(String(v))}>
-          {v}
-        </button>
-      ))}
-    </span>
+    <SegmentedControl
+      value={value.trim()}
+      options={picks.map(v => ({ value: String(v), label: v }))}
+      className={changed ? 'chg' : undefined}
+      ariaLabel={ariaLabel}
+      onChange={onPick}
+    />
   );
 }
 
@@ -2155,6 +2157,418 @@ const Fld = ({ label, children }: { label?: string; children: React.ReactNode })
     <div className="v">{children}</div>
   </div>
 );
+
+function intelligenceEligibility(node: NodeAgentStateItem): { eligible: boolean; reason: string } {
+  if (node.lifecycle_phase !== 'active') return { eligible: false, reason: '机器不在运行生命周期' };
+  if (node.operationally_isolated) return { eligible: false, reason: '机器已隔离' };
+  if (node.agent_protocol_version == null || node.agent_protocol_version < MIN_AGENT_PROTOCOL_VERSION) {
+    return { eligible: false, reason: `需要 Agent 协议 v${MIN_AGENT_PROTOCOL_VERSION} 或更高版本` };
+  }
+  if (!node.runtime_report_fresh) return { eligible: false, reason: '运行状态已过期' };
+  return { eligible: true, reason: '可分发' };
+}
+
+const VPNGATE_PROVIDER_LABEL: Record<VpngateIpProvider, string> = {
+  proxycheck: 'ProxyCheck v3',
+  ffraud: 'FFraud',
+  iplogs: 'IPLogs',
+};
+
+const DEFAULT_VPNGATE_INTELLIGENCE_POLICY: VpngateIntelligencePolicy = {
+  refresh_mode: 'on_change',
+  refresh_interval_hours: 168,
+  active_window_hours: 72,
+  stale_policy: 'retain',
+  stale_after_hours: 168,
+};
+
+function VpngateIntelligenceSection({
+  nodes,
+  admissionPolicy,
+  intelligencePolicy,
+  proxycheckApiKeyConfigured,
+  editable,
+}: {
+  nodes: NodeAgentStateItem[];
+  admissionPolicy: VpngateAdmissionPolicy;
+  intelligencePolicy: VpngateIntelligencePolicy;
+  proxycheckApiKeyConfigured: boolean;
+  editable: boolean;
+}) {
+  const queryClient = useQueryClient();
+  const [proxycheckApiKeyInputs, setProxycheckApiKeyInputs] = useState(['']);
+  const { form: admissionForm, setForm: setAdmissionForm, accept: acceptAdmission } = useServerForm(admissionPolicy);
+  const {
+    form: intelligenceForm,
+    setForm: setIntelligenceForm,
+    accept: acceptIntelligence,
+  } = useServerForm(intelligencePolicy);
+  const admissionDirty = JSON.stringify(admissionForm) !== JSON.stringify(admissionPolicy);
+  const intelligenceDirty = JSON.stringify(intelligenceForm) !== JSON.stringify(intelligencePolicy);
+  useUnsavedChanges(admissionDirty, 'VPN Gate 准入规则', 'vpngate-admission-policy');
+  useUnsavedChanges(intelligenceDirty, 'VPN Gate 情报更新规则', 'vpngate-intelligence-policy');
+  const selection = useMutation({
+    mutationFn: ({ nodeId, enabled }: { nodeId: string; enabled: boolean }) =>
+      updateVpngateIntelligenceNode(nodeId, enabled),
+    onSuccess: result => {
+      queryClient.setQueryData<{ nodes: NodeAgentStateItem[] }>(['nodes'], current =>
+        current
+          ? {
+              nodes: current.nodes.map(node =>
+                node.node_id === result.node_id ? { ...node, vpngate_intelligence_enabled: result.enabled } : node,
+              ),
+            }
+          : current,
+      );
+    },
+  });
+  const savePolicy = useMutation({
+    mutationFn: (submitted: VpngateAdmissionPolicy) => updateVpngateAdmissionPolicy(submitted),
+    onSuccess: (saved, submitted) => {
+      acceptAdmission(saved, submitted);
+      queryClient.setQueryData<VpngateOverview>(['vpngate'], current =>
+        current ? { ...current, admission_policy: saved } : current,
+      );
+    },
+  });
+  const saveIntelligencePolicy = useMutation({
+    mutationFn: (submitted: VpngateIntelligencePolicy) => updateVpngateIntelligencePolicy(submitted),
+    onSuccess: (saved, submitted) => {
+      acceptIntelligence(saved, submitted);
+      queryClient.setQueryData<VpngateOverview>(['vpngate'], current =>
+        current ? { ...current, intelligence_policy: saved } : current,
+      );
+    },
+  });
+  const saveIntelligenceCredentials = useMutation({
+    mutationFn: updateVpngateIntelligenceCredentials,
+    onSuccess: credentials => {
+      setProxycheckApiKeyInputs(['']);
+      queryClient.setQueryData<VpngateOverview>(['vpngate'], current =>
+        current ? { ...current, intelligence_credentials: credentials } : current,
+      );
+    },
+  });
+  const refreshIntelligence = useMutation({
+    mutationFn: startVpngateIntelligenceRefresh,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['vpngate'] }),
+  });
+  const providerScore = (provider: VpngateIpProvider) =>
+    admissionForm.provider_rules.find(rule => rule.provider === provider)?.maximum_score ?? 80;
+  const setProviderScore = (provider: VpngateIpProvider, maximumScore: number) =>
+    setAdmissionForm({
+      ...admissionForm,
+      provider_rules: admissionForm.provider_rules.map(rule =>
+        rule.provider === provider ? { ...rule, maximum_score: maximumScore } : rule,
+      ),
+    });
+  const policyValid =
+    Number.isInteger(admissionForm.minimum_successful_sources) &&
+    admissionForm.minimum_successful_sources >= 1 &&
+    admissionForm.minimum_successful_sources <= 3 &&
+    admissionForm.provider_rules.length === 3 &&
+    admissionForm.provider_rules.every(
+      rule => Number.isInteger(rule.maximum_score) && rule.maximum_score >= 0 && rule.maximum_score <= 100,
+    );
+  const intelligencePolicyValid = [
+    intelligenceForm.active_window_hours,
+    intelligenceForm.refresh_interval_hours,
+    intelligenceForm.stale_after_hours,
+  ].every(hours => Number.isInteger(hours) && hours >= 1 && hours <= 87_600);
+  const proxycheckApiKeys = proxycheckApiKeyInputs.map(key => key.trim());
+  const proxycheckApiKeysValid =
+    proxycheckApiKeys.length >= 1 &&
+    proxycheckApiKeys.length <= 32 &&
+    proxycheckApiKeys.every(key => /^[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{6}){3}$/.test(key)) &&
+    new Set(proxycheckApiKeys).size === proxycheckApiKeys.length;
+  const rows = nodes
+    .map(node => ({ node, eligibility: intelligenceEligibility(node) }))
+    .sort(
+      (left, right) =>
+        Number(right.node.vpngate_intelligence_enabled) - Number(left.node.vpngate_intelligence_enabled) ||
+        Number(right.eligibility.eligible) - Number(left.eligibility.eligible) ||
+        left.node.name.localeCompare(right.node.name),
+    );
+  const selected = rows.filter(row => row.node.vpngate_intelligence_enabled).length;
+  return (
+    <section className="panel config-panel vpngate-intelligence-settings" id="set-vpngate-intelligence">
+      <header>
+        <SettingsTitle id="set-vpngate-intelligence">情报任务</SettingsTitle>
+        <span className="vpngate-selected-count">{selected} 台 Agent</span>
+      </header>
+      <p className="cardsub">集中管理 VPN Gate 目录情报与出口 IP 情报</p>
+      <div className="vpngate-intelligence-layout">
+        <section className="setgrp settings-block vpngate-settings-section vpngate-intelligence-policy-card">
+          <div className="vpngate-settings-card-head">
+            <p className="eyebrow">出口 IP 情报</p>
+            <button
+              type="button"
+              className="btn sm"
+              disabled={!editable || refreshIntelligence.isPending}
+              onClick={() => refreshIntelligence.mutate()}
+            >
+              {refreshIntelligence.isPending ? '排队中…' : '立即刷新'}
+            </button>
+          </div>
+          <Fld label="ProxyCheck API">
+            <div className="vpngate-api-key-list" role="group" aria-label="ProxyCheck API 密钥">
+              {proxycheckApiKeyInputs.map((key, index) => (
+                <div className="vpngate-api-key-row" key={index}>
+                  <input
+                    className="f vpngate-api-key"
+                    type="password"
+                    autoComplete="new-password"
+                    aria-label={`ProxyCheck API 密钥 ${index + 1}`}
+                    placeholder={
+                      index === 0 && proxycheckApiKeyConfigured ? '输入要追加的新密钥' : 'xxxxxx-xxxxxx-xxxxxx-xxxxxx'
+                    }
+                    value={key}
+                    onChange={event =>
+                      setProxycheckApiKeyInputs(current =>
+                        current.map((item, itemIndex) => (itemIndex === index ? event.target.value : item)),
+                      )
+                    }
+                  />
+                  {proxycheckApiKeyInputs.length > 1 && (
+                    <button
+                      type="button"
+                      className="btn sm vpngate-api-key-remove"
+                      aria-label={`移除 ProxyCheck API 密钥 ${index + 1}`}
+                      disabled={!editable || saveIntelligenceCredentials.isPending}
+                      onClick={() =>
+                        setProxycheckApiKeyInputs(current => current.filter((_, itemIndex) => itemIndex !== index))
+                      }
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="vpngate-api-key-actions">
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={!editable || proxycheckApiKeyInputs.length >= 32 || saveIntelligenceCredentials.isPending}
+                  onClick={() => setProxycheckApiKeyInputs(current => [...current, ''])}
+                >
+                  ＋ 添加密钥
+                </button>
+                <button
+                  type="button"
+                  className="btn sm primary"
+                  disabled={!editable || !proxycheckApiKeysValid || saveIntelligenceCredentials.isPending}
+                  onClick={() => saveIntelligenceCredentials.mutate(proxycheckApiKeys)}
+                >
+                  {saveIntelligenceCredentials.isPending ? '追加中…' : '追加到 Key 池'}
+                </button>
+              </div>
+            </div>
+            <span className="hint">
+              {proxycheckApiKeyConfigured ? '已配置；旧 Key 不回显，追加不会覆盖' : '未配置'} · 最多 32 个，随机起点轮换
+            </span>
+          </Fld>
+          {saveIntelligenceCredentials.error && <ErrorBox error={saveIntelligenceCredentials.error} />}
+          <Fld label="查询策略">
+            <SegmentedControl
+              value={intelligenceForm.refresh_mode}
+              options={[
+                { value: 'on_change', label: '仅出口变化时' },
+                { value: 'periodic', label: '定期刷新' },
+              ]}
+              ariaLabel="IP 情报查询策略"
+              onChange={refresh_mode => setIntelligenceForm({ ...intelligenceForm, refresh_mode })}
+            />
+          </Fld>
+          {intelligenceForm.refresh_mode === 'periodic' && (
+            <Fld label="刷新周期">
+              <input
+                className="f vpngate-hours-input"
+                aria-label="IP 情报刷新周期间隔"
+                type="number"
+                min={1}
+                max={87_600}
+                value={intelligenceForm.refresh_interval_hours}
+                onChange={event =>
+                  setIntelligenceForm({ ...intelligenceForm, refresh_interval_hours: Number(event.target.value) })
+                }
+              />
+              <span>小时</span>
+            </Fld>
+          )}
+          <Fld label="可拨窗口">
+            <input
+              className="f vpngate-hours-input"
+              aria-label="纳入 IP 情报更新的最后成功拨通小时数"
+              type="number"
+              min={1}
+              max={87_600}
+              value={intelligenceForm.active_window_hours}
+              onChange={event =>
+                setIntelligenceForm({ ...intelligenceForm, active_window_hours: Number(event.target.value) })
+              }
+            />
+            <span className="unit">小时</span>
+          </Fld>
+          <Fld label="旧情报">
+            <select
+              className="f"
+              value={intelligenceForm.stale_policy}
+              onChange={event =>
+                setIntelligenceForm({
+                  ...intelligenceForm,
+                  stale_policy: event.target.value as VpngateIntelligencePolicy['stale_policy'],
+                })
+              }
+            >
+              <option value="retain">继续使用最近一次成功结果</option>
+              <option value="mark">标记陈旧但继续使用</option>
+              <option value="reject">超过期限后禁止准入</option>
+            </select>
+          </Fld>
+          {intelligenceForm.stale_policy !== 'retain' && (
+            <Fld label="陈旧期限">
+              <input
+                className="f vpngate-hours-input"
+                aria-label="IP 情报陈旧期限"
+                type="number"
+                min={1}
+                max={87_600}
+                value={intelligenceForm.stale_after_hours}
+                onChange={event =>
+                  setIntelligenceForm({ ...intelligenceForm, stale_after_hours: Number(event.target.value) })
+                }
+              />
+              <span className="unit">小时</span>
+            </Fld>
+          )}
+          <SettingsSaveBar
+            dirty={intelligenceDirty}
+            saving={saveIntelligencePolicy.isPending}
+            savedText={saveIntelligencePolicy.isSuccess ? '更新规则已保存' : null}
+            editable={editable}
+            disabled={!intelligencePolicyValid}
+            title={intelligencePolicyValid ? undefined : '小时数必须是 1–87600 的整数'}
+            label="保存更新规则"
+            onSave={() => saveIntelligencePolicy.mutate(intelligenceForm)}
+          />
+          {saveIntelligencePolicy.error && <ErrorBox error={saveIntelligencePolicy.error} />}
+          {refreshIntelligence.data && (
+            <p className="hint">已将 {refreshIntelligence.data.queued} 个当前可拨出口加入刷新队列。</p>
+          )}
+          {refreshIntelligence.error && <ErrorBox error={refreshIntelligence.error} />}
+        </section>
+
+        <section className="setgrp settings-block vpngate-settings-section vpngate-admission-settings">
+          <p className="eyebrow">准入规则</p>
+          <div className="vpngate-admission-grid">
+            <Fld label="成功来源">
+              <select
+                className="f"
+                value={admissionForm.minimum_successful_sources}
+                onChange={event =>
+                  setAdmissionForm({ ...admissionForm, minimum_successful_sources: Number(event.target.value) })
+                }
+              >
+                <option value={1}>1 家（任一来源即可）</option>
+                <option value={2}>2 家</option>
+                <option value={3}>3 家</option>
+              </select>
+            </Fld>
+            <Fld label="地区判断">
+              <select
+                className="f"
+                value={admissionForm.country_policy}
+                onChange={event =>
+                  setAdmissionForm({
+                    ...admissionForm,
+                    country_policy: event.target.value as VpngateAdmissionPolicy['country_policy'],
+                  })
+                }
+              >
+                <option value="any_match">任一来源匹配即可</option>
+                <option value="all_match">所有已返回来源都要匹配</option>
+                <option value="ignore">不检查地区</option>
+              </select>
+            </Fld>
+            <Fld label="结论组合">
+              <select
+                className="f"
+                value={admissionForm.risk_decision_policy}
+                onChange={event =>
+                  setAdmissionForm({
+                    ...admissionForm,
+                    risk_decision_policy: event.target.value as VpngateAdmissionPolicy['risk_decision_policy'],
+                  })
+                }
+              >
+                <option value="all_available_pass">所有已返回来源分别通过</option>
+                <option value="any_available_pass">任一已返回来源通过</option>
+              </select>
+            </Fld>
+            {(['proxycheck', 'ffraud', 'iplogs'] as const).map(provider => (
+              <Fld label={VPNGATE_PROVIDER_LABEL[provider]} key={provider}>
+                <input
+                  className="f"
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={providerScore(provider)}
+                  onChange={event => setProviderScore(provider, Number(event.target.value))}
+                />
+                <span className="unit">分</span>
+              </Fld>
+            ))}
+          </div>
+          <SettingsSaveBar
+            dirty={admissionDirty}
+            saving={savePolicy.isPending}
+            savedText={savePolicy.isSuccess ? '准入规则已保存' : null}
+            editable={editable}
+            disabled={!policyValid}
+            title={policyValid ? undefined : '来源数量和风险分数超出范围'}
+            label="保存准入规则"
+            onSave={() => savePolicy.mutate(admissionForm)}
+          />
+          {savePolicy.error && <ErrorBox error={savePolicy.error} />}
+        </section>
+
+        <section className="setgrp settings-block vpngate-settings-section vpngate-intelligence-agents">
+          <div className="vpngate-settings-card-head">
+            <p className="eyebrow">情报执行 Agent</p>
+            <span className="vpngate-agent-count">
+              {selected}/{rows.length}
+            </span>
+          </div>
+          <p className="vpngate-intelligence-agent-note">
+            选中的 Agent 同时执行 VPN Gate 上游目录采集和出口 IP 情报查询；无需安装 OpenVPN。
+          </p>
+          <div className="vpngate-intelligence-grid">
+            {rows.map(({ node, eligibility }) => {
+              const busy = selection.isPending && selection.variables?.nodeId === node.node_id;
+              return (
+                <label className="vpngate-intelligence-node" key={node.node_id}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(node.vpngate_intelligence_enabled)}
+                    disabled={!editable || busy || (!eligibility.eligible && !node.vpngate_intelligence_enabled)}
+                    onChange={event => selection.mutate({ nodeId: node.node_id, enabled: event.currentTarget.checked })}
+                  />
+                  <span>
+                    <b>{node.name}</b>
+                    <small className="mono">{node.node_id}</small>
+                  </span>
+                  {!eligibility.eligible && <span className="vpngate-agent-warning">{eligibility.reason}</span>}
+                </label>
+              );
+            })}
+          </div>
+          {rows.length === 0 && <p className="empty">机队中还没有 Agent。</p>}
+          {selection.error && <ErrorBox error={selection.error} />}
+        </section>
+      </div>
+    </section>
+  );
+}
 
 export function SettingsPane() {
   const { who } = useSession();
@@ -2176,6 +2590,19 @@ export function SettingsPane() {
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
   const pingProbe = useQuery({ queryKey: ['ping-probe-settings'], queryFn: fetchPingProbeSettings });
+  const tunnelProbes = useQuery({
+    queryKey: ['tunnel-probes'],
+    queryFn: fetchTunnelProbes,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+  const tunnelProbeCapability = useQuery({
+    queryKey: ['tunnel-probe-capability'],
+    queryFn: fetchTunnelProbeCapability,
+    staleTime: 60_000,
+  });
+  const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const vpngate = useQuery({ queryKey: ['vpngate'], queryFn: fetchVpngateOverview });
   const [form, setForm] = useState<Form>(EMPTY);
   const [saved, setSaved] = useState<Partial<Record<SectionKey, number>>>({});
   const [muxExpanded, setMuxExpanded] = useState(false);
@@ -2197,6 +2624,9 @@ export function SettingsPane() {
       ? { ...pendingSettings, ports: settings.data.ports, probe: settings.data.probe }
       : pendingSettings;
   const pristine = pendingBaseline ? formOf(pendingBaseline) : settings.data ? formOf(settings.data) : null;
+  const modelFormDirty =
+    pristine !== null && Object.values(SECTION_FIELDS).some(fields => fields.some(key => form[key] !== pristine[key]));
+  useUnsavedChanges(modelFormDirty, '全局模型设置');
 
   // Rebase untouched fields when the draft changes or is discarded. Preserve only genuine
   // local edits, so saving one section never clears another section's unfinished input.
@@ -2327,10 +2757,26 @@ export function SettingsPane() {
     certs.isPending ||
     dist.isPending ||
     logPolicy.isPending ||
-    pingProbe.isPending
+    pingProbe.isPending ||
+    tunnelProbes.isPending ||
+    tunnelProbeCapability.isPending ||
+    vpngate.isPending ||
+    nodes.isPending
   )
-    return <Loading />;
-  if (settings.error) return <ErrorBox error={settings.error} />;
+    return <Loading variant="settings" />;
+  const initialError =
+    settings.error ??
+    branding.error ??
+    visitor.error ??
+    certs.error ??
+    dist.error ??
+    logPolicy.error ??
+    pingProbe.error ??
+    tunnelProbes.error ??
+    tunnelProbeCapability.error ??
+    vpngate.error ??
+    nodes.error;
+  if (initialError) return <ErrorBox error={initialError} />;
 
   const editable = can(who.role, 'system');
   const dirtyOf = (key: SectionKey) => pristine !== null && SECTION_FIELDS[key].some(f => form[f] !== pristine[f]);
@@ -2353,12 +2799,11 @@ export function SettingsPane() {
     <div className="cardpage">
       {/* 非 system-admin 仍可查看实际配置，但整页必须是真正的只读控件。此前只禁用了
           保存按钮，输入框和分段开关仍能改出一份永远无法保存的“脏”表单。 */}
-      <fieldset disabled={!editable} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
-        <div className="duo">
-          {/* 两栏各自成流，不对齐底部。分段位置按高度定——证书段展示完整
-            签发记录，单它一段就抵得上右栏的两段，与它同栏的只能是最短的那两段。
-            编号仍从上到下、从左到右连续。 */}
-          <div className="col">
+      <div className="duo settings-layout">
+        {/* 两栏各自成流，不对齐底部。代理池情报补在较短的左栏，隧道监测补在右栏；
+            两张运行时设置卡不再脱离双栏成为通栏。 */}
+        <div className="col">
+          <fieldset className="settings-column-fields" disabled={!editable}>
             {save.error && <ErrorBox error={save.error} />}
 
             {branding.error ? (
@@ -2486,9 +2931,20 @@ export function SettingsPane() {
                 )}
               </div>
             </Section>
-          </div>
+            <VpngateIntelligenceSection
+              nodes={nodes.data!.nodes}
+              admissionPolicy={vpngate.data!.admission_policy}
+              intelligencePolicy={vpngate.data!.intelligence_policy ?? DEFAULT_VPNGATE_INTELLIGENCE_POLICY}
+              proxycheckApiKeyConfigured={Boolean(
+                vpngate.data!.intelligence_credentials?.proxycheck_api_key_configured,
+              )}
+              editable={editable}
+            />
+          </fieldset>
+        </div>
 
-          <div className="col">
+        <div className="col">
+          <fieldset className="settings-column-fields" disabled={!editable}>
             {/* 位于 XRAY 之后、WIREGUARD 之前：上一段是接入面的服务端参数，本段是同一个
           xray 进程的另一部分——连接的存活时长和内存占用。两者都属于 xray，
           先说明对外配置再说明内部配置。 */}
@@ -2529,6 +2985,7 @@ export function SettingsPane() {
                   <Secs
                     value={form.connUplink}
                     changed={chg('connUplink') !== 'f'}
+                    ariaLabel="UplinkOnly 等待秒数"
                     onPick={v => setForm({ ...form, connUplink: v })}
                   />
                   <span className="hint">对端服务器先关闭下行、连接只剩上行时，再等待这么久后整条断开。默认 2</span>
@@ -2537,6 +2994,7 @@ export function SettingsPane() {
                   <Secs
                     value={form.connDownlink}
                     changed={chg('connDownlink') !== 'f'}
+                    ariaLabel="DownlinkOnly 等待秒数"
                     onPick={v => setForm({ ...form, connDownlink: v })}
                   />
                   <span className="hint">相反方向：客户端先关闭上行、只剩下行。默认 5</span>
@@ -2900,9 +3358,10 @@ export function SettingsPane() {
                 </div>
               </Group>
             </Section>
-          </div>
+          </fieldset>
+          <TunnelProbeSettingsSection editable={can(who.role, 'edit')} />
         </div>
-      </fieldset>
+      </div>
     </div>
   );
 }

@@ -8,6 +8,10 @@ import {
   modelIdsArePaired,
   tunnelId,
   tunnelIdFromBytes,
+  vpngateTunnelId,
+  vpngateTunnelIdFromBytes,
+  warpTunnelId,
+  warpTunnelIdFromBytes,
 } from '../src/model-id';
 
 describe('关联模型 ID', () => {
@@ -39,10 +43,26 @@ describe('关联模型 ID', () => {
     expect(second.chainId).not.toBe(first.chainId);
   });
 
-  it('隧道使用 tunnel 加两段四位十六进制随机值', () => {
-    expect(tunnelIdFromBytes(new Uint8Array([0x8f, 0x3a, 0x2d, 0x71]))).toBe('tunnel-8f3a-2d71');
-    expect(isModelId('tunnel', 'tunnel-8f3a-2d71')).toBe(true);
+  it('自定义隧道使用 custom 加两段四位十六进制随机值', () => {
+    expect(tunnelIdFromBytes(new Uint8Array([0x8f, 0x3a, 0x2d, 0x71]))).toBe('custom-8f3a-2d71');
+    expect(isModelId('tunnel', 'custom-8f3a-2d71')).toBe(true);
+    expect(isModelId('tunnel', 'tunnel-8f3a-2d71')).toBe(false);
     expect(isModelId('tunnel', 'external-1')).toBe(false);
-    expect(tunnelId(new Set(['tunnel-0000-0000']))).toMatch(/^tunnel-[0-9a-f]{4}-[0-9a-f]{4}$/);
+    expect(tunnelId(new Set(['custom-0000-0000']))).toMatch(/^custom-[0-9a-f]{4}-[0-9a-f]{4}$/);
+  });
+
+  it('WARP 使用独立前缀和两段四位十六进制随机值', () => {
+    expect(warpTunnelIdFromBytes(new Uint8Array([0x8f, 0x3a, 0x2d, 0x71]))).toBe('warp-8f3a-2d71');
+    expect(isModelId('tunnel', 'warp-8f3a-2d71')).toBe(true);
+    expect(isModelId('tunnel', 'warp')).toBe(false);
+    expect(isModelId('tunnel', 'warp.platform')).toBe(false);
+    expect(warpTunnelId(new Set(['warp-0000-0000']))).toMatch(/^warp-[0-9a-f]{4}-[0-9a-f]{4}$/);
+  });
+
+  it('VPN Gate 使用 vpngate 前缀和两段四位十六进制随机值', () => {
+    expect(vpngateTunnelIdFromBytes(new Uint8Array([0x8f, 0x3a, 0x2d, 0x71]))).toBe('vpngate-8f3a-2d71');
+    expect(isModelId('tunnel', 'vpngate-8f3a-2d71')).toBe(true);
+    expect(isModelId('tunnel', 'vpngate-jp')).toBe(false);
+    expect(vpngateTunnelId(new Set(['vpngate-0000-0000']))).toMatch(/^vpngate-[0-9a-f]{4}-[0-9a-f]{4}$/);
   });
 });

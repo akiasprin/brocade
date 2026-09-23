@@ -9,8 +9,9 @@ use brocade_core::{
         ExternalOutboundProtocol, ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2,
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
         IngressWires, IpFamily, ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint,
-        ProjectionEndpoint, RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User,
-        WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+        ProjectionEndpoint, ProtocolProjection, RealityFallbackMode, RealityXhttp, Tls, TlsXhttp,
+        Transport, User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux,
+        XhttpXmuxRange,
     },
     physical::user::{project_user, SubscriptionProtocol, UserPlan},
     Level,
@@ -24,14 +25,17 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
         node("us", "us.example.net", [10, 66, 0, 2]),
     ]);
     doc.users.push(user("platform.acme", "alice", "uuid-alice"));
+    let mut target = ingress("i-us", "c-us", "us", Some("f"));
+    target.wires = IngressWires::VlessAnyTlsAndHysteria2 {
+        vless: target.wires.vless().expect("fixture has VLESS").clone(),
+        anytls: AnyTls::default(),
+        hysteria2: Hysteria2::default(),
+    };
     let app = AppView {
         id: "front".to_owned(),
         label: "前置".to_owned(),
         chains: vec![chain("c-front", "香港入口"), chain("c-us", "美国出口")],
-        ingresses: vec![
-            ingress("i-front", "c-front", "hk", None),
-            ingress("i-us", "c-us", "us", Some("f")),
-        ],
+        ingresses: vec![ingress("i-front", "c-front", "hk", None), target],
         fronts: vec![Front {
             id: "f".to_owned(),
             tenant: "platform.acme".to_owned(),
@@ -91,7 +95,11 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
         1,
         "多个节点共用一个 servername 时只能输出一条 skip-domain：{clash_text}"
     );
-    assert!(clash_text.contains("dialer-proxy: \"入口组\""));
+    assert_eq!(
+        clash_text.matches("dialer-proxy: \"入口组\"").count(),
+        3,
+        "VLESS、AnyTLS 和 Hysteria2 目标都必须经过前置组：{clash_text}"
+    );
     assert!(clash_text.contains("type: url-test"));
     assert!(clash_text.contains("proxies: [\"香港入口\"]"));
     assert!(!clash_text.contains("priv-i-front"));
@@ -104,16 +112,90 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
     assert!(haitun_text.contains("server: hk.example.net"));
     assert!(haitun_text.contains("server: us.example.net"));
     assert!(haitun_text.contains("    tfo: true"), "{haitun_text}");
-    assert!(haitun_text.contains("dialer-proxy: \"入口组\""));
+    assert_eq!(
+        haitun_text.matches("dialer-proxy: \"入口组\"").count(),
+        3,
+        "测速订阅也必须保留每种协议的前置组：{haitun_text}"
+    );
     assert!(haitun_text.contains("  - name: \"入口组\"\n    type: url-test"));
     assert!(haitun_text.contains(
-        "  - name: \"koipy 测速\"\n    type: select\n    proxies: [\"香港入口\", \"美国出口\"]"
+        "  - name: \"koipy 测速\"\n    type: select\n    proxies: [\"香港入口\", \"美国出口\", \"美国出口 | AnyTLS\", \"美国出口 | QUIC\"]"
     ));
     assert!(haitun_text.contains("  - MATCH,koipy 测速"));
     assert!(!haitun_text.contains("rule-providers:"));
     assert!(!haitun_text.contains("dns:"));
     assert!(!haitun_text.contains("skip-domain:"));
     assert!(!haitun_text.contains("gstatic.com"));
+}
+
+#[test]
+fn a_front_is_projected_only_inside_its_tenant_branch() {
+    let mut hk = node("hk", "hk.example.net", [10, 66, 0, 1]);
+    let mut us = node("us", "us.example.net", [10, 66, 0, 2]);
+    hk.tenant = "platform".to_owned();
+    us.tenant = "platform".to_owned();
+    let mut doc = doc(vec![hk, us]);
+    doc.users
+        .push(user("platform.acme.child", "alice", "uuid-acme-child"));
+    doc.users.push(user("platform.beta", "alice", "uuid-beta"));
+    let mut front_chain = chain("c-front", "香港入口");
+    let mut target_chain = chain("c-us", "美国出口");
+    front_chain.tenant = "platform".to_owned();
+    target_chain.tenant = "platform".to_owned();
+    let grant = |tenant: &str, ingress: &str| Grant {
+        tenant: tenant.to_owned(),
+        user: "alice".to_owned(),
+        ingress: ingress.to_owned(),
+    };
+    let app = AppView {
+        id: "front".to_owned(),
+        label: "前置".to_owned(),
+        chains: vec![front_chain, target_chain],
+        ingresses: vec![
+            ingress("i-front", "c-front", "hk", None),
+            ingress("i-us", "c-us", "us", Some("f")),
+        ],
+        fronts: vec![Front {
+            id: "f".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "Acme 入口组".to_owned(),
+            via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
+            strategy: FrontStrategy::Select,
+        }],
+        steps: Vec::new(),
+        grants: vec![
+            grant("platform.acme.child", "i-front"),
+            grant("platform.acme.child", "i-us"),
+            // The sibling tenant has the shared target but not the Front member. The group is
+            // outside its branch, so this remains a valid direct grant.
+            grant("platform.beta", "i-us"),
+        ],
+    };
+    let mut diagnostics = Vec::new();
+    let system = compile_system(&doc, &mut diagnostics);
+    let ir = compile_app(&doc, &app, &mut diagnostics);
+    validate_app(&system, &ir, &mut diagnostics);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+
+    let child = project_user(std::slice::from_ref(&ir), "platform.acme.child", "alice");
+    assert_eq!(child.front_groups.len(), 1);
+    assert!(child
+        .entries
+        .iter()
+        .any(|entry| entry.ingress_id == "i-us" && entry.front_id.as_deref() == Some("f")));
+
+    let sibling = project_user(&[ir], "platform.beta", "alice");
+    assert!(sibling.front_groups.is_empty());
+    assert!(sibling
+        .entries
+        .iter()
+        .any(|entry| entry.ingress_id == "i-us" && entry.front_id.is_none()));
 }
 
 #[test]
@@ -138,19 +220,19 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
     };
     doc.external_outbounds = vec![
         socks(
-            "joined",
+            "custom-1111-1111",
             "供应商前置",
             "joined.proxy.example",
             "joined-secret",
         ),
         socks(
-            "unused",
+            "custom-2222-2222",
             "未加入隧道",
             "unused.proxy.example",
             "unused-secret",
         ),
         ExternalOutbound {
-            id: "classic-ss".to_owned(),
+            id: "custom-3333-3333".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Shadowsocks 前置".to_owned(),
             address: "ss.proxy.example".to_owned(),
@@ -163,7 +245,7 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
-            id: "warp".to_owned(),
+            id: "warp-8f3a-2d71".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Cloudflare WARP".to_owned(),
             address: "engage.cloudflareclient.com".to_owned(),
@@ -196,9 +278,9 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             // Include WARP deliberately: validation must reject it and projection must still
             // fail closed if a caller renders despite the diagnostic.
             external_via: vec![
-                "joined".to_owned(),
-                "classic-ss".to_owned(),
-                "warp".to_owned(),
+                "custom-1111-1111".to_owned(),
+                "custom-3333-3333".to_owned(),
+                "warp-8f3a-2d71".to_owned(),
             ],
             strategy: FrontStrategy::UrlTest,
         }],
@@ -1214,15 +1296,17 @@ fn anytls_subscription_loads_in_the_real_mihomo_binary() {
         return;
     }
 
-    let artifact = subscription::build(&plan(|face| {
-        face.wires = IngressWires::AnyTls(AnyTls {
-            idle_session_check_interval_secs: Some(11),
-            idle_session_timeout_secs: Some(22),
-            min_idle_session: Some(3),
-            ..AnyTls::default()
-        });
-    }));
+    let artifact = subscription::build(&fronted_plan(IngressWires::AnyTls(AnyTls {
+        idle_session_check_interval_secs: Some(11),
+        idle_session_timeout_secs: Some(22),
+        min_idle_session: Some(3),
+        ..AnyTls::default()
+    })));
     let config = yaml::clash_haitun_subscription(&artifact);
+    assert!(
+        config.contains("dialer-proxy: \"入口组\""),
+        "真实解析用例必须覆盖 AnyTLS 链式拨号：{config}"
+    );
     let dir = std::env::temp_dir().join(format!("brocade-mihomo-anytls-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1500,6 +1584,99 @@ fn dual_stack_subscription_keeps_each_protocols_v4_v6_pair_together() {
 }
 
 #[test]
+fn each_protocol_uses_its_own_public_mapping() {
+    let plan = plan(|face| {
+        let vless = face.wires.vless().unwrap().clone();
+        let anytls = AnyTls {
+            port: 2443,
+            ..AnyTls::default()
+        };
+        let hysteria2 = Hysteria2 {
+            port: 3443,
+            ..Hysteria2::default()
+        };
+        face.wires = IngressWires::VlessAnyTlsAndHysteria2 {
+            vless,
+            anytls,
+            hysteria2,
+        };
+        face.projection = Projection {
+            v4: projected("vless.edge.example", 10443),
+            anytls: Some(ProtocolProjection {
+                v4: projected("anytls.edge.example", 20443),
+                v6: None,
+            }),
+            hysteria2: Some(ProtocolProjection {
+                v4: projected("hy2.edge.example", 30443),
+                v6: None,
+            }),
+            ..Projection::default()
+        };
+    });
+
+    let vless = plan
+        .entries
+        .iter()
+        .find(|entry| entry.name == "香港")
+        .unwrap();
+    let anytls = plan
+        .entries
+        .iter()
+        .find(|entry| entry.name == "香港 | AnyTLS")
+        .unwrap();
+    let hysteria2 = plan
+        .entries
+        .iter()
+        .find(|entry| entry.name == "香港 | QUIC")
+        .unwrap();
+    assert_eq!(
+        (vless.server.as_str(), vless.port),
+        ("vless.edge.example", 10443)
+    );
+    assert_eq!(
+        (anytls.server.as_str(), anytls.port),
+        ("anytls.edge.example", 20443)
+    );
+    assert_eq!(
+        (hysteria2.server.as_str(), hysteria2.port),
+        ("hy2.edge.example", 30443)
+    );
+}
+
+#[test]
+fn legacy_shared_mapping_keeps_each_protocols_listening_port() {
+    let plan = plan(|face| {
+        let vless = face.wires.vless().unwrap().clone();
+        let anytls = AnyTls {
+            port: 2443,
+            ..AnyTls::default()
+        };
+        let hysteria2 = Hysteria2 {
+            port: 3443,
+            ..Hysteria2::default()
+        };
+        face.wires = IngressWires::VlessAnyTlsAndHysteria2 {
+            vless,
+            anytls,
+            hysteria2,
+        };
+        face.projection.v4 = projected("legacy.edge.example", 10443);
+    });
+
+    let endpoint = |name: &str| {
+        let entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap();
+        (entry.server.as_str(), entry.port)
+    };
+    assert_eq!(endpoint("香港"), ("legacy.edge.example", 10443));
+    assert_eq!(endpoint("香港 | AnyTLS"), ("legacy.edge.example", 2443));
+    assert_eq!(endpoint("香港 | QUIC"), ("legacy.edge.example", 3443));
+}
+
+#[test]
 fn a_dual_wire_subscription_can_be_narrowed_to_either_protocol() {
     let make_plan = || {
         plan(|face| {
@@ -1636,6 +1813,44 @@ fn plan(shape: impl FnOnce(&mut Ingress)) -> UserPlan {
         fronts: Vec::new(),
         steps: Vec::new(),
         grants: vec![grant("alice", "i-hk")],
+    };
+    let mut diagnostics = Vec::new();
+    let ir = compile_app(&doc, &app, &mut diagnostics);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.level == Level::Error),
+        "{diagnostics:#?}"
+    );
+    project_user(&[ir], "platform.acme", "alice")
+}
+
+fn fronted_plan(target_wires: IngressWires) -> UserPlan {
+    let mut hk = node("hk", "203.0.113.7", [10, 66, 0, 1]);
+    hk.certificate_name = Some("hk-cert.example.net".to_owned());
+    let mut us = node("us", "203.0.113.8", [10, 66, 0, 2]);
+    us.certificate_name = Some("us-cert.example.net".to_owned());
+    let mut doc = doc(vec![hk, us]);
+    doc.users.push(user("platform.acme", "alice", "uuid-alice"));
+    let mut member = ingress("i-front", "c-front", "hk", None);
+    member.wires = IngressWires::AnyTls(AnyTls::default());
+    let mut target = ingress("i-us", "c-us", "us", Some("f"));
+    target.wires = target_wires;
+    let app = AppView {
+        id: "front".to_owned(),
+        label: "前置".to_owned(),
+        chains: vec![chain("c-front", "香港入口"), chain("c-us", "美国出口")],
+        ingresses: vec![member, target],
+        fronts: vec![Front {
+            id: "f".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "入口组".to_owned(),
+            via: vec!["i-front".to_owned()],
+            external_via: Vec::new(),
+            strategy: FrontStrategy::UrlTest,
+        }],
+        steps: Vec::new(),
+        grants: vec![grant("alice", "i-front"), grant("alice", "i-us")],
     };
     let mut diagnostics = Vec::new();
     let ir = compile_app(&doc, &app, &mut diagnostics);
@@ -1808,6 +2023,7 @@ fn projecting_one_family_leaves_the_other_on_its_public_address() {
     let (uri_text, clash_text) = render_with_projection(Projection {
         v4: projected("cu.acc.example.net", 20443),
         v6: None,
+        ..Projection::default()
     });
 
     // v4 becomes the projected address and port — note that the port follows the address
@@ -1827,6 +2043,7 @@ fn projecting_both_families_replaces_both_addresses() {
     let (uri_text, clash_text) = render_with_projection(Projection {
         v4: projected("cu.acc.example.net", 20443),
         v6: projected("v6.acc.example.net", 30443),
+        ..Projection::default()
     });
 
     assert!(uri_text.contains("@cu.acc.example.net:20443?"));
@@ -1845,6 +2062,7 @@ fn an_ipv6_literal_projection_still_gets_brackets_in_the_uri() {
     let (uri_text, clash_text) = render_with_projection(Projection {
         v4: None,
         v6: projected("2001:db8:acc::9", 30443),
+        ..Projection::default()
     });
 
     // uri_host keys on containing a colon, regardless of whether the address came from a
@@ -1869,6 +2087,7 @@ fn projection_ignores_nat_and_a_missing_public_address() {
     face.projection = Projection {
         v4: projected("cu.acc.example.net", 20443),
         v6: None,
+        ..Projection::default()
     };
     let app = AppView {
         id: "app".to_owned(),
@@ -1951,6 +2170,7 @@ fn a_projected_host_is_filtered_by_the_slot_it_came_from() {
     face.projection = Projection {
         v4: projected("v4.acc.example.net", 20443),
         v6: projected("v6.acc.example.net", 30443),
+        ..Projection::default()
     };
     let app = AppView {
         id: "app".to_owned(),

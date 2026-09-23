@@ -22,7 +22,7 @@
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
-    net::{TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -35,6 +35,48 @@ pub(crate) const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 const HTTP_DEFAULT_PORT: u16 = 80;
 const HTTPS_DEFAULT_PORT: u16 = 443;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressFamily {
+    V4,
+    V6,
+}
+
+impl AddressFamily {
+    fn accepts(self, address: &SocketAddr) -> bool {
+        match self {
+            Self::V4 => address.is_ipv4(),
+            Self::V6 => address.is_ipv6(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::V4 => "IPv4",
+            Self::V6 => "IPv6",
+        }
+    }
+}
+
+struct RequestBody<'a> {
+    bytes: &'a [u8],
+    content_type: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct RequestTransport {
+    family: Option<AddressFamily>,
+    io_timeout: Duration,
+}
+
+impl Default for RequestTransport {
+    fn default() -> Self {
+        Self {
+            family: None,
+            io_timeout: HTTP_IO_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct HttpClient {
@@ -102,8 +144,99 @@ impl HttpClient {
         body: Option<&str>,
         extra_headers: &[(&str, String)],
     ) -> Result<HttpResponse, String> {
+        self.request_inner(
+            method,
+            path,
+            Some(token),
+            RequestBody {
+                bytes: body.unwrap_or("").as_bytes(),
+                content_type: "application/json",
+            },
+            extra_headers,
+            RequestTransport::default(),
+        )
+    }
+
+    /// Send an unauthenticated request through one address family. The configured Console token
+    /// is deliberately not accepted by this API because the destination may be an operator-set
+    /// public trace service rather than the Console origin.
+    pub(crate) fn request_public_on_family(
+        &self,
+        family: AddressFamily,
+        method: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<HttpResponse, String> {
+        self.request_inner(
+            method,
+            path,
+            None,
+            RequestBody {
+                bytes: &[],
+                content_type: "application/json",
+            },
+            &[],
+            RequestTransport {
+                family: Some(family),
+                io_timeout: timeout,
+            },
+        )
+    }
+
+    pub(crate) fn request_bytes_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: &[u8],
+        content_type: &str,
+        extra_headers: &[(&str, String)],
+    ) -> Result<HttpResponse, String> {
+        self.request_inner(
+            method,
+            path,
+            Some(token),
+            RequestBody {
+                bytes: body,
+                content_type,
+            },
+            extra_headers,
+            RequestTransport::default(),
+        )
+    }
+
+    /// Send an unauthenticated JSON request to a public service. Keeping this separate from
+    /// `request` is a security boundary: the node bearer token and Brocade protocol headers must
+    /// never leave the configured Console origin.
+    pub(crate) fn request_public(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<HttpResponse, String> {
+        self.request_inner(
+            method,
+            path,
+            None,
+            RequestBody {
+                bytes: body.unwrap_or("").as_bytes(),
+                content_type: "application/json",
+            },
+            &[],
+            RequestTransport::default(),
+        )
+    }
+
+    fn request_inner(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: RequestBody<'_>,
+        extra_headers: &[(&str, String)],
+        transport: RequestTransport,
+    ) -> Result<HttpResponse, String> {
         let full_path = format!("{}{}", self.prefix, path);
-        let body = body.unwrap_or("");
         let mut extra = String::new();
         for (name, value) in extra_headers {
             extra.push_str(name);
@@ -111,39 +244,51 @@ impl HttpClient {
             extra.push_str(value);
             extra.push_str("\r\n");
         }
-        let tcp = self.connect()?;
+        let tcp = self.connect_with_family(
+            transport.family,
+            transport.io_timeout.min(HTTP_CONNECT_TIMEOUT),
+        )?;
         // Timeouts go on the TcpStream, and they go on before TLS wraps it: the
         // handshake is itself a round of reads and writes, so without them a peer
         // that never answers blocks forever. A stalled convergence loop is
         // invisible from the console — that node merely stops reporting.
-        tcp.set_read_timeout(Some(HTTP_IO_TIMEOUT))
+        tcp.set_read_timeout(Some(transport.io_timeout))
             .map_err(|error| error.to_string())?;
-        tcp.set_write_timeout(Some(HTTP_IO_TIMEOUT))
+        tcp.set_write_timeout(Some(transport.io_timeout))
             .map_err(|error| error.to_string())?;
         let mut stream = self.wrap_tls(tcp)?;
+        let internal_headers = token
+            .map(|token| {
+                format!(
+                    "Authorization: Bearer {token}\r\nX-Brocade-Protocol-Version: {protocol}\r\n",
+                    protocol = brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
+                )
+            })
+            .unwrap_or_default();
         let request = format!(
             "{method} {full_path} HTTP/1.1\r\n\
              Host: {host}\r\n\
-             Authorization: Bearer {token}\r\n\
              User-Agent: brocade-agent/{identity}\r\n\
-             X-Brocade-Protocol-Version: {protocol}\r\n\
+             {internal_headers}\
              Accept: application/json\r\n\
-             Content-Type: application/json\r\n\
+             Content-Type: {content_type}\r\n\
              {extra}\
              Content-Length: {len}\r\n\
              Connection: close\r\n\
-             \r\n\
-             {body}",
+             \r\n",
             host = self.host_header,
             // The sha256 of this very binary, not a version number somebody has to remember to
             // bump — the reasoning is at the top of `identity.rs`. It lands in
             // `node_agent_state.agent_version`, whose sole writer is the poll path.
             identity = crate::identity::self_identity(),
-            protocol = brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
-            len = body.len(),
+            content_type = body.content_type,
+            len = body.bytes.len(),
         );
         stream
             .write_all(request.as_bytes())
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(body.bytes)
             .map_err(|error| error.to_string())?;
 
         let mut raw = Vec::new();
@@ -179,19 +324,40 @@ impl HttpClient {
     }
 
     pub(crate) fn connect(&self) -> Result<TcpStream, String> {
+        self.connect_with_family(None, HTTP_CONNECT_TIMEOUT)
+    }
+
+    fn connect_with_family(
+        &self,
+        family: Option<AddressFamily>,
+        connect_timeout: Duration,
+    ) -> Result<TcpStream, String> {
         let addresses = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .map_err(|error| format!("resolve {}:{} failed: {error}", self.host, self.port))?;
         let mut last_error = None;
-        for address in addresses {
-            match TcpStream::connect_timeout(&address, HTTP_CONNECT_TIMEOUT) {
+        let mut matched = false;
+        for address in
+            addresses.filter(|address| family.is_none_or(|family| family.accepts(address)))
+        {
+            matched = true;
+            match TcpStream::connect_timeout(&address, connect_timeout) {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last_error = Some(error),
             }
         }
         Err(match last_error {
             Some(error) => format!("connect {}:{} failed: {error}", self.host, self.port),
-            None => format!("resolve {}:{} returned no addresses", self.host, self.port),
+            None if matched => format!("connect {}:{} failed", self.host, self.port),
+            None => match family {
+                Some(family) => format!(
+                    "resolve {}:{} returned no {} addresses",
+                    self.host,
+                    self.port,
+                    family.label()
+                ),
+                None => format!("resolve {}:{} returned no addresses", self.host, self.port),
+            },
         })
     }
 
@@ -458,7 +624,121 @@ pub(crate) fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_chunked_body, parse_http_response, HttpClient};
+    use std::{io::Read as _, io::Write as _, net::TcpListener, sync::mpsc, thread};
+
+    use super::{decode_chunked_body, parse_http_response, AddressFamily, HttpClient};
+
+    #[test]
+    fn address_family_filter_keeps_v4_and_v6_separate() {
+        let v4 = "127.0.0.1:80".parse().unwrap();
+        let v6 = "[::1]:80".parse().unwrap();
+
+        assert!(AddressFamily::V4.accepts(&v4));
+        assert!(!AddressFamily::V4.accepts(&v6));
+        assert!(AddressFamily::V6.accepts(&v6));
+        assert!(!AddressFamily::V6.accepts(&v4));
+    }
+
+    #[test]
+    fn family_request_rejects_an_origin_without_that_address_family() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::new(&format!("http://{address}")).unwrap();
+
+        let error = client
+            .request_public_on_family(
+                AddressFamily::V6,
+                "GET",
+                "/ip",
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("no IPv6 addresses"), "{error}");
+    }
+
+    #[test]
+    fn public_requests_never_send_console_credentials_or_protocol_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, received) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            sent.send(String::from_utf8_lossy(&request[..length]).into_owned())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let client = HttpClient::new(&format!("http://{address}")).unwrap();
+        assert_eq!(
+            client.request_public("GET", "/intel", None).unwrap().status,
+            200
+        );
+        let request = received.recv().unwrap();
+        server.join().unwrap();
+        assert!(!request.contains("Authorization:"), "{request}");
+        assert!(
+            !request.contains("X-Brocade-Protocol-Version:"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn authenticated_binary_requests_preserve_the_compressed_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0_u8; 4096];
+                let length = stream.read(&mut chunk).unwrap();
+                assert!(length > 0, "request ended before its body arrived");
+                request.extend_from_slice(&chunk[..length]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= header_end + 4 + content_length {
+                    break (header_end, content_length);
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.contains("Content-Type: application/gzip\r\n"));
+            assert_eq!(
+                &request[header_end + 4..header_end + 4 + content_length],
+                &[0, 0x9f, 0xff, 7]
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let client = HttpClient::new(&format!("http://{address}")).unwrap();
+
+        let response = client
+            .request_bytes_with_headers(
+                "POST",
+                "/catalogue",
+                "node-token",
+                &[0, 0x9f, 0xff, 7],
+                "application/gzip",
+                &[],
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(response.status, 200);
+    }
 
     #[test]
     fn response_headers_are_case_insensitive() {

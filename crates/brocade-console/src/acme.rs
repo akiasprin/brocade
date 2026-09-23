@@ -204,6 +204,7 @@ pub struct DnsChallenge {
 impl Session {
     pub async fn start(directory_url: &str, key: AccountKey) -> Result<Self> {
         let http = reqwest::Client::builder()
+            .use_rustls_tls()
             // Every request here is small and to one host. A total timeout rather than a read
             // timeout, so a server that trickles bytes forever still ends.
             .timeout(Duration::from_secs(30))

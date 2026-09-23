@@ -32,6 +32,7 @@ const { SessionProvider } = await import('../src/session');
 const { DnsCard, WgCard } = await import('../src/panes/nodes');
 
 const SESSION = {
+  initial: { node_count: 0, chain_group_count: [] },
   who: {
     operator_id: 'tester',
     role: 'system-admin' as const,
@@ -70,13 +71,16 @@ function node(id: string, name: string): NodeAgentStateItem {
     token_revoked_at: null,
     agent_version: null,
     agent_protocol_version: null,
+    vpngate_probe_enabled: false,
     runtime_versions: null,
     spool_backlog: null,
     last_local_reconcile: null,
     wireguard_health: null,
     runtime_reported_at: null,
+    runtime_report_fresh: false,
     geodata_observed: null,
     last_poll_at: null,
+    desired_poll_fresh: false,
     last_usage_report_at: null,
     xray_started_at: null,
     mtu: null,
@@ -319,7 +323,9 @@ describe('写草稿的行保存后是否保持新值', () => {
 
     render(<Harness />);
     await waitFor(() => expect(compileCalls).toBeGreaterThan(0));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Phantun' }).getAttribute('aria-pressed')).toBe('true'));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Phantun' }).getAttribute('aria-pressed')).toBe('true'),
+    );
 
     cleanup();
     const callsBeforePeer = compileCalls;

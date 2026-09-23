@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Rule, SnapshotStep } from '../src/api';
-import { compilerFallbackRules, defaultChainRuleOccurrence } from '../src/panes/chains';
+import { compilerFallbackRules, defaultChainRuleOccurrence, effectiveChainRuleSteps } from '../src/panes/chains';
 
 const step = (node: string, rules: Rule[] = []): SnapshotStep => ({
   chain: 'c',
@@ -16,6 +16,17 @@ const forward = (to: string): Rule => ({
 });
 
 describe('machine-detail rule default expansion', () => {
+  it('projects unsaved forwarding changes into the displayed tree', () => {
+    const steps = [step('entry', [forward('old-relay')]), step('old-relay')];
+    const effective = effectiveChainRuleSteps('c', steps, {
+      entry: [forward('new-relay')],
+      'new-relay': [{ m: { t: 'any' }, a: { t: 'egress', send_through: null } }],
+    });
+
+    expect(defaultChainRuleOccurrence(['entry'], effective, 'new-relay')).toBe('entry>new-relay');
+    expect(defaultChainRuleOccurrence(['entry'], effective, 'old-relay')).toBe('old-relay');
+  });
+
   it('locates the current machine by its full path from the chain entry', () => {
     const steps = [step('entry', [forward('relay')]), step('relay', [forward('egress')]), step('egress')];
 
