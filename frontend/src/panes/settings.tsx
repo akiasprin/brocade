@@ -16,6 +16,7 @@ import {
   scanCerts,
   fetchDistribution,
   fetchAgentLogPolicy,
+  fetchHostNetworkTuning,
   fetchLinkMtu,
   fetchNodes,
   fetchSettings,
@@ -27,6 +28,7 @@ import {
   startVpngateIntelligenceRefresh,
   saveDistribution,
   saveAgentLogDefault,
+  saveHostNetworkTuning,
   saveNodeLogPolicy,
   savePortSettings,
   saveProbeSettings,
@@ -51,6 +53,7 @@ import {
   type AgentLogLimitOverrides,
   type AgentLogPolicyNode,
   type AgentLogPolicyView,
+  type HostNetworkTuning,
   type GroupCertificate,
   type LinkMtuItem,
   type HopMux,
@@ -303,6 +306,7 @@ const NAV: NavItem[] = [
   { id: 'set-visitor', label: '访客模式', icon: 'access' },
   { id: 'set-dist', label: '分发', icon: 'deploy' },
   { id: 'set-agent-logs', label: '日志保留', icon: 'artifacts' },
+  { id: 'set-host-network', label: '主网卡调优', icon: 'observe' },
   { id: 'set-cert', label: '证书', icon: 'certificate' },
   { id: 'set-xray', label: 'XRAY', icon: 'protocol', key: 'xray' },
   { id: 'set-conn', label: '连接策略', icon: 'config', key: 'connection' },
@@ -1881,6 +1885,112 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
   );
 }
 
+const HOST_GRO_MAX_NS = 1_000_000;
+const HOST_NAPI_DEFER_MAX = 64;
+
+type HostNetworkTuningForm = {
+  gro_flush_timeout_ns: string;
+  napi_defer_hard_irqs: string;
+};
+
+const hostNetworkTuningForm = (settings: HostNetworkTuning): HostNetworkTuningForm => ({
+  gro_flush_timeout_ns: String(settings.gro_flush_timeout_ns),
+  napi_defer_hard_irqs: String(settings.napi_defer_hard_irqs),
+});
+
+const parseHostNetworkTuning = (form: HostNetworkTuningForm): HostNetworkTuning | null => {
+  const gro = Number(form.gro_flush_timeout_ns);
+  const defer = Number(form.napi_defer_hard_irqs);
+  if (
+    !Number.isInteger(gro) ||
+    gro < 0 ||
+    gro > HOST_GRO_MAX_NS ||
+    !Number.isInteger(defer) ||
+    defer < 0 ||
+    defer > HOST_NAPI_DEFER_MAX
+  ) {
+    return null;
+  }
+  return { gro_flush_timeout_ns: gro, napi_defer_hard_irqs: defer };
+};
+
+export function HostNetworkTuningSection({ editable, data }: { editable: boolean; data: HostNetworkTuning }) {
+  const qc = useQueryClient();
+  const { form, setForm, accept } = useServerForm(hostNetworkTuningForm(data));
+  const parsed = parseHostNetworkTuning(form);
+  const baseline = hostNetworkTuningForm(data);
+  const dirty =
+    form.gro_flush_timeout_ns !== baseline.gro_flush_timeout_ns ||
+    form.napi_defer_hard_irqs !== baseline.napi_defer_hard_irqs;
+  useUnsavedChanges(dirty, '主网卡调优');
+  const save = useMutation({
+    onMutate: () => qc.cancelQueries({ queryKey: ['host-network-tuning'] }),
+    mutationFn: (settings: HostNetworkTuning) => saveHostNetworkTuning(settings),
+    onSuccess: async (saved, submitted) => {
+      await qc.cancelQueries({ queryKey: ['host-network-tuning'] });
+      accept(hostNetworkTuningForm(saved), hostNetworkTuningForm(submitted));
+      qc.setQueryData(['host-network-tuning'], saved);
+    },
+  });
+
+  return (
+    <section className="panel config-panel" id="set-host-network">
+      <header>
+        <SettingsTitle id="set-host-network">主网卡调优</SettingsTitle>
+      </header>
+      <p className="cardsub">由 Agent 写入主路由网卡；保存后下一轮生效，不重启 XRAY</p>
+      {save.error && <ErrorBox error={save.error} />}
+      <Group label="Virtio / NAPI 软件中断合并">
+        <Fld label="GRO 刷新等待">
+          <input
+            className={form.gro_flush_timeout_ns !== baseline.gro_flush_timeout_ns ? 'f chg' : 'f'}
+            type="number"
+            min={0}
+            max={HOST_GRO_MAX_NS}
+            step={1}
+            aria-label="GRO 刷新等待"
+            disabled={!editable || save.isPending}
+            value={form.gro_flush_timeout_ns}
+            onChange={event => setForm({ ...form, gro_flush_timeout_ns: event.target.value })}
+          />
+          <span className="unit">ns</span>
+        </Fld>
+        <Fld label="延迟硬中断">
+          <input
+            className={form.napi_defer_hard_irqs !== baseline.napi_defer_hard_irqs ? 'f chg' : 'f'}
+            type="number"
+            min={0}
+            max={HOST_NAPI_DEFER_MAX}
+            step={1}
+            aria-label="NAPI 延迟硬中断轮数"
+            disabled={!editable || save.isPending}
+            value={form.napi_defer_hard_irqs}
+            onChange={event => setForm({ ...form, napi_defer_hard_irqs: event.target.value })}
+          />
+          <span className="unit">轮</span>
+        </Fld>
+        <p className="hint">
+          对应 <code>gro_flush_timeout</code> 与 <code>napi_defer_hard_irqs</code>；两项填 0 可恢复内核默认行为。
+        </p>
+        {parsed === null && (
+          <span className="agent-log-invalid">
+            GRO 等待需为 0–{HOST_GRO_MAX_NS} ns，延迟轮数需为 0–{HOST_NAPI_DEFER_MAX} 的整数
+          </span>
+        )}
+      </Group>
+      <SettingsSaveBar
+        dirty={dirty}
+        saving={save.isPending}
+        savedText={save.isSuccess ? '已保存，下一轮生效' : null}
+        editable={editable}
+        disabled={parsed === null}
+        label="保存网卡调优"
+        onSave={() => parsed && save.mutate(parsed)}
+      />
+    </section>
+  );
+}
+
 const validPingProbeNumber = (value: number, min: number, max: number) =>
   Number.isInteger(value) && value >= min && value <= max;
 
@@ -2680,6 +2790,10 @@ export function SettingsPane() {
   });
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
+  const hostNetworkTuning = useQuery({
+    queryKey: ['host-network-tuning'],
+    queryFn: fetchHostNetworkTuning,
+  });
   const pingProbe = useQuery({ queryKey: ['ping-probe-settings'], queryFn: fetchPingProbeSettings });
   const tunnelProbes = useQuery({
     queryKey: ['tunnel-probes'],
@@ -2846,6 +2960,7 @@ export function SettingsPane() {
     certs.isPending ||
     dist.isPending ||
     logPolicy.isPending ||
+    hostNetworkTuning.isPending ||
     pingProbe.isPending ||
     tunnelProbes.isPending ||
     tunnelProbeCapability.isPending ||
@@ -2860,6 +2975,7 @@ export function SettingsPane() {
     certs.error ??
     dist.error ??
     logPolicy.error ??
+    hostNetworkTuning.error ??
     pingProbe.error ??
     tunnelProbes.error ??
     tunnelProbeCapability.error ??
@@ -2914,6 +3030,11 @@ export function SettingsPane() {
               <ErrorBox error={logPolicy.error} />
             ) : (
               <AgentLogPolicySection editable={editable} data={logPolicy.data!} />
+            )}
+            {hostNetworkTuning.error ? (
+              <ErrorBox error={hostNetworkTuning.error} />
+            ) : (
+              <HostNetworkTuningSection editable={editable} data={hostNetworkTuning.data!} />
             )}
             {certs.error ? <ErrorBox error={certs.error} /> : <CertSection editable={editable} view={certs.data!} />}
 
@@ -3350,6 +3471,7 @@ export function SettingsPane() {
                   </Fld>
                   <Fld label="中转端口">
                     <input
+                      aria-label="中转端口起始值"
                       className={chg('hopBase')}
                       type="number"
                       min={1}

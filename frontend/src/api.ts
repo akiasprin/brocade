@@ -3285,6 +3285,19 @@ export const saveNodeLogPolicy = (nodeId: string, overrides: AgentLogLimitOverri
     body: JSON.stringify(overrides),
   });
 
+/* ── 主网卡 NAPI/GRO：即时运行态配置，不进入模型修订，也不重启 XRAY ── */
+export interface HostNetworkTuning {
+  gro_flush_timeout_ns: number;
+  napi_defer_hard_irqs: number;
+}
+
+export const fetchHostNetworkTuning = () => api<HostNetworkTuning>('/host-network-tuning');
+export const saveHostNetworkTuning = (body: HostNetworkTuning) =>
+  api<HostNetworkTuning>('/host-network-tuning', '', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+
 /* ── 机器物理网卡累计：UTC 重置周期与总量校准，均为即时运行态配置 ── */
 export type NodeTrafficCycleKind = 'monthly' | 'yearly';
 

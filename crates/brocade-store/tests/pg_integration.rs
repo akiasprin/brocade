@@ -35,8 +35,8 @@ use brocade_store::{
     CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest,
     CreateIngressRequest, CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest,
     CreateUserRequest, CreateXrayReleaseRequest, DeleteFrontRequest, HopInRequest, HopWireRequest,
-    IsolateDeploymentTargetRequest, IsolateNodeRequest, IssuedCertificate, LinkProbe,
-    LinkProbeRequest, LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment,
+    HostNetworkTuning, IsolateDeploymentTargetRequest, IsolateNodeRequest, IssuedCertificate,
+    LinkProbe, LinkProbeRequest, LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment,
     NodeTrafficCycleKind, PgStore, PingProbeFamily, PingProbeKind, PingProbeReportRequest,
     PingProbeSample, PingProbeSettings, PingProbeSkipReason, PingProbeTarget, ProbeTransport,
     ProvisionNodeRequest, PublicIpObservationOutcome, PutStepRequest, RegisterWarpBindingRequest,
@@ -2301,9 +2301,9 @@ async fn agent_log_policy_resolves_global_node_override_and_clear_without_a_revi
     assert_eq!(
         db.store.effective_node_log_limits("n1").await.unwrap(),
         AgentLogLimits {
-            agent_journal_mib: 100,
-            xray_mib: 100,
-            phantun_mib: 16,
+            agent_journal_mib: 20,
+            xray_mib: 20,
+            phantun_mib: 10,
         }
     );
     db.store
@@ -2407,6 +2407,54 @@ async fn agent_log_policy_resolves_global_node_override_and_clear_without_a_revi
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn host_network_tuning_is_live_validated_and_does_not_create_a_revision() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let revision_before: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+    assert_eq!(
+        db.store.host_network_tuning().await.unwrap(),
+        HostNetworkTuning::default()
+    );
+    let updated = HostNetworkTuning {
+        gro_flush_timeout_ns: 40_000,
+        napi_defer_hard_irqs: 4,
+    };
+    assert_eq!(
+        db.store
+            .update_host_network_tuning(&system_admin(), updated)
+            .await
+            .unwrap(),
+        updated
+    );
+    assert_eq!(db.store.host_network_tuning().await.unwrap(), updated);
+    assert!(db
+        .store
+        .update_host_network_tuning(
+            &system_admin(),
+            HostNetworkTuning {
+                gro_flush_timeout_ns: 1_000_001,
+                napi_defer_hard_irqs: 4,
+            },
+        )
+        .await
+        .is_err());
+    let revision_after: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(revision_after, revision_before);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn realtime_policy_is_global_validated_and_does_not_create_a_revision() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -2465,6 +2513,8 @@ async fn deployment_schema_matches_convergence_design() {
     assert_column_exists(db.pool(), "control_state", "agent_log_max_mib").await;
     assert_column_exists(db.pool(), "control_state", "xray_log_max_mib").await;
     assert_column_exists(db.pool(), "control_state", "phantun_log_max_mib").await;
+    assert_column_exists(db.pool(), "control_state", "nic_gro_flush_timeout_ns").await;
+    assert_column_exists(db.pool(), "control_state", "nic_napi_defer_hard_irqs").await;
     assert_column_exists(db.pool(), "control_state", "ping_probe_targets").await;
     assert_column_exists(db.pool(), "control_state", "ping_probe_interval_secs").await;
     assert_column_exists(db.pool(), "control_state", "ping_probe_timeout_ms").await;
@@ -4277,6 +4327,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
         xray: Some("Xray 26.3.27 (Xray, Penetrates Everything.)".to_owned()),
         xray_installed_sha256: Some("a".repeat(64)),
         xray_running_sha256: Some("a".repeat(64)),
+        kernel_tls_module: Some(true),
         phantun: Some("phantun 0.7.0".to_owned()),
         openvpn: Some("OpenVPN 2.6.12 x86_64-pc-linux-gnu".to_owned()),
         vpngate_catalog_probe_workers: Some(16),
@@ -5060,6 +5111,7 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
             xray: None,
             xray_installed_sha256: None,
             xray_running_sha256: None,
+            kernel_tls_module: None,
             phantun: None,
             openvpn: None,
             vpngate_catalog_probe_workers: None,
@@ -5119,6 +5171,7 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
                 xray: None,
                 xray_installed_sha256: None,
                 xray_running_sha256: None,
+                kernel_tls_module: None,
                 phantun: None,
                 openvpn: None,
                 vpngate_catalog_probe_workers: None,
@@ -5588,6 +5641,7 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
             xray: None,
             xray_installed_sha256: None,
             xray_running_sha256: None,
+            kernel_tls_module: None,
             phantun: None,
             openvpn: None,
             vpngate_catalog_probe_workers: None,

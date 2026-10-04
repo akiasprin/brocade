@@ -10,6 +10,31 @@ fn new_ingresses_default_to_strict_reality_fallback_limits() {
 }
 
 #[test]
+fn fresh_install_log_limits_match_the_runtime_defaults() {
+    assert!(INITIAL_SCHEMA.contains("agent_log_max_mib INTEGER DEFAULT 20 NOT NULL"));
+    assert!(INITIAL_SCHEMA.contains("xray_log_max_mib INTEGER DEFAULT 20 NOT NULL"));
+    assert!(INITIAL_SCHEMA.contains("phantun_log_max_mib INTEGER DEFAULT 10 NOT NULL"));
+    assert!(INITIAL_SCHEMA
+        .contains("control_state_agent_log_max_mib_range CHECK (((agent_log_max_mib >= 10)"));
+    assert!(INITIAL_SCHEMA
+        .contains("control_state_xray_log_max_mib_range CHECK (((xray_log_max_mib >= 10)"));
+    assert!(INITIAL_SCHEMA
+        .contains("control_state_phantun_log_max_mib_range CHECK (((phantun_log_max_mib >= 10)"));
+}
+
+#[test]
+fn fresh_install_host_network_tuning_matches_the_runtime_defaults() {
+    assert!(INITIAL_SCHEMA.contains("nic_gro_flush_timeout_ns INTEGER DEFAULT 20000 NOT NULL"));
+    assert!(INITIAL_SCHEMA.contains("nic_napi_defer_hard_irqs INTEGER DEFAULT 2 NOT NULL"));
+    assert!(INITIAL_SCHEMA.contains(
+        "control_state_nic_gro_flush_timeout_ns_range CHECK (((nic_gro_flush_timeout_ns >= 0)"
+    ));
+    assert!(INITIAL_SCHEMA.contains(
+        "control_state_nic_napi_defer_hard_irqs_range CHECK (((nic_napi_defer_hard_irqs >= 0)"
+    ));
+}
+
+#[test]
 fn schema_source_is_a_single_fresh_install_definition() {
     let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let mut files = fs::read_dir(migrations)

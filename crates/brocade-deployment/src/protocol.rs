@@ -26,10 +26,33 @@ pub const MAX_ONLINE_SOURCE_ENTRIES: usize = 4_096;
 
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
-pub const DEFAULT_AGENT_LOG_MAX_MIB: u32 = 100;
-pub const DEFAULT_PHANTUN_LOG_MAX_MIB: u32 = 16;
-pub const MIN_AGENT_LOG_MAX_MIB: u32 = 16;
+pub const DEFAULT_AGENT_LOG_MAX_MIB: u32 = 20;
+pub const DEFAULT_XRAY_LOG_MAX_MIB: u32 = 20;
+pub const DEFAULT_PHANTUN_LOG_MAX_MIB: u32 = 10;
+pub const MIN_AGENT_LOG_MAX_MIB: u32 = 10;
 pub const MAX_AGENT_LOG_MAX_MIB: u32 = 4096;
+
+/// Fleet-wide defaults for the physical NIC's software IRQ coalescing. Zero remains valid for
+/// either field so an operator can return to the kernel defaults without rolling back an Agent.
+pub const DEFAULT_NIC_GRO_FLUSH_TIMEOUT_NS: u32 = 20_000;
+pub const DEFAULT_NIC_NAPI_DEFER_HARD_IRQS: u32 = 2;
+pub const MAX_NIC_GRO_FLUSH_TIMEOUT_NS: u32 = 1_000_000;
+pub const MAX_NIC_NAPI_DEFER_HARD_IRQS: u32 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostNetworkTuning {
+    pub gro_flush_timeout_ns: u32,
+    pub napi_defer_hard_irqs: u32,
+}
+
+impl Default for HostNetworkTuning {
+    fn default() -> Self {
+        Self {
+            gro_flush_timeout_ns: DEFAULT_NIC_GRO_FLUSH_TIMEOUT_NS,
+            napi_defer_hard_irqs: DEFAULT_NIC_NAPI_DEFER_HARD_IRQS,
+        }
+    }
+}
 
 /// Live telemetry is an operational stream, not another diagnostic or accounting cadence.
 /// These are deliberately the only accepted values so the control plane can bound fan-out and
@@ -1939,6 +1962,13 @@ pub struct NodeVersions {
     /// identified, not that the managed binary is absent.
     #[serde(default)]
     pub xray_running_sha256: Option<String>,
+    /// Whether Linux currently exposes the `tls` kernel module used by the AnyTLS kTLS path.
+    ///
+    /// New Agents try to load it once at startup and again before starting Xray. `None` is an
+    /// older Agent that did not observe the prerequisite; `Some(false)` is a real failed/missing
+    /// prerequisite and must not be read as an idle kTLS data path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_tls_module: Option<bool>,
     pub phantun: Option<String>,
     /// The first line of `openvpn --version`, reported only while `/dev/net/tun` is usable.
     ///
@@ -3140,6 +3170,7 @@ mod tests {
         .unwrap();
         assert_eq!(versions.xray_installed_sha256, None);
         assert_eq!(versions.xray_running_sha256, None);
+        assert_eq!(versions.kernel_tls_module, None);
         assert_eq!(versions.openvpn, None);
         assert_eq!(versions.vpngate_catalog_probe_workers, None);
     }

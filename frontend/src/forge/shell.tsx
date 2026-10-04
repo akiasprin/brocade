@@ -5,6 +5,7 @@ import {
   Fragment,
   lazy,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -456,6 +457,7 @@ function TopBar({
   const [more, setMore] = useState(false);
   const moreButtonRef = useRef<HTMLButtonElement>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
+  const pendingAppearanceTransition = useRef<(() => void) | null>(null);
   const menuPresence = usePresence(more, 180);
   const diagPresence = usePresence(st.diag, 180);
   const themeKey = useSyncExternalStore(theme.subscribe, theme.snapshot);
@@ -463,6 +465,20 @@ function TopBar({
   const selectedPaletteName = PALETTES.find(option => option.key === paletteKey)?.name ?? paletteKey;
   const nextThemeTransition = theme.snapshot() === 'dark' ? 'theme-light' : 'theme-dark';
   const toggleTheme = () => runVisualTransition(() => theme.toggle(), nextThemeTransition);
+  const closeMenuThenTransition = (transition: () => void) => {
+    pendingAppearanceTransition.current = transition;
+    setMore(false);
+  };
+
+  /* 外观切换会给整页截图。等菜单的退出动画结束并从 DOM 移除后再截图，避免旧菜单被
+     烙进亮暗或色调切换的第一帧。两种外观控制必须共用这一时序。 */
+  useLayoutEffect(() => {
+    if (more || menuPresence.present) return;
+    const transition = pendingAppearanceTransition.current;
+    if (!transition) return;
+    pendingAppearanceTransition.current = null;
+    queueMicrotask(transition);
+  }, [menuPresence.present, more]);
   /* 评审角色无法获取产物（服务端返回 403），开关一并隐藏 */
   const artifacts = can(who.role, 'artifacts');
   const account = accountOf(who);
@@ -643,9 +659,8 @@ function TopBar({
               aria-label="使用亮色模式"
               aria-checked={themeKey === 'light'}
               onClick={() => {
-                setMore(false);
-                if (themeKey === 'light') return;
-                toggleTheme();
+                if (themeKey === 'light') return setMore(false);
+                closeMenuThenTransition(toggleTheme);
               }}
             >
               <Icon of="sun" size={12} className="fg-theme-option-icon" />
@@ -658,9 +673,8 @@ function TopBar({
               aria-label="使用暗色模式"
               aria-checked={themeKey === 'dark'}
               onClick={() => {
-                setMore(false);
-                if (themeKey === 'dark') return;
-                toggleTheme();
+                if (themeKey === 'dark') return setMore(false);
+                closeMenuThenTransition(toggleTheme);
               }}
             >
               <Icon of="moon" size={12} className="fg-theme-option-icon" />
@@ -683,12 +697,10 @@ function TopBar({
                 aria-label={`使用${option.name}色调：${option.description}`}
                 aria-checked={paletteKey === option.key}
                 onClick={event => {
-                  setMore(false);
-                  if (paletteKey === option.key) return;
-                  runVisualTransition(
-                    () => palette.set(option.key),
-                    'appearance',
-                    motionOriginFor(event.currentTarget, event.clientX, event.clientY),
+                  if (paletteKey === option.key) return setMore(false);
+                  const origin = motionOriginFor(event.currentTarget, event.clientX, event.clientY);
+                  closeMenuThenTransition(() =>
+                    runVisualTransition(() => palette.set(option.key), 'appearance', origin),
                   );
                 }}
               >

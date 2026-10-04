@@ -746,9 +746,14 @@ CREATE TABLE control_state (
     -- Runtime log retention is operational policy, not compiled model state. Agent journal, Xray,
     -- and Phantun have independent ceilings. Fleet defaults apply
     -- wherever the matching node column is NULL. Agent polls pick up changes without a revision.
-    agent_log_max_mib INTEGER DEFAULT 100 NOT NULL,
-    xray_log_max_mib INTEGER DEFAULT 100 NOT NULL,
-    phantun_log_max_mib INTEGER DEFAULT 16 NOT NULL,
+    agent_log_max_mib INTEGER DEFAULT 20 NOT NULL,
+    xray_log_max_mib INTEGER DEFAULT 20 NOT NULL,
+    phantun_log_max_mib INTEGER DEFAULT 10 NOT NULL,
+    -- Volatile per-NIC software IRQ coalescing. Agents apply these to the physical interface
+    -- carrying the default route on startup and every desired-state poll. Zero restores the
+    -- corresponding kernel default without requiring an Agent rollback.
+    nic_gro_flush_timeout_ns INTEGER DEFAULT 20000 NOT NULL,
+    nic_napi_defer_hard_irqs INTEGER DEFAULT 2 NOT NULL,
     -- Live NIC rates are kept only in control-plane memory, but whether the channel is available
     -- and its fleet-wide cadence must survive a restart. It is independent of both the persisted
     -- 30-second diagnostic windows and the cumulative usage ledger.
@@ -843,9 +848,11 @@ CREATE TABLE control_state (
     -- A scope that is not `off` while no build is named would be a clearance to install nothing.
     -- Refused here so that no code downstream has to decide what it means.
     CONSTRAINT control_state_agent_release_armed CHECK (((agent_release_scope = 'off') OR (agent_release_id IS NOT NULL))),
-    CONSTRAINT control_state_agent_log_max_mib_range CHECK (((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096))),
-    CONSTRAINT control_state_xray_log_max_mib_range CHECK (((xray_log_max_mib >= 16) AND (xray_log_max_mib <= 4096))),
-    CONSTRAINT control_state_phantun_log_max_mib_range CHECK (((phantun_log_max_mib >= 16) AND (phantun_log_max_mib <= 4096))),
+    CONSTRAINT control_state_agent_log_max_mib_range CHECK (((agent_log_max_mib >= 10) AND (agent_log_max_mib <= 4096))),
+    CONSTRAINT control_state_xray_log_max_mib_range CHECK (((xray_log_max_mib >= 10) AND (xray_log_max_mib <= 4096))),
+    CONSTRAINT control_state_phantun_log_max_mib_range CHECK (((phantun_log_max_mib >= 10) AND (phantun_log_max_mib <= 4096))),
+    CONSTRAINT control_state_nic_gro_flush_timeout_ns_range CHECK (((nic_gro_flush_timeout_ns >= 0) AND (nic_gro_flush_timeout_ns <= 1000000))),
+    CONSTRAINT control_state_nic_napi_defer_hard_irqs_range CHECK (((nic_napi_defer_hard_irqs >= 0) AND (nic_napi_defer_hard_irqs <= 64))),
     CONSTRAINT control_state_realtime_interval_known CHECK ((realtime_interval_secs = ANY (ARRAY[1, 2, 5]))),
     CONSTRAINT control_state_geodata_cron_shape CHECK ((geodata_cron ~ '^((CRON_)?TZ=\S+\s+)?\S+(\s+\S+){4}$')),
     CONSTRAINT control_state_geodata_geoip_url_shape CHECK ((geodata_geoip_url ~ '^https?://')),
@@ -1128,9 +1135,9 @@ CREATE TABLE nodes (
     xray_log_max_mib INTEGER,
     phantun_log_max_mib INTEGER,
     CONSTRAINT nodes_api_port_check CHECK (((api_port >= 1) AND (api_port <= 65535))),
-    CONSTRAINT nodes_agent_log_max_mib_range CHECK (((agent_log_max_mib IS NULL) OR ((agent_log_max_mib >= 16) AND (agent_log_max_mib <= 4096)))),
-    CONSTRAINT nodes_xray_log_max_mib_range CHECK (((xray_log_max_mib IS NULL) OR ((xray_log_max_mib >= 16) AND (xray_log_max_mib <= 4096)))),
-    CONSTRAINT nodes_phantun_log_max_mib_range CHECK (((phantun_log_max_mib IS NULL) OR ((phantun_log_max_mib >= 16) AND (phantun_log_max_mib <= 4096)))),
+    CONSTRAINT nodes_agent_log_max_mib_range CHECK (((agent_log_max_mib IS NULL) OR ((agent_log_max_mib >= 10) AND (agent_log_max_mib <= 4096)))),
+    CONSTRAINT nodes_xray_log_max_mib_range CHECK (((xray_log_max_mib IS NULL) OR ((xray_log_max_mib >= 10) AND (xray_log_max_mib <= 4096)))),
+    CONSTRAINT nodes_phantun_log_max_mib_range CHECK (((phantun_log_max_mib IS NULL) OR ((phantun_log_max_mib >= 10) AND (phantun_log_max_mib <= 4096)))),
     CONSTRAINT nodes_check CHECK ((((dns_kind = 'system') AND (dns_servers = '[]'::jsonb)) OR (dns_kind = 'servers'))),
     CONSTRAINT nodes_dns_kind_check CHECK ((dns_kind IN ('system', 'servers'))),
     CONSTRAINT nodes_dns_servers_check CHECK ((jsonb_typeof(dns_servers) = 'array')),

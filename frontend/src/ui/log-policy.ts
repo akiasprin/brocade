@@ -1,5 +1,5 @@
 /** Shared bounds for the settings page and each machine's local log override. */
-export const LOG_MIN_MIB = 16;
+export const LOG_MIN_MIB = 10;
 export const LOG_MAX_MIB = 4096;
 
 export const validLogMib = (raw: string) => {

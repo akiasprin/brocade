@@ -13,8 +13,8 @@ use std::{
 };
 
 use brocade_deployment::protocol::{
-    DEFAULT_AGENT_LOG_MAX_MIB, DEFAULT_PHANTUN_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
-    MIN_AGENT_LOG_MAX_MIB,
+    DEFAULT_AGENT_LOG_MAX_MIB, DEFAULT_PHANTUN_LOG_MAX_MIB, DEFAULT_XRAY_LOG_MAX_MIB,
+    MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
 };
 
 const AGENT_JOURNAL_POLICY_FILE: &str = "log-agent-journal-max-mib";
@@ -252,7 +252,7 @@ fn consume_dynamic(input: &mut impl Read, path: &Path, policy: &Path) -> io::Res
         if policy.file_name().and_then(|name| name.to_str()) == Some(PHANTUN_POLICY_FILE) {
             DEFAULT_PHANTUN_LOG_MAX_MIB
         } else {
-            DEFAULT_AGENT_LOG_MAX_MIB
+            DEFAULT_XRAY_LOG_MAX_MIB
         };
     let initial = read_policy_mib(policy)
         .map(max_bytes)
@@ -422,6 +422,16 @@ mod tests {
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("brocade-logcap-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn defaults_and_lower_bound_match_the_fleet_policy() {
+        assert_eq!(DEFAULT_AGENT_LOG_MAX_MIB, 20);
+        assert_eq!(DEFAULT_XRAY_LOG_MAX_MIB, 20);
+        assert_eq!(DEFAULT_PHANTUN_LOG_MAX_MIB, 10);
+        assert_eq!(MIN_AGENT_LOG_MAX_MIB, 10);
+        assert_eq!(validate_mib(10).unwrap(), 10);
+        assert!(validate_mib(9).is_err());
     }
 
     #[test]

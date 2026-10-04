@@ -12,8 +12,8 @@ use sqlx::{PgPool, Row};
 use crate::{AdminContext, Result, StoreError};
 
 pub use brocade_deployment::protocol::{
-    DEFAULT_AGENT_LOG_MAX_MIB, DEFAULT_PHANTUN_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
-    MIN_AGENT_LOG_MAX_MIB,
+    DEFAULT_AGENT_LOG_MAX_MIB, DEFAULT_PHANTUN_LOG_MAX_MIB, DEFAULT_XRAY_LOG_MAX_MIB,
+    MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,10 +61,10 @@ pub struct UpdateNodeLogPolicyRequest {
     pub phantun_mib: Option<u32>,
 }
 
-fn valid(value: u32) -> Result<u32> {
+fn valid(value: u32, class: &str) -> Result<u32> {
     if !(MIN_AGENT_LOG_MAX_MIB..=MAX_AGENT_LOG_MAX_MIB).contains(&value) {
         return Err(StoreError::InvalidData(format!(
-            "日志上限需在 {MIN_AGENT_LOG_MAX_MIB}–{MAX_AGENT_LOG_MAX_MIB} MiB 之间"
+            "{class} 日志上限需在 {MIN_AGENT_LOG_MAX_MIB}–{MAX_AGENT_LOG_MAX_MIB} MiB 之间"
         )));
     }
     Ok(value)
@@ -73,7 +73,7 @@ fn valid(value: u32) -> Result<u32> {
 fn u32_column(owner: &str, value: i32) -> Result<u32> {
     let value =
         u32::try_from(value).map_err(|_| StoreError::InvalidData(format!("{owner} 是负数")))?;
-    valid(value)
+    valid(value, owner)
 }
 
 pub async fn load_agent_log_policy(
@@ -160,9 +160,9 @@ pub async fn update_agent_log_default(
         ));
     }
     let limits = AgentLogLimits {
-        agent_journal_mib: valid(request.agent_journal_mib)?,
-        xray_mib: valid(request.xray_mib)?,
-        phantun_mib: valid(request.phantun_mib)?,
+        agent_journal_mib: valid(request.agent_journal_mib, "Agent")?,
+        xray_mib: valid(request.xray_mib, "XRAY")?,
+        phantun_mib: valid(request.phantun_mib, "Phantun")?,
     };
     sqlx::query(
         "UPDATE control_state
@@ -191,9 +191,18 @@ pub async fn update_node_log_policy(
         ));
     }
     let overrides = AgentLogLimitOverrides {
-        agent_journal_mib: request.agent_journal_mib.map(valid).transpose()?,
-        xray_mib: request.xray_mib.map(valid).transpose()?,
-        phantun_mib: request.phantun_mib.map(valid).transpose()?,
+        agent_journal_mib: request
+            .agent_journal_mib
+            .map(|value| valid(value, "Agent"))
+            .transpose()?,
+        xray_mib: request
+            .xray_mib
+            .map(|value| valid(value, "XRAY"))
+            .transpose()?,
+        phantun_mib: request
+            .phantun_mib
+            .map(|value| valid(value, "Phantun"))
+            .transpose()?,
     };
     let changed = sqlx::query(
         "UPDATE nodes
@@ -257,9 +266,9 @@ mod tests {
 
     #[test]
     fn bounds_are_inclusive() {
-        assert_eq!(valid(MIN_AGENT_LOG_MAX_MIB).unwrap(), 16);
-        assert_eq!(valid(MAX_AGENT_LOG_MAX_MIB).unwrap(), 4096);
-        assert!(valid(MIN_AGENT_LOG_MAX_MIB - 1).is_err());
-        assert!(valid(MAX_AGENT_LOG_MAX_MIB + 1).is_err());
+        assert_eq!(valid(MIN_AGENT_LOG_MAX_MIB, "Agent").unwrap(), 10);
+        assert_eq!(valid(MAX_AGENT_LOG_MAX_MIB, "Phantun").unwrap(), 4096);
+        assert!(valid(MIN_AGENT_LOG_MAX_MIB - 1, "XRAY").is_err());
+        assert!(valid(MAX_AGENT_LOG_MAX_MIB + 1, "Agent").is_err());
     }
 }

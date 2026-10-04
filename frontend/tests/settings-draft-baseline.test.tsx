@@ -87,6 +87,7 @@ const ROUTES: Record<string, () => unknown> = {
     global: { agent_journal_mib: 100, xray_mib: 100, phantun_mib: 100 },
     nodes: [],
   }),
+  '/host-network-tuning': () => ({ gro_flush_timeout_ns: 20000, napi_defer_hard_irqs: 2 }),
   '/tunnel-probes': () => ({
     origin: 'console',
     endpoint_url: 'http://cp.cloudflare.com/cdn-cgi/trace',
@@ -924,7 +925,7 @@ describe('设置页分段保存的基准', () => {
   it('丢弃草稿恢复已保存字段，并保留其他段尚未保存的输入', async () => {
     render(<Harness />);
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
-    const hopBase = (await screen.findByDisplayValue('20000')) as HTMLInputElement;
+    const hopBase = (await screen.findByLabelText('中转端口起始值')) as HTMLInputElement;
     fireEvent.change(dest, { target: { value: 'www.edited.example:443' } });
     fireEvent.click(section('set-xray').getByText('保存这一段'));
     await waitFor(() => expect(section('set-xray').queryByText('有未保存的改动')).toBeNull());
@@ -943,7 +944,7 @@ describe('设置页分段保存的基准', () => {
     fireEvent.click(section('set-xray').getByText('保存这一段'));
     await waitFor(() => expect(dest.value).toBe('www.edited.example:443'));
     expect(section('set-xray').queryByText('有未保存的改动')).toBeNull();
-    const hopBase = (await screen.findByDisplayValue('20000')) as HTMLInputElement;
+    const hopBase = (await screen.findByLabelText('中转端口起始值')) as HTMLInputElement;
     fireEvent.change(hopBase, { target: { value: '020100' } });
     fireEvent.click(section('set-ports').getByText('保存这一段'));
     await waitFor(() => expect(hopBase.value).toBe('20100'));
@@ -961,7 +962,7 @@ describe('设置页分段保存的基准', () => {
     );
 
     /* 再改另一段并保存。两段互不相干，前一段已经在草稿里，不应被这次保存覆盖回去。 */
-    const hopBase = (await screen.findByDisplayValue('20000')) as HTMLInputElement;
+    const hopBase = (await screen.findByLabelText('中转端口起始值')) as HTMLInputElement;
     fireEvent.change(hopBase, { target: { value: '20100' } });
     fireEvent.click(section('set-ports').getByText('保存这一段'));
 
@@ -982,7 +983,7 @@ describe('设置页分段保存的基准', () => {
     render(<Harness />);
 
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
-    const hopBase = (await screen.findByDisplayValue('20000')) as HTMLInputElement;
+    const hopBase = (await screen.findByLabelText('中转端口起始值')) as HTMLInputElement;
 
     fireEvent.change(dest, { target: { value: 'www.edited.example:443' } });
     fireEvent.change(hopBase, { target: { value: '20100' } });

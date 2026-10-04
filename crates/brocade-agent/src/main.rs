@@ -3,6 +3,7 @@ mod command;
 mod conntrack;
 use brocade_probe as e2e;
 mod fsutil;
+mod host_tuning;
 mod http;
 mod hy2_port_hop;
 mod icmp;
@@ -93,6 +94,8 @@ const XRAY_SECURE_DOKODEMO_SPLICE_CAPABILITY: &str = "secure-dokodemo-splice";
 const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
 const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
 const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
+const NIC_GRO_FLUSH_TIMEOUT_NS_HEADER: &str = "x-brocade-nic-gro-flush-timeout-ns";
+const NIC_NAPI_DEFER_HARD_IRQS_HEADER: &str = "x-brocade-nic-napi-defer-hard-irqs";
 static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1171,6 +1174,15 @@ fn spawn_spool_reporter(
 fn run_forever(options: Options) -> Result<(), String> {
     certfile::ensure_layout(&options.state_dir)?;
     install_termination_handlers()?;
+    match host_tuning::reconcile_saved(&options.state_dir) {
+        Ok(applied) => println!("host network tuning 已应用到 {}", applied.interface),
+        // Some containers and old or non-NAPI drivers do not expose these per-device knobs. The
+        // tuning is an optimization, so keep convergence alive but leave one searchable warning.
+        Err(error) => warn(format!("host network tuning 未能完整应用：{error}")),
+    }
+    if !ensure_kernel_tls_module() {
+        warn("Linux tls 内核模块未能加载；AnyTLS kTLS 灰度前置条件未满足");
+    }
     match logcap::ensure_agent_journal_namespace(&options.state_dir) {
         Ok(true) => {
             println!("agent 日志已切到独立 journal，重启一次使配置生效");
@@ -1756,6 +1768,21 @@ fn log_policy_from_response(response: &HttpResponse) -> Result<Option<logcap::Lo
     }))
 }
 
+fn host_tuning_from_response(
+    response: &HttpResponse,
+) -> Result<Option<brocade_deployment::protocol::HostNetworkTuning>, String> {
+    let gro = log_limit_header(response, NIC_GRO_FLUSH_TIMEOUT_NS_HEADER)?;
+    let defer = log_limit_header(response, NIC_NAPI_DEFER_HARD_IRQS_HEADER)?;
+    if gro.is_none() && defer.is_none() {
+        return Ok(None);
+    }
+    let missing = |name: &str| format!("{name} 缺失");
+    Ok(Some(brocade_deployment::protocol::HostNetworkTuning {
+        gro_flush_timeout_ns: gro.ok_or_else(|| missing(NIC_GRO_FLUSH_TIMEOUT_NS_HEADER))?,
+        napi_defer_hard_irqs: defer.ok_or_else(|| missing(NIC_NAPI_DEFER_HARD_IRQS_HEADER))?,
+    }))
+}
+
 fn apply_once_inner(
     options: Options,
     meter: Option<&Arc<Mutex<()>>>,
@@ -1800,6 +1827,20 @@ fn apply_once_inner(
         },
         Ok(None) => {}
         Err(error) => warn(format!("控制面返回的日志上限无效：{error}")),
+    }
+    match host_tuning_from_response(&response) {
+        Ok(Some(settings)) => {
+            match host_tuning::apply_control_plane(&options.state_dir, settings) {
+                Ok(applied) if applied.policy_changed || applied.runtime_changed => println!(
+                "host network tuning 已更新：{} gro_flush_timeout={} ns，napi_defer_hard_irqs={}",
+                applied.interface, settings.gro_flush_timeout_ns, settings.napi_defer_hard_irqs
+            ),
+                Ok(_) => {}
+                Err(error) => warn(format!("host network tuning 未能落地：{error}")),
+            }
+        }
+        Ok(None) => {}
+        Err(error) => warn(format!("控制面返回的 host network tuning 无效：{error}")),
     }
     if response.status == 204 {
         println!("no desired state");
@@ -2626,6 +2667,46 @@ fn apply_hot_swap(
     Ok(())
 }
 
+fn xray_launch_command(splice_mode: &str, executable: &str, conf: &str) -> String {
+    // Set both modes explicitly so a service-manager environment cannot retain either the legacy
+    // process-wide splice disable or a temporary kTLS disable after the installed Xray gains the
+    // corresponding connection-scoped safeguards. kTLS auto still falls back to Go TLS when the
+    // kernel, cipher suite, or socket is unsupported; writev auto only applies after kTLS succeeds.
+    format!(
+        "env 'xray.buf.splice={splice_mode}' 'xray.anytls.ktls=auto' 'xray.anytls.writev=auto' 'xray.anytls.splice=off' {executable} run -config {conf}"
+    )
+}
+
+/// Make the kTLS ULP available before Xray accepts AnyTLS sessions.
+///
+/// The install script persists the same module for new machines, but an Agent self-update does not
+/// rerun that script. Loading it here closes that upgrade gap. Failure remains observable through
+/// `NodeVersions::kernel_tls_module`; the caller decides whether a rollout may continue while
+/// Xray's `auto` mode keeps existing traffic compatible on unsupported kernels.
+fn ensure_kernel_tls_module() -> bool {
+    ensure_kernel_tls_module_with(Path::new("/sys/module/tls"), || {
+        run_command("modprobe", &["tls"]).map(|_| ())
+    })
+}
+
+fn ensure_kernel_tls_module_with(
+    module_path: &Path,
+    load: impl FnOnce() -> Result<(), String>,
+) -> bool {
+    if module_path.is_dir() {
+        return true;
+    }
+    if let Err(error) = load() {
+        warn(format!("加载 Linux tls 内核模块失败：{error}"));
+        return false;
+    }
+    module_path.is_dir()
+}
+
+fn kernel_tls_module_loaded() -> bool {
+    Path::new("/sys/module/tls").is_dir()
+}
+
 fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     let conf = shell_quote(&path.display().to_string());
     let content =
@@ -2635,9 +2716,10 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     let xray = xray_program();
     let executable = shell_quote(&xray);
     let splice_mode = if disable_splice { "disable" } else { "auto" };
-    // Set both modes explicitly so a service-manager environment cannot retain the legacy
-    // process-wide disable after the installed Xray gains the connection-scoped guard.
-    let launch = format!("env 'xray.buf.splice={splice_mode}' {executable} run -config {conf}");
+    if !ensure_kernel_tls_module() {
+        warn("启动 Xray 前仍未观察到 Linux tls 内核模块；AnyTLS 将按 auto 回退");
+    }
+    let launch = xray_launch_command(splice_mode, &executable, &conf);
     let state_dir = path.parent().ok_or("xray config has no state directory")?;
     let log_dir = state_dir.join("logs");
     create_private_dir(&log_dir)?;
@@ -3795,6 +3877,27 @@ mod tests {
         assert!(super::log_policy_from_response(&incomplete).is_err());
     }
 
+    #[test]
+    fn host_network_tuning_requires_the_pair_and_accepts_zero() {
+        let response = crate::http::parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Nic-Gro-Flush-Timeout-Ns: 0\r\nX-Brocade-Nic-Napi-Defer-Hard-Irqs: 0\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::host_tuning_from_response(&response).unwrap(),
+            Some(brocade_deployment::protocol::HostNetworkTuning {
+                gro_flush_timeout_ns: 0,
+                napi_defer_hard_irqs: 0,
+            })
+        );
+
+        let incomplete = crate::http::parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nX-Brocade-Nic-Gro-Flush-Timeout-Ns: 20000\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(super::host_tuning_from_response(&incomplete).is_err());
+    }
+
     // By default a panic on a thread terminates only that thread while the process
     // continues, so the control plane observes a healthy machine. This test verifies
     // that `each_round` catches the panic.
@@ -4823,6 +4926,39 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
         assert!(crate::splice_mode_differs(Some(true), false));
         assert!(!crate::splice_mode_differs(Some(false), false));
         assert!(crate::splice_mode_differs(None, false));
+    }
+
+    #[test]
+    fn xray_launch_enables_ktls_but_keeps_anytls_framed_splice_off() {
+        let command = crate::xray_launch_command("auto", "'/opt/xray'", "'/tmp/config.json'");
+        assert!(command.contains("'xray.buf.splice=auto'"));
+        assert!(command.contains("'xray.anytls.ktls=auto'"));
+        assert!(command.contains("'xray.anytls.writev=auto'"));
+        assert!(command.contains("'xray.anytls.splice=off'"));
+    }
+
+    #[test]
+    fn kernel_tls_module_is_loaded_and_rechecked_before_xray() {
+        let dir = test_state_dir("ktls-module");
+        let module = dir.join("sys/module/tls");
+        let calls = std::cell::Cell::new(0_u8);
+        assert!(super::ensure_kernel_tls_module_with(&module, || {
+            calls.set(calls.get() + 1);
+            fs::create_dir_all(&module).map_err(|error| error.to_string())
+        }));
+        assert_eq!(calls.get(), 1);
+
+        assert!(super::ensure_kernel_tls_module_with(&module, || {
+            calls.set(calls.get() + 1);
+            Err("must not run".to_owned())
+        }));
+        assert_eq!(calls.get(), 1, "已加载时不应重复执行 modprobe");
+
+        fs::remove_dir_all(&module).unwrap();
+        assert!(!super::ensure_kernel_tls_module_with(&module, || {
+            Err("unsupported".to_owned())
+        }));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

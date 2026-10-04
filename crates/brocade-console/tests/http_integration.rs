@@ -2183,21 +2183,35 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
             .headers()
             .get("x-brocade-agent-journal-max-mib")
             .unwrap(),
-        "100"
+        "20"
     );
     assert_eq!(
         missing_protocol
             .headers()
             .get("x-brocade-xray-log-max-mib")
             .unwrap(),
-        "100"
+        "20"
     );
     assert_eq!(
         missing_protocol
             .headers()
             .get("x-brocade-phantun-log-max-mib")
             .unwrap(),
-        "16"
+        "10"
+    );
+    assert_eq!(
+        missing_protocol
+            .headers()
+            .get("x-brocade-nic-gro-flush-timeout-ns")
+            .unwrap(),
+        "20000"
+    );
+    assert_eq!(
+        missing_protocol
+            .headers()
+            .get("x-brocade-nic-napi-defer-hard-irqs")
+            .unwrap(),
+        "2"
     );
     assert_eq!(
         missing_protocol
@@ -2241,18 +2255,32 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
             .headers()
             .get("x-brocade-agent-journal-max-mib")
             .unwrap(),
-        "100"
+        "20"
     );
     assert_eq!(
         desired.headers().get("x-brocade-xray-log-max-mib").unwrap(),
-        "100"
+        "20"
     );
     assert_eq!(
         desired
             .headers()
             .get("x-brocade-phantun-log-max-mib")
             .unwrap(),
-        "16"
+        "10"
+    );
+    assert_eq!(
+        desired
+            .headers()
+            .get("x-brocade-nic-gro-flush-timeout-ns")
+            .unwrap(),
+        "20000"
+    );
+    assert_eq!(
+        desired
+            .headers()
+            .get("x-brocade-nic-napi-defer-hard-irqs")
+            .unwrap(),
+        "2"
     );
     assert_eq!(
         desired

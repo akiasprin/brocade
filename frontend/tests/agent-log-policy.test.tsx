@@ -71,6 +71,19 @@ describe('Agent log policy inheritance', () => {
     view.unmount();
   });
 
+  it('accepts the shared 10 MiB lower bound and rejects 9 MiB', () => {
+    const view = mounted();
+    fireEvent.change(view.getByLabelText('全局 Agent 日志上限'), { target: { value: '10' } });
+    fireEvent.change(view.getByLabelText('全局 XRAY 日志上限'), { target: { value: '10' } });
+    fireEvent.change(view.getByLabelText('全局 Phantun 日志上限'), { target: { value: '10' } });
+    expect((view.getByRole('button', { name: '保存全局值' }) as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.change(view.getByLabelText('全局 Agent 日志上限'), { target: { value: '9' } });
+    expect(view.queryByRole('button', { name: '保存全局值' })).toBeNull();
+    expect(view.getByText('三项均需填写 10–4096 的整数')).toBeTruthy();
+    view.unmount();
+  });
+
   it('preserves an unfinished machine override when inherited limits or its name refresh', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const row = (data: AgentLogPolicyView) => (

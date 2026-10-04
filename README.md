@@ -52,7 +52,7 @@ Ping 探测目标在设置页按 ICMP / TCP 分类，每个目标有 IPv4、IPv6
 
 机器配置中的「流量统计」另行记录默认路由网卡的累计接收与发送字节，并与 Xray 用户/中继用量同时展示。Agent 每 10 秒把逻辑累计值原子写入私有状态文件，进程重启沿用原值；整机重启时保留累计值并接入新 boot 的内核计数。异常断电、网卡替换、计数倒退或状态文件丢失时不会猜测缺少的字节，而是把该边界标为缺口；控制面跨 UTC 日期长时间失联时，绝对累计值仍会补回，但无法精确拆分到可能经过的重置边界，也会标出缺口，供操作者以当前总量校准建立新锚点。月度或年度重置均以 UTC+0 的 00:00 为界；当月不存在所选日期时取月末。重置策略与校准属于运行态账务设置，不进入模型修订，也不触发发布。
 
-节点日志默认有界：设置页配置全局上限（默认 100 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。systemd 节点使用独立 journald namespace；OpenRC（Alpine）节点写入 `$BROCADE_AGENT_STATE_DIR/logs/agent.log`；Agent 拉起的 Xray 与每个 Phantun 实例也分别写入该 `logs` 目录。每个日志项的当前段与前一段合计不超过生效上限，降低上限会在线截断已有分段，不重启 Xray/Phantun。systemd 上使用 `journalctl --namespace=brocade-agent -u brocade-agent` 查看 Agent 日志，OpenRC 上使用 `tail -n 100 $BROCADE_AGENT_STATE_DIR/logs/agent.log`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动。
+节点日志默认有界：设置页配置全局上限（Agent 20 MiB、Xray 20 MiB、每个 Phantun 实例 10 MiB，三类最低均为 10 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。systemd 节点使用独立 journald namespace；OpenRC（Alpine）节点写入 `$BROCADE_AGENT_STATE_DIR/logs/agent.log`；Agent 拉起的 Xray 与每个 Phantun 实例也分别写入该 `logs` 目录。每个日志项的当前段与前一段合计不超过生效上限，降低上限会在线截断已有分段，不重启 Xray/Phantun。systemd 上使用 `journalctl --namespace=brocade-agent -u brocade-agent` 查看 Agent 日志，OpenRC 上使用 `tail -n 100 $BROCADE_AGENT_STATE_DIR/logs/agent.log`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动。
 
 机器公网 IP 观测复用设置页的端到端探测落点。Agent 按同一间隔并行强制 IPv4、IPv6 直连该 CGI Trace 地址，从 `ip=`/`loc=` 取得两族事实，再分别上报 Console；没有 IPv6 不会阻塞或清空 IPv4。它不使用 Agent 请求的 `X-Real-IP`、`X-Forwarded-For` 或 Cloudflare 代理地址，也不把内核默认路由的 `src` 当作 NAT 后公网地址。配置中的公网地址、默认路由源地址和实际公网观测分别存放；首次观测立即生效，后续变更须跨至少 10 秒连续确认两次。稳定样本只刷新最后观测时间，变更事件保留 90 天，机器详情默认展示最近 14 天。
 

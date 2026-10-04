@@ -12,6 +12,7 @@ mod draft;
 mod egress_dns;
 mod grant_automation;
 mod grant_probe;
+mod host_tuning;
 mod input;
 mod lifecycle;
 mod load;
@@ -76,6 +77,10 @@ pub use brocade_deployment::protocol::{
     VpngateProviderRiskRule, VpngateReconcileReport, VpngateRiskDecisionPolicy, VpngateTransport,
     XrayReleaseOffer, XrayReleaseOutcome, XrayReleaseReport,
 };
+pub use brocade_deployment::protocol::{
+    HostNetworkTuning, DEFAULT_NIC_GRO_FLUSH_TIMEOUT_NS, DEFAULT_NIC_NAPI_DEFER_HARD_IRQS,
+    MAX_NIC_GRO_FLUSH_TIMEOUT_NS, MAX_NIC_NAPI_DEFER_HARD_IRQS,
+};
 pub use cert::{
     CertDomain, CertDomainInput, CertGroup, CertificateDnsTarget, CertificateOrder,
     CertificateScanLock, CertificateSigningMethod, GroupCertificate, IssuedCertificate,
@@ -135,7 +140,8 @@ pub use load::{
 pub use log_policy::{
     AgentLogLimitOverrides, AgentLogLimits, AgentLogPolicyView, NodeLogPolicyItem,
     UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, DEFAULT_AGENT_LOG_MAX_MIB,
-    DEFAULT_PHANTUN_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB, MIN_AGENT_LOG_MAX_MIB,
+    DEFAULT_PHANTUN_LOG_MAX_MIB, DEFAULT_XRAY_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
+    MIN_AGENT_LOG_MAX_MIB,
 };
 pub use notifications::{
     ClaimedNotificationDelivery, MachineEventList, MachineEventView, MACHINE_EVENT_RETENTION_DAYS,

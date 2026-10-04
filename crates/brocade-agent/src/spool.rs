@@ -198,6 +198,7 @@ fn observe_versions(state_dir: &Path) -> NodeVersions {
         xray: first_line(run_command(&xray.to_string_lossy(), &["version"]).ok()),
         xray_installed_sha256: crate::installed_xray_sha256(),
         xray_running_sha256: crate::running_xray_sha256(),
+        kernel_tls_module: Some(crate::kernel_tls_module_loaded()),
         phantun: first_line(run_command("phantun-client", &["--version"]).ok()),
         // OpenVPN alone is not a usable capability: without an openable TUN clone device every
         // provider profile reaches the same local failure and can poison the fleet-wide candidate

@@ -49,13 +49,13 @@ use brocade_store::{
     CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest,
     CreateIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
     CreateXrayReleaseRequest, DeleteFrontRequest, DistributionSettings, E2eProbeItem,
-    E2eProbeRequest, IsolateDeploymentTargetRequest, IsolateNodeRequest, LinkHealthRequest,
-    LinkProbeRequest, LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore,
-    PhantunBinaries, PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest,
-    ProvisionNodeResult, ProvisionedNode, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
-    RemoveWarpBindingRequest, RequestVpngatePoolSwitch, SetUserAppQuotaRequest,
-    SetUserPasswordRequest, StoreError, SystemInitRequest, TunnelProbeSource,
-    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    E2eProbeRequest, HostNetworkTuning, IsolateDeploymentTargetRequest, IsolateNodeRequest,
+    LinkHealthRequest, LinkProbeRequest, LoadReportRequest, LoadSeriesQuery, ModelOp,
+    NodeLifecyclePhase, PgStore, PhantunBinaries, PingProbeReportRequest, PingProbeSettings,
+    ProvisionNodeRequest, ProvisionNodeResult, ProvisionedNode, RegisterWarpBindingRequest,
+    RemoveRetiredNodesRequest, RemoveWarpBindingRequest, RequestVpngatePoolSwitch,
+    SetUserAppQuotaRequest, SetUserPasswordRequest, StoreError, SystemInitRequest,
+    TunnelProbeSource, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
     UpdateNodeStatusRequest, UpdateNodeTrafficRequest, UpdateTunnelProbePolicy,
     UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateVpngateCatalogSettings,
     UpdateVpngateIntelligenceCredentials, UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode,
@@ -77,6 +77,8 @@ const ROUTE_IPV6_HEADER: &str = "x-brocade-route-ipv6";
 const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
 const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
 const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
+const NIC_GRO_FLUSH_TIMEOUT_NS_HEADER: &str = "x-brocade-nic-gro-flush-timeout-ns";
+const NIC_NAPI_DEFER_HARD_IRQS_HEADER: &str = "x-brocade-nic-napi-defer-hard-irqs";
 /// Which architecture the asking agent was built for, in `uname -m`'s vocabulary. Only the node
 /// knows this, and the control plane has no other source for it: enrolment records no
 /// architecture, and an incorrect guess would hand a machine a binary that installs, verifies,
@@ -1104,6 +1106,12 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/agent-log-policy/nodes/{node_id}",
             put(update_node_log_policy),
+        )
+        // Kernel NIC/NAPI coalescing is live operational state. Agents persist and reconcile it
+        // from every desired-state response; saving here creates no model revision or Xray restart.
+        .route(
+            "/host-network-tuning",
+            get(get_host_network_tuning).put(update_host_network_tuning),
         )
         // Physical interface accounting is live operational state. Policy and calibration apply
         // immediately and never create a model revision or deployment.
@@ -2748,6 +2756,29 @@ async fn update_node_log_policy(
         .update_node_log_policy(&admin, &node_id, request)
         .await?;
     Ok(Json(state.store.agent_log_policy(&admin).await?).into_response())
+}
+
+async fn get_host_network_tuning(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.host_network_tuning().await?).into_response())
+}
+
+async fn update_host_network_tuning(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<HostNetworkTuning>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(
+        state
+            .store
+            .update_host_network_tuning(&admin, settings)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn get_node_traffic(
@@ -5414,6 +5445,7 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
     // otherwise converged and the body is 204. This changes retention without inventing a fake
     // deployment or restarting Xray.
     let log_limits = state.store.effective_node_log_limits(&node.node_id).await?;
+    let host_tuning = state.store.host_network_tuning().await?;
     let agent_version = user_agent(&headers).map(str::to_owned);
     let protocol_version = agent_protocol_version(&headers);
     state
@@ -5440,7 +5472,10 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             "x-brocade-agent-upgrade-required",
             HeaderValue::from_static("1"),
         );
-        return Ok(with_agent_log_policy(response, log_limits));
+        return Ok(with_host_network_tuning(
+            with_agent_log_policy(response, log_limits),
+            host_tuning,
+        ));
     }
 
     let desired = state.store.claim_desired_for_node(&node.node_id).await?;
@@ -5484,7 +5519,10 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             true => StatusCode::NO_CONTENT.into_response(),
         },
     };
-    Ok(with_agent_log_policy(response, log_limits))
+    Ok(with_host_network_tuning(
+        with_agent_log_policy(response, log_limits),
+        host_tuning,
+    ))
 }
 
 async fn agent_public_ip_observation(
@@ -5509,6 +5547,25 @@ fn with_agent_log_policy(
         (AGENT_JOURNAL_MAX_MIB_HEADER, limits.agent_journal_mib),
         (XRAY_LOG_MAX_MIB_HEADER, limits.xray_mib),
         (PHANTUN_LOG_MAX_MIB_HEADER, limits.phantun_mib),
+    ] {
+        response.headers_mut().insert(
+            name,
+            HeaderValue::from_str(&value.to_string()).expect("u32 is a valid HTTP header value"),
+        );
+    }
+    response
+}
+
+fn with_host_network_tuning(mut response: Response, settings: HostNetworkTuning) -> Response {
+    for (name, value) in [
+        (
+            NIC_GRO_FLUSH_TIMEOUT_NS_HEADER,
+            settings.gro_flush_timeout_ns,
+        ),
+        (
+            NIC_NAPI_DEFER_HARD_IRQS_HEADER,
+            settings.napi_defer_hard_irqs,
+        ),
     ] {
         response.headers_mut().insert(
             name,
@@ -7272,7 +7329,9 @@ mod tests {
     use axum::extract::Path;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    use brocade_store::{AdminContext, AdminRole, AgentLogLimits, AuthenticatedAdmin, StoreError};
+    use brocade_store::{
+        AdminContext, AdminRole, AgentLogLimits, AuthenticatedAdmin, HostNetworkTuning, StoreError,
+    };
 
     use super::{
         bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
@@ -7655,6 +7714,25 @@ mod tests {
         );
         assert_eq!(response.headers()[super::XRAY_LOG_MAX_MIB_HEADER], "80");
         assert_eq!(response.headers()[super::PHANTUN_LOG_MAX_MIB_HEADER], "64");
+    }
+
+    #[test]
+    fn host_network_tuning_headers_are_present_on_idle_agent_responses() {
+        let response = super::with_host_network_tuning(
+            StatusCode::NO_CONTENT.into_response(),
+            HostNetworkTuning {
+                gro_flush_timeout_ns: 20_000,
+                napi_defer_hard_irqs: 2,
+            },
+        );
+        assert_eq!(
+            response.headers()[super::NIC_GRO_FLUSH_TIMEOUT_NS_HEADER],
+            "20000"
+        );
+        assert_eq!(
+            response.headers()[super::NIC_NAPI_DEFER_HARD_IRQS_HEADER],
+            "2"
+        );
     }
 
     #[test]
@@ -8093,6 +8171,9 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("modprobe tun"));
         assert!(INSTALL_SCRIPT.contains("/etc/modules-load.d/brocade-vpngate.conf"));
         assert!(INSTALL_SCRIPT.contains("tun_device_usable"));
+        assert!(INSTALL_SCRIPT.contains("modprobe tls"));
+        assert!(INSTALL_SCRIPT.contains("/etc/modules-load.d/brocade-xray-ktls.conf"));
+        assert!(INSTALL_SCRIPT.contains("enable_xray_ktls || true"));
     }
 
     #[test]

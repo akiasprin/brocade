@@ -91,13 +91,25 @@ test('外观控制分开呈现明暗模式与当前色调', () => {
   assert.match(shell, /<span className="fg-appearance-label">主题<\/span>/);
   assert.match(shell, /<small>\{selectedPaletteName\}<\/small>/);
   assert.match(shell, /aria-checked=\{paletteKey === option\.key\}/);
+  const deferredAppearance =
+    shell.match(/const closeMenuThenTransition = \(transition: \(\) => void\) => \{([\s\S]*?)\n\s*\};/)?.[1] ?? '';
+  assert.match(deferredAppearance, /pendingAppearanceTransition\.current = transition;/);
+  assert.match(deferredAppearance, /setMore\(false\);/);
+  assert.match(
+    shell,
+    /if \(more \|\| menuPresence\.present\) return;[\s\S]*?pendingAppearanceTransition\.current = null;[\s\S]*?queueMicrotask\(transition\);/,
+  );
   const themeOptions = [...shell.matchAll(/className="fg-theme-option"[\s\S]*?onClick=\{\(\) => \{([\s\S]*?)\}\}/g)];
   assert.equal(themeOptions.length, 2);
-  for (const [, handler] of themeOptions) assert.match(handler, /setMore\(false\);/);
+  for (const [, handler] of themeOptions) {
+    assert.match(handler, /if \(themeKey === '(?:light|dark)'\) return setMore\(false\);/);
+    assert.match(handler, /closeMenuThenTransition\(toggleTheme\);/);
+  }
   const paletteHandler =
     shell.match(/className="fg-accdot"[\s\S]*?onClick=\{event => \{([\s\S]*?)\n\s*\}\}/)?.[1] ?? '';
-  assert.match(paletteHandler, /setMore\(false\);/);
-  assert.match(paletteHandler, /if \(paletteKey === option\.key\) return;/);
+  assert.match(paletteHandler, /if \(paletteKey === option\.key\) return setMore\(false\);/);
+  assert.match(paletteHandler, /const origin = motionOriginFor\(/);
+  assert.match(paletteHandler, /closeMenuThenTransition\(\(\) =>/);
   assert.match(styles, /button\.fg-theme-option\[aria-checked='true'\]/);
   // 选中的色点用一圈正文色标出，不靠颜色本身。
   assert.match(

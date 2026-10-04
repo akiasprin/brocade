@@ -18,6 +18,7 @@ use crate::deployment;
 use crate::distribution;
 use crate::grant_automation;
 use crate::grant_probe;
+use crate::host_tuning;
 use crate::load;
 use crate::notifications;
 use crate::ping_probe;
@@ -259,6 +260,20 @@ impl PgStore {
 
     pub async fn effective_node_log_limits(&self, node_id: &str) -> Result<crate::AgentLogLimits> {
         crate::log_policy::effective_node_log_limits(&self.pool, node_id).await
+    }
+
+    /// Fleet-wide NIC/NAPI tuning. It is operational state, so reads are fresh and writes create
+    /// neither a model revision nor a deployment.
+    pub async fn host_network_tuning(&self) -> Result<crate::HostNetworkTuning> {
+        host_tuning::load(&self.pool).await
+    }
+
+    pub async fn update_host_network_tuning(
+        &self,
+        actor: &AdminContext,
+        settings: crate::HostNetworkTuning,
+    ) -> Result<crate::HostNetworkTuning> {
+        host_tuning::update(&self.pool, actor, settings).await
     }
 
     /// Physical NIC totals are operational accounting: no model revision or deployment is made.

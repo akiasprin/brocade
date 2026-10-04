@@ -937,6 +937,48 @@ tune_tcp_fast_open() {
 }
 tune_tcp_fast_open || true
 
+# AnyTLS can move TLS 1.3 AES-GCM record processing into the kernel. Xray keeps kTLS in `auto`, so
+# an old or restricted kernel still works through ordinary Go TLS; the installer only makes a
+# usable module available now and after reboot. The kTLS writev path is selected by Xray without
+# host setup; the separate pipe-splice experiment stays independently switchable because its result
+# varies with the kernel and workload. Keep the module file separate from brocade.conf because
+# tune_conntrack rewrites that file on every installation.
+enable_xray_ktls() {
+    if [ ! -d /sys/module/tls ]; then
+        if ! have modprobe; then
+            echo "installing kmod for optional Xray kTLS support ..." >&2
+            if ! install_pkg kmod; then
+                echo "无法安装 modprobe；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
+                return 0
+            fi
+        fi
+        if ! modprobe tls >/dev/null 2>&1; then
+            echo "当前内核无法加载 tls 模块；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
+            return 0
+        fi
+    fi
+
+    if [ ! -d /sys/module/tls ]; then
+        echo "tls 模块加载后仍不可见；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
+        return 0
+    fi
+
+    if ! install -d -m 0755 /etc/modules-load.d; then
+        echo "写不了 /etc/modules-load.d；kTLS 当前可用，但重启后可能回退到 Go TLS。" >&2
+        return 0
+    fi
+    ktls_module_stage=/etc/modules-load.d/.brocade-xray-ktls.$$
+    TMPFILES="$TMPFILES $ktls_module_stage"
+    if ! printf 'tls\n' > "$ktls_module_stage" ||
+       ! chmod 0644 "$ktls_module_stage" ||
+       ! mv -f "$ktls_module_stage" /etc/modules-load.d/brocade-xray-ktls.conf; then
+        echo "持久化 tls 模块失败；kTLS 当前可用，但重启后可能回退到 Go TLS。" >&2
+        return 0
+    fi
+    echo "Xray kTLS 模块已就绪，并会在开机时加载（运行时仍按 auto 安全回退）。" >&2
+}
+enable_xray_ktls || true
+
 # 连接跟踪表。写进同一个 99-brocade.conf，但单独一个函数——两者的失败条件不一样，而且
 # BBR 设不上的那批机器（OpenVZ/LXC、老内核）恰恰是内存最小、最先撞上连接表上限的那批，
 # 让它们因为没有 BBR 就连这个也拿不到是反的。
@@ -1046,7 +1088,7 @@ fi
 LOG_NAMESPACE_LINE=
 AGENT_LOG_FILE=
 if [ "$SERVICE_MODE" = "systemd" ]; then
-    # Give Brocade its own journal namespace so the bootstrap 100 MiB ceiling applies to this
+    # Give Brocade its own journal namespace so the bootstrap 20 MiB ceiling applies to this
     # agent, not to unrelated host services. The first authenticated poll replaces it with the
     # global/per-machine value from Settings. Namespaces landed in systemd 245; on an older host
     # retaining the global journal is safer than shrinking every service's logs to our limit.
@@ -1062,10 +1104,10 @@ EOF
         cat > /etc/systemd/journald@brocade-agent.conf.d/limits.conf <<'EOF'
 [Journal]
 Storage=persistent
-SystemMaxUse=100M
-RuntimeMaxUse=100M
-SystemMaxFileSize=25M
-RuntimeMaxFileSize=25M
+SystemMaxUse=20M
+RuntimeMaxUse=20M
+SystemMaxFileSize=5M
+RuntimeMaxFileSize=5M
 EOF
     else
         rm -f /etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf
