@@ -14,6 +14,14 @@ import (
 	"github.com/xtls/xray-core/common/signal"
 )
 
+// FramedDownlinkSplicer allows a multiplexed inbound to preserve its frame
+// boundaries while moving payload bytes directly from a raw outbound socket.
+// Implementations must return handled=false before consuming any source bytes
+// when the fast path is unavailable.
+type FramedDownlinkSplicer interface {
+	SpliceDownlink(context.Context, net.Conn, func(int64)) (handled bool, err error)
+}
+
 // SpliceCopyState describes the connection's progression from protocol parsing
 // through direct copy and into an operating-system-assisted splice. The zero
 // value deliberately means that no protocol has opted the connection in.
@@ -120,6 +128,9 @@ type Inbound struct {
 	CanSpliceCopy AtomicSpliceCopyState
 	// SpliceMetrics is set only by protocols that expose splice observability.
 	SpliceMetrics SpliceMetrics
+	// FramedDownlinkSplicer is set on per-stream metadata by multiplexed
+	// protocols that can encode frames around an OS-assisted payload copy.
+	FramedDownlinkSplicer FramedDownlinkSplicer
 }
 
 // Clone returns a shallow metadata copy while loading the atomic splice state
@@ -130,16 +141,17 @@ func (i *Inbound) Clone() *Inbound {
 		return nil
 	}
 	clone := &Inbound{
-		Source:        i.Source,
-		Local:         i.Local,
-		Gateway:       i.Gateway,
-		Tag:           i.Tag,
-		Name:          i.Name,
-		User:          i.User,
-		VlessRoute:    i.VlessRoute,
-		Conn:          i.Conn,
-		Timer:         i.Timer,
-		SpliceMetrics: i.SpliceMetrics,
+		Source:                i.Source,
+		Local:                 i.Local,
+		Gateway:               i.Gateway,
+		Tag:                   i.Tag,
+		Name:                  i.Name,
+		User:                  i.User,
+		VlessRoute:            i.VlessRoute,
+		Conn:                  i.Conn,
+		Timer:                 i.Timer,
+		SpliceMetrics:         i.SpliceMetrics,
+		FramedDownlinkSplicer: i.FramedDownlinkSplicer,
 	}
 	clone.CanSpliceCopy.Store(i.CanSpliceCopy.Load())
 	return clone

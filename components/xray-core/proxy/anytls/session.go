@@ -18,10 +18,12 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	sessionctx "github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/singbridge"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	v2tls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 type session struct {
@@ -198,7 +200,18 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	if s.isClosed() {
 		return errors.New("anytls: session closed")
 	}
-	l, err := s.dispatcher.Dispatch(ctx, dest)
+	dispatchCtx := ctx
+	var downlinkSplicer *framedDownlinkSplicer
+	if _, ok := v2tls.KernelTLSRawConn(s.conn); ok {
+		if inbound := sessionctx.InboundFromContext(ctx); inbound != nil {
+			streamInbound := inbound.Clone()
+			streamInbound.CanSpliceCopy.Store(sessionctx.SpliceCopyDirect)
+			downlinkSplicer = &framedDownlinkSplicer{session: s, sid: st.sid, ready: make(chan struct{})}
+			streamInbound.FramedDownlinkSplicer = downlinkSplicer
+			dispatchCtx = sessionctx.ContextWithInbound(ctx, streamInbound)
+		}
+	}
+	l, err := s.dispatcher.Dispatch(dispatchCtx, dest)
 	if err != nil {
 		errors.LogWarning(ctx, "anytls: new stream dispatcher error, streamId=", st.sid, " err=", err)
 		if sendErr := s.sendFrame(&frame{cmd: cmdSYNACK, sid: st.sid, data: []byte(err.Error())}); sendErr != nil {
@@ -216,6 +229,9 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 		errors.LogWarning(ctx, "anytls: new stream SYNACK send error, streamId=", st.sid, " err=", err)
 		return err
+	}
+	if downlinkSplicer != nil {
+		close(downlinkSplicer.ready)
 	}
 
 	if bodyReader.Len() > 0 {

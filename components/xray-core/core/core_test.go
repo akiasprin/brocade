@@ -6,7 +6,7 @@ import (
 )
 
 func TestVersionStatementAdvertisesBrocadeCapabilities(t *testing.T) {
-	want := "Brocade-Capabilities: secure-dokodemo-splice"
+	want := "Brocade-Capabilities: anytls-ktls-splice secure-dokodemo-splice"
 	if !slices.Contains(VersionStatement(), want) {
 		t.Fatal("version statement does not advertise Brocade splice capabilities")
 	}

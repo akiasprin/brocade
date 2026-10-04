@@ -13,10 +13,11 @@ const (
 	AssetLocation   = "xray.location.asset"
 	CertLocation    = "xray.location.cert"
 
-	UseReadV         = "xray.buf.readv"
-	UseFreedomSplice = "xray.buf.splice"
-	UseVmessPadding  = "xray.vmess.padding"
-	UseCone          = "xray.cone.disabled"
+	UseReadV           = "xray.buf.readv"
+	UseFreedomSplice   = "xray.buf.splice"
+	UseAnyTLSKernelTLS = "xray.anytls.ktls"
+	UseVmessPadding    = "xray.vmess.padding"
+	UseCone            = "xray.cone.disabled"
 
 	BufferSize           = "xray.ray.buffer.size"
 	BrowserDialerAddress = "xray.browser.dialer"

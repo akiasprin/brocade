@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pires/go-proxyproto"
+	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
@@ -296,6 +297,29 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+		if destination.Network == net.Network_TCP && inbound != nil && inbound.FramedDownlinkSplicer != nil &&
+			responseSpliceEnabled(inbound) && proxy.IsRAWTransportWithoutSecurity(conn) {
+			rawConn, readCounter, _ := proxy.UnwrapRawConn(conn)
+			var userCounter stats.Counter
+			if statWriter, ok := output.(*dispatcher.SizeStatWriter); ok {
+				userCounter = statWriter.Counter
+			}
+			handled, spliceErr := inbound.FramedDownlinkSplicer.SpliceDownlink(ctx, rawConn, func(bytes int64) {
+				if readCounter != nil {
+					readCounter.Add(bytes)
+				}
+				if userCounter != nil {
+					userCounter.Add(bytes)
+				}
+				timer.Update()
+			})
+			if handled {
+				if spliceErr != nil && errors.Cause(spliceErr) != io.EOF {
+					return errors.New("failed to splice framed response").Base(spliceErr)
+				}
+				return nil
+			}
+		}
 		if destination.Network != net.Network_TCP {
 			proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedCommand)
 		} else if !responseSpliceEnabled(inbound) {

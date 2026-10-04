@@ -1,10 +1,18 @@
 package session
 
 import (
+	"context"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
+
+type testFramedDownlinkSplicer struct{}
+
+func (*testFramedDownlinkSplicer) SpliceDownlink(context.Context, net.Conn, func(int64)) (bool, error) {
+	return false, nil
+}
 
 func TestAtomicSpliceCopyStateTransition(t *testing.T) {
 	var state AtomicSpliceCopyState
@@ -39,7 +47,8 @@ func TestAtomicSpliceCopyStateTransition(t *testing.T) {
 }
 
 func TestInboundCloneLoadsSpliceState(t *testing.T) {
-	inbound := &Inbound{Name: "vless"}
+	framedSplicer := &testFramedDownlinkSplicer{}
+	inbound := &Inbound{Name: "vless", FramedDownlinkSplicer: framedSplicer}
 	inbound.CanSpliceCopy.Store(SpliceCopyWaiting)
 
 	clone := inbound.Clone()
@@ -50,5 +59,8 @@ func TestInboundCloneLoadsSpliceState(t *testing.T) {
 	}
 	if got := clone.CanSpliceCopy.Load(); got != SpliceCopyDisabled {
 		t.Fatalf("clone state = %d, want %d", got, SpliceCopyDisabled)
+	}
+	if clone.FramedDownlinkSplicer != framedSplicer {
+		t.Fatal("clone did not preserve the per-stream framed splicer")
 	}
 }

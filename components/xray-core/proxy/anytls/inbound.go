@@ -15,7 +15,9 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	featurestats "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	v2tls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 type Server struct {
@@ -26,6 +28,7 @@ type Server struct {
 	userMu         sync.RWMutex
 	paddingScheme  string
 	masquerade     *masquerade
+	performance    *performanceStats
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -47,6 +50,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		usersByEmail:   make(map[string]*protocol.MemoryUser),
 		activeSessions: make(map[*protocol.MemoryUser]map[*session]struct{}),
 		paddingScheme:  rawPaddingScheme,
+		performance:    newPerformanceStats(v.GetFeature(featurestats.ManagerType()).(featurestats.Manager)),
 	}
 	var err error
 	s.masquerade, err = newMasquerade(config.Masquerade)
@@ -91,6 +95,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	sessPol := s.policyManager.ForLevel(0)
 	handshakeDeadline := time.Now().Add(sessPol.Timeouts.Handshake)
 	_ = conn.SetReadDeadline(handshakeDeadline)
+	kernelTLSEnabled, err := v2tls.TryEnableKernelTLS(ctx, conn)
+	if err != nil {
+		return errors.New("anytls: enable kTLS").Base(err)
+	}
+	s.performance.recordKernelTLS(kernelTLSEnabled)
 
 	sess := s.newSession(conn, dispatcher)
 	sess.fw = newFrameWriter(sess.bw)

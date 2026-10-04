@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"math/big"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -27,16 +29,106 @@ var _ Interface = (*Conn)(nil)
 
 type Conn struct {
 	*tls.Conn
+
+	rawConn      net.Conn
+	serverConfig *tls.Config
+
+	stateMu    sync.RWMutex
+	kernelConn net.Conn
+	ioStarted  atomic.Bool
+	promoteMu  sync.Mutex
 }
 
 const tlsCloseTimeout = 250 * time.Millisecond
 
 func (c *Conn) Close() error {
+	if c.kernelTLSConn() != nil {
+		return closeKernelTLS(c.rawConn)
+	}
 	timer := time.AfterFunc(tlsCloseTimeout, func() {
 		c.Conn.NetConn().Close()
 	})
 	defer timer.Stop()
 	return c.Conn.Close()
+}
+
+func (c *Conn) Read(p []byte) (int, error) {
+	if conn := c.kernelTLSConn(); conn != nil {
+		return conn.Read(p)
+	}
+	c.ioStarted.Store(true)
+	return c.tlsConn().Read(p)
+}
+
+func (c *Conn) Write(p []byte) (int, error) {
+	if conn := c.kernelTLSConn(); conn != nil {
+		return conn.Write(p)
+	}
+	c.ioStarted.Store(true)
+	return c.tlsConn().Write(p)
+}
+
+func (c *Conn) SetDeadline(t time.Time) error {
+	if conn := c.kernelTLSConn(); conn != nil {
+		return conn.SetDeadline(t)
+	}
+	return c.tlsConn().SetDeadline(t)
+}
+
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	if conn := c.kernelTLSConn(); conn != nil {
+		return conn.SetReadDeadline(t)
+	}
+	return c.tlsConn().SetReadDeadline(t)
+}
+
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	if conn := c.kernelTLSConn(); conn != nil {
+		return conn.SetWriteDeadline(t)
+	}
+	return c.tlsConn().SetWriteDeadline(t)
+}
+
+func (c *Conn) LocalAddr() net.Addr {
+	return c.rawConn.LocalAddr()
+}
+
+func (c *Conn) RemoteAddr() net.Addr {
+	return c.rawConn.RemoteAddr()
+}
+
+func (c *Conn) NetConn() net.Conn {
+	return c.rawConn
+}
+
+func (c *Conn) HandshakeContext(ctx context.Context) error {
+	if c.kernelTLSConn() != nil {
+		return nil
+	}
+	c.ioStarted.Store(true)
+	return c.tlsConn().HandshakeContext(ctx)
+}
+
+func (c *Conn) Handshake() error {
+	return c.HandshakeContext(context.Background())
+}
+
+func (c *Conn) ConnectionState() tls.ConnectionState {
+	return c.tlsConn().ConnectionState()
+}
+
+func (c *Conn) tlsConn() *tls.Conn {
+	c.stateMu.RLock()
+	conn := c.Conn
+	c.stateMu.RUnlock()
+	return conn
+}
+
+func (c *Conn) kernelTLSConn() net.Conn {
+	c.stateMu.RLock()
+	conn := c.kernelConn
+	c.stateMu.RUnlock()
+	return conn
 }
 
 func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -61,8 +153,9 @@ func (c *Conn) NegotiatedProtocol() string {
 // VisionBuffers exposes TLS read-ahead through the transport wrapper instead
 // of making protocol handlers depend on crypto/tls' private struct layout.
 func (c *Conn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
-	input, inputOK := utils.TryAccessField[bytes.Reader](c.Conn, "input")
-	rawInput, rawInputOK := utils.TryAccessField[bytes.Buffer](c.Conn, "rawInput")
+	tlsConn := c.tlsConn()
+	input, inputOK := utils.TryAccessField[bytes.Reader](tlsConn, "input")
+	rawInput, rawInputOK := utils.TryAccessField[bytes.Buffer](tlsConn, "rawInput")
 	if !inputOK || !rawInputOK {
 		return nil, nil
 	}
@@ -72,13 +165,13 @@ func (c *Conn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
 // Client initiates a TLS client handshake on the given connection.
 func Client(c net.Conn, config *tls.Config) net.Conn {
 	tlsConn := tls.Client(c, config)
-	return &Conn{Conn: tlsConn}
+	return &Conn{Conn: tlsConn, rawConn: c}
 }
 
 // Server initiates a TLS server handshake on the given connection.
 func Server(c net.Conn, config *tls.Config) net.Conn {
 	tlsConn := tls.Server(c, config)
-	return &Conn{Conn: tlsConn}
+	return &Conn{Conn: tlsConn, rawConn: c, serverConfig: config}
 }
 
 type UConn struct {
