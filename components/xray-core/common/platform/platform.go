@@ -16,6 +16,8 @@ const (
 	UseReadV           = "xray.buf.readv"
 	UseFreedomSplice   = "xray.buf.splice"
 	UseAnyTLSKernelTLS = "xray.anytls.ktls"
+	UseAnyTLSSplice    = "xray.anytls.splice"
+	UseAnyTLSWritev    = "xray.anytls.writev"
 	UseVmessPadding    = "xray.vmess.padding"
 	UseCone            = "xray.cone.disabled"
 

@@ -199,6 +199,42 @@ func TestSendStreamDataBatchesAdjacentFrames(t *testing.T) {
 	}
 }
 
+func TestSendStreamDataFits128KiBPayloadAndHeadersInOneWrite(t *testing.T) {
+	conn := new(countingConn)
+	s := &session{
+		conn:    conn,
+		bw:      buf.NewBufferedWriter(buf.NewWriter(conn)),
+		streams: make(map[uint32]*stream),
+	}
+	s.fw = newFrameWriter(s.bw)
+	s.paddingScheme, _ = parsePaddingScheme("stop=0\n0=30-30")
+
+	payload := make([]byte, maxPSHBatchPayloadSize)
+	for index := range payload {
+		payload[index] = byte(index)
+	}
+	if err := s.sendStreamData(17, buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	if conn.writeCalls != 1 {
+		t.Fatalf("connection writes = %d, want one 128 KiB payload batch", conn.writeCalls)
+	}
+	if conn.maxWrite != len(payload)+3*frameHeaderSize {
+		t.Fatalf("wire size = %d, want %d", conn.maxWrite, len(payload)+3*frameHeaderSize)
+	}
+	frames := parseTestFrames(t, conn.wire.Bytes())
+	if len(frames) != 3 {
+		t.Fatalf("frame count = %d, want 3", len(frames))
+	}
+	var got bytes.Buffer
+	for _, frame := range frames {
+		got.Write(frame.data)
+	}
+	if !bytes.Equal(got.Bytes(), payload) {
+		t.Fatal("128 KiB batched payload was not reconstructed exactly")
+	}
+}
+
 func TestSendStreamDataFlushesControlFrameBeforeDirectWrite(t *testing.T) {
 	conn := new(countingConn)
 	s := &session{

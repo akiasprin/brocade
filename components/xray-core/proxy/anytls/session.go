@@ -202,11 +202,16 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	}
 	dispatchCtx := ctx
 	var downlinkSplicer *framedDownlinkSplicer
-	if _, ok := v2tls.KernelTLSRawConn(s.conn); ok {
+	if _, ok := v2tls.KernelTLSRawConn(s.conn); ok && (framedDownlinkSpliceEnabled() || kernelTLSVectoredWriteEnabled()) {
 		if inbound := sessionctx.InboundFromContext(ctx); inbound != nil {
 			streamInbound := inbound.Clone()
 			streamInbound.CanSpliceCopy.Store(sessionctx.SpliceCopyDirect)
-			downlinkSplicer = &framedDownlinkSplicer{session: s, sid: st.sid, ready: make(chan struct{})}
+			downlinkSplicer = &framedDownlinkSplicer{
+				session:   s,
+				sid:       st.sid,
+				ready:     make(chan struct{}),
+				useSplice: framedDownlinkSpliceEnabled(),
+			}
 			streamInbound.FramedDownlinkSplicer = downlinkSplicer
 			dispatchCtx = sessionctx.ContextWithInbound(ctx, streamInbound)
 		}
@@ -609,6 +614,16 @@ func (s *session) nextPacketIndex() (uint32, bool) {
 	return s.nextPacketIndexLocked()
 }
 
+// unpaddedFastPathAvailable reports whether a raw framed writer may bypass the
+// packet encoder. Padding is session-wide and the packet counter only moves
+// forward, so once the stop point is reached it cannot become active again.
+func (s *session) unpaddedFastPathAvailable() bool {
+	s.schemeMu.RLock()
+	scheme := s.paddingScheme
+	s.schemeMu.RUnlock()
+	return scheme == nil || s.pktCounter.Load() >= scheme.stop
+}
+
 func (s *session) writePacketLocked(frames buf.MultiBuffer) error {
 	packetIndex, paddingEnabled := s.nextPacketIndexLocked()
 	if paddingEnabled {
@@ -634,6 +649,11 @@ func (s *session) writeFramesLocked(sid uint32, data buf.MultiBuffer, packetInde
 	if !paddingEnabled && s.conn != nil {
 		if err := s.fw.flush(); err != nil {
 			return err
+		}
+		if kernelTLSVectoredWriteEnabled() {
+			if handled, err := s.writeKernelTLSVectoredLocked(sid, data); handled {
+				return err
+			}
 		}
 		return writePSHBatch(s.conn, sid, data)
 	}
@@ -663,7 +683,35 @@ func (s *session) writeFramesLocked(sid uint32, data buf.MultiBuffer, packetInde
 	return nil
 }
 
-const maxPSHBatchWireSize int32 = 128 * 1024
+// writeKernelTLSVectoredLocked writes data directly to the promoted kTLS
+// socket. The caller holds writeMu so control frames and other multiplexed
+// streams cannot interleave with the generated PSH frames.
+func (s *session) writeKernelTLSVectoredLocked(sid uint32, data buf.MultiBuffer) (bool, error) {
+	result := writePSHBatchKernelTLS(s.conn, sid, data)
+	if !result.handled {
+		return false, nil
+	}
+	if counterConn, ok := s.conn.(*stat.CounterConnection); ok && counterConn.WriteCounter != nil && result.wireBytes > 0 {
+		counterConn.WriteCounter.Add(result.wireBytes)
+	}
+	var performance *performanceStats
+	if s.server != nil {
+		performance = s.server.performance
+	}
+	if result.err != nil {
+		performance.recordWritev(result.payloadBytes, result.batches, 0)
+		performance.recordWritevError(result.syscalls)
+		return true, result.err
+	}
+	performance.recordWritev(result.payloadBytes, result.batches, result.syscalls)
+	return true, nil
+}
+
+const (
+	maxPSHBatchPayloadSize int32 = 128 * 1024
+	maxPSHBatchFrameCount        = (maxPSHBatchPayloadSize + maxFramePayload - 1) / maxFramePayload
+	maxPSHBatchWireSize    int32 = maxPSHBatchPayloadSize + maxPSHBatchFrameCount*frameHeaderSize
+)
 
 // writePSHBatch takes ownership of data. It preserves the 16-bit AnyTLS frame
 // limit while grouping adjacent PSH frames into bounded connection writes.

@@ -11,6 +11,10 @@ type performanceStats struct {
 	spliceConnections    stats.Counter
 	spliceBytes          stats.Counter
 	spliceErrors         stats.Counter
+	writevBatches        stats.Counter
+	writevBytes          stats.Counter
+	writevSyscalls       stats.Counter
+	writevErrors         stats.Counter
 }
 
 func newPerformanceStats(manager stats.Manager) *performanceStats {
@@ -21,6 +25,10 @@ func newPerformanceStats(manager stats.Manager) *performanceStats {
 		spliceConnections:    getOrRegisterPerformanceCounter(manager, performanceStatsPrefix+"splice_connections"),
 		spliceBytes:          getOrRegisterPerformanceCounter(manager, performanceStatsPrefix+"splice_bytes"),
 		spliceErrors:         getOrRegisterPerformanceCounter(manager, performanceStatsPrefix+"splice_errors"),
+		writevBatches:        getOrRegisterPerformanceCounter(manager, performanceStatsPrefix+"writev_batches"),
+		writevBytes:          getOrRegisterPerformanceCounter(manager, performanceStatsPrefix+"writev_bytes"),
+		writevSyscalls:       getOrRegisterPerformanceCounter(manager, performanceStatsPrefix+"writev_syscalls"),
+		writevErrors:         getOrRegisterPerformanceCounter(manager, performanceStatsPrefix+"writev_errors"),
 	}
 }
 
@@ -71,5 +79,32 @@ func (s *performanceStats) recordSpliceBytes(bytes int64) {
 func (s *performanceStats) recordSpliceError() {
 	if s != nil && s.spliceErrors != nil {
 		s.spliceErrors.Add(1)
+	}
+}
+
+func (s *performanceStats) recordWritev(payloadBytes, batches, syscalls int64) {
+	if s == nil {
+		return
+	}
+	if batches > 0 && s.writevBatches != nil {
+		s.writevBatches.Add(batches)
+	}
+	if payloadBytes > 0 && s.writevBytes != nil {
+		s.writevBytes.Add(payloadBytes)
+	}
+	if syscalls > 0 && s.writevSyscalls != nil {
+		s.writevSyscalls.Add(syscalls)
+	}
+}
+
+func (s *performanceStats) recordWritevError(syscalls int64) {
+	if s == nil {
+		return
+	}
+	if syscalls > 0 && s.writevSyscalls != nil {
+		s.writevSyscalls.Add(syscalls)
+	}
+	if s.writevErrors != nil {
+		s.writevErrors.Add(1)
 	}
 }

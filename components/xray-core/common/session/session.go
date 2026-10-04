@@ -15,7 +15,8 @@ import (
 )
 
 // FramedDownlinkSplicer allows a multiplexed inbound to preserve its frame
-// boundaries while moving payload bytes directly from a raw outbound socket.
+// boundaries while moving payload bytes directly from a raw outbound socket,
+// bypassing the ordinary transport-pipe copy loop.
 // Implementations must return handled=false before consuming any source bytes
 // when the fast path is unavailable.
 type FramedDownlinkSplicer interface {

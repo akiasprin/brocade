@@ -29,7 +29,7 @@ var (
 	intro    = "A unified platform for anti-censorship."
 )
 
-const brocadeCapabilities = "anytls-ktls-splice secure-dokodemo-splice"
+const brocadeCapabilities = "anytls-ktls-splice anytls-ktls-writev secure-dokodemo-splice"
 
 func init() {
 	// Manually injected

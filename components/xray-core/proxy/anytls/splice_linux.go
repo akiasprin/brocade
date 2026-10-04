@@ -10,6 +10,7 @@ import (
 	"net"
 	"syscall"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	v2tls "github.com/xtls/xray-core/transport/internet/tls"
@@ -20,6 +21,10 @@ type framedDownlinkSplicer struct {
 	session *session
 	sid     uint32
 	ready   chan struct{}
+	// useSplice selects the zero-copy socket -> pipe -> kTLS socket path.
+	// Otherwise the hook bypasses the transport pipe but reads the source into
+	// pooled buffers and submits each complete AnyTLS batch with writev.
+	useSplice bool
 }
 
 func (s *framedDownlinkSplicer) SpliceDownlink(ctx context.Context, source net.Conn, onBytes func(int64)) (bool, error) {
@@ -32,6 +37,12 @@ func (s *framedDownlinkSplicer) SpliceDownlink(ctx context.Context, source net.C
 		case <-ctx.Done():
 			return true, ctx.Err()
 		}
+	}
+	if !s.session.unpaddedFastPathAvailable() {
+		return false, nil
+	}
+	if !s.useSplice {
+		return s.writevDownlink(ctx, source, onBytes)
 	}
 	destination, ok := v2tls.KernelTLSRawConn(s.session.conn)
 	if !ok {
@@ -99,6 +110,71 @@ func (s *framedDownlinkSplicer) SpliceDownlink(ctx context.Context, source net.C
 	}
 }
 
+func (s *framedDownlinkSplicer) writevDownlink(ctx context.Context, source net.Conn, onBytes func(int64)) (bool, error) {
+	// The framed fast-path contract only permits a fallback before consuming
+	// source bytes. Validate kTLS and syscall.Conn before the first read.
+	if !kernelTLSWritevAvailable(s.session.conn) {
+		return false, nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		default:
+		}
+
+		payload := buf.NewWithSize(maxPSHBatchPayloadSize)
+		readBuffer := payload.ExtendUninitialized(maxPSHBatchPayloadSize)
+		length, readErr := source.Read(readBuffer)
+		payload.Resize(0, int32(length))
+
+		if length > 0 {
+			s.session.writeMu.Lock()
+			if s.session.isClosed() {
+				s.session.writeMu.Unlock()
+				payload.Release()
+				return true, errSessionClosed
+			}
+			flushErr := s.session.fw.flush()
+			var handled bool
+			var writeErr error
+			if flushErr == nil {
+				handled, writeErr = s.session.writeKernelTLSVectoredLocked(s.sid, buf.MultiBuffer{payload})
+			}
+			s.session.writeMu.Unlock()
+			payload.Release()
+
+			if flushErr != nil {
+				s.session.close(flushErr)
+				return true, flushErr
+			}
+			if !handled {
+				writeErr = errors.New("anytls: kTLS writev became unavailable after consuming source data")
+			}
+			if writeErr != nil {
+				s.session.close(writeErr)
+				return true, writeErr
+			}
+			if onBytes != nil {
+				onBytes(int64(length))
+			}
+		} else {
+			payload.Release()
+		}
+
+		if readErr != nil {
+			if errors.Cause(readErr) == io.EOF {
+				return true, nil
+			}
+			return true, readErr
+		}
+		if length == 0 {
+			return true, io.ErrNoProgress
+		}
+	}
+}
+
 func (s *framedDownlinkSplicer) writeSplicedFrame(ctx context.Context, destination syscall.RawConn, pipeReadFD, length int) error {
 	select {
 	case <-ctx.Done():
@@ -156,7 +232,14 @@ func splicePipeToSocket(destination syscall.RawConn, pipeReadFD, length int) err
 			opErr   error
 		)
 		err := destination.Write(func(fd uintptr) bool {
-			n, spliceErr := unix.Splice(pipeReadFD, nil, int(fd), nil, remaining, unix.SPLICE_F_MOVE|unix.SPLICE_F_MORE)
+			// This call completes the AnyTLS frame body. SPLICE_F_MORE maps to
+			// MSG_MORE on the socket side and may leave a short kTLS record
+			// corked while the origin waits for the peer's next request. That is
+			// especially visible for a TLS ServerHello: both sides then wait for
+			// each other until the application handshake deadline. A partial
+			// splice is retried below, so every successful call may terminate the
+			// current TLS record and must not advertise an unknown future write.
+			n, spliceErr := unix.Splice(pipeReadFD, nil, int(fd), nil, remaining, unix.SPLICE_F_MOVE)
 			if spliceErr == unix.EAGAIN || spliceErr == unix.EWOULDBLOCK {
 				return false
 			}
