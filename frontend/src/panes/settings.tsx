@@ -1871,7 +1871,7 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
             三项均需填写 {LOG_MIN_MIB}–{LOG_MAX_MIB} 的整数
           </span>
         )}
-        <p className="agent-log-scope-note">保存后由机器下一轮读取，不产生修订，也不需要发布线路。</p>
+        <p className="settings-block-note">保存后由机器下一轮读取，不产生修订，也不需要发布线路。</p>
       </Group>
       <SettingsSaveBar
         dirty={dirty}
@@ -1940,36 +1940,38 @@ export function HostNetworkTuningSection({ editable, data }: { editable: boolean
       </header>
       <p className="cardsub">由 Agent 写入主路由网卡；保存后下一轮生效，不重启 XRAY</p>
       {save.error && <ErrorBox error={save.error} />}
-      <Group label="Virtio / NAPI 软件中断合并">
-        <Fld label="GRO 刷新等待">
-          <input
-            className={form.gro_flush_timeout_ns !== baseline.gro_flush_timeout_ns ? 'f chg' : 'f'}
-            type="number"
-            min={0}
-            max={HOST_GRO_MAX_NS}
-            step={1}
-            aria-label="GRO 刷新等待"
-            disabled={!editable || save.isPending}
-            value={form.gro_flush_timeout_ns}
-            onChange={event => setForm({ ...form, gro_flush_timeout_ns: event.target.value })}
-          />
-          <span className="unit">ns</span>
-        </Fld>
-        <Fld label="延迟硬中断">
-          <input
-            className={form.napi_defer_hard_irqs !== baseline.napi_defer_hard_irqs ? 'f chg' : 'f'}
-            type="number"
-            min={0}
-            max={HOST_NAPI_DEFER_MAX}
-            step={1}
-            aria-label="NAPI 延迟硬中断轮数"
-            disabled={!editable || save.isPending}
-            value={form.napi_defer_hard_irqs}
-            onChange={event => setForm({ ...form, napi_defer_hard_irqs: event.target.value })}
-          />
-          <span className="unit">轮</span>
-        </Fld>
-        <p className="hint">
+      <Group label="Virtio / NAPI 软件中断合并" className="settings-field-grid-container">
+        <div className="settings-field-grid settings-field-grid-two host-network-tuning-grid">
+          <Fld label="GRO 刷新等待">
+            <input
+              className={form.gro_flush_timeout_ns !== baseline.gro_flush_timeout_ns ? 'f chg' : 'f'}
+              type="number"
+              min={0}
+              max={HOST_GRO_MAX_NS}
+              step={1}
+              aria-label="GRO 刷新等待"
+              disabled={!editable || save.isPending}
+              value={form.gro_flush_timeout_ns}
+              onChange={event => setForm({ ...form, gro_flush_timeout_ns: event.target.value })}
+            />
+            <span className="unit">ns</span>
+          </Fld>
+          <Fld label="延迟硬中断">
+            <input
+              className={form.napi_defer_hard_irqs !== baseline.napi_defer_hard_irqs ? 'f chg' : 'f'}
+              type="number"
+              min={0}
+              max={HOST_NAPI_DEFER_MAX}
+              step={1}
+              aria-label="NAPI 延迟硬中断轮数"
+              disabled={!editable || save.isPending}
+              value={form.napi_defer_hard_irqs}
+              onChange={event => setForm({ ...form, napi_defer_hard_irqs: event.target.value })}
+            />
+            <span className="unit">轮</span>
+          </Fld>
+        </div>
+        <p className="settings-block-note">
           对应 <code>gro_flush_timeout</code> 与 <code>napi_defer_hard_irqs</code>；两项填 0 可恢复内核默认行为。
         </p>
         {parsed === null && (
